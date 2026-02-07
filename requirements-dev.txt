@@ -1,0 +1,28 @@
+# NeuroStack API - Development Requirements
+
+-r requirements.txt
+
+# Testing
+pytest>=7.4.4
+pytest-asyncio>=0.23.3
+pytest-cov>=4.1.0
+pytest-mock>=3.12.0
+
+# Code Quality
+black>=24.1.0
+isort>=5.13.2
+flake8>=7.0.0
+mypy>=1.8.0
+pre-commit>=3.6.0
+
+# Test Utilities
+faker>=22.0.0
+factory-boy>=3.3.0
+
+# Load Testing
+locust>=2.22.0
+
+# Documentation
+mkdocs>=1.5.3
+mkdocs-material>=9.5.3
+

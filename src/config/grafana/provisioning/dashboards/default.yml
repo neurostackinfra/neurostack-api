@@ -1,0 +1,19 @@
+# ============================================
+# NeuroStack - Grafana Dashboard Provisioning
+# ============================================
+# Auto-load dashboards from JSON files
+
+apiVersion: 1
+
+providers:
+  - name: 'NeuroStack Dashboards'
+    orgId: 1
+    folder: 'NeuroStack'
+    folderUid: 'neurostack'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+

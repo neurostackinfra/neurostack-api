@@ -1,0 +1,112 @@
+# ============================================
+# NeuroStack - Loki Configuration
+# ============================================
+# Log aggregation and querying service
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: info
+
+common:
+  instance_addr: 127.0.0.1
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100
+
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: boltdb-shipper
+      object_store: filesystem
+      schema: v11
+      index:
+        prefix: index_
+        period: 24h
+
+storage_config:
+  boltdb_shipper:
+    active_index_directory: /loki/boltdb-shipper-active
+    cache_location: /loki/boltdb-shipper-cache
+    cache_ttl: 24h
+    shared_store: filesystem
+  filesystem:
+    directory: /loki/chunks
+
+distributor:
+  ring:
+    kvstore:
+      store: inmemory
+
+ingester:
+  # WAL desabilitado temporariamente para evitar problemas de permissão
+  # Pode ser reabilitado após garantir que o diretório existe com permissões corretas
+  wal:
+    enabled: false
+  lifecycler:
+    ring:
+      kvstore:
+        store: inmemory
+      replication_factor: 1
+
+compactor:
+  working_directory: /loki/boltdb-shipper-compactor
+  shared_store: filesystem
+
+limits_config:
+  # Retenção de logs por 7 dias
+  retention_period: 168h
+  
+  # Limites de ingestão
+  ingestion_rate_mb: 10
+  ingestion_burst_size_mb: 20
+  max_streams_per_user: 10000
+  max_line_size: 256kb
+  
+  # Limites de query
+  max_entries_limit_per_query: 5000
+  max_query_series: 500
+  max_query_parallelism: 32
+  
+  # Permitir queries estruturadas
+  allow_structured_metadata: true
+  
+  # Habilitar volume de logs
+  volume_enabled: true
+
+chunk_store_config:
+  max_look_back_period: 168h
+
+table_manager:
+  retention_deletes_enabled: true
+  retention_period: 168h
+
+ruler:
+  alertmanager_url: http://alertmanager:9093
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+  rule_path: /loki/rules-temp
+  ring:
+    kvstore:
+      store: inmemory
+  enable_api: true
+
+analytics:
+  reporting_enabled: false
+

@@ -1,0 +1,105 @@
+# ============================================
+# NeuroStack - Promtail Configuration
+# ============================================
+# Log collection agent for Loki
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: info
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    batchwait: 1s
+    batchsize: 1048576
+    timeout: 10s
+
+scrape_configs:
+  # NeuroStack API logs (container)
+  - job_name: neurostack-api
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # Apenas containers do NeuroStack
+      - source_labels: ['__meta_docker_container_name']
+        regex: '.*neurostack.*'
+        action: keep
+      
+      # Nome do container como label
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: container
+      
+      # Ambiente
+      - source_labels: ['__meta_docker_container_label_environment']
+        target_label: environment
+        
+    pipeline_stages:
+      # Tentar parse JSON (opcional - não falha se não for JSON)
+      - json:
+          expressions:
+            level: level
+            message: event
+            timestamp: timestamp
+            request_id: request_id
+            tenant_id: tenant_id
+            session_id: session_id
+            path: path
+            method: method
+            status_code: status_code
+            latency_ms: latency_ms
+          drop_malformed: false
+      
+      # Usar timestamp do log se disponível (JSON)
+      - timestamp:
+          source: timestamp
+          format: RFC3339Nano
+          fallback_formats:
+            - RFC3339
+            - Unix
+      
+      # Labels extraídos (se disponíveis em JSON)
+      - labels:
+          level:
+          request_id:
+          tenant_id:
+          session_id:
+
+  # Docker container logs genéricos
+  - job_name: docker-containers
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: container
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: service
+    pipeline_stages:
+      - docker: {}
+
+  # Logs de arquivo local (desenvolvimento)
+  - job_name: local-logs
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: neurostack
+          __path__: /var/log/neurostack/*.log
+    pipeline_stages:
+      - json:
+          expressions:
+            level: level
+            message: event
+            timestamp: timestamp
+      - timestamp:
+          source: timestamp
+          format: RFC3339Nano
+      - labels:
+          level:
+

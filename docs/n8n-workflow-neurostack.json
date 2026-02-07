@@ -1,0 +1,699 @@
+{
+  "name": "NeuroStack Chat Integration",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "chat",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-receive",
+      "name": "Webhook - Receber Mensagem",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "neurostack-chat-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extrair dados da mensagem recebida\nconst body = $input.item.json || {};\n\n// Suporta diferentes formatos de entrada\nlet userMessage = '';\nlet userId = 'unknown';\nlet channel = 'whatsapp';\n\n// Tentar múltiplos formatos de entrada\n\n// 1. Formato direto simples\nif (body.message && typeof body.message === 'string') {\n  userMessage = body.message;\n  userId = body.user_id || body.userId || body.from || 'unknown';\n  channel = body.channel || 'whatsapp';\n}\n// 2. Formato com campo 'text'\nelse if (body.text && typeof body.text === 'string') {\n  userMessage = body.text;\n  userId = body.from || body.user_id || body.userId || 'unknown';\n  channel = body.channel || 'whatsapp';\n}\n// 3. Formato WhatsApp Business API\nelse if (body.entry && Array.isArray(body.entry) && body.entry.length > 0) {\n  const entry = body.entry[0]?.changes?.[0]?.value;\n  if (entry?.messages?.[0]) {\n    const msg = entry.messages[0];\n    userMessage = msg.text?.body || msg.body || '';\n    userId = msg.from || entry.contacts?.[0]?.wa_id || 'unknown';\n    channel = 'whatsapp';\n  }\n}\n// 4. Formato com 'content'\nelse if (body.content && typeof body.content === 'string') {\n  userMessage = body.content;\n  userId = body.user_id || body.userId || body.from || 'unknown';\n  channel = body.channel || 'whatsapp';\n}\n// 5. Formato com 'payload'\nelse if (body.payload) {\n  const payload = body.payload;\n  userMessage = payload.content || payload.message || payload.text || '';\n  userId = payload.user_id || payload.userId || payload.from || 'unknown';\n  channel = payload.channel || 'whatsapp';\n}\n// 6. Tentar extrair do body diretamente (último recurso)\nelse if (typeof body === 'string') {\n  userMessage = body;\n  userId = 'unknown';\n  channel = 'whatsapp';\n}\n// 7. Se body é um objeto, tentar encontrar qualquer campo de texto\nelse if (typeof body === 'object' && body !== null) {\n  // Procurar por campos comuns que podem conter a mensagem\n  const textFields = ['message', 'text', 'content', 'body', 'input', 'query', 'prompt'];\n  for (const field of textFields) {\n    if (body[field] && typeof body[field] === 'string' && body[field].trim().length > 0) {\n      userMessage = body[field];\n      break;\n    }\n  }\n  \n  // Procurar por campos comuns que podem conter user_id\n  const idFields = ['user_id', 'userId', 'from', 'sender', 'user', 'chat_id'];\n  for (const field of idFields) {\n    if (body[field]) {\n      userId = String(body[field]);\n      break;\n    }\n  }\n  \n  channel = body.channel || 'whatsapp';\n}\n\n// Validar que temos pelo menos uma mensagem\nif (!userMessage || userMessage.trim().length === 0) {\n  // Se não encontrou mensagem, usar um valor padrão ou o body inteiro como string\n  userMessage = JSON.stringify(body).substring(0, 500);\n}\n\n// Função para gerar GUID (UUID v4)\nfunction generateGuid() {\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\n// Verificar se já existe session_id no payload, senão gerar um novo GUID\nlet sessionId = body.session_id || body.sessionId || body.body.session_id;\nif (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {\n  sessionId = generateGuid();\n}\n\n// Adicionar timestamp único para evitar colisões\nconst timestamp = new Date().toISOString();\n\nreturn {\n  json: {\n    user_message: userMessage.trim(),\n    user_id: userId,\n    channel: channel,\n    session_id: sessionId,\n    timestamp: timestamp,\n    raw_body: body // Incluir body original para debug\n  }\n};"
+      },
+      "id": "extract-message",
+      "name": "Extrair Dados da Mensagem",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $vars.NEUROSTACK_BASE_URL || 'https://api.neurostack.ai' }}/health",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $vars.NEUROSTACK_API_KEY }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "health-check",
+      "name": "Health Check NeuroStack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [680, 300],
+      "notes": "Verifica se a API está disponível"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "health-status",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "healthy",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "check-health",
+      "name": "API Disponível?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $vars.NEUROSTACK_BASE_URL || 'https://api.neurostack.ai/v1' }}/sessions/{{ $('Extrair Dados da Mensagem').item.json.session_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $vars.NEUROSTACK_API_KEY }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "get-session",
+      "name": "Verificar Sessão Existente",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1120, 200],
+      "notes": "Tenta recuperar sessão existente"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "session-exists",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "check-session",
+      "name": "Sessão Existe?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1340, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.NEUROSTACK_BASE_URL || 'https://api.neurostack.ai/v1' }}/sessions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $vars.NEUROSTACK_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "tenant_id",
+              "value": "={{ $vars.NEUROSTACK_TENANT_ID }}"
+            },
+            {
+              "name": "user_id",
+              "value": "={{ $('Extrair Dados da Mensagem').item.json.user_id }}"
+            },
+            {
+              "name": "channel",
+              "value": "={{ $('Extrair Dados da Mensagem').item.json.channel }}"
+            },
+            {
+              "name": "initial_context",
+              "value": "={}"
+            },
+            {
+              "name": "metadata",
+              "value": "={{ { \"created_by\": \"n8n\", \"timestamp\": $('Extrair Dados da Mensagem').item.json.timestamp } }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "create-session",
+      "name": "Criar Nova Sessão",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1340, 400],
+      "notes": "Cria nova sessão se não existir"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Unificar dados da sessão (criada ou existente)\nconst sessionData = $input.item.json;\nconst messageData = $('Extrair Dados da Mensagem').item.json;\n\nreturn {\n  json: {\n    session_id: sessionData.id || sessionData.session_id || messageData.session_id,\n    user_id: messageData.user_id,\n    user_message: messageData.user_message,\n    channel: messageData.channel\n  }\n};"
+      },
+      "id": "prepare-session",
+      "name": "Preparar Dados da Sessão",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.NEUROSTACK_BASE_URL || 'https://api.neurostack.ai/v1' }}/events",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $vars.NEUROSTACK_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Request-ID",
+              "value": "={{ $now.toISO() }}-{{ Math.random().toString(36).substring(7) }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "tenant_id",
+              "value": "={{ $vars.NEUROSTACK_TENANT_ID }}"
+            },
+            {
+              "name": "session_id",
+              "value": "={{ $json.session_id }}"
+            },
+            {
+              "name": "event_type",
+              "value": "message.in"
+            },
+            {
+              "name": "payload",
+              "value": "={{ { \"content\": $json.user_message, \"channel\": $json.channel, \"user_id\": $json.user_id, \"metadata\": { \"timestamp\": new Date().toISOString() } } }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "process-message",
+      "name": "Processar Mensagem no NeuroStack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1780, 300],
+      "notes": "Envia mensagem para NeuroStack processar"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "handoff-required",
+              "leftValue": "={{ $json.decision?.handoff_required }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "check-handoff",
+      "name": "Handoff Necessário?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2000, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Preparar dados para handoff\nconst neurostackResponse = $input.item.json;\nconst sessionData = $('Preparar Dados da Sessão').item.json;\n\nconst handoffInfo = neurostackResponse.handoff_summary || {};\n\nreturn {\n  json: {\n    user_id: sessionData.user_id,\n    session_id: sessionData.session_id,\n    reason: neurostackResponse.decision?.handoff_reason || 'unknown',\n    summary: handoffInfo.summary || 'Handoff necessário',\n    key_info: handoffInfo.key_info || {},\n    urgency: handoffInfo.urgency || 'normal',\n    message: 'Vou transferir você para um de nossos atendentes. Aguarde um momento, por favor.'\n  }\n};"
+      },
+      "id": "prepare-handoff",
+      "name": "Preparar Handoff",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 200],
+      "notes": "Prepara resposta de handoff"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.HANDOFF_WEBHOOK_URL || 'https://api.seu-sistema.com/webhooks/handoff' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "session_id",
+              "value": "={{ $json.session_id }}"
+            },
+            {
+              "name": "user_id",
+              "value": "={{ $json.user_id }}"
+            },
+            {
+              "name": "reason",
+              "value": "={{ $json.reason }}"
+            },
+            {
+              "name": "summary",
+              "value": "={{ $json.summary }}"
+            },
+            {
+              "name": "urgency",
+              "value": "={{ $json.urgency }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "notify-handoff",
+      "name": "Notificar Handoff",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [2440, 200],
+      "notes": "Notifica sistema externo sobre handoff"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Preparar prompt para LLM\nconst neurostackResponse = $input.item.json;\nconst sessionData = $('Preparar Dados da Sessão').item.json;\n\nconst prompt = neurostackResponse.prompt || {};\nconst context = neurostackResponse.context || {};\n\n// Construir system prompt\nlet systemPrompt = prompt.system || 'Você é um assistente de saúde amigável e profissional.';\n\n// Adicionar constraints\nif (prompt.constraints && prompt.constraints.length > 0) {\n  systemPrompt += '\\n\\nRESTRIÇÕES IMPORTANTES:\\n';\n  prompt.constraints.forEach(c => {\n    systemPrompt += `- ${c}\\n`;\n  });\n}\n\n// Preparar histórico de mensagens\nconst messages = [];\n\n// System prompt\nmessages.push({\n  role: 'system',\n  content: systemPrompt\n});\n\n// Histórico recente\nif (context.recent_messages) {\n  context.recent_messages.slice(-5).forEach(msg => {\n    messages.push({\n      role: msg.role || 'user',\n      content: msg.content || ''\n    });\n  });\n}\n\n// Mensagem atual\nmessages.push({\n  role: 'user',\n  content: sessionData.user_message\n});\n\n// Instruções específicas\nif (prompt.instructions) {\n  messages.push({\n    role: 'system',\n    content: `Instruções para esta resposta: ${prompt.instructions}`\n  });\n}\n\nreturn {\n  json: {\n    messages: messages,\n    intent: neurostackResponse.decision?.intent || 'unknown',\n    funnel_stage: neurostackResponse.decision?.funnel_stage || 'unknown',\n    session_id: sessionData.session_id,\n    user_id: sessionData.user_id,\n    channel: sessionData.channel,\n    mode: neurostackResponse.mode || 'normal',\n    temperature: 0.7,\n    max_tokens: 500\n  }\n};"
+      },
+      "id": "prepare-llm",
+      "name": "Preparar Prompt para LLM",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 400],
+      "notes": "Prepara mensagens para OpenAI"
+    },
+    {
+      "parameters": {
+        "model": "gpt-4",
+        "options": {
+          "temperature": "={{ $json.temperature }}",
+          "maxTokens": "={{ $json.max_tokens }}"
+        },
+        "messages": {
+          "values": "={{ $json.messages }}"
+        }
+      },
+      "id": "call-openai",
+      "name": "Gerar Resposta com OpenAI",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [2440, 400],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-credentials",
+          "name": "OpenAI API"
+        }
+      },
+      "notes": "Gera resposta usando GPT-4"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Preparar resposta final\nconst openaiResponse = $input.item.json;\nconst llmData = $('Preparar Prompt para LLM').item.json;\nconst sessionData = $('Preparar Dados da Sessão').item.json;\n\nconst reply = openaiResponse.choices?.[0]?.message?.content || 'Desculpe, não consegui processar sua mensagem.';\n\nreturn {\n  json: {\n    reply: reply,\n    intent: llmData.intent,\n    funnel_stage: llmData.funnel_stage,\n    session_id: sessionData.session_id,\n    user_id: sessionData.user_id,\n    channel: sessionData.channel,\n    handoff_required: false,\n    timestamp: new Date().toISOString()\n  }\n};"
+      },
+      "id": "format-response",
+      "name": "Formatar Resposta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2660, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.NEUROSTACK_BASE_URL || 'https://api.neurostack.ai/v1' }}/events",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $vars.NEUROSTACK_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "tenant_id",
+              "value": "={{ $vars.NEUROSTACK_TENANT_ID }}"
+            },
+            {
+              "name": "session_id",
+              "value": "={{ $json.session_id }}"
+            },
+            {
+              "name": "event_type",
+              "value": "message.out"
+            },
+            {
+              "name": "payload",
+              "value": "={{ { \"content\": $json.reply, \"channel\": $json.channel, \"user_id\": $json.user_id, \"metadata\": { \"timestamp\": $json.timestamp } } }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "log-response",
+      "name": "Logar Resposta no NeuroStack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [2880, 400],
+      "notes": "Registra resposta enviada"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"reply\": $json.reply, \"intent\": $json.intent, \"handoff_required\": $json.handoff_required } }}"
+      },
+      "id": "webhook-response",
+      "name": "Responder ao Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [3100, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Resposta de erro\nconst error = $input.item.json.error || $input.item.json.message || 'Erro desconhecido';\n\nreturn {\n  json: {\n    reply: 'Desculpe, ocorreu um erro ao processar sua mensagem. Por favor, tente novamente.',\n    error: error,\n    handoff_required: false,\n    timestamp: new Date().toISOString()\n  }\n};"
+      },
+      "id": "error-handler",
+      "name": "Tratar Erro",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 500]
+    }
+  ],
+  "connections": {
+    "Webhook - Receber Mensagem": {
+      "main": [
+        [
+          {
+            "node": "Extrair Dados da Mensagem",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extrair Dados da Mensagem": {
+      "main": [
+        [
+          {
+            "node": "Health Check NeuroStack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Health Check NeuroStack": {
+      "main": [
+        [
+          {
+            "node": "API Disponível?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "API Disponível?": {
+      "main": [
+        [
+          {
+            "node": "Verificar Sessão Existente",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Tratar Erro",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verificar Sessão Existente": {
+      "main": [
+        [
+          {
+            "node": "Sessão Existe?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sessão Existe?": {
+      "main": [
+        [
+          {
+            "node": "Preparar Dados da Sessão",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Criar Nova Sessão",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Criar Nova Sessão": {
+      "main": [
+        [
+          {
+            "node": "Preparar Dados da Sessão",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Dados da Sessão": {
+      "main": [
+        [
+          {
+            "node": "Processar Mensagem no NeuroStack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Processar Mensagem no NeuroStack": {
+      "main": [
+        [
+          {
+            "node": "Handoff Necessário?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handoff Necessário?": {
+      "main": [
+        [
+          {
+            "node": "Preparar Handoff",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Preparar Prompt para LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Handoff": {
+      "main": [
+        [
+          {
+            "node": "Notificar Handoff",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notificar Handoff": {
+      "main": [
+        [
+          {
+            "node": "Responder ao Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Prompt para LLM": {
+      "main": [
+        [
+          {
+            "node": "Gerar Resposta com OpenAI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gerar Resposta com OpenAI": {
+      "main": [
+        [
+          {
+            "node": "Formatar Resposta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Formatar Resposta": {
+      "main": [
+        [
+          {
+            "node": "Logar Resposta no NeuroStack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Logar Resposta no NeuroStack": {
+      "main": [
+        [
+          {
+            "node": "Responder ao Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tratar Erro": {
+      "main": [
+        [
+          {
+            "node": "Responder ao Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:00:00.000Z",
+      "id": "neurostack",
+      "name": "NeuroStack"
+    },
+    {
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:00:00.000Z",
+      "id": "chatbot",
+      "name": "Chatbot"
+    }
+  ],
+  "triggerCount": 1,
+  "updatedAt": "2026-01-01T00:00:00.000Z",
+  "versionId": "1"
+}

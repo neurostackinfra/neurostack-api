@@ -1,0 +1,144 @@
+# ============================================
+# NeuroStack - Alertmanager Configuration
+# ============================================
+# Configuração de roteamento e notificações de alertas
+
+global:
+  # Tempo máximo para resolver um alerta antes de renotificar
+  resolve_timeout: 5m
+  
+  # Configuração de SMTP para emails (customize conforme necessário)
+  # smtp_smarthost: 'smtp.gmail.com:587'
+  # smtp_from: 'alertmanager@neurostack.io'
+  # smtp_auth_username: 'your-email@gmail.com'
+  # smtp_auth_password: 'your-app-password'
+
+  # Configuração de Slack (customize conforme necessário)
+  # slack_api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+
+# Templates customizados para notificações
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'
+
+# Roteamento de alertas
+route:
+  # Receiver padrão
+  receiver: 'default-receiver'
+  
+  # Agrupamento de alertas
+  group_by: ['alertname', 'severity', 'team']
+  
+  # Tempo para esperar antes de enviar grupo inicial
+  group_wait: 30s
+  
+  # Intervalo entre notificações de alertas no mesmo grupo
+  group_interval: 5m
+  
+  # Intervalo para reenviar alertas ativos
+  repeat_interval: 4h
+
+  # Rotas específicas por severidade e time
+  routes:
+    # Alertas críticos - notificação imediata
+    - match:
+        severity: critical
+      receiver: 'critical-receiver'
+      group_wait: 10s
+      repeat_interval: 1h
+      continue: true
+
+    # Alertas do time clínico
+    - match:
+        team: clinical
+      receiver: 'clinical-receiver'
+      group_wait: 10s
+      repeat_interval: 30m
+
+    # Alertas do time de backend
+    - match:
+        team: backend
+      receiver: 'backend-receiver'
+      repeat_interval: 2h
+
+    # Alertas do time de produto
+    - match:
+        team: product
+      receiver: 'product-receiver'
+      repeat_interval: 4h
+
+    # Alertas informativos
+    - match:
+        severity: info
+      receiver: 'info-receiver'
+      repeat_interval: 12h
+
+# Inibição de alertas
+inhibit_rules:
+  # Se a API está down, inibir outros alertas
+  - source_match:
+      alertname: 'APIDown'
+    target_match_re:
+      alertname: '.*'
+    equal: ['job']
+
+  # Se há erro crítico, inibir warnings
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname']
+
+# Definição de receivers
+receivers:
+  # Receiver padrão (webhook genérico)
+  - name: 'default-receiver'
+    webhook_configs:
+      - url: 'http://localhost:9093/webhook'
+        send_resolved: true
+
+  # Alertas críticos - múltiplos canais
+  - name: 'critical-receiver'
+    webhook_configs:
+      - url: 'http://localhost:9093/webhook/critical'
+        send_resolved: true
+    # Descomente e configure para usar Slack
+    # slack_configs:
+    #   - channel: '#alerts-critical'
+    #     send_resolved: true
+    #     title: '🚨 CRITICAL: {{ .GroupLabels.alertname }}'
+    #     text: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
+
+  # Alertas clínicos
+  - name: 'clinical-receiver'
+    webhook_configs:
+      - url: 'http://localhost:9093/webhook/clinical'
+        send_resolved: true
+    # Configurar notificação para equipe clínica
+    # pagerduty_configs:
+    #   - service_key: 'your-pagerduty-key'
+    #     severity: 'critical'
+
+  # Alertas de backend
+  - name: 'backend-receiver'
+    webhook_configs:
+      - url: 'http://localhost:9093/webhook/backend'
+        send_resolved: true
+    # slack_configs:
+    #   - channel: '#backend-alerts'
+    #     send_resolved: true
+
+  # Alertas de produto
+  - name: 'product-receiver'
+    webhook_configs:
+      - url: 'http://localhost:9093/webhook/product'
+        send_resolved: true
+    # slack_configs:
+    #   - channel: '#product-alerts'
+    #     send_resolved: true
+
+  # Alertas informativos
+  - name: 'info-receiver'
+    webhook_configs:
+      - url: 'http://localhost:9093/webhook/info'
+        send_resolved: true
+

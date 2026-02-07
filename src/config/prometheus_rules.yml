@@ -1,0 +1,237 @@
+# ============================================
+# NeuroStack API - Prometheus Alert Rules
+# ============================================
+# Alertas para latência, erros e métricas de negócio
+
+groups:
+  # =====================
+  # Performance Alerts
+  # =====================
+  - name: neurostack_performance
+    interval: 30s
+    rules:
+      # Latência p95 acima do SLO (200ms)
+      - alert: HighLatencyP95
+        expr: |
+          histogram_quantile(0.95, 
+            sum(rate(neurostack_request_latency_seconds_bucket[5m])) by (le)
+          ) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Latência p95 acima do SLO"
+          description: "Latência p95 está em {{ $value | humanizeDuration }} (SLO: 200ms) por mais de 5 minutos"
+          runbook_url: "https://docs.neurostack.io/runbooks/high-latency"
+
+      # Latência p99 crítica (>500ms)
+      - alert: CriticalLatencyP99
+        expr: |
+          histogram_quantile(0.99, 
+            sum(rate(neurostack_request_latency_seconds_bucket[5m])) by (le)
+          ) > 0.5
+        for: 2m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "Latência p99 crítica"
+          description: "Latência p99 está em {{ $value | humanizeDuration }} por mais de 2 minutos"
+          runbook_url: "https://docs.neurostack.io/runbooks/critical-latency"
+
+  # =====================
+  # Error Rate Alerts
+  # =====================
+  - name: neurostack_errors
+    interval: 30s
+    rules:
+      # Taxa de erro 5xx acima de 1%
+      - alert: HighErrorRate5xx
+        expr: |
+          (
+            sum(rate(neurostack_requests_total{status=~"5.."}[5m])) 
+            / sum(rate(neurostack_requests_total[5m]))
+          ) * 100 > 1
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Taxa de erro 5xx elevada"
+          description: "Taxa de erro 5xx está em {{ $value | printf \"%.2f\" }}% por mais de 5 minutos"
+          runbook_url: "https://docs.neurostack.io/runbooks/high-error-rate"
+
+      # Taxa de erro 5xx crítica (>5%)
+      - alert: CriticalErrorRate5xx
+        expr: |
+          (
+            sum(rate(neurostack_requests_total{status=~"5.."}[5m])) 
+            / sum(rate(neurostack_requests_total[5m]))
+          ) * 100 > 5
+        for: 2m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "Taxa de erro 5xx crítica"
+          description: "Taxa de erro 5xx está em {{ $value | printf \"%.2f\" }}% por mais de 2 minutos"
+          runbook_url: "https://docs.neurostack.io/runbooks/critical-error-rate"
+
+      # Taxa de erro 4xx elevada (>10%)
+      - alert: HighErrorRate4xx
+        expr: |
+          (
+            sum(rate(neurostack_requests_total{status=~"4.."}[5m])) 
+            / sum(rate(neurostack_requests_total[5m]))
+          ) * 100 > 10
+        for: 10m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Taxa de erro 4xx elevada"
+          description: "Taxa de erro 4xx está em {{ $value | printf \"%.2f\" }}%"
+
+  # =====================
+  # Availability Alerts
+  # =====================
+  - name: neurostack_availability
+    interval: 30s
+    rules:
+      # API não respondendo
+      - alert: APIDown
+        expr: up{job="neurostack-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "NeuroStack API está down"
+          description: "API não está respondendo há mais de 1 minuto"
+          runbook_url: "https://docs.neurostack.io/runbooks/api-down"
+
+      # Baixo throughput (possível problema)
+      - alert: LowThroughput
+        expr: sum(rate(neurostack_requests_total[5m])) < 0.1
+        for: 10m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Throughput muito baixo"
+          description: "Menos de 0.1 req/s nos últimos 10 minutos (possível problema de conectividade)"
+
+      # Muitas conexões ativas
+      - alert: HighActiveConnections
+        expr: sum(neurostack_active_requests) > 100
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Muitas conexões ativas"
+          description: "{{ $value }} conexões ativas (possível backpressure)"
+
+  # =====================
+  # Business Metrics Alerts
+  # =====================
+  - name: neurostack_business
+    interval: 60s
+    rules:
+      # Alta taxa de safety triggers
+      - alert: HighSafetyTriggerRate
+        expr: |
+          (
+            sum(rate(neurostack_safety_triggers_total[1h])) 
+            / sum(rate(neurostack_srm_decisions_total[1h]))
+          ) * 100 > 10
+        for: 30m
+        labels:
+          severity: warning
+          team: product
+        annotations:
+          summary: "Alta taxa de safety triggers"
+          description: "{{ $value | printf \"%.1f\" }}% das decisões estão acionando safety triggers"
+          runbook_url: "https://docs.neurostack.io/runbooks/high-safety-rate"
+
+      # Alta taxa de handoffs
+      - alert: HighHandoffRate
+        expr: |
+          (
+            sum(rate(neurostack_handoffs_total[1h])) 
+            / sum(rate(neurostack_srm_decisions_total[1h]))
+          ) * 100 > 25
+        for: 30m
+        labels:
+          severity: warning
+          team: product
+        annotations:
+          summary: "Alta taxa de handoffs"
+          description: "{{ $value | printf \"%.1f\" }}% das conversas estão sendo escalonadas para humanos"
+
+      # Safety trigger crítico (categoria clinical)
+      - alert: ClinicalSafetyAlert
+        expr: rate(neurostack_safety_triggers_total{category="clinical"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          team: clinical
+        annotations:
+          summary: "Safety trigger clínico detectado"
+          description: "Detectado conteúdo que requer atenção clínica imediata"
+          runbook_url: "https://docs.neurostack.io/runbooks/clinical-safety"
+
+  # =====================
+  # Cache & Performance
+  # =====================
+  - name: neurostack_cache
+    interval: 30s
+    rules:
+      # Baixa taxa de cache hit
+      - alert: LowCacheHitRate
+        expr: |
+          (
+            sum(rate(neurostack_cache_hits_total[5m])) 
+            / (sum(rate(neurostack_cache_hits_total[5m])) + sum(rate(neurostack_cache_misses_total[5m])))
+          ) * 100 < 50
+        for: 15m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Taxa de cache hit baixa"
+          description: "Cache hit rate está em {{ $value | printf \"%.1f\" }}%"
+
+  # =====================
+  # SRM Processing
+  # =====================
+  - name: neurostack_srm
+    interval: 30s
+    rules:
+      # SRM latência alta
+      - alert: HighSRMLatency
+        expr: |
+          histogram_quantile(0.95, 
+            sum(rate(neurostack_srm_processing_seconds_bucket[5m])) by (le)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Latência do SRM elevada"
+          description: "SRM p95 está em {{ $value | humanizeDuration }}"
+
+      # Baixa confiança nas classificações
+      - alert: LowClassificationConfidence
+        expr: |
+          avg(neurostack_intent_confidence) < 0.6
+        for: 15m
+        labels:
+          severity: info
+          team: ml
+        annotations:
+          summary: "Baixa confiança nas classificações de intent"
+          description: "Confiança média de classificação está em {{ $value | printf \"%.2f\" }}"
+
