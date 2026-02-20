@@ -1,0 +1,53 @@
+{
+  "description": "Clínica de Dermatologia e Estética - atendimento via WhatsApp",
+  "rate_limit": 100,
+  "session_ttl_seconds": 86400,
+  "max_sessions_per_user": 10,
+  "webhook_url": "https://api.minha-clinica.com/webhooks/neurostack",
+  "features": {
+    "rag_enabled": true,
+    "handoff_enabled": true,
+    "safety_strict_mode": true
+  },
+  "branding": {
+    "primary_color": "#1a365d",
+    "logo_url": "https://cdn.minha-clinica.com/logo.png"
+  },
+  "custom_settings": {},
+  "clinic_config": {
+    "clinic_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "version": 1,
+    "persona": {
+      "clinic_display_name": "Clínica Saúde & Beleze",
+      "agent_display_name": "Assistente Virtual",
+      "use_personal_name": false
+    },
+    "scheduling": {
+      "has_scheduling_agent": true,
+      "hours_rag_key": "horarios-atendimento"
+    },
+    "pricing": {
+      "disclosure_mode": "range_allowed",
+      "range_table_available": true,
+      "exact_table_available": false,
+      "range_format": "A partir de R$ {min} (consulta tipo {tipo})",
+      "special_conditions_note_enabled": true
+    },
+    "post_care": {
+      "standard_instructions_rag_key": "pos-atendimento-padrao",
+      "emergency_warning_text_enabled": true
+    },
+    "handoff": {
+      "default_mode": "whatsapp_human_takeover",
+      "sector_defaults": {
+        "agendamento": "prioritario",
+        "financeiro": "rotina",
+        "administrativo": "rotina",
+        "gerencia": "prioritario",
+        "clinico": "prioritario",
+        "urgencia": "imediato",
+        "fidelizacao": "rotina"
+      }
+    }
+  }
+}

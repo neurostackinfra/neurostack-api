@@ -8,6 +8,7 @@ This module exports all ORM models for database operations.
 from src.models.base import Base, TimestampMixin
 from src.models.tenant import Tenant, TenantConfig
 from src.models.clinic_config import ClinicConfig
+from src.models.clinic_config_table import ClinicConfigTable
 from src.models.session import Session
 from src.models.event import Event
 from src.models.policy import Policy
@@ -22,6 +23,7 @@ __all__ = [
     "Tenant",
     "TenantConfig",
     "ClinicConfig",
+    "ClinicConfigTable",
     "Session",
     "Event",
     "Policy",

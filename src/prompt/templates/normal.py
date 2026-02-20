@@ -27,13 +27,13 @@ Voc\u00ea \u00e9 um assistente virtual inteligente, projetado para oferecer aten
 3. Seja conciso, mas completo nas informa\u00e7\u00f5es
 4. Se n\u00e3o souber algo, admita e ofere\u00e7a alternativas
 5. Nunca invente informa\u00e7\u00f5es
-6. Fa\u00e7a no m\u00e1ximo uma pergunta por resposta
-7. Quando precisar coletar dados sequenciais, colete um dado por vez e aguarde a resposta do usu\u00e1rio antes de avan\u00e7ar
 
-## Contexto da Conversa
+## Contexto para Condu\u00e7\u00e3o
+O contexto que voc\u00ea recebe \u00e9 a **jornada do usu\u00e1rio no funil**, n\u00e3o o hist\u00f3rico de mensagens. Use a jornada para conduzir o usu\u00e1rio pelas etapas corretas do funil, na ordem adequada.
+
 - Canal: {{channel}}
-- Est\u00e1gio do funil: {{funnel_stage}}
-- Turno atual: {{turn_count}}
+- Est\u00e1gio atual do funil: {{funnel_stage}}
+- Turno: {{turn_count}}
 """
 
 # Instruções por etapa do funil canônico (11 etapas MVP v0.5)
@@ -41,12 +41,11 @@ FUNNEL_INSTRUCTIONS = {
     "lead_novo": """
 ## Instruções para Lead Novo
 - Primeiro contato; verificar se já é paciente (pergunta de direcionamento)
-- Seja acolhedor; apresente nome e clínica; faça uma pergunta por vez (comece pelo objetivo e depois peça nome)
+- Seja acolhedor; apresente nome e clínica; pergunte objetivo e depois nome
 """,
     "em_qualificacao": """
 ## Instruções para Em Qualificação
 - Fluxo de venda em andamento; aplicar sequência de perguntas para qualificação
-- Em qualificação e agendamento, faça apenas uma pergunta por turno e espere a resposta antes de continuar
 - Faça a Pergunta-Chave sobre experiência prévia para classificar perfil (Novidade/Decepção/Continuidade)
 """,
     "qualificado": """
@@ -121,8 +120,18 @@ class NormalTemplate(BaseTemplate):
         return self.render_template(NORMAL_SYSTEM_PROMPT, variables)
 
     def get_context_instructions(self, variables: PromptVariables) -> str:
-        """Get context-specific instructions based on funnel stage."""
+        """Get context-specific instructions based on funnel stage and user journey."""
         parts = []
+
+        # Jornada do usuário no funil (contexto principal para condução)
+        if variables.user_journey:
+            journey_section = TemplateSection("Jornada do Usu\u00e1rio no Funil")
+            journey_section.add(
+                "Use as informa\u00e7\u00f5es abaixo para conduzir o usu\u00e1rio pela pr\u00f3xima etapa correta. "
+                "N\u00e3o repita etapas j\u00e1 percorridas; avance conforme o funil."
+            )
+            journey_section.add(variables.user_journey)
+            parts.append(journey_section.build())
         
         # Funnel stage instructions
         funnel_stage = variables.funnel_stage.lower()
@@ -158,18 +167,8 @@ class NormalTemplate(BaseTemplate):
         intent_instructions = {
             "scheduling_request": """
 ## Objetivo: Agendamento
-- Conduza em fases: fa\u00e7a uma pergunta por resposta e aguarde retorno antes da pr\u00f3xima
-- Colete um item por vez (objetivo/sintoma, se j\u00e1 fez procedimento, prefer\u00eancia de dia/turno)
-- Se o usu\u00e1rio s\u00f3 disser "quero agendar", comece com: "Gostaria de saber um pouco mais do que voc\u00ea est\u00e1 sentindo?"
-- Confirme disponibilidade ap\u00f3s receber as prefer\u00eancias
-- Forne\u00e7a op\u00e7\u00f5es se necess\u00e1rio
-""",
-            "agendar": """
-## Objetivo: Agendamento
-- Conduza em fases: fa\u00e7a uma pergunta por resposta e aguarde retorno antes da pr\u00f3xima
-- Colete um item por vez (objetivo/sintoma, se j\u00e1 fez procedimento, prefer\u00eancia de dia/turno)
-- Se o usu\u00e1rio s\u00f3 disser "quero agendar", comece com: "Gostaria de saber um pouco mais do que voc\u00ea est\u00e1 sentindo?"
-- Confirme disponibilidade ap\u00f3s receber as prefer\u00eancias
+- Colete data, hor\u00e1rio e tipo de servi\u00e7o
+- Confirme disponibilidade
 - Forne\u00e7a op\u00e7\u00f5es se necess\u00e1rio
 """,
             "question_price": """
@@ -199,3 +198,4 @@ class NormalTemplate(BaseTemplate):
         }
         
         return intent_instructions.get(intent, "")
+

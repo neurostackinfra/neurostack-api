@@ -81,8 +81,8 @@ class PromptRenderer:
             # Track used variables
             variables_used.extend(template.get_used_variables(system_message.content))
 
-        # Add history messages
-        if config.include_history and history_messages:
+        # Contexto principal é a jornada do usuário (user_journey no system). Histórico de mensagens é omitido.
+        if config.include_history and history_messages and not variables.user_journey:
             for msg in history_messages:
                 role = MessageRole(msg.get("role", "user"))
                 content = msg.get("content", "")
@@ -213,16 +213,28 @@ class VariableResolver:
         Returns:
             PromptVariables
         """
-        # Extract values from context
+        # Jornada do usuário a partir do estado cognitivo (condução pelo funil)
+        cog = context.cognitive
+        journey_parts = [
+            f"**Etapa atual do funil:** {cog.funnel_stage}",
+            f"**Última intenção:** {cog.last_intent or '—'}",
+        ]
+        if cog.intent_history:
+            journey_parts.append(f"**Intenções já percorridas:** {', '.join(cog.intent_history[-10:])}")
+        if cog.slots:
+            journey_parts.append("**Dados já coletados:** " + ", ".join(f"{k}={v}" for k, v in list(cog.slots.items())[:15]))
+        user_journey = "\n".join(journey_parts)
+
         return PromptVariables(
             session_id=context.session_id,
             tenant_id=context.tenant_id,
-            funnel_stage=context.cognitive.funnel_stage,
-            last_intent=context.cognitive.last_intent,
-            slots=context.cognitive.slots,
+            funnel_stage=cog.funnel_stage,
+            last_intent=cog.last_intent,
+            slots=cog.slots,
             constraints=context.constraints,
             safety_reminders=context.safety_reminders,
             history_summary=context.compressed_history,
+            user_journey=user_journey,
         )
 
     @staticmethod

@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, status, Depends, Request
 
 from src.api.schemas.base import ErrorResponse
 from src.api.schemas.policies import (
@@ -41,6 +41,7 @@ from src.policy import (
     RuleCategory,
 )
 from src.config.logging import get_logger
+from src.api.middleware.auth import TenantContext, get_tenant_context
 
 logger = get_logger(__name__)
 
@@ -138,7 +139,10 @@ When processing events, policies are merged in priority order:
     },
     tags=["Policies"],
 )
-async def create_policy(request: PolicyCreateRequest) -> PolicyResponse:
+async def create_policy(
+    request: PolicyCreateRequest,
+    tenant: TenantContext = Depends(get_tenant_context),
+) -> PolicyResponse:
     """
     Create a new policy.
 
@@ -146,8 +150,11 @@ async def create_policy(request: PolicyCreateRequest) -> PolicyResponse:
     - Tenant policies apply only to specific tenant
     - Policies are merged and applied in priority order
     """
+    # Determine effective tenant_id: prefer request payload, fallback to authenticated tenant
+    effective_tenant_id = request.tenant_id or tenant.tenant_id
+
     # Global policies cannot be created via API
-    if request.tenant_id is None or request.policy_type == PolicyType.GLOBAL:
+    if effective_tenant_id is None or request.policy_type == PolicyType.GLOBAL:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Global policies can only be managed by system administrators",
@@ -180,7 +187,7 @@ async def create_policy(request: PolicyCreateRequest) -> PolicyResponse:
         is_active=True,
     )
     
-    policy = await store.create_policy(request.tenant_id, policy_create)
+    policy = await store.create_policy(effective_tenant_id, policy_create)
     
     return convert_to_response(policy)
 

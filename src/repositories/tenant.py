@@ -4,11 +4,15 @@ Data access layer for Tenant model.
 """
 
 from typing import Optional
+from uuid import UUID
 
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from src.models.tenant import Tenant
+from src.models.clinic_config import ClinicConfig
+from src.models.clinic_config_table import ClinicConfigTable
 from src.repositories.base import BaseRepository
 from src.config.logging import get_logger
 
@@ -56,7 +60,56 @@ class TenantRepository(BaseRepository[Tenant]):
         stmt = select(Tenant).where(Tenant.api_key_hash == api_key_hash)
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
-    
+
+    async def find_by_api_key_hash_with_clinic_config(
+        self, api_key_hash: str
+    ) -> Optional[Tenant]:
+        """
+        Find tenant by API key hash com clinic_config carregado (tabela clinic_configs).
+        """
+        stmt = (
+            select(Tenant)
+            .where(Tenant.api_key_hash == api_key_hash)
+            .options(selectinload(Tenant.clinic_config_row))
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_by_id_with_clinic_config(self, tenant_id: UUID) -> Optional[Tenant]:
+        """
+        Busca tenant por ID com clinic_config carregado (tabela clinic_configs).
+        """
+        return await self.get_by_id(
+            tenant_id,
+            load_relationships=["clinic_config_row"],
+        )
+
+    async def upsert_clinic_config(
+        self, tenant_id: UUID, clinic_config: ClinicConfig
+    ) -> ClinicConfigTable:
+        """
+        Cria ou atualiza a configuração da clínica do tenant (tabela clinic_configs).
+        """
+        stmt = select(ClinicConfigTable).where(ClinicConfigTable.tenant_id == tenant_id)
+        result = await self.session.execute(stmt)
+        row = result.scalar_one_or_none()
+        if row:
+            row.clinic_id = clinic_config.clinic_id
+            row.version = clinic_config.version
+            row.persona = clinic_config.persona.model_dump()
+            row.scheduling = clinic_config.scheduling.model_dump()
+            row.pricing = clinic_config.pricing.model_dump()
+            row.post_care = clinic_config.post_care.model_dump()
+            row.handoff = clinic_config.handoff.model_dump()
+            await self.session.flush()
+            await self.session.refresh(row)
+            return row
+        entity = ClinicConfigTable.from_pydantic(tenant_id, clinic_config)
+        self.session.add(entity)
+        await self.session.flush()
+        await self.session.refresh(entity)
+        return entity
+
     async def find_active(self, skip: int = 0, limit: Optional[int] = None) -> list[Tenant]:
         """
         Find all active tenants.

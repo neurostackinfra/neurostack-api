@@ -4,7 +4,7 @@ Business logic for event processing and management.
 """
 
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -68,26 +68,23 @@ class EventService:
         Returns:
             Event response with cognitive decision
         """
-        # Build pipeline input from persisted session context (if available)
+        # Build pipeline input
+        # TODO: In production, load session state from StateStore (Redis)
         from src.core.pipeline import PipelineInput
-
-        session_context = await self._load_session_context_from_events(
-            tenant_id=request.tenant_id,
-            session_id=request.session_id,
-        )
-
+        
         pipeline_input = PipelineInput(
             tenant_id=request.tenant_id,
             session_id=request.session_id,
             message=request.payload.content,
             channel=request.payload.channel,
             user_id=request.payload.user_id,
-            current_funnel_stage=session_context.get("current_funnel_stage", "lead_novo"),
-            turn_count=session_context.get("turn_count", 0),
-            intent_history=session_context.get("intent_history", []),
-            slots=session_context.get("slots", {}),
-            flags=session_context.get("flags", {}),
-            message_history=session_context.get("message_history", []),
+            # Session context would come from StateStore
+            current_funnel_stage="lead_novo",
+            turn_count=0,
+            intent_history=[],
+            slots={},
+            flags={},
+            message_history=[],
         )
 
         # Process through the complete pipeline
@@ -102,106 +99,6 @@ class EventService:
         await self._save_events_to_store(request, result)
 
         return response
-
-    async def _load_session_context_from_events(
-        self,
-        tenant_id: UUID,
-        session_id: UUID,
-    ) -> dict[str, Any]:
-        """
-        Reconstruct session context from persisted events.
-
-        Falls back to a safe default context when event history is unavailable.
-        """
-        context: dict[str, Any] = {
-            "current_funnel_stage": "lead_novo",
-            "turn_count": 0,
-            "intent_history": [],
-            "slots": {},
-            "flags": {},
-            "message_history": [],
-        }
-
-        try:
-            event_store = await get_event_store()
-            events_result = await event_store.query_by_session(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                event_types=["message.in", "message.out", "srm.decision"],
-                limit=200,
-                order_desc=False,
-            )
-        except EventStoreError as e:
-            logger.warning(
-                "Failed to load prior events for session context; using defaults",
-                tenant_id=str(tenant_id),
-                session_id=str(session_id),
-                error=str(e),
-            )
-            return context
-        except Exception as e:
-            logger.warning(
-                "Unexpected error loading session context; using defaults",
-                tenant_id=str(tenant_id),
-                session_id=str(session_id),
-                error=str(e),
-                error_type=type(e).__name__,
-            )
-            return context
-
-        for event in events_result.events:
-            if event.event_type in ("message.in", "message.out"):
-                content = event.event_data.get("content")
-                if not content:
-                    continue
-
-                role = event.event_data.get("role")
-                if not role:
-                    role = "user" if event.event_type == "message.in" else "assistant"
-
-                context["message_history"].append(
-                    {
-                        "role": role,
-                        "content": content,
-                        "timestamp": event.created_at.isoformat(),
-                    }
-                )
-
-                if event.event_type == "message.in":
-                    context["turn_count"] += 1
-                continue
-
-            if event.event_type != "srm.decision":
-                continue
-
-            event_intent = event.event_data.get("intent")
-            if event_intent:
-                context["intent_history"].append(event_intent)
-
-            stage = (
-                event.event_data.get("funnel_stage_after")
-                or event.event_data.get("funnel_stage")
-            )
-            if isinstance(stage, str) and stage.strip():
-                context["current_funnel_stage"] = stage
-
-            state_patch = event.event_data.get("state_patch") or {}
-            if not isinstance(state_patch, dict):
-                continue
-
-            patch_slots = state_patch.get("slots")
-            if isinstance(patch_slots, dict):
-                context["slots"].update(patch_slots)
-
-            patch_flags = state_patch.get("flags")
-            if isinstance(patch_flags, dict):
-                context["flags"].update(patch_flags)
-
-        # Keep context compact for prompt construction
-        context["intent_history"] = context["intent_history"][-20:]
-        context["message_history"] = context["message_history"][-10:]
-
-        return context
 
     def _convert_pipeline_result_to_response(
         self, result: "PipelineResult"

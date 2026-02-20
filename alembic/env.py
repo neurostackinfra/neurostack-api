@@ -23,6 +23,7 @@ from src.config.settings import settings
 from src.models.base import Base
 from src.models import (
     Tenant,
+    ClinicConfigTable,
     Session,
     Event,
     Policy,
