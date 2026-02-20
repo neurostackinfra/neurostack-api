@@ -50,6 +50,37 @@ logger = get_logger(__name__)
 
 
 # ============================================
+# User Journey (contexto para condução pelo funil)
+# ============================================
+
+def build_user_journey(
+    current_funnel_stage: str,
+    intent_history: list[str],
+    slots: dict[str, Any],
+    turn_count: int,
+    last_intent: Optional[str] = None,
+) -> str:
+    """
+    Monta a jornada do usuário no funil para o prompt.
+    O contexto do assistente deve ser a jornada (etapas/intenções/dados),
+    não o histórico de mensagens, para conduzir o usuário pelas etapas corretas.
+    """
+    parts = [
+        f"**Etapa atual do funil:** {current_funnel_stage}",
+        f"**Turno:** {turn_count}",
+    ]
+    if last_intent:
+        parts.append(f"**Última intenção detectada:** {last_intent}")
+    if intent_history:
+        steps = ", ".join(intent_history[-10:])  # últimas 10
+        parts.append(f"**Intenções já percorridas (ordem):** {steps}")
+    if slots:
+        slot_lines = [f"- {k}: {v}" for k, v in list(slots.items())[:20]]
+        parts.append("**Dados já coletados:**\n" + "\n".join(slot_lines))
+    return "\n".join(parts)
+
+
+# ============================================
 # Prometheus Metrics
 # ============================================
 
@@ -435,38 +466,26 @@ class CognitivePipeline:
             "handoff": PromptMode.HANDOFF,
         }
         prompt_mode = prompt_mode_map.get(effective_mode, PromptMode.NORMAL)
-
-        # Reuse context output to keep prompt state aligned with current session
-        ctx_window = getattr(context_response, "context", None)
-        ctx_slots = (ctx_window.cognitive.slots if ctx_window and ctx_window.cognitive else {}) or {}
-        ctx_history_summary = ctx_window.compressed_history if ctx_window else None
-        ctx_safety_reminders = ctx_window.safety_reminders if ctx_window else []
-
-        knowledge_context = None
-        knowledge_sources: list[str] = []
-        if ctx_window and ctx_window.knowledge_chunks:
-            knowledge_context = "\n\n".join(
-                chunk.content for chunk in ctx_window.knowledge_chunks if chunk.content
-            ) or None
-            knowledge_sources = [
-                chunk.source for chunk in ctx_window.knowledge_chunks if chunk.source
-            ]
+        
+        # Jornada do usuário no funil (contexto principal: etapas/intenções/dados, não mensagens)
+        user_journey = build_user_journey(
+            current_funnel_stage=srm_decision.funnel_stage.value,
+            intent_history=input_data.intent_history,
+            slots=input_data.slots,
+            turn_count=input_data.turn_count,
+            last_intent=srm_decision.intent,
+        )
 
         # Build variables
         variables = PromptVariables(
-            session_id=input_data.session_id,
-            tenant_id=input_data.tenant_id,
-            channel=input_data.channel,
-            turn_count=input_data.turn_count,
             user_message=input_data.message,
             funnel_stage=srm_decision.funnel_stage.value,
             last_intent=srm_decision.intent,
-            slots=ctx_slots or input_data.slots,
-            knowledge_context=knowledge_context,
-            knowledge_sources=knowledge_sources,
+            channel=input_data.channel,
+            turn_count=input_data.turn_count,
+            slots=input_data.slots,
             constraints=policy_result.constraints or [],
-            safety_reminders=ctx_safety_reminders or [],
-            history_summary=ctx_history_summary,
+            user_journey=user_journey,
         )
         
         # Add safety context if needed
@@ -474,18 +493,8 @@ class CognitivePipeline:
             variables.safety_category = srm_decision.safety_category.value
             variables.safety_level = 1
         
-        # Get conversation history
-        history_source = input_data.message_history
-        if ctx_window and ctx_window.messages:
-            history_source = [
-                {"role": m.role.value, "content": m.content}
-                for m in ctx_window.messages
-            ]
-
-        history = [
-            {"role": m.get("role", "user"), "content": m.get("content", "")}
-            for m in history_source
-        ]
+        # Contexto é a jornada do usuário, não o histórico de mensagens (condução pelo funil)
+        history: list[dict[str, str]] = []
         
         return await self._prompt.generate(
             mode=prompt_mode,

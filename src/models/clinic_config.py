@@ -79,7 +79,8 @@ class ClinicHandoff(BaseModel):
 class ClinicConfig(BaseModel):
     """
     Configuração da clínica (documentação MVP v0.5).
-    Armazenada em Tenant.config ou carregada no pipeline/CTX para SRM e handoff.
+    Armazenada na tabela SQL clinic_configs (modelo fixo); fallback em tenants.config["clinic_config"].
+    Usada no pipeline/CTX para SRM e handoff.
     """
 
     clinic_id: Optional[UUID] = None

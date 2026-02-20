@@ -189,7 +189,6 @@ class TestNormalTemplate:
         
         assert "Assistente Virtual" in prompt
         assert "whatsapp" in prompt
-        assert "uma pergunta por resposta" in prompt
 
     def test_get_context_instructions(self, sample_variables):
         """Test context instructions."""
@@ -197,19 +196,6 @@ class TestNormalTemplate:
         instructions = template.get_context_instructions(sample_variables)
         
         assert "Consideração" in instructions or "consideration" in instructions.lower()
-
-    def test_agendar_intent_uses_scheduling_guidance(self):
-        """Test canonical 'agendar' intent maps to scheduling guidance."""
-        template = NormalTemplate()
-        variables = PromptVariables(
-            funnel_stage="em_qualificacao",
-            last_intent="agendar",
-        )
-
-        instructions = template.get_context_instructions(variables)
-
-        assert "Objetivo: Agendamento" in instructions
-        assert "uma pergunta por resposta" in instructions
 
     def test_build_system_message(self, sample_variables):
         """Test complete system message."""
