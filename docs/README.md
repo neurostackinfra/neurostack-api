@@ -13,6 +13,7 @@
 |-----------|-----------|-----------|
 | [Guia de Integração](./builder-integration-guide.md) | Guia completo para integrar NeuroStack | Desenvolvedores |
 | [API Contracts](./api-contracts.md) | Especificação completa da API | Desenvolvedores |
+| [Configuração (Tenant e ClinicConfig)](./configuration.md) | Onde e como configurar tenant e clínica; exemplo JSON | Desenvolvedores / Administradores |
 | [Exemplos de Código](./code-examples.md) | Snippets em Python, Node.js, cURL | Desenvolvedores |
 | [Configuração de Políticas](./policy-configuration.md) | Como configurar guardrails | Administradores |
 | [Troubleshooting](./troubleshooting.md) | Resolução de problemas comuns | Desenvolvedores/Ops |
@@ -24,6 +25,7 @@
 | [Testes de Carga](./load-testing.md) | Guia de load testing e performance | DevOps/SRE |
 | [Pipeline Cognitivo](./cognitive-pipeline.md) | Arquitetura interna do pipeline | Engenheiros |
 | [Templates de Prompt e Funil](./prompt-templates-and-funnel.md) | Relação entre templates (Normal, Safety, Handoff) e as 11 etapas do funil | Engenheiros / Prompt |
+| [Schema do banco e índices](./database-schema.md) | Tabelas, relacionamentos, índices compostos e triggers | Engenheiros / DBA |
 | [Observabilidade](./observability.md) | Métricas, logs, alertas e dashboards | DevOps/SRE |
 
 ---

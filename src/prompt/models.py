@@ -75,7 +75,10 @@ class PromptVariables(BaseModel):
     
     # Conversation history summary
     history_summary: Optional[str] = None
-    
+
+    # Jornada do usuário no funil (etapas, intenções, dados coletados) — contexto principal para condução
+    user_journey: Optional[str] = None
+
     # Custom variables
     custom: dict[str, Any] = Field(default_factory=dict)
 

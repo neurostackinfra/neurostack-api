@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from src.models.policy import Policy
     from src.models.knowledge import KnowledgeDocument
     from src.models.handoff import HandoffRecord
+    from src.models.clinic_config_table import ClinicConfigTable
 
 
 class TenantConfig:
@@ -182,6 +183,13 @@ class Tenant(Base, TimestampMixin):
         lazy="dynamic",
         cascade="all, delete-orphan",
     )
+    clinic_config_row: Mapped[Optional["ClinicConfigTable"]] = relationship(
+        "ClinicConfigTable",
+        back_populates="tenant",
+        uselist=False,
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
 
     def get_config(self) -> TenantConfig:
         """Get typed configuration object."""
@@ -192,8 +200,10 @@ class Tenant(Base, TimestampMixin):
         self.config = config.to_dict()
 
     def get_clinic_config(self) -> Optional["ClinicConfig"]:
-        """Get ClinicConfig from config (doc MVP v0.5). Returns None if not set."""
+        """Get ClinicConfig: primeiro da tabela clinic_configs, depois fallback em config JSON (retrocompat)."""
         from src.models.clinic_config import ClinicConfig
+        if self.clinic_config_row:
+            return self.clinic_config_row.to_pydantic()
         data = (self.config or {}).get("clinic_config")
         if not data:
             return None

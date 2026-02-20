@@ -194,35 +194,61 @@ response = openai.ChatCompletion.create(
 
 ## Configuração do Tenant
 
-### Configurações Disponíveis
+A configuração do tenant é armazenada na tabela `tenants`, coluna `config` (JSONB). Inclui parâmetros gerais (rate limit, webhook, features, branding) e, opcionalmente, a **configuração da clínica** (ClinicConfig) em `config.clinic_config`.
+
+**Documentação completa:** [Configuração (Tenant e ClinicConfig)](./configuration.md)
+
+**Exemplo completo em JSON:** [examples/tenant-config-with-clinic.json](./examples/tenant-config-with-clinic.json)
+
+### Resumo das configurações
+
+| Área | Campos principais |
+|------|--------------------|
+| **Tenant** | `description`, `rate_limit`, `session_ttl_seconds`, `max_sessions_per_user`, `webhook_url`, `features`, `branding`, `custom_settings` |
+| **ClinicConfig** (`config.clinic_config`) | `persona` (nome da clínica/agente), `scheduling` (agendamento, RAG), `pricing` (disclosure_mode, tabelas), `post_care`, `handoff` (default_mode, sector_defaults/SLA) |
+
+### Exemplo mínimo (tenant + clinic_config)
 
 ```json
 {
-  "tenant_config": {
-    "rate_limit": 100,
-    "session_ttl_seconds": 86400,
-    "webhook_url": "https://api.seu-sistema.com/webhooks/neurostack",
-    "features": {
-      "rag_enabled": true,
-      "handoff_enabled": true,
-      "analytics_enabled": true
+  "rate_limit": 100,
+  "session_ttl_seconds": 86400,
+  "webhook_url": "https://api.seu-sistema.com/webhooks/neurostack",
+  "features": {
+    "rag_enabled": true,
+    "handoff_enabled": true,
+    "safety_strict_mode": false
+  },
+  "clinic_config": {
+    "version": 1,
+    "persona": {
+      "clinic_display_name": "Clínica Saúde Premium",
+      "agent_display_name": "Assistente Virtual",
+      "use_personal_name": false
     },
-    "branding": {
-      "assistant_name": "Dra. Ana",
-      "clinic_name": "Clínica Saúde Premium"
+    "scheduling": { "has_scheduling_agent": true },
+    "pricing": { "disclosure_mode": "range_allowed" },
+    "post_care": { "emergency_warning_text_enabled": true },
+    "handoff": {
+      "default_mode": "whatsapp_human_takeover",
+      "sector_defaults": {
+        "urgencia": "imediato",
+        "agendamento": "prioritario",
+        "clinico": "prioritario"
+      }
     }
   }
 }
 ```
 
-### Solicitar Alterações
+### Solicitar alterações
 
 Entre em contato com a equipe NeuroStack para ajustar:
 
 - Rate limits customizados
 - TTL de sessão
 - Feature flags
-- Configurações de branding
+- Configurações de branding e ClinicConfig (persona, preços, handoff)
 
 ---
 

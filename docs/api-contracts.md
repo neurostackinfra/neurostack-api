@@ -557,7 +557,7 @@ Configurações do tenant.
 | `webhook_url` | string | URL do webhook |
 | `features` | TenantFeatures | Feature flags |
 | `branding` | TenantBranding | Configurações de branding |
-| **`clinic_config`** | **ClinicConfig** | **Doc MVP v0.5:** persona, scheduling, pricing (disclosure_mode), post_care, handoff (sector_defaults) |
+| **`clinic_config`** | **ClinicConfig** | **Doc MVP v0.5:** persona, scheduling, pricing (disclosure_mode), post_care, handoff (sector_defaults). Ver [Configuração (Tenant e ClinicConfig)](./configuration.md) e [exemplo JSON](./examples/tenant-config-with-clinic.json). |
 
 ### SRMDecision / Decision Trace (CTXDecisionOutput)
 
