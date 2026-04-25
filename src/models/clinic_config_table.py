@@ -6,14 +6,18 @@ Modelo fixo de configuração da clínica armazenado no banco SQL.
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import ForeignKey, Integer, UniqueConstraint
+from sqlalchemy import ForeignKey, Integer, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import Base, TimestampMixin
 from src.models.clinic_config import (
+    ClinicBusinessRules,
     ClinicConfig,
     ClinicHandoff,
+    ClinicIdentity,
+    ClinicLGPD,
+    ClinicOperations,
     ClinicPersona,
     ClinicPostCare,
     ClinicPricing,
@@ -77,6 +81,39 @@ class ClinicConfigTable(Base, TimestampMixin):
         server_default="{}",
     )
 
+    # --- New admin-panel buckets (migration 005) ---
+
+    identity: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=True,
+        server_default=text("'{}'"),
+    )
+    operations: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=True,
+        server_default=text("'{}'"),
+    )
+    business_rules: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=True,
+        server_default=text("'{}'"),
+    )
+    lgpd: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=True,
+        server_default=text("'{}'"),
+    )
+    professionals: Mapped[Optional[list[Any]]] = mapped_column(
+        JSONB,
+        nullable=True,
+        server_default=text("'[]'"),
+    )
+    services: Mapped[Optional[list[Any]]] = mapped_column(
+        JSONB,
+        nullable=True,
+        server_default=text("'[]'"),
+    )
+
     tenant: Mapped["Tenant"] = relationship(
         "Tenant",
         back_populates="clinic_config_row",
@@ -92,6 +129,10 @@ class ClinicConfigTable(Base, TimestampMixin):
             pricing=ClinicPricing.model_validate(self.pricing or {}),
             post_care=ClinicPostCare.model_validate(self.post_care or {}),
             handoff=ClinicHandoff.model_validate(self.handoff or {}),
+            identity=ClinicIdentity.model_validate(self.identity or {}),
+            operations=ClinicOperations.model_validate(self.operations or {}),
+            business_rules=ClinicBusinessRules.model_validate(self.business_rules or {}),
+            lgpd=ClinicLGPD.model_validate(self.lgpd or {}),
         )
 
     @classmethod
@@ -113,4 +154,10 @@ class ClinicConfigTable(Base, TimestampMixin):
             pricing=config.pricing.model_dump(),
             post_care=config.post_care.model_dump(),
             handoff=config.handoff.model_dump(),
+            identity=config.identity.model_dump(),
+            operations=config.operations.model_dump(),
+            business_rules=config.business_rules.model_dump(),
+            lgpd=config.lgpd.model_dump(),
+            professionals=config.professionals,
+            services=config.services,
         )
