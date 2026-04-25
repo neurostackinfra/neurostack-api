@@ -36,7 +36,7 @@ from src.api.middleware.tracing import (
     instrument_redis,
     instrument_sqlalchemy,
 )
-from src.api.routes import config, events, handoff, health, knowledge, policies, sessions, traces
+from src.api.routes import auth, config, events, handoff, health, knowledge, policies, sessions, traces
 from src.config.logging import configure_logging, get_logger
 from src.config.settings import settings
 from src.core.exceptions import ConfigurationError
@@ -270,7 +270,30 @@ def create_app() -> FastAPI:
             
             # Add headers to all path operations
             _add_headers_to_paths(openapi_schema)
-            
+
+            # Add security schemes (X-API-Key and Bearer JWT)
+            if "components" not in openapi_schema:
+                openapi_schema["components"] = {}
+            if "securitySchemes" not in openapi_schema["components"]:
+                openapi_schema["components"]["securitySchemes"] = {}
+            openapi_schema["components"]["securitySchemes"]["ApiKeyAuth"] = {
+                "type": "apiKey",
+                "in": "header",
+                "name": settings.api_key_header,
+                "description": "API key passed via X-API-Key header.",
+            }
+            openapi_schema["components"]["securitySchemes"]["BearerAuth"] = {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "JWT",
+                "description": "JWT token obtained from the /v1/auth/login endpoint.",
+            }
+            # Apply both security schemes globally
+            openapi_schema["security"] = [
+                {"ApiKeyAuth": []},
+                {"BearerAuth": []},
+            ]
+
             # Validate schema has required fields
             if not openapi_schema.get("openapi") or not openapi_schema.get("info") or not openapi_schema.get("paths"):
                 logger.warning(
@@ -370,6 +393,11 @@ def create_app() -> FastAPI:
         handoff.router,
         prefix=f"{settings.api_prefix}/handoffs",
         tags=["Handoffs"],
+    )
+    app.include_router(
+        auth.router,
+        prefix=f"{settings.api_prefix}/auth",
+        tags=["Auth"],
     )
     app.include_router(
         traces.router,
