@@ -36,7 +36,7 @@ from src.api.middleware.tracing import (
     instrument_redis,
     instrument_sqlalchemy,
 )
-from src.api.routes import events, handoff, health, knowledge, policies, sessions, traces
+from src.api.routes import config, events, handoff, health, knowledge, policies, sessions, traces
 from src.config.logging import configure_logging, get_logger
 from src.config.settings import settings
 from src.core.exceptions import ConfigurationError
@@ -375,6 +375,11 @@ def create_app() -> FastAPI:
         traces.router,
         prefix=f"{settings.api_prefix}/traces",
         tags=["Traces"],
+    )
+    app.include_router(
+        config.router,
+        prefix=f"{settings.api_prefix}/config",
+        tags=["Config"],
     )
     
     # Override OpenAPI schema to include headers (after all routers are registered)
