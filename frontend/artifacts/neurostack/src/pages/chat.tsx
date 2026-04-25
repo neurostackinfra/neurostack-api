@@ -286,7 +286,7 @@ export default function Chat() {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    setMessages(isInvestor ? (DEMO_CHAT_MESSAGES as Message[]) : []);
+    setMessages([]);
     setActiveTrace(null);
     setSessionId(null);
   }, [activeClinicId]);
@@ -435,7 +435,7 @@ export default function Chat() {
             ) : (
               messages.map((msg) => {
                 // For the demo last message, pre-open RLHF block with seed text
-                const isDemoPreOpened = isInvestor && msg.id === DEMO_LAST_MSG_ID;
+                const isDemoPreOpened = false;
 
                 return (
                   <div
@@ -460,9 +460,9 @@ export default function Chat() {
                         <FeedbackBlock
                           msg={msg}
                           defaultPhase={isDemoPreOpened ? "input" : "idle"}
-                          defaultText={isDemoPreOpened ? DEMO_FEEDBACK_TEXT : ""}
+                          defaultText=""
                           isReadOnly={isReadOnly}
-                          showArrow={isInvestor && msg.id === DEMO_FIRST_ASSIST_ID}
+                          showArrow={false}
                         />
                       </div>
                     ) : (
