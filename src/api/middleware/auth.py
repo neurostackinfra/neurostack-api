@@ -1,20 +1,20 @@
 """
 NeuroStack API - Authentication Middleware
-API Key based authentication for tenant identification.
+JWT and API Key based authentication for tenant identification.
 """
-
-from typing import Any, Callable, Optional
-from uuid import UUID
-
-from fastapi import HTTPException, Request, status
-from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-from passlib.context import CryptContext
-from passlib.exc import InvalidHashError
-from sqlalchemy.exc import SQLAlchemyError
 
 import sys
 from pathlib import Path
+from typing import Any, Callable, Optional
+from uuid import UUID
+
+import jwt
+from fastapi import HTTPException, Request, status
+from fastapi.responses import JSONResponse
+from passlib.context import CryptContext
+from passlib.exc import InvalidHashError
+from sqlalchemy.exc import SQLAlchemyError
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # Add the project root to sys.path for local module resolution
 project_root = Path(__file__).resolve().parent.parent.parent
@@ -50,14 +50,18 @@ class TenantContext:
     def __init__(
         self,
         tenant_id: UUID,
-        api_key: str,
+        api_key: str = "",
         rate_limit: Optional[int] = None,
         is_active: bool = True,
+        user_id: Optional[UUID] = None,
+        role: Optional[str] = None,
     ) -> None:
         self.tenant_id = tenant_id
         self.api_key = api_key
         self.rate_limit = rate_limit or settings.rate_limit_requests_per_minute
         self.is_active = is_active
+        self.user_id = user_id
+        self.role = role
 
 
 # ============================================
@@ -258,6 +262,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         "/openapi.json",
         "/v1/openapi.json",
         "/metrics",
+        "/v1/auth",
+        "/v1/auth/login",
     }
 
     async def dispatch(
@@ -275,44 +281,83 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if request.method == "OPTIONS":
             return await call_next(request)
 
-        # Extract API key from header
-        api_key = request.headers.get(settings.api_key_header)
+        # --- Try JWT (Bearer) first, then fall back to API key ---
+        tenant_context: Optional[TenantContext] = None
+        auth_header = request.headers.get("Authorization", "")
 
-        if not api_key:
-            logger.warning(
-                "Missing API key",
-                path=request.url.path,
-                method=request.method,
-                client_ip=self._get_client_ip(request),
-            )
-            return JSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                content={
-                    "error": "unauthorized",
-                    "message": f"Missing {settings.api_key_header} header",
-                    "documentation_url": "https://docs.neurostack.ai/auth",
-                },
-            )
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+            try:
+                payload = jwt.decode(
+                    token,
+                    settings.secret_key,
+                    algorithms=["HS256"],
+                    options={"require": ["sub", "tenant_id", "exp"]},
+                )
+                tenant_context = TenantContext(
+                    tenant_id=UUID(payload["tenant_id"]),
+                    user_id=UUID(payload["sub"]),
+                    role=payload.get("role"),
+                    is_active=True,
+                )
+            except jwt.ExpiredSignatureError:
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={
+                        "error": "unauthorized",
+                        "message": "Token has expired",
+                        "documentation_url": "https://docs.neurostack.ai/auth",
+                    },
+                )
+            except (jwt.InvalidTokenError, KeyError, ValueError):
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={
+                        "error": "unauthorized",
+                        "message": "Invalid token",
+                        "documentation_url": "https://docs.neurostack.ai/auth",
+                    },
+                )
 
-        # Validate API key
-        tenant_context = await APIKeyStore.validate_api_key(api_key)
-
+        # Fall back to API key if no Bearer token
         if tenant_context is None:
-            logger.warning(
-                "Invalid API key",
-                path=request.url.path,
-                method=request.method,
-                client_ip=self._get_client_ip(request),
-                api_key_prefix=api_key[:8] + "..." if len(api_key) > 8 else "***",
-            )
-            return JSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                content={
-                    "error": "unauthorized",
-                    "message": "Invalid API key",
-                    "documentation_url": "https://docs.neurostack.ai/auth",
-                },
-            )
+            api_key = request.headers.get(settings.api_key_header)
+
+            if not api_key:
+                logger.warning(
+                    "Missing credentials",
+                    path=request.url.path,
+                    method=request.method,
+                    client_ip=self._get_client_ip(request),
+                )
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={
+                        "error": "unauthorized",
+                        "message": f"Missing Authorization or {settings.api_key_header} header",
+                        "documentation_url": "https://docs.neurostack.ai/auth",
+                    },
+                )
+
+            # Validate API key
+            tenant_context = await APIKeyStore.validate_api_key(api_key)
+
+            if tenant_context is None:
+                logger.warning(
+                    "Invalid API key",
+                    path=request.url.path,
+                    method=request.method,
+                    client_ip=self._get_client_ip(request),
+                    api_key_prefix=api_key[:8] + "..." if len(api_key) > 8 else "***",
+                )
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={
+                        "error": "unauthorized",
+                        "message": "Invalid API key",
+                        "documentation_url": "https://docs.neurostack.ai/auth",
+                    },
+                )
 
         # Check if tenant is active
         if not tenant_context.is_active:
@@ -331,7 +376,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         # Attach tenant context to request state
         request.state.tenant = tenant_context
-        request.state.api_key = api_key
+        request.state.api_key = tenant_context.api_key
 
         # Log successful authentication
         logger.debug(
