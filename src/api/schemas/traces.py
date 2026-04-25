@@ -1,0 +1,227 @@
+"""
+NeuroStack API - Traces Schemas
+Contracts for read-only trace view endpoints (/v1/traces).
+"""
+
+from typing import Any
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class TraceItem(BaseModel):
+    """
+    A single trace item representing a processed message event.
+
+    Traces provide a read-only view over message.in events that
+    were fully processed through the cognitive pipeline.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "id": "c3d4e5f6-a7b8-9012-cdef-123456789012",
+                "timestamp": "2025-12-31T10:30:00Z",
+                "user_message": "Ola, gostaria de agendar uma consulta",
+                "srm_decision": {
+                    "intent": "scheduling_request",
+                    "intent_category": "scheduling",
+                    "funnel_stage": "consideration",
+                    "action": "collect_availability",
+                    "confidence": 0.92,
+                    "safety_concern": False,
+                    "handoff_required": False,
+                },
+                "context_summary": "Paciente novo buscando agendamento",
+                "prompt_built": None,
+                "processing_time_ms": 45,
+                "mode": "normal",
+            }
+        }
+    )
+
+    id: UUID = Field(
+        ...,
+        description="Unique event identifier",
+    )
+    timestamp: str = Field(
+        ...,
+        description="ISO 8601 timestamp of the event",
+    )
+    user_message: str = Field(
+        ...,
+        description="Original user message content",
+    )
+    srm_decision: dict[str, Any] = Field(
+        ...,
+        description="SRM decision output with intent, intent_category, funnel_stage, action, confidence, safety_concern, handoff_required",
+    )
+    context_summary: str | None = Field(
+        default=None,
+        description="Brief summary of the conversation context",
+    )
+    prompt_built: str | None = Field(
+        default=None,
+        description="Generated prompt instructions",
+    )
+    processing_time_ms: int | None = Field(
+        default=None,
+        ge=0,
+        description="Processing time in milliseconds",
+    )
+    mode: str = Field(
+        default="normal",
+        description="Flow mode used for this response (normal, rag, safety, handoff)",
+    )
+
+
+class TraceListResponse(BaseModel):
+    """Paginated list of traces."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "items": [],
+                "total": 0,
+                "limit": 20,
+                "offset": 0,
+            }
+        }
+    )
+
+    items: list[TraceItem] = Field(
+        default_factory=list,
+        description="List of trace items",
+    )
+    total: int = Field(
+        ...,
+        ge=0,
+        description="Total number of matching traces",
+    )
+    limit: int = Field(
+        ...,
+        ge=1,
+        description="Maximum items per page",
+    )
+    offset: int = Field(
+        ...,
+        ge=0,
+        description="Current offset",
+    )
+
+
+class TraceDetailResponse(TraceItem):
+    """
+    Detailed trace response extending TraceItem with full context and prompt objects.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "id": "c3d4e5f6-a7b8-9012-cdef-123456789012",
+                "timestamp": "2025-12-31T10:30:00Z",
+                "user_message": "Ola, gostaria de agendar uma consulta",
+                "srm_decision": {
+                    "intent": "scheduling_request",
+                    "intent_category": "scheduling",
+                    "funnel_stage": "consideration",
+                    "action": "collect_availability",
+                    "confidence": 0.92,
+                    "safety_concern": False,
+                    "handoff_required": False,
+                },
+                "context_summary": "Paciente novo buscando agendamento",
+                "prompt_built": "Pergunte sobre a disponibilidade...",
+                "processing_time_ms": 45,
+                "mode": "normal",
+                "full_context": {
+                    "recent_messages": [],
+                    "session_summary": "Nova sessao de agendamento",
+                },
+                "full_prompt": {
+                    "system": "Voce e um assistente...",
+                    "instructions": "Pergunte sobre a disponibilidade...",
+                    "constraints": [],
+                },
+                "session_id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+                "event_data": {},
+                "event_metadata": {},
+            }
+        }
+    )
+
+    full_context: dict[str, Any] | None = Field(
+        default=None,
+        description="Full context object used in the decision",
+    )
+    full_prompt: dict[str, Any] | None = Field(
+        default=None,
+        description="Full prompt object generated for the LLM",
+    )
+    session_id: UUID | None = Field(
+        default=None,
+        description="Associated session identifier",
+    )
+    event_data: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Raw event data payload",
+    )
+    event_metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Raw event metadata",
+    )
+
+
+class TraceStatsResponse(BaseModel):
+    """Aggregated trace statistics over a time period."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "total_traces": 150,
+                "avg_processing_time_ms": 42.5,
+                "safety_flags_count": 3,
+                "handoff_count": 7,
+                "intent_distribution": {
+                    "scheduling_request": 45,
+                    "price_question": 30,
+                    "greeting": 25,
+                },
+                "period_start": "2025-12-24T00:00:00Z",
+                "period_end": "2025-12-31T00:00:00Z",
+            }
+        }
+    )
+
+    total_traces: int = Field(
+        ...,
+        ge=0,
+        description="Total number of traces in the period",
+    )
+    avg_processing_time_ms: float = Field(
+        ...,
+        ge=0.0,
+        description="Average processing time in milliseconds",
+    )
+    safety_flags_count: int = Field(
+        ...,
+        ge=0,
+        description="Number of traces with safety concerns flagged",
+    )
+    handoff_count: int = Field(
+        ...,
+        ge=0,
+        description="Number of traces requiring human handoff",
+    )
+    intent_distribution: dict[str, int] = Field(
+        default_factory=dict,
+        description="Distribution of intents across traces",
+    )
+    period_start: str = Field(
+        ...,
+        description="ISO 8601 start of the statistics period",
+    )
+    period_end: str = Field(
+        ...,
+        description="ISO 8601 end of the statistics period",
+    )
