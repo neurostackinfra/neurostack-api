@@ -14,6 +14,7 @@ from src.models.event import Event
 from src.models.policy import Policy
 from src.models.knowledge import KnowledgeDocument
 from src.models.handoff import HandoffRecord
+from src.models.user import User, UserRole
 
 __all__ = [
     # Base
@@ -29,5 +30,7 @@ __all__ = [
     "Policy",
     "KnowledgeDocument",
     "HandoffRecord",
+    "User",
+    "UserRole",
 ]
 
