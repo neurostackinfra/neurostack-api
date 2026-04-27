@@ -20,12 +20,8 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # Create the userrole enum type
-    userrole_enum = sa.Enum(
-        "clinic_admin", "super_admin", "investor",
-        name="userrole",
-    )
-    userrole_enum.create(op.get_bind(), checkfirst=True)
+    # Create the userrole enum type via raw SQL to avoid double-create
+    op.execute("DO $$ BEGIN CREATE TYPE userrole AS ENUM ('clinic_admin', 'super_admin', 'investor'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;")
 
     op.create_table(
         "users",
@@ -35,7 +31,7 @@ def upgrade() -> None:
         sa.Column("password_hash", sa.String(255), nullable=False),
         sa.Column(
             "role",
-            sa.Enum("clinic_admin", "super_admin", "investor", name="userrole", create_type=False),
+            sa.VARCHAR(50),
             nullable=False,
         ),
         sa.Column("is_active", sa.Boolean(), server_default=sa.text("true"), nullable=False),

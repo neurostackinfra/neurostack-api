@@ -9,6 +9,7 @@ and structured prompts for LLM response generation.
 Implements Task 13.0 - End-to-End Integration.
 """
 
+from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -268,8 +269,8 @@ Supports pagination and filtering for efficient querying of the Event Store.
 )
 async def list_events(
     tenant_id: UUID = Query(..., description="Filter by tenant ID"),
-    session_id: UUID | None = Query(default=None, description="Filter by session ID"),
-    event_type: EventType | None = Query(default=None, description="Filter by event type"),
+    session_id: Optional[UUID] = Query(default=None, description="Filter by session ID"),
+    event_type: Optional[EventType] = Query(default=None, description="Filter by event type"),
     limit: int = Query(default=50, ge=1, le=100, description="Maximum events to return"),
     offset: int = Query(default=0, ge=0, description="Offset for pagination"),
     session: AsyncSession = Depends(get_db_session_dependency),

@@ -3,6 +3,8 @@ NeuroStack - Centralized Exception Hierarchy
 All exceptions used across the application.
 """
 
+from typing import Optional
+
 
 # ============================================
 # Base Exceptions
@@ -125,8 +127,8 @@ class WebhookDeliveryError(WebhookError):
     def __init__(
         self,
         message: str,
-        status_code: int | None = None,
-        response_body: str | None = None,
+        status_code: Optional[int] = None,
+        response_body: Optional[str] = None,
     ):
         super().__init__(message)
         self.status_code = status_code

@@ -117,6 +117,15 @@ class Settings(BaseSettings):
     prompt_max_context_tokens: int = Field(default=4000, ge=100)
     prompt_max_recent_messages: int = Field(default=10, ge=1, le=50)
 
+    # ============================================
+    # LLM Provider (OpenAI-compatible)
+    # ============================================
+    llm_base_url: str = ""
+    llm_api_key: str = ""
+    llm_model: str = "o4-mini"
+    llm_temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    llm_max_tokens: int = Field(default=1024, ge=64, le=16384)
+
     @field_validator("database_url")
     @classmethod
     def validate_database_url(cls, v: str) -> str:

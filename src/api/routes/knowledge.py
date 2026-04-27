@@ -8,6 +8,7 @@ Provides endpoints for:
 - Knowledge base management
 """
 
+from typing import Optional
 from datetime import datetime
 from uuid import UUID
 
@@ -176,7 +177,7 @@ async def list_documents(
     tenant_id: UUID = Query(..., description="Tenant ID"),
     page: int = Query(default=1, ge=1, description="Page number"),
     page_size: int = Query(default=20, ge=1, le=100, description="Items per page"),
-    category: str | None = Query(default=None, description="Filter by category"),
+    category: Optional[str] = Query(default=None, description="Filter by category"),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> DocumentListResponse:
     """

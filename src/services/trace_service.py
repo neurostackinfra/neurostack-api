@@ -44,6 +44,9 @@ def _apply_filters(
     if start_date is not None:
         query = query.where(Event.created_at >= start_date)
     if end_date is not None:
+        # When end_date arrives as "YYYY-MM-DD" (midnight), include the whole day
+        if end_date.hour == 0 and end_date.minute == 0 and end_date.second == 0:
+            end_date = end_date.replace(hour=23, minute=59, second=59)
         query = query.where(Event.created_at <= end_date)
     # Safety flag and handoff_required are stored in event_metadata
     # or associated srm.decision events. Filter via JSONB operators.
@@ -162,6 +165,36 @@ async def get_trace(
     return result.scalar_one_or_none()
 
 
+async def get_prompt_event_for_trace(
+    db: AsyncSession,
+    tenant_id: UUID,
+    session_id: UUID,
+    trace_created_at,
+) -> Optional[Event]:
+    """
+    Fetch the prompt.generated event associated with a message.in trace.
+
+    Looks for the prompt.generated event in the same session that was
+    created right after (within 5 seconds of) the message.in event.
+    """
+    from datetime import timedelta
+
+    query = (
+        select(Event)
+        .where(
+            Event.tenant_id == tenant_id,
+            Event.session_id == session_id,
+            Event.event_type == "prompt.generated",
+            Event.created_at >= trace_created_at,
+            Event.created_at <= trace_created_at + timedelta(seconds=5),
+        )
+        .order_by(Event.created_at.asc())
+        .limit(1)
+    )
+    result = await db.execute(query)
+    return result.scalar_one_or_none()
+
+
 async def get_trace_stats(
     db: AsyncSession,
     tenant_id: UUID,
@@ -183,6 +216,8 @@ async def get_trace_stats(
     now = datetime.now(timezone.utc)
     if end_date is None:
         end_date = now
+    elif end_date.hour == 0 and end_date.minute == 0 and end_date.second == 0:
+        end_date = end_date.replace(hour=23, minute=59, second=59)
     if start_date is None:
         start_date = now - timedelta(days=7)
 

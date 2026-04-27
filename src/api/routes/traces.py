@@ -25,6 +25,7 @@ from src.repositories import get_db_session_dependency
 from src.services.trace_service import (
     _event_to_trace_dict,
     export_traces_csv,
+    get_prompt_event_for_trace,
     get_trace,
     get_trace_stats,
     list_traces,
@@ -161,20 +162,43 @@ async def trace_detail(
     event_data = event.event_data or {}
     metadata = event.event_metadata or {}
 
+    # Fetch the associated prompt.generated event for full prompt/context
+    full_context = event_data.get("context")
+    full_prompt = event_data.get("prompt")
+    prompt_built = trace["prompt_built"]
+
+    llm_response = None
+
+    if not full_prompt and event.session_id and event.created_at:
+        prompt_event = await get_prompt_event_for_trace(
+            db=db,
+            tenant_id=tenant.tenant_id,
+            session_id=event.session_id,
+            trace_created_at=event.created_at,
+        )
+        if prompt_event:
+            prompt_data = prompt_event.event_data or {}
+            full_prompt = prompt_data
+            full_context = prompt_data.get("context_summary")
+            if not prompt_built:
+                prompt_built = prompt_data.get("system_prompt")
+            llm_response = prompt_data.get("suggested_response")
+
     return TraceDetailResponse(
         id=trace["id"],
         timestamp=trace["timestamp"],
         user_message=trace["user_message"],
         srm_decision=trace["srm_decision"],
         context_summary=trace["context_summary"],
-        prompt_built=trace["prompt_built"],
+        prompt_built=prompt_built,
         processing_time_ms=trace["processing_time_ms"],
         mode=trace["mode"],
-        full_context=event_data.get("context"),
-        full_prompt=event_data.get("prompt"),
+        full_context=full_context,
+        full_prompt=full_prompt,
         session_id=event.session_id,
         event_data=event_data,
         event_metadata=metadata,
+        llm_response=llm_response,
     )
 
 

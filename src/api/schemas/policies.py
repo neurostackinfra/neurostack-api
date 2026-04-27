@@ -5,7 +5,7 @@ Contracts for policy management endpoints (/v1/policies).
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -82,7 +82,7 @@ class PolicyRule(BaseModel):
         }
     )
 
-    rule_id: str | None = Field(
+    rule_id: Optional[str] = Field(
         default=None,
         description="Unique identifier for the rule",
         json_schema_extra={"example": "no_medical_diagnosis"},
@@ -97,7 +97,7 @@ class PolicyRule(BaseModel):
         description="Human-readable rule description",
         json_schema_extra={"example": "Não fornecer diagnósticos médicos"},
     )
-    description: str | None = Field(
+    description: Optional[str] = Field(
         default=None,
         description="Detailed explanation of the rule",
     )
@@ -159,7 +159,7 @@ class PolicyResponse(BaseModel):
         description="Unique policy identifier",
         json_schema_extra={"example": "d4e5f6a7-b8c9-0123-def0-123456789abc"},
     )
-    tenant_id: UUID | None = Field(
+    tenant_id: Optional[UUID] = Field(
         default=None,
         description="Tenant ID (null for global policies)",
     )
@@ -168,7 +168,7 @@ class PolicyResponse(BaseModel):
         description="Policy name",
         json_schema_extra={"example": "Global Safety Policy"},
     )
-    description: str | None = Field(
+    description: Optional[str] = Field(
         default=None,
         description="Policy description",
     )
@@ -241,7 +241,7 @@ class PolicyCreateRequest(BaseModel):
         }
     )
 
-    tenant_id: UUID | None = Field(
+    tenant_id: Optional[UUID] = Field(
         default=None,
         description="Tenant ID (null for global policies)",
     )
@@ -252,7 +252,7 @@ class PolicyCreateRequest(BaseModel):
         description="Policy name",
         json_schema_extra={"example": "Clinic XYZ Policy"},
     )
-    description: str | None = Field(
+    description: Optional[str] = Field(
         default=None,
         max_length=1000,
         description="Policy description",
@@ -297,28 +297,28 @@ class PolicyUpdateRequest(BaseModel):
         }
     )
 
-    name: str | None = Field(
+    name: Optional[str] = Field(
         default=None,
         min_length=1,
         max_length=255,
         description="New policy name",
     )
-    description: str | None = Field(
+    description: Optional[str] = Field(
         default=None,
         max_length=1000,
         description="New policy description",
     )
-    rules: list[PolicyRule] | None = Field(
+    rules: Optional[list[PolicyRule]] = Field(
         default=None,
         description="New list of rules (replaces existing)",
     )
-    priority: int | None = Field(
+    priority: Optional[int] = Field(
         default=None,
         ge=0,
         le=10000,
         description="New priority level",
     )
-    is_active: bool | None = Field(
+    is_active: Optional[bool] = Field(
         default=None,
         description="Activate/deactivate policy",
     )

@@ -5,7 +5,7 @@ Contracts for event processing endpoints (/v1/events).
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -142,7 +142,7 @@ class EventPayload(BaseModel):
         description="Communication channel (whatsapp, web, telegram, etc.)",
         json_schema_extra={"example": "whatsapp"},
     )
-    user_id: str | None = Field(
+    user_id: Optional[str] = Field(
         default=None,
         description="External user identifier from the builder's system",
         json_schema_extra={"example": "user-xyz-123"},
@@ -290,12 +290,12 @@ class SRMDecision(BaseModel):
         default=False,
         description="Whether human handoff is required",
     )
-    handoff_reason: str | None = Field(
+    handoff_reason: Optional[str] = Field(
         default=None,
         description="Reason for handoff if required",
         json_schema_extra={"example": "User explicitly requested to speak with a human"},
     )
-    reasoning: str | None = Field(
+    reasoning: Optional[str] = Field(
         default=None,
         description="Brief explanation of the decision",
         json_schema_extra={"example": "User explicitly requested to schedule an appointment"},
@@ -331,7 +331,7 @@ class StatePatch(BaseModel):
         description="Slot values extracted from the conversation",
         json_schema_extra={"example": {"intent_confirmed": True}},
     )
-    funnel_stage: str | None = Field(
+    funnel_stage: Optional[str] = Field(
         default=None,
         description="New funnel stage if changed",
         json_schema_extra={"example": "consideration"},
@@ -382,12 +382,12 @@ class PromptOutput(BaseModel):
         description="List of constraints/rules the response must follow",
         json_schema_extra={"example": ["Não forneça diagnósticos médicos"]},
     )
-    context_summary: str | None = Field(
+    context_summary: Optional[str] = Field(
         default=None,
         description="Brief summary of the conversation context",
         json_schema_extra={"example": "Paciente novo buscando agendamento"},
     )
-    suggested_response: str | None = Field(
+    suggested_response: Optional[str] = Field(
         default=None,
         description="Optional suggested response (for simple cases)",
     )
@@ -438,7 +438,7 @@ class RAGSource(BaseModel):
     )
 
     document_id: str = Field(..., description="Unique identifier of the source document")
-    title: str | None = Field(default=None, description="Title of the source document")
+    title: Optional[str] = Field(default=None, description="Title of the source document")
     content: str = Field(..., description="Relevant content excerpt")
     relevance_score: float = Field(
         ...,
@@ -477,7 +477,7 @@ class ContextOutput(BaseModel):
         default_factory=list,
         description="Recent messages in the conversation",
     )
-    session_summary: str | None = Field(
+    session_summary: Optional[str] = Field(
         default=None,
         description="AI-generated summary of the session so far",
         json_schema_extra={"example": "Nova sessão de agendamento iniciada"},
@@ -602,7 +602,7 @@ class EventResponse(BaseModel):
         description="Flow mode used for this response",
         json_schema_extra={"example": "normal"},
     )
-    handoff_summary: HandoffSummary | None = Field(
+    handoff_summary: Optional[HandoffSummary] = Field(
         default=None,
         description="Handoff summary if handoff is required",
     )
@@ -611,7 +611,7 @@ class EventResponse(BaseModel):
         description="ISO 8601 timestamp of when the event was processed",
         json_schema_extra={"example": "2025-12-31T10:30:00Z"},
     )
-    processing_time_ms: int | None = Field(
+    processing_time_ms: Optional[int] = Field(
         default=None,
         ge=0,
         description="Processing time in milliseconds",
@@ -641,6 +641,6 @@ class EventDetailResponse(BaseModel):
     session_id: UUID = Field(..., description="Session identifier")
     event_type: EventType = Field(..., description="Type of event")
     payload: dict[str, Any] = Field(..., description="Original event payload")
-    decision: dict[str, Any] | None = Field(default=None, description="SRM decision if applicable")
+    decision: Optional[dict[str, Any]] = Field(default=None, description="SRM decision if applicable")
     created_at: str = Field(..., description="Event creation timestamp")
 

@@ -5,7 +5,7 @@ Contracts for session management endpoints (/v1/sessions).
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -90,16 +90,16 @@ class CognitiveState(BaseModel):
         ge=0,
         description="Number of safety concerns triggered in this session",
     )
-    last_intent: str | None = Field(
+    last_intent: Optional[str] = Field(
         default=None,
         description="Most recently detected intent",
         json_schema_extra={"example": "scheduling_request"},
     )
-    last_action: str | None = Field(
+    last_action: Optional[str] = Field(
         default=None,
         description="Last action taken (doc MVP v0.5)",
     )
-    confidence_avg: float | None = Field(
+    confidence_avg: Optional[float] = Field(
         default=None,
         ge=0.0,
         le=1.0,
@@ -121,9 +121,9 @@ class CognitiveState(BaseModel):
         default_factory=dict,
         description="Last decision: intent, action, policy_refs, constraints (doc MVP v0.5)",
     )
-    first_contact_at: str | None = Field(default=None, description="First contact timestamp")
-    pos_atendimento_started_at: str | None = Field(default=None, description="Pós-atendimento start")
-    last_message_at: str | None = Field(default=None, description="Last message timestamp")
+    first_contact_at: Optional[str] = Field(default=None, description="First contact timestamp")
+    pos_atendimento_started_at: Optional[str] = Field(default=None, description="Pós-atendimento start")
+    last_message_at: Optional[str] = Field(default=None, description="Last message timestamp")
 
 
 class SessionResponse(BaseModel):
@@ -169,7 +169,7 @@ class SessionResponse(BaseModel):
         description="Tenant that owns this session",
         json_schema_extra={"example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"},
     )
-    user_id: str | None = Field(
+    user_id: Optional[str] = Field(
         default=None,
         description="External user identifier from the builder's system",
         json_schema_extra={"example": "user-xyz-123"},
@@ -202,7 +202,7 @@ class SessionResponse(BaseModel):
         ge=0,
         description="Total number of messages in the session",
     )
-    handoff_status: str | None = Field(
+    handoff_status: Optional[str] = Field(
         default=None,
         description="Handoff status if applicable (pending, active, completed)",
         json_schema_extra={"example": None},
@@ -240,7 +240,7 @@ class SessionCreateRequest(BaseModel):
         description="Tenant identifier",
         json_schema_extra={"example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"},
     )
-    user_id: str | None = Field(
+    user_id: Optional[str] = Field(
         default=None,
         description="External user identifier",
         json_schema_extra={"example": "user-xyz-123"},
@@ -277,11 +277,11 @@ class SessionUpdateRequest(BaseModel):
         }
     )
 
-    metadata: dict[str, Any] | None = Field(
+    metadata: Optional[dict[str, Any]] = Field(
         default=None,
         description="Metadata to update/merge",
     )
-    is_active: bool | None = Field(
+    is_active: Optional[bool] = Field(
         default=None,
         description="Update active status",
     )
@@ -354,7 +354,7 @@ class SessionEventResponse(BaseModel):
     event_id: UUID = Field(..., description="Event identifier")
     event_type: str = Field(..., description="Type of event")
     payload: dict[str, Any] = Field(..., description="Event payload")
-    decision: dict[str, Any] | None = Field(default=None, description="SRM decision")
+    decision: Optional[dict[str, Any]] = Field(default=None, description="SRM decision")
     created_at: str = Field(..., description="Event timestamp")
 
 

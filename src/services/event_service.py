@@ -53,6 +53,33 @@ class EventService:
         self._pipeline = pipeline
         self._event_repo = event_repo
 
+    async def _load_clinic_config(self, tenant_id: UUID) -> Optional[dict]:
+        """Load clinic config from DB for the given tenant."""
+        try:
+            from src.repositories import get_db_session
+            from src.models.clinic_config_table import ClinicConfigTable
+            from sqlalchemy import select
+
+            async with get_db_session() as db_session:
+                stmt = select(ClinicConfigTable).where(
+                    ClinicConfigTable.tenant_id == tenant_id
+                )
+                result = await db_session.execute(stmt)
+                row = result.scalar_one_or_none()
+                if row:
+                    return {
+                        "identity": row.identity or {},
+                        "persona": row.persona or {},
+                        "operations": row.operations or {},
+                        "business_rules": row.business_rules or {},
+                        "services": row.services or {},
+                        "pricing": row.pricing or {},
+                        "handoff": row.handoff or {},
+                    }
+        except Exception as exc:
+            logger.warning("Failed to load clinic config", error=str(exc))
+        return None
+
     async def process_event(
         self,
         request: EventRequest,
@@ -68,10 +95,13 @@ class EventService:
         Returns:
             Event response with cognitive decision
         """
+        # Load clinic config for the tenant (provides identity, services, pricing)
+        clinic_config = await self._load_clinic_config(request.tenant_id)
+
         # Build pipeline input
         # TODO: In production, load session state from StateStore (Redis)
         from src.core.pipeline import PipelineInput
-        
+
         pipeline_input = PipelineInput(
             tenant_id=request.tenant_id,
             session_id=request.session_id,
@@ -85,6 +115,7 @@ class EventService:
             slots={},
             flags={},
             message_history=[],
+            clinic_config=clinic_config,
         )
 
         # Process through the complete pipeline
@@ -92,22 +123,30 @@ class EventService:
         
         result: PipelineResult = await self._pipeline.process(pipeline_input)
 
-        # Convert pipeline result to API response
-        response = self._convert_pipeline_result_to_response(result)
+        # Convert pipeline result to API response (pass user message for LLM)
+        response = await self._convert_pipeline_result_to_response(
+            result, user_message=request.payload.content
+        )
 
         # Save events to Event Store (non-blocking)
-        await self._save_events_to_store(request, result)
+        suggested_response = None
+        if response.prompt and response.prompt.suggested_response:
+            suggested_response = response.prompt.suggested_response
+        await self._save_events_to_store(request, result, suggested_response=suggested_response)
 
         return response
 
-    def _convert_pipeline_result_to_response(
-        self, result: "PipelineResult"
+    async def _convert_pipeline_result_to_response(
+        self, result: "PipelineResult", user_message: str = ""
     ) -> EventResponse:
         """
         Convert pipeline result to API response.
 
+        If an LLM provider is configured, calls it to generate suggested_response.
+
         Args:
             result: Pipeline result
+            user_message: Original user message for LLM context
 
         Returns:
             Event response
@@ -135,11 +174,27 @@ class EventService:
             flags=result.state_patch.get("flags", {}),
         )
 
+        # Call LLM to generate suggested_response if configured
+        suggested_response = None
+        try:
+            from src.llm import get_llm_client
+            llm = get_llm_client()
+            if llm and user_message:
+                messages = [
+                    {"role": "system", "content": result.system_prompt or ""},
+                    {"role": "user", "content": user_message},
+                ]
+                suggested_response = await llm.generate(messages)
+                logger.debug("LLM response generated", length=len(suggested_response))
+        except Exception as exc:
+            logger.warning("LLM call failed, returning without suggested_response", error=str(exc))
+
         prompt = PromptOutput(
             system=result.system_prompt,
             instructions=result.instructions,
             constraints=result.constraints,
             context_summary=result.context_summary,
+            suggested_response=suggested_response,
         )
 
         recent_messages = [
@@ -190,7 +245,8 @@ class EventService:
         )
 
     async def _save_events_to_store(
-        self, request: EventRequest, result: "PipelineResult"
+        self, request: EventRequest, result: "PipelineResult",
+        suggested_response: Optional[str] = None,
     ) -> None:
         """
         Save events to Event Store (non-blocking).
@@ -198,11 +254,13 @@ class EventService:
         Args:
             request: Original event request
             result: Pipeline result
+            suggested_response: LLM-generated response (if available)
         """
         try:
             event_store = await get_event_store()
 
-            # Save the incoming message event
+            # Save the incoming message event — enriched with SRM decision data
+            # so that trace_service can extract decision fields directly from message.in
             message_event = EventData(
                 id=uuid4(),
                 tenant_id=request.tenant_id,
@@ -213,10 +271,30 @@ class EventService:
                     "channel": request.payload.channel,
                     "user_id": request.payload.user_id,
                     "role": "user",
+                    # SRM decision data (enrichment for trace_service)
+                    "intent": result.intent,
+                    "intent_category": result.intent_category,
+                    "funnel_stage": result.funnel_stage,
+                    "action": result.action,
+                    "confidence": result.confidence,
+                    "safety_concern": result.safety_concern,
+                    "safety_category": result.safety_category,
+                    "needs_rag": result.needs_rag,
+                    "handoff_required": result.handoff_required,
+                    "handoff_reason": result.handoff_reason,
+                    "mode": result.mode,
+                    "reasoning": result.reasoning,
+                    "sentiment_label": result.sentiment_label,
+                    "sentiment_score": result.sentiment_score,
                 },
                 event_metadata={
                     "processing_time_ms": result.processing_time_ms,
                     "mode": result.mode,
+                    # Duplicated for trace_service filter queries (JSONB operators)
+                    "safety_concern": result.safety_concern,
+                    "handoff_required": result.handoff_required,
+                    "intent": result.intent,
+                    "funnel_stage": result.funnel_stage,
                 },
             )
             await event_store.append(message_event)
@@ -302,6 +380,7 @@ class EventService:
                     "mode": result.mode,
                     "intent": result.intent,
                     "funnel_stage": result.funnel_stage,
+                    "suggested_response": suggested_response,
                 },
                 event_metadata={
                     "processing_time_ms": result.processing_time_ms,
@@ -379,10 +458,9 @@ class EventService:
         Raises:
             ValueError: If event not found
         """
-        if not self._event_repo:
-            self._event_repo = EventRepository(session)
+        event_repo = EventRepository(session)
 
-        event = await self._event_repo.get_by_id(event_id)
+        event = await event_repo.get_by_id(event_id)
 
         if not event:
             raise ValueError(f"Event {event_id} not found")
@@ -420,11 +498,10 @@ class EventService:
         Returns:
             List of event detail responses
         """
-        if not self._event_repo:
-            self._event_repo = EventRepository(session)
+        event_repo = EventRepository(session)
 
         if session_id:
-            events_list = await self._event_repo.find_by_session(
+            events_list = await event_repo.find_by_session(
                 tenant_id=tenant_id,
                 session_id=session_id,
                 skip=offset,
@@ -432,7 +509,7 @@ class EventService:
                 event_type=event_type.value if event_type else None,
             )
         else:
-            events_list = await self._event_repo.find_by_tenant(
+            events_list = await event_repo.find_by_tenant(
                 tenant_id=tenant_id,
                 skip=offset,
                 limit=limit,

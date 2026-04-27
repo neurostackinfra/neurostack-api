@@ -5,7 +5,7 @@ Contracts for health, readiness, and liveness endpoints.
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -53,13 +53,13 @@ class ComponentHealth(BaseModel):
         description="Health status",
         json_schema_extra={"example": "healthy"},
     )
-    latency_ms: int | None = Field(
+    latency_ms: Optional[int] = Field(
         default=None,
         ge=0,
         description="Response latency in milliseconds",
         json_schema_extra={"example": 5},
     )
-    message: str | None = Field(
+    message: Optional[str] = Field(
         default=None,
         description="Optional status message",
     )
@@ -115,7 +115,7 @@ class HealthResponse(BaseModel):
         description="ISO 8601 timestamp of the health check",
         json_schema_extra={"example": "2025-12-31T10:30:00Z"},
     )
-    uptime_seconds: int | None = Field(
+    uptime_seconds: Optional[int] = Field(
         default=None,
         ge=0,
         description="API uptime in seconds",
@@ -166,7 +166,7 @@ class ReadinessResponse(BaseModel):
             }
         },
     )
-    message: str | None = Field(
+    message: Optional[str] = Field(
         default=None,
         description="Optional message about readiness status",
     )

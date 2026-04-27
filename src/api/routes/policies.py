@@ -10,7 +10,7 @@ Policies define the rules that govern agent behavior, including:
 """
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Query, status, Depends, Request
@@ -268,10 +268,10 @@ Results are ordered by priority (highest first).
     tags=["Policies"],
 )
 async def list_policies(
-    tenant_id: UUID | None = Query(default=None, description="Filter by tenant ID"),
+    tenant_id: Optional[UUID] = Query(default=None, description="Filter by tenant ID"),
     include_global: bool = Query(default=True, description="Include global policies"),
     active_only: bool = Query(default=True, description="Only return active policies"),
-    policy_type: PolicyType | None = Query(default=None, description="Filter by policy type"),
+    policy_type: Optional[PolicyType] = Query(default=None, description="Filter by policy type"),
 ) -> PolicyListResponse:
     """
     List policies.

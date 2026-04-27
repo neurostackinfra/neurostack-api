@@ -4,7 +4,7 @@ Minimal service layer for CRUD clinic configuration.
 Maps flat frontend fields to JSONB bucket columns.
 """
 
-from typing import Any
+from typing import Any, Union
 
 from src.models.clinic_config_table import ClinicConfigTable
 
@@ -14,6 +14,10 @@ from src.models.clinic_config_table import ClinicConfigTable
 # ============================================
 
 FIELD_TO_BUCKET: dict[str, str] = {
+    # persona
+    "use_personal_name": "persona",
+    "agent_display_name": "persona",
+    "clinic_display_name": "persona",
     # identity
     "clinic_name": "identity",
     "main_domain": "identity",
@@ -48,6 +52,13 @@ FIELD_TO_BUCKET: dict[str, str] = {
     "clinic_contact": "lgpd",
     "dpo_name": "lgpd",
     "dpo_contact": "lgpd",
+    # handoff
+    "handoff_active": "handoff",
+    "handoff_period": "handoff",
+    "handoff_cycle_days": "handoff",
+    "standby_mode": "handoff",
+    "handoff_sectors": "handoff",
+    "default_mode": "handoff",
     # top-level array buckets (field name == bucket name)
     "professionals": "professionals",
     "services": "services",
@@ -98,7 +109,7 @@ def flatten_config(config_row: ClinicConfigTable) -> dict[str, Any]:
     return flat
 
 
-def unflatten_patch(patch: dict[str, Any]) -> dict[str, dict[str, Any] | list]:
+def unflatten_patch(patch: dict[str, Any]) -> dict[str, Union[dict[str, Any], list]]:
     """
     Group patch fields by their target JSONB bucket.
 

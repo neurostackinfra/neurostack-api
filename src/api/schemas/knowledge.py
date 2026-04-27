@@ -3,7 +3,7 @@ NeuroStack API - Knowledge Schemas
 Request and response models for knowledge base endpoints.
 """
 
-from typing import Any
+from typing import Any, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -12,9 +12,9 @@ from pydantic import BaseModel, Field
 class DocumentMetadata(BaseModel):
     """Metadata for an uploaded document."""
 
-    title: str | None = Field(default=None, description="Document title")
-    source: str | None = Field(default=None, description="Document source")
-    category: str | None = Field(default=None, description="Document category")
+    title: Optional[str] = Field(default=None, description="Document title")
+    source: Optional[str] = Field(default=None, description="Document source")
+    category: Optional[str] = Field(default=None, description="Document category")
     tags: list[str] = Field(default_factory=list, description="Tags for filtering")
     custom: dict[str, Any] = Field(default_factory=dict, description="Custom metadata")
 
