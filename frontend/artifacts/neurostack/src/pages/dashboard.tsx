@@ -30,11 +30,39 @@ function getToken(): string | null {
 // -- Intent metadata ---
 
 const INTENT_META: Record<string, { bar: string; dot: string; hex: string }> = {
-  pedido_preco:            { bar: "bg-blue-500",    dot: "bg-blue-500",    hex: "#3b82f6" },
-  agendar:                 { bar: "bg-emerald-500", dot: "bg-emerald-500", hex: "#10b981" },
-  interesse_tratamento:    { bar: "bg-indigo-500",  dot: "bg-indigo-500",  hex: "#6366f1" },
-  reclamacao:              { bar: "bg-rose-500",    dot: "bg-rose-500",    hex: "#f43f5e" },
-  duvida_pos_procedimento: { bar: "bg-violet-500",  dot: "bg-violet-500",  hex: "#8b5cf6" },
+  // Greeting
+  saudacao:                              { bar: "bg-sky-500",     dot: "bg-sky-500",     hex: "#0ea5e9" },
+  // Interest & Qualification
+  interesse_tratamento:                  { bar: "bg-violet-500",  dot: "bg-violet-500",  hex: "#8b5cf6" },
+  qualificacao_publico:                  { bar: "bg-purple-500",  dot: "bg-purple-500",  hex: "#a855f7" },
+  comparacao_tratamentos:                { bar: "bg-fuchsia-500", dot: "bg-fuchsia-500", hex: "#d946ef" },
+  // Price & Objections
+  pedido_preco:                          { bar: "bg-blue-500",    dot: "bg-blue-500",    hex: "#3b82f6" },
+  objecao_vou_pensar:                    { bar: "bg-amber-500",   dot: "bg-amber-500",   hex: "#f59e0b" },
+  // Scheduling
+  agendar:                               { bar: "bg-green-500",   dot: "bg-green-500",   hex: "#22c55e" },
+  reagendar:                             { bar: "bg-emerald-500", dot: "bg-emerald-500", hex: "#10b981" },
+  cancelar:                              { bar: "bg-orange-500",  dot: "bg-orange-500",  hex: "#f97316" },
+  confirmar_presenca:                    { bar: "bg-teal-500",    dot: "bg-teal-500",    hex: "#14b8a6" },
+  disponibilidade_horarios:              { bar: "bg-cyan-500",    dot: "bg-cyan-500",    hex: "#06b6d4" },
+  // Info & FAQ
+  detalhes_servicos:                     { bar: "bg-indigo-400",  dot: "bg-indigo-400",  hex: "#818cf8" },
+  informacoes_profissionais:             { bar: "bg-indigo-500",  dot: "bg-indigo-500",  hex: "#6366f1" },
+  faq:                                   { bar: "bg-slate-500",   dot: "bg-slate-500",   hex: "#64748b" },
+  cultura_historia:                      { bar: "bg-slate-400",   dot: "bg-slate-400",   hex: "#94a3b8" },
+  duvida_generica_sem_contexto:          { bar: "bg-gray-500",    dot: "bg-gray-500",    hex: "#6b7280" },
+  pre_atendimento:                       { bar: "bg-lime-500",    dot: "bg-lime-500",    hex: "#84cc16" },
+  // Post-care
+  pos_atendimento_duvida:                { bar: "bg-indigo-500",  dot: "bg-indigo-500",  hex: "#6366f1" },
+  pos_atendimento_sintomas_preocupantes: { bar: "bg-red-500",     dot: "bg-red-500",     hex: "#ef4444" },
+  pedido_alterar_medicacao:              { bar: "bg-red-600",     dot: "bg-red-600",     hex: "#dc2626" },
+  // Admin / Financial
+  documentos_e_comprovantes:             { bar: "bg-zinc-500",    dot: "bg-zinc-500",    hex: "#71717a" },
+  orcamento_existente:                   { bar: "bg-blue-400",    dot: "bg-blue-400",    hex: "#60a5fa" },
+  cobranca_renegociacao:                 { bar: "bg-yellow-500",  dot: "bg-yellow-500",  hex: "#eab308" },
+  // Escalation
+  reclamacao:                            { bar: "bg-rose-500",    dot: "bg-rose-500",    hex: "#f43f5e" },
+  conduta_inadequada_ameaca:             { bar: "bg-red-700",     dot: "bg-red-700",     hex: "#b91c1c" },
 };
 
 function getIntentLabel(key: string, t: (k: TranslationKey) => string): string {
@@ -198,16 +226,22 @@ function KpiCards({ stats, t }: { stats: KpiStats; t: (k: TranslationKey) => str
 
 // -- Intent breakdown chart ---
 
+const INVESTOR_INTENTS = ["pedido_preco", "agendar", "interesse_tratamento", "reclamacao", "pos_atendimento_duvida"];
+
 function IntentBreakdown({
-  byIntent, t, intentFilter, onIntentFilterChange,
+  byIntent, t, intentFilter, onIntentFilterChange, isInvestor,
 }: {
   byIntent: Record<string, number>;
   t: (k: TranslationKey) => string;
   intentFilter: string;
   onIntentFilterChange: (v: string) => void;
+  isInvestor?: boolean;
 }) {
+  const baseIntent = isInvestor
+    ? Object.fromEntries(Object.entries(byIntent).filter(([k]) => INVESTOR_INTENTS.includes(k)))
+    : byIntent;
   const visibleIntent = Object.fromEntries(
-    Object.entries(byIntent).filter(([k]) => !intentFilter || k === intentFilter)
+    Object.entries(baseIntent).filter(([k]) => !intentFilter || k === intentFilter)
   );
   const intentTotal = Object.values(visibleIntent).reduce((s, n) => s + n, 0);
   const chartData = Object.entries(visibleIntent)
@@ -232,7 +266,7 @@ function IntentBreakdown({
             className="rounded-md border border-border bg-background px-3 py-1.5 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent h-8 w-full sm:w-48"
           >
             <option value="">{t("dash_intent_all")}</option>
-            {Object.keys(INTENT_META).map(key => (
+            {(isInvestor ? INVESTOR_INTENTS : Object.keys(INTENT_META)).map(key => (
               <option key={key} value={key}>{getIntentLabel(key, t)}</option>
             ))}
           </select>
@@ -297,7 +331,7 @@ function IntentBreakdown({
             </div>
             <div className="flex flex-wrap justify-center gap-x-3 gap-y-1.5">
               {Object.entries(INTENT_META)
-                .filter(([key]) => !intentFilter || key === intentFilter)
+                .filter(([key]) => (!isInvestor || INVESTOR_INTENTS.includes(key)) && (!intentFilter || key === intentFilter))
                 .map(([key, m]) => (
                   <div key={key} className="flex items-center gap-1">
                     <span className="h-2 w-2 rounded-full shrink-0" style={{ backgroundColor: m.hex }} />
@@ -316,6 +350,7 @@ function IntentBreakdown({
 
 export default function Dashboard() {
   const { t } = useI18n();
+  const { isInvestor } = useAuth();
   const { startDate: defStart, endDate: defEnd } = defaultDates();
   const [startDate, setStartDate] = useState(defStart);
   const [endDate, setEndDate] = useState(defEnd);
@@ -325,13 +360,15 @@ export default function Dashboard() {
     queryKey: ["trace-stats", startDate, endDate],
     queryFn: async () => {
       const token = getToken();
+      if (!token) throw new Error("Sessão expirada. Faça login novamente.");
       const params = new URLSearchParams({
         start_date: startDate,
         end_date: endDate,
       });
       const res = await fetch(`/v1/traces/stats?${params.toString()}`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        headers: { Authorization: `Bearer ${token}` },
       });
+      if (res.status === 401) throw new Error("Token inválido ou expirado. Faça login novamente.");
       if (!res.ok) throw new Error(`Stats fetch failed: ${res.status}`);
       const data = await res.json();
       // Map from API snake_case to the KpiStats shape
@@ -389,6 +426,7 @@ export default function Dashboard() {
           <IntentBreakdown
             byIntent={stats.byIntent} t={t}
             intentFilter={intentFilter} onIntentFilterChange={setIntentFilter}
+            isInvestor={isInvestor}
           />
         </>
       )}

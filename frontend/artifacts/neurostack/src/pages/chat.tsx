@@ -9,7 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import {
-  Send, User, Bot, Loader2, Activity,
+  Send, User, Bot, Loader2, Activity, RotateCcw,
   SlidersHorizontal, ShieldAlert, CheckCircle2, Lightbulb, X, ArrowDown,
 } from "lucide-react";
 import { TraceViewer } from "@/components/trace-viewer";
@@ -52,7 +52,8 @@ interface CognitiveEventResponse {
 }
 
 interface SessionResponse {
-  session_id: string;
+  id?: string;
+  session_id?: string;
   [key: string]: any;
 }
 
@@ -306,7 +307,8 @@ export default function Chat() {
         user_id: userId,
       }),
     });
-    return resp.session_id;
+    // Backend returns "id", not "session_id"
+    return resp.session_id ?? resp.id;
   }, [tenantId, userId]);
 
   // Send a message via POST /v1/events (cognitive pipeline)
@@ -417,12 +419,25 @@ export default function Chat() {
 
       {/* -- Chat Panel -- */}
       <div className="flex-1 flex flex-col min-h-[400px] border border-border rounded-lg bg-card overflow-hidden shadow-sm">
-        <div className="bg-slate-50 border-b border-border p-4 shrink-0">
-          <h2 className="font-semibold text-foreground uppercase tracking-wider text-sm flex items-center gap-2">
-            <Bot className="h-4 w-4 text-accent" />
-            {t("chat_title")}
-          </h2>
-          <p className="text-xs text-muted-foreground mt-1">{t("chat_subtitle")}</p>
+        <div className="bg-slate-50 border-b border-border p-4 shrink-0 flex items-center justify-between">
+          <div>
+            <h2 className="font-semibold text-foreground uppercase tracking-wider text-sm flex items-center gap-2">
+              <Bot className="h-4 w-4 text-accent" />
+              {t("chat_title")}
+            </h2>
+            <p className="text-xs text-muted-foreground mt-1">{t("chat_subtitle")}</p>
+          </div>
+          {sessionId && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="text-xs gap-1.5"
+              onClick={() => { setSessionId(null); setMessages([]); setActiveTrace(null); }}
+            >
+              <RotateCcw className="h-3 w-3" />
+              Nova Conversa
+            </Button>
+          )}
         </div>
 
         <ScrollArea className="flex-1 p-4" ref={scrollRef}>

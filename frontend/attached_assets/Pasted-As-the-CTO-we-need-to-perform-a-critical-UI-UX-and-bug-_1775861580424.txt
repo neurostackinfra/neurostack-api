@@ -1,0 +1,27 @@
+As the CTO, we need to perform a critical UI/UX and bug-fixing pass on the Demo Account and Roadmap pages based on our QA review.
+
+Please implement the following fixes systematically:
+
+1. ROUTING & 404 FIXES:
+- TRACE NOT FOUND: Fix the issue where clicking a trace in the Demo account (e.g., id 'demo-007') shows "Trace Not Found". Ensure the `TraceDetail` view has mock fallback data so any demo trace ID successfully loads the layout instead of an error.
+- AUDITORIA RLHF 404: The "Auditoria RLHF" link in the sidebar leads to a 404. Ensure this route (e.g., `/rlhf-audit`) is properly registered in the React Router (`App.tsx` or equivalent) and loads the page we created.
+
+2. DEMO CHAT SIMULATOR & TRACE DETAIL TWEAKS:
+- RED ARROW UI HINT: In the Demo Chat Simulator, add a small red arrow pointing to the first "Corrigir / Enviar Feedback" button, along with the small red text "clique aqui", to guide the investor to test the feature.
+- UPDATE DEMO TEXT: Change the text of the second AI message in the demo chat (and the corresponding LLM RESPONSE block in the Trace Detail) to EXACTLY this:
+  "O investimento varia conforme o número de facetas e o caso clínico, mas costuma ficar entre 6 consultas ao longo de 4 a 6 semanas. Nossa clínica trabalha com porcelana de altíssima qualidade importada, com garantia de 10 anos. Para valores exatos e um plano personalizado, agende sua consulta inicial aqui mesmo, no momento está sem custos!"
+- MOCK TRACE CONTEXT: In the Demo Trace Detail, the "SELECTED CONTEXT" is empty. Add two mock items:
+  1. Badge: [RAG] Text: "tempo médio de tratamento facetas"
+  2. Badge: [CLINIC_CONFIG] Text: "diferenciais do serviço"
+- DEFAULT LLM: In the Demo account configuration, change the mock active AI Provider to "Dropout".
+
+3. TYPOGRAPHY & REMOVING "AI TELL" DASHES:
+- Scan the Roadmap pages and remove all em-dashes/dashes ("—" or "-") used as separators in the text paragraphs. Replace them with commas, periods, or spaces to sound more natural. Specifically fix these pages:
+  * Menu Conhecimento (RAG)
+  * SLM Cortex
+  * Faturamento
+  * Inteligência de Voz
+
+4. ROADMAP UI ENHANCEMENTS:
+- POLICY LAYER BOX: Increase the border thickness (e.g., `border-2` or `border-l-4`) and text contrast (use darker text like `text-gray-900`) for the "ROADMAP: Disponível no plano Enterprise" warning box to make it more legible.
+- SLM CORTEX PACKS: In the SLM page, add "Pack de cirurgia plástica" to the list of pre-trained packs.

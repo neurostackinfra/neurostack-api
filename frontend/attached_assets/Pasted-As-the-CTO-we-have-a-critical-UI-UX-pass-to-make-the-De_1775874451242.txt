@@ -1,0 +1,25 @@
+As the CTO, we have a critical UI/UX pass to make the Demo account and Lead Capture Gate professional and welcoming to international VCs. Currently, the "NeuroStack" text at the top is unreadable against the black background, the critical "Email" field is missing, and the form is only in Portuguese, which is a blocker for foreign investors.
+
+Please perform the following visual and functional updates:
+
+1. TOP LOGO CONTRAST (White Text):
+- In the top navigation bar, locate the text 'NeuroStack' (next to the brain icon and 'DEMO' badge).
+- Change its color from dark/gray to **pure white** so it stands out and is perfectly legible against the black background.
+
+2. BILINGUAL TOGGLE & DYNAMIC TRANSLATIONS (PT / EN):
+- In the white login modal, at the very top, add two large, clear, and easy-to-click buttons (or a prominent toggle pill) for language selection: "PT" and "EN".
+- Ensure the active language button is visually highlighted (e.g., high contrast background) so the user knows which one is selected.
+- Implement dynamic translation state:
+  * Default the state to 'PT'.
+  * DYNAMIC LABELS (PT): "Bem-vindo ao Demo Exclusivo", "Nome Completo", "Empresa / Fundo", "Telefone / WhatsApp", "Acessar Demo". Placeholders should match.
+  * DYNAMIC LABELS (EN): "Welcome to the Exclusive Demo", "Full Name", "Company / Fund", "Phone / WhatsApp", "Access Demo". Placeholders should match.
+- Ensure placeholder examples (like "João Silva" and the phone number) remain but labels change.
+
+3. ADD "PROFESSIONAL EMAIL" FIELD:
+- In the white modal, right after the "Nome Completo" (or "Full Name") field, insert a new required input field for "E-mail Profissional" (PT) / "Professional Email" (EN).
+- Add the corresponding email icon (`type="email"`), make it required, and ensure the value is saved in the `demo_leads` database table.
+
+4. MASTER ADMIN LEAD MONITORING:
+- Update the Lead Monitoring table in the Master Admin view to include a new column for "E-mail" so the Master Admin can see the complete contact info.
+
+Do not break any existing database connections or authentication flow, just make the Lead Gate bilingual, readable, and collect all critical contact information before unlocking.

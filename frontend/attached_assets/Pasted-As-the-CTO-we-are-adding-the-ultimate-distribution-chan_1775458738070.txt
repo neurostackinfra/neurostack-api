@@ -1,0 +1,35 @@
+As the CTO, we are adding the ultimate distribution channel feature to our Roadmap: the "Portal de Parceiros & Builders" (Master Tenant/Agency Dashboard). We explicitly DO NOT want white-label; we want a "Powered by NeuroStack / Intel Inside" co-branding strategy to build brand equity as a Seal of Quality.
+
+Please implement the following UI for the `/portal-parceiros` route:
+
+1. SIDEBAR UPDATE:
+- Add "Portal de Parceiros (Builders)" under the Roadmap section (icon: briefcase or users).
+
+2. PAGE HEADER:
+- Title: "Torre de Controle para Builders (Master Tenant)".
+- Add a global badge: "ROADMAP: Gestão de Múltiplas Clínicas".
+
+3. BUILDER DASHBOARD UI (Deeptech Styling, opacity-70, disabled):
+
+  - Block 1: Visão Global & Alertas (Command Center)
+    - 3 metric cards: "Clínicas Ativas (12)", "Tokens Consumidos (Mês) (1.2M)", "Z-API Status (1 Desconectada 🔴)".
+    - A quick alert: "Clínica Odonto Prime: Necessita atenção no Handoff".
+
+  - Block 2: Gestão de Sub-Contas (Impersonation)
+    - A clean table listing managed clinics.
+    - Columns: Nome da Clínica, Especialidade, LLM Ativo, Status.
+    - Action button on each row: "Acessar Painel (Impersonate)" - allowing the Builder to log in as the clinic seamlessly.
+
+  - Block 3: Central de Clonagem (Deploy em 1-Clique)
+    - Title: "Blueprints e Templates de IA".
+    - Description: "Salve a personalidade e o SRM de uma clínica de sucesso e faça o deploy em um novo cliente em segundos."
+    - Button: "Salvar como Blueprint" and "Deploy em Nova Clínica".
+
+  - Block 4: Selo de Qualidade & Co-Branding (Powered By)
+    - Title: "Selo de Qualidade NeuroStack".
+    - Description: "Seus clientes sabem que seus dados estão protegidos. Exiba sua marca lado a lado com a auditoria e compliance da NeuroStack."
+    - Visual placeholder showing a mockup of a widget: "[Logo da Agência] + Powered by NeuroStack Health AI".
+
+4. VISUAL & ACCESSIBILITY:
+- High contrast: Dark slate/black text.
+- Must look highly analytical and scalable, representing an Enterprise tool built for power users.

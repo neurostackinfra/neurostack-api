@@ -1,0 +1,35 @@
+As the CTO, we are adding the final and highly requested feature to our Roadmap: "Voz Sintética & Clonagem (Voice AI)". This module will manage API integrations for Voice AI (like ElevenLabs/OpenAI TTS) and the strategic logic of when to reply with audio.
+
+Please implement the following UI for the `/voice-ai` route:
+
+1. SIDEBAR UPDATE:
+- Add "Inteligência de Voz" under the Roadmap section (icon: mic or volume-2).
+
+2. PAGE HEADER:
+- Title: "Inteligência de Voz & Síntese (Voice AI)".
+- Add a global badge: "ROADMAP: Em desenvolvimento / Voice Cloning".
+
+3. VOICE MANAGEMENT UI (Deeptech Styling, opacity-70, disabled):
+
+  - Block 1: Integração de API de Voz
+    - Dropdown: "Provedor de Voz Sintética" (Options: ElevenLabs, OpenAI TTS, Neuralake Voice).
+    - Input: "API Key do Provedor".
+    - Button: "Treinar/Clonar Voz da Clínica" (disabled).
+    - Badge: "Suporte a clonagem de voz do profissional".
+
+  - Block 2: Regras de Gatilho (Trigger Logic)
+    - Description: "Otimize os custos e a experiência do paciente escolhendo exatamente quando a IA deve responder enviando um arquivo de áudio."
+    - Add a complex selector/dropdown for "Frequência de Uso de Áudio":
+      - Option A: "Sempre responder em áudio (Custo Alto)".
+      - Option B: "Misto Fixo (50% ou 25% das interações)".
+      - Option C: "Espelhamento: Responder em áudio APENAS se o lead enviar áudio".
+      - Option D: "Quebra de Objeção: Enviar áudio se o lead consumir mais de 1.000 tokens na mesma sessão (Lead com muitas dúvidas)".
+      - Option E: "Nunca responder em áudio (Apenas Texto)".
+
+  - Block 3: Transcrição Inbound (Text-to-Speech / Speech-to-Text)
+    - Toggle: "Transcrever áudios do paciente automaticamente" (Toggled ON).
+    - Description: "A IA escuta o áudio do paciente, transcreve para o banco de dados e analisa a intenção antes de responder."
+
+4. VISUAL & ACCESSIBILITY:
+- Maintain high-contrast standards: Dark slate/black text, medium font weight.
+- Ensure the options in Block 2 look like advanced algorithmic controls.

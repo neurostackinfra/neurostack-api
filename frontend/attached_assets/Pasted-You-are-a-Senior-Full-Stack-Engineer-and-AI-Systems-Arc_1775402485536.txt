@@ -1,0 +1,42 @@
+You are a Senior Full Stack Engineer and AI Systems Architect. 
+I am building an MVP called NeuroStack: a cognitive infrastructure layer for AI agents in healthcare. 
+
+Your task is to scaffold a Full-Stack application (Monorepo) with Node.js/Express (Backend) and React/Vite/Tailwind CSS (Frontend).
+
+# 🎯 OBJECTIVE
+Build a system that proves the core concept: 
+decision → controlled context → LLM → trace.
+The LLM MUST NOT decide business logic.
+
+# 🎨 FRONTEND DESIGN SYSTEM (Deeptech / Health)
+- Framework: React + Vite + Tailwind CSS + Lucide Icons.
+- Typography: 'Inter' font.
+- Colors: 
+  - Deep Slate (Primary/Backgrounds): #1a232c
+  - Off-White (Main App Background): #F8FAFC
+  - Accent (Buttons/Interactive): #0284C7
+  - Text: #FFFFFF (on dark), #334155 (on light)
+- Style: Clean, structured, slightly rounded borders (rounded-md), subtle shadows. Minimalist.
+- UI Components needed:
+  1. A Chat Simulator (to send messages as a user).
+  2. A Decision Trace Viewer (a panel showing the SRM logic, Context used, and LLM output in real-time).
+
+# ⚙️ BACKEND ARCHITECTURE
+- Framework: Node.js, Express, TypeScript.
+- DB: In-memory arrays or SQLite (keep it simple for now).
+- Core Flow per request:
+  1. Input (receive message)
+  2. SRM (Service Reasoning Module): Lightweight deterministic logic. Decides intent (price, schedule, general), stage, handoff_required, safety_flag. (Mock this with simple keyword logic/regex).
+  3. Context Selector: Receives SRM decision, looks at a mocked `clinic_config` object, and selects ONLY relevant context (max 1-3 items). NEVER send full clinic data.
+  4. Prompt Engine: Builds the final string using User Message + SRM Decision + Selected Context + Strict Rules (e.g., no_diagnosis=true).
+  5. LLM: Calls a mock or OpenAI-compatible API (Dropout API) just for text generation.
+  6. Trace: Saves the entire transaction to a Decision Trace log.
+
+# 📦 WHAT TO DO NOW
+1. Scaffold the project structure (Backend and Frontend folders).
+2. Set up Tailwind CSS with the specified custom colors.
+3. Create the foundational TypeScript interfaces for the Backend (ClinicConfig, UserState, DecisionTrace).
+4. Build a simple Express API route (`/api/chat`) that executes the sequential flow (Input -> SRM -> Context -> Prompt -> Mock LLM -> Trace).
+5. Build a basic React layout with the Chat Simulator on the left and the Decision Trace Viewer on the right.
+
+DO NOT overengineer. No Microservices. No VectorDBs. Focus strictly on modularity and making the end-to-end flow work.
