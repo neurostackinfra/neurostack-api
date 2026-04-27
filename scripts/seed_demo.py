@@ -66,15 +66,17 @@ USERS = [
 # Clinic config JSONB buckets
 # ---------------------------------------------------------------------------
 CLINIC_PERSONA = {
-    "clinic_display_name": "Clinica Demo",
-    "agent_display_name": "Nina",
+    "clinic_display_name": "Clínica Vida Nova",
+    "agent_display_name": "Daniela",
     "use_personal_name": True,
 }
 
 CLINIC_IDENTITY = {
-    "clinic_name": "Clinica Demo",
+    "clinic_name": "Clínica Vida Nova",
+    "agent_name": "Daniela",
     "main_domain": "medicina",
-    "agent_presentation": "Assistente virtual",
+    "agent_presentation": "Sou a Daniela da Clínica Vida Nova",
+    "clinic_specialties": ["dermatologia", "estética", "odontologia", "ortopedia"],
     "use_emojis": "yes",
 }
 
