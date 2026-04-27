@@ -3,7 +3,7 @@ NeuroStack API - Traces Schemas
 Contracts for read-only trace view endpoints (/v1/traces).
 """
 
-from typing import Any
+from typing import Any, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -56,15 +56,15 @@ class TraceItem(BaseModel):
         ...,
         description="SRM decision output with intent, intent_category, funnel_stage, action, confidence, safety_concern, handoff_required",
     )
-    context_summary: str | None = Field(
+    context_summary: Optional[str] = Field(
         default=None,
         description="Brief summary of the conversation context",
     )
-    prompt_built: str | None = Field(
+    prompt_built: Optional[str] = Field(
         default=None,
         description="Generated prompt instructions",
     )
-    processing_time_ms: int | None = Field(
+    processing_time_ms: Optional[int] = Field(
         default=None,
         ge=0,
         description="Processing time in milliseconds",
@@ -150,15 +150,15 @@ class TraceDetailResponse(TraceItem):
         }
     )
 
-    full_context: dict[str, Any] | None = Field(
+    full_context: Optional[dict[str, Any]] = Field(
         default=None,
         description="Full context object used in the decision",
     )
-    full_prompt: dict[str, Any] | None = Field(
+    full_prompt: Optional[dict[str, Any]] = Field(
         default=None,
         description="Full prompt object generated for the LLM",
     )
-    session_id: UUID | None = Field(
+    session_id: Optional[UUID] = Field(
         default=None,
         description="Associated session identifier",
     )
@@ -169,6 +169,10 @@ class TraceDetailResponse(TraceItem):
     event_metadata: dict[str, Any] = Field(
         default_factory=dict,
         description="Raw event metadata",
+    )
+    llm_response: Optional[str] = Field(
+        default=None,
+        description="LLM-generated suggested response",
     )
 
 

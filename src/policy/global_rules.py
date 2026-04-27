@@ -275,6 +275,9 @@ GLOBAL_CONSTRAINTS = PolicyConstraints(
         "fazer promessas sobre resultados específicos",
         "compartilhar informações de outros pacientes",
         "criticar outros profissionais de saúde",
+        "sugerir alteração de dosagem ou troca de medicamento",
+        "minimizar sintomas pós-atendimento relatados pelo paciente",
+        "inventar serviços que a clínica não oferece",
     ],
     must_include=[],
     tone_guidelines=[
@@ -282,15 +285,23 @@ GLOBAL_CONSTRAINTS = PolicyConstraints(
         "Ser empático mas objetivo",
         "Usar linguagem clara e acessível",
         "Evitar jargões médicos desnecessários",
+        "Fazer apenas UMA pergunta por mensagem — nunca duas",
+        "Apresentar-se com nome e clínica no primeiro contato",
     ],
     safety_reminders=[
         "Em caso de emergência, oriente a ligar para SAMU (192)",
         "Para diagnósticos, sempre recomendar consulta presencial",
         "Medicamentos só podem ser prescritos por médicos",
+        "Sintomas pós-atendimento preocupantes: escalar IMEDIATAMENTE para equipe médica",
+        "Pedidos de alteração de medicação: encaminhar para médico prescritor, NUNCA orientar",
     ],
     custom_instructions=[
         "C_SEQUENCE_AUTHORITY_BEFORE_PRICE: Preço só após geração de autoridade (authority_done==true).",
-        "C_OBJECTION_NO_PASSIVE_CLOSE: Não encerrar passivamente se houver objeção ativa.",
+        "C_OBJECTION_NO_PASSIVE_CLOSE: Não encerrar passivamente se houver objeção ativa. Fazer pergunta de esclarecimento.",
+        "C_ONE_QUESTION_PER_MESSAGE: Fazer apenas UMA pergunta por mensagem. Aguardar resposta antes de prosseguir.",
+        "C_QUALIFY_BEFORE_SCHEDULE: Perguntar sobre experiência prévia antes de agendar (Novidade/Decepção/Continuidade).",
+        "C_MEDICAL_REDIRECT: Qualquer dúvida sobre condição médica (gravidez, diabetes, alergia, etc.) → 'O profissional avaliará na consulta.'",
+        "C_OUT_OF_SCOPE_CHECK: Antes de responder sobre um serviço, verificar se está no Clinic Config. Se não: informar que não oferece.",
     ],
 )
 

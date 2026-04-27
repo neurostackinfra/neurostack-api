@@ -110,11 +110,10 @@ class SessionService:
         Raises:
             ValueError: If tenant not found or not active
         """
-        if not self._tenant_repo:
-            self._tenant_repo = TenantRepository(db)
+        tenant_repo = TenantRepository(db)
 
         # Validate tenant exists
-        tenant = await self._tenant_repo.get_by_id(request.tenant_id)
+        tenant = await tenant_repo.get_by_id(request.tenant_id)
 
         if not tenant:
             raise ValueError(f"Tenant {request.tenant_id} not found")
@@ -122,8 +121,7 @@ class SessionService:
         if not tenant.is_active:
             raise ValueError(f"Tenant {request.tenant_id} is not active")
 
-        if not self._session_repo:
-            self._session_repo = SessionRepository(db)
+        session_repo = SessionRepository(db)
 
         # Create initial cognitive state
         initial_state = CognitiveStateData(
@@ -136,7 +134,7 @@ class SessionService:
         )
 
         # Create session
-        new_session = await self._session_repo.create(
+        new_session = await session_repo.create(
             tenant_id=request.tenant_id,
             user_id=request.user_id,
             channel=request.channel,
@@ -162,10 +160,9 @@ class SessionService:
         Raises:
             ValueError: If session not found
         """
-        if not self._session_repo:
-            self._session_repo = SessionRepository(db)
+        session_repo = SessionRepository(db)
 
-        db_session = await self._session_repo.get_by_id(session_id)
+        db_session = await session_repo.get_by_id(session_id)
 
         if not db_session:
             raise ValueError(f"Session {session_id} not found")
@@ -195,30 +192,29 @@ class SessionService:
         Returns:
             Session list response
         """
-        if not self._session_repo:
-            self._session_repo = SessionRepository(db)
+        session_repo = SessionRepository(db)
 
         skip = (page - 1) * page_size
 
         if channel:
-            sessions_list = await self._session_repo.find_by_channel(
+            sessions_list = await session_repo.find_by_channel(
                 tenant_id=tenant_id,
                 channel=channel,
                 active_only=active_only,
                 skip=skip,
                 limit=page_size,
             )
-            total = await self._session_repo.count_by_tenant(
+            total = await session_repo.count_by_tenant(
                 tenant_id, active_only=active_only
             )
         else:
-            sessions_list = await self._session_repo.find_by_tenant(
+            sessions_list = await session_repo.find_by_tenant(
                 tenant_id=tenant_id,
                 active_only=active_only,
                 skip=skip,
                 limit=page_size,
             )
-            total = await self._session_repo.count_by_tenant(
+            total = await session_repo.count_by_tenant(
                 tenant_id, active_only=active_only
             )
 
@@ -251,8 +247,7 @@ class SessionService:
         Raises:
             ValueError: If session not found
         """
-        if not self._session_repo:
-            self._session_repo = SessionRepository(db)
+        session_repo = SessionRepository(db)
 
         update_data = {}
         if request.metadata is not None:
@@ -260,7 +255,7 @@ class SessionService:
         if request.is_active is not None:
             update_data["is_active"] = request.is_active
 
-        updated_session = await self._session_repo.update(session_id, **update_data)
+        updated_session = await session_repo.update(session_id, **update_data)
 
         if not updated_session:
             raise ValueError(f"Session {session_id} not found")
@@ -280,10 +275,9 @@ class SessionService:
         Raises:
             ValueError: If session not found
         """
-        if not self._session_repo:
-            self._session_repo = SessionRepository(db)
+        session_repo = SessionRepository(db)
 
-        success = await self._session_repo.end_session(session_id)
+        success = await session_repo.end_session(session_id)
 
         if not success:
             raise ValueError(f"Session {session_id} not found")
@@ -309,16 +303,15 @@ class SessionService:
         Returns:
             Session events response
         """
-        if not self._event_repo:
-            self._event_repo = EventRepository(db)
+        event_repo = EventRepository(db)
 
-        events_list = await self._event_repo.find_by_session(
+        events_list = await event_repo.find_by_session(
             tenant_id=tenant_id,
             session_id=session_id,
             skip=offset,
             limit=limit,
         )
-        total = await self._event_repo.count_by_session(tenant_id, session_id)
+        total = await event_repo.count_by_session(tenant_id, session_id)
 
         event_responses = [
             SessionEventResponse(
@@ -355,10 +348,9 @@ class SessionService:
         Raises:
             ValueError: If session not found
         """
-        if not self._session_repo:
-            self._session_repo = SessionRepository(db)
+        session_repo = SessionRepository(db)
 
-        db_session = await self._session_repo.get_by_id(session_id)
+        db_session = await session_repo.get_by_id(session_id)
 
         if not db_session:
             raise ValueError(f"Session {session_id} not found")

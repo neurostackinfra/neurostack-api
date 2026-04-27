@@ -105,6 +105,7 @@ async def patch_config(
             setattr(row, bucket_name, merged)
 
     await session.flush()
+    await session.commit()
 
     flat = flatten_config(row)
     return ConfigResponse(**flat)

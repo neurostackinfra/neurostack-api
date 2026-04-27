@@ -73,22 +73,22 @@ class TenantBranding(BaseModel):
         }
     )
 
-    assistant_name: str | None = Field(
+    assistant_name: Optional[str] = Field(
         default=None,
         max_length=100,
         description="Name of the AI assistant",
     )
-    tone: str | None = Field(
+    tone: Optional[str] = Field(
         default=None,
         max_length=50,
         description="Tone of voice (professional, friendly, formal)",
     )
-    greeting: str | None = Field(
+    greeting: Optional[str] = Field(
         default=None,
         max_length=500,
         description="Default greeting message",
     )
-    farewell: str | None = Field(
+    farewell: Optional[str] = Field(
         default=None,
         max_length=500,
         description="Default farewell message",
@@ -146,7 +146,7 @@ class TenantConfig(BaseModel):
         le=100,
         description="Maximum concurrent sessions per user",
     )
-    webhook_url: str | None = Field(
+    webhook_url: Optional[str] = Field(
         default=None,
         max_length=500,
         description="Webhook URL for handoff and safety notifications",
@@ -207,7 +207,7 @@ class TenantResponse(BaseModel):
         ...,
         description="Tenant name",
     )
-    slug: str | None = Field(
+    slug: Optional[str] = Field(
         default=None,
         description="URL-friendly identifier",
     )
@@ -227,7 +227,7 @@ class TenantResponse(BaseModel):
         ...,
         description="ISO 8601 last update timestamp",
     )
-    stats: dict[str, Any] | None = Field(
+    stats: Optional[dict[str, Any]] = Field(
         default=None,
         description="Optional statistics about the tenant",
     )
@@ -260,7 +260,7 @@ class TenantCreateRequest(BaseModel):
         max_length=255,
         description="Tenant name",
     )
-    slug: str | None = Field(
+    slug: Optional[str] = Field(
         default=None,
         min_length=1,
         max_length=100,
@@ -292,24 +292,24 @@ class TenantUpdateRequest(BaseModel):
         }
     )
 
-    name: str | None = Field(
+    name: Optional[str] = Field(
         default=None,
         min_length=1,
         max_length=255,
         description="New tenant name",
     )
-    slug: str | None = Field(
+    slug: Optional[str] = Field(
         default=None,
         min_length=1,
         max_length=100,
         pattern=r"^[a-z0-9-]+$",
         description="New slug",
     )
-    config: TenantConfig | None = Field(
+    config: Optional[TenantConfig] = Field(
         default=None,
         description="Updated configuration (merged with existing)",
     )
-    is_active: bool | None = Field(
+    is_active: Optional[bool] = Field(
         default=None,
         description="Activate/deactivate tenant",
     )
@@ -454,7 +454,7 @@ class APIKeyRotateRequest(BaseModel):
         default=True,
         description="Whether to immediately revoke the previous key",
     )
-    reason: str | None = Field(
+    reason: Optional[str] = Field(
         default=None,
         max_length=500,
         description="Reason for rotation (for audit)",

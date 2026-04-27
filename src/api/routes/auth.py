@@ -3,6 +3,7 @@ NeuroStack API - Auth Endpoint
 User login with JWT token generation.
 """
 
+from typing import Optional
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -82,7 +83,7 @@ async def login(body: LoginRequest) -> LoginResponse:
             )
 
         # Look up clinic_id for the tenant (if exists)
-        clinic_id: str | None = None
+        clinic_id: Optional[str] = None
         clinic_stmt = select(ClinicConfigTable.clinic_id).where(
             ClinicConfigTable.tenant_id == user.tenant_id
         )

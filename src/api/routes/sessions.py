@@ -9,6 +9,7 @@ Sessions track the cognitive state of a conversation, including:
 - Safety trigger count
 """
 
+from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -83,7 +84,11 @@ async def create_session(
     """
     service = get_session_service()
     try:
-        return await service.create_session(request, db)
+        result = await service.create_session(request, db)
+        # Explicit commit — ensures the session row is visible to other
+        # connections (e.g. EventStore) before the response is sent.
+        await db.commit()
+        return result
     except ValueError as e:
         error_msg = str(e)
         if "not found" in error_msg:
@@ -179,7 +184,7 @@ async def list_sessions(
     page: int = Query(default=1, ge=1, description="Page number"),
     page_size: int = Query(default=20, ge=1, le=100, description="Items per page"),
     active_only: bool = Query(default=True, description="Only return active sessions"),
-    channel: str | None = Query(default=None, description="Filter by channel"),
+    channel: Optional[str] = Query(default=None, description="Filter by channel"),
     db: AsyncSession = Depends(get_db_session_dependency),
 ) -> SessionListResponse:
     """
@@ -231,7 +236,9 @@ async def update_session(
     """
     service = get_session_service()
     try:
-        return await service.update_session(session_id, request, db)
+        result = await service.update_session(session_id, request, db)
+        await db.commit()
+        return result
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -271,6 +278,7 @@ async def end_session(
     service = get_session_service()
     try:
         await service.end_session(session_id, db)
+        await db.commit()
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

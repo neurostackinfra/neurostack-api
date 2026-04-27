@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from passlib.context import CryptContext
 from passlib.exc import InvalidHashError
 from sqlalchemy.exc import SQLAlchemyError
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 # Add the project root to sys.path for local module resolution
 project_root = Path(__file__).resolve().parent.parent.parent
@@ -243,12 +243,14 @@ class APIKeyStore:
 # ============================================
 
 
-class AuthMiddleware(BaseHTTPMiddleware):
+class AuthMiddleware:
     """
-    FastAPI middleware for API key authentication.
-    
-    Extracts API key from X-API-Key header, validates it,
-    and attaches tenant context to the request state.
+    Pure ASGI middleware for authentication.
+
+    Uses the raw ASGI interface instead of BaseHTTPMiddleware so that
+    FastAPI async-generator dependencies (like get_db_session_dependency)
+    can properly execute their post-yield cleanup (commit / rollback).
+    BaseHTTPMiddleware is known to break this lifecycle.
     """
 
     # Paths that don't require authentication
@@ -266,20 +268,20 @@ class AuthMiddleware(BaseHTTPMiddleware):
         "/v1/auth/login",
     }
 
-    async def dispatch(
-        self,
-        request: Request,
-        call_next: Callable,
-    ) -> JSONResponse:
-        """Process request through authentication."""
-        
-        # Skip auth for public paths
-        if self._is_public_path(request.url.path):
-            return await call_next(request)
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
 
-        # Skip auth for OPTIONS (CORS preflight)
-        if request.method == "OPTIONS":
-            return await call_next(request)
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive, send)
+
+        # Skip auth for public paths and OPTIONS
+        if self._is_public_path(request.url.path) or request.method == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
 
         # --- Try JWT (Bearer) first, then fall back to API key ---
         tenant_context: Optional[TenantContext] = None
@@ -301,7 +303,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     is_active=True,
                 )
             except jwt.ExpiredSignatureError:
-                return JSONResponse(
+                response = JSONResponse(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     content={
                         "error": "unauthorized",
@@ -309,8 +311,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
                         "documentation_url": "https://docs.neurostack.ai/auth",
                     },
                 )
+                await response(scope, receive, send)
+                return
             except (jwt.InvalidTokenError, KeyError, ValueError):
-                return JSONResponse(
+                response = JSONResponse(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     content={
                         "error": "unauthorized",
@@ -318,6 +322,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
                         "documentation_url": "https://docs.neurostack.ai/auth",
                     },
                 )
+                await response(scope, receive, send)
+                return
 
         # Fall back to API key if no Bearer token
         if tenant_context is None:
@@ -330,7 +336,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     method=request.method,
                     client_ip=self._get_client_ip(request),
                 )
-                return JSONResponse(
+                response = JSONResponse(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     content={
                         "error": "unauthorized",
@@ -338,6 +344,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
                         "documentation_url": "https://docs.neurostack.ai/auth",
                     },
                 )
+                await response(scope, receive, send)
+                return
 
             # Validate API key
             tenant_context = await APIKeyStore.validate_api_key(api_key)
@@ -350,7 +358,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     client_ip=self._get_client_ip(request),
                     api_key_prefix=api_key[:8] + "..." if len(api_key) > 8 else "***",
                 )
-                return JSONResponse(
+                response = JSONResponse(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     content={
                         "error": "unauthorized",
@@ -358,6 +366,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
                         "documentation_url": "https://docs.neurostack.ai/auth",
                     },
                 )
+                await response(scope, receive, send)
+                return
 
         # Check if tenant is active
         if not tenant_context.is_active:
@@ -366,13 +376,15 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 tenant_id=str(tenant_context.tenant_id),
                 path=request.url.path,
             )
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=status.HTTP_403_FORBIDDEN,
                 content={
                     "error": "forbidden",
                     "message": "Tenant account is inactive",
                 },
             )
+            await response(scope, receive, send)
+            return
 
         # Attach tenant context to request state
         request.state.tenant = tenant_context
@@ -385,43 +397,29 @@ class AuthMiddleware(BaseHTTPMiddleware):
             path=request.url.path,
         )
 
-        # Continue processing
-        response = await call_next(request)
-
-        return response
+        # Continue processing — pure ASGI passthrough
+        await self.app(scope, receive, send)
 
     def _is_public_path(self, path: str) -> bool:
         """Check if path is public (no auth required)."""
-        # Check exact match
         if path in self.PUBLIC_PATHS:
             return True
-
-        # Check path prefixes for docs and metrics
         if path.startswith("/docs") or path.startswith("/redoc"):
             return True
-
         if path.startswith("/metrics"):
             return True
-
         return False
 
     def _get_client_ip(self, request: Request) -> str:
         """Extract client IP from request, handling proxies."""
-        # Check X-Forwarded-For header (common for load balancers)
         forwarded_for = request.headers.get("X-Forwarded-For")
         if forwarded_for:
-            # Get first IP in chain (original client)
             return forwarded_for.split(",")[0].strip()
-
-        # Check X-Real-IP header (nginx)
         real_ip = request.headers.get("X-Real-IP")
         if real_ip:
             return real_ip
-
-        # Fall back to direct client
         if request.client:
             return request.client.host
-
         return "unknown"
 
 

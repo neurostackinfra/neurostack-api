@@ -5,7 +5,7 @@ Foundation classes for all API schemas.
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -40,7 +40,7 @@ class BaseResponse(BaseModel):
     )
 
     success: bool = Field(default=True, description="Whether the operation was successful")
-    message: str | None = Field(default=None, description="Optional message about the operation")
+    message: Optional[str] = Field(default=None, description="Optional message about the operation")
 
 
 class ErrorCode(str, Enum):
@@ -87,9 +87,9 @@ class ErrorDetail(BaseModel):
         }
     )
 
-    field: str | None = Field(default=None, description="Field that caused the error")
+    field: Optional[str] = Field(default=None, description="Field that caused the error")
     message: str = Field(..., description="Human-readable error message")
-    code: str | None = Field(default=None, description="Error code for programmatic handling")
+    code: Optional[str] = Field(default=None, description="Error code for programmatic handling")
 
 
 class ErrorResponse(BaseModel):
@@ -127,16 +127,16 @@ class ErrorResponse(BaseModel):
         description="Human-readable error message",
         json_schema_extra={"example": "Request validation failed"},
     )
-    details: list[ErrorDetail] | None = Field(
+    details: Optional[list[ErrorDetail]] = Field(
         default=None,
         description="Detailed error information for each field/issue",
     )
-    request_id: str | None = Field(
+    request_id: Optional[str] = Field(
         default=None,
         description="Unique request identifier for debugging",
         json_schema_extra={"example": "req_abc123xyz"},
     )
-    documentation_url: str | None = Field(
+    documentation_url: Optional[str] = Field(
         default=None,
         description="URL to documentation about this error",
     )

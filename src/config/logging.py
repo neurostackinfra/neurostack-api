@@ -5,7 +5,7 @@ Structured logging using structlog
 
 import logging
 import sys
-from typing import Any
+from typing import Any, Optional
 
 import structlog
 from structlog.types import Processor
@@ -65,7 +65,7 @@ def configure_logging() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
+def get_logger(name: Optional[str] = None) -> structlog.stdlib.BoundLogger:
     """Get a structured logger instance."""
     return structlog.get_logger(name)
 

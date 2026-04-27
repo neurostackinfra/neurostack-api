@@ -175,27 +175,14 @@ def get_db_session() -> AsyncSession:
 async def get_db_session_dependency() -> AsyncSession:
     """
     Dependency function for FastAPI dependency injection.
-    
-    Usage:
-        @app.get("/endpoint")
-        async def endpoint(session: AsyncSession = Depends(get_db_session_dependency)):
-            ...
+
+    Yields a session and closes it when done.  Route handlers that perform
+    writes MUST call ``await db.commit()`` explicitly before returning —
+    the post-yield phase of async-generator dependencies is unreliable
+    when any Starlette middleware wraps the request.
     """
-    async with get_db_session() as session:
-        try:
-            yield session
-            await session.commit()
-        except SQLAlchemyError:
-            await session.rollback()
-            raise
-        except Exception as e:
-            await session.rollback()
-            logger.error(
-                "Unexpected error in database session",
-                error=str(e),
-                error_type=type(e).__name__,
-                exc_info=True,
-            )
-            raise
-        finally:
-            await session.close()
+    session = get_db_session()
+    try:
+        yield session
+    finally:
+        await session.close()

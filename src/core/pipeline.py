@@ -8,7 +8,7 @@ connecting: SRM → Policy → CTX → Flow → Prompt → Handoff
 
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from uuid import UUID, uuid4
 
 from prometheus_client import Counter, Histogram
@@ -124,7 +124,7 @@ class PipelineInput(BaseModel):
     current_funnel_stage: str = "lead_novo"
     turn_count: int = 0
     intent_history: list[str] = Field(default_factory=list)
-    slots: dict[str, str | int | float | bool] = Field(default_factory=dict)
+    slots: dict[str, Union[str, int, float, bool]] = Field(default_factory=dict)
     flags: dict[str, bool] = Field(default_factory=dict)
     message_history: list[dict[str, str]] = Field(default_factory=list)
     # Doc MVP v0.5: ClinicConfig e UserState (quando carregados)
@@ -476,6 +476,35 @@ class CognitivePipeline:
             last_intent=srm_decision.intent,
         )
 
+        # Build custom variables from clinic_config (identity, services, pricing, etc.)
+        custom_vars: dict[str, Any] = {}
+        if input_data.clinic_config:
+            cfg = input_data.clinic_config
+            identity = cfg.get("identity", {})
+            operations = cfg.get("operations", {})
+            business = cfg.get("business_rules", {})
+            pricing = cfg.get("pricing", {})
+            persona = cfg.get("persona", {})
+            custom_vars["agent_name"] = (
+                identity.get("agent_name")
+                or persona.get("agent_display_name")
+                or "assistente"
+            )
+            custom_vars["clinic_name"] = (
+                identity.get("clinic_name")
+                or persona.get("clinic_display_name")
+                or "nossa clínica"
+            )
+            raw_specs = identity.get("clinic_specialties", [])
+            if isinstance(raw_specs, str):
+                raw_specs = [s.strip() for s in raw_specs.split(",") if s.strip()]
+            custom_vars["clinic_specialties"] = raw_specs
+            custom_vars["working_hours"] = operations.get("working_hours", "")
+            custom_vars["full_address"] = operations.get("full_address", "")
+            custom_vars["differentials"] = business.get("differentials", "")
+            custom_vars["payment_methods"] = business.get("payment_methods", "")
+            custom_vars["pricing_mode"] = pricing.get("disclosure_mode", "CONSULT_ONLY")
+
         # Build variables
         variables = PromptVariables(
             user_message=input_data.message,
@@ -486,6 +515,7 @@ class CognitivePipeline:
             slots=input_data.slots,
             constraints=policy_result.constraints or [],
             user_journey=user_journey,
+            custom=custom_vars,
         )
         
         # Add safety context if needed

@@ -9,7 +9,7 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 # Third-party imports
 from fastapi import FastAPI, Request
@@ -169,7 +169,7 @@ def create_app() -> FastAPI:
         required: bool,
         description: str,
         schema_type: str = "string",
-        schema_format: str | None = None,
+        schema_format: Optional[str] = None,
     ) -> None:
         """Add a header parameter to an operation if it doesn't exist."""
         if "parameters" not in operation:

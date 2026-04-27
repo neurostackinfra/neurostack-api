@@ -17,7 +17,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from threading import Lock
-from typing import Callable
+from typing import Callable, Optional
 
 from fastapi import Request, Response
 from prometheus_client import Counter, Histogram, Gauge
@@ -100,7 +100,7 @@ class LRUCache:
         self._cache: OrderedDict[str, CacheEntry] = OrderedDict()
         self._lock = Lock()
     
-    def get(self, key: str) -> CacheEntry | None:
+    def get(self, key: str) -> Optional[CacheEntry]:
         """
         Get value from cache.
         
@@ -127,7 +127,7 @@ class LRUCache:
         value: bytes,
         content_type: str = "application/json",
         status_code: int = 200,
-        ttl: float | None = None,
+        ttl: Optional[float] = None,
     ) -> None:
         """
         Set value in cache.
@@ -153,7 +153,7 @@ class LRUCache:
                 expires_at=time.time() + ttl,
             )
     
-    def invalidate(self, pattern: str | None = None) -> int:
+    def invalidate(self, pattern: Optional[str] = None) -> int:
         """
         Invalidate cache entries.
         
