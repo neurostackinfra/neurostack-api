@@ -1,0 +1,116 @@
+As the CTO, we are implementing a massive B2B value-add: an automated, dynamic LGPD (Data Protection) Compliance system. We need to create a public Privacy Policy page that dynamically loads the tenant's legal data, and a config panel for them to set it up.
+
+Please implement the following architecture:
+
+1. DATABASE SCHEMA (`clinic_config` table):
+Add the following columns to store LGPD settings:
+- `lgpd_enabled` (boolean, default: false)
+- `lgpd_message` (text)
+- `lgpd_custom_link` (text, nullable)
+- `clinic_legal_name` (text, nullable)
+- `clinic_cnpj` (text, nullable)
+- `clinic_contact` (text, nullable)
+- `dpo_name` (text, nullable)
+- `dpo_contact` (text, nullable)
+
+2. CLINIC CONFIG UI (Admin/Pilot Dashboard):
+Create a "Compliance & LGPD 🛡️" section.
+- Toggle: "Ativar LGPD no Atendimento"
+- Textarea: "Mensagem de Abertura". Default value:
+  "Olá! Bem-vindo(a) ao atendimento da [Nome da Clínica]. 🏥 Para garantir o melhor cuidado com a sua saúde e segurança, nossa assistente virtual processa seus dados de acordo com a Lei Geral de Proteção de Dados (LGPD). Ao continuar esta conversa, você concorda com o uso dos seus dados para fins de agendamento e orientações sobre serviços. 📄 Leia nossa Política de Privacidade completa aqui: {{lgpd_link}} Como posso te ajudar hoje?"
+- Radio options: "Usar página padrão NeuroStack" vs "Usar link próprio".
+- If "Usar link próprio", show a simple URL input.
+- If "Usar página padrão", show inputs for: Nome Legal da Clínica, CNPJ, E-mail/Telefone de Contato da Clínica, Nome do Encarregado (DPO), e E-mail/Contato do DPO.
+- Below this, display a read-only field showing their unique dynamic link: `https://[your-domain]/privacidade/{clinic_id}`
+
+3. BACKEND PUBLIC API:
+Create a public read-only endpoint `GET /api/public/privacidade/:clinicId` that returns the clinic's legal name, CNPJ, contacts, and DPO info. Do not expose sensitive API keys here.
+
+4. NEW FRONTEND PUBLIC ROUTE (`/privacidade/:clinicId`):
+Create a clean, professional, text-focused public page (readable on mobile). 
+It must fetch the data from the endpoint above and display the exact text below, replacing the bracketed placeholders with the fetched data (and using the current date for [DATA]).
+
+--- START OF PRIVACY POLICY TEXT ---
+# Política de Privacidade do Atendimento por Chatbot
+A sua privacidade é importante para nós.
+Este chatbot é utilizado para facilitar o atendimento da clínica, incluindo dúvidas iniciais, informações sobre serviços, encaminhamento para equipe humana, agendamentos, confirmações de contato e registro do histórico de atendimento.
+Ao utilizar este canal, seus dados pessoais poderão ser tratados para viabilizar o atendimento solicitado, melhorar a comunicação com a clínica, cumprir obrigações legais e regulatórias e manter a segurança das interações, nos termos da Lei Geral de Proteção de Dados Pessoais, Lei nº 13.709/2018. 
+
+## 1. Quem são os responsáveis pelo tratamento dos dados
+O controlador dos seus dados pessoais é a clínica responsável por este atendimento:
+**[clinic_legal_name]**
+CNPJ: **[clinic_cnpj]**
+Contato: **[clinic_contact]**
+
+A NeuroStack atua como provedora da tecnologia utilizada neste chatbot, podendo operar dados pessoais em nome da clínica para viabilizar o funcionamento da solução, conforme as instruções da própria clínica e os limites da legislação aplicável. A LGPD diferencia os papéis de controlador e operador no tratamento de dados pessoais. 
+
+## 2. Quais dados podem ser tratados
+Dependendo da sua interação, este canal pode tratar dados como:
+- nome
+- telefone
+- e-mail
+- CPF, quando necessário para identificação ou agendamento
+- informações fornecidas por você durante a conversa
+- dados de atendimento, como data, horário e unidade
+- histórico de mensagens trocadas neste canal
+
+Em alguns casos, especialmente em contextos de saúde, podem ser tratados dados pessoais sensíveis, como informações relacionadas à sua saúde, quando isso for necessário para o atendimento solicitado. A LGPD trata dados de saúde como dados pessoais sensíveis, sujeitos a proteção reforçada. 
+
+## 3. Para quais finalidades usamos os dados
+Seus dados podem ser utilizados para:
+- realizar atendimento inicial e responder suas solicitações
+- direcionar você para a equipe da clínica
+- realizar ou apoiar agendamentos, confirmações e remarcações
+- registrar o histórico do atendimento
+- melhorar a qualidade, segurança e organização do serviço
+- cumprir obrigações legais, regulatórias e de auditoria
+- prevenir fraudes, abusos e uso indevido do canal
+
+## 4. Com quem os dados podem ser compartilhados
+Os dados poderão ser compartilhados, quando necessário, com:
+- profissionais e equipes autorizadas da própria clínica
+- prestadores de tecnologia e hospedagem envolvidos na operação do chatbot
+- sistemas integrados da clínica, como agenda, CRM ou prontuário, quando aplicável
+- autoridades públicas, quando houver obrigação legal ou regulatória
+
+O compartilhamento será realizado apenas quando necessário para as finalidades informadas e dentro dos limites da legislação aplicável. A transparência sobre compartilhamento e finalidades é parte esperada de um aviso de privacidade adequado. 
+
+## 5. Por quanto tempo os dados são armazenados
+Os dados serão armazenados pelo tempo necessário para cumprir as finalidades deste atendimento, atender exigências legais, regulatórias e contratuais e resguardar direitos da clínica, do paciente e dos envolvidos no atendimento.
+Quando possível e aplicável, os dados serão eliminados, anonimizados ou mantidos de forma segura conforme os prazos legais e a necessidade operacional.
+
+## 6. Como protegemos os dados
+Adotamos medidas técnicas e organizacionais de segurança para proteger os dados pessoais contra acessos não autorizados, perda, alteração, divulgação indevida ou qualquer forma de tratamento inadequado.
+Ainda assim, nenhum sistema é totalmente livre de riscos. Caso ocorra incidente de segurança com risco ou dano relevante, as medidas cabíveis serão adotadas conforme a legislação. A ANPD prevê a comunicação de incidentes relevantes. 
+
+## 7. Seus direitos como titular de dados
+Nos termos da LGPD, você pode solicitar, quando aplicável:
+- confirmação da existência de tratamento
+- acesso aos seus dados
+- correção de dados incompletos, inexatos ou desatualizados
+- anonimização, bloqueio ou eliminação de dados desnecessários, excessivos ou tratados de forma inadequada
+- portabilidade, quando cabível
+- informação sobre compartilhamentos realizados
+- revisão de decisões, quando aplicável
+- informações sobre a possibilidade de não fornecer consentimento, quando essa base legal for utilizada
+- revogação do consentimento, quando o tratamento depender dele
+
+A ANPD orienta que o exercício desses direitos deve ser solicitado primeiro ao controlador dos dados. 
+
+## 8. Como exercer seus direitos ou tirar dúvidas
+Para solicitações relacionadas aos seus dados pessoais, entre em contato com:
+**[dpo_name]**
+Contato/E-mail: **[dpo_contact]**
+
+A LGPD prevê a divulgação pública da identidade e das informações de contato do encarregado, quando aplicável, de forma clara e objetiva. 
+
+## 9. Sobre o uso deste canal
+Este chatbot é um canal de apoio ao atendimento. Em situações específicas, você poderá ser direcionado para um atendente humano da clínica.
+Recomendamos que você não envie, por este canal, informações desnecessárias ou excessivas. Caso precise de atendimento clínico urgente, procure imediatamente o canal adequado da clínica ou o serviço de urgência mais próximo.
+
+## 10. Atualizações desta política
+Esta Política de Privacidade poderá ser atualizada a qualquer momento para refletir melhorias no serviço, mudanças operacionais ou exigências legais.
+Última atualização: **[Current Date Format: DD/MM/YYYY]**
+--- END OF PRIVACY POLICY TEXT ---
+
+Ensure the form properly saves all this data and the public page renders it beautifully.

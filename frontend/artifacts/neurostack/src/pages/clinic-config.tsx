@@ -128,11 +128,11 @@ function ApiInput({
 }
 
 function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
-  clinicId: number; isReadOnly: boolean; isSuperAdmin: boolean;
+  clinicId: string; isReadOnly: boolean; isSuperAdmin: boolean;
 }) {
   const { toast } = useToast();
   const [clinics, setClinics]               = useState<ClinicSlim[]>([]);
-  const [selectedClinicId, setSelectedClinicId] = useState<number>(clinicId);
+  const [selectedClinicId, setSelectedClinicId] = useState<string>(clinicId);
   const [status, setStatus]                 = useState<CredentialStatus | null>(null);
   const [loading, setLoading]               = useState(false);
   const [saving, setSaving]                 = useState(false);

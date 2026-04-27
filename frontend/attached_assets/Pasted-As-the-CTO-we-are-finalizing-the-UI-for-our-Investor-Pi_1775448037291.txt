@@ -1,0 +1,41 @@
+As the CTO, we are finalizing the UI for our Investor Pitch. We need to add two new highly strategic modules to the sidebar under a "ROADMAP" or "ECOSSISTEMA" section to showcase our Enterprise compliance and PLG (Product-Led Growth) strategy.
+
+Please implement the following routes and UI components:
+
+1. SIDEBAR UPDATES:
+- Add "Onboarding" (icon: book-open or graduation-cap).
+- Add "Segurança & Compliance" (icon: shield-check or lock).
+
+2. ONBOARDING PAGE UI (/onboarding):
+- Title: "NeuroStack Academy & Onboarding".
+- Create a CSS Grid with 3 professional, clickable-looking cards:
+  - Card 1: "Mapa Mental da Operação" (Visualizing the AI logic flow).
+  - Card 2: "Treinamentos em Vídeo" (Setup and Z-API configuration guides).
+  - Card 3: "E-book: Boas Práticas de IA na Saúde" (Guidelines for clinic admins).
+- Add a "Acessar Material" button to each card.
+
+3. SECURITY & POLICY LAYER PAGE UI (/seguranca):
+- Title: "Policy Layer & Governança (Enterprise)".
+- Add a prominent global badge at the top: "ROADMAP: Disponível no plano Enterprise".
+- Divide the page into 5 distinct, Deeptech-styled blocks. All inputs/toggles inside these blocks must be visually disabled (opacity-50, read-only) but fully rendered to show our architecture:
+
+  - Block 1: Jurisdiction Pack
+    - Selectors for: Country, State/Region, Regulatory Regime (LGPD / HIPAA / GDPR / Mixed).
+    - Toggles: Cross-border transfer allowed, Data residency required.
+  
+  - Block 2: Sensitive Health Data Controls
+    - Toggles: Data Minimization, Masking/Redaction (PHI/PII), Pseudonymization.
+    - Selectors: Data Retention Policy, Audit Trail Level.
+
+  - Block 3: Consent & Notice
+    - Toggles: Privacy Notice Active, Required Explicit Consent.
+    - Info fields: Versioned Consent Log, Legal Basis per Flow.
+
+  - Block 4: Access Control
+    - Toggles: RBAC (Role-Based Access Control), Strict Clinic Segregation, Human Handoff Audit Trail.
+
+  - Block 5: AI Governance
+    - Toggles: Mandatory Human Oversight, Decision Justification Trace.
+    - Info field: Banned Responses Policy, Policy Reference Link.
+
+Make this page look like a highly sophisticated, military-grade data protection dashboard. This is the ultimate "eye-candy" for our investors.

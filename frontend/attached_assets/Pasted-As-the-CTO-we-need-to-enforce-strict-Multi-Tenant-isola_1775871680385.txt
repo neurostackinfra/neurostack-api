@@ -1,0 +1,22 @@
+As the CTO, we need to enforce strict Multi-Tenant isolation (RBAC), implement "Dogfooding" for the Master Admin, and create a Lead Capture Gate for the Demo account. 
+
+Currently, we have 7 specific users. Please enforce the following backend and frontend architecture:
+
+1. DEMO USER GATE (ID 7 - investidor@demo.com):
+- Read-Only & Mocked: Keep the entire environment mocked as previously configured.
+- LEAD CAPTURE MODAL (NEW): Immediately after the Demo user logs in, block access to the dashboard with a full-screen Modal. 
+- Form fields required: "Nome Completo" (Full Name), "Empresa / Fundo" (Company/Fund), and "Telefone/WhatsApp" (Phone).
+- Action: When submitted, save this data to a new database table called `demo_leads` and unlock the Demo UI for that session.
+
+2. STRICT PILOT ISOLATION (IDs 2 to 6):
+- Ensure absolute tenant isolation. Users `pilot1@clinic.com` through `pilot5@clinic.com` MUST ONLY see their own data.
+- Enforce `WHERE clinic_id = ?` on every single backend query: Dashboard metrics, Traces, Clinic Config (Z-API, LLM), Support Tickets, and RLHF Feedback. 
+- A pilot must never be able to access another pilot's traces or config.
+
+3. MASTER ADMIN HYBRID ROLE (ID 1 - admin@neurostack.com):
+- Dogfooding Workspace: The Admin must have their own isolated `clinic_id` environment to test Z-API configurations, select LLMs, generate Traces, and use the Chat Simulator just like a regular Pilot.
+- RLHF Tracking: If the Admin submits RLHF feedback, it should appear in the Master Audit table clearly marked as originating from the "Admin" to differentiate from actual client feedback.
+- God Mode Views: The `/master-admin` routes must fetch REAL data from the 5 pilots (Total Traces, API usage, Support Tickets). 
+- Lead Monitoring: Add a small section or table in the Master Admin dashboard to display the leads captured from the Demo Gate (Name, Company, Phone, Timestamp).
+
+Please ensure the database schema is updated to support the `demo_leads` and ensure all queries strictly respect the user's role and clinic association.

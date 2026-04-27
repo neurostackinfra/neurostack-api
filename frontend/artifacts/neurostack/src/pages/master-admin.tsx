@@ -1,0 +1,1421 @@
+import { useState } from "react";
+import { useLocation } from "wouter";
+import {
+  Shield, Building2, Users, Activity, ToggleLeft, ToggleRight,
+  Plus, Eye, CheckCircle2, XCircle, Loader2, AlertTriangle, KeyRound,
+  Inbox, Paperclip, ChevronDown, ChevronRight, CheckCheck, UserCheck,
+  Phone, TrendingUp, Download, Search, CalendarRange, RefreshCw,
+  RotateCcw, Briefcase, Trash2, Pencil, DollarSign,
+} from "lucide-react";
+import { useAuth } from "@/context/auth";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Badge } from "@/components/ui/badge";
+import {
+  Card, CardContent, CardDescription, CardHeader, CardTitle,
+} from "@/components/ui/card";
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter,
+  DialogHeader, DialogTitle, DialogTrigger,
+} from "@/components/ui/dialog";
+import { useToast } from "@/hooks/use-toast";
+import { useI18n } from "@/context/i18n";
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+interface SupportTicket {
+  id: number;
+  clinic_id: number;
+  clinic_name: string | null;
+  email: string;
+  tipo: string;
+  mensagem: string;
+  filename: string | null;
+  file_type: string | null;
+  file_data: string | null;
+  status: "open" | "closed";
+  created_at: string;
+}
+
+interface DemoLead {
+  id: number;
+  email: string;
+  nome: string;
+  email_contato: string;
+  empresa: string;
+  telefone: string;
+  created_at: string;
+}
+
+interface AdminStats {
+  totalTraces: number;
+  totalTokens: number;
+  openTickets: number;
+  activePilots: number;
+  activeBuilders: number;
+  activeManagedClinics: number;
+  estimatedMrr: number;
+}
+
+interface BuilderClinic {
+  clinic_id: number;
+  clinic_name: string;
+  slug: string | null;
+  status: "active" | "inactive";
+  plan_type: string;
+  builder_id: number;
+  traceCount: number;
+  apisConfigured: boolean;
+}
+
+interface BuilderWithClinics {
+  id: number;
+  name: string;
+  status: "active" | "inactive";
+  created_at: string;
+  clinics: BuilderClinic[];
+}
+
+interface ClinicSlot {
+  clinic_id: number;
+  clinic_name: string;
+  agent_name: string;
+  slug: string | null;
+  status: "active" | "inactive";
+  plan_type: "pilot" | "demo" | "admin";
+  traceCount: number;
+  apisConfigured: boolean;
+  zapiInstanceId: string | null;
+  users: { id: number; email: string; role: string }[];
+}
+
+// ── API helpers ───────────────────────────────────────────────────────────────
+
+function useAdminToken() {
+  const { clinicId } = useAuth();
+  void clinicId;
+  const raw = localStorage.getItem("ns_auth");
+  try {
+    return (JSON.parse(raw ?? "{}") as { token?: string }).token ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function authHeaders(token: string) {
+  return { "Content-Type": "application/json", Authorization: `Bearer ${token}` };
+}
+
+const BASE = import.meta.env.BASE_URL.replace(/\/$/, "");
+
+// ── Status Badge ──────────────────────────────────────────────────────────────
+
+function StatusBadge({ status }: { status: string }) {
+  const { t } = useI18n();
+  return status === "active" ? (
+    <Badge className="bg-emerald-500/15 text-emerald-400 border-emerald-500/30 text-[10px]">
+      <CheckCircle2 className="h-3 w-3 mr-1" /> {t("admin_status_active")}
+    </Badge>
+  ) : (
+    <Badge variant="outline" className="text-slate-400 border-slate-600 text-[10px]">
+      <XCircle className="h-3 w-3 mr-1" /> {t("admin_status_inactive")}
+    </Badge>
+  );
+}
+
+function PlanBadge({ plan }: { plan: string }) {
+  const styles: Record<string, string> = {
+    pilot: "bg-blue-500/15 text-blue-400 border-blue-500/30",
+    demo:  "bg-amber-500/15 text-amber-400 border-amber-500/30",
+    admin: "bg-violet-500/15 text-violet-400 border-violet-500/30",
+  };
+  return (
+    <Badge className={`${styles[plan] ?? styles.pilot} text-[10px]`}>
+      {plan.toUpperCase()}
+    </Badge>
+  );
+}
+
+// ── Create Pilot Dialog ───────────────────────────────────────────────────────
+
+function CreatePilotDialog({ token, onCreated }: { token: string; onCreated: () => void }) {
+  const { t } = useI18n();
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const { toast } = useToast();
+
+  const handleCreate = async () => {
+    if (!name || !email || !password) {
+      setError(t("admin_create_required"));
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${BASE}/api/admin/clinics`, {
+        method: "POST",
+        headers: authHeaders(token),
+        body: JSON.stringify({ clinic_name: name, admin_email: email, admin_password: password, plan_type: "pilot" }),
+      });
+      const data = await res.json() as { ok?: boolean; error?: string; clinic_id?: number };
+      if (!res.ok) { setError(data.error ?? t("admin_create_err_generic")); return; }
+      toast({ title: t("admin_create_ok_title"), description: `${t("admin_create_ok_desc_prefix")} "${name}" ID ${data.clinic_id}.` });
+      setOpen(false);
+      setName(""); setEmail(""); setPassword("");
+      onCreated();
+    } catch {
+      setError(t("admin_create_err_network"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button size="sm" className="gap-2">
+          <Plus className="h-4 w-4" /> {t("admin_create_btn")}
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{t("admin_create_title")}</DialogTitle>
+          <DialogDescription>
+            {t("admin_create_desc")}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3 py-2">
+          <div className="space-y-1">
+            <Label>{t("admin_create_name_label")}</Label>
+            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder={t("admin_create_name_ph")} />
+          </div>
+          <div className="space-y-1">
+            <Label>{t("admin_create_email_label")}</Label>
+            <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder={t("admin_create_email_ph")} />
+          </div>
+          <div className="space-y-1">
+            <Label>{t("admin_create_pass_label")}</Label>
+            <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" />
+          </div>
+          {error && (
+            <p className="text-sm text-destructive flex items-center gap-1.5">
+              <AlertTriangle className="h-3.5 w-3.5" /> {error}
+            </p>
+          )}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => setOpen(false)}>{t("admin_create_cancel")}</Button>
+          <Button onClick={handleCreate} disabled={loading}>
+            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : t("admin_create_submit")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ── Clinic Card ───────────────────────────────────────────────────────────────
+
+function ClinicCard({
+  clinic, token, onToggle, onViewTraces, isReadOnly = false,
+}: {
+  clinic: ClinicSlot;
+  token: string;
+  onToggle: (id: number, newStatus: "active" | "inactive") => Promise<void>;
+  onViewTraces: (id: number) => void;
+  isReadOnly?: boolean;
+}) {
+  const { t } = useI18n();
+  const { toast } = useToast();
+  const [toggling, setToggling] = useState(false);
+  const isEmpty = !clinic.clinic_name || clinic.clinic_name.startsWith("Piloto Slot") || clinic.clinic_name.startsWith("Slot");
+  const adminUser = clinic.users.find((u) => u.role === "clinic_admin" || u.role === "investor");
+
+  const handleToggle = async () => {
+    if (isReadOnly) {
+      toast({ title: "Modo Visualização: Ações de administrador desabilitadas nesta conta." });
+      return;
+    }
+    setToggling(true);
+    const next = clinic.status === "active" ? "inactive" : "active";
+    await onToggle(clinic.clinic_id, next);
+    setToggling(false);
+  };
+
+  return (
+    <Card className={`border ${clinic.status === "active" ? "border-border" : "border-dashed border-slate-700 opacity-60"}`}>
+      <CardHeader className="pb-2">
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <Building2 className="h-4 w-4 text-muted-foreground shrink-0" />
+            <div className="min-w-0">
+              <CardTitle className="text-sm truncate">
+                {isEmpty ? <span className="text-muted-foreground italic">{t("admin_slot_available")}</span> : clinic.clinic_name}
+              </CardTitle>
+              <CardDescription className="text-[10px]">
+                ID {clinic.clinic_id} {clinic.slug ? `· /${clinic.slug}` : ""}
+              </CardDescription>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <PlanBadge plan={clinic.plan_type} />
+            <StatusBadge status={clinic.status} />
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="flex items-center gap-3 text-xs text-muted-foreground">
+          <span className="flex items-center gap-1">
+            <Users className="h-3 w-3" />
+            {clinic.users.length} {clinic.users.length === 1 ? t("admin_users_label") : t("admin_users_label_pl")}
+          </span>
+          <span className="flex items-center gap-1">
+            <Activity className="h-3 w-3" />
+            {clinic.traceCount} {t("admin_traces_label")}
+          </span>
+          <span className={`flex items-center gap-1 ml-auto ${clinic.apisConfigured ? "text-emerald-400" : "text-slate-500"}`}>
+            <KeyRound className="h-3 w-3" />
+            {clinic.apisConfigured ? "API ✓" : "API —"}
+          </span>
+        </div>
+        {clinic.zapiInstanceId && (
+          <p className="text-[10px] font-mono text-muted-foreground/60 truncate">
+            Z-API: {clinic.zapiInstanceId.slice(0, 12)}…
+          </p>
+        )}
+        {adminUser && (
+          <p className="text-[11px] text-muted-foreground truncate">
+            <span className="text-foreground">{adminUser.email}</span>
+          </p>
+        )}
+        <div className="flex items-center gap-2 pt-1">
+          <Button
+            variant="outline"
+            size="sm"
+            className={`h-7 text-xs gap-1.5 flex-1 ${isReadOnly ? "opacity-50 cursor-not-allowed" : ""}`}
+            onClick={handleToggle}
+            disabled={toggling}
+          >
+            {toggling ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : clinic.status === "active" ? (
+              <><ToggleRight className="h-3.5 w-3.5 text-emerald-400" /> {t("admin_toggle_deactivate")}</>
+            ) : (
+              <><ToggleLeft className="h-3.5 w-3.5" /> {t("admin_toggle_activate")}</>
+            )}
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 text-xs gap-1.5 flex-1"
+            onClick={() => onViewTraces(clinic.clinic_id)}
+            disabled={isEmpty}
+          >
+            <Eye className="h-3.5 w-3.5" /> {t("admin_view_traces")}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// ── Demo mock clinics (investor short-circuit — no API call) ──────────────────
+
+const DEMO_CLINICS: ClinicSlot[] = [
+  {
+    clinic_id: 1, clinic_name: "Clínica Odonto Prime", agent_name: "Odonto Prime",
+    slug: "piloto-1", status: "active", plan_type: "pilot", traceCount: 12_500,
+    apisConfigured: true,  zapiInstanceId: "inst_a1b2c3",
+    users: [{ id: 10, email: "pilot1@clinic.com", role: "clinic_admin" }],
+  },
+  {
+    clinic_id: 2, clinic_name: "Instituto Face SP", agent_name: "Face SP",
+    slug: "piloto-2", status: "active", plan_type: "pilot", traceCount: 5_200,
+    apisConfigured: true,  zapiInstanceId: "inst_e5f6g7",
+    users: [{ id: 11, email: "pilot2@clinic.com", role: "clinic_admin" }],
+  },
+  {
+    clinic_id: 3, clinic_name: "Estética Rio Norte", agent_name: "Rio Norte",
+    slug: "piloto-3", status: "active", plan_type: "pilot", traceCount: 1_100,
+    apisConfigured: false, zapiInstanceId: null,
+    users: [{ id: 12, email: "pilot3@clinic.com", role: "clinic_admin" }],
+  },
+  {
+    clinic_id: 5, clinic_name: "Lumina Derma Clinic", agent_name: "Lumina Derma",
+    slug: "piloto-4", status: "active", plan_type: "pilot", traceCount: 8_400,
+    apisConfigured: true,  zapiInstanceId: "inst_i9j0k1",
+    users: [{ id: 13, email: "pilot4@clinic.com", role: "clinic_admin" }],
+  },
+];
+
+// ── Demo mock builders (investor short-circuit) ───────────────────────────────
+
+const DEMO_BUILDERS: BuilderWithClinics[] = [
+  {
+    id: 1, name: "Builder Alfa", status: "active", created_at: "2026-01-15T10:00:00Z",
+    clinics: [
+      { clinic_id: 8,  clinic_name: "Clínica Alfa 1", slug: "alfa-1", status: "active", plan_type: "pilot", builder_id: 1, traceCount: 3200, apisConfigured: true },
+      { clinic_id: 9,  clinic_name: "Clínica Alfa 2", slug: "alfa-2", status: "active", plan_type: "pilot", builder_id: 1, traceCount: 1800, apisConfigured: true },
+      { clinic_id: 10, clinic_name: "Clínica Alfa 3", slug: "alfa-3", status: "active", plan_type: "pilot", builder_id: 1, traceCount: 950,  apisConfigured: false },
+    ],
+  },
+  {
+    id: 2, name: "Builder Beta", status: "active", created_at: "2026-02-01T10:00:00Z",
+    clinics: [
+      { clinic_id: 11, clinic_name: "Clínica Beta 1", slug: "beta-1", status: "active", plan_type: "pilot", builder_id: 2, traceCount: 2100, apisConfigured: true },
+      { clinic_id: 12, clinic_name: "Clínica Beta 2", slug: "beta-2", status: "active", plan_type: "pilot", builder_id: 2, traceCount: 890,  apisConfigured: false },
+    ],
+  },
+];
+
+// ── Master Admin Page ─────────────────────────────────────────────────────────
+
+export default function MasterAdmin() {
+  const { t } = useI18n();
+  const { isSuperAdmin, isInvestor, setViewingClinicId } = useAuth();
+  const [, navigate] = useLocation();
+  const token = useAdminToken();
+  const { toast } = useToast();
+
+  // Demo users get instant static data — never call the restricted API
+  const [clinics, setClinics] = useState<ClinicSlot[]>(isInvestor ? DEMO_CLINICS : []);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(isInvestor);          // already "loaded" for investors
+  const [tickets, setTickets] = useState<SupportTicket[]>([]);
+  const [ticketsLoaded, setTicketsLoaded] = useState(isInvestor);
+  const [expandedTicket, setExpandedTicket] = useState<number | null>(null);
+  const [ticketSearch, setTicketSearch] = useState("");
+  const [ticketDateStart, setTicketDateStart] = useState("");
+  const [ticketDateEnd, setTicketDateEnd] = useState("");
+  const [ticketStatusFilter, setTicketStatusFilter] = useState<"all" | "open" | "closed">("all");
+  const [leads, setLeads] = useState<DemoLead[]>([]);
+  const [leadsLoaded, setLeadsLoaded] = useState(false);
+  const [leadStart, setLeadStart] = useState("");
+  const [leadEnd, setLeadEnd] = useState("");
+  const [stats, setStats] = useState<AdminStats | null>(null);
+  const [statsLoaded, setStatsLoaded] = useState(false);
+
+  // Builders state
+  const [builders, setBuilders] = useState<BuilderWithClinics[]>(isInvestor ? DEMO_BUILDERS : []);
+  const [buildersLoaded, setBuildersLoaded] = useState(isInvestor);
+  const [expandedBuilderId, setExpandedBuilderId] = useState<number | null>(null);
+  const [newBuilderName, setNewBuilderName] = useState("");
+  const [addingBuilder, setAddingBuilder] = useState(false);
+  const [editingBuilderId, setEditingBuilderId] = useState<number | null>(null);
+  const [editBuilderName, setEditBuilderName] = useState("");
+  const [addingClinicToBuilderId, setAddingClinicToBuilderId] = useState<number | null>(null);
+  const [newClinicName, setNewClinicName] = useState("");
+  const [newClinicEmail, setNewClinicEmail] = useState("");
+  const [newClinicPassword, setNewClinicPassword] = useState("");
+
+  const fetchClinics = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${BASE}/api/admin/clinics`, { headers: authHeaders(token) });
+      if (!res.ok) { setError(t("admin_err_clinics")); return; }
+      const data = await res.json() as ClinicSlot[];
+      setClinics(data);
+      setLoaded(true);
+    } catch {
+      setError(t("admin_err_network"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchBuilders = async () => {
+    try {
+      const res = await fetch(`${BASE}/api/admin/builders`, { headers: authHeaders(token) });
+      if (!res.ok) return;
+      setBuilders(await res.json() as BuilderWithClinics[]);
+      setBuildersLoaded(true);
+    } catch { /* silent */ }
+  };
+
+  const handleAddBuilder = async () => {
+    if (!newBuilderName.trim()) return;
+    setAddingBuilder(true);
+    try {
+      const res = await fetch(`${BASE}/api/admin/builders`, {
+        method: "POST", headers: authHeaders(token),
+        body: JSON.stringify({ name: newBuilderName.trim() }),
+      });
+      if (!res.ok) { toast({ title: "Erro ao criar builder", variant: "destructive" }); return; }
+      setNewBuilderName("");
+      await fetchBuilders();
+      toast({ title: "Builder criado com sucesso!" });
+    } catch {
+      toast({ title: "Erro de rede", variant: "destructive" });
+    } finally {
+      setAddingBuilder(false);
+    }
+  };
+
+  const handleToggleBuilder = async (id: number, newStatus: "active" | "inactive") => {
+    if (isInvestor) { toast({ title: "Modo Visualização: ação desabilitada." }); return; }
+    try {
+      const res = await fetch(`${BASE}/api/admin/builders/${id}`, {
+        method: "PATCH", headers: authHeaders(token),
+        body: JSON.stringify({ status: newStatus }),
+      });
+      if (!res.ok) { toast({ title: "Erro ao alterar status", variant: "destructive" }); return; }
+      setBuilders((prev) => prev.map((b) => b.id === id ? { ...b, status: newStatus } : b));
+      toast({ title: newStatus === "active" ? "Builder ativado" : "Builder desativado", description: `ID ${id}` });
+    } catch {
+      toast({ title: "Erro de rede", variant: "destructive" });
+    }
+  };
+
+  const handleSaveBuilderName = async (id: number) => {
+    if (!editBuilderName.trim()) return;
+    try {
+      const res = await fetch(`${BASE}/api/admin/builders/${id}`, {
+        method: "PATCH", headers: authHeaders(token),
+        body: JSON.stringify({ name: editBuilderName.trim() }),
+      });
+      if (!res.ok) { toast({ title: "Erro ao renomear builder", variant: "destructive" }); return; }
+      setBuilders((prev) => prev.map((b) => b.id === id ? { ...b, name: editBuilderName.trim() } : b));
+      setEditingBuilderId(null);
+      toast({ title: "Nome do builder atualizado." });
+    } catch {
+      toast({ title: "Erro de rede", variant: "destructive" });
+    }
+  };
+
+  const handleDeleteBuilder = async (id: number, name: string) => {
+    if (!confirm(`Excluir builder "${name}"? As clínicas vinculadas serão desvinculadas, mas não deletadas.`)) return;
+    try {
+      const res = await fetch(`${BASE}/api/admin/builders/${id}`, {
+        method: "DELETE", headers: authHeaders(token),
+      });
+      if (!res.ok) { toast({ title: "Erro ao excluir builder", variant: "destructive" }); return; }
+      setBuilders((prev) => prev.filter((b) => b.id !== id));
+      toast({ title: `Builder "${name}" excluído.` });
+    } catch {
+      toast({ title: "Erro de rede", variant: "destructive" });
+    }
+  };
+
+  const handleAddClinicToBuilder = async (builderId: number) => {
+    if (!newClinicName.trim() || !newClinicEmail.trim() || !newClinicPassword.trim()) {
+      toast({ title: "Preencha nome, e-mail e senha.", variant: "destructive" }); return;
+    }
+    try {
+      const res = await fetch(`${BASE}/api/admin/builders/${builderId}/clinics`, {
+        method: "POST", headers: authHeaders(token),
+        body: JSON.stringify({ clinic_name: newClinicName.trim(), admin_email: newClinicEmail.trim(), admin_password: newClinicPassword }),
+      });
+      if (!res.ok) {
+        const err = await res.json() as { error?: string };
+        toast({ title: err.error ?? "Erro ao criar clínica", variant: "destructive" }); return;
+      }
+      setNewClinicName(""); setNewClinicEmail(""); setNewClinicPassword("");
+      setAddingClinicToBuilderId(null);
+      await fetchBuilders();
+      toast({ title: "Clínica criada com sucesso!" });
+    } catch {
+      toast({ title: "Erro de rede", variant: "destructive" });
+    }
+  };
+
+  const handleToggleBuilderClinic = async (clinicId: number, newStatus: "active" | "inactive") => {
+    if (isInvestor) { toast({ title: "Modo Visualização: ação desabilitada." }); return; }
+    try {
+      const res = await fetch(`${BASE}/api/admin/clinics/${clinicId}/status`, {
+        method: "PATCH", headers: authHeaders(token),
+        body: JSON.stringify({ status: newStatus }),
+      });
+      if (!res.ok) { toast({ title: "Erro ao alterar status da clínica", variant: "destructive" }); return; }
+      setBuilders((prev) => prev.map((b) => ({
+        ...b,
+        clinics: b.clinics.map((c) => c.clinic_id === clinicId ? { ...c, status: newStatus } : c),
+      })));
+    } catch {
+      toast({ title: "Erro de rede", variant: "destructive" });
+    }
+  };
+
+  const handleDeleteBuilderClinic = async (clinicId: number, clinicName: string) => {
+    if (!confirm(`Excluir clínica "${clinicName}" e todos os seus dados permanentemente?`)) return;
+    try {
+      const res = await fetch(`${BASE}/api/admin/clinics/${clinicId}`, {
+        method: "DELETE", headers: authHeaders(token),
+      });
+      if (!res.ok) { toast({ title: "Erro ao excluir clínica", variant: "destructive" }); return; }
+      setBuilders((prev) => prev.map((b) => ({ ...b, clinics: b.clinics.filter((c) => c.clinic_id !== clinicId) })));
+      toast({ title: `Clínica "${clinicName}" excluída.` });
+    } catch {
+      toast({ title: "Erro de rede", variant: "destructive" });
+    }
+  };
+
+  // Only real admins hit the network
+  if (!isInvestor && !loaded && !loading) { void fetchClinics(); }
+  if (!isInvestor && !buildersLoaded) { void fetchBuilders(); }
+
+  if (!isSuperAdmin && !isInvestor) {
+    return (
+      <div className="flex items-center justify-center h-64 text-muted-foreground">
+        <Shield className="h-8 w-8 mr-2" /> {t("admin_restricted")}
+      </div>
+    );
+  }
+
+  const handleToggle = async (id: number, newStatus: "active" | "inactive") => {
+    try {
+      const res = await fetch(`${BASE}/api/admin/clinics/${id}/status`, {
+        method: "PATCH",
+        headers: authHeaders(token),
+        body: JSON.stringify({ status: newStatus }),
+      });
+      if (!res.ok) {
+        toast({ title: t("admin_toggle_err_title"), description: t("admin_toggle_err"), variant: "destructive" });
+        return;
+      }
+      setClinics((prev) => prev.map((c) => c.clinic_id === id ? { ...c, status: newStatus } : c));
+      toast({
+        title: newStatus === "active" ? t("admin_toggle_ok_on") : t("admin_toggle_ok_off"),
+        description: `ID ${id}`,
+      });
+    } catch {
+      toast({ title: t("admin_create_err_network"), variant: "destructive" });
+    }
+  };
+
+  const handleViewTraces = (id: number) => {
+    setViewingClinicId(id);
+    navigate("/traces");
+  };
+
+  const fetchTickets = async () => {
+    try {
+      const res = await fetch(`${BASE}/api/support/tickets`, { headers: authHeaders(token) });
+      if (!res.ok) return;
+      setTickets(await res.json() as SupportTicket[]);
+      setTicketsLoaded(true);
+    } catch { /* silent */ }
+  };
+
+  const fetchLeads = async () => {
+    try {
+      const res = await fetch(`${BASE}/api/admin/demo-leads`, { headers: authHeaders(token) });
+      if (!res.ok) return;
+      setLeads(await res.json() as DemoLead[]);
+      setLeadsLoaded(true);
+    } catch { /* silent */ }
+  };
+
+  const fetchStats = async () => {
+    try {
+      const res = await fetch(`${BASE}/api/admin/stats`, { headers: authHeaders(token) });
+      if (!res.ok) return;
+      setStats(await res.json() as AdminStats);
+      setStatsLoaded(true);
+    } catch { /* silent */ }
+  };
+
+  if (!ticketsLoaded) { void fetchTickets(); }
+  if (!leadsLoaded && isSuperAdmin) { void fetchLeads(); }
+  if (!statsLoaded && isSuperAdmin) { void fetchStats(); }
+
+  // ── Lead filtering & export ────────────────────────────────────────────────
+
+  const filteredLeads = leads.filter((l) => {
+    const d = new Date(l.created_at);
+    if (leadStart && d < new Date(leadStart)) return false;
+    if (leadEnd) {
+      const end = new Date(leadEnd);
+      end.setHours(23, 59, 59, 999);
+      if (d > end) return false;
+    }
+    return true;
+  });
+
+  const displayedLeads = filteredLeads.slice(0, 10);
+
+  const exportCSV = () => {
+    const rows = [
+      ["Nome", "E-mail", "Empresa / Fundo", "Telefone", "Data"],
+      ...filteredLeads.map((l) => [
+        l.nome,
+        l.email_contato || "",
+        l.empresa,
+        l.telefone,
+        new Date(l.created_at).toLocaleString("pt-BR"),
+      ]),
+    ];
+    const csv = rows
+      .map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(","))
+      .join("\n");
+    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "neurostack_leads_export.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleUpdateTicketStatus = async (id: number, newStatus: "open" | "closed") => {
+    try {
+      const res = await fetch(`${BASE}/api/support/tickets/${id}/status`, {
+        method: "PATCH",
+        headers: authHeaders(token),
+        body: JSON.stringify({ status: newStatus }),
+      });
+      if (!res.ok) throw new Error();
+      setTickets((prev) => prev.map((tk) => tk.id === id ? { ...tk, status: newStatus } : tk));
+      toast({
+        title: newStatus === "closed" ? t("admin_ticket_closed_toast") : "Ticket reaberto",
+        description: `#${id}`,
+      });
+    } catch {
+      toast({ title: t("admin_ticket_err_toast"), variant: "destructive" });
+    }
+  };
+
+  // ── Ticket filtering & export ──────────────────────────────────────────────
+
+  const filteredTickets = tickets.filter((tk) => {
+    if (ticketStatusFilter !== "all" && tk.status !== ticketStatusFilter) return false;
+    if (ticketSearch) {
+      const q = ticketSearch.toLowerCase();
+      const nameMatch = (tk.clinic_name ?? "").toLowerCase().includes(q);
+      const emailMatch = tk.email.toLowerCase().includes(q);
+      const msgMatch = tk.mensagem.toLowerCase().includes(q);
+      if (!nameMatch && !emailMatch && !msgMatch) return false;
+    }
+    if (ticketDateStart || ticketDateEnd) {
+      const d = new Date(tk.created_at);
+      if (ticketDateStart && d < new Date(ticketDateStart)) return false;
+      if (ticketDateEnd) {
+        const end = new Date(ticketDateEnd);
+        end.setHours(23, 59, 59, 999);
+        if (d > end) return false;
+      }
+    }
+    return true;
+  });
+
+  const displayedTickets = filteredTickets.slice(0, 10);
+
+  const exportTicketsCSV = () => {
+    const rows = [
+      ["#", "Clínica", "E-mail", "Tipo", "Mensagem", "Status", "Data"],
+      ...filteredTickets.map((tk) => [
+        String(tk.id),
+        tk.clinic_name ?? `Clínica ${tk.clinic_id}`,
+        tk.email,
+        tk.tipo,
+        tk.mensagem.replace(/\n/g, " "),
+        tk.status === "open" ? "Pendente" : "Resolvido",
+        new Date(tk.created_at).toLocaleString("pt-BR"),
+      ]),
+    ];
+    const csv = rows
+      .map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(","))
+      .join("\n");
+    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "neurostack_tickets_export.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // Investors see impressive demo numbers; real admins see live DB stats
+  const totalClinics  = isInvestor ? 14 : clinics.filter((c) => c.plan_type === "pilot").length;
+  const activePilots  = isInvestor ? 14 : (stats?.activePilots ?? clinics.filter((c) => c.plan_type === "pilot" && c.status === "active").length);
+  const totalTraces   = isInvestor ? "27.2K" : (stats ? stats.totalTraces.toLocaleString("pt-BR") : "...");
+  const tokenDisplay  = isInvestor ? "2.4M" : (stats ? `${(stats.totalTokens / 1_000_000).toFixed(1)}M` : "...");
+  const openTicketCnt = isInvestor ? 0 : (stats?.openTickets ?? tickets.filter((t) => t.status === "open").length);
+
+  return (
+    <div className="max-w-6xl mx-auto space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="flex items-center gap-2">
+            <Shield className="h-5 w-5 text-violet-400" />
+            <h1 className="text-xl font-bold">Master Admin</h1>
+            {isInvestor && (
+              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                Modo Visualização
+              </span>
+            )}
+          </div>
+          <p className="text-sm text-muted-foreground mt-0.5">
+            {t("admin_infra_desc")} · {totalClinics} slots · {activePilots} {t("admin_pilots_label")}
+          </p>
+        </div>
+        {isInvestor ? (
+          <Button
+            size="sm"
+            className="gap-2 opacity-50 cursor-not-allowed"
+            onClick={() => toast({ title: "Modo Visualização: Ações de administrador desabilitadas nesta conta." })}
+          >
+            <Plus className="h-4 w-4" /> {t("admin_create_btn")}
+          </Button>
+        ) : (
+          <CreatePilotDialog token={token} onCreated={fetchClinics} />
+        )}
+      </div>
+
+      {/* Stats row */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <Card className="border-border">
+          <CardContent className="pt-4 pb-3">
+            <p className="text-[11px] text-muted-foreground">{t("admin_stat_total")}</p>
+            <p className="text-2xl font-bold text-foreground">{totalClinics}</p>
+          </CardContent>
+        </Card>
+        <Card className="border-border">
+          <CardContent className="pt-4 pb-3">
+            <p className="text-[11px] text-muted-foreground">{t("admin_stat_active")}</p>
+            <p className="text-2xl font-bold text-emerald-400">{activePilots}</p>
+          </CardContent>
+        </Card>
+        <Card className="border-violet-500/30 bg-gradient-to-br from-violet-950/30 to-transparent">
+          <CardContent className="pt-4 pb-3">
+            <div className="flex items-center gap-1.5 mb-1">
+              <DollarSign className="h-3.5 w-3.5 text-violet-400" />
+              <p className="text-[11px] text-muted-foreground font-medium">MRR Estimado</p>
+            </div>
+            <p className="text-2xl font-bold text-violet-400">
+              {isInvestor
+                ? "R$ 5.750"
+                : stats?.estimatedMrr != null
+                  ? `R$ ${stats.estimatedMrr.toLocaleString("pt-BR")}`
+                  : "R$ …"}
+            </p>
+            <p className="text-[10px] text-muted-foreground/60 mt-0.5">
+              {isInvestor
+                ? "2 builders × R$2k + 5 clínicas × R$350"
+                : stats
+                  ? `${stats.activeBuilders} builder${stats.activeBuilders !== 1 ? "s" : ""} × R$2k + ${stats.activeManagedClinics} clínica${stats.activeManagedClinics !== 1 ? "s" : ""} × R$350`
+                  : ""}
+            </p>
+          </CardContent>
+        </Card>
+        <Card className="border-border bg-gradient-to-br from-blue-950/20 to-transparent">
+          <CardContent className="pt-4 pb-3">
+            <p className="text-[11px] text-muted-foreground">Consumo API (Mês)</p>
+            <p className="text-2xl font-bold text-blue-400">
+              {tokenDisplay} <span className="text-base font-medium">Tokens</span>
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Real-data metrics row (super_admin only) */}
+      {isSuperAdmin && (
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+          <Card className="border-border bg-gradient-to-br from-emerald-950/20 to-transparent">
+            <CardContent className="pt-4 pb-3">
+              <div className="flex items-center gap-1.5 mb-1">
+                <TrendingUp className="h-3.5 w-3.5 text-emerald-400" />
+                <p className="text-[11px] text-muted-foreground">Total de Traces (Pilotos)</p>
+              </div>
+              <p className="text-2xl font-bold text-emerald-400">{totalTraces}</p>
+            </CardContent>
+          </Card>
+          <Card className="border-border bg-gradient-to-br from-rose-950/20 to-transparent">
+            <CardContent className="pt-4 pb-3">
+              <div className="flex items-center gap-1.5 mb-1">
+                <Inbox className="h-3.5 w-3.5 text-rose-400" />
+                <p className="text-[11px] text-muted-foreground">Tickets Abertos</p>
+              </div>
+              <p className="text-2xl font-bold text-rose-400">{openTicketCnt}</p>
+            </CardContent>
+          </Card>
+          <Card className="border-border bg-gradient-to-br from-amber-950/20 to-transparent">
+            <CardContent className="pt-4 pb-3">
+              <div className="flex items-center gap-1.5 mb-1">
+                <UserCheck className="h-3.5 w-3.5 text-amber-400" />
+                <p className="text-[11px] text-muted-foreground">Leads Capturados</p>
+              </div>
+              <p className="text-2xl font-bold text-amber-400">{leads.length}</p>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {/* ── Gestão de Builders ──────────────────────────────────────────── */}
+      <Card className="border-border">
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-2">
+              <Briefcase className="h-4 w-4 text-violet-400" />
+              <CardTitle className="text-sm font-semibold">Gestão de Builders</CardTitle>
+              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-violet-500/15 text-violet-400 border border-violet-500/30">
+                {builders.filter((b) => b.status === "active").length} ativo{builders.filter((b) => b.status === "active").length !== 1 ? "s" : ""}
+              </span>
+            </div>
+            {isSuperAdmin && (
+              <div className="flex items-center gap-2">
+                <Input
+                  value={newBuilderName}
+                  onChange={(e) => setNewBuilderName(e.target.value)}
+                  placeholder="Nome do novo builder..."
+                  className="h-8 text-xs w-44"
+                  onKeyDown={(e) => { if (e.key === "Enter") void handleAddBuilder(); }}
+                />
+                <Button size="sm" className="h-8 gap-1.5 text-xs" onClick={() => void handleAddBuilder()} disabled={addingBuilder || !newBuilderName.trim()}>
+                  {addingBuilder ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
+                  Novo Builder
+                </Button>
+              </div>
+            )}
+          </div>
+          <CardDescription className="text-xs">
+            Revendedores e agências. MRR = R$2.000/builder ativo + R$350/clínica ativa gerenciada.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="pt-0 space-y-2">
+          {builders.length === 0 ? (
+            <div className="flex flex-col items-center py-8 text-muted-foreground gap-2">
+              <Briefcase className="h-8 w-8 opacity-25" />
+              <p className="text-xs">Nenhum builder cadastrado ainda.</p>
+            </div>
+          ) : (
+            builders.map((builder) => {
+              const isExpanded = expandedBuilderId === builder.id;
+              const isEditing = editingBuilderId === builder.id;
+              const isAddingClinic = addingClinicToBuilderId === builder.id;
+              const activeClinics = builder.clinics.filter((c) => c.status === "active").length;
+              return (
+                <div key={builder.id} className={`rounded-lg border transition-all ${builder.status === "active" ? "border-border" : "border-dashed border-slate-700 opacity-60"}`}>
+                  {/* Builder row header */}
+                  <div className="flex items-center gap-2 px-3 py-2.5">
+                    <button
+                      type="button"
+                      className="flex items-center gap-1.5 text-muted-foreground hover:text-foreground transition-colors"
+                      onClick={() => setExpandedBuilderId(isExpanded ? null : builder.id)}
+                    >
+                      {isExpanded
+                        ? <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+                        : <ChevronRight className="h-3.5 w-3.5 shrink-0" />}
+                    </button>
+
+                    {isEditing ? (
+                      <div className="flex items-center gap-1.5 flex-1 min-w-0">
+                        <Input
+                          value={editBuilderName}
+                          onChange={(e) => setEditBuilderName(e.target.value)}
+                          className="h-7 text-xs flex-1"
+                          onKeyDown={(e) => { if (e.key === "Enter") void handleSaveBuilderName(builder.id); if (e.key === "Escape") setEditingBuilderId(null); }}
+                          autoFocus
+                        />
+                        <Button size="sm" className="h-7 text-xs px-2" onClick={() => void handleSaveBuilderName(builder.id)}>Salvar</Button>
+                        <Button size="sm" variant="ghost" className="h-7 text-xs px-2" onClick={() => setEditingBuilderId(null)}>✕</Button>
+                      </div>
+                    ) : (
+                      <span className="font-medium text-sm flex-1 min-w-0 truncate">{builder.name}</span>
+                    )}
+
+                    <div className="flex items-center gap-1.5 shrink-0 ml-auto">
+                      <span className="text-[11px] text-muted-foreground">
+                        {builder.clinics.length} clínica{builder.clinics.length !== 1 ? "s" : ""} · {activeClinics} ativa{activeClinics !== 1 ? "s" : ""}
+                      </span>
+                      <StatusBadge status={builder.status} />
+
+                      {isSuperAdmin && (
+                        <>
+                          <Button
+                            variant="ghost" size="sm"
+                            className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground"
+                            title="Renomear"
+                            onClick={() => { setEditingBuilderId(builder.id); setEditBuilderName(builder.name); }}
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost" size="sm"
+                            className={`h-7 w-7 p-0 ${builder.status === "active" ? "text-emerald-400 hover:text-emerald-300" : "text-muted-foreground hover:text-foreground"}`}
+                            title={builder.status === "active" ? "Desativar builder" : "Ativar builder"}
+                            onClick={() => void handleToggleBuilder(builder.id, builder.status === "active" ? "inactive" : "active")}
+                          >
+                            {builder.status === "active" ? <ToggleRight className="h-4 w-4" /> : <ToggleLeft className="h-4 w-4" />}
+                          </Button>
+                          <Button
+                            variant="ghost" size="sm"
+                            className="h-7 w-7 p-0 text-muted-foreground hover:text-destructive"
+                            title="Excluir builder"
+                            onClick={() => void handleDeleteBuilder(builder.id, builder.name)}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Expanded: list of clinics */}
+                  {isExpanded && (
+                    <div className="border-t border-border/40 px-3 py-3 space-y-2 bg-muted/10 rounded-b-lg">
+                      <div className="flex items-center justify-between mb-2">
+                        <p className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
+                          Clínicas de {builder.name}
+                        </p>
+                        {isSuperAdmin && (
+                          <Button
+                            variant="outline" size="sm"
+                            className="h-7 text-xs gap-1.5"
+                            onClick={() => setAddingClinicToBuilderId(isAddingClinic ? null : builder.id)}
+                          >
+                            <Plus className="h-3.5 w-3.5" /> Nova Clínica
+                          </Button>
+                        )}
+                      </div>
+
+                      {/* Add clinic form */}
+                      {isAddingClinic && (
+                        <div className="rounded-md border border-dashed border-violet-500/40 bg-violet-500/5 p-3 space-y-2">
+                          <p className="text-[11px] font-medium text-violet-400">Nova clínica em {builder.name}</p>
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                            <Input value={newClinicName} onChange={(e) => setNewClinicName(e.target.value)} placeholder="Nome da clínica" className="h-7 text-xs" />
+                            <Input value={newClinicEmail} onChange={(e) => setNewClinicEmail(e.target.value)} placeholder="E-mail do admin" className="h-7 text-xs" type="email" />
+                            <Input value={newClinicPassword} onChange={(e) => setNewClinicPassword(e.target.value)} placeholder="Senha" className="h-7 text-xs" type="password" />
+                          </div>
+                          <div className="flex gap-2">
+                            <Button size="sm" className="h-7 text-xs gap-1.5" onClick={() => void handleAddClinicToBuilder(builder.id)}>
+                              <Plus className="h-3.5 w-3.5" /> Criar Clínica
+                            </Button>
+                            <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={() => setAddingClinicToBuilderId(null)}>Cancelar</Button>
+                          </div>
+                        </div>
+                      )}
+
+                      {builder.clinics.length === 0 ? (
+                        <p className="text-xs text-muted-foreground text-center py-3">Nenhuma clínica vinculada.</p>
+                      ) : (
+                        <div className="space-y-1">
+                          {builder.clinics.map((c) => (
+                            <div key={c.clinic_id} className={`flex items-center gap-3 rounded-md px-2.5 py-2 text-xs transition-colors ${c.status === "active" ? "bg-background/60 border border-border/40" : "bg-muted/20 border border-dashed border-slate-700 opacity-60"}`}>
+                              <Building2 className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                              <span className="font-medium flex-1 min-w-0 truncate">{c.clinic_name}</span>
+                              {c.slug && <span className="text-muted-foreground font-mono text-[10px]">/{c.slug}</span>}
+                              <span className="flex items-center gap-1 text-muted-foreground">
+                                <Activity className="h-3 w-3" /> {c.traceCount}
+                              </span>
+                              <StatusBadge status={c.status} />
+                              {isSuperAdmin && (
+                                <div className="flex items-center gap-1 shrink-0">
+                                  <Button
+                                    variant="ghost" size="sm"
+                                    className={`h-6 w-6 p-0 ${c.status === "active" ? "text-emerald-400 hover:text-emerald-300" : "text-muted-foreground"}`}
+                                    onClick={() => void handleToggleBuilderClinic(c.clinic_id, c.status === "active" ? "inactive" : "active")}
+                                  >
+                                    {c.status === "active" ? <ToggleRight className="h-3.5 w-3.5" /> : <ToggleLeft className="h-3.5 w-3.5" />}
+                                  </Button>
+                                  <Button
+                                    variant="ghost" size="sm"
+                                    className="h-6 w-6 p-0 text-muted-foreground hover:text-destructive"
+                                    onClick={() => void handleDeleteBuilderClinic(c.clinic_id, c.clinic_name)}
+                                  >
+                                    <Trash2 className="h-3 w-3" />
+                                  </Button>
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Clinic grid */}
+      {loading && (
+        <div className="flex items-center gap-2 text-muted-foreground py-8 justify-center">
+          <Loader2 className="h-5 w-5 animate-spin" /> {t("admin_loading")}
+        </div>
+      )}
+      {error && (
+        <div className="flex items-center gap-2 text-destructive py-4">
+          <AlertTriangle className="h-4 w-4" /> {error}
+        </div>
+      )}
+      {!loading && loaded && (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {clinics.map((c) => (
+            <ClinicCard
+              key={c.clinic_id}
+              clinic={c}
+              token={token}
+              onToggle={handleToggle}
+              onViewTraces={handleViewTraces}
+              isReadOnly={isInvestor}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* ── Support Tickets Inbox ─────────────────────────────────────────── */}
+      <Card className="border-border">
+        <CardHeader className="pb-3">
+          {/* Row 1: title + badges + refresh + export */}
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-2">
+              <Inbox className="h-4 w-4 text-foreground/70" />
+              <CardTitle className="text-sm font-semibold text-foreground">
+                {t("admin_tickets_heading")}
+              </CardTitle>
+              {tickets.filter((tk) => tk.status === "open").length > 0 && (
+                <Badge className="bg-rose-500/15 text-rose-400 border-rose-500/30 text-[10px]">
+                  {tickets.filter((tk) => tk.status === "open").length} {t("admin_tickets_open_badge")}
+                </Badge>
+              )}
+              {(ticketSearch || ticketStatusFilter !== "all" || ticketDateStart || ticketDateEnd) && (
+                <Badge className="bg-violet-500/15 text-violet-400 border-violet-500/30 text-[10px]">
+                  {filteredTickets.length}/{tickets.length} filtrados
+                </Badge>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 text-xs gap-1.5 text-muted-foreground"
+                onClick={() => { setTicketsLoaded(false); }}
+              >
+                <RefreshCw className="h-3 w-3" /> {t("admin_tickets_refresh")}
+              </Button>
+              <Button
+                size="sm"
+                className="h-7 text-xs gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white"
+                onClick={exportTicketsCSV}
+                disabled={filteredTickets.length === 0}
+              >
+                <Download className="h-3 w-3" /> Exportar CSV
+              </Button>
+            </div>
+          </div>
+          <CardDescription className="text-xs">
+            {t("admin_tickets_desc")}
+          </CardDescription>
+
+          {/* Row 2: search + status filter */}
+          <div className="flex flex-wrap gap-2 pt-2">
+            <div className="relative flex-1 min-w-[180px]">
+              <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground pointer-events-none" />
+              <input
+                type="text"
+                value={ticketSearch}
+                onChange={(e) => setTicketSearch(e.target.value)}
+                placeholder="Buscar por clínica, e-mail ou palavra-chave..."
+                className="w-full h-8 pl-8 pr-3 rounded-md border border-border bg-background text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent"
+              />
+            </div>
+            <select
+              value={ticketStatusFilter}
+              onChange={(e) => setTicketStatusFilter(e.target.value as "all" | "open" | "closed")}
+              className="h-8 rounded-md border border-border bg-background px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent"
+            >
+              <option value="all">Todos os status</option>
+              <option value="open">Pendente</option>
+              <option value="closed">Resolvido</option>
+            </select>
+          </div>
+
+          {/* Row 3: date range filters */}
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <div className="flex items-center gap-1.5">
+              <CalendarRange className="h-3.5 w-3.5 text-muted-foreground" />
+              <Label className="text-[11px] text-muted-foreground whitespace-nowrap">De</Label>
+              <input
+                type="date"
+                value={ticketDateStart}
+                onChange={(e) => setTicketDateStart(e.target.value)}
+                className="h-7 rounded-md border border-border bg-background px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent"
+              />
+            </div>
+            <div className="flex items-center gap-1.5">
+              <Label className="text-[11px] text-muted-foreground whitespace-nowrap">Até</Label>
+              <input
+                type="date"
+                value={ticketDateEnd}
+                onChange={(e) => setTicketDateEnd(e.target.value)}
+                className="h-7 rounded-md border border-border bg-background px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent"
+              />
+            </div>
+            {(ticketSearch || ticketStatusFilter !== "all" || ticketDateStart || ticketDateEnd) && (
+              <button
+                type="button"
+                onClick={() => { setTicketSearch(""); setTicketStatusFilter("all"); setTicketDateStart(""); setTicketDateEnd(""); }}
+                className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors"
+              >
+                <RotateCcw className="h-3 w-3" /> Limpar filtros
+              </button>
+            )}
+          </div>
+        </CardHeader>
+        <CardContent className="pt-0">
+          {tickets.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-8 text-center text-muted-foreground gap-2">
+              <Inbox className="h-8 w-8 opacity-30" />
+              <p className="text-xs font-medium">{t("admin_tickets_empty")}</p>
+            </div>
+          ) : filteredTickets.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-6 text-center text-muted-foreground gap-2">
+              <Search className="h-6 w-6 opacity-30" />
+              <p className="text-xs font-medium">Nenhum ticket encontrado com os filtros aplicados.</p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {displayedTickets.map((ticket) => {
+                const isExpanded = expandedTicket === ticket.id;
+                const tipoLabel =
+                  ticket.tipo === "solicitacao" ? t("admin_ticket_tipo_request")
+                  : ticket.tipo === "feedback"   ? t("admin_ticket_tipo_feedback")
+                  :                                t("admin_ticket_tipo_financial");
+                const tipoColor = ticket.tipo === "financeiro"
+                  ? "bg-amber-500/15 text-amber-400 border-amber-500/30"
+                  : ticket.tipo === "feedback"
+                    ? "bg-blue-500/15 text-blue-400 border-blue-500/30"
+                    : "bg-muted text-muted-foreground border-border";
+                const dateStr = new Date(ticket.created_at).toLocaleString("pt-BR", {
+                  day: "2-digit", month: "2-digit", year: "2-digit",
+                  hour: "2-digit", minute: "2-digit",
+                });
+                return (
+                  <div key={ticket.id} className={`rounded-lg border transition-colors ${ticket.status === "closed" ? "border-border/40 opacity-70" : "border-border/70"}`}>
+                    {/* Row header */}
+                    <button
+                      type="button"
+                      className="w-full flex items-center gap-3 px-3 py-2.5 text-left hover:bg-muted/20 transition-colors rounded-lg"
+                      onClick={() => setExpandedTicket(isExpanded ? null : ticket.id)}
+                    >
+                      {isExpanded
+                        ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                        : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                      }
+                      <Badge variant="outline" className={`text-[10px] shrink-0 ${tipoColor}`}>{tipoLabel}</Badge>
+                      <span className="text-xs font-medium text-foreground truncate flex-1">
+                        {ticket.clinic_name ?? `Clínica ${ticket.clinic_id}`}
+                        <span className="text-muted-foreground font-normal ml-1">· {ticket.email}</span>
+                      </span>
+                      {ticket.filename && <Paperclip className="h-3 w-3 text-muted-foreground shrink-0" />}
+                      <span className="text-[10px] text-muted-foreground shrink-0">{dateStr}</span>
+                      <Badge
+                        variant="outline"
+                        className={`text-[10px] shrink-0 ${
+                          ticket.status === "open"
+                            ? "border-amber-500/30 text-amber-400"
+                            : "border-emerald-500/30 text-emerald-400"
+                        }`}
+                      >
+                        {ticket.status === "open" ? "Pendente" : "Resolvido"}
+                      </Badge>
+                    </button>
+                    {/* Expanded content */}
+                    {isExpanded && (
+                      <div className="px-4 pb-3 pt-1 border-t border-border/40 space-y-3">
+                        <p className="text-sm text-foreground/85 whitespace-pre-wrap leading-relaxed">{ticket.mensagem}</p>
+                        {ticket.filename && ticket.file_data && (
+                          <div className="flex items-center gap-2">
+                            <Paperclip className="h-3.5 w-3.5 text-muted-foreground" />
+                            <a
+                              href={`data:${ticket.file_type};base64,${ticket.file_data}`}
+                              download={ticket.filename}
+                              className="text-xs font-medium text-blue-400 hover:underline underline-offset-2"
+                            >
+                              {ticket.filename}
+                            </a>
+                          </div>
+                        )}
+                        <div className="flex items-center justify-between pt-1">
+                          <span className="text-[11px] text-muted-foreground">
+                            Resposta via e-mail manual · <span className="font-mono">{ticket.email}</span>
+                          </span>
+                          <div className="flex gap-1.5">
+                            {ticket.status === "open" ? (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-7 text-xs gap-1.5 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/10"
+                                onClick={() => handleUpdateTicketStatus(ticket.id, "closed")}
+                              >
+                                <CheckCheck className="h-3.5 w-3.5" /> Marcar Resolvido
+                              </Button>
+                            ) : (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-7 text-xs gap-1.5 border-amber-500/30 text-amber-400 hover:bg-amber-500/10"
+                                onClick={() => handleUpdateTicketStatus(ticket.id, "open")}
+                              >
+                                <RotateCcw className="h-3.5 w-3.5" /> Reabrir
+                              </Button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {filteredTickets.length > 10 && (
+                <p className="text-center text-[11px] text-muted-foreground pt-2">
+                  Mostrando 10 de {filteredTickets.length} tickets filtrados. Use "Exportar CSV" para ver todos.
+                </p>
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ── Demo Leads Monitoring (super_admin only) ─────────────────────── */}
+      {isSuperAdmin && (
+        <Card className="border-border">
+          <CardHeader className="pb-3">
+            {/* Row 1: title + badge + refresh */}
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <UserCheck className="h-4 w-4 text-amber-400" />
+                <CardTitle className="text-sm font-semibold text-foreground">
+                  Leads do Demo Gate
+                </CardTitle>
+                {leads.length > 0 && (
+                  <Badge className="bg-amber-500/15 text-amber-400 border-amber-500/30 text-[10px]">
+                    {filteredLeads.length}{leads.length !== filteredLeads.length ? `/${leads.length}` : ""} lead{filteredLeads.length !== 1 ? "s" : ""}
+                  </Badge>
+                )}
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 text-xs gap-1.5 text-muted-foreground"
+                onClick={() => { setLeadsLoaded(false); }}
+              >
+                <Loader2 className="h-3 w-3" /> Atualizar
+              </Button>
+            </div>
+            <CardDescription className="text-xs">
+              Contatos capturados no formulário de acesso ao demo do investidor.
+            </CardDescription>
+            {/* Row 2: date filters + export */}
+            <div className="flex flex-wrap items-center gap-2 pt-2">
+              <div className="flex items-center gap-1.5">
+                <Label className="text-[11px] text-muted-foreground whitespace-nowrap">De</Label>
+                <input
+                  type="date"
+                  value={leadStart}
+                  onChange={(e) => setLeadStart(e.target.value)}
+                  className="h-7 rounded-md border border-border bg-background px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                />
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Label className="text-[11px] text-muted-foreground whitespace-nowrap">Até</Label>
+                <input
+                  type="date"
+                  value={leadEnd}
+                  onChange={(e) => setLeadEnd(e.target.value)}
+                  className="h-7 rounded-md border border-border bg-background px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                />
+              </div>
+              {(leadStart || leadEnd) && (
+                <button
+                  type="button"
+                  onClick={() => { setLeadStart(""); setLeadEnd(""); }}
+                  className="text-[11px] text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  Limpar
+                </button>
+              )}
+              <Button
+                size="sm"
+                className="h-7 text-xs gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white ml-auto"
+                onClick={exportCSV}
+                disabled={filteredLeads.length === 0}
+              >
+                <Download className="h-3 w-3" /> Exportar CSV
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent className="pt-0">
+            {displayedLeads.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-8 text-center text-muted-foreground gap-2">
+                <UserCheck className="h-8 w-8 opacity-30" />
+                <p className="text-xs font-medium">
+                  {leads.length === 0 ? "Nenhum lead capturado ainda" : "Nenhum lead no período selecionado"}
+                </p>
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-border/50">
+                      <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Nome</th>
+                      <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">E-mail</th>
+                      <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Empresa / Fundo</th>
+                      <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">
+                        <Phone className="h-3 w-3 inline mr-1" />Telefone
+                      </th>
+                      <th className="text-left pb-2 font-medium text-muted-foreground">Data</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {displayedLeads.map((lead) => (
+                      <tr key={lead.id} className="border-b border-border/30 last:border-0">
+                        <td className="py-2 pr-4 font-medium text-foreground">{lead.nome}</td>
+                        <td className="py-2 pr-4 text-violet-400/90 font-mono text-[11px]">{lead.email_contato || "—"}</td>
+                        <td className="py-2 pr-4 text-muted-foreground">{lead.empresa}</td>
+                        <td className="py-2 pr-4 font-mono text-amber-400/90">{lead.telefone}</td>
+                        <td className="py-2 text-muted-foreground whitespace-nowrap">
+                          {new Date(lead.created_at).toLocaleString("pt-BR", {
+                            day: "2-digit", month: "2-digit", year: "2-digit",
+                            hour: "2-digit", minute: "2-digit",
+                          })}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {filteredLeads.length > 10 && (
+                  <p className="text-[11px] text-muted-foreground text-center pt-3">
+                    Mostrando 10 de {filteredLeads.length} leads. Use "Exportar CSV" para ver todos.
+                  </p>
+                )}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Webhook reference */}
+      <Card className="border-dashed border-violet-500/30 bg-violet-500/5">
+        <CardHeader className="pb-2">
+          <CardTitle className="text-sm text-violet-400">{t("admin_webhook_title")}</CardTitle>
+          <CardDescription className="text-xs">{t("admin_webhook_desc")}</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-1">
+            {clinics.filter((c) => c.status === "active" && c.plan_type !== "demo").map((c) => (
+              <div key={c.clinic_id} className="flex items-center gap-2 text-[11px] font-mono bg-slate-900 rounded px-2 py-1">
+                <span className="text-violet-400 shrink-0">POST</span>
+                <span className="text-muted-foreground truncate">/api/whatsapp/webhook?clinic_id={c.clinic_id}</span>
+                <Badge variant="outline" className="ml-auto text-[9px] shrink-0">
+                  {c.clinic_name.split(" ").slice(0, 2).join(" ")}
+                </Badge>
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}

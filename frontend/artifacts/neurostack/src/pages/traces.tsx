@@ -101,6 +101,11 @@ export default function TracesList() {
     setLoadError(null);
     try {
       const token = getToken();
+      if (!token) {
+        setLoadError("Sessão expirada. Faça login novamente.");
+        setTraces([]);
+        return;
+      }
       const params = new URLSearchParams({
         limit: String(PAGE_SIZE),
         offset: String(offset),
@@ -111,12 +116,17 @@ export default function TracesList() {
       if (onlyHandoff) params.set("handoff_required", "true");
 
       const res = await fetch(`/v1/traces?${params.toString()}`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        headers: { Authorization: `Bearer ${token}` },
       });
+      if (res.status === 401) {
+        setLoadError("Token inválido ou expirado. Faça login novamente.");
+        setTraces([]);
+        return;
+      }
       if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
       const data: TracesResponse = await res.json();
-      setTraces(data.items.map(mapTrace));
-      setTotal(data.total);
+      setTraces((data.items ?? []).map(mapTrace));
+      setTotal(data.total ?? 0);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : "Unknown error");
       setTraces([]);
@@ -325,8 +335,9 @@ export default function TracesList() {
             </Card>
           ))
         ) : loadError ? (
-          <div className="p-8 text-center text-destructive bg-destructive/10 rounded-lg">
-            {t("traces_fail")}
+          <div className="p-8 text-center text-destructive bg-destructive/10 rounded-lg space-y-2">
+            <p className="font-medium">{t("traces_fail")}</p>
+            <p className="text-sm opacity-80">{loadError}</p>
           </div>
         ) : recentTraces.length === 0 ? (
           <div className="p-12 text-center text-muted-foreground bg-muted/30 rounded-lg border border-border">

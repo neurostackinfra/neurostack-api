@@ -1,0 +1,21 @@
+Por favor, implemente as seguintes duas grandes atualizações no nosso sistema (Frontend e lógica de Internacionalização):
+
+**1. Atualização da secção "AI PROVIDER — LLM" (Configuração da Clínica):**
+- Altere a ordem e os nomes dos cards de seleção dos provedores para que fiquem estritamente nesta ordem:
+  1º. SLM Cortex (by NeuroStack)
+  2º. Dropout (by Neuralake)
+  3º. GPT (by OpenAI)
+  4º. Outros (Substituindo o antigo "Muse Spark").
+- **Comportamento da opção "Outros":** Quando o utilizador selecionar a opção "Outros", o formulário deve exibir os campos habituais de "API URL" e "API Key", mas deve também incluir um novo campo de input de texto chamado "Nome do Modelo" (Model Name).
+- **Lista de Recomendações:** Imediatamente abaixo deste novo campo "Nome do Modelo" na opção "Outros", adicione um bloco de texto de ajuda (help text) com o título "Recomendados no momento:" e a seguinte lista (exatamente com esta formatação):
+  1) Qwen 3.5-35B-A3B by Alibaba
+  2) Mistral Small 4 by Mistral
+  3) Qwen 3-235B-A22B by Alibaba
+  4) Llama 4 Maverick by Meta
+  5) DeepSeek V3.2 by DeepSeek
+
+**2. Revisão e Correção do Sistema de Tradução (Inglês <-> Português):**
+- Atualmente, a alternância de idiomas está a mudar os títulos principais, mas está a falhar nas opções fixas e nos dados mapeados. Faça uma revisão geral no sistema de i18n (dicionários de tradução).
+- **Foco no Painel de Intenções (Dashboard):** Certifique-se de que as categorias no gráfico e na lista de intenções (ex: "Agendamento", "Pedido de Preço", "Interesse Tratamento", "Reclamação", "Dúvida Pós-Procedimento") sejam traduzidas corretamente quando o idioma muda para Inglês.
+- Se essas intenções vêm do Backend como strings fixas em Português, crie uma função de mapeamento no Frontend que passe essas strings pelas chaves de tradução (ex: `t(intentName)`) antes de as renderizar no ecrã e nos gráficos.
+- Verifique também os menus laterais e os dropdowns de seleção em todo o sistema para garantir que não restam strings "hardcoded" (fixas no código) sem passar pelo hook de tradução.

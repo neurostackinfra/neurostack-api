@@ -1,0 +1,18 @@
+Excelente! O visual da integração do WhatsApp já está pronto e muito bem estruturado no Frontend (com as opções Z-API, Evolution API e WABA). Agora, precisamos conectar essa interface existente ao nosso novo sistema de segurança e persistência no Backend.
+
+Por favor, revise e implemente a seguinte lógica ESTRITAMENTE para a seção "WHATSAPP — PROVEDOR ATIVO" nas configurações da clínica:
+
+**1. Persistência de Dados (State e Backend):**
+- Conecte os campos de input `Instance URL / ID` e `Client Token` (tanto para Z-API quanto para Evolution API) à nossa rota de API de configurações.
+- Ao clicar em "Salvar Configuração", os dados preenchidos devem ser salvos no banco de dados (usando `UPDATE` ou `UPSERT`) vinculados ao `clinicId` correspondente.
+
+**2. Criptografia Bidirecional do Token (Segurança CRÍTICA):**
+- O `Client Token` (ou Instance Token) do WhatsApp NUNCA deve ser salvo em texto limpo no banco de dados.
+- Utilize a variável de ambiente `ENCRYPTION_KEY` e a biblioteca nativa `crypto` do Node.js para criptografar este token ANTES de inseri-lo no banco.
+
+**3. Mascaramento Visual (Prevenção de Sobrescrita):**
+- Ao recarregar a página, o frontend deve buscar os dados do banco. O campo de URL deve ser preenchido normalmente. 
+- O campo `Client Token` DEVE ser recebido e exibido no frontend apenas como uma máscara de segurança (ex: `••••••••` ou `Configurado`). A chave real descriptografada não deve ir para o navegador.
+- Lógica de Salvamento Inteligente: Se o usuário submeter o formulário mantendo a máscara (`••••••••`), o backend DEVE ignorar a atualização desse campo específico, mantendo a chave criptografada original intacta no banco de dados. O token só deve ser atualizado se o usuário digitar uma string nova e diferente da máscara.
+
+⚠️ IMPORTANTE: Atualize APENAS a lógica de estado (React) e a comunicação de API/Banco de Dados para garantir o salvamento seguro. Mantenha TODO o layout, abas e design atual estritamente intactos. Não apague nem modifique a parte visual do WABA (Enterprise).

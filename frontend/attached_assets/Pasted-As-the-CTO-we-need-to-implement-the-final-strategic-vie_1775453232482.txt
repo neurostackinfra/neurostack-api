@@ -1,0 +1,39 @@
+As the CTO, we need to implement the final strategic view for our investors: the "Faturamento & Assinatura" (Billing) page. This must be added to the Roadmap section to prove our PLG (Product-Led Growth) and self-service monetization capabilities.
+
+Please implement the following UI for the `/billing` route:
+
+1. SIDEBAR UPDATE:
+- Add "Assinatura & Pagamento" under the Roadmap section (icon: credit-card or wallet).
+
+2. PAGE HEADER:
+- Title: "Faturamento e Gestão de Assinatura (Billing)".
+- Add a global badge: "ROADMAP: Módulo Financeiro Integrado".
+
+3. BILLING UI BLOCKS (Deeptech Styling, opacity-70, fully disabled/read-only, NO specific monetary values):
+
+  - Block 1: Plano Atual (Current Plan)
+    - Show a premium card: "Plano: NeuroStack Enterprise (Piloto)".
+    - Status badge: "Ativo" (Green).
+    - Description: "Acesso total à arquitetura Multi-Tenant, BYOK, Handoff e integrações Z-API."
+    - Buttons (disabled): "Fazer Upgrade de Plano", "Gerenciar Assinatura".
+
+  - Block 2: Recarga de Créditos (Add-ons)
+    - Title: "Saldo de Créditos Extras".
+    - Description: "Adquira pacotes de créditos para uso de funcionalidades Premium (Voz Sintética ElevenLabs e SLM Cortex)."
+    - Button (disabled): "+ Adicionar Créditos (Pacotes Avulsos)".
+
+  - Block 3: Métodos de Pagamento (Payment Methods)
+    - Display two placeholder methods:
+      1. "Cartão de Crédito" - (Mastercard icon, ending in **** 4242).
+      2. "PIX (Faturamento Automático)".
+    - Button (disabled): "Adicionar Novo Cartão / Método".
+
+  - Block 4: Histórico de Faturas (Invoice History)
+    - A clean, simple list/table of recent transactions.
+    - Example rows: 
+      - "Fatura Referente à Assinatura Mensal - Status: Paga - PDF".
+      - "Compra de Pacote de Créditos (Voz) - Status: Paga - PDF".
+
+4. VISUAL & ACCESSIBILITY:
+- Ensure strict adherence to our high-contrast rule (dark slate/black text, medium weight).
+- Do NOT display any explicit prices or currency symbols (e.g., $ or R$) to avoid anchoring investors to premature pricing strategies. Keep it purely structural.

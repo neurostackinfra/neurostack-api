@@ -1,0 +1,33 @@
+As the CTO, we need to correct and expand the RLHF feedback flow. The previous iteration was too hidden. The feedback mechanism must be explicitly visible below the AI's response in the "Simulador de Chat", and we need to build the foundation for the "Auditoria RLHF" Master Admin page.
+
+Please implement the following exact flow:
+
+1. INLINE FEEDBACK UI (SIMULATOR):
+- Directly below the AI's response bubble in the Chat Simulator, add a visible, persistent button: "💡 Corrigir / Enviar Feedback" (Correct / Send Feedback).
+- When clicked, it expands an inline box (not a popup modal, but an expanding div right there in the chat interface) with a `textarea` for the user to type their preferred response.
+- Initial Button: "Analisar Sugestão" (Analyze Suggestion).
+
+2. METHODOLOGY VALIDATION FLOW (MOCKED):
+- When "Analisar Sugestão" is clicked, simulate a brief loading state. 
+- MOCK LOGIC: If the user's text contains words like "diagnóstico", "remédio", "urgência" or "preço", trigger the RED FLAG state. Otherwise, trigger the GREEN FLAG state.
+
+3. RED FLAG STATE (Methodology Violation):
+- Show a clear warning box: "⚠️ Alerta: Esta sugestão fere a metodologia SRM NeuroStack."
+- Display two buttons:
+  * Button 1 (Safe): "Manter Padrão SRM NeuroStack" (Cancels the feedback, collapses the box).
+  * Button 2 (Danger/Override): "Aplicar Sugestão Pessoal" (Saves the feedback as a forced override).
+
+4. GREEN FLAG STATE (Aligned with Methodology):
+- Show a success text: "✅ Sugestão alinhada com a metodologia."
+- Display one button: "Aplicar Sugestão Pessoal" (Saves the feedback cleanly).
+
+5. MASTER ADMIN "AUDITORIA RLHF" PAGE:
+- Create the visual layout for the "Auditoria RLHF" page (accessible via sidebar for Master Admin).
+- Build a Data Table with the following columns:
+  * Clínica/Usuário (Who submitted it)
+  * Status (Green badge for "Alinhado", Red badge for "Forçado/Fere Metodologia")
+  * Feedback Original vs Sugestão (What they corrected)
+  * Ação (Action column with a button: "Aprovar para Treinamento SLM").
+- For now, populate the table with 2 or 3 mocked rows demonstrating one Green Flag and one Red Flag submission.
+
+Make sure the UI is extremely clear, replacing the hidden hover mechanism with this explicit, step-by-step methodology guardrail.

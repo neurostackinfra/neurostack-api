@@ -1,0 +1,23 @@
+As the CTO, we have a final QA polishing pass for the Demo data and UI to remove any remaining "AI-generated" text patterns and improve contrast.
+
+Please implement the following exact updates:
+
+1. REMOVE DASHES IN DEMO CHAT:
+- Locate the first AI message in the Chat Simulator demo ("Olá! Que ótima escolha — as facetas...").
+- Change it exactly to: "Olá! Que ótima escolha. As facetas de porcelana são o padrão ouro para transformação de sorriso, com resultados naturais e duradouros. Para te oferecer um orçamento preciso, o ideal é uma avaliação personalizada com nosso especialista. Posso agendar para você?"
+
+2. UPDATE MOCK TRACES DATA (Contexts & Text Fixes):
+- Trace 1: User Message "Quero um orçamento completo para transformação do meu sorriso"
+  * Set Selected Context to: "[CLINIC_CONFIG] diferenciais"
+  * Update AI Response (removing the dash): "Uma transformação de sorriso completa é um projeto personalizado e emocionante! Cada caso é único. Por isso nosso especialista realiza um mapeamento digital 3D antes de qualquer proposta. Podemos agendar sua avaliação diagnóstica gratuita esta semana?"
+- Trace 2: User Message "Qual é o tempo de tratamento para ortodontia com alinhadores invisíveis?"
+  * Set Selected Context to: "[RAG] tratamento alinhadores"
+- Trace 3: User Message "Fiz clareamento há 3 dias e ainda sinto sensibilidade nos dentes"
+  * Set Selected Context to: "[RAG] Pós tratamento clareamento"
+- Trace 4: User Message "Tenho interesse em implante dentário, como funciona?"
+  * Set Selected Context to: "[CLINIC_CONFIG] diferenciais implantes dentário"
+
+3. RLHF AUDIT PAGE STYLING:
+- Locate the restricted access banner on the Auditoria RLHF page (currently light purple with the text "Acesso restrito — Somente Master Admin...").
+- Change the styling to a high-contrast Black and White theme (e.g., apply Tailwind classes like `bg-gray-900 text-white border border-black`).
+- Update the text to remove the dash: "Acesso restrito: Somente Master Admin. Contém metodologia proprietária de alinhamento SRM."

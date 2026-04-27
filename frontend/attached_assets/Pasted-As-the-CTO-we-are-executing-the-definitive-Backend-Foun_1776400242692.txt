@@ -1,0 +1,24 @@
+As the CTO, we are executing the definitive Backend Foundation & Security Update. We must ensure HIPAA/LGPD compliance, prepare for the GCP PostgreSQL migration via Drizzle ORM, and strictly enforce our BYOK (Bring Your Own Key) architecture.
+
+Please execute this massive refactor carefully:
+
+1. ORM & MIGRATION FOUNDATION (DRIZZLE):
+- Install `drizzle-orm` and `drizzle-kit`.
+- Create a formal `schema.ts` defining our tables: `users`, `clinic_config`, `traces`, `support_tickets`, `rlhf_feedback`, and `demo_leads`.
+- Refactor the current raw SQLite queries to use Drizzle ORM syntax. Ensure the app still runs locally on SQLite but is 100% ready to switch to PostgreSQL by only changing the driver.
+
+2. HIPAA/LGPD SECURITY LAYER (CRITICAL):
+- Users Table: Implement `bcrypt` (or `bcryptjs`). ALL user passwords must be hashed before saving. Never store plain text passwords.
+- Clinic Config Table (API Keys): Use Node's native `crypto` module to symmetrically encrypt sensitive fields (`llm_api_key`, `zapi_token`, `evolution_global_key`) BEFORE saving them to the database, and decrypt them when pulling them into the backend memory. 
+- Ensure these keys are never sent back to the frontend in plain text (mask them as "••••••••" in the UI after saving).
+
+3. ABSOLUTE DATA PERSISTENCE & ISOLATION:
+- Ensure that when users save their configuration in "Clinic Config", the frontend fetches this saved config on page load (`GET /api/clinic-config`). The fields must NEVER reset on refresh.
+- Enforce strict RBAC & Tenant Isolation: Every query in Drizzle MUST include `WHERE clinic_id = ?` (except for Master Admin God-Mode views).
+
+4. WHATSAPP & LLM CONFIG READINESS:
+- Ensure the DB schema supports Z-API (`instance_id`, `instance_token`), Evolution API (`base_url`, `instance_name`, `global_api_key`), and LLM Provider info (`llm_provider`, `model`, encrypted `llm_api_key`).
+
+5. UNIQUE TENANT WEBHOOK URLS:
+- The Clinic Config UI must dynamically display a unique Webhook URL for the user to copy: `https://app.neurostack.global/api/whatsapp/webhook/{clinic_id}`.
+- Ensure the backend `POST /api/whatsapp/webhook/:clinic_id` route is active, ready to receive payloads, and uses the specific tenant's decrypted API keys to process the message.

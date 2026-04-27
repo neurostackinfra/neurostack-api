@@ -1,0 +1,21 @@
+Por favor, implemente as seguintes atualizações estruturais focadas em Multi-tenancy, Persistência e Segurança de Dados:
+
+**1. Isolamento de Dados (Traces e Saúde do Sistema):**
+- Atualize os endpoints de "Histórico de Traces" e "Saúde do Sistema" para respeitarem a arquitetura Multi-tenant.
+- As consultas ao banco de dados devem SEMPRE filtrar os dados pelo `clinicId` (ou ID do usuário logado).
+- No Histórico de Traces, traga os 20 últimos registos reais dessa clínica específica (ordenados por data decrescente). Os filtros de data devem continuar funcionando sobre esses dados.
+- EXCEÇÃO: Se o usuário logado for a conta "Demo", o sistema deve ignorar a busca no banco e retornar os dados "mockados" (fictícios) configurados no frontend/backend.
+
+**2. Persistência de Configurações (LLM e WhatsApp):**
+- Corrija o bug onde as chaves e URLs de API (LLM e WhatsApp) desaparecem ao fazer um novo login. 
+- Quando o usuário preencher e clicar em "Salvar", os dados devem fazer um `UPSERT` ou `UPDATE` na tabela da clínica no banco de dados.
+- Ao carregar a página de Configurações, o frontend deve buscar os dados salvos no banco e preencher os inputs automaticamente.
+- Prepare as colunas no banco de dados e os campos no Frontend para a integração do WhatsApp (ex: WhatsApp API URL, WhatsApp Token/Instance Key e Webhook URL).
+
+**3. Segurança e Criptografia de Dados Sensíveis (CRÍTICO):**
+- NUNCA salve `API Keys` (LLM) ou `Tokens` (WhatsApp) em texto limpo (plain text) no banco de dados.
+- Implemente uma função de criptografia bidirecional (ex: AES-256-GCM usando a biblioteca nativa `crypto` do Node.js).
+- Antes de salvar no banco, criptografe esses dados sensíveis usando uma variável de ambiente chamada `ENCRYPTION_KEY`.
+- O sistema só deve descriptografar esses dados na memória do Backend, no exato momento em que for fazer a requisição HTTP para a API do LLM ou WhatsApp.
+- Ao enviar os dados do Backend para o Frontend (para popular a tela de configurações), envie a chave mascarada (ex: `sk-****************1234`) para que ela não fique exposta no navegador do usuário.
+- Se o usuário enviar o formulário com a chave mascarada (contendo asteriscos), o backend deve ignorar e manter a chave criptografada original salva no banco.

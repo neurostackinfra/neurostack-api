@@ -40,8 +40,12 @@ function mapTrace(data: any) {
       source: c.source ?? "",
     })),
     promptBuilt: data.prompt_built ?? data.promptBuilt ?? "",
-    llmResponse: data.llm_response ?? data.llmResponse ?? "",
+    llmResponse: data.llm_response ?? data.llmResponse ?? data.full_prompt?.suggested_response ?? "",
     processingTimeMs: data.processing_time_ms ?? data.processingTimeMs ?? 0,
+    eventData: data.event_data ?? data.eventData ?? undefined,
+    eventMetadata: data.event_metadata ?? data.eventMetadata ?? undefined,
+    fullContext: data.full_context ?? data.fullContext ?? undefined,
+    fullPrompt: data.full_prompt ?? data.fullPrompt ?? undefined,
   };
 }
 

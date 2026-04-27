@@ -1,0 +1,27 @@
+Preciso reformular a página "Master Admin" e a lógica de negócio do sistema para o modelo de "Builders" (Revendedores/Agências). Por favor, implemente as seguintes alterações no Backend (Banco de Dados) e Frontend:
+
+**1. Estrutura do Banco de Dados (Nova Hierarquia):**
+- Crie ou atualize o esquema para suportar a entidade "Builder" (Construtor/Agência).
+- Cada "Builder" deve ter os campos: Nome, Status (Ativo/Inativo) e Data de Criação.
+- A entidade "Clínica" (Clinic/Tenant) agora deve pertencer a um "Builder" (ex: adicionar `builderId` na tabela de clínicas).
+- Garanta que as contas de "Admin Master" e "Demo" sejam tratadas de forma separada no banco ou identificadas por um papel (role) específico, para não entrarem na contagem de MRR.
+
+**2. Lógica Financeira (MRR Estimado):**
+- Atualize a função que calcula o MRR no painel Master Admin com a seguinte regra rigorosa:
+  - Valor por Builder Ativo = R$ 2.000,00
+  - Valor por Clínica Ativa = R$ 350,00
+  - Fórmula: (Total Builders Ativos * 2000) + (Total Clínicas Ativas * 350).
+- Clínicas ou Builders "Inativos", bem como contas "Admin" e "Demo", NÃO devem somar no MRR.
+
+**3. Frontend (Página Master Admin):**
+- Adicione um "Card" de destaque mostrando o MRR Estimado em Reais (R$).
+- Crie uma seção de Gestão de Builders: Uma tabela ou lista onde o Admin Master possa Adicionar, Editar, Excluir e Ativar/Desativar Builders (Toggle switch).
+- Gestão de Clínicas Aninhadas: Dentro da visualização de cada Builder (pode ser um accordion expansível ou clicando no Builder), o Admin Master deve conseguir ver, Adicionar, Editar, Excluir e Ativar/Desativar as Clínicas pertencentes àquele Builder.
+
+**4. Dados de Simulação (Seed):**
+- Para testar a visualização, gere os seguintes dados no banco:
+  - 1 Builder chamado "Builder Alfa" (Ativo) contendo 3 Clínicas (Ativas).
+  - 1 Builder chamado "Builder Beta" (Ativo) contendo 2 Clínicas (Ativas).
+- Isto deverá resultar num MRR exibido de R$ 5.750,00 no painel.
+
+⚠️ IMPORTANTE: Atualize APENAS a parte solicitada. Mantenha todo o resto do código, layouts, imports e lógicas existentes estritamente intactos. Não remova as funcionalidades prévias ao gerar o novo código.
