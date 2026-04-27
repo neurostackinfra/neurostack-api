@@ -188,3 +188,8 @@ temp/
 alembic/versions/*.pyc
 
 .github/
+# Genie CLI
+.genie/
+
+# Replit artifacts
+.replit-artifact/
