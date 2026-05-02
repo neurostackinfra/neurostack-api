@@ -47,7 +47,7 @@ class CreateClinicRequest(BaseModel):
 
     clinic_name: str = Field(..., min_length=1, max_length=255)
     admin_email: EmailStr
-    admin_password: str = Field(..., min_length=8)
+    admin_password: str = Field(..., min_length=6)
     plan_type: str = Field(default="pilot", pattern=r"^(pilot|demo|admin)$")
     builder_id: Optional[UUID] = None
 
@@ -73,6 +73,8 @@ class CreateBuilderRequest(BaseModel):
     """Request body for creating a builder."""
 
     name: str = Field(..., min_length=1, max_length=255)
+    admin_email: EmailStr
+    admin_password: str = Field(..., min_length=6)
 
 
 class UpdateBuilderRequest(BaseModel):
@@ -113,7 +115,7 @@ class CreateBuilderClinicRequest(BaseModel):
 
     clinic_name: str = Field(..., min_length=1, max_length=255)
     admin_email: EmailStr
-    admin_password: str = Field(..., min_length=8)
+    admin_password: str = Field(..., min_length=6)
 
 
 # ============================================

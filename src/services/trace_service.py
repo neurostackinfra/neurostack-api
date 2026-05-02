@@ -236,6 +236,8 @@ async def get_trace_stats(
     safety_count = 0
     handoff_count = 0
     intent_dist: dict[str, int] = {}
+    total_tokens_sum = 0
+    model_tokens: dict[str, int] = {}
 
     for event in events:
         metadata = event.event_metadata or {}
@@ -261,13 +263,29 @@ async def get_trace_stats(
         intent = decision.get("intent", event_data.get("intent", metadata.get("intent", "unknown")))
         intent_dist[intent] = intent_dist.get(intent, 0) + 1
 
+        # Token usage
+        llm_usage = metadata.get("llm_usage", {})
+        llm_model = metadata.get("llm_model", "")
+        tokens = llm_usage.get("total_tokens", 0)
+        if tokens:
+            total_tokens_sum += tokens
+            if llm_model:
+                model_tokens[llm_model] = model_tokens.get(llm_model, 0) + tokens
+
     avg_pt = (sum(processing_times) / len(processing_times)) if processing_times else 0.0
+
+    model_breakdown = [
+        {"model": model, "tokens": toks}
+        for model, toks in sorted(model_tokens.items(), key=lambda x: x[1], reverse=True)
+    ]
 
     return {
         "total_traces": total,
         "avg_processing_time_ms": round(avg_pt, 2),
         "safety_flags_count": safety_count,
         "handoff_count": handoff_count,
+        "total_tokens_sum": total_tokens_sum,
+        "model_breakdown": model_breakdown,
         "intent_distribution": intent_dist,
         "period_start": start_date.isoformat(),
         "period_end": end_date.isoformat(),

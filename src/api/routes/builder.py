@@ -398,11 +398,38 @@ async def _get_builder_stats(
     )
     total_traces = trace_result.scalar() or 0
 
+    # Aggregate LLM token usage across all managed clinics
+    events_result = await session.execute(
+        select(Event.event_metadata).where(
+            Event.tenant_id.in_(tenant_ids_stmt),
+            Event.event_type == "message.in",
+        )
+    )
+    total_tokens = 0
+    model_tokens: dict[str, int] = {}
+    for (metadata,) in events_result.all():
+        if not metadata:
+            continue
+        llm_usage = metadata.get("llm_usage", {})
+        llm_model = metadata.get("llm_model", "")
+        tokens = llm_usage.get("total_tokens", 0) if llm_usage else 0
+        if tokens:
+            total_tokens += tokens
+            if llm_model:
+                model_tokens[llm_model] = model_tokens.get(llm_model, 0) + tokens
+
+    model_breakdown = [
+        {"model": model, "tokens": toks}
+        for model, toks in sorted(model_tokens.items(), key=lambda x: x[1], reverse=True)
+    ]
+
     return BuilderStatsResponse(
         clinic_count=clinic_count,
         active_clinics=active_clinics,
         inactive_clinics=clinic_count - active_clinics,
         total_traces=total_traces,
+        total_tokens=total_tokens,
+        model_breakdown=model_breakdown,
     )
 
 

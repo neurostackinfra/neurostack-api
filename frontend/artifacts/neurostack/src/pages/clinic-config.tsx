@@ -160,7 +160,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
 
   useEffect(() => {
     if (!isSuperAdmin) return;
-    void fetch(`${API_BASE}/api/admin/clinics`, { headers: { Authorization: `Bearer ${getToken()}` } })
+    void fetch(`/v1/admin/clinics`, { headers: { Authorization: `Bearer ${getToken()}` } })
       .then(r => r.json()).then((d: ClinicSlim[]) => setClinics(d)).catch(() => {});
   }, [isSuperAdmin]);
 
@@ -170,7 +170,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   const fetchStatus = useCallback(async () => {
     setLoading(true); setError(null);
     try {
-      const res = await fetch(`${API_BASE}/api/config/api-credentials?clinic_id=${targetId}`, {
+      const res = await fetch(`/v1/config/api-credentials?clinic_id=${targetId}`, {
         headers: { Authorization: `Bearer ${getToken()}` },
       });
       if (!res.ok) { setError("Erro ao carregar configurações."); return; }
@@ -183,8 +183,8 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       setEvolApiUrl(data.evolution_api_url ?? "");
       setEvolInstanceName(data.evolution_instance_name ?? "");
       // LLM
-      setLlmModelName(data.llm_model_name ?? "");
       const inferredProvider = inferProvider(data.llm_base_url);
+      setLlmModelName(inferredProvider === "dropout" ? "text" : (data.llm_model_name ?? ""));
       setLlmProvider(inferredProvider);
       setLlmApiUrl(data.llm_base_url ?? PROVIDER_DEFAULT_URL[inferredProvider]);
       // WhatsApp secret fields: left empty so the placeholder "••••••••• (manter atual)"
@@ -222,8 +222,12 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         body["llm_api_url"]  = llmApiUrl || PROVIDER_DEFAULT_URL[llmProvider];
         body["llm_provider"] = llmProvider;
       }
-      if (llmModelName && (llmProvider === "openai" || llmProvider === "outros"))  body["llm_model_name"] = llmModelName;
-      const res = await fetch(`${API_BASE}/api/config/api-credentials`, {
+      if (llmProvider === "dropout") body["llm_model_name"] = "text";
+      else if (llmModelName && (llmProvider === "openai" || llmProvider === "outros"))  body["llm_model_name"] = llmModelName;
+      const saveUrl = targetId
+        ? `/v1/config/api-credentials?clinic_id=${targetId}`
+        : `/v1/config/api-credentials`;
+      const res = await fetch(saveUrl, {
         method: "PATCH",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${getToken()}` },
         body: JSON.stringify(body),
@@ -428,6 +432,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
                   setLlmProvider(p.id);
                   setLlmApiUrl(PROVIDER_DEFAULT_URL[p.id]);
                   setLlmApiKey(""); // clear key — different providers use different keys
+                  setLlmModelName(p.id === "dropout" ? "text" : "");
                 }}
                 className={`relative flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2.5 text-left transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
                   active
@@ -465,12 +470,12 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
               <ApiInput label="API URL" value={llmApiUrl} onChange={setLlmApiUrl}
                 placeholder="https://api.neuralake.cloud/v1" disabled={isReadOnly} mono />
             </div>
-            <div className="sm:col-span-2 space-y-1.5">
-              <ApiInput label="API Key" value={llmApiKey} onChange={setLlmApiKey} type="password"
-                placeholder={status?.llm_api_key_set ? "••••••••• (manter atual)" : "ns-live-..."}
-                disabled={isReadOnly} configured={status?.llm_api_key_set} />
-              <p className="text-[10px] font-mono text-foreground tracking-wide">OpenAI SDK Compatible</p>
-            </div>
+            <ApiInput label="API Key" value={llmApiKey} onChange={setLlmApiKey} type="password"
+              placeholder={status?.llm_api_key_set ? "••••••••• (manter atual)" : "ns-live-..."}
+              disabled={isReadOnly} configured={status?.llm_api_key_set} />
+            <ApiInput label="Model Name" value="text" onChange={() => {}}
+              disabled mono />
+            <p className="text-[10px] font-mono text-foreground tracking-wide sm:col-span-2">OpenAI SDK Compatible</p>
           </div>
         )}
 
@@ -603,7 +608,7 @@ function SwitchRow({
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function ClinicConfig() {
-  const { clinicId, isReadOnly, role } = useAuth();
+  const { clinicId, isReadOnly, isClinicAdmin, role, isBuilder, viewingClinicId } = useAuth();
   const { t, locale } = useI18n();
   const txt = (p: string, e: string) => locale === "en" ? e : p;
   const { toast } = useToast();
@@ -617,7 +622,10 @@ export default function ClinicConfig() {
       setIsLoading(true);
       try {
         const token = getToken();
-        const res = await fetch("/v1/config", {
+        const configUrl = isBuilder && viewingClinicId
+          ? `/v1/config?tenant_id=${viewingClinicId}`
+          : "/v1/config";
+        const res = await fetch(configUrl, {
           headers: token ? { Authorization: `Bearer ${token}` } : {},
         });
         if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`);
@@ -630,7 +638,7 @@ export default function ClinicConfig() {
       }
     }
     void loadConfig();
-  }, [clinicId]);
+  }, [clinicId, viewingClinicId]);
 
   // Tab 1 — Identidade
   const [clinicName, setClinicName] = useState("");
@@ -687,9 +695,9 @@ export default function ClinicConfig() {
 
   useEffect(() => {
     if (!config) return;
-    setClinicName(config.clinic_name);
+    setClinicName(config.clinic_name ?? "");
     setMainDomain(config.main_domain ?? "");
-    setAgentName(config.agent_name);
+    setAgentName(config.agent_name ?? "");
     setAgentPresentation(config.agent_presentation ?? "");
     setAiDisclosure(config.ai_disclosure ?? "");
     setUseEmojis(config.use_emojis ?? "no");
@@ -701,7 +709,7 @@ export default function ClinicConfig() {
     setWorkingHours(config.working_hours ?? "");
     setSchedulingHours(config.scheduling_hours ?? "");
     setServiceFormat(config.service_format ?? "");
-    setDifferentials(config.differentials);
+    setDifferentials(config.differentials ?? "");
     setAcceptsInsurance(config.accepts_insurance ?? "no");
     setInsuranceList(config.insurance_list ?? "");
     setInitialConsultation(config.initial_consultation ?? "");
@@ -788,7 +796,10 @@ export default function ClinicConfig() {
     };
     try {
       const token = getToken();
-      const res = await fetch("/v1/config", {
+      const patchUrl = isBuilder && viewingClinicId
+        ? `/v1/config?tenant_id=${viewingClinicId}`
+        : "/v1/config";
+      const res = await fetch(patchUrl, {
         method: "PATCH",
         headers: {
           "Content-Type": "application/json",
@@ -833,15 +844,15 @@ export default function ClinicConfig() {
 
       {/* Tabs */}
       <Tabs defaultValue="identidade" className="w-full">
-        <TabsList className="w-full grid grid-cols-6 h-auto p-1 bg-muted/50 border border-border rounded-lg">
+        <TabsList className={`w-full grid h-auto p-1 bg-muted/50 border border-border rounded-lg ${isClinicAdmin ? "grid-cols-4" : "grid-cols-6"}`}>
           {[
-            { value: "identidade", icon: User,          label: t("config_tab_identidade") },
-            { value: "operacao",   icon: Building2,      label: t("config_tab_operacao")   },
-            { value: "negocio",    icon: Shield,         label: t("config_tab_negocio")    },
-            { value: "handoff",    icon: PhoneForwarded, label: t("config_tab_handoff")    },
-            { value: "servicos",   icon: Boxes,          label: t("config_tab_servicos")   },
-            { value: "integracoes",icon: Plug,           label: t("config_tab_apis")       },
-          ].map(({ value, icon: Icon, label }) => (
+            { value: "identidade", icon: User,          label: t("config_tab_identidade"), clinicHidden: false },
+            { value: "operacao",   icon: Building2,      label: t("config_tab_operacao"),   clinicHidden: false },
+            { value: "negocio",    icon: Shield,         label: t("config_tab_negocio"),    clinicHidden: false },
+            { value: "handoff",    icon: PhoneForwarded, label: t("config_tab_handoff"),    clinicHidden: true },
+            { value: "servicos",   icon: Boxes,          label: t("config_tab_servicos"),   clinicHidden: false },
+            { value: "integracoes",icon: Plug,           label: t("config_tab_apis"),       clinicHidden: true },
+          ].filter(tab => !(isClinicAdmin && tab.clinicHidden)).map(({ value, icon: Icon, label }) => (
             <TabsTrigger
               key={value}
               value={value}
@@ -1568,7 +1579,7 @@ export default function ClinicConfig() {
             </CardHeader>
             <CardContent className="pt-5">
               <ApiCredentialsForm
-                clinicId={clinicId}
+                clinicId={isBuilder && viewingClinicId ? viewingClinicId : clinicId}
                 isReadOnly={isReadOnly}
                 isSuperAdmin={role === "super_admin"}
               />

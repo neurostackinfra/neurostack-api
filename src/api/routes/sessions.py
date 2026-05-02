@@ -12,10 +12,59 @@ Sessions track the cognitive state of a conversation, including:
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import jwt as pyjwt
+
+from src.api.middleware.auth import (
+    TenantContext,
+    get_tenant_context,
+    require_builder_clinic_access,
+)
+from src.config.logging import get_logger
+from src.config.settings import settings
 from src.api.schemas.base import ErrorResponse
+
+_logger = get_logger(__name__)
+
+
+async def _resolve_tenant(
+    request: Request,
+    tenant: TenantContext,
+    override_tenant_id: Optional[UUID],
+    db: AsyncSession,
+) -> UUID:
+    """Resolve effective tenant_id, supporting builder clinic override."""
+    if override_tenant_id is None:
+        return tenant.tenant_id
+
+    if tenant.role != "builder":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"tenant_id param not allowed for role '{tenant.role}'",
+        )
+
+    auth_header = request.headers.get("Authorization", "")
+    builder_id_str: Optional[str] = None
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        try:
+            payload = pyjwt.decode(
+                token, settings.secret_key,
+                algorithms=["HS256"],
+                options={"require": ["sub", "tenant_id", "exp"]},
+            )
+            builder_id_str = payload.get("builder_id")
+        except (pyjwt.InvalidTokenError, KeyError, ValueError):
+            pass
+
+    if not builder_id_str:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Builder ID not found in token")
+
+    builder_id = UUID(builder_id_str)
+    _logger.info("builder_clinic_override", extra={"builder_id": str(builder_id), "tenant_id": str(override_tenant_id), "endpoint": request.url.path})
+    return await require_builder_clinic_access(override_tenant_id, builder_id, db)
 from src.api.schemas.sessions import (
     CognitiveState,
     SessionCreateRequest,
@@ -77,11 +126,21 @@ TTL is reset with each event processed.
 )
 async def create_session(
     request: SessionCreateRequest,
+    http_request: Request,
+    tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
 ) -> SessionResponse:
     """
     Create a new conversation session.
+
+    When a builder creates a session for a clinic they manage,
+    the session is created with the clinic's tenant_id (not the builder's).
     """
+    # Builder creating session for a clinic: validate ownership
+    if tenant.role == "builder" and request.tenant_id != tenant.tenant_id:
+        await _resolve_tenant(http_request, tenant, request.tenant_id, db)
+        # _resolve_tenant validates ownership; session uses request.tenant_id as-is
+
     service = get_session_service()
     try:
         result = await service.create_session(request, db)
@@ -180,19 +239,28 @@ Results are ordered by last activity (most recent first).
     tags=["Sessions"],
 )
 async def list_sessions(
+    request: Request,
     tenant_id: UUID = Query(..., description="Tenant ID to filter by"),
     page: int = Query(default=1, ge=1, description="Page number"),
     page_size: int = Query(default=20, ge=1, le=100, description="Items per page"),
     active_only: bool = Query(default=True, description="Only return active sessions"),
     channel: Optional[str] = Query(default=None, description="Filter by channel"),
+    tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
 ) -> SessionListResponse:
     """
     List sessions for a tenant.
+    Builder role can pass tenant_id of a clinic they manage.
+    Non-builder roles must pass their own tenant_id.
     """
+    # For builders, validate they own the requested tenant
+    if tenant.role == "builder" and tenant_id != tenant.tenant_id:
+        effective_tenant_id = await _resolve_tenant(request, tenant, tenant_id, db)
+    else:
+        effective_tenant_id = tenant_id
     service = get_session_service()
     return await service.list_sessions(
-        tenant_id=tenant_id,
+        tenant_id=effective_tenant_id,
         db=db,
         page=page,
         page_size=page_size,
@@ -314,18 +382,25 @@ Useful for debugging and conversation analysis.
 )
 async def get_session_events(
     session_id: UUID,
+    request: Request,
     tenant_id: UUID = Query(..., description="Tenant ID"),
     limit: int = Query(default=50, ge=1, le=200, description="Maximum events to return"),
     offset: int = Query(default=0, ge=0, description="Offset for pagination"),
+    tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
 ) -> SessionEventsResponse:
     """
     Retrieve events for a session from Event Store.
+    Builder role can pass tenant_id of a clinic they manage.
     """
+    if tenant.role == "builder" and tenant_id != tenant.tenant_id:
+        effective_tenant_id = await _resolve_tenant(request, tenant, tenant_id, db)
+    else:
+        effective_tenant_id = tenant_id
     service = get_session_service()
     return await service.get_session_events(
         session_id=session_id,
-        tenant_id=tenant_id,
+        tenant_id=effective_tenant_id,
         db=db,
         limit=limit,
         offset=offset,

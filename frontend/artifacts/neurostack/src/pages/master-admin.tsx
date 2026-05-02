@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { useLocation } from "wouter";
 import {
-  Shield, Building2, Users, Activity, ToggleLeft, ToggleRight,
-  Plus, Eye, CheckCircle2, XCircle, Loader2, AlertTriangle, KeyRound,
+  Shield, Building2, Users, ToggleLeft, ToggleRight,
+  Plus, Eye, CheckCircle2, XCircle, Loader2, AlertTriangle,
   Inbox, Paperclip, ChevronDown, ChevronRight, CheckCheck, UserCheck,
   Phone, TrendingUp, TrendingDown, Download, Search, CalendarRange, RefreshCw,
   RotateCcw, Briefcase, Trash2, Pencil, DollarSign, Info,
@@ -20,6 +20,10 @@ import {
   Dialog, DialogContent, DialogDescription, DialogFooter,
   DialogHeader, DialogTitle, DialogTrigger,
 } from "@/components/ui/dialog";
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { useToast } from "@/hooks/use-toast";
 import { useI18n } from "@/context/i18n";
 
@@ -173,28 +177,6 @@ function PlanBadge({ plan }: { plan: string }) {
   );
 }
 
-// ── Health Dot ───────────────────────────────────────────────────────────────
-
-function HealthDot({ status }: { status?: "healthy" | "warning" | "critical" }) {
-  const { t } = useI18n();
-  const color =
-    status === "healthy"  ? "bg-emerald-400" :
-    status === "warning"  ? "bg-amber-400"   :
-    status === "critical" ? "bg-rose-400"    :
-    "bg-slate-500";
-  const label =
-    status === "healthy"  ? t("admin_health_dot_healthy") :
-    status === "warning"  ? t("admin_health_dot_warning") :
-    status === "critical" ? t("admin_health_dot_critical") :
-    "Unknown";
-  return (
-    <span
-      className={`inline-block h-2.5 w-2.5 rounded-full shrink-0 ${color}`}
-      title={label}
-    />
-  );
-}
-
 // ── Relative Time Helper ─────────────────────────────────────────────────────
 
 function relativeTime(iso: string | null | undefined): string {
@@ -316,7 +298,7 @@ function CreatePilotDialog({ token, onCreated }: { token: string; onCreated: () 
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${BASE}/api/admin/clinics`, {
+      const res = await fetch(`/v1/admin/clinics`, {
         method: "POST",
         headers: authHeaders(token),
         body: JSON.stringify({ clinic_name: name, admin_email: email, admin_password: password, plan_type: "pilot" }),
@@ -381,12 +363,13 @@ function CreatePilotDialog({ token, onCreated }: { token: string; onCreated: () 
 // ── Clinic Card ───────────────────────────────────────────────────────────────
 
 function ClinicCard({
-  clinic, token, onToggle, onViewTraces, isReadOnly = false,
+  clinic, token, onToggle, onViewTraces, onDelete, isReadOnly = false,
 }: {
   clinic: ClinicSlot;
   token: string;
   onToggle: (id: number, newStatus: "active" | "inactive") => Promise<void>;
   onViewTraces: (id: number) => void;
+  onDelete?: (id: number, name: string) => void;
   isReadOnly?: boolean;
 }) {
   const { t } = useI18n();
@@ -411,7 +394,6 @@ function ClinicCard({
       <CardHeader className="pb-2">
         <div className="flex items-start justify-between gap-2">
           <div className="flex items-center gap-2 min-w-0">
-            <HealthDot status={clinic.health_status} />
             <Building2 className="h-4 w-4 text-muted-foreground shrink-0" />
             <div className="min-w-0">
               <CardTitle className="text-sm truncate">
@@ -434,37 +416,6 @@ function ClinicCard({
             <Users className="h-3 w-3" />
             {clinic.users.length} {clinic.users.length === 1 ? t("admin_users_label") : t("admin_users_label_pl")}
           </span>
-          <span className="flex items-center gap-1">
-            <Activity className="h-3 w-3" />
-            {clinic.traceCount} {t("admin_traces_label")}
-          </span>
-          <span className={`flex items-center gap-1 ml-auto ${clinic.apisConfigured ? "text-emerald-400" : "text-slate-500"}`}>
-            <KeyRound className="h-3 w-3" />
-            {clinic.apisConfigured ? "API ✓" : "API —"}
-          </span>
-        </div>
-        <div className="flex items-center gap-3 text-xs text-muted-foreground">
-          <span className="flex items-center gap-1">
-            {t("admin_health_last_trace")}: {relativeTime(clinic.last_trace_at)}
-          </span>
-          {clinic.config_completeness != null && (
-            <span className="flex items-center gap-1.5 ml-auto">
-              {t("admin_health_config_completeness")}
-              <span className="inline-flex items-center gap-1">
-                <span className="inline-block h-1.5 w-16 rounded-full bg-slate-700 overflow-hidden">
-                  <span
-                    className={`block h-full rounded-full ${
-                      clinic.config_completeness >= 80 ? "bg-emerald-400" :
-                      clinic.config_completeness >= 50 ? "bg-amber-400"   :
-                      "bg-rose-400"
-                    }`}
-                    style={{ width: `${clinic.config_completeness}%` }}
-                  />
-                </span>
-                <span className="text-[10px]">{clinic.config_completeness}%</span>
-              </span>
-            </span>
-          )}
         </div>
         {clinic.zapiInstanceId && (
           <p className="text-[10px] font-mono text-muted-foreground/60 truncate">
@@ -501,6 +452,17 @@ function ClinicCard({
           >
             <Eye className="h-3.5 w-3.5" /> {t("admin_view_traces")}
           </Button>
+          {onDelete && !isReadOnly && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0 text-muted-foreground hover:text-destructive shrink-0"
+              title="Excluir clínica"
+              onClick={() => onDelete(clinic.clinic_id, clinic.clinic_name)}
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </Button>
+          )}
         </div>
       </CardContent>
     </Card>
@@ -622,6 +584,8 @@ export default function MasterAdmin() {
   const [buildersLoaded, setBuildersLoaded] = useState(isInvestor);
   const [expandedBuilderId, setExpandedBuilderId] = useState<number | null>(null);
   const [newBuilderName, setNewBuilderName] = useState("");
+  const [newBuilderEmail, setNewBuilderEmail] = useState("");
+  const [newBuilderPassword, setNewBuilderPassword] = useState("");
   const [addingBuilder, setAddingBuilder] = useState(false);
   const [editingBuilderId, setEditingBuilderId] = useState<number | null>(null);
   const [editBuilderName, setEditBuilderName] = useState("");
@@ -629,12 +593,16 @@ export default function MasterAdmin() {
   const [newClinicName, setNewClinicName] = useState("");
   const [newClinicEmail, setNewClinicEmail] = useState("");
   const [newClinicPassword, setNewClinicPassword] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState<{ type: "builder" | "clinic"; id: number; name: string } | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [linkingClinicToBuilderId, setLinkingClinicToBuilderId] = useState<number | null>(null);
+  const [selectedLinkClinicId, setSelectedLinkClinicId] = useState("");
 
   const fetchClinics = async () => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${BASE}/api/admin/clinics`, { headers: authHeaders(token) });
+      const res = await fetch(`/v1/admin/clinics`, { headers: authHeaders(token) });
       if (!res.ok) { setError(t("admin_err_clinics")); return; }
       const data = await res.json() as ClinicSlot[];
       setClinics(data);
@@ -648,7 +616,7 @@ export default function MasterAdmin() {
 
   const fetchBuilders = async () => {
     try {
-      const res = await fetch(`${BASE}/api/admin/builders`, { headers: authHeaders(token) });
+      const res = await fetch(`/v1/admin/builders`, { headers: authHeaders(token) });
       if (!res.ok) return;
       setBuilders(await res.json() as BuilderWithClinics[]);
       setBuildersLoaded(true);
@@ -656,15 +624,15 @@ export default function MasterAdmin() {
   };
 
   const handleAddBuilder = async () => {
-    if (!newBuilderName.trim()) return;
+    if (!newBuilderName.trim() || !newBuilderEmail.trim() || !newBuilderPassword.trim()) return;
     setAddingBuilder(true);
     try {
-      const res = await fetch(`${BASE}/api/admin/builders`, {
+      const res = await fetch(`/v1/admin/builders`, {
         method: "POST", headers: authHeaders(token),
-        body: JSON.stringify({ name: newBuilderName.trim() }),
+        body: JSON.stringify({ name: newBuilderName.trim(), admin_email: newBuilderEmail.trim(), admin_password: newBuilderPassword }),
       });
-      if (!res.ok) { toast({ title: "Erro ao criar builder", variant: "destructive" }); return; }
-      setNewBuilderName("");
+      if (!res.ok) { const err = await res.json().catch(() => ({})) as { detail?: string }; toast({ title: err.detail ?? "Erro ao criar builder", variant: "destructive" }); return; }
+      setNewBuilderName(""); setNewBuilderEmail(""); setNewBuilderPassword("");
       await fetchBuilders();
       toast({ title: "Builder criado com sucesso!" });
     } catch {
@@ -677,7 +645,7 @@ export default function MasterAdmin() {
   const handleToggleBuilder = async (id: number, newStatus: "active" | "inactive") => {
     if (isInvestor) { toast({ title: "Modo Visualização: ação desabilitada." }); return; }
     try {
-      const res = await fetch(`${BASE}/api/admin/builders/${id}`, {
+      const res = await fetch(`/v1/admin/builders/${id}`, {
         method: "PATCH", headers: authHeaders(token),
         body: JSON.stringify({ status: newStatus }),
       });
@@ -692,7 +660,7 @@ export default function MasterAdmin() {
   const handleSaveBuilderName = async (id: number) => {
     if (!editBuilderName.trim()) return;
     try {
-      const res = await fetch(`${BASE}/api/admin/builders/${id}`, {
+      const res = await fetch(`/v1/admin/builders/${id}`, {
         method: "PATCH", headers: authHeaders(token),
         body: JSON.stringify({ name: editBuilderName.trim() }),
       });
@@ -705,18 +673,8 @@ export default function MasterAdmin() {
     }
   };
 
-  const handleDeleteBuilder = async (id: number, name: string) => {
-    if (!confirm(`Excluir builder "${name}"? As clínicas vinculadas serão desvinculadas, mas não deletadas.`)) return;
-    try {
-      const res = await fetch(`${BASE}/api/admin/builders/${id}`, {
-        method: "DELETE", headers: authHeaders(token),
-      });
-      if (!res.ok) { toast({ title: "Erro ao excluir builder", variant: "destructive" }); return; }
-      setBuilders((prev) => prev.filter((b) => b.id !== id));
-      toast({ title: `Builder "${name}" excluído.` });
-    } catch {
-      toast({ title: "Erro de rede", variant: "destructive" });
-    }
+  const handleDeleteBuilder = (id: number, name: string) => {
+    setDeleteTarget({ type: "builder", id, name });
   };
 
   const handleAddClinicToBuilder = async (builderId: number) => {
@@ -724,13 +682,14 @@ export default function MasterAdmin() {
       toast({ title: "Preencha nome, e-mail e senha.", variant: "destructive" }); return;
     }
     try {
-      const res = await fetch(`${BASE}/api/admin/builders/${builderId}/clinics`, {
+      const res = await fetch(`/v1/admin/builders/${builderId}/clinics`, {
         method: "POST", headers: authHeaders(token),
         body: JSON.stringify({ clinic_name: newClinicName.trim(), admin_email: newClinicEmail.trim(), admin_password: newClinicPassword }),
       });
       if (!res.ok) {
-        const err = await res.json() as { error?: string };
-        toast({ title: err.error ?? "Erro ao criar clínica", variant: "destructive" }); return;
+        const err = await res.json() as { error?: string; detail?: unknown };
+        const msg = err.error ?? (typeof err.detail === "string" ? err.detail : Array.isArray(err.detail) ? (err.detail as Array<{ msg?: string }>).map((e) => e.msg).join("; ") : "Erro ao criar clínica");
+        toast({ title: msg, variant: "destructive" }); return;
       }
       setNewClinicName(""); setNewClinicEmail(""); setNewClinicPassword("");
       setAddingClinicToBuilderId(null);
@@ -744,7 +703,7 @@ export default function MasterAdmin() {
   const handleToggleBuilderClinic = async (clinicId: number, newStatus: "active" | "inactive") => {
     if (isInvestor) { toast({ title: "Modo Visualização: ação desabilitada." }); return; }
     try {
-      const res = await fetch(`${BASE}/api/admin/clinics/${clinicId}/status`, {
+      const res = await fetch(`/v1/admin/clinics/${clinicId}/status`, {
         method: "PATCH", headers: authHeaders(token),
         body: JSON.stringify({ status: newStatus }),
       });
@@ -758,17 +717,56 @@ export default function MasterAdmin() {
     }
   };
 
-  const handleDeleteBuilderClinic = async (clinicId: number, clinicName: string) => {
-    if (!confirm(`Excluir clínica "${clinicName}" e todos os seus dados permanentemente?`)) return;
+  const handleDeleteBuilderClinic = (clinicId: number, clinicName: string) => {
+    setDeleteTarget({ type: "clinic", id: clinicId, name: clinicName });
+  };
+
+  const handleLinkClinic = async (builderId: number) => {
+    if (!selectedLinkClinicId) return;
     try {
-      const res = await fetch(`${BASE}/api/admin/clinics/${clinicId}`, {
-        method: "DELETE", headers: authHeaders(token),
+      const res = await fetch(`/v1/admin/builders/${builderId}/link-clinic`, {
+        method: "POST", headers: authHeaders(token),
+        body: JSON.stringify({ clinic_id: selectedLinkClinicId }),
       });
-      if (!res.ok) { toast({ title: "Erro ao excluir clínica", variant: "destructive" }); return; }
-      setBuilders((prev) => prev.map((b) => ({ ...b, clinics: b.clinics.filter((c) => c.clinic_id !== clinicId) })));
-      toast({ title: `Clínica "${clinicName}" excluída.` });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({})) as { detail?: string };
+        toast({ title: err.detail ?? "Erro ao vincular clínica", variant: "destructive" });
+        return;
+      }
+      setSelectedLinkClinicId("");
+      setLinkingClinicToBuilderId(null);
+      await fetchBuilders();
+      await fetchClinics();
+      toast({ title: "Clínica vinculada com sucesso!" });
     } catch {
       toast({ title: "Erro de rede", variant: "destructive" });
+    }
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    const { type, id, name } = deleteTarget;
+    const url = type === "builder" ? `/v1/admin/builders/${id}` : `/v1/admin/clinics/${id}`;
+    try {
+      const res = await fetch(url, { method: "DELETE", headers: authHeaders(token) });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({})) as { detail?: string };
+        toast({ title: err.detail ?? `Erro ao excluir ${type === "builder" ? "builder" : "clínica"}`, variant: "destructive" });
+        return;
+      }
+      if (type === "builder") {
+        setBuilders((prev) => prev.filter((b) => b.id !== id));
+      } else {
+        setClinics((prev) => prev.filter((c) => c.clinic_id !== id));
+        setBuilders((prev) => prev.map((b) => ({ ...b, clinics: b.clinics.filter((c) => c.clinic_id !== id) })));
+      }
+      toast({ title: `${type === "builder" ? "Builder" : "Clínica"} "${name}" excluído(a).` });
+    } catch {
+      toast({ title: "Erro de rede", variant: "destructive" });
+    } finally {
+      setDeleting(false);
+      setDeleteTarget(null);
     }
   };
 
@@ -786,7 +784,7 @@ export default function MasterAdmin() {
 
   const handleToggle = async (id: number, newStatus: "active" | "inactive") => {
     try {
-      const res = await fetch(`${BASE}/api/admin/clinics/${id}/status`, {
+      const res = await fetch(`/v1/admin/clinics/${id}/status`, {
         method: "PATCH",
         headers: authHeaders(token),
         body: JSON.stringify({ status: newStatus }),
@@ -805,6 +803,10 @@ export default function MasterAdmin() {
     }
   };
 
+  const handleDeleteClinic = (id: number, name: string) => {
+    setDeleteTarget({ type: "clinic", id, name });
+  };
+
   const handleViewTraces = (id: number) => {
     setViewingClinicId(id);
     navigate("/traces");
@@ -821,7 +823,7 @@ export default function MasterAdmin() {
 
   const fetchLeads = async () => {
     try {
-      const res = await fetch(`${BASE}/api/admin/demo-leads`, { headers: authHeaders(token) });
+      const res = await fetch(`/v1/admin/demo-leads`, { headers: authHeaders(token) });
       if (!res.ok) return;
       setLeads(await res.json() as DemoLead[]);
       setLeadsLoaded(true);
@@ -830,16 +832,25 @@ export default function MasterAdmin() {
 
   const fetchStats = async () => {
     try {
-      const res = await fetch(`${BASE}/api/admin/stats`, { headers: authHeaders(token) });
+      const res = await fetch(`/v1/admin/stats`, { headers: authHeaders(token) });
       if (!res.ok) return;
-      setStats(await res.json() as AdminStats);
+      const raw = await res.json() as Record<string, unknown>;
+      setStats({
+        totalTraces: (raw.total_traces ?? raw.totalTraces ?? 0) as number,
+        totalTokens: (raw.total_tokens ?? raw.totalTokens ?? 0) as number,
+        openTickets: (raw.open_tickets ?? raw.openTickets ?? 0) as number,
+        activePilots: (raw.active_pilots ?? raw.activePilots ?? 0) as number,
+        activeBuilders: (raw.active_builders ?? raw.activeBuilders ?? 0) as number,
+        activeManagedClinics: (raw.active_managed_clinics ?? raw.activeManagedClinics ?? 0) as number,
+        estimatedMrr: (raw.estimated_mrr ?? raw.estimatedMrr ?? 0) as number,
+      });
       setStatsLoaded(true);
     } catch { /* silent */ }
   };
 
   const fetchDashboard = async () => {
     try {
-      const res = await fetch(`${BASE}/api/admin/dashboard`, { headers: authHeaders(token) });
+      const res = await fetch(`/v1/admin/dashboard`, { headers: authHeaders(token) });
       if (!res.ok) return;
       setDashboard(await res.json() as AdminDashboardData);
       setDashboardLoaded(true);
@@ -985,6 +996,7 @@ export default function MasterAdmin() {
   });
 
   return (
+    <>
     <div className="max-w-6xl mx-auto space-y-6">
       {/* Header */}
       <div className="flex items-center justify-between">
@@ -1160,11 +1172,27 @@ export default function MasterAdmin() {
                 <Input
                   value={newBuilderName}
                   onChange={(e) => setNewBuilderName(e.target.value)}
-                  placeholder="Nome do novo builder..."
-                  className="h-8 text-xs w-44"
+                  placeholder="Nome do builder..."
+                  className="h-8 text-xs w-36"
                   onKeyDown={(e) => { if (e.key === "Enter") void handleAddBuilder(); }}
                 />
-                <Button size="sm" className="h-8 gap-1.5 text-xs" onClick={() => void handleAddBuilder()} disabled={addingBuilder || !newBuilderName.trim()}>
+                <Input
+                  value={newBuilderEmail}
+                  onChange={(e) => setNewBuilderEmail(e.target.value)}
+                  placeholder="Email admin..."
+                  className="h-8 text-xs w-40"
+                  type="email"
+                  onKeyDown={(e) => { if (e.key === "Enter") void handleAddBuilder(); }}
+                />
+                <Input
+                  value={newBuilderPassword}
+                  onChange={(e) => setNewBuilderPassword(e.target.value)}
+                  placeholder="Senha (min 6)..."
+                  className="h-8 text-xs w-32"
+                  type="password"
+                  onKeyDown={(e) => { if (e.key === "Enter") void handleAddBuilder(); }}
+                />
+                <Button size="sm" className="h-8 gap-1.5 text-xs" onClick={() => void handleAddBuilder()} disabled={addingBuilder || !newBuilderName.trim() || !newBuilderEmail.trim() || !newBuilderPassword.trim()}>
                   {addingBuilder ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
                   Novo Builder
                 </Button>
@@ -1188,11 +1216,8 @@ export default function MasterAdmin() {
               const isAddingClinic = addingClinicToBuilderId === builder.id;
               const activeClinics = builder.clinics.filter((c) => c.status === "active").length;
               const totalClinicCount = builder.clinics.length;
-              const healthyClinics = builder.clinics.filter((c) => c.health_status === "healthy").length;
-              const criticalClinics = builder.clinics.filter((c) => c.health_status === "critical").length;
-              const healthyPct = totalClinicCount > 0 ? Math.round((healthyClinics / totalClinicCount) * 100) : 0;
-              const criticalPct = totalClinicCount > 0 ? Math.round((criticalClinics / totalClinicCount) * 100) : 0;
-              const builderTotalTraces = builder.clinics.reduce((sum, c) => sum + c.traceCount, 0);
+
+
               return (
                 <div key={builder.id} className={`rounded-lg border transition-all ${builder.status === "active" ? "border-border" : "border-dashed border-slate-700 opacity-60"}`}>
                   {/* Builder row header */}
@@ -1227,13 +1252,8 @@ export default function MasterAdmin() {
                       <span className="text-[11px] text-muted-foreground">
                         {builder.clinics.length} clínica{builder.clinics.length !== 1 ? "s" : ""} · {activeClinics} ativa{activeClinics !== 1 ? "s" : ""}
                       </span>
-                      {totalClinicCount > 0 && (
-                        <span className="flex items-center gap-1.5 text-[10px]">
-                          <span className="text-emerald-400">{healthyPct}% {t("admin_builder_healthy_pct")}</span>
-                          {criticalPct > 0 && <span className="text-rose-400">{criticalPct}% {t("admin_builder_critical_pct")}</span>}
-                          <span className="text-muted-foreground">{builderTotalTraces.toLocaleString()} {t("admin_traces_label")}</span>
-                        </span>
-                      )}
+
+
                       <StatusBadge status={builder.status} />
 
                       {isSuperAdmin && (
@@ -1275,13 +1295,22 @@ export default function MasterAdmin() {
                           Clínicas de {builder.name}
                         </p>
                         {isSuperAdmin && (
-                          <Button
-                            variant="outline" size="sm"
-                            className="h-7 text-xs gap-1.5"
-                            onClick={() => setAddingClinicToBuilderId(isAddingClinic ? null : builder.id)}
-                          >
-                            <Plus className="h-3.5 w-3.5" /> Nova Clínica
-                          </Button>
+                          <div className="flex items-center gap-2">
+                            <Button
+                              variant="outline" size="sm"
+                              className="h-7 text-xs gap-1.5"
+                              onClick={() => { setAddingClinicToBuilderId(isAddingClinic ? null : builder.id); setLinkingClinicToBuilderId(null); }}
+                            >
+                              <Plus className="h-3.5 w-3.5" /> Nova Clínica
+                            </Button>
+                            <Button
+                              variant="outline" size="sm"
+                              className="h-7 text-xs gap-1.5"
+                              onClick={() => { setLinkingClinicToBuilderId(linkingClinicToBuilderId === builder.id ? null : builder.id); setAddingClinicToBuilderId(null); setSelectedLinkClinicId(""); }}
+                            >
+                              <Building2 className="h-3.5 w-3.5" /> Vincular Existente
+                            </Button>
+                          </div>
                         )}
                       </div>
 
@@ -1303,6 +1332,37 @@ export default function MasterAdmin() {
                         </div>
                       )}
 
+                      {/* Link existing clinic form */}
+                      {linkingClinicToBuilderId === builder.id && (() => {
+                        const linkedIds = new Set(builders.flatMap((b) => b.clinics.map((c) => c.clinic_id)));
+                        const available = clinics.filter((c) => !linkedIds.has(c.clinic_id));
+                        return (
+                          <div className="rounded-md border border-dashed border-emerald-500/40 bg-emerald-500/5 p-3 space-y-2">
+                            <p className="text-[11px] font-medium text-emerald-400">Vincular clínica existente a {builder.name}</p>
+                            {available.length === 0 ? (
+                              <p className="text-xs text-muted-foreground">Nenhuma clínica disponível para vincular.</p>
+                            ) : (
+                              <div className="flex items-center gap-2">
+                                <select
+                                  value={selectedLinkClinicId}
+                                  onChange={(e) => setSelectedLinkClinicId(e.target.value)}
+                                  className="h-7 text-xs rounded-md border border-border bg-background px-2 flex-1"
+                                >
+                                  <option value="">Selecione uma clínica...</option>
+                                  {available.map((c) => (
+                                    <option key={c.clinic_id} value={String(c.clinic_id)}>{c.clinic_name} {c.slug ? `(/${c.slug})` : ""}</option>
+                                  ))}
+                                </select>
+                                <Button size="sm" className="h-7 text-xs gap-1.5" onClick={() => void handleLinkClinic(builder.id)} disabled={!selectedLinkClinicId}>
+                                  <Building2 className="h-3.5 w-3.5" /> Vincular
+                                </Button>
+                                <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={() => setLinkingClinicToBuilderId(null)}>Cancelar</Button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
+
                       {builder.clinics.length === 0 ? (
                         <p className="text-xs text-muted-foreground text-center py-3">Nenhuma clínica vinculada.</p>
                       ) : (
@@ -1312,9 +1372,8 @@ export default function MasterAdmin() {
                               <Building2 className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
                               <span className="font-medium flex-1 min-w-0 truncate">{c.clinic_name}</span>
                               {c.slug && <span className="text-muted-foreground font-mono text-[10px]">/{c.slug}</span>}
-                              <span className="flex items-center gap-1 text-muted-foreground">
-                                <Activity className="h-3 w-3" /> {c.traceCount}
-                              </span>
+
+
                               <StatusBadge status={c.status} />
                               {isSuperAdmin && (
                                 <div className="flex items-center gap-1 shrink-0">
@@ -1367,6 +1426,7 @@ export default function MasterAdmin() {
               token={token}
               onToggle={handleToggle}
               onViewTraces={handleViewTraces}
+              onDelete={isSuperAdmin ? handleDeleteClinic : undefined}
               isReadOnly={isInvestor}
             />
           ))}
@@ -1726,5 +1786,32 @@ export default function MasterAdmin() {
         </CardContent>
       </Card>
     </div>
+
+    <AlertDialog open={!!deleteTarget} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>
+            Excluir {deleteTarget?.type === "builder" ? "builder" : "clínica"} &quot;{deleteTarget?.name}&quot;?
+          </AlertDialogTitle>
+          <AlertDialogDescription>
+            {deleteTarget?.type === "builder"
+              ? "O builder, seu tenant e todos os usuários vinculados serão excluídos permanentemente. As clínicas gerenciadas serão desvinculadas, mas não deletadas."
+              : "A clínica e todos os seus dados (usuários, sessões, traces) serão excluídos permanentemente. Esta ação não pode ser desfeita."}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={deleting}>Cancelar</AlertDialogCancel>
+          <AlertDialogAction
+            onClick={(e) => { e.preventDefault(); void handleConfirmDelete(); }}
+            disabled={deleting}
+            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+          >
+            {deleting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+            Excluir
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+    </>
   );
 }

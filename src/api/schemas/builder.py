@@ -30,7 +30,7 @@ class BuilderProfileResponse(BaseModel):
 
 
 class BuilderClinicResponse(BaseModel):
-    """Clinic summary for builder panel."""
+    """Clinic summary for builder panel with embedded health fields."""
 
     id: UUID
     name: str
@@ -39,6 +39,13 @@ class BuilderClinicResponse(BaseModel):
     plan_type: str = "pilot"
     is_active: bool = True
     created_at: Optional[datetime] = None
+    # Health fields (enriched)
+    last_trace_at: Optional[datetime] = None
+    health_status: str = "critical"
+    trace_count_7d: int = 0
+    safety_flags_7d: int = 0
+    handoff_count_7d: int = 0
+    config_completeness: int = 0
 
 
 class CreateBuilderClinicRequest(BaseModel):
@@ -46,7 +53,7 @@ class CreateBuilderClinicRequest(BaseModel):
 
     clinic_name: str = Field(..., min_length=1, max_length=255)
     admin_email: EmailStr
-    admin_password: str = Field(..., min_length=8)
+    admin_password: str = Field(..., min_length=6)
 
 
 class ToggleClinicStatusRequest(BaseModel):
@@ -67,3 +74,36 @@ class BuilderStatsResponse(BaseModel):
     active_clinics: int = 0
     inactive_clinics: int = 0
     total_traces: int = 0
+    total_tokens: int = 0
+    model_breakdown: list[dict] = []
+
+
+# ============================================
+# Dashboard & Alerts
+# ============================================
+
+
+class BuilderAlertResponse(BaseModel):
+    """A single computed alert for a builder's clinic."""
+
+    type: str  # inactivity, deactivated, api_error
+    severity: str  # critical, warning, info
+    clinic_id: UUID
+    clinic_name: str
+    message: str
+    detected_at: Optional[datetime] = None
+
+
+class TraceTimeSeriesPoint(BaseModel):
+    """A single day in the traces time-series."""
+
+    date: str  # YYYY-MM-DD
+    count: int = 0
+
+
+class BuilderDashboardResponse(BaseModel):
+    """Combined dashboard response: stats + time-series + alerts."""
+
+    stats: BuilderStatsResponse
+    time_series: list[TraceTimeSeriesPoint] = []
+    alerts: list[BuilderAlertResponse] = []

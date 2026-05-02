@@ -115,6 +115,10 @@ OFFICIAL_INTENTS = [
     "pedido_alterar_medicacao",
     "reclamacao",
     "conduta_inadequada_ameaca",
+    "pedido_atendente_humano",
+    "paciente_ativo",
+    "fora_do_escopo",
+    "fora_do_horario",
 ]
 
 

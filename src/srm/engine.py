@@ -25,7 +25,7 @@ from src.srm.funnel_detector import FunnelDetector, get_funnel_detector
 from src.srm.safety_detector import SafetyDetector, get_safety_detector
 from src.srm.handoff_decider import HandoffDecider, get_handoff_decider
 from src.srm.rag_decider import RagDecider, get_rag_decider
-from src.srm.sentiment_classifier import get_sentiment_classifier
+from src.srm.models import SentimentLabel
 
 
 # ============================================
@@ -148,7 +148,6 @@ class SRMEngine:
             min_confidence=confidence_threshold,
         )
         self.rag_decider = get_rag_decider(confidence_threshold=confidence_threshold)
-        self.sentiment_classifier = get_sentiment_classifier()
 
     def process(self, input_data: SRMInput) -> SRMDecision:
         """
@@ -168,10 +167,7 @@ class SRMEngine:
         # Step 2: Detect safety concerns
         safety_result = self.safety_detector.detect(input_data.message)
 
-        # Step 3: Classify sentiment
-        sentiment_result = self.sentiment_classifier.classify(input_data.message)
-        
-        # Step 4: Detect funnel stage transition
+        # Step 3: Detect funnel stage transition
         funnel_result = self.funnel_detector.detect(
             current_stage=input_data.current_funnel_stage,
             intent=intent_result.intent,
@@ -181,7 +177,7 @@ class SRMEngine:
             flags=input_data.flags,
         )
 
-        # Step 5: Check for handoff requirement
+        # Step 4: Check for handoff requirement
         handoff_result = self.handoff_decider.decide(
             message=input_data.message,
             intent=intent_result.intent,
@@ -193,7 +189,7 @@ class SRMEngine:
             flags=input_data.flags,
         )
 
-        # Step 6: Decide on RAG
+        # Step 5: Decide on RAG
         rag_result = self.rag_decider.decide(
             message=input_data.message,
             intent=intent_result.intent,
@@ -203,7 +199,7 @@ class SRMEngine:
             flags=input_data.flags,
         )
 
-        # Step 7: Determine action
+        # Step 6: Determine action
         action = self._determine_action(
             intent=intent_result.intent,
             intent_category=intent_result.category,
@@ -211,29 +207,27 @@ class SRMEngine:
             handoff_result=handoff_result,
         )
 
-        # Step 8: Determine flow mode
+        # Step 7: Determine flow mode
         mode = self._determine_mode(
             safety_result=safety_result,
             handoff_result=handoff_result,
             rag_result=rag_result,
         )
 
-        # Step 9: Generate state patch
+        # Step 8: Generate state patch
         state_patch = self._generate_state_patch(
             intent_result=intent_result,
             funnel_result=funnel_result,
             safety_result=safety_result,
-            sentiment_result=sentiment_result,
             action=action,
         )
 
-        # Step 10: Generate reasoning
+        # Step 9: Generate reasoning
         reasoning = self._generate_reasoning(
             intent_result=intent_result,
             safety_result=safety_result,
             handoff_result=handoff_result,
             rag_result=rag_result,
-            sentiment_result=sentiment_result,
         )
         
         # Calculate processing time
@@ -245,21 +239,67 @@ class SRMEngine:
             if funnel_result.should_transition and funnel_result.next_stage
             else funnel_result.current_stage
         )
-        
+
+        # Escalation intents force STANDBY (100% human), safety_concern=True, handoff=True
+        _ESCALATION_INTENTS = {"reclamacao", "conduta_inadequada_ameaca", "pedido_atendente_humano"}
+        is_escalation = intent_result.intent in _ESCALATION_INTENTS
+        if is_escalation:
+            final_funnel_stage = FunnelStage.STANDBY
+            handoff_result.required = True
+            handoff_result.reason = HandoffReason.ESCALATION
+            handoff_result.urgency = "prioritario"
+            if not handoff_result.sector:
+                handoff_result.sector = "gerencia"
+            if not handoff_result.sla:
+                handoff_result.sla = "prioritario"
+            mode = FlowMode.HANDOFF
+
+        # Clinical-safety intents force safety_concern=True, handoff=True
+        _CLINICAL_SAFETY_INTENTS = {"pos_atendimento_sintomas_preocupantes", "pedido_alterar_medicacao"}
+        is_clinical_safety = intent_result.intent in _CLINICAL_SAFETY_INTENTS
+        if is_clinical_safety:
+            handoff_result.required = True
+            if not handoff_result.reason:
+                handoff_result.reason = HandoffReason.SAFETY_CONCERN
+            handoff_result.urgency = handoff_result.urgency or "alto"
+            if not handoff_result.sector:
+                handoff_result.sector = "clinico"
+            if not handoff_result.sla:
+                handoff_result.sla = "prioritario"
+            mode = FlowMode.SAFETY
+
+        # Safety concern: safety_detector OR escalation OR clinical-safety intent
+        safety_concern = (not safety_result.is_safe) or is_escalation or is_clinical_safety
+        safety_category = (
+            SafetyCategory.CONDUCT_RISK
+            if is_escalation and safety_result.is_safe
+            else SafetyCategory.CLINICAL_RISK
+            if is_clinical_safety and safety_result.is_safe
+            else safety_result.category
+        )
+
+        # Action details: include escalation_notice for escalation intents
+        action_details = self._get_action_details(action, intent_result.intent)
+        if is_escalation:
+            action_details = (
+                "escalation_notice: O paciente expressou insatisfação. "
+                "Priorize empatia, acolhimento e encaminhe para atendimento humano imediatamente."
+            )
+
         # Build decision
         decision = SRMDecision(
             intent=intent_result.intent,
             intent_category=intent_result.category,
             funnel_stage=final_funnel_stage,
-            funnel_transition=funnel_result.transition_reason if funnel_result.should_transition else None,
+            funnel_transition="Escalation: handoff to human" if is_escalation else (funnel_result.transition_reason if funnel_result.should_transition else None),
             action=action,
-            action_details=self._get_action_details(action, intent_result.intent),
+            action_details=action_details,
             confidence=intent_result.confidence,
-            safety_concern=not safety_result.is_safe,
-            safety_category=safety_result.category,
-            sentiment_label=sentiment_result.label,
-            sentiment_score=sentiment_result.score,
-            sentiment_confidence=sentiment_result.confidence,
+            safety_concern=safety_concern,
+            safety_category=safety_category,
+            sentiment_label=SentimentLabel.NEUTRAL,
+            sentiment_score=0.0,
+            sentiment_confidence=0.0,
             mode=mode,
             needs_rag=rag_result.needs_rag,
             handoff_required=handoff_result.required,
@@ -285,9 +325,11 @@ class SRMEngine:
         handoff_result,
     ) -> ActionType:
         """Determine the action based on intent and context (Action Catalog v0.1)."""
-        # Handoff required -> use handoff action (sector decided by handoff_decider later)
+        # Handoff required -> use intent-specific handoff if available, else fallback
         if handoff_result.required:
-            return ActionType.HANDOFF_ADMINISTRATIVO  # fallback; sector in Fase 2.2
+            if intent in INTENT_ACTIONS:
+                return INTENT_ACTIONS[intent]
+            return ActionType.HANDOFF_ADMINISTRATIVO
         
         # Safety concerns -> safety + handoff
         if not safety_result.is_safe:
@@ -327,7 +369,6 @@ class SRMEngine:
         intent_result,
         funnel_result,
         safety_result,
-        sentiment_result,
         action: ActionType,
     ) -> StatePatch:
         """Generate state changes to apply to session (UserState doc)."""
@@ -347,26 +388,33 @@ class SRMEngine:
             patch.flags["safety_triggered"] = True
             patch.flags[f"safety_{safety_result.category.value}"] = True
 
-        # Update sentiment signals
-        patch.sentiment_label = sentiment_result.label.value
-        patch.sentiment_score = sentiment_result.score
-        patch.sentiment_confidence = sentiment_result.confidence
-
         # Update slots and flags (incl. objection_active, authority_done)
         self._extract_slots(intent_result.intent, patch)
 
         return patch
 
     def _extract_slots(self, intent: str, patch: StatePatch) -> None:
-        """Extract slot updates based on intent (official 23 intents)."""
+        """Extract slot updates based on intent (official 29 intents)."""
         if intent in ("agendar", "interesse_tratamento", "pedido_preco"):
             patch.flags["scheduling_interest"] = True
+        if intent == "pedido_preco":
+            patch.constraints.append("C_SEQUENCE_AUTHORITY_BEFORE_PRICE")
         if intent == "confirmar_presenca":
             patch.flags["confirmation_pending"] = False
         if intent == "objecao_vou_pensar":
             patch.flags["objection_active"] = True
         if intent in ("documentos_e_comprovantes", "orcamento_existente", "cobranca_renegociacao"):
             patch.flags["handoff_requested"] = True
+        # Complaints and threats → escalation constraint + handoff flag
+        if intent in ("reclamacao", "conduta_inadequada_ameaca"):
+            patch.constraints.append("C_ESCALATE_TO_HUMAN")
+            patch.flags["handoff_requested"] = True
+            patch.flags["escalation_required"] = True
+        if intent == "pedido_atendente_humano":
+            patch.constraints.append("C_ESCALATE_TO_HUMAN")
+            patch.flags["handoff_requested"] = True
+        if intent == "pos_atendimento_sintomas_preocupantes":
+            patch.constraints.append("C_POST_PROCEDURE_SAFETY")
 
     def _get_action_details(self, action: ActionType, intent: str) -> str:
         """Get detailed description of the action (Action Catalog v0.1)."""
@@ -405,24 +453,23 @@ class SRMEngine:
         safety_result,
         handoff_result,
         rag_result,
-        sentiment_result,
     ) -> str:
         """Generate a brief reasoning explanation."""
         parts = []
-        
+
         # Intent reasoning
         parts.append(
             f"Detected intent '{intent_result.intent}' "
             f"({intent_result.category.value}) with {intent_result.confidence:.0%} confidence"
         )
-        
+
         # Safety reasoning
         if not safety_result.is_safe:
             parts.append(
                 f"Safety concern: {safety_result.category.value} "
                 f"(triggers: {', '.join(safety_result.triggers[:2])})"
             )
-        
+
         # Handoff reasoning
         if handoff_result.required:
             parts.append(f"Handoff required: {handoff_result.reason.value}")
@@ -430,12 +477,6 @@ class SRMEngine:
         # RAG reasoning
         if rag_result.needs_rag:
             parts.append(f"RAG needed: {rag_result.reason}")
-
-        # Sentiment reasoning
-        if sentiment_result.confidence > 0:
-            parts.append(
-                f"Sentiment: {sentiment_result.label.value} ({sentiment_result.confidence:.0%})"
-            )
 
         return ". ".join(parts)
 

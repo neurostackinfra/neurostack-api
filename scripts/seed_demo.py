@@ -24,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.config.settings import settings
+from src.models.builder import Builder
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.event import Event
 from src.models.session import Session
@@ -38,27 +39,22 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # ---------------------------------------------------------------------------
 TENANT_ID = UUID("d0000000-0000-0000-0000-000000000001")
 SESSION_ID = UUID("d0000000-0000-0000-0000-000000000010")
+BUILDER_ID = UUID("b0000000-0000-0000-0000-000000000001")
+BUILDER_TENANT_ID = UUID("b0000000-0000-0000-0000-000000000002")
+ADMIN_TENANT_ID = UUID("a0000000-0000-0000-0000-000000000001")
+INVESTOR_TENANT_ID = UUID("a0000000-0000-0000-0000-000000000002")
 DEMO_API_KEY = "ns_dev_demo_key"
 DEMO_TENANT_NAME = "Clinica Demo"
+BUILDER_TENANT_NAME = "Builder Demo Tenant"
 
 # ---------------------------------------------------------------------------
 # User definitions
 # ---------------------------------------------------------------------------
-USERS = [
+CLINIC_USERS = [
     {
         "email": "admin@demo.com",
         "password": "demo123",
         "role": UserRole.clinic_admin,
-    },
-    {
-        "email": "super@demo.com",
-        "password": "demo123",
-        "role": UserRole.super_admin,
-    },
-    {
-        "email": "investor@demo.com",
-        "password": "demo123",
-        "role": UserRole.investor,
     },
 ]
 
@@ -235,9 +231,9 @@ async def seed_tenant(session: AsyncSession) -> Tenant:
 
 
 async def seed_users(session: AsyncSession, tenant_id: UUID) -> list[User]:
-    """Create demo users if they do not exist."""
+    """Create clinic demo users if they do not exist."""
     created: list[User] = []
-    for user_def in USERS:
+    for user_def in CLINIC_USERS:
         result = await session.execute(
             select(User).where(User.email == user_def["email"])
         )
@@ -367,8 +363,149 @@ async def seed_events(
 
 
 # ---------------------------------------------------------------------------
+# Builder seed
+# ---------------------------------------------------------------------------
+
+
+async def seed_builder(session: AsyncSession) -> Builder:
+    """Create demo builder entity if it does not exist."""
+    result = await session.execute(
+        select(Builder).where(Builder.id == BUILDER_ID)
+    )
+    existing = result.scalars().first()
+    if existing:
+        print(f"  [skip] Builder already exists: {existing.name} ({existing.id})")
+        return existing
+
+    builder = Builder(
+        id=BUILDER_ID,
+        name="Demo Builder",
+        status="active",
+        is_active=True,
+    )
+    session.add(builder)
+    await session.flush()
+    print(f"  [created] Builder: {builder.name} ({builder.id})")
+    return builder
+
+
+async def seed_builder_tenant_and_user(session: AsyncSession, builder_id: UUID) -> None:
+    """Create builder's own tenant + user with role=builder."""
+    # Tenant for the builder user (needed for auth)
+    result = await session.execute(
+        select(Tenant).where(Tenant.id == BUILDER_TENANT_ID)
+    )
+    if not result.scalars().first():
+        builder_tenant = Tenant(
+            id=BUILDER_TENANT_ID,
+            name=BUILDER_TENANT_NAME,
+            slug="builder-demo",
+            api_key_hash=pwd_context.hash("ns_builder_key"),
+            is_active=True,
+            config={},
+        )
+        session.add(builder_tenant)
+        await session.flush()
+        print(f"  [created] Builder tenant: {builder_tenant.name} ({builder_tenant.id})")
+    else:
+        print(f"  [skip] Builder tenant already exists")
+
+    # Builder user
+    result = await session.execute(
+        select(User).where(User.email == "builder@demo.com")
+    )
+    if not result.scalars().first():
+        user = User(
+            id=uuid4(),
+            tenant_id=BUILDER_TENANT_ID,
+            email="builder@demo.com",
+            password_hash=pwd_context.hash("demo123"),
+            role=UserRole.builder,
+            builder_id=builder_id,
+            is_active=True,
+        )
+        session.add(user)
+        await session.flush()
+        print(f"  [created] Builder user: builder@demo.com (role=builder, builder_id={builder_id})")
+    else:
+        print(f"  [skip] Builder user already exists: builder@demo.com")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+
+async def seed_super_admin(session: AsyncSession) -> None:
+    """Create super_admin on its own tenant (independent of any clinic)."""
+    result = await session.execute(select(Tenant).where(Tenant.id == ADMIN_TENANT_ID))
+    if not result.scalars().first():
+        t = Tenant(
+            id=ADMIN_TENANT_ID,
+            name="NeuroStack Admin",
+            slug="neurostack-admin",
+            api_key_hash=pwd_context.hash("ns_admin_key"),
+            is_active=True,
+            plan_type="admin",
+            config={},
+        )
+        session.add(t)
+        await session.flush()
+        print(f"  [created] Admin tenant: {t.name} ({t.id})")
+    else:
+        print("  [skip] Admin tenant already exists")
+
+    result = await session.execute(select(User).where(User.email == "super@demo.com"))
+    if not result.scalars().first():
+        user = User(
+            id=uuid4(),
+            tenant_id=ADMIN_TENANT_ID,
+            email="super@demo.com",
+            password_hash=pwd_context.hash("demo123"),
+            role=UserRole.super_admin,
+            is_active=True,
+        )
+        session.add(user)
+        await session.flush()
+        print("  [created] User: super@demo.com (super_admin)")
+    else:
+        print("  [skip] User already exists: super@demo.com")
+
+
+async def seed_investor(session: AsyncSession) -> None:
+    """Create investor on its own tenant (independent of any clinic)."""
+    result = await session.execute(select(Tenant).where(Tenant.id == INVESTOR_TENANT_ID))
+    if not result.scalars().first():
+        t = Tenant(
+            id=INVESTOR_TENANT_ID,
+            name="Investor Portal",
+            slug="investor-portal",
+            api_key_hash=pwd_context.hash("ns_investor_key"),
+            is_active=True,
+            plan_type="admin",
+            config={},
+        )
+        session.add(t)
+        await session.flush()
+        print(f"  [created] Investor tenant: {t.name} ({t.id})")
+    else:
+        print("  [skip] Investor tenant already exists")
+
+    result = await session.execute(select(User).where(User.email == "investor@demo.com"))
+    if not result.scalars().first():
+        user = User(
+            id=uuid4(),
+            tenant_id=INVESTOR_TENANT_ID,
+            email="investor@demo.com",
+            password_hash=pwd_context.hash("demo123"),
+            role=UserRole.investor,
+            is_active=True,
+        )
+        session.add(user)
+        await session.flush()
+        print("  [created] User: investor@demo.com (investor)")
+    else:
+        print("  [skip] User already exists: investor@demo.com")
 
 
 async def main() -> None:
@@ -384,20 +521,32 @@ async def main() -> None:
 
     async with async_session() as session:
         async with session.begin():
-            print("[1/5] Tenant")
+            print("[1/9] Super Admin (tenant próprio)")
+            await seed_super_admin(session)
+
+            print("[2/9] Investor (tenant próprio)")
+            await seed_investor(session)
+
+            print("[3/9] Clinica Demo Tenant")
             tenant = await seed_tenant(session)
 
-            print("[2/5] Users")
+            print("[4/9] Clinic Users")
             await seed_users(session, tenant.id)
 
-            print("[3/5] Clinic Config")
+            print("[5/9] Clinic Config")
             await seed_clinic_config(session, tenant.id)
 
-            print("[4/5] Session")
+            print("[6/9] Session")
             demo_session = await seed_session(session, tenant.id)
 
-            print("[5/5] Events")
+            print("[7/9] Events")
             await seed_events(session, tenant.id, demo_session.id)
+
+            print("[8/9] Builder")
+            builder = await seed_builder(session)
+
+            print("[9/9] Builder User")
+            await seed_builder_tenant_and_user(session, builder.id)
 
     await engine.dispose()
 
@@ -405,9 +554,11 @@ async def main() -> None:
     print("=" * 60)
     print("Seed complete.")
     print(f"  API Key : {DEMO_API_KEY}")
-    print(f"  Tenant  : {DEMO_TENANT_NAME} ({TENANT_ID})")
-    print(f"  Users   : admin@demo.com / super@demo.com / investor@demo.com")
-    print(f"  Password: demo123")
+    print(f"  Clinic  : {DEMO_TENANT_NAME} ({TENANT_ID}) — admin@demo.com")
+    print(f"  Admin   : NeuroStack Admin ({ADMIN_TENANT_ID}) — super@demo.com")
+    print(f"  Investor: Investor Portal ({INVESTOR_TENANT_ID}) — investor@demo.com")
+    print(f"  Builder : builder@demo.com (role=builder)")
+    print(f"  Password: demo123 (all users)")
     print("=" * 60)
 
 

@@ -1,10 +1,11 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useLocation } from "wouter";
 import {
-  Wrench, Building2, Activity, Plus, CheckCircle2, XCircle,
-  Loader2, AlertTriangle, KeyRound, ToggleLeft, ToggleRight,
-  Sliders, Inbox,
+  Wrench, Building2, Activity, Plus, CheckCircle2, XCircle, Zap,
+  Loader2, AlertTriangle, AlertCircle, Info, KeyRound, ToggleLeft, ToggleRight,
+  Sliders, Inbox, ChevronDown, ChevronUp, TrendingUp, TrendingDown, ExternalLink,
 } from "lucide-react";
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { useAuth } from "@/context/auth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -13,26 +14,58 @@ import { Badge } from "@/components/ui/badge";
 import {
   Card, CardContent, CardDescription, CardHeader, CardTitle,
 } from "@/components/ui/card";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { Progress } from "@/components/ui/progress";
+import { Skeleton } from "@/components/ui/skeleton";
 import { useToast } from "@/hooks/use-toast";
 import { useI18n } from "@/context/i18n";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 interface BuilderClinic {
-  clinic_id: string;
-  clinic_name: string;
+  id: string;
+  name: string;
   slug: string | null;
   status: "active" | "inactive";
   plan_type: string;
-  trace_count: number;
-  apis_configured: boolean;
+  is_active: boolean;
+  created_at: string | null;
+  last_trace_at: string | null;
+  health_status: "healthy" | "warning" | "critical";
+  trace_count_7d: number;
+  safety_flags_7d: number;
+  handoff_count_7d: number;
+  config_completeness: number;
 }
 
 interface BuilderStats {
-  total_clinics: number;
+  clinic_count: number;
   active_clinics: number;
   inactive_clinics: number;
   total_traces: number;
+  total_tokens: number;
+  model_breakdown: { model: string; tokens: number }[];
+}
+
+interface BuilderAlert {
+  type: "inactivity" | "deactivated" | "api_error";
+  severity: "critical" | "warning" | "info";
+  clinic_id: string;
+  clinic_name: string;
+  message: string;
+  detected_at: string | null;
+}
+
+interface TraceTimeSeriesPoint {
+  date: string;
+  count: number;
+}
+
+interface DashboardData {
+  stats: BuilderStats;
+  time_series: TraceTimeSeriesPoint[];
+  alerts: BuilderAlert[];
 }
 
 interface BuilderProfile {
@@ -87,21 +120,68 @@ function PlanBadge({ plan }: { plan: string }) {
   );
 }
 
+// ── Health Dot ────────────────────────────────────────────────────────────────
+
+function HealthDot({ status }: { status: string }) {
+  const color =
+    status === "healthy" ? "bg-emerald-400" :
+    status === "warning" ? "bg-amber-400" :
+    "bg-red-400";
+  return <span className={`inline-block w-2 h-2 rounded-full ${color}`} />;
+}
+
+// ── Chart Tooltip ─────────────────────────────────────────────────────────────
+
+function ChartTooltip({ active, payload }: { active?: boolean; payload?: { value: number; payload: { date: string } }[] }) {
+  if (!active || !payload?.length) return null;
+  const d = payload[0];
+  const dateParts = d.payload.date.split("-");
+  const label = `${dateParts[2]}/${dateParts[1]}`;
+  return (
+    <div className="rounded-lg border border-border bg-popover px-3 py-2 text-xs shadow-lg">
+      <p className="text-foreground font-semibold">{label}: {d.value} traces</p>
+    </div>
+  );
+}
+
+// ── Trend helper ──────────────────────────────────────────────────────────────
+
+function computeTrend(timeSeries: TraceTimeSeriesPoint[]): { diff: number; direction: "up" | "down" | "flat" } {
+  if (timeSeries.length < 14) return { diff: 0, direction: "flat" };
+  const recent7 = timeSeries.slice(-7).reduce((s, p) => s + p.count, 0);
+  const prev7 = timeSeries.slice(-14, -7).reduce((s, p) => s + p.count, 0);
+  const diff = recent7 - prev7;
+  return { diff, direction: diff > 0 ? "up" : diff < 0 ? "down" : "flat" };
+}
+
+// ── Relative time ─────────────────────────────────────────────────────────────
+
+function relativeTime(dateStr: string | null, neverLabel: string, daysLabel: string): string {
+  if (!dateStr) return neverLabel;
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const days = Math.floor(diff / 86400000);
+  if (days < 1) return "< 1 dia";
+  return `${days} ${daysLabel}`;
+}
+
 // ── Builder Panel ─────────────────────────────────────────────────────────────
 
 export default function BuilderPanel() {
   const { t } = useI18n();
-  const { builderId, isBuilder, setViewingClinicId } = useAuth();
+  const { isBuilder, setViewingClinicId } = useAuth();
   const [, navigate] = useLocation();
   const token = useBuilderToken();
   const { toast } = useToast();
 
   // Data state
   const [profile, setProfile] = useState<BuilderProfile | null>(null);
-  const [stats, setStats] = useState<BuilderStats | null>(null);
+  const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [clinics, setClinics] = useState<BuilderClinic[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Tab state
+  const [activeTab, setActiveTab] = useState("overview");
 
   // Create clinic form state
   const [showCreateForm, setShowCreateForm] = useState(false);
@@ -111,34 +191,75 @@ export default function BuilderPanel() {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
-  // Fetch all data on mount
+  // Expandable clinic state
+  const [expandedClinicId, setExpandedClinicId] = useState<string | null>(null);
+
+  // Fetch all data on mount and when token changes
   useEffect(() => {
-    void fetchAll();
+    if (token) {
+      void fetchAll();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [token]);
 
   async function fetchAll() {
     setLoading(true);
     setError(null);
     try {
       const headers = authHeaders(token);
-      const [profileRes, statsRes, clinicsRes] = await Promise.all([
+      const [profileRes, dashboardRes, clinicsRes] = await Promise.all([
         fetch("/v1/builder/me", { headers }),
-        fetch("/v1/builder/stats", { headers }),
+        fetch("/v1/builder/dashboard", { headers }),
         fetch("/v1/builder/clinics", { headers }),
       ]);
-      if (profileRes.ok) setProfile(await profileRes.json() as BuilderProfile);
-      if (statsRes.ok) setStats(await statsRes.json() as BuilderStats);
-      if (clinicsRes.ok) setClinics(await clinicsRes.json() as BuilderClinic[]);
-      if (!profileRes.ok && !statsRes.ok && !clinicsRes.ok) {
-        setError("Erro ao carregar dados");
+
+      const errors: string[] = [];
+
+      if (profileRes.ok) {
+        setProfile(await profileRes.json() as BuilderProfile);
+      } else {
+        errors.push(`profile: ${profileRes.status}`);
       }
-    } catch {
+
+      if (dashboardRes.ok) {
+        setDashboard(await dashboardRes.json() as DashboardData);
+      } else {
+        errors.push(`dashboard: ${dashboardRes.status}`);
+      }
+
+      if (clinicsRes.ok) {
+        setClinics(await clinicsRes.json() as BuilderClinic[]);
+      } else {
+        errors.push(`clinics: ${clinicsRes.status}`);
+      }
+
+      if (errors.length > 0) {
+        console.warn("[Builder] Fetch errors:", errors);
+        if (errors.length === 3) {
+          setError("Erro ao carregar dados");
+        }
+      }
+    } catch (err) {
+      console.error("[Builder] fetchAll failed:", err);
       setError("Erro ao carregar dados");
     } finally {
       setLoading(false);
     }
   }
+
+  // Sort clinics: critical first, then warning, then healthy
+  const sortedClinics = useMemo(() => {
+    const order: Record<string, number> = { critical: 0, warning: 1, healthy: 2 };
+    return [...clinics].sort(
+      (a, b) => (order[a.health_status] ?? 2) - (order[b.health_status] ?? 2)
+    );
+  }, [clinics]);
+
+  // Trend calculation
+  const trend = useMemo(
+    () => computeTrend(dashboard?.time_series ?? []),
+    [dashboard]
+  );
 
   // Create clinic handler
   async function handleCreateClinic() {
@@ -158,9 +279,19 @@ export default function BuilderPanel() {
           admin_password: newPassword,
         }),
       });
-      const data = await res.json() as { ok?: boolean; error?: string; id?: string };
+      const data = await res.json() as { ok?: boolean; error?: string; detail?: unknown; id?: string };
       if (!res.ok) {
-        setCreateError(data.error ?? t("admin_create_err_generic"));
+        // Backend returns "detail" (FastAPI) or "error"
+        let msg = data.error ?? t("admin_create_err_generic");
+        if (data.detail) {
+          if (typeof data.detail === "string") {
+            msg = data.detail;
+          } else if (Array.isArray(data.detail)) {
+            // Pydantic validation errors
+            msg = (data.detail as Array<{ msg?: string }>).map((e) => e.msg).join("; ");
+          }
+        }
+        setCreateError(msg);
         return;
       }
       toast({ title: t("builder_create_success") });
@@ -178,38 +309,35 @@ export default function BuilderPanel() {
 
   // Toggle clinic status handler
   async function handleToggleStatus(clinicId: string, currentStatus: string) {
-    const newStatus = currentStatus === "active" ? "inactive" : "active";
-    // Optimistic update
+    const newActive = currentStatus !== "active";
     setClinics((prev) =>
       prev.map((c) =>
-        c.clinic_id === clinicId ? { ...c, status: newStatus as "active" | "inactive" } : c
+        c.id === clinicId ? { ...c, status: (newActive ? "active" : "inactive") as "active" | "inactive", is_active: newActive } : c
       )
     );
     try {
       const res = await fetch(`/v1/builder/clinics/${clinicId}/status`, {
         method: "PATCH",
         headers: authHeaders(token),
-        body: JSON.stringify({ status: newStatus }),
+        body: JSON.stringify({ is_active: newActive }),
       });
       if (!res.ok) {
-        // Revert optimistic update
         setClinics((prev) =>
           prev.map((c) =>
-            c.clinic_id === clinicId ? { ...c, status: currentStatus as "active" | "inactive" } : c
+            c.id === clinicId ? { ...c, status: currentStatus as "active" | "inactive", is_active: currentStatus === "active" } : c
           )
         );
         toast({ title: t("admin_toggle_err_title"), description: t("admin_toggle_err"), variant: "destructive" });
         return;
       }
       toast({
-        title: newStatus === "active" ? t("admin_toggle_ok_on") : t("admin_toggle_ok_off"),
+        title: newActive ? t("admin_toggle_ok_on") : t("admin_toggle_ok_off"),
         description: `ID ${clinicId}`,
       });
     } catch {
-      // Revert optimistic update
       setClinics((prev) =>
         prev.map((c) =>
-          c.clinic_id === clinicId ? { ...c, status: currentStatus as "active" | "inactive" } : c
+          c.id === clinicId ? { ...c, status: currentStatus as "active" | "inactive", is_active: currentStatus === "active" } : c
         )
       );
       toast({ title: t("admin_create_err_network"), variant: "destructive" });
@@ -222,6 +350,18 @@ export default function BuilderPanel() {
     navigate("/config");
   }
 
+  // Navigate to clinic panel (simulator)
+  function handleAccessClinicPanel(clinicTenantId: string) {
+    setViewingClinicId(clinicTenantId);
+    navigate("/");
+  }
+
+  // Navigate to clinic from alert
+  function handleAlertClick(clinicId: string) {
+    setActiveTab("clinics");
+    setExpandedClinicId(clinicId);
+  }
+
   // Guard: only builders
   if (!isBuilder) {
     return (
@@ -230,6 +370,8 @@ export default function BuilderPanel() {
       </div>
     );
   }
+
+  const stats = dashboard?.stats;
 
   return (
     <div className="max-w-6xl mx-auto space-y-6">
@@ -247,114 +389,6 @@ export default function BuilderPanel() {
         <StatusBadge status={profile?.status ?? "active"} />
       </div>
 
-      {/* Stats row — 4 cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <Card className="border-border">
-          <CardContent className="pt-4 pb-3">
-            <p className="text-[11px] text-muted-foreground">{t("builder_total_clinics")}</p>
-            <p className="text-2xl font-bold text-foreground">{stats?.total_clinics ?? 0}</p>
-          </CardContent>
-        </Card>
-        <Card className="border-border">
-          <CardContent className="pt-4 pb-3">
-            <p className="text-[11px] text-muted-foreground">{t("builder_active")}</p>
-            <p className="text-2xl font-bold text-emerald-400">{stats?.active_clinics ?? 0}</p>
-          </CardContent>
-        </Card>
-        <Card className="border-border">
-          <CardContent className="pt-4 pb-3">
-            <p className="text-[11px] text-muted-foreground">{t("builder_inactive")}</p>
-            <p className="text-2xl font-bold text-slate-400">{stats?.inactive_clinics ?? 0}</p>
-          </CardContent>
-        </Card>
-        <Card className="border-border bg-gradient-to-br from-indigo-950/20 to-transparent">
-          <CardContent className="pt-4 pb-3">
-            <div className="flex items-center gap-1.5 mb-1">
-              <Activity className="h-3.5 w-3.5 text-indigo-400" />
-              <p className="text-[11px] text-muted-foreground">{t("builder_total_traces")}</p>
-            </div>
-            <p className="text-2xl font-bold text-indigo-400">{stats?.total_traces?.toLocaleString("pt-BR") ?? 0}</p>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Create clinic section */}
-      <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold flex items-center gap-2">
-          <Building2 className="h-4 w-4 text-muted-foreground" />
-          {t("builder_total_clinics")}
-          <Badge variant="outline" className="text-[10px]">
-            {clinics.length}
-          </Badge>
-        </h2>
-        <Button
-          size="sm"
-          className="gap-2"
-          onClick={() => setShowCreateForm(!showCreateForm)}
-        >
-          <Plus className="h-4 w-4" /> {t("builder_new_clinic")}
-        </Button>
-      </div>
-
-      {/* Create clinic form */}
-      {showCreateForm && (
-        <Card className="border-dashed border-indigo-500/40 bg-indigo-500/5">
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm text-indigo-400">{t("builder_new_clinic")}</CardTitle>
-            <CardDescription className="text-xs">
-              {t("admin_create_desc")}
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <div className="space-y-1">
-                <Label className="text-xs">{t("admin_create_name_label")}</Label>
-                <Input
-                  value={newName}
-                  onChange={(e) => setNewName(e.target.value)}
-                  placeholder={t("admin_create_name_ph")}
-                  className="h-8 text-xs"
-                />
-              </div>
-              <div className="space-y-1">
-                <Label className="text-xs">{t("admin_create_email_label")}</Label>
-                <Input
-                  type="email"
-                  value={newEmail}
-                  onChange={(e) => setNewEmail(e.target.value)}
-                  placeholder={t("admin_create_email_ph")}
-                  className="h-8 text-xs"
-                />
-              </div>
-              <div className="space-y-1">
-                <Label className="text-xs">{t("admin_create_pass_label")}</Label>
-                <Input
-                  type="password"
-                  value={newPassword}
-                  onChange={(e) => setNewPassword(e.target.value)}
-                  placeholder="••••••••"
-                  className="h-8 text-xs"
-                />
-              </div>
-            </div>
-            {createError && (
-              <p className="text-sm text-destructive flex items-center gap-1.5">
-                <AlertTriangle className="h-3.5 w-3.5" /> {createError}
-              </p>
-            )}
-            <div className="flex gap-2">
-              <Button size="sm" className="gap-1.5" onClick={() => void handleCreateClinic()} disabled={creating}>
-                {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-                {t("admin_create_submit")}
-              </Button>
-              <Button size="sm" variant="outline" onClick={() => { setShowCreateForm(false); setCreateError(null); }}>
-                {t("admin_create_cancel")}
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
       {/* Loading state */}
       {loading && (
         <div className="flex items-center gap-2 text-muted-foreground py-8 justify-center">
@@ -369,90 +403,440 @@ export default function BuilderPanel() {
         </div>
       )}
 
-      {/* Empty state */}
-      {!loading && clinics.length === 0 && !error && (
-        <Card className="border-dashed">
-          <CardContent className="flex flex-col items-center justify-center py-12 text-center text-muted-foreground gap-3">
-            <Inbox className="h-10 w-10 opacity-25" />
-            <p className="text-sm font-medium">{t("builder_empty")}</p>
-            <Button
-              size="sm"
-              variant="outline"
-              className="gap-1.5"
-              onClick={() => setShowCreateForm(true)}
-            >
-              <Plus className="h-3.5 w-3.5" /> {t("builder_new_clinic")}
-            </Button>
-          </CardContent>
-        </Card>
+      {/* Partial load warning */}
+      {!loading && !error && !dashboard && (
+        <div className="flex items-center gap-2 text-amber-500 py-4">
+          <AlertCircle className="h-4 w-4" />
+          <span className="text-sm">Falha ao carregar dashboard. Tente sair e entrar novamente.</span>
+        </div>
       )}
 
-      {/* Clinic list */}
-      {!loading && clinics.length > 0 && (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {clinics.map((clinic) => (
-            <Card
-              key={clinic.clinic_id}
-              className={`border ${
-                clinic.status === "active"
-                  ? "border-border"
-                  : "border-dashed border-slate-700 opacity-60"
-              }`}
-            >
-              <CardHeader className="pb-2">
-                <div className="flex items-start justify-between gap-2">
-                  <div className="flex items-center gap-2 min-w-0">
-                    <Building2 className="h-4 w-4 text-muted-foreground shrink-0" />
-                    <div className="min-w-0">
-                      <CardTitle className="text-sm truncate">{clinic.clinic_name}</CardTitle>
-                      <CardDescription className="text-[10px]">
-                        ID {clinic.clinic_id} {clinic.slug ? `· /${clinic.slug}` : ""}
-                      </CardDescription>
-                    </div>
+      {/* Tabs */}
+      {!loading && !error && (
+        <Tabs value={activeTab} onValueChange={setActiveTab}>
+          <TabsList>
+            <TabsTrigger value="overview">{t("builder_tab_overview")}</TabsTrigger>
+            <TabsTrigger value="clinics">{t("builder_tab_clinics")}</TabsTrigger>
+          </TabsList>
+
+          {/* ══════════════════════════════════════════════════════════════════
+              VISAO GLOBAL TAB
+             ══════════════════════════════════════════════════════════════════ */}
+          <TabsContent value="overview" className="space-y-6 mt-4">
+            {/* KPI row — 4 cards with trend */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              <Card className="border-border">
+                <CardContent className="pt-4 pb-3">
+                  <p className="text-[11px] text-muted-foreground">{t("builder_total_clinics")}</p>
+                  <p className="text-2xl font-bold text-foreground">{stats?.clinic_count ?? 0}</p>
+                </CardContent>
+              </Card>
+              <Card className="border-border">
+                <CardContent className="pt-4 pb-3">
+                  <p className="text-[11px] text-muted-foreground">{t("builder_active")}</p>
+                  <p className="text-2xl font-bold text-emerald-400">{stats?.active_clinics ?? 0}</p>
+                </CardContent>
+              </Card>
+              <Card className="border-border">
+                <CardContent className="pt-4 pb-3">
+                  <p className="text-[11px] text-muted-foreground">{t("builder_inactive")}</p>
+                  <p className="text-2xl font-bold text-slate-400">{stats?.inactive_clinics ?? 0}</p>
+                </CardContent>
+              </Card>
+              <Card className="border-border bg-gradient-to-br from-indigo-950/20 to-transparent">
+                <CardContent className="pt-4 pb-3">
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <Activity className="h-3.5 w-3.5 text-indigo-400" />
+                    <p className="text-[11px] text-muted-foreground">{t("builder_total_traces")}</p>
                   </div>
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    <PlanBadge plan={clinic.plan_type} />
-                    <StatusBadge status={clinic.status} />
-                  </div>
-                </div>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                <div className="flex items-center gap-3 text-xs text-muted-foreground">
-                  <span className="flex items-center gap-1">
-                    <Activity className="h-3 w-3" />
-                    {clinic.trace_count} traces
-                  </span>
-                  <span className={`flex items-center gap-1 ml-auto ${clinic.apis_configured ? "text-emerald-400" : "text-slate-500"}`}>
-                    <KeyRound className="h-3 w-3" />
-                    {clinic.apis_configured ? "API ok" : "API --"}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2 pt-1">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 text-xs gap-1.5 flex-1"
-                    onClick={() => void handleToggleStatus(clinic.clinic_id, clinic.status)}
-                  >
-                    {clinic.status === "active" ? (
-                      <><ToggleRight className="h-3.5 w-3.5 text-emerald-400" /> {t("admin_toggle_deactivate")}</>
-                    ) : (
-                      <><ToggleLeft className="h-3.5 w-3.5" /> {t("admin_toggle_activate")}</>
+                  <div className="flex items-center gap-2">
+                    <p className="text-2xl font-bold text-indigo-400">
+                      {stats?.total_traces?.toLocaleString("pt-BR") ?? 0}
+                    </p>
+                    {trend.direction !== "flat" && (
+                      <span className={`flex items-center gap-0.5 text-[10px] ${trend.direction === "up" ? "text-emerald-400" : "text-red-400"}`}>
+                        {trend.direction === "up" ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
+                        {Math.abs(trend.diff)}
+                      </span>
                     )}
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 text-xs gap-1.5 flex-1"
-                    onClick={() => handleConfigureClinic(clinic.clinic_id)}
-                  >
-                    <Sliders className="h-3.5 w-3.5" /> {t("builder_configure")}
-                  </Button>
-                </div>
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+
+            {/* LLM Token Consumption */}
+            {(stats?.total_tokens ?? 0) > 0 && (
+              <Card className="border-border">
+                <CardHeader className="pb-2">
+                  <div className="flex items-center gap-2">
+                    <Zap className="h-4 w-4 text-amber-400" />
+                    <CardTitle className="text-sm">{t("builder_token_title")}</CardTitle>
+                  </div>
+                </CardHeader>
+                <CardContent>
+                  <p className="text-2xl font-bold text-foreground mb-3">
+                    {(stats?.total_tokens ?? 0).toLocaleString("pt-BR")} tokens
+                  </p>
+                  {stats?.model_breakdown && stats.model_breakdown.length > 0 && (
+                    <div className="space-y-2 pt-2 border-t border-border">
+                      {stats.model_breakdown.map(({ model, tokens: toks }) => {
+                        const maxToks = stats.model_breakdown[0]?.tokens ?? 1;
+                        const pct = (toks / maxToks) * 100;
+                        return (
+                          <div key={model} className="space-y-1">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-[11px] font-medium text-foreground truncate max-w-[200px]" title={model}>{model}</span>
+                              <span className="text-[11px] text-muted-foreground shrink-0 tabular-nums">{toks.toLocaleString("pt-BR")}</span>
+                            </div>
+                            <div className="h-1 w-full rounded-full bg-muted overflow-hidden">
+                              <div className="h-full bg-amber-400 rounded-full transition-all duration-500" style={{ width: `${pct}%` }} />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Traces chart */}
+            <Card className="border-border">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm">{t("builder_traces_chart_title")}</CardTitle>
+              </CardHeader>
+              <CardContent>
+                {dashboard?.time_series ? (
+                  <ResponsiveContainer width="100%" height={220}>
+                    <LineChart data={dashboard.time_series}>
+                      <XAxis
+                        dataKey="date"
+                        tickFormatter={(v: string) => { const p = v.split("-"); return `${p[2]}/${p[1]}`; }}
+                        stroke="#64748b"
+                        fontSize={10}
+                        tickLine={false}
+                        axisLine={false}
+                      />
+                      <YAxis stroke="#64748b" fontSize={10} tickLine={false} axisLine={false} width={30} />
+                      <Tooltip content={<ChartTooltip />} />
+                      <Line
+                        type="monotone"
+                        dataKey="count"
+                        stroke="#818cf8"
+                        strokeWidth={2}
+                        dot={false}
+                        activeDot={{ r: 4, fill: "#818cf8" }}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <Skeleton className="h-[220px] w-full" />
+                )}
               </CardContent>
             </Card>
-          ))}
-        </div>
+
+            {/* Alerts */}
+            <Card className="border-border">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm flex items-center gap-2">
+                  <AlertTriangle className="h-4 w-4 text-amber-400" />
+                  {t("builder_alerts_title")}
+                  {(dashboard?.alerts?.length ?? 0) > 0 && (
+                    <Badge variant="outline" className="text-[10px]">{dashboard?.alerts.length}</Badge>
+                  )}
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                {!dashboard?.alerts || dashboard.alerts.length === 0 ? (
+                  <div className="flex items-center gap-2 text-emerald-400 text-sm py-3">
+                    <CheckCircle2 className="h-4 w-4" /> {t("builder_alerts_empty")}
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {dashboard.alerts.map((alert, i) => (
+                      <button
+                        key={`${alert.clinic_id}-${alert.type}-${i}`}
+                        className="flex items-start gap-3 w-full text-left p-2.5 rounded-lg border border-border hover:bg-muted/50 transition-colors"
+                        onClick={() => handleAlertClick(alert.clinic_id)}
+                      >
+                        {alert.severity === "critical" ? (
+                          <AlertTriangle className="h-4 w-4 text-red-400 mt-0.5 shrink-0" />
+                        ) : alert.severity === "warning" ? (
+                          <AlertCircle className="h-4 w-4 text-amber-400 mt-0.5 shrink-0" />
+                        ) : (
+                          <Info className="h-4 w-4 text-blue-400 mt-0.5 shrink-0" />
+                        )}
+                        <div className="min-w-0">
+                          <p className="text-sm font-medium text-foreground">{alert.clinic_name}</p>
+                          <p className="text-xs text-muted-foreground">{alert.message}</p>
+                        </div>
+                        {alert.type === "api_error" && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-6 text-[10px] ml-auto shrink-0"
+                            onClick={(e) => { e.stopPropagation(); handleConfigureClinic(alert.clinic_id); }}
+                          >
+                            <Sliders className="h-3 w-3 mr-1" /> {t("builder_configure")}
+                          </Button>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Clinic health grid */}
+            {clinics.length > 0 && (
+              <Card className="border-border">
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm">{t("builder_health_grid_title")}</CardTitle>
+                  <CardDescription className="text-[10px]">{t("builder_health_legend")}</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                    {sortedClinics.map((clinic) => (
+                      <button
+                        key={clinic.id}
+                        className="flex items-center gap-2 p-2.5 rounded-lg border border-border hover:bg-muted/50 transition-colors text-left"
+                        onClick={() => { setActiveTab("clinics"); setExpandedClinicId(clinic.id); }}
+                      >
+                        <HealthDot status={clinic.health_status} />
+                        <div className="min-w-0">
+                          <p className="text-xs font-medium truncate">{clinic.name}</p>
+                          <p className="text-[10px] text-muted-foreground">
+                            {t("builder_last_trace")}: {relativeTime(clinic.last_trace_at, t("builder_never"), t("builder_days_ago"))}
+                          </p>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+          </TabsContent>
+
+          {/* ══════════════════════════════════════════════════════════════════
+              SUB-CONTAS TAB
+             ══════════════════════════════════════════════════════════════════ */}
+          <TabsContent value="clinics" className="space-y-4 mt-4">
+            {/* Create clinic section */}
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold flex items-center gap-2">
+                <Building2 className="h-4 w-4 text-muted-foreground" />
+                {t("builder_total_clinics")}
+                <Badge variant="outline" className="text-[10px]">
+                  {clinics.length}
+                </Badge>
+              </h2>
+              <Button
+                size="sm"
+                className="gap-2"
+                onClick={() => setShowCreateForm(!showCreateForm)}
+              >
+                <Plus className="h-4 w-4" /> {t("builder_new_clinic")}
+              </Button>
+            </div>
+
+            {/* Create clinic form */}
+            {showCreateForm && (
+              <Card className="border-dashed border-indigo-500/40 bg-indigo-500/5">
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm text-indigo-400">{t("builder_new_clinic")}</CardTitle>
+                  <CardDescription className="text-xs">
+                    {t("admin_create_desc")}
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div className="space-y-1">
+                      <Label className="text-xs">{t("admin_create_name_label")}</Label>
+                      <Input
+                        value={newName}
+                        onChange={(e) => setNewName(e.target.value)}
+                        placeholder={t("admin_create_name_ph")}
+                        className="h-8 text-xs"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label className="text-xs">{t("admin_create_email_label")}</Label>
+                      <Input
+                        type="email"
+                        value={newEmail}
+                        onChange={(e) => setNewEmail(e.target.value)}
+                        placeholder={t("admin_create_email_ph")}
+                        className="h-8 text-xs"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label className="text-xs">{t("admin_create_pass_label")}</Label>
+                      <Input
+                        type="password"
+                        value={newPassword}
+                        onChange={(e) => setNewPassword(e.target.value)}
+                        placeholder="••••••••"
+                        className="h-8 text-xs"
+                      />
+                    </div>
+                  </div>
+                  {createError && (
+                    <p className="text-sm text-destructive flex items-center gap-1.5">
+                      <AlertTriangle className="h-3.5 w-3.5" /> {createError}
+                    </p>
+                  )}
+                  <div className="flex gap-2">
+                    <Button size="sm" className="gap-1.5" onClick={() => void handleCreateClinic()} disabled={creating}>
+                      {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                      {t("admin_create_submit")}
+                    </Button>
+                    <Button size="sm" variant="outline" onClick={() => { setShowCreateForm(false); setCreateError(null); }}>
+                      {t("admin_create_cancel")}
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Empty state */}
+            {clinics.length === 0 && (
+              <Card className="border-dashed">
+                <CardContent className="flex flex-col items-center justify-center py-12 text-center text-muted-foreground gap-3">
+                  <Inbox className="h-10 w-10 opacity-25" />
+                  <p className="text-sm font-medium">{t("builder_empty")}</p>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="gap-1.5"
+                    onClick={() => setShowCreateForm(true)}
+                  >
+                    <Plus className="h-3.5 w-3.5" /> {t("builder_new_clinic")}
+                  </Button>
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Clinic list */}
+            {sortedClinics.length > 0 && (
+              <div className="space-y-3">
+                {sortedClinics.map((clinic) => (
+                  <Collapsible
+                    key={clinic.id}
+                    open={expandedClinicId === clinic.id}
+                    onOpenChange={(open) => setExpandedClinicId(open ? clinic.id : null)}
+                  >
+                    <Card
+                      className={`border ${
+                        clinic.status === "active"
+                          ? "border-border"
+                          : "border-dashed border-slate-700 opacity-60"
+                      }`}
+                    >
+                      <CardHeader className="pb-2">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <HealthDot status={clinic.health_status} />
+                            <div className="min-w-0">
+                              <CardTitle className="text-sm truncate">{clinic.name}</CardTitle>
+                              <CardDescription className="text-[10px]">
+                                {t("builder_last_trace")}: {relativeTime(clinic.last_trace_at, t("builder_never"), t("builder_days_ago"))}
+                              </CardDescription>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <PlanBadge plan={clinic.plan_type} />
+                            <StatusBadge status={clinic.status} />
+                            <CollapsibleTrigger asChild>
+                              <Button variant="ghost" size="sm" className="h-7 w-7 p-0">
+                                {expandedClinicId === clinic.id ? (
+                                  <ChevronUp className="h-4 w-4" />
+                                ) : (
+                                  <ChevronDown className="h-4 w-4" />
+                                )}
+                              </Button>
+                            </CollapsibleTrigger>
+                          </div>
+                        </div>
+                      </CardHeader>
+                      <CardContent className="space-y-3">
+                        <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                          <span className="flex items-center gap-1">
+                            <Activity className="h-3 w-3" />
+                            {clinic.trace_count_7d} traces (7d)
+                          </span>
+                          <span className={`flex items-center gap-1 ml-auto ${clinic.config_completeness > 0 ? "text-emerald-400" : "text-slate-500"}`}>
+                            <KeyRound className="h-3 w-3" />
+                            {clinic.config_completeness > 0 ? "API ok" : "API --"}
+                          </span>
+                        </div>
+
+                        {/* Expandable detail */}
+                        <CollapsibleContent className="space-y-3 pt-2 border-t border-border">
+                          {/* Mini stats row */}
+                          <div className="grid grid-cols-3 gap-2">
+                            <div className="text-center p-2 rounded-lg bg-muted/30">
+                              <p className="text-lg font-bold text-foreground">{clinic.trace_count_7d}</p>
+                              <p className="text-[10px] text-muted-foreground">{t("builder_traces_7d")}</p>
+                            </div>
+                            <div className="text-center p-2 rounded-lg bg-muted/30">
+                              <p className="text-lg font-bold text-amber-400">{clinic.safety_flags_7d}</p>
+                              <p className="text-[10px] text-muted-foreground">{t("builder_safety_7d")}</p>
+                            </div>
+                            <div className="text-center p-2 rounded-lg bg-muted/30">
+                              <p className="text-lg font-bold text-blue-400">{clinic.handoff_count_7d}</p>
+                              <p className="text-[10px] text-muted-foreground">{t("builder_handoffs_7d")}</p>
+                            </div>
+                          </div>
+
+                          {/* Config completeness */}
+                          <div className="space-y-1">
+                            <div className="flex items-center justify-between text-xs">
+                              <span className="text-muted-foreground">{t("builder_config_completeness")}</span>
+                              <span className="font-medium">{clinic.config_completeness}%</span>
+                            </div>
+                            <Progress value={clinic.config_completeness} className="h-2" />
+                          </div>
+                        </CollapsibleContent>
+
+                        {/* Actions */}
+                        <div className="flex items-center gap-2 pt-1">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 text-xs gap-1.5 flex-1"
+                            onClick={() => void handleToggleStatus(clinic.id, clinic.status)}
+                          >
+                            {clinic.status === "active" ? (
+                              <><ToggleRight className="h-3.5 w-3.5 text-emerald-400" /> {t("admin_toggle_deactivate")}</>
+                            ) : (
+                              <><ToggleLeft className="h-3.5 w-3.5" /> {t("admin_toggle_activate")}</>
+                            )}
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 text-xs gap-1.5 flex-1"
+                            onClick={() => handleAccessClinicPanel(clinic.id)}
+                          >
+                            <ExternalLink className="h-3.5 w-3.5" /> Acessar Painel
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 text-xs gap-1.5 flex-1"
+                            onClick={() => handleConfigureClinic(clinic.id)}
+                          >
+                            <Sliders className="h-3.5 w-3.5" /> {t("builder_configure")}
+                          </Button>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  </Collapsible>
+                ))}
+              </div>
+            )}
+          </TabsContent>
+        </Tabs>
       )}
     </div>
   );

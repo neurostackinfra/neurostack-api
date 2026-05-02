@@ -5,14 +5,18 @@ CRUD clinic configuration for the admin panel.
 
 import logging
 from typing import Any, Optional
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+import jwt
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.middleware.auth import TenantContext, get_tenant_context
+from src.api.middleware.auth import TenantContext, get_tenant_context, require_builder_clinic_access
 from src.api.schemas.config import ConfigPatchRequest, ConfigResponse
+from src.config.settings import settings
 from src.models.clinic_config_table import ClinicConfigTable
+from src.models.tenant import Tenant
 from src.repositories import get_db_session_dependency
 from src.services.config_service import (
     ALL_BUCKETS,
@@ -24,6 +28,52 @@ from src.services.config_service import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _extract_builder_id(request: Request) -> UUID:
+    """Extract builder_id from the JWT Authorization header."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=403, detail="Missing authorization")
+    token = auth_header[7:]
+    try:
+        payload = jwt.decode(
+            token,
+            settings.secret_key,
+            algorithms=["HS256"],
+            options={"require": ["sub", "tenant_id", "exp"]},
+        )
+        builder_id_str = payload.get("builder_id")
+    except (jwt.InvalidTokenError, KeyError, ValueError):
+        raise HTTPException(status_code=403, detail="Invalid token")
+    if not builder_id_str:
+        raise HTTPException(status_code=403, detail="No builder_id in token")
+    return UUID(builder_id_str)
+
+
+async def _resolve_config_tenant(
+    request: Request,
+    tenant: TenantContext,
+    session: AsyncSession,
+) -> TenantContext:
+    """If builder passes ?tenant_id= or ?clinic_id=, validate ownership and override."""
+    override = request.query_params.get("tenant_id") or request.query_params.get("clinic_id")
+    if not override or override == str(tenant.tenant_id):
+        return tenant
+    if tenant.role != "builder":
+        raise HTTPException(status_code=403, detail="Only builders can override tenant_id")
+    try:
+        target_id = UUID(override)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid tenant_id")
+    builder_id = _extract_builder_id(request)
+    await require_builder_clinic_access(target_id, builder_id, session)
+    # Return a new context pointing to the target clinic
+    return TenantContext(
+        tenant_id=target_id,
+        role=tenant.role,
+        user_id=tenant.user_id,
+    )
 
 
 async def _get_or_create_config(
@@ -68,10 +118,12 @@ async def _get_or_create_config(
     tags=["Config"],
 )
 async def get_config(
+    request: Request,
     tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> ConfigResponse:
     """Return the full flat config for the authenticated tenant."""
+    tenant = await _resolve_config_tenant(request, tenant, session)
     row = await _get_or_create_config(session, tenant)
     flat = flatten_config(row)
     return ConfigResponse(**flat)
@@ -88,11 +140,13 @@ async def get_config(
     tags=["Config"],
 )
 async def patch_config(
+    request: Request,
     body: ConfigPatchRequest,
     tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> ConfigResponse:
     """Apply a partial update and return the full flat config."""
+    tenant = await _resolve_config_tenant(request, tenant, session)
     row = await _get_or_create_config(session, tenant)
 
     # Group incoming fields by bucket
@@ -161,17 +215,19 @@ def _build_credential_status(creds: dict[str, Any]) -> dict[str, Any]:
 
 
 def _is_configured(creds: dict[str, Any]) -> bool:
-    """Check if at least WhatsApp provider credentials are fully set."""
+    """Check if WhatsApp OR LLM provider credentials are fully set."""
+    whatsapp_ok = False
     provider = creds.get("whatsapp_provider", "zapi")
     if provider == "zapi":
-        return bool(creds.get("zapi_instance_id") and creds.get("zapi_token"))
+        whatsapp_ok = bool(creds.get("zapi_instance_id") and creds.get("zapi_token"))
     else:
-        return bool(
+        whatsapp_ok = bool(
             creds.get("evolution_api_url")
             and creds.get("evolution_instance_name")
             and creds.get("evolution_api_key")
         )
-
+    llm_ok = bool(creds.get("llm_api_key") and creds.get("llm_api_url"))
+    return whatsapp_ok or llm_ok
 
 @router.get(
     "/api-credentials",
@@ -179,10 +235,12 @@ def _is_configured(creds: dict[str, Any]) -> bool:
     description="Return credential configuration status with masked secrets.",
 )
 async def get_api_credentials(
+    request: Request,
     clinic_id: Optional[str] = Query(None),
     tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
 ):
+    tenant = await _resolve_config_tenant(request, tenant, session)
     row = await _get_or_create_config(session, tenant)
     creds = row.api_credentials or {}
     return _build_credential_status(creds)
@@ -194,10 +252,12 @@ async def get_api_credentials(
     description="Save WhatsApp and LLM provider credentials. Empty secret fields preserve existing values.",
 )
 async def patch_api_credentials(
+    request: Request,
     body: dict[str, Any],
     tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
 ):
+    tenant = await _resolve_config_tenant(request, tenant, session)
     row = await _get_or_create_config(session, tenant)
     creds = dict(row.api_credentials or {})
 
