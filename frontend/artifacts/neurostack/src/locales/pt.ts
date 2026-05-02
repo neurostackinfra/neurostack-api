@@ -306,4 +306,51 @@ export const pt: Record<TranslationKey, string> = {
   builder_configure: "Configurar",
   builder_empty: "Nenhuma clinica cadastrada",
   builder_create_success: "Clinica criada com sucesso",
+  builder_tab_overview: "Visao Global",
+  builder_tab_clinics: "Sub-Contas",
+  builder_alerts_title: "Alertas",
+  builder_alerts_empty: "Nenhum alerta — tudo funcionando",
+  builder_health_grid_title: "Saude das Clinicas",
+  builder_health_legend: "Verde = ativo, Amarelo = sem traces 3-7 dias, Vermelho = sem traces 7+ dias",
+  builder_last_trace: "Ultimo trace",
+  builder_days_ago: "dias atras",
+  builder_never: "nunca",
+  builder_traces_7d: "Traces (7d)",
+  builder_safety_7d: "Alertas seguranca (7d)",
+  builder_handoffs_7d: "Handoffs (7d)",
+  builder_config_completeness: "Config completa",
+  builder_traces_chart_title: "Traces — Ultimos 30 dias",
+  builder_alert_inactivity: "Sem traces ha mais de 7 dias",
+  builder_alert_deactivated: "Clinica desativada",
+  builder_alert_api_error: "Integracao de API nao configurada",
+  builder_trend_up: "subiu",
+  builder_trend_down: "caiu",
+
+  // ── Admin Health ──
+  admin_health_dot_healthy: "Saudável",
+  admin_health_dot_warning: "Atenção",
+  admin_health_dot_critical: "Crítico",
+  admin_health_last_trace: "Último trace",
+  admin_health_days_ago: "dias atrás",
+  admin_health_never: "nunca",
+  admin_health_config_completeness: "Config completa",
+
+  // ── Admin Alerts ──
+  admin_alerts_title: "Alertas da Plataforma",
+  admin_alerts_empty: "Sem alertas — todos os sistemas operacionais",
+
+  // ── Admin Charts ──
+  admin_chart_traces_title: "Traces — Últimos 30 dias",
+  admin_chart_trend_up: "acima",
+  admin_chart_trend_down: "abaixo",
+
+  // ── Admin Builder Health ──
+  admin_builder_health: "Saúde",
+  admin_builder_healthy_pct: "saudáveis",
+  admin_builder_critical_pct: "críticas",
+
+  // ── Admin Filters ──
+  admin_filter_severity: "Severidade",
+  admin_filter_builder: "Builder",
+  admin_filter_all: "Todos",
 };
