@@ -491,7 +491,10 @@ def require_builder(request: Request) -> UUID:
     if not builder_id_str or tenant.role != "builder":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Builder profile not found. Contact admin to enable builder access.",
+            detail={
+                "detail": "Builder profile not found. Contact admin to enable builder access.",
+                "error_code": "BUILDER_NOT_CONFIGURED",
+            },
         )
 
     return UUID(builder_id_str)

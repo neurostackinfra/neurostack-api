@@ -7,13 +7,14 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, DateTime, String, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import Base, TimestampMixin
 
 if TYPE_CHECKING:
+    from src.models.builder import Builder
     from src.models.session import Session
     from src.models.event import Event
     from src.models.policy import Policy
@@ -145,6 +146,22 @@ class Tenant(Base, TimestampMixin):
         index=True,
     )
 
+    # Builder FK (nullable — standalone clinics have no builder)
+    builder_id: Mapped[Optional[UUID]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("builders.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # Plan type: pilot, demo, admin
+    plan_type: Mapped[str] = mapped_column(
+        String(20),
+        default="pilot",
+        server_default="pilot",
+        nullable=False,
+    )
+
     # Configuration (JSONB)
     config: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
@@ -182,6 +199,11 @@ class Tenant(Base, TimestampMixin):
         back_populates="tenant",
         lazy="dynamic",
         cascade="all, delete-orphan",
+    )
+    builder: Mapped[Optional["Builder"]] = relationship(
+        "Builder",
+        back_populates="tenants",
+        lazy="select",
     )
     clinic_config_row: Mapped[Optional["ClinicConfigTable"]] = relationship(
         "ClinicConfigTable",

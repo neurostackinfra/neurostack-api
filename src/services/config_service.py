@@ -62,6 +62,17 @@ FIELD_TO_BUCKET: dict[str, str] = {
     # top-level array buckets (field name == bucket name)
     "professionals": "professionals",
     "services": "services",
+    # api_credentials
+    "whatsapp_provider": "api_credentials",
+    "zapi_instance_id": "api_credentials",
+    "zapi_token": "api_credentials",
+    "evolution_api_url": "api_credentials",
+    "evolution_instance_name": "api_credentials",
+    "evolution_api_key": "api_credentials",
+    "llm_api_key": "api_credentials",
+    "llm_api_url": "api_credentials",
+    "llm_provider": "api_credentials",
+    "llm_model_name": "api_credentials",
 }
 
 # All JSONB bucket column names on ClinicConfigTable
@@ -77,6 +88,7 @@ ALL_BUCKETS = [
     "lgpd",
     "professionals",
     "services",
+    "api_credentials",
 ]
 
 # Buckets that are stored as arrays (not dicts)

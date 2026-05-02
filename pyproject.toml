@@ -32,6 +32,7 @@ opentelemetry-instrumentation-redis = "^0.43b0"
 opentelemetry-instrumentation-sqlalchemy = "^0.43b0"
 prometheus-client = "^0.19.0"
 qdrant-client = "^1.7.0"
+aiosmtplib = "^3.0.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"

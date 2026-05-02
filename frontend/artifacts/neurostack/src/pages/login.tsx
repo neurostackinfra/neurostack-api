@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useLocation } from "wouter";
 import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
 import { Lock, Mail, Globe } from "lucide-react";
@@ -14,8 +15,9 @@ export default function Login() {
   const [hasError, setHasError] = useState(false);
   const [isPending, setIsPending] = useState(false);
 
-  const { login } = useAuth();
+  const { login, role } = useAuth();
   const { t, locale, setLocale } = useI18n();
+  const [, navigate] = useLocation();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -24,6 +26,20 @@ export default function Login() {
 
     try {
       await login(email, password);
+      // Post-login redirect for builder role
+      // We need to read from localStorage since state may not have updated yet
+      try {
+        const raw = localStorage.getItem("ns_auth");
+        if (raw) {
+          const parsed = JSON.parse(raw) as { role?: string };
+          if (parsed.role === "builder") {
+            navigate("/builder");
+            return;
+          }
+        }
+      } catch {
+        // ignore parse error, default routing will apply
+      }
     } catch {
       setHasError(true);
     } finally {

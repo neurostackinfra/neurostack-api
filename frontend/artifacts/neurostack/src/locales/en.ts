@@ -293,6 +293,17 @@ export const en = {
   config_service_price: "Price",
   config_service_authority: "Authority Differentials",
   config_service_authority_hint: "Injected with the description to reinforce trust. e.g. 'Only clinic with X technology in the city.'",
+
+  // ── Builder Panel ────────────────────────────────────────────────────────
+  builder_panel_title: "Builder Panel",
+  builder_total_clinics: "Total Clinics",
+  builder_active: "Active",
+  builder_inactive: "Inactive",
+  builder_total_traces: "Total Traces",
+  builder_new_clinic: "New Clinic",
+  builder_configure: "Configure",
+  builder_empty: "No clinics registered",
+  builder_create_success: "Clinic created successfully",
 } as const;
 
 export type TranslationKey = keyof typeof en;

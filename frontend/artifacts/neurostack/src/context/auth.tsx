@@ -15,6 +15,7 @@ interface JwtPayload {
   tenant_id?: string;
   clinic_id?: string;
   user_id?: string;
+  builder_id?: string;
   role?: string;
   exp?: number;
 }
@@ -25,6 +26,7 @@ interface AuthState {
   clinicId: string | null;
   tenantId: string | null;
   userId: string | null;
+  builderId: string | null;
   role: string | null;
   viewingClinicId: string | null;
   leadSubmitted: boolean;
@@ -44,9 +46,11 @@ interface AuthContextValue {
   clinicId: string;
   tenantId: string;
   userId: string;
+  builderId: string | null;
   role: string;
   isSuperAdmin: boolean;
   isInvestor: boolean;
+  isBuilder: boolean;
   isReadOnly: boolean;
   leadSubmitted: boolean;
   viewingClinicId: string;
@@ -62,7 +66,7 @@ const LS_KEY = "ns_auth";
 function loadAuth(): AuthState {
   try {
     const raw = localStorage.getItem(LS_KEY);
-    if (!raw) return { token: null, email: null, clinicId: null, tenantId: null, userId: null, role: null, viewingClinicId: null, leadSubmitted: false };
+    if (!raw) return { token: null, email: null, clinicId: null, tenantId: null, userId: null, builderId: null, role: null, viewingClinicId: null, leadSubmitted: false };
     const parsed = JSON.parse(raw) as AuthState;
     // Check token expiration
     if (parsed.token) {
@@ -70,17 +74,17 @@ function loadAuth(): AuthState {
         const decoded = jwtDecode<JwtPayload>(parsed.token);
         if (decoded.exp && decoded.exp * 1000 < Date.now()) {
           localStorage.removeItem(LS_KEY);
-          return { token: null, email: null, clinicId: null, tenantId: null, userId: null, role: null, viewingClinicId: null, leadSubmitted: false };
+          return { token: null, email: null, clinicId: null, tenantId: null, userId: null, builderId: null, role: null, viewingClinicId: null, leadSubmitted: false };
         }
       } catch {
         // If token can't be decoded, clear it
         localStorage.removeItem(LS_KEY);
-        return { token: null, email: null, clinicId: null, tenantId: null, userId: null, role: null, viewingClinicId: null, leadSubmitted: false };
+        return { token: null, email: null, clinicId: null, tenantId: null, userId: null, builderId: null, role: null, viewingClinicId: null, leadSubmitted: false };
       }
     }
     return { ...parsed, leadSubmitted: parsed.leadSubmitted ?? false };
   } catch {
-    return { token: null, email: null, clinicId: null, tenantId: null, userId: null, role: null, viewingClinicId: null, leadSubmitted: false };
+    return { token: null, email: null, clinicId: null, tenantId: null, userId: null, builderId: null, role: null, viewingClinicId: null, leadSubmitted: false };
   }
 }
 
@@ -111,10 +115,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // Decode JWT to extract additional fields
     let tenantId: string | null = null;
     let userId: string | null = null;
+    let builderId: string | null = null;
     try {
       const decoded = jwtDecode<JwtPayload>(token);
       tenantId = decoded.tenant_id ?? null;
       userId = decoded.user_id ?? decoded.sub ?? null;
+      builderId = decoded.builder_id ?? null;
       if (!email && decoded.email) email = decoded.email;
       if (!role && decoded.role) role = decoded.role;
       if (!clinicId && decoded.clinic_id) clinicId = decoded.clinic_id;
@@ -128,6 +134,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       clinicId,
       tenantId,
       userId,
+      builderId,
       role,
       viewingClinicId: clinicId,
       leadSubmitted: false,
@@ -159,7 +166,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = useCallback(() => {
     localStorage.removeItem(LS_KEY);
-    setState({ token: null, email: null, clinicId: null, tenantId: null, userId: null, role: null, viewingClinicId: null, leadSubmitted: false });
+    setState({ token: null, email: null, clinicId: null, tenantId: null, userId: null, builderId: null, role: null, viewingClinicId: null, leadSubmitted: false });
   }, []);
 
   const setViewingClinicId = useCallback((id: string) => {
@@ -181,6 +188,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const role         = state.role ?? "clinic_admin";
   const isSuperAdmin = role === "super_admin";
   const isInvestor   = role === "investor";
+  const isBuilder    = role === "builder";
+  const builderId    = state.builderId ?? null;
   const clinicId     = state.clinicId ?? "";
   const tenantId     = state.tenantId ?? "";
   const userId       = state.userId ?? "";
@@ -194,9 +203,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         clinicId,
         tenantId,
         userId,
+        builderId,
         role,
         isSuperAdmin,
         isInvestor,
+        isBuilder,
         isReadOnly: isInvestor,
         leadSubmitted: state.leadSubmitted,
         viewingClinicId,

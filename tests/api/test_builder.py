@@ -160,7 +160,12 @@ class TestBuilderAuthEnforcement:
         response = client.get("/v1/builder/clinics", headers=clinic_admin_headers)
         assert response.status_code == 403
         data = response.json()
-        assert "Builder profile not found" in data.get("detail", "")
+        detail = data.get("detail", {})
+        if isinstance(detail, dict):
+            assert "BUILDER_NOT_CONFIGURED" == detail.get("error_code")
+            assert "Builder profile not found" in detail.get("detail", "")
+        else:
+            assert "Builder profile not found" in str(detail)
 
     def test_create_clinic_returns_403_for_non_builder(self, client: TestClient, clinic_admin_headers):
         response = client.post(
@@ -198,6 +203,20 @@ class TestBuilderListClinics:
         assert isinstance(response.json(), list)
 
 
+class TestBuilderProfile:
+    """Test GET /v1/builder/me."""
+
+    def test_returns_profile_or_404(self, client: TestClient, builder_a_headers):
+        """Builder profile returns 404 when builder doesn't exist in DB (expected for test)."""
+        response = client.get("/v1/builder/me", headers=builder_a_headers)
+        # Without a real builder in DB, we expect 404; validates endpoint is reachable and auth works
+        assert response.status_code in (200, 404)
+
+    def test_returns_403_for_non_builder(self, client: TestClient, clinic_admin_headers):
+        response = client.get("/v1/builder/me", headers=clinic_admin_headers)
+        assert response.status_code == 403
+
+
 class TestBuilderCreateClinic:
     """Test POST /v1/builder/clinics."""
 
@@ -215,6 +234,42 @@ class TestBuilderCreateClinic:
         data = response.json()
         assert data["ok"] is True
         assert "id" in data
+
+    def test_rejects_empty_name(self, client: TestClient, builder_a_headers):
+        response = client.post(
+            "/v1/builder/clinics",
+            headers=builder_a_headers,
+            json={
+                "clinic_name": "",
+                "admin_email": "test@test.com",
+                "admin_password": "12345678",
+            },
+        )
+        assert response.status_code == 422
+
+    def test_rejects_invalid_email(self, client: TestClient, builder_a_headers):
+        response = client.post(
+            "/v1/builder/clinics",
+            headers=builder_a_headers,
+            json={
+                "clinic_name": "Test Clinic",
+                "admin_email": "not-an-email",
+                "admin_password": "12345678",
+            },
+        )
+        assert response.status_code == 422
+
+    def test_rejects_short_password(self, client: TestClient, builder_a_headers):
+        response = client.post(
+            "/v1/builder/clinics",
+            headers=builder_a_headers,
+            json={
+                "clinic_name": "Test Clinic",
+                "admin_email": "test@test.com",
+                "admin_password": "short",
+            },
+        )
+        assert response.status_code == 422
 
 
 class TestBuilderToggleClinicStatus:

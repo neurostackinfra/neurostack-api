@@ -28,6 +28,7 @@ import Suporte from "@/pages/suporte";
 import PortalParceiros from "@/pages/portal-parceiros";
 import RlhfAudit from "@/pages/rlhf-audit";
 import Privacidade from "@/pages/privacidade";
+import BuilderPanel from "@/pages/builder";
 
 const queryClient = new QueryClient();
 
@@ -43,7 +44,7 @@ function Router() {
 }
 
 function AuthenticatedRouter() {
-  const { isAuthenticated, isSuperAdmin, isInvestor, leadSubmitted } = useAuth();
+  const { isAuthenticated, isSuperAdmin, isInvestor, isBuilder, leadSubmitted } = useAuth();
 
   if (!isAuthenticated) {
     return <Login />;
@@ -65,8 +66,9 @@ function AuthenticatedRouter() {
         <Route path="/agents" component={Agents} />
         <Route path="/crm" component={CRMIntegration} />
         <Route path="/knowledge-base" component={KnowledgeBase} />
-        {(isSuperAdmin || isInvestor) && <Route path="/master-admin" component={MasterAdmin} />}
-        {(isSuperAdmin || isInvestor) && <Route path="/rlhf-audit" component={RlhfAudit} />}
+        {(isSuperAdmin || isInvestor) && !isBuilder && <Route path="/master-admin" component={MasterAdmin} />}
+        {(isSuperAdmin || isInvestor) && !isBuilder && <Route path="/rlhf-audit" component={RlhfAudit} />}
+        {isBuilder && <Route path="/builder" component={BuilderPanel} />}
         <Route path="/onboarding" component={Onboarding} />
         <Route path="/seguranca" component={Seguranca} />
         <Route path="/slm-cortex" component={SlmCortex} />

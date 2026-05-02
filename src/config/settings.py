@@ -118,6 +118,15 @@ class Settings(BaseSettings):
     prompt_max_recent_messages: int = Field(default=10, ge=1, le=50)
 
     # ============================================
+    # SMTP (Support Email)
+    # ============================================
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    support_email_to: str = "info@neurostack.global"
+
+    # ============================================
     # LLM Provider (OpenAI-compatible)
     # ============================================
     llm_base_url: str = ""

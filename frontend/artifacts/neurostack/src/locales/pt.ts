@@ -46,12 +46,12 @@ export const pt: Record<TranslationKey, string> = {
 
   // Rótulos de intenção (dashboard)
   intent_saudacao: "Saudação",
-  intent_interesse_tratamento: "Interesse em Tratamento",
+  intent_interesse_tratamento: "Interesse Tratamento",
   intent_qualificacao_publico: "Qualificação",
   intent_comparacao_tratamentos: "Comparação",
   intent_pedido_preco: "Pedido de Preço",
   intent_objecao_vou_pensar: "Objeção",
-  intent_agendar: "Agendamento",
+  intent_agendar: "Solicitação de Agendamento",
   intent_reagendar: "Reagendamento",
   intent_cancelar: "Cancelamento",
   intent_confirmar_presenca: "Confirmação de Presença",
@@ -62,7 +62,7 @@ export const pt: Record<TranslationKey, string> = {
   intent_cultura_historia: "Sobre a Clínica",
   intent_duvida_generica_sem_contexto: "Dúvida Genérica",
   intent_pre_atendimento: "Pré-Atendimento",
-  intent_pos_atendimento_duvida: "Pós — Dúvida",
+  intent_pos_atendimento_duvida: "Dúvida Pós-Procedimento",
   intent_pos_atendimento_sintomas_preocupantes: "Pós — Sintomas",
   intent_pedido_alterar_medicacao: "Alterar Medicação",
   intent_documentos_e_comprovantes: "Documentos",
@@ -295,4 +295,15 @@ export const pt: Record<TranslationKey, string> = {
   config_service_price: "Preço",
   config_service_authority: "Diferenciais de Autoridade",
   config_service_authority_hint: "Injetados junto com a descrição para reforçar confiança. Ex: 'Única clínica com tecnologia X na cidade.'",
+
+  // ── Painel Builder ────────────────────────────────────────────────────────
+  builder_panel_title: "Painel Builder",
+  builder_total_clinics: "Total Clinicas",
+  builder_active: "Ativas",
+  builder_inactive: "Inativas",
+  builder_total_traces: "Total Traces",
+  builder_new_clinic: "Nova Clinica",
+  builder_configure: "Configurar",
+  builder_empty: "Nenhuma clinica cadastrada",
+  builder_create_success: "Clinica criada com sucesso",
 };
