@@ -304,6 +304,53 @@ export const en = {
   builder_configure: "Configure",
   builder_empty: "No clinics registered",
   builder_create_success: "Clinic created successfully",
+  builder_tab_overview: "Dashboard",
+  builder_tab_clinics: "Clinics",
+  builder_alerts_title: "Alerts",
+  builder_alerts_empty: "No alerts — everything running smoothly",
+  builder_health_grid_title: "Clinic Health",
+  builder_health_legend: "Green = active, Yellow = no traces 3-7 days, Red = no traces 7+ days",
+  builder_last_trace: "Last trace",
+  builder_days_ago: "days ago",
+  builder_never: "never",
+  builder_traces_7d: "Traces (7d)",
+  builder_safety_7d: "Safety flags (7d)",
+  builder_handoffs_7d: "Handoffs (7d)",
+  builder_config_completeness: "Config completeness",
+  builder_traces_chart_title: "Traces — Last 30 days",
+  builder_alert_inactivity: "No traces in 7+ days",
+  builder_alert_deactivated: "Clinic is deactivated",
+  builder_alert_api_error: "API integration not configured",
+  builder_trend_up: "up",
+  builder_trend_down: "down",
+
+  // ── Admin Health ──
+  admin_health_dot_healthy: "Healthy",
+  admin_health_dot_warning: "Warning",
+  admin_health_dot_critical: "Critical",
+  admin_health_last_trace: "Last trace",
+  admin_health_days_ago: "days ago",
+  admin_health_never: "never",
+  admin_health_config_completeness: "Config completeness",
+
+  // ── Admin Alerts ──
+  admin_alerts_title: "Platform Alerts",
+  admin_alerts_empty: "No alerts — all systems operational",
+
+  // ── Admin Charts ──
+  admin_chart_traces_title: "Traces — Last 30 days",
+  admin_chart_trend_up: "up",
+  admin_chart_trend_down: "down",
+
+  // ── Admin Builder Health ──
+  admin_builder_health: "Health",
+  admin_builder_healthy_pct: "healthy",
+  admin_builder_critical_pct: "critical",
+
+  // ── Admin Filters ──
+  admin_filter_severity: "Severity",
+  admin_filter_builder: "Builder",
+  admin_filter_all: "All",
 } as const;
 
 export type TranslationKey = keyof typeof en;

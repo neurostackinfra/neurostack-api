@@ -176,15 +176,16 @@ function PlanBadge({ plan }: { plan: string }) {
 // ── Health Dot ───────────────────────────────────────────────────────────────
 
 function HealthDot({ status }: { status?: "healthy" | "warning" | "critical" }) {
+  const { t } = useI18n();
   const color =
     status === "healthy"  ? "bg-emerald-400" :
     status === "warning"  ? "bg-amber-400"   :
     status === "critical" ? "bg-rose-400"    :
     "bg-slate-500";
   const label =
-    status === "healthy"  ? "Healthy" :
-    status === "warning"  ? "Warning" :
-    status === "critical" ? "Critical" :
+    status === "healthy"  ? t("admin_health_dot_healthy") :
+    status === "warning"  ? t("admin_health_dot_warning") :
+    status === "critical" ? t("admin_health_dot_critical") :
     "Unknown";
   return (
     <span
@@ -212,13 +213,14 @@ function relativeTime(iso: string | null | undefined): string {
 // ── Alerts Section ───────────────────────────────────────────────────────────
 
 function AlertsSection({ alerts }: { alerts: AdminAlert[] }) {
+  const { t } = useI18n();
   if (alerts.length === 0) return null;
   return (
     <Card className="border-border">
       <CardHeader className="pb-2">
         <div className="flex items-center gap-2">
           <AlertTriangle className="h-4 w-4 text-amber-400" />
-          <CardTitle className="text-sm font-semibold">Alertas</CardTitle>
+          <CardTitle className="text-sm font-semibold">{t("admin_alerts_title")}</CardTitle>
           <Badge className="bg-rose-500/15 text-rose-400 border-rose-500/30 text-[10px]">
             {alerts.length}
           </Badge>
@@ -258,11 +260,12 @@ function AlertsSection({ alerts }: { alerts: AdminAlert[] }) {
 // ── Trace Chart (30-day) ─────────────────────────────────────────────────────
 
 function TraceChart({ data }: { data: AdminTimeSeriesPoint[] }) {
+  const { t } = useI18n();
   if (data.length === 0) return null;
   return (
     <Card className="border-border">
       <CardHeader className="pb-2">
-        <CardTitle className="text-sm">Traces (30 dias)</CardTitle>
+        <CardTitle className="text-sm">{t("admin_chart_traces_title")}</CardTitle>
       </CardHeader>
       <CardContent>
         <ResponsiveContainer width="100%" height={220}>
@@ -442,11 +445,11 @@ function ClinicCard({
         </div>
         <div className="flex items-center gap-3 text-xs text-muted-foreground">
           <span className="flex items-center gap-1">
-            Last trace: {relativeTime(clinic.last_trace_at)}
+            {t("admin_health_last_trace")}: {relativeTime(clinic.last_trace_at)}
           </span>
           {clinic.config_completeness != null && (
             <span className="flex items-center gap-1.5 ml-auto">
-              Config
+              {t("admin_health_config_completeness")}
               <span className="inline-flex items-center gap-1">
                 <span className="inline-block h-1.5 w-16 rounded-full bg-slate-700 overflow-hidden">
                   <span
@@ -609,6 +612,10 @@ export default function MasterAdmin() {
   const [statsLoaded, setStatsLoaded] = useState(false);
   const [dashboard, setDashboard] = useState<AdminDashboardData | null>(isInvestor ? DEMO_DASHBOARD : null);
   const [dashboardLoaded, setDashboardLoaded] = useState(isInvestor);
+
+  // Alert filter state
+  const [alertSeverityFilter, setAlertSeverityFilter] = useState<string>("all");
+  const [alertBuilderFilter, setAlertBuilderFilter] = useState<string>("all");
 
   // Builders state
   const [builders, setBuilders] = useState<BuilderWithClinics[]>(isInvestor ? DEMO_BUILDERS : []);
@@ -968,6 +975,15 @@ export default function MasterAdmin() {
     return { direction: pct >= 0 ? "up" as const : "down" as const, pct: Math.abs(pct) };
   })();
 
+  // ── Alert filtering (client-side) ────────────────────────────────────────
+  const allAlerts = dashboard?.alerts ?? [];
+  const alertBuilderNames = Array.from(new Set(allAlerts.map((a) => a.clinic_name))).sort();
+  const filteredAlerts = allAlerts.filter((a) => {
+    if (alertSeverityFilter !== "all" && a.severity !== alertSeverityFilter) return false;
+    if (alertBuilderFilter !== "all" && a.clinic_name !== alertBuilderFilter) return false;
+    return true;
+  });
+
   return (
     <div className="max-w-6xl mx-auto space-y-6">
       {/* Header */}
@@ -1087,8 +1103,40 @@ export default function MasterAdmin() {
       )}
 
       {/* ── Alerts ──────────────────────────────────────────────────────── */}
-      {dashboard && dashboard.alerts.length > 0 && (
-        <AlertsSection alerts={dashboard.alerts} />
+      {dashboard && allAlerts.length > 0 && (
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <select
+              value={alertSeverityFilter}
+              onChange={(e) => setAlertSeverityFilter(e.target.value)}
+              className="h-8 rounded-md border border-border bg-background px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent"
+            >
+              <option value="all">{t("admin_filter_severity")}: {t("admin_filter_all")}</option>
+              <option value="critical">{t("admin_health_dot_critical")}</option>
+              <option value="warning">{t("admin_health_dot_warning")}</option>
+              <option value="info">Info</option>
+            </select>
+            <select
+              value={alertBuilderFilter}
+              onChange={(e) => setAlertBuilderFilter(e.target.value)}
+              className="h-8 rounded-md border border-border bg-background px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent"
+            >
+              <option value="all">{t("admin_filter_builder")}: {t("admin_filter_all")}</option>
+              {alertBuilderNames.map((name) => (
+                <option key={name} value={name}>{name}</option>
+              ))}
+            </select>
+          </div>
+          {filteredAlerts.length > 0 ? (
+            <AlertsSection alerts={filteredAlerts} />
+          ) : (
+            <Card className="border-border">
+              <CardContent className="py-6 text-center text-xs text-muted-foreground">
+                {t("admin_alerts_empty")}
+              </CardContent>
+            </Card>
+          )}
+        </div>
       )}
 
       {/* ── 30-day Trace Chart ────────────────────────────────────────────── */}
@@ -1139,6 +1187,12 @@ export default function MasterAdmin() {
               const isEditing = editingBuilderId === builder.id;
               const isAddingClinic = addingClinicToBuilderId === builder.id;
               const activeClinics = builder.clinics.filter((c) => c.status === "active").length;
+              const totalClinicCount = builder.clinics.length;
+              const healthyClinics = builder.clinics.filter((c) => c.health_status === "healthy").length;
+              const criticalClinics = builder.clinics.filter((c) => c.health_status === "critical").length;
+              const healthyPct = totalClinicCount > 0 ? Math.round((healthyClinics / totalClinicCount) * 100) : 0;
+              const criticalPct = totalClinicCount > 0 ? Math.round((criticalClinics / totalClinicCount) * 100) : 0;
+              const builderTotalTraces = builder.clinics.reduce((sum, c) => sum + c.traceCount, 0);
               return (
                 <div key={builder.id} className={`rounded-lg border transition-all ${builder.status === "active" ? "border-border" : "border-dashed border-slate-700 opacity-60"}`}>
                   {/* Builder row header */}
@@ -1173,6 +1227,13 @@ export default function MasterAdmin() {
                       <span className="text-[11px] text-muted-foreground">
                         {builder.clinics.length} clínica{builder.clinics.length !== 1 ? "s" : ""} · {activeClinics} ativa{activeClinics !== 1 ? "s" : ""}
                       </span>
+                      {totalClinicCount > 0 && (
+                        <span className="flex items-center gap-1.5 text-[10px]">
+                          <span className="text-emerald-400">{healthyPct}% {t("admin_builder_healthy_pct")}</span>
+                          {criticalPct > 0 && <span className="text-rose-400">{criticalPct}% {t("admin_builder_critical_pct")}</span>}
+                          <span className="text-muted-foreground">{builderTotalTraces.toLocaleString()} {t("admin_traces_label")}</span>
+                        </span>
+                      )}
                       <StatusBadge status={builder.status} />
 
                       {isSuperAdmin && (
