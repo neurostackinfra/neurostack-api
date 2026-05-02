@@ -4,9 +4,10 @@ import {
   Shield, Building2, Users, Activity, ToggleLeft, ToggleRight,
   Plus, Eye, CheckCircle2, XCircle, Loader2, AlertTriangle, KeyRound,
   Inbox, Paperclip, ChevronDown, ChevronRight, CheckCheck, UserCheck,
-  Phone, TrendingUp, Download, Search, CalendarRange, RefreshCw,
-  RotateCcw, Briefcase, Trash2, Pencil, DollarSign,
+  Phone, TrendingUp, TrendingDown, Download, Search, CalendarRange, RefreshCw,
+  RotateCcw, Briefcase, Trash2, Pencil, DollarSign, Info,
 } from "lucide-react";
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { useAuth } from "@/context/auth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -58,6 +59,35 @@ interface AdminStats {
   estimatedMrr: number;
 }
 
+interface AdminTimeSeriesPoint {
+  date: string;
+  count: number;
+}
+
+interface AdminAlert {
+  type: string;
+  severity: "critical" | "warning" | "info";
+  clinic_id: number;
+  clinic_name: string;
+  message: string;
+  detected_at: string;
+}
+
+interface AdminDashboardData {
+  stats: {
+    total_traces: number;
+    active_pilots: number;
+    active_builders: number;
+    active_managed_clinics: number;
+    estimated_mrr: number;
+    safety_flags_7d: number;
+    handoff_count_7d: number;
+    [key: string]: number;
+  };
+  time_series: AdminTimeSeriesPoint[];
+  alerts: AdminAlert[];
+}
+
 interface BuilderClinic {
   clinic_id: number;
   clinic_name: string;
@@ -67,6 +97,9 @@ interface BuilderClinic {
   builder_id: number;
   traceCount: number;
   apisConfigured: boolean;
+  health_status?: "healthy" | "warning" | "critical";
+  last_trace_at?: string | null;
+  config_completeness?: number;
 }
 
 interface BuilderWithClinics {
@@ -88,6 +121,9 @@ interface ClinicSlot {
   apisConfigured: boolean;
   zapiInstanceId: string | null;
   users: { id: number; email: string; role: string }[];
+  health_status?: "healthy" | "warning" | "critical";
+  last_trace_at?: string | null;
+  config_completeness?: number;
 }
 
 // ── API helpers ───────────────────────────────────────────────────────────────
@@ -134,6 +170,126 @@ function PlanBadge({ plan }: { plan: string }) {
     <Badge className={`${styles[plan] ?? styles.pilot} text-[10px]`}>
       {plan.toUpperCase()}
     </Badge>
+  );
+}
+
+// ── Health Dot ───────────────────────────────────────────────────────────────
+
+function HealthDot({ status }: { status?: "healthy" | "warning" | "critical" }) {
+  const color =
+    status === "healthy"  ? "bg-emerald-400" :
+    status === "warning"  ? "bg-amber-400"   :
+    status === "critical" ? "bg-rose-400"    :
+    "bg-slate-500";
+  const label =
+    status === "healthy"  ? "Healthy" :
+    status === "warning"  ? "Warning" :
+    status === "critical" ? "Critical" :
+    "Unknown";
+  return (
+    <span
+      className={`inline-block h-2.5 w-2.5 rounded-full shrink-0 ${color}`}
+      title={label}
+    />
+  );
+}
+
+// ── Relative Time Helper ─────────────────────────────────────────────────────
+
+function relativeTime(iso: string | null | undefined): string {
+  if (!iso) return "never";
+  const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 0) return "just now";
+  const mins = Math.floor(diff / 60_000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+// ── Alerts Section ───────────────────────────────────────────────────────────
+
+function AlertsSection({ alerts }: { alerts: AdminAlert[] }) {
+  if (alerts.length === 0) return null;
+  return (
+    <Card className="border-border">
+      <CardHeader className="pb-2">
+        <div className="flex items-center gap-2">
+          <AlertTriangle className="h-4 w-4 text-amber-400" />
+          <CardTitle className="text-sm font-semibold">Alertas</CardTitle>
+          <Badge className="bg-rose-500/15 text-rose-400 border-rose-500/30 text-[10px]">
+            {alerts.length}
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="pt-0 space-y-1.5">
+        {alerts.map((alert, i) => {
+          const iconColor =
+            alert.severity === "critical" ? "text-rose-400" :
+            alert.severity === "warning"  ? "text-amber-400" :
+            "text-blue-400";
+          const Icon =
+            alert.severity === "critical" ? AlertTriangle :
+            alert.severity === "warning"  ? AlertTriangle :
+            Info;
+          return (
+            <div
+              key={`${alert.clinic_id}-${alert.type}-${i}`}
+              className="flex items-start gap-2.5 rounded-md border border-border/50 px-3 py-2 text-xs"
+            >
+              <Icon className={`h-3.5 w-3.5 shrink-0 mt-0.5 ${iconColor}`} />
+              <div className="flex-1 min-w-0">
+                <span className="font-medium text-foreground">{alert.clinic_name}</span>
+                <span className="text-muted-foreground ml-1.5">{alert.message}</span>
+              </div>
+              <span className="text-[10px] text-muted-foreground shrink-0">
+                {relativeTime(alert.detected_at)}
+              </span>
+            </div>
+          );
+        })}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ── Trace Chart (30-day) ─────────────────────────────────────────────────────
+
+function TraceChart({ data }: { data: AdminTimeSeriesPoint[] }) {
+  if (data.length === 0) return null;
+  return (
+    <Card className="border-border">
+      <CardHeader className="pb-2">
+        <CardTitle className="text-sm">Traces (30 dias)</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <ResponsiveContainer width="100%" height={220}>
+          <LineChart data={data}>
+            <XAxis
+              dataKey="date"
+              tickFormatter={(v: string) => { const p = v.split("-"); return `${p[2]}/${p[1]}`; }}
+              stroke="#64748b"
+              fontSize={10}
+            />
+            <YAxis stroke="#64748b" fontSize={10} width={40} />
+            <Tooltip
+              contentStyle={{ background: "#1e293b", border: "1px solid #334155", borderRadius: 8, fontSize: 12 }}
+              labelFormatter={(v: string) => { const p = v.split("-"); return `${p[2]}/${p[1]}/${p[0]}`; }}
+            />
+            <Line
+              type="monotone"
+              dataKey="count"
+              stroke="#818cf8"
+              strokeWidth={2}
+              dot={false}
+              activeDot={{ r: 4, fill: "#818cf8" }}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -252,6 +408,7 @@ function ClinicCard({
       <CardHeader className="pb-2">
         <div className="flex items-start justify-between gap-2">
           <div className="flex items-center gap-2 min-w-0">
+            <HealthDot status={clinic.health_status} />
             <Building2 className="h-4 w-4 text-muted-foreground shrink-0" />
             <div className="min-w-0">
               <CardTitle className="text-sm truncate">
@@ -282,6 +439,29 @@ function ClinicCard({
             <KeyRound className="h-3 w-3" />
             {clinic.apisConfigured ? "API ✓" : "API —"}
           </span>
+        </div>
+        <div className="flex items-center gap-3 text-xs text-muted-foreground">
+          <span className="flex items-center gap-1">
+            Last trace: {relativeTime(clinic.last_trace_at)}
+          </span>
+          {clinic.config_completeness != null && (
+            <span className="flex items-center gap-1.5 ml-auto">
+              Config
+              <span className="inline-flex items-center gap-1">
+                <span className="inline-block h-1.5 w-16 rounded-full bg-slate-700 overflow-hidden">
+                  <span
+                    className={`block h-full rounded-full ${
+                      clinic.config_completeness >= 80 ? "bg-emerald-400" :
+                      clinic.config_completeness >= 50 ? "bg-amber-400"   :
+                      "bg-rose-400"
+                    }`}
+                    style={{ width: `${clinic.config_completeness}%` }}
+                  />
+                </span>
+                <span className="text-[10px]">{clinic.config_completeness}%</span>
+              </span>
+            </span>
+          )}
         </div>
         {clinic.zapiInstanceId && (
           <p className="text-[10px] font-mono text-muted-foreground/60 truncate">
@@ -332,24 +512,28 @@ const DEMO_CLINICS: ClinicSlot[] = [
     slug: "piloto-1", status: "active", plan_type: "pilot", traceCount: 12_500,
     apisConfigured: true,  zapiInstanceId: "inst_a1b2c3",
     users: [{ id: 10, email: "pilot1@clinic.com", role: "clinic_admin" }],
+    health_status: "healthy", last_trace_at: "2026-05-02T08:30:00Z", config_completeness: 95,
   },
   {
     clinic_id: 2, clinic_name: "Instituto Face SP", agent_name: "Face SP",
     slug: "piloto-2", status: "active", plan_type: "pilot", traceCount: 5_200,
     apisConfigured: true,  zapiInstanceId: "inst_e5f6g7",
     users: [{ id: 11, email: "pilot2@clinic.com", role: "clinic_admin" }],
+    health_status: "healthy", last_trace_at: "2026-05-01T22:15:00Z", config_completeness: 88,
   },
   {
     clinic_id: 3, clinic_name: "Estética Rio Norte", agent_name: "Rio Norte",
     slug: "piloto-3", status: "active", plan_type: "pilot", traceCount: 1_100,
     apisConfigured: false, zapiInstanceId: null,
     users: [{ id: 12, email: "pilot3@clinic.com", role: "clinic_admin" }],
+    health_status: "warning", last_trace_at: "2026-04-28T14:00:00Z", config_completeness: 42,
   },
   {
     clinic_id: 5, clinic_name: "Lumina Derma Clinic", agent_name: "Lumina Derma",
     slug: "piloto-4", status: "active", plan_type: "pilot", traceCount: 8_400,
     apisConfigured: true,  zapiInstanceId: "inst_i9j0k1",
     users: [{ id: 13, email: "pilot4@clinic.com", role: "clinic_admin" }],
+    health_status: "critical", last_trace_at: null, config_completeness: 70,
   },
 ];
 
@@ -359,19 +543,42 @@ const DEMO_BUILDERS: BuilderWithClinics[] = [
   {
     id: 1, name: "Builder Alfa", status: "active", created_at: "2026-01-15T10:00:00Z",
     clinics: [
-      { clinic_id: 8,  clinic_name: "Clínica Alfa 1", slug: "alfa-1", status: "active", plan_type: "pilot", builder_id: 1, traceCount: 3200, apisConfigured: true },
-      { clinic_id: 9,  clinic_name: "Clínica Alfa 2", slug: "alfa-2", status: "active", plan_type: "pilot", builder_id: 1, traceCount: 1800, apisConfigured: true },
-      { clinic_id: 10, clinic_name: "Clínica Alfa 3", slug: "alfa-3", status: "active", plan_type: "pilot", builder_id: 1, traceCount: 950,  apisConfigured: false },
+      { clinic_id: 8,  clinic_name: "Clínica Alfa 1", slug: "alfa-1", status: "active", plan_type: "pilot", builder_id: 1, traceCount: 3200, apisConfigured: true, health_status: "healthy", last_trace_at: "2026-05-02T07:00:00Z", config_completeness: 100 },
+      { clinic_id: 9,  clinic_name: "Clínica Alfa 2", slug: "alfa-2", status: "active", plan_type: "pilot", builder_id: 1, traceCount: 1800, apisConfigured: true, health_status: "healthy", last_trace_at: "2026-05-01T18:30:00Z", config_completeness: 85 },
+      { clinic_id: 10, clinic_name: "Clínica Alfa 3", slug: "alfa-3", status: "active", plan_type: "pilot", builder_id: 1, traceCount: 950,  apisConfigured: false, health_status: "warning", last_trace_at: "2026-04-27T10:00:00Z", config_completeness: 35 },
     ],
   },
   {
     id: 2, name: "Builder Beta", status: "active", created_at: "2026-02-01T10:00:00Z",
     clinics: [
-      { clinic_id: 11, clinic_name: "Clínica Beta 1", slug: "beta-1", status: "active", plan_type: "pilot", builder_id: 2, traceCount: 2100, apisConfigured: true },
-      { clinic_id: 12, clinic_name: "Clínica Beta 2", slug: "beta-2", status: "active", plan_type: "pilot", builder_id: 2, traceCount: 890,  apisConfigured: false },
+      { clinic_id: 11, clinic_name: "Clínica Beta 1", slug: "beta-1", status: "active", plan_type: "pilot", builder_id: 2, traceCount: 2100, apisConfigured: true, health_status: "healthy", last_trace_at: "2026-05-02T06:45:00Z", config_completeness: 92 },
+      { clinic_id: 12, clinic_name: "Clínica Beta 2", slug: "beta-2", status: "active", plan_type: "pilot", builder_id: 2, traceCount: 890,  apisConfigured: false, health_status: "critical", last_trace_at: null, config_completeness: 20 },
     ],
   },
 ];
+
+// ── Demo dashboard data (investor short-circuit) ────────────────────────────
+
+const DEMO_DASHBOARD: AdminDashboardData = {
+  stats: {
+    total_traces: 27200,
+    active_pilots: 14,
+    active_builders: 2,
+    active_managed_clinics: 5,
+    estimated_mrr: 5750,
+    safety_flags_7d: 2,
+    handoff_count_7d: 48,
+  },
+  time_series: Array.from({ length: 31 }, (_, i) => {
+    const d = new Date("2026-04-02");
+    d.setDate(d.getDate() + i);
+    return { date: d.toISOString().slice(0, 10), count: 600 + Math.floor(Math.random() * 400) };
+  }),
+  alerts: [
+    { type: "no_traces", severity: "critical", clinic_id: 5, clinic_name: "Lumina Derma Clinic", message: "No traces in 7 days", detected_at: "2026-05-01T12:00:00Z" },
+    { type: "low_config", severity: "warning", clinic_id: 3, clinic_name: "Estética Rio Norte", message: "Config completeness below 50%", detected_at: "2026-04-30T09:00:00Z" },
+  ],
+};
 
 // ── Master Admin Page ─────────────────────────────────────────────────────────
 
@@ -400,6 +607,8 @@ export default function MasterAdmin() {
   const [leadEnd, setLeadEnd] = useState("");
   const [stats, setStats] = useState<AdminStats | null>(null);
   const [statsLoaded, setStatsLoaded] = useState(false);
+  const [dashboard, setDashboard] = useState<AdminDashboardData | null>(isInvestor ? DEMO_DASHBOARD : null);
+  const [dashboardLoaded, setDashboardLoaded] = useState(isInvestor);
 
   // Builders state
   const [builders, setBuilders] = useState<BuilderWithClinics[]>(isInvestor ? DEMO_BUILDERS : []);
@@ -621,9 +830,19 @@ export default function MasterAdmin() {
     } catch { /* silent */ }
   };
 
+  const fetchDashboard = async () => {
+    try {
+      const res = await fetch(`${BASE}/api/admin/dashboard`, { headers: authHeaders(token) });
+      if (!res.ok) return;
+      setDashboard(await res.json() as AdminDashboardData);
+      setDashboardLoaded(true);
+    } catch { /* silent */ }
+  };
+
   if (!ticketsLoaded) { void fetchTickets(); }
   if (!leadsLoaded && isSuperAdmin) { void fetchLeads(); }
   if (!statsLoaded && isSuperAdmin) { void fetchStats(); }
+  if (!dashboardLoaded && !isInvestor) { void fetchDashboard(); }
 
   // ── Lead filtering & export ────────────────────────────────────────────────
 
@@ -738,6 +957,17 @@ export default function MasterAdmin() {
   const tokenDisplay  = isInvestor ? "2.4M" : (stats ? `${(stats.totalTokens / 1_000_000).toFixed(1)}M` : "...");
   const openTicketCnt = isInvestor ? 0 : (stats?.openTickets ?? tickets.filter((t) => t.status === "open").length);
 
+  // Trend: compare last 7 days vs previous 7 days from time_series
+  const traceTrend = (() => {
+    const ts = dashboard?.time_series;
+    if (!ts || ts.length < 14) return null;
+    const last7 = ts.slice(-7).reduce((s, p) => s + p.count, 0);
+    const prev7 = ts.slice(-14, -7).reduce((s, p) => s + p.count, 0);
+    if (prev7 === 0) return null;
+    const pct = Math.round(((last7 - prev7) / prev7) * 100);
+    return { direction: pct >= 0 ? "up" as const : "down" as const, pct: Math.abs(pct) };
+  })();
+
   return (
     <div className="max-w-6xl mx-auto space-y-6">
       {/* Header */}
@@ -824,7 +1054,15 @@ export default function MasterAdmin() {
                 <TrendingUp className="h-3.5 w-3.5 text-emerald-400" />
                 <p className="text-[11px] text-muted-foreground">Total de Traces (Pilotos)</p>
               </div>
-              <p className="text-2xl font-bold text-emerald-400">{totalTraces}</p>
+              <div className="flex items-center gap-2">
+                <p className="text-2xl font-bold text-emerald-400">{totalTraces}</p>
+                {traceTrend && (
+                  <span className={`flex items-center gap-0.5 text-[11px] font-medium ${traceTrend.direction === "up" ? "text-emerald-400" : "text-rose-400"}`}>
+                    {traceTrend.direction === "up" ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
+                    {traceTrend.pct}%
+                  </span>
+                )}
+              </div>
             </CardContent>
           </Card>
           <Card className="border-border bg-gradient-to-br from-rose-950/20 to-transparent">
@@ -846,6 +1084,16 @@ export default function MasterAdmin() {
             </CardContent>
           </Card>
         </div>
+      )}
+
+      {/* ── Alerts ──────────────────────────────────────────────────────── */}
+      {dashboard && dashboard.alerts.length > 0 && (
+        <AlertsSection alerts={dashboard.alerts} />
+      )}
+
+      {/* ── 30-day Trace Chart ────────────────────────────────────────────── */}
+      {dashboard && dashboard.time_series.length > 0 && (
+        <TraceChart data={dashboard.time_series} />
       )}
 
       {/* ── Gestão de Builders ──────────────────────────────────────────── */}
