@@ -3,17 +3,29 @@ NeuroStack API - Admin Endpoints
 Super-admin-only routes for cross-tenant management (clinics + builders).
 """
 
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from passlib.context import CryptContext
-from sqlalchemy import func, select
+from sqlalchemy import cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.types import String
 
+from src.api.helpers.health import (
+    _compute_alerts,
+    _compute_config_completeness,
+    _compute_health_status,
+    _get_time_series,
+)
 from src.api.middleware.auth import TenantContext, require_super_admin
 from src.api.schemas.admin import (
+    AdminAlertResponse,
+    AdminDashboardResponse,
+    AdminDashboardStatsResponse,
     AdminStatsResponse,
+    AdminTimeSeriesPoint,
     BuilderClinicResponse,
     BuilderWithClinicsResponse,
     ClinicSlotResponse,
@@ -44,6 +56,9 @@ def _build_clinic_slot(
     users: list[User],
     trace_count: int,
     apis_configured: bool,
+    health_status: str = None,
+    last_trace_at: datetime = None,
+    config_completeness: int = 0,
 ) -> dict:
     identity = {}
     api_creds = {}
@@ -65,6 +80,9 @@ def _build_clinic_slot(
             ClinicUserResponse(id=u.id, email=u.email, role=u.role.value)
             for u in users
         ],
+        health_status=health_status,
+        last_trace_at=last_trace_at,
+        config_completeness=config_completeness,
     ).model_dump(mode="json")
 
 
@@ -82,11 +100,10 @@ async def list_clinics(
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
 ):
-    # Load tenants with related config and users
+    # Load ALL tenants (including deactivated) with related config
     stmt = (
         select(Tenant)
         .options(selectinload(Tenant.clinic_config_row))
-        .where(Tenant.is_active.is_(True))
         .order_by(Tenant.name)
     )
     result = await session.execute(stmt)
@@ -111,15 +128,36 @@ async def list_clinics(
     trace_result = await session.execute(trace_stmt)
     trace_counts = {row[0]: row[1] for row in trace_result.all()}
 
-    return [
-        _build_clinic_slot(
-            t,
-            users_by_tenant.get(t.id, []),
-            trace_counts.get(t.id, 0),
-            False,
+    # Batch query: last_trace_at per tenant
+    last_trace_stmt = (
+        select(
+            Event.tenant_id,
+            func.max(Event.created_at).label("last_trace_at"),
         )
-        for t in tenants
-    ]
+        .where(Event.tenant_id.in_(tenant_ids))
+        .group_by(Event.tenant_id)
+    )
+    last_trace_result = await session.execute(last_trace_stmt)
+    last_trace_map = {row.tenant_id: row.last_trace_at for row in last_trace_result}
+
+    clinics = []
+    for t in tenants:
+        last_trace = last_trace_map.get(t.id)
+        health = _compute_health_status(last_trace, t.is_active)
+        completeness = _compute_config_completeness(t.clinic_config_row)
+
+        clinics.append(
+            _build_clinic_slot(
+                t,
+                users_by_tenant.get(t.id, []),
+                trace_counts.get(t.id, 0),
+                False,
+                health_status=health,
+                last_trace_at=last_trace,
+                config_completeness=completeness,
+            )
+        )
+    return clinics
 
 
 @router.post(
@@ -271,6 +309,111 @@ async def admin_stats(
 
 
 # ============================================
+# GET /dashboard - Admin Control Tower
+# ============================================
+
+
+@router.get(
+    "/dashboard",
+    summary="Admin Dashboard",
+    description="Combined admin dashboard: platform-wide stats + 30-day time-series + alerts.",
+    response_model=AdminDashboardResponse,
+)
+async def admin_dashboard(
+    tenant: TenantContext = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
+):
+    now = datetime.now(timezone.utc)
+    seven_days_ago = now - timedelta(days=7)
+
+    # Total traces
+    trace_count_result = await session.execute(select(func.count(Event.id)))
+    total_traces = trace_count_result.scalar() or 0
+
+    # Active pilots
+    pilot_result = await session.execute(
+        select(func.count(Tenant.id)).where(
+            Tenant.is_active.is_(True),
+            Tenant.plan_type == "pilot",
+        )
+    )
+    active_pilots = pilot_result.scalar() or 0
+
+    # Active builders
+    builder_result = await session.execute(
+        select(func.count(Builder.id)).where(Builder.is_active.is_(True))
+    )
+    active_builders = builder_result.scalar() or 0
+
+    # Active managed clinics
+    managed_result = await session.execute(
+        select(func.count(Tenant.id)).where(
+            Tenant.is_active.is_(True),
+            Tenant.builder_id.isnot(None),
+        )
+    )
+    active_managed = managed_result.scalar() or 0
+
+    # Safety flags 7d (platform-wide)
+    safety_result = await session.execute(
+        select(func.count(Event.id)).where(
+            Event.created_at >= seven_days_ago,
+            cast(Event.event_metadata["safety_concern"].as_string(), String) == "true",
+        )
+    )
+    safety_flags_7d = safety_result.scalar() or 0
+
+    # Handoff count 7d (platform-wide)
+    handoff_result = await session.execute(
+        select(func.count(Event.id)).where(
+            Event.created_at >= seven_days_ago,
+            Event.event_type == "handoff.created",
+        )
+    )
+    handoff_count_7d = handoff_result.scalar() or 0
+
+    stats = AdminDashboardStatsResponse(
+        total_traces=total_traces,
+        total_tokens=0,
+        open_tickets=0,
+        active_pilots=active_pilots,
+        active_builders=active_builders,
+        active_managed_clinics=active_managed,
+        estimated_mrr=0.0,
+        safety_flags_7d=safety_flags_7d,
+        handoff_count_7d=handoff_count_7d,
+    )
+
+    # Platform-wide time-series (all tenants)
+    all_tenant_ids_result = await session.execute(select(Tenant.id))
+    all_tenant_ids = [row[0] for row in all_tenant_ids_result.all()]
+    time_series_raw = await _get_time_series(all_tenant_ids, session, days=30)
+    time_series = [
+        AdminTimeSeriesPoint(date=p.date, count=p.count) for p in time_series_raw
+    ]
+
+    # Platform-wide alerts (builder_id=None means all clinics)
+    alerts_raw = await _compute_alerts(builder_id=None, session=session)
+    alerts = [
+        AdminAlertResponse(
+            type=a.type,
+            severity=a.severity,
+            clinic_id=a.clinic_id,
+            clinic_name=a.clinic_name,
+            message=a.message,
+            detected_at=a.detected_at,
+        )
+        for a in alerts_raw
+    ]
+
+    return AdminDashboardResponse(
+        stats=stats,
+        time_series=time_series,
+        alerts=alerts,
+    )
+
+
+# ============================================
 # Stubs for frontend compatibility (Group 3)
 # ============================================
 
@@ -332,6 +475,7 @@ async def list_builders(
     # Trace counts for builder clinics
     tenant_ids = [t.id for t in all_tenants]
     trace_counts: dict = {}
+    last_trace_map: dict = {}
     if tenant_ids:
         trace_stmt = (
             select(Event.tenant_id, func.count(Event.id))
@@ -341,6 +485,20 @@ async def list_builders(
         trace_result = await session.execute(trace_stmt)
         trace_counts = {row[0]: row[1] for row in trace_result.all()}
 
+        # Batch query: last_trace_at per tenant
+        last_trace_stmt = (
+            select(
+                Event.tenant_id,
+                func.max(Event.created_at).label("last_trace_at"),
+            )
+            .where(Event.tenant_id.in_(tenant_ids))
+            .group_by(Event.tenant_id)
+        )
+        last_trace_result = await session.execute(last_trace_stmt)
+        last_trace_map = {
+            row.tenant_id: row.last_trace_at for row in last_trace_result
+        }
+
     output = []
     for b in builders:
         clinics = []
@@ -348,6 +506,9 @@ async def list_builders(
             api_creds = {}
             if t.clinic_config_row:
                 api_creds = t.clinic_config_row.api_credentials or {}
+            last_trace = last_trace_map.get(t.id)
+            health = _compute_health_status(last_trace, t.is_active)
+            completeness = _compute_config_completeness(t.clinic_config_row)
             clinics.append(
                 BuilderClinicResponse(
                     clinic_id=t.id,
@@ -357,6 +518,9 @@ async def list_builders(
                     plan_type=t.plan_type,
                     trace_count=trace_counts.get(t.id, 0),
                     apis_configured=bool(api_creds.get("zapi_instance_id")),
+                    health_status=health,
+                    last_trace_at=last_trace,
+                    config_completeness=completeness,
                 ).model_dump(mode="json")
             )
         output.append(

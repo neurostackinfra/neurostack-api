@@ -36,6 +36,10 @@ class ClinicSlotResponse(BaseModel):
     apis_configured: bool = False
     zapi_instance_id: Optional[str] = None
     users: list[ClinicUserResponse] = Field(default_factory=list)
+    # Health fields (enriched)
+    health_status: Optional[str] = None
+    last_trace_at: Optional[datetime] = None
+    config_completeness: int = 0
 
 
 class CreateClinicRequest(BaseModel):
@@ -88,6 +92,10 @@ class BuilderClinicResponse(BaseModel):
     plan_type: str = "pilot"
     trace_count: int = 0
     apis_configured: bool = False
+    # Health fields (enriched)
+    health_status: Optional[str] = None
+    last_trace_at: Optional[datetime] = None
+    config_completeness: int = 0
 
 
 class BuilderWithClinicsResponse(BaseModel):
@@ -106,3 +114,48 @@ class CreateBuilderClinicRequest(BaseModel):
     clinic_name: str = Field(..., min_length=1, max_length=255)
     admin_email: EmailStr
     admin_password: str = Field(..., min_length=8)
+
+
+# ============================================
+# Dashboard Schemas (Admin Control Tower)
+# ============================================
+
+
+class AdminDashboardStatsResponse(BaseModel):
+    """Extended stats for the admin dashboard (superset of AdminStatsResponse)."""
+
+    total_traces: int = 0
+    total_tokens: int = 0
+    open_tickets: int = 0
+    active_pilots: int = 0
+    active_builders: int = 0
+    active_managed_clinics: int = 0
+    estimated_mrr: float = 0.0
+    safety_flags_7d: int = 0
+    handoff_count_7d: int = 0
+
+
+class AdminAlertResponse(BaseModel):
+    """A single computed alert for the admin dashboard."""
+
+    type: str  # inactivity, deactivated, api_error
+    severity: str  # critical, warning, info
+    clinic_id: UUID
+    clinic_name: str
+    message: str
+    detected_at: Optional[datetime] = None
+
+
+class AdminTimeSeriesPoint(BaseModel):
+    """A single day in the admin traces time-series."""
+
+    date: str  # YYYY-MM-DD
+    count: int = 0
+
+
+class AdminDashboardResponse(BaseModel):
+    """Combined admin dashboard response: stats + time-series + alerts."""
+
+    stats: AdminDashboardStatsResponse
+    time_series: list[AdminTimeSeriesPoint] = []
+    alerts: list[AdminAlertResponse] = []
