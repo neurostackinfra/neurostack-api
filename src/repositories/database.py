@@ -11,13 +11,25 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy import text
+from sqlalchemy import JSON, event, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.config.logging import get_logger
 from src.core.exceptions import ConfigurationError
 
 logger = get_logger(__name__)
+
+
+def _patch_jsonb_for_sqlite() -> None:
+    """Register JSONB as JSON on SQLite so create_all works in tests."""
+    from sqlalchemy.dialects.postgresql import JSONB
+    from sqlalchemy.dialects import sqlite as sqlite_dialect
+
+    # Teach the SQLite compiler to treat JSONB as plain JSON
+    sqlite_dialect.base.SQLiteTypeCompiler.visit_JSONB = (
+        sqlite_dialect.base.SQLiteTypeCompiler.visit_JSON
+    )
+
 
 # Global engine and session factory
 _engine: Optional[AsyncEngine] = None
@@ -78,8 +90,11 @@ async def init_database() -> None:
             from src.models.base import Base as _Base
 
             if _engine.url.drivername.startswith("sqlite"):
-                # Create all tables on the sync engine for sqlite (including in-memory)
-                _Base.metadata.create_all(bind=_engine.sync_engine)
+                _patch_jsonb_for_sqlite()
+                # Use run_sync inside an async connection — calling create_all
+                # synchronously on the sync_engine triggers MissingGreenlet.
+                async with _engine.begin() as conn:
+                    await conn.run_sync(_Base.metadata.create_all)
                 logger.info("Created sqlite schema (in-memory or file-backed) for tests")
         except Exception:
             # Non-fatal: if schema creation fails, we'll surface errors later when queries run
@@ -110,9 +125,17 @@ async def init_database() -> None:
                 autoflush=False,
                 autocommit=False,
             )
-            # Ensure the connection works
+            # Ensure the connection works and create schema
             async with _engine.begin() as conn:
                 await conn.execute(text("SELECT 1"))
+            try:
+                import src.models  # noqa: F401
+                from src.models.base import Base as _Base
+                async with _engine.begin() as conn:
+                    await conn.run_sync(_Base.metadata.create_all)
+                logger.info("Created sqlite schema in fallback path")
+            except Exception:
+                logger.debug("Fallback schema creation failed", exc_info=True)
             logger.info("Fallback in-memory sqlite database initialized for tests")
             return
         raise ConfigurationError("Failed to initialize database connection") from e

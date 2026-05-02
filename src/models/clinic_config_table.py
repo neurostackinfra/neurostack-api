@@ -114,6 +114,14 @@ class ClinicConfigTable(Base, TimestampMixin):
         server_default=text("'[]'"),
     )
 
+    # --- API credentials bucket (migration 006) ---
+
+    api_credentials: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=True,
+        server_default=text("'{}'"),
+    )
+
     tenant: Mapped["Tenant"] = relationship(
         "Tenant",
         back_populates="clinic_config_row",

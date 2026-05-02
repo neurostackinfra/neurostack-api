@@ -5,6 +5,24 @@ All API contracts and data models for the NeuroStack API.
 This module exports all schema classes for use in API routes and documentation.
 """
 
+from src.api.schemas.admin import (
+    AdminStatsResponse,
+    BuilderClinicResponse,
+    BuilderWithClinicsResponse,
+    ClinicSlotResponse,
+    ClinicUserResponse,
+    CreateBuilderClinicRequest,
+    CreateBuilderRequest,
+    CreateClinicRequest,
+    UpdateBuilderRequest,
+)
+from src.api.schemas.builder import (
+    BuilderClinicResponse as BuilderPanelClinicResponse,
+    BuilderProfileResponse,
+    BuilderStatsResponse,
+    CreateBuilderClinicRequest as CreateBuilderPanelClinicRequest,
+    ToggleClinicStatusRequest,
+)
 from src.api.schemas.base import (
     BaseResponse,
     ErrorDetail,
@@ -83,6 +101,22 @@ from src.api.schemas.tenants import (
 )
 
 __all__ = [
+    # Builder (panel)
+    "BuilderPanelClinicResponse",
+    "BuilderProfileResponse",
+    "BuilderStatsResponse",
+    "CreateBuilderPanelClinicRequest",
+    "ToggleClinicStatusRequest",
+    # Admin
+    "AdminStatsResponse",
+    "BuilderClinicResponse",
+    "BuilderWithClinicsResponse",
+    "ClinicSlotResponse",
+    "ClinicUserResponse",
+    "CreateBuilderClinicRequest",
+    "CreateBuilderRequest",
+    "CreateClinicRequest",
+    "UpdateBuilderRequest",
     # Base
     "BaseResponse",
     "ErrorDetail",

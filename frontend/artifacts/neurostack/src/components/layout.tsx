@@ -23,6 +23,7 @@ import {
   HelpCircle,
   Briefcase,
   FlaskConical,
+  Wrench,
 } from "lucide-react";
 import logoSrc from "@assets/logo_png_1775411054369.png";
 import { Button } from "@/components/ui/button";
@@ -37,7 +38,7 @@ interface LayoutProps {
 
 export function Layout({ children }: LayoutProps) {
   const [location] = useLocation();
-  const { logout, email, clinicId, isSuperAdmin, isInvestor, isReadOnly, viewingClinicId } = useAuth();
+  const { logout, email, clinicId, isSuperAdmin, isInvestor, isBuilder, isReadOnly, viewingClinicId } = useAuth();
   const { t, locale, setLocale } = useI18n();
   const displayClinicId = isSuperAdmin ? viewingClinicId : clinicId;
   const { data: clinicConfig } = useGetClinicConfig({ clinic_id: displayClinicId });
@@ -117,8 +118,8 @@ export function Layout({ children }: LayoutProps) {
             </Link>
           ))}
 
-          {/* Master Admin section — super_admin + investor */}
-          {(isSuperAdmin || isInvestor) && (
+          {/* Master Admin section — super_admin + investor (hide from builders) */}
+          {(isSuperAdmin || isInvestor) && !isBuilder && (
             <>
               <div className="mt-3 pt-3 border-t border-sidebar-border">
                 <p className="text-[10px] font-semibold uppercase tracking-wider text-violet-400/60 px-2 mb-1.5 flex items-center gap-1">
@@ -138,6 +139,32 @@ export function Layout({ children }: LayoutProps) {
                 >
                   <Shield className="h-4 w-4" />
                   Master Admin
+                </Button>
+              </Link>
+            </>
+          )}
+
+          {/* Builder Panel section */}
+          {isBuilder && (
+            <>
+              <div className="mt-3 pt-3 border-t border-sidebar-border">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-indigo-400/60 px-2 mb-1.5 flex items-center gap-1">
+                  <Wrench className="h-3 w-3" />
+                  Builder
+                </p>
+              </div>
+              <Link href="/builder">
+                <Button
+                  variant={location === "/builder" ? "secondary" : "ghost"}
+                  className={`w-full justify-start gap-2 ${
+                    location === "/builder"
+                      ? "bg-indigo-500/20 text-indigo-400"
+                      : "text-indigo-400/70 hover:bg-indigo-500/10 hover:text-indigo-400"
+                  }`}
+                  data-testid="nav-link-builder"
+                >
+                  <Wrench className="h-4 w-4" />
+                  {t("builder_panel_title")}
                 </Button>
               </Link>
             </>
