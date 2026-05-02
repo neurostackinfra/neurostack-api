@@ -36,7 +36,7 @@ from src.api.middleware.tracing import (
     instrument_redis,
     instrument_sqlalchemy,
 )
-from src.api.routes import auth, config, events, handoff, health, knowledge, policies, sessions, traces
+from src.api.routes import admin, auth, builder, config, events, handoff, health, knowledge, policies, rlhf, sessions, support, traces
 from src.config.logging import configure_logging, get_logger
 from src.config.settings import settings
 from src.core.exceptions import ConfigurationError
@@ -408,6 +408,26 @@ def create_app() -> FastAPI:
         config.router,
         prefix=f"{settings.api_prefix}/config",
         tags=["Config"],
+    )
+    app.include_router(
+        support.router,
+        prefix=f"{settings.api_prefix}/support",
+        tags=["Support"],
+    )
+    app.include_router(
+        builder.router,
+        prefix=f"{settings.api_prefix}/builder",
+        tags=["Builder"],
+    )
+    app.include_router(
+        admin.router,
+        prefix=f"{settings.api_prefix}/admin",
+        tags=["Admin"],
+    )
+    app.include_router(
+        rlhf.router,
+        prefix=f"{settings.api_prefix}/rlhf",
+        tags=["RLHF"],
     )
     
     # Override OpenAPI schema to include headers (after all routers are registered)

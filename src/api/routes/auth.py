@@ -104,6 +104,10 @@ async def login(body: LoginRequest) -> LoginResponse:
             "jti": str(uuid4()),
         }
 
+        # Include builder_id claim if user has one
+        if user.builder_id is not None:
+            claims["builder_id"] = str(user.builder_id)
+
         token = jwt.encode(claims, settings.secret_key, algorithm=JWT_ALGORITHM)
 
         return LoginResponse(

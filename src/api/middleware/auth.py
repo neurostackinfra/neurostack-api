@@ -448,6 +448,55 @@ def get_tenant_context(request: Request) -> TenantContext:
     return request.state.tenant
 
 
+def require_super_admin(request: Request) -> TenantContext:
+    """
+    FastAPI dependency that enforces super_admin role.
+    Raises 403 if the authenticated user is not a super_admin.
+    """
+    tenant = get_tenant_context(request)
+    if tenant.role != "super_admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Super admin access required",
+        )
+    return tenant
+
+
+def require_builder(request: Request) -> UUID:
+    """
+    FastAPI dependency that enforces builder role and extracts builder_id from JWT.
+    Raises 403 if the authenticated user does not have a builder_id claim.
+    Returns the builder_id UUID for use in route handlers.
+    """
+    tenant = get_tenant_context(request)
+
+    # Extract builder_id from JWT claims (stored in request state during middleware)
+    # The middleware decodes the JWT and puts role in TenantContext, but builder_id
+    # is an extra claim. We re-decode from the Authorization header.
+    auth_header = request.headers.get("Authorization", "")
+    builder_id_str: Optional[str] = None
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        try:
+            payload = jwt.decode(
+                token,
+                settings.secret_key,
+                algorithms=["HS256"],
+                options={"require": ["sub", "tenant_id", "exp"]},
+            )
+            builder_id_str = payload.get("builder_id")
+        except (jwt.InvalidTokenError, KeyError, ValueError):
+            pass
+
+    if not builder_id_str or tenant.role != "builder":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Builder profile not found. Contact admin to enable builder access.",
+        )
+
+    return UUID(builder_id_str)
+
+
 def get_optional_tenant_context(request: Request) -> Optional[TenantContext]:
     """
     FastAPI dependency for optionally getting tenant context.

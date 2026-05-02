@@ -24,6 +24,7 @@ class UserRole(str, Enum):
     clinic_admin = "clinic_admin"
     super_admin = "super_admin"
     investor = "investor"
+    builder = "builder"
 
 
 class User(Base, TimestampMixin):
@@ -73,6 +74,14 @@ class User(Base, TimestampMixin):
     role: Mapped[UserRole] = mapped_column(
         PGEnum(UserRole, name="userrole", create_type=True),
         nullable=False,
+    )
+
+    # Builder FK (nullable — only builder-role users have this)
+    builder_id: Mapped[Optional[UUID]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("builders.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
 
     # Status
