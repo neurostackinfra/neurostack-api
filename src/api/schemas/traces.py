@@ -217,6 +217,15 @@ class TraceStatsResponse(BaseModel):
         ge=0,
         description="Number of traces requiring human handoff",
     )
+    total_tokens_sum: int = Field(
+        default=0,
+        ge=0,
+        description="Total LLM tokens consumed in the period",
+    )
+    model_breakdown: list[dict] = Field(
+        default_factory=list,
+        description="Token consumption per model, sorted descending by tokens",
+    )
     intent_distribution: dict[str, int] = Field(
         default_factory=dict,
         description="Distribution of intents across traces",

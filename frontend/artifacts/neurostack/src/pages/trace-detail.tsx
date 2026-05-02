@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { ArrowLeft, Clock, MessageSquare } from "lucide-react";
 import { format } from "date-fns";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
 
 function getToken(): string | null {
@@ -35,9 +36,11 @@ function mapTrace(data: any) {
       gate_authority_before_price: srm.gate_authority_before_price ?? (srm.intent === "pedido_preco"),
     },
     selectedContext: (data.selected_context ?? data.selectedContext ?? []).map((c: any) => ({
-      key: c.key ?? "",
-      value: c.value ?? "",
-      source: c.source ?? "",
+      key: c.field ?? c.key ?? "",
+      value: c.content ?? c.value ?? "",
+      source: c.origin ?? c.source ?? "",
+      title: c.title ?? "",
+      field: c.field ?? c.key ?? "",
     })),
     promptBuilt: data.prompt_built ?? data.promptBuilt ?? "",
     llmResponse: data.llm_response ?? data.llmResponse ?? data.full_prompt?.suggested_response ?? "",
@@ -53,6 +56,7 @@ export default function TraceDetail() {
   const params = useParams();
   const id = params.id as string;
   const { t } = useI18n();
+  const { isBuilder, viewingClinicId } = useAuth();
 
   const [trace, setTrace] = useState<ReturnType<typeof mapTrace> | null>(null);
   const [loading, setLoading] = useState(true);
@@ -67,7 +71,8 @@ export default function TraceDetail() {
       setLoadError(null);
       try {
         const token = getToken();
-        const res = await fetch(`/v1/traces/${id}`, {
+        const tenantParam = isBuilder && viewingClinicId ? `?tenant_id=${viewingClinicId}` : "";
+        const res = await fetch(`/v1/traces/${id}${tenantParam}`, {
           headers: token ? { Authorization: `Bearer ${token}` } : {},
         });
         if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);

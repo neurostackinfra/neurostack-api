@@ -73,7 +73,7 @@ function mapTrace(t: ApiTrace) {
 }
 
 export default function TracesList() {
-  const { isReadOnly } = useAuth();
+  const { isReadOnly, isBuilder, viewingClinicId } = useAuth();
   const { t, locale } = useI18n();
   const txt = (p: string, e: string) => locale === "en" ? e : p;
   const { toast } = useToast();
@@ -114,6 +114,7 @@ export default function TracesList() {
       if (endDate) params.set("end_date", endDate);
       if (onlySafety) params.set("safety_flag", "true");
       if (onlyHandoff) params.set("handoff_required", "true");
+      if (isBuilder && viewingClinicId) params.set("tenant_id", viewingClinicId);
 
       const res = await fetch(`/v1/traces?${params.toString()}`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -133,7 +134,7 @@ export default function TracesList() {
     } finally {
       setLoading(false);
     }
-  }, [offset, startDate, endDate, onlySafety, onlyHandoff]);
+  }, [offset, startDate, endDate, onlySafety, onlyHandoff, isBuilder, viewingClinicId]);
 
   useEffect(() => {
     void fetchTraces();
@@ -169,6 +170,7 @@ export default function TracesList() {
       });
       if (onlySafety) params.set("safety_flag", "true");
       if (onlyHandoff) params.set("handoff_required", "true");
+      if (isBuilder && viewingClinicId) params.set("tenant_id", viewingClinicId);
 
       const res = await fetch(`/v1/traces/export?${params.toString()}`, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},

@@ -51,6 +51,7 @@ interface AuthContextValue {
   isSuperAdmin: boolean;
   isInvestor: boolean;
   isBuilder: boolean;
+  isClinicAdmin: boolean;
   isReadOnly: boolean;
   leadSubmitted: boolean;
   viewingClinicId: string;
@@ -189,11 +190,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const isSuperAdmin = role === "super_admin";
   const isInvestor   = role === "investor";
   const isBuilder    = role === "builder";
+  const isClinicAdmin = role === "clinic_admin";
   const builderId    = state.builderId ?? null;
   const clinicId     = state.clinicId ?? "";
   const tenantId     = state.tenantId ?? "";
   const userId       = state.userId ?? "";
   const viewingClinicId = state.viewingClinicId ?? clinicId;
+
+  // Auto-resolve viewingClinicId for builders with no clinic assigned
+  useEffect(() => {
+    if (!isBuilder || !state.token || viewingClinicId) return;
+    fetch("/v1/builder/clinics", {
+      headers: { Authorization: `Bearer ${state.token}` },
+    })
+      .then((r) => (r.ok ? r.json() : Promise.reject(r)))
+      .then((data: Array<{ id: string; name: string; tenant_id?: string }> | { clinics?: Array<{ id: string; name: string; tenant_id?: string }> }) => {
+        const clinics = Array.isArray(data) ? data : (data.clinics ?? []);
+        if (clinics.length > 0) {
+          setViewingClinicId(clinics[0].tenant_id ?? clinics[0].id);
+        }
+      })
+      .catch(() => {});
+  }, [isBuilder, state.token, viewingClinicId, setViewingClinicId]);
 
   return (
     <AuthContext.Provider
@@ -208,6 +226,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         isSuperAdmin,
         isInvestor,
         isBuilder,
+        isClinicAdmin,
         isReadOnly: isInvestor,
         leadSubmitted: state.leadSubmitted,
         viewingClinicId,

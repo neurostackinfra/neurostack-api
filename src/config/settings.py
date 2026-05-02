@@ -133,7 +133,7 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "o4-mini"
     llm_temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    llm_max_tokens: int = Field(default=1024, ge=64, le=16384)
+    llm_max_tokens: int = Field(default=4096, ge=64, le=16384)
 
     @field_validator("database_url")
     @classmethod

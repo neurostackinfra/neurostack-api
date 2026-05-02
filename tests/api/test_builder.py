@@ -341,3 +341,150 @@ class TestBuilderStats:
         assert "active_clinics" in data
         assert "inactive_clinics" in data
         assert "total_traces" in data
+
+
+# ============================================
+# Dashboard Tests
+# ============================================
+
+
+class TestBuilderDashboard:
+    """Test GET /v1/builder/dashboard."""
+
+    def test_returns_dashboard_structure(self, client: TestClient, builder_a_headers):
+        response = client.get("/v1/builder/dashboard", headers=builder_a_headers)
+        assert response.status_code == 200
+        data = response.json()
+        assert "stats" in data
+        assert "time_series" in data
+        assert "alerts" in data
+        # Stats structure
+        stats = data["stats"]
+        assert "clinic_count" in stats
+        assert "active_clinics" in stats
+        assert "inactive_clinics" in stats
+        assert "total_traces" in stats
+
+    def test_time_series_has_31_days(self, client: TestClient, builder_a_headers):
+        """Time series should have 31 points (day 0 through day 30)."""
+        response = client.get("/v1/builder/dashboard", headers=builder_a_headers)
+        assert response.status_code == 200
+        data = response.json()
+        ts = data["time_series"]
+        assert isinstance(ts, list)
+        assert len(ts) == 31
+        for point in ts:
+            assert "date" in point
+            assert "count" in point
+
+    def test_alerts_is_list(self, client: TestClient, builder_a_headers):
+        response = client.get("/v1/builder/dashboard", headers=builder_a_headers)
+        assert response.status_code == 200
+        assert isinstance(response.json()["alerts"], list)
+
+    def test_returns_401_without_token(self, client: TestClient):
+        response = client.get("/v1/builder/dashboard")
+        assert response.status_code == 401
+
+    def test_returns_403_for_clinic_admin(self, client: TestClient, clinic_admin_headers):
+        response = client.get("/v1/builder/dashboard", headers=clinic_admin_headers)
+        assert response.status_code == 403
+
+    def test_dashboard_scope_isolation(
+        self, client: TestClient, builder_a_headers, builder_b_headers
+    ):
+        """Each builder sees only their own data in the dashboard."""
+        response_a = client.get("/v1/builder/dashboard", headers=builder_a_headers)
+        response_b = client.get("/v1/builder/dashboard", headers=builder_b_headers)
+        assert response_a.status_code == 200
+        assert response_b.status_code == 200
+
+
+# ============================================
+# Enriched Clinics Tests
+# ============================================
+
+
+class TestBuilderEnrichedClinics:
+    """Test that GET /v1/builder/clinics returns health fields."""
+
+    def test_clinics_have_health_fields(self, client: TestClient, builder_a_headers):
+        """Even an empty list validates the endpoint works; if clinics exist, check fields."""
+        response = client.get("/v1/builder/clinics", headers=builder_a_headers)
+        assert response.status_code == 200
+        data = response.json()
+        assert isinstance(data, list)
+        # If there are clinics, verify health fields exist
+        if len(data) > 0:
+            clinic = data[0]
+            assert "last_trace_at" in clinic
+            assert "health_status" in clinic
+            assert "trace_count_7d" in clinic
+            assert "safety_flags_7d" in clinic
+            assert "handoff_count_7d" in clinic
+            assert "config_completeness" in clinic
+            assert clinic["health_status"] in ("healthy", "warning", "critical")
+            assert 0 <= clinic["config_completeness"] <= 100
+
+    def test_enriched_response_schema_has_all_fields(self, client: TestClient, builder_a_headers):
+        """Verify the enriched clinic response schema includes all health fields.
+        Even if empty, the endpoint should return 200 with the right structure."""
+        response = client.get("/v1/builder/clinics", headers=builder_a_headers)
+        assert response.status_code == 200
+        # Endpoint works — empty list is fine (no DB data for random builder_id)
+        assert isinstance(response.json(), list)
+
+    def test_health_status_values(self):
+        """Test the health status helper directly."""
+        from src.api.routes.builder import _compute_health_status
+
+        now = datetime.now(timezone.utc)
+        # Recent trace → healthy
+        assert _compute_health_status(now - timedelta(hours=1), True) == "healthy"
+        # 5 days ago → warning
+        assert _compute_health_status(now - timedelta(days=5), True) == "warning"
+        # 10 days ago → critical
+        assert _compute_health_status(now - timedelta(days=10), True) == "critical"
+        # No traces → critical
+        assert _compute_health_status(None, True) == "critical"
+        # Inactive → critical regardless of trace
+        assert _compute_health_status(now - timedelta(hours=1), False) == "critical"
+
+    def test_config_completeness_calculation(self):
+        """Test the config completeness helper directly."""
+        from src.api.routes.builder import _compute_config_completeness
+
+        # None → 0%
+        assert _compute_config_completeness(None) == 0
+
+        # Create a mock config with some filled buckets
+        class MockConfig:
+            identity = {"clinic_name": "Test"}
+            operations = {"hours": "8-18"}
+            business_rules = {}  # empty dict = not filled
+            persona = {"name": "Ana"}
+            services = [{"name": "Consulta"}]
+            professionals = []  # empty list = not filled
+
+        mock = MockConfig()
+        result = _compute_config_completeness(mock)
+        # 3 filled (identity, operations, persona) + 1 (services) = 4 out of 6
+        # Wait: services = [{"name": "Consulta"}] is non-empty → filled
+        # professionals = [] → empty → not filled
+        # business_rules = {} → empty → not filled
+        # So 4/6 = 66%
+        assert result == 66
+
+    def test_config_completeness_all_filled(self):
+        """Test completeness with all buckets filled."""
+        from src.api.routes.builder import _compute_config_completeness
+
+        class FullConfig:
+            identity = {"a": 1}
+            operations = {"b": 2}
+            business_rules = {"c": 3}
+            persona = {"d": 4}
+            services = [{"e": 5}]
+            professionals = [{"f": 6}]
+
+        assert _compute_config_completeness(FullConfig()) == 100

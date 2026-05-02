@@ -83,7 +83,14 @@ TRANSITION_TRIGGERS: dict[tuple[FunnelStage, str], FunnelStage] = {
     (FunnelStage.LEAD_NOVO, "pedido_preco"): FunnelStage.EM_QUALIFICACAO,
     (FunnelStage.LEAD_NOVO, "agendar"): FunnelStage.EM_QUALIFICACAO,
     (FunnelStage.LEAD_NOVO, "duvida_generica_sem_contexto"): FunnelStage.LEAD_NOVO,
-    # lead_novo -> paciente_ativo (já é paciente - por slot/flag, não intent único)
+    (FunnelStage.LEAD_NOVO, "comparacao_tratamentos"): FunnelStage.EM_QUALIFICACAO,
+    (FunnelStage.LEAD_NOVO, "orcamento_existente"): FunnelStage.EM_QUALIFICACAO,
+    (FunnelStage.LEAD_NOVO, "paciente_ativo"): FunnelStage.PACIENTE_ATIVO,
+    (FunnelStage.LEAD_NOVO, "pos_atendimento_duvida"): FunnelStage.POS_ATENDIMENTO,
+    (FunnelStage.LEAD_NOVO, "pos_atendimento_sintomas_preocupantes"): FunnelStage.POS_ATENDIMENTO,
+    (FunnelStage.LEAD_NOVO, "pedido_alterar_medicacao"): FunnelStage.POS_ATENDIMENTO,
+    # lead_novo stays (info/admin intents — no transition needed, handled by default)
+    # lead_novo -> paciente_ativo (já é paciente - por slot/flag ou intent direto)
     # em_qualificacao -> qualificado (quando qualificação completa, via slots/flags)
     (FunnelStage.EM_QUALIFICACAO, "agendar"): FunnelStage.AGENDAMENTO_SOLICITADO,
     (FunnelStage.EM_QUALIFICACAO, "disponibilidade_horarios"): FunnelStage.EM_QUALIFICACAO,

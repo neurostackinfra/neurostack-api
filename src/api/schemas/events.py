@@ -423,28 +423,32 @@ class MessageHistory(BaseModel):
     )
 
 
-class RAGSource(BaseModel):
-    """A source document retrieved via RAG."""
+class ContextSource(BaseModel):
+    """A context source used in prompt generation (config field or RAG document)."""
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "document_id": "doc-123",
-                "title": "Horários de Atendimento",
-                "content": "A clínica funciona de segunda a sexta, das 8h às 18h.",
-                "relevance_score": 0.95,
+                "origin": "config",
+                "field": "identity.clinic_name",
+                "title": "Nome da Clínica",
+                "content": "Clínica Estética Vitória",
+                "document_id": None,
+                "relevance_score": None,
             }
         }
     )
 
-    document_id: str = Field(..., description="Unique identifier of the source document")
-    title: Optional[str] = Field(default=None, description="Title of the source document")
-    content: str = Field(..., description="Relevant content excerpt")
-    relevance_score: float = Field(
-        ...,
+    origin: str = Field(..., description="Source origin: 'config' or 'rag'")
+    field: Optional[str] = Field(default=None, description="Technical field path (e.g. 'identity.clinic_name')")
+    title: str = Field(..., description="Human-readable title in Portuguese")
+    content: str = Field(..., description="Value or content excerpt")
+    document_id: Optional[str] = Field(default=None, description="Document ID for RAG sources")
+    relevance_score: Optional[float] = Field(
+        default=None,
         ge=0.0,
         le=1.0,
-        description="Relevance score from vector search",
+        description="Relevance score from vector search (RAG only)",
     )
 
 
@@ -467,7 +471,7 @@ class ContextOutput(BaseModel):
                     }
                 ],
                 "session_summary": "Nova sessão de agendamento iniciada",
-                "rag_sources": [],
+                "context_sources": [],
                 "turn_count": 1,
             }
         }
@@ -482,9 +486,9 @@ class ContextOutput(BaseModel):
         description="AI-generated summary of the session so far",
         json_schema_extra={"example": "Nova sessão de agendamento iniciada"},
     )
-    rag_sources: list[RAGSource] = Field(
+    context_sources: list[ContextSource] = Field(
         default_factory=list,
-        description="Sources retrieved via RAG if applicable",
+        description="Context sources used in prompt generation (config fields and RAG documents)",
     )
     turn_count: int = Field(
         default=0,

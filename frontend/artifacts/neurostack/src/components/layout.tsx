@@ -1,3 +1,4 @@
+import { useState, useEffect } from "react";
 import { Link, useLocation } from "wouter";
 import {
   MessageSquare,
@@ -24,8 +25,10 @@ import {
   Briefcase,
   FlaskConical,
   Wrench,
+  ChevronDown,
 } from "lucide-react";
 import logoSrc from "@assets/logo_png_1775411054369.png";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import { useAuth } from "@/context/auth";
@@ -38,34 +41,57 @@ interface LayoutProps {
 
 export function Layout({ children }: LayoutProps) {
   const [location] = useLocation();
-  const { logout, email, clinicId, isSuperAdmin, isInvestor, isBuilder, isReadOnly, viewingClinicId } = useAuth();
+  const { logout, email, clinicId, role, isSuperAdmin, isInvestor, isBuilder, isClinicAdmin, isReadOnly, viewingClinicId } = useAuth();
   const { t, locale, setLocale } = useI18n();
-  const displayClinicId = isSuperAdmin ? viewingClinicId : clinicId;
+  const { setViewingClinicId } = useAuth();
+  const displayClinicId = (isSuperAdmin || isBuilder) ? viewingClinicId : clinicId;
   const { data: clinicConfig } = useGetClinicConfig({ clinic_id: displayClinicId });
   const clinicName = clinicConfig?.clinic_name ?? `Clinic ${displayClinicId}`;
+
+  // Builder clinic list for dropdown
+  const [builderClinics, setBuilderClinics] = useState<Array<{ id: string; name: string; tenant_id: string }>>([]);
+  useEffect(() => {
+    if (!isBuilder) return;
+    const raw = localStorage.getItem("ns_auth");
+    const token = raw ? (JSON.parse(raw) as { token?: string }).token : null;
+    if (!token) return;
+    fetch("/v1/builder/clinics", {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => r.ok ? r.json() : Promise.reject(r))
+      .then((data: { clinics?: Array<{ id: string; name: string; tenant_id: string }> }) => {
+        const clinics = data.clinics ?? [];
+        setBuilderClinics(clinics);
+        // Stale viewingClinicId guard
+        if (clinics.length > 0 && !clinics.some((c) => c.tenant_id === viewingClinicId)) {
+          setViewingClinicId(clinics[0].tenant_id);
+        }
+      })
+      .catch(() => {});
+  }, [isBuilder, viewingClinicId, setViewingClinicId]);
 
   const navItems = [
     { href: "/",         label: t("nav_chat"),      icon: MessageSquare,  id: "chat-simulator", hideFor: [] },
     { href: "/traces",   label: t("nav_traces"),    icon: Activity,       id: "trace-history",  hideFor: [] },
     { href: "/dashboard",label: t("nav_dashboard"), icon: LayoutDashboard,id: "dashboard",      hideFor: [] },
     { href: "/config",   label: t("nav_config"),    icon: Sliders,        id: "clinic-config",  hideFor: [] },
-    { href: "/suporte",  label: "Suporte",           icon: HelpCircle,    id: "suporte",        hideFor: [] },
-  ].filter(() => true);
+    { href: "/suporte",  label: "Suporte",           icon: HelpCircle,    id: "suporte",        hideFor: [], badge: isClinicAdmin ? "Em breve" : undefined },
+  ].filter(item => !(item.hideFor as string[]).includes(role));
 
   const roadmapItems = [
-    { href: "/agents",         label: t("nav_agents"),         icon: Network,       id: "agents",         v: "v3"  },
-    { href: "/crm",            label: t("nav_crm"),            icon: Link2,         id: "crm",            v: "v2"  },
-    { href: "/knowledge-base", label: t("nav_knowledge_base"), icon: Library,       id: "knowledge-base", v: "v2"  },
-    { href: "/onboarding",     label: "Onboarding",            icon: GraduationCap, id: "onboarding",     v: "v2"  },
-    { href: "/seguranca",      label: "Segurança & Compliance",icon: ShieldCheck,   id: "seguranca",      v: "v2"  },
-    { href: "/slm-cortex",     label: "SLM Cortex",            icon: Cpu,           id: "slm-cortex",     v: "v3"  },
-    { href: "/rlhf-audit",     label: "Auditoria RLHF",        icon: FlaskConical,  id: "rlhf-audit",     v: "v3"  },
-    { href: "/consultoria",    label: "Consultoria Comercial", icon: Lightbulb,     id: "consultoria",    v: "v2"  },
-    { href: "/midias",         label: "Mídias & Ativos",       icon: FolderOpen,    id: "midias",         v: "v3"  },
-    { href: "/billing",        label: "Assinatura & Pagamento",icon: CreditCard,    id: "billing",        v: "v2"  },
-    { href: "/voice-ai",       label: "Inteligência de Voz",   icon: Mic,           id: "voice-ai",       v: "v3"  },
-    { href: "/portal-parceiros",label: "Portal de Parceiros",  icon: Briefcase,     id: "portal-parceiros",v: "v3" },
-  ];
+    { href: "/agents",         label: t("nav_agents"),         icon: Network,       id: "agents",         v: "v3",  hideFor: ["clinic_admin"] },
+    { href: "/crm",            label: t("nav_crm"),            icon: Link2,         id: "crm",            v: "v2",  hideFor: ["clinic_admin"] },
+    { href: "/knowledge-base", label: t("nav_knowledge_base"), icon: Library,       id: "knowledge-base", v: "v2",  hideFor: ["clinic_admin"] },
+    { href: "/onboarding",     label: "Onboarding",            icon: GraduationCap, id: "onboarding",     v: "v2",  hideFor: [] },
+    { href: "/seguranca",      label: "Segurança & Compliance",icon: ShieldCheck,   id: "seguranca",      v: "v2",  hideFor: ["clinic_admin"] },
+    { href: "/slm-cortex",     label: "SLM Cortex",            icon: Cpu,           id: "slm-cortex",     v: "v3",  hideFor: ["clinic_admin"] },
+    { href: "/rlhf-audit",     label: "Auditoria RLHF",        icon: FlaskConical,  id: "rlhf-audit",     v: "v3",  hideFor: ["clinic_admin"] },
+    { href: "/consultoria",    label: "Consultoria Comercial", icon: Lightbulb,     id: "consultoria",    v: "v2",  hideFor: [] },
+    { href: "/midias",         label: "Mídias & Ativos",       icon: FolderOpen,    id: "midias",         v: "v3",  hideFor: ["clinic_admin"] },
+    { href: "/billing",        label: "Assinatura & Pagamento",icon: CreditCard,    id: "billing",        v: "v2",  hideFor: ["clinic_admin"] },
+    { href: "/voice-ai",       label: "Inteligência de Voz",   icon: Mic,           id: "voice-ai",       v: "v3",  hideFor: ["clinic_admin"] },
+    { href: "/portal-parceiros",label: "Portal de Parceiros",  icon: Briefcase,     id: "portal-parceiros",v: "v3", hideFor: ["clinic_admin"] },
+  ].filter(item => !item.hideFor.includes(role));
 
   const SidebarContent = () => (
     <div className="flex h-full flex-col bg-sidebar text-sidebar-foreground">
@@ -89,6 +115,30 @@ export function Layout({ children }: LayoutProps) {
           {clinicName}
         </p>
       </div>
+
+      {/* Builder clinic dropdown */}
+      {isBuilder && builderClinics.length > 0 && (
+        <div className="border-b border-sidebar-border px-3 py-2">
+          <div className="flex items-center gap-1.5 mb-1 px-1">
+            <ChevronDown className="h-3 w-3 text-indigo-400" />
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-indigo-400/60">
+              Selecionar Clínica
+            </span>
+          </div>
+          <select
+            value={viewingClinicId}
+            onChange={(e) => setViewingClinicId(e.target.value)}
+            className="w-full rounded-md border border-sidebar-border bg-sidebar px-2 py-1.5 text-xs text-sidebar-foreground focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            data-testid="builder-clinic-dropdown"
+          >
+            {builderClinics.map((c) => (
+              <option key={c.id} value={c.tenant_id}>
+                {c.name}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
 
       {/* Investor / read-only badge */}
       {isReadOnly && (
@@ -114,6 +164,11 @@ export function Layout({ children }: LayoutProps) {
               >
                 <item.icon className="h-4 w-4" />
                 {item.label}
+                {"badge" in item && item.badge && (
+                  <Badge variant="outline" className="ml-auto text-[9px] px-1.5 py-0 border-amber-500/40 text-amber-500">
+                    {item.badge}
+                  </Badge>
+                )}
               </Button>
             </Link>
           ))}

@@ -46,10 +46,6 @@ from src.srm.models import (
     RagResult,
     SentimentResult,
 )
-from src.srm.sentiment_classifier import (
-    SentimentClassifier,
-    get_sentiment_classifier,
-)
 from src.srm.intent_classifier import (
     IntentClassifier,
     get_intent_classifier,
@@ -106,8 +102,6 @@ __all__ = [
     "get_handoff_decider",
     "RagDecider",
     "get_rag_decider",
-    "SentimentClassifier",
-    "get_sentiment_classifier",
     # Engine
     "SRMEngine",
     "get_srm_engine",

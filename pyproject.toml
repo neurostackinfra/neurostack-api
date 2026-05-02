@@ -99,6 +99,7 @@ python_files = ["test_*.py", "*_test.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short --strict-markers"
 markers = [
+    "asyncio: Async tests",
     "unit: Unit tests",
     "integration: Integration tests",
     "e2e: End-to-end tests",

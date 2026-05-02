@@ -15,6 +15,7 @@ from src.prompt.templates.base import BaseTemplate, TemplateSection
 NORMAL_SYSTEM_PROMPT = """# Assistente Virtual de Clínica — Metodologia NeuroStack v0.6
 
 Você é {{agent_name}}, assistente virtual da {{clinic_name}}.
+{{agent_presentation}}
 Seu papel é atender pacientes e leads via chat (WhatsApp, web) com excelência, conduzindo cada pessoa pela jornada correta do funil de atendimento.
 
 ## Identidade
@@ -149,9 +150,9 @@ Objetivo: Direcionar para agendamento ou esclarecer dúvidas finais.
 - Se pede preço: aplique sequência de autoridade ANTES do valor.
 
 ### Sequência de autoridade antes de preço:
-1. Mencione diferenciais da clínica (técnica, profissionais, resultados).
-2. Explique o que está incluído no atendimento.
-3. Só então fale de valor (faixa de preço se disponível, detalhes na consulta).
+1. Mencione os diferenciais de autoridade do serviço (authority_notes) e a qualidade dos profissionais.
+2. Explique o que está incluído no serviço (description).
+3. Só então fale de valor: se provide_prices = yes, informe o preço exato configurado. Senão, diga que detalhes são na consulta.
 """,
     "followup": """
 ## Instruções para Follow-up (Reengajamento)
@@ -360,7 +361,11 @@ class NormalTemplate(BaseTemplate):
             section.add(f"**Formas de pagamento:** {custom['payment_methods']}")
         if custom.get("differentials"):
             section.add(f"**Diferenciais:** {custom['differentials']}")
-        if custom.get("pricing_mode"):
+        # Pricing policy: provide_prices overrides pricing_mode when set to yes/true
+        provide_prices = custom.get("provide_prices")
+        if provide_prices in (True, "yes", "true", "True"):
+            section.add("**Política de preço:** Pode informar preços exatos dos serviços quando o paciente solicitar.")
+        elif custom.get("pricing_mode"):
             mode = custom["pricing_mode"]
             if mode == "RANGE_ALLOWED":
                 section.add("**Política de preço:** Pode informar faixa de preço quando solicitado.")
@@ -368,6 +373,37 @@ class NormalTemplate(BaseTemplate):
                 section.add("**Política de preço:** Pode informar valores exatos quando solicitado.")
             else:
                 section.add("**Política de preço:** Valores apenas na consulta presencial.")
+
+        # Extended config fields
+        accepts_ins = custom.get("accepts_insurance")
+        if accepts_ins and str(accepts_ins).lower() not in ("no", "false", "0", "none"):
+            insurance_text = "**Aceita convênio:** Sim"
+            if custom.get("insurance_list"):
+                insurance_text += f" — {custom['insurance_list']}"
+            section.add(insurance_text)
+        if custom.get("initial_consultation"):
+            section.add(f"**Tipo de consulta inicial:** {custom['initial_consultation']}")
+        if custom.get("parking_info"):
+            section.add(f"**Estacionamento:** {custom['parking_info']}")
+        if custom.get("scheduling_hours"):
+            section.add(f"**Horários de agendamento:** {custom['scheduling_hours']}")
+        if custom.get("service_format"):
+            section.add(f"**Formato de atendimento:** {custom['service_format']}")
+        if custom.get("use_emojis"):
+            section.add("**Estilo:** Pode usar emojis nas respostas.")
+        if custom.get("language_policy"):
+            section.add(f"**Política de idioma:** {custom['language_policy']}")
+        # provide_prices already handled above in pricing policy section
+
+        # Services section (with prices if available)
+        if custom.get("services_detail"):
+            section.add("\n## Serviços Oferecidos")
+            section.add(custom["services_detail"])
+
+        # Professionals section
+        if custom.get("professionals"):
+            section.add("\n## Equipe Profissional")
+            section.add(custom["professionals"])
 
         content = section.build()
         return content if section.content else ""
@@ -407,11 +443,10 @@ class NormalTemplate(BaseTemplate):
             "pedido_preco": """
 ## Objetivo: Informação de Preços
 ### SEQUÊNCIA OBRIGATÓRIA — Autoridade ANTES do preço:
-1. **Gere autoridade**: mencione diferenciais da clínica, qualidade do atendimento, técnica dos profissionais.
-2. **Explique o que está incluído**: "Para te dar todas as informações, quero explicar o que está incluído..."
-3. **Informe que valores dependem da avaliação**: "Os valores são definidos após a avaliação com o profissional."
-4. **Se insistir na faixa de preço**: forneça APENAS se o Clinic Config permitir (pricing_mode = RANGE_ALLOWED ou EXACT_ALLOWED).
-5. **Conduza para agendamento**: "Vamos agendar uma avaliação?"
+1. **Gere autoridade**: mencione os diferenciais de autoridade do serviço perguntado (campo authority_notes) e a qualidade do atendimento.
+2. **Explique o que está incluído**: descreva brevemente o serviço usando a descrição configurada.
+3. **Informe o preço**: Se provide_prices = yes/true, informe o valor exato do serviço conforme configurado. Se provide_prices = no/false, diga que os valores são definidos após avaliação presencial.
+4. **Conduza para agendamento**: "Vamos agendar uma avaliação?"
 
 ### Formas de pagamento:
 - Se perguntar sobre parcelamento/pagamento: informe conforme Clinic Config.

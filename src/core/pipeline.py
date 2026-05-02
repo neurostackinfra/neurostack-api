@@ -170,7 +170,7 @@ class PipelineResult(BaseModel):
     
     # Context
     recent_messages: list[dict[str, str]] = Field(default_factory=list)
-    rag_sources: list[dict[str, Any]] = Field(default_factory=list)
+    context_sources: list[dict[str, Any]] = Field(default_factory=list)
     turn_count: int = 0
     
     # Flow
@@ -287,7 +287,7 @@ class CognitivePipeline:
             
             # Stage 5: Prompt Generation
             stage_start = time.perf_counter()
-            generated_prompt = await self._run_prompt_engine(
+            generated_prompt, context_sources = await self._run_prompt_engine(
                 input_data, srm_decision, context_response, effective_mode, policy_result
             )
             stage_timings["prompt"] = (time.perf_counter() - stage_start) * 1000
@@ -311,6 +311,7 @@ class CognitivePipeline:
                 handoff_response=handoff_response,
                 stage_timings=stage_timings,
                 total_time=total_time,
+                context_sources=context_sources,
             )
             
             # Record metrics
@@ -456,7 +457,7 @@ class CognitivePipeline:
         context_response,
         effective_mode: str,
         policy_result: PolicyEvaluationResult,
-    ) -> GeneratedPrompt:
+    ) -> tuple[GeneratedPrompt, list[dict[str, Any]]]:
         """Run prompt engine."""
         # Map mode to PromptMode
         prompt_mode_map = {
@@ -505,6 +506,128 @@ class CognitivePipeline:
             custom_vars["payment_methods"] = business.get("payment_methods", "")
             custom_vars["pricing_mode"] = pricing.get("disclosure_mode", "CONSULT_ONLY")
 
+            # Extended config injection (Group 1 — clinic-config-fullstack)
+            custom_vars["agent_presentation"] = persona.get("agent_presentation", "")
+            custom_vars["use_emojis"] = persona.get("use_emojis", False)
+            custom_vars["language_policy"] = persona.get("language_policy", "")
+            custom_vars["clinic_history"] = identity.get("clinic_history", "")
+            custom_vars["parking_info"] = operations.get("parking_info", "")
+            custom_vars["scheduling_hours"] = operations.get("scheduling_hours", "")
+            custom_vars["service_format"] = operations.get("service_format", "")
+            custom_vars["accepts_insurance"] = business.get("accepts_insurance", False)
+            custom_vars["insurance_list"] = business.get("insurance_list", "")
+            custom_vars["provide_prices"] = business.get("provide_prices", False)
+            custom_vars["initial_consultation"] = business.get("initial_consultation", "")
+
+            # Format professionals array
+            professionals = cfg.get("professionals", [])
+            if professionals and isinstance(professionals, list):
+                lines = []
+                for p in professionals:
+                    if isinstance(p, dict):
+                        name = p.get("name", "")
+                        specialty = p.get("specialty", "")
+                        desc = p.get("description", "")
+                        line = f"- {name}, {specialty}" if specialty else f"- {name}"
+                        if desc:
+                            line += f": {desc}"
+                        lines.append(line)
+                custom_vars["professionals"] = "\n".join(lines)
+            else:
+                custom_vars["professionals"] = ""
+
+            # Format services array (with price and description when available)
+            services = cfg.get("services", [])
+            if services and isinstance(services, list):
+                svc_names = []
+                svc_lines = []
+                for s in services:
+                    if isinstance(s, dict):
+                        name = s.get("name", "")
+                        if not name:
+                            continue
+                        svc_names.append(name)
+                        line = f"- {name}"
+                        price = s.get("price", "")
+                        if price:
+                            line += f" — {price}"
+                        desc = s.get("description", "")
+                        if desc:
+                            line += f": {desc}"
+                        authority = s.get("authority_notes", "")
+                        if authority:
+                            line += f" ({authority})"
+                        svc_lines.append(line)
+                    elif isinstance(s, str) and s:
+                        svc_names.append(s)
+                        svc_lines.append(f"- {s}")
+                custom_vars["services"] = ", ".join(svc_names)
+                custom_vars["services_detail"] = "\n".join(svc_lines)
+            else:
+                custom_vars["services"] = ""
+                custom_vars["services_detail"] = ""
+
+        # Collect context sources from non-empty custom_vars
+        context_sources: list[dict[str, Any]] = []
+        if input_data.clinic_config:
+            _FIELD_TITLES: dict[str, tuple[str, str]] = {
+                "clinic_name": ("identity.clinic_name", "Nome da Clínica"),
+                "agent_name": ("persona.agent_name", "Nome do Agente"),
+                "clinic_specialties": ("identity.clinic_specialties", "Especialidades"),
+                "working_hours": ("operations.working_hours", "Horário de Funcionamento"),
+                "full_address": ("operations.full_address", "Endereço"),
+                "differentials": ("business_rules.differentials", "Diferenciais"),
+                "payment_methods": ("business_rules.payment_methods", "Formas de Pagamento"),
+                "pricing_mode": ("pricing.disclosure_mode", "Modo de Preços"),
+                "agent_presentation": ("persona.agent_presentation", "Apresentação do Agente"),
+                "use_emojis": ("persona.use_emojis", "Uso de Emojis"),
+                "language_policy": ("persona.language_policy", "Política de Linguagem"),
+                "clinic_history": ("identity.clinic_history", "História da Clínica"),
+                "parking_info": ("operations.parking_info", "Estacionamento"),
+                "scheduling_hours": ("operations.scheduling_hours", "Horário de Agendamento"),
+                "service_format": ("operations.service_format", "Formato de Atendimento"),
+                "accepts_insurance": ("business_rules.accepts_insurance", "Aceita Convênio"),
+                "insurance_list": ("business_rules.insurance_list", "Lista de Convênios"),
+                "provide_prices": ("business_rules.provide_prices", "Fornecer Preços"),
+            }
+            for var_key, (field_path, title) in _FIELD_TITLES.items():
+                val = custom_vars.get(var_key)
+                if val is None or val == "" or val == [] or val is False:
+                    continue
+                content = ", ".join(val) if isinstance(val, list) else str(val)
+                if content and content not in ("assistente", "nossa clínica", "CONSULT_ONLY"):
+                    context_sources.append({
+                        "origin": "config",
+                        "field": field_path,
+                        "title": title,
+                        "content": content[:200],
+                    })
+
+            # Grouped: services
+            svc_val = custom_vars.get("services", "")
+            if svc_val:
+                svc_list = [s.strip() for s in svc_val.split(",") if s.strip()]
+                if svc_list:
+                    context_sources.append({
+                        "origin": "config",
+                        "field": "services",
+                        "title": f"Serviços ({len(svc_list)})",
+                        "content": svc_val[:200],
+                    })
+
+            # Grouped: professionals
+            prof_val = custom_vars.get("professionals", "")
+            if prof_val:
+                prof_lines = [l for l in prof_val.split("\n") if l.strip()]
+                if prof_lines:
+                    prof_names = [l.lstrip("- ").split(",")[0].strip() for l in prof_lines]
+                    context_sources.append({
+                        "origin": "config",
+                        "field": "professionals",
+                        "title": f"Profissionais ({len(prof_lines)})",
+                        "content": ", ".join(prof_names)[:200],
+                    })
+
         # Build variables
         variables = PromptVariables(
             user_message=input_data.message,
@@ -526,11 +649,12 @@ class CognitivePipeline:
         # Contexto é a jornada do usuário, não o histórico de mensagens (condução pelo funil)
         history: list[dict[str, str]] = []
         
-        return await self._prompt.generate(
+        generated = await self._prompt.generate(
             mode=prompt_mode,
             variables=variables,
             history=history,
         )
+        return generated, context_sources
 
     async def _run_handoff(
         self,
@@ -660,6 +784,7 @@ class CognitivePipeline:
         handoff_response: Optional[HandoffResponse],
         stage_timings: dict[str, float],
         total_time: int,
+        context_sources: Optional[list[dict[str, Any]]] = None,
     ) -> PipelineResult:
         """Build the final pipeline result."""
         # Extract prompt messages
@@ -750,7 +875,7 @@ class CognitivePipeline:
             constraints=constraints,
             context_summary=context_response.context.compressed_history if context_response.context else None,
             recent_messages=recent_messages,
-            rag_sources=[],  # TODO: Add RAG sources when Knowledge Service is implemented
+            context_sources=context_sources or [],
             turn_count=input_data.turn_count + 1,
             mode=effective_mode,
             handoff_summary=handoff_summary,

@@ -140,8 +140,16 @@ async def list_clinics(
     last_trace_result = await session.execute(last_trace_stmt)
     last_trace_map = {row.tenant_id: row.last_trace_at for row in last_trace_result}
 
+    # Roles that indicate non-clinic tenants (builder HQ, super-admin, investor)
+    non_clinic_roles = {UserRole.builder, UserRole.super_admin, UserRole.investor}
+
     clinics = []
     for t in tenants:
+        tenant_users = users_by_tenant.get(t.id, [])
+        # Skip tenants where ALL users have non-clinic roles (e.g. builder HQ tenant)
+        if tenant_users and all(u.role in non_clinic_roles for u in tenant_users):
+            continue
+
         last_trace = last_trace_map.get(t.id)
         health = _compute_health_status(last_trace, t.is_active)
         completeness = _compute_config_completeness(t.clinic_config_row)
@@ -149,7 +157,7 @@ async def list_clinics(
         clinics.append(
             _build_clinic_slot(
                 t,
-                users_by_tenant.get(t.id, []),
+                tenant_users,
                 trace_counts.get(t.id, 0),
                 False,
                 health_status=health,
@@ -227,17 +235,17 @@ async def create_clinic(
     )
     session.add(new_config)
 
-    await session.flush()
+    await session.commit()
 
     return {"ok": True, "id": str(tenant_id)}
 
 
 @router.delete(
     "/clinics/{clinic_id}",
-    summary="Deactivate Clinic",
-    description="Soft-delete a tenant by setting is_active=False. Super admin only.",
+    summary="Delete Clinic",
+    description="Hard-delete a tenant and all associated data (users, sessions, events). Super admin only.",
 )
-async def deactivate_clinic(
+async def delete_clinic(
     clinic_id: str,
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
@@ -254,8 +262,40 @@ async def deactivate_clinic(
     if not t:
         raise HTTPException(status_code=404, detail="Clinic not found")
 
-    t.is_active = False
-    await session.flush()
+    await session.delete(t)
+    await session.commit()
+    return {"ok": True}
+
+
+@router.patch(
+    "/clinics/{clinic_id}/status",
+    summary="Toggle Clinic Status",
+    description="Activate or deactivate a clinic. Super admin only.",
+)
+async def toggle_clinic_status(
+    clinic_id: str,
+    body: dict,
+    tenant: TenantContext = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
+):
+    from uuid import UUID as _UUID
+
+    new_status = body.get("status")
+    if new_status not in ("active", "inactive"):
+        raise HTTPException(status_code=400, detail="status must be 'active' or 'inactive'")
+
+    try:
+        cid = _UUID(clinic_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid clinic ID")
+
+    result = await session.execute(select(Tenant).where(Tenant.id == cid))
+    t = result.scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Clinic not found")
+
+    t.is_active = (new_status == "active")
+    await session.commit()
     return {"ok": True}
 
 
@@ -547,6 +587,16 @@ async def create_builder(
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
 ):
+    # Check email uniqueness
+    existing = await session.execute(
+        select(User).where(User.email == body.admin_email)
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"O email {body.admin_email} já está em uso. Use um email diferente.",
+        )
+
     builder_id = uuid4()
     new_builder = Builder(
         id=builder_id,
@@ -555,7 +605,33 @@ async def create_builder(
         is_active=True,
     )
     session.add(new_builder)
-    await session.flush()
+
+    # Create tenant for the builder
+    tenant_id = uuid4()
+    new_tenant = Tenant(
+        id=tenant_id,
+        name=f"{body.name} (Builder)",
+        slug=body.name.lower().replace(" ", "-")[:100],
+        api_key_hash=pwd_context.hash(f"ns_auto_{uuid4().hex[:16]}"),
+        is_active=True,
+        plan_type="admin",
+        config={},
+    )
+    session.add(new_tenant)
+
+    # Create builder admin user
+    new_user = User(
+        id=uuid4(),
+        tenant_id=tenant_id,
+        email=body.admin_email,
+        password_hash=pwd_context.hash(body.admin_password),
+        role=UserRole.builder,
+        builder_id=builder_id,
+        is_active=True,
+    )
+    session.add(new_user)
+
+    await session.commit()
     return {"ok": True, "id": str(builder_id)}
 
 
@@ -587,16 +663,16 @@ async def update_builder(
     if body.status is not None:
         builder.status = body.status
 
-    await session.flush()
+    await session.commit()
     return {"ok": True}
 
 
 @router.delete(
     "/builders/{builder_id}",
-    summary="Deactivate Builder",
-    description="Soft-delete builder and unlink all clinics. Super admin only.",
+    summary="Delete Builder",
+    description="Hard-delete builder, its tenant, and associated users. Unlinks managed clinics first. Super admin only.",
 )
-async def deactivate_builder(
+async def delete_builder(
     builder_id: str,
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
@@ -613,15 +689,22 @@ async def deactivate_builder(
     if not builder:
         raise HTTPException(status_code=404, detail="Builder not found")
 
-    builder.is_active = False
-
-    # Unlink all clinics from this builder
+    # Unlink managed clinics (set builder_id = NULL so they aren't orphaned)
     linked_stmt = select(Tenant).where(Tenant.builder_id == bid)
     linked_result = await session.execute(linked_stmt)
     for t in linked_result.scalars().all():
         t.builder_id = None
 
-    await session.flush()
+    # Delete the builder's own tenant (cascade deletes users, sessions, events)
+    builder_tenant_stmt = select(Tenant).join(User, User.tenant_id == Tenant.id).where(User.builder_id == bid)
+    builder_tenant_result = await session.execute(builder_tenant_stmt)
+    builder_tenant = builder_tenant_result.scalar_one_or_none()
+    if builder_tenant:
+        await session.delete(builder_tenant)
+
+    # Delete the builder record itself
+    await session.delete(builder)
+    await session.commit()
     return {"ok": True}
 
 
@@ -656,7 +739,7 @@ async def create_builder_clinic(
     if existing.scalar_one_or_none():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Email already in use",
+            detail=f"O email {body.admin_email} já está em uso. Cada clínica precisa de um email diferente.",
         )
 
     # Create tenant linked to builder
@@ -705,6 +788,50 @@ async def create_builder_clinic(
     )
     session.add(new_config)
 
-    await session.flush()
+    await session.commit()
 
     return {"ok": True, "id": str(tenant_id)}
+
+
+@router.post(
+    "/builders/{builder_id}/link-clinic",
+    summary="Link Existing Clinic to Builder",
+    description="Link an existing unlinked clinic to a builder. Super admin only.",
+)
+async def link_clinic_to_builder(
+    builder_id: str,
+    body: dict,
+    tenant: TenantContext = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
+):
+    from uuid import UUID as _UUID
+
+    try:
+        bid = _UUID(builder_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid builder ID")
+
+    clinic_id = body.get("clinic_id")
+    if not clinic_id:
+        raise HTTPException(status_code=400, detail="clinic_id is required")
+
+    try:
+        cid = _UUID(clinic_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid clinic ID")
+
+    builder_result = await session.execute(select(Builder).where(Builder.id == bid))
+    if not builder_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Builder not found")
+
+    clinic_result = await session.execute(select(Tenant).where(Tenant.id == cid))
+    clinic = clinic_result.scalar_one_or_none()
+    if not clinic:
+        raise HTTPException(status_code=404, detail="Clínica não encontrada")
+
+    if clinic.builder_id is not None:
+        raise HTTPException(status_code=409, detail="Esta clínica já está vinculada a um builder")
+
+    clinic.builder_id = bid
+    await session.commit()
+    return {"ok": True}

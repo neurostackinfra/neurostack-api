@@ -226,26 +226,24 @@ function KpiCards({ stats, t }: { stats: KpiStats; t: (k: TranslationKey) => str
 
 // -- Intent breakdown chart ---
 
-const INVESTOR_INTENTS = ["pedido_preco", "agendar", "interesse_tratamento", "reclamacao", "pos_atendimento_duvida"];
+const VISIBLE_INTENTS = ["pedido_preco", "agendar", "interesse_tratamento", "reclamacao", "pos_atendimento_duvida"];
 
 function IntentBreakdown({
-  byIntent, t, intentFilter, onIntentFilterChange, isInvestor,
+  byIntent, t, intentFilter, onIntentFilterChange,
 }: {
   byIntent: Record<string, number>;
   t: (k: TranslationKey) => string;
   intentFilter: string;
   onIntentFilterChange: (v: string) => void;
-  isInvestor?: boolean;
 }) {
-  const baseIntent = isInvestor
-    ? Object.fromEntries(Object.entries(byIntent).filter(([k]) => INVESTOR_INTENTS.includes(k)))
-    : byIntent;
+  const baseIntent = Object.fromEntries(
+    VISIBLE_INTENTS.map(k => [k, byIntent[k] ?? 0])
+  );
   const visibleIntent = Object.fromEntries(
     Object.entries(baseIntent).filter(([k]) => !intentFilter || k === intentFilter)
   );
   const intentTotal = Object.values(visibleIntent).reduce((s, n) => s + n, 0);
   const chartData = Object.entries(visibleIntent)
-    .filter(([, count]) => count > 0)
     .map(([intent, count]) => ({
       key: intent,
       name: getIntentLabel(intent, t),
@@ -266,7 +264,7 @@ function IntentBreakdown({
             className="rounded-md border border-border bg-background px-3 py-1.5 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent h-8 w-full sm:w-48"
           >
             <option value="">{t("dash_intent_all")}</option>
-            {(isInvestor ? INVESTOR_INTENTS : Object.keys(INTENT_META)).map(key => (
+            {VISIBLE_INTENTS.map(key => (
               <option key={key} value={key}>{getIntentLabel(key, t)}</option>
             ))}
           </select>
@@ -331,7 +329,7 @@ function IntentBreakdown({
             </div>
             <div className="flex flex-wrap justify-center gap-x-3 gap-y-1.5">
               {Object.entries(INTENT_META)
-                .filter(([key]) => (!isInvestor || INVESTOR_INTENTS.includes(key)) && (!intentFilter || key === intentFilter))
+                .filter(([key]) => VISIBLE_INTENTS.includes(key) && (!intentFilter || key === intentFilter))
                 .map(([key, m]) => (
                   <div key={key} className="flex items-center gap-1">
                     <span className="h-2 w-2 rounded-full shrink-0" style={{ backgroundColor: m.hex }} />
@@ -350,14 +348,15 @@ function IntentBreakdown({
 
 export default function Dashboard() {
   const { t } = useI18n();
-  const { isInvestor } = useAuth();
+  const { isBuilder, viewingClinicId } = useAuth();
   const { startDate: defStart, endDate: defEnd } = defaultDates();
   const [startDate, setStartDate] = useState(defStart);
   const [endDate, setEndDate] = useState(defEnd);
   const [intentFilter, setIntentFilter] = useState("");
 
   const { data: stats, isLoading, error } = useQuery<KpiStats>({
-    queryKey: ["trace-stats", startDate, endDate],
+    queryKey: ["trace-stats", startDate, endDate, isBuilder ? viewingClinicId : null],
+    enabled: !(isBuilder && !viewingClinicId),
     queryFn: async () => {
       const token = getToken();
       if (!token) throw new Error("Sessão expirada. Faça login novamente.");
@@ -365,6 +364,7 @@ export default function Dashboard() {
         start_date: startDate,
         end_date: endDate,
       });
+      if (isBuilder && viewingClinicId) params.set("tenant_id", viewingClinicId);
       const res = await fetch(`/v1/traces/stats?${params.toString()}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
@@ -426,7 +426,6 @@ export default function Dashboard() {
           <IntentBreakdown
             byIntent={stats.byIntent} t={t}
             intentFilter={intentFilter} onIntentFilterChange={setIntentFilter}
-            isInvestor={isInvestor}
           />
         </>
       )}

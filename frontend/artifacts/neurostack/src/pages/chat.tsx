@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import {
   DecisionTrace,
+  SRMDecisionIntent,
+  SRMDecisionStage,
   customFetch,
 } from "@workspace/api-client-react";
 import { useAuth } from "@/context/auth";
@@ -32,7 +34,7 @@ interface CognitiveDecision {
 interface CognitivePrompt {
   system?: string;
   instructions?: string;
-  constraints?: string;
+  constraints?: string | string[];
   context_summary?: string;
   suggested_response?: string;
 }
@@ -40,11 +42,12 @@ interface CognitivePrompt {
 interface CognitiveEventResponse {
   event_id: string;
   decision?: CognitiveDecision;
+  state_patch?: Record<string, any>;
   prompt?: CognitivePrompt;
   context?: {
     recent_messages?: any[];
     session_summary?: string;
-    rag_sources?: any[];
+    context_sources?: any[];
     turn_count?: number;
   };
   mode?: string;
@@ -69,23 +72,19 @@ interface Message {
 
 type FeedbackPhase = "idle" | "input" | "analyzing" | "red" | "green";
 
-const RED_KEYWORDS = ["diagnostico", "remedio", "urgencia", "preco", "diagnose", "medicine"];
-
-function runGuardrail(text: string): boolean {
-  return RED_KEYWORDS.some((kw) => text.toLowerCase().includes(kw));
-}
-
 // --- FeedbackBlock ---
 
 interface FeedbackBlockProps {
   msg: Message;
+  sessionId?: string | null;
+  userMessage?: string;
   defaultPhase?: FeedbackPhase;
   defaultText?: string;
   isReadOnly?: boolean;
   showArrow?: boolean;
 }
 
-function FeedbackBlock({ msg, defaultPhase = "idle", defaultText = "", isReadOnly = false, showArrow = false }: FeedbackBlockProps) {
+function FeedbackBlock({ msg, sessionId, userMessage = "", defaultPhase = "idle", defaultText = "", isReadOnly = false, showArrow = false }: FeedbackBlockProps) {
   const { toast } = useToast();
   const [phase, setPhase] = useState<FeedbackPhase>(defaultPhase);
   const [text, setText]   = useState(defaultText);
@@ -93,25 +92,42 @@ function FeedbackBlock({ msg, defaultPhase = "idle", defaultText = "", isReadOnl
   const openFb  = () => { setPhase("input"); setText(""); };
   const closeFb = () => { setPhase("idle");  setText(""); };
 
-  const analyze = () => {
+  const analyze = async () => {
     if (!text.trim()) return;
     setPhase("analyzing");
-    setTimeout(() => setPhase(runGuardrail(text) ? "red" : "green"), 1200);
+    try {
+      const res = await customFetch<{ status: string; violations: { rule: string; message: string; category: string }[] }>("/v1/rlhf/validate", {
+        method: "POST",
+        body: JSON.stringify({
+          suggestion: text,
+          original_message: userMessage,
+          agent_response: msg.content,
+        }),
+      });
+      setPhase(res.status === "aligned" ? "green" : "red");
+    } catch {
+      toast({ title: "Erro ao validar sugestao", variant: "destructive" });
+      setPhase("input");
+    }
   };
 
-  const finishDemo = () => {
-    closeFb();
-    if (isReadOnly) {
-      toast({
-        title: "Modo Visualizacao: Alteracoes nao permitidas nesta conta de teste.",
-        description: "Esta e uma demonstracao — nenhum dado foi salvo.",
+  const saveFeedback = async (status: "aligned" | "forced") => {
+    try {
+      await customFetch("/v1/rlhf/feedback", {
+        method: "POST",
+        body: JSON.stringify({
+          session_id: sessionId || "",
+          user_message: userMessage,
+          agent_response: msg.content,
+          suggested_response: text,
+          status,
+        }),
       });
-    } else {
-      toast({
-        title: "[Demonstracao] Fluxo de feedback testado com sucesso.",
-        description: "Nenhum dado foi salvo.",
-      });
+      toast({ title: "Feedback salvo com sucesso." });
+    } catch {
+      toast({ title: "Erro ao salvar feedback", variant: "destructive" });
     }
+    closeFb();
   };
 
   if (phase === "idle") {
@@ -131,9 +147,6 @@ function FeedbackBlock({ msg, defaultPhase = "idle", defaultText = "", isReadOnl
           <Lightbulb className="h-3 w-3" />
           Corrigir / Enviar Feedback
         </button>
-        <span className="text-[10px] text-gray-400 italic">
-          (Apenas demonstracao — feature em breve)
-        </span>
       </div>
     );
   }
@@ -226,7 +239,7 @@ function FeedbackBlock({ msg, defaultPhase = "idle", defaultText = "", isReadOnl
                 size="sm"
                 variant="outline"
                 className="text-xs h-7 border-red-500/40 text-red-400 hover:bg-red-500/10 gap-1.5"
-                onClick={finishDemo}
+                onClick={() => saveFeedback("forced")}
                 data-testid={`btn-force-${msg.id}`}
               >
                 <ShieldAlert className="h-3 w-3" />
@@ -257,7 +270,7 @@ function FeedbackBlock({ msg, defaultPhase = "idle", defaultText = "", isReadOnl
               <Button
                 size="sm"
                 className="text-xs h-7 bg-green-600 hover:bg-green-500 text-white gap-1.5"
-                onClick={finishDemo}
+                onClick={() => saveFeedback("aligned")}
                 data-testid={`btn-apply-green-${msg.id}`}
               >
                 <CheckCircle2 className="h-3 w-3" />
@@ -274,7 +287,8 @@ function FeedbackBlock({ msg, defaultPhase = "idle", defaultText = "", isReadOnl
 // --- Chat ---
 
 export default function Chat() {
-  const { clinicId: activeClinicId, tenantId, userId, isInvestor, isReadOnly } = useAuth();
+  const { clinicId: activeClinicId, tenantId, userId, isInvestor, isReadOnly, isBuilder, viewingClinicId } = useAuth();
+  const effectiveTenantId = isBuilder ? viewingClinicId : tenantId;
   const { t } = useI18n();
   const { toast } = useToast();
 
@@ -290,7 +304,7 @@ export default function Chat() {
     setMessages([]);
     setActiveTrace(null);
     setSessionId(null);
-  }, [activeClinicId]);
+  }, [activeClinicId, effectiveTenantId]);
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -302,14 +316,14 @@ export default function Chat() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        tenant_id: tenantId,
+        tenant_id: effectiveTenantId,
         channel: "web",
         user_id: userId,
       }),
     });
     // Backend returns "id", not "session_id"
     return resp.session_id ?? resp.id;
-  }, [tenantId, userId]);
+  }, [effectiveTenantId, userId]);
 
   // Send a message via POST /v1/events (cognitive pipeline)
   const sendEvent = useCallback(async (content: string, currentSessionId: string): Promise<CognitiveEventResponse> => {
@@ -317,7 +331,7 @@ export default function Chat() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        tenant_id: tenantId,
+        tenant_id: effectiveTenantId,
         session_id: currentSessionId,
         event_type: "message.in",
         payload: {
@@ -327,30 +341,51 @@ export default function Chat() {
         },
       }),
     });
-  }, [tenantId, userId]);
+  }, [effectiveTenantId, userId]);
 
   // Map cognitive pipeline response to a trace-like structure for the TraceViewer
   const mapToTrace = (resp: CognitiveEventResponse, userMessage: string): DecisionTrace => {
+    // Extract constraints from prompt (backend sends list[str])
+    const rawConstraints = resp.prompt?.constraints;
+    const constraints: string[] = Array.isArray(rawConstraints)
+      ? rawConstraints
+      : typeof rawConstraints === "string" && rawConstraints.trim()
+        ? rawConstraints.split(",").map((s) => s.trim())
+        : [];
+
+    // Derive gate_authority_before_price from state_patch or constraints
+    const gateAuthority =
+      resp.state_patch?.authority_done === false ||
+      constraints.some((c) => c.includes("AUTHORITY_BEFORE_PRICE"));
+
     return {
       id: resp.event_id ?? crypto.randomUUID(),
       timestamp: new Date().toISOString(),
       userMessage,
       srmDecision: {
-        intent: resp.decision?.intent ?? "unknown",
-        funnelStage: resp.decision?.funnel_stage ?? "unknown",
+        intent: (resp.decision?.intent ?? "unknown") as SRMDecisionIntent,
+        stage: (resp.decision?.funnel_stage ?? "initial") as SRMDecisionStage,
         confidence: resp.decision?.confidence ?? 0,
         action: resp.decision?.action ?? "respond",
-        safetyConcern: resp.decision?.safety_concern ?? false,
-        handoffRequired: resp.decision?.handoff_required ?? false,
-      } as any,
-      selectedContext: resp.context?.rag_sources?.map((src: any) => ({
-        source: src.source ?? "rag",
-        content: src.content ?? "",
-        score: src.score ?? 0,
+        constraints,
+        gate_authority_before_price: gateAuthority,
+        safety_concern: resp.decision?.safety_concern ?? false,
+        handoff_required: resp.decision?.handoff_required ?? false,
+      },
+      selectedContext: resp.context?.context_sources?.map((src: any) => ({
+        key: src.field ?? "context",
+        value: src.content ?? "",
+        source: src.origin ?? "config",
+        title: src.title ?? "",
+        field: src.field ?? "",
       })) ?? [],
       promptBuilt: resp.prompt?.system ?? "",
       llmResponse: resp.prompt?.suggested_response ?? "",
       processingTimeMs: resp.processing_time_ms ?? 0,
+      eventData: resp.decision as Record<string, any>,
+      eventMetadata: { mode: resp.mode, turn_count: resp.context?.turn_count },
+      fullContext: resp.context as Record<string, any>,
+      fullPrompt: resp.prompt as Record<string, any>,
     };
   };
 
@@ -448,9 +483,12 @@ export default function Chat() {
                 <p className="text-sm">{t("chat_start")}</p>
               </div>
             ) : (
-              messages.map((msg) => {
+              messages.map((msg, idx) => {
                 // For the demo last message, pre-open RLHF block with seed text
                 const isDemoPreOpened = false;
+                // Find the user message this assistant response is replying to
+                const prevUserMsg = msg.role === "assistant" && idx > 0 && messages[idx - 1].role === "user"
+                  ? messages[idx - 1].content : "";
 
                 return (
                   <div
@@ -474,6 +512,8 @@ export default function Chat() {
                         </div>
                         <FeedbackBlock
                           msg={msg}
+                          sessionId={sessionId}
+                          userMessage={prevUserMsg}
                           defaultPhase={isDemoPreOpened ? "input" : "idle"}
                           defaultText=""
                           isReadOnly={isReadOnly}

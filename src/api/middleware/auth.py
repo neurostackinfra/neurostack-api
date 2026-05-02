@@ -9,7 +9,9 @@ from typing import Any, Callable, Optional
 from uuid import UUID
 
 import jwt
-from fastapi import HTTPException, Request, status
+from fastapi import Depends, HTTPException, Query, Request, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.responses import JSONResponse
 from passlib.context import CryptContext
 from passlib.exc import InvalidHashError
@@ -500,10 +502,95 @@ def require_builder(request: Request) -> UUID:
     return UUID(builder_id_str)
 
 
+async def require_builder_clinic_access(
+    tenant_id: UUID,
+    builder_id: UUID,
+    db: AsyncSession,
+) -> UUID:
+    """
+    Validate that a builder owns the requested clinic tenant.
+    Returns tenant_id on success, raises 403 on failure.
+    Never returns 404 to avoid leaking clinic existence.
+    """
+    from src.models.tenant import Tenant
+
+    result = await db.execute(
+        select(Tenant.id).where(
+            Tenant.id == tenant_id,
+            Tenant.builder_id == builder_id,
+        )
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Builder does not manage this clinic",
+        )
+    return tenant_id
+
+
+async def resolve_builder_tenant_override(
+    request: Request,
+    override_tenant_id: Optional[UUID] = Query(None, alias="tenant_id"),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: AsyncSession = Depends(lambda: None),  # placeholder — wired at endpoint level
+) -> UUID:
+    """
+    Resolve effective tenant_id for endpoints supporting builder override.
+    - Builder + tenant_id param: validate ownership, audit log, return clinic tenant_id
+    - Non-builder + tenant_id param: return 400 (fail loud)
+    - No tenant_id param: return JWT tenant_id
+    """
+    if override_tenant_id is None:
+        return tenant.tenant_id
+
+    if tenant.role != "builder":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"tenant_id param not allowed for role '{tenant.role}'",
+        )
+
+    # Extract builder_id from JWT
+    auth_header = request.headers.get("Authorization", "")
+    builder_id_str: Optional[str] = None
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        try:
+            payload = jwt.decode(
+                token,
+                settings.secret_key,
+                algorithms=["HS256"],
+                options={"require": ["sub", "tenant_id", "exp"]},
+            )
+            builder_id_str = payload.get("builder_id")
+        except (jwt.InvalidTokenError, KeyError, ValueError):
+            pass
+
+    if not builder_id_str:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Builder ID not found in token",
+        )
+
+    builder_id = UUID(builder_id_str)
+
+    # Audit log before query
+    logger.info(
+        "builder_clinic_override",
+        extra={
+            "builder_id": str(builder_id),
+            "tenant_id": str(override_tenant_id),
+            "endpoint": request.url.path,
+        },
+    )
+
+    # Validate ownership
+    return await require_builder_clinic_access(override_tenant_id, builder_id, db)
+
+
 def get_optional_tenant_context(request: Request) -> Optional[TenantContext]:
     """
     FastAPI dependency for optionally getting tenant context.
-    
+
     Returns None if not authenticated (useful for public endpoints
     that behave differently for authenticated users).
     """

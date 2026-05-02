@@ -20,6 +20,9 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    # Add 'builder' value to the userrole enum
+    op.execute("ALTER TYPE userrole ADD VALUE IF NOT EXISTS 'builder'")
+
     op.add_column(
         "users",
         sa.Column(

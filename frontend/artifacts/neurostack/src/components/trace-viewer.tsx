@@ -12,6 +12,8 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import { useAuth } from "@/context/auth";
+import { useI18n } from "@/context/i18n";
+import type { TranslationKey } from "@/locales/en";
 
 export function IntentBadge({ intent }: { intent: string }) {
   const intentConfig: Record<string, { className: string; label: string }> = {
@@ -123,6 +125,23 @@ export function IntentBadge({ intent }: { intent: string }) {
       className: "bg-red-700 hover:bg-red-800 text-white",
       label: "Conduta Inadequada",
     },
+    pedido_atendente_humano: {
+      className: "bg-rose-600 hover:bg-rose-700 text-white",
+      label: "Pedido Atendente Humano",
+    },
+    // Patient & Out-of-scope
+    paciente_ativo: {
+      className: "bg-teal-600 hover:bg-teal-700 text-white",
+      label: "Paciente Ativo",
+    },
+    fora_do_escopo: {
+      className: "bg-stone-500 hover:bg-stone-600 text-white",
+      label: "Fora do Escopo",
+    },
+    fora_do_horario: {
+      className: "bg-stone-600 hover:bg-stone-700 text-white",
+      label: "Fora do Horário",
+    },
   };
 
   const config = intentConfig[intent];
@@ -135,6 +154,20 @@ export function IntentBadge({ intent }: { intent: string }) {
     </Badge>
   );
 }
+
+const STAGE_LABELS: Record<string, string> = {
+  initial: "Inicial",
+  em_qualificacao: "Em Qualificação",
+  qualificado: "Qualificado",
+  followup: "Follow-up",
+  agendamento_solicitado: "Agendamento Solicitado",
+  agendado: "Agendado",
+  paciente_ativo: "Paciente Ativo",
+  pos_atendimento: "Pós-Atendimento",
+  fidelizacao: "Fidelização",
+  inativo: "Inativo",
+  escalation: "Escalação",
+};
 
 const CONSTRAINT_META: Record<
   string,
@@ -172,8 +205,15 @@ function PayloadSection({ title, data }: { title: string; data: any }) {
   );
 }
 
+function ctxFieldTitle(field: string, count: string | undefined, t: (k: TranslationKey) => string): string {
+  const key = `ctx_field_${field.replace(/\./g, "_")}` as TranslationKey;
+  const base = t(key) || field;
+  return count ? `${base} (${count})` : base;
+}
+
 export function TraceViewer({ trace }: { trace: DecisionTrace }) {
-  const { isInvestor } = useAuth();
+  const { isSuperAdmin } = useAuth();
+  const { t } = useI18n();
   const srm = trace.srmDecision;
   const hasConstraints = srm.constraints && srm.constraints.length > 0;
   const hasFlags =
@@ -203,7 +243,7 @@ export function TraceViewer({ trace }: { trace: DecisionTrace }) {
                 Stage
               </div>
               <div className="text-sm font-mono font-medium" data-testid="trace-stage">
-                {srm.stage}
+                {STAGE_LABELS[srm.stage] ?? srm.stage}
               </div>
             </div>
             <div>
@@ -288,44 +328,61 @@ export function TraceViewer({ trace }: { trace: DecisionTrace }) {
         </CardContent>
       </Card>
 
-      {/* Selected Context Panel */}
+      {/* Context Sources Panel */}
       <Card className="border-border shadow-sm">
         <CardHeader className="pb-2 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
           <CardTitle className="text-sm font-semibold text-foreground uppercase tracking-wider">
-            Selected Context
+            {t("ctx_panel_title")}
           </CardTitle>
         </CardHeader>
         <CardContent className="pt-4">
           {trace.selectedContext && trace.selectedContext.length > 0 ? (
             <div className="space-y-3">
-              {trace.selectedContext.map((ctx, idx) => (
-                <div
-                  key={idx}
-                  className="text-sm bg-muted rounded-md p-3 border border-border"
-                  data-testid={`context-item-${idx}`}
-                >
-                  <div className="flex justify-between items-start mb-1">
-                    <span className="font-mono text-xs font-bold text-accent">
-                      {ctx.key}
-                    </span>
-                    <span className="text-[10px] uppercase tracking-wider text-muted-foreground bg-background px-1.5 py-0.5 rounded border border-border">
-                      {ctx.source}
-                    </span>
+              {trace.selectedContext.map((ctx, idx) => {
+                const countMatch = ctx.title?.match(/\((\d+)\)$/);
+                const count = countMatch ? countMatch[1] : undefined;
+                const fieldKey = ctx.field || ctx.key;
+                const label = ctxFieldTitle(fieldKey, count, t);
+                return (
+                  <div
+                    key={idx}
+                    className="text-sm bg-muted rounded-md p-3 border border-border"
+                    data-testid={`context-item-${idx}`}
+                  >
+                    <div className="flex justify-between items-start mb-1">
+                      <div className="flex flex-col gap-0.5">
+                        <span className="text-xs font-bold text-foreground">
+                          {label}
+                        </span>
+                        {fieldKey && (
+                          <span className="font-mono text-[10px] text-muted-foreground">
+                            {fieldKey}
+                          </span>
+                        )}
+                      </div>
+                      <span className={`text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded font-medium ${
+                        ctx.source === "rag"
+                          ? "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300"
+                          : "bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300"
+                      }`}>
+                        {ctx.source === "rag" ? t("ctx_origin_rag") : t("ctx_origin_config")}
+                      </span>
+                    </div>
+                    <div className="text-foreground mt-1">{ctx.value}</div>
                   </div>
-                  <div className="text-foreground">{ctx.value}</div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           ) : (
             <div className="text-sm text-muted-foreground italic">
-              No context selected.
+              {t("ctx_empty")}
             </div>
           )}
         </CardContent>
       </Card>
 
       {/* Developer Payload — Admin & Builder (not investor) */}
-      {!isInvestor && (
+      {isSuperAdmin && (
         <Card className="border-slate-700 shadow-lg overflow-hidden">
           <CardHeader className="pb-2.5 pt-3 bg-slate-900 border-b border-slate-700">
             <CardTitle className="text-sm font-semibold text-slate-100 flex items-center gap-2 uppercase tracking-wider">
