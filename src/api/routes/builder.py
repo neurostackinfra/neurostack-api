@@ -3,21 +3,34 @@ NeuroStack API - Builder Endpoints
 Builder-scoped routes with SQL-level tenant isolation.
 """
 
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from passlib.context import CryptContext
-from sqlalchemy import func, select
+from sqlalchemy import case, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.types import String
 
 from src.api.middleware.auth import require_builder
 from src.api.schemas.builder import (
+    BuilderAlertResponse,
     BuilderClinicResponse,
+    BuilderDashboardResponse,
     BuilderProfileResponse,
     BuilderStatsResponse,
     CreateBuilderClinicRequest,
     ToggleClinicStatusRequest,
+    TraceTimeSeriesPoint,
+)
+from src.api.helpers.health import (
+    CONFIG_COMPLETENESS_BUCKETS,
+    _compute_alerts,
+    _compute_config_completeness,
+    _compute_health_status,
+    _get_time_series,
 )
 from src.models.builder import Builder
 from src.models.clinic_config_table import ClinicConfigTable
@@ -74,44 +87,119 @@ async def builder_profile(
 
 
 # ============================================
-# GET /clinics - List builder's clinics
+# GET /clinics - List builder's clinics (enriched)
 # ============================================
 
 
 @router.get(
     "/clinics",
     summary="List Builder Clinics",
-    description="Return clinics owned by the authenticated builder (SQL-level scope isolation).",
+    description="Return clinics owned by the authenticated builder with health metrics (SQL-level scope isolation).",
 )
 async def list_clinics(
     builder_id: UUID = Depends(require_builder),
     session: AsyncSession = Depends(get_db_session_dependency),
 ):
-    # SQL-level scope isolation: WHERE builder_id = :jwt_builder_id AND is_active = True
+    # Fetch tenants with config
     stmt = (
         select(Tenant)
         .options(selectinload(Tenant.clinic_config_row))
-        .where(
-            Tenant.builder_id == builder_id,
-            Tenant.is_active.is_(True),
-        )
+        .where(Tenant.builder_id == builder_id)
         .order_by(Tenant.name)
     )
     result = await session.execute(stmt)
     tenants = result.scalars().all()
 
-    return [
-        BuilderClinicResponse(
-            id=t.id,
-            name=t.name,
-            slug=t.slug,
-            status="active" if t.is_active else "inactive",
-            plan_type=t.plan_type,
-            is_active=t.is_active,
-            created_at=t.created_at,
-        ).model_dump(mode="json")
-        for t in tenants
-    ]
+    if not tenants:
+        return []
+
+    tenant_ids = [t.id for t in tenants]
+    now = datetime.now(timezone.utc)
+    seven_days_ago = now - timedelta(days=7)
+
+    # Batch query: last_trace_at per tenant
+    last_trace_stmt = (
+        select(
+            Event.tenant_id,
+            func.max(Event.created_at).label("last_trace_at"),
+        )
+        .where(Event.tenant_id.in_(tenant_ids))
+        .group_by(Event.tenant_id)
+    )
+    last_trace_result = await session.execute(last_trace_stmt)
+    last_trace_map = {row.tenant_id: row.last_trace_at for row in last_trace_result}
+
+    # Batch query: trace_count_7d per tenant
+    trace_7d_stmt = (
+        select(
+            Event.tenant_id,
+            func.count(Event.id).label("count"),
+        )
+        .where(
+            Event.tenant_id.in_(tenant_ids),
+            Event.created_at >= seven_days_ago,
+        )
+        .group_by(Event.tenant_id)
+    )
+    trace_7d_result = await session.execute(trace_7d_stmt)
+    trace_7d_map = {row.tenant_id: row.count for row in trace_7d_result}
+
+    # Batch query: safety_flags_7d per tenant
+    safety_stmt = (
+        select(
+            Event.tenant_id,
+            func.count(Event.id).label("count"),
+        )
+        .where(
+            Event.tenant_id.in_(tenant_ids),
+            Event.created_at >= seven_days_ago,
+            cast(Event.event_metadata["safety_concern"].as_string(), String) == "true",
+        )
+        .group_by(Event.tenant_id)
+    )
+    safety_result = await session.execute(safety_stmt)
+    safety_map = {row.tenant_id: row.count for row in safety_result}
+
+    # Batch query: handoff_count_7d per tenant
+    handoff_stmt = (
+        select(
+            Event.tenant_id,
+            func.count(Event.id).label("count"),
+        )
+        .where(
+            Event.tenant_id.in_(tenant_ids),
+            Event.created_at >= seven_days_ago,
+            Event.event_type == "handoff.created",
+        )
+        .group_by(Event.tenant_id)
+    )
+    handoff_result = await session.execute(handoff_stmt)
+    handoff_map = {row.tenant_id: row.count for row in handoff_result}
+
+    clinics = []
+    for t in tenants:
+        last_trace = last_trace_map.get(t.id)
+        health = _compute_health_status(last_trace, t.is_active)
+        completeness = _compute_config_completeness(t.clinic_config_row)
+
+        clinics.append(
+            BuilderClinicResponse(
+                id=t.id,
+                name=t.name,
+                slug=t.slug,
+                status="active" if t.is_active else "inactive",
+                plan_type=t.plan_type,
+                is_active=t.is_active,
+                created_at=t.created_at,
+                last_trace_at=last_trace,
+                health_status=health,
+                trace_count_7d=trace_7d_map.get(t.id, 0),
+                safety_flags_7d=safety_map.get(t.id, 0),
+                handoff_count_7d=handoff_map.get(t.id, 0),
+                config_completeness=completeness,
+            ).model_dump(mode="json")
+        )
+    return clinics
 
 
 # ============================================
@@ -279,4 +367,67 @@ async def builder_stats(
         active_clinics=active_clinics,
         inactive_clinics=inactive_clinics,
         total_traces=total_traces,
+    )
+
+
+# ============================================
+# GET /dashboard - Builder Control Tower
+# ============================================
+
+
+async def _get_builder_stats(
+    builder_id: UUID, session: AsyncSession
+) -> BuilderStatsResponse:
+    """Reusable stats computation."""
+    total_result = await session.execute(
+        select(func.count(Tenant.id)).where(Tenant.builder_id == builder_id)
+    )
+    clinic_count = total_result.scalar() or 0
+
+    active_result = await session.execute(
+        select(func.count(Tenant.id)).where(
+            Tenant.builder_id == builder_id,
+            Tenant.is_active.is_(True),
+        )
+    )
+    active_clinics = active_result.scalar() or 0
+
+    tenant_ids_stmt = select(Tenant.id).where(Tenant.builder_id == builder_id)
+    trace_result = await session.execute(
+        select(func.count(Event.id)).where(Event.tenant_id.in_(tenant_ids_stmt))
+    )
+    total_traces = trace_result.scalar() or 0
+
+    return BuilderStatsResponse(
+        clinic_count=clinic_count,
+        active_clinics=active_clinics,
+        inactive_clinics=clinic_count - active_clinics,
+        total_traces=total_traces,
+    )
+
+
+@router.get(
+    "/dashboard",
+    summary="Builder Dashboard",
+    description="Combined dashboard: stats + 30-day time-series + computed alerts.",
+    response_model=BuilderDashboardResponse,
+)
+async def builder_dashboard(
+    builder_id: UUID = Depends(require_builder),
+    session: AsyncSession = Depends(get_db_session_dependency),
+):
+    # Get tenant IDs for time-series
+    tenant_ids_result = await session.execute(
+        select(Tenant.id).where(Tenant.builder_id == builder_id)
+    )
+    tenant_ids = [row[0] for row in tenant_ids_result.all()]
+
+    stats = await _get_builder_stats(builder_id, session)
+    time_series = await _get_time_series(tenant_ids, session)
+    alerts = await _compute_alerts(builder_id, session)
+
+    return BuilderDashboardResponse(
+        stats=stats,
+        time_series=time_series,
+        alerts=alerts,
     )
