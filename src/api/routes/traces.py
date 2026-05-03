@@ -7,7 +7,7 @@ through the cognitive pipeline, including SRM decisions, context, and prompts.
 """
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -226,11 +226,12 @@ async def trace_detail(
     prompt_built = trace["prompt_built"]
 
     llm_response = None
+    selected_context: list[dict[str, Any]] = []
 
     if not full_prompt and event.session_id and event.created_at:
         prompt_event = await get_prompt_event_for_trace(
             db=db,
-            tenant_id=tenant.tenant_id,
+            tenant_id=effective_tenant_id,
             session_id=event.session_id,
             trace_created_at=event.created_at,
         )
@@ -241,6 +242,7 @@ async def trace_detail(
             if not prompt_built:
                 prompt_built = prompt_data.get("system_prompt")
             llm_response = prompt_data.get("suggested_response")
+            selected_context = prompt_data.get("context_sources", [])
 
     return TraceDetailResponse(
         id=trace["id"],
@@ -257,6 +259,7 @@ async def trace_detail(
         event_data=event_data,
         event_metadata=metadata,
         llm_response=llm_response,
+        selected_context=selected_context,
     )
 
 

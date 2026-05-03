@@ -78,11 +78,12 @@ export default function TracesList() {
   const txt = (p: string, e: string) => locale === "en" ? e : p;
   const { toast } = useToast();
 
-  const today = format(new Date(), "yyyy-MM-dd");
-  const thirtyDaysAgo = format(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000), "yyyy-MM-dd");
+  const now = new Date();
+  const todayDateTime = format(now, "yyyy-MM-dd") + "T" + format(now, "HH:mm");
+  const thirtyDaysAgoDateTime = format(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000), "yyyy-MM-dd") + "T00:00";
 
-  const [startDate, setStartDate] = useState(thirtyDaysAgo);
-  const [endDate, setEndDate] = useState(today);
+  const [startDate, setStartDate] = useState(thirtyDaysAgoDateTime);
+  const [endDate, setEndDate] = useState(todayDateTime);
   const [onlySafety, setOnlySafety] = useState(false);
   const [onlyHandoff, setOnlyHandoff] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -234,7 +235,7 @@ export default function TracesList() {
                 <CalendarRange className="h-3 w-3" /> {t("traces_start_date")}
               </label>
               <input
-                type="date"
+                type="datetime-local"
                 value={startDate}
                 max={endDate}
                 onChange={e => setStartDate(e.target.value)}
@@ -246,10 +247,10 @@ export default function TracesList() {
                 <CalendarRange className="h-3 w-3" /> {t("traces_end_date")}
               </label>
               <input
-                type="date"
+                type="datetime-local"
                 value={endDate}
                 min={startDate}
-                max={today}
+                max={todayDateTime}
                 onChange={e => setEndDate(e.target.value)}
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent"
               />
