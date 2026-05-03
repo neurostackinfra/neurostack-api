@@ -519,9 +519,9 @@ class CognitivePipeline:
             custom_vars["pricing_mode"] = pricing.get("disclosure_mode", "CONSULT_ONLY")
 
             # Extended config injection (Group 1 — clinic-config-fullstack)
-            custom_vars["agent_presentation"] = persona.get("agent_presentation", "")
-            custom_vars["use_emojis"] = persona.get("use_emojis", False)
-            custom_vars["language_policy"] = persona.get("language_policy", "")
+            custom_vars["agent_presentation"] = identity.get("agent_presentation", "")
+            custom_vars["use_emojis"] = identity.get("use_emojis", False)
+            custom_vars["language_policy"] = business.get("language_policy", "")
             custom_vars["clinic_history"] = identity.get("clinic_history", "")
             custom_vars["parking_info"] = operations.get("parking_info", "")
             custom_vars["scheduling_hours"] = operations.get("scheduling_hours", "")
