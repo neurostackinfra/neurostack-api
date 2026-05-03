@@ -36,7 +36,7 @@ from src.api.middleware.tracing import (
     instrument_redis,
     instrument_sqlalchemy,
 )
-from src.api.routes import admin, auth, builder, config, events, handoff, health, knowledge, policies, rlhf, sessions, support, traces, webhook
+from src.api.routes import admin, auth, builder, config, demo_leads, events, handoff, health, knowledge, policies, rlhf, sessions, support, traces, webhook
 from src.config.logging import configure_logging, get_logger
 from src.config.settings import settings
 from src.core.exceptions import ConfigurationError
@@ -433,6 +433,11 @@ def create_app() -> FastAPI:
         webhook.router,
         prefix=f"{settings.api_prefix}/webhook",
         tags=["Webhook"],
+    )
+    app.include_router(
+        demo_leads.router,
+        prefix=f"{settings.api_prefix}/demo-leads",
+        tags=["Demo Leads"],
     )
     
     # Override OpenAPI schema to include headers (after all routers are registered)

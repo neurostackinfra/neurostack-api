@@ -285,6 +285,11 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # POST /v1/demo-leads is public (lead capture form)
+        if request.url.path == "/v1/demo-leads" and request.method == "POST":
+            await self.app(scope, receive, send)
+            return
+
         # --- Try JWT (Bearer) first, then fall back to API key ---
         tenant_context: Optional[TenantContext] = None
         auth_header = request.headers.get("Authorization", "")
