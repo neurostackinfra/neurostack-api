@@ -237,15 +237,22 @@ async def _handle_clinic_message(
     handoff_cfg = await _load_handoff_config(tenant_id, db)
 
     handoff_active = str(handoff_cfg.get("handoff_active", "yes")).lower()
-    trigger_msg = " ".join(str(handoff_cfg.get(
+    import re as _re
+    def _normalize_for_match(s: str) -> str:
+        """Normalize: lowercase, collapse whitespace, remove spaces around punctuation."""
+        s = " ".join(s.strip().lower().split())
+        s = _re.sub(r'\s*([,;:.!?])\s*', r'\1', s)
+        return s
+
+    trigger_msg = _normalize_for_match(str(handoff_cfg.get(
         "trigger_message",
         "Precisando de algo mais,estamos a disposição.",
-    )).strip().lower().split())
+    )))
     reactivation_hours = int(handoff_cfg.get("reactivation_delay_hours", 1))
 
-    normalized_text = " ".join(message_text.strip().lower().split())
+    normalized_text = _normalize_for_match(message_text)
 
-    # Check if message contains the trigger phrase (flexible match, space-tolerant)
+    # Check if message contains the trigger phrase (flexible match, punctuation-tolerant)
     if trigger_msg in normalized_text:
         if session.is_paused:
             session.paused_until = datetime.now(timezone.utc) + timedelta(hours=reactivation_hours)
