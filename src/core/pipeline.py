@@ -697,6 +697,7 @@ class CognitivePipeline:
             SRMHandoffReason.LOW_CONFIDENCE: HandoffReason.LOW_CONFIDENCE,
             SRMHandoffReason.COMPLEX_QUERY: HandoffReason.COMPLEX_QUERY,
             SRMHandoffReason.ESCALATION: HandoffReason.ESCALATION,
+            SRMHandoffReason.SCHEDULING: HandoffReason.SCHEDULING,
         }
         
         reason = reason_map.get(
