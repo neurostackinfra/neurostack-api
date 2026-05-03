@@ -193,9 +193,9 @@ export const en = {
   // ── Master Admin ──────────────────────────────────────────────────────────
   admin_infra_desc: "Multi-tenant infrastructure",
   admin_slots_label: "slots",
-  admin_pilots_label: "active pilots",
+  admin_pilots_label: "active clinics",
   admin_stat_total: "Total Clinics",
-  admin_stat_active: "Active Pilots",
+  admin_stat_active: "Active Clinics",
   admin_stat_free: "Free Slots",
   admin_stat_traces: "Total Traces",
   admin_create_btn: "Create Pilot",

@@ -17,7 +17,40 @@ import {
 import { TraceViewer } from "@/components/trace-viewer";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useToast } from "@/hooks/use-toast";
-// Demo data removed — chat now works against real backend only
+// ── Investor demo: static mock conversations ──
+
+const MOCK_CONVERSATIONS = [
+  {
+    id: "mock-conv-1",
+    label: "Consulta de Preço — Botox",
+    messages: [
+      { id: "m1", role: "user" as const, content: "Olá, boa tarde! Quanto custa a aplicação de botox na testa?" },
+      { id: "m2", role: "assistant" as const, content: "Olá! Que bom que você se interessou pelo nosso tratamento de toxina botulínica! 😊\n\nAntes de falar sobre valores, deixa eu compartilhar: aqui na clínica, o procedimento é realizado pela Dra. Ana Lima, dermatologista com mais de 12 anos de experiência e mais de 500 aplicações bem-sucedidas.\n\nO investimento para a região da testa é a partir de R$ 1.200, com avaliação personalizada inclusa. Posso agendar uma consulta de avaliação para você?" },
+      { id: "m3", role: "user" as const, content: "Parece bom! Quais horários tem disponível?" },
+      { id: "m4", role: "assistant" as const, content: "Fico feliz com o seu interesse! 😊\n\nTemos disponibilidade esta semana:\n• Quarta-feira: 14h ou 16h\n• Quinta-feira: 10h ou 15h\n• Sexta-feira: 9h ou 11h\n\nQual horário funciona melhor para você? A consulta de avaliação é cortesia e dura cerca de 30 minutos." },
+    ],
+  },
+  {
+    id: "mock-conv-2",
+    label: "Pós-Procedimento — Dúvida",
+    messages: [
+      { id: "m5", role: "user" as const, content: "Fiz um preenchimento labial ontem e estou com um inchaço. É normal?" },
+      { id: "m6", role: "assistant" as const, content: "Entendo sua preocupação! O inchaço nas primeiras 48-72 horas após o preenchimento labial é completamente normal e esperado. 😊\n\nAlgumas orientações importantes:\n• Aplique compressas frias por 10 minutos a cada hora\n• Evite exercícios físicos intensos por 24-48h\n• Não manipule a região com as mãos\n• Beba bastante água\n\nO resultado final aparece em 7-14 dias, quando o inchaço reduz completamente. Se notar assimetria acentuada, dor intensa ou manchas roxas que aumentam, entre em contato conosco imediatamente." },
+      { id: "m7", role: "user" as const, content: "Ok, obrigada! E posso usar maquiagem?" },
+      { id: "m8", role: "assistant" as const, content: "De nada! 😊 Sobre maquiagem: o ideal é aguardar pelo menos 12 horas após o procedimento para aplicar qualquer produto na região.\n\nDepois desse período, pode usar maquiagem normalmente, mas prefira produtos hipoalergênicos e evite pressionar muito a área durante a aplicação.\n\nSe tiver mais alguma dúvida sobre os cuidados pós-procedimento, estou aqui para ajudar!" },
+    ],
+  },
+  {
+    id: "mock-conv-3",
+    label: "Agendamento — Limpeza de Pele",
+    messages: [
+      { id: "m9", role: "user" as const, content: "Oi! Gostaria de agendar uma limpeza de pele profunda." },
+      { id: "m10", role: "assistant" as const, content: "Olá! Será um prazer agendar para você! 😊\n\nNossa limpeza de pele profunda é realizada por esteticistas especializadas e inclui: extração, peeling enzimático, máscara calmante e proteção solar.\n\nTemos disponibilidade:\n• Segunda: 14h\n• Terça: 10h ou 16h\n• Quarta: 9h\n\nQual dia e horário prefere?" },
+      { id: "m11", role: "user" as const, content: "Terça às 10h está ótimo!" },
+      { id: "m12", role: "assistant" as const, content: "Perfeito! Agendei sua limpeza de pele profunda para terça-feira às 10h. ✅\n\nAlgumas orientações para o dia:\n• Venha sem maquiagem, se possível\n• Evite exposição solar intensa 48h antes\n• O procedimento dura cerca de 1h30\n\nEndereço: Rua das Flores, 123 — Sala 45 — Jardim Paulista\n🅿️ Estacionamento conveniado no Shopping ao lado.\n\nTe aguardamos! Se precisar reagendar, é só me avisar." },
+    ],
+  },
+];
 
 // --- Types for cognitive pipeline responses ---
 
@@ -286,8 +319,127 @@ function FeedbackBlock({ msg, sessionId, userMessage = "", defaultPhase = "idle"
 
 // --- Chat ---
 
+// ── Investor Mock Chat ──
+
+function InvestorMockChat() {
+  const { toast } = useToast();
+  const [activeConv, setActiveConv] = useState(0);
+  const conv = MOCK_CONVERSATIONS[activeConv];
+
+  const handleFeedback = () => {
+    toast({ title: "Feedback registrado!", description: "Obrigado pelo feedback. A sugestão será analisada pela equipe." });
+  };
+
+  return (
+    <div className="flex flex-col lg:flex-row h-[calc(100vh-6rem)] lg:h-[calc(100vh-4rem)] gap-6">
+      {/* Chat Panel */}
+      <div className="flex-1 flex flex-col min-h-[400px] border border-border rounded-lg bg-card overflow-hidden shadow-sm">
+        <div className="bg-slate-50 border-b border-border p-4 shrink-0">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h2 className="font-semibold text-foreground uppercase tracking-wider text-sm flex items-center gap-2">
+                <Bot className="h-4 w-4 text-accent" />
+                Chat Simulator — Demo
+              </h2>
+              <p className="text-xs text-muted-foreground mt-1">Conversas estáticas pré-definidas</p>
+            </div>
+          </div>
+          <div className="flex gap-2">
+            {MOCK_CONVERSATIONS.map((c, i) => (
+              <button
+                key={c.id}
+                onClick={() => setActiveConv(i)}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all ${
+                  activeConv === i
+                    ? "bg-accent text-accent-foreground shadow-sm"
+                    : "bg-muted text-muted-foreground hover:bg-muted/80"
+                }`}
+              >
+                {c.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <ScrollArea className="flex-1 p-4">
+          <div className="space-y-5 pb-4">
+            {conv.messages.map((msg) => (
+              <div
+                key={msg.id}
+                className={`flex gap-3 ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+              >
+                {msg.role === "assistant" && (
+                  <div className="h-8 w-8 rounded-full bg-accent/10 flex items-center justify-center shrink-0 mt-0.5">
+                    <Bot className="h-4 w-4 text-accent" />
+                  </div>
+                )}
+                {msg.role === "assistant" ? (
+                  <div className="max-w-[82%] flex flex-col">
+                    <div className="rounded-lg px-4 py-3 text-sm bg-muted border border-border text-foreground whitespace-pre-line">
+                      {msg.content}
+                    </div>
+                    <div className="mt-1.5 ml-1">
+                      <button
+                        onClick={handleFeedback}
+                        className="inline-flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground hover:text-violet-400 transition-colors"
+                      >
+                        <Lightbulb className="h-3 w-3" />
+                        Corrigir / Enviar Feedback
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="max-w-[80%] rounded-lg px-4 py-3 text-sm bg-primary text-primary-foreground">
+                    {msg.content}
+                  </div>
+                )}
+                {msg.role === "user" && (
+                  <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center shrink-0 mt-0.5">
+                    <User className="h-4 w-4 text-primary" />
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </ScrollArea>
+
+        <div className="p-4 border-t border-border bg-card shrink-0">
+          <div className="flex gap-2">
+            <Input
+              placeholder="Modo visualização — envio desativado"
+              className="flex-1"
+              disabled
+            />
+            <Button disabled>
+              <Send className="h-4 w-4" />
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      {/* Trace Viewer Panel */}
+      <div className="flex-[1.2] flex flex-col min-h-[400px] border border-border rounded-lg bg-card overflow-hidden shadow-sm">
+        <div className="bg-slate-50 border-b border-border p-4 shrink-0">
+          <h2 className="font-semibold text-foreground uppercase tracking-wider text-sm">
+            Decision Trace — Real-time
+          </h2>
+          <p className="text-xs text-muted-foreground mt-1">Pipeline de decisão em tempo real</p>
+        </div>
+        <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground p-8 space-y-4">
+          <div className="w-16 h-16 border-2 border-dashed border-muted-foreground/30 rounded-full flex items-center justify-center">
+            <Activity className="h-6 w-6 text-muted-foreground/50" />
+          </div>
+          <p className="text-sm text-center">Clique em uma mensagem da IA para ver o trace de decisão</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Chat() {
   const { clinicId: activeClinicId, tenantId, userId, isInvestor, isReadOnly, isBuilder, viewingClinicId } = useAuth();
+
+  if (isInvestor) return <InvestorMockChat />;
   const effectiveTenantId = isBuilder ? viewingClinicId : tenantId;
   const { t } = useI18n();
   const { toast } = useToast();

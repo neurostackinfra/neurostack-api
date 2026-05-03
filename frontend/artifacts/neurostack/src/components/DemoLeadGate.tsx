@@ -86,13 +86,12 @@ export function DemoLeadGate() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${BASE}/api/demo-leads`, {
+      const res = await fetch(`/v1/demo-leads`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ nome, emailContato, empresa, telefone }),
+        body: JSON.stringify({ name: nome, email: emailContato, company: empresa, phone: telefone }),
       });
       if (!res.ok) {
         const data = await res.json() as { error?: string };

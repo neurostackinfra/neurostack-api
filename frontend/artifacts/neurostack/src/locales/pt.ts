@@ -195,9 +195,9 @@ export const pt: Record<TranslationKey, string> = {
   // ── Master Admin ──────────────────────────────────────────────────────────
   admin_infra_desc: "Infraestrutura multi-tenant",
   admin_slots_label: "slots",
-  admin_pilots_label: "pilotos ativos",
+  admin_pilots_label: "clínicas ativas",
   admin_stat_total: "Total Clínicas",
-  admin_stat_active: "Pilotos Ativos",
+  admin_stat_active: "Clínicas Ativas",
   admin_stat_free: "Slots Livres",
   admin_stat_traces: "Total Traces",
   admin_create_btn: "Criar Piloto",
