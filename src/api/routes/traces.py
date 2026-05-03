@@ -138,6 +138,7 @@ CSV response with Content-Disposition header for download.
     tags=["Traces"],
 )
 async def trace_export(
+    request: Request,
     start_date: Optional[datetime] = Query(
         default=None, description="Filter from date (ISO 8601)"
     ),
@@ -150,13 +151,18 @@ async def trace_export(
     handoff_required: Optional[bool] = Query(
         default=None, description="Filter by handoff required flag"
     ),
+    override_tenant_id: Optional[UUID] = Query(
+        default=None, alias="tenant_id",
+        description="Builder override: export traces for a managed clinic",
+    ),
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
 ) -> StreamingResponse:
     """Export traces as a CSV download."""
+    effective_tenant_id = await _resolve_tenant(request, tenant, override_tenant_id, db)
     csv_content = await export_traces_csv(
         db=db,
-        tenant_id=tenant.tenant_id,
+        tenant_id=effective_tenant_id,
         start_date=start_date,
         end_date=end_date,
         safety_flag=safety_flag,
