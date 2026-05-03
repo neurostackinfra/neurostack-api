@@ -98,11 +98,6 @@ export default function Suporte() {
         body: JSON.stringify({ tipo, mensagem, filename: file?.name, file_type: file?.type, file_data }),
       });
       if (!res.ok) throw new Error("fail");
-      const data = await res.json();
-      if (!data.email_sent) {
-        toast({ title: "Erro ao enviar email", description: "SMTP não configurado ou falhou. Contate o suporte diretamente.", variant: "destructive" });
-        return;
-      }
       toast({
         title: t("support_toast_ok_title"),
         description: file

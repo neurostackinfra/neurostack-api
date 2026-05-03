@@ -818,7 +818,7 @@ export default function MasterAdmin() {
 
   const fetchTickets = async () => {
     try {
-      const res = await fetch(`${BASE}/api/support/tickets`, { headers: authHeaders(token) });
+      const res = await fetch(`/v1/support/tickets`, { headers: authHeaders(token) });
       if (!res.ok) return;
       setTickets(await res.json() as SupportTicket[]);
       setTicketsLoaded(true);
@@ -906,9 +906,9 @@ export default function MasterAdmin() {
 
   const handleUpdateTicketStatus = async (id: number, newStatus: "open" | "closed") => {
     try {
-      const res = await fetch(`${BASE}/api/support/tickets/${id}/status`, {
+      const res = await fetch(`/v1/support/tickets/${id}/status`, {
         method: "PATCH",
-        headers: authHeaders(token),
+        headers: { "Content-Type": "application/json", ...authHeaders(token) },
         body: JSON.stringify({ status: newStatus }),
       });
       if (!res.ok) throw new Error();
@@ -977,7 +977,7 @@ export default function MasterAdmin() {
   const activeClinics  = isInvestor ? 170 : (stats?.activeClinics ?? clinics.filter((c) => c.plan_type === "pilot" && c.status === "active").length);
   const totalTraces   = isInvestor ? "27.2K" : (stats ? stats.totalTraces.toLocaleString("pt-BR") : "...");
   const tokenDisplay  = isInvestor ? "2.4M" : (stats ? `${(stats.totalTokens / 1_000_000).toFixed(1)}M` : "...");
-  const openTicketCnt = isInvestor ? 0 : (stats?.openTickets ?? tickets.filter((t) => t.status === "open").length);
+  const openTicketCnt = isInvestor ? 0 : (ticketsLoaded ? tickets.filter((t) => t.status === "open").length : (stats?.openTickets ?? 0));
 
   // Trend: compare last 7 days vs previous 7 days from time_series
   const traceTrend = (() => {

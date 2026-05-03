@@ -17,6 +17,7 @@ from src.models.knowledge import KnowledgeDocument
 from src.models.handoff import HandoffRecord
 from src.models.user import User, UserRole
 from src.models.demo_lead import DemoLead
+from src.models.support_ticket import SupportTicket
 
 __all__ = [
     # Base
@@ -36,5 +37,6 @@ __all__ = [
     "User",
     "UserRole",
     "DemoLead",
+    "SupportTicket",
 ]
 

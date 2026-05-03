@@ -598,11 +598,13 @@ function SwitchRow({
   hint,
   checked,
   onCheckedChange,
+  disabled,
 }: {
   label: string;
   hint?: string;
   checked: boolean;
   onCheckedChange: (v: boolean) => void;
+  disabled?: boolean;
 }) {
   return (
     <div className="flex items-center justify-between gap-4 rounded-md border border-border bg-muted/20 px-3 py-3">
@@ -610,151 +612,55 @@ function SwitchRow({
         <p className="text-sm font-medium text-foreground">{label}</p>
         {hint && <p className="text-xs text-muted-foreground mt-0.5">{hint}</p>}
       </div>
-      <Switch checked={checked} onCheckedChange={onCheckedChange} className="shrink-0" />
+      <Switch checked={checked} onCheckedChange={onCheckedChange} disabled={disabled} className="shrink-0" />
     </div>
   );
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-// ── Investor Mock Config ──
-function InvestorMockConfig() {
-  const { t, locale } = useI18n();
-  const txt = (p: string, e: string) => locale === "en" ? e : p;
-  return (
-    <div className="max-w-2xl mx-auto space-y-5">
-      <div className="flex items-center gap-3">
-        <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent/10 border border-accent/20">
-          <Sliders className="h-5 w-5 text-accent" />
-        </div>
-        <div>
-          <h1 className="text-xl font-semibold text-foreground">{t("config_title")}</h1>
-          <p className="text-sm text-muted-foreground">{t("config_subtitle")}</p>
-        </div>
-      </div>
-      <Tabs defaultValue="identidade" className="w-full">
-        <TabsList className="w-full grid h-auto p-1 bg-muted/50 border border-border rounded-lg grid-cols-6">
-          {[
-            { value: "identidade", icon: User, label: txt("Identidade", "Identity") },
-            { value: "operacao", icon: Building2, label: txt("Operação", "Operations") },
-            { value: "negocio", icon: Shield, label: txt("Negócio", "Business") },
-            { value: "handoff", icon: PhoneForwarded, label: "Handoff" },
-            { value: "servicos", icon: Boxes, label: txt("Serviços", "Services") },
-            { value: "integracoes", icon: Plug, label: "APIs" },
-          ].map(({ value, icon: Icon, label }) => (
-            <TabsTrigger key={value} value={value} className="flex flex-col items-center gap-0.5 py-2 text-[10px] font-medium data-[state=active]:bg-background data-[state=active]:shadow-sm">
-              <Icon className="h-3.5 w-3.5" />
-              {label}
-            </TabsTrigger>
-          ))}
-        </TabsList>
-        <TabsContent value="identidade" className="mt-4">
-          <Card className="border-border shadow-sm">
-            <CardHeader className="pb-3 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
-              <CardTitle className="text-sm font-semibold uppercase tracking-wider">{txt("Identidade da Clínica", "Clinic Identity")}</CardTitle>
-              <CardDescription className="text-xs">{txt("Informações básicas da clínica e do agente", "Basic clinic and agent information")}</CardDescription>
-            </CardHeader>
-            <CardContent className="pt-5 space-y-3 text-sm">
-              <div className="grid grid-cols-2 gap-4">
-                <div><Label className="text-xs text-muted-foreground">{txt("Nome da Clínica", "Clinic Name")}</Label><p className="font-medium">Clínica Estética Lumina</p></div>
-                <div><Label className="text-xs text-muted-foreground">{txt("Domínio", "Domain")}</Label><p className="font-medium">Estética</p></div>
-              </div>
-              <div><Label className="text-xs text-muted-foreground">{txt("Nome do Agente", "Agent Name")}</Label><p className="font-medium">Lumina</p></div>
-              <div><Label className="text-xs text-muted-foreground">{txt("Apresentação", "Presentation")}</Label><p className="font-medium">Nome — Atendente Virtual</p></div>
-              <div><Label className="text-xs text-muted-foreground">{txt("Especialidades", "Specialties")}</Label><p className="font-medium">Dermatologia, Medicina Estética, Nutrição Clínica</p></div>
-              <div><Label className="text-xs text-muted-foreground">{txt("Equipe", "Team")}</Label>
-                <div className="mt-1 space-y-1">
-                  <p className="text-xs">Dra. Ana Lima — Dermatologista (12 anos de experiência)</p>
-                  <p className="text-xs">Dr. Carlos Mendes — Cirurgião Plástico (8 anos)</p>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-        </TabsContent>
-        <TabsContent value="operacao" className="mt-4">
-          <Card className="border-border shadow-sm">
-            <CardHeader className="pb-3 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
-              <CardTitle className="text-sm font-semibold uppercase tracking-wider">{txt("Operação", "Operations")}</CardTitle>
-            </CardHeader>
-            <CardContent className="pt-5 space-y-3 text-sm">
-              <div><Label className="text-xs text-muted-foreground">{txt("Endereço", "Address")}</Label><p className="font-medium">Rua das Flores, 123 — Sala 45, Jardim Paulista, São Paulo/SP</p></div>
-              <div><Label className="text-xs text-muted-foreground">{txt("Horário de Funcionamento", "Business Hours")}</Label><p className="font-medium">Seg–Sex: 9h–19h | Sáb: 9h–14h</p></div>
-              <div><Label className="text-xs text-muted-foreground">{txt("Formato", "Format")}</Label><p className="font-medium">Online e Presencial</p></div>
-            </CardContent>
-          </Card>
-        </TabsContent>
-        <TabsContent value="negocio" className="mt-4">
-          <Card className="border-border shadow-sm">
-            <CardHeader className="pb-3 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
-              <CardTitle className="text-sm font-semibold uppercase tracking-wider">{txt("Regras de Negócio", "Business Rules")}</CardTitle>
-            </CardHeader>
-            <CardContent className="pt-5 space-y-3 text-sm">
-              <div><Label className="text-xs text-muted-foreground">{txt("Convênios", "Insurance")}</Label><p className="font-medium">Unimed, Bradesco Saúde, SulAmérica</p></div>
-              <div><Label className="text-xs text-muted-foreground">{txt("Consulta Inicial", "Initial Consultation")}</Label><p className="font-medium">Cortesia</p></div>
-              <div><Label className="text-xs text-muted-foreground">{txt("Política de Preços", "Pricing")}</Label><p className="font-medium">Fornece preços após autoridade</p></div>
-              <div><Label className="text-xs text-muted-foreground">LGPD</Label><p className="font-medium">Ativo — Página padrão NeuroStack</p></div>
-            </CardContent>
-          </Card>
-        </TabsContent>
-        <TabsContent value="handoff" className="mt-4">
-          <Card className="border-border shadow-sm">
-            <CardHeader className="pb-3 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
-              <CardTitle className="text-sm font-semibold uppercase tracking-wider">Handoff</CardTitle>
-            </CardHeader>
-            <CardContent className="pt-5 space-y-3 text-sm">
-              <Badge className="bg-emerald-500/15 text-emerald-400 border-emerald-500/30">ON</Badge>
-              <div><Label className="text-xs text-muted-foreground">{txt("Modo Stand-by", "Stand-by Mode")}</Label><p className="font-medium">Ativo</p></div>
-              <div><Label className="text-xs text-muted-foreground">{txt("Período", "Period")}</Label><p className="font-medium">Permanente</p></div>
-              <div><Label className="text-xs text-muted-foreground">Human-in-the-Loop</Label><p className="font-medium text-muted-foreground">Roadmap V2</p></div>
-            </CardContent>
-          </Card>
-        </TabsContent>
-        <TabsContent value="servicos" className="mt-4">
-          <Card className="border-border shadow-sm">
-            <CardHeader className="pb-3 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
-              <CardTitle className="text-sm font-semibold uppercase tracking-wider">{txt("Catálogo de Serviços", "Service Catalog")}</CardTitle>
-            </CardHeader>
-            <CardContent className="pt-5 space-y-4 text-sm">
-              {[
-                { name: "Toxina Botulínica (Botox)", price: "R$ 1.200", desc: "Aplicação para rugas dinâmicas na testa, glabela e região dos olhos" },
-                { name: "Preenchimento Labial", price: "R$ 2.500", desc: "Ácido hialurônico para volume e contorno labial" },
-                { name: "Limpeza de Pele Profunda", price: "R$ 350", desc: "Extração, peeling enzimático, máscara calmante" },
-                { name: "Harmonização Facial", price: "R$ 4.800", desc: "Protocolo completo: mandíbula, mento, bigode chinês" },
-              ].map((s, i) => (
-                <div key={i} className="rounded-md border border-border p-3">
-                  <div className="flex justify-between items-start">
-                    <p className="font-medium">{s.name}</p>
-                    <Badge variant="outline" className="text-xs shrink-0">{s.price}</Badge>
-                  </div>
-                  <p className="text-xs text-muted-foreground mt-1">{s.desc}</p>
-                </div>
-              ))}
-            </CardContent>
-          </Card>
-        </TabsContent>
-        <TabsContent value="integracoes" className="mt-4">
-          <Card className="border-border shadow-sm">
-            <CardHeader className="pb-3 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
-              <CardTitle className="text-sm font-semibold uppercase tracking-wider">APIs & Integrações</CardTitle>
-            </CardHeader>
-            <CardContent className="pt-5 space-y-3 text-sm">
-              <div className="flex flex-wrap gap-3">
-                <div className="flex items-center gap-1.5"><CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /><span>Z-API (WhatsApp)</span></div>
-                <div className="flex items-center gap-1.5"><CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /><span>GPT-4o-mini (LLM)</span></div>
-                <div className="flex items-center gap-1.5"><CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /><span>Webhook configurado</span></div>
-              </div>
-            </CardContent>
-          </Card>
-        </TabsContent>
-      </Tabs>
-    </div>
-  );
-}
+// ── Investor mock config data ──
+const INVESTOR_MOCK_CONFIG = {
+  clinic_name: "Clínica Estética Lumina",
+  main_domain: "estetica",
+  agent_name: "Lumina",
+  agent_presentation: "name_attendant",
+  ai_disclosure: "affirm_ai",
+  use_emojis: "yes",
+  clinic_history: "Fundada em 2018, a Clínica Estética Lumina nasceu da missão de democratizar tratamentos estéticos com segurança e resultados naturais. Com atendimento humanizado e tecnologia de ponta, já realizamos mais de 15.000 procedimentos.",
+  clinic_specialties: "Dermatologia, Medicina Estética, Nutrição Clínica, Fisioterapia Dermatofuncional",
+  professionals: [
+    { name: "Dra. Ana Lima", specialty: "Dermatologista", description: "Especialista em procedimentos estéticos com 12 anos de experiência, CRM 12345. Mais de 500 aplicações de toxina botulínica." },
+    { name: "Dr. Carlos Mendes", specialty: "Cirurgião Plástico", description: "Cirurgião plástico com 8 anos de experiência, membro da SBCP. Especialista em harmonização facial." },
+  ],
+  full_address: "Rua das Flores, 123 — Sala 45 — Jardim Paulista, São Paulo/SP — CEP 01234-000",
+  parking_info: "Estacionamento conveniado no Shopping Paulista, entrada pela Av. Brasil",
+  working_hours: "Seg–Sex: 9h–19h | Sáb: 9h–14h | Dom: fechado",
+  scheduling_hours: "Seg–Sex: 8h–18h",
+  service_format: "both",
+  online_services_desc: "Consulta de avaliação, acompanhamento pós-procedimento, orientações nutricionais",
+  presential_services_desc: "Aplicação de toxina botulínica, preenchimento labial, limpeza de pele profunda, harmonização facial",
+  differentials: "Especialistas com mais de 10 anos de experiência, atendimento humanizado e foco em resultados naturais. Equipamentos de última geração importados da Alemanha.",
+  accepts_insurance: "yes",
+  insurance_list: "Unimed, Bradesco Saúde, SulAmérica, Amil",
+  initial_consultation: "free",
+  provide_prices: "yes",
+  lgpd_active: "yes",
+  lgpd_enabled: "yes",
+  language_policy: "neurostack_default",
+  handoff_active: "yes",
+  standby_mode: "active",
+  handoff_period: "permanent",
+  services: [
+    { name: "Toxina Botulínica (Botox)", description: "Aplicação para rugas dinâmicas na testa, glabela e região dos olhos", price: "R$ 1.200", authority_notes: "Procedimento realizado por Dra. Ana Lima, dermatologista com mais de 500 aplicações bem-sucedidas" },
+    { name: "Preenchimento Labial", description: "Ácido hialurônico para volume e contorno labial", price: "R$ 2.500", authority_notes: "Técnica avançada com produto Juvederm, referência mundial em preenchimento" },
+    { name: "Limpeza de Pele Profunda", description: "Extração, peeling enzimático, máscara calmante e proteção solar", price: "R$ 350", authority_notes: "Protocolo exclusivo desenvolvido pela equipe de estética da clínica" },
+    { name: "Harmonização Facial", description: "Protocolo completo: mandíbula, mento, bigode chinês, olheiras", price: "R$ 4.800", authority_notes: "Realizado por Dr. Carlos Mendes, membro da SBCP com mais de 300 harmonizações" },
+  ],
+};
 
 export default function ClinicConfig() {
   const { clinicId, isReadOnly, isClinicAdmin, role, isBuilder, isInvestor, viewingClinicId } = useAuth();
-
-  if (isInvestor) return <InvestorMockConfig />;
   const { t, locale } = useI18n();
   const txt = (p: string, e: string) => locale === "en" ? e : p;
   const { toast } = useToast();
@@ -764,6 +670,11 @@ export default function ClinicConfig() {
   const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
+    if (isInvestor) {
+      setConfig(INVESTOR_MOCK_CONFIG);
+      setIsLoading(false);
+      return;
+    }
     async function loadConfig() {
       setIsLoading(true);
       try {
@@ -784,7 +695,7 @@ export default function ClinicConfig() {
       }
     }
     void loadConfig();
-  }, [clinicId, viewingClinicId]);
+  }, [clinicId, viewingClinicId, isInvestor]);
 
   // Tab 1 — Identidade
   const [clinicName, setClinicName] = useState("");
@@ -1029,11 +940,12 @@ export default function ClinicConfig() {
                     value={clinicName}
                     onChange={(e) => setClinicName(e.target.value)}
                     placeholder={txt("Ex: Clínica Estética Lumina", "e.g. Lumina Aesthetic Clinic")}
+                    disabled={isReadOnly}
                     data-testid="input-clinic-name"
                   />
                 </Field>
                 <Field label={txt("Domínio Principal", "Main Domain")}>
-                  <Select value={mainDomain} onValueChange={setMainDomain}>
+                  <Select value={mainDomain} onValueChange={setMainDomain} disabled={isReadOnly}>
                     <SelectTrigger className="h-9 text-sm">
                       <SelectValue placeholder={txt("Selecione...", "Select...")} />
                     </SelectTrigger>
@@ -1053,12 +965,13 @@ export default function ClinicConfig() {
                   value={agentName}
                   onChange={(e) => setAgentName(e.target.value)}
                   placeholder={txt("Ex: Lumina, Sofia, Ana", "e.g. Lumina, Sofia, Ana")}
+                  disabled={isReadOnly}
                   data-testid="input-agent-name"
                 />
               </Field>
 
               <Field label={txt("Apresentação", "Presentation")}>
-                <Select value={agentPresentation} onValueChange={setAgentPresentation}>
+                <Select value={agentPresentation} onValueChange={setAgentPresentation} disabled={isReadOnly}>
                   <SelectTrigger className="h-9 text-sm">
                     <SelectValue placeholder={txt("Selecione o formato...", "Select format...")} />
                   </SelectTrigger>
@@ -1071,7 +984,7 @@ export default function ClinicConfig() {
               </Field>
 
               <Field label={txt("Resposta sobre ser IA", "Response about being AI")}>
-                <Select value={aiDisclosure} onValueChange={setAiDisclosure}>
+                <Select value={aiDisclosure} onValueChange={setAiDisclosure} disabled={isReadOnly}>
                   <SelectTrigger className="h-9 text-sm">
                     <SelectValue placeholder={txt("Selecione...", "Select...")} />
                   </SelectTrigger>
@@ -1087,6 +1000,7 @@ export default function ClinicConfig() {
                 hint={txt("Permite uso de emojis nas respostas do agente", "Allows emoji use in agent responses")}
                 checked={useEmojis === "yes"}
                 onCheckedChange={(v) => setUseEmojis(v ? "yes" : "no")}
+                disabled={isReadOnly}
               />
 
               <SectionLabel>{txt("História & Especialidades", "History & Specialties")}</SectionLabel>
@@ -1097,6 +1011,7 @@ export default function ClinicConfig() {
                   placeholder={txt("Ex: Fundada em 2015, a Clínica Lumina nasceu da missão de...", "e.g. Founded in 2015, Lumina Clinic was born from the mission of...")}
                   rows={3}
                   className="resize-none text-sm"
+                  disabled={isReadOnly}
                 />
               </Field>
               <Field label={txt("Especialidades da Clínica", "Clinic Specialties")} hint={txt("Liste as especialidades separadas por vírgula.", "List specialties separated by commas.")}>
@@ -1106,12 +1021,14 @@ export default function ClinicConfig() {
                   placeholder={txt("Ex: Dermatologia, Medicina Estética, Nutrição Clínica, Fisioterapia", "e.g. Dermatology, Aesthetic Medicine, Clinical Nutrition, Physiotherapy")}
                   rows={2}
                   className="resize-none text-sm"
+                  disabled={isReadOnly}
                   data-testid="textarea-clinic-specialties"
                 />
               </Field>
 
               <div className="flex items-center justify-between pt-1">
                 <SectionLabel>{txt("Equipe", "Team")}</SectionLabel>
+                {!isReadOnly && (
                 <Button
                   size="sm"
                   variant="outline"
@@ -1122,6 +1039,7 @@ export default function ClinicConfig() {
                   <Plus className="h-3.5 w-3.5" />
                   {t("config_add")}
                 </Button>
+                )}
               </div>
 
               {professionals.length === 0 && (
@@ -1140,6 +1058,7 @@ export default function ClinicConfig() {
                     <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-muted-foreground">
                       {txt("Profissional", "Professional")} {idx + 1}
                     </span>
+                    {!isReadOnly && (
                     <Button
                       size="icon"
                       variant="ghost"
@@ -1149,6 +1068,7 @@ export default function ClinicConfig() {
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </Button>
+                    )}
                   </div>
 
                   <div className="grid grid-cols-2 gap-3">
@@ -1158,6 +1078,7 @@ export default function ClinicConfig() {
                         onChange={(e) => updateProfessional(idx, "name", e.target.value)}
                         placeholder={txt("Ex: Dra. Ana Lima", "e.g. Dr. Ana Lima")}
                         className="h-8 text-sm"
+                        disabled={isReadOnly}
                         data-testid={`input-professional-name-${idx}`}
                       />
                     </Field>
@@ -1167,6 +1088,7 @@ export default function ClinicConfig() {
                         onChange={(e) => updateProfessional(idx, "specialty", e.target.value)}
                         placeholder={txt("Ex: Dermatologista", "e.g. Dermatologist")}
                         className="h-8 text-sm"
+                        disabled={isReadOnly}
                         data-testid={`input-professional-specialty-${idx}`}
                       />
                     </Field>
@@ -1179,6 +1101,7 @@ export default function ClinicConfig() {
                       placeholder={txt("Ex: Especialista em procedimentos estéticos com 12 anos de experiência, CRM 12345", "e.g. Specialist in aesthetic procedures with 12 years of experience, CRM 12345")}
                       rows={2}
                       className="resize-none text-sm"
+                      disabled={isReadOnly}
                       data-testid={`input-professional-description-${idx}`}
                     />
                   </Field>
@@ -1208,6 +1131,7 @@ export default function ClinicConfig() {
                   placeholder={txt("Ex: Rua das Flores, 123 — Sala 45 — Jardim Paulista, São Paulo/SP — CEP 01234-000", "e.g. 123 Flower St, Suite 45, Downtown, São Paulo/SP — ZIP 01234-000")}
                   rows={2}
                   className="resize-none text-sm"
+                  disabled={isReadOnly}
                   data-testid="input-full-address"
                 />
               </Field>
@@ -1216,6 +1140,7 @@ export default function ClinicConfig() {
                   value={parkingInfo}
                   onChange={(e) => setParkingInfo(e.target.value)}
                   placeholder={txt("Ex: Estacionamento conveniado no Shopping X, entrada pela Av. Brasil", "e.g. Partner parking at Shopping X, entrance on Brasil Ave.")}
+                  disabled={isReadOnly}
                 />
               </Field>
 
@@ -1225,6 +1150,7 @@ export default function ClinicConfig() {
                   value={workingHours}
                   onChange={(e) => setWorkingHours(e.target.value)}
                   placeholder={txt("Ex: Seg–Sex: 9h–19h | Sáb: 9h–14h | Dom: fechado", "e.g. Mon–Fri: 9am–7pm | Sat: 9am–2pm | Sun: closed")}
+                  disabled={isReadOnly}
                   data-testid="input-working-hours"
                 />
               </Field>
@@ -1233,12 +1159,13 @@ export default function ClinicConfig() {
                   value={schedulingHours}
                   onChange={(e) => setSchedulingHours(e.target.value)}
                   placeholder={txt("Ex: Seg–Sex: 8h–18h (agendamentos apenas por WhatsApp)", "e.g. Mon–Fri: 8am–6pm (scheduling via WhatsApp only)")}
+                  disabled={isReadOnly}
                 />
               </Field>
 
               <SectionLabel>{txt("Formato de Atendimento", "Service Format")}</SectionLabel>
               <Field label={txt("Modalidade", "Modality")}>
-                <Select value={serviceFormat} onValueChange={setServiceFormat}>
+                <Select value={serviceFormat} onValueChange={setServiceFormat} disabled={isReadOnly}>
                   <SelectTrigger className="h-9 text-sm">
                     <SelectValue placeholder={txt("Selecione...", "Select...")} />
                   </SelectTrigger>
@@ -1261,6 +1188,7 @@ export default function ClinicConfig() {
                     placeholder={txt("Ex: Consulta de avaliação, acompanhamento pós-procedimento, orientações nutricionais", "e.g. Assessment consultation, post-procedure follow-up, nutritional guidance")}
                     rows={3}
                     className="resize-none text-sm"
+                    disabled={isReadOnly}
                     data-testid="textarea-online-services"
                   />
                 </Field>
@@ -1277,6 +1205,7 @@ export default function ClinicConfig() {
                     placeholder={txt("Ex: Aplicação de toxina botulínica, preenchimento labial, limpeza de pele profunda", "e.g. Botulinum toxin application, lip filler, deep skin cleansing")}
                     rows={3}
                     className="resize-none text-sm"
+                    disabled={isReadOnly}
                     data-testid="textarea-presential-services"
                   />
                 </Field>
@@ -1302,6 +1231,7 @@ export default function ClinicConfig() {
                 label={txt("Atende Convênios", "Accepts Insurance")}
                 checked={acceptsInsurance === "yes"}
                 onCheckedChange={(v) => setAcceptsInsurance(v ? "yes" : "no")}
+                disabled={isReadOnly}
               />
               {acceptsInsurance === "yes" && (
                 <Field label={txt("Lista de Convênios Aceitos", "Accepted Insurance Plans")}>
@@ -1311,13 +1241,14 @@ export default function ClinicConfig() {
                     placeholder={txt("Ex: Unimed, Bradesco Saúde, SulAmérica, Amil", "e.g. Aetna, Cigna, UnitedHealth, BlueCross")}
                     rows={2}
                     className="resize-none text-sm"
+                    disabled={isReadOnly}
                   />
                 </Field>
               )}
 
               <SectionLabel>{txt("Consulta Inicial", "Initial Consultation")}</SectionLabel>
               <Field label={txt("Tipo de Consulta Inicial", "Initial Consultation Type")}>
-                <Select value={initialConsultation} onValueChange={setInitialConsultation}>
+                <Select value={initialConsultation} onValueChange={setInitialConsultation} disabled={isReadOnly}>
                   <SelectTrigger className="h-9 text-sm">
                     <SelectValue placeholder={txt("Selecione...", "Select...")} />
                   </SelectTrigger>
@@ -1334,6 +1265,7 @@ export default function ClinicConfig() {
                 hint={txt("Se desativado, o agente não cita valores e direciona para avaliação", "If disabled, the agent does not quote prices and redirects to evaluation")}
                 checked={providePrices === "yes"}
                 onCheckedChange={(v) => setProvidePrices(v ? "yes" : "no")}
+                disabled={isReadOnly}
               />
 
               <SectionLabel>{t("config_service_authority")}</SectionLabel>
@@ -1347,6 +1279,7 @@ export default function ClinicConfig() {
                   placeholder={txt("Ex: Especialistas com mais de 10 anos de experiência, atendimento humanizado e foco em resultados naturais.", "e.g. Specialists with over 10 years of experience, humanized care and a focus on natural results.")}
                   rows={4}
                   className="resize-none text-sm leading-relaxed"
+                  disabled={isReadOnly}
                   data-testid="textarea-differentials"
                 />
               </Field>
@@ -1363,6 +1296,7 @@ export default function ClinicConfig() {
                 hint={txt("Envia mensagem de abertura com aviso de privacidade", "Sends an opening message with a privacy notice")}
                 checked={lgpdEnabled}
                 onCheckedChange={setLgpdEnabled}
+                disabled={isReadOnly}
               />
 
               {lgpdEnabled && (<>
@@ -1376,8 +1310,9 @@ export default function ClinicConfig() {
                     placeholder={`Olá! Bem-vindo(a) ao atendimento da ${clinicName || "[Nome da Clínica]"}. 🏥 Para garantir o melhor cuidado com a sua saúde e segurança, nossa assistente virtual processa seus dados de acordo com a LGPD. Ao continuar, você concorda com o uso dos seus dados para fins de agendamento. 📄 Leia nossa Política de Privacidade: {{lgpd_link}} Como posso te ajudar?`}
                     rows={5}
                     className="text-sm"
+                    disabled={isReadOnly}
                   />
-                  {!lgpdMessage && (
+                  {!lgpdMessage && !isReadOnly && (
                     <button
                       type="button"
                       className="text-[11px] text-violet-400 hover:text-violet-300 transition-colors mt-1"
@@ -1395,7 +1330,7 @@ export default function ClinicConfig() {
                         <label key={mode} className="flex items-center gap-2 cursor-pointer select-none">
                           <div
                             className={`h-4 w-4 rounded-full border-2 flex items-center justify-center transition-colors ${lgpdLinkMode === mode ? "border-violet-500 bg-violet-500" : "border-border"}`}
-                            onClick={() => setLgpdLinkMode(mode)}
+                            onClick={() => !isReadOnly && setLgpdLinkMode(mode)}
                           >
                             {lgpdLinkMode === mode && <div className="h-1.5 w-1.5 rounded-full bg-white" />}
                           </div>
@@ -1413,6 +1348,7 @@ export default function ClinicConfig() {
                         placeholder="https://suaclinica.com.br/privacidade"
                         type="url"
                         className="text-sm font-mono"
+                        disabled={isReadOnly}
                       />
                     )}
                   </div>
@@ -1425,21 +1361,21 @@ export default function ClinicConfig() {
                     </p>
                     <div className="grid grid-cols-2 gap-2">
                       <Field label={txt("Nome Legal da Clínica", "Clinic Legal Name")} hint="">
-                        <Input value={clinicLegalName} onChange={(e) => setClinicLegalName(e.target.value)} placeholder={txt("Clínica Saúde Ltda.", "Health Clinic Ltd.")} className="text-sm h-8" />
+                        <Input value={clinicLegalName} onChange={(e) => setClinicLegalName(e.target.value)} placeholder={txt("Clínica Saúde Ltda.", "Health Clinic Ltd.")} className="text-sm h-8" disabled={isReadOnly} />
                       </Field>
                       <Field label={txt("CNPJ", "Tax ID / CNPJ")} hint="">
-                        <Input value={clinicCnpj} onChange={(e) => setClinicCnpj(e.target.value)} placeholder="00.000.000/0001-00" className="text-sm h-8 font-mono" />
+                        <Input value={clinicCnpj} onChange={(e) => setClinicCnpj(e.target.value)} placeholder="00.000.000/0001-00" className="text-sm h-8 font-mono" disabled={isReadOnly} />
                       </Field>
                     </div>
                     <Field label={txt("E-mail / Telefone de Contato da Clínica", "Clinic Contact Email / Phone")} hint="">
-                      <Input value={clinicContact} onChange={(e) => setClinicContact(e.target.value)} placeholder={txt("contato@suaclinica.com.br / (11) 3000-0000", "contact@yourclinic.com / +1 (555) 000-0000")} className="text-sm h-8" />
+                      <Input value={clinicContact} onChange={(e) => setClinicContact(e.target.value)} placeholder={txt("contato@suaclinica.com.br / (11) 3000-0000", "contact@yourclinic.com / +1 (555) 000-0000")} className="text-sm h-8" disabled={isReadOnly} />
                     </Field>
                     <div className="grid grid-cols-2 gap-2">
                       <Field label={txt("Nome do Encarregado (DPO)", "DPO Name")} hint="">
-                        <Input value={dpoName} onChange={(e) => setDpoName(e.target.value)} placeholder={txt("João Silva", "John Smith")} className="text-sm h-8" />
+                        <Input value={dpoName} onChange={(e) => setDpoName(e.target.value)} placeholder={txt("João Silva", "John Smith")} className="text-sm h-8" disabled={isReadOnly} />
                       </Field>
                       <Field label={txt("E-mail / Contato do DPO", "DPO Email / Contact")} hint="">
-                        <Input value={dpoContact} onChange={(e) => setDpoContact(e.target.value)} placeholder={txt("dpo@suaclinica.com.br", "dpo@yourclinic.com")} className="text-sm h-8" />
+                        <Input value={dpoContact} onChange={(e) => setDpoContact(e.target.value)} placeholder={txt("dpo@suaclinica.com.br", "dpo@yourclinic.com")} className="text-sm h-8" disabled={isReadOnly} />
                       </Field>
                     </div>
                   </div>
@@ -1466,7 +1402,7 @@ export default function ClinicConfig() {
 
               <SectionLabel>{txt("Política de Linguagem", "Language Policy")}</SectionLabel>
               <Field label={txt("Estilo de Resposta", "Response Style")}>
-                <Select value={languagePolicy} onValueChange={setLanguagePolicy}>
+                <Select value={languagePolicy} onValueChange={setLanguagePolicy} disabled={isReadOnly}>
                   <SelectTrigger className="h-9 text-sm">
                     <SelectValue />
                   </SelectTrigger>
@@ -1484,6 +1420,7 @@ export default function ClinicConfig() {
                     placeholder={txt("Ex: Responda de forma formal, sem abreviações, usando sempre 'você' e nunca 'vc'.", "e.g. Respond formally, without abbreviations, always using 'you' and never 'u'.")}
                     rows={3}
                     className="resize-none text-sm"
+                    disabled={isReadOnly}
                   />
                 </Field>
               )}
@@ -1529,6 +1466,7 @@ export default function ClinicConfig() {
                       </div>
                       <Switch
                         checked={hitlActive}
+                        disabled={isReadOnly}
                         onCheckedChange={() => {
                           toast({
                             title: txt("Funcionalidade em desenvolvimento", "Feature in development"),
@@ -1544,7 +1482,7 @@ export default function ClinicConfig() {
                         <label className="text-xs font-semibold text-foreground/80">
                           {txt("Tempo de Pausa Ativa (Cooldown)", "Active Pause Time (Cooldown)")}
                         </label>
-                        <Select value={hitlCooldown} onValueChange={setHitlCooldown}>
+                        <Select value={hitlCooldown} onValueChange={setHitlCooldown} disabled={isReadOnly}>
                           <SelectTrigger className="h-9 text-sm">
                             <SelectValue />
                           </SelectTrigger>
@@ -1566,10 +1504,11 @@ export default function ClinicConfig() {
                     hint={txt("A IA fica inativa após acionar handoff até o ciclo se encerrar", "AI goes inactive after triggering handoff until the cycle ends")}
                     checked={standbyMode === "active"}
                     onCheckedChange={(v) => setStandbyMode(v ? "active" : "inactive")}
+                    disabled={isReadOnly}
                   />
 
                   <Field label={txt("Período de Handoff", "Handoff Period")}>
-                    <Select value={handoffPeriod} onValueChange={setHandoffPeriod}>
+                    <Select value={handoffPeriod} onValueChange={setHandoffPeriod} disabled={isReadOnly}>
                       <SelectTrigger className="h-9 text-sm">
                         <SelectValue />
                       </SelectTrigger>
@@ -1590,6 +1529,7 @@ export default function ClinicConfig() {
                         onChange={(e) => setHandoffCycleDays(e.target.value)}
                         placeholder={txt("Ex: 7", "e.g. 7")}
                         className="w-32 text-sm"
+                        disabled={isReadOnly}
                       />
                     </Field>
                   )}
@@ -1610,6 +1550,7 @@ export default function ClinicConfig() {
                     {txt("Cada serviço é injetado como contexto literal. Os Diferenciais de Autoridade reforçam credibilidade antes de qualquer preço.", "Each service is injected as literal context. Authority Differentials reinforce credibility before any price.")}
                   </CardDescription>
                 </div>
+                {!isReadOnly && (
                 <Button
                   size="sm"
                   variant="outline"
@@ -1620,6 +1561,7 @@ export default function ClinicConfig() {
                   <Plus className="h-3.5 w-3.5" />
                   {t("config_add")}
                 </Button>
+                )}
               </div>
             </CardHeader>
             <CardContent className="pt-5 space-y-4">
@@ -1638,6 +1580,7 @@ export default function ClinicConfig() {
                     <span className="text-xs font-mono text-muted-foreground uppercase tracking-wider">
                       {t("config_service_label")} {idx + 1}
                     </span>
+                    {!isReadOnly && (
                     <Button
                       size="icon"
                       variant="ghost"
@@ -1647,6 +1590,7 @@ export default function ClinicConfig() {
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </Button>
+                    )}
                   </div>
 
                   <div className="grid grid-cols-[1fr_auto] gap-3">
@@ -1656,6 +1600,7 @@ export default function ClinicConfig() {
                         onChange={(e) => updateService(idx, "name", e.target.value)}
                         placeholder={t("config_service_name_ph")}
                         className="h-8 text-sm"
+                        disabled={isReadOnly}
                         data-testid={`input-service-name-${idx}`}
                       />
                     </Field>
@@ -1666,6 +1611,7 @@ export default function ClinicConfig() {
                         onChange={(e) => updateService(idx, "price", e.target.value)}
                         placeholder="Ex: $150, €100, R$500"
                         className="h-8 text-sm w-36"
+                        disabled={isReadOnly}
                       />
                     </Field>
                   </div>
@@ -1677,6 +1623,7 @@ export default function ClinicConfig() {
                       placeholder={t("config_service_desc_ph")}
                       rows={2}
                       className="resize-none text-sm"
+                      disabled={isReadOnly}
                       data-testid={`input-service-description-${idx}`}
                     />
                   </Field>
@@ -1691,6 +1638,7 @@ export default function ClinicConfig() {
                       placeholder={txt("Ex: Procedimento realizado por especialista certificado pela SBCD com mais de 500 casos de sucesso.", "e.g. Procedure performed by a specialist certified by SBCD with over 500 successful cases.")}
                       rows={2}
                       className="resize-none text-sm"
+                      disabled={isReadOnly}
                     />
                   </Field>
                 </div>
