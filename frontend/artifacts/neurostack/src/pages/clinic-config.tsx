@@ -39,7 +39,6 @@ import {
 
 // ── API Credentials (Tab 6) ───────────────────────────────────────────────────
 
-const PROD_BASE = "https://app.neurostack.global";
 const API_BASE  = import.meta.env.BASE_URL.replace(/\/$/, "");
 
 function getToken(): string {
@@ -165,7 +164,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   }, [isSuperAdmin]);
 
   const targetId   = isSuperAdmin ? selectedClinicId : clinicId;
-  const webhookUrl = `${PROD_BASE}/api/whatsapp/webhook?clinic_id=${targetId}`;
+  const webhookUrl = waProvider ? `${window.location.origin}/v1/webhook/${waProvider}` : "";
 
   const fetchStatus = useCallback(async () => {
     setLoading(true); setError(null);
@@ -269,37 +268,41 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         </div>
       )}
 
-      {/* ── Webhook URL ── */}
-      <div className="rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50/60 dark:bg-blue-950/30 p-4 space-y-3">
-        <div className="flex items-center gap-2">
-          <Link2 className="h-4 w-4 text-blue-500 shrink-0" />
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-blue-700 dark:text-blue-400">
-            Webhook URL — WhatsApp
-          </p>
-          {status && (
-            <span className={`ml-auto text-[10px] font-bold px-2 py-0.5 rounded-full border ${status.apis_configured ? "bg-emerald-500/15 text-emerald-500 border-emerald-500/30" : "bg-amber-500/15 text-amber-500 border-amber-500/30"}`}>
-              {status.apis_configured ? "Configurado" : "Pendente"}
-            </span>
-          )}
-        </div>
-        <div className="space-y-1">
-          <label className="text-xs text-muted-foreground">Cole esta URL no campo de webhook do seu provedor de WhatsApp</label>
-          <div className="flex gap-2">
-            <input
-              readOnly value={webhookUrl}
-              onClick={e => (e.target as HTMLInputElement).select()}
-              className="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-mono text-foreground cursor-text focus:outline-none focus:ring-1 focus:ring-accent"
-            />
-            <button type="button" onClick={copyWebhook}
-              className="inline-flex items-center gap-1.5 rounded-md border border-blue-300 dark:border-blue-700 bg-white dark:bg-blue-900/20 px-3 py-1.5 text-xs font-medium text-blue-700 dark:text-blue-300 hover:bg-blue-50 dark:hover:bg-blue-900/40 transition-colors shrink-0"
-            >
-              {copiedWebhook
-                ? <><Check className="h-3.5 w-3.5 text-emerald-500" /> Copiado!</>
-                : <><Copy className="h-3.5 w-3.5" /> Copiar URL</>}
-            </button>
+      {/* ── Webhook URL (only when provider is selected) ── */}
+      {waProvider && webhookUrl && (
+        <div className="rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50/60 dark:bg-blue-950/30 p-4 space-y-3">
+          <div className="flex items-center gap-2">
+            <Link2 className="h-4 w-4 text-blue-500 shrink-0" />
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-blue-700 dark:text-blue-400">
+              Webhook URL — {waProvider === "zapi" ? "Z-API" : "Evolution API"}
+            </p>
+            {status && (
+              <span className={`ml-auto text-[10px] font-bold px-2 py-0.5 rounded-full border ${status.apis_configured ? "bg-emerald-500/15 text-emerald-500 border-emerald-500/30" : "bg-amber-500/15 text-amber-500 border-amber-500/30"}`}>
+                {status.apis_configured ? "Configurado" : "Pendente"}
+              </span>
+            )}
+          </div>
+          <div className="space-y-1">
+            <label className="text-xs text-muted-foreground">
+              Cole na configuração de webhooks do {waProvider === "zapi" ? "Z-API" : "Evolution API"}
+            </label>
+            <div className="flex gap-2">
+              <input
+                readOnly value={webhookUrl}
+                onClick={e => (e.target as HTMLInputElement).select()}
+                className="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-mono text-foreground cursor-text focus:outline-none focus:ring-1 focus:ring-accent"
+              />
+              <button type="button" onClick={copyWebhook}
+                className="inline-flex items-center gap-1.5 rounded-md border border-blue-300 dark:border-blue-700 bg-white dark:bg-blue-900/20 px-3 py-1.5 text-xs font-medium text-blue-700 dark:text-blue-300 hover:bg-blue-50 dark:hover:bg-blue-900/40 transition-colors shrink-0"
+              >
+                {copiedWebhook
+                  ? <><Check className="h-3.5 w-3.5 text-emerald-500" /> Copiado!</>
+                  : <><Copy className="h-3.5 w-3.5" /> Copiar URL</>}
+              </button>
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
       {loading && <div className="flex items-center gap-2 text-muted-foreground text-sm"><Loader2 className="h-4 w-4 animate-spin" /> Carregando...</div>}
 
