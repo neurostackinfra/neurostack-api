@@ -24,6 +24,32 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Track message IDs sent by the AI so we can ignore their fromMe=true echo.
+# Bounded set with LRU-style eviction to prevent unbounded growth.
+_sent_message_ids: set[str] = set()
+_SENT_IDS_MAX = 2000
+
+
+def _track_sent_message(zapi_response: dict) -> None:
+    """Store the messageId from a Z-API send response."""
+    mid = zapi_response.get("messageId") or zapi_response.get("zapiMessageId")
+    if not mid:
+        return
+    if len(_sent_message_ids) >= _SENT_IDS_MAX:
+        # Evict ~half to amortize cleanup
+        to_remove = list(_sent_message_ids)[:_SENT_IDS_MAX // 2]
+        for item in to_remove:
+            _sent_message_ids.discard(item)
+    _sent_message_ids.add(str(mid))
+
+
+def _is_ai_sent_message(message_id: str) -> bool:
+    """Check if a messageId was sent by the AI."""
+    if message_id in _sent_message_ids:
+        _sent_message_ids.discard(message_id)
+        return True
+    return False
+
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -304,8 +330,11 @@ async def zapi_webhook(
         logger.warning("Z-API webhook: no tenant for instance %s", instance_id)
         return {"ok": True, "skipped": "unknown_instance"}
 
-    # ── fromMe=true: clinic/secretary message — dedicated handler ──
+    # ── fromMe=true: check if AI-sent echo or real clinic message ──
     if body.get("fromMe", False):
+        webhook_msg_id = body.get("messageId", "")
+        if webhook_msg_id and _is_ai_sent_message(webhook_msg_id):
+            return {"ok": True, "skipped": "ai_echo"}
         result = await _handle_clinic_message(tenant_id, phone, message_text, db)
         await db.commit()
         return result
@@ -364,7 +393,8 @@ async def zapi_webhook(
         return {"ok": True, "replied": False, "reason": "no_credentials"}
 
     try:
-        await send_text_message(zapi_inst, zapi_token, phone, suggested, client_token=zapi_client_token)
+        send_result = await send_text_message(zapi_inst, zapi_token, phone, suggested, client_token=zapi_client_token)
+        _track_sent_message(send_result)
         logger.info("Z-API reply sent to %s (%d chars)", phone, len(suggested))
     except Exception as exc:
         logger.exception("Z-API send failed for %s — %s", phone, exc)
@@ -439,8 +469,11 @@ async def evolution_webhook(
         logger.warning("Evolution webhook: no tenant for instance %s", instance_name)
         return {"ok": True, "skipped": "unknown_instance"}
 
-    # ── fromMe=true: clinic/secretary message — dedicated handler ──
+    # ── fromMe=true: check if AI-sent echo or real clinic message ──
     if is_from_me:
+        webhook_msg_id = key.get("id", "")
+        if webhook_msg_id and _is_ai_sent_message(webhook_msg_id):
+            return {"ok": True, "skipped": "ai_echo"}
         result = await _handle_clinic_message(tenant_id, phone, message_text, db)
         await db.commit()
         return result
@@ -497,7 +530,8 @@ async def evolution_webhook(
         return {"ok": True, "replied": False, "reason": "no_credentials"}
 
     try:
-        await send_evolution_text(evol_url, evol_name, evol_key, phone, suggested)
+        send_result = await send_evolution_text(evol_url, evol_name, evol_key, phone, suggested)
+        _track_sent_message(send_result)
         logger.info("Evolution reply sent to %s (%d chars)", phone, len(suggested))
     except Exception:
         logger.exception("Evolution send failed for %s", phone)
