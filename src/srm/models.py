@@ -86,6 +86,7 @@ class HandoffReason(str, Enum):
     LOW_CONFIDENCE = "low_confidence"
     COMPLEX_QUERY = "complex_query"
     ESCALATION = "escalation"
+    SCHEDULING = "scheduling"
 
 
 # 23 intenções canônicas (CTX/SRM Intents v0.1) - documentação MVP v0.5

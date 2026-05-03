@@ -345,6 +345,7 @@ class ConversationSummarizer:
             HandoffReason.LOW_CONFIDENCE: "Baixa confiança nas respostas",
             HandoffReason.COMPLEX_QUERY: "Questão complexa requer especialista",
             HandoffReason.ESCALATION: "Escalação/reclamação do usuário",
+            HandoffReason.SCHEDULING: "Paciente quer agendar consulta",
         }
         return texts.get(reason, "Motivo não especificado")
 

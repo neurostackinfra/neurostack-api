@@ -60,6 +60,7 @@ class HandoffReason(str, Enum):
     LOW_CONFIDENCE = "low_confidence"
     COMPLEX_QUERY = "complex_query"
     ESCALATION = "escalation"
+    SCHEDULING = "scheduling"
 
 
 class WebhookStatus(str, Enum):
@@ -326,6 +327,10 @@ class HandoffServiceConfig(BaseModel):
         HandoffReason.COMPLEX_QUERY.value: (
             "Essa é uma questão que requer atenção especial. "
             "Vou transferir para um especialista."
+        ),
+        HandoffReason.SCHEDULING.value: (
+            "Perfeito! Vou te encaminhar para nossa equipe agendar sua consulta. "
+            "Em instantes alguém da clínica vai te atender!"
         ),
     })
 

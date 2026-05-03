@@ -142,7 +142,7 @@ class HandoffDecider:
         if intent in ("agendar", "reagendar", "cancelar") or intent_category == IntentCategory.SCHEDULING:
             return HandoffResult(
                 required=True,
-                reason=HandoffReason.COMPLEX_QUERY,
+                reason=HandoffReason.SCHEDULING,
                 urgency="normal",
                 summary="Paciente quer agendar/reagendar/cancelar — handoff para recepção",
                 sector="agendamento",
@@ -296,6 +296,10 @@ class HandoffDecider:
             HandoffReason.COMPLEX_QUERY: (
                 "Essa \u00e9 uma quest\u00e3o que requer aten\u00e7\u00e3o especial. "
                 "Vou transferir para um especialista."
+            ),
+            HandoffReason.SCHEDULING: (
+                "Perfeito! Vou te encaminhar para nossa equipe agendar sua consulta. "
+                "Em instantes algu\u00e9m da cl\u00ednica vai te atender!"
             ),
         }
         
