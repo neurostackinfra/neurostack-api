@@ -93,6 +93,15 @@ class BaseTemplate(ABC):
         reminders_text = "\n".join(f"\u26a0\ufe0f {r}" for r in variables.safety_reminders)
         return f"\n## Lembretes de Seguran\u00e7a\n{reminders_text}\n"
 
+    def _get_response_format_reminder(self) -> str:
+        """Final reinforcement block — placed last so the LLM weighs it heavily."""
+        return (
+            "\n## FORMATO DA RESPOSTA (OBRIGATÓRIO)\n"
+            "- Responda em NO MÁXIMO 2-3 frases curtas (máximo 40 palavras).\n"
+            "- Faça APENAS UMA pergunta por mensagem. NUNCA duas ou mais.\n"
+            "- Estilo WhatsApp: direto, acolhedor, sem parágrafos longos.\n"
+        )
+
     def build_system_message(self, variables: PromptVariables) -> PromptMessage:
         """
         Build the complete system message.
@@ -108,8 +117,9 @@ class BaseTemplate(ABC):
             self.get_context_instructions(variables),
             self.get_constraints(variables),
             self.get_safety_reminders(variables),
+            self._get_response_format_reminder(),
         ]
-        
+
         # Filter empty parts and join
         content = "\n".join(p for p in parts if p.strip())
         
