@@ -25,29 +25,45 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Track message IDs sent by the AI so we can ignore their fromMe=true echo.
-# Bounded set with LRU-style eviction to prevent unbounded growth.
-_sent_message_ids: set[str] = set()
-_SENT_IDS_MAX = 2000
+# Uses Redis for persistence across container restarts and multiple workers.
+_SENT_ID_PREFIX = "ai_sent:"
+_SENT_ID_TTL = 300  # 5 minutes — enough for Z-API echo to arrive
+
+
+def _get_redis():
+    """Get Redis client (lazy import to avoid circular deps)."""
+    try:
+        from src.config.settings import settings
+        import redis
+        return redis.from_url(settings.redis_url, decode_responses=True)
+    except Exception:
+        return None
 
 
 def _track_sent_message(zapi_response: dict) -> None:
-    """Store the messageId from a Z-API send response."""
+    """Store the messageId from a Z-API send response in Redis."""
     mid = zapi_response.get("messageId") or zapi_response.get("zapiMessageId")
     if not mid:
         return
-    if len(_sent_message_ids) >= _SENT_IDS_MAX:
-        # Evict ~half to amortize cleanup
-        to_remove = list(_sent_message_ids)[:_SENT_IDS_MAX // 2]
-        for item in to_remove:
-            _sent_message_ids.discard(item)
-    _sent_message_ids.add(str(mid))
+    r = _get_redis()
+    if r:
+        try:
+            r.setex(f"{_SENT_ID_PREFIX}{mid}", _SENT_ID_TTL, "1")
+        except Exception:
+            pass
 
 
 def _is_ai_sent_message(message_id: str) -> bool:
-    """Check if a messageId was sent by the AI."""
-    if message_id in _sent_message_ids:
-        _sent_message_ids.discard(message_id)
-        return True
+    """Check if a messageId was sent by the AI (stored in Redis)."""
+    r = _get_redis()
+    if r:
+        try:
+            key = f"{_SENT_ID_PREFIX}{message_id}"
+            if r.exists(key):
+                r.delete(key)
+                return True
+        except Exception:
+            pass
     return False
 
 
