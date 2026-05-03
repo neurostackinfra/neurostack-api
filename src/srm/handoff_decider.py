@@ -298,8 +298,8 @@ class HandoffDecider:
                 "Vou transferir para um especialista."
             ),
             HandoffReason.SCHEDULING: (
-                "Perfeito! Vou te encaminhar para nossa equipe agendar sua consulta. "
-                "Em instantes algu\u00e9m da cl\u00ednica vai te atender!"
+                "Vou te encaminhar para a nossa equipe, que dar\u00e1 seguimento "
+                "e verificar\u00e1 os melhores hor\u00e1rios dispon\u00edveis para voc\u00ea."
             ),
         }
         
