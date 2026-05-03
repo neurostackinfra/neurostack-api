@@ -138,7 +138,18 @@ class HandoffDecider:
                 sla="prioritario",
             )
 
-        # Priority 4: Escalation keywords → gerencia
+        # Priority 4: Scheduling intents → agendamento, prioritario
+        if intent in ("agendar", "reagendar", "cancelar") or intent_category == IntentCategory.SCHEDULING:
+            return HandoffResult(
+                required=True,
+                reason=HandoffReason.COMPLEX_QUERY,
+                urgency="normal",
+                summary="Paciente quer agendar/reagendar/cancelar — handoff para recepção",
+                sector="agendamento",
+                sla="prioritario",
+            )
+
+        # Priority 5: Escalation keywords → gerencia
         escalation_result = self._check_escalation_keywords(message_lower)
         if escalation_result:
             return escalation_result
