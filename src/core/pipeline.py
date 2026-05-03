@@ -7,7 +7,7 @@ connecting: SRM → Policy → CTX → Flow → Prompt → Handoff
 """
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Union
 from uuid import UUID, uuid4
 
@@ -179,6 +179,10 @@ class PipelineResult(BaseModel):
     # Handoff
     handoff_summary: Optional[dict[str, Any]] = None
     handoff_user_message: Optional[str] = None
+
+    # Pause (set by handoff engine when session should be paused)
+    should_pause: bool = False
+    paused_until: Optional[str] = None  # ISO datetime string or None (permanent)
     
     # Metadata
     processed_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -294,9 +298,15 @@ class CognitivePipeline:
             
             # Stage 6: Handoff (if required)
             handoff_response = None
+            should_pause = False
+            paused_until_iso: Optional[str] = None
             if srm_decision.handoff_required:
                 stage_start = time.perf_counter()
                 handoff_response = await self._run_handoff(input_data, srm_decision)
+
+                # Handoff engine: check config and pause session if allowed
+                should_pause, paused_until_iso = await self._apply_handoff_pause(input_data)
+
                 stage_timings["handoff"] = (time.perf_counter() - stage_start) * 1000
             
             # Build final result
@@ -312,6 +322,8 @@ class CognitivePipeline:
                 stage_timings=stage_timings,
                 total_time=total_time,
                 context_sources=context_sources,
+                should_pause=should_pause,
+                paused_until=paused_until_iso,
             )
             
             # Record metrics
@@ -729,6 +741,79 @@ class CognitivePipeline:
         )
         return await self._handoff.initiate_handoff(request)
 
+    async def _apply_handoff_pause(
+        self,
+        input_data: PipelineInput,
+    ) -> tuple[bool, Optional[str]]:
+        """Check handoff config and determine if session should be paused.
+
+        Called after SRM detects handoff_required=True.
+        Returns (should_pause, paused_until_iso).
+        """
+        cfg = (input_data.clinic_config or {}).get("handoff", {})
+        handoff_active = str(cfg.get("handoff_active", "yes")).lower()
+        standby_mode = str(cfg.get("standby_mode", "active")).lower()
+
+        if handoff_active != "yes" or standby_mode != "active":
+            logger.info(
+                "handoff_pause_skipped",
+                extra={
+                    "session_id": str(input_data.session_id),
+                    "handoff_active": handoff_active,
+                    "standby_mode": standby_mode,
+                },
+            )
+            return False, None
+
+        # Calculate paused_until based on handoff_period
+        handoff_period = str(cfg.get("handoff_period", "permanent")).lower()
+        paused_until_iso: Optional[str] = None
+
+        if handoff_period == "cycle":
+            cycle_days = int(cfg.get("handoff_cycle_days", 7))
+            paused_until = datetime.now(timezone.utc) + timedelta(days=cycle_days)
+            paused_until_iso = paused_until.isoformat()
+
+        logger.info(
+            "session_paused",
+            extra={
+                "event": "session_paused",
+                "reason": "auto_handoff",
+                "session_id": str(input_data.session_id),
+                "tenant_id": str(input_data.tenant_id),
+                "handoff_period": handoff_period,
+                "paused_until": paused_until_iso,
+            },
+        )
+
+        # Fire-and-forget: mark WhatsApp conversation as unread
+        try:
+            api_creds = (input_data.clinic_config or {}).get("api_credentials", {})
+            instance_id = api_creds.get("zapi_instance_id")
+            token = api_creds.get("zapi_token")
+            client_token = api_creds.get("zapi_client_token", "")
+            phone = input_data.user_id
+
+            if instance_id and token and phone:
+                from src.services.zapi_service import mark_conversation_unread
+
+                await mark_conversation_unread(
+                    instance_id=instance_id,
+                    token=token,
+                    phone=phone,
+                    client_token=client_token,
+                )
+        except Exception as exc:
+            logger.warning(
+                "mark_unread_fire_and_forget_failed",
+                extra={
+                    "session_id": str(input_data.session_id),
+                    "error": str(exc),
+                },
+            )
+
+        return True, paused_until_iso
+
     def _get_effective_mode(
         self,
         srm_decision: SRMDecisionModel,
@@ -792,6 +877,8 @@ class CognitivePipeline:
         stage_timings: dict[str, float],
         total_time: int,
         context_sources: Optional[list[dict[str, Any]]] = None,
+        should_pause: bool = False,
+        paused_until: Optional[str] = None,
     ) -> PipelineResult:
         """Build the final pipeline result."""
         # Extract prompt messages
@@ -887,6 +974,8 @@ class CognitivePipeline:
             mode=effective_mode,
             handoff_summary=handoff_summary,
             handoff_user_message=handoff_user_message,
+            should_pause=should_pause,
+            paused_until=paused_until,
             processing_time_ms=total_time,
             stage_timings=stage_timings,
         )

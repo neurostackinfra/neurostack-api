@@ -5,10 +5,12 @@ through the cognitive pipeline, and sends the LLM response back.
 """
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -104,6 +106,153 @@ async def _load_tenant_credentials(
     return result.scalar_one_or_none() or {}
 
 
+async def _load_handoff_config(
+    tenant_id: UUID,
+    db: AsyncSession,
+) -> dict:
+    """Load handoff config bucket for a tenant."""
+    stmt = select(ClinicConfigTable.handoff).where(
+        ClinicConfigTable.tenant_id == tenant_id,
+    )
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none() or {}
+
+
+async def _check_pause_state(
+    tenant_id: UUID,
+    phone: str,
+    db: AsyncSession,
+) -> Optional[dict]:
+    """Check if session is paused. Returns action dict or None to continue.
+
+    Implements lazy unpause: if paused_until has expired, unpauses the session.
+    """
+    repo = SessionRepository(db)
+    sessions = await repo.find_by_user(
+        tenant_id=tenant_id,
+        user_id=phone,
+        active_only=True,
+        limit=1,
+    )
+    if not sessions:
+        return None
+
+    session = sessions[0]
+    if not session.is_paused:
+        return None
+
+    now = datetime.now(timezone.utc)
+
+    # Lazy unpause: paused_until expired
+    if session.paused_until and session.paused_until <= now:
+        session.is_paused = False
+        session.paused_until = None
+        await db.flush()
+        logger.info(
+            "session_auto_unpause",
+            extra={
+                "session_id": str(session.id),
+                "tenant_id": str(tenant_id),
+                "phone": phone,
+            },
+        )
+        return None  # Continue processing
+
+    # Still paused
+    logger.info(
+        "message_skipped_paused",
+        extra={
+            "session_id": str(session.id),
+            "tenant_id": str(tenant_id),
+            "phone": phone,
+            "paused_until": session.paused_until.isoformat() if session.paused_until else "permanent",
+        },
+    )
+    return {"ok": True, "skipped": "session_paused"}
+
+
+async def _handle_clinic_message(
+    tenant_id: UUID,
+    phone: str,
+    message_text: str,
+    db: AsyncSession,
+) -> dict:
+    """Handle fromMe=true messages (clinic/secretary).
+
+    Never enters pipeline/SRM. Checks for trigger message or human takeover.
+    """
+    repo = SessionRepository(db)
+    sessions = await repo.find_by_user(
+        tenant_id=tenant_id,
+        user_id=phone,
+        active_only=True,
+        limit=1,
+    )
+    if not sessions:
+        return {"ok": True, "action": "no_session"}
+
+    session = sessions[0]
+    handoff_cfg = await _load_handoff_config(tenant_id, db)
+
+    handoff_active = str(handoff_cfg.get("handoff_active", "yes")).lower()
+    trigger_msg = str(handoff_cfg.get(
+        "trigger_message",
+        "Ok! Precisando de algo mais,estamos a disposição.",
+    )).strip().lower()
+    reactivation_hours = int(handoff_cfg.get("reactivation_delay_hours", 1))
+
+    normalized_text = message_text.strip().lower()
+
+    # Check if this is the trigger message
+    if normalized_text == trigger_msg:
+        if session.is_paused:
+            session.paused_until = datetime.now(timezone.utc) + timedelta(hours=reactivation_hours)
+            await db.flush()
+            logger.info(
+                "trigger_reactivation",
+                extra={
+                    "event": "trigger_reactivation",
+                    "session_id": str(session.id),
+                    "tenant_id": str(tenant_id),
+                    "phone": phone,
+                    "reactivates_at": session.paused_until.isoformat(),
+                },
+            )
+            return {"ok": True, "action": "trigger_reactivation"}
+        return {"ok": True, "action": "already_active"}
+
+    # Not trigger message — check for human takeover
+    if handoff_active != "yes":
+        return {"ok": True, "skipped": "handoff_inactive"}
+
+    if session.is_paused:
+        return {"ok": True, "action": "already_paused"}
+
+    # Human takeover: pause session (no mark-unread — secretary is in conversation)
+    session.is_paused = True
+
+    handoff_period = str(handoff_cfg.get("handoff_period", "permanent")).lower()
+    if handoff_period == "cycle":
+        cycle_days = int(handoff_cfg.get("handoff_cycle_days", 7))
+        session.paused_until = datetime.now(timezone.utc) + timedelta(days=cycle_days)
+    else:
+        session.paused_until = None
+
+    await db.flush()
+    logger.info(
+        "session_paused",
+        extra={
+            "event": "session_paused",
+            "reason": "human_takeover",
+            "session_id": str(session.id),
+            "tenant_id": str(tenant_id),
+            "phone": phone,
+            "paused_until": session.paused_until.isoformat() if session.paused_until else None,
+        },
+    )
+    return {"ok": True, "action": "human_takeover"}
+
+
 # ── Z-API webhook endpoint ──────────────────────────────────────────
 
 @router.post(
@@ -133,10 +282,7 @@ async def zapi_webhook(
     """
     body: dict[str, Any] = await request.json()
 
-    # ── ignore outgoing / non-text / status events ──
-    if body.get("fromMe", False):
-        return {"ok": True, "skipped": "outgoing"}
-
+    # ── extract text from payload ──
     text_obj = body.get("text")
     if not text_obj or not isinstance(text_obj, dict):
         return {"ok": True, "skipped": "non-text"}
@@ -157,6 +303,18 @@ async def zapi_webhook(
     if not tenant_id:
         logger.warning("Z-API webhook: no tenant for instance %s", instance_id)
         return {"ok": True, "skipped": "unknown_instance"}
+
+    # ── fromMe=true: clinic/secretary message — dedicated handler ──
+    if body.get("fromMe", False):
+        result = await _handle_clinic_message(tenant_id, phone, message_text, db)
+        await db.commit()
+        return result
+
+    # ── pause check for patient messages ──
+    pause_result = await _check_pause_state(tenant_id, phone, db)
+    if pause_result:
+        await db.commit()
+        return JSONResponse(status_code=202, content=pause_result)
 
     # ── get or create a session for this phone ──
     session_id = await _get_or_create_session(tenant_id, phone, db)
@@ -254,10 +412,7 @@ async def evolution_webhook(
         return {"ok": True, "skipped": "invalid_data"}
 
     key = data.get("key", {})
-
-    # ── ignore outgoing ──
-    if key.get("fromMe", False):
-        return {"ok": True, "skipped": "outgoing"}
+    is_from_me = key.get("fromMe", False)
 
     # ── extract message text ──
     msg_obj = data.get("message", {})
@@ -283,6 +438,18 @@ async def evolution_webhook(
     if not tenant_id:
         logger.warning("Evolution webhook: no tenant for instance %s", instance_name)
         return {"ok": True, "skipped": "unknown_instance"}
+
+    # ── fromMe=true: clinic/secretary message — dedicated handler ──
+    if is_from_me:
+        result = await _handle_clinic_message(tenant_id, phone, message_text, db)
+        await db.commit()
+        return result
+
+    # ── pause check for patient messages ──
+    pause_result = await _check_pause_state(tenant_id, phone, db)
+    if pause_result:
+        await db.commit()
+        return JSONResponse(status_code=202, content=pause_result)
 
     # ── get or create a session for this phone ──
     session_id = await _get_or_create_session(tenant_id, phone, db)

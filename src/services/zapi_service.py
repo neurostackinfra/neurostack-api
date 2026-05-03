@@ -45,6 +45,48 @@ async def send_text_message(
         return data
 
 
+async def mark_conversation_unread(
+    instance_id: str,
+    token: str,
+    phone: str,
+    client_token: str = "",
+) -> bool:
+    """Mark a WhatsApp conversation as unread via Z-API.
+
+    Fire-and-forget: logs errors but never raises.
+
+    Args:
+        instance_id: Z-API instance ID.
+        token: Z-API instance token.
+        phone: Phone number to mark unread.
+        client_token: Z-API client-token (security header).
+
+    Returns:
+        True on success, False on failure.
+    """
+    url = f"{ZAPI_BASE}/instances/{instance_id}/token/{token}/modify-chat"
+    payload = {"phone": phone, "action": "unread"}
+    headers = {"Content-Type": "application/json"}
+    if client_token:
+        headers["Client-Token"] = client_token
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            logger.info(
+                "zapi_mark_unread_success",
+                extra={"phone": phone, "instance_id": instance_id, "status": resp.status_code},
+            )
+            return True
+    except Exception as exc:
+        logger.warning(
+            "zapi_mark_unread_failed",
+            extra={"phone": phone, "instance_id": instance_id, "error": str(exc)},
+        )
+        return False
+
+
 async def send_evolution_text(
     api_url: str,
     instance_name: str,
