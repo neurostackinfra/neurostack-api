@@ -385,6 +385,7 @@ async def zapi_webhook(
 
     service = get_event_service()
     response = await service.process_event(event_request, session=db)
+    await db.commit()
 
     # ── send LLM response back via Z-API ──
     suggested = (
@@ -524,6 +525,7 @@ async def evolution_webhook(
 
     service = get_event_service()
     response = await service.process_event(event_request, session=db)
+    await db.commit()
 
     # ── send LLM response back via Evolution API ──
     suggested = (
