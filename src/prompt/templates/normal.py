@@ -287,7 +287,10 @@ class NormalTemplate(BaseTemplate):
 
     def get_context_instructions(self, variables: PromptVariables) -> str:
         """Get context-specific instructions based on funnel stage and user journey."""
-        parts = []
+        from datetime import datetime, timezone, timedelta
+        br_tz = timezone(timedelta(hours=-3))
+        now_br = datetime.now(br_tz)
+        parts = [f"**Data e hora atual:** {now_br.strftime('%d/%m/%Y %H:%M')} (horário de Brasília)"]
 
         # Inject clinic identity for template placeholders in funnel instructions
         agent_name = variables.custom.get("agent_name", "assistente")
