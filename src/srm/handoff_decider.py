@@ -138,13 +138,17 @@ class HandoffDecider:
                 sla="prioritario",
             )
 
-        # Priority 4: Scheduling intents → agendamento, prioritario
-        if intent in ("agendar", "reagendar", "cancelar") or intent_category == IntentCategory.SCHEDULING:
+        # Priority 4: Scheduling — two-turn flow
+        # Turn 1 (scheduling_interest not set): LLM collects name + day/time, no handoff
+        # Turn 2+ (scheduling_interest already set): handoff to human team
+        already_collecting = flags.get("scheduling_interest", False)
+        is_scheduling = intent in ("agendar", "reagendar", "cancelar") or intent_category == IntentCategory.SCHEDULING
+        if already_collecting or (is_scheduling and intent in ("reagendar", "cancelar")):
             return HandoffResult(
                 required=True,
                 reason=HandoffReason.SCHEDULING,
                 urgency="normal",
-                summary="Paciente quer agendar/reagendar/cancelar — handoff para recepção",
+                summary="Paciente forneceu dados de agendamento — handoff para recepção",
                 sector="agendamento",
                 sla="prioritario",
             )
