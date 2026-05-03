@@ -16,6 +16,18 @@ import { useToast } from "@/hooks/use-toast";
 
 const PAGE_SIZE = 20;
 
+// ── Investor mock traces ──
+const MOCK_TRACES = [
+  { id: "t1", timestamp: "2026-05-03T14:32:00Z", userMessage: "Quanto custa a aplicação de botox na testa?", srmDecision: { intent: "pedido_preco", stage: "qualification", action: "respond", confidence: 0.94, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: true }, processingTimeMs: 823 },
+  { id: "t2", timestamp: "2026-05-03T14:15:00Z", userMessage: "Gostaria de agendar uma limpeza de pele", srmDecision: { intent: "agendar", stage: "scheduling", action: "respond", confidence: 0.97, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 654 },
+  { id: "t3", timestamp: "2026-05-03T13:45:00Z", userMessage: "Quero saber sobre tratamento para manchas", srmDecision: { intent: "interesse_tratamento", stage: "discovery", action: "respond", confidence: 0.91, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 912 },
+  { id: "t4", timestamp: "2026-05-03T12:22:00Z", userMessage: "Fiz um preenchimento e estou com inchaço intenso, está muito roxo", srmDecision: { intent: "pos_atendimento_sintomas_preocupantes", stage: "post_care", action: "respond", confidence: 0.98, safety_concern: true, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 1102 },
+  { id: "t5", timestamp: "2026-05-03T11:50:00Z", userMessage: "Preciso cancelar minha consulta de amanhã", srmDecision: { intent: "cancelar", stage: "scheduling", action: "respond", confidence: 0.96, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 589 },
+  { id: "t6", timestamp: "2026-05-03T10:30:00Z", userMessage: "O atendimento foi péssimo, quero falar com o gerente", srmDecision: { intent: "reclamacao", stage: "escalation", action: "handoff", confidence: 0.99, safety_concern: false, handoff_required: true, constraints: [], gate_authority_before_price: false }, processingTimeMs: 734 },
+  { id: "t7", timestamp: "2026-05-03T09:12:00Z", userMessage: "Vocês fazem harmonização facial?", srmDecision: { intent: "interesse_tratamento", stage: "discovery", action: "respond", confidence: 0.88, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 876 },
+  { id: "t8", timestamp: "2026-05-02T16:45:00Z", userMessage: "Queria remarcar minha consulta para semana que vem", srmDecision: { intent: "reagendar", stage: "scheduling", action: "respond", confidence: 0.95, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 701 },
+];
+
 function getToken(): string | null {
   try {
     const raw = localStorage.getItem("ns_auth");
@@ -73,7 +85,7 @@ function mapTrace(t: ApiTrace) {
 }
 
 export default function TracesList() {
-  const { isReadOnly, isBuilder, viewingClinicId } = useAuth();
+  const { isReadOnly, isBuilder, isInvestor, viewingClinicId } = useAuth();
   const { t, locale } = useI18n();
   const txt = (p: string, e: string) => locale === "en" ? e : p;
   const { toast } = useToast();
@@ -98,6 +110,13 @@ export default function TracesList() {
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const fetchTraces = useCallback(async () => {
+    // Investor: use mock data
+    if (isInvestor) {
+      setTraces(MOCK_TRACES);
+      setTotal(MOCK_TRACES.length);
+      setLoading(false);
+      return;
+    }
     // For builders, wait until viewingClinicId is resolved
     if (isBuilder && !viewingClinicId) {
       setLoading(true);
@@ -140,7 +159,7 @@ export default function TracesList() {
     } finally {
       setLoading(false);
     }
-  }, [offset, startDate, endDate, onlySafety, onlyHandoff, isBuilder, viewingClinicId]);
+  }, [offset, startDate, endDate, onlySafety, onlyHandoff, isBuilder, isInvestor, viewingClinicId]);
 
   useEffect(() => {
     void fetchTraces();

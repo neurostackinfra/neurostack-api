@@ -617,8 +617,144 @@ function SwitchRow({
 
 // ── Main component ────────────────────────────────────────────────────────────
 
+// ── Investor Mock Config ──
+function InvestorMockConfig() {
+  const { t, locale } = useI18n();
+  const txt = (p: string, e: string) => locale === "en" ? e : p;
+  return (
+    <div className="max-w-2xl mx-auto space-y-5">
+      <div className="flex items-center gap-3">
+        <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent/10 border border-accent/20">
+          <Sliders className="h-5 w-5 text-accent" />
+        </div>
+        <div>
+          <h1 className="text-xl font-semibold text-foreground">{t("config_title")}</h1>
+          <p className="text-sm text-muted-foreground">{t("config_subtitle")}</p>
+        </div>
+      </div>
+      <Tabs defaultValue="identidade" className="w-full">
+        <TabsList className="w-full grid h-auto p-1 bg-muted/50 border border-border rounded-lg grid-cols-6">
+          {[
+            { value: "identidade", icon: User, label: txt("Identidade", "Identity") },
+            { value: "operacao", icon: Building2, label: txt("Operação", "Operations") },
+            { value: "negocio", icon: Shield, label: txt("Negócio", "Business") },
+            { value: "handoff", icon: PhoneForwarded, label: "Handoff" },
+            { value: "servicos", icon: Boxes, label: txt("Serviços", "Services") },
+            { value: "integracoes", icon: Plug, label: "APIs" },
+          ].map(({ value, icon: Icon, label }) => (
+            <TabsTrigger key={value} value={value} className="flex flex-col items-center gap-0.5 py-2 text-[10px] font-medium data-[state=active]:bg-background data-[state=active]:shadow-sm">
+              <Icon className="h-3.5 w-3.5" />
+              {label}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+        <TabsContent value="identidade" className="mt-4">
+          <Card className="border-border shadow-sm">
+            <CardHeader className="pb-3 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
+              <CardTitle className="text-sm font-semibold uppercase tracking-wider">{txt("Identidade da Clínica", "Clinic Identity")}</CardTitle>
+              <CardDescription className="text-xs">{txt("Informações básicas da clínica e do agente", "Basic clinic and agent information")}</CardDescription>
+            </CardHeader>
+            <CardContent className="pt-5 space-y-3 text-sm">
+              <div className="grid grid-cols-2 gap-4">
+                <div><Label className="text-xs text-muted-foreground">{txt("Nome da Clínica", "Clinic Name")}</Label><p className="font-medium">Clínica Estética Lumina</p></div>
+                <div><Label className="text-xs text-muted-foreground">{txt("Domínio", "Domain")}</Label><p className="font-medium">Estética</p></div>
+              </div>
+              <div><Label className="text-xs text-muted-foreground">{txt("Nome do Agente", "Agent Name")}</Label><p className="font-medium">Lumina</p></div>
+              <div><Label className="text-xs text-muted-foreground">{txt("Apresentação", "Presentation")}</Label><p className="font-medium">Nome — Atendente Virtual</p></div>
+              <div><Label className="text-xs text-muted-foreground">{txt("Especialidades", "Specialties")}</Label><p className="font-medium">Dermatologia, Medicina Estética, Nutrição Clínica</p></div>
+              <div><Label className="text-xs text-muted-foreground">{txt("Equipe", "Team")}</Label>
+                <div className="mt-1 space-y-1">
+                  <p className="text-xs">Dra. Ana Lima — Dermatologista (12 anos de experiência)</p>
+                  <p className="text-xs">Dr. Carlos Mendes — Cirurgião Plástico (8 anos)</p>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+        <TabsContent value="operacao" className="mt-4">
+          <Card className="border-border shadow-sm">
+            <CardHeader className="pb-3 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
+              <CardTitle className="text-sm font-semibold uppercase tracking-wider">{txt("Operação", "Operations")}</CardTitle>
+            </CardHeader>
+            <CardContent className="pt-5 space-y-3 text-sm">
+              <div><Label className="text-xs text-muted-foreground">{txt("Endereço", "Address")}</Label><p className="font-medium">Rua das Flores, 123 — Sala 45, Jardim Paulista, São Paulo/SP</p></div>
+              <div><Label className="text-xs text-muted-foreground">{txt("Horário de Funcionamento", "Business Hours")}</Label><p className="font-medium">Seg–Sex: 9h–19h | Sáb: 9h–14h</p></div>
+              <div><Label className="text-xs text-muted-foreground">{txt("Formato", "Format")}</Label><p className="font-medium">Online e Presencial</p></div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+        <TabsContent value="negocio" className="mt-4">
+          <Card className="border-border shadow-sm">
+            <CardHeader className="pb-3 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
+              <CardTitle className="text-sm font-semibold uppercase tracking-wider">{txt("Regras de Negócio", "Business Rules")}</CardTitle>
+            </CardHeader>
+            <CardContent className="pt-5 space-y-3 text-sm">
+              <div><Label className="text-xs text-muted-foreground">{txt("Convênios", "Insurance")}</Label><p className="font-medium">Unimed, Bradesco Saúde, SulAmérica</p></div>
+              <div><Label className="text-xs text-muted-foreground">{txt("Consulta Inicial", "Initial Consultation")}</Label><p className="font-medium">Cortesia</p></div>
+              <div><Label className="text-xs text-muted-foreground">{txt("Política de Preços", "Pricing")}</Label><p className="font-medium">Fornece preços após autoridade</p></div>
+              <div><Label className="text-xs text-muted-foreground">LGPD</Label><p className="font-medium">Ativo — Página padrão NeuroStack</p></div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+        <TabsContent value="handoff" className="mt-4">
+          <Card className="border-border shadow-sm">
+            <CardHeader className="pb-3 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
+              <CardTitle className="text-sm font-semibold uppercase tracking-wider">Handoff</CardTitle>
+            </CardHeader>
+            <CardContent className="pt-5 space-y-3 text-sm">
+              <Badge className="bg-emerald-500/15 text-emerald-400 border-emerald-500/30">ON</Badge>
+              <div><Label className="text-xs text-muted-foreground">{txt("Modo Stand-by", "Stand-by Mode")}</Label><p className="font-medium">Ativo</p></div>
+              <div><Label className="text-xs text-muted-foreground">{txt("Período", "Period")}</Label><p className="font-medium">Permanente</p></div>
+              <div><Label className="text-xs text-muted-foreground">Human-in-the-Loop</Label><p className="font-medium text-muted-foreground">Roadmap V2</p></div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+        <TabsContent value="servicos" className="mt-4">
+          <Card className="border-border shadow-sm">
+            <CardHeader className="pb-3 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
+              <CardTitle className="text-sm font-semibold uppercase tracking-wider">{txt("Catálogo de Serviços", "Service Catalog")}</CardTitle>
+            </CardHeader>
+            <CardContent className="pt-5 space-y-4 text-sm">
+              {[
+                { name: "Toxina Botulínica (Botox)", price: "R$ 1.200", desc: "Aplicação para rugas dinâmicas na testa, glabela e região dos olhos" },
+                { name: "Preenchimento Labial", price: "R$ 2.500", desc: "Ácido hialurônico para volume e contorno labial" },
+                { name: "Limpeza de Pele Profunda", price: "R$ 350", desc: "Extração, peeling enzimático, máscara calmante" },
+                { name: "Harmonização Facial", price: "R$ 4.800", desc: "Protocolo completo: mandíbula, mento, bigode chinês" },
+              ].map((s, i) => (
+                <div key={i} className="rounded-md border border-border p-3">
+                  <div className="flex justify-between items-start">
+                    <p className="font-medium">{s.name}</p>
+                    <Badge variant="outline" className="text-xs shrink-0">{s.price}</Badge>
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-1">{s.desc}</p>
+                </div>
+              ))}
+            </CardContent>
+          </Card>
+        </TabsContent>
+        <TabsContent value="integracoes" className="mt-4">
+          <Card className="border-border shadow-sm">
+            <CardHeader className="pb-3 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
+              <CardTitle className="text-sm font-semibold uppercase tracking-wider">APIs & Integrações</CardTitle>
+            </CardHeader>
+            <CardContent className="pt-5 space-y-3 text-sm">
+              <div className="flex flex-wrap gap-3">
+                <div className="flex items-center gap-1.5"><CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /><span>Z-API (WhatsApp)</span></div>
+                <div className="flex items-center gap-1.5"><CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /><span>GPT-4o-mini (LLM)</span></div>
+                <div className="flex items-center gap-1.5"><CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /><span>Webhook configurado</span></div>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
+    </div>
+  );
+}
+
 export default function ClinicConfig() {
-  const { clinicId, isReadOnly, isClinicAdmin, role, isBuilder, viewingClinicId } = useAuth();
+  const { clinicId, isReadOnly, isClinicAdmin, role, isBuilder, isInvestor, viewingClinicId } = useAuth();
+
+  if (isInvestor) return <InvestorMockConfig />;
   const { t, locale } = useI18n();
   const txt = (p: string, e: string) => locale === "en" ? e : p;
   const { toast } = useToast();

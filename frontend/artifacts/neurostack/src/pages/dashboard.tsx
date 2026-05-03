@@ -346,18 +346,40 @@ function IntentBreakdown({
 
 // -- Main Dashboard ---
 
+// ── Investor mock stats ──
+const INVESTOR_MOCK_STATS: KpiStats = {
+  total: 291,
+  avgProcessingTimeMs: 849,
+  safetyFlagCount: 3,
+  handoffCount: 11,
+  totalTokensSum: 66967,
+  modelBreakdown: [
+    { model: "gpt-4o-mini", tokens: 46275 },
+    { model: "claude-3-haiku", tokens: 20692 },
+  ],
+  byIntent: {
+    pedido_preco: 78,
+    agendar: 64,
+    interesse_tratamento: 52,
+    reclamacao: 12,
+    pos_atendimento_duvida: 31,
+  },
+};
+
 export default function Dashboard() {
   const { t } = useI18n();
-  const { isBuilder, viewingClinicId } = useAuth();
+  const { isBuilder, isInvestor, viewingClinicId } = useAuth();
   const { startDate: defStart, endDate: defEnd } = defaultDates();
   const [startDate, setStartDate] = useState(defStart);
   const [endDate, setEndDate] = useState(defEnd);
   const [intentFilter, setIntentFilter] = useState("");
 
   const { data: stats, isLoading, error } = useQuery<KpiStats>({
-    queryKey: ["trace-stats", startDate, endDate, isBuilder ? viewingClinicId : null],
+    queryKey: ["trace-stats", startDate, endDate, isBuilder ? viewingClinicId : null, isInvestor],
     enabled: !(isBuilder && !viewingClinicId),
     queryFn: async () => {
+      // Investor: return mock stats
+      if (isInvestor) return INVESTOR_MOCK_STATS;
       const token = getToken();
       if (!token) throw new Error("Sessão expirada. Faça login novamente.");
       const params = new URLSearchParams({

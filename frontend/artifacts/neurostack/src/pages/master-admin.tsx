@@ -44,12 +44,11 @@ interface SupportTicket {
 }
 
 interface DemoLead {
-  id: number;
+  id: string;
+  name: string;
   email: string;
-  nome: string;
-  email_contato: string;
-  empresa: string;
-  telefone: string;
+  company: string;
+  phone: string;
   created_at: string;
 }
 
@@ -57,7 +56,7 @@ interface AdminStats {
   totalTraces: number;
   totalTokens: number;
   openTickets: number;
-  activePilots: number;
+  activeClinics: number;
   activeBuilders: number;
   activeManagedClinics: number;
   estimatedMrr: number;
@@ -527,12 +526,17 @@ const DEMO_BUILDERS: BuilderWithClinics[] = [
 const DEMO_DASHBOARD: AdminDashboardData = {
   stats: {
     total_traces: 27200,
-    active_pilots: 14,
-    active_builders: 2,
-    active_managed_clinics: 5,
-    estimated_mrr: 5750,
+    active_pilots: 170,
+    active_builders: 80,
+    active_managed_clinics: 170,
+    estimated_mrr: 270000,
     safety_flags_7d: 2,
     handoff_count_7d: 48,
+    // Extended stats for investor breakdown
+    total_clinics: 200,
+    inactive_clinics: 30,
+    total_builders: 100,
+    inactive_builders: 20,
   },
   time_series: Array.from({ length: 31 }, (_, i) => {
     const d = new Date("2026-04-02");
@@ -823,7 +827,7 @@ export default function MasterAdmin() {
 
   const fetchLeads = async () => {
     try {
-      const res = await fetch(`/v1/admin/demo-leads`, { headers: authHeaders(token) });
+      const res = await fetch(`/v1/demo-leads`, { headers: authHeaders(token) });
       if (!res.ok) return;
       setLeads(await res.json() as DemoLead[]);
       setLeadsLoaded(true);
@@ -839,7 +843,7 @@ export default function MasterAdmin() {
         totalTraces: (raw.total_traces ?? raw.totalTraces ?? 0) as number,
         totalTokens: (raw.total_tokens ?? raw.totalTokens ?? 0) as number,
         openTickets: (raw.open_tickets ?? raw.openTickets ?? 0) as number,
-        activePilots: (raw.active_pilots ?? raw.activePilots ?? 0) as number,
+        activeClinics: (raw.active_pilots ?? raw.activeClinics ?? 0) as number,
         activeBuilders: (raw.active_builders ?? raw.activeBuilders ?? 0) as number,
         activeManagedClinics: (raw.active_managed_clinics ?? raw.activeManagedClinics ?? 0) as number,
         estimatedMrr: (raw.estimated_mrr ?? raw.estimatedMrr ?? 0) as number,
@@ -881,10 +885,10 @@ export default function MasterAdmin() {
     const rows = [
       ["Nome", "E-mail", "Empresa / Fundo", "Telefone", "Data"],
       ...filteredLeads.map((l) => [
-        l.nome,
-        l.email_contato || "",
-        l.empresa,
-        l.telefone,
+        l.name,
+        l.email || "",
+        l.company,
+        l.phone,
         new Date(l.created_at).toLocaleString("pt-BR"),
       ]),
     ];
@@ -969,8 +973,8 @@ export default function MasterAdmin() {
   };
 
   // Investors see impressive demo numbers; real admins see live DB stats
-  const totalClinics  = isInvestor ? 14 : clinics.filter((c) => c.plan_type === "pilot").length;
-  const activePilots  = isInvestor ? 14 : (stats?.activePilots ?? clinics.filter((c) => c.plan_type === "pilot" && c.status === "active").length);
+  const totalClinics  = isInvestor ? 200 : clinics.filter((c) => c.plan_type === "pilot").length;
+  const activeClinics  = isInvestor ? 170 : (stats?.activeClinics ?? clinics.filter((c) => c.plan_type === "pilot" && c.status === "active").length);
   const totalTraces   = isInvestor ? "27.2K" : (stats ? stats.totalTraces.toLocaleString("pt-BR") : "...");
   const tokenDisplay  = isInvestor ? "2.4M" : (stats ? `${(stats.totalTokens / 1_000_000).toFixed(1)}M` : "...");
   const openTicketCnt = isInvestor ? 0 : (stats?.openTickets ?? tickets.filter((t) => t.status === "open").length);
@@ -1011,7 +1015,7 @@ export default function MasterAdmin() {
             )}
           </div>
           <p className="text-sm text-muted-foreground mt-0.5">
-            {t("admin_infra_desc")} · {totalClinics} slots · {activePilots} {t("admin_pilots_label")}
+            {t("admin_infra_desc")} · {totalClinics} slots · {activeClinics} {t("admin_pilots_label")}
           </p>
         </div>
         {isInvestor ? (
@@ -1038,7 +1042,7 @@ export default function MasterAdmin() {
         <Card className="border-border">
           <CardContent className="pt-4 pb-3">
             <p className="text-[11px] text-muted-foreground">{t("admin_stat_active")}</p>
-            <p className="text-2xl font-bold text-emerald-400">{activePilots}</p>
+            <p className="text-2xl font-bold text-emerald-400">{activeClinics}</p>
           </CardContent>
         </Card>
         <Card className="border-violet-500/30 bg-gradient-to-br from-violet-950/30 to-transparent">
@@ -1049,14 +1053,14 @@ export default function MasterAdmin() {
             </div>
             <p className="text-2xl font-bold text-violet-400">
               {isInvestor
-                ? "R$ 5.750"
+                ? "R$ 270.000"
                 : stats?.estimatedMrr != null
                   ? `R$ ${stats.estimatedMrr.toLocaleString("pt-BR")}`
                   : "R$ …"}
             </p>
             <p className="text-[10px] text-muted-foreground/60 mt-0.5">
               {isInvestor
-                ? "2 builders × R$2k + 5 clínicas × R$350"
+                ? "100 builders × R$2k + 200 clínicas × R$350"
                 : stats
                   ? `${stats.activeBuilders} builder${stats.activeBuilders !== 1 ? "s" : ""} × R$2k + ${stats.activeManagedClinics} clínica${stats.activeManagedClinics !== 1 ? "s" : ""} × R$350`
                   : ""}
@@ -1072,6 +1076,72 @@ export default function MasterAdmin() {
           </CardContent>
         </Card>
       </div>
+
+      {/* Investor breakdown: clinics + builders totals */}
+      {isInvestor && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          {/* Clinics breakdown */}
+          <Card className="border-border">
+            <CardHeader className="pb-2">
+              <div className="flex items-center gap-2">
+                <Building2 className="h-4 w-4 text-blue-400" />
+                <CardTitle className="text-sm font-semibold">Clínicas</CardTitle>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-muted-foreground">Total Clínicas</span>
+                <span className="text-xl font-bold text-foreground">200</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-muted-foreground flex items-center gap-1.5">
+                  <CheckCircle2 className="h-3 w-3 text-emerald-400" /> Clínicas Ativas
+                </span>
+                <span className="text-lg font-bold text-emerald-400">170</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-muted-foreground flex items-center gap-1.5">
+                  <XCircle className="h-3 w-3 text-slate-400" /> Clínicas Inativas
+                </span>
+                <span className="text-lg font-bold text-slate-400">30</span>
+              </div>
+              <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
+                <div className="h-full bg-emerald-500 rounded-full" style={{ width: "85%" }} />
+              </div>
+            </CardContent>
+          </Card>
+          {/* Builders breakdown */}
+          <Card className="border-border">
+            <CardHeader className="pb-2">
+              <div className="flex items-center gap-2">
+                <Users className="h-4 w-4 text-indigo-400" />
+                <CardTitle className="text-sm font-semibold">Builders</CardTitle>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-muted-foreground">Total Builders</span>
+                <span className="text-xl font-bold text-foreground">100</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-muted-foreground flex items-center gap-1.5">
+                  <CheckCircle2 className="h-3 w-3 text-emerald-400" /> Builders Ativos
+                </span>
+                <span className="text-lg font-bold text-emerald-400">80</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-muted-foreground flex items-center gap-1.5">
+                  <XCircle className="h-3 w-3 text-slate-400" /> Builders Inativos
+                </span>
+                <span className="text-lg font-bold text-slate-400">20</span>
+              </div>
+              <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
+                <div className="h-full bg-indigo-500 rounded-full" style={{ width: "80%" }} />
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
 
       {/* Real-data metrics row (super_admin only) */}
       {isSuperAdmin && (
@@ -1740,10 +1810,10 @@ export default function MasterAdmin() {
                   <tbody>
                     {displayedLeads.map((lead) => (
                       <tr key={lead.id} className="border-b border-border/30 last:border-0">
-                        <td className="py-2 pr-4 font-medium text-foreground">{lead.nome}</td>
-                        <td className="py-2 pr-4 text-violet-400/90 font-mono text-[11px]">{lead.email_contato || "—"}</td>
-                        <td className="py-2 pr-4 text-muted-foreground">{lead.empresa}</td>
-                        <td className="py-2 pr-4 font-mono text-amber-400/90">{lead.telefone}</td>
+                        <td className="py-2 pr-4 font-medium text-foreground">{lead.name}</td>
+                        <td className="py-2 pr-4 text-violet-400/90 font-mono text-[11px]">{lead.email || "—"}</td>
+                        <td className="py-2 pr-4 text-muted-foreground">{lead.company}</td>
+                        <td className="py-2 pr-4 font-mono text-amber-400/90">{lead.phone}</td>
                         <td className="py-2 text-muted-foreground whitespace-nowrap">
                           {new Date(lead.created_at).toLocaleString("pt-BR", {
                             day: "2-digit", month: "2-digit", year: "2-digit",
