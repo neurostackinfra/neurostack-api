@@ -33,8 +33,36 @@ async def _resolve_tenant(
     override_tenant_id: Optional[UUID],
     db: AsyncSession,
 ) -> UUID:
-    """Resolve effective tenant_id, supporting builder clinic override."""
+    """Resolve effective tenant_id, supporting builder clinic override.
+    For builders without explicit tenant_id, auto-resolve to first managed clinic.
+    """
     if override_tenant_id is None:
+        # For builders, auto-resolve to first managed clinic
+        if tenant.role == "builder":
+            from src.models.tenant import Tenant
+            from sqlalchemy import select as sa_select
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:]
+                try:
+                    payload = pyjwt.decode(
+                        token, settings.secret_key,
+                        algorithms=["HS256"],
+                        options={"require": ["sub", "tenant_id", "exp"]},
+                    )
+                    bid = payload.get("builder_id")
+                    if bid:
+                        result = await db.execute(
+                            sa_select(Tenant.id)
+                            .where(Tenant.builder_id == UUID(bid))
+                            .order_by(Tenant.name)
+                            .limit(1)
+                        )
+                        first_clinic = result.scalar_one_or_none()
+                        if first_clinic:
+                            return first_clinic
+                except (pyjwt.InvalidTokenError, KeyError, ValueError):
+                    pass
         return tenant.tenant_id
 
     if tenant.role != "builder":
