@@ -329,8 +329,8 @@ class HandoffServiceConfig(BaseModel):
             "Vou transferir para um especialista."
         ),
         HandoffReason.SCHEDULING.value: (
-            "Perfeito! Vou te encaminhar para nossa equipe agendar sua consulta. "
-            "Em instantes alguém da clínica vai te atender!"
+            "Vou te encaminhar para a nossa equipe, que dará seguimento "
+            "e verificará os melhores horários disponíveis para você."
         ),
     })
 
