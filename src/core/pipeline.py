@@ -798,9 +798,9 @@ class CognitivePipeline:
         # Fire-and-forget: mark WhatsApp conversation as unread
         try:
             api_creds = (input_data.clinic_config or {}).get("api_credentials", {})
-            instance_id = api_creds.get("zapi_instance_id")
-            token = api_creds.get("zapi_token")
-            client_token = api_creds.get("zapi_client_token", "")
+            instance_id = (api_creds.get("zapi_instance_id") or "").strip()
+            token = (api_creds.get("zapi_token") or "").strip()
+            client_token = (api_creds.get("zapi_client_token") or "").strip()
             phone = input_data.user_id
 
             if instance_id and token and phone:
