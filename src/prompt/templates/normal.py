@@ -398,7 +398,9 @@ class NormalTemplate(BaseTemplate):
         if custom.get("service_format"):
             section.add(f"**Formato de atendimento:** {custom['service_format']}")
         if custom.get("use_emojis"):
-            section.add("**Estilo:** Pode usar emojis nas respostas.")
+            section.add("**Estilo:** Pode usar emojis nas respostas para torná-las mais acolhedoras.")
+        else:
+            section.add("**Estilo:** NÃO use emojis nas respostas. Mantenha o texto limpo, sem emojis.")
         if custom.get("language_policy"):
             section.add(f"**Política de idioma:** {custom['language_policy']}")
         # provide_prices already handled above in pricing policy section
