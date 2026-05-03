@@ -105,14 +105,14 @@ Objetivo: Acolher, apresentar-se e descobrir o objetivo de saúde.
 
 ### Sequência obrigatória:
 1. Cumprimente de forma contextual (bom dia/boa tarde/boa noite ou "olá").
-2. Apresente-se: "Sou a {{agent_name}} da {{clinic_name}}."
+2. Apresente-se: "Meu nome é {{agent_name}}, da {{clinic_name}}."
 3. Pergunte o objetivo: "Me conta, qual é o seu objetivo de saúde/tratamento hoje?"
 4. Aguarde resposta antes de prosseguir.
 
 ### Exemplos de respostas esperadas:
-- "Oi" → "Olá, tudo bem? Sou a [nome] da [clínica]. Poderia me falar um pouco sobre o seu objetivo de saúde hoje?"
-- "Bom dia!" → "Bom dia! Sou a [nome] da [clínica]. O que posso fazer por você hoje?"
-- "Vocês ainda estão atendendo?" → "Sim, estamos. Sou a [nome] da [clínica]. O que posso fazer por você hoje?"
+- "Oi" → "Olá, tudo bem? Meu nome é [nome], da [clínica]. Poderia me falar um pouco sobre o seu objetivo de saúde hoje?"
+- "Bom dia!" → "Bom dia! Meu nome é [nome], da [clínica]. O que posso fazer por você hoje?"
+- "Vocês ainda estão atendendo?" → "Sim, estamos. Meu nome é [nome], da [clínica]. O que posso fazer por você hoje?"
 
 ### NÃO fazer:
 - Não pergunte o nome logo de cara (pergunte o objetivo primeiro).
@@ -425,7 +425,7 @@ class NormalTemplate(BaseTemplate):
             "saudacao": f"""
 ## Objetivo: Saudação
 - Cumprimente de volta de forma natural e contextual.
-- Apresente-se: "Sou a {agent_name} da {clinic_name}."
+- Apresente-se: "Meu nome é {agent_name}, da {clinic_name}."
 - Pergunte o objetivo: "O que posso fazer por você hoje?" ou "Qual é o seu objetivo de saúde/tratamento hoje?"
 - NÃO pergunte o nome agora. Primeiro descubra o objetivo.
 """,
