@@ -98,6 +98,11 @@ export default function TracesList() {
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const fetchTraces = useCallback(async () => {
+    // For builders, wait until viewingClinicId is resolved
+    if (isBuilder && !viewingClinicId) {
+      setLoading(true);
+      return;
+    }
     setLoading(true);
     setLoadError(null);
     try {
