@@ -16,6 +16,7 @@ from src.models.policy import Policy
 from src.models.knowledge import KnowledgeDocument
 from src.models.handoff import HandoffRecord
 from src.models.user import User, UserRole
+from src.models.demo_lead import DemoLead
 
 __all__ = [
     # Base
@@ -34,5 +35,6 @@ __all__ = [
     "HandoffRecord",
     "User",
     "UserRole",
+    "DemoLead",
 ]
 
