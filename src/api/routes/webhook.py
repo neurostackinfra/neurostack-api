@@ -87,6 +87,43 @@ def _normalise_phone(raw: str) -> str:
     return raw.lstrip("+").replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
 
 
+async def _resolve_phone_from_lid(
+    tenant_id: UUID,
+    lid: str,
+    db: AsyncSession,
+) -> Optional[str]:
+    """Resolve a real phone number from a WhatsApp LID using session metadata."""
+    from sqlalchemy import text as sa_text
+    result = await db.execute(
+        sa_text(
+            "SELECT user_id FROM sessions "
+            "WHERE tenant_id = :tid AND metadata->>'chat_lid' = :lid "
+            "AND is_active = true "
+            "ORDER BY last_activity_at DESC LIMIT 1"
+        ),
+        {"tid": str(tenant_id), "lid": lid},
+    )
+    row = result.first()
+    return row[0] if row else None
+
+
+async def _save_lid_mapping(
+    tenant_id: UUID,
+    phone: str,
+    chat_lid: str,
+    db: AsyncSession,
+) -> None:
+    """Save chatLid in session metadata so fromMe=true messages can resolve the real phone."""
+    from sqlalchemy import text as sa_text
+    await db.execute(
+        sa_text(
+            "UPDATE sessions SET metadata = jsonb_set(COALESCE(metadata, '{}'), '{chat_lid}', to_jsonb(:lid::text)) "
+            "WHERE tenant_id = :tid AND user_id = :phone AND is_active = true"
+        ),
+        {"tid": str(tenant_id), "phone": phone, "lid": chat_lid},
+    )
+
+
 async def _get_or_create_session(
     tenant_id: UUID,
     phone: str,
@@ -341,7 +378,9 @@ async def zapi_webhook(
         return {"ok": True, "skipped": "empty"}
 
     instance_id = body.get("instanceId", "")
-    phone = _normalise_phone(body.get("phone", ""))
+    raw_phone = body.get("phone", "")
+    phone = _normalise_phone(raw_phone)
+    chat_lid = body.get("chatLid", "")
     sender_name = body.get("senderName", "")
 
     if not instance_id or not phone:
@@ -358,7 +397,14 @@ async def zapi_webhook(
         webhook_msg_id = body.get("messageId", "")
         if webhook_msg_id and _is_ai_sent_message(webhook_msg_id):
             return {"ok": True, "skipped": "ai_echo"}
-        result = await _handle_clinic_message(tenant_id, phone, message_text, db)
+        # When phone is in @lid format, resolve real phone from session metadata
+        effective_phone = phone
+        if "@lid" in raw_phone:
+            effective_phone = await _resolve_phone_from_lid(tenant_id, raw_phone, db)
+            if not effective_phone:
+                logger.warning("zapi_lid_unresolved", extra={"lid": raw_phone, "tenant_id": str(tenant_id)})
+                return {"ok": True, "skipped": "lid_unresolved"}
+        result = await _handle_clinic_message(tenant_id, effective_phone, message_text, db)
         await db.commit()
         return result
 
@@ -370,6 +416,11 @@ async def zapi_webhook(
 
     # ── get or create a session for this phone ──
     session_id = await _get_or_create_session(tenant_id, phone, db)
+
+    # ── save chatLid mapping so fromMe=true can resolve the real phone ──
+    if chat_lid and "@lid" in chat_lid:
+        await _save_lid_mapping(tenant_id, phone, chat_lid, db)
+
     await db.commit()
 
     # ── process through NeuroStack pipeline ──
