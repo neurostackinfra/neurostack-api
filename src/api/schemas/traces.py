@@ -73,6 +73,10 @@ class TraceItem(BaseModel):
         default="normal",
         description="Flow mode used for this response (normal, rag, safety, handoff)",
     )
+    channel: str = Field(
+        default="unknown",
+        description="Communication channel (whatsapp, web)",
+    )
 
 
 class TraceListResponse(BaseModel):

@@ -18,14 +18,14 @@ const PAGE_SIZE = 20;
 
 // ── Investor mock traces ──
 const MOCK_TRACES = [
-  { id: "t1", timestamp: "2026-05-03T14:32:00Z", userMessage: "Quanto custa a aplicação de botox na testa?", srmDecision: { intent: "pedido_preco", stage: "qualification", action: "respond", confidence: 0.94, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: true }, processingTimeMs: 823 },
-  { id: "t2", timestamp: "2026-05-03T14:15:00Z", userMessage: "Gostaria de agendar uma limpeza de pele", srmDecision: { intent: "agendar", stage: "scheduling", action: "respond", confidence: 0.97, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 654 },
-  { id: "t3", timestamp: "2026-05-03T13:45:00Z", userMessage: "Quero saber sobre tratamento para manchas", srmDecision: { intent: "interesse_tratamento", stage: "discovery", action: "respond", confidence: 0.91, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 912 },
-  { id: "t4", timestamp: "2026-05-03T12:22:00Z", userMessage: "Fiz um preenchimento e estou com inchaço intenso, está muito roxo", srmDecision: { intent: "pos_atendimento_sintomas_preocupantes", stage: "post_care", action: "respond", confidence: 0.98, safety_concern: true, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 1102 },
-  { id: "t5", timestamp: "2026-05-03T11:50:00Z", userMessage: "Preciso cancelar minha consulta de amanhã", srmDecision: { intent: "cancelar", stage: "scheduling", action: "respond", confidence: 0.96, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 589 },
-  { id: "t6", timestamp: "2026-05-03T10:30:00Z", userMessage: "O atendimento foi péssimo, quero falar com o gerente", srmDecision: { intent: "reclamacao", stage: "escalation", action: "handoff", confidence: 0.99, safety_concern: false, handoff_required: true, constraints: [], gate_authority_before_price: false }, processingTimeMs: 734 },
-  { id: "t7", timestamp: "2026-05-03T09:12:00Z", userMessage: "Vocês fazem harmonização facial?", srmDecision: { intent: "interesse_tratamento", stage: "discovery", action: "respond", confidence: 0.88, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 876 },
-  { id: "t8", timestamp: "2026-05-02T16:45:00Z", userMessage: "Queria remarcar minha consulta para semana que vem", srmDecision: { intent: "reagendar", stage: "scheduling", action: "respond", confidence: 0.95, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 701 },
+  { id: "t1", timestamp: "2026-05-03T14:32:00Z", userMessage: "Quanto custa a aplicação de botox na testa?", srmDecision: { intent: "pedido_preco", stage: "qualification", action: "respond", confidence: 0.94, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: true }, processingTimeMs: 823, channel: "whatsapp" },
+  { id: "t2", timestamp: "2026-05-03T14:15:00Z", userMessage: "Gostaria de agendar uma limpeza de pele", srmDecision: { intent: "agendar", stage: "scheduling", action: "respond", confidence: 0.97, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 654, channel: "whatsapp" },
+  { id: "t3", timestamp: "2026-05-03T13:45:00Z", userMessage: "Quero saber sobre tratamento para manchas", srmDecision: { intent: "interesse_tratamento", stage: "discovery", action: "respond", confidence: 0.91, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 912, channel: "web" },
+  { id: "t4", timestamp: "2026-05-03T12:22:00Z", userMessage: "Fiz um preenchimento e estou com inchaço intenso, está muito roxo", srmDecision: { intent: "pos_atendimento_sintomas_preocupantes", stage: "post_care", action: "respond", confidence: 0.98, safety_concern: true, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 1102, channel: "whatsapp" },
+  { id: "t5", timestamp: "2026-05-03T11:50:00Z", userMessage: "Preciso cancelar minha consulta de amanhã", srmDecision: { intent: "cancelar", stage: "scheduling", action: "respond", confidence: 0.96, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 589, channel: "whatsapp" },
+  { id: "t6", timestamp: "2026-05-03T10:30:00Z", userMessage: "O atendimento foi péssimo, quero falar com o gerente", srmDecision: { intent: "reclamacao", stage: "escalation", action: "handoff", confidence: 0.99, safety_concern: false, handoff_required: true, constraints: [], gate_authority_before_price: false }, processingTimeMs: 734, channel: "whatsapp" },
+  { id: "t7", timestamp: "2026-05-03T09:12:00Z", userMessage: "Vocês fazem harmonização facial?", srmDecision: { intent: "interesse_tratamento", stage: "discovery", action: "respond", confidence: 0.88, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 876, channel: "web" },
+  { id: "t8", timestamp: "2026-05-02T16:45:00Z", userMessage: "Queria remarcar minha consulta para semana que vem", srmDecision: { intent: "reagendar", stage: "scheduling", action: "respond", confidence: 0.95, safety_concern: false, handoff_required: false, constraints: [], gate_authority_before_price: false }, processingTimeMs: 701, channel: "whatsapp" },
 ];
 
 function getToken(): string | null {
@@ -55,6 +55,7 @@ interface ApiTrace {
   prompt_built?: string;
   processing_time_ms: number;
   mode?: string;
+  channel?: string;
 }
 
 interface TracesResponse {
@@ -81,6 +82,7 @@ function mapTrace(t: ApiTrace) {
       gate_authority_before_price: t.srm_decision.intent === "pedido_preco",
     },
     processingTimeMs: t.processing_time_ms,
+    channel: t.channel ?? "unknown",
   };
 }
 
@@ -98,6 +100,7 @@ export default function TracesList() {
   const [endDate, setEndDate] = useState(todayDateTime);
   const [onlySafety, setOnlySafety] = useState(false);
   const [onlyHandoff, setOnlyHandoff] = useState(false);
+  const [channelFilter, setChannelFilter] = useState<"all" | "whatsapp" | "web">("all");
   const [exporting, setExporting] = useState(false);
 
   // Pagination
@@ -139,6 +142,7 @@ export default function TracesList() {
       if (endDate) params.set("end_date", endDate);
       if (onlySafety) params.set("safety_flag", "true");
       if (onlyHandoff) params.set("handoff_required", "true");
+      if (channelFilter !== "all") params.set("channel", channelFilter);
       if (isBuilder && viewingClinicId) params.set("tenant_id", viewingClinicId);
 
       const res = await fetch(`/v1/traces?${params.toString()}`, {
@@ -159,7 +163,7 @@ export default function TracesList() {
     } finally {
       setLoading(false);
     }
-  }, [offset, startDate, endDate, onlySafety, onlyHandoff, isBuilder, isInvestor, viewingClinicId]);
+  }, [offset, startDate, endDate, onlySafety, onlyHandoff, channelFilter, isBuilder, isInvestor, viewingClinicId]);
 
   useEffect(() => {
     void fetchTraces();
@@ -195,6 +199,7 @@ export default function TracesList() {
       });
       if (onlySafety) params.set("safety_flag", "true");
       if (onlyHandoff) params.set("handoff_required", "true");
+      if (channelFilter !== "all") params.set("channel", channelFilter);
       if (isBuilder && viewingClinicId) params.set("tenant_id", viewingClinicId);
 
       const res = await fetch(`/v1/traces/export?${params.toString()}`, {
@@ -324,12 +329,30 @@ export default function TracesList() {
               <Badge className="text-[10px] px-1.5 py-0 h-4 bg-orange-500 text-white hover:bg-orange-500">{t("traces_filter_active_badge")}</Badge>
             )}
           </label>
+
+          <div className="flex items-center gap-2 ml-2 pl-2 border-l border-border">
+            <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">{txt("Origem", "Source")}</span>
+            <select
+              value={channelFilter}
+              onChange={e => { setChannelFilter(e.target.value as "all" | "whatsapp" | "web"); setOffset(0); }}
+              className="h-7 rounded-md border border-border bg-background px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent cursor-pointer"
+            >
+              <option value="all">{txt("Todos", "All")}</option>
+              <option value="whatsapp">WhatsApp</option>
+              <option value="web">{txt("Simulador", "Simulator")}</option>
+            </select>
+            {channelFilter !== "all" && (
+              <Badge className={`text-[10px] px-1.5 py-0 h-4 ${channelFilter === "whatsapp" ? "bg-emerald-500 text-white hover:bg-emerald-500" : "bg-blue-500 text-white hover:bg-blue-500"}`}>
+                {channelFilter === "whatsapp" ? "WhatsApp" : txt("Simulador", "Simulator")}
+              </Badge>
+            )}
+          </div>
         </div>
 
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
           <p className="text-xs text-muted-foreground leading-relaxed">
             {t("traces_report_hint")}
-            {(onlySafety || onlyHandoff) && (
+            {(onlySafety || onlyHandoff || channelFilter !== "all") && (
               <span className="ml-1 font-medium text-foreground">{t("traces_filter_csv_note")}</span>
             )}
           </p>
@@ -368,7 +391,7 @@ export default function TracesList() {
           </div>
         ) : recentTraces.length === 0 ? (
           <div className="p-12 text-center text-muted-foreground bg-muted/30 rounded-lg border border-border">
-            {(onlySafety || onlyHandoff)
+            {(onlySafety || onlyHandoff || channelFilter !== "all")
               ? t("traces_no_filter_match")
               : t("traces_empty")
             }
@@ -398,6 +421,9 @@ export default function TracesList() {
                     <span className="flex items-center gap-1">
                       <Clock className="h-3 w-3" />
                       {Math.round(trace.processingTimeMs)}ms
+                    </span>
+                    <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium ${trace.channel === "whatsapp" ? "bg-emerald-500/10 text-emerald-500" : trace.channel === "web" ? "bg-blue-500/10 text-blue-500" : "bg-muted text-muted-foreground"}`}>
+                      {trace.channel === "whatsapp" ? "WhatsApp" : trace.channel === "web" ? txt("Simulador", "Simulator") : trace.channel}
                     </span>
                     {(trace.srmDecision.safety_concern || trace.srmDecision.handoff_required) && (
                       <div className="flex items-center gap-2 ml-2">
