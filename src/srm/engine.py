@@ -395,7 +395,7 @@ class SRMEngine:
 
     def _extract_slots(self, intent: str, patch: StatePatch) -> None:
         """Extract slot updates based on intent (official 29 intents)."""
-        if intent in ("agendar", "interesse_tratamento", "pedido_preco"):
+        if intent == "agendar":
             patch.flags["scheduling_interest"] = True
         if intent == "pedido_preco":
             patch.constraints.append("C_SEQUENCE_AUTHORITY_BEFORE_PRICE")
