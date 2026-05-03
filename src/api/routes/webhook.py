@@ -117,7 +117,7 @@ async def _save_lid_mapping(
     from sqlalchemy import text as sa_text
     await db.execute(
         sa_text(
-            "UPDATE sessions SET metadata = jsonb_set(COALESCE(metadata, '{}'), '{chat_lid}', to_jsonb(:lid::text)) "
+            "UPDATE sessions SET metadata = jsonb_set(COALESCE(metadata, '{}'), '{chat_lid}', to_jsonb(CAST(:lid AS text))) "
             "WHERE tenant_id = :tid AND user_id = :phone AND is_active = true"
         ),
         {"tid": str(tenant_id), "phone": phone, "lid": chat_lid},
