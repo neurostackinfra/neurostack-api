@@ -388,16 +388,31 @@ class NormalTemplate(BaseTemplate):
             ic = custom["initial_consultation"]
             section.add(f"**Tipo de consulta inicial:** {ic}")
             ic_lower = str(ic).lower()
-            if any(w in ic_lower for w in ("gratuita", "cortesia", "grátis", "free", "complimentary")):
+            is_cortesia = any(w in ic_lower for w in ("gratuita", "cortesia", "grátis", "free", "complimentary"))
+            consult_price = str(custom.get("consult_service_price", "")).strip()
+            consult_price_is_zero = consult_price.replace("R$", "").replace(",", ".").strip() in ("0", "0.00", "0,00", "")
+
+            if is_cortesia and consult_price_is_zero:
+                # Cenário 3: Cortesia + preço R$0 ou sem preço = todas as consultas são sem custo
+                section.add(
+                    "⚠️ REGRA OBRIGATÓRIA SOBRE CONSULTAS:\n"
+                    "- TODAS as consultas e avaliações da clínica são SEM CUSTO para o paciente.\n"
+                    "- Quando o paciente perguntar sobre consulta, diga: 'As consultas/avaliações são sem custo para você.'\n"
+                    "- NUNCA mencione valores ou preços ao falar de consultas."
+                )
+            elif is_cortesia:
+                # Cenário 1: Cortesia + serviço Consulta com preço > 0 = primeira grátis, posteriores pagas
                 section.add(
                     "⚠️ REGRA OBRIGATÓRIA SOBRE CONSULTA INICIAL:\n"
-                    "- A PRIMEIRA CONSULTA/AVALIAÇÃO É CORTESIA da clínica (o paciente NÃO paga).\n"
-                    "- Se existir um serviço 'Consulta' com preço na lista de serviços, esse preço se refere a consultas POSTERIORES (retornos ou consultas regulares), NÃO à primeira consulta.\n"
-                    "- Quando o paciente perguntar sobre a primeira consulta, diga: 'A primeira consulta é uma CORTESIA da clínica.' e se houver preço de consulta nos serviços, complemente: 'As consultas posteriores têm o valor de [preço].'\n"
+                    f"- A PRIMEIRA CONSULTA/AVALIAÇÃO É CORTESIA da clínica (o paciente NÃO paga).\n"
+                    f"- As consultas POSTERIORES (retornos/regulares) têm o valor de {consult_price}.\n"
+                    "- Quando o paciente perguntar sobre a primeira consulta, diga: 'A primeira consulta é uma CORTESIA da clínica.'\n"
+                    f"- Se perguntar sobre valores de consulta em geral, complemente: 'As consultas posteriores têm o valor de {consult_price}.'\n"
                     "- Use a palavra CORTESIA, nunca 'gratuita' ou 'grátis'.\n"
-                    "- NUNCA mencione o preço do serviço Consulta ao falar da primeira consulta."
+                    "- NUNCA mencione o preço ao falar da primeira consulta."
                 )
             else:
+                # Cenário 2: Consulta inicial paga
                 section.add(
                     "⚠️ REGRA SOBRE CONSULTA INICIAL:\n"
                     "- A consulta inicial É PAGA.\n"

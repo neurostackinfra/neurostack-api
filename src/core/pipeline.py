@@ -554,6 +554,14 @@ class CognitivePipeline:
             initial_free = any(w in initial_consult for w in ("gratuita", "cortesia", "grátis", "free", "complimentary"))
 
             services = cfg.get("services", [])
+            # Detect consultation service price for prompt rules
+            consult_price = ""
+            for s in (services if isinstance(services, list) else []):
+                if isinstance(s, dict) and s.get("name", "").lower().strip() in ("consulta", "consulta inicial", "avaliação"):
+                    consult_price = s.get("price", "")
+                    break
+            custom_vars["consult_service_price"] = consult_price
+
             if services and isinstance(services, list):
                 svc_names = []
                 svc_lines = []
