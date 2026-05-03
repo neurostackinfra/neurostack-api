@@ -491,7 +491,7 @@ class EventService:
                         mode=result.mode,
                         tenant_model=tenant_model,
                     )
-                    llm_result = await llm.generate(messages, model=tenant_model)
+                    llm_result = await llm.generate(messages, model=tenant_model, max_tokens=300)
                     suggested_response = llm_result.get("content", "")
                     llm_usage = llm_result.get("usage", {})
                     llm_model = llm_result.get("model", "")
