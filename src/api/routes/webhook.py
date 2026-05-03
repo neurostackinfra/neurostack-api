@@ -239,14 +239,14 @@ async def _handle_clinic_message(
     handoff_active = str(handoff_cfg.get("handoff_active", "yes")).lower()
     trigger_msg = str(handoff_cfg.get(
         "trigger_message",
-        "Ok! Precisando de algo mais,estamos a disposição.",
+        "Precisando de algo mais,estamos a disposição.",
     )).strip().lower()
     reactivation_hours = int(handoff_cfg.get("reactivation_delay_hours", 1))
 
     normalized_text = message_text.strip().lower()
 
-    # Check if this is the trigger message
-    if normalized_text == trigger_msg:
+    # Check if message contains the trigger phrase (flexible match)
+    if trigger_msg in normalized_text:
         if session.is_paused:
             session.paused_until = datetime.now(timezone.utc) + timedelta(hours=reactivation_hours)
             await db.flush()
