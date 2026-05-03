@@ -114,9 +114,14 @@ Objetivo: Acolher, apresentar-se e descobrir o objetivo de saúde.
 3. Pergunte o objetivo: "Me conta, qual é o seu objetivo de saúde/tratamento hoje?"
 4. Aguarde resposta antes de prosseguir.
 
+### Saudação contextual por horário (use a data/hora atual informada acima):
+- Antes das 12h: "Bom dia"
+- Das 12h às 18h: "Boa tarde"
+- Após 18h: "Boa noite"
+
 ### Exemplos de respostas esperadas:
-- "Oi" → "Olá, tudo bem? Meu nome é [nome], da [clínica]. Poderia me falar um pouco sobre o seu objetivo de saúde hoje?"
-- "Bom dia!" → "Bom dia! Meu nome é [nome], da [clínica]. O que posso fazer por você hoje?"
+- "Oi" (às 20h) → "Boa noite! Meu nome é [nome], da [clínica]. Poderia me falar um pouco sobre o seu objetivo de saúde hoje?"
+- "Bom dia!" (às 9h) → "Bom dia! Meu nome é [nome], da [clínica]. O que posso fazer por você hoje?"
 - "Vocês ainda estão atendendo?" → "Sim, estamos. Meu nome é [nome], da [clínica]. O que posso fazer por você hoje?"
 
 ### NÃO fazer:
@@ -458,7 +463,10 @@ class NormalTemplate(BaseTemplate):
             # ===== SAUDAÇÃO =====
             "saudacao": f"""
 ## Objetivo: Saudação
-- Cumprimente de volta de forma natural e contextual.
+- Cumprimente de volta de forma natural e contextual, USANDO O HORÁRIO DE BRASÍLIA informado acima para escolher a saudação correta:
+  - Antes das 12h: "Bom dia"
+  - Das 12h às 18h: "Boa tarde"
+  - Após 18h: "Boa noite"
 - Apresente-se: "Meu nome é {agent_name}, da {clinic_name}."
 - Pergunte o objetivo: "O que posso fazer por você hoje?" ou "Qual é o seu objetivo de saúde/tratamento hoje?"
 - NÃO pergunte o nome agora. Primeiro descubra o objetivo.
