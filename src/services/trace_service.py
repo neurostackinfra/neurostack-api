@@ -48,6 +48,7 @@ def _apply_filters(
     end_date: Optional[datetime] = None,
     safety_flag: Optional[bool] = None,
     handoff_required: Optional[bool] = None,
+    channel: Optional[str] = None,
 ):
     """Apply optional filters to a trace query."""
     if start_date is not None:
@@ -66,6 +67,10 @@ def _apply_filters(
     if handoff_required is not None:
         query = query.where(
             Event.event_metadata["handoff_required"].as_boolean() == handoff_required
+        )
+    if channel is not None:
+        query = query.where(
+            Event.event_data["channel"].as_string() == channel
         )
     return query
 
@@ -104,6 +109,7 @@ def _event_to_trace_dict(event: Event) -> dict:
         "prompt_built": event_data.get("prompt_built", metadata.get("prompt_built")),
         "processing_time_ms": metadata.get("processing_time_ms"),
         "mode": metadata.get("mode", event_data.get("mode", "normal")),
+        "channel": event_data.get("channel", "unknown"),
     }
 
 
@@ -116,6 +122,7 @@ async def list_traces(
     end_date: Optional[datetime] = None,
     safety_flag: Optional[bool] = None,
     handoff_required: Optional[bool] = None,
+    channel: Optional[str] = None,
 ) -> tuple[list[Event], int]:
     """
     List traces with pagination and optional filters.
@@ -129,12 +136,13 @@ async def list_traces(
         end_date: Optional end date filter
         safety_flag: Optional safety concern filter
         handoff_required: Optional handoff required filter
+        channel: Optional channel filter (whatsapp, web)
 
     Returns:
         Tuple of (list of Event objects, total count)
     """
     base = _base_trace_query(tenant_id)
-    base = _apply_filters(base, start_date, end_date, safety_flag, handoff_required)
+    base = _apply_filters(base, start_date, end_date, safety_flag, handoff_required, channel)
 
     # Count query
     count_query = select(func.count()).select_from(base.subquery())
@@ -312,6 +320,7 @@ async def export_traces_csv(
     end_date: Optional[datetime] = None,
     safety_flag: Optional[bool] = None,
     handoff_required: Optional[bool] = None,
+    channel: Optional[str] = None,
 ) -> str:
     """
     Export traces as a CSV string.
@@ -323,12 +332,13 @@ async def export_traces_csv(
         end_date: Optional end date filter
         safety_flag: Optional safety concern filter
         handoff_required: Optional handoff required filter
+        channel: Optional channel filter (whatsapp, web)
 
     Returns:
         CSV formatted string with trace data
     """
     base = _base_trace_query(tenant_id)
-    base = _apply_filters(base, start_date, end_date, safety_flag, handoff_required)
+    base = _apply_filters(base, start_date, end_date, safety_flag, handoff_required, channel)
 
     result = await db.execute(base)
     events = list(result.scalars().all())

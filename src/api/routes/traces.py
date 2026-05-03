@@ -179,6 +179,9 @@ async def trace_export(
     handoff_required: Optional[bool] = Query(
         default=None, description="Filter by handoff required flag"
     ),
+    channel: Optional[str] = Query(
+        default=None, description="Filter by channel (whatsapp, web)"
+    ),
     override_tenant_id: Optional[UUID] = Query(
         default=None, alias="tenant_id",
         description="Builder override: export traces for a managed clinic",
@@ -195,6 +198,7 @@ async def trace_export(
         end_date=end_date,
         safety_flag=safety_flag,
         handoff_required=handoff_required,
+        channel=channel,
     )
 
     def iterate_csv():
@@ -329,6 +333,9 @@ async def trace_list(
     handoff_required: Optional[bool] = Query(
         default=None, description="Filter by handoff required flag"
     ),
+    channel: Optional[str] = Query(
+        default=None, description="Filter by channel (whatsapp, web)"
+    ),
     override_tenant_id: Optional[UUID] = Query(None, alias="tenant_id", description="Builder clinic override"),
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
@@ -344,6 +351,7 @@ async def trace_list(
         end_date=end_date,
         safety_flag=safety_flag,
         handoff_required=handoff_required,
+        channel=channel,
     )
 
     items = [
