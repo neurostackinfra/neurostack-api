@@ -36,7 +36,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     started_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     last_activity_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     ended_at TIMESTAMP WITH TIME ZONE,
-    is_active BOOLEAN DEFAULT TRUE
+    is_active BOOLEAN DEFAULT TRUE,
+    message_count INTEGER DEFAULT 0,
+    handoff_status VARCHAR(50),
+    is_paused BOOLEAN NOT NULL DEFAULT FALSE,
+    paused_until TIMESTAMP WITH TIME ZONE
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_tenant_id ON sessions(tenant_id);

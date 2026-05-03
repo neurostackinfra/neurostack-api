@@ -59,6 +59,8 @@ FIELD_TO_BUCKET: dict[str, str] = {
     "standby_mode": "handoff",
     "handoff_sectors": "handoff",
     "default_mode": "handoff",
+    "trigger_message": "handoff",
+    "reactivation_delay_hours": "handoff",
     # top-level array buckets (field name == bucket name)
     "professionals": "professionals",
     "services": "services",

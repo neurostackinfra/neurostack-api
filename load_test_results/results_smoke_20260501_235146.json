@@ -1,0 +1,35 @@
+{
+  "passed": false,
+  "checks": [
+    {
+      "name": "p95_latency",
+      "passed": true,
+      "actual": 5.0,
+      "threshold": 200.0,
+      "unit": "ms"
+    },
+    {
+      "name": "error_rate",
+      "passed": false,
+      "actual": 99.76851851851852,
+      "threshold": 0.1,
+      "unit": "%"
+    },
+    {
+      "name": "throughput",
+      "passed": false,
+      "actual": 22.677397194933143,
+      "threshold": 100.0,
+      "unit": "req/s"
+    }
+  ],
+  "summary": {
+    "total_requests": 1296,
+    "failed_requests": 1293,
+    "error_rate_percent": 99.769,
+    "avg_response_time_ms": 3.06,
+    "p95_response_time_ms": 5.0,
+    "p99_response_time_ms": 6.0,
+    "requests_per_second": 22.68
+  }
+}

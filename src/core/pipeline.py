@@ -537,6 +537,10 @@ class CognitivePipeline:
                 custom_vars["professionals"] = ""
 
             # Format services array (with price and description when available)
+            # Check if initial consultation is free (to annotate service lines)
+            initial_consult = str(cfg.get("initial_consultation", "")).lower()
+            initial_free = any(w in initial_consult for w in ("gratuita", "cortesia", "grátis", "free", "complimentary"))
+
             services = cfg.get("services", [])
             if services and isinstance(services, list):
                 svc_names = []
@@ -551,6 +555,9 @@ class CognitivePipeline:
                         price = s.get("price", "")
                         if price:
                             line += f" — {price}"
+                        # If this looks like a consultation service and initial is free, annotate
+                        if initial_free and name.lower().strip() in ("consulta", "consulta inicial", "avaliação"):
+                            line += " (⚠️ PRIMEIRA CONSULTA É CORTESIA da clínica — não cobrar)"
                         desc = s.get("description", "")
                         if desc:
                             line += f": {desc}"

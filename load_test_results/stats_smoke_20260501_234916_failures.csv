@@ -1,0 +1,11 @@
+Method,Name,Error,Occurrences
+POST,POST /v1/events (normal),CatchResponseError('Error: 404'),853
+POST,POST /v1/events,HTTPError('404 Client Error: Not Found for url: POST /v1/events'),74
+POST,POST /v1/sessions,HTTPError('404 Client Error: Not Found for url: POST /v1/sessions'),15
+POST,POST /v1/events (session.start),CatchResponseError('Error: 404'),164
+POST,POST /v1/sessions,CatchResponseError('Error: 404'),39
+GET,GET /v1/sessions,CatchResponseError('Error: 404'),34
+POST,POST /v1/events (safety),CatchResponseError('Error: 404'),84
+GET,GET /ready,CatchResponseError('Error: 404'),6
+GET,GET /live,CatchResponseError('Error: 404'),18
+GET,GET /live,HTTPError('404 Client Error: Not Found for url: GET /live'),6

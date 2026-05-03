@@ -274,6 +274,17 @@ class Session(Base):
         nullable=True,
     )
 
+    # Pause / handoff engine
+    is_paused: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+    )
+    paused_until: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
     # Relationships
     tenant: Mapped["Tenant"] = relationship(
         "Tenant",
