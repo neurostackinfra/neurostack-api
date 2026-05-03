@@ -797,7 +797,7 @@ export default function ClinicConfig() {
       dpo_contact: dpoContact.trim() || null,
       language_policy: languagePolicy || null,
       language_policy_custom: languagePolicyCustom.trim() || null,
-      handoff_active: handoffActive || null,
+      handoff_active: "yes",
       standby_mode: standbyMode || null,
       handoff_period: handoffPeriod || null,
       handoff_cycle_days: handoffCycleDays.trim() || null,
@@ -1367,16 +1367,12 @@ export default function ClinicConfig() {
               </CardDescription>
             </CardHeader>
             <CardContent className="pt-5 space-y-4">
-              <SwitchRow
-                label={txt("Handoff Ativo", "Handoff Active")}
-                hint={txt("Quando ativado, o agente pode acionar transferência para humano ou agente especializado.", "When enabled, the agent can trigger transfer to a human or specialized agent.")}
-                checked={handoffActive === "yes"}
-                onCheckedChange={(v) => setHandoffActive(v ? "yes" : "no")}
-              />
+              <div className="rounded-md border border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950/30 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-300 flex items-center gap-2">
+                <span className="inline-flex items-center rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] font-bold tracking-wider text-emerald-600 dark:text-emerald-400">ON</span>
+                {txt("Handoff sempre ativo — o agente transfere a conversa para um humano quando necessário.", "Handoff always active — the agent transfers the conversation to a human when needed.")}
+              </div>
 
-              {handoffActive === "yes" && (
-                <>
-                  {/* ── HITL Block ─────────────────────────────────────── */}
+              {/* ── HITL Block ─────────────────────────────────────── */}
                   <div className="rounded-lg border border-border/60 bg-muted/20 px-4 py-4 space-y-3">
                     <div className="flex items-start justify-between gap-3">
                       <div className="space-y-1 flex-1">
@@ -1461,14 +1457,6 @@ export default function ClinicConfig() {
                       />
                     </Field>
                   )}
-                </>
-              )}
-
-              {handoffActive !== "yes" && (
-                <div className="rounded-md border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/30 px-4 py-3 text-sm text-amber-700 dark:text-amber-300">
-                  {txt("Handoff desativado — o agente nunca transfere a conversa para um humano.", "Handoff disabled — the agent never transfers the conversation to a human.")}
-                </div>
-              )}
             </CardContent>
           </Card>
         </TabsContent>
