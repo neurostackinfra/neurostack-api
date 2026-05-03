@@ -192,22 +192,25 @@ async def zapi_webhook(
 
     if not suggested:
         logger.info("Z-API webhook: no suggested_response for %s", phone)
-        return {"ok": True, "replied": False}
+        return {"ok": True, "replied": False, "reason": "no_llm_response"}
+
+    logger.info("Z-API webhook: LLM generated %d chars for %s", len(suggested), phone)
 
     creds = await _load_tenant_credentials(tenant_id, db)
-    zapi_token = creds.get("zapi_token", "")
-    zapi_inst = creds.get("zapi_instance_id", "")
+    zapi_token = creds.get("zapi_token", "").strip()
+    zapi_inst = creds.get("zapi_instance_id", "").strip()
+    zapi_client_token = creds.get("zapi_client_token", "").strip()
 
     if not zapi_token or not zapi_inst:
         logger.warning("Z-API credentials missing for tenant %s", tenant_id)
         return {"ok": True, "replied": False, "reason": "no_credentials"}
 
     try:
-        await send_text_message(zapi_inst, zapi_token, phone, suggested)
+        await send_text_message(zapi_inst, zapi_token, phone, suggested, client_token=zapi_client_token)
         logger.info("Z-API reply sent to %s (%d chars)", phone, len(suggested))
-    except Exception:
-        logger.exception("Z-API send failed for %s", phone)
-        return {"ok": True, "replied": False, "reason": "send_failed"}
+    except Exception as exc:
+        logger.exception("Z-API send failed for %s — %s", phone, exc)
+        return {"ok": True, "replied": False, "reason": "send_failed", "error": str(exc)}
 
     return {"ok": True, "replied": True}
 

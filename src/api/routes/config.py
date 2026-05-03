@@ -179,7 +179,7 @@ async def patch_config(
 # API Credentials (WhatsApp + LLM providers)
 # ============================================
 
-SECRET_FIELDS = {"zapi_token", "evolution_api_key", "llm_api_key"}
+SECRET_FIELDS = {"zapi_token", "zapi_client_token", "evolution_api_key", "llm_api_key"}
 
 
 def _mask(value: Optional[str]) -> Optional[str]:
@@ -199,6 +199,7 @@ def _build_credential_status(creds: dict[str, Any]) -> dict[str, Any]:
         "zapi_instance_id": creds.get("zapi_instance_id"),
         "zapi_token_set": bool(creds.get("zapi_token")),
         "zapi_token_masked": _mask(creds.get("zapi_token")),
+        "zapi_client_token_set": bool(creds.get("zapi_client_token")),
         # Evolution API
         "evolution_api_url": creds.get("evolution_api_url"),
         "evolution_instance_name": creds.get("evolution_instance_name"),
@@ -263,7 +264,7 @@ async def patch_api_credentials(
 
     # Known credential fields
     known_fields = {
-        "whatsapp_provider", "zapi_instance_id", "zapi_token",
+        "whatsapp_provider", "zapi_instance_id", "zapi_token", "zapi_client_token",
         "evolution_api_url", "evolution_instance_name", "evolution_api_key",
         "llm_api_key", "llm_api_url", "llm_provider", "llm_model_name",
     }

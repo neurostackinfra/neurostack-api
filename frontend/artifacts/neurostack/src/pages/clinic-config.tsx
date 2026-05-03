@@ -144,6 +144,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   // Z-API fields
   const [zapiInstanceId, setZapiInstanceId] = useState("");
   const [zapiToken, setZapiToken]           = useState("");
+  const [zapiClientToken, setZapiClientToken] = useState("");
 
   // Evolution API fields
   const [evolApiUrl, setEvolApiUrl]           = useState("");
@@ -207,8 +208,9 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       // WhatsApp provider selection — always send to persist the chosen provider
       body["whatsapp_provider"] = waProvider;
       if (waProvider === "zapi") {
-        if (zapiInstanceId) body["zapi_instance_id"] = zapiInstanceId;
-        if (zapiToken)      body["zapi_token"]        = zapiToken;
+        if (zapiInstanceId)  body["zapi_instance_id"]  = zapiInstanceId;
+        if (zapiToken)       body["zapi_token"]        = zapiToken;
+        if (zapiClientToken) body["zapi_client_token"] = zapiClientToken;
       } else {
         if (evolApiUrl)      body["evolution_api_url"]      = evolApiUrl;
         if (evolInstanceName) body["evolution_instance_name"] = evolInstanceName;
@@ -367,11 +369,16 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         {/* Z-API fields */}
         {waProvider === "zapi" && (
           <div className="grid gap-3 sm:grid-cols-2">
-            <ApiInput label="Instance URL / ID" value={zapiInstanceId} onChange={setZapiInstanceId}
+            <ApiInput label="ID da Instância" value={zapiInstanceId} onChange={setZapiInstanceId}
               placeholder="3F13596C8ABCA2F740884AC8C214C6FF" disabled={isReadOnly} mono />
-            <ApiInput label="Client Token" value={zapiToken} onChange={setZapiToken} type="password"
+            <ApiInput label="Token da Instância" value={zapiToken} onChange={setZapiToken} type="password"
               placeholder={status?.zapi_token_set ? "••••••••• (manter atual)" : "Cole o token da instância"}
               disabled={isReadOnly} configured={status?.zapi_token_set} />
+            <div className="sm:col-span-2">
+              <ApiInput label="Client-Token (Segurança)" value={zapiClientToken} onChange={setZapiClientToken} type="password"
+                placeholder="Cole o Client-Token da aba Segurança do Z-API"
+                disabled={isReadOnly} />
+            </div>
           </div>
         )}
 
