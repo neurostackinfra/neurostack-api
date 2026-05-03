@@ -100,6 +100,10 @@ class BaseTemplate(ABC):
             "- Responda em NO MÁXIMO 2-3 frases curtas (máximo 40 palavras).\n"
             "- Faça APENAS UMA pergunta por mensagem. NUNCA duas ou mais.\n"
             "- Estilo WhatsApp: direto, acolhedor, sem parágrafos longos.\n"
+            "- NUNCA use parênteses com observações, dicas ou meta-comentários. Ex: '(Se você tiver...)' é PROIBIDO.\n"
+            "- NUNCA invente serviços que não estão no Clinic Config. Só mencione o que está listado em Serviços Oferecidos.\n"
+            "- NUNCA use listas com bullet points (*, -, 1.). Responda em texto corrido.\n"
+            "- NÃO se apresente novamente se já se apresentou antes (verifique o histórico).\n"
         )
 
     def build_system_message(self, variables: PromptVariables) -> PromptMessage:
