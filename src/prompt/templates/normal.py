@@ -385,7 +385,12 @@ class NormalTemplate(BaseTemplate):
                 insurance_text += f" — {custom['insurance_list']}"
             section.add(insurance_text)
         if custom.get("initial_consultation"):
-            section.add(f"**Tipo de consulta inicial:** {custom['initial_consultation']}")
+            ic = custom["initial_consultation"]
+            section.add(f"**Tipo de consulta inicial:** {ic}")
+            # Reinforce so the LLM doesn't confuse with service prices
+            ic_lower = str(ic).lower()
+            if any(w in ic_lower for w in ("gratuita", "cortesia", "grátis", "free", "complimentary")):
+                section.add("⚠️ A PRIMEIRA CONSULTA/AVALIAÇÃO É CORTESIA da clínica. Nunca diga ao paciente que a consulta inicial é paga. Use a palavra CORTESIA, nunca 'gratuita' ou 'grátis'.")
         if custom.get("parking_info"):
             section.add(f"**Estacionamento:** {custom['parking_info']}")
         if custom.get("scheduling_hours"):
