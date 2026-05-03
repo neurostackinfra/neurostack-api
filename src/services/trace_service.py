@@ -33,6 +33,15 @@ def _base_trace_query(tenant_id: UUID):
     )
 
 
+def _to_utc(dt: datetime) -> datetime:
+    """Convert naive datetime (assumed BRT / UTC-3) to UTC-aware."""
+    if dt.tzinfo is not None:
+        return dt
+    from datetime import timezone, timedelta
+    brt = timezone(timedelta(hours=-3))
+    return dt.replace(tzinfo=brt).astimezone(timezone.utc)
+
+
 def _apply_filters(
     query,
     start_date: Optional[datetime] = None,
@@ -42,12 +51,12 @@ def _apply_filters(
 ):
     """Apply optional filters to a trace query."""
     if start_date is not None:
-        query = query.where(Event.created_at >= start_date)
+        query = query.where(Event.created_at >= _to_utc(start_date))
     if end_date is not None:
         # When end_date arrives as "YYYY-MM-DD" (midnight), include the whole day
         if end_date.hour == 0 and end_date.minute == 0 and end_date.second == 0:
             end_date = end_date.replace(hour=23, minute=59, second=59)
-        query = query.where(Event.created_at <= end_date)
+        query = query.where(Event.created_at <= _to_utc(end_date))
     # Safety flag and handoff_required are stored in event_metadata
     # or associated srm.decision events. Filter via JSONB operators.
     if safety_flag is not None:
@@ -216,10 +225,14 @@ async def get_trace_stats(
     now = datetime.now(timezone.utc)
     if end_date is None:
         end_date = now
-    elif end_date.hour == 0 and end_date.minute == 0 and end_date.second == 0:
-        end_date = end_date.replace(hour=23, minute=59, second=59)
+    else:
+        if end_date.hour == 0 and end_date.minute == 0 and end_date.second == 0:
+            end_date = end_date.replace(hour=23, minute=59, second=59)
+        end_date = _to_utc(end_date)
     if start_date is None:
         start_date = now - timedelta(days=7)
+    else:
+        start_date = _to_utc(start_date)
 
     base = _base_trace_query(tenant_id)
     base = base.where(
