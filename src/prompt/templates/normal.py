@@ -387,10 +387,22 @@ class NormalTemplate(BaseTemplate):
         if custom.get("initial_consultation"):
             ic = custom["initial_consultation"]
             section.add(f"**Tipo de consulta inicial:** {ic}")
-            # Reinforce so the LLM doesn't confuse with service prices
             ic_lower = str(ic).lower()
             if any(w in ic_lower for w in ("gratuita", "cortesia", "grátis", "free", "complimentary")):
-                section.add("⚠️ A PRIMEIRA CONSULTA/AVALIAÇÃO É CORTESIA da clínica. Nunca diga ao paciente que a consulta inicial é paga. Use a palavra CORTESIA, nunca 'gratuita' ou 'grátis'.")
+                section.add(
+                    "⚠️ REGRA OBRIGATÓRIA SOBRE CONSULTA INICIAL:\n"
+                    "- A PRIMEIRA CONSULTA/AVALIAÇÃO É CORTESIA da clínica (o paciente NÃO paga).\n"
+                    "- Se existir um serviço 'Consulta' com preço na lista de serviços, esse preço se refere a consultas POSTERIORES (retornos ou consultas regulares), NÃO à primeira consulta.\n"
+                    "- Quando o paciente perguntar sobre a primeira consulta, diga: 'A primeira consulta é uma CORTESIA da clínica.' e se houver preço de consulta nos serviços, complemente: 'As consultas posteriores têm o valor de [preço].'\n"
+                    "- Use a palavra CORTESIA, nunca 'gratuita' ou 'grátis'.\n"
+                    "- NUNCA mencione o preço do serviço Consulta ao falar da primeira consulta."
+                )
+            else:
+                section.add(
+                    "⚠️ REGRA SOBRE CONSULTA INICIAL:\n"
+                    "- A consulta inicial É PAGA.\n"
+                    "- Se existir um serviço 'Consulta' com preço na lista de serviços, informe esse valor ao paciente quando perguntar sobre a primeira consulta."
+                )
         if custom.get("parking_info"):
             section.add(f"**Estacionamento:** {custom['parking_info']}")
         if custom.get("scheduling_hours"):
