@@ -303,6 +303,24 @@ class EventService:
                         cognitive.funnel_stage = result.state_patch["funnel_stage"]
                 session_row.set_cognitive_state(cognitive)
                 session_row.increment_message_count()
+
+                # Handoff engine: persist pause state from pipeline result
+                if result.should_pause:
+                    session_row.is_paused = True
+                    if result.paused_until:
+                        from datetime import datetime
+
+                        session_row.paused_until = datetime.fromisoformat(result.paused_until)
+                    else:
+                        session_row.paused_until = None
+                    logger.info(
+                        "session_pause_persisted",
+                        extra={
+                            "session_id": str(session_id),
+                            "paused_until": result.paused_until,
+                        },
+                    )
+
                 await db.flush()
         except Exception as exc:
             logger.error("Failed to persist session state to PG",
