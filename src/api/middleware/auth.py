@@ -410,6 +410,8 @@ class AuthMiddleware:
             return True
         if path.startswith("/metrics"):
             return True
+        if path.startswith("/v1/webhook/"):
+            return True
         return False
 
     def _get_client_ip(self, request: Request) -> str:
