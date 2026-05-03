@@ -524,6 +524,13 @@ class EventService:
         except Exception as exc:
             logger.error("LLM call failed", error=str(exc), exc_info=True)
 
+        # If handoff is required, prepend the handoff user message to the response
+        if result.handoff_required and result.handoff_user_message:
+            if suggested_response:
+                suggested_response = f"{suggested_response}\n\n{result.handoff_user_message}"
+            else:
+                suggested_response = result.handoff_user_message
+
         prompt = PromptOutput(
             system=result.system_prompt,
             instructions=result.instructions,
