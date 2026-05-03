@@ -26,6 +26,8 @@ from src.api.schemas.events import (
 
 from src.memory import EventData, get_event_store
 from src.repositories import EventRepository
+from src.repositories.session import SessionRepository
+from src.models.session import CognitiveStateData
 from src.core.exceptions import EventStoreError
 from src.config.logging import get_logger
 
@@ -255,6 +257,106 @@ class EventService:
             logger.warning("Failed to load clinic config", error=str(exc))
         return None
 
+    async def _load_session_state(
+        self, session_id: UUID, db: Optional[AsyncSession],
+    ) -> CognitiveStateData:
+        """Load cognitive state from PG Session, fallback to default."""
+        if db:
+            try:
+                repo = SessionRepository(db)
+                session_row = await repo.get_by_id(session_id)
+                if session_row and session_row.cognitive_state:
+                    state = session_row.get_cognitive_state()
+                    logger.info("session_state_loaded",
+                        state_source="pg", session_id=str(session_id),
+                        turn_count=state.turn_count, funnel_stage=state.funnel_stage)
+                    return state
+            except Exception as exc:
+                logger.warning("Failed to load session state from PG",
+                    session_id=str(session_id), error=str(exc))
+        logger.info("session_state_loaded",
+            state_source="default", session_id=str(session_id), turn_count=0)
+        return CognitiveStateData()
+
+    async def _persist_session_state(
+        self, session_id: UUID, result: "PipelineResult", db: Optional[AsyncSession],
+    ) -> None:
+        """Persist pipeline result back to PG Session cognitive_state."""
+        if not db:
+            return
+        try:
+            repo = SessionRepository(db)
+            session_row = await repo.get_by_id(session_id)
+            if session_row:
+                cognitive = session_row.get_cognitive_state()
+                cognitive.add_intent(result.intent)
+                cognitive.funnel_stage = result.funnel_stage
+                cognitive.sentiment_label = result.sentiment_label
+                cognitive.sentiment_score = result.sentiment_score
+                # Merge slots and flags from state_patch
+                if result.state_patch:
+                    for k, v in result.state_patch.get("slots", {}).items():
+                        cognitive.update_slot(k, v)
+                    for k, v in result.state_patch.get("flags", {}).items():
+                        cognitive.set_flag(k, v)
+                    if result.state_patch.get("funnel_stage"):
+                        cognitive.funnel_stage = result.state_patch["funnel_stage"]
+                session_row.set_cognitive_state(cognitive)
+                session_row.increment_message_count()
+                await db.flush()
+        except Exception as exc:
+            logger.error("Failed to persist session state to PG",
+                session_id=str(session_id), error=str(exc))
+
+    async def _load_message_history(
+        self, tenant_id: UUID, session_id: UUID, db: Optional[AsyncSession], limit: int = 20,
+    ) -> list[dict[str, str]]:
+        """Reconstruct conversation history from Event Store for multi-turn LLM context."""
+        if not db:
+            return []
+        try:
+            from sqlalchemy import select, or_
+            from src.models.event import Event as EventModel
+            stmt = (
+                select(EventModel)
+                .where(
+                    EventModel.session_id == session_id,
+                    EventModel.tenant_id == tenant_id,
+                    or_(
+                        EventModel.event_type == "message.in",
+                        EventModel.event_type == "prompt.generated",
+                    ),
+                )
+                .order_by(EventModel.created_at.desc())
+                .limit(limit)
+            )
+            result = await db.execute(stmt)
+            events = list(result.scalars().all())
+            events.reverse()  # Chronological order
+
+            total_available = len(events)
+            history: list[dict[str, str]] = []
+            for e in events:
+                data = e.event_data or {}
+                if e.event_type == "message.in":
+                    content = data.get("content", "")
+                    if content:
+                        history.append({"role": "user", "content": content})
+                elif e.event_type == "prompt.generated":
+                    resp = data.get("suggested_response", "")
+                    if resp:
+                        history.append({"role": "assistant", "content": resp})
+
+            if total_available >= limit:
+                logger.info("history_truncated",
+                    history_truncated=True, session_id=str(session_id),
+                    messages_available=total_available, messages_sent=len(history))
+            return history
+        except Exception as exc:
+            logger.warning("Failed to load message history",
+                session_id=str(session_id), error=str(exc))
+            return []
+
     async def process_event(
         self,
         request: EventRequest,
@@ -273,8 +375,14 @@ class EventService:
         # Load clinic config for the tenant (provides identity, services, pricing)
         clinic_config = await self._load_clinic_config(request.tenant_id)
 
-        # Build pipeline input
-        # TODO: In production, load session state from StateStore (Redis)
+        # Load session state from PG
+        state = await self._load_session_state(request.session_id, session)
+
+        # Load message history from Event Store
+        message_history = await self._load_message_history(
+            request.tenant_id, request.session_id, session)
+
+        # Build pipeline input with loaded state
         from src.core.pipeline import PipelineInput
 
         pipeline_input = PipelineInput(
@@ -283,25 +391,27 @@ class EventService:
             message=request.payload.content,
             channel=request.payload.channel,
             user_id=request.payload.user_id,
-            # Session context would come from StateStore
-            current_funnel_stage="lead_novo",
-            turn_count=0,
-            intent_history=[],
-            slots={},
-            flags={},
-            message_history=[],
+            current_funnel_stage=state.funnel_stage,
+            turn_count=state.turn_count,
+            intent_history=state.intent_history,
+            slots=state.slots,
+            flags=state.flags,
+            message_history=message_history,
             clinic_config=clinic_config,
         )
 
         # Process through the complete pipeline
         from src.core.pipeline import PipelineResult
-        
+
         result: PipelineResult = await self._pipeline.process(pipeline_input)
 
-        # Convert pipeline result to API response (pass user message for LLM)
+        # Persist state back to PG
+        await self._persist_session_state(request.session_id, result, session)
+
+        # Convert pipeline result to API response (pass user message + history for LLM)
         response, llm_usage, llm_model = await self._convert_pipeline_result_to_response(
             result, user_message=request.payload.content, clinic_config=clinic_config,
-            tenant_id=request.tenant_id,
+            tenant_id=request.tenant_id, message_history=message_history,
         )
 
         # Save events to Event Store (non-blocking)
@@ -320,6 +430,7 @@ class EventService:
     async def _convert_pipeline_result_to_response(
         self, result: "PipelineResult", user_message: str = "",
         clinic_config: Optional[dict] = None, tenant_id: Optional[UUID] = None,
+        message_history: Optional[list[dict[str, str]]] = None,
     ) -> tuple[EventResponse, dict, str]:
         """
         Convert pipeline result to API response.
@@ -367,10 +478,11 @@ class EventService:
             tenant_model = api_creds.get("llm_model_name") or None
             if llm and user_message:
                 sys_prompt = result.system_prompt or ""
-                messages = [
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": user_message},
-                ]
+                messages = [{"role": "system", "content": sys_prompt}]
+                # Insert conversation history for multi-turn context
+                for msg in (message_history or []):
+                    messages.append(msg)
+                messages.append({"role": "user", "content": user_message})
                 for attempt in range(2):
                     logger.info("Calling LLM",
                         attempt=attempt + 1,
@@ -594,6 +706,11 @@ class EventService:
                     "instructions": result.instructions,
                     "constraints": result.constraints,
                     "context_summary": result.context_summary,
+                    "context_sources": _filter_relevant_sources(
+                        result.context_sources or [],
+                        request.payload.content,
+                        suggested_response,
+                    ),
                     "mode": result.mode,
                     "intent": result.intent,
                     "funnel_stage": result.funnel_stage,

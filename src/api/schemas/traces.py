@@ -174,6 +174,10 @@ class TraceDetailResponse(TraceItem):
         default=None,
         description="LLM-generated suggested response",
     )
+    selected_context: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Context sources used in prompt generation (config fields, RAG docs)",
+    )
 
 
 class TraceStatsResponse(BaseModel):
