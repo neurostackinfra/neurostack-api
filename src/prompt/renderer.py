@@ -112,6 +112,11 @@ class PromptRenderer:
             f"Rendered prompt: mode={config.mode.value}, "
             f"messages={len(messages)}, tokens≈{total_tokens}"
         )
+        # Temporary: log system prompt for debugging greeting issue
+        if messages and messages[0].role == MessageRole.SYSTEM:
+            sys_content = messages[0].content
+            if "Saudação" in sys_content or "saudacao" in sys_content.lower():
+                logger.warning(f"[GREETING_DEBUG] System prompt excerpt (last 500 chars): ...{sys_content[-500:]}")
 
         return GeneratedPrompt(
             messages=messages,
