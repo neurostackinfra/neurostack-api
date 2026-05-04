@@ -19,35 +19,104 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { useToast } from "@/hooks/use-toast";
 // ── Investor demo: static mock conversations ──
 
-const MOCK_CONVERSATIONS = [
+interface MockTrace {
+  intent: string;
+  stage: string;
+  confidence: number;
+  processingMs: number;
+  gate?: string;
+  context: { title: string; content: string; source: string }[];
+  llmResponse: string;
+}
+
+interface MockMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  trace?: MockTrace;
+}
+
+const MOCK_CONVERSATIONS: { id: string; label: string; messages: MockMessage[] }[] = [
   {
     id: "mock-conv-1",
-    label: "Consulta de Preço — Botox",
+    label: "Consulta de Preço — Facetas",
     messages: [
-      { id: "m1", role: "user" as const, content: "Olá, boa tarde! Quanto custa a aplicação de botox na testa?" },
-      { id: "m2", role: "assistant" as const, content: "Olá! Que bom que você se interessou pelo nosso tratamento de toxina botulínica! 😊\n\nAntes de falar sobre valores, deixa eu compartilhar: aqui na clínica, o procedimento é realizado pela Dra. Ana Lima, dermatologista com mais de 12 anos de experiência e mais de 500 aplicações bem-sucedidas.\n\nO investimento para a região da testa é a partir de R$ 1.200, com avaliação personalizada inclusa. Posso agendar uma consulta de avaliação para você?" },
-      { id: "m3", role: "user" as const, content: "Parece bom! Quais horários tem disponível?" },
-      { id: "m4", role: "assistant" as const, content: "Fico feliz com o seu interesse! 😊\n\nTemos disponibilidade esta semana:\n• Quarta-feira: 14h ou 16h\n• Quinta-feira: 10h ou 15h\n• Sexta-feira: 9h ou 11h\n\nQual horário funciona melhor para você? A consulta de avaliação é cortesia e dura cerca de 30 minutos." },
+      { id: "m1", role: "user", content: "Oi! Tenho interesse em fazer facetas de porcelana. Qual é o valor?" },
+      {
+        id: "m2", role: "assistant",
+        content: "Olá! Que ótima escolha. As facetas de porcelana são o padrão ouro para transformação de sorriso, com resultados naturais e duradouros. Para te oferecer um orçamento preciso, o ideal é uma avaliação personalizada com nosso especialista. Posso agendar para você?",
+        trace: {
+          intent: "Price Inquiry",
+          stage: "authority",
+          confidence: 96.0,
+          processingMs: 287,
+          gate: "Gate: Authority Before Price",
+          context: [
+            { title: "tempo médio de tratamento facetas", content: "tempo médio de tratamento facetas", source: "RAG" },
+            { title: "diferenciais do serviço", content: "diferenciais do serviço", source: "CLINIC_CONFIG" },
+          ],
+          llmResponse: "Olá! Que ótima escolha. As facetas de porcelana são o padrão ouro para transformação de sorriso, com resultados naturais e duradouros. Para te oferecer um orçamento preciso, o ideal é uma avaliação personalizada com nosso especialista. Posso agendar para você?",
+        },
+      },
+      { id: "m3", role: "user", content: "Mas me dá uma ideia de valor antes. E quanto tempo leva o tratamento?" },
+      {
+        id: "m4", role: "assistant",
+        content: "O investimento varia conforme o número de facetas e o caso clínico, mas costuma ficar entre 6 consultas ao longo de 4 a 6 semanas. Nossa clínica trabalha com porcelana de altíssima qualidade importada, com garantia de 10 anos. Para valores exatos e um plano personalizado, agende sua consulta inicial aqui mesmo, no momento está sem custos!",
+        trace: {
+          intent: "Price Inquiry",
+          stage: "consideration",
+          confidence: 94.0,
+          processingMs: 312,
+          context: [
+            { title: "tempo médio de tratamento facetas", content: "tempo médio de tratamento facetas", source: "RAG" },
+            { title: "diferenciais do serviço", content: "diferenciais do serviço", source: "CLINIC_CONFIG" },
+          ],
+          llmResponse: "O investimento varia conforme o número de facetas e o caso clínico, mas costuma ficar entre 6 consultas ao longo de 4 a 6 semanas. Nossa clínica trabalha com porcelana de altíssima qualidade importada, com garantia de 10 anos. Para valores exatos e um plano personalizado, agende sua consulta inicial aqui mesmo, no momento está sem custos!",
+        },
+      },
     ],
   },
   {
     id: "mock-conv-2",
     label: "Pós-Procedimento — Dúvida",
     messages: [
-      { id: "m5", role: "user" as const, content: "Fiz um preenchimento labial ontem e estou com um inchaço. É normal?" },
-      { id: "m6", role: "assistant" as const, content: "Entendo sua preocupação! O inchaço nas primeiras 48-72 horas após o preenchimento labial é completamente normal e esperado. 😊\n\nAlgumas orientações importantes:\n• Aplique compressas frias por 10 minutos a cada hora\n• Evite exercícios físicos intensos por 24-48h\n• Não manipule a região com as mãos\n• Beba bastante água\n\nO resultado final aparece em 7-14 dias, quando o inchaço reduz completamente. Se notar assimetria acentuada, dor intensa ou manchas roxas que aumentam, entre em contato conosco imediatamente." },
-      { id: "m7", role: "user" as const, content: "Ok, obrigada! E posso usar maquiagem?" },
-      { id: "m8", role: "assistant" as const, content: "De nada! 😊 Sobre maquiagem: o ideal é aguardar pelo menos 12 horas após o procedimento para aplicar qualquer produto na região.\n\nDepois desse período, pode usar maquiagem normalmente, mas prefira produtos hipoalergênicos e evite pressionar muito a área durante a aplicação.\n\nSe tiver mais alguma dúvida sobre os cuidados pós-procedimento, estou aqui para ajudar!" },
+      { id: "m5", role: "user", content: "Fiz um preenchimento labial ontem e estou com um inchaço. É normal?" },
+      {
+        id: "m6", role: "assistant",
+        content: "Entendo sua preocupação! O inchaço nas primeiras 48-72 horas após o preenchimento labial é completamente normal e esperado.\n\nAlgumas orientações importantes:\n• Aplique compressas frias por 10 minutos a cada hora\n• Evite exercícios físicos intensos por 24-48h\n• Não manipule a região com as mãos\n• Beba bastante água\n\nO resultado final aparece em 7-14 dias, quando o inchaço reduz completamente.",
+        trace: {
+          intent: "Post-Procedure",
+          stage: "retention",
+          confidence: 98.0,
+          processingMs: 195,
+          context: [
+            { title: "cuidados pós preenchimento", content: "cuidados pós preenchimento labial", source: "RAG" },
+          ],
+          llmResponse: "Entendo sua preocupação! O inchaço nas primeiras 48-72 horas após o preenchimento labial é completamente normal e esperado...",
+        },
+      },
     ],
   },
   {
     id: "mock-conv-3",
     label: "Agendamento — Limpeza de Pele",
     messages: [
-      { id: "m9", role: "user" as const, content: "Oi! Gostaria de agendar uma limpeza de pele profunda." },
-      { id: "m10", role: "assistant" as const, content: "Olá! Será um prazer agendar para você! 😊\n\nNossa limpeza de pele profunda é realizada por esteticistas especializadas e inclui: extração, peeling enzimático, máscara calmante e proteção solar.\n\nTemos disponibilidade:\n• Segunda: 14h\n• Terça: 10h ou 16h\n• Quarta: 9h\n\nQual dia e horário prefere?" },
-      { id: "m11", role: "user" as const, content: "Terça às 10h está ótimo!" },
-      { id: "m12", role: "assistant" as const, content: "Perfeito! Agendei sua limpeza de pele profunda para terça-feira às 10h. ✅\n\nAlgumas orientações para o dia:\n• Venha sem maquiagem, se possível\n• Evite exposição solar intensa 48h antes\n• O procedimento dura cerca de 1h30\n\nEndereço: Rua das Flores, 123 — Sala 45 — Jardim Paulista\n🅿️ Estacionamento conveniado no Shopping ao lado.\n\nTe aguardamos! Se precisar reagendar, é só me avisar." },
+      { id: "m9", role: "user", content: "Oi! Gostaria de agendar uma limpeza de pele profunda." },
+      {
+        id: "m10", role: "assistant",
+        content: "Olá! Será um prazer agendar para você!\n\nNossa limpeza de pele profunda é realizada por esteticistas especializadas e inclui: extração, peeling enzimático, máscara calmante e proteção solar.\n\nTemos disponibilidade:\n• Segunda: 14h\n• Terça: 10h ou 16h\n• Quarta: 9h\n\nQual dia e horário prefere?",
+        trace: {
+          intent: "Scheduling Request",
+          stage: "consideration",
+          confidence: 97.0,
+          processingMs: 224,
+          context: [
+            { title: "serviços disponíveis", content: "limpeza de pele profunda", source: "CLINIC_CONFIG" },
+            { title: "horários disponíveis", content: "agenda da semana", source: "CLINIC_CONFIG" },
+          ],
+          llmResponse: "Olá! Será um prazer agendar para você!\n\nNossa limpeza de pele profunda é realizada por esteticistas especializadas...",
+        },
+      },
     ],
   },
 ];
@@ -324,7 +393,14 @@ function FeedbackBlock({ msg, sessionId, userMessage = "", defaultPhase = "idle"
 function InvestorMockChat() {
   const { toast } = useToast();
   const [activeConv, setActiveConv] = useState(0);
+  const [activeTrace, setActiveTrace] = useState<MockTrace | null>(null);
   const conv = MOCK_CONVERSATIONS[activeConv];
+
+  // Auto-select first assistant trace when switching conversations
+  useEffect(() => {
+    const firstAssistant = conv.messages.find(m => m.role === "assistant" && m.trace);
+    setActiveTrace(firstAssistant?.trace ?? null);
+  }, [activeConv]);
 
   const handleFeedback = () => {
     toast({ title: "Feedback registrado!", description: "Obrigado pelo feedback. A sugestão será analisada pela equipe." });
@@ -339,9 +415,9 @@ function InvestorMockChat() {
             <div>
               <h2 className="font-semibold text-foreground uppercase tracking-wider text-sm flex items-center gap-2">
                 <Bot className="h-4 w-4 text-accent" />
-                Chat Simulator — Demo
+                SIMULADOR DE CHAT
               </h2>
-              <p className="text-xs text-muted-foreground mt-1">Conversas estáticas pré-definidas</p>
+              <p className="text-xs text-muted-foreground mt-1">Teste o agente de IA clínico. As respostas geram traces em tempo real.</p>
             </div>
           </div>
           <div className="flex gap-2">
@@ -363,43 +439,60 @@ function InvestorMockChat() {
 
         <ScrollArea className="flex-1 p-4">
           <div className="space-y-5 pb-4">
-            {conv.messages.map((msg) => (
-              <div
-                key={msg.id}
-                className={`flex gap-3 ${msg.role === "user" ? "justify-end" : "justify-start"}`}
-              >
-                {msg.role === "assistant" && (
-                  <div className="h-8 w-8 rounded-full bg-accent/10 flex items-center justify-center shrink-0 mt-0.5">
-                    <Bot className="h-4 w-4 text-accent" />
-                  </div>
-                )}
-                {msg.role === "assistant" ? (
-                  <div className="max-w-[82%] flex flex-col">
-                    <div className="rounded-lg px-4 py-3 text-sm bg-muted border border-border text-foreground whitespace-pre-line">
+            {conv.messages.map((msg, idx) => {
+              const isFirstAssistant = msg.role === "assistant" && !conv.messages.slice(0, idx).some(m => m.role === "assistant");
+              return (
+                <div
+                  key={msg.id}
+                  className={`flex gap-3 ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+                >
+                  {msg.role === "assistant" && (
+                    <div className="h-8 w-8 rounded-full bg-accent/10 flex items-center justify-center shrink-0 mt-0.5">
+                      <Bot className="h-4 w-4 text-accent" />
+                    </div>
+                  )}
+                  {msg.role === "assistant" ? (
+                    <div className="max-w-[82%] flex flex-col">
+                      <div
+                        className={`rounded-lg px-4 py-3 text-sm bg-muted border text-foreground whitespace-pre-line cursor-pointer transition-colors ${
+                          activeTrace === msg.trace ? "border-accent" : "border-border hover:border-accent/50"
+                        }`}
+                        onClick={() => msg.trace && setActiveTrace(msg.trace)}
+                      >
+                        {msg.content}
+                      </div>
+                      <div className="mt-1.5 ml-1 flex flex-col gap-0.5">
+                        {isFirstAssistant && (
+                          <div className="flex items-center gap-1 text-red-500 text-[11px] font-bold animate-bounce mb-0.5">
+                            <ArrowDown className="h-3 w-3" />
+                            <span>clique aqui</span>
+                          </div>
+                        )}
+                        <button
+                          onClick={handleFeedback}
+                          className={`inline-flex items-center gap-1.5 text-[11px] font-medium transition-colors ${
+                            isFirstAssistant ? "text-red-500 hover:text-red-400 font-bold" : "text-muted-foreground hover:text-violet-400"
+                          }`}
+                        >
+                          <Lightbulb className="h-3 w-3" />
+                          Corrigir / Enviar Feedback
+                        </button>
+                        <p className="text-[10px] text-muted-foreground/60 italic">(Apenas demonstração — feature em breve)</p>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="max-w-[80%] rounded-lg px-4 py-3 text-sm bg-primary text-primary-foreground">
                       {msg.content}
                     </div>
-                    <div className="mt-1.5 ml-1">
-                      <button
-                        onClick={handleFeedback}
-                        className="inline-flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground hover:text-violet-400 transition-colors"
-                      >
-                        <Lightbulb className="h-3 w-3" />
-                        Corrigir / Enviar Feedback
-                      </button>
+                  )}
+                  {msg.role === "user" && (
+                    <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center shrink-0 mt-0.5">
+                      <User className="h-4 w-4 text-primary" />
                     </div>
-                  </div>
-                ) : (
-                  <div className="max-w-[80%] rounded-lg px-4 py-3 text-sm bg-primary text-primary-foreground">
-                    {msg.content}
-                  </div>
-                )}
-                {msg.role === "user" && (
-                  <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center shrink-0 mt-0.5">
-                    <User className="h-4 w-4 text-primary" />
-                  </div>
-                )}
-              </div>
-            ))}
+                  )}
+                </div>
+              );
+            })}
           </div>
         </ScrollArea>
 
@@ -419,18 +512,96 @@ function InvestorMockChat() {
 
       {/* Trace Viewer Panel */}
       <div className="flex-[1.2] flex flex-col min-h-[400px] border border-border rounded-lg bg-card overflow-hidden shadow-sm">
-        <div className="bg-slate-50 border-b border-border p-4 shrink-0">
-          <h2 className="font-semibold text-foreground uppercase tracking-wider text-sm">
-            Decision Trace — Real-time
-          </h2>
-          <p className="text-xs text-muted-foreground mt-1">Pipeline de decisão em tempo real</p>
-        </div>
-        <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground p-8 space-y-4">
-          <div className="w-16 h-16 border-2 border-dashed border-muted-foreground/30 rounded-full flex items-center justify-center">
-            <Activity className="h-6 w-6 text-muted-foreground/50" />
+        <div className="bg-slate-50 border-b border-border p-4 shrink-0 flex justify-between items-center">
+          <div>
+            <h2 className="font-semibold text-foreground uppercase tracking-wider text-sm">
+              TRACE DE DECISÃO AO VIVO
+            </h2>
+            <p className="text-xs text-muted-foreground mt-1">Visão diagnóstica do último ciclo de raciocínio.</p>
           </div>
-          <p className="text-sm text-center">Clique em uma mensagem da IA para ver o trace de decisão</p>
+          <div className="text-xs font-mono text-muted-foreground bg-muted px-2 py-1 rounded">
+            ID: demo-001...
+          </div>
         </div>
+        <ScrollArea className="flex-1">
+          <div className="p-4 space-y-4">
+            {activeTrace ? (
+              <>
+                {/* SRM Decision */}
+                <div className="border border-border rounded-lg p-5 space-y-4">
+                  <h3 className="font-semibold text-foreground text-sm flex items-center gap-2">
+                    <Activity className="h-4 w-4" />
+                    SRM DECISION
+                  </h3>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1">Intent</p>
+                      <span className="inline-block bg-blue-600 text-white text-xs font-medium px-3 py-1 rounded-md">
+                        {activeTrace.intent}
+                      </span>
+                    </div>
+                    <div>
+                      <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1">Stage</p>
+                      <p className="text-sm text-foreground">{activeTrace.stage}</p>
+                    </div>
+                    <div>
+                      <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1">Confidence</p>
+                      <p className="text-sm text-foreground font-medium">{activeTrace.confidence.toFixed(1)}%</p>
+                    </div>
+                    <div>
+                      <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1">Processing</p>
+                      <p className="text-sm text-foreground font-medium">{activeTrace.processingMs}ms</p>
+                    </div>
+                  </div>
+                  {activeTrace.gate && (
+                    <div className="pt-1">
+                      <span className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 bg-blue-50 border border-blue-200 rounded-full px-3 py-1">
+                        🔑 {activeTrace.gate}
+                      </span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Selected Context */}
+                <div className="border border-border rounded-lg p-5 space-y-3">
+                  <h3 className="font-semibold text-foreground text-sm uppercase tracking-wider">
+                    SELECTED CONTEXT
+                  </h3>
+                  <div className="space-y-3">
+                    {activeTrace.context.map((ctx, i) => (
+                      <div key={i} className="bg-slate-50 rounded-lg p-4 border border-border">
+                        <div className="flex items-center justify-between mb-1">
+                          <p className="text-sm font-medium text-blue-500">{ctx.title}</p>
+                          <span className="text-[10px] font-mono text-muted-foreground bg-muted px-2 py-0.5 rounded border border-border">
+                            {ctx.source}
+                          </span>
+                        </div>
+                        <p className="text-sm text-foreground">{ctx.content}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* LLM Response */}
+                <div className="border border-border rounded-lg p-5 space-y-3">
+                  <h3 className="font-semibold text-foreground text-sm uppercase tracking-wider">
+                    LLM RESPONSE
+                  </h3>
+                  <div className="bg-slate-900 text-slate-100 rounded-lg p-4 text-sm whitespace-pre-line font-mono leading-relaxed">
+                    {activeTrace.llmResponse}
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="h-full flex flex-col items-center justify-center text-muted-foreground pt-24 space-y-4">
+                <div className="w-16 h-16 border-2 border-dashed border-muted-foreground/30 rounded-full flex items-center justify-center">
+                  <Activity className="h-6 w-6 text-muted-foreground/50" />
+                </div>
+                <p className="text-sm text-center">Clique em uma mensagem da IA para ver o trace de decisão</p>
+              </div>
+            )}
+          </div>
+        </ScrollArea>
       </div>
     </div>
   );
@@ -439,7 +610,8 @@ function InvestorMockChat() {
 export default function Chat() {
   const { clinicId: activeClinicId, tenantId, userId, isInvestor, isReadOnly, isBuilder, viewingClinicId } = useAuth();
 
-  const effectiveTenantId = (isBuilder || isInvestor) ? viewingClinicId : tenantId;
+  if (isInvestor) return <InvestorMockChat />;
+  const effectiveTenantId = isBuilder ? viewingClinicId : tenantId;
   const { t } = useI18n();
   const { toast } = useToast();
 
@@ -637,8 +809,6 @@ export default function Chat() {
               messages.map((msg, idx) => {
                 // For the demo last message, pre-open RLHF block with seed text
                 const isDemoPreOpened = false;
-                // Show arrow on first assistant message for investors
-                const isFirstAssistant = isInvestor && msg.role === "assistant" && !messages.slice(0, idx).some(m => m.role === "assistant");
                 // Find the user message this assistant response is replying to
                 const prevUserMsg = msg.role === "assistant" && idx > 0 && messages[idx - 1].role === "user"
                   ? messages[idx - 1].content : "";
@@ -669,12 +839,9 @@ export default function Chat() {
                           userMessage={prevUserMsg}
                           defaultPhase={isDemoPreOpened ? "input" : "idle"}
                           defaultText=""
-                          isReadOnly={isReadOnly || isInvestor}
-                          showArrow={isFirstAssistant}
+                          isReadOnly={isReadOnly}
+                          showArrow={false}
                         />
-                        {isInvestor && (
-                          <p className="text-[10px] text-muted-foreground/60 italic ml-1 mt-0.5">(Apenas demonstração — feature em breve)</p>
-                        )}
                       </div>
                     ) : (
                       <div className="max-w-[80%] rounded-lg px-4 py-3 text-sm bg-primary text-primary-foreground">
