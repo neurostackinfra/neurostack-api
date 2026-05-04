@@ -82,6 +82,16 @@ class UpdateBuilderRequest(BaseModel):
 
     name: Optional[str] = Field(default=None, max_length=255)
     status: Optional[str] = Field(default=None, pattern=r"^(active|inactive|suspended)$")
+    email: Optional[EmailStr] = None
+    password: Optional[str] = Field(default=None, min_length=6)
+
+
+class UpdateClinicRequest(BaseModel):
+    """Request body for updating a clinic (tenant + user credentials)."""
+
+    clinic_name: Optional[str] = Field(default=None, max_length=255)
+    email: Optional[EmailStr] = None
+    password: Optional[str] = Field(default=None, min_length=6)
 
 
 class BuilderClinicResponse(BaseModel):
@@ -89,6 +99,7 @@ class BuilderClinicResponse(BaseModel):
 
     clinic_id: UUID
     clinic_name: str
+    admin_email: Optional[str] = None
     slug: Optional[str] = None
     status: str = "active"
     plan_type: str = "pilot"
@@ -105,6 +116,7 @@ class BuilderWithClinicsResponse(BaseModel):
 
     id: UUID
     name: str
+    admin_email: Optional[str] = None
     status: str
     created_at: datetime
     clinics: list[BuilderClinicResponse] = Field(default_factory=list)

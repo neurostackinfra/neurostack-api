@@ -34,6 +34,7 @@ from src.api.schemas.admin import (
     CreateBuilderRequest,
     CreateClinicRequest,
     UpdateBuilderRequest,
+    UpdateClinicRequest,
 )
 from src.models.builder import Builder
 from src.models.clinic_config_table import ClinicConfigTable
@@ -299,6 +300,50 @@ async def toggle_clinic_status(
     return {"ok": True}
 
 
+@router.patch(
+    "/clinics/{clinic_id}",
+    summary="Update Clinic",
+    description="Update clinic name, admin email, and/or password. Super admin only.",
+)
+async def update_clinic(
+    clinic_id: str,
+    body: UpdateClinicRequest,
+    tenant: TenantContext = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
+):
+    from uuid import UUID as _UUID
+
+    try:
+        cid = _UUID(clinic_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid clinic ID")
+
+    result = await session.execute(select(Tenant).where(Tenant.id == cid))
+    t = result.scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Clinic not found")
+
+    if body.clinic_name is not None:
+        t.name = body.clinic_name
+
+    if body.email is not None or body.password is not None:
+        user_result = await session.execute(
+            select(User).where(User.tenant_id == cid, User.role == UserRole.clinic_admin)
+        )
+        user = user_result.scalar_one_or_none()
+        if user:
+            if body.email is not None and body.email != user.email:
+                existing = await session.execute(select(User).where(User.email == body.email))
+                if existing.scalar_one_or_none():
+                    raise HTTPException(status_code=409, detail=f"O email {body.email} já está em uso.")
+                user.email = body.email
+            if body.password is not None:
+                user.password_hash = pwd_context.hash(body.password)
+
+    await session.commit()
+    return {"ok": True}
+
+
 @router.get(
     "/stats",
     summary="Admin Dashboard Stats",
@@ -539,6 +584,27 @@ async def list_builders(
             row.tenant_id: row.last_trace_at for row in last_trace_result
         }
 
+    # Load admin emails: builder users + clinic admin users
+    all_relevant_tenant_ids = tenant_ids + [
+        u_tid for u_tid in []  # placeholder
+    ]
+    # Builder user emails (keyed by builder_id)
+    builder_user_stmt = select(User.builder_id, User.email).where(
+        User.builder_id.in_(builder_ids), User.role == UserRole.builder
+    )
+    builder_user_result = await session.execute(builder_user_stmt)
+    builder_email_map = {row[0]: row[1] for row in builder_user_result.all()}
+
+    # Clinic admin emails (keyed by tenant_id)
+    if tenant_ids:
+        clinic_user_stmt = select(User.tenant_id, User.email).where(
+            User.tenant_id.in_(tenant_ids), User.role == UserRole.clinic_admin
+        )
+        clinic_user_result = await session.execute(clinic_user_stmt)
+        clinic_email_map = {row[0]: row[1] for row in clinic_user_result.all()}
+    else:
+        clinic_email_map = {}
+
     output = []
     for b in builders:
         clinics = []
@@ -553,6 +619,7 @@ async def list_builders(
                 BuilderClinicResponse(
                     clinic_id=t.id,
                     clinic_name=t.name,
+                    admin_email=clinic_email_map.get(t.id),
                     slug=t.slug,
                     status="active" if t.is_active else "inactive",
                     plan_type=t.plan_type,
@@ -567,6 +634,7 @@ async def list_builders(
             BuilderWithClinicsResponse(
                 id=b.id,
                 name=b.name,
+                admin_email=builder_email_map.get(b.id),
                 status=b.status,
                 created_at=b.created_at,
                 clinics=clinics,
@@ -662,6 +730,22 @@ async def update_builder(
         builder.name = body.name
     if body.status is not None:
         builder.status = body.status
+
+    # Update builder user email/password
+    if body.email is not None or body.password is not None:
+        user_result = await session.execute(
+            select(User).where(User.builder_id == bid, User.role == UserRole.builder)
+        )
+        user = user_result.scalar_one_or_none()
+        if user:
+            if body.email is not None and body.email != user.email:
+                # Check email uniqueness
+                existing = await session.execute(select(User).where(User.email == body.email))
+                if existing.scalar_one_or_none():
+                    raise HTTPException(status_code=409, detail=f"O email {body.email} já está em uso.")
+                user.email = body.email
+            if body.password is not None:
+                user.password_hash = pwd_context.hash(body.password)
 
     await session.commit()
     return {"ok": True}
