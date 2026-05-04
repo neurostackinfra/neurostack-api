@@ -501,6 +501,12 @@ class EventService:
                 for msg in (message_history or []):
                     messages.append(msg)
                 messages.append({"role": "user", "content": user_message})
+                # Reinforce greeting for saudacao intent — LLM tends to echo patient's wrong greeting
+                if result.state_patch.get("last_intent") == "saudacao":
+                    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+                    _h = _dt.now(_tz(_td(hours=-3))).hour
+                    _g = "Bom dia" if _h < 12 else ("Boa tarde" if _h < 18 else "Boa noite")
+                    messages.append({"role": "system", "content": f'LEMBRETE: Agora são {_dt.now(_tz(_td(hours=-3))).strftime("%H:%M")} BRT. Comece sua resposta com "{_g}!" — NÃO use outra saudação.'})
                 for attempt in range(2):
                     logger.info("Calling LLM",
                         attempt=attempt + 1,
