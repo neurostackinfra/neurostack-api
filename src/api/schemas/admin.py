@@ -48,7 +48,7 @@ class CreateClinicRequest(BaseModel):
     clinic_name: str = Field(..., min_length=1, max_length=255)
     admin_email: EmailStr
     admin_password: str = Field(..., min_length=6)
-    plan_type: str = Field(default="pilot", pattern=r"^(pilot|demo|admin)$")
+    plan_type: str = Field(default="clinic", pattern=r"^(clinic|pilot|demo|admin)$")
     builder_id: Optional[UUID] = None
 
 

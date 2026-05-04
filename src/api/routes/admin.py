@@ -362,7 +362,7 @@ async def admin_stats(
     pilot_result = await session.execute(
         select(func.count(Tenant.id)).where(
             Tenant.is_active.is_(True),
-            Tenant.plan_type == "pilot",
+            Tenant.plan_type.in_(["pilot", "clinic"]),
         )
     )
     active_pilots = pilot_result.scalar() or 0
@@ -419,7 +419,7 @@ async def admin_dashboard(
     pilot_result = await session.execute(
         select(func.count(Tenant.id)).where(
             Tenant.is_active.is_(True),
-            Tenant.plan_type == "pilot",
+            Tenant.plan_type.in_(["pilot", "clinic"]),
         )
     )
     active_pilots = pilot_result.scalar() or 0
@@ -839,7 +839,7 @@ async def create_builder_clinic(
         slug=slug,
         api_key_hash=pwd_context.hash(f"ns_auto_{uuid4().hex[:16]}"),
         is_active=True,
-        plan_type="pilot",
+        plan_type="clinic",
         builder_id=bid,
         config={},
     )
