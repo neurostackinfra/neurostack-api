@@ -75,7 +75,7 @@ export function Layout({ children }: LayoutProps) {
     { href: "/traces",   label: t("nav_traces"),    icon: Activity,       id: "trace-history",  hideFor: [] },
     { href: "/dashboard",label: t("nav_dashboard"), icon: LayoutDashboard,id: "dashboard",      hideFor: [] },
     { href: "/config",   label: t("nav_config"),    icon: Sliders,        id: "clinic-config",  hideFor: [] },
-    { href: "/suporte",  label: "Suporte",           icon: HelpCircle,    id: "suporte",        hideFor: [], badge: isClinicAdmin ? "Em breve" : undefined },
+    { href: "/suporte",  label: "Suporte",           icon: HelpCircle,    id: "suporte",        hideFor: ["super_admin"], badge: isClinicAdmin ? "Em breve" : undefined },
   ].filter(item => !(item.hideFor as string[]).includes(role));
 
   const roadmapItems = [
