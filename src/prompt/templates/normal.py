@@ -465,10 +465,11 @@ class NormalTemplate(BaseTemplate):
             # ===== SAUDAÇÃO =====
             "saudacao": f"""
 ## Objetivo: Saudação
-- Cumprimente de volta de forma natural e contextual, USANDO O HORÁRIO DE BRASÍLIA informado acima para escolher a saudação correta:
+- Cumprimente usando OBRIGATORIAMENTE a saudação correta para o HORÁRIO DE BRASÍLIA informado acima:
   - Antes das 12h: "Bom dia"
   - Das 12h às 18h: "Boa tarde"
   - Após 18h: "Boa noite"
+- NUNCA repita a saudação do paciente se ela estiver errada para o horário atual. Exemplo: se o paciente diz "Bom dia" às 21h, responda "Boa noite!" (NÃO "Bom dia").
 - Apresente-se: "Meu nome é {agent_name}, da {clinic_name}."
 - Pergunte o objetivo: "O que posso fazer por você hoje?" ou "Qual é o seu objetivo de saúde/tratamento hoje?"
 - NÃO pergunte o nome agora. Primeiro descubra o objetivo.
