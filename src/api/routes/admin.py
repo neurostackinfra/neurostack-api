@@ -328,7 +328,7 @@ async def update_clinic(
 
     if body.email is not None or body.password is not None:
         user_result = await session.execute(
-            select(User).where(User.tenant_id == cid, User.role == "clinic_admin")
+            select(User).where(User.tenant_id == cid, cast(User.role, String) == "clinic_admin")
         )
         user = user_result.scalar_one_or_none()
         if user:
@@ -590,7 +590,7 @@ async def list_builders(
     ]
     # Builder user emails (keyed by builder_id)
     builder_user_stmt = select(User.builder_id, User.email).where(
-        User.builder_id.in_(builder_ids), User.role == "builder"
+        User.builder_id.in_(builder_ids), cast(User.role, String) == "builder"
     )
     builder_user_result = await session.execute(builder_user_stmt)
     builder_email_map = {row[0]: row[1] for row in builder_user_result.all()}
@@ -598,7 +598,7 @@ async def list_builders(
     # Clinic admin emails (keyed by tenant_id)
     if tenant_ids:
         clinic_user_stmt = select(User.tenant_id, User.email).where(
-            User.tenant_id.in_(tenant_ids), User.role == "clinic_admin"
+            User.tenant_id.in_(tenant_ids), cast(User.role, String) == "clinic_admin"
         )
         clinic_user_result = await session.execute(clinic_user_stmt)
         clinic_email_map = {row[0]: row[1] for row in clinic_user_result.all()}
@@ -734,7 +734,7 @@ async def update_builder(
     # Update builder user email/password
     if body.email is not None or body.password is not None:
         user_result = await session.execute(
-            select(User).where(User.builder_id == bid, User.role == "builder")
+            select(User).where(User.builder_id == bid, cast(User.role, String) == "builder")
         )
         user = user_result.scalar_one_or_none()
         if user:
