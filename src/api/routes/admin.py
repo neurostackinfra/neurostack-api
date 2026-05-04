@@ -549,7 +549,11 @@ async def list_builders(
     tenants_stmt = (
         select(Tenant)
         .options(selectinload(Tenant.clinic_config_row))
-        .where(Tenant.builder_id.in_(builder_ids), Tenant.is_active.is_(True))
+        .where(
+            Tenant.builder_id.in_(builder_ids),
+            Tenant.is_active.is_(True),
+            Tenant.plan_type != "admin",
+        )
     )
     tenants_result = await session.execute(tenants_stmt)
     all_tenants = tenants_result.scalars().all()
