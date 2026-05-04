@@ -439,8 +439,7 @@ function InvestorMockChat() {
 export default function Chat() {
   const { clinicId: activeClinicId, tenantId, userId, isInvestor, isReadOnly, isBuilder, viewingClinicId } = useAuth();
 
-  if (isInvestor) return <InvestorMockChat />;
-  const effectiveTenantId = isBuilder ? viewingClinicId : tenantId;
+  const effectiveTenantId = (isBuilder || isInvestor) ? viewingClinicId : tenantId;
   const { t } = useI18n();
   const { toast } = useToast();
 
@@ -638,6 +637,8 @@ export default function Chat() {
               messages.map((msg, idx) => {
                 // For the demo last message, pre-open RLHF block with seed text
                 const isDemoPreOpened = false;
+                // Show arrow on first assistant message for investors
+                const isFirstAssistant = isInvestor && msg.role === "assistant" && !messages.slice(0, idx).some(m => m.role === "assistant");
                 // Find the user message this assistant response is replying to
                 const prevUserMsg = msg.role === "assistant" && idx > 0 && messages[idx - 1].role === "user"
                   ? messages[idx - 1].content : "";
@@ -668,9 +669,12 @@ export default function Chat() {
                           userMessage={prevUserMsg}
                           defaultPhase={isDemoPreOpened ? "input" : "idle"}
                           defaultText=""
-                          isReadOnly={isReadOnly}
-                          showArrow={false}
+                          isReadOnly={isReadOnly || isInvestor}
+                          showArrow={isFirstAssistant}
                         />
+                        {isInvestor && (
+                          <p className="text-[10px] text-muted-foreground/60 italic ml-1 mt-0.5">(Apenas demonstração — feature em breve)</p>
+                        )}
                       </div>
                     ) : (
                       <div className="max-w-[80%] rounded-lg px-4 py-3 text-sm bg-primary text-primary-foreground">
