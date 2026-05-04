@@ -18,7 +18,7 @@ from src.api.schemas.events import EventPayload, EventRequest
 from src.models.clinic_config_table import ClinicConfigTable
 from src.repositories import SessionRepository, get_db_session_dependency
 from src.services.event_service import get_event_service
-from src.services.zapi_service import send_evolution_text, send_text_message
+from src.services.zapi_service import mark_message_read, send_evolution_text, send_text_message
 
 logger = logging.getLogger(__name__)
 
@@ -407,6 +407,21 @@ async def zapi_webhook(
         result = await _handle_clinic_message(tenant_id, effective_phone, message_text, db)
         await db.commit()
         return result
+
+    # ── mark message as read (blue checkmarks) ──
+    try:
+        _cr = await db.execute(
+            text("SELECT api_credentials FROM clinic_configs WHERE tenant_id = :tid"),
+            {"tid": str(tenant_id)},
+        )
+        _creds = (_cr.first() or [None])[0] or {}
+        _inst = _creds.get("zapi_instance_id", "")
+        _tok = _creds.get("zapi_token", "")
+        _ct = _creds.get("zapi_client_token", "")
+        if _inst and _tok:
+            await mark_message_read(_inst, _tok, phone, body.get("messageId", ""), _ct)
+    except Exception:
+        pass  # fire-and-forget
 
     # ── pause check for patient messages ──
     pause_result = await _check_pause_state(tenant_id, phone, db)
