@@ -76,49 +76,6 @@ const MOCK_CONVERSATIONS: { id: string; label: string; messages: MockMessage[] }
       },
     ],
   },
-  {
-    id: "mock-conv-2",
-    label: "Pós-Procedimento — Dúvida",
-    messages: [
-      { id: "m5", role: "user", content: "Fiz um preenchimento labial ontem e estou com um inchaço. É normal?" },
-      {
-        id: "m6", role: "assistant",
-        content: "Entendo sua preocupação! O inchaço nas primeiras 48-72 horas após o preenchimento labial é completamente normal e esperado.\n\nAlgumas orientações importantes:\n• Aplique compressas frias por 10 minutos a cada hora\n• Evite exercícios físicos intensos por 24-48h\n• Não manipule a região com as mãos\n• Beba bastante água\n\nO resultado final aparece em 7-14 dias, quando o inchaço reduz completamente.",
-        trace: {
-          intent: "Post-Procedure",
-          stage: "retention",
-          confidence: 98.0,
-          processingMs: 195,
-          context: [
-            { title: "cuidados pós preenchimento", content: "cuidados pós preenchimento labial", source: "RAG" },
-          ],
-          llmResponse: "Entendo sua preocupação! O inchaço nas primeiras 48-72 horas após o preenchimento labial é completamente normal e esperado...",
-        },
-      },
-    ],
-  },
-  {
-    id: "mock-conv-3",
-    label: "Agendamento — Limpeza de Pele",
-    messages: [
-      { id: "m9", role: "user", content: "Oi! Gostaria de agendar uma limpeza de pele profunda." },
-      {
-        id: "m10", role: "assistant",
-        content: "Olá! Será um prazer agendar para você!\n\nNossa limpeza de pele profunda é realizada por esteticistas especializadas e inclui: extração, peeling enzimático, máscara calmante e proteção solar.\n\nTemos disponibilidade:\n• Segunda: 14h\n• Terça: 10h ou 16h\n• Quarta: 9h\n\nQual dia e horário prefere?",
-        trace: {
-          intent: "Scheduling Request",
-          stage: "consideration",
-          confidence: 97.0,
-          processingMs: 224,
-          context: [
-            { title: "serviços disponíveis", content: "limpeza de pele profunda", source: "CLINIC_CONFIG" },
-            { title: "horários disponíveis", content: "agenda da semana", source: "CLINIC_CONFIG" },
-          ],
-          llmResponse: "Olá! Será um prazer agendar para você!\n\nNossa limpeza de pele profunda é realizada por esteticistas especializadas...",
-        },
-      },
-    ],
-  },
 ];
 
 // --- Types for cognitive pipeline responses ---
@@ -419,21 +376,6 @@ function InvestorMockChat() {
               </h2>
               <p className="text-xs text-muted-foreground mt-1">Teste o agente de IA clínico. As respostas geram traces em tempo real.</p>
             </div>
-          </div>
-          <div className="flex gap-2">
-            {MOCK_CONVERSATIONS.map((c, i) => (
-              <button
-                key={c.id}
-                onClick={() => setActiveConv(i)}
-                className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all ${
-                  activeConv === i
-                    ? "bg-accent text-accent-foreground shadow-sm"
-                    : "bg-muted text-muted-foreground hover:bg-muted/80"
-                }`}
-              >
-                {c.label}
-              </button>
-            ))}
           </div>
         </div>
 
