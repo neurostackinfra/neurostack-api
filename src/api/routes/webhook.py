@@ -18,7 +18,7 @@ from src.api.schemas.events import EventPayload, EventRequest
 from src.models.clinic_config_table import ClinicConfigTable
 from src.repositories import SessionRepository, get_db_session_dependency
 from src.services.event_service import get_event_service
-from src.services.zapi_service import mark_message_read, send_evolution_text, send_text_message
+from src.services.zapi_service import mark_conversation_unread, mark_message_read, send_evolution_text, send_text_message
 
 logger = logging.getLogger(__name__)
 
@@ -489,6 +489,14 @@ async def zapi_webhook(
     except Exception as exc:
         logger.exception("Z-API send failed for %s — %s", phone, exc)
         return {"ok": True, "replied": False, "reason": "send_failed", "error": str(exc)}
+
+    # ── mark conversation as unread (green dot) after handoff message ──
+    if response.handoff_summary or (response.decision and response.decision.handoff_required):
+        try:
+            await mark_conversation_unread(zapi_inst, zapi_token, phone, client_token=zapi_client_token)
+            logger.info("Z-API mark_unread after handoff for %s", phone)
+        except Exception:
+            pass  # fire-and-forget
 
     return {"ok": True, "replied": True}
 
