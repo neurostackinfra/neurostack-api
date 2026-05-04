@@ -126,6 +126,14 @@ async def get_config(
     tenant = await _resolve_config_tenant(request, tenant, session)
     row = await _get_or_create_config(session, tenant)
     flat = flatten_config(row)
+    # Fallback: if clinic_name not in identity config, use tenant name
+    if not flat.get("clinic_name"):
+        t_result = await session.execute(
+            select(Tenant.name).where(Tenant.id == tenant.tenant_id)
+        )
+        t_name = t_result.scalar_one_or_none()
+        if t_name:
+            flat["clinic_name"] = t_name
     return ConfigResponse(**flat)
 
 
