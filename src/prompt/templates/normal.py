@@ -327,7 +327,7 @@ class NormalTemplate(BaseTemplate):
         # Intent-specific instructions
         if variables.last_intent:
             intent_instruction = self._get_intent_instruction(
-                variables.last_intent, agent_name, clinic_name
+                variables.last_intent, agent_name, clinic_name, now_br
             )
             if intent_instruction:
                 parts.append(intent_instruction)
@@ -458,18 +458,31 @@ class NormalTemplate(BaseTemplate):
         return content if section.content else ""
 
     def _get_intent_instruction(
-        self, intent: str, agent_name: str = "assistente", clinic_name: str = "clínica"
+        self, intent: str, agent_name: str = "assistente", clinic_name: str = "clínica",
+        now_br=None,
     ) -> str:
         """Get instruction for specific intent — NeuroStack v0.6 methodology."""
+        # Compute correct greeting for current BRT time
+        if now_br is not None:
+            hour = now_br.hour
+            if hour < 12:
+                saudacao_correta = "Bom dia"
+            elif hour < 18:
+                saudacao_correta = "Boa tarde"
+            else:
+                saudacao_correta = "Boa noite"
+            hora_str = now_br.strftime("%H:%M")
+        else:
+            saudacao_correta = "Olá"
+            hora_str = ""
+
         intent_instructions = {
             # ===== SAUDAÇÃO =====
             "saudacao": f"""
 ## Objetivo: Saudação
-- Cumprimente usando OBRIGATORIAMENTE a saudação correta para o HORÁRIO DE BRASÍLIA informado acima:
-  - Antes das 12h: "Bom dia"
-  - Das 12h às 18h: "Boa tarde"
-  - Após 18h: "Boa noite"
-- NUNCA repita a saudação do paciente se ela estiver errada para o horário atual. Exemplo: se o paciente diz "Bom dia" às 21h, responda "Boa noite!" (NÃO "Bom dia").
+- Agora são {hora_str} (horário de Brasília). A saudação correta é: **"{saudacao_correta}"**.
+- Você DEVE começar sua resposta com "{saudacao_correta}!" — independentemente do que o paciente disse.
+- NUNCA diga "Bom dia" se for depois das 12h. NUNCA diga "Boa tarde" se for depois das 18h.
 - Apresente-se: "Meu nome é {agent_name}, da {clinic_name}."
 - Pergunte o objetivo: "O que posso fazer por você hoje?" ou "Qual é o seu objetivo de saúde/tratamento hoje?"
 - NÃO pergunte o nome agora. Primeiro descubra o objetivo.
