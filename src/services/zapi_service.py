@@ -87,6 +87,36 @@ async def mark_conversation_unread(
         return False
 
 
+async def mark_message_read(
+    instance_id: str,
+    token: str,
+    phone: str,
+    message_id: str = "",
+    client_token: str = "",
+) -> bool:
+    """Mark a WhatsApp message as read (blue checkmarks) via Z-API.
+
+    Fire-and-forget: logs errors but never raises.
+    """
+    url = f"{ZAPI_BASE}/instances/{instance_id}/token/{token}/read-message"
+    payload = {"phone": phone}
+    if message_id:
+        payload["messageId"] = message_id
+    headers = {"Content-Type": "application/json"}
+    if client_token:
+        headers["Client-Token"] = client_token
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            logger.info("zapi_mark_read_success", extra={"phone": phone})
+            return True
+    except Exception as exc:
+        logger.warning("zapi_mark_read_failed", extra={"phone": phone, "error": str(exc)})
+        return False
+
+
 async def send_evolution_text(
     api_url: str,
     instance_name: str,
