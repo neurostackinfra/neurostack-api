@@ -94,6 +94,7 @@ interface AdminDashboardData {
 interface BuilderClinic {
   clinic_id: number;
   clinic_name: string;
+  admin_email?: string | null;
   slug: string | null;
   status: "active" | "inactive";
   plan_type: string;
@@ -108,6 +109,7 @@ interface BuilderClinic {
 interface BuilderWithClinics {
   id: number;
   name: string;
+  admin_email?: string | null;
   status: "active" | "inactive";
   created_at: string;
   clinics: BuilderClinic[];
@@ -593,6 +595,12 @@ export default function MasterAdmin() {
   const [addingBuilder, setAddingBuilder] = useState(false);
   const [editingBuilderId, setEditingBuilderId] = useState<number | null>(null);
   const [editBuilderName, setEditBuilderName] = useState("");
+  const [editBuilderEmail, setEditBuilderEmail] = useState("");
+  const [editBuilderPassword, setEditBuilderPassword] = useState("");
+  const [editingClinicId, setEditingClinicId] = useState<number | null>(null);
+  const [editClinicName, setEditClinicName] = useState("");
+  const [editClinicEmail, setEditClinicEmail] = useState("");
+  const [editClinicPassword, setEditClinicPassword] = useState("");
   const [addingClinicToBuilderId, setAddingClinicToBuilderId] = useState<number | null>(null);
   const [newClinicName, setNewClinicName] = useState("");
   const [newClinicEmail, setNewClinicEmail] = useState("");
@@ -661,17 +669,44 @@ export default function MasterAdmin() {
     }
   };
 
-  const handleSaveBuilderName = async (id: number) => {
+  const handleSaveBuilder = async (id: number) => {
     if (!editBuilderName.trim()) return;
+    const payload: Record<string, string> = { name: editBuilderName.trim() };
+    if (editBuilderEmail.trim()) payload.email = editBuilderEmail.trim();
+    if (editBuilderPassword.trim()) payload.password = editBuilderPassword;
     try {
       const res = await fetch(`/v1/admin/builders/${id}`, {
         method: "PATCH", headers: authHeaders(token),
-        body: JSON.stringify({ name: editBuilderName.trim() }),
+        body: JSON.stringify(payload),
       });
-      if (!res.ok) { toast({ title: "Erro ao renomear builder", variant: "destructive" }); return; }
-      setBuilders((prev) => prev.map((b) => b.id === id ? { ...b, name: editBuilderName.trim() } : b));
+      if (!res.ok) { const err = await res.json().catch(() => ({})) as { detail?: string }; toast({ title: err.detail ?? "Erro ao atualizar builder", variant: "destructive" }); return; }
+      setBuilders((prev) => prev.map((b) => b.id === id ? { ...b, name: editBuilderName.trim(), admin_email: editBuilderEmail.trim() || b.admin_email } : b));
       setEditingBuilderId(null);
-      toast({ title: "Nome do builder atualizado." });
+      setEditBuilderPassword("");
+      toast({ title: "Builder atualizado com sucesso." });
+    } catch {
+      toast({ title: "Erro de rede", variant: "destructive" });
+    }
+  };
+
+  const handleSaveClinic = async (clinicId: number) => {
+    if (!editClinicName.trim()) return;
+    const payload: Record<string, string> = { clinic_name: editClinicName.trim() };
+    if (editClinicEmail.trim()) payload.email = editClinicEmail.trim();
+    if (editClinicPassword.trim()) payload.password = editClinicPassword;
+    try {
+      const res = await fetch(`/v1/admin/clinics/${clinicId}`, {
+        method: "PATCH", headers: authHeaders(token),
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) { const err = await res.json().catch(() => ({})) as { detail?: string }; toast({ title: err.detail ?? "Erro ao atualizar clínica", variant: "destructive" }); return; }
+      setBuilders((prev) => prev.map((b) => ({
+        ...b,
+        clinics: b.clinics.map((c) => c.clinic_id === clinicId ? { ...c, clinic_name: editClinicName.trim(), admin_email: editClinicEmail.trim() || c.admin_email } : c),
+      })));
+      setEditingClinicId(null);
+      setEditClinicPassword("");
+      toast({ title: "Clínica atualizada com sucesso." });
     } catch {
       toast({ title: "Erro de rede", variant: "destructive" });
     }
@@ -1307,15 +1342,35 @@ export default function MasterAdmin() {
                         <Input
                           value={editBuilderName}
                           onChange={(e) => setEditBuilderName(e.target.value)}
-                          className="h-7 text-xs flex-1"
-                          onKeyDown={(e) => { if (e.key === "Enter") void handleSaveBuilderName(builder.id); if (e.key === "Escape") setEditingBuilderId(null); }}
+                          className="h-7 text-xs w-32"
+                          placeholder="Nome"
+                          onKeyDown={(e) => { if (e.key === "Enter") void handleSaveBuilder(builder.id); if (e.key === "Escape") setEditingBuilderId(null); }}
                           autoFocus
                         />
-                        <Button size="sm" className="h-7 text-xs px-2" onClick={() => void handleSaveBuilderName(builder.id)}>Salvar</Button>
-                        <Button size="sm" variant="ghost" className="h-7 text-xs px-2" onClick={() => setEditingBuilderId(null)}>✕</Button>
+                        <Input
+                          value={editBuilderEmail}
+                          onChange={(e) => setEditBuilderEmail(e.target.value)}
+                          className="h-7 text-xs w-40"
+                          placeholder="Email"
+                          type="email"
+                          onKeyDown={(e) => { if (e.key === "Enter") void handleSaveBuilder(builder.id); if (e.key === "Escape") setEditingBuilderId(null); }}
+                        />
+                        <Input
+                          value={editBuilderPassword}
+                          onChange={(e) => setEditBuilderPassword(e.target.value)}
+                          className="h-7 text-xs w-28"
+                          placeholder="Nova senha"
+                          type="password"
+                          onKeyDown={(e) => { if (e.key === "Enter") void handleSaveBuilder(builder.id); if (e.key === "Escape") setEditingBuilderId(null); }}
+                        />
+                        <Button size="sm" className="h-7 text-xs px-2" onClick={() => void handleSaveBuilder(builder.id)}>Salvar</Button>
+                        <Button size="sm" variant="ghost" className="h-7 text-xs px-2" onClick={() => { setEditingBuilderId(null); setEditBuilderPassword(""); }}>✕</Button>
                       </div>
                     ) : (
-                      <span className="font-medium text-sm flex-1 min-w-0 truncate">{builder.name}</span>
+                      <div className="flex items-center gap-2 flex-1 min-w-0">
+                        <span className="font-medium text-sm truncate">{builder.name}</span>
+                        {builder.admin_email && <span className="text-[10px] text-muted-foreground truncate">{builder.admin_email}</span>}
+                      </div>
                     )}
 
                     <div className="flex items-center gap-1.5 shrink-0 ml-auto">
@@ -1332,7 +1387,7 @@ export default function MasterAdmin() {
                             variant="ghost" size="sm"
                             className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground"
                             title="Renomear"
-                            onClick={() => { setEditingBuilderId(builder.id); setEditBuilderName(builder.name); }}
+                            onClick={() => { setEditingBuilderId(builder.id); setEditBuilderName(builder.name); setEditBuilderEmail(builder.admin_email ?? ""); setEditBuilderPassword(""); }}
                           >
                             <Pencil className="h-3.5 w-3.5" />
                           </Button>
@@ -1437,34 +1492,81 @@ export default function MasterAdmin() {
                         <p className="text-xs text-muted-foreground text-center py-3">Nenhuma clínica vinculada.</p>
                       ) : (
                         <div className="space-y-1">
-                          {builder.clinics.map((c) => (
-                            <div key={c.clinic_id} className={`flex items-center gap-3 rounded-md px-2.5 py-2 text-xs transition-colors ${c.status === "active" ? "bg-background/60 border border-border/40" : "bg-muted/20 border border-dashed border-slate-700 opacity-60"}`}>
-                              <Building2 className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                              <span className="font-medium flex-1 min-w-0 truncate">{c.clinic_name}</span>
-                              {c.slug && <span className="text-muted-foreground font-mono text-[10px]">/{c.slug}</span>}
+                          {builder.clinics.map((c) => {
+                            const isEditingClinic = editingClinicId === c.clinic_id;
+                            return (
+                            <div key={c.clinic_id} className={`rounded-md px-2.5 py-2 text-xs transition-colors ${c.status === "active" ? "bg-background/60 border border-border/40" : "bg-muted/20 border border-dashed border-slate-700 opacity-60"}`}>
+                              {isEditingClinic ? (
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  <Building2 className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                                  <Input
+                                    value={editClinicName}
+                                    onChange={(e) => setEditClinicName(e.target.value)}
+                                    className="h-7 text-xs w-32"
+                                    placeholder="Nome"
+                                    autoFocus
+                                    onKeyDown={(e) => { if (e.key === "Enter") void handleSaveClinic(c.clinic_id); if (e.key === "Escape") setEditingClinicId(null); }}
+                                  />
+                                  <Input
+                                    value={editClinicEmail}
+                                    onChange={(e) => setEditClinicEmail(e.target.value)}
+                                    className="h-7 text-xs w-40"
+                                    placeholder="Email"
+                                    type="email"
+                                    onKeyDown={(e) => { if (e.key === "Enter") void handleSaveClinic(c.clinic_id); if (e.key === "Escape") setEditingClinicId(null); }}
+                                  />
+                                  <Input
+                                    value={editClinicPassword}
+                                    onChange={(e) => setEditClinicPassword(e.target.value)}
+                                    className="h-7 text-xs w-28"
+                                    placeholder="Nova senha"
+                                    type="password"
+                                    onKeyDown={(e) => { if (e.key === "Enter") void handleSaveClinic(c.clinic_id); if (e.key === "Escape") setEditingClinicId(null); }}
+                                  />
+                                  <Button size="sm" className="h-7 text-xs px-2" onClick={() => void handleSaveClinic(c.clinic_id)}>Salvar</Button>
+                                  <Button size="sm" variant="ghost" className="h-7 text-xs px-2" onClick={() => { setEditingClinicId(null); setEditClinicPassword(""); }}>✕</Button>
+                                </div>
+                              ) : (
+                                <div className="flex items-center gap-3">
+                                  <Building2 className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                                  <span className="font-medium truncate">{c.clinic_name}</span>
+                                  {c.admin_email && <span className="text-[10px] text-muted-foreground truncate">{c.admin_email}</span>}
+                                  {c.slug && <span className="text-muted-foreground font-mono text-[10px]">/{c.slug}</span>}
 
-
-                              <StatusBadge status={c.status} />
-                              {isSuperAdmin && (
-                                <div className="flex items-center gap-1 shrink-0">
-                                  <Button
-                                    variant="ghost" size="sm"
-                                    className={`h-6 w-6 p-0 ${c.status === "active" ? "text-emerald-400 hover:text-emerald-300" : "text-muted-foreground"}`}
-                                    onClick={() => void handleToggleBuilderClinic(c.clinic_id, c.status === "active" ? "inactive" : "active")}
-                                  >
-                                    {c.status === "active" ? <ToggleRight className="h-3.5 w-3.5" /> : <ToggleLeft className="h-3.5 w-3.5" />}
-                                  </Button>
-                                  <Button
-                                    variant="ghost" size="sm"
-                                    className="h-6 w-6 p-0 text-muted-foreground hover:text-destructive"
-                                    onClick={() => void handleDeleteBuilderClinic(c.clinic_id, c.clinic_name)}
-                                  >
-                                    <Trash2 className="h-3 w-3" />
-                                  </Button>
+                                  <div className="ml-auto flex items-center gap-1 shrink-0">
+                                    <StatusBadge status={c.status} />
+                                    {isSuperAdmin && (
+                                      <>
+                                        <Button
+                                          variant="ghost" size="sm"
+                                          className="h-6 w-6 p-0 text-muted-foreground hover:text-foreground"
+                                          title="Editar clínica"
+                                          onClick={() => { setEditingClinicId(c.clinic_id); setEditClinicName(c.clinic_name); setEditClinicEmail(c.admin_email ?? ""); setEditClinicPassword(""); }}
+                                        >
+                                          <Pencil className="h-3 w-3" />
+                                        </Button>
+                                        <Button
+                                          variant="ghost" size="sm"
+                                          className={`h-6 w-6 p-0 ${c.status === "active" ? "text-emerald-400 hover:text-emerald-300" : "text-muted-foreground"}`}
+                                          onClick={() => void handleToggleBuilderClinic(c.clinic_id, c.status === "active" ? "inactive" : "active")}
+                                        >
+                                          {c.status === "active" ? <ToggleRight className="h-3.5 w-3.5" /> : <ToggleLeft className="h-3.5 w-3.5" />}
+                                        </Button>
+                                        <Button
+                                          variant="ghost" size="sm"
+                                          className="h-6 w-6 p-0 text-muted-foreground hover:text-destructive"
+                                          onClick={() => void handleDeleteBuilderClinic(c.clinic_id, c.clinic_name)}
+                                        >
+                                          <Trash2 className="h-3 w-3" />
+                                        </Button>
+                                      </>
+                                    )}
+                                  </div>
                                 </div>
                               )}
                             </div>
-                          ))}
+                            );
+                          })}
                         </div>
                       )}
                     </div>
