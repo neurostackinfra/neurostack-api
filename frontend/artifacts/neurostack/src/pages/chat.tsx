@@ -154,6 +154,12 @@ function FeedbackBlock({ msg, sessionId, userMessage = "", defaultPhase = "idle"
   const analyze = async () => {
     if (!text.trim()) return;
     setPhase("analyzing");
+    if (isReadOnly) {
+      // Demo mode: simulate analysis without API call
+      await new Promise(r => setTimeout(r, 1500));
+      setPhase(Math.random() > 0.5 ? "green" : "red");
+      return;
+    }
     try {
       const res = await customFetch<{ status: string; violations: { rule: string; message: string; category: string }[] }>("/v1/rlhf/validate", {
         method: "POST",
@@ -171,6 +177,11 @@ function FeedbackBlock({ msg, sessionId, userMessage = "", defaultPhase = "idle"
   };
 
   const saveFeedback = async (status: "aligned" | "forced") => {
+    if (isReadOnly) {
+      toast({ title: "Feedback registrado!", description: "Obrigado pelo feedback. (Demonstração)" });
+      closeFb();
+      return;
+    }
     try {
       await customFetch("/v1/rlhf/feedback", {
         method: "POST",
@@ -359,10 +370,6 @@ function InvestorMockChat() {
     setActiveTrace(firstAssistant?.trace ?? null);
   }, [activeConv]);
 
-  const handleFeedback = () => {
-    toast({ title: "Feedback registrado!", description: "Obrigado pelo feedback. A sugestão será analisada pela equipe." });
-  };
-
   return (
     <div className="flex flex-col lg:flex-row h-[calc(100vh-6rem)] lg:h-[calc(100vh-4rem)] gap-6">
       {/* Chat Panel */}
@@ -383,6 +390,8 @@ function InvestorMockChat() {
           <div className="space-y-5 pb-4">
             {conv.messages.map((msg, idx) => {
               const isFirstAssistant = msg.role === "assistant" && !conv.messages.slice(0, idx).some(m => m.role === "assistant");
+              const prevUserMsg = msg.role === "assistant" && idx > 0 && conv.messages[idx - 1].role === "user"
+                ? conv.messages[idx - 1].content : "";
               return (
                 <div
                   key={msg.id}
@@ -403,24 +412,16 @@ function InvestorMockChat() {
                       >
                         {msg.content}
                       </div>
-                      <div className="mt-1.5 ml-1 flex flex-col gap-0.5">
-                        {isFirstAssistant && (
-                          <div className="flex items-center gap-1 text-red-500 text-[11px] font-bold animate-bounce mb-0.5">
-                            <ArrowDown className="h-3 w-3" />
-                            <span>clique aqui</span>
-                          </div>
-                        )}
-                        <button
-                          onClick={handleFeedback}
-                          className={`inline-flex items-center gap-1.5 text-[11px] font-medium transition-colors ${
-                            isFirstAssistant ? "text-red-500 hover:text-red-400 font-bold" : "text-muted-foreground hover:text-violet-400"
-                          }`}
-                        >
-                          <Lightbulb className="h-3 w-3" />
-                          Corrigir / Enviar Feedback
-                        </button>
-                        <p className="text-[10px] text-muted-foreground/60 italic">(Apenas demonstração — feature em breve)</p>
-                      </div>
+                      <FeedbackBlock
+                        msg={msg as Message}
+                        sessionId={null}
+                        userMessage={prevUserMsg}
+                        defaultPhase="idle"
+                        defaultText=""
+                        isReadOnly={true}
+                        showArrow={isFirstAssistant}
+                      />
+                      <p className="text-[10px] text-muted-foreground/60 italic ml-1 mt-0.5">(Apenas demonstração — feature em breve)</p>
                     </div>
                   ) : (
                     <div className="max-w-[80%] rounded-lg px-4 py-3 text-sm bg-primary text-primary-foreground">
