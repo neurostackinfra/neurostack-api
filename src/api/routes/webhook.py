@@ -491,12 +491,20 @@ async def zapi_webhook(
         return {"ok": True, "replied": False, "reason": "send_failed", "error": str(exc)}
 
     # ── mark conversation as unread (green dot) after handoff message ──
-    if response.handoff_summary or (response.decision and response.decision.handoff_required):
+    _handoff = response.handoff_summary or (response.decision and response.decision.handoff_required)
+    logger.info(
+        "Z-API handoff check for %s: handoff_summary=%s, decision.handoff_required=%s → mark_unread=%s",
+        phone,
+        bool(response.handoff_summary),
+        response.decision.handoff_required if response.decision else None,
+        bool(_handoff),
+    )
+    if _handoff:
         try:
             await mark_conversation_unread(zapi_inst, zapi_token, phone, client_token=zapi_client_token)
-            logger.info("Z-API mark_unread after handoff for %s", phone)
-        except Exception:
-            pass  # fire-and-forget
+            logger.info("Z-API mark_unread SUCCESS after handoff for %s", phone)
+        except Exception as exc:
+            logger.warning("Z-API mark_unread FAILED for %s — %s", phone, exc)
 
     return {"ok": True, "replied": True}
 

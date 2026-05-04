@@ -795,31 +795,9 @@ class CognitivePipeline:
             },
         )
 
-        # Fire-and-forget: mark WhatsApp conversation as unread
-        try:
-            api_creds = (input_data.clinic_config or {}).get("api_credentials", {})
-            instance_id = (api_creds.get("zapi_instance_id") or "").strip()
-            token = (api_creds.get("zapi_token") or "").strip()
-            client_token = (api_creds.get("zapi_client_token") or "").strip()
-            phone = input_data.user_id
-
-            if instance_id and token and phone:
-                from src.services.zapi_service import mark_conversation_unread
-
-                await mark_conversation_unread(
-                    instance_id=instance_id,
-                    token=token,
-                    phone=phone,
-                    client_token=client_token,
-                )
-        except Exception as exc:
-            logger.warning(
-                "mark_unread_fire_and_forget_failed",
-                extra={
-                    "session_id": str(input_data.session_id),
-                    "error": str(exc),
-                },
-            )
+        # NOTE: mark_conversation_unread is called in webhook.py AFTER the
+        # handoff message is sent — doing it here (before send) would be
+        # overridden by the outgoing message marking the chat as read again.
 
         return True, paused_until_iso
 
