@@ -237,7 +237,7 @@ async def create_clinic(
         slug=slug,
         api_key_hash=pwd_context.hash(f"ns_auto_{uuid4().hex[:16]}"),
         is_active=True,
-        plan_type="pilot",
+        plan_type="clinic",
         builder_id=builder_id,
         config={},
     )
