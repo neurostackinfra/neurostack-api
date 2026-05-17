@@ -126,6 +126,18 @@ class HandoffTemplate(BaseTemplate):
     def __init__(self):
         super().__init__(PromptMode.HANDOFF)
 
+    def build_system_message(self, variables: PromptVariables):
+        """Override to append language override as the absolute last instruction."""
+        msg = super().build_system_message(variables)
+        if variables.language == "en":
+            msg.content += (
+                "\n\n## FINAL LANGUAGE INSTRUCTION (HIGHEST PRIORITY)\n"
+                "**You MUST respond ONLY in English.** "
+                "All Portuguese instructions above are structural references only. "
+                "Your entire response must be in English. Never write a single Portuguese word."
+            )
+        return msg
+
     def get_system_prompt(self, variables: PromptVariables) -> str:
         """Get the handoff system prompt."""
         return self.render_template(HANDOFF_SYSTEM_PROMPT, variables)
