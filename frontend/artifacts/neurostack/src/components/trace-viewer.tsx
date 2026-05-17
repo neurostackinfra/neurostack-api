@@ -15,159 +15,84 @@ import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
 import type { TranslationKey } from "@/locales/en";
 
-export function IntentBadge({ intent }: { intent: string }) {
-  const intentConfig: Record<string, { className: string; label: string }> = {
-    // Greeting / Farewell
-    saudacao: {
-      className: "bg-sky-500 hover:bg-sky-600 text-white",
-      label: "Saudação",
-    },
-    // Interest & Qualification
-    interesse_tratamento: {
-      className: "bg-violet-500 hover:bg-violet-600 text-white",
-      label: "Interesse em Tratamento",
-    },
-    qualificacao_publico: {
-      className: "bg-purple-500 hover:bg-purple-600 text-white",
-      label: "Qualificação",
-    },
-    comparacao_tratamentos: {
-      className: "bg-fuchsia-500 hover:bg-fuchsia-600 text-white",
-      label: "Comparação",
-    },
-    // Price & Objections
-    pedido_preco: {
-      className: "bg-blue-500 hover:bg-blue-600 text-white",
-      label: "Pedido de Preço",
-    },
-    objecao_vou_pensar: {
-      className: "bg-amber-500 hover:bg-amber-600 text-white",
-      label: "Objeção",
-    },
-    // Scheduling
-    agendar: {
-      className: "bg-green-500 hover:bg-green-600 text-white",
-      label: "Agendamento",
-    },
-    reagendar: {
-      className: "bg-emerald-500 hover:bg-emerald-600 text-white",
-      label: "Reagendamento",
-    },
-    cancelar: {
-      className: "bg-orange-500 hover:bg-orange-600 text-white",
-      label: "Cancelamento",
-    },
-    confirmar_presenca: {
-      className: "bg-teal-500 hover:bg-teal-600 text-white",
-      label: "Confirmação",
-    },
-    disponibilidade_horarios: {
-      className: "bg-cyan-500 hover:bg-cyan-600 text-white",
-      label: "Horários",
-    },
-    // Info & FAQ
-    detalhes_servicos: {
-      className: "bg-indigo-400 hover:bg-indigo-500 text-white",
-      label: "Detalhes Serviços",
-    },
-    informacoes_profissionais: {
-      className: "bg-indigo-500 hover:bg-indigo-600 text-white",
-      label: "Info Profissionais",
-    },
-    faq: {
-      className: "bg-slate-500 hover:bg-slate-600 text-white",
-      label: "FAQ",
-    },
-    cultura_historia: {
-      className: "bg-slate-400 hover:bg-slate-500 text-white",
-      label: "Sobre a Clínica",
-    },
-    duvida_generica_sem_contexto: {
-      className: "bg-gray-500 hover:bg-gray-600 text-white",
-      label: "Dúvida Genérica",
-    },
-    pre_atendimento: {
-      className: "bg-lime-500 hover:bg-lime-600 text-white",
-      label: "Pré-Atendimento",
-    },
-    // Post-care
-    pos_atendimento_duvida: {
-      className: "bg-indigo-500 hover:bg-indigo-600 text-white",
-      label: "Pós — Dúvida",
-    },
-    pos_atendimento_sintomas_preocupantes: {
-      className: "bg-red-500 hover:bg-red-600 text-white",
-      label: "Pós — Sintomas",
-    },
-    pedido_alterar_medicacao: {
-      className: "bg-red-600 hover:bg-red-700 text-white",
-      label: "Alterar Medicação",
-    },
-    // Admin / Financial
-    documentos_e_comprovantes: {
-      className: "bg-zinc-500 hover:bg-zinc-600 text-white",
-      label: "Documentos",
-    },
-    orcamento_existente: {
-      className: "bg-blue-400 hover:bg-blue-500 text-white",
-      label: "Orçamento",
-    },
-    cobranca_renegociacao: {
-      className: "bg-yellow-500 hover:bg-yellow-600 text-white",
-      label: "Financeiro",
-    },
-    // Escalation
-    reclamacao: {
-      className: "bg-rose-500 hover:bg-rose-600 text-white",
-      label: "Reclamação",
-    },
-    conduta_inadequada_ameaca: {
-      className: "bg-red-700 hover:bg-red-800 text-white",
-      label: "Conduta Inadequada",
-    },
-    pedido_atendente_humano: {
-      className: "bg-rose-600 hover:bg-rose-700 text-white",
-      label: "Pedido Atendente Humano",
-    },
-    // Patient & Out-of-scope
-    paciente_ativo: {
-      className: "bg-teal-600 hover:bg-teal-700 text-white",
-      label: "Paciente Ativo",
-    },
-    fora_do_escopo: {
-      className: "bg-stone-500 hover:bg-stone-600 text-white",
-      label: "Fora do Escopo",
-    },
-    fora_do_horario: {
-      className: "bg-stone-600 hover:bg-stone-700 text-white",
-      label: "Fora do Horário",
-    },
-  };
+const INTENT_CLASSNAMES: Record<string, string> = {
+  // Greeting / Farewell
+  saudacao: "bg-sky-500 hover:bg-sky-600 text-white",
+  // Interest & Qualification
+  interesse_tratamento: "bg-violet-500 hover:bg-violet-600 text-white",
+  qualificacao_publico: "bg-purple-500 hover:bg-purple-600 text-white",
+  comparacao_tratamentos: "bg-fuchsia-500 hover:bg-fuchsia-600 text-white",
+  // Price & Objections
+  pedido_preco: "bg-blue-500 hover:bg-blue-600 text-white",
+  objecao_vou_pensar: "bg-amber-500 hover:bg-amber-600 text-white",
+  // Scheduling
+  agendar: "bg-green-500 hover:bg-green-600 text-white",
+  reagendar: "bg-emerald-500 hover:bg-emerald-600 text-white",
+  cancelar: "bg-orange-500 hover:bg-orange-600 text-white",
+  confirmar_presenca: "bg-teal-500 hover:bg-teal-600 text-white",
+  disponibilidade_horarios: "bg-cyan-500 hover:bg-cyan-600 text-white",
+  // Info & FAQ
+  detalhes_servicos: "bg-indigo-400 hover:bg-indigo-500 text-white",
+  informacoes_profissionais: "bg-indigo-500 hover:bg-indigo-600 text-white",
+  faq: "bg-slate-500 hover:bg-slate-600 text-white",
+  cultura_historia: "bg-slate-400 hover:bg-slate-500 text-white",
+  duvida_generica_sem_contexto: "bg-gray-500 hover:bg-gray-600 text-white",
+  pre_atendimento: "bg-lime-500 hover:bg-lime-600 text-white",
+  // Post-care
+  pos_atendimento_duvida: "bg-indigo-500 hover:bg-indigo-600 text-white",
+  pos_atendimento_sintomas_preocupantes: "bg-red-500 hover:bg-red-600 text-white",
+  pedido_alterar_medicacao: "bg-red-600 hover:bg-red-700 text-white",
+  // Admin / Financial
+  documentos_e_comprovantes: "bg-zinc-500 hover:bg-zinc-600 text-white",
+  orcamento_existente: "bg-blue-400 hover:bg-blue-500 text-white",
+  cobranca_renegociacao: "bg-yellow-500 hover:bg-yellow-600 text-white",
+  // Escalation
+  reclamacao: "bg-rose-500 hover:bg-rose-600 text-white",
+  conduta_inadequada_ameaca: "bg-red-700 hover:bg-red-800 text-white",
+  pedido_atendente_humano: "bg-rose-600 hover:bg-rose-700 text-white",
+  // Patient & Out-of-scope
+  paciente_ativo: "bg-teal-600 hover:bg-teal-700 text-white",
+  fora_do_escopo: "bg-stone-500 hover:bg-stone-600 text-white",
+  fora_do_horario: "bg-stone-600 hover:bg-stone-700 text-white",
+};
 
-  const config = intentConfig[intent];
+const STAGE_KEYS = [
+  "initial",
+  "em_qualificacao",
+  "qualificado",
+  "followup",
+  "agendamento_solicitado",
+  "agendado",
+  "paciente_ativo",
+  "pos_atendimento",
+  "fidelizacao",
+  "inativo",
+  "escalation",
+] as const;
+
+export function IntentBadge({ intent }: { intent: string }) {
+  const { t } = useI18n();
+  const className = INTENT_CLASSNAMES[intent];
+  const labelKey = `intent_${intent}` as TranslationKey;
+  const translated = t(labelKey);
+  const label = translated && translated !== labelKey ? translated : intent;
   return (
     <Badge
-      className={config?.className ?? "bg-slate-500 text-white"}
+      className={className ?? "bg-slate-500 text-white"}
       data-testid={`badge-intent-${intent}`}
     >
-      {config?.label ?? intent}
+      {label}
     </Badge>
   );
 }
 
-const STAGE_LABELS: Record<string, string> = {
-  initial: "Inicial",
-  em_qualificacao: "Em Qualificação",
-  qualificado: "Qualificado",
-  followup: "Follow-up",
-  agendamento_solicitado: "Agendamento Solicitado",
-  agendado: "Agendado",
-  paciente_ativo: "Paciente Ativo",
-  pos_atendimento: "Pós-Atendimento",
-  fidelizacao: "Fidelização",
-  inativo: "Inativo",
-  escalation: "Escalação",
-};
+function getStageLabel(stage: string, t: (k: TranslationKey) => string): string {
+  if ((STAGE_KEYS as readonly string[]).includes(stage)) {
+    const translated = t(`stage_${stage}` as TranslationKey);
+    if (translated) return translated;
+  }
+  return stage;
+}
 
 const CONSTRAINT_META: Record<
   string,
@@ -243,7 +168,7 @@ export function TraceViewer({ trace }: { trace: DecisionTrace }) {
                 Stage
               </div>
               <div className="text-sm font-mono font-medium" data-testid="trace-stage">
-                {STAGE_LABELS[srm.stage] ?? srm.stage}
+                {getStageLabel(srm.stage, t)}
               </div>
             </div>
             <div>
