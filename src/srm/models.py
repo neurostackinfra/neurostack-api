@@ -177,7 +177,8 @@ class SRMInput(BaseModel):
     message: str
     channel: str = "unknown"
     user_id: Optional[str] = None
-    
+    language: str = "pt-BR"
+
     # Current session state
     current_funnel_stage: FunnelStage = FunnelStage.LEAD_NOVO
     turn_count: int = 0
