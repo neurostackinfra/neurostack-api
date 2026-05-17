@@ -57,7 +57,7 @@ type Lang = keyof typeof T;
 
 export function DemoLeadGate() {
   const { setLeadSubmitted } = useAuth();
-  const [lang, setLang] = useState<Lang>("PT");
+  const [lang, setLang] = useState<Lang>("EN");
   const [nome, setNome] = useState("");
   const [emailContato, setEmailContato] = useState("");
   const [empresa, setEmpresa] = useState("");

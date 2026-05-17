@@ -116,7 +116,7 @@ export default function Login() {
                 className="w-full"
                 disabled={isPending}
               >
-                {isPending ? "Entrando..." : "Acessar Plataforma"}
+                {isPending ? t("login_submit_loading") : t("login_submit")}
               </Button>
             </form>
           </CardContent>
