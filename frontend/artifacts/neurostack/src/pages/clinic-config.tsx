@@ -759,7 +759,8 @@ export default function ClinicConfig() {
     setAiDisclosure(config.ai_disclosure ?? "");
     setUseEmojis(config.use_emojis ?? "no");
     setClinicHistory(config.clinic_history ?? "");
-    setClinicSpecialties(config.clinic_specialties ?? "");
+    const rawSpecialties = config.clinic_specialties;
+    setClinicSpecialties(Array.isArray(rawSpecialties) ? rawSpecialties.join(", ") : (rawSpecialties ?? ""));
     setProfessionals(config.professionals ?? []);
     setFullAddress(config.full_address ?? "");
     setParkingInfo(config.parking_info ?? "");

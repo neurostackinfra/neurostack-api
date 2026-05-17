@@ -82,6 +82,9 @@ class PromptVariables(BaseModel):
     # Custom variables
     custom: dict[str, Any] = Field(default_factory=dict)
 
+    # Response language (pt-BR default)
+    language: str = "pt-BR"
+
 
 class PromptConfig(BaseModel):
     """Configuration for prompt generation."""
