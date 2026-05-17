@@ -75,7 +75,7 @@ export function Layout({ children }: LayoutProps) {
     { href: "/traces",   label: t("nav_traces"),    icon: Activity,       id: "trace-history",  hideFor: [] },
     { href: "/dashboard",label: t("nav_dashboard"), icon: LayoutDashboard,id: "dashboard",      hideFor: [] },
     { href: "/config",   label: t("nav_config"),    icon: Sliders,        id: "clinic-config",  hideFor: [] },
-    { href: "/suporte",  label: "Suporte",           icon: HelpCircle,    id: "suporte",        hideFor: ["super_admin"], badge: isClinicAdmin ? "Em breve" : undefined },
+    { href: "/suporte",  label: t("nav_support"),    icon: HelpCircle,    id: "suporte",        hideFor: ["super_admin"], badge: isClinicAdmin ? t("badge_coming_soon") : undefined },
   ].filter(item => !(item.hideFor as string[]).includes(role));
 
   const roadmapItems = [
@@ -83,14 +83,14 @@ export function Layout({ children }: LayoutProps) {
     { href: "/crm",            label: t("nav_crm"),            icon: Link2,         id: "crm",            v: "v2",  hideFor: ["clinic_admin"] },
     { href: "/knowledge-base", label: t("nav_knowledge_base"), icon: Library,       id: "knowledge-base", v: "v2",  hideFor: ["clinic_admin"] },
     { href: "/onboarding",     label: "Onboarding",            icon: GraduationCap, id: "onboarding",     v: "v2",  hideFor: [] },
-    { href: "/seguranca",      label: "Segurança & Compliance",icon: ShieldCheck,   id: "seguranca",      v: "v2",  hideFor: ["clinic_admin"] },
+    { href: "/seguranca",      label: t("nav_security"),       icon: ShieldCheck,   id: "seguranca",      v: "v2",  hideFor: ["clinic_admin"] },
     { href: "/slm-cortex",     label: "SLM Cortex",            icon: Cpu,           id: "slm-cortex",     v: "v3",  hideFor: ["clinic_admin"] },
-    { href: "/rlhf-audit",     label: "Auditoria RLHF",        icon: FlaskConical,  id: "rlhf-audit",     v: "v3",  hideFor: ["clinic_admin"] },
-    { href: "/consultoria",    label: "Consultoria Comercial", icon: Lightbulb,     id: "consultoria",    v: "v2",  hideFor: [] },
-    { href: "/midias",         label: "Mídias & Ativos",       icon: FolderOpen,    id: "midias",         v: "v3",  hideFor: ["clinic_admin"] },
-    { href: "/billing",        label: "Assinatura & Pagamento",icon: CreditCard,    id: "billing",        v: "v2",  hideFor: ["clinic_admin"] },
-    { href: "/voice-ai",       label: "Inteligência de Voz",   icon: Mic,           id: "voice-ai",       v: "v3",  hideFor: ["clinic_admin"] },
-    { href: "/portal-parceiros",label: "Portal de Parceiros",  icon: Briefcase,     id: "portal-parceiros",v: "v3", hideFor: ["clinic_admin"] },
+    { href: "/rlhf-audit",     label: t("nav_rlhf"),           icon: FlaskConical,  id: "rlhf-audit",     v: "v3",  hideFor: ["clinic_admin"] },
+    { href: "/consultoria",    label: t("nav_consulting"),     icon: Lightbulb,     id: "consultoria",    v: "v2",  hideFor: [] },
+    { href: "/midias",         label: t("nav_media"),          icon: FolderOpen,    id: "midias",         v: "v3",  hideFor: ["clinic_admin"] },
+    { href: "/billing",        label: t("nav_billing"),        icon: CreditCard,    id: "billing",        v: "v2",  hideFor: ["clinic_admin"] },
+    { href: "/voice-ai",       label: t("nav_voice"),          icon: Mic,           id: "voice-ai",       v: "v3",  hideFor: ["clinic_admin"] },
+    { href: "/portal-parceiros",label: t("nav_partners"),      icon: Briefcase,     id: "portal-parceiros",v: "v3", hideFor: ["clinic_admin"] },
   ].filter(item => !item.hideFor.includes(role));
 
   const SidebarContent = () => (
@@ -122,7 +122,7 @@ export function Layout({ children }: LayoutProps) {
           <div className="flex items-center gap-1.5 mb-1 px-1">
             <ChevronDown className="h-3 w-3 text-indigo-400" />
             <span className="text-[10px] font-semibold uppercase tracking-wider text-indigo-400/60">
-              Selecionar Clínica
+              {t("label_select_clinic")}
             </span>
           </div>
           <select
@@ -144,7 +144,7 @@ export function Layout({ children }: LayoutProps) {
       {isReadOnly && (
         <div className="mx-3 mb-1 mt-2 flex items-center gap-1.5 rounded-md bg-amber-500/10 border border-amber-500/30 px-2 py-1.5">
           <Eye className="h-3 w-3 text-amber-400 shrink-0" />
-          <span className="text-[10px] text-amber-400 font-medium">Modo somente leitura</span>
+          <span className="text-[10px] text-amber-400 font-medium">{t("label_read_only_mode")}</span>
         </div>
       )}
 
