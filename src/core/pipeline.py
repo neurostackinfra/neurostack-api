@@ -668,6 +668,7 @@ class CognitivePipeline:
             constraints=policy_result.constraints or [],
             user_journey=user_journey,
             custom=custom_vars,
+            language=input_data.language,
         )
         
         # Add safety context if needed
