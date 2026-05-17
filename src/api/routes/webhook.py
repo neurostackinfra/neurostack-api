@@ -30,6 +30,14 @@ _SENT_ID_PREFIX = "ai_sent:"
 _SENT_ID_TTL = 300  # 5 minutes — enough for Z-API echo to arrive
 
 
+def _get_agent_language(clinic_config: Optional[dict]) -> str:
+    """Return the configured agent language for the clinic, defaulting to pt-BR."""
+    if not clinic_config:
+        return "pt-BR"
+    business = clinic_config.get("business_rules") or {}
+    return business.get("agent_language") or "pt-BR"
+
+
 def _get_redis():
     """Get Redis client (lazy import to avoid circular deps)."""
     try:
@@ -439,6 +447,8 @@ async def zapi_webhook(
     await db.commit()
 
     # ── process through NeuroStack pipeline ──
+    service = get_event_service()
+    clinic_config = await service._load_clinic_config(tenant_id)
     event_request = EventRequest(
         tenant_id=tenant_id,
         session_id=session_id,
@@ -447,6 +457,7 @@ async def zapi_webhook(
             content=message_text,
             channel="whatsapp",
             user_id=phone,
+            language=_get_agent_language(clinic_config),
             metadata={
                 "phone": phone,
                 "senderName": sender_name,
@@ -456,7 +467,6 @@ async def zapi_webhook(
         ),
     )
 
-    service = get_event_service()
     response = await service.process_event(event_request, session=db)
     await db.commit()
 
@@ -595,6 +605,8 @@ async def evolution_webhook(
     await db.commit()
 
     # ── process through NeuroStack pipeline ──
+    service = get_event_service()
+    clinic_config = await service._load_clinic_config(tenant_id)
     event_request = EventRequest(
         tenant_id=tenant_id,
         session_id=session_id,
@@ -603,6 +615,7 @@ async def evolution_webhook(
             content=message_text,
             channel="whatsapp",
             user_id=phone,
+            language=_get_agent_language(clinic_config),
             metadata={
                 "phone": phone,
                 "pushName": sender_name,
@@ -612,7 +625,6 @@ async def evolution_webhook(
         ),
     )
 
-    service = get_event_service()
     response = await service.process_event(event_request, session=db)
     await db.commit()
 
