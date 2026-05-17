@@ -1404,8 +1404,14 @@ export default function ClinicConfig() {
                 </>)}
               </>)}
 
-              <SectionLabel>{txt("Política de Linguagem", "Language Policy")}</SectionLabel>
-              <Field label={txt("Idioma do Agente", "Agent Language")}>
+              <SectionLabel>{txt("Idioma do Agente", "Agent Language")}</SectionLabel>
+              <Field
+                label={txt("Idioma do Agente", "Agent Language")}
+                hint={txt(
+                  "Define o idioma das respostas do agente para pacientes em todos os canais (chat, WhatsApp).",
+                  "Sets the language the agent uses when responding to patients across all channels (chat, WhatsApp)."
+                )}
+              >
                 <Select value={agentLanguage} onValueChange={setAgentLanguage} disabled={isReadOnly}>
                   <SelectTrigger className="h-9 text-sm">
                     <SelectValue />
@@ -1416,6 +1422,7 @@ export default function ClinicConfig() {
                   </SelectContent>
                 </Select>
               </Field>
+              <SectionLabel>{txt("Estilo de Resposta", "Response Style")}</SectionLabel>
               <Field label={txt("Estilo de Resposta", "Response Style")}>
                 <Select value={languagePolicy} onValueChange={setLanguagePolicy} disabled={isReadOnly}>
                   <SelectTrigger className="h-9 text-sm">
