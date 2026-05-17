@@ -108,6 +108,7 @@ class ClinicBusinessRules(BaseModel):
     differentials: Optional[str] = None
     language_policy: Optional[str] = None
     language_policy_custom: Optional[str] = None
+    agent_language: Optional[str] = None  # "pt-BR" | "en" | None → defaults to "pt-BR"
 
 
 class ClinicLGPD(BaseModel):
