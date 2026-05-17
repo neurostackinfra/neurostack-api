@@ -737,6 +737,7 @@ export default function ClinicConfig() {
   const [dpoContact, setDpoContact] = useState("");
   const [languagePolicy, setLanguagePolicy] = useState("neurostack_default");
   const [languagePolicyCustom, setLanguagePolicyCustom] = useState("");
+  const [agentLanguage, setAgentLanguage] = useState("pt-BR");
 
   // Tab 4 — Handoff
   const [handoffActive, setHandoffActive] = useState("yes");
@@ -785,6 +786,7 @@ export default function ClinicConfig() {
     setDpoContact(config.dpo_contact ?? "");
     setLanguagePolicy(config.language_policy ?? "neurostack_default");
     setLanguagePolicyCustom(config.language_policy_custom ?? "");
+    setAgentLanguage(config.agent_language ?? "pt-BR");
     setHandoffActive(config.handoff_active ?? "yes");
     setStandbyMode(config.standby_mode ?? "active");
     setHandoffPeriod(config.handoff_period ?? "permanent");
@@ -845,6 +847,7 @@ export default function ClinicConfig() {
       dpo_contact: dpoContact.trim() || null,
       language_policy: languagePolicy || null,
       language_policy_custom: languagePolicyCustom.trim() || null,
+      agent_language: agentLanguage || "pt-BR",
       handoff_active: "yes",
       standby_mode: standbyMode || null,
       handoff_period: handoffPeriod || null,
@@ -1402,6 +1405,17 @@ export default function ClinicConfig() {
               </>)}
 
               <SectionLabel>{txt("Política de Linguagem", "Language Policy")}</SectionLabel>
+              <Field label={txt("Idioma do Agente", "Agent Language")}>
+                <Select value={agentLanguage} onValueChange={setAgentLanguage} disabled={isReadOnly}>
+                  <SelectTrigger className="h-9 text-sm">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="pt-BR">{txt("Português (BR)", "Portuguese (BR)")}</SelectItem>
+                    <SelectItem value="en">{txt("Inglês", "English")}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </Field>
               <Field label={txt("Estilo de Resposta", "Response Style")}>
                 <Select value={languagePolicy} onValueChange={setLanguagePolicy} disabled={isReadOnly}>
                   <SelectTrigger className="h-9 text-sm">
