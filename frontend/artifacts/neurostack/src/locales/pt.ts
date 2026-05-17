@@ -17,6 +17,17 @@ export const pt: Record<TranslationKey, string> = {
   nav_agents: "Conexões & Agentes",
   nav_crm: "Integração CRM",
   nav_knowledge_base: "Base de Conhecimento",
+  nav_support: "Suporte",
+  nav_security: "Segurança & Compliance",
+  nav_rlhf: "Auditoria RLHF",
+  nav_consulting: "Consultoria Comercial",
+  nav_media: "Mídias & Ativos",
+  nav_billing: "Assinatura & Pagamento",
+  nav_voice: "Inteligência de Voz",
+  nav_partners: "Portal de Parceiros",
+  badge_coming_soon: "Em breve",
+  label_select_clinic: "Selecionar Clínica",
+  label_read_only_mode: "Modo somente leitura",
 
   // Login
   login_title: "Acesso Builder",

@@ -15,6 +15,17 @@ export const en = {
   nav_agents: "Connections & Agents",
   nav_crm: "CRM Integration",
   nav_knowledge_base: "Knowledge Base",
+  nav_support: "Support",
+  nav_security: "Security & Compliance",
+  nav_rlhf: "RLHF Audit",
+  nav_consulting: "Commercial Consulting",
+  nav_media: "Media & Assets",
+  nav_billing: "Subscription & Billing",
+  nav_voice: "Voice Intelligence",
+  nav_partners: "Partners Portal",
+  badge_coming_soon: "Coming soon",
+  label_select_clinic: "Select Clinic",
+  label_read_only_mode: "Read-only mode",
 
   // Login
   login_title: "Builder Access",
@@ -69,6 +80,23 @@ export const en = {
   intent_cobranca_renegociacao: "Financial",
   intent_reclamacao: "Complaint",
   intent_conduta_inadequada_ameaca: "Misconduct",
+  intent_pedido_atendente_humano: "Human Agent Request",
+  intent_paciente_ativo: "Active Patient",
+  intent_fora_do_escopo: "Out of Scope",
+  intent_fora_do_horario: "Out of Hours",
+
+  // Stage labels (trace viewer)
+  stage_initial: "Initial",
+  stage_em_qualificacao: "Qualifying",
+  stage_qualificado: "Qualified",
+  stage_followup: "Follow-up",
+  stage_agendamento_solicitado: "Booking Requested",
+  stage_agendado: "Booked",
+  stage_paciente_ativo: "Active Patient",
+  stage_pos_atendimento: "Post-Care",
+  stage_fidelizacao: "Retention",
+  stage_inativo: "Inactive",
+  stage_escalation: "Escalation",
 
   // Trace History
   traces_title: "Trace History",
