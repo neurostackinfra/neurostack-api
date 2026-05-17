@@ -534,12 +534,28 @@ class EventService:
         except Exception as exc:
             logger.error("LLM call failed", error=str(exc), exc_info=True)
 
-        # If handoff is required, prepend the handoff user message to the response
-        if result.handoff_required and result.handoff_user_message:
-            if suggested_response:
-                suggested_response = f"{suggested_response}\n\n{result.handoff_user_message}"
-            else:
-                suggested_response = result.handoff_user_message
+        # If handoff is required, append the handoff user message to the response.
+        # When language is EN, use English fallback instead of the PT template message.
+        if result.handoff_required:
+            EN_HANDOFF_MESSAGES = {
+                "user_request":        "I'll transfer you to a human agent right away. Is there anything specific they should know?",
+                "safety_concern":      "For your safety, I'm connecting you with a specialist. Someone will be in touch shortly.",
+                "max_turns_exceeded":  "Let me connect you with one of our team members who can better assist you.",
+                "low_confidence":      "To ensure you get the best help, I'm transferring you to a specialist.",
+                "escalation":          "I understand your situation. I'm escalating this to a supervisor who can help you.",
+                "complex_query":       "This requires special attention. I'm transferring you to a specialist.",
+                "scheduling":          "I'll connect you with our team to confirm the best available times for you.",
+            }
+            handoff_msg = result.handoff_user_message or ""
+            if language_code == "en" and handoff_msg:
+                # Derive reason from handoff_summary if available
+                handoff_reason = (result.handoff_summary or {}).get("reason", "escalation")
+                handoff_msg = EN_HANDOFF_MESSAGES.get(handoff_reason, EN_HANDOFF_MESSAGES["escalation"])
+            if handoff_msg:
+                if suggested_response:
+                    suggested_response = f"{suggested_response}\n\n{handoff_msg}"
+                else:
+                    suggested_response = handoff_msg
 
         prompt = PromptOutput(
             system=result.system_prompt,
