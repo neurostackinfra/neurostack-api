@@ -487,6 +487,334 @@ INTENT_DEFINITIONS: dict[str, dict] = {
 
 
 # ============================================
+# English Intent Patterns
+# ============================================
+# Mirrors INTENT_DEFINITIONS but with English regex/keywords.
+# When language="en", these patterns override the PT ones per intent;
+# any intent missing here falls back to its PT patterns.
+
+EN_INTENT_PATTERNS: dict[str, dict] = {
+    "saudacao": {
+        "patterns": [
+            r"^(hello|hi+|hey+|howdy|yo)\b[!.,?]*\s*$",
+            r"^(hello|hi|hey)\b.*$",
+            r"\bgood (morning|afternoon|evening|night)\b",
+        ],
+        "keywords": ["hello", "hi", "hey", "howdy", "good morning",
+                      "good afternoon", "good evening"],
+    },
+    "interesse_tratamento": {
+        "patterns": [
+            r"\b(i'?m|i am)\s+interested\s+in\b",
+            r"\b(i want|i'd like|i would like|i need)\b.*\b(to know about|information about|treatment|procedure|consultation)\b",
+            r"\btell me (more )?about\b",
+            r"\b(i'?m|i am) looking for\b.*\b(treatment|procedure|clinic)\b",
+            r"\b(do you|can you)\b.*\b(treat|offer|do|perform)\b",
+            r"\bi want to know\b",
+        ],
+        "keywords": ["interested in", "tell me about", "looking for treatment",
+                      "i want to know", "information about"],
+    },
+    "pedido_preco": {
+        "patterns": [
+            r"\bhow much\b",
+            r"\bwhat'?s the (price|cost|fee|rate)\b",
+            r"\b(price|cost|fee|fees|rate|pricing|quote)\b",
+            r"\bdoes it cost\b",
+            r"\bhow much (is|does|do)\b",
+            r"\bcan i pay\b.*\b(installments|in parts)\b",
+            r"\b(discount|promotion|offer)\b",
+            r"\bpayment (method|options?)\b",
+        ],
+        "keywords": ["how much", "price", "cost", "pricing", "fee", "fees",
+                      "rate", "quote", "value", "payment"],
+    },
+    "comparacao_tratamentos": {
+        "patterns": [
+            r"\bcompared to\b",
+            r"\b(versus|vs\.?)\b",
+            r"\bdifference between\b",
+            r"\bbetter than\b",
+            r"\bwhich (is|one is) better\b",
+            r"\b(which|what) (do you|would you) recommend\b",
+        ],
+        "keywords": ["compared to", "versus", "difference between",
+                      "better than", "which is better"],
+    },
+    "objecao_vou_pensar": {
+        "patterns": [
+            r"\bi'?ll think\b",
+            r"\blet me think\b",
+            r"\bneed to think\b",
+            r"\bwill consider\b",
+            r"\bmaybe later\b",
+            r"\bnot sure( yet)?\b",
+            r"\bit'?s (too )?expensive\b",
+            r"\bi'?m afraid\b",
+            r"\bside effects?\b",
+            r"\bi'?ll get back to you\b",
+        ],
+        "keywords": ["think about it", "let me think", "maybe later",
+                      "not sure", "too expensive", "afraid"],
+    },
+    "duvida_generica_sem_contexto": {
+        "patterns": [
+            r"^(what|how|when|where|why|which|who)\s*[?]?\s*$",
+            r"\bcan you explain\b",
+            r"\bi have a question\b",
+            r"\btell me more\b",
+        ],
+        "keywords": [],
+    },
+    "agendar": {
+        "patterns": [
+            r"\b(i want|i'd like|i would like|i need)\b.*\b(to )?(schedule|book|make|set up)\b",
+            r"\b(schedule|book|reserve)\b.*\b(appointment|consultation|visit|session)\b",
+            r"\bmake an appointment\b",
+            r"\bcan i (schedule|book|come in)\b",
+            r"\bi want to book\b",
+            r"\bset up (a |an )?(meeting|appointment)\b",
+            r"\bavailable (slots?|times?|appointments?)\b",
+        ],
+        "keywords": ["schedule", "book", "appointment", "reserve",
+                      "make an appointment", "set up"],
+    },
+    "reagendar": {
+        "patterns": [
+            r"\breschedule\b",
+            r"\b(change|move)\b.*\b(my )?appointment\b",
+            r"\bmove (the |my )?appointment\b",
+            r"\bcan we (change|move|reschedule)\b",
+        ],
+        "keywords": ["reschedule", "change my appointment", "move appointment"],
+    },
+    "cancelar": {
+        "patterns": [
+            r"\bcancel\b.*\b(appointment|consultation|booking|session)?\b",
+            r"\bi want to cancel\b",
+            r"\bi (can'?t|cannot|won'?t)\b.*\b(make it|come|attend)\b",
+        ],
+        "keywords": ["cancel", "cancel appointment", "can't make it"],
+    },
+    "confirmar_presenca": {
+        "patterns": [
+            r"^(yes|ok|okay|sure|confirmed|confirm|correct|right|exactly)\b[!.]?\s*$",
+            r"\bi'?ll be there\b",
+            r"\bconfirming (my )?appointment\b",
+            r"\byes,? i'?m coming\b",
+        ],
+        "keywords": ["yes", "ok", "confirm", "i'll be there", "coming"],
+    },
+    "disponibilidade_horarios": {
+        "patterns": [
+            r"\bavailable (times?|hours?|slots?)\b",
+            r"\bwhen are you open\b",
+            r"\bwhat (times?|hours?) (are you|do you) open\b",
+            r"\bwhat times? (are )?available\b",
+            r"\b(business|opening|operating) hours\b",
+            r"\bschedule availability\b",
+        ],
+        "keywords": ["available times", "when are you open",
+                      "business hours", "opening hours"],
+    },
+    "detalhes_servicos": {
+        "patterns": [
+            r"\bwhat services\b",
+            r"\bwhat (do you|services do you) offer\b",
+            r"\bwhat procedures\b",
+            r"\bservice details\b",
+            r"\bwhere (are you|is the clinic) located\b",
+            r"\bwhat'?s your address\b",
+            r"\b(do|does) (you|the clinic) accept\b.*\b(insurance|plan)\b",
+            r"\bparking\b",
+        ],
+        "keywords": ["what services", "what do you offer", "procedures",
+                      "address", "location", "insurance", "parking"],
+    },
+    "pre_atendimento": {
+        "patterns": [
+            r"\bbefore (the |my )?(appointment|procedure|consultation)\b",
+            r"\bwhat (should i|do i need to|to) (bring|do|prepare)\b",
+            r"\b(preparation|prep|fasting)\b.*\b(appointment|procedure)?\b",
+        ],
+        "keywords": ["before the appointment", "what to bring",
+                      "preparation", "fasting"],
+    },
+    "faq": {
+        "patterns": [
+            r"\bfrequently asked\b",
+            r"\bcommon questions?\b",
+            r"\bhow does (it|this) work\b",
+        ],
+        "keywords": ["frequently asked", "common questions", "how does it work"],
+    },
+    "cultura_historia": {
+        "patterns": [
+            r"\babout the clinic\b",
+            r"\bclinic('?s)? history\b",
+            r"\bwho are you\b",
+            r"\babout you(r clinic)?\b",
+            r"\bhow long have you\b",
+        ],
+        "keywords": ["about the clinic", "clinic history", "who are you"],
+    },
+    "qualificacao_publico": {
+        "patterns": [
+            r"\bis this for me\b",
+            r"\b(do|does) you treat\b",
+            r"\bwho is this for\b",
+            r"\bam i a (candidate|good fit)\b",
+        ],
+        "keywords": ["is this for me", "do you treat", "candidate"],
+    },
+    "informacoes_profissionais": {
+        "patterns": [
+            r"\b(doctor|dr\.?|physician|specialist)\b.*\b(who|what|qualifications|formation)\b",
+            r"\bwho will (treat|see) me\b",
+            r"\b(your |the )?(staff|team|professionals)\b",
+            r"\b(do you have|is there)\b.*\b(specialist|dermatologist|psychologist|nutritionist)\b",
+        ],
+        "keywords": ["doctor", "professional", "specialist", "staff", "team",
+                      "who will treat me"],
+    },
+    "pos_atendimento_duvida": {
+        "patterns": [
+            r"\bafter (the |my )?(procedure|appointment|treatment|surgery)\b",
+            r"\bpost(-|\s)?(treatment|procedure|op)\b",
+            r"\bfollow(-|\s)?up question\b",
+            r"\baftercare\b",
+            r"\bcan i (eat|drink|drive|exercise) after\b",
+            r"\bhow long (until|before|will it take)\b",
+        ],
+        "keywords": ["after the procedure", "post treatment", "follow up",
+                      "aftercare"],
+    },
+    "pos_atendimento_sintomas_preocupantes": {
+        "patterns": [
+            r"\b(severe|bad|terrible) pain\b",
+            r"\b(bleeding|swelling|fever)\b",
+            r"\ballergic reaction\b",
+            r"\bside effects?\b",
+            r"\bsomething('?s| is) wrong\b",
+            r"\b(emergency|urgent)\b",
+            r"\bgetting worse\b",
+        ],
+        "keywords": ["pain", "swelling", "bleeding", "allergic reaction",
+                      "side effect", "something wrong", "emergency"],
+    },
+    "pedido_alterar_medicacao": {
+        "patterns": [
+            r"\b(change|alter|adjust|stop)\b.*\b(my )?(medication|prescription|meds|dose|dosage)\b",
+            r"\bcan i (take|stop)\b.*\b(medication|meds|pill)\b",
+            r"\b(lower|higher|stronger|weaker)\b.*\b(dose|dosage)\b",
+        ],
+        "keywords": ["change medication", "alter prescription",
+                      "adjust meds", "stop taking", "dose"],
+    },
+    "reclamacao": {
+        "patterns": [
+            r"\bcomplaint\b",
+            r"\b(i'?m |i am )?(not satisfied|unhappy|dissatisfied|disappointed)\b",
+            r"\b(terrible|awful|horrible|bad)\b.*\b(service|treatment|experience)\b",
+            r"\b(service|treatment|experience)\b.*\b(was|is)\b.*\b(terrible|awful|horrible|bad)\b",
+            r"\b(i )?(want|need|demand)\b.*\b(refund|my money back)\b",
+            r"\bmoney back\b",
+            r"\bi hated?\b",
+            r"\bbad service\b",
+            r"\bspeak to (a |the )?(manager|supervisor)\b",
+        ],
+        "keywords": ["complaint", "not satisfied", "unhappy", "terrible",
+                      "awful", "refund", "money back", "disappointed",
+                      "bad service", "hated"],
+    },
+    "conduta_inadequada_ameaca": {
+        "patterns": [
+            r"\b(sue|lawsuit|lawyer|attorney)\b",
+            r"\bi'?ll (sue|report)\b",
+            r"\breport you\b",
+            r"\bthis is (unacceptable|outrageous|absurd)\b",
+            r"\b(threat|threaten)\b",
+            r"\b(abusive|abuse)\b",
+            r"\bexpose you\b.*\b(online|social media)\b",
+        ],
+        "keywords": ["sue", "lawyer", "report you", "unacceptable",
+                      "threat", "abusive"],
+    },
+    "documentos_e_comprovantes": {
+        "patterns": [
+            r"\b(receipt|invoice|document|certificate)\b",
+            r"\bproof of (service|attendance|payment)\b",
+            r"\b(send|email|provide)\b.*\b(receipt|invoice|document|certificate)\b",
+            r"\bmedical (record|report)\b",
+        ],
+        "keywords": ["receipt", "invoice", "document", "certificate",
+                      "proof of service", "medical record"],
+    },
+    "orcamento_existente": {
+        "patterns": [
+            r"\bi (have|got)\b.*\b(quote|estimate|budget)\b",
+            r"\bmy (budget|quote) is\b",
+            r"\bprevious (quote|estimate)\b",
+        ],
+        "keywords": ["i have a quote", "my budget", "previous quote"],
+    },
+    "cobranca_renegociacao": {
+        "patterns": [
+            r"\b(billing|payment) (issue|problem|question)\b",
+            r"\b(charge|charged|charging)\b.*\b(wrong|dispute|incorrect)\b",
+            r"\b(renegotiate|negotiate)\b.*\b(debt|payment|bill)\b",
+            r"\bdispute (the |a )?(charge|bill)\b",
+            r"\binstallments?\b.*\b(debt|payment|bill)\b",
+        ],
+        "keywords": ["billing", "payment issue", "renegotiate",
+                      "dispute charge", "wrong charge"],
+    },
+    "pedido_atendente_humano": {
+        "patterns": [
+            r"\b(talk|speak|chat)\b.*\b(to|with)\b.*\b(human|person|real person|agent|attendant|someone)\b",
+            r"\bi want\b.*\b(human|real person|person)\b",
+            r"\b(not|don'?t want)\b.*\b(bot|robot|ai|machine)\b",
+            r"\btransfer me\b.*\b(human|person|someone|agent)\b",
+            r"\bcan i (talk|speak) to (a )?(human|person|someone)\b",
+        ],
+        "keywords": ["human", "real person", "speak to someone",
+                      "talk to a person", "agent", "attendant", "not a bot"],
+    },
+    "paciente_ativo": {
+        "patterns": [
+            r"\bi'?m (a |an )?(patient|client)\b",
+            r"\bi already (use|go|come)\b",
+            r"\b(returning|existing) patient\b",
+            r"\bi'?ve been (here |to you )?before\b",
+            r"\bi already (have|am) (a )?(patient|treatment)\b",
+        ],
+        "keywords": ["i'm a patient", "returning patient",
+                      "already use", "been before"],
+    },
+    "fora_do_escopo": {
+        "patterns": [
+            r"\b(not related|off topic|different topic|something else)\b",
+            r"\bdo you (sell|do)\b.*\b(veterinary|animals|pets|blood test|x-ray)\b",
+            r"\b(unrelated|nothing to do)\b",
+        ],
+        "keywords": ["not related", "off topic", "different topic",
+                      "something else"],
+    },
+    "fora_do_horario": {
+        "patterns": [
+            r"\bare you open\b",
+            r"\b(are you )?closed\b",
+            r"\b(business|operating|opening) hours\b",
+            r"\bwhat time do you (open|close)\b",
+            r"\bafter hours\b",
+        ],
+        "keywords": ["are you open", "closed", "business hours",
+                      "what time do you open", "after hours"],
+    },
+}
+
+
+# ============================================
 # Safety Guard Patterns (checked before scoring)
 # ============================================
 
@@ -521,7 +849,7 @@ class IntentClassifier:
         if custom_intents:
             self.intents.update(custom_intents)
 
-        # Compile regex patterns
+        # Compile regex patterns (PT — default)
         self._compiled_patterns: dict[str, list[re.Pattern]] = {}
         for intent_name, intent_def in self.intents.items():
             self._compiled_patterns[intent_name] = [
@@ -529,7 +857,17 @@ class IntentClassifier:
                 for pattern in intent_def.get("patterns", [])
             ]
 
-    def classify(self, message: str) -> IntentResult:
+        # Compile English patterns (only those defined in EN_INTENT_PATTERNS)
+        self._compiled_patterns_en: dict[str, list[re.Pattern]] = {}
+        self._en_keywords: dict[str, list[str]] = {}
+        for intent_name, en_def in EN_INTENT_PATTERNS.items():
+            self._compiled_patterns_en[intent_name] = [
+                re.compile(pattern, re.IGNORECASE | re.UNICODE)
+                for pattern in en_def.get("patterns", [])
+            ]
+            self._en_keywords[intent_name] = en_def.get("keywords", [])
+
+    def classify(self, message: str, language: str = "pt-BR") -> IntentResult:
         """
         Classify the intent of a message.
 
@@ -558,9 +896,9 @@ class IntentClassifier:
                 )
 
         # Regex classification
-        return self._classify_with_regex(message_lower)
+        return self._classify_with_regex(message_lower, language=language)
 
-    def _classify_with_regex(self, message: str) -> IntentResult:
+    def _classify_with_regex(self, message: str, language: str = "pt-BR") -> IntentResult:
         """Classify using regex patterns."""
         best_intent = "duvida_generica_sem_contexto"
         best_category = IntentCategory.QUESTION
@@ -569,7 +907,7 @@ class IntentClassifier:
         matched_patterns: list[str] = []
 
         for intent_name, intent_def in self.intents.items():
-            score, patterns = self._score_intent(message, intent_name, intent_def)
+            score, patterns = self._score_intent(message, intent_name, intent_def, language=language)
 
             if score > best_score:
                 second_best_score = best_score
@@ -598,21 +936,31 @@ class IntentClassifier:
         message: str,
         intent_name: str,
         intent_def: dict,
+        language: str = "pt-BR",
     ) -> tuple[float, list[str]]:
         """Calculate score for an intent based on pattern and keyword matching."""
         score = 0.0
         matched: list[str] = []
         weight = intent_def.get("weight", 1.0)
 
+        # Select pattern + keyword set by language.
+        # EN patterns override PT for any intent defined in EN_INTENT_PATTERNS;
+        # intents missing from EN fall back to PT patterns.
+        use_en = language.lower().startswith("en") and intent_name in self._compiled_patterns_en
+        if use_en:
+            patterns = self._compiled_patterns_en.get(intent_name, [])
+            keywords = self._en_keywords.get(intent_name, [])
+        else:
+            patterns = self._compiled_patterns.get(intent_name, [])
+            keywords = intent_def.get("keywords", [])
+
         # Pattern matching (higher weight)
-        patterns = self._compiled_patterns.get(intent_name, [])
         for pattern in patterns:
             if pattern.search(message):
                 score += 0.5 * weight
                 matched.append(pattern.pattern)
 
         # Keyword matching (lower weight)
-        keywords = intent_def.get("keywords", [])
         keyword_matches = 0
         for keyword in keywords:
             if keyword.lower() in message:

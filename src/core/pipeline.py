@@ -394,6 +394,7 @@ class CognitivePipeline:
             flags=input_data.flags,
             clinic_config=getattr(input_data, "clinic_config", None),
             user_state=getattr(input_data, "user_state", None),
+            language=input_data.language,
         )
         return self._srm.process(srm_input)
 
