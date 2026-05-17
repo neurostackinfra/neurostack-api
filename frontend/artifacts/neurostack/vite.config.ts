@@ -64,7 +64,7 @@ export default defineConfig({
     allowedHosts: true,
     proxy: {
       "/v1": {
-        target: "http://localhost:8000",
+        target: "http://localhost:8001",
         changeOrigin: true,
       },
     },

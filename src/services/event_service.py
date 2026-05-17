@@ -499,16 +499,8 @@ class EventService:
             tenant_model = api_creds.get("llm_model_name") or None
             if llm and user_message:
                 sys_prompt = result.system_prompt or ""
-                messages = [{"role": "system", "content": sys_prompt}]
-                # Inject language override right after the system prompt when
-                # the requested language differs from the default (pt-BR).
                 language_code = language or "pt-BR"
-                LANGUAGE_INSTRUCTIONS = {
-                    "en": "IMPORTANT: You must respond ONLY in English. Do not use Portuguese or any other language.",
-                    "es": "IMPORTANTE: Debes responder ÚNICAMENTE en español.",
-                }
-                if language_code != "pt-BR" and language_code in LANGUAGE_INSTRUCTIONS:
-                    messages.insert(1, {"role": "system", "content": LANGUAGE_INSTRUCTIONS[language_code]})
+                messages = [{"role": "system", "content": sys_prompt}]
                 # Insert conversation history for multi-turn context
                 for msg in (message_history or []):
                     messages.append(msg)
