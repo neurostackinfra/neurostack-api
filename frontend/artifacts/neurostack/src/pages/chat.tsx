@@ -555,7 +555,7 @@ export default function Chat() {
 
   if (isInvestor) return <InvestorMockChat />;
   const effectiveTenantId = isBuilder ? viewingClinicId : tenantId;
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const { toast } = useToast();
 
   const [messages, setMessages]       = useState<Message[]>([]);
@@ -604,10 +604,11 @@ export default function Chat() {
           content,
           channel: "web",
           user_id: userId,
+          language: locale === "en" ? "en" : "pt-BR",
         },
       }),
     });
-  }, [effectiveTenantId, userId]);
+  }, [effectiveTenantId, userId, locale]);
 
   // Map cognitive pipeline response to a trace-like structure for the TraceViewer
   const mapToTrace = (resp: CognitiveEventResponse, userMessage: string): DecisionTrace => {
