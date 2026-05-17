@@ -82,6 +82,23 @@ export const pt: Record<TranslationKey, string> = {
   intent_cobranca_renegociacao: "Financeiro",
   intent_reclamacao: "Reclamação",
   intent_conduta_inadequada_ameaca: "Conduta Inadequada",
+  intent_pedido_atendente_humano: "Pedido Atendente Humano",
+  intent_paciente_ativo: "Paciente Ativo",
+  intent_fora_do_escopo: "Fora do Escopo",
+  intent_fora_do_horario: "Fora do Horário",
+
+  // Stage labels (trace viewer)
+  stage_initial: "Inicial",
+  stage_em_qualificacao: "Em Qualificação",
+  stage_qualificado: "Qualificado",
+  stage_followup: "Follow-up",
+  stage_agendamento_solicitado: "Agendamento Solicitado",
+  stage_agendado: "Agendado",
+  stage_paciente_ativo: "Paciente Ativo",
+  stage_pos_atendimento: "Pós-Atendimento",
+  stage_fidelizacao: "Fidelização",
+  stage_inativo: "Inativo",
+  stage_escalation: "Escalação",
 
   // Trace History
   traces_title: "Histórico de Traces",
