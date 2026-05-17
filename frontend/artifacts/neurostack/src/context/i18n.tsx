@@ -22,7 +22,7 @@ function loadLocale(): Locale {
   } catch {
     // ignore
   }
-  return "pt"; // default to Portuguese for pilot clinics
+  return "en"; // default to English for the American demo
 }
 
 interface I18nContextValue {
