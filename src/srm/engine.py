@@ -162,7 +162,9 @@ class SRMEngine:
         start_time = time.perf_counter()
         
         # Step 1: Classify intent
-        intent_result = self.intent_classifier.classify(input_data.message)
+        intent_result = self.intent_classifier.classify(
+            input_data.message, language=input_data.language
+        )
         
         # Step 2: Detect safety concerns
         safety_result = self.safety_detector.detect(input_data.message)
