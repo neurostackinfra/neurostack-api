@@ -152,6 +152,11 @@ class EventPayload(BaseModel):
         description="Additional metadata from the channel",
         json_schema_extra={"example": {"phone": "+5511999999999"}},
     )
+    language: str = Field(
+        default="pt-BR",
+        description="Response language code (pt-BR, en, es)",
+        json_schema_extra={"example": "pt-BR"},
+    )
 
 
 class EventRequest(BaseModel):

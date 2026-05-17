@@ -416,6 +416,7 @@ class EventService:
             flags=state.flags,
             message_history=message_history,
             clinic_config=clinic_config,
+            language=request.payload.language,
         )
 
         # Process through the complete pipeline
@@ -430,6 +431,7 @@ class EventService:
         response, llm_usage, llm_model = await self._convert_pipeline_result_to_response(
             result, user_message=request.payload.content, clinic_config=clinic_config,
             tenant_id=request.tenant_id, message_history=message_history,
+            language=request.payload.language,
         )
 
         # Save events to Event Store (non-blocking)
@@ -449,6 +451,7 @@ class EventService:
         self, result: "PipelineResult", user_message: str = "",
         clinic_config: Optional[dict] = None, tenant_id: Optional[UUID] = None,
         message_history: Optional[list[dict[str, str]]] = None,
+        language: str = "pt-BR",
     ) -> tuple[EventResponse, dict, str]:
         """
         Convert pipeline result to API response.
@@ -497,6 +500,15 @@ class EventService:
             if llm and user_message:
                 sys_prompt = result.system_prompt or ""
                 messages = [{"role": "system", "content": sys_prompt}]
+                # Inject language override right after the system prompt when
+                # the requested language differs from the default (pt-BR).
+                language_code = language or "pt-BR"
+                LANGUAGE_INSTRUCTIONS = {
+                    "en": "IMPORTANT: You must respond ONLY in English. Do not use Portuguese or any other language.",
+                    "es": "IMPORTANTE: Debes responder ÚNICAMENTE en español.",
+                }
+                if language_code != "pt-BR" and language_code in LANGUAGE_INSTRUCTIONS:
+                    messages.insert(1, {"role": "system", "content": LANGUAGE_INSTRUCTIONS[language_code]})
                 # Insert conversation history for multi-turn context
                 for msg in (message_history or []):
                     messages.append(msg)
