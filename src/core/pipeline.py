@@ -130,6 +130,8 @@ class PipelineInput(BaseModel):
     # Doc MVP v0.5: ClinicConfig e UserState (quando carregados)
     clinic_config: Optional[dict] = None
     user_state: Optional[dict] = None
+    # Response language code (pt-BR default to preserve existing behavior)
+    language: str = "pt-BR"
 
 
 class PipelineResult(BaseModel):
