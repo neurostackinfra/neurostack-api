@@ -199,13 +199,13 @@ _DEFAULT_LGPD_MESSAGE = (
 )
 
 
-def _build_lgpd_message(lgpd: dict, clinic_id: str) -> str:
-    """Build the LGPD opening message with the resolved privacy link.
+def _build_lgpd_message(lgpd: dict, clinic_id: str, clinic_name: str = "") -> str:
+    """Build the LGPD opening message with the resolved privacy link and clinic name.
 
     - Uses `lgpd_message` from config or a sensible default.
     - If `lgpd_custom_link` is set, uses it; otherwise builds
       `{PUBLIC_BASE_URL}/privacidade/{clinic_id}`.
-    - Replaces `{{lgpd_link}}` placeholder with the resolved URL.
+    - Replaces `{{lgpd_link}}` and `{{clinic_name}}` / `[Nome da Clínica]` placeholders.
     """
     message = (lgpd or {}).get("lgpd_message") or _DEFAULT_LGPD_MESSAGE
     custom_link = ((lgpd or {}).get("lgpd_custom_link") or "").strip()
@@ -214,7 +214,11 @@ def _build_lgpd_message(lgpd: dict, clinic_id: str) -> str:
     else:
         base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
         link = f"{base_url}/privacidade/{clinic_id}" if base_url else f"/privacidade/{clinic_id}"
-    return message.replace("{{lgpd_link}}", link)
+    message = message.replace("{{lgpd_link}}", link)
+    if clinic_name:
+        message = message.replace("{{clinic_name}}", clinic_name)
+        message = message.replace("[Nome da Clínica]", clinic_name)
+    return message
 
 
 async def _load_tenant_credentials(
@@ -496,7 +500,8 @@ async def zapi_webhook(
             z_ct = creds_lgpd.get("zapi_client_token", "").strip()
             if z_inst and z_tok:
                 try:
-                    privacy_msg = _build_lgpd_message(lgpd_cfg, clinic_id=str(tenant_id))
+                    _clinic_name = (clinic_config or {}).get("identity", {}).get("clinic_name", "")
+                    privacy_msg = _build_lgpd_message(lgpd_cfg, clinic_id=str(tenant_id), clinic_name=_clinic_name)
                     send_result = await send_text_message(
                         z_inst, z_tok, phone, privacy_msg, client_token=z_ct,
                     )
@@ -673,7 +678,8 @@ async def evolution_webhook(
             e_key = creds_lgpd.get("evolution_api_key", "")
             if e_url and e_name and e_key:
                 try:
-                    privacy_msg = _build_lgpd_message(lgpd_cfg, clinic_id=str(tenant_id))
+                    _clinic_name = (clinic_config or {}).get("identity", {}).get("clinic_name", "")
+                    privacy_msg = _build_lgpd_message(lgpd_cfg, clinic_id=str(tenant_id), clinic_name=_clinic_name)
                     send_result = await send_evolution_text(
                         e_url, e_name, e_key, phone, privacy_msg,
                     )
