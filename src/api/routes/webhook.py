@@ -5,6 +5,7 @@ through the cognitive pipeline, and sends the LLM response back.
 """
 
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import UUID
@@ -136,8 +137,14 @@ async def _get_or_create_session(
     tenant_id: UUID,
     phone: str,
     db: AsyncSession,
-) -> UUID:
-    """Return an active session for this phone, or create one (race-safe)."""
+) -> tuple[UUID, bool]:
+    """Return an active session for this phone, or create one (race-safe).
+
+    Returns:
+        Tuple of (session_id, is_new). `is_new=True` when the session was just
+        created by this call; `False` when an existing session was found
+        (including the race-recovery path).
+    """
     repo = SessionRepository(db)
     sessions = await repo.find_by_user(
         tenant_id=tenant_id,
@@ -146,7 +153,7 @@ async def _get_or_create_session(
         limit=1,
     )
     if sessions:
-        return sessions[0].id
+        return sessions[0].id, False
 
     from src.models.session import CognitiveStateData
     initial_state = CognitiveStateData(
@@ -166,7 +173,7 @@ async def _get_or_create_session(
             session_metadata={"phone": phone, "source": "webhook"},
         )
         await db.flush()
-        return new_session.id
+        return new_session.id, True
     except Exception:
         # Race condition: another request created the session concurrently
         await db.rollback()
@@ -177,8 +184,37 @@ async def _get_or_create_session(
             limit=1,
         )
         if sessions:
-            return sessions[0].id
+            return sessions[0].id, False
         raise
+
+
+_DEFAULT_LGPD_MESSAGE = (
+    "Olá! Bem-vindo(a) ao atendimento da [Nome da Clínica]. 🏥 "
+    "Para garantir o melhor cuidado com a sua saúde e segurança, nossa "
+    "assistente virtual processa seus dados de acordo com a Lei Geral de "
+    "Proteção de Dados (LGPD). Ao continuar esta conversa, você concorda "
+    "com o uso dos seus dados para fins de agendamento e orientações sobre "
+    "serviços. 📄 Leia nossa Política de Privacidade completa aqui: "
+    "{{lgpd_link}} Como posso te ajudar hoje?"
+)
+
+
+def _build_lgpd_message(lgpd: dict, clinic_id: str) -> str:
+    """Build the LGPD opening message with the resolved privacy link.
+
+    - Uses `lgpd_message` from config or a sensible default.
+    - If `lgpd_custom_link` is set, uses it; otherwise builds
+      `{PUBLIC_BASE_URL}/privacidade/{clinic_id}`.
+    - Replaces `{{lgpd_link}}` placeholder with the resolved URL.
+    """
+    message = (lgpd or {}).get("lgpd_message") or _DEFAULT_LGPD_MESSAGE
+    custom_link = ((lgpd or {}).get("lgpd_custom_link") or "").strip()
+    if custom_link:
+        link = custom_link
+    else:
+        base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+        link = f"{base_url}/privacidade/{clinic_id}" if base_url else f"/privacidade/{clinic_id}"
+    return message.replace("{{lgpd_link}}", link)
 
 
 async def _load_tenant_credentials(
@@ -438,7 +474,7 @@ async def zapi_webhook(
         return JSONResponse(status_code=202, content=pause_result)
 
     # ── get or create a session for this phone ──
-    session_id = await _get_or_create_session(tenant_id, phone, db)
+    session_id, is_new = await _get_or_create_session(tenant_id, phone, db)
 
     # ── save chatLid mapping so fromMe=true can resolve the real phone ──
     if chat_lid and "@lid" in chat_lid:
@@ -449,6 +485,25 @@ async def zapi_webhook(
     # ── process through NeuroStack pipeline ──
     service = get_event_service()
     clinic_config = await service._load_clinic_config(tenant_id)
+
+    # ── send LGPD privacy notice as the very first message of a new session ──
+    if is_new:
+        lgpd_cfg = (clinic_config or {}).get("lgpd") or {}
+        if lgpd_cfg.get("lgpd_enabled"):
+            creds_lgpd = await _load_tenant_credentials(tenant_id, db)
+            z_inst = creds_lgpd.get("zapi_instance_id", "").strip()
+            z_tok = creds_lgpd.get("zapi_token", "").strip()
+            z_ct = creds_lgpd.get("zapi_client_token", "").strip()
+            if z_inst and z_tok:
+                try:
+                    privacy_msg = _build_lgpd_message(lgpd_cfg, clinic_id=str(tenant_id))
+                    send_result = await send_text_message(
+                        z_inst, z_tok, phone, privacy_msg, client_token=z_ct,
+                    )
+                    _track_sent_message(send_result)
+                    logger.info("Z-API LGPD privacy message sent to %s", phone)
+                except Exception as exc:
+                    logger.warning("Z-API LGPD send failed for %s — %s", phone, exc)
     event_request = EventRequest(
         tenant_id=tenant_id,
         session_id=session_id,
@@ -601,12 +656,32 @@ async def evolution_webhook(
         return JSONResponse(status_code=202, content=pause_result)
 
     # ── get or create a session for this phone ──
-    session_id = await _get_or_create_session(tenant_id, phone, db)
+    session_id, is_new = await _get_or_create_session(tenant_id, phone, db)
     await db.commit()
 
     # ── process through NeuroStack pipeline ──
     service = get_event_service()
     clinic_config = await service._load_clinic_config(tenant_id)
+
+    # ── send LGPD privacy notice as the very first message of a new session ──
+    if is_new:
+        lgpd_cfg = (clinic_config or {}).get("lgpd") or {}
+        if lgpd_cfg.get("lgpd_enabled"):
+            creds_lgpd = await _load_tenant_credentials(tenant_id, db)
+            e_url = creds_lgpd.get("evolution_api_url", "")
+            e_name = creds_lgpd.get("evolution_instance_name", "")
+            e_key = creds_lgpd.get("evolution_api_key", "")
+            if e_url and e_name and e_key:
+                try:
+                    privacy_msg = _build_lgpd_message(lgpd_cfg, clinic_id=str(tenant_id))
+                    send_result = await send_evolution_text(
+                        e_url, e_name, e_key, phone, privacy_msg,
+                    )
+                    _track_sent_message(send_result)
+                    logger.info("Evolution LGPD privacy message sent to %s", phone)
+                except Exception as exc:
+                    logger.warning("Evolution LGPD send failed for %s — %s", phone, exc)
+
     event_request = EventRequest(
         tenant_id=tenant_id,
         session_id=session_id,
