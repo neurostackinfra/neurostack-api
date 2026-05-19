@@ -46,8 +46,6 @@ def _render_page(
   p {{ margin: 0.5rem 0; }}
   hr {{ margin: 1.5rem 0; border: 0; border-top: 1px solid #e5e5e5; }}
   .message {{ white-space: pre-wrap; }}
-  .whatsapp-preview {{ background: #e5f7e5; border-radius: 0 12px 12px 12px; padding: 0.75rem 1rem; display: inline-block; max-width: 85%; white-space: pre-wrap; font-size: 0.95rem; line-height: 1.5; word-break: break-word; }}
-  .preview-wrapper {{ background: #f0f0f0; border-radius: 8px; padding: 1rem 1.25rem; margin-top: 0.5rem; }}
 </style>
 </head>
 <body>
@@ -56,11 +54,6 @@ def _render_page(
 <p><strong>Responsável pelo Tratamento de Dados:</strong> {dpo_name}</p>
 <p><strong>Contato DPO:</strong> {dpo_contact}</p>
 <p><strong>Contato da Clínica:</strong> {clinic_contact}</p>
-<hr>
-<h2>📱 Como a mensagem aparece no WhatsApp</h2>
-<div class="preview-wrapper">
-  <div class="whatsapp-preview">{lgpd_message}</div>
-</div>
 </body>
 </html>
 """
