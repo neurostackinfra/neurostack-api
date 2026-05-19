@@ -62,6 +62,10 @@ interface CredentialStatus {
   llm_api_key_masked:       string | null;
   llm_base_url:             string | null;
   llm_model_name:           string | null;
+  // Whisper (audio transcription)
+  whisper_api_key_set?:     boolean;
+  whisper_api_key_masked?:  string | null;
+  whisper_model?:           string | null;
   apis_configured:          boolean;
 }
 interface ClinicSlim { clinic_id: number; clinic_name: string; }
@@ -130,6 +134,8 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   clinicId: string; isReadOnly: boolean; isSuperAdmin: boolean;
 }) {
   const { toast } = useToast();
+  const { locale } = useI18n();
+  const txt = (p: string, e: string) => locale === "en" ? e : p;
   const [clinics, setClinics]               = useState<ClinicSlim[]>([]);
   const [selectedClinicId, setSelectedClinicId] = useState<string>(clinicId);
   const [status, setStatus]                 = useState<CredentialStatus | null>(null);
@@ -157,6 +163,10 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   const [llmApiUrl, setLlmApiUrl]           = useState("");
   const [llmModelName, setLlmModelName]     = useState("");
   const [llmFallback, setLlmFallback]       = useState<"openai" | "dropout">("dropout");
+
+  // Whisper (audio transcription)
+  const [whisperModel, setWhisperModel]     = useState("whisper-large-v3-turbo");
+  const [whisperApiKey, setWhisperApiKey]   = useState("");
 
   useEffect(() => {
     if (!isSuperAdmin) return;
@@ -195,6 +205,9 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       // LLM API key: send partial mask (sk-pro****9xyz) so the user can visually
       // confirm which key is configured. Backend detects "****" and skips update.
       setLlmApiKey(data.llm_api_key_masked ?? "");
+      // Whisper (audio transcription)
+      setWhisperModel(data.whisper_model ?? "whisper-large-v3-turbo");
+      setWhisperApiKey(data.whisper_api_key_masked ?? "");
     } catch { setError("Erro de rede."); }
     finally { setLoading(false); }
   }, [targetId]);
@@ -225,6 +238,11 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       }
       if (llmProvider === "dropout") body["llm_model_name"] = "text";
       else if (llmModelName && (llmProvider === "openai" || llmProvider === "outros"))  body["llm_model_name"] = llmModelName;
+      // Whisper (audio transcription)
+      body["whisper_model"] = whisperModel;
+      if (whisperApiKey && !whisperApiKey.includes("•") && !whisperApiKey.includes("*")) {
+        body["whisper_api_key"] = whisperApiKey;
+      }
       const saveUrl = targetId
         ? `/v1/config/api-credentials?clinic_id=${targetId}`
         : `/v1/config/api-credentials`;
@@ -543,6 +561,44 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
             </div>
           </div>
         )}
+      </div>
+
+      {/* ── Whisper (Audio Transcription) ── */}
+      <div className="space-y-4 rounded-lg border border-slate-700/50 bg-muted/20 p-4">
+        <SectionLabel>{txt("Transcrição de Áudio (Whisper)", "Audio Transcription (Whisper)")}</SectionLabel>
+        <p className="text-xs text-muted-foreground -mt-2 mb-3">
+          {txt(
+            "Transcreve mensagens de voz do WhatsApp para texto usando Groq Whisper.",
+            "Transcribes WhatsApp voice messages to text using Groq Whisper."
+          )}
+        </p>
+        <Field label={txt("Modelo Whisper", "Whisper Model")}>
+          <Select value={whisperModel} onValueChange={setWhisperModel} disabled={isReadOnly}>
+            <SelectTrigger className="h-9 text-sm font-mono">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="whisper-large-v3-turbo">
+                whisper-large-v3-turbo — {txt("Rápido e econômico", "Fast & economical")} ($0.04/hr)
+              </SelectItem>
+              <SelectItem value="whisper-large-v3">
+                whisper-large-v3 — {txt("Alta precisão", "High accuracy")} ($0.111/hr)
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
+        <Field label="Groq API Key" hint={txt("Chave da API Groq para transcrição de áudio.", "Groq API key for audio transcription.")}>
+          <ApiInput
+            label=""
+            value={whisperApiKey}
+            onChange={setWhisperApiKey}
+            type="password"
+            placeholder={status?.whisper_api_key_set ? "••••••••• (manter atual)" : "gsk-..."}
+            disabled={isReadOnly}
+            configured={status?.whisper_api_key_set}
+            mono
+          />
+        </Field>
       </div>
 
       {error && <p className="flex items-center gap-1.5 text-sm text-destructive"><AlertTriangle className="h-3.5 w-3.5" />{error}</p>}
