@@ -435,14 +435,9 @@ async def zapi_webhook(
     """
     body: dict[str, Any] = await request.json()
 
-    # ── extract text from payload ──
+    # ── extract payload identifiers ──
     text_obj = body.get("text")
-    if not text_obj or not isinstance(text_obj, dict):
-        return {"ok": True, "skipped": "non-text"}
-
-    message_text = text_obj.get("message", "").strip()
-    if not message_text:
-        return {"ok": True, "skipped": "empty"}
+    audio_obj = body.get("audio")
 
     instance_id = body.get("instanceId", "")
     raw_phone = body.get("phone", "")
@@ -458,6 +453,68 @@ async def zapi_webhook(
     if not tenant_id:
         logger.warning("Z-API webhook: no tenant for instance %s", instance_id)
         return {"ok": True, "skipped": "unknown_instance"}
+
+    # ── load clinic_config early so audio/text handling can use credentials ──
+    service = get_event_service()
+    clinic_config = await service._load_clinic_config(tenant_id)
+
+    # ── extract message text (from text payload or audio transcription) ──
+    message_text = ""
+    if text_obj and isinstance(text_obj, dict):
+        message_text = (text_obj.get("message") or "").strip()
+
+    # Handle audio/voice messages
+    if audio_obj and not message_text:
+        audio_url = audio_obj.get("url") or audio_obj.get("audioUrl")
+        mimetype = audio_obj.get("mimeType") or "audio/ogg"
+        if audio_url and clinic_config:
+            creds = (clinic_config or {}).get("api_credentials", {}) or {}
+            whisper_key = creds.get("whisper_api_key")
+            whisper_model = creds.get("whisper_model") or "whisper-large-v3-turbo"
+            agent_lang = _get_agent_language(clinic_config)
+            lang_hint = "en" if agent_lang == "en" else "pt"
+            if whisper_key:
+                z_inst = (creds.get("zapi_instance_id") or "").strip()
+                z_tok = (creds.get("zapi_token") or "").strip()
+                z_ct = (creds.get("zapi_client_token") or "").strip()
+                try:
+                    import httpx
+                    async with httpx.AsyncClient(timeout=30) as hx:
+                        audio_resp = await hx.get(audio_url)
+                        audio_resp.raise_for_status()
+                    audio_bytes = audio_resp.content
+                    # Reject audios > 5MB (~5 min of OGG/Opus in clinic context)
+                    MAX_AUDIO_BYTES = 5 * 1024 * 1024
+                    if len(audio_bytes) > MAX_AUDIO_BYTES:
+                        if z_inst and z_tok:
+                            await send_text_message(
+                                z_inst, z_tok, phone,
+                                "Por favor, envie um áudio mais curto (máximo 5 minutos). 🎙️",
+                                client_token=z_ct,
+                            )
+                        return {"ok": True, "skipped": "audio_too_large"}
+                    logger.info(
+                        "Audio received for transcription: size=%d bytes, mimetype=%s",
+                        len(audio_bytes), mimetype,
+                    )
+                    from src.services.groq_service import transcribe_audio
+                    message_text = await transcribe_audio(
+                        api_key=whisper_key,
+                        audio_bytes=audio_bytes,
+                        mimetype=mimetype,
+                        model=whisper_model,
+                        language=lang_hint,
+                    )
+                except Exception as exc:
+                    logger.warning("Audio transcription failed: %s", exc)
+                    return {"ok": True, "skipped": "transcription_failed"}
+            else:
+                return {"ok": True, "skipped": "no_whisper_key"}
+
+    if not text_obj and not audio_obj:
+        return {"ok": True, "skipped": "non-text"}
+    if not message_text:
+        return {"ok": True, "skipped": "empty"}
 
     # ── fromMe=true: check if AI-sent echo or real clinic message ──
     if body.get("fromMe", False):
@@ -506,8 +563,7 @@ async def zapi_webhook(
     await db.commit()
 
     # ── process through NeuroStack pipeline ──
-    service = get_event_service()
-    clinic_config = await service._load_clinic_config(tenant_id)
+    # (service + clinic_config were loaded earlier so audio handling could use them)
 
     # ── send LGPD privacy notice as the very first message of a new session ──
     if is_new:

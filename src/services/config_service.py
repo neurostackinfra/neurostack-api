@@ -77,6 +77,8 @@ FIELD_TO_BUCKET: dict[str, str] = {
     "llm_api_url": "api_credentials",
     "llm_provider": "api_credentials",
     "llm_model_name": "api_credentials",
+    "whisper_api_key": "api_credentials",
+    "whisper_model": "api_credentials",
 }
 
 # All JSONB bucket column names on ClinicConfigTable
