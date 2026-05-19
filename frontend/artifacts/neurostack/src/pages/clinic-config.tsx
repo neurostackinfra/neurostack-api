@@ -728,7 +728,6 @@ export default function ClinicConfig() {
   const [lgpdEnabled, setLgpdEnabled] = useState(false);
   const DEFAULT_LGPD_MESSAGE = "Olá! Bem-vindo(a) ao atendimento da [Nome da Clínica]. 🏥 Para garantir o melhor cuidado com a sua saúde e segurança, nossa assistente virtual processa seus dados de acordo com a Lei Geral de Proteção de Dados (LGPD). Ao continuar esta conversa, você concorda com o uso dos seus dados para fins de agendamento e orientações sobre serviços. 📄 Leia nossa Política de Privacidade completa aqui: {{lgpd_link}} Como posso te ajudar hoje?";
   const [lgpdMessage, setLgpdMessage] = useState(DEFAULT_LGPD_MESSAGE);
-  const [lgpdMessageEn, setLgpdMessageEn] = useState("");
   const [lgpdLinkMode, setLgpdLinkMode] = useState<"neurostack" | "custom">("neurostack");
   const [lgpdCustomLink, setLgpdCustomLink] = useState("");
   const [clinicLegalName, setClinicLegalName] = useState("");
@@ -778,7 +777,6 @@ export default function ClinicConfig() {
     setPrivacyLink(config.privacy_link ?? "");
     setLgpdEnabled(config.lgpd_enabled === "yes");
     setLgpdMessage(config.lgpd_message || DEFAULT_LGPD_MESSAGE);
-    setLgpdMessageEn(config.lgpd_message_en ?? "");
     setLgpdLinkMode(config.lgpd_custom_link ? "custom" : "neurostack");
     setLgpdCustomLink(config.lgpd_custom_link ?? "");
     setClinicLegalName(config.clinic_legal_name ?? "");
@@ -841,7 +839,6 @@ export default function ClinicConfig() {
       privacy_link: privacyLink.trim() || null,
       lgpd_enabled: lgpdEnabled ? "yes" : "no",
       lgpd_message: lgpdMessage.trim() || null,
-      lgpd_message_en: lgpdMessageEn.trim() || null,
       lgpd_custom_link: lgpdLinkMode === "custom" ? lgpdCustomLink.trim() || null : null,
       clinic_legal_name: clinicLegalName.trim() || null,
       clinic_cnpj: clinicCnpj.trim() || null,
@@ -1330,22 +1327,6 @@ export default function ClinicConfig() {
                   )}
                 </Field>
 
-                <Field
-                  label={txt("Mensagem de Abertura (English)", "Opening Message (English)")}
-                  hint={txt(
-                    "Usado quando o Idioma do Agente estiver configurado como Inglês.",
-                    "Used when Agent Language is set to English."
-                  )}
-                >
-                  <Textarea
-                    value={lgpdMessageEn}
-                    onChange={(e) => setLgpdMessageEn(e.target.value)}
-                    placeholder="Hello! Welcome to {{clinic_name}}. 🏥 ..."
-                    rows={5}
-                    className="resize-none text-sm"
-                    disabled={isReadOnly}
-                  />
-                </Field>
 
                 <Field label={txt("Link de Privacidade", "Privacy Link")} hint="">
                   <div className="flex flex-col gap-2">
