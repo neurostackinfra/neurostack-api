@@ -43,6 +43,7 @@ FIELD_TO_BUCKET: dict[str, str] = {
     "differentials": "business_rules",
     "language_policy": "business_rules",
     "language_policy_custom": "business_rules",
+    "agent_language": "business_rules",
     # lgpd
     "lgpd_enabled": "lgpd",
     "lgpd_message": "lgpd",
