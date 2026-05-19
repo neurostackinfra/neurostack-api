@@ -42,9 +42,12 @@ def _render_page(
 <style>
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; line-height: 1.6; }}
   h1 {{ font-size: 1.5rem; margin-bottom: 1.5rem; }}
+  h2 {{ font-size: 1.1rem; color: #555; margin-top: 2rem; }}
   p {{ margin: 0.5rem 0; }}
   hr {{ margin: 1.5rem 0; border: 0; border-top: 1px solid #e5e5e5; }}
   .message {{ white-space: pre-wrap; }}
+  .whatsapp-preview {{ background: #e5f7e5; border-radius: 0 12px 12px 12px; padding: 0.75rem 1rem; display: inline-block; max-width: 85%; white-space: pre-wrap; font-size: 0.95rem; line-height: 1.5; word-break: break-word; }}
+  .preview-wrapper {{ background: #f0f0f0; border-radius: 8px; padding: 1rem 1.25rem; margin-top: 0.5rem; }}
 </style>
 </head>
 <body>
@@ -54,7 +57,10 @@ def _render_page(
 <p><strong>Contato DPO:</strong> {dpo_contact}</p>
 <p><strong>Contato da Clínica:</strong> {clinic_contact}</p>
 <hr>
-<p class="message">{lgpd_message}</p>
+<h2>📱 Como a mensagem aparece no WhatsApp</h2>
+<div class="preview-wrapper">
+  <div class="whatsapp-preview">{lgpd_message}</div>
+</div>
 </body>
 </html>
 """
@@ -116,6 +122,19 @@ async def get_privacy_page(
 
     legal_name = lgpd.get("clinic_legal_name") or tenant_name or "Clínica"
 
+    # Build the resolved privacy link (same logic as webhook)
+    from src.config.settings import settings
+    custom_link = (lgpd.get("lgpd_custom_link") or "").strip()
+    if custom_link:
+        privacy_link = custom_link
+    else:
+        base_url = (settings.public_base_url or "").rstrip("/")
+        privacy_link = f"{base_url}/privacidade/{clinic_id}" if base_url else f"/privacidade/{clinic_id}"
+
+    # Replace placeholder in message before escaping
+    raw_message = lgpd.get("lgpd_message") or ""
+    resolved_message = raw_message.replace("{{lgpd_link}}", privacy_link)
+
     html_body = _render_page(
         title=_esc(legal_name),
         legal_name=_esc(legal_name),
@@ -123,6 +142,6 @@ async def get_privacy_page(
         dpo_name=_esc(lgpd.get("dpo_name")),
         dpo_contact=_esc(lgpd.get("dpo_contact")),
         clinic_contact=_esc(lgpd.get("clinic_contact")),
-        lgpd_message=_esc(lgpd.get("lgpd_message")),
+        lgpd_message=_esc(resolved_message),
     )
     return HTMLResponse(content=html_body, status_code=200)
