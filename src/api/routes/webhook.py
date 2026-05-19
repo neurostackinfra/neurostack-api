@@ -87,7 +87,7 @@ async def _resolve_tenant_by_credential(
         ClinicConfigTable.api_credentials[key].astext == value,
     )
     result = await session.execute(stmt)
-    return result.scalar_one_or_none()
+    return result.scalars().first()
 
 
 def _normalise_phone(raw: str) -> str:
