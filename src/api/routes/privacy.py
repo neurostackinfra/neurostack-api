@@ -131,9 +131,11 @@ async def get_privacy_page(
         base_url = (settings.public_base_url or "").rstrip("/")
         privacy_link = f"{base_url}/privacidade/{clinic_id}" if base_url else f"/privacidade/{clinic_id}"
 
-    # Replace placeholder in message before escaping
+    # Replace placeholders in message before escaping
     raw_message = lgpd.get("lgpd_message") or ""
     resolved_message = raw_message.replace("{{lgpd_link}}", privacy_link)
+    resolved_message = resolved_message.replace("{{clinic_name}}", legal_name)
+    resolved_message = resolved_message.replace("[Nome da Clínica]", legal_name)
 
     html_body = _render_page(
         title=_esc(legal_name),
