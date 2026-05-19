@@ -250,6 +250,7 @@ class EventService:
                         "handoff": row.handoff or {},
                         "professionals": row.professionals or [],
                         "api_credentials": api_creds,
+                        "lgpd": row.lgpd or {},
                     }
                     await _set_cached_config(tenant_id, config)
                     return config
