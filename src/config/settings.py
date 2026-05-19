@@ -127,6 +127,11 @@ class Settings(BaseSettings):
     support_email_to: str = "info@neurostack.global"
 
     # ============================================
+    # Public base URL (for LGPD privacy links, etc.)
+    # ============================================
+    public_base_url: str = ""
+
+    # ============================================
     # LLM Provider (OpenAI-compatible)
     # ============================================
     llm_base_url: str = ""

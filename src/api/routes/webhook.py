@@ -212,7 +212,8 @@ def _build_lgpd_message(lgpd: dict, clinic_id: str, clinic_name: str = "") -> st
     if custom_link:
         link = custom_link
     else:
-        base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+        from src.config.settings import settings
+        base_url = (settings.public_base_url or "").rstrip("/")
         link = f"{base_url}/privacidade/{clinic_id}" if base_url else f"/privacidade/{clinic_id}"
     message = message.replace("{{lgpd_link}}", link)
     if clinic_name:
