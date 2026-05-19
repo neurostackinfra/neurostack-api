@@ -199,15 +199,33 @@ _DEFAULT_LGPD_MESSAGE = (
 )
 
 
-def _build_lgpd_message(lgpd: dict, clinic_id: str, clinic_name: str = "") -> str:
+_DEFAULT_LGPD_MESSAGE_EN = (
+    "Hello! Welcome to {{clinic_name}}. 🏥 To ensure the best care for your health "
+    "and safety, our virtual assistant processes your data in accordance with "
+    "applicable privacy laws. By continuing this conversation, you agree to the "
+    "use of your data for scheduling and service guidance purposes. "
+    "📄 Read our full Privacy Policy here: {{lgpd_link}} How can I help you today?"
+)
+
+
+def _build_lgpd_message(
+    lgpd: dict,
+    clinic_id: str,
+    clinic_name: str = "",
+    agent_language: str = "pt-BR",
+) -> str:
     """Build the LGPD opening message with the resolved privacy link and clinic name.
 
-    - Uses `lgpd_message` from config or a sensible default.
+    - Uses `lgpd_message` (PT) or `lgpd_message_en` (EN) from config based on
+      ``agent_language``; falls back to a sensible default per language.
     - If `lgpd_custom_link` is set, uses it; otherwise builds
       `{PUBLIC_BASE_URL}/privacidade/{clinic_id}`.
     - Replaces `{{lgpd_link}}` and `{{clinic_name}}` / `[Nome da Clínica]` placeholders.
     """
-    message = (lgpd or {}).get("lgpd_message") or _DEFAULT_LGPD_MESSAGE
+    if agent_language == "en":
+        message = (lgpd or {}).get("lgpd_message_en") or _DEFAULT_LGPD_MESSAGE_EN
+    else:
+        message = (lgpd or {}).get("lgpd_message") or _DEFAULT_LGPD_MESSAGE
     custom_link = ((lgpd or {}).get("lgpd_custom_link") or "").strip()
     if custom_link:
         link = custom_link
@@ -502,7 +520,7 @@ async def zapi_webhook(
             if z_inst and z_tok:
                 try:
                     _clinic_name = (clinic_config or {}).get("identity", {}).get("clinic_name", "")
-                    privacy_msg = _build_lgpd_message(lgpd_cfg, clinic_id=str(tenant_id), clinic_name=_clinic_name)
+                    privacy_msg = _build_lgpd_message(lgpd_cfg, clinic_id=str(tenant_id), clinic_name=_clinic_name, agent_language=_get_agent_language(clinic_config))
                     send_result = await send_text_message(
                         z_inst, z_tok, phone, privacy_msg, client_token=z_ct,
                     )
@@ -680,7 +698,7 @@ async def evolution_webhook(
             if e_url and e_name and e_key:
                 try:
                     _clinic_name = (clinic_config or {}).get("identity", {}).get("clinic_name", "")
-                    privacy_msg = _build_lgpd_message(lgpd_cfg, clinic_id=str(tenant_id), clinic_name=_clinic_name)
+                    privacy_msg = _build_lgpd_message(lgpd_cfg, clinic_id=str(tenant_id), clinic_name=_clinic_name, agent_language=_get_agent_language(clinic_config))
                     send_result = await send_evolution_text(
                         e_url, e_name, e_key, phone, privacy_msg,
                     )

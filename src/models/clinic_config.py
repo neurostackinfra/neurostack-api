@@ -115,6 +115,7 @@ class ClinicLGPD(BaseModel):
     """LGPD bucket — data-protection / compliance fields."""
     lgpd_enabled: bool = False
     lgpd_message: Optional[str] = None
+    lgpd_message_en: Optional[str] = None
     lgpd_custom_link: Optional[str] = None
     clinic_legal_name: Optional[str] = None
     clinic_cnpj: Optional[str] = None
