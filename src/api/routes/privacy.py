@@ -114,6 +114,8 @@ async def get_privacy_page(
         )
 
     lgpd = row.lgpd or {}
+    business_rules = row.business_rules or {}
+    agent_language = business_rules.get("agent_language") or "pt-BR"
 
     tenant_row = await session.execute(
         select(Tenant.name).where(Tenant.id == clinic_uuid)
@@ -131,8 +133,12 @@ async def get_privacy_page(
         base_url = (settings.public_base_url or "").rstrip("/")
         privacy_link = f"{base_url}/privacidade/{clinic_id}" if base_url else f"/privacidade/{clinic_id}"
 
+    # Pick PT or EN message based on agent language
+    if agent_language == "en":
+        raw_message = lgpd.get("lgpd_message_en") or ""
+    else:
+        raw_message = lgpd.get("lgpd_message") or ""
     # Replace placeholders in message before escaping
-    raw_message = lgpd.get("lgpd_message") or ""
     resolved_message = raw_message.replace("{{lgpd_link}}", privacy_link)
     resolved_message = resolved_message.replace("{{clinic_name}}", legal_name)
     resolved_message = resolved_message.replace("[Nome da Clínica]", legal_name)

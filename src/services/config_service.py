@@ -47,6 +47,7 @@ FIELD_TO_BUCKET: dict[str, str] = {
     # lgpd
     "lgpd_enabled": "lgpd",
     "lgpd_message": "lgpd",
+    "lgpd_message_en": "lgpd",
     "lgpd_custom_link": "lgpd",
     "clinic_legal_name": "lgpd",
     "clinic_cnpj": "lgpd",
