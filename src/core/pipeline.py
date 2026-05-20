@@ -523,7 +523,8 @@ class CognitivePipeline:
 
             # Extended config injection (Group 1 — clinic-config-fullstack)
             custom_vars["agent_presentation"] = identity.get("agent_presentation", "")
-            custom_vars["use_emojis"] = identity.get("use_emojis", False)
+            _raw_emojis = identity.get("use_emojis", False)
+            custom_vars["use_emojis"] = _raw_emojis in (True, "yes", "true", "1", 1)
             custom_vars["language_policy"] = business.get("language_policy", "")
             custom_vars["clinic_history"] = identity.get("clinic_history", "")
             custom_vars["parking_info"] = operations.get("parking_info", "")
