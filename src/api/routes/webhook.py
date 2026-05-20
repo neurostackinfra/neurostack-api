@@ -584,6 +584,16 @@ async def zapi_webhook(
                     logger.info("Z-API LGPD privacy message sent to %s", phone)
                 except Exception as exc:
                     logger.warning("Z-API LGPD send failed for %s — %s", phone, exc)
+    _event_metadata: dict = {
+        "phone": phone,
+        "senderName": sender_name,
+        "messageId": body.get("messageId", ""),
+        "source": "zapi",
+    }
+    if audio_obj and message_text:
+        _event_metadata["whisper_model"] = creds.get("whisper_model") or "whisper-large-v3-turbo"  # type: ignore[possibly-undefined]
+        _event_metadata["audio_seconds"] = audio_obj.get("seconds") or 0
+        _event_metadata["is_audio"] = True
     event_request = EventRequest(
         tenant_id=tenant_id,
         session_id=session_id,
@@ -593,12 +603,7 @@ async def zapi_webhook(
             channel="whatsapp",
             user_id=phone,
             language=_get_agent_language(clinic_config),
-            metadata={
-                "phone": phone,
-                "senderName": sender_name,
-                "messageId": body.get("messageId", ""),
-                "source": "zapi",
-            },
+            metadata=_event_metadata,
         ),
     )
 

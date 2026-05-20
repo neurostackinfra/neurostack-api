@@ -284,7 +284,7 @@ async def get_trace_stats(
         intent = decision.get("intent", event_data.get("intent", metadata.get("intent", "unknown")))
         intent_dist[intent] = intent_dist.get(intent, 0) + 1
 
-        # Token usage
+        # Token usage (LLM)
         llm_usage = metadata.get("llm_usage", {})
         llm_model = metadata.get("llm_model", "")
         tokens = llm_usage.get("total_tokens", 0)
@@ -292,6 +292,11 @@ async def get_trace_stats(
             total_tokens_sum += tokens
             if llm_model:
                 model_tokens[llm_model] = model_tokens.get(llm_model, 0) + tokens
+        # Audio transcription (Whisper) — track separately with audio seconds as unit
+        whisper_model = metadata.get("whisper_model")
+        if whisper_model and metadata.get("is_audio"):
+            audio_sec = int(metadata.get("audio_seconds") or 0)
+            model_tokens[f"🎙️ {whisper_model}"] = model_tokens.get(f"🎙️ {whisper_model}", 0) + max(audio_sec, 1)
 
     avg_pt = (sum(processing_times) / len(processing_times)) if processing_times else 0.0
 
