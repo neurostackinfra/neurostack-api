@@ -222,6 +222,7 @@ def _build_credential_status(creds: dict[str, Any]) -> dict[str, Any]:
         "whisper_api_key_set": bool(creds.get("whisper_api_key")),
         "whisper_api_key_masked": _mask(creds.get("whisper_api_key")),
         "whisper_model": creds.get("whisper_model"),
+        "audio_max_seconds": creds.get("audio_max_seconds") or 60,
         # Overall status
         "apis_configured": _is_configured(creds),
     }
