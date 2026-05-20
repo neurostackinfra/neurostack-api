@@ -510,12 +510,14 @@ class EventService:
                 if result.state_patch.get("last_intent") == "saudacao":
                     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
                     _h = _dt.now(_tz(_td(hours=-3))).hour
+                    _use_emojis = (clinic_config or {}).get("identity", {}).get("use_emojis")
+                    _emoji_hint = " Use 1-2 emojis na resposta. 😊" if _use_emojis else ""
                     if language_code == "en":
                         _g = "Good morning" if _h < 12 else ("Good afternoon" if _h < 18 else "Good evening")
-                        messages.append({"role": "system", "content": f'REMINDER: It is now {_dt.now(_tz(_td(hours=-3))).strftime("%H:%M")} BRT. Start your response with "{_g}!" — do NOT use any other greeting.'})
+                        messages.append({"role": "system", "content": f'REMINDER: It is now {_dt.now(_tz(_td(hours=-3))).strftime("%H:%M")} BRT. Start your response with "{_g}!" — do NOT use any other greeting.{_emoji_hint}'})
                     else:
                         _g = "Bom dia" if _h < 12 else ("Boa tarde" if _h < 18 else "Boa noite")
-                        messages.append({"role": "system", "content": f'LEMBRETE: Agora são {_dt.now(_tz(_td(hours=-3))).strftime("%H:%M")} BRT. Comece sua resposta com "{_g}!" — NÃO use outra saudação.'})
+                        messages.append({"role": "system", "content": f'LEMBRETE: Agora são {_dt.now(_tz(_td(hours=-3))).strftime("%H:%M")} BRT. Comece sua resposta com "{_g}!" — NÃO use outra saudação.{_emoji_hint}'})
                 for attempt in range(2):
                     logger.info("Calling LLM",
                         attempt=attempt + 1,
