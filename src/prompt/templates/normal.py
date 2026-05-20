@@ -747,7 +747,7 @@ class NormalTemplate(BaseTemplate):
         if custom.get("service_format"):
             section.add(f"**Formato de atendimento:** {custom['service_format']}")
         if custom.get("use_emojis"):
-            section.add("**Estilo:** Pode usar emojis nas respostas para torná-las mais acolhedoras.")
+            section.add("**Estilo:** USE emojis nas respostas para torná-las mais acolhedoras. 😊 Inclua 1-2 emojis relevantes por mensagem.")
         else:
             section.add("**Estilo:** NÃO use emojis nas respostas. Mantenha o texto limpo, sem emojis.")
         if custom.get("language_policy"):
