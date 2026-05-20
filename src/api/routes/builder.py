@@ -417,6 +417,11 @@ async def _get_builder_stats(
             total_tokens += tokens
             if llm_model:
                 model_tokens[llm_model] = model_tokens.get(llm_model, 0) + tokens
+        # Track audio transcriptions (whisper) — use audio_seconds as the metric unit
+        whisper_model = metadata.get("whisper_model")
+        if whisper_model and metadata.get("is_audio"):
+            audio_sec = int(metadata.get("audio_seconds") or 0)
+            model_tokens[f"🎙️ {whisper_model}"] = model_tokens.get(f"🎙️ {whisper_model}", 0) + max(audio_sec, 1)
 
     model_breakdown = [
         {"model": model, "tokens": toks}
