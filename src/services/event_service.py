@@ -680,6 +680,9 @@ class EventService:
                     "llm_model": llm_model,
                     "llm_usage": llm_usage or {},
                     "funnel_stage": result.funnel_stage,
+                    # Audio transcription metadata (from webhook payload)
+                    **{k: v for k, v in (request.payload.metadata or {}).items()
+                       if k in ("whisper_model", "is_audio", "audio_seconds")},
                 },
             )
             await event_store.append(message_event)
