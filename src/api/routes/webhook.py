@@ -477,22 +477,37 @@ async def zapi_webhook(
                 z_inst = (creds.get("zapi_instance_id") or "").strip()
                 z_tok = (creds.get("zapi_token") or "").strip()
                 z_ct = (creds.get("zapi_client_token") or "").strip()
+
+                # Duration-based limit: long audios trigger human handoff instead of transcription
+                audio_max_seconds = int((creds or {}).get("audio_max_seconds") or 60)
+                audio_seconds = int(audio_obj.get("seconds") or 0)
+                if audio_seconds > audio_max_seconds:
+                    if z_inst and z_tok:
+                        if agent_lang == "en":
+                            handoff_msg = (
+                                "I received your voice message! 🎙️ Since it's a bit longer, I'll forward it to our team, "
+                                "who will listen and get back to you shortly. 😊"
+                            )
+                        else:
+                            handoff_msg = (
+                                "Recebi seu áudio! 🎙️ Como ele é mais longo, vou encaminhar para a nossa equipe, "
+                                "que vai ouvir e te responder com atenção. 😊"
+                            )
+                        await send_text_message(z_inst, z_tok, phone, handoff_msg, client_token=z_ct)
+                        # Mark conversation as unread so the clinic team sees the pending audio
+                        await mark_conversation_unread(z_inst, z_tok, phone, client_token=z_ct)
+                    logger.info(
+                        "Audio too long (%ds > %ds limit), skipping transcription for %s",
+                        audio_seconds, audio_max_seconds, phone,
+                    )
+                    return {"ok": True, "skipped": "audio_too_long"}
+
                 try:
                     import httpx
                     async with httpx.AsyncClient(timeout=30) as hx:
                         audio_resp = await hx.get(audio_url)
                         audio_resp.raise_for_status()
                     audio_bytes = audio_resp.content
-                    # Reject audios > 5MB (~5 min of OGG/Opus in clinic context)
-                    MAX_AUDIO_BYTES = 5 * 1024 * 1024
-                    if len(audio_bytes) > MAX_AUDIO_BYTES:
-                        if z_inst and z_tok:
-                            await send_text_message(
-                                z_inst, z_tok, phone,
-                                "Por favor, envie um áudio mais curto (máximo 5 minutos). 🎙️",
-                                client_token=z_ct,
-                            )
-                        return {"ok": True, "skipped": "audio_too_large"}
                     logger.info(
                         "Audio received for transcription: size=%d bytes, mimetype=%s",
                         len(audio_bytes), mimetype,
