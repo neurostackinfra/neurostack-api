@@ -552,8 +552,16 @@ class NormalTemplate(BaseTemplate):
         super().__init__(PromptMode.NORMAL)
 
     def build_system_message(self, variables: PromptVariables):
-        """Override to append language override as the absolute last instruction."""
+        """Override to append emoji and language overrides as the absolute last instructions."""
         msg = super().build_system_message(variables)
+        # Emoji directive — appended last so it has highest priority
+        if variables.custom.get("use_emojis"):
+            msg.content += (
+                "\n\n## EMOJI INSTRUCTION (MANDATORY)\n"
+                "**You MUST include 1-2 relevant emojis in EVERY response.** "
+                "Place them naturally within the text or at the end of sentences. "
+                "Examples: 😊 🏥 📅 ✅ 💬 👋"
+            )
         if variables.language == "en":
             msg.content += (
                 "\n\n## FINAL LANGUAGE INSTRUCTION (HIGHEST PRIORITY)\n"
