@@ -510,7 +510,8 @@ class EventService:
                 if result.state_patch.get("last_intent") == "saudacao":
                     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
                     _h = _dt.now(_tz(_td(hours=-3))).hour
-                    _use_emojis = (clinic_config or {}).get("identity", {}).get("use_emojis")
+                    _raw_emojis = (clinic_config or {}).get("identity", {}).get("use_emojis")
+                    _use_emojis = _raw_emojis in (True, "yes", "true", "1", 1)
                     _emoji_hint = " Use 1-2 emojis na resposta. 😊" if _use_emojis else ""
                     if language_code == "en":
                         _g = "Good morning" if _h < 12 else ("Good afternoon" if _h < 18 else "Good evening")
