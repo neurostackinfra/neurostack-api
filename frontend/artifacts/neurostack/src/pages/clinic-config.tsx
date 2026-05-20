@@ -167,6 +167,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   // Whisper (audio transcription)
   const [whisperModel, setWhisperModel]     = useState("whisper-large-v3-turbo");
   const [whisperApiKey, setWhisperApiKey]   = useState("");
+  const [audioMaxSeconds, setAudioMaxSeconds] = useState(60);
 
   useEffect(() => {
     if (!isSuperAdmin) return;
@@ -208,6 +209,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       // Whisper (audio transcription)
       setWhisperModel(data.whisper_model ?? "whisper-large-v3-turbo");
       setWhisperApiKey(data.whisper_api_key_masked ?? "");
+      setAudioMaxSeconds(Number(data.audio_max_seconds) || 60);
     } catch { setError("Erro de rede."); }
     finally { setLoading(false); }
   }, [targetId]);
@@ -240,6 +242,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       else if (llmModelName && (llmProvider === "openai" || llmProvider === "outros"))  body["llm_model_name"] = llmModelName;
       // Whisper (audio transcription)
       body["whisper_model"] = whisperModel;
+      body["audio_max_seconds"] = audioMaxSeconds;
       if (whisperApiKey && !whisperApiKey.includes("•") && !whisperApiKey.includes("*")) {
         body["whisper_api_key"] = whisperApiKey;
       }
@@ -597,6 +600,23 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
             disabled={isReadOnly}
             configured={status?.whisper_api_key_set}
             mono
+          />
+        </Field>
+        <Field
+          label={txt("Duração Máxima de Áudio (segundos)", "Max Audio Duration (seconds)")}
+          hint={txt(
+            "Áudios mais longos serão encaminhados para atendimento humano em vez de transcritos.",
+            "Audios longer than this limit will be routed to human support instead of transcribed."
+          )}
+        >
+          <input
+            type="number"
+            min={10}
+            max={300}
+            value={audioMaxSeconds}
+            onChange={(e) => setAudioMaxSeconds(Number(e.target.value))}
+            disabled={isReadOnly}
+            className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
           />
         </Field>
       </div>
