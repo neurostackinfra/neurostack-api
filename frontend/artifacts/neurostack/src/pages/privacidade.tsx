@@ -5,7 +5,7 @@ import { Loader2, Shield, AlertTriangle } from "lucide-react";
 const API_BASE = import.meta.env.BASE_URL.replace(/\/$/, "");
 
 interface ClinicPrivData {
-  clinic_id: number;
+  clinic_id: string;
   clinic_name: string;
   clinic_legal_name: string | null;
   clinic_cnpj: string | null;
