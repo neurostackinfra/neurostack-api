@@ -16,6 +16,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.schemas.events import EventPayload, EventRequest
+from src.core.lgpd_utils import resolve_privacy_link
 from src.models.clinic_config_table import ClinicConfigTable
 from src.repositories import SessionRepository, get_db_session_dependency
 from src.services.event_service import get_event_service
@@ -226,13 +227,7 @@ def _build_lgpd_message(
         message = (lgpd or {}).get("lgpd_message_en") or _DEFAULT_LGPD_MESSAGE_EN
     else:
         message = (lgpd or {}).get("lgpd_message") or _DEFAULT_LGPD_MESSAGE
-    custom_link = ((lgpd or {}).get("lgpd_custom_link") or "").strip()
-    if custom_link:
-        link = custom_link
-    else:
-        from src.config.settings import settings
-        base_url = (settings.public_base_url or "").rstrip("/")
-        link = f"{base_url}/privacidade/{clinic_id}" if base_url else f"/privacidade/{clinic_id}"
+    link = resolve_privacy_link(lgpd or {}, clinic_id)
     message = message.replace("{{lgpd_link}}", link)
     if clinic_name:
         message = message.replace("{{clinic_name}}", clinic_name)

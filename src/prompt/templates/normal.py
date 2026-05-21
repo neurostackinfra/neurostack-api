@@ -772,6 +772,14 @@ class NormalTemplate(BaseTemplate):
             section.add("\n## Equipe Profissional")
             section.add(custom["professionals"])
 
+        # LGPD — always inject privacy link so agent can respond when user asks
+        if custom.get("privacy_link"):
+            section.add(
+                f"\n[LGPD] Se o usuário perguntar sobre seus dados pessoais, "
+                f"política de privacidade ou LGPD, informe que os dados são tratados "
+                f"pela clínica responsável pelo atendimento e forneça o link: {custom['privacy_link']}"
+            )
+
         content = section.build()
         return content if section.content else ""
 

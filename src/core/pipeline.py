@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 from prometheus_client import Counter, Histogram
 
 from src.config.logging import get_logger
+from src.core.lgpd_utils import resolve_privacy_link
 from src.core.exceptions import (
     ServiceError,
     PolicyServiceError,
@@ -534,6 +535,9 @@ class CognitivePipeline:
             custom_vars["insurance_list"] = business.get("insurance_list", "")
             custom_vars["provide_prices"] = business.get("provide_prices", False)
             custom_vars["initial_consultation"] = business.get("initial_consultation", "")
+            custom_vars["privacy_link"] = resolve_privacy_link(
+                cfg.get("lgpd", {}), str(input_data.tenant_id)
+            )
 
             # Format professionals array
             professionals = cfg.get("professionals", [])
