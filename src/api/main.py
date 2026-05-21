@@ -443,6 +443,11 @@ def create_app() -> FastAPI:
         privacy.router,
         tags=["Privacy"],
     )
+    app.include_router(
+        privacy.public_router,
+        prefix="/api/public",
+        tags=["Privacy"],
+    )
     
     # Override OpenAPI schema to include headers (after all routers are registered)
     # This must be done after all routers are registered so routes are available
