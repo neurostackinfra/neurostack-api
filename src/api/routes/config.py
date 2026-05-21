@@ -175,6 +175,17 @@ async def patch_config(
     await session.flush()
     await session.commit()
 
+    # Warn when lgpd_enabled but mandatory compliance fields are missing
+    lgpd_bucket = row.lgpd or {}
+    if lgpd_bucket.get("lgpd_enabled") in (True, "yes", "true"):
+        missing = [f for f in ("clinic_legal_name", "dpo_contact") if not lgpd_bucket.get(f)]
+        if missing:
+            logger.warning(
+                "lgpd_enabled but required compliance fields missing — tenant=%s fields=%s",
+                tenant.tenant_id,
+                missing,
+            )
+
     # Invalidate Redis cache so next pipeline run picks up changes
     from src.services.event_service import invalidate_clinic_config_cache
     await invalidate_clinic_config_cache(tenant.tenant_id)

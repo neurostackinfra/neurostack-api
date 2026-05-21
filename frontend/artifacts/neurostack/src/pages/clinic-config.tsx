@@ -811,6 +811,7 @@ export default function ClinicConfig() {
   const [clinicContact, setClinicContact] = useState("");
   const [dpoName, setDpoName] = useState("");
   const [dpoContact, setDpoContact] = useState("");
+  const [lgpdErrors, setLgpdErrors] = useState<Record<string, string>>({});
   const [languagePolicy, setLanguagePolicy] = useState("neurostack_default");
   const [languagePolicyCustom, setLanguagePolicyCustom] = useState("");
   const [agentLanguage, setAgentLanguage] = useState("pt-BR");
@@ -887,6 +888,24 @@ export default function ClinicConfig() {
     setServices((prev) => prev.map((s, i) => (i === idx ? { ...s, [field]: value } : s)));
 
   const handleSave = async () => {
+    // LGPD hard block — validate before API call
+    const lgpdValidationErrors: Record<string, string> = {};
+    const requiredMsg = txt("Campo obrigatório para cumprimento da LGPD", "Required for LGPD compliance");
+    if (!clinicLegalName.trim()) lgpdValidationErrors.clinic_legal_name = requiredMsg;
+    if (lgpdLinkMode === "neurostack") {
+      if (!clinicCnpj.trim()) lgpdValidationErrors.clinic_cnpj = requiredMsg;
+      if (!dpoName.trim()) lgpdValidationErrors.dpo_name = requiredMsg;
+      if (!dpoContact.trim()) lgpdValidationErrors.dpo_contact = requiredMsg;
+    } else if (lgpdLinkMode === "custom") {
+      if (!lgpdCustomLink.trim()) lgpdValidationErrors.lgpd_custom_link = requiredMsg;
+    }
+    if (Object.keys(lgpdValidationErrors).length > 0) {
+      setLgpdErrors(lgpdValidationErrors);
+      toast.error(txt("Preencha os campos obrigatórios de LGPD antes de salvar.", "Fill in the required LGPD fields before saving."));
+      return;
+    }
+    setLgpdErrors({});
+
     setIsSaving(true);
     const payload: Record<string, any> = {
       clinic_name: clinicName.trim(),
@@ -1373,13 +1392,134 @@ export default function ClinicConfig() {
 
               <SwitchRow
                 label={txt("Ativar LGPD no Atendimento", "Enable LGPD in Attendance")}
-                hint={txt("Envia mensagem de abertura com aviso de privacidade", "Sends an opening message with a privacy notice")}
+                hint={txt("Envia mensagem de abertura com aviso de privacidade na primeira interação", "Sends a privacy notice on the first interaction")}
                 checked={lgpdEnabled}
                 onCheckedChange={setLgpdEnabled}
                 disabled={isReadOnly}
               />
 
-              {lgpdEnabled && (<>
+              {/* Ergonomist banner — always visible, explains why fields are needed even when OFF */}
+              <div className="rounded-md border border-amber-500/20 bg-amber-500/5 px-3 py-2 flex items-start gap-2">
+                <Shield className="h-3.5 w-3.5 text-amber-400 shrink-0 mt-0.5" />
+                <p className="text-[11px] text-amber-400/90 leading-relaxed">
+                  {txt(
+                    "Os dados abaixo são obrigatórios mesmo com o aviso desativado. Quando um paciente perguntar sobre privacidade ou LGPD, o agente precisa fornecer o link da política — independente do toggle.",
+                    "The fields below are required even when the notice is off. When a patient asks about privacy or LGPD, the agent must provide the policy link — regardless of the toggle."
+                  )}
+                </p>
+              </div>
+
+              {/* Privacy link selector — always visible */}
+              <Field label={txt("Link de Privacidade", "Privacy Link")} hint="">
+                <div className="flex flex-col gap-2">
+                  <div className="flex gap-4">
+                    {(["neurostack", "custom"] as const).map((mode) => (
+                      <label key={mode} className="flex items-center gap-2 cursor-pointer select-none">
+                        <div
+                          className={`h-4 w-4 rounded-full border-2 flex items-center justify-center transition-colors ${lgpdLinkMode === mode ? "border-violet-500 bg-violet-500" : "border-border"}`}
+                          onClick={() => !isReadOnly && setLgpdLinkMode(mode)}
+                        >
+                          {lgpdLinkMode === mode && <div className="h-1.5 w-1.5 rounded-full bg-white" />}
+                        </div>
+                        <span className="text-sm text-foreground/80">
+                          {mode === "neurostack" ? txt("Usar página padrão NeuroStack", "Use NeuroStack default page") : txt("Usar link próprio", "Use own link")}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+
+                  {lgpdLinkMode === "custom" && (
+                    <div>
+                      <Input
+                        value={lgpdCustomLink}
+                        onChange={(e) => { setLgpdCustomLink(e.target.value); setLgpdErrors(prev => { const n = {...prev}; delete n.lgpd_custom_link; return n; }); }}
+                        placeholder="https://suaclinica.com.br/privacidade"
+                        type="url"
+                        className={`text-sm font-mono${lgpdErrors.lgpd_custom_link ? " border-red-500" : ""}`}
+                        disabled={isReadOnly}
+                      />
+                      {lgpdErrors.lgpd_custom_link && <p className="text-xs text-red-400 mt-1">{lgpdErrors.lgpd_custom_link}</p>}
+                    </div>
+                  )}
+                </div>
+              </Field>
+
+              {/* Clinic data fields — always visible (required for LGPD compliance) */}
+              <div className="rounded-md border border-violet-500/20 bg-violet-500/5 p-3 space-y-2">
+                <p className="text-[11px] font-medium text-violet-400">
+                  {txt("Dados da clínica responsável pelo tratamento de dados *", "Clinic data controller fields *")}
+                </p>
+                <div className="grid grid-cols-2 gap-2">
+                  <Field label={txt("Nome Legal da Clínica *", "Clinic Legal Name *")} hint="">
+                    <Input
+                      value={clinicLegalName}
+                      onChange={(e) => { setClinicLegalName(e.target.value); setLgpdErrors(prev => { const n = {...prev}; delete n.clinic_legal_name; return n; }); }}
+                      placeholder={txt("Clínica Saúde Ltda.", "Health Clinic Ltd.")}
+                      className={`text-sm h-8${lgpdErrors.clinic_legal_name ? " border-red-500" : ""}`}
+                      disabled={isReadOnly}
+                    />
+                    {lgpdErrors.clinic_legal_name && <p className="text-xs text-red-400 mt-1">{lgpdErrors.clinic_legal_name}</p>}
+                  </Field>
+                  <Field label={lgpdLinkMode === "neurostack" ? txt("CNPJ *", "Tax ID / CNPJ *") : txt("CNPJ", "Tax ID / CNPJ")} hint="">
+                    <Input
+                      value={clinicCnpj}
+                      onChange={(e) => { setClinicCnpj(e.target.value); setLgpdErrors(prev => { const n = {...prev}; delete n.clinic_cnpj; return n; }); }}
+                      placeholder="00.000.000/0001-00"
+                      className={`text-sm h-8 font-mono${lgpdErrors.clinic_cnpj ? " border-red-500" : ""}`}
+                      disabled={isReadOnly}
+                    />
+                    {lgpdErrors.clinic_cnpj && <p className="text-xs text-red-400 mt-1">{lgpdErrors.clinic_cnpj}</p>}
+                  </Field>
+                </div>
+                <Field label={txt("E-mail / Telefone de Contato da Clínica", "Clinic Contact Email / Phone")} hint="">
+                  <Input value={clinicContact} onChange={(e) => setClinicContact(e.target.value)} placeholder={txt("contato@suaclinica.com.br / (11) 3000-0000", "contact@yourclinic.com / +1 (555) 000-0000")} className="text-sm h-8" disabled={isReadOnly} />
+                </Field>
+                <div className="grid grid-cols-2 gap-2">
+                  <Field label={lgpdLinkMode === "neurostack" ? txt("Nome do Encarregado (DPO) *", "DPO Name *") : txt("Nome do Encarregado (DPO)", "DPO Name")} hint="">
+                    <Input
+                      value={dpoName}
+                      onChange={(e) => { setDpoName(e.target.value); setLgpdErrors(prev => { const n = {...prev}; delete n.dpo_name; return n; }); }}
+                      placeholder={txt("João Silva", "John Smith")}
+                      className={`text-sm h-8${lgpdErrors.dpo_name ? " border-red-500" : ""}`}
+                      disabled={isReadOnly}
+                    />
+                    {lgpdErrors.dpo_name && <p className="text-xs text-red-400 mt-1">{lgpdErrors.dpo_name}</p>}
+                  </Field>
+                  <Field label={lgpdLinkMode === "neurostack" ? txt("E-mail / Contato do DPO *", "DPO Email / Contact *") : txt("E-mail / Contato do DPO", "DPO Email / Contact")} hint="">
+                    <Input
+                      value={dpoContact}
+                      onChange={(e) => { setDpoContact(e.target.value); setLgpdErrors(prev => { const n = {...prev}; delete n.dpo_contact; return n; }); }}
+                      placeholder={txt("dpo@suaclinica.com.br", "dpo@yourclinic.com")}
+                      className={`text-sm h-8${lgpdErrors.dpo_contact ? " border-red-500" : ""}`}
+                      disabled={isReadOnly}
+                    />
+                    {lgpdErrors.dpo_contact && <p className="text-xs text-red-400 mt-1">{lgpdErrors.dpo_contact}</p>}
+                  </Field>
+                </div>
+
+                {lgpdLinkMode === "neurostack" && (
+                  <Field label={txt("Sua URL única de Política de Privacidade", "Your unique Privacy Policy URL")} hint={txt("Compartilhe este link com seus pacientes", "Share this link with your patients")}>
+                    <div className="flex items-center gap-2">
+                      <Input
+                        readOnly
+                        value={`${window.location.origin}${API_BASE}/privacidade/${clinicId}`}
+                        className="text-sm font-mono bg-muted/40 text-muted-foreground"
+                      />
+                      <a
+                        href={`${API_BASE}/privacidade/${clinicId}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border hover:bg-accent transition-colors shrink-0"
+                      >
+                        <ExternalLink className="h-3.5 w-3.5" />
+                      </a>
+                    </div>
+                  </Field>
+                )}
+              </div>
+
+              {/* Opening message — only when toggle ON */}
+              {lgpdEnabled && (
                 <Field
                   label={txt("Mensagem de Abertura", "Opening Message")}
                   hint={txt("Use {{lgpd_link}} onde o link de privacidade será inserido automaticamente", "Use {{lgpd_link}} where the privacy link will be inserted automatically")}
@@ -1402,84 +1542,7 @@ export default function ClinicConfig() {
                     </button>
                   )}
                 </Field>
-
-
-                <Field label={txt("Link de Privacidade", "Privacy Link")} hint="">
-                  <div className="flex flex-col gap-2">
-                    <div className="flex gap-4">
-                      {(["neurostack", "custom"] as const).map((mode) => (
-                        <label key={mode} className="flex items-center gap-2 cursor-pointer select-none">
-                          <div
-                            className={`h-4 w-4 rounded-full border-2 flex items-center justify-center transition-colors ${lgpdLinkMode === mode ? "border-violet-500 bg-violet-500" : "border-border"}`}
-                            onClick={() => !isReadOnly && setLgpdLinkMode(mode)}
-                          >
-                            {lgpdLinkMode === mode && <div className="h-1.5 w-1.5 rounded-full bg-white" />}
-                          </div>
-                          <span className="text-sm text-foreground/80">
-                            {mode === "neurostack" ? txt("Usar página padrão NeuroStack", "Use NeuroStack default page") : txt("Usar link próprio", "Use own link")}
-                          </span>
-                        </label>
-                      ))}
-                    </div>
-
-                    {lgpdLinkMode === "custom" && (
-                      <Input
-                        value={lgpdCustomLink}
-                        onChange={(e) => setLgpdCustomLink(e.target.value)}
-                        placeholder="https://suaclinica.com.br/privacidade"
-                        type="url"
-                        className="text-sm font-mono"
-                        disabled={isReadOnly}
-                      />
-                    )}
-                  </div>
-                </Field>
-
-                {lgpdLinkMode === "neurostack" && (<>
-                  <div className="rounded-md border border-violet-500/20 bg-violet-500/5 p-3 space-y-2">
-                    <p className="text-[11px] font-medium text-violet-400">
-                      {txt("Dados da página pública de privacidade", "Public privacy page data")}
-                    </p>
-                    <div className="grid grid-cols-2 gap-2">
-                      <Field label={txt("Nome Legal da Clínica", "Clinic Legal Name")} hint="">
-                        <Input value={clinicLegalName} onChange={(e) => setClinicLegalName(e.target.value)} placeholder={txt("Clínica Saúde Ltda.", "Health Clinic Ltd.")} className="text-sm h-8" disabled={isReadOnly} />
-                      </Field>
-                      <Field label={txt("CNPJ", "Tax ID / CNPJ")} hint="">
-                        <Input value={clinicCnpj} onChange={(e) => setClinicCnpj(e.target.value)} placeholder="00.000.000/0001-00" className="text-sm h-8 font-mono" disabled={isReadOnly} />
-                      </Field>
-                    </div>
-                    <Field label={txt("E-mail / Telefone de Contato da Clínica", "Clinic Contact Email / Phone")} hint="">
-                      <Input value={clinicContact} onChange={(e) => setClinicContact(e.target.value)} placeholder={txt("contato@suaclinica.com.br / (11) 3000-0000", "contact@yourclinic.com / +1 (555) 000-0000")} className="text-sm h-8" disabled={isReadOnly} />
-                    </Field>
-                    <div className="grid grid-cols-2 gap-2">
-                      <Field label={txt("Nome do Encarregado (DPO)", "DPO Name")} hint="">
-                        <Input value={dpoName} onChange={(e) => setDpoName(e.target.value)} placeholder={txt("João Silva", "John Smith")} className="text-sm h-8" disabled={isReadOnly} />
-                      </Field>
-                      <Field label={txt("E-mail / Contato do DPO", "DPO Email / Contact")} hint="">
-                        <Input value={dpoContact} onChange={(e) => setDpoContact(e.target.value)} placeholder={txt("dpo@suaclinica.com.br", "dpo@yourclinic.com")} className="text-sm h-8" disabled={isReadOnly} />
-                      </Field>
-                    </div>
-                  </div>
-
-                  <Field label={txt("Sua URL única de Política de Privacidade", "Your unique Privacy Policy URL")} hint={txt("Compartilhe este link com seus pacientes", "Share this link with your patients")}>
-                    <div className="flex items-center gap-2">
-                      <Input
-                        readOnly
-                        value={`${window.location.origin}${API_BASE}/privacidade/${clinicId}`}
-                        className="text-sm font-mono bg-muted/40 text-muted-foreground"
-                      />
-                      <a
-                        href={`${API_BASE}/privacidade/${clinicId}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border hover:bg-accent transition-colors shrink-0"
-                      >
-                        <ExternalLink className="h-3.5 w-3.5" />
-                      </a>
-                    </div>
-                  </Field>
-                </>)}
-              </>)}
+              )}
 
               <SectionLabel>{txt("Idioma do Agente", "Agent Language")}</SectionLabel>
               <Field
