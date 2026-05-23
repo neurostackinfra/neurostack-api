@@ -320,13 +320,23 @@ async def update_clinic(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid clinic ID")
 
-    result = await session.execute(select(Tenant).where(Tenant.id == cid))
+    result = await session.execute(
+        select(Tenant)
+        .options(selectinload(Tenant.clinic_config_row))
+        .where(Tenant.id == cid)
+    )
     t = result.scalar_one_or_none()
     if not t:
         raise HTTPException(status_code=404, detail="Clinic not found")
 
     if body.clinic_name is not None:
         t.name = body.clinic_name
+        # Sync clinic_name into the identity JSONB bucket so the frontend
+        # header (which reads clinicConfig.clinic_name) stays in sync.
+        if t.clinic_config_row:
+            identity = dict(t.clinic_config_row.identity or {})
+            identity["clinic_name"] = body.clinic_name
+            t.clinic_config_row.identity = identity
 
     if body.email is not None or body.password is not None:
         user_result = await session.execute(
