@@ -772,22 +772,24 @@ class CognitivePipeline:
         handoff_active = str(cfg.get("handoff_active", "yes")).lower()
         standby_mode = str(cfg.get("standby_mode", "active")).lower()
 
-        if handoff_active != "yes" or standby_mode != "active":
+        if handoff_active != "yes":
             logger.info(
                 "handoff_pause_skipped",
                 extra={
                     "session_id": str(input_data.session_id),
                     "handoff_active": handoff_active,
-                    "standby_mode": standby_mode,
                 },
             )
             return False, None
 
-        # Calculate paused_until based on handoff_period
         handoff_period = str(cfg.get("handoff_period", "permanent")).lower()
         paused_until_iso: Optional[str] = None
 
-        if handoff_period == "cycle":
+        if standby_mode == "inactive":
+            fallback_hours = int(cfg.get("handoff_inactive_default_hours", 24))
+            paused_until = datetime.now(timezone.utc) + timedelta(hours=fallback_hours)
+            paused_until_iso = paused_until.isoformat()
+        elif handoff_period == "cycle":
             cycle_days = int(cfg.get("handoff_cycle_days", 7))
             paused_until = datetime.now(timezone.utc) + timedelta(days=cycle_days)
             paused_until_iso = paused_until.isoformat()
