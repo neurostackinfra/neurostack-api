@@ -49,7 +49,7 @@ export function Layout({ children }: LayoutProps) {
   const clinicName = clinicConfig?.clinic_name ?? `Clinic ${displayClinicId}`;
 
   // Builder clinic list for dropdown
-  const [builderClinics, setBuilderClinics] = useState<Array<{ id: string; name: string; tenant_id: string }>>([]);
+  const [builderClinics, setBuilderClinics] = useState<Array<{ id: string; name: string }>>([]);
   useEffect(() => {
     if (!isBuilder) return;
     const raw = localStorage.getItem("ns_auth");
@@ -59,12 +59,13 @@ export function Layout({ children }: LayoutProps) {
       headers: { Authorization: `Bearer ${token}` },
     })
       .then((r) => r.ok ? r.json() : Promise.reject(r))
-      .then((data: { clinics?: Array<{ id: string; name: string; tenant_id: string }> }) => {
-        const clinics = data.clinics ?? [];
+      .then((data: Array<{ id: string; name: string }> | { clinics?: Array<{ id: string; name: string }> }) => {
+        // API returns a plain array, not { clinics: [...] }
+        const clinics = Array.isArray(data) ? data : (data.clinics ?? []);
         setBuilderClinics(clinics);
-        // Stale viewingClinicId guard
-        if (clinics.length > 0 && !clinics.some((c) => c.tenant_id === viewingClinicId)) {
-          setViewingClinicId(clinics[0].tenant_id);
+        // Stale viewingClinicId guard — use c.id (the tenant UUID)
+        if (clinics.length > 0 && !clinics.some((c) => c.id === viewingClinicId)) {
+          setViewingClinicId(clinics[0].id);
         }
       })
       .catch(() => {});
@@ -132,7 +133,7 @@ export function Layout({ children }: LayoutProps) {
             data-testid="builder-clinic-dropdown"
           >
             {builderClinics.map((c) => (
-              <option key={c.id} value={c.tenant_id}>
+              <option key={c.id} value={c.id}>
                 {c.name}
               </option>
             ))}
