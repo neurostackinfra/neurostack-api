@@ -36,8 +36,10 @@ from src.api.schemas.admin import (
     UpdateBuilderRequest,
     UpdateClinicRequest,
 )
+from src.api.schemas.billing import CouponResponse, CreateCouponRequest
 from src.models.builder import Builder
 from src.models.clinic_config_table import ClinicConfigTable
+from src.models.coupon import Coupon
 from src.models.event import Event
 from src.models.tenant import Tenant
 from src.models.user import User, UserRole
@@ -921,5 +923,106 @@ async def link_clinic_to_builder(
         raise HTTPException(status_code=409, detail="Esta clínica já está vinculada a um builder")
 
     clinic.builder_id = bid
+    await session.commit()
+    return {"ok": True}
+
+
+# ============================================
+# Coupons Endpoints
+# ============================================
+
+
+@router.post(
+    "/coupons",
+    summary="Create Coupon",
+    description="Create a new discount coupon. Super admin only.",
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_coupon(
+    body: CreateCouponRequest,
+    tenant: TenantContext = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
+):
+    code_upper = body.code.strip().upper()
+    existing = await session.execute(
+        select(Coupon).where(Coupon.code == code_upper)
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cupom '{code_upper}' já existe",
+        )
+
+    coupon = Coupon(
+        code=code_upper,
+        discount_percent=body.discount_percent,
+        max_uses=body.max_uses,
+        expires_at=body.expires_at,
+    )
+    session.add(coupon)
+    await session.commit()
+    return CouponResponse(
+        id=str(coupon.id),
+        code=coupon.code,
+        discount_percent=coupon.discount_percent,
+        max_uses=coupon.max_uses,
+        uses_count=coupon.uses_count,
+        expires_at=coupon.expires_at,
+        is_active=coupon.is_active,
+        created_at=coupon.created_at,
+    ).model_dump(mode="json")
+
+
+@router.get(
+    "/coupons",
+    summary="List Coupons",
+    description="List all coupons. Super admin only.",
+)
+async def list_coupons(
+    tenant: TenantContext = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
+):
+    result = await session.execute(
+        select(Coupon).order_by(Coupon.created_at.desc())
+    )
+    coupons = result.scalars().all()
+    return [
+        CouponResponse(
+            id=str(c.id),
+            code=c.code,
+            discount_percent=c.discount_percent,
+            max_uses=c.max_uses,
+            uses_count=c.uses_count,
+            expires_at=c.expires_at,
+            is_active=c.is_active,
+            created_at=c.created_at,
+        ).model_dump(mode="json")
+        for c in coupons
+    ]
+
+
+@router.patch(
+    "/coupons/{coupon_id}",
+    summary="Deactivate Coupon",
+    description="Deactivate an existing coupon. Super admin only.",
+)
+async def deactivate_coupon(
+    coupon_id: str,
+    tenant: TenantContext = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
+):
+    from uuid import UUID as _UUID
+
+    try:
+        cid = _UUID(coupon_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid coupon ID")
+
+    result = await session.execute(select(Coupon).where(Coupon.id == cid))
+    coupon = result.scalar_one_or_none()
+    if not coupon:
+        raise HTTPException(status_code=404, detail="Cupom não encontrado")
+
+    coupon.is_active = False
     await session.commit()
     return {"ok": True}

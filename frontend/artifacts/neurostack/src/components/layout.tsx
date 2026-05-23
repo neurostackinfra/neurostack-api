@@ -76,6 +76,7 @@ export function Layout({ children }: LayoutProps) {
     { href: "/dashboard",label: t("nav_dashboard"), icon: LayoutDashboard,id: "dashboard",      hideFor: [] },
     { href: "/config",   label: t("nav_config"),    icon: Sliders,        id: "clinic-config",  hideFor: [] },
     { href: "/suporte",  label: t("nav_support"),    icon: HelpCircle,    id: "suporte",        hideFor: ["super_admin"], badge: isClinicAdmin ? t("badge_coming_soon") : undefined },
+    { href: "/billing",  label: t("nav_billing"),    icon: CreditCard,    id: "billing",        hideFor: ["clinic_admin"] },
   ].filter(item => !(item.hideFor as string[]).includes(role));
 
   const roadmapItems = [
@@ -88,7 +89,6 @@ export function Layout({ children }: LayoutProps) {
     { href: "/rlhf-audit",     label: t("nav_rlhf"),           icon: FlaskConical,  id: "rlhf-audit",     v: "v3",  hideFor: ["clinic_admin"] },
     { href: "/consultoria",    label: t("nav_consulting"),     icon: Lightbulb,     id: "consultoria",    v: "v2",  hideFor: [] },
     { href: "/midias",         label: t("nav_media"),          icon: FolderOpen,    id: "midias",         v: "v3",  hideFor: ["clinic_admin"] },
-    { href: "/billing",        label: t("nav_billing"),        icon: CreditCard,    id: "billing",        v: "v2",  hideFor: ["clinic_admin"] },
     { href: "/voice-ai",       label: t("nav_voice"),          icon: Mic,           id: "voice-ai",       v: "v3",  hideFor: ["clinic_admin"] },
     { href: "/portal-parceiros",label: t("nav_partners"),      icon: Briefcase,     id: "portal-parceiros",v: "v3", hideFor: ["clinic_admin"] },
   ].filter(item => !item.hideFor.includes(role));

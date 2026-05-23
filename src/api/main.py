@@ -36,7 +36,7 @@ from src.api.middleware.tracing import (
     instrument_redis,
     instrument_sqlalchemy,
 )
-from src.api.routes import admin, auth, builder, config, demo_leads, events, handoff, health, knowledge, policies, privacy, rlhf, sessions, support, traces, webhook
+from src.api.routes import admin, auth, billing, builder, config, demo_leads, events, handoff, health, knowledge, policies, privacy, rlhf, sessions, support, traces, webhook
 from src.config.logging import configure_logging, get_logger
 from src.config.settings import settings
 from src.core.exceptions import ConfigurationError
@@ -418,6 +418,11 @@ def create_app() -> FastAPI:
         builder.router,
         prefix=f"{settings.api_prefix}/builder",
         tags=["Builder"],
+    )
+    app.include_router(
+        billing.router,
+        prefix=f"{settings.api_prefix}/billing",
+        tags=["Billing"],
     )
     app.include_router(
         admin.router,

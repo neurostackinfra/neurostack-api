@@ -132,6 +132,12 @@ class Settings(BaseSettings):
     public_base_url: str = ""
 
     # ============================================
+    # AbacatePay (Payment Gateway)
+    # ============================================
+    abacatepay_api_key: str = ""
+    abacatepay_webhook_secret: str = ""
+
+    # ============================================
     # LLM Provider (OpenAI-compatible)
     # ============================================
     llm_base_url: str = ""

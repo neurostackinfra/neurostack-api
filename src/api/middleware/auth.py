@@ -417,6 +417,8 @@ class AuthMiddleware:
             return True
         if path.startswith("/v1/webhook/"):
             return True
+        if path == "/v1/billing/webhook":
+            return True
         if path.startswith("/privacidade/"):
             return True
         if path.startswith("/api/public/privacidade/"):
