@@ -7,6 +7,7 @@ This module exports all ORM models for database operations.
 
 from src.models.base import Base, TimestampMixin
 from src.models.builder import Builder
+from src.models.coupon import Coupon
 from src.models.tenant import Tenant, TenantConfig
 from src.models.clinic_config import ClinicConfig
 from src.models.clinic_config_table import ClinicConfigTable
@@ -25,6 +26,7 @@ __all__ = [
     "TimestampMixin",
     # Core Models
     "Builder",
+    "Coupon",
     "Tenant",
     "TenantConfig",
     "ClinicConfig",

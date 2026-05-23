@@ -3,7 +3,7 @@ NeuroStack - Builder Model
 Represents a builder (company/partner) that manages one or more clinic tenants.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 from uuid import UUID, uuid4
 
 from sqlalchemy import Boolean, String
@@ -30,6 +30,17 @@ class Builder(Base, TimestampMixin):
     )
     is_active: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default="true", nullable=False,
+    )
+
+    # Billing / subscription
+    subscription_plan: Mapped[Optional[str]] = mapped_column(
+        String(20), nullable=True,
+    )
+    billing_cycle: Mapped[str] = mapped_column(
+        String(10), default="monthly", server_default="monthly", nullable=False,
+    )
+    subscription_status: Mapped[str] = mapped_column(
+        String(20), default="trial", server_default="trial", nullable=False,
     )
 
     # Relationships

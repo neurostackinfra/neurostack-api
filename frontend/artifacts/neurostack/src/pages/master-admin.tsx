@@ -611,6 +611,16 @@ export default function MasterAdmin() {
   const [linkingClinicToBuilderId, setLinkingClinicToBuilderId] = useState<number | null>(null);
   const [selectedLinkClinicId, setSelectedLinkClinicId] = useState("");
 
+  // Coupons state
+  const [coupons, setCoupons] = useState<Array<{ id: string; code: string; discount_percent: number; max_uses: number | null; uses_count: number; expires_at: string | null; is_active: boolean; created_at: string | null }>>([]);
+  const [couponsLoaded, setCouponsLoaded] = useState(false);
+  const [showCouponsSection, setShowCouponsSection] = useState(false);
+  const [newCouponCode, setNewCouponCode] = useState("");
+  const [newCouponDiscount, setNewCouponDiscount] = useState("");
+  const [newCouponMaxUses, setNewCouponMaxUses] = useState("");
+  const [newCouponExpires, setNewCouponExpires] = useState("");
+  const [addingCoupon, setAddingCoupon] = useState(false);
+
   const fetchClinics = async () => {
     setLoading(true);
     setError(null);
@@ -633,6 +643,56 @@ export default function MasterAdmin() {
       if (!res.ok) return;
       setBuilders(await res.json() as BuilderWithClinics[]);
       setBuildersLoaded(true);
+    } catch { /* silent */ }
+  };
+
+  const fetchCoupons = async () => {
+    try {
+      const res = await fetch(`/v1/admin/coupons`, { headers: authHeaders(token) });
+      if (!res.ok) return;
+      setCoupons(await res.json());
+      setCouponsLoaded(true);
+    } catch { /* silent */ }
+  };
+
+  const handleAddCoupon = async () => {
+    if (!newCouponCode.trim() || !newCouponDiscount) return;
+    setAddingCoupon(true);
+    try {
+      const body: Record<string, unknown> = {
+        code: newCouponCode.trim().toUpperCase(),
+        discount_percent: parseInt(newCouponDiscount, 10),
+      };
+      if (newCouponMaxUses) body.max_uses = parseInt(newCouponMaxUses, 10);
+      if (newCouponExpires) body.expires_at = new Date(newCouponExpires).toISOString();
+      const res = await fetch(`/v1/admin/coupons`, {
+        method: "POST", headers: authHeaders(token),
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({})) as { detail?: string };
+        toast({ title: err.detail ?? "Erro ao criar cupom", variant: "destructive" });
+        return;
+      }
+      setNewCouponCode(""); setNewCouponDiscount(""); setNewCouponMaxUses(""); setNewCouponExpires("");
+      await fetchCoupons();
+      toast({ title: "Cupom criado com sucesso!" });
+    } catch {
+      toast({ title: "Erro de rede", variant: "destructive" });
+    } finally {
+      setAddingCoupon(false);
+    }
+  };
+
+  const handleDeactivateCoupon = async (couponId: string) => {
+    try {
+      const res = await fetch(`/v1/admin/coupons/${couponId}`, {
+        method: "PATCH", headers: authHeaders(token),
+      });
+      if (res.ok) {
+        await fetchCoupons();
+        toast({ title: "Cupom desativado" });
+      }
     } catch { /* silent */ }
   };
 
@@ -1935,6 +1995,143 @@ export default function MasterAdmin() {
               </div>
             )}
           </CardContent>
+        </Card>
+      )}
+
+      {/* Coupons Section */}
+      {isSuperAdmin && (
+        <Card className="border-border/60">
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <DollarSign className="h-4 w-4 text-emerald-400" />
+                <CardTitle className="text-sm">Cupons de Desconto</CardTitle>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5 text-xs"
+                onClick={() => { setShowCouponsSection(!showCouponsSection); if (!couponsLoaded) void fetchCoupons(); }}
+              >
+                {showCouponsSection ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                {showCouponsSection ? "Fechar" : "Gerenciar"}
+              </Button>
+            </div>
+          </CardHeader>
+          {showCouponsSection && (
+            <CardContent className="space-y-4">
+              {/* Create coupon form */}
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-2 items-end">
+                <div>
+                  <Label className="text-[10px] text-muted-foreground">Código</Label>
+                  <Input
+                    value={newCouponCode}
+                    onChange={(e) => setNewCouponCode(e.target.value.toUpperCase())}
+                    placeholder="PILOTO50"
+                    className="text-xs font-mono uppercase h-8"
+                  />
+                </div>
+                <div>
+                  <Label className="text-[10px] text-muted-foreground">Desconto %</Label>
+                  <Input
+                    type="number"
+                    min="1"
+                    max="100"
+                    value={newCouponDiscount}
+                    onChange={(e) => setNewCouponDiscount(e.target.value)}
+                    placeholder="50"
+                    className="text-xs h-8"
+                  />
+                </div>
+                <div>
+                  <Label className="text-[10px] text-muted-foreground">Max usos</Label>
+                  <Input
+                    type="number"
+                    min="1"
+                    value={newCouponMaxUses}
+                    onChange={(e) => setNewCouponMaxUses(e.target.value)}
+                    placeholder="∞"
+                    className="text-xs h-8"
+                  />
+                </div>
+                <div>
+                  <Label className="text-[10px] text-muted-foreground">Expira em</Label>
+                  <Input
+                    type="date"
+                    value={newCouponExpires}
+                    onChange={(e) => setNewCouponExpires(e.target.value)}
+                    className="text-xs h-8"
+                  />
+                </div>
+                <Button
+                  size="sm"
+                  onClick={() => void handleAddCoupon()}
+                  disabled={addingCoupon || !newCouponCode.trim() || !newCouponDiscount}
+                  className="gap-1.5 h-8"
+                >
+                  {addingCoupon ? <Loader2 className="h-3 w-3 animate-spin" /> : <Plus className="h-3 w-3" />}
+                  Criar
+                </Button>
+              </div>
+
+              {/* Coupons table */}
+              {couponsLoaded && coupons.length > 0 && (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="border-b border-border/50">
+                        <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Código</th>
+                        <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Desconto</th>
+                        <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Usos</th>
+                        <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Expira</th>
+                        <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Status</th>
+                        <th className="text-left pb-2 font-medium text-muted-foreground">Ação</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {coupons.map((c) => (
+                        <tr key={c.id} className="border-b border-border/30 last:border-0">
+                          <td className="py-2 pr-4 font-mono font-bold text-foreground">{c.code}</td>
+                          <td className="py-2 pr-4 text-emerald-400 font-semibold">{c.discount_percent}%</td>
+                          <td className="py-2 pr-4 text-muted-foreground">
+                            {c.uses_count}{c.max_uses ? ` / ${c.max_uses}` : " / ∞"}
+                          </td>
+                          <td className="py-2 pr-4 text-muted-foreground">
+                            {c.expires_at
+                              ? new Date(c.expires_at).toLocaleDateString("pt-BR")
+                              : "—"}
+                          </td>
+                          <td className="py-2 pr-4">
+                            <Badge className={c.is_active
+                              ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/30 text-[10px]"
+                              : "bg-red-500/15 text-red-400 border-red-500/30 text-[10px]"
+                            }>
+                              {c.is_active ? "Ativo" : "Inativo"}
+                            </Badge>
+                          </td>
+                          <td className="py-2">
+                            {c.is_active && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-6 px-2 text-[10px] text-red-400 hover:text-red-300 hover:bg-red-500/10"
+                                onClick={() => void handleDeactivateCoupon(c.id)}
+                              >
+                                Desativar
+                              </Button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {couponsLoaded && coupons.length === 0 && (
+                <p className="text-xs text-muted-foreground text-center py-4">Nenhum cupom criado ainda.</p>
+              )}
+            </CardContent>
+          )}
         </Card>
       )}
 
