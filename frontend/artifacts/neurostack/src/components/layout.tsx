@@ -33,7 +33,7 @@ import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
-import { useGetClinicConfig } from "@workspace/api-client-react";
+// useGetClinicConfig removed — it ignores clinic_id; layout now fetches directly
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -45,8 +45,22 @@ export function Layout({ children }: LayoutProps) {
   const { t, locale, setLocale } = useI18n();
   const { setViewingClinicId } = useAuth();
   const displayClinicId = (isSuperAdmin || isBuilder) ? viewingClinicId : clinicId;
-  const { data: clinicConfig } = useGetClinicConfig({ clinic_id: displayClinicId });
-  const clinicName = clinicConfig?.clinic_name ?? `Clinic ${displayClinicId}`;
+
+  // useGetClinicConfig ignores clinic_id — fetch directly with ?clinic_id= so
+  // builders see the selected clinic's name instead of their own HQ config.
+  const [clinicName, setClinicName] = useState<string>("");
+  useEffect(() => {
+    if (!displayClinicId) { setClinicName(""); return; }
+    const raw = localStorage.getItem("ns_auth");
+    const token = raw ? (JSON.parse(raw) as { token?: string }).token : null;
+    if (!token) return;
+    fetch(`/v1/config?clinic_id=${displayClinicId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => r.ok ? r.json() : Promise.reject(r))
+      .then((cfg: { clinic_name?: string }) => setClinicName(cfg.clinic_name ?? ""))
+      .catch(() => {});
+  }, [displayClinicId]);
 
   // Builder clinic list for dropdown
   const [builderClinics, setBuilderClinics] = useState<Array<{ id: string; name: string }>>([]);
