@@ -379,12 +379,16 @@ async def _handle_clinic_message(
     # Human takeover: pause session (no mark-unread — secretary is in conversation)
     session.is_paused = True
 
+    standby_mode = str(handoff_cfg.get("standby_mode", "active")).lower()
     handoff_period = str(handoff_cfg.get("handoff_period", "permanent")).lower()
-    if handoff_period == "cycle":
+    if standby_mode == "inactive":
+        fallback_hours = int(handoff_cfg.get("handoff_inactive_default_hours", 24))
+        session.paused_until = datetime.now(timezone.utc) + timedelta(hours=fallback_hours)
+    elif handoff_period == "cycle":
         cycle_days = int(handoff_cfg.get("handoff_cycle_days", 7))
         session.paused_until = datetime.now(timezone.utc) + timedelta(days=cycle_days)
     else:
-        session.paused_until = None
+        session.paused_until = None  # permanent — espera frase mestra
 
     await db.flush()
     logger.info(

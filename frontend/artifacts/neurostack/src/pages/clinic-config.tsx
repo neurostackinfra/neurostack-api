@@ -821,6 +821,7 @@ export default function ClinicConfig() {
   const [standbyMode, setStandbyMode] = useState("active");
   const [handoffPeriod, setHandoffPeriod] = useState("permanent");
   const [handoffCycleDays, setHandoffCycleDays] = useState("");
+  const [handoffInactiveDefaultHours, setHandoffInactiveDefaultHours] = useState("24");
   const [hitlActive, setHitlActive] = useState(false);
   const [hitlCooldown, setHitlCooldown] = useState("15");
 
@@ -868,6 +869,7 @@ export default function ClinicConfig() {
     setStandbyMode(config.standby_mode ?? "active");
     setHandoffPeriod(config.handoff_period ?? "permanent");
     setHandoffCycleDays(config.handoff_cycle_days ?? "");
+    setHandoffInactiveDefaultHours(config.handoff_inactive_default_hours ?? "24");
     setOnlineServicesDesc(config.online_services_desc ?? "");
     setPresentialServicesDesc(config.presential_services_desc ?? "");
     setServices(config.services ?? []);
@@ -947,6 +949,7 @@ export default function ClinicConfig() {
       standby_mode: standbyMode || null,
       handoff_period: handoffPeriod || null,
       handoff_cycle_days: handoffCycleDays.trim() || null,
+      handoff_inactive_default_hours: parseInt(handoffInactiveDefaultHours, 10) || 24,
       online_services_desc: onlineServicesDesc.trim() || null,
       presential_services_desc: presentialServicesDesc.trim() || null,
     };
@@ -1604,7 +1607,7 @@ export default function ClinicConfig() {
             <CardContent className="pt-5 space-y-4">
               <div className="rounded-md border border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950/30 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-300 flex items-center gap-2">
                 <span className="inline-flex items-center rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] font-bold tracking-wider text-emerald-600 dark:text-emerald-400">ON</span>
-                {txt("Handoff sempre ativo — o agente transfere a conversa para um humano quando necessário.", "Handoff always active — the agent transfers the conversation to a human when needed.")}
+                {txt("Handoff sempre ativo — agentes especializados estão no roadmap. Em breve será possível alternar entre handoff humano e agentes treinados por área.", "Handoff always active — specialized agents are on the roadmap. Soon you'll be able to switch between human handoff and area-specialized agents.")}
               </div>
 
               {/* ── HITL Block ─────────────────────────────────────── */}
@@ -1668,6 +1671,12 @@ export default function ClinicConfig() {
                     onCheckedChange={(v) => setStandbyMode(v ? "active" : "inactive")}
                     disabled={isReadOnly}
                   />
+                  <div className="text-[11px] text-muted-foreground -mt-1 ml-1">
+                    {txt(
+                      `Se inativo, opera em handoff padrão de ${handoffInactiveDefaultHours}h (janela WhatsApp API)`,
+                      `If inactive, operates with default handoff of ${handoffInactiveDefaultHours}h (WhatsApp API window)`
+                    )}
+                  </div>
 
                   <Field label={txt("Período de Handoff", "Handoff Period")}>
                     <Select value={handoffPeriod} onValueChange={setHandoffPeriod} disabled={isReadOnly}>
@@ -1695,6 +1704,22 @@ export default function ClinicConfig() {
                       />
                     </Field>
                   )}
+
+                  <Field
+                    label={txt("Período padrão (horas) quando Standby está inativo", "Default period (hours) when Standby is inactive")}
+                    hint={txt("Padrão: 24h. Aplicado automaticamente quando o modo Stand-by está desativado.", "Default: 24h. Applied automatically when Stand-by mode is off.")}
+                  >
+                    <Input
+                      type="number"
+                      min="1"
+                      max="720"
+                      value={handoffInactiveDefaultHours}
+                      onChange={(e) => setHandoffInactiveDefaultHours(e.target.value)}
+                      placeholder="24"
+                      className="w-32 text-sm"
+                      disabled={isReadOnly}
+                    />
+                  </Field>
             </CardContent>
           </Card>
         </TabsContent>
