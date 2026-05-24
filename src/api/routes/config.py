@@ -60,12 +60,19 @@ async def _resolve_config_tenant(
     override = request.query_params.get("tenant_id") or request.query_params.get("clinic_id")
     if not override or override == str(tenant.tenant_id):
         return tenant
-    if tenant.role != "builder":
-        raise HTTPException(status_code=403, detail="Only builders can override tenant_id")
     try:
         target_id = UUID(override)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid tenant_id")
+    # Super admin can access any clinic without ownership validation
+    if tenant.role == "super_admin":
+        return TenantContext(
+            tenant_id=target_id,
+            role=tenant.role,
+            user_id=tenant.user_id,
+        )
+    if tenant.role != "builder":
+        raise HTTPException(status_code=403, detail="Only builders can override tenant_id")
     builder_id = _extract_builder_id(request)
     await require_builder_clinic_access(target_id, builder_id, session)
     # Return a new context pointing to the target clinic

@@ -68,7 +68,7 @@ export default function TraceDetail() {
   const params = useParams();
   const id = params.id as string;
   const { t } = useI18n();
-  const { isBuilder, isInvestor, viewingClinicId } = useAuth();
+  const { isBuilder, isSuperAdmin, isInvestor, viewingClinicId } = useAuth();
 
   const [trace, setTrace] = useState<ReturnType<typeof mapTrace> | null>(null);
   const [loading, setLoading] = useState(true);
@@ -90,7 +90,7 @@ export default function TraceDetail() {
       setLoadError(null);
       try {
         const token = getToken();
-        const tenantParam = isBuilder && viewingClinicId ? `?tenant_id=${viewingClinicId}` : "";
+        const tenantParam = (isBuilder || isSuperAdmin) && viewingClinicId ? `?tenant_id=${viewingClinicId}` : "";
         const res = await fetch(`/v1/traces/${id}${tenantParam}`, {
           headers: token ? { Authorization: `Bearer ${token}` } : {},
         });
