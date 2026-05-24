@@ -39,7 +39,7 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(quero)\b.*\b(tratar|melhorar|cuidar|fazer|entender|saber|marcar)\b",
             r"\b(vocês|voces)\b.*\b(botox|peeling|clareamento|harmonização|harmonizacao|dermatologia|implante)\b",
             r"\b(já fiz|ja fiz|nunca fiz|primeira vez)\b.*\b(botox|procedimento|tratamento|peeling|harmonização|harmonizacao)\b",
-            r"\bprimeira vez\b",  # bare "primeira vez" → new patient expressing first visit/first interest
+            r"^\s*primeira vez[!?.]?\s*$",  # ONLY when message IS "primeira vez" (exact trace case)
             r"\b(tenho|sofro|estou com)\b.*\b(acne|manchas|queda|bruxismo|medo|vergonha|interesse)\b",
             r"\b(posso fazer|posso|podem)\b.*\b(procedimento|tratamento|botox)\b",
             r"\b(experiência ruim|experiencia ruim|medo|vergonha)\b.*\b(dentista|procedimento|tratamento)\b",
@@ -59,7 +59,7 @@ INTENT_DEFINITIONS: dict[str, dict] = {
         ],
         "keywords": ["tratamento", "procedimento", "avaliação", "botox", "peeling",
                       "clareamento", "harmonização", "tratar", "quero fazer",
-                      "quero saber", "me explica", "tenho interesse", "primeira vez"],
+                      "quero saber", "me explica", "tenho interesse"],
         "weight": 1.0,
     },
     "pedido_preco": {
