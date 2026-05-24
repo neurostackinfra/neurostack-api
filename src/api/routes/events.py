@@ -199,19 +199,24 @@ async def process_event(
 
     This is the main entry point for all agent interactions.
     """
+    from src.config.logging import get_logger as _get_logger
+    _logger = _get_logger(__name__)
+
     service = get_event_service()
+
+    # ── Phase 1: fast DB work (load state → pipeline → flush state) ──────────
+    # Any exception here rolls back the transaction so nothing is left dirty.
     try:
-        response = await service.process_event(request, session=db)
-        # Commit session-state updates (flush was called in _persist_session_state)
-        await db.commit()
-        return response
+        result, clinic_config, message_history = await service.run_pipeline(
+            request, session=db
+        )
     except HTTPException:
+        await db.rollback()
         raise
     except Exception as e:
-        from src.config.logging import get_logger as _get_logger
-        _logger = _get_logger(__name__)
+        await db.rollback()
         _logger.error(
-            "Unhandled error in process_event",
+            "Pipeline error in process_event (phase 1 — no LLM called)",
             tenant_id=str(request.tenant_id),
             session_id=str(request.session_id),
             error=str(e),
@@ -221,6 +226,45 @@ async def process_event(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Pipeline processing failed",
+        )
+
+    # ── Early commit: release the DB connection before the slow LLM call ─────
+    # Overlapping /v1/events calls for the same session now read the updated
+    # cognitive_state.  If commit fails, abort before the LLM call runs.
+    try:
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        _logger.error(
+            "DB commit failed after state flush (phase 1 commit)",
+            tenant_id=str(request.tenant_id),
+            session_id=str(request.session_id),
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="State persistence failed",
+        )
+
+    # ── Phase 2: slow I/O (LLM + event-store) ────────────────────────────────
+    # DB session is already committed/released; failures here are independent.
+    try:
+        return await service.finish_response(request, result, clinic_config, message_history)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _logger.error(
+            "Error in process_event phase 2 (LLM/event-store)",
+            tenant_id=str(request.tenant_id),
+            session_id=str(request.session_id),
+            error=str(e),
+            error_type=type(e).__name__,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Response generation failed",
         )
 
 
