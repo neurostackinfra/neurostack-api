@@ -760,6 +760,11 @@ class CognitivePipeline:
             except ValueError:
                 pass
 
+        # Merge phone into key_info so the service can populate numero_whatsapp in the DB record
+        key_info = dict(input_data.slots)
+        if input_data.user_id:
+            key_info.setdefault("numero_whatsapp", input_data.user_id)
+
         request = HandoffRequest(
             tenant_id=input_data.tenant_id,
             session_id=input_data.session_id,
@@ -769,7 +774,7 @@ class CognitivePipeline:
             sla=sla,
             funnel_stage=input_data.current_funnel_stage,
             recent_messages=recent_messages,
-            key_info=input_data.slots,
+            key_info=key_info,
         )
         return await self._handoff.initiate_handoff(request)
 
