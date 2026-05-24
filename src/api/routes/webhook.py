@@ -635,9 +635,17 @@ async def zapi_webhook(
         if audio_url and clinic_config:
             creds = (clinic_config or {}).get("api_credentials", {}) or {}
             whisper_key = creds.get("whisper_api_key")
-            whisper_model = creds.get("whisper_model") or "whisper-large-v3-turbo"
             stt_provider = (creds.get("stt_provider") or "outros").strip()
             stt_api_url = (creds.get("stt_api_url") or "").strip()
+            # Per-provider model defaults — avoid sending Groq model names to OpenAI
+            _STT_DEFAULT_MODELS: dict[str, str] = {
+                "openai_whisper":    "whisper-1",
+                "elevenlabs_scribe": "scribe_v1",
+            }
+            whisper_model = (
+                creds.get("whisper_model")
+                or _STT_DEFAULT_MODELS.get(stt_provider, "whisper-large-v3-turbo")
+            )
             agent_lang = _get_agent_language(clinic_config)
             lang_hint = "en" if agent_lang == "en" else "pt"
             if whisper_key:

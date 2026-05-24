@@ -270,8 +270,9 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       body["audio_max_seconds"] = audioMaxSeconds;
       if (sttApiKey && !sttApiKey.includes("•") && !sttApiKey.includes("*"))
         body["whisper_api_key"] = sttApiKey;
-      if (sttProvider !== "google_stt")
-        body["stt_api_url"] = sttApiUrl;   // send for all providers except google (incompatible format)
+      // Always send stt_api_url so the backend can clear a stale value.
+      // For google_stt: clear any previously saved endpoint (different API format).
+      body["stt_api_url"] = sttProvider !== "google_stt" ? sttApiUrl : "";
       const saveUrl = targetId
         ? `/v1/config/api-credentials?clinic_id=${targetId}`
         : `/v1/config/api-credentials`;
