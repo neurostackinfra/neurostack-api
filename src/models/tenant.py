@@ -146,6 +146,15 @@ class Tenant(Base, TimestampMixin):
         index=True,
     )
 
+    # AI Bot Active (pause toggle — independent from billing)
+    # When False: webhook skips pipeline, sends offline_message once per session.
+    bot_active: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default="true",
+        nullable=False,
+    )
+
     # Builder FK (nullable — standalone clinics have no builder)
     builder_id: Mapped[Optional[UUID]] = mapped_column(
         PG_UUID(as_uuid=True),

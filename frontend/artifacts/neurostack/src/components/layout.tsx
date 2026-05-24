@@ -49,8 +49,9 @@ export function Layout({ children }: LayoutProps) {
   // useGetClinicConfig ignores clinic_id — fetch directly with ?clinic_id= so
   // builders see the selected clinic's name instead of their own HQ config.
   const [clinicName, setClinicName] = useState<string>("");
+  const [botActive, setBotActive] = useState<boolean | null>(null);
   useEffect(() => {
-    if (!displayClinicId) { setClinicName(""); return; }
+    if (!displayClinicId) { setClinicName(""); setBotActive(null); return; }
     const raw = localStorage.getItem("ns_auth");
     const token = raw ? (JSON.parse(raw) as { token?: string }).token : null;
     if (!token) return;
@@ -58,7 +59,10 @@ export function Layout({ children }: LayoutProps) {
       headers: { Authorization: `Bearer ${token}` },
     })
       .then((r) => r.ok ? r.json() : Promise.reject(r))
-      .then((cfg: { clinic_name?: string }) => setClinicName(cfg.clinic_name ?? ""))
+      .then((cfg: { clinic_name?: string; bot_active?: boolean }) => {
+        setClinicName(cfg.clinic_name ?? "");
+        if (cfg.bot_active !== undefined) setBotActive(cfg.bot_active);
+      })
       .catch(() => {});
   }, [displayClinicId]);
 
@@ -208,6 +212,17 @@ export function Layout({ children }: LayoutProps) {
         <div className="mx-3 mb-1 mt-2 flex items-center gap-1.5 rounded-md bg-amber-500/10 border border-amber-500/30 px-2 py-1.5">
           <Eye className="h-3 w-3 text-amber-400 shrink-0" />
           <span className="text-[10px] text-amber-400 font-medium">{t("label_read_only_mode")}</span>
+        </div>
+      )}
+
+      {/* IA Pausada badge — shown when bot_active=false for clinic_admin or builder */}
+      {(isClinicAdmin || isBuilder) && botActive === false && (
+        <div
+          className="mx-3 mb-1 mt-1 flex items-center gap-1.5 rounded-md bg-amber-500/10 border border-amber-500/30 px-2 py-1.5"
+          data-testid="badge-ia-pausada"
+        >
+          <Cpu className="h-3 w-3 text-amber-400 shrink-0" />
+          <span className="text-[10px] text-amber-400 font-semibold">IA Pausada</span>
         </div>
       )}
 

@@ -816,6 +816,10 @@ export default function ClinicConfig() {
   const [languagePolicyCustom, setLanguagePolicyCustom] = useState("");
   const [agentLanguage, setAgentLanguage] = useState("pt-BR");
 
+  // Bot active toggle (independent from billing — pauses AI without deactivating clinic)
+  const [botActive, setBotActive] = useState(true);
+  const [isTogglingBot, setIsTogglingBot] = useState(false);
+
   // Tab 4 — Handoff
   const [handoffActive, setHandoffActive] = useState("yes");
   const [standbyMode, setStandbyMode] = useState("active");
@@ -873,6 +877,8 @@ export default function ClinicConfig() {
     setOnlineServicesDesc(config.online_services_desc ?? "");
     setPresentialServicesDesc(config.presential_services_desc ?? "");
     setServices(config.services ?? []);
+    // bot_active: treat null/undefined as true (default on)
+    setBotActive(config.bot_active !== false);
   }, [config]);
 
   const addProfessional = () =>
@@ -888,6 +894,41 @@ export default function ClinicConfig() {
   const removeService = (idx: number) => setServices((prev) => prev.filter((_, i) => i !== idx));
   const updateService = (idx: number, field: keyof ClinicService, value: string) =>
     setServices((prev) => prev.map((s, i) => (i === idx ? { ...s, [field]: value } : s)));
+
+  const handleBotToggle = async (newValue: boolean) => {
+    setIsTogglingBot(true);
+    setBotActive(newValue); // optimistic update
+    try {
+      const token = getToken();
+      const toggleUrl = (isBuilder || isSuperAdmin) && viewingClinicId
+        ? `/v1/config/bot-toggle?tenant_id=${viewingClinicId}`
+        : "/v1/config/bot-toggle";
+      const res = await fetch(toggleUrl, {
+        method: "PATCH",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) throw new Error(`Toggle failed: ${res.status}`);
+      const data = await res.json();
+      setBotActive(data.bot_active);
+      toast({
+        title: data.bot_active
+          ? txt("IA Ativada ✅", "AI Enabled ✅")
+          : txt("IA Pausada ⏸️", "AI Paused ⏸️"),
+        description: data.bot_active
+          ? txt("O assistente voltou a responder normalmente.", "The assistant is responding normally again.")
+          : txt("O assistente não responderá mensagens até ser reativado.", "The assistant won't respond to messages until re-enabled."),
+      });
+    } catch {
+      setBotActive(!newValue); // revert on error
+      toast({
+        title: txt("Erro", "Error"),
+        description: txt("Não foi possível alterar o estado da IA.", "Could not change AI state."),
+        variant: "destructive",
+      });
+    } finally {
+      setIsTogglingBot(false);
+    }
+  };
 
   const handleSave = async () => {
     // LGPD hard block — validate before API call
@@ -1000,6 +1041,45 @@ export default function ClinicConfig() {
           <p className="text-sm text-muted-foreground">{t("config_subtitle")}</p>
         </div>
       </div>
+
+      {/* ── Controle da IA — bot_active toggle (clinic_admin + builder only) ── */}
+      {!isInvestor && !isSuperAdmin && (
+        <Card className={`${cardShell} ${!botActive ? "border-amber-500/40" : ""}`} data-testid="card-bot-active">
+          <CardContent className="pt-4 pb-4">
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <div className={`flex h-9 w-9 items-center justify-center rounded-lg border ${botActive ? "bg-emerald-500/10 border-emerald-500/20" : "bg-amber-500/10 border-amber-500/20"}`}>
+                  <Cpu className={`h-4 w-4 ${botActive ? "text-emerald-400" : "text-amber-400"}`} />
+                </div>
+                <div>
+                  <p className="text-sm font-semibold text-foreground">
+                    {txt("Controle da IA", "AI Control")}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    {botActive
+                      ? txt("Assistente ativo — respondendo normalmente", "Assistant active — responding normally")
+                      : txt("IA pausada — mensagens não serão respondidas pela IA", "AI paused — messages won't be answered by the AI")}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                {isTogglingBot && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
+                {!botActive && (
+                  <span className="text-[10px] font-semibold uppercase tracking-wider text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded px-1.5 py-0.5">
+                    {txt("Pausada", "Paused")}
+                  </span>
+                )}
+                <Switch
+                  checked={botActive}
+                  onCheckedChange={handleBotToggle}
+                  disabled={isTogglingBot || isReadOnly}
+                  data-testid="switch-bot-active"
+                />
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Tabs */}
       <Tabs defaultValue="identidade" className="w-full">
