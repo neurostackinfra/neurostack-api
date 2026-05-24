@@ -96,6 +96,13 @@ const STT_PROVIDERS: { id: SttProvider; label: string; sub: string; activeCls: s
   { id: "outros",            label: "Outros",    sub: "Groq / OpenRouter", activeCls: "border-slate-500/50 text-slate-300 bg-slate-500/10"  },
 ];
 
+const PROVIDER_DEFAULT_STT_URL: Partial<Record<SttProvider, string>> = {
+  openai_whisper:    "https://api.openai.com/v1",
+  elevenlabs_scribe: "https://api.elevenlabs.io/v1",
+  // google_stt: incompatible API format — no default URL
+  // outros: user-provided — no default
+};
+
 const PROVIDERS: { id: LlmProvider; label: string; sub: string; activeCls: string }[] = [
   { id: "slm_cortex", label: "SLM Cortex", sub: "by NeuroStack", activeCls: "border-violet-500/50 text-violet-400 bg-violet-500/10"  },
   { id: "dropout",    label: "Dropout",    sub: "by Neuralake",  activeCls: "border-blue-500/50 text-blue-400 bg-blue-500/10"         },
@@ -221,9 +228,10 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       // confirm which key is configured. Backend detects "****" and skips update.
       setLlmApiKey(data.llm_api_key_masked ?? "");
       // STT (audio transcription)
-      setSttProvider((data.stt_provider as SttProvider) ?? "outros");
+      const savedSttProvider = (data.stt_provider as SttProvider) ?? "outros";
+      setSttProvider(savedSttProvider);
       setSttApiKey(data.whisper_api_key_masked ?? "");
-      setSttApiUrl(data.stt_api_url ?? "");
+      setSttApiUrl(data.stt_api_url || PROVIDER_DEFAULT_STT_URL[savedSttProvider] || "");
       setSttModelName(data.whisper_model ?? "");
       setAudioMaxSeconds(Number(data.audio_max_seconds) || 60);
     } catch { setError("Erro de rede."); }
@@ -262,8 +270,8 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       body["audio_max_seconds"] = audioMaxSeconds;
       if (sttApiKey && !sttApiKey.includes("•") && !sttApiKey.includes("*"))
         body["whisper_api_key"] = sttApiKey;
-      if (sttProvider === "outros")
-        body["stt_api_url"] = sttApiUrl;   // send even when empty so backend can clear a stale URL
+      if (sttProvider !== "google_stt")
+        body["stt_api_url"] = sttApiUrl;   // send for all providers except google (incompatible format)
       const saveUrl = targetId
         ? `/v1/config/api-credentials?clinic_id=${targetId}`
         : `/v1/config/api-credentials`;
@@ -605,7 +613,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
                   setSttProvider(p.id);
                   setSttApiKey("");
                   setSttModelName("");
-                  setSttApiUrl("");
+                  setSttApiUrl(PROVIDER_DEFAULT_STT_URL[p.id] ?? "");
                 }}
                 className={`relative flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2.5 text-left transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
                   active
@@ -623,10 +631,15 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
 
         {/* Conditional fields based on sttProvider */}
         <div className="grid gap-3 sm:grid-cols-2">
-          {sttProvider === "outros" && (
+          {sttProvider !== "google_stt" && (
             <div className="sm:col-span-2">
               <ApiInput label="API URL" value={sttApiUrl} onChange={setSttApiUrl}
-                placeholder="https://api.groq.com/openai/v1" disabled={isReadOnly} mono />
+                placeholder={
+                  sttProvider === "openai_whisper"    ? "https://api.openai.com/v1" :
+                  sttProvider === "elevenlabs_scribe" ? "https://api.elevenlabs.io/v1" :
+                  "https://api.groq.com/openai/v1"
+                }
+                disabled={isReadOnly} mono />
             </div>
           )}
           <ApiInput label="API Key" value={sttApiKey} onChange={setSttApiKey} type="password"

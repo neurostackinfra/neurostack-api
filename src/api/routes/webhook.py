@@ -684,21 +684,23 @@ async def zapi_webhook(
                         OPENAI_API_BASE,
                         transcribe_audio,
                     )
-                    # Resolve the STT base URL from the saved provider
-                    _STT_BASE_URLS: dict[str, str] = {
-                        "openai_whisper": OPENAI_API_BASE,
-                        "outros": stt_api_url or GROQ_API_BASE,
-                    }
-                    stt_base_url = _STT_BASE_URLS.get(stt_provider)
-                    if stt_base_url is None:
-                        # ElevenLabs Scribe / Google Cloud STT — not yet wired
+                    # Resolve STT base URL: use the saved URL (set by the UI for
+                    # any provider), fall back to known defaults, then Groq as
+                    # last resort for legacy configs without a saved URL.
+                    if stt_api_url:
+                        stt_base_url = stt_api_url
+                    elif stt_provider == "openai_whisper":
+                        stt_base_url = OPENAI_API_BASE
+                    elif stt_provider == "elevenlabs_scribe":
+                        stt_base_url = "https://api.elevenlabs.io/v1"
+                    else:
+                        stt_base_url = GROQ_API_BASE  # outros / google_stt / legacy
+                    if stt_provider in ("elevenlabs_scribe", "google_stt"):
                         logger.warning(
-                            "STT provider %r is not yet implemented in runtime; "
-                            "falling back to Groq endpoint. Configure 'Outros' in the "
-                            "API settings to use a custom endpoint.",
+                            "STT provider %r is not yet fully implemented in runtime — "
+                            "transcription will attempt the configured endpoint but may fail.",
                             stt_provider,
                         )
-                        stt_base_url = stt_api_url or GROQ_API_BASE
                     message_text = await transcribe_audio(
                         api_key=whisper_key,
                         audio_bytes=audio_bytes,
