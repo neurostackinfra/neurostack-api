@@ -282,6 +282,9 @@ def _build_credential_status(creds: dict[str, Any]) -> dict[str, Any]:
         "whisper_api_key_masked": _mask(creds.get("whisper_api_key")),
         "whisper_model": creds.get("whisper_model"),
         "audio_max_seconds": creds.get("audio_max_seconds") or 60,
+        # STT provider
+        "stt_provider": creds.get("stt_provider", "outros"),
+        "stt_api_url": creds.get("stt_api_url", ""),
         # Overall status
         "apis_configured": _is_configured(creds),
     }
@@ -340,6 +343,7 @@ async def patch_api_credentials(
         "evolution_api_url", "evolution_instance_name", "evolution_api_key",
         "llm_api_key", "llm_api_url", "llm_provider", "llm_model_name",
         "whisper_api_key", "whisper_model",
+        "stt_provider", "stt_api_url",
     }
 
     for field in known_fields:
