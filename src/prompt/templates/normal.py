@@ -733,17 +733,20 @@ class NormalTemplate(BaseTemplate):
             ic_lower = str(ic).lower()
             is_cortesia = any(w in ic_lower for w in ("gratuita", "cortesia", "grátis", "free", "complimentary"))
             consult_price = str(custom.get("consult_service_price", "")).strip()
-            consult_price_is_zero = consult_price.replace("R$", "").replace(",", ".").strip() in ("0", "0.00", "0,00", "")
+            consult_price_num = consult_price.replace("R$", "").replace(",", ".").strip()
+            # Empty string = "not configured", NOT free — only explicit "0" / "0.00" means explicitly free
+            is_explicitly_zero = consult_price_num in ("0", "0.00", "0,00")
+            has_followup_price = consult_price_num != "" and not is_explicitly_zero
 
-            if is_cortesia and consult_price_is_zero:
-                # Cenário 3: Cortesia + preço R$0 ou sem preço = todas as consultas são sem custo
+            if is_cortesia and is_explicitly_zero:
+                # Cenário 3: Cortesia + preço explicitamente R$0 = todas as consultas são sem custo
                 section.add(
                     "⚠️ REGRA OBRIGATÓRIA SOBRE CONSULTAS:\n"
                     "- TODAS as consultas e avaliações da clínica são SEM CUSTO para o paciente.\n"
                     "- Quando o paciente perguntar sobre consulta, diga: 'As consultas/avaliações são sem custo para você.'\n"
                     "- NUNCA mencione valores ou preços ao falar de consultas."
                 )
-            elif is_cortesia:
+            elif is_cortesia and has_followup_price:
                 # Cenário 1: Cortesia + serviço Consulta com preço > 0 = primeira grátis, posteriores pagas
                 section.add(
                     "⚠️ REGRA OBRIGATÓRIA SOBRE CONSULTA INICIAL:\n"
@@ -753,6 +756,15 @@ class NormalTemplate(BaseTemplate):
                     f"- Se perguntar sobre valores de consulta em geral, complemente: 'As consultas posteriores têm o valor de {consult_price}.'\n"
                     "- Use a palavra CORTESIA, nunca 'gratuita' ou 'grátis'.\n"
                     "- NUNCA mencione o preço ao falar da primeira consulta."
+                )
+            elif is_cortesia:
+                # Cenário 1b: Cortesia sem preço de retorno configurado = apenas primeira grátis, não mencionar valores posteriores
+                section.add(
+                    "⚠️ REGRA OBRIGATÓRIA SOBRE CONSULTA INICIAL:\n"
+                    "- A PRIMEIRA CONSULTA/AVALIAÇÃO É CORTESIA da clínica (o paciente NÃO paga).\n"
+                    "- Quando o paciente perguntar sobre a primeira consulta, diga: 'A primeira consulta é uma CORTESIA da clínica.'\n"
+                    "- Use a palavra CORTESIA, nunca 'gratuita' ou 'grátis'.\n"
+                    "- NÃO mencione valores de consultas posteriores — esse detalhe deve ser tratado na clínica."
                 )
             else:
                 # Cenário 2: Consulta inicial paga
