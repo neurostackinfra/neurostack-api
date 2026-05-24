@@ -231,7 +231,7 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(informe|informar|diga|fale|me passe)\b.*\b(disponibilidade|horário|horario)\b",
             # "queria saber os horários de vocês" — info-seeking about hours (even inside
             # messages that mention "encaminhar" as a precondition, e.g. "antes de me encaminhar")
-            r"\b(queria?|quero|gostaria)\s+saber\b.*\b(horários?|horarios?|disponibilidade|agenda)\b",
+            r"\b(queria?|quero|gostaria)(\s+de)?\s+saber\b.*\b(horários?|horarios?|disponibilidade|agenda)\b",
         ],
         "keywords": ["horário", "horario", "funciona", "abre", "fecha",
                       "funcionamento", "expediente"],
