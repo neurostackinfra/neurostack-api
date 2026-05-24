@@ -14,6 +14,7 @@ interface ClinicPrivData {
   dpo_contact: string | null;
   lgpd_enabled: string | null;
   lgpd_custom_link: string | null;
+  slm_training_consent?: boolean;
 }
 
 function today(): string {
@@ -227,6 +228,33 @@ export default function Privacidade() {
             Última atualização: <strong>{today()}</strong>
           </p>
         </Section>
+
+        {data.slm_training_consent && (
+          <Section title="Adendo Especial: Uso de Dados Anonimizados para Treinamento de IA (SLM)">
+            <p>
+              Com o objetivo exclusivo de especializar o atendimento, aumentar a precisão das respostas
+              médicas/odontológicas e reduzir os custos operacionais da plataforma, os dados de interações
+              e históricos de conversas poderão ser utilizados para o treinamento, ajuste fino (fine-tuning)
+              e calibração de Modelos de Linguagem (Small Language Models - SLMs) e motores cognitivos de
+              inteligência artificial.
+            </p>
+            <p className="mt-3">
+              <strong>Garantia de Anonimização Absoluta:</strong> Para que ocorra este processo sem qualquer
+              risco à sua privacidade, todos os dados transitados passam por um rigoroso processo de
+              descaracterização e anonimização irreversível. Isso significa que nomes, números de telefone,
+              CPFs, documentos, fotos e qualquer outra informação que possa identificar direta ou
+              indiretamente o paciente são sumariamente removidos antes de qualquer processamento por estes
+              motores de IA.
+            </p>
+            <p className="mt-3">
+              Conforme o artigo 12 da Lei Geral de Proteção de Dados (LGPD - Lei nº 13.709/18), os dados
+              anonimizados perdem a natureza de dados pessoais para fins legais. Dessa forma, garantimos que
+              o seu histórico de atendimento seja tratado puramente como um padrão estatístico e de
+              linguagem, totalmente desvinculado da sua identidade e focado apenas na evolução contínua da
+              qualidade do atendimento em saúde.
+            </p>
+          </Section>
+        )}
 
         {/* Footer */}
         <footer className="pt-8 border-t border-slate-200 text-xs text-slate-400 flex items-center gap-2">
