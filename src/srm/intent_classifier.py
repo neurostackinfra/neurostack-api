@@ -149,7 +149,7 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(agendar|marcar|reservar)\b.*\b(consulta|horário|horario|atendimento|sessão|sessao|avaliação|avaliaçao|procedimento)\b",
             r"\b(quero|preciso|gostaria)\b.*\b(agendar|marcar)\b",
             r"\b(tem|há|ha)\b.*\b(horário|horario|vaga|disponibilidade)\b.*\b(disponível|disponivel|livre)?\b",
-            r"\b(disponibilidade|agenda)\b",
+            r"\b(agenda)\b",  # bare "agenda" is scheduling-specific; "disponibilidade" alone → disponibilidade_horarios
             r"\bvamos agendar\b",
             r"\bpode (marcar|agendar)\b",
             r"\b(tem|há)\b.*\b(vaga|encaixe|horário|horario)\b",
@@ -171,9 +171,11 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\bconsigo\b.*\b(horário|horario)\b",
         ],
         "keywords": ["agendar", "marcar", "reservar", "horário", "horario",
-                      "consulta", "vaga", "disponibilidade", "encaixe",
+                      "consulta", "vaga", "encaixe",
                       "agenda", "disponível", "fim de semana", "sábado",
                       "sabado", "domingo"],
+        # NOTE: "disponibilidade" removed from keywords — belongs to disponibilidade_horarios.
+        # "tem disponibilidade?" is still captured by pattern line above (tem|há.*disponibilidade).
         "weight": 1.0,
     },
     "reagendar": {
@@ -215,9 +217,14 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(funcionamento|expediente)\b",
             r"\b(até que horas|ate que horas)\b.*\b(atendem|funciona|abre)\b",
             r"\b(abrem?|fecham?)\b.*\b(sábado|sabado|domingo|feriado)\b",
+            # "me informe a disponibilidade" — user asks to be informed about available times
+            # NOTE: bare r"\b(disponibilidade)\b" is intentionally omitted — it would beat
+            # the agendar "tem disponibilidade?" pattern. Only "informe/diga + disponibilidade"
+            # is unambiguously an info query rather than a scheduling request.
+            r"\b(informe|informar|diga|fale|me passe)\b.*\b(disponibilidade|horário|horario)\b",
         ],
         "keywords": ["horário", "horario", "funciona", "abre", "fecha",
-                      "funcionamento", "expediente"],
+                      "funcionamento", "expediente", "disponibilidade"],
         "weight": 1.0,
     },
     "detalhes_servicos": {
