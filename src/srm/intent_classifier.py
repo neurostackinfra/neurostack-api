@@ -154,6 +154,9 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\bpode (marcar|agendar)\b",
             r"\b(tem|há)\b.*\b(vaga|encaixe|horário|horario)\b",
             r"\b(pode ser|posso)\b.*\b(segunda|terça|terca|quarta|quinta|sexta|sábado|sabado|domingo|manhã|manha|tarde|noite|amanhã|amanha|hoje)\b",
+            # Standalone day+time reply (user answering a scheduling question, e.g. "Segunda às 8 da manhã")
+            r"\b(segunda|terça|terca|quarta|quinta|sexta|sábado|sabado|domingo)\b.*\b(\d{1,2}\s*h|\d{1,2}:\d{2}|manhã|manha|tarde|noite)\b",
+            r"\b(às?|as)\s+\d{1,2}\s*(h|hora|horas)?\b.*\b(manhã|manha|tarde|noite)\b",
             r"\bquero garantir\b.*\bhorário\b",
             r"\bquando posso ir\b",
             r"\bquero marcar\b(?!.*\b(avaliação|avaliaçao|avaliar)\b)",
@@ -277,12 +280,14 @@ INTENT_DEFINITIONS: dict[str, dict] = {
         "patterns": [
             r"\b(médico|medico|doutor|dr|dra)\b.*\b(quem|qual|formação|formacao)\b",
             r"\b(quem)\b.*\b(são|sao)\b.*\b(médicos|medicos|profissionais|doutores)\b",
-            r"\b(profissionais|equipe)\b",
+            # Narrowed: require clinical/professional context to avoid matching "equipe de agendamento"
+            r"\b(profissionais|equipe)\b.*\b(clínica|clinica|médica|medica|saúde|saude|dentária|dentaria)\b",
+            r"\b(quais?|quem)\b.*\b(profissionais|equipe)\b",
             r"\b(têm|tem|vocês têm|voces tem)\b.*\b(nutricionista|fisioterapeuta|psicólog[oa]|psicologo|dermatologista|ortopedista)\b",
             r"\b(médico|medico)\b.*\b(especialista)\b",
             r"\b(formação|formacao)\b.*\b(dr|dra|doutor|médico|medico)\b",
         ],
-        "keywords": ["médico", "medico", "doutor", "profissionais", "equipe",
+        "keywords": ["médico", "medico", "doutor", "profissionais",
                       "especialista", "nutricionista", "formação", "formacao"],
         "weight": 1.1,
     },
@@ -436,9 +441,13 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(não|nao)\b.*\b(robô|robo|bot|máquina|maquina)\b",
             r"\b(me transfere|transferir)\b.*\b(alguém|alguem|pessoa|atendente)\b",
             r"\b(tem como falar)\b.*\b(pessoa|humano|alguém|alguem)\b",
+            # "encaminhar pra equipe / atendente / agendamento" — user asking for handoff
+            r"\b(encaminh(ar|e|a|asse|em))\b.*\b(equipe|atendente|pessoa|agendamento|secretaria)\b",
+            r"\b(gostaria|quero|preciso)\b.*\b(encaminh)\b",
+            r"\bme encaminh(e|ar|em)\b",
         ],
         "keywords": ["atendente humano", "humano", "pessoa real", "não robô",
-                      "falar com alguém", "transfere"],
+                      "falar com alguém", "transfere", "encaminhe", "encaminhar"],
         "weight": 1.0,
     },
     "paciente_ativo": {
