@@ -28,8 +28,8 @@ export const en = {
   label_read_only_mode: "Read-only mode",
 
   // Login
-  login_title: "Builder Access",
-  login_subtitle: "NeuroStack Credentialed",
+  login_title: "Platform Access",
+  login_subtitle: "Sign in to your NeuroStack account",
   login_email: "Email",
   login_password: "Password",
   login_submit: "Sign In",

@@ -30,8 +30,8 @@ export const pt: Record<TranslationKey, string> = {
   label_read_only_mode: "Modo somente leitura",
 
   // Login
-  login_title: "Acesso Builder",
-  login_subtitle: "Credenciado NeuroStack",
+  login_title: "Acesso à Plataforma",
+  login_subtitle: "Entre com suas credenciais NeuroStack",
   login_email: "E-mail",
   login_password: "Senha",
   login_submit: "Acessar Plataforma",
