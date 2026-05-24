@@ -313,27 +313,17 @@ async def _check_pause_state(
     return {"ok": True, "skipped": "session_paused"}
 
 
-_DEFAULT_OFFLINE_MESSAGE = (
-    "No momento, o atendimento automático está pausado. "
-    "Nossa equipe retornará em breve. 🙏"
-)
-
-
 async def _check_bot_active(
     tenant_id: UUID,
     phone: str,
-    clinic_config: Optional[dict],
     db: AsyncSession,
-    provider: str = "zapi",
 ) -> Optional[dict]:
     """Return a skip-dict when bot_active=False, or None to continue normally.
 
-    When the AI is paused (bot_active=False):
-    - First message in the session → sends offline_message once, sets offline_notified flag.
-    - Subsequent messages in the same session → silent skip (no repeat notification).
-    - When bot is re-enabled → offline_notified is cleared by the bot-toggle endpoint.
+    When the AI is paused (bot_active=False), all incoming messages are silently
+    dropped — no reply is sent to the patient.  The human team handles the
+    conversation directly.
     """
-    # Check tenant.bot_active
     result = await db.execute(
         select(TenantModel.bot_active).where(TenantModel.id == tenant_id)
     )
@@ -341,89 +331,9 @@ async def _check_bot_active(
     if bot_active is None or bot_active:
         return None  # Bot is on — continue normally
 
-    # Bot is paused. Check offline_notified flag in this phone's active session.
-    already_notified = await db.execute(
-        text(
-            "SELECT cognitive_state->'flags'->>'offline_notified' "
-            "FROM sessions "
-            "WHERE tenant_id = :tid AND user_id = :phone AND is_active = true "
-            "ORDER BY last_activity_at DESC LIMIT 1"
-        ),
-        {"tid": str(tenant_id), "phone": phone},
-    )
-    row = already_notified.first()
-    notified_flag = row[0] if row else None
-
-    if notified_flag == "true":
-        # Already sent offline message this session — silent skip
-        logger.info(
-            "bot_paused_silent_skip",
-            extra={"tenant_id": str(tenant_id), "phone": phone},
-        )
-        return {"ok": True, "skipped": "bot_paused_silent"}
-
-    # Not yet notified — send offline message
-    ops = (clinic_config or {}).get("operations") or {}
-    offline_message = ops.get("offline_message") or _DEFAULT_OFFLINE_MESSAGE
-    creds = (clinic_config or {}).get("api_credentials") or {}
-
-    try:
-        if provider == "evolution":
-            e_url = creds.get("evolution_api_url", "")
-            e_name = creds.get("evolution_instance_name", "")
-            e_key = creds.get("evolution_api_key", "")
-            if e_url and e_name and e_key:
-                await send_evolution_text(e_url, e_name, e_key, phone, offline_message)
-        else:
-            z_inst = creds.get("zapi_instance_id", "")
-            z_tok = creds.get("zapi_token", "")
-            z_ct = creds.get("zapi_client_token", "")
-            if z_inst and z_tok:
-                await send_text_message(z_inst, z_tok, phone, offline_message, client_token=z_ct)
-    except Exception as exc:
-        logger.warning("Offline message send failed for %s — %s", phone, exc)
-
-    # Set offline_notified=true in session flags (creates session if needed)
-    # Try UPDATE first (most common case: session exists)
-    updated = await db.execute(
-        text(
-            "UPDATE sessions "
-            "SET cognitive_state = jsonb_set("
-            "  COALESCE(cognitive_state, '{}')::jsonb,"
-            "  '{flags,offline_notified}',"
-            "  'true'::jsonb"
-            ") "
-            "WHERE tenant_id = :tid AND user_id = :phone AND is_active = true"
-        ),
-        {"tid": str(tenant_id), "phone": phone},
-    )
-    if updated.rowcount == 0:
-        # No session yet — create one with offline_notified pre-set
-        repo = SessionRepository(db)
-        from src.models.session import CognitiveStateData
-        initial_state = CognitiveStateData(
-            funnel_stage="lead_novo",
-            intent_history=[],
-            slots={},
-            flags={"offline_notified": True},
-            turn_count=0,
-            safety_triggers=0,
-        )
-        try:
-            await repo.create(
-                tenant_id=tenant_id,
-                user_id=phone,
-                channel="whatsapp",
-                cognitive_state=initial_state.to_dict(),
-                session_metadata={"phone": phone, "source": "webhook"},
-            )
-            await db.flush()
-        except Exception:
-            pass  # race-safe — another worker may have created it
-
     logger.info(
-        "bot_paused_offline_notified",
-        extra={"tenant_id": str(tenant_id), "phone": phone, "provider": provider},
+        "bot_paused_skip",
+        extra={"tenant_id": str(tenant_id), "phone": phone},
     )
     return {"ok": True, "skipped": "bot_paused"}
 
@@ -678,7 +588,7 @@ async def zapi_webhook(
         pass  # fire-and-forget
 
     # ── bot_active check — if AI is paused, send offline msg once then skip ──
-    bot_skip = await _check_bot_active(tenant_id, phone, clinic_config, db, provider="zapi")
+    bot_skip = await _check_bot_active(tenant_id, phone, db)
     if bot_skip:
         await db.commit()
         return JSONResponse(status_code=202, content=bot_skip)
@@ -875,7 +785,7 @@ async def evolution_webhook(
         return result
 
     # ── bot_active check — if AI is paused, send offline msg once then skip ──
-    bot_skip = await _check_bot_active(tenant_id, phone, clinic_config, db, provider="evolution")
+    bot_skip = await _check_bot_active(tenant_id, phone, db)
     if bot_skip:
         await db.commit()
         return JSONResponse(status_code=202, content=bot_skip)
