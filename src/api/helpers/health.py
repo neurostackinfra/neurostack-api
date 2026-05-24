@@ -116,8 +116,12 @@ async def _compute_alerts(
     now = datetime.now(timezone.utc)
     seven_days_ago = now - timedelta(days=7)
 
-    # Fetch clinics (including inactive) with config
-    stmt = select(Tenant).options(selectinload(Tenant.clinic_config_row))
+    # Fetch clinics (including inactive) with config — skip admin HQ tenants
+    stmt = (
+        select(Tenant)
+        .options(selectinload(Tenant.clinic_config_row))
+        .where(Tenant.plan_type != "admin")
+    )
     if builder_id is not None:
         stmt = stmt.where(Tenant.builder_id == builder_id)
     result = await session.execute(stmt)
