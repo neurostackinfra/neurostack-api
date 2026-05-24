@@ -223,6 +223,12 @@ class SRMEngine:
             safety_result=safety_result,
             action=action,
         )
+        # Scheduling confirmation flow: propagate pending/cancelled flags
+        if handoff_result.confirmation_pending:
+            state_patch.flags["handoff_confirmation_pending"] = True
+        if handoff_result.scheduling_cancelled:
+            state_patch.flags["handoff_confirmation_pending"] = False
+            state_patch.flags["scheduling_interest"] = False
 
         # Step 9: Generate reasoning
         reasoning = self._generate_reasoning(

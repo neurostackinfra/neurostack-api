@@ -602,6 +602,10 @@ class CognitivePipeline:
                 custom_vars["services"] = ""
                 custom_vars["services_detail"] = ""
 
+        # Scheduling confirmation pending: tell LLM to ask (not announce transfer)
+        if input_data.flags.get("handoff_confirmation_pending"):
+            custom_vars["handoff_confirmation_pending"] = True
+
         # Collect context sources from non-empty custom_vars
         context_sources: list[dict[str, Any]] = []
         if input_data.clinic_config:

@@ -29,6 +29,14 @@ EXPLICIT_HANDOFF_PATTERNS = [
     r"^(atendente|humano|pessoa)$",
 ]
 
+# Confirmation response patterns for the scheduling two-step flow
+CONFIRMATION_POSITIVE = [
+    r"\b(sim|s\u00edm|yes|claro|pode|quero|por favor|tudo\s+bem|ok|okay|certo|confirmo|confirmar|aceito|aceitar|encaminhe|encaminha|manda|mande|fa\u00e7a|va|v\u00e1|vai|boa|beleza|com\s+certeza|com\s+certeza\s+sim|isso|exato|exatamente|perfeito|\u00f3timo|otimo)\b",
+]
+CONFIRMATION_NEGATIVE = [
+    r"\b(n\u00e3o|nao|no|nunca|negativo|nem|agora\s+n\u00e3o|agora\s+nao|ainda\s+n\u00e3o|ainda\s+nao|por\s+enquanto\s+n\u00e3o|por\s+enquanto\s+nao|cancel|cancela|desist|volta)\b",
+]
+
 
 class HandoffDecider:
     """
@@ -68,6 +76,14 @@ class HandoffDecider:
         self._patterns = [
             re.compile(p, re.IGNORECASE | re.UNICODE)
             for p in EXPLICIT_HANDOFF_PATTERNS
+        ]
+        self._positive_patterns = [
+            re.compile(p, re.IGNORECASE | re.UNICODE)
+            for p in CONFIRMATION_POSITIVE
+        ]
+        self._negative_patterns = [
+            re.compile(p, re.IGNORECASE | re.UNICODE)
+            for p in CONFIRMATION_NEGATIVE
         ]
 
     def decide(
@@ -138,20 +154,34 @@ class HandoffDecider:
                 sla="prioritario",
             )
 
-        # Priority 4: Scheduling — two-turn flow
-        # Turn 1 (scheduling_interest not set): LLM collects name + day/time, no handoff
-        # Turn 2+ (scheduling_interest already set): handoff to human team
+        # Priority 4: Scheduling — three-step flow with explicit confirmation
+        # Step 1 (scheduling_interest not set): LLM collects name + day/time, no handoff
+        # Step 2 (scheduling_interest set, confirmation NOT pending): ask for confirmation
+        # Step 3 (handoff_confirmation_pending set): user replies yes/no → act accordingly
         already_collecting = flags.get("scheduling_interest", False)
+        confirmation_pending = flags.get("handoff_confirmation_pending", False)
         is_scheduling = intent in ("agendar", "reagendar", "cancelar") or intent_category == IntentCategory.SCHEDULING
+
+        if confirmation_pending:
+            # User is answering the confirmation question
+            if self._is_positive_confirmation(message_lower):
+                return HandoffResult(
+                    required=True,
+                    reason=HandoffReason.SCHEDULING,
+                    urgency="normal",
+                    summary="Paciente confirmou encaminhamento para equipe de agendamento",
+                    sector="agendamento",
+                    sla="prioritario",
+                )
+            if self._is_negative_confirmation(message_lower):
+                # User declined → clear flags, continue normally
+                return HandoffResult(required=False, scheduling_cancelled=True)
+            # Ambiguous answer — keep confirmation pending
+            return HandoffResult(required=False, confirmation_pending=True)
+
         if already_collecting or (is_scheduling and intent in ("reagendar", "cancelar")):
-            return HandoffResult(
-                required=True,
-                reason=HandoffReason.SCHEDULING,
-                urgency="normal",
-                summary="Paciente forneceu dados de agendamento — handoff para recepção",
-                sector="agendamento",
-                sla="prioritario",
-            )
+            # Data collected, now ask for confirmation before handing off
+            return HandoffResult(required=False, confirmation_pending=True)
 
         # Priority 5: Escalation keywords → gerencia
         escalation_result = self._check_escalation_keywords(message_lower)
@@ -192,6 +222,14 @@ class HandoffDecider:
             )
 
         return HandoffResult(required=False)
+
+    def _is_positive_confirmation(self, message: str) -> bool:
+        """Return True if user message is a positive confirmation (sim, yes, claro, etc.)."""
+        return any(p.search(message) for p in self._positive_patterns)
+
+    def _is_negative_confirmation(self, message: str) -> bool:
+        """Return True if user message is a negative response (não, no, agora não, etc.)."""
+        return any(p.search(message) for p in self._negative_patterns)
 
     def _check_explicit_request(self, message: str) -> Optional[HandoffResult]:
         """Check if user explicitly requested a human → administrativo, prioritario (doc)."""
