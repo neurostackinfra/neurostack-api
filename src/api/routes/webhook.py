@@ -636,6 +636,8 @@ async def zapi_webhook(
             creds = (clinic_config or {}).get("api_credentials", {}) or {}
             whisper_key = creds.get("whisper_api_key")
             whisper_model = creds.get("whisper_model") or "whisper-large-v3-turbo"
+            stt_provider = (creds.get("stt_provider") or "outros").strip()
+            stt_api_url = (creds.get("stt_api_url") or "").strip()
             agent_lang = _get_agent_language(clinic_config)
             lang_hint = "en" if agent_lang == "en" else "pt"
             if whisper_key:
@@ -677,13 +679,33 @@ async def zapi_webhook(
                         "Audio received for transcription: size=%d bytes, mimetype=%s",
                         len(audio_bytes), mimetype,
                     )
-                    from src.services.groq_service import transcribe_audio
+                    from src.services.groq_service import (
+                        GROQ_API_BASE,
+                        OPENAI_API_BASE,
+                        transcribe_audio,
+                    )
+                    # Resolve the STT base URL from the saved provider
+                    _STT_BASE_URLS: dict[str, str] = {
+                        "openai_whisper": OPENAI_API_BASE,
+                        "outros": stt_api_url or GROQ_API_BASE,
+                    }
+                    stt_base_url = _STT_BASE_URLS.get(stt_provider)
+                    if stt_base_url is None:
+                        # ElevenLabs Scribe / Google Cloud STT — not yet wired
+                        logger.warning(
+                            "STT provider %r is not yet implemented in runtime; "
+                            "falling back to Groq endpoint. Configure 'Outros' in the "
+                            "API settings to use a custom endpoint.",
+                            stt_provider,
+                        )
+                        stt_base_url = stt_api_url or GROQ_API_BASE
                     message_text = await transcribe_audio(
                         api_key=whisper_key,
                         audio_bytes=audio_bytes,
                         mimetype=mimetype,
                         model=whisper_model,
                         language=lang_hint,
+                        base_url=stt_base_url,
                     )
                 except Exception as exc:
                     logger.warning("Audio transcription failed: %s", exc)
