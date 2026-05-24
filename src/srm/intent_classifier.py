@@ -39,7 +39,7 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(quero)\b.*\b(tratar|melhorar|cuidar|fazer|entender|saber|marcar)\b",
             r"\b(vocês|voces)\b.*\b(botox|peeling|clareamento|harmonização|harmonizacao|dermatologia|implante)\b",
             r"\b(já fiz|ja fiz|nunca fiz|primeira vez)\b.*\b(botox|procedimento|tratamento|peeling|harmonização|harmonizacao)\b",
-            r"^\s*primeira vez[!?.]?\s*$",  # ONLY when message IS "primeira vez" (exact trace case)
+            r"^\s*(minha\s+)?primeira vez[!?.]?\s*$",  # "primeira vez" or "minha primeira vez" as full message
             r"\b(tenho|sofro|estou com)\b.*\b(acne|manchas|queda|bruxismo|medo|vergonha|interesse)\b",
             r"\b(posso fazer|posso|podem)\b.*\b(procedimento|tratamento|botox)\b",
             r"\b(experiência ruim|experiencia ruim|medo|vergonha)\b.*\b(dentista|procedimento|tratamento)\b",
@@ -229,6 +229,9 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             # the agendar "tem disponibilidade?" pattern. Only "informe/diga + disponibilidade"
             # is unambiguously an info query rather than a scheduling request.
             r"\b(informe|informar|diga|fale|me passe)\b.*\b(disponibilidade|horário|horario)\b",
+            # "queria saber os horários de vocês" — info-seeking about hours (even inside
+            # messages that mention "encaminhar" as a precondition, e.g. "antes de me encaminhar")
+            r"\b(queria?|quero|gostaria)\s+saber\b.*\b(horários?|horarios?|disponibilidade|agenda)\b",
         ],
         "keywords": ["horário", "horario", "funciona", "abre", "fecha",
                       "funcionamento", "expediente"],
