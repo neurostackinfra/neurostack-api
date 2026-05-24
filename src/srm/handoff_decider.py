@@ -29,13 +29,25 @@ EXPLICIT_HANDOFF_PATTERNS = [
     r"^(atendente|humano|pessoa)$",
 ]
 
-# Confirmation response patterns for the scheduling two-step flow
-CONFIRMATION_POSITIVE = [
-    r"\b(sim|s\u00edm|yes|claro|pode|quero|por favor|tudo\s+bem|ok|okay|certo|confirmo|confirmar|aceito|aceitar|encaminhe|encaminha|manda|mande|fa\u00e7a|va|v\u00e1|vai|boa|beleza|com\s+certeza|com\s+certeza\s+sim|isso|exato|exatamente|perfeito|\u00f3timo|otimo)\b",
-]
-CONFIRMATION_NEGATIVE = [
-    r"\b(n\u00e3o|nao|no|nunca|negativo|nem|agora\s+n\u00e3o|agora\s+nao|ainda\s+n\u00e3o|ainda\s+nao|por\s+enquanto\s+n\u00e3o|por\s+enquanto\s+nao|cancel|cancela|desist|volta)\b",
-]
+# Confirmation response patterns for the scheduling two-step flow.
+#
+# STRONG positives: match regardless of sentence length.
+# WEAK positives: only valid when the whole trimmed message is \u2264 3 words,
+#   so "quero saber os hor\u00e1rios antes" (5 words) never fires the handoff.
+_STRONG_POSITIVE_RE = re.compile(
+    r"\b(sim|s[\u00edi]m|yes|claro|com\s+certeza|confirmo|confirmar|aceito|aceitar"
+    r"|encaminhe|encaminha|perfeito|[\u00f3o]timo|beleza)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+_WEAK_POSITIVE_RE = re.compile(
+    r"^(pode|quero|ok|okay|isso|vai|v[a\u00e1]|manda|mande|tudo\s+bem|por\s+favor|certo|exato|exatamente|boa)[\s!.,]*$",
+    re.IGNORECASE | re.UNICODE,
+)
+_NEGATIVE_RE = re.compile(
+    r"\b(n[a\u00e3]o|no|nunca|negativo|nem|agora\s+n[a\u00e3]o|ainda\s+n[a\u00e3]o"
+    r"|por\s+enquanto\s+n[a\u00e3]o|cancel|cancela|desist|volta)\b",
+    re.IGNORECASE | re.UNICODE,
+)
 
 
 class HandoffDecider:
@@ -72,18 +84,10 @@ class HandoffDecider:
             "ouvidoria", "procon", "processo", "advogado",
         ]
         
-        # Compile patterns
+        # Compile explicit handoff patterns
         self._patterns = [
             re.compile(p, re.IGNORECASE | re.UNICODE)
             for p in EXPLICIT_HANDOFF_PATTERNS
-        ]
-        self._positive_patterns = [
-            re.compile(p, re.IGNORECASE | re.UNICODE)
-            for p in CONFIRMATION_POSITIVE
-        ]
-        self._negative_patterns = [
-            re.compile(p, re.IGNORECASE | re.UNICODE)
-            for p in CONFIRMATION_NEGATIVE
         ]
 
     def decide(
@@ -224,12 +228,23 @@ class HandoffDecider:
         return HandoffResult(required=False)
 
     def _is_positive_confirmation(self, message: str) -> bool:
-        """Return True if user message is a positive confirmation (sim, yes, claro, etc.)."""
-        return any(p.search(message) for p in self._positive_patterns)
+        """Return True if user message is a positive confirmation.
+
+        Strong positives (sim, claro, confirmo…) match in any length message.
+        Weak positives (pode, quero, ok, isso…) only match when the entire
+        trimmed message is ≤ 3 words, preventing false positives like
+        "quero saber os horários antes" from triggering a handoff.
+        """
+        if _STRONG_POSITIVE_RE.search(message):
+            return True
+        words = message.strip().split()
+        if len(words) <= 3 and _WEAK_POSITIVE_RE.search(message.strip()):
+            return True
+        return False
 
     def _is_negative_confirmation(self, message: str) -> bool:
         """Return True if user message is a negative response (não, no, agora não, etc.)."""
-        return any(p.search(message) for p in self._negative_patterns)
+        return bool(_NEGATIVE_RE.search(message))
 
     def _check_explicit_request(self, message: str) -> Optional[HandoffResult]:
         """Check if user explicitly requested a human → administrativo, prioritario (doc)."""
