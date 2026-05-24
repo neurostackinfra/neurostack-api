@@ -42,6 +42,7 @@ from src.models.clinic_config_table import ClinicConfigTable
 from src.models.coupon import Coupon
 from src.models.event import Event
 from src.models.tenant import Tenant
+from src.models.transaction import Transaction
 from src.models.user import User, UserRole
 from src.repositories import get_db_session_dependency
 
@@ -717,6 +718,61 @@ async def create_builder(
 
     await session.commit()
     return {"ok": True, "id": str(builder_id)}
+
+
+@router.get(
+    "/builders/subscriptions",
+    summary="Builder Subscription Overview",
+    description="Subscription status for all builders. Super admin only.",
+)
+async def builder_subscriptions(
+    tenant: TenantContext = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
+):
+    stmt = select(Builder).order_by(Builder.name)
+    result = await session.execute(stmt)
+    builders = result.scalars().all()
+    return [
+        {
+            "id": str(b.id),
+            "name": b.name,
+            "subscription_plan": b.subscription_plan,
+            "subscription_status": b.subscription_status,
+            "billing_cycle": b.billing_cycle,
+            "updated_at": b.updated_at.isoformat() if b.updated_at else None,
+        }
+        for b in builders
+    ]
+
+
+@router.get(
+    "/transactions",
+    summary="List Payment Transactions",
+    description="List all confirmed payment transactions. Super admin only.",
+)
+async def list_transactions(
+    tenant: TenantContext = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
+):
+    stmt = select(Transaction).order_by(Transaction.created_at.desc()).limit(200)
+    result = await session.execute(stmt)
+    txs = result.scalars().all()
+    return [
+        {
+            "id": str(tx.id),
+            "builder_id": str(tx.builder_id),
+            "builder_name": tx.builder_name,
+            "amount_cents": tx.amount_cents,
+            "method": tx.method,
+            "cycle": tx.cycle,
+            "plan": tx.plan,
+            "coupon_code": tx.coupon_code,
+            "external_id": tx.external_id,
+            "event_type": tx.event_type,
+            "created_at": tx.created_at.isoformat() if tx.created_at else None,
+        }
+        for tx in txs
+    ]
 
 
 @router.patch(

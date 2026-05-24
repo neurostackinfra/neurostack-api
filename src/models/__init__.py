@@ -19,6 +19,7 @@ from src.models.handoff import HandoffRecord
 from src.models.user import User, UserRole
 from src.models.demo_lead import DemoLead
 from src.models.support_ticket import SupportTicket
+from src.models.transaction import Transaction
 
 __all__ = [
     # Base
@@ -40,5 +41,6 @@ __all__ = [
     "UserRole",
     "DemoLead",
     "SupportTicket",
+    "Transaction",
 ]
 

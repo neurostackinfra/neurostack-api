@@ -25,7 +25,7 @@ MOCK_SUBSCRIPTION = {
 MOCK_PIX_CHARGE = {
     "charge_id": "chg_mock_dev_001",
     "qr_code": "00020126580014br.gov.bcb.pix0136mock-pix-key-for-development520400005303986540510.005802BR5913NeuroStack6009SAO PAULO62070503***6304ABCD",
-    "qr_code_url": "https://pay.abacatepay.com/mock/qr.png",
+    "qr_code_url": "",  # Em produção AbacatePay retorna uma URL real; mock não tem imagem
 }
 
 
