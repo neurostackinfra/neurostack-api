@@ -229,10 +229,12 @@ class SRMEngine:
         if handoff_result.scheduling_cancelled:
             state_patch.flags["handoff_confirmation_pending"] = False
             state_patch.flags["scheduling_interest"] = False
-        # P2a-fix: always clear the pending flag when handoff actually fires,
-        # so a resumed session doesn't re-enter the confirmation branch.
+        # P2a/P2-fix: when handoff fires, clear both confirmation flags so a resumed
+        # session (e.g. after handoff-pause expires) starts fresh instead of
+        # re-entering the confirmation step.
         if handoff_result.required:
             state_patch.flags["handoff_confirmation_pending"] = False
+            state_patch.flags["scheduling_interest"] = False
 
         # Step 9: Generate reasoning
         reasoning = self._generate_reasoning(

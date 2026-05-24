@@ -603,13 +603,18 @@ class CognitivePipeline:
                 custom_vars["services_detail"] = ""
 
         # Scheduling confirmation pending: tell LLM to ask (not announce transfer).
-        # P1-fix: also check srm_decision.state_patch.flags so the instruction is
-        # visible on the SAME turn the flag is first set (not one turn later).
-        if (
-            input_data.flags.get("handoff_confirmation_pending")
-            or srm_decision.state_patch.flags.get("handoff_confirmation_pending")
-        ):
+        #
+        # Priority: state_patch (this-turn decision) overrides the stored session flag.
+        # - patch=True  → engine set it this turn → ask for confirmation
+        # - patch=False → engine cleared it this turn (user said "não" or handoff fired)
+        #                 → do NOT show confirmation prompt, even if session flag was True
+        # - patch absent → no change this turn → fall back to stored session flag
+        _patch_pending = srm_decision.state_patch.flags.get("handoff_confirmation_pending")
+        if _patch_pending is True:
             custom_vars["handoff_confirmation_pending"] = True
+        elif _patch_pending is None and input_data.flags.get("handoff_confirmation_pending"):
+            custom_vars["handoff_confirmation_pending"] = True
+        # patch=False → engine explicitly cleared it → leave custom_vars unset
 
         # Collect context sources from non-empty custom_vars
         context_sources: list[dict[str, Any]] = []
