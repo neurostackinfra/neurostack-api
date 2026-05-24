@@ -154,8 +154,10 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\bpode (marcar|agendar)\b",
             r"\b(tem|há)\b.*\b(vaga|encaixe|horário|horario)\b",
             r"\b(pode ser|posso)\b.*\b(segunda|terça|terca|quarta|quinta|sexta|sábado|sabado|domingo|manhã|manha|tarde|noite|amanhã|amanha|hoje)\b",
-            # Standalone day+time reply (user answering a scheduling question, e.g. "Segunda às 8 da manhã")
+            # Standalone day+time reply (user answering a scheduling question)
+            # e.g. "Segunda às 8 da manhã", "Segunda às 8h", "Segunda às 8"
             r"\b(segunda|terça|terca|quarta|quinta|sexta|sábado|sabado|domingo)\b.*\b(\d{1,2}\s*h|\d{1,2}:\d{2}|manhã|manha|tarde|noite)\b",
+            r"\b(segunda|terça|terca|quarta|quinta|sexta|sábado|sabado|domingo)\b.*\bàs?\s+\d{1,2}\b",
             r"\b(às?|as)\s+\d{1,2}\s*(h|hora|horas)?\b.*\b(manhã|manha|tarde|noite)\b",
             r"\bquero garantir\b.*\bhorário\b",
             r"\bquando posso ir\b",
@@ -447,7 +449,10 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\bme encaminh(e|ar|em)\b",
         ],
         "keywords": ["atendente humano", "humano", "pessoa real", "não robô",
-                      "falar com alguém", "transfere", "encaminhe", "encaminhar"],
+                      "falar com alguém", "transfere"],
+        # NOTE: do NOT add bare verbs like "encaminhar"/"encaminhe" here —
+        # they are too generic and cause false-positives ("encaminhar exames").
+        # The patterns above already require handoff context (equipe/agendamento/etc.)
         "weight": 1.0,
     },
     "paciente_ativo": {
