@@ -34,7 +34,7 @@ import {
   Sliders, Plus, Trash2, Save, Loader2, Plug, User, Building2,
   Shield, PhoneForwarded, Boxes,
   Copy, Check, KeyRound, AlertTriangle, CheckCircle2, XCircle, Link2,
-  Cpu, MessageSquare, Lock, ChevronDown, ExternalLink, FileText,
+  Cpu, MessageSquare, Lock, ChevronDown, ExternalLink, FileText, Mic2,
 } from "lucide-react";
 
 // ── API Credentials (Tab 6) ───────────────────────────────────────────────────
@@ -66,6 +66,10 @@ interface CredentialStatus {
   whisper_api_key_set?:     boolean;
   whisper_api_key_masked?:  string | null;
   whisper_model?:           string | null;
+  // STT provider
+  stt_provider?:            string | null;
+  stt_api_url?:             string | null;
+  audio_max_seconds?:       number | null;
   apis_configured:          boolean;
 }
 interface ClinicSlim { clinic_id: number; clinic_name: string; }
@@ -78,10 +82,18 @@ function StatusDot({ configured }: { configured: boolean }) {
 
 type LlmProvider = "openai" | "dropout" | "slm_cortex" | "outros";
 type WhatsappProvider = "zapi" | "evolution";
+type SttProvider = "openai_whisper" | "elevenlabs_scribe" | "google_stt" | "outros";
 
 const WA_PROVIDERS: { id: WhatsappProvider; label: string; sub: string; activeCls: string }[] = [
   { id: "zapi",      label: "Z-API",        sub: "by Z-API.io",   activeCls: "border-[#25D366]/50 text-[#25D366] bg-[#25D366]/10" },
   { id: "evolution", label: "Evolution API", sub: "Open Source",   activeCls: "border-purple-500/50 text-purple-400 bg-purple-500/10" },
+];
+
+const STT_PROVIDERS: { id: SttProvider; label: string; sub: string; activeCls: string }[] = [
+  { id: "openai_whisper",    label: "Whisper",   sub: "by OpenAI",       activeCls: "border-amber-500/50 text-amber-400 bg-amber-500/10"   },
+  { id: "elevenlabs_scribe", label: "Scribe",    sub: "by ElevenLabs",   activeCls: "border-orange-500/50 text-orange-400 bg-orange-500/10" },
+  { id: "google_stt",        label: "Cloud STT", sub: "by Google",       activeCls: "border-sky-500/50 text-sky-400 bg-sky-500/10"          },
+  { id: "outros",            label: "Outros",    sub: "Groq / OpenRouter", activeCls: "border-slate-500/50 text-slate-300 bg-slate-500/10"  },
 ];
 
 const PROVIDERS: { id: LlmProvider; label: string; sub: string; activeCls: string }[] = [
@@ -164,9 +176,11 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   const [llmModelName, setLlmModelName]     = useState("");
   const [llmFallback, setLlmFallback]       = useState<"openai" | "dropout">("dropout");
 
-  // Whisper (audio transcription)
-  const [whisperModel, setWhisperModel]     = useState("whisper-large-v3-turbo");
-  const [whisperApiKey, setWhisperApiKey]   = useState("");
+  // STT (audio transcription)
+  const [sttProvider, setSttProvider]       = useState<SttProvider>("outros");
+  const [sttApiKey, setSttApiKey]           = useState("");
+  const [sttApiUrl, setSttApiUrl]           = useState("");
+  const [sttModelName, setSttModelName]     = useState("");
   const [audioMaxSeconds, setAudioMaxSeconds] = useState(60);
 
   useEffect(() => {
@@ -206,9 +220,11 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       // LLM API key: send partial mask (sk-pro****9xyz) so the user can visually
       // confirm which key is configured. Backend detects "****" and skips update.
       setLlmApiKey(data.llm_api_key_masked ?? "");
-      // Whisper (audio transcription)
-      setWhisperModel(data.whisper_model ?? "whisper-large-v3-turbo");
-      setWhisperApiKey(data.whisper_api_key_masked ?? "");
+      // STT (audio transcription)
+      setSttProvider((data.stt_provider as SttProvider) ?? "outros");
+      setSttApiKey(data.whisper_api_key_masked ?? "");
+      setSttApiUrl(data.stt_api_url ?? "");
+      setSttModelName(data.whisper_model ?? "");
       setAudioMaxSeconds(Number(data.audio_max_seconds) || 60);
     } catch { setError("Erro de rede."); }
     finally { setLoading(false); }
@@ -240,12 +256,14 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       }
       if (llmProvider === "dropout") body["llm_model_name"] = "text";
       else if (llmModelName && (llmProvider === "openai" || llmProvider === "outros"))  body["llm_model_name"] = llmModelName;
-      // Whisper (audio transcription)
-      body["whisper_model"] = whisperModel;
+      // STT (audio transcription)
+      body["stt_provider"]     = sttProvider;
+      body["whisper_model"]    = sttModelName;
       body["audio_max_seconds"] = audioMaxSeconds;
-      if (whisperApiKey && !whisperApiKey.includes("•") && !whisperApiKey.includes("*")) {
-        body["whisper_api_key"] = whisperApiKey;
-      }
+      if (sttApiKey && !sttApiKey.includes("•") && !sttApiKey.includes("*"))
+        body["whisper_api_key"] = sttApiKey;
+      if (sttProvider === "outros" && sttApiUrl)
+        body["stt_api_url"] = sttApiUrl;
       const saveUrl = targetId
         ? `/v1/config/api-credentials?clinic_id=${targetId}`
         : `/v1/config/api-credentials`;
@@ -566,59 +584,83 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         )}
       </div>
 
-      {/* ── Whisper (Audio Transcription) ── */}
+      {/* ── Provider Speech to Text ── */}
       <div className="space-y-4 rounded-lg border border-slate-700/50 bg-muted/20 p-4">
-        <SectionLabel>{txt("Transcrição de Áudio (Whisper)", "Audio Transcription (Whisper)")}</SectionLabel>
-        <p className="text-xs text-muted-foreground -mt-2 mb-3">
-          {txt(
-            "Transcreve mensagens de voz do WhatsApp para texto usando Groq Whisper.",
-            "Transcribes WhatsApp voice messages to text using Groq Whisper."
+        <div className="flex items-center gap-2">
+          <Mic2 className="h-3.5 w-3.5 text-accent" />
+          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Provider Speech to Text</p>
+        </div>
+
+        {/* Provider toggle group */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          {STT_PROVIDERS.map(p => {
+            const active = sttProvider === p.id;
+            return (
+              <button
+                key={p.id}
+                type="button"
+                disabled={isReadOnly}
+                onClick={() => {
+                  if (sttProvider === p.id) return;
+                  setSttProvider(p.id);
+                  setSttApiKey("");
+                  setSttModelName("");
+                  setSttApiUrl("");
+                }}
+                className={`relative flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2.5 text-left transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
+                  active
+                    ? p.activeCls
+                    : "border-border bg-background text-muted-foreground hover:border-slate-500"
+                }`}
+              >
+                <span className="text-xs font-bold">{p.label}</span>
+                <span className="text-[10px] opacity-70">{p.sub}</span>
+                {active && <span className="absolute top-2 right-2 h-1.5 w-1.5 rounded-full bg-current opacity-80" />}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Conditional fields based on sttProvider */}
+        <div className="grid gap-3 sm:grid-cols-2">
+          {sttProvider === "outros" && (
+            <div className="sm:col-span-2">
+              <ApiInput label="API URL" value={sttApiUrl} onChange={setSttApiUrl}
+                placeholder="https://api.groq.com/openai/v1" disabled={isReadOnly} mono />
+            </div>
           )}
-        </p>
-        <Field label={txt("Modelo Whisper", "Whisper Model")}>
-          <Select value={whisperModel} onValueChange={setWhisperModel} disabled={isReadOnly}>
-            <SelectTrigger className="h-9 text-sm font-mono">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="whisper-large-v3-turbo">
-                whisper-large-v3-turbo, {txt("Rápido e econômico", "Fast & economical")} ($0.04/hr)
-              </SelectItem>
-              <SelectItem value="whisper-large-v3">
-                whisper-large-v3, {txt("Alta precisão", "High accuracy")} ($0.111/hr)
-              </SelectItem>
-            </SelectContent>
-          </Select>
-        </Field>
-        <Field label="Groq API Key" hint={txt("Chave da API Groq para transcrição de áudio.", "Groq API key for audio transcription.")}>
-          <ApiInput
-            label=""
-            value={whisperApiKey}
-            onChange={setWhisperApiKey}
-            type="password"
-            placeholder={status?.whisper_api_key_set ? "••••••••• (manter atual)" : "gsk-..."}
-            disabled={isReadOnly}
-            configured={status?.whisper_api_key_set}
-            mono
-          />
-        </Field>
-        <Field
-          label={txt("Duração Máxima de Áudio (segundos)", "Max Audio Duration (seconds)")}
-          hint={txt(
-            "Áudios mais longos serão encaminhados para atendimento humano em vez de transcritos.",
-            "Audios longer than this limit will be routed to human support instead of transcribed."
-          )}
-        >
-          <input
-            type="number"
-            min={10}
-            max={300}
-            value={audioMaxSeconds}
-            onChange={(e) => setAudioMaxSeconds(Number(e.target.value))}
-            disabled={isReadOnly}
-            className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
-          />
-        </Field>
+          <ApiInput label="API Key" value={sttApiKey} onChange={setSttApiKey} type="password"
+            placeholder={
+              status?.whisper_api_key_set ? "••••••••• (manter atual)" :
+              sttProvider === "openai_whisper" ? "sk-..." :
+              sttProvider === "elevenlabs_scribe" ? "sk_..." :
+              sttProvider === "google_stt" ? "AIza..." :
+              "gsk_..."
+            }
+            disabled={isReadOnly} configured={status?.whisper_api_key_set} />
+          <ApiInput label="Model Name" value={sttModelName} onChange={setSttModelName}
+            placeholder={
+              sttProvider === "openai_whisper" ? "whisper-1" :
+              sttProvider === "elevenlabs_scribe" ? "scribe_v1" :
+              sttProvider === "google_stt" ? "latest_long" :
+              "distil-whisper-large-v3-en"
+            }
+            disabled={isReadOnly} mono />
+          <div className="space-y-1">
+            <label className="text-xs font-medium text-muted-foreground">
+              {txt("Duração Máxima (segundos)", "Max Duration (seconds)")}
+            </label>
+            <input
+              type="number"
+              min={10}
+              max={300}
+              value={audioMaxSeconds}
+              onChange={(e) => setAudioMaxSeconds(Number(e.target.value))}
+              disabled={isReadOnly}
+              className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
+            />
+          </div>
+        </div>
       </div>
 
       {error && <p className="flex items-center gap-1.5 text-sm text-destructive"><AlertTriangle className="h-3.5 w-3.5" />{error}</p>}
