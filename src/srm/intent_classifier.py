@@ -148,8 +148,10 @@ INTENT_DEFINITIONS: dict[str, dict] = {
         "patterns": [
             r"\b(agendar|marcar|reservar)\b.*\b(consulta|horário|horario|atendimento|sessão|sessao|avaliação|avaliaçao|procedimento)\b",
             r"\b(quero|preciso|gostaria)\b.*\b(agendar|marcar)\b",
-            r"\b(tem|há|ha)\b.*\b(horário|horario|vaga|disponibilidade)\b.*\b(disponível|disponivel|livre)?\b",
-            r"\b(agenda)\b",  # bare "agenda" is scheduling-specific; "disponibilidade" alone → disponibilidade_horarios
+            r"\b(têm?|há|ha)\b.*\b(horário|horario|vaga|disponibilidade)\b.*\b(disponível|disponivel|livre)?\b",
+            r"\b(agenda)\b",  # bare "agenda" is scheduling-specific
+            # Date-specific availability asks (without tem/têm): "qual a disponibilidade para segunda?"
+            r"\b(disponibilidade)\b.*\b(para|pra|hoje|amanhã|amanha|segunda|terça|terca|quarta|quinta|sexta|sábado|sabado|domingo)\b",
             r"\bvamos agendar\b",
             r"\bpode (marcar|agendar)\b",
             r"\b(tem|há)\b.*\b(vaga|encaixe|horário|horario)\b",
@@ -224,7 +226,10 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(informe|informar|diga|fale|me passe)\b.*\b(disponibilidade|horário|horario)\b",
         ],
         "keywords": ["horário", "horario", "funciona", "abre", "fecha",
-                      "funcionamento", "expediente", "disponibilidade"],
+                      "funcionamento", "expediente"],
+        # NOTE: "disponibilidade" intentionally excluded — it scores as agendar for
+        # "têm disponibilidade?" and date-specific asks; only "informe+disponibilidade"
+        # belongs here (captured by pattern above, not keyword scoring).
         "weight": 1.0,
     },
     "detalhes_servicos": {
