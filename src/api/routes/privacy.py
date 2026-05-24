@@ -32,6 +32,7 @@ class ClinicPrivData(BaseModel):
     dpo_contact: Optional[str] = None
     lgpd_enabled: Optional[str] = None
     lgpd_custom_link: Optional[str] = None
+    slm_training_consent: bool = False
 
 
 _SHIELD_SVG = (
@@ -65,11 +66,33 @@ def _render_page(
     dpo_contact: str,
     clinic_contact: str,
     lgpd_message: str,
+    slm_training: bool = False,
 ) -> str:
     from datetime import date
     today = date.today().strftime("%d/%m/%Y")
     shield_header = _shield(20, "#7c3aed")
     shield_footer = _shield(14, "#a78bfa")
+    slm_section = ""
+    if slm_training:
+        slm_section = """
+  <section class="section">
+    <h2>Adendo Especial: Uso de Dados Anonimizados para Treinamento de IA (SLM)</h2>
+    <p>Com o objetivo exclusivo de especializar o atendimento, aumentar a precisão das respostas
+    médicas/odontológicas e reduzir os custos operacionais da plataforma, os dados de interações
+    e históricos de conversas poderão ser utilizados para o treinamento, ajuste fino (fine-tuning)
+    e calibração de Modelos de Linguagem (Small Language Models - SLMs) e motores cognitivos de
+    inteligência artificial.</p>
+    <p style="margin-top:0.75rem"><strong>Garantia de Anonimização Absoluta:</strong> Para que ocorra este processo
+    sem qualquer risco à sua privacidade, todos os dados transitados passam por um rigoroso processo
+    de descaracterização e anonimização irreversível. Isso significa que nomes, números de telefone,
+    CPFs, documentos, fotos e qualquer outra informação que possa identificar direta ou indiretamente
+    o paciente são sumariamente removidos antes de qualquer processamento por estes motores de IA.</p>
+    <p style="margin-top:0.75rem">Conforme o artigo 12 da Lei Geral de Proteção de Dados (LGPD - Lei nº 13.709/18), os dados
+    anonimizados perdem a natureza de dados pessoais para fins legais. Dessa forma, garantimos que
+    o seu histórico de atendimento seja tratado puramente como um padrão estatístico e de linguagem,
+    totalmente desvinculado da sua identidade e focado apenas na evolução contínua da qualidade do
+    atendimento em saúde.</p>
+  </section>"""
     return f"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -270,6 +293,7 @@ def _render_page(
     </div>
   </section>
 
+{slm_section}
   <section>
     <h2>10. Atualizações desta política</h2>
     <div class="section-body">
@@ -372,6 +396,9 @@ async def get_privacy_page(
     resolved_message = resolved_message.replace("{{clinic_name}}", legal_name)
     resolved_message = resolved_message.replace("[Nome da Clínica]", legal_name)
 
+    slm_training_raw = lgpd.get("builder_slm_training")
+    slm_training_flag = slm_training_raw is True or str(slm_training_raw).lower() in ("true", "yes", "1") if slm_training_raw is not None else False
+
     html_body = _render_page(
         title=_esc(legal_name),
         legal_name=_esc(legal_name),
@@ -380,6 +407,7 @@ async def get_privacy_page(
         dpo_contact=_esc(lgpd.get("dpo_contact")),
         clinic_contact=_esc(lgpd.get("clinic_contact")),
         lgpd_message=_esc(resolved_message),
+        slm_training=slm_training_flag,
     )
     return HTMLResponse(content=html_body, status_code=200)
 
@@ -426,6 +454,9 @@ async def get_privacy_data(
     else:
         lgpd_enabled_str = None
 
+    slm_raw = lgpd.get("builder_slm_training")
+    slm_consent = slm_raw is True or str(slm_raw).lower() in ("true", "yes", "1") if slm_raw is not None else False
+
     return ClinicPrivData(
         clinic_id=str(clinic_uuid),
         clinic_name=tenant.name,
@@ -436,4 +467,5 @@ async def get_privacy_data(
         dpo_contact=lgpd.get("dpo_contact") or None,
         lgpd_enabled=lgpd_enabled_str,
         lgpd_custom_link=lgpd.get("lgpd_custom_link") or None,
+        slm_training_consent=slm_consent,
     )
