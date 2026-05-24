@@ -409,6 +409,29 @@ export const en = {
   admin_filter_severity: "Severity",
   admin_filter_builder: "Builder",
   admin_filter_all: "All",
+
+  // ── Handoff Queue ──
+  nav_handoff_queue: "Handoff Queue",
+  handoff_queue_title: "Handoff Queue",
+  handoff_queue_tab_geral: "General",
+  handoff_queue_tab_setor: "By Sector (Coming Soon)",
+  handoff_avg_wait: "Avg. Queue Wait",
+  handoff_pct_sla: "Within SLA",
+  handoff_legend_green: "Less than 5 min",
+  handoff_legend_yellow: "5 to 10 min",
+  handoff_legend_red: "Over 10 min",
+  handoff_waiting_since: "Waiting for:",
+  handoff_session_code: "Code",
+  handoff_intent: "Intent",
+  handoff_stage: "Stage",
+  handoff_entry_time: "Entry",
+  handoff_first_message: "Message",
+  handoff_btn_attended: "Attended",
+  handoff_export_csv: "Export CSV",
+  handoff_empty: "No active handoffs at the moment.",
+  handoff_no_clinic: "Select a clinic to view the queue.",
+  handoff_meta_minutos_label: "SLA target (minutes) after handoff",
+  handoff_meta_minutos_hint: "Target time for first human response.",
 } as const;
 
 export type TranslationKey = keyof typeof en;

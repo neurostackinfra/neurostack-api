@@ -74,6 +74,7 @@ class ClinicHandoff(BaseModel):
     """Configuração de handoff (doc MVP v0.5)."""
     default_mode: HandoffDefaultMode = HandoffDefaultMode.WHATSAPP_HUMAN_TAKEOVER
     sector_defaults: SectorDefaults = Field(default_factory=SectorDefaults)
+    meta_minutos_atendimento: int = 10
 
 
 class ClinicIdentity(BaseModel):
