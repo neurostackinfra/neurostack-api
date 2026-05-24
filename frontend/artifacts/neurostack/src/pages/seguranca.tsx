@@ -161,7 +161,7 @@ export default function Seguranca() {
         {/* Status grid */}
         <div className="grid grid-cols-3 gap-3">
           {[
-            { label: txt("Audit Events / Dia", "Audit Events / Day"), value: "—",      note: "Enterprise"                 },
+            { label: txt("Audit Events / Dia", "Audit Events / Day"), value: "-",      note: "Enterprise"                 },
             { label: txt("Jurisdições Suportadas", "Supported Jurisdictions"), value: "12",     note: txt("países", "countries") },
             { label: "Uptime SLA",                                            value: "99.99%", note: txt("garantido", "guaranteed") },
           ].map(s => (
@@ -197,8 +197,8 @@ export default function Seguranca() {
             />
             <DisabledSelect
               label={txt("Estado / Região", "State / Region")}
-              value={txt("São Paulo — SP", "São Paulo — SP")}
-              options={["Rio de Janeiro — RJ", "Minas Gerais — MG"]}
+              value={txt("São Paulo - SP", "São Paulo - SP")}
+              options={["Rio de Janeiro - RJ", "Minas Gerais - MG"]}
             />
             <DisabledSelect
               label={txt("Regime Regulatório", "Regulatory Framework")}
@@ -206,7 +206,7 @@ export default function Seguranca() {
               options={[
                 "HIPAA (Health Insurance Portability)",
                 "GDPR (General Data Protection Regulation)",
-                txt("Mixed — LGPD + GDPR", "Mixed — LGPD + GDPR"),
+                txt("Mixed - LGPD + GDPR", "Mixed - LGPD + GDPR"),
               ]}
             />
             <div className="pt-1">
@@ -281,11 +281,11 @@ export default function Seguranca() {
             />
             <DisabledSelect
               label={txt("Nível de Audit Trail", "Audit Trail Level")}
-              value={txt("Completo — Todas as operações", "Full — All operations")}
+              value={txt("Completo - Todas as operações", "Full - All operations")}
               options={[
-                txt("Básico — Leitura/Escrita", "Basic — Read/Write"),
-                txt("Intermediário — + Decisões SRM", "Intermediate — + SRM Decisions"),
-                txt("Completo — Todas as operações", "Full — All operations"),
+                txt("Básico - Leitura/Escrita", "Basic - Read/Write"),
+                txt("Intermediário - + Decisões SRM", "Intermediate - + SRM Decisions"),
+                txt("Completo - Todas as operações", "Full - All operations"),
               ]}
             />
           </CardContent>
@@ -352,7 +352,7 @@ export default function Seguranca() {
           />
           <CardContent className="space-y-0 divide-y divide-border/30">
             <DisabledToggle
-              label="RBAC — Role-Based Access Control"
+              label="RBAC - Role-Based Access Control"
               defaultChecked={true}
               sublabel={txt(
                 "Permissões atribuídas por papel: super_admin, clinic_admin, investor, read-only",
@@ -363,8 +363,8 @@ export default function Seguranca() {
               label={txt("Segregação Estrita de Clínicas", "Strict Clinic Segregation")}
               defaultChecked={true}
               sublabel={txt(
-                "Dados de cada tenant completamente isolados — sem acesso cruzado",
-                "Each tenant's data completely isolated — no cross-access"
+                "Dados de cada tenant completamente isolados, sem acesso cruzado",
+                "Each tenant's data completely isolated, no cross-access"
               )}
             />
             <DisabledToggle

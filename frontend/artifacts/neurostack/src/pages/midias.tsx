@@ -182,7 +182,7 @@ export default function Midias() {
                 {txt("Arraste um arquivo ou clique para selecionar", "Drag a file or click to select")}
               </p>
               <p className="text-[11px] font-medium text-foreground/35 mt-1">
-                {txt("MP4, MP3, PDF, JPG, PNG — até 50 MB", "MP4, MP3, PDF, JPG, PNG — up to 50 MB")}
+                {txt("MP4, MP3, PDF, JPG, PNG - até 50 MB", "MP4, MP3, PDF, JPG, PNG - up to 50 MB")}
               </p>
             </div>
 

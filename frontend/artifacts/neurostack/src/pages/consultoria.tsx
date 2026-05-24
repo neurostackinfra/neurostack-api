@@ -125,7 +125,7 @@ export default function Consultoria() {
             <div className="flex items-center gap-2">
               <AlertTriangle className="h-4 w-4 text-violet-500" />
               <CardTitle className="text-sm font-semibold text-foreground">
-                {txt("Dica de Gestão — Ponto Crítico Identificado", "Management Tip — Critical Point Identified")}
+                {txt("Dica de Gestão - Ponto Crítico Identificado", "Management Tip - Critical Point Identified")}
               </CardTitle>
               <Badge variant="outline" className="ml-auto text-[9px] font-bold bg-amber-500/10 border-amber-500/25 text-amber-600 dark:text-amber-400">
                 {txt("Alta Prioridade", "High Priority")}

@@ -56,8 +56,8 @@ export default function KnowledgeBase() {
         <div className="min-w-0 flex-1">
           <p className="text-xs font-semibold text-violet-300">
             {txt(
-              "Funcionalidade em desenvolvimento — disponível nos próximos releases",
-              "Feature under development — available in upcoming releases"
+              "Funcionalidade em desenvolvimento, disponível nos próximos releases",
+              "Feature under development, available in upcoming releases"
             )}
           </p>
           <p className="text-[11px] text-muted-foreground mt-0.5">

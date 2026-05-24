@@ -330,7 +330,7 @@ function CreatePilotDialog({ token, onCreated }: { token: string; onCreated: () 
       });
       const data = await res.json() as { ok?: boolean; error?: string; id?: string; clinic_id?: string };
       if (!res.ok) { setError((data as { detail?: string; error?: string }).detail ?? (data as { error?: string }).error ?? t("admin_create_err_generic")); return; }
-      const newId = data.id ?? data.clinic_id ?? "—";
+      const newId = data.id ?? data.clinic_id ?? "-";
       toast({ title: t("admin_create_ok_title"), description: `${t("admin_create_ok_desc_prefix")} "${name}" ID ${newId}.` });
       setOpen(false);
       setName(""); setEmail(""); setPassword("");
@@ -2016,7 +2016,7 @@ export default function MasterAdmin() {
                     {displayedLeads.map((lead) => (
                       <tr key={lead.id} className="border-b border-border/30 last:border-0">
                         <td className="py-2 pr-4 font-medium text-foreground">{lead.name}</td>
-                        <td className="py-2 pr-4 text-violet-400/90 font-mono text-[11px]">{lead.email || "—"}</td>
+                        <td className="py-2 pr-4 text-violet-400/90 font-mono text-[11px]">{lead.email || "-"}</td>
                         <td className="py-2 pr-4 text-muted-foreground">{lead.company}</td>
                         <td className="py-2 pr-4 font-mono text-amber-400/90">{lead.phone}</td>
                         <td className="py-2 text-muted-foreground whitespace-nowrap">
@@ -2092,7 +2092,7 @@ export default function MasterAdmin() {
                             <td className="py-2 pr-4 font-medium">{s.name}</td>
                             <td className="py-2 pr-4">
                               <Badge className="bg-indigo-500/15 text-indigo-400 border-indigo-500/30 text-[10px]">
-                                {s.subscription_plan ?? "—"}
+                                {s.subscription_plan ?? "-"}
                               </Badge>
                             </td>
                             <td className="py-2 pr-4">
@@ -2110,7 +2110,7 @@ export default function MasterAdmin() {
                             </td>
                             <td className="py-2 pr-4 text-muted-foreground capitalize">{s.billing_cycle}</td>
                             <td className="py-2 text-muted-foreground">
-                              {s.updated_at ? relativeTime(s.updated_at) : "—"}
+                              {s.updated_at ? relativeTime(s.updated_at) : "-"}
                             </td>
                           </tr>
                         ))}
@@ -2146,7 +2146,7 @@ export default function MasterAdmin() {
                         {transactions.map((tx) => (
                           <tr key={tx.id} className="border-b border-border/30 last:border-0">
                             <td className="py-2 pr-4 text-muted-foreground tabular-nums">
-                              {tx.created_at ? new Date(tx.created_at).toLocaleDateString("pt-BR") : "—"}
+                              {tx.created_at ? new Date(tx.created_at).toLocaleDateString("pt-BR") : "-"}
                             </td>
                             <td className="py-2 pr-4 font-medium">{tx.builder_name}</td>
                             <td className="py-2 pr-4 tabular-nums font-medium text-emerald-400">
@@ -2170,7 +2170,7 @@ export default function MasterAdmin() {
                                   {tx.coupon_code}
                                 </Badge>
                               ) : (
-                                <span className="text-muted-foreground/40">—</span>
+                                <span className="text-muted-foreground/40">-</span>
                               )}
                             </td>
                           </tr>
@@ -2286,7 +2286,7 @@ export default function MasterAdmin() {
                           <td className="py-2 pr-4 text-muted-foreground">
                             {c.expires_at
                               ? new Date(c.expires_at).toLocaleDateString("pt-BR")
-                              : "—"}
+                              : "-"}
                           </td>
                           <td className="py-2 pr-4">
                             <Badge className={c.is_active

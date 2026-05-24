@@ -168,7 +168,7 @@ export default function Suporte() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 items-start">
 
         {/* ══════════════════════════════════════════════════════════════════════
-            LEFT — Active ticket system
+            LEFT - Active ticket system
         ══════════════════════════════════════════════════════════════════════ */}
         <Card className="border-border/70 shadow-sm">
           <CardHeader className="pb-3 border-b border-border/50">
@@ -278,7 +278,7 @@ export default function Suporte() {
         </Card>
 
         {/* ══════════════════════════════════════════════════════════════════════
-            RIGHT — Concierge / Live Chat (Roadmap)
+            RIGHT - Concierge / Live Chat (Roadmap)
         ══════════════════════════════════════════════════════════════════════ */}
         <div className="opacity-60 pointer-events-none select-none">
           <Card className="border-border/50 shadow-sm">

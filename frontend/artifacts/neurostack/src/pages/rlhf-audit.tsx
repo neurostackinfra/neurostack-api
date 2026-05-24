@@ -49,7 +49,7 @@ const MOCK_ENTRIES: AuditEntry[] = [
     submittedBy: "coordenador@bhmedi.com",
     userInput: "Fiquei insatisfeito com o resultado.",
     agentResponse: "Lamentamos muito. Por favor, entre em contato com nossa equipe.",
-    suggestedResponse: "Sinto muito que sua experiência não foi positiva. Vou conectar você imediatamente com nosso coordenador médico para resolvermos isso da melhor forma — sem burocracia.",
+    suggestedResponse: "Sinto muito que sua experiência não foi positiva. Vou conectar você imediatamente com nosso coordenador médico para resolvermos isso da melhor forma, sem burocracia.",
     status: "aligned",
     intent: "reclamacao",
     approvedForTraining: true,
@@ -100,7 +100,7 @@ export default function RlhfAudit() {
                 </span>
               </div>
               <p className="text-xs text-violet-400 font-semibold uppercase tracking-widest">
-                Relatório de Alinhamento — RLHF Data Flywheel
+                Relatório de Alinhamento - RLHF Data Flywheel
               </p>
             </div>
           </div>
@@ -180,7 +180,7 @@ export default function RlhfAudit() {
                 >
                   {entry.status === "aligned"
                     ? <><CheckCircle2 className="h-2.5 w-2.5" /> Alinhado</>
-                    : <><ShieldAlert className="h-2.5 w-2.5" /> Forçado — Fere Metodologia</>
+                    : <><ShieldAlert className="h-2.5 w-2.5" /> Forçado, Fere Metodologia</>
                   }
                 </Badge>
                 <span className="text-[10px] text-muted-foreground hidden sm:block">{entry.ts}</span>
@@ -266,7 +266,7 @@ export default function RlhfAudit() {
                       size="sm"
                       className="text-[11px] h-7 bg-violet-600 text-white gap-1.5 w-full opacity-60 cursor-not-allowed"
                       disabled
-                      title="Pipeline SLM disponível na V2 — Roadmap"
+                      title="Pipeline SLM disponível na V2 - Roadmap"
                     >
                       <Zap className="h-3 w-3" />
                       Aprovar para Treinamento SLM
@@ -274,11 +274,11 @@ export default function RlhfAudit() {
                   )}
                   {entry.status === "forced" ? (
                     <p className="text-[10px] text-rose-600 dark:text-rose-400 font-medium">
-                      Não elegível — fere metodologia
+                      Não elegível, fere metodologia
                     </p>
                   ) : (
                     <p className="text-[10px] text-amber-600 dark:text-amber-400 font-medium">
-                      Pipeline SLM — V2
+                      Pipeline SLM - V2
                     </p>
                   )}
                 </div>

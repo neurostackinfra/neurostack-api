@@ -232,7 +232,7 @@ export default function Privacidade() {
         <footer className="pt-8 border-t border-slate-200 text-xs text-slate-400 flex items-center gap-2">
           <Shield className="h-3.5 w-3.5 text-violet-400 shrink-0" />
           <span>
-            Página gerada pela plataforma <strong className="text-slate-500">NeuroStack</strong> — infraestrutura cognitiva para agentes de IA em saúde.
+            Página gerada pela plataforma <strong className="text-slate-500">NeuroStack</strong>, infraestrutura cognitiva para agentes de IA em saúde.
           </span>
         </footer>
       </main>
