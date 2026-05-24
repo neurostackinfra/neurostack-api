@@ -33,6 +33,21 @@ _SENT_ID_PREFIX = "ai_sent:"
 _SENT_ID_TTL = 300  # 5 minutes — enough for Z-API echo to arrive
 
 
+def _is_enabled(value: Any) -> bool:
+    """Safely evaluate a config flag that may be stored as bool, 'yes'/'no', or '1'/'0'.
+
+    Returns True only for: True, 1, 'yes', 'true', '1' (case-insensitive).
+    Returns False for everything else, including 'no', 'false', '0', None, ''.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("yes", "true", "1")
+    return False
+
+
 def _get_agent_language(clinic_config: Optional[dict]) -> str:
     """Return the configured agent language for the clinic, defaulting to pt-BR."""
     if not clinic_config:
@@ -614,7 +629,7 @@ async def zapi_webhook(
     # ── send LGPD privacy notice as the very first message of a new session ──
     if is_new:
         lgpd_cfg = (clinic_config or {}).get("lgpd") or {}
-        if lgpd_cfg.get("lgpd_enabled"):
+        if _is_enabled(lgpd_cfg.get("lgpd_enabled")):
             creds_lgpd = await _load_tenant_credentials(tenant_id, db)
             z_inst = creds_lgpd.get("zapi_instance_id", "").strip()
             z_tok = creds_lgpd.get("zapi_token", "").strip()
@@ -803,7 +818,7 @@ async def evolution_webhook(
     # ── send LGPD privacy notice as the very first message of a new session ──
     if is_new:
         lgpd_cfg = (clinic_config or {}).get("lgpd") or {}
-        if lgpd_cfg.get("lgpd_enabled"):
+        if _is_enabled(lgpd_cfg.get("lgpd_enabled")):
             creds_lgpd = await _load_tenant_credentials(tenant_id, db)
             e_url = creds_lgpd.get("evolution_api_url", "")
             e_name = creds_lgpd.get("evolution_instance_name", "")
