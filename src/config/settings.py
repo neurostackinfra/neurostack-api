@@ -135,6 +135,9 @@ class Settings(BaseSettings):
     # AbacatePay (Payment Gateway)
     # ============================================
     abacatepay_api_key: str = ""
+    # ABACATEPAY_WEBHOOK_SECRET: string gerada pela AbacatePay ao cadastrar o endpoint
+    # webhook em app.abacatepay.com → Webhooks → Criar endpoint → copiar o "Secret"
+    # NÃO colocar a URL do webhook aqui — apenas o token/secret HMAC.
     abacatepay_webhook_secret: str = ""
 
     # ============================================

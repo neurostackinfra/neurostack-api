@@ -36,10 +36,16 @@ class AbacatePayClient:
         self._api_key = api_key
         self._env = env
 
-        if not api_key and env in ("production", "staging"):
-            raise RuntimeError("ABACATEPAY_API_KEY not configured")
+        if env in ("development", "test"):
+            self._mock = True
+            return
 
-        self._mock = not api_key and env in ("development", "test")
+        if not api_key:
+            raise RuntimeError(
+                f"ABACATEPAY_API_KEY não configurada para ambiente '{env}'. "
+                "Defina a variável de ambiente antes de iniciar o servidor."
+            )
+        self._mock = False
 
     def _headers(self) -> dict[str, str]:
         return {

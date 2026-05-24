@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   CreditCard,
   CheckCircle2,
@@ -100,6 +100,9 @@ export default function Billing() {
   const [checkoutLoading, setCheckoutLoading] = useState(false);
   const [checkoutResult, setCheckoutResult] = useState<CheckoutResult | null>(null);
   const [qrCopied, setQrCopied] = useState(false);
+  const [checkoutError, setCheckoutError] = useState<string | null>(null);
+  const [pollingStatus, setPollingStatus] = useState(false);
+  const checkoutRef = useRef<HTMLDivElement>(null);
 
   // Fetch summary
   const fetchSummary = useCallback(async () => {
@@ -165,6 +168,7 @@ export default function Billing() {
   const handleCheckout = async () => {
     setCheckoutLoading(true);
     setCheckoutResult(null);
+    setCheckoutError(null);
     try {
       const res = await fetch("/v1/billing/checkout", {
         method: "POST",
@@ -177,15 +181,38 @@ export default function Billing() {
           installments: paymentMethod === "card" && billingCycle === "annual" ? installments : undefined,
         }),
       });
-      const data = await res.json();
-      if (res.ok) {
-        setCheckoutResult(data);
-        if (data.payment_url && data.method === "card") {
-          window.open(data.payment_url, "_blank");
-        }
+      if (!res.ok) {
+        setCheckoutError(
+          txt("Erro ao processar pagamento. Tente novamente.", "Payment processing error. Please try again.")
+        );
+        return;
       }
+      const data = await res.json();
+      setCheckoutResult(data);
+      if (data.payment_url && data.method === "card") {
+        window.open(data.payment_url, "_blank");
+      }
+      setPollingStatus(true);
+      const interval = setInterval(async () => {
+        try {
+          const pollRes = await fetch("/v1/billing/summary", { headers: authHeaders(token) });
+          if (pollRes.ok) {
+            const pollData = await pollRes.json();
+            if (pollData.subscription_status === "active") {
+              setSummary(pollData);
+              setPollingStatus(false);
+              clearInterval(interval);
+            }
+          }
+        } catch {
+          // polling error — ignore and retry
+        }
+      }, 5000);
+      setTimeout(() => { clearInterval(interval); setPollingStatus(false); }, 60000);
     } catch {
-      // network error
+      setCheckoutError(
+        txt("Erro ao processar pagamento. Tente novamente.", "Payment processing error. Please try again.")
+      );
     } finally {
       setCheckoutLoading(false);
     }
@@ -313,15 +340,29 @@ export default function Billing() {
                     )}
                   </p>
                 </div>
-                <Button
-                  className="w-full gap-2"
-                  onClick={() => { setShowCheckout(true); setCheckoutResult(null); }}
-                >
-                  <Zap className="h-4 w-4" />
-                  {subscriptionStatus === "active"
-                    ? txt("Alterar Plano", "Change Plan")
-                    : txt("Assinar agora", "Subscribe now")}
-                </Button>
+                {subscriptionStatus === "active" ? (
+                  <>
+                    <Badge className="bg-emerald-500/20 text-emerald-600 border-emerald-500/30 w-fit">
+                      {txt("✓ Ativo", "✓ Active")}
+                    </Badge>
+                    <Button disabled variant="outline" className="w-full opacity-60 cursor-not-allowed">
+                      {txt("Gerenciar Assinatura", "Manage Subscription")}
+                    </Button>
+                  </>
+                ) : (
+                  <Button
+                    className="w-full gap-2"
+                    onClick={() => {
+                      setShowCheckout(true);
+                      setCheckoutResult(null);
+                      setCheckoutError(null);
+                      setTimeout(() => checkoutRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+                    }}
+                  >
+                    <Zap className="h-4 w-4" />
+                    {txt("Assinar agora", "Subscribe now")}
+                  </Button>
+                )}
               </CardContent>
             </Card>
 
@@ -372,7 +413,7 @@ export default function Billing() {
 
       {/* ── Section 03: Checkout ──────────────────────────────────────────── */}
       {showCheckout && (
-        <div className="space-y-3">
+        <div ref={checkoutRef} className="space-y-3">
           <SectionDivider num="03" label={txt("Checkout / Pagamento", "Checkout / Payment")} />
           <Card className="border-emerald-500/20 bg-card">
             <CardHeader className="pb-3">
@@ -521,18 +562,23 @@ export default function Billing() {
 
               {/* Pay button */}
               {!checkoutResult && (
-                <Button
-                  className="w-full gap-2"
-                  onClick={() => void handleCheckout()}
-                  disabled={checkoutLoading}
-                >
-                  {checkoutLoading ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <ArrowRight className="h-4 w-4" />
+                <>
+                  <Button
+                    className="w-full gap-2"
+                    onClick={() => void handleCheckout()}
+                    disabled={checkoutLoading}
+                  >
+                    {checkoutLoading ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <ArrowRight className="h-4 w-4" />
+                    )}
+                    {txt("Pagar", "Pay")} {formatBRL(priceAfterCoupon)}
+                  </Button>
+                  {checkoutError && (
+                    <p className="text-sm text-destructive mt-2">{checkoutError}</p>
                   )}
-                  {txt("Pagar", "Pay")} {formatBRL(priceAfterCoupon)}
-                </Button>
+                </>
               )}
 
               {/* PIX QR result */}
@@ -570,6 +616,22 @@ export default function Billing() {
                     <ArrowRight className="h-3.5 w-3.5" />
                     {txt("Abrir link de pagamento", "Open payment link")}
                   </Button>
+                </div>
+              )}
+
+              {/* Polling banner */}
+              {pollingStatus && (
+                <div className="text-sm text-muted-foreground flex items-center gap-2 mt-2">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  {txt("Aguardando confirmação do pagamento…", "Waiting for payment confirmation…")}
+                </div>
+              )}
+
+              {/* Active subscription banner after polling completes */}
+              {subscriptionStatus === "active" && checkoutResult && !pollingStatus && (
+                <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-4 flex items-center gap-2 text-sm font-semibold text-emerald-400">
+                  <CheckCircle2 className="h-4 w-4" />
+                  {txt("Assinatura ativa ✓", "Subscription active ✓")}
                 </div>
               )}
             </CardContent>
