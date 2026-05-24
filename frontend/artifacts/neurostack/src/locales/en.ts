@@ -29,7 +29,7 @@ export const en = {
 
   // Login
   login_title: "Platform Access",
-  login_subtitle: "Sign in to your NeuroStack account",
+  login_subtitle: "NeuroStack Credentialed",
   login_email: "Email",
   login_password: "Password",
   login_submit: "Sign In",
