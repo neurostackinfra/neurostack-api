@@ -335,8 +335,8 @@ export default function Billing() {
                   <p>+ {formatBRL(350)}{txt("/clínica acima de 2 inclusas", "/clinic above 2 included")}</p>
                   <p className="text-foreground/80 font-medium">
                     {txt(
-                      `Você tem ${activeClinics} clínica(s) ativa(s) — ${Math.min(activeClinics, freeTier)} inclusa(s), ${extraClinics} cobrada(s)`,
-                      `You have ${activeClinics} active clinic(s) — ${Math.min(activeClinics, freeTier)} included, ${extraClinics} charged`
+                      `Você tem ${activeClinics} clínica(s) ativa(s), ${Math.min(activeClinics, freeTier)} inclusa(s), ${extraClinics} cobrada(s)`,
+                      `You have ${activeClinics} active clinic(s), ${Math.min(activeClinics, freeTier)} included, ${extraClinics} charged`
                     )}
                   </p>
                 </div>
@@ -377,7 +377,7 @@ export default function Billing() {
                     </Badge>
                   </div>
                   <div>
-                    <p className="text-2xl font-bold text-muted-foreground/50">—</p>
+                    <p className="text-2xl font-bold text-muted-foreground/50">-</p>
                   </div>
                   <Button disabled variant="outline" className="w-full opacity-50 cursor-not-allowed">
                     {txt("Em breve", "Coming soon")}
@@ -471,7 +471,7 @@ export default function Billing() {
               <div className="rounded-lg border border-border/50 bg-muted/20 p-4 space-y-2">
                 <div className="flex justify-between text-sm">
                   <span className="text-muted-foreground">
-                    NeuroStack Start — {billingCycle === "monthly" ? txt("Mensal", "Monthly") : txt("Anual", "Annual")}
+                    NeuroStack Start - {billingCycle === "monthly" ? txt("Mensal", "Monthly") : txt("Anual", "Annual")}
                   </span>
                   <span className={`font-semibold ${couponDiscount ? "line-through text-muted-foreground" : "text-foreground"}`}>
                     {formatBRL(displayPrice)}
@@ -538,24 +538,24 @@ export default function Billing() {
               {paymentMethod === "card" && billingCycle === "monthly" && (
                 <p className="text-xs text-muted-foreground bg-muted/30 rounded-lg px-3 py-2">
                   {txt(
-                    "AbacatePay debita automaticamente todo mês na mesma data — Subscription MONTHLY",
-                    "AbacatePay charges automatically every month on the same date — MONTHLY Subscription"
+                    "AbacatePay debita automaticamente todo mês na mesma data - Subscription MONTHLY",
+                    "AbacatePay charges automatically every month on the same date - MONTHLY Subscription"
                   )}
                 </p>
               )}
               {paymentMethod === "pix" && billingCycle === "monthly" && (
                 <p className="text-xs text-muted-foreground bg-muted/30 rounded-lg px-3 py-2">
                   {txt(
-                    "AbacatePay envia PIX a cada ciclo mensal — Subscription MONTHLY",
-                    "AbacatePay sends PIX each monthly cycle — MONTHLY Subscription"
+                    "AbacatePay envia PIX a cada ciclo mensal - Subscription MONTHLY",
+                    "AbacatePay sends PIX each monthly cycle - MONTHLY Subscription"
                   )}
                 </p>
               )}
               {paymentMethod === "pix" && billingCycle === "annual" && (
                 <p className="text-xs text-muted-foreground bg-muted/30 rounded-lg px-3 py-2">
                   {txt(
-                    "PIX único anual — Subscription YEARLY",
-                    "Single annual PIX — YEARLY Subscription"
+                    "PIX único anual, Subscription YEARLY",
+                    "Single annual PIX, YEARLY Subscription"
                   )}
                 </p>
               )}

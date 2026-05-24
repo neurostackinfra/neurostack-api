@@ -151,10 +151,10 @@ export const en = {
   config_integrations_desc: "Bring Your Own Keys. Configure external LLM and WhatsApp providers. Leave blank to use the built-in mock.",
   config_llm_section: "LLM Provider",
   config_provider: "Provider",
-  config_llm_none: "— None (use mock) —",
+  config_llm_none: "- None (use mock) -",
   config_llm_openai: "OpenAI",
   config_llm_dropout: "Dropout (OpenAI-compatible)",
-  config_llm_cortex: "SLM Cortex — Fallback to Dropout (Coming Soon)",
+  config_llm_cortex: "SLM Cortex - Fallback to Dropout (Coming Soon)",
   config_cortex_note: "Proprietary Vertical SLM. Routing via Dropout for MVP testing.",
   config_roadmap: "Roadmap",
   config_llm_key: "API Key",
@@ -313,12 +313,12 @@ export const en = {
   config_tab_identidade_header: "Identity & Persona",
   config_tab_identidade_desc: "Defines how the agent presents itself and answers questions about its nature.",
   config_tab_operacao_header: "Operation & Logistics",
-  config_tab_operacao_desc: "Data injected as literal string into context — no reinterpretation.",
+  config_tab_operacao_desc: "Data injected as literal string into context, no reinterpretation.",
   config_tab_negocio_header: "Business Rules & AI",
-  config_tab_negocio_desc: "Directives that control SRM Core behavior — the agent reasoning nucleus.",
+  config_tab_negocio_desc: "Directives that control SRM Core behavior, the agent reasoning nucleus.",
   config_tab_handoff_header: "Handoff Management",
   config_tab_handoff_desc: "Controls when and how the agent transfers the conversation to a human agent.",
-  config_readonly_note: "Read-only mode — changes disabled",
+  config_readonly_note: "Read-only mode, changes disabled",
   config_service_price: "Price",
   config_service_authority: "Authority Differentials",
   config_service_authority_hint: "Injected with the description to reinforce trust. e.g. 'Only clinic with X technology in the city.'",
@@ -337,7 +337,7 @@ export const en = {
   builder_tab_overview: "Dashboard",
   builder_tab_clinics: "Clinics",
   builder_alerts_title: "Alerts",
-  builder_alerts_empty: "No alerts — everything running smoothly",
+  builder_alerts_empty: "No alerts, everything running smoothly",
   builder_health_grid_title: "Clinic Health",
   builder_health_legend: "Green = active, Yellow = no traces 3-7 days, Red = no traces 7+ days",
   builder_last_trace: "Last trace",
@@ -347,7 +347,7 @@ export const en = {
   builder_safety_7d: "Safety flags (7d)",
   builder_handoffs_7d: "Handoffs (7d)",
   builder_config_completeness: "Config completeness",
-  builder_traces_chart_title: "Traces — Last 30 days",
+  builder_traces_chart_title: "Traces - Last 30 days",
   builder_alert_inactivity: "No traces in 7+ days",
   builder_alert_deactivated: "Clinic is deactivated",
   builder_alert_api_error: "API integration not configured",
@@ -365,7 +365,7 @@ export const en = {
 
   // ── Admin Alerts ──
   admin_alerts_title: "Platform Alerts",
-  admin_alerts_empty: "No alerts — all systems operational",
+  admin_alerts_empty: "No alerts, all systems operational",
 
   // ── Context Sources (Trace Viewer) ──
   ctx_panel_title: "Context Used",
@@ -394,7 +394,7 @@ export const en = {
   ctx_field_professionals: "Professionals",
 
   // ── Admin Charts ──
-  admin_chart_traces_title: "Traces — Last 30 days",
+  admin_chart_traces_title: "Traces - Last 30 days",
   admin_chart_trend_up: "up",
   admin_chart_trend_down: "down",
 

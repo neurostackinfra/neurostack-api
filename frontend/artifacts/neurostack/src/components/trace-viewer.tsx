@@ -330,7 +330,7 @@ export function TraceViewer({ trace }: { trace: DecisionTrace }) {
                   <span className="h-2.5 w-2.5 rounded-full bg-yellow-500/70" />
                   <span className="h-2.5 w-2.5 rounded-full bg-green-500/70" />
                   <span className="ml-3 text-[10px] font-mono text-slate-500 tracking-wider">
-                    system_prompt.txt — read-only
+                    system_prompt.txt, read-only
                   </span>
                 </div>
                 <pre className="text-xs text-green-400 font-mono whitespace-pre-wrap leading-relaxed p-5 max-h-[400px] overflow-auto">

@@ -184,8 +184,8 @@ export default function CRMIntegration() {
           <Zap className="h-4 w-4 text-accent mt-0.5 shrink-0" />
           <p>
             {txt(
-              <>Cada transição de stage no NeuroStack dispara um{" "}<span className="font-semibold">webhook em tempo real</span> para atualizar automaticamente o pipeline do seu CRM — sem intervenção manual.</>,
-              <>Every stage transition in NeuroStack triggers a{" "}<span className="font-semibold">real-time webhook</span> to automatically update your CRM pipeline — no manual intervention needed.</>
+              <>Cada transição de stage no NeuroStack dispara um{" "}<span className="font-semibold">webhook em tempo real</span> para atualizar automaticamente o pipeline do seu CRM, sem intervenção manual.</>,
+              <>Every stage transition in NeuroStack triggers a{" "}<span className="font-semibold">real-time webhook</span> to automatically update your CRM pipeline, no manual intervention needed.</>
             )}
           </p>
         </div>

@@ -297,7 +297,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
           <div className="flex items-center gap-2">
             <Link2 className="h-4 w-4 text-blue-500 shrink-0" />
             <p className="text-[11px] font-semibold uppercase tracking-wider text-blue-700 dark:text-blue-400">
-              Webhook URL — {waProvider === "zapi" ? "Z-API" : "Evolution API"}
+              Webhook URL - {waProvider === "zapi" ? "Z-API" : "Evolution API"}
             </p>
             {status && (
               <span className={`ml-auto text-[10px] font-bold px-2 py-0.5 rounded-full border ${status.apis_configured ? "bg-emerald-500/15 text-emerald-500 border-emerald-500/30" : "bg-amber-500/15 text-amber-500 border-amber-500/30"}`}>
@@ -358,7 +358,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         {/* Section header */}
         <div className="flex items-center gap-2">
           <MessageSquare className="h-3.5 w-3.5 text-[#25D366]" />
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">WhatsApp — Provedor Ativo</p>
+          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">WhatsApp - Provedor Ativo</p>
           <span className="ml-auto text-[10px] font-bold px-1.5 py-0.5 rounded border bg-[#25D366]/10 text-[#25D366] border-[#25D366]/30">Ativo</span>
         </div>
 
@@ -425,10 +425,10 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
           <MessageSquare className="h-3.5 w-3.5 text-slate-400" />
           <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">WABA / WhatsApp Business API (Oficial)</p>
           <span className="ml-auto flex items-center gap-1.5 text-[10px] font-bold px-1.5 py-0.5 rounded border bg-muted text-foreground border-border">
-            <Lock className="h-2.5 w-2.5" /> Enterprise — Em breve
+            <Lock className="h-2.5 w-2.5" /> Enterprise, Em breve
           </span>
         </div>
-        <p className="text-xs text-slate-400">Conexão direta via Meta Business Platform. Ideal para grandes redes — conformidade total com LGPD/HIPAA.</p>
+        <p className="text-xs text-slate-400">Conexão direta via Meta Business Platform. Ideal para grandes redes, conformidade total com LGPD/HIPAA.</p>
         <div className="grid gap-3 sm:grid-cols-3">
           {["Phone Number ID", "WABA ID", "Permanent Token"].map(f => (
             <div key={f} className="space-y-1">
@@ -443,7 +443,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       <div className="space-y-4 rounded-lg border border-slate-700/50 bg-muted/20 p-4">
         <div className="flex items-center gap-2">
           <Cpu className="h-3.5 w-3.5 text-accent" />
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">AI Provider — LLM</p>
+          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">AI Provider - LLM</p>
           {isComingSoon && (
             <span className="ml-auto text-[10px] font-bold px-1.5 py-0.5 rounded border bg-violet-500/10 text-violet-400 border-violet-500/30">Em breve</span>
           )}
@@ -515,7 +515,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
           <div className="space-y-3 opacity-60 pointer-events-none">
             <div className="flex items-start gap-2 rounded-md border border-slate-600 bg-slate-900 px-3 py-2.5 text-xs text-white">
               <Cpu className="h-3.5 w-3.5 mt-0.5 shrink-0 text-violet-400" />
-              <p>O SLM Cortex é o modelo sovereign da NeuroStack — treinado com dados clínicos anonimizados em ambiente isolado. A URL de inferência é gerenciada internamente.</p>
+              <p>O SLM Cortex é o modelo sovereign da NeuroStack, treinado com dados clínicos anonimizados em ambiente isolado. A URL de inferência é gerenciada internamente.</p>
             </div>
             <ApiInput label="API Key (NeuroStack)" value={llmApiKey} onChange={setLlmApiKey} type="password"
               placeholder="ns-cortex-..." configured={status?.llm_api_key_set} />
@@ -582,10 +582,10 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="whisper-large-v3-turbo">
-                whisper-large-v3-turbo — {txt("Rápido e econômico", "Fast & economical")} ($0.04/hr)
+                whisper-large-v3-turbo, {txt("Rápido e econômico", "Fast & economical")} ($0.04/hr)
               </SelectItem>
               <SelectItem value="whisper-large-v3">
-                whisper-large-v3 — {txt("Alta precisão", "High accuracy")} ($0.111/hr)
+                whisper-large-v3, {txt("Alta precisão", "High accuracy")} ($0.111/hr)
               </SelectItem>
             </SelectContent>
           </Select>
@@ -709,7 +709,7 @@ const INVESTOR_MOCK_CONFIG = {
     { name: "Dra. Ana Lima", specialty: "Dermatologista", description: "Especialista em procedimentos estéticos com 12 anos de experiência, CRM 12345. Mais de 500 aplicações de toxina botulínica." },
     { name: "Dr. Carlos Mendes", specialty: "Cirurgião Plástico", description: "Cirurgião plástico com 8 anos de experiência, membro da SBCP. Especialista em harmonização facial." },
   ],
-  full_address: "Rua das Flores, 123 — Sala 45 — Jardim Paulista, São Paulo/SP — CEP 01234-000",
+  full_address: "Rua das Flores, 123, Sala 45, Jardim Paulista, São Paulo/SP, CEP 01234-000",
   parking_info: "Estacionamento conveniado no Shopping Paulista, entrada pela Av. Brasil",
   working_hours: "Seg–Sex: 9h–19h | Sáb: 9h–14h | Dom: fechado",
   scheduling_hours: "Seg–Sex: 8h–18h",
@@ -1057,8 +1057,8 @@ export default function ClinicConfig() {
                   </p>
                   <p className="text-xs text-muted-foreground">
                     {botActive
-                      ? txt("Assistente ativo — respondendo normalmente", "Assistant active — responding normally")
-                      : txt("IA pausada — mensagens não serão respondidas pela IA", "AI paused — messages won't be answered by the AI")}
+                      ? txt("Assistente ativo, respondendo normalmente", "Assistant active, responding normally")
+                      : txt("IA pausada, mensagens não serão respondidas pela IA", "AI paused, messages won't be answered by the AI")}
                   </p>
                 </div>
               </div>
@@ -1158,9 +1158,9 @@ export default function ClinicConfig() {
                     <SelectValue placeholder={txt("Selecione o formato...", "Select format...")} />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="name_only">{txt('Nome — "Olá, sou a Lumina"', 'Name — "Hi, I\'m Lumina"')}</SelectItem>
-                    <SelectItem value="name_attendant">{txt("Nome — Atendente Virtual", "Name — Virtual Attendant")}</SelectItem>
-                    <SelectItem value="name_ai">{txt("Nome — Assistente IA", "Name — AI Assistant")}</SelectItem>
+                    <SelectItem value="name_only">{txt('Nome - "Olá, sou a Lumina"', 'Name - "Hi, I\'m Lumina"')}</SelectItem>
+                    <SelectItem value="name_attendant">{txt("Nome - Atendente Virtual", "Name - Virtual Attendant")}</SelectItem>
+                    <SelectItem value="name_ai">{txt("Nome - Assistente IA", "Name - AI Assistant")}</SelectItem>
                   </SelectContent>
                 </Select>
               </Field>
@@ -1172,7 +1172,7 @@ export default function ClinicConfig() {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="forward_human">{txt("Encaminha para humano", "Redirects to human")}</SelectItem>
-                    <SelectItem value="affirm_ai">{txt("Afirma ser IA — foco em agilidade", "Confirms being AI — speed-focused")}</SelectItem>
+                    <SelectItem value="affirm_ai">{txt("Afirma ser IA, foco em agilidade", "Confirms being AI, speed-focused")}</SelectItem>
                   </SelectContent>
                 </Select>
               </Field>
@@ -1310,7 +1310,7 @@ export default function ClinicConfig() {
                 <Textarea
                   value={fullAddress}
                   onChange={(e) => setFullAddress(e.target.value)}
-                  placeholder={txt("Ex: Rua das Flores, 123 — Sala 45 — Jardim Paulista, São Paulo/SP — CEP 01234-000", "e.g. 123 Flower St, Suite 45, Downtown, São Paulo/SP — ZIP 01234-000")}
+                  placeholder={txt("Ex: Rua das Flores, 123, Sala 45, Jardim Paulista, São Paulo/SP, CEP 01234-000", "e.g. 123 Flower St, Suite 45, Downtown, São Paulo/SP, ZIP 01234-000")}
                   rows={2}
                   className="resize-none text-sm"
                   disabled={isReadOnly}
@@ -1453,7 +1453,7 @@ export default function ClinicConfig() {
               <SectionLabel>{t("config_service_authority")}</SectionLabel>
               <Field
                 label={txt("Contexto de Autoridade", "Authority Context")}
-                hint={txt("Injetado como contexto quando o SRM detecta pedido de preço — antes de qualquer valor.", "Injected as context when SRM detects a price request — before any value.")}
+                hint={txt("Injetado como contexto quando o SRM detecta pedido de preço, antes de qualquer valor.", "Injected as context when SRM detects a price request, before any value.")}
               >
                 <Textarea
                   value={differentials}
@@ -1486,8 +1486,8 @@ export default function ClinicConfig() {
                 <Shield className="h-3.5 w-3.5 text-amber-400 shrink-0 mt-0.5" />
                 <p className="text-[11px] text-amber-400/90 leading-relaxed">
                   {txt(
-                    "Os dados abaixo são obrigatórios mesmo com o aviso desativado. Quando um paciente perguntar sobre privacidade ou LGPD, o agente precisa fornecer o link da política — independente do toggle.",
-                    "The fields below are required even when the notice is off. When a patient asks about privacy or LGPD, the agent must provide the policy link — regardless of the toggle."
+                    "Os dados abaixo são obrigatórios mesmo com o aviso desativado. Quando um paciente perguntar sobre privacidade ou LGPD, o agente precisa fornecer o link da política, independente do toggle.",
+                    "The fields below are required even when the notice is off. When a patient asks about privacy or LGPD, the agent must provide the policy link, regardless of the toggle."
                   )}
                 </p>
               </div>
@@ -1687,7 +1687,7 @@ export default function ClinicConfig() {
             <CardContent className="pt-5 space-y-4">
               <div className="rounded-md border border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950/30 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-300 flex items-center gap-2">
                 <span className="inline-flex items-center rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] font-bold tracking-wider text-emerald-600 dark:text-emerald-400">ON</span>
-                {txt("Handoff sempre ativo — agentes especializados estão no roadmap. Em breve será possível alternar entre handoff humano e agentes treinados por área.", "Handoff always active — specialized agents are on the roadmap. Soon you'll be able to switch between human handoff and area-specialized agents.")}
+                {txt("Handoff sempre ativo, agentes especializados estão no roadmap. Em breve será possível alternar entre handoff humano e agentes treinados por área.", "Handoff always active, specialized agents are on the roadmap. Soon you'll be able to switch between human handoff and area-specialized agents.")}
               </div>
 
               {/* ── HITL Block ─────────────────────────────────────── */}

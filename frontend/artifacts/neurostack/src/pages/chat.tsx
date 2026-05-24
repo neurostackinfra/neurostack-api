@@ -39,7 +39,7 @@ interface MockMessage {
 const MOCK_CONVERSATIONS: { id: string; label: string; messages: MockMessage[] }[] = [
   {
     id: "mock-conv-1",
-    label: "Consulta de Preço — Facetas",
+    label: "Consulta de Preço - Facetas",
     messages: [
       { id: "m1", role: "user", content: "Oi! Tenho interesse em fazer facetas de porcelana. Qual é o valor?" },
       {
@@ -228,7 +228,7 @@ function FeedbackBlock({ msg, sessionId, userMessage = "", defaultPhase = "idle"
         <div className="flex items-center gap-1.5">
           <SlidersHorizontal className="h-3.5 w-3.5 text-violet-400" />
           <span className="text-[11px] font-bold uppercase tracking-widest text-violet-400">
-            RLHF — Feedback de Abordagem
+            RLHF - Feedback de Abordagem
           </span>
         </div>
         {phase !== "analyzing" && (
@@ -421,7 +421,7 @@ function InvestorMockChat() {
                         isReadOnly={true}
                         showArrow={isFirstAssistant}
                       />
-                      <p className="text-[10px] text-muted-foreground/60 italic ml-1 mt-0.5">(Apenas demonstração — feature em breve)</p>
+                      <p className="text-[10px] text-muted-foreground/60 italic ml-1 mt-0.5">(Apenas demonstração, feature em breve)</p>
                     </div>
                   ) : (
                     <div className="max-w-[80%] rounded-lg px-4 py-3 text-sm bg-primary text-primary-foreground">
@@ -442,7 +442,7 @@ function InvestorMockChat() {
         <div className="p-4 border-t border-border bg-card shrink-0">
           <div className="flex gap-2">
             <Input
-              placeholder="Modo visualização — envio desativado"
+              placeholder="Modo visualização, envio desativado"
               className="flex-1"
               disabled
             />
@@ -662,7 +662,7 @@ export default function Chat() {
     if (isReadOnly) {
       toast({
         title: "Modo Visualizacao: Alteracoes nao permitidas nesta conta de teste.",
-        description: "Esta e uma demonstracao — nenhum envio foi realizado.",
+        description: "Esta e uma demonstracao, nenhum envio foi realizado.",
       });
       setInput("");
       return;
@@ -823,7 +823,7 @@ export default function Chat() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder={isReadOnly ? "Modo visualizacao — envio desativado" : t("chat_placeholder")}
+              placeholder={isReadOnly ? "Modo visualizacao, envio desativado" : t("chat_placeholder")}
               className="flex-1"
               disabled={isPending}
               data-testid="input-chat"

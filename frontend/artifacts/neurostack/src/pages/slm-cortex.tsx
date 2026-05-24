@@ -41,8 +41,8 @@ export default function SlmCortex() {
               </h1>
               <p className="text-sm font-medium text-foreground/70 mt-0.5">
                 {txt(
-                  "Motor de linguagem proprietário — rápido, privado e econômico",
-                  "Proprietary language engine — fast, private and cost-efficient"
+                  "Motor de linguagem proprietário, rápido, privado e econômico",
+                  "Proprietary language engine, fast, private and cost-efficient"
                 )}
               </p>
             </div>
@@ -66,8 +66,8 @@ export default function SlmCortex() {
               </p>
               <p className="text-xs font-medium text-white/80 mt-0.5 leading-relaxed">
                 {txt(
-                  "O SLM Cortex é o motor de IA proprietário da NeuroStack — treinado exclusivamente em dados do setor de saúde brasileiro. Processamento 100% local, sem vazamento de dados externos.",
-                  "SLM Cortex is NeuroStack's proprietary AI engine — trained exclusively on Brazilian healthcare sector data. 100% local processing, no external data leakage."
+                  "O SLM Cortex é o motor de IA proprietário da NeuroStack, treinado exclusivamente em dados do setor de saúde brasileiro. Processamento 100% local, sem vazamento de dados externos.",
+                  "SLM Cortex is NeuroStack's proprietary AI engine, trained exclusively on Brazilian healthcare sector data. 100% local processing, no external data leakage."
                 )}
               </p>
             </div>

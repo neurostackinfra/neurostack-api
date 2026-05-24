@@ -75,7 +75,7 @@ export const pt: Record<TranslationKey, string> = {
   intent_duvida_generica_sem_contexto: "Dúvida Genérica",
   intent_pre_atendimento: "Pré-Atendimento",
   intent_pos_atendimento_duvida: "Dúvida Pós-Procedimento",
-  intent_pos_atendimento_sintomas_preocupantes: "Pós — Sintomas",
+  intent_pos_atendimento_sintomas_preocupantes: "Pós - Sintomas",
   intent_pedido_alterar_medicacao: "Alterar Medicação",
   intent_documentos_e_comprovantes: "Documentos",
   intent_orcamento_existente: "Orçamento Existente",
@@ -153,10 +153,10 @@ export const pt: Record<TranslationKey, string> = {
   config_integrations_desc: "Traga suas próprias chaves. Configure LLM e WhatsApp externos. Deixe em branco para usar o mock.",
   config_llm_section: "Provedor de LLM",
   config_provider: "Provedor",
-  config_llm_none: "— Nenhum (usar mock) —",
+  config_llm_none: "- Nenhum (usar mock) -",
   config_llm_openai: "OpenAI",
   config_llm_dropout: "Dropout (compatível com OpenAI)",
-  config_llm_cortex: "SLM Cortex — Fallback para Dropout (Em Breve)",
+  config_llm_cortex: "SLM Cortex - Fallback para Dropout (Em Breve)",
   config_cortex_note: "SLM Vertical Proprietário. Roteando via Dropout para testes de MVP.",
   config_roadmap: "Roadmap",
   config_llm_key: "Chave API",
@@ -315,12 +315,12 @@ export const pt: Record<TranslationKey, string> = {
   config_tab_identidade_header: "Identidade & Persona",
   config_tab_identidade_desc: "Define como o agente se apresenta e como responde perguntas sobre sua natureza.",
   config_tab_operacao_header: "Operação & Logística",
-  config_tab_operacao_desc: "Dados injetados como string literal no contexto — sem reinterpretação.",
+  config_tab_operacao_desc: "Dados injetados como string literal no contexto, sem reinterpretação.",
   config_tab_negocio_header: "Regras de Negócio & IA",
-  config_tab_negocio_desc: "Diretivas que controlam o comportamento do SRM Core — o núcleo de raciocínio do agente.",
+  config_tab_negocio_desc: "Diretivas que controlam o comportamento do SRM Core, o núcleo de raciocínio do agente.",
   config_tab_handoff_header: "Gestão de Handoff",
   config_tab_handoff_desc: "Controla quando e como o agente transfere a conversa para um atendente humano.",
-  config_readonly_note: "Modo somente leitura — alterações desabilitadas",
+  config_readonly_note: "Modo somente leitura, alterações desabilitadas",
   config_service_price: "Preço",
   config_service_authority: "Diferenciais de Autoridade",
   config_service_authority_hint: "Injetados junto com a descrição para reforçar confiança. Ex: 'Única clínica com tecnologia X na cidade.'",
@@ -339,7 +339,7 @@ export const pt: Record<TranslationKey, string> = {
   builder_tab_overview: "Visao Global",
   builder_tab_clinics: "Sub-Contas",
   builder_alerts_title: "Alertas",
-  builder_alerts_empty: "Nenhum alerta — tudo funcionando",
+  builder_alerts_empty: "Nenhum alerta, tudo funcionando",
   builder_health_grid_title: "Saude das Clinicas",
   builder_health_legend: "Verde = ativo, Amarelo = sem traces 3-7 dias, Vermelho = sem traces 7+ dias",
   builder_last_trace: "Ultimo trace",
@@ -349,7 +349,7 @@ export const pt: Record<TranslationKey, string> = {
   builder_safety_7d: "Alertas seguranca (7d)",
   builder_handoffs_7d: "Handoffs (7d)",
   builder_config_completeness: "Config completa",
-  builder_traces_chart_title: "Traces — Ultimos 30 dias",
+  builder_traces_chart_title: "Traces - Ultimos 30 dias",
   builder_alert_inactivity: "Sem traces ha mais de 7 dias",
   builder_alert_deactivated: "Clinica desativada",
   builder_alert_api_error: "Integracao de API nao configurada",
@@ -367,7 +367,7 @@ export const pt: Record<TranslationKey, string> = {
 
   // ── Admin Alerts ──
   admin_alerts_title: "Alertas da Plataforma",
-  admin_alerts_empty: "Sem alertas — todos os sistemas operacionais",
+  admin_alerts_empty: "Sem alertas, todos os sistemas operacionais",
 
   // ── Context Sources (Trace Viewer) ──
   ctx_panel_title: "Contexto Utilizado",
@@ -396,7 +396,7 @@ export const pt: Record<TranslationKey, string> = {
   ctx_field_professionals: "Profissionais",
 
   // ── Admin Charts ──
-  admin_chart_traces_title: "Traces — Últimos 30 dias",
+  admin_chart_traces_title: "Traces - Últimos 30 dias",
   admin_chart_trend_up: "acima",
   admin_chart_trend_down: "abaixo",
 

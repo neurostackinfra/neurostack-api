@@ -80,7 +80,7 @@ export default function PortalParceiros() {
                 1 <WifiOff className="h-4 w-4 text-rose-400 inline" />
               </span>
             }
-            label={txt("Z-API Status — 1 Desconectada", "Z-API Status — 1 Disconnected")}
+            label={txt("Z-API Status - 1 Desconectada", "Z-API Status - 1 Disconnected")}
             color="text-rose-400"
             icon={<Wifi className="h-4 w-4 text-rose-400" />}
           />
@@ -95,8 +95,8 @@ export default function PortalParceiros() {
             </p>
             <p className="text-xs text-foreground/70 mt-0.5">
               {txt(
-                "Necessita atenção no módulo de Handoff — agente sem resposta há 14 min.",
-                "Requires attention in the Handoff module — agent unresponsive for 14 min."
+                "Necessita atenção no módulo de Handoff, agente sem resposta há 14 min.",
+                "Requires attention in the Handoff module, agent unresponsive for 14 min."
               )}
             </p>
           </div>
@@ -334,8 +334,8 @@ export default function PortalParceiros() {
                     icon: <Star className="h-4 w-4 text-amber-400" />,
                     title: txt("Estratégia Intel Inside", "Intel Inside Strategy"),
                     desc: txt(
-                      "Co-branding como Selo de Qualidade — não white-label. Constrói equity de marca para você e para a NeuroStack.",
-                      "Co-branding as a Quality Seal — not white-label. Builds brand equity for you and NeuroStack."
+                      "Co-branding como Selo de Qualidade, não white-label. Constrói equity de marca para você e para a NeuroStack.",
+                      "Co-branding as a Quality Seal, not white-label. Builds brand equity for you and NeuroStack."
                     ),
                   },
                   {
@@ -370,8 +370,8 @@ export default function PortalParceiros() {
           </p>
           <p className="text-xs text-muted-foreground mt-0.5">
             {txt(
-              "Acesso antecipado ao programa de parceiros — construa e monetize seu portfólio de clínicas com IA.",
-              "Early access to the partner program — build and monetize your AI clinic portfolio."
+              "Acesso antecipado ao programa de parceiros, construa e monetize seu portfólio de clínicas com IA.",
+              "Early access to the partner program, build and monetize your AI clinic portfolio."
             )}
           </p>
         </div>
