@@ -282,50 +282,50 @@ class EventService:
     async def _persist_session_state(
         self, session_id: UUID, result: "PipelineResult", db: Optional[AsyncSession],
     ) -> None:
-        """Persist pipeline result back to PG Session cognitive_state."""
+        """Persist pipeline result back to PG Session cognitive_state.
+
+        Intentionally does NOT swallow exceptions — the caller is responsible
+        for rollback so that failures are detected *before* the slow LLM path.
+        """
         if not db:
             return
-        try:
-            repo = SessionRepository(db)
-            session_row = await repo.get_by_id(session_id)
-            if session_row:
-                cognitive = session_row.get_cognitive_state()
-                cognitive.add_intent(result.intent)
-                cognitive.funnel_stage = result.funnel_stage
-                cognitive.sentiment_label = result.sentiment_label
-                cognitive.sentiment_score = result.sentiment_score
-                # Merge slots and flags from state_patch
-                if result.state_patch:
-                    for k, v in result.state_patch.get("slots", {}).items():
-                        cognitive.update_slot(k, v)
-                    for k, v in result.state_patch.get("flags", {}).items():
-                        cognitive.set_flag(k, v)
-                    if result.state_patch.get("funnel_stage"):
-                        cognitive.funnel_stage = result.state_patch["funnel_stage"]
-                session_row.set_cognitive_state(cognitive)
-                session_row.increment_message_count()
+        repo = SessionRepository(db)
+        session_row = await repo.get_by_id(session_id)
+        if session_row:
+            cognitive = session_row.get_cognitive_state()
+            cognitive.add_intent(result.intent)
+            cognitive.funnel_stage = result.funnel_stage
+            cognitive.sentiment_label = result.sentiment_label
+            cognitive.sentiment_score = result.sentiment_score
+            # Merge slots and flags from state_patch
+            if result.state_patch:
+                for k, v in result.state_patch.get("slots", {}).items():
+                    cognitive.update_slot(k, v)
+                for k, v in result.state_patch.get("flags", {}).items():
+                    cognitive.set_flag(k, v)
+                if result.state_patch.get("funnel_stage"):
+                    cognitive.funnel_stage = result.state_patch["funnel_stage"]
+            session_row.set_cognitive_state(cognitive)
+            session_row.increment_message_count()
 
-                # Handoff engine: persist pause state from pipeline result
-                if result.should_pause:
-                    session_row.is_paused = True
-                    if result.paused_until:
-                        from datetime import datetime
+            # Handoff engine: persist pause state from pipeline result
+            if result.should_pause:
+                session_row.is_paused = True
+                if result.paused_until:
+                    from datetime import datetime
 
-                        session_row.paused_until = datetime.fromisoformat(result.paused_until)
-                    else:
-                        session_row.paused_until = None
-                    logger.info(
-                        "session_pause_persisted",
-                        extra={
-                            "session_id": str(session_id),
-                            "paused_until": result.paused_until,
-                        },
-                    )
+                    session_row.paused_until = datetime.fromisoformat(result.paused_until)
+                else:
+                    session_row.paused_until = None
+                logger.info(
+                    "session_pause_persisted",
+                    extra={
+                        "session_id": str(session_id),
+                        "paused_until": result.paused_until,
+                    },
+                )
 
-                await db.flush()
-        except Exception as exc:
-            logger.error("Failed to persist session state to PG",
-                session_id=str(session_id), error=str(exc))
+            await db.flush()
 
     async def _load_message_history(
         self, tenant_id: UUID, session_id: UUID, db: Optional[AsyncSession], limit: int = 20,
@@ -376,20 +376,24 @@ class EventService:
                 session_id=str(session_id), error=str(exc))
             return []
 
-    async def process_event(
+    async def run_pipeline(
         self,
         request: EventRequest,
         session: Optional[AsyncSession] = None,
-    ) -> EventResponse:
+    ) -> tuple["PipelineResult", Optional[dict], list[dict]]:
         """
-        Process an incoming event through the cognitive pipeline.
+        Phase 1 — fast, DB-bound work: load state → run pipeline → flush state.
 
-        Args:
-            request: Event request
-            session: Optional database session
+        The caller MUST commit (or rollback) the session immediately after this
+        returns, *before* starting any slow I/O (LLM calls, event store writes).
+        This ensures:
+        - Overlapping calls for the same session_id see the updated cognitive_state
+        - The pooled DB connection is released before the LLM round-trip
+        - If the flush fails, the caller can rollback and abort without having
+          wasted an LLM call or produced orphaned event-store rows
 
-        Returns:
-            Event response with cognitive decision
+        Raises on persistence failure (does NOT swallow) so the route handler
+        can detect the failure and rollback before calling finish_response().
         """
         # Load clinic config for the tenant (provides identity, services, pricing)
         clinic_config = await self._load_clinic_config(request.tenant_id)
@@ -420,22 +424,38 @@ class EventService:
             language=request.payload.language,
         )
 
-        # Process through the complete pipeline
+        # Process through the complete pipeline (CPU-bound, no I/O)
         from src.core.pipeline import PipelineResult
 
         result: PipelineResult = await self._pipeline.process(pipeline_input)
 
-        # Persist state back to PG
+        # Persist state back to PG (flush only — caller must commit)
+        # Raises on failure so the caller can rollback before starting LLM
         await self._persist_session_state(request.session_id, result, session)
 
-        # Convert pipeline result to API response (pass user message + history for LLM)
+        return result, clinic_config, message_history
+
+    async def finish_response(
+        self,
+        request: EventRequest,
+        result: "PipelineResult",
+        clinic_config: Optional[dict],
+        message_history: list[dict],
+    ) -> EventResponse:
+        """
+        Phase 2 — slow I/O: LLM call + event-store writes.
+
+        Called only after the DB transaction from run_pipeline() has been
+        committed, so the connection is already released when this runs.
+        """
+        # Convert pipeline result to API response (LLM call happens here)
         response, llm_usage, llm_model = await self._convert_pipeline_result_to_response(
             result, user_message=request.payload.content, clinic_config=clinic_config,
             tenant_id=request.tenant_id, message_history=message_history,
             language=request.payload.language,
         )
 
-        # Save events to Event Store (non-blocking)
+        # Save events to Event Store (separate DB connections, committed independently)
         suggested_response = None
         if response.prompt and response.prompt.suggested_response:
             suggested_response = response.prompt.suggested_response
@@ -447,6 +467,23 @@ class EventService:
         )
 
         return response
+
+    async def process_event(
+        self,
+        request: EventRequest,
+        session: Optional[AsyncSession] = None,
+    ) -> EventResponse:
+        """
+        Backwards-compatible entry point (session=None path, used by tests and
+        internal callers that don't need state persistence).
+
+        The /v1/events route handler calls run_pipeline() + finish_response()
+        directly so it can commit between the two phases.
+        """
+        result, clinic_config, message_history = await self.run_pipeline(request, session)
+        # When session is provided the caller must commit — here we don't have
+        # that responsibility, so just proceed to finish (stateless path).
+        return await self.finish_response(request, result, clinic_config, message_history)
 
     async def _convert_pipeline_result_to_response(
         self, result: "PipelineResult", user_message: str = "",
