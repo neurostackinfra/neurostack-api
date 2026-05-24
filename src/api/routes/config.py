@@ -133,15 +133,74 @@ async def get_config(
     tenant = await _resolve_config_tenant(request, tenant, session)
     row = await _get_or_create_config(session, tenant)
     flat = flatten_config(row)
-    # Fallback: if clinic_name not in identity config, use tenant name
-    if not flat.get("clinic_name"):
-        t_result = await session.execute(
-            select(Tenant.name).where(Tenant.id == tenant.tenant_id)
-        )
-        t_name = t_result.scalar_one_or_none()
-        if t_name:
-            flat["clinic_name"] = t_name
+    # Also return bot_active and clinic_name from the Tenant row
+    t_result = await session.execute(
+        select(Tenant.name, Tenant.bot_active).where(Tenant.id == tenant.tenant_id)
+    )
+    t_row = t_result.first()
+    if t_row:
+        if not flat.get("clinic_name"):
+            flat["clinic_name"] = t_row[0]
+        flat["bot_active"] = t_row[1] if t_row[1] is not None else True
     return ConfigResponse(**flat)
+
+
+@router.patch(
+    "/bot-toggle",
+    summary="Toggle AI Bot Active",
+    description=(
+        "Atomically toggle `bot_active` for the clinic. "
+        "When pausing (False→False), the next webhook message triggers one offline notification per session. "
+        "When re-enabling (→True), clears `offline_notified` from all active sessions. "
+        "Does NOT affect `is_active` (billing stays on)."
+    ),
+    tags=["Config"],
+)
+async def toggle_bot_active(
+    request: Request,
+    tenant: TenantContext = Depends(get_tenant_context),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> dict:
+    """Toggle tenant.bot_active and return the new state."""
+    from sqlalchemy import text as sa_text
+
+    tenant = await _resolve_config_tenant(request, tenant, session)
+
+    t_result = await session.execute(
+        select(Tenant).where(Tenant.id == tenant.tenant_id)
+    )
+    t = t_result.scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    t.bot_active = not t.bot_active
+    new_value = t.bot_active
+
+    # When re-enabling: clear offline_notified so each session gets one notification
+    # if the bot is paused again in the future.
+    if new_value:
+        await session.execute(
+            sa_text(
+                "UPDATE sessions "
+                "SET cognitive_state = jsonb_set("
+                "  COALESCE(cognitive_state, '{}')::jsonb,"
+                "  '{flags,offline_notified}',"
+                "  'false'::jsonb"
+                ") "
+                "WHERE tenant_id = :tid AND is_active = true"
+            ),
+            {"tid": str(tenant.tenant_id)},
+        )
+
+    await session.flush()
+    await session.commit()
+
+    logger.info(
+        "bot_active_toggled tenant=%s new_value=%s",
+        tenant.tenant_id,
+        new_value,
+    )
+    return {"bot_active": new_value}
 
 
 @router.patch(
