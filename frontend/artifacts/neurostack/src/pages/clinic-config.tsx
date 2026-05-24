@@ -828,6 +828,7 @@ export default function ClinicConfig() {
   const [handoffInactiveDefaultHours, setHandoffInactiveDefaultHours] = useState("24");
   const [hitlActive, setHitlActive] = useState(false);
   const [hitlCooldown, setHitlCooldown] = useState("15");
+  const [metaMinutosAtendimento, setMetaMinutosAtendimento] = useState("10");
 
   // Tab 5 — Catálogo de Serviços
   const [services, setServices] = useState<ClinicService[]>([]);
@@ -874,6 +875,7 @@ export default function ClinicConfig() {
     setHandoffPeriod(config.handoff_period ?? "permanent");
     setHandoffCycleDays(config.handoff_cycle_days ?? "");
     setHandoffInactiveDefaultHours(config.handoff_inactive_default_hours ?? "24");
+    setMetaMinutosAtendimento(String(config.meta_minutos_atendimento ?? "10"));
     setOnlineServicesDesc(config.online_services_desc ?? "");
     setPresentialServicesDesc(config.presential_services_desc ?? "");
     setServices(config.services ?? []);
@@ -991,6 +993,7 @@ export default function ClinicConfig() {
       handoff_period: handoffPeriod || null,
       handoff_cycle_days: handoffCycleDays.trim() || null,
       handoff_inactive_default_hours: parseInt(handoffInactiveDefaultHours, 10) || 24,
+      meta_minutos_atendimento: parseInt(metaMinutosAtendimento, 10) || 10,
       online_services_desc: onlineServicesDesc.trim() || null,
       presential_services_desc: presentialServicesDesc.trim() || null,
     };
@@ -1796,6 +1799,22 @@ export default function ClinicConfig() {
                       value={handoffInactiveDefaultHours}
                       onChange={(e) => setHandoffInactiveDefaultHours(e.target.value)}
                       placeholder="24"
+                      className="w-32 text-sm"
+                      disabled={isReadOnly}
+                    />
+                  </Field>
+
+                  <Field
+                    label={t("handoff_meta_minutos_label")}
+                    hint={t("handoff_meta_minutos_hint")}
+                  >
+                    <Input
+                      type="number"
+                      min={1}
+                      max={120}
+                      value={metaMinutosAtendimento}
+                      onChange={(e) => setMetaMinutosAtendimento(e.target.value)}
+                      placeholder="10"
                       className="w-32 text-sm"
                       disabled={isReadOnly}
                     />

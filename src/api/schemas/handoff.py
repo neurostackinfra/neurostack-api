@@ -53,8 +53,41 @@ class HandoffUpdateRequest(BaseModel):
 
 class MessageResponse(BaseModel):
     """Simple message response."""
-    
+
     message: str
+
+
+# ── Queue schemas ──────────────────────────────────────────────────────────────
+
+from datetime import datetime as _dt
+
+
+class HandoffQueueItem(BaseModel):
+    """Single item in the handoff queue."""
+
+    id: UUID
+    numero_whatsapp: Optional[str] = None
+    session_id: UUID
+    intencao_detectada: Optional[str] = None
+    estagio_atual: Optional[str] = None
+    primeira_linha_mensagem: Optional[str] = None
+    created_at: _dt
+    data_hora_saida: Optional[_dt] = None
+    status: str
+
+
+class HandoffQueueResponse(BaseModel):
+    """Response for GET /queue — items + aggregate stats."""
+
+    items: list[HandoffQueueItem]
+    avg_wait_seconds: float
+    pct_within_sla: float
+
+
+class HandoffCheckoutResponse(HandoffQueueItem):
+    """Response after checkout — item + computed wait."""
+
+    wait_seconds: Optional[float] = None
 
 
 __all__ = [
@@ -63,6 +96,9 @@ __all__ = [
     "WebhookTestResponse",
     "HandoffUpdateRequest",
     "MessageResponse",
+    "HandoffQueueItem",
+    "HandoffQueueResponse",
+    "HandoffCheckoutResponse",
     # Re-export for convenience
     "HandoffDetail",
     "HandoffListItem",
