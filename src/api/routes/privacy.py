@@ -293,7 +293,6 @@ def _render_page(
     </div>
   </section>
 
-{slm_section}
   <section>
     <h2>10. Atualizações desta política</h2>
     <div class="section-body">
@@ -305,6 +304,7 @@ def _render_page(
     </div>
   </section>
 
+{slm_section}
   <footer>
     {shield_footer}
     <span>Página gerada pela plataforma <strong>NeuroStack</strong> — infraestrutura cognitiva para agentes de IA em saúde.</span>
