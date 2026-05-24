@@ -760,9 +760,11 @@ class CognitivePipeline:
             except ValueError:
                 pass
 
-        # Merge phone into key_info so the service can populate numero_whatsapp in the DB record
+        # Merge phone into key_info so the service can populate numero_whatsapp in the DB record.
+        # Only for WhatsApp channel: user_id is a phone number there; other channels use
+        # arbitrary IDs (e.g. "user-xyz-123") that must NOT appear in the WhatsApp queue field.
         key_info = dict(input_data.slots)
-        if input_data.user_id:
+        if input_data.user_id and input_data.channel == "whatsapp":
             key_info.setdefault("numero_whatsapp", input_data.user_id)
 
         request = HandoffRequest(
