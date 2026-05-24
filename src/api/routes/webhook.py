@@ -133,6 +133,69 @@ def _is_ai_sent_message(message_id: str) -> bool:
     return False
 
 
+# ── DB-backed AI message deduplication (cross-worker safe) ───────────
+
+def _session_has_ai_msg_id(session: Any, message_id: str) -> bool:
+    """Return True (and consume the entry) if message_id is a recent bot-sent ID.
+
+    Stored in session.metadata["ai_msg_ids"] as [[id, monotonic_ts], ...].
+    This is shared across all Uvicorn workers via PostgreSQL.
+    """
+    meta = dict(session.metadata or {})
+    entries: list = meta.get("ai_msg_ids", [])
+    if not entries:
+        return False
+    now = _time.monotonic()
+    found = False
+    remaining = []
+    for entry in entries:
+        try:
+            mid, ts = entry[0], entry[1]
+        except (IndexError, TypeError):
+            continue
+        if mid == message_id and now - ts < _SENT_ID_TTL:
+            found = True  # consume — don't add to remaining
+        elif now - ts < _SENT_ID_TTL:
+            remaining.append(entry)  # still valid, keep
+        # expired entries are silently dropped
+    if found:
+        meta["ai_msg_ids"] = remaining
+        session.metadata = meta
+    return found
+
+
+async def _store_ai_msg_id_to_db(
+    session_id: "UUID",
+    message_id: str,
+    db: AsyncSession,
+) -> None:
+    """Persist a bot-sent messageId into session.metadata for cross-worker dedup.
+
+    Non-fatal: silently ignores any DB error so send failures don't abort the
+    webhook handler.
+    """
+    if not message_id:
+        return
+    try:
+        from src.repositories.session import SessionRepository as _SR
+        repo = _SR(db)
+        sess = await repo.get_by_id(session_id)
+        if not sess:
+            return
+        meta = dict(sess.metadata or {})
+        entries: list = meta.get("ai_msg_ids", [])
+        now = _time.monotonic()
+        # Prune expired, cap at 20
+        entries = [[m, t] for m, t in entries if now - t < _SENT_ID_TTL]
+        entries.append([message_id, now])
+        entries = entries[-20:]
+        meta["ai_msg_ids"] = entries
+        sess.metadata = meta
+        await db.flush()
+    except Exception as _exc:
+        logger.debug("_store_ai_msg_id_to_db failed (non-fatal): %s", _exc)
+
+
 # ── helpers ──────────────────────────────────────────────────────────
 
 async def _resolve_tenant_by_credential(
@@ -398,10 +461,16 @@ async def _handle_clinic_message(
     phone: str,
     message_text: str,
     db: AsyncSession,
+    message_id: Optional[str] = None,
 ) -> dict:
     """Handle fromMe=true messages (clinic/secretary).
 
     Never enters pipeline/SRM. Checks for trigger message or human takeover.
+
+    message_id: Z-API/Evolution messageId from the webhook payload. When
+    provided, it is checked against the session's ai_msg_ids metadata (set
+    by _store_ai_msg_id_to_db) so bot-sent echoes are silently skipped
+    even across multiple Uvicorn workers.
     """
     repo = SessionRepository(db)
     sessions = await repo.find_by_user(
@@ -414,6 +483,22 @@ async def _handle_clinic_message(
         return {"ok": True, "action": "no_session"}
 
     session = sessions[0]
+
+    # ── Cross-worker bot-echo dedup (DB-backed, shared across all workers) ──
+    # _session_has_ai_msg_id checks session.metadata["ai_msg_ids"] written by
+    # _store_ai_msg_id_to_db after each outbound message. This is the
+    # authoritative store — it works even when Redis is down and even when the
+    # fromMe echo is routed to a different Uvicorn worker than the one that
+    # sent the original message.
+    if message_id and _session_has_ai_msg_id(session, message_id):
+        logger.debug(
+            "fromMe_echo_skipped_db",
+            extra={"session_id": str(session.id), "message_id": message_id},
+        )
+        # Persist the consumed entry list back to the DB
+        await db.flush()
+        return {"ok": True, "skipped": "ai_echo_db"}
+
     handoff_cfg = await _load_handoff_config(tenant_id, db)
 
     handoff_active = str(handoff_cfg.get("handoff_active", "yes")).lower()
@@ -614,6 +699,7 @@ async def zapi_webhook(
     # ── fromMe=true: check if AI-sent echo or real clinic message ──
     if body.get("fromMe", False):
         webhook_msg_id = body.get("messageId", "")
+        # Fast path: in-memory + Redis check (same worker, Redis available)
         if webhook_msg_id and _is_ai_sent_message(webhook_msg_id):
             return {"ok": True, "skipped": "ai_echo"}
         # When phone is in @lid format, resolve real phone from session metadata
@@ -623,7 +709,10 @@ async def zapi_webhook(
             if not effective_phone:
                 logger.warning("zapi_lid_unresolved", extra={"lid": raw_phone, "tenant_id": str(tenant_id)})
                 return {"ok": True, "skipped": "lid_unresolved"}
-        result = await _handle_clinic_message(tenant_id, effective_phone, message_text, db)
+        # Pass message_id for DB-backed cross-worker dedup inside _handle_clinic_message
+        result = await _handle_clinic_message(
+            tenant_id, effective_phone, message_text, db, message_id=webhook_msg_id
+        )
         await db.commit()
         return result
 
@@ -682,6 +771,11 @@ async def zapi_webhook(
                         z_inst, z_tok, phone, privacy_msg, client_token=z_ct,
                     )
                     _track_sent_message(send_result)
+                    # DB-backed dedup: store LGPD message ID so its fromMe echo is
+                    # recognised as a bot echo across all Uvicorn workers
+                    _lgpd_mid = send_result.get("messageId") or send_result.get("zapiMessageId", "")
+                    if _lgpd_mid:
+                        await _store_ai_msg_id_to_db(session_id, _lgpd_mid, db)
                     logger.info("Z-API LGPD privacy message sent to %s", phone)
                 except Exception as exc:
                     logger.warning("Z-API LGPD send failed for %s — %s", phone, exc)
@@ -736,6 +830,12 @@ async def zapi_webhook(
     try:
         send_result = await send_text_message(zapi_inst, zapi_token, phone, suggested, client_token=zapi_client_token)
         _track_sent_message(send_result)
+        # DB-backed dedup: store reply message ID so its fromMe echo is recognised
+        # as a bot echo across all Uvicorn workers (works even when Redis is down)
+        _reply_mid = send_result.get("messageId") or send_result.get("zapiMessageId", "")
+        if _reply_mid:
+            await _store_ai_msg_id_to_db(session_id, _reply_mid, db)
+            await db.commit()  # commit the metadata update immediately
         logger.info("Z-API reply sent to %s (%d chars)", phone, len(suggested))
     except Exception as exc:
         logger.exception("Z-API send failed for %s — %s", phone, exc)
@@ -833,9 +933,13 @@ async def evolution_webhook(
     # ── fromMe=true: check if AI-sent echo or real clinic message ──
     if is_from_me:
         webhook_msg_id = key.get("id", "")
+        # Fast path: in-memory + Redis check (same worker, Redis available)
         if webhook_msg_id and _is_ai_sent_message(webhook_msg_id):
             return {"ok": True, "skipped": "ai_echo"}
-        result = await _handle_clinic_message(tenant_id, phone, message_text, db)
+        # Pass message_id for DB-backed cross-worker dedup inside _handle_clinic_message
+        result = await _handle_clinic_message(
+            tenant_id, phone, message_text, db, message_id=webhook_msg_id
+        )
         await db.commit()
         return result
 
@@ -871,6 +975,10 @@ async def evolution_webhook(
                         e_url, e_name, e_key, phone, privacy_msg,
                     )
                     _track_sent_message(send_result)
+                    # DB-backed dedup: store LGPD message ID for cross-worker echo detection
+                    _lgpd_mid = send_result.get("messageId") or send_result.get("id", "")
+                    if _lgpd_mid:
+                        await _store_ai_msg_id_to_db(session_id, _lgpd_mid, db)
                     logger.info("Evolution LGPD privacy message sent to %s", phone)
                 except Exception as exc:
                     logger.warning("Evolution LGPD send failed for %s — %s", phone, exc)
@@ -919,6 +1027,11 @@ async def evolution_webhook(
     try:
         send_result = await send_evolution_text(evol_url, evol_name, evol_key, phone, suggested)
         _track_sent_message(send_result)
+        # DB-backed dedup: store reply message ID for cross-worker echo detection
+        _reply_mid = send_result.get("messageId") or send_result.get("id", "")
+        if _reply_mid:
+            await _store_ai_msg_id_to_db(session_id, _reply_mid, db)
+            await db.commit()  # commit the metadata update immediately
         logger.info("Evolution reply sent to %s (%d chars)", phone, len(suggested))
     except Exception:
         logger.exception("Evolution send failed for %s", phone)
