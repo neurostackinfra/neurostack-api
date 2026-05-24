@@ -87,7 +87,7 @@ function mapTrace(t: ApiTrace) {
 }
 
 export default function TracesList() {
-  const { isReadOnly, isBuilder, isInvestor, viewingClinicId } = useAuth();
+  const { isReadOnly, isBuilder, isSuperAdmin, isInvestor, viewingClinicId } = useAuth();
   const { t, locale } = useI18n();
   const txt = (p: string, e: string) => locale === "en" ? e : p;
   const { toast } = useToast();
@@ -120,8 +120,8 @@ export default function TracesList() {
       setLoading(false);
       return;
     }
-    // For builders, wait until viewingClinicId is resolved
-    if (isBuilder && !viewingClinicId) {
+    // For builders/super_admin, wait until viewingClinicId is resolved
+    if ((isBuilder || isSuperAdmin) && !viewingClinicId) {
       setLoading(true);
       return;
     }
@@ -143,7 +143,7 @@ export default function TracesList() {
       if (onlySafety) params.set("safety_flag", "true");
       if (onlyHandoff) params.set("handoff_required", "true");
       if (channelFilter !== "all") params.set("channel", channelFilter);
-      if (isBuilder && viewingClinicId) params.set("tenant_id", viewingClinicId);
+      if ((isBuilder || isSuperAdmin) && viewingClinicId) params.set("tenant_id", viewingClinicId);
 
       const res = await fetch(`/v1/traces?${params.toString()}`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -163,7 +163,7 @@ export default function TracesList() {
     } finally {
       setLoading(false);
     }
-  }, [offset, startDate, endDate, onlySafety, onlyHandoff, channelFilter, isBuilder, isInvestor, viewingClinicId]);
+  }, [offset, startDate, endDate, onlySafety, onlyHandoff, channelFilter, isBuilder, isSuperAdmin, isInvestor, viewingClinicId]);
 
   useEffect(() => {
     void fetchTraces();
@@ -200,7 +200,7 @@ export default function TracesList() {
       if (onlySafety) params.set("safety_flag", "true");
       if (onlyHandoff) params.set("handoff_required", "true");
       if (channelFilter !== "all") params.set("channel", channelFilter);
-      if (isBuilder && viewingClinicId) params.set("tenant_id", viewingClinicId);
+      if ((isBuilder || isSuperAdmin) && viewingClinicId) params.set("tenant_id", viewingClinicId);
 
       const res = await fetch(`/v1/traces/export?${params.toString()}`, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},

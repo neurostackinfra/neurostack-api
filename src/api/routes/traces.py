@@ -65,6 +65,10 @@ async def _resolve_tenant(
                     pass
         return tenant.tenant_id
 
+    # Super admin can query any tenant without ownership validation
+    if tenant.role == "super_admin":
+        return override_tenant_id
+
     if tenant.role != "builder":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

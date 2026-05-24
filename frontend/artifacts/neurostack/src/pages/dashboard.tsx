@@ -368,15 +368,15 @@ const INVESTOR_MOCK_STATS: KpiStats = {
 
 export default function Dashboard() {
   const { t } = useI18n();
-  const { isBuilder, isInvestor, viewingClinicId } = useAuth();
+  const { isBuilder, isSuperAdmin, isInvestor, viewingClinicId } = useAuth();
   const { startDate: defStart, endDate: defEnd } = defaultDates();
   const [startDate, setStartDate] = useState(defStart);
   const [endDate, setEndDate] = useState(defEnd);
   const [intentFilter, setIntentFilter] = useState("");
 
   const { data: stats, isLoading, error } = useQuery<KpiStats>({
-    queryKey: ["trace-stats", startDate, endDate, isBuilder ? viewingClinicId : null, isInvestor],
-    enabled: !(isBuilder && !viewingClinicId),
+    queryKey: ["trace-stats", startDate, endDate, (isBuilder || isSuperAdmin) ? viewingClinicId : null, isInvestor],
+    enabled: !((isBuilder || isSuperAdmin) && !viewingClinicId),
     queryFn: async () => {
       // Investor: return mock stats
       if (isInvestor) return INVESTOR_MOCK_STATS;
@@ -386,7 +386,7 @@ export default function Dashboard() {
         start_date: startDate,
         end_date: endDate,
       });
-      if (isBuilder && viewingClinicId) params.set("tenant_id", viewingClinicId);
+      if ((isBuilder || isSuperAdmin) && viewingClinicId) params.set("tenant_id", viewingClinicId);
       const res = await fetch(`/v1/traces/stats?${params.toString()}`, {
         headers: { Authorization: `Bearer ${token}` },
       });

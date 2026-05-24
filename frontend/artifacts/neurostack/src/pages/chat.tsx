@@ -551,10 +551,10 @@ function InvestorMockChat() {
 }
 
 export default function Chat() {
-  const { clinicId: activeClinicId, tenantId, userId, isInvestor, isReadOnly, isBuilder, viewingClinicId } = useAuth();
+  const { clinicId: activeClinicId, tenantId, userId, isInvestor, isReadOnly, isBuilder, isSuperAdmin, viewingClinicId } = useAuth();
 
   if (isInvestor) return <InvestorMockChat />;
-  const effectiveTenantId = isBuilder ? viewingClinicId : tenantId;
+  const effectiveTenantId = (isBuilder || isSuperAdmin) ? viewingClinicId : tenantId;
   const { t, locale } = useI18n();
   const { toast } = useToast();
 

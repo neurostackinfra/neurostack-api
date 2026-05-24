@@ -736,7 +736,7 @@ const INVESTOR_MOCK_CONFIG = {
 };
 
 export default function ClinicConfig() {
-  const { clinicId, isReadOnly, isClinicAdmin, role, isBuilder, isInvestor, viewingClinicId } = useAuth();
+  const { clinicId, isReadOnly, isClinicAdmin, role, isBuilder, isSuperAdmin, isInvestor, viewingClinicId } = useAuth();
   const { t, locale } = useI18n();
   const txt = (p: string, e: string) => locale === "en" ? e : p;
   const { toast } = useToast();
@@ -755,7 +755,7 @@ export default function ClinicConfig() {
       setIsLoading(true);
       try {
         const token = getToken();
-        const configUrl = isBuilder && viewingClinicId
+        const configUrl = (isBuilder || isSuperAdmin) && viewingClinicId
           ? `/v1/config?tenant_id=${viewingClinicId}`
           : "/v1/config";
         const res = await fetch(configUrl, {
@@ -955,7 +955,7 @@ export default function ClinicConfig() {
     };
     try {
       const token = getToken();
-      const patchUrl = isBuilder && viewingClinicId
+      const patchUrl = (isBuilder || isSuperAdmin) && viewingClinicId
         ? `/v1/config?tenant_id=${viewingClinicId}`
         : "/v1/config";
       const res = await fetch(patchUrl, {
@@ -1848,7 +1848,7 @@ export default function ClinicConfig() {
             </CardHeader>
             <CardContent className="pt-5">
               <ApiCredentialsForm
-                clinicId={isBuilder && viewingClinicId ? viewingClinicId : clinicId}
+                clinicId={(isBuilder || isSuperAdmin) && viewingClinicId ? viewingClinicId : clinicId}
                 isReadOnly={isReadOnly}
                 isSuperAdmin={role === "super_admin"}
               />
