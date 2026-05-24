@@ -262,8 +262,8 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       body["audio_max_seconds"] = audioMaxSeconds;
       if (sttApiKey && !sttApiKey.includes("•") && !sttApiKey.includes("*"))
         body["whisper_api_key"] = sttApiKey;
-      if (sttProvider === "outros" && sttApiUrl)
-        body["stt_api_url"] = sttApiUrl;
+      if (sttProvider === "outros")
+        body["stt_api_url"] = sttApiUrl;   // send even when empty so backend can clear a stale URL
       const saveUrl = targetId
         ? `/v1/config/api-credentials?clinic_id=${targetId}`
         : `/v1/config/api-credentials`;
