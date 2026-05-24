@@ -459,6 +459,10 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(encaminh(ar|e|a|asse|em))\b.*\b(equipe|atendente|pessoa|agendamento|secretaria)\b",
             r"\b(gostaria|quero|preciso)\b.*\b(encaminh)\b",
             r"\bme encaminh(e|ar|em)\b",
+            # Bare "pode encaminhar" or "encaminhar" + urgency/timing — context-implied handoff
+            # e.g. "pode encaminhar agora", "encaminha já", "encaminhar então"
+            r"\b(pode|podes|poderia|podia)\b.*\bencaminh(ar|a|e)\b",
+            r"\bencaminh(ar|a|e)\b.*\b(agora|já|ja|direto|logo|então|entao|sim)\b",
         ],
         "keywords": ["atendente humano", "humano", "pessoa real", "não robô",
                       "falar com alguém", "transfere"],
