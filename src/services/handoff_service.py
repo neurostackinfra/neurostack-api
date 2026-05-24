@@ -37,6 +37,8 @@ from src.handoff.webhook import (
     WebhookDispatcher,
     get_webhook_dispatcher,
 )
+from src.models.handoff import HandoffRecord as HandoffRecordORM
+from src.repositories.database import get_db_session
 from src.memory.event_store import (
     EventData,
     EventStore,
@@ -174,7 +176,57 @@ class HandoffService:
                 "resolution_notes": None,
             }
             self._handoffs[handoff_id] = handoff_record
-            
+
+            # Persist to DB so the queue UI can read it
+            try:
+                db = get_db_session()
+                async with db:
+                    # Extract display fields from the request
+                    first_message: Optional[str] = None
+                    if request.recent_messages:
+                        for msg in request.recent_messages:
+                            content = (
+                                msg.get("content") if isinstance(msg, dict)
+                                else getattr(msg, "content", None)
+                            )
+                            role = (
+                                msg.get("role") if isinstance(msg, dict)
+                                else getattr(msg, "role", "user")
+                            )
+                            if role == "user" and content:
+                                first_message = str(content)[:500]
+                                break
+
+                    whatsapp_num: Optional[str] = (
+                        request.key_info.get("whatsapp_number")
+                        or request.key_info.get("phone")
+                        or request.key_info.get("numero_whatsapp")
+                        if request.key_info else None
+                    )
+
+                    orm_record = HandoffRecordORM(
+                        id=handoff_id,
+                        tenant_id=request.tenant_id,
+                        session_id=request.session_id,
+                        reason=request.reason.value,
+                        summary=summary.summary_text if summary else None,
+                        context=request.key_info or {},
+                        urgency=request.urgency.value,
+                        status=HandoffStatus.PENDING.value,
+                        numero_whatsapp=whatsapp_num,
+                        intencao_detectada=request.reason.value,
+                        estagio_atual=str(request.funnel_stage) if request.funnel_stage else None,
+                        primeira_linha_mensagem=first_message,
+                    )
+                    db.add(orm_record)
+                    await db.commit()
+            except Exception as db_err:
+                logger.warning(
+                    "Failed to persist HandoffRecord to DB (queue will be empty for this handoff)",
+                    handoff_id=str(handoff_id),
+                    error=str(db_err),
+                )
+
             # Log event to Event Store
             await self._log_handoff_event(
                 tenant_id=request.tenant_id,
