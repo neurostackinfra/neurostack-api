@@ -3,7 +3,7 @@ NeuroStack - Handoff Record Model
 Tracks human handoff events and their resolution.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID, uuid4
@@ -149,6 +149,28 @@ class HandoffRecord(Base):
         nullable=True,
     )
 
+    # Queue display fields
+    numero_whatsapp: Mapped[Optional[str]] = mapped_column(
+        String(50),
+        nullable=True,
+    )
+    intencao_detectada: Mapped[Optional[str]] = mapped_column(
+        String(100),
+        nullable=True,
+    )
+    estagio_atual: Mapped[Optional[str]] = mapped_column(
+        String(50),
+        nullable=True,
+    )
+    primeira_linha_mensagem: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    data_hora_saida: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
     # Timestamp
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -166,6 +188,11 @@ class HandoffRecord(Base):
         "Session",
         back_populates="handoff_records",
     )
+
+    def checkout(self) -> None:
+        """Mark handoff as attended via queue UI."""
+        self.data_hora_saida = datetime.now(timezone.utc)
+        self.status = HandoffStatus.COMPLETED.value
 
     def accept(self, agent_id: Optional[str] = None) -> None:
         """Mark handoff as accepted by human agent."""

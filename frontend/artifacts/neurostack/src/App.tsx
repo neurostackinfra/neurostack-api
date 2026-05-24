@@ -29,6 +29,7 @@ import PortalParceiros from "@/pages/portal-parceiros";
 import RlhfAudit from "@/pages/rlhf-audit";
 import Privacidade from "@/pages/privacidade";
 import BuilderPanel from "@/pages/builder";
+import HandoffQueuePage from "@/pages/handoff-queue";
 
 const queryClient = new QueryClient();
 
@@ -78,6 +79,7 @@ function AuthenticatedRouter() {
         <Route path="/voice-ai" component={VoiceAI} />
         <Route path="/suporte" component={Suporte} />
         <Route path="/portal-parceiros" component={PortalParceiros} />
+        <Route path="/handoff-queue" component={HandoffQueuePage} />
         <Route component={NotFound} />
       </Switch>
     </Layout>

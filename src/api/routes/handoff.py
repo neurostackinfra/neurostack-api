@@ -3,16 +3,25 @@ NeuroStack API - Handoff Routes
 Endpoints for human handoff management and webhook configuration.
 """
 
+import csv
+import io
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
+from sqlalchemy import func as sa_func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.middleware.auth import TenantContext, get_tenant_context
 from src.api.schemas.handoff import (
+    HandoffCheckoutResponse,
     HandoffDetail,
     HandoffListItem,
     HandoffListResponse,
+    HandoffQueueItem,
+    HandoffQueueResponse,
     HandoffUpdateRequest,
     MessageResponse,
     WebhookConfigCreate,
@@ -22,6 +31,8 @@ from src.api.schemas.handoff import (
     WebhookTestResponse,
 )
 from src.handoff.models import HandoffStatus, WebhookConfig
+from src.models.handoff import HandoffRecord
+from src.repositories import get_db_session_dependency
 from src.services import (
     HandoffService,
     get_handoff_service,
@@ -48,6 +59,221 @@ router = APIRouter()
 def get_service() -> HandoffService:
     """Get handoff service dependency."""
     return get_handoff_service()
+
+
+# ============================================
+# Queue Endpoints (DB-direct, not HandoffService)
+# ============================================
+
+
+@router.get(
+    "/queue",
+    response_model=HandoffQueueResponse,
+    summary="Get Handoff Queue",
+)
+async def get_handoff_queue(
+    tenant_id: UUID = Query(..., description="Tenant to fetch queue for"),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: AsyncSession = Depends(get_db_session_dependency),
+) -> HandoffQueueResponse:
+    """Active handoffs (pending/accepted) with aggregate stats."""
+    if tenant_id != tenant.tenant_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="tenant_mismatch")
+
+    # Active items
+    q = (
+        select(HandoffRecord)
+        .where(
+            HandoffRecord.tenant_id == tenant_id,
+            HandoffRecord.status.in_(["pending", "accepted"]),
+        )
+        .order_by(HandoffRecord.created_at.asc())
+    )
+    result = await db.execute(q)
+    records = result.scalars().all()
+
+    items = [
+        HandoffQueueItem(
+            id=r.id,
+            numero_whatsapp=r.numero_whatsapp,
+            session_id=r.session_id,
+            intencao_detectada=r.intencao_detectada,
+            estagio_atual=r.estagio_atual,
+            primeira_linha_mensagem=r.primeira_linha_mensagem,
+            created_at=r.created_at,
+            data_hora_saida=r.data_hora_saida,
+            status=r.status,
+        )
+        for r in records
+    ]
+
+    # Stats: avg wait + pct within SLA (last 30 days completed)
+    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+    stats_q = (
+        select(
+            sa_func.avg(
+                sa_func.extract("epoch", HandoffRecord.data_hora_saida - HandoffRecord.created_at)
+            ).label("avg_wait"),
+            sa_func.count().label("total"),
+        )
+        .where(
+            HandoffRecord.tenant_id == tenant_id,
+            HandoffRecord.status == "completed",
+            HandoffRecord.data_hora_saida.isnot(None),
+            HandoffRecord.created_at >= thirty_days_ago,
+        )
+    )
+    stats_result = await db.execute(stats_q)
+    row = stats_result.one()
+    avg_wait = float(row.avg_wait or 0)
+    total_completed = int(row.total or 0)
+
+    # Get meta_minutos from clinic config
+    meta_minutes = 10
+    try:
+        from src.models.clinic_config_table import ClinicConfigTable
+        cfg_q = select(ClinicConfigTable).where(ClinicConfigTable.tenant_id == tenant_id)
+        cfg_result = await db.execute(cfg_q)
+        cfg_row = cfg_result.scalar_one_or_none()
+        if cfg_row and cfg_row.handoff:
+            meta_minutes = cfg_row.handoff.get("meta_minutos_atendimento", 10) if isinstance(cfg_row.handoff, dict) else 10
+    except Exception:
+        pass
+
+    # pct within SLA
+    pct_within_sla = 0.0
+    if total_completed > 0:
+        sla_seconds = meta_minutes * 60
+        sla_q = (
+            select(sa_func.count())
+            .select_from(HandoffRecord)
+            .where(
+                HandoffRecord.tenant_id == tenant_id,
+                HandoffRecord.status == "completed",
+                HandoffRecord.data_hora_saida.isnot(None),
+                HandoffRecord.created_at >= thirty_days_ago,
+                sa_func.extract("epoch", HandoffRecord.data_hora_saida - HandoffRecord.created_at) <= sla_seconds,
+            )
+        )
+        sla_result = await db.execute(sla_q)
+        within_count = sla_result.scalar() or 0
+        pct_within_sla = round((within_count / total_completed) * 100, 1)
+
+    return HandoffQueueResponse(
+        items=items,
+        avg_wait_seconds=round(avg_wait, 1),
+        pct_within_sla=pct_within_sla,
+    )
+
+
+@router.post(
+    "/queue/{handoff_id}/checkout",
+    response_model=HandoffCheckoutResponse,
+    summary="Checkout Handoff",
+)
+async def checkout_handoff(
+    handoff_id: UUID,
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: AsyncSession = Depends(get_db_session_dependency),
+) -> HandoffCheckoutResponse:
+    """Mark a handoff as attended. Returns 409 if already completed."""
+    q = select(HandoffRecord).where(HandoffRecord.id == handoff_id)
+    result = await db.execute(q)
+    record = result.scalar_one_or_none()
+
+    if not record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="handoff_not_found")
+    if record.tenant_id != tenant.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="handoff_not_found")
+    if record.data_hora_saida is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="already_completed")
+
+    record.checkout()
+    await db.commit()
+    await db.refresh(record)
+
+    wait_seconds = None
+    if record.data_hora_saida and record.created_at:
+        wait_seconds = (record.data_hora_saida - record.created_at).total_seconds()
+
+    return HandoffCheckoutResponse(
+        id=record.id,
+        numero_whatsapp=record.numero_whatsapp,
+        session_id=record.session_id,
+        intencao_detectada=record.intencao_detectada,
+        estagio_atual=record.estagio_atual,
+        primeira_linha_mensagem=record.primeira_linha_mensagem,
+        created_at=record.created_at,
+        data_hora_saida=record.data_hora_saida,
+        status=record.status,
+        wait_seconds=wait_seconds,
+    )
+
+
+@router.get(
+    "/queue/export",
+    summary="Export Handoffs CSV",
+)
+async def export_handoffs_csv(
+    tenant_id: UUID = Query(..., description="Tenant ID"),
+    from_date: Optional[date] = Query(None, description="Start date (default: 30 days ago)"),
+    to_date: Optional[date] = Query(None, description="End date (default: today)"),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: AsyncSession = Depends(get_db_session_dependency),
+) -> StreamingResponse:
+    """Export completed handoffs as CSV with UTF-8 BOM."""
+    if tenant_id != tenant.tenant_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="tenant_mismatch")
+
+    today = date.today()
+    effective_to = to_date or today
+    effective_from = from_date or (today - timedelta(days=30))
+
+    if (effective_to - effective_from).days > 90:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="max_window_90_days",
+        )
+
+    q = (
+        select(HandoffRecord)
+        .where(
+            HandoffRecord.tenant_id == tenant_id,
+            HandoffRecord.status == "completed",
+            HandoffRecord.data_hora_saida.isnot(None),
+            sa_func.date(HandoffRecord.data_hora_saida) >= effective_from,
+            sa_func.date(HandoffRecord.data_hora_saida) <= effective_to,
+        )
+        .order_by(HandoffRecord.data_hora_saida.desc())
+        .limit(10000)
+    )
+    result = await db.execute(q)
+    records = result.scalars().all()
+
+    output = io.StringIO()
+    output.write("﻿")  # UTF-8 BOM
+    writer = csv.writer(output)
+    writer.writerow(["numero_whatsapp", "session_id", "created_at", "data_hora_saida", "tempo_espera_segundos"])
+    for r in records:
+        wait = ""
+        if r.data_hora_saida and r.created_at:
+            wait = str(round((r.data_hora_saida - r.created_at).total_seconds(), 1))
+        writer.writerow([
+            r.numero_whatsapp or "",
+            str(r.session_id),
+            r.created_at.isoformat() if r.created_at else "",
+            r.data_hora_saida.isoformat() if r.data_hora_saida else "",
+            wait,
+        ])
+
+    output.seek(0)
+    filename = f"handoffs_{effective_from}_{effective_to}.csv"
+
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ============================================
