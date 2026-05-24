@@ -85,6 +85,30 @@ export function Layout({ children }: LayoutProps) {
       .catch(() => {});
   }, [isBuilder, viewingClinicId, setViewingClinicId]);
 
+  // Super admin clinic list for dropdown (all active clinics on the platform)
+  const [superAdminClinics, setSuperAdminClinics] = useState<Array<{ id: string; name: string }>>([]);
+  useEffect(() => {
+    if (!isSuperAdmin) return;
+    const raw = localStorage.getItem("ns_auth");
+    const token = raw ? (JSON.parse(raw) as { token?: string }).token : null;
+    if (!token) return;
+    fetch("/v1/admin/clinics", {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => r.ok ? r.json() : Promise.reject(r))
+      .then((data: Array<{ clinic_id: string; clinic_name: string; status: string }>) => {
+        const active = data
+          .filter((c) => c.status === "active")
+          .map((c) => ({ id: c.clinic_id, name: c.clinic_name }));
+        setSuperAdminClinics(active);
+        // Auto-select first clinic if current viewingClinicId is not in the list
+        if (active.length > 0 && !active.some((c) => c.id === viewingClinicId)) {
+          setViewingClinicId(active[0].id);
+        }
+      })
+      .catch(() => {});
+  }, [isSuperAdmin, viewingClinicId, setViewingClinicId]);
+
   const navItems = [
     { href: "/",         label: t("nav_chat"),      icon: MessageSquare,  id: "chat-simulator", hideFor: [] },
     { href: "/traces",   label: t("nav_traces"),    icon: Activity,       id: "trace-history",  hideFor: [] },
@@ -147,6 +171,30 @@ export function Layout({ children }: LayoutProps) {
             data-testid="builder-clinic-dropdown"
           >
             {builderClinics.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {/* Super admin clinic dropdown */}
+      {isSuperAdmin && superAdminClinics.length > 0 && (
+        <div className="border-b border-sidebar-border px-3 py-2">
+          <div className="flex items-center gap-1.5 mb-1 px-1">
+            <ChevronDown className="h-3 w-3 text-violet-400" />
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-violet-400/60">
+              {t("label_select_clinic")}
+            </span>
+          </div>
+          <select
+            value={viewingClinicId ?? ""}
+            onChange={(e) => setViewingClinicId(e.target.value)}
+            className="w-full rounded-md border border-sidebar-border bg-sidebar px-2 py-1.5 text-xs text-sidebar-foreground focus:outline-none focus:ring-1 focus:ring-violet-500"
+            data-testid="super-admin-clinic-dropdown"
+          >
+            {superAdminClinics.map((c) => (
               <option key={c.id} value={c.id}>
                 {c.name}
               </option>
