@@ -36,11 +36,16 @@ EXPLICIT_HANDOFF_PATTERNS = [
 #   so "quero saber os hor\u00e1rios antes" (5 words) never fires the handoff.
 _STRONG_POSITIVE_RE = re.compile(
     r"\b(sim|s[\u00edi]m|yes|claro|com\s+certeza|confirmo|confirmar|aceito|aceitar"
-    r"|encaminhe|encaminha|perfeito|[\u00f3o]timo|beleza)\b",
+    r"|encaminhe|encaminha)\b",
     re.IGNORECASE | re.UNICODE,
 )
+# Weak positives only fire when the ENTIRE trimmed message is \u2264 3 words.
+# Moved here from strong: perfeito / \u00f3timo / beleza \u2014 these appear mid-sentence
+# when users describe a preferred time ("segunda \u00e0s 9h fica perfeito pra mim")
+# and must NOT trigger confirmation when the message is longer than 3 words.
 _WEAK_POSITIVE_RE = re.compile(
-    r"^(pode|quero|ok|okay|isso|vai|v[a\u00e1]|manda|mande|tudo\s+bem|por\s+favor|certo|exato|exatamente|boa)[\s!.,]*$",
+    r"^(pode|quero|ok|okay|isso|vai|v[a\u00e1]|manda|mande|tudo\s+bem|por\s+favor"
+    r"|certo|exato|exatamente|boa|perfeito|[\u00f3o]timo|beleza)[\s!.,]*$",
     re.IGNORECASE | re.UNICODE,
 )
 _NEGATIVE_RE = re.compile(
