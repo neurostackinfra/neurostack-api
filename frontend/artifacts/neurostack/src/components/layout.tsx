@@ -91,7 +91,7 @@ export function Layout({ children }: LayoutProps) {
     { href: "/dashboard",label: t("nav_dashboard"), icon: LayoutDashboard,id: "dashboard",      hideFor: [] },
     { href: "/config",   label: t("nav_config"),    icon: Sliders,        id: "clinic-config",  hideFor: [] },
     { href: "/suporte",  label: t("nav_support"),    icon: HelpCircle,    id: "suporte",        hideFor: ["super_admin"], badge: isClinicAdmin ? t("badge_coming_soon") : undefined },
-    { href: "/billing",  label: t("nav_billing"),    icon: CreditCard,    id: "billing",        hideFor: ["clinic_admin"] },
+    { href: "/billing",  label: t("nav_billing"),    icon: CreditCard,    id: "billing",        hideFor: ["clinic_admin", "super_admin", "investor"] },
   ].filter(item => !(item.hideFor as string[]).includes(role));
 
   const roadmapItems = [

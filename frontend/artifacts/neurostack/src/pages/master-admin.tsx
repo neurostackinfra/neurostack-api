@@ -5,7 +5,7 @@ import {
   Plus, Eye, CheckCircle2, XCircle, Loader2, AlertTriangle,
   Inbox, Paperclip, ChevronDown, ChevronRight, CheckCheck, UserCheck,
   Phone, TrendingUp, TrendingDown, Download, Search, CalendarRange, RefreshCw,
-  RotateCcw, Briefcase, Trash2, Pencil, DollarSign, Info,
+  RotateCcw, Briefcase, Trash2, Pencil, DollarSign, Info, Receipt, CreditCard,
 } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { useAuth } from "@/context/auth";
@@ -129,6 +129,29 @@ interface ClinicSlot {
   health_status?: "healthy" | "warning" | "critical";
   last_trace_at?: string | null;
   config_completeness?: number;
+}
+
+interface Transaction {
+  id: string;
+  builder_id: string;
+  builder_name: string;
+  amount_cents: number;
+  method: string;
+  cycle: string;
+  plan: string;
+  coupon_code: string | null;
+  external_id: string | null;
+  event_type: string;
+  created_at: string | null;
+}
+
+interface BuilderSubscription {
+  id: string;
+  name: string;
+  subscription_plan: string | null;
+  subscription_status: string;
+  billing_cycle: string;
+  updated_at: string | null;
 }
 
 // ── API helpers ───────────────────────────────────────────────────────────────
@@ -305,9 +328,10 @@ function CreatePilotDialog({ token, onCreated }: { token: string; onCreated: () 
         headers: authHeaders(token),
         body: JSON.stringify({ clinic_name: name, admin_email: email, admin_password: password, plan_type: "pilot" }),
       });
-      const data = await res.json() as { ok?: boolean; error?: string; clinic_id?: number };
-      if (!res.ok) { setError(data.error ?? t("admin_create_err_generic")); return; }
-      toast({ title: t("admin_create_ok_title"), description: `${t("admin_create_ok_desc_prefix")} "${name}" ID ${data.clinic_id}.` });
+      const data = await res.json() as { ok?: boolean; error?: string; id?: string; clinic_id?: string };
+      if (!res.ok) { setError((data as { detail?: string; error?: string }).detail ?? (data as { error?: string }).error ?? t("admin_create_err_generic")); return; }
+      const newId = data.id ?? data.clinic_id ?? "—";
+      toast({ title: t("admin_create_ok_title"), description: `${t("admin_create_ok_desc_prefix")} "${name}" ID ${newId}.` });
       setOpen(false);
       setName(""); setEmail(""); setPassword("");
       onCreated();
@@ -611,6 +635,12 @@ export default function MasterAdmin() {
   const [linkingClinicToBuilderId, setLinkingClinicToBuilderId] = useState<number | null>(null);
   const [selectedLinkClinicId, setSelectedLinkClinicId] = useState("");
 
+  // Transactions state
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [builderSubscriptions, setBuilderSubscriptions] = useState<BuilderSubscription[]>([]);
+  const [transactionsLoaded, setTransactionsLoaded] = useState(false);
+  const [showTransactionsSection, setShowTransactionsSection] = useState(false);
+
   // Coupons state
   const [coupons, setCoupons] = useState<Array<{ id: string; code: string; discount_percent: number; max_uses: number | null; uses_count: number; expires_at: string | null; is_active: boolean; created_at: string | null }>>([]);
   const [couponsLoaded, setCouponsLoaded] = useState(false);
@@ -652,6 +682,18 @@ export default function MasterAdmin() {
       if (!res.ok) return;
       setCoupons(await res.json());
       setCouponsLoaded(true);
+    } catch { /* silent */ }
+  };
+
+  const fetchTransactions = async () => {
+    try {
+      const [txRes, subRes] = await Promise.all([
+        fetch(`/v1/admin/transactions`, { headers: authHeaders(token) }),
+        fetch(`/v1/admin/builders/subscriptions`, { headers: authHeaders(token) }),
+      ]);
+      if (txRes.ok) setTransactions(await txRes.json() as Transaction[]);
+      if (subRes.ok) setBuilderSubscriptions(await subRes.json() as BuilderSubscription[]);
+      setTransactionsLoaded(true);
     } catch { /* silent */ }
   };
 
@@ -1995,6 +2037,151 @@ export default function MasterAdmin() {
               </div>
             )}
           </CardContent>
+        </Card>
+      )}
+
+      {/* Transactions Section */}
+      {isSuperAdmin && (
+        <Card className="border-border/60">
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Receipt className="h-4 w-4 text-indigo-400" />
+                <CardTitle className="text-sm">Transações Financeiras</CardTitle>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5 text-xs"
+                onClick={() => {
+                  setShowTransactionsSection(!showTransactionsSection);
+                  if (!transactionsLoaded) void fetchTransactions();
+                }}
+              >
+                {showTransactionsSection ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                {showTransactionsSection ? "Fechar" : "Ver"}
+              </Button>
+            </div>
+          </CardHeader>
+          {showTransactionsSection && (
+            <CardContent className="space-y-6">
+              {/* Builder Subscription Overview */}
+              <div>
+                <p className="text-xs font-semibold text-muted-foreground mb-2 flex items-center gap-1.5">
+                  <CreditCard className="h-3.5 w-3.5" /> Assinaturas por Builder
+                </p>
+                {builderSubscriptions.length === 0 ? (
+                  <p className="text-xs text-muted-foreground text-center py-4">
+                    {transactionsLoaded ? "Nenhum builder encontrado." : "Carregando…"}
+                  </p>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-border/50">
+                          <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Builder</th>
+                          <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Plano</th>
+                          <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Status</th>
+                          <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Ciclo</th>
+                          <th className="text-left pb-2 font-medium text-muted-foreground">Atualizado</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {builderSubscriptions.map((s) => (
+                          <tr key={s.id} className="border-b border-border/30 last:border-0">
+                            <td className="py-2 pr-4 font-medium">{s.name}</td>
+                            <td className="py-2 pr-4">
+                              <Badge className="bg-indigo-500/15 text-indigo-400 border-indigo-500/30 text-[10px]">
+                                {s.subscription_plan ?? "—"}
+                              </Badge>
+                            </td>
+                            <td className="py-2 pr-4">
+                              {s.subscription_status === "active" ? (
+                                <Badge className="bg-emerald-500/15 text-emerald-400 border-emerald-500/30 text-[10px]">
+                                  <CheckCircle2 className="h-3 w-3 mr-1" /> Ativo
+                                </Badge>
+                              ) : s.subscription_status === "trial" ? (
+                                <Badge className="bg-amber-500/15 text-amber-400 border-amber-500/30 text-[10px]">Trial</Badge>
+                              ) : (
+                                <Badge variant="outline" className="text-slate-400 border-slate-600 text-[10px]">
+                                  {s.subscription_status}
+                                </Badge>
+                              )}
+                            </td>
+                            <td className="py-2 pr-4 text-muted-foreground capitalize">{s.billing_cycle}</td>
+                            <td className="py-2 text-muted-foreground">
+                              {s.updated_at ? relativeTime(s.updated_at) : "—"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              {/* Payment Log */}
+              <div>
+                <p className="text-xs font-semibold text-muted-foreground mb-2 flex items-center gap-1.5">
+                  <Receipt className="h-3.5 w-3.5" /> Histórico de Pagamentos
+                </p>
+                {transactions.length === 0 ? (
+                  <p className="text-xs text-muted-foreground text-center py-4">
+                    {transactionsLoaded ? "Nenhum pagamento registrado ainda. Os pagamentos aparecem aqui após confirmação via webhook." : "Carregando…"}
+                  </p>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-border/50">
+                          <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Data</th>
+                          <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Builder</th>
+                          <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Valor</th>
+                          <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Método</th>
+                          <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Ciclo</th>
+                          <th className="text-left pb-2 font-medium text-muted-foreground">Cupom</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {transactions.map((tx) => (
+                          <tr key={tx.id} className="border-b border-border/30 last:border-0">
+                            <td className="py-2 pr-4 text-muted-foreground tabular-nums">
+                              {tx.created_at ? new Date(tx.created_at).toLocaleDateString("pt-BR") : "—"}
+                            </td>
+                            <td className="py-2 pr-4 font-medium">{tx.builder_name}</td>
+                            <td className="py-2 pr-4 tabular-nums font-medium text-emerald-400">
+                              {(tx.amount_cents / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" })}
+                            </td>
+                            <td className="py-2 pr-4">
+                              <Badge
+                                className={
+                                  tx.method === "pix"
+                                    ? "bg-teal-500/15 text-teal-400 border-teal-500/30 text-[10px]"
+                                    : "bg-blue-500/15 text-blue-400 border-blue-500/30 text-[10px]"
+                                }
+                              >
+                                {tx.method.toUpperCase()}
+                              </Badge>
+                            </td>
+                            <td className="py-2 pr-4 text-muted-foreground capitalize">{tx.cycle}</td>
+                            <td className="py-2">
+                              {tx.coupon_code ? (
+                                <Badge variant="outline" className="text-amber-400 border-amber-500/30 text-[10px] font-mono">
+                                  {tx.coupon_code}
+                                </Badge>
+                              ) : (
+                                <span className="text-muted-foreground/40">—</span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </CardContent>
+          )}
         </Card>
       )}
 

@@ -903,7 +903,7 @@ export default function ClinicConfig() {
     }
     if (Object.keys(lgpdValidationErrors).length > 0) {
       setLgpdErrors(lgpdValidationErrors);
-      toast.error(txt("Preencha os campos obrigatórios de LGPD antes de salvar.", "Fill in the required LGPD fields before saving."));
+      toast({ title: txt("Preencha os campos obrigatórios de LGPD antes de salvar.", "Fill in the required LGPD fields before saving."), variant: "destructive" });
       return;
     }
     setLgpdErrors({});

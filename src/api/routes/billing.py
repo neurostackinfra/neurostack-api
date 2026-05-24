@@ -22,6 +22,7 @@ from src.config.settings import settings
 from src.models.builder import Builder
 from src.models.coupon import Coupon
 from src.models.tenant import Tenant
+from src.models.transaction import Transaction
 from src.repositories import get_db_session_dependency
 from src.services.abacatepay import AbacatePayClient
 
@@ -182,18 +183,17 @@ async def create_checkout(
     frequency = "MONTHLY" if body.cycle == "monthly" else "YEARLY"
 
     if body.method == "pix" and body.cycle == "monthly":
-        result_pay = client.create_subscription(
+        # PIX gera QR code para o primeiro ciclo; AbacatePay envia cobranças mensais
+        result_pay = client.create_pix_charge(
             amount_cents=amount_cents,
-            frequency="MONTHLY",
-            method="PIX",
-            description=f"NeuroStack Start - Mensal (PIX)",
-            customer={"name": builder.name},
+            description="NeuroStack Start - Mensal (PIX)",
             metadata=metadata,
         )
         return CheckoutResponse(
             method="pix",
-            payment_url=result_pay["subscription_url"],
-            subscription_id=result_pay["subscription_id"],
+            qr_code=result_pay["qr_code"],
+            qr_code_url=result_pay.get("qr_code_url"),
+            subscription_id=result_pay.get("charge_id"),
         )
 
     if body.method == "pix" and body.cycle == "annual":
@@ -295,6 +295,20 @@ async def abacatepay_webhook(
             coupon.uses_count += 1
             if coupon.max_uses is not None and coupon.uses_count >= coupon.max_uses:
                 coupon.is_active = False
+
+    # Log transaction record
+    tx = Transaction(
+        builder_id=bid,
+        builder_name=builder.name,
+        amount_cents=data.get("amount", 0),
+        method=data.get("method", "unknown").lower(),
+        cycle=cycle,
+        plan=plan,
+        coupon_code=coupon_code if coupon_code else None,
+        external_id=data.get("id") or data.get("charge_id") or data.get("subscription_id"),
+        event_type=event_type,
+    )
+    db.add(tx)
 
     await db.commit()
     logger.info("Webhook processed", builder_id=builder_id_str, event=event_type)
