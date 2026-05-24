@@ -162,8 +162,6 @@ async def toggle_bot_active(
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> dict:
     """Toggle tenant.bot_active and return the new state."""
-    from sqlalchemy import text as sa_text
-
     tenant = await _resolve_config_tenant(request, tenant, session)
 
     t_result = await session.execute(
@@ -175,22 +173,6 @@ async def toggle_bot_active(
 
     t.bot_active = not t.bot_active
     new_value = t.bot_active
-
-    # When re-enabling: clear offline_notified so each session gets one notification
-    # if the bot is paused again in the future.
-    if new_value:
-        await session.execute(
-            sa_text(
-                "UPDATE sessions "
-                "SET cognitive_state = jsonb_set("
-                "  COALESCE(cognitive_state, '{}')::jsonb,"
-                "  '{flags,offline_notified}',"
-                "  'false'::jsonb"
-                ") "
-                "WHERE tenant_id = :tid AND is_active = true"
-            ),
-            {"tid": str(tenant.tenant_id)},
-        )
 
     await session.flush()
     await session.commit()
