@@ -112,6 +112,8 @@ export const en = {
   chat_trace_subtitle: "Diagnostic view of the latest reasoning cycle.",
   chat_waiting: "Waiting for activity. Send a message to generate a trace.",
   chat_placeholder: "Message the agent...",
+  chat_no_clinic_selected_title: "No clinic selected",
+  chat_no_clinic_selected_desc: "Select a clinic from the sidebar before using the simulator.",
 
   // Clinic Config — Identity
   config_title: "Clinic Config",

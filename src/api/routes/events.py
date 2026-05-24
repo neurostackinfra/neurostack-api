@@ -190,14 +190,38 @@ decision = response.json()
         ]
     },
 )
-async def process_event(request: EventRequest) -> EventResponse:
+async def process_event(
+    request: EventRequest,
+    db: AsyncSession = Depends(get_db_session_dependency),
+) -> EventResponse:
     """
     Process an incoming event through the NeuroStack cognitive pipeline.
 
     This is the main entry point for all agent interactions.
     """
     service = get_event_service()
-    return await service.process_event(request)
+    try:
+        response = await service.process_event(request, session=db)
+        # Commit session-state updates (flush was called in _persist_session_state)
+        await db.commit()
+        return response
+    except HTTPException:
+        raise
+    except Exception as e:
+        from src.config.logging import get_logger as _get_logger
+        _logger = _get_logger(__name__)
+        _logger.error(
+            "Unhandled error in process_event",
+            tenant_id=str(request.tenant_id),
+            session_id=str(request.session_id),
+            error=str(e),
+            error_type=type(e).__name__,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Pipeline processing failed",
+        )
 
 
 @router.get(
