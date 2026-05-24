@@ -29,8 +29,16 @@ router = APIRouter()
 
 # Track message IDs sent by the AI so we can ignore their fromMe=true echo.
 # Uses Redis for persistence across container restarts and multiple workers.
+# Falls back to an in-process LRU set when Redis is unavailable.
 _SENT_ID_PREFIX = "ai_sent:"
 _SENT_ID_TTL = 300  # 5 minutes — enough for Z-API echo to arrive
+
+# In-memory fallback: bounded set of (message_id, expiry_epoch) tuples.
+# Used when Redis is down so bot echoes don't trigger false human-takeover.
+import time as _time
+from collections import OrderedDict as _OrderedDict
+_INMEM_SENT: "_OrderedDict[str, float]" = _OrderedDict()
+_INMEM_MAX = 500  # cap at 500 entries to bound memory
 
 
 def _is_enabled(value: Any) -> bool:
@@ -67,20 +75,51 @@ def _get_redis():
 
 
 def _track_sent_message(zapi_response: dict) -> None:
-    """Store the messageId from a Z-API send response in Redis."""
+    """Store the messageId from a Z-API send response (Redis + in-memory fallback).
+
+    Always writes to the in-process dict so echoes are recognised even if Redis
+    is temporarily down between _track and _is_ai_sent_message calls.
+    """
     mid = zapi_response.get("messageId") or zapi_response.get("zapiMessageId")
     if not mid:
         return
+
+    # Always store in-memory (cheap, bounded, zero-latency fallback)
+    expiry = _time.monotonic() + _SENT_ID_TTL
+    _INMEM_SENT[mid] = expiry
+    while len(_INMEM_SENT) > _INMEM_MAX:
+        _INMEM_SENT.popitem(last=False)
+
+    # Also persist to Redis for multi-worker / multi-container deployments
     r = _get_redis()
     if r:
         try:
             r.setex(f"{_SENT_ID_PREFIX}{mid}", _SENT_ID_TTL, "1")
         except Exception:
-            pass
+            pass  # Redis failure is non-fatal — in-memory handles the echo
 
 
 def _is_ai_sent_message(message_id: str) -> bool:
-    """Check if a messageId was sent by the AI (stored in Redis)."""
+    """Check if a messageId was sent by the AI (Redis with in-memory fallback).
+
+    Checks in-memory first (fastest, always available), then Redis (authoritative
+    for multi-worker setups). Consumes the entry so repeated echoes are rejected.
+    """
+    # Check in-memory first (fastest path, works when Redis is down)
+    if message_id in _INMEM_SENT:
+        expiry = _INMEM_SENT.pop(message_id)
+        if _time.monotonic() < expiry:
+            # Also clean up Redis if available (avoid stale key)
+            r = _get_redis()
+            if r:
+                try:
+                    r.delete(f"{_SENT_ID_PREFIX}{message_id}")
+                except Exception:
+                    pass
+            return True
+        # Expired in-memory entry — continue to Redis check
+
+    # Check Redis (authoritative for other workers/containers)
     r = _get_redis()
     if r:
         try:
@@ -90,6 +129,7 @@ def _is_ai_sent_message(message_id: str) -> bool:
                 return True
         except Exception:
             pass
+
     return False
 
 
