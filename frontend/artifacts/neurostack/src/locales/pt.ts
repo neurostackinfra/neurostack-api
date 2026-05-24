@@ -114,6 +114,8 @@ export const pt: Record<TranslationKey, string> = {
   chat_trace_subtitle: "Visão diagnóstica do último ciclo de raciocínio.",
   chat_waiting: "Aguardando atividade. Envie uma mensagem para gerar um trace.",
   chat_placeholder: "Mensagem para o agente...",
+  chat_no_clinic_selected_title: "Nenhuma clínica selecionada",
+  chat_no_clinic_selected_desc: "Selecione uma clínica no menu lateral antes de usar o simulador.",
 
   // Clinic Config — Identity
   config_title: "Config. da Clínica",

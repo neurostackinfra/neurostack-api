@@ -668,6 +668,16 @@ export default function Chat() {
       return;
     }
 
+    // Guard: builder/super-admin must have a clinic selected
+    if ((isBuilder || isSuperAdmin) && !effectiveTenantId) {
+      toast({
+        title: t("chat_no_clinic_selected_title") ?? "Nenhuma clínica selecionada",
+        description: t("chat_no_clinic_selected_desc") ?? "Selecione uma clínica no menu lateral antes de usar o simulador.",
+        variant: "destructive",
+      });
+      return;
+    }
+
     const userMsg: Message = { id: Date.now().toString(), role: "user", content: input };
     setMessages((prev) => [...prev, userMsg]);
     const messageText = input;

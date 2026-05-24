@@ -168,6 +168,14 @@ async def create_session(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=error_msg,
         )
+    except HTTPException:
+        raise
+    except Exception as e:
+        _logger.error("Unexpected error creating session", error=str(e), exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create session",
+        )
 
 
 @router.get(
