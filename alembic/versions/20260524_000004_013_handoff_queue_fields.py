@@ -6,7 +6,8 @@ Create Date: 2026-05-24
 
 Adds display columns to handoff_records for the queue UI:
 - numero_whatsapp, intencao_detectada, estagio_atual, primeira_linha_mensagem, data_hora_saida
-- Composite index (tenant_id, status) for queue queries
+
+Note: idx_handoff_tenant_status already exists from migration 003. No new index created.
 """
 
 from alembic import op
@@ -43,15 +44,10 @@ def upgrade() -> None:
             nullable=True,
         ),
     )
-    op.create_index(
-        "ix_handoff_records_tenant_status",
-        "handoff_records",
-        ["tenant_id", "status"],
-    )
+    # Note: idx_handoff_tenant_status already exists from migration 003 — no duplicate created.
 
 
 def downgrade() -> None:
-    op.drop_index("ix_handoff_records_tenant_status", table_name="handoff_records")
     op.drop_column("handoff_records", "data_hora_saida")
     op.drop_column("handoff_records", "primeira_linha_mensagem")
     op.drop_column("handoff_records", "estagio_atual")

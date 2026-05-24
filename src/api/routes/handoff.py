@@ -14,7 +14,8 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func as sa_func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.middleware.auth import TenantContext, get_tenant_context
+from fastapi import Request
+from src.api.middleware.auth import TenantContext, get_tenant_context, require_builder_clinic_access
 from src.api.schemas.handoff import (
     HandoffCheckoutResponse,
     HandoffDetail,
@@ -62,6 +63,56 @@ def get_service() -> HandoffService:
 
 
 # ============================================
+# Tenant resolution (builder / super-admin override)
+# ============================================
+
+import jwt as pyjwt
+from src.config.settings import settings as _settings
+
+
+async def _resolve_queue_tenant(
+    request: Request,
+    tenant_id: UUID,
+    tenant: TenantContext,
+    db: AsyncSession,
+) -> UUID:
+    """Resolve effective tenant_id for queue endpoints.
+
+    - Clinic/API-key callers: tenant_id must match their token.
+    - Super-admins: may pass any tenant_id freely.
+    - Builders: may pass a clinic they own (validated via require_builder_clinic_access).
+    """
+    if tenant_id == tenant.tenant_id:
+        return tenant_id
+    if tenant.role == "super_admin":
+        return tenant_id
+    if tenant.role != "builder":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="tenant_mismatch")
+
+    # Extract builder_id from JWT
+    auth_header = request.headers.get("Authorization", "")
+    builder_id_str: Optional[str] = None
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        try:
+            payload = pyjwt.decode(
+                token,
+                _settings.secret_key,
+                algorithms=["HS256"],
+                options={"require": ["sub", "tenant_id", "exp"]},
+            )
+            builder_id_str = payload.get("builder_id")
+        except (pyjwt.InvalidTokenError, KeyError, ValueError):
+            pass
+
+    if not builder_id_str:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="builder_id_not_found_in_token")
+
+    builder_id = UUID(builder_id_str)
+    return await require_builder_clinic_access(tenant_id, builder_id, db)
+
+
+# ============================================
 # Queue Endpoints (DB-direct, not HandoffService)
 # ============================================
 
@@ -72,19 +123,19 @@ def get_service() -> HandoffService:
     summary="Get Handoff Queue",
 )
 async def get_handoff_queue(
+    request: Request,
     tenant_id: UUID = Query(..., description="Tenant to fetch queue for"),
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
 ) -> HandoffQueueResponse:
     """Active handoffs (pending/accepted) with aggregate stats."""
-    if tenant_id != tenant.tenant_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="tenant_mismatch")
+    effective_tenant_id = await _resolve_queue_tenant(request, tenant_id, tenant, db)
 
     # Active items
     q = (
         select(HandoffRecord)
         .where(
-            HandoffRecord.tenant_id == tenant_id,
+            HandoffRecord.tenant_id == effective_tenant_id,
             HandoffRecord.status.in_(["pending", "accepted"]),
         )
         .order_by(HandoffRecord.created_at.asc())
@@ -117,7 +168,7 @@ async def get_handoff_queue(
             sa_func.count().label("total"),
         )
         .where(
-            HandoffRecord.tenant_id == tenant_id,
+            HandoffRecord.tenant_id == effective_tenant_id,
             HandoffRecord.status == "completed",
             HandoffRecord.data_hora_saida.isnot(None),
             HandoffRecord.created_at >= thirty_days_ago,
@@ -132,7 +183,7 @@ async def get_handoff_queue(
     meta_minutes = 10
     try:
         from src.models.clinic_config_table import ClinicConfigTable
-        cfg_q = select(ClinicConfigTable).where(ClinicConfigTable.tenant_id == tenant_id)
+        cfg_q = select(ClinicConfigTable).where(ClinicConfigTable.tenant_id == effective_tenant_id)
         cfg_result = await db.execute(cfg_q)
         cfg_row = cfg_result.scalar_one_or_none()
         if cfg_row and cfg_row.handoff:
@@ -148,7 +199,7 @@ async def get_handoff_queue(
             select(sa_func.count())
             .select_from(HandoffRecord)
             .where(
-                HandoffRecord.tenant_id == tenant_id,
+                HandoffRecord.tenant_id == effective_tenant_id,
                 HandoffRecord.status == "completed",
                 HandoffRecord.data_hora_saida.isnot(None),
                 HandoffRecord.created_at >= thirty_days_ago,
@@ -172,6 +223,7 @@ async def get_handoff_queue(
     summary="Checkout Handoff",
 )
 async def checkout_handoff(
+    request: Request,
     handoff_id: UUID,
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
@@ -183,8 +235,10 @@ async def checkout_handoff(
 
     if not record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="handoff_not_found")
-    if record.tenant_id != tenant.tenant_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="handoff_not_found")
+
+    # Allow builder/super-admin to check out handoffs for clinics they manage
+    await _resolve_queue_tenant(request, record.tenant_id, tenant, db)
+
     if record.data_hora_saida is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="already_completed")
 
@@ -215,6 +269,7 @@ async def checkout_handoff(
     summary="Export Handoffs CSV",
 )
 async def export_handoffs_csv(
+    request: Request,
     tenant_id: UUID = Query(..., description="Tenant ID"),
     from_date: Optional[date] = Query(None, description="Start date (default: 30 days ago)"),
     to_date: Optional[date] = Query(None, description="End date (default: today)"),
@@ -222,8 +277,7 @@ async def export_handoffs_csv(
     db: AsyncSession = Depends(get_db_session_dependency),
 ) -> StreamingResponse:
     """Export completed handoffs as CSV with UTF-8 BOM."""
-    if tenant_id != tenant.tenant_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="tenant_mismatch")
+    effective_tenant_id = await _resolve_queue_tenant(request, tenant_id, tenant, db)
 
     today = date.today()
     effective_to = to_date or today
@@ -238,7 +292,7 @@ async def export_handoffs_csv(
     q = (
         select(HandoffRecord)
         .where(
-            HandoffRecord.tenant_id == tenant_id,
+            HandoffRecord.tenant_id == effective_tenant_id,
             HandoffRecord.status == "completed",
             HandoffRecord.data_hora_saida.isnot(None),
             sa_func.date(HandoffRecord.data_hora_saida) >= effective_from,
