@@ -603,6 +603,19 @@ class NormalTemplate(BaseTemplate):
         agent_name = variables.custom.get("agent_name", "assistente")
         clinic_name = variables.custom.get("clinic_name", "nossa clínica")
 
+        # Scheduling handoff confirmation pending: ask user to confirm, do NOT announce transfer yet
+        if variables.custom.get("handoff_confirmation_pending"):
+            parts.append(
+                "\n## AÇÃO OBRIGATÓRIA — CONFIRMAÇÃO DE ENCAMINHAMENTO\n"
+                "O usuário forneceu dados de agendamento. Você deve **perguntar se ele confirma o encaminhamento** "
+                "para a equipe humana antes de fazer qualquer transferência.\n"
+                "- Faça apenas UMA pergunta curta e direta, como: "
+                "\"Posso encaminhar você para nossa equipe de agendamento agora?\"\n"
+                "- **NÃO anuncie a transferência ainda** — aguarde a resposta do usuário.\n"
+                "- Se ele disser sim: a próxima mensagem acionará o encaminhamento.\n"
+                "- Se ele disser não: continue a conversa normalmente sem mencionar transferência.\n"
+            )
+
         # Jornada do usuário no funil (contexto principal para condução)
         if variables.user_journey:
             journey_section = TemplateSection("Jornada do Usuário no Funil")

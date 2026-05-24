@@ -238,6 +238,9 @@ class HandoffResult(BaseModel):
     summary: Optional[str] = None
     sector: Optional[str] = None  # agendamento, financeiro, gerencia, administrativo, clinico, urgencia, fidelizacao
     sla: Optional[str] = None  # imediato, prioritario, rotina
+    # Two-step scheduling confirmation flow
+    confirmation_pending: bool = False   # ask user to confirm before triggering handoff
+    scheduling_cancelled: bool = False   # user declined — clear scheduling_interest flag
 
 
 class RagResult(BaseModel):
