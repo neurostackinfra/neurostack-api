@@ -208,11 +208,10 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"^(sim|ok|pode|confirmo|confirmado|certo|correto|isso|exato)\s*[!.]?\s*$",
             r"\b(sim|ok)\b.*\b(pode|confirmo)\b",
             r"\b(está|ta|tá)\b.*\b(bom|ótimo|otimo|perfeito|certo)\b",
-            # "pode confirmar" — user confirming after agent asked for name/time
-            r"\b(pode|podes|pode sim)\s+confirmar\b",
-            # "confirmar" + "sim" anywhere in message
-            r"\bconfirmar\b.*\b(sim|ok|pode|isso|certo)\b",
-            r"\b(sim|ok|isso|certo)\b.*\bconfirmar\b",
+            # "pode confirmar" — user confirming after agent asked for name/time.
+            # Anchored to end-of-utterance: "pode confirmar a disponibilidade?" does NOT match
+            # (has trailing content after "confirmar"); "...e pode confirmar" DOES match.
+            r"\b(pode|podes|pode sim)\s+confirmar[!?.]?\s*$",
         ],
         "keywords": ["sim", "ok", "confirmo", "confirmado", "certo", "correto", "perfeito"],
         "weight": 0.9,
