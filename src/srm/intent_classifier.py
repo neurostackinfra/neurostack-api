@@ -459,10 +459,12 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(encaminh(ar|e|a|asse|em))\b.*\b(equipe|atendente|pessoa|agendamento|secretaria)\b",
             r"\b(gostaria|quero|preciso)\b.*\b(encaminh)\b",
             r"\bme encaminh(e|ar|em)\b",
-            # Bare "pode encaminhar" or "encaminhar" + urgency/timing — context-implied handoff
-            # e.g. "pode encaminhar agora", "encaminha já", "encaminhar então"
-            r"\b(pode|podes|poderia|podia)\b.*\bencaminh(ar|a|e)\b",
-            r"\bencaminh(ar|a|e)\b.*\b(agora|já|ja|direto|logo|então|entao|sim)\b",
+            # "pode encaminhar agora/?" — context-implied handoff, timing must follow directly
+            # Requires ? or timing word immediately after encaminhar (no object in between)
+            # Prevents: "pode encaminhar meu exame agora?" from being an escalation
+            r"\b(pode|podes|poderia|podia)\b.*\bencaminh(ar|a|e)\b(?:\s*\?|\s+(?:agora|já|ja|logo|direto|então|entao))",
+            # "encaminha agora", "encaminhar já" — timing word required (NOT "sim" — that's a confirmation)
+            r"\bencaminh(ar|a|e)\b.*\b(agora|já|ja|direto|logo|então|entao)\b",
         ],
         "keywords": ["atendente humano", "humano", "pessoa real", "não robô",
                       "falar com alguém", "transfere"],
