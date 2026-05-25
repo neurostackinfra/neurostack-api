@@ -279,16 +279,17 @@ Objetivo: Retomar intenção, resolver objeções, conduzir para agendamento.
     "agendamento_solicitado": """
 ## Instruções para Agendamento Solicitado
 
-Objetivo: Coletar nome completo, preferência de horário e encaminhar.
+Objetivo: Coletar nome completo e preferência de horário, confirmar com o paciente, e só então encaminhar.
 
 ### Sequência:
 1. Pergunte **nome completo** e preferência de dia/horário juntos:
    - Se já sabe o primeiro nome: "[Nome], pode me passar seu nome completo para o agendamento? E qual dia e horário ficam melhores para você?"
    - Se não sabe: "Para o agendamento, pode me passar seu nome completo? E qual dia e horário ficam melhores para você?"
-2. Só encaminhe para a equipe quando tiver **ambas** as informações: nome completo E preferência de dia/horário.
-   - Se o paciente forneceu apenas o nome e não mencionou dia/horário: "Ótimo! E qual dia e horário ficam melhores para você?"
-   - Se o paciente forneceu apenas o dia/horário e não o nome: "Pode me passar seu nome completo para confirmar o agendamento?"
-   - Quando tiver os dois: agradeça e encaminhe para a equipe de agendamento.
+2. Só siga para o passo 3 quando tiver **ambas** as informações: nome completo E preferência de dia/horário.
+   ⚠️ Nome sem dia/horário NÃO conta como "ambas": se o paciente não mencionou nenhum dia, período ou horário, pergunte OBRIGATORIAMENTE: "Ótimo! E qual dia e horário ficam melhores para você?"
+   - Se o paciente forneceu apenas o dia/horário e não o nome: "Pode me passar seu nome completo?"
+3. Quando tiver os dois, pergunte APENAS: "Posso encaminhar você para nossa equipe de agendamento agora?"
+   NUNCA diga "Vou encaminhar", NUNCA diga "está disponível", NUNCA confirme o agendamento — o sistema cuida do encaminhamento após a confirmação do paciente.
 
 ### Reagendamento:
 - Se o paciente quer mudar: "Qual novo horário seria melhor para você?"
@@ -458,16 +459,17 @@ Goal: Resume intent, resolve objections, guide to scheduling.
     "agendamento_solicitado": """
 ## Instructions for Scheduling Requested
 
-Goal: Collect full name, time preference, and hand off.
+Goal: Collect full name and time preference, confirm with the patient, then hand off.
 
 ### Sequence:
 1. Ask for **full name** and preferred day/time together:
    - If you already know the first name: "[Name], could you share your full name for the appointment? And what day and time work best for you?"
    - If you don't know: "For the appointment, could you share your full name? And what day and time work best for you?"
-2. Only hand off to the scheduling team when you have **both**: full name AND day/time preference.
-   - If the patient gave only their name but no day/time: "Great! And what day and time work best for you?"
-   - If the patient gave only a day/time but no name: "Could you share your full name to confirm the appointment?"
-   - When you have both: thank them and hand off to the scheduling team.
+2. Only move to step 3 when you have **both**: full name AND day/time preference.
+   ⚠️ A name with no day/time does NOT count as "both": if the patient mentioned no day, period, or time, ask MANDATORY: "Great! And what day and time work best for you?"
+   - If the patient gave only a day/time but no name: "Could you share your full name?"
+3. When you have both, ask ONLY: "Can I connect you with our scheduling team now?"
+   NEVER say "I'll connect you", NEVER say "that time is available", NEVER confirm the appointment — the system handles the transfer after the patient confirms.
 
 ### Rescheduling:
 - If the patient wants to change: "What new time would work best for you?"
