@@ -609,19 +609,6 @@ class NormalTemplate(BaseTemplate):
         agent_name = variables.custom.get("agent_name", "assistente")
         clinic_name = variables.custom.get("clinic_name", "nossa clínica")
 
-        # Scheduling handoff confirmation pending: ask user to confirm, do NOT announce transfer yet
-        if variables.custom.get("handoff_confirmation_pending"):
-            parts.append(
-                "\n## AÇÃO OBRIGATÓRIA — CONFIRMAÇÃO DE ENCAMINHAMENTO\n"
-                "O usuário forneceu dados de agendamento. Você deve **perguntar se ele confirma o encaminhamento** "
-                "para a equipe humana antes de fazer qualquer transferência.\n"
-                "- Faça apenas UMA pergunta curta e direta, como: "
-                "\"Posso encaminhar você para nossa equipe de agendamento agora?\"\n"
-                "- **NÃO anuncie a transferência ainda** — aguarde a resposta do usuário.\n"
-                "- Se ele disser sim: a próxima mensagem acionará o encaminhamento.\n"
-                "- Se ele disser não: continue a conversa normalmente sem mencionar transferência.\n"
-            )
-
         # Jornada do usuário no funil (contexto principal para condução)
         if variables.user_journey:
             journey_section = TemplateSection("Jornada do Usuário no Funil")
@@ -669,6 +656,28 @@ class NormalTemplate(BaseTemplate):
         clinic_info = self._build_clinic_context(variables)
         if clinic_info:
             parts.append(clinic_info)
+
+        # Scheduling handoff confirmation pending — injected LAST so it overrides
+        # all funnel/intent instructions above (recency = highest LLM priority).
+        # When this flag is set, the LLM must ask ONE short confirmation question
+        # and do nothing else — regardless of what the funnel stage says.
+        if variables.custom.get("handoff_confirmation_pending"):
+            parts.append(
+                "\n## ⚠️ AÇÃO OBRIGATÓRIA — SOBRESCREVE TODAS AS INSTRUÇÕES ACIMA\n"
+                "Você já coletou nome completo e preferência de horário. "
+                "Antes de encaminhar, DEVE confirmar com o paciente.\n\n"
+                "**Sua resposta deve conter SOMENTE esta pergunta:**\n"
+                "\"Posso te encaminhar para nossa equipe de agendamento agora?\"\n\n"
+                "**ESTRITAMENTE PROIBIDO na sua resposta:**\n"
+                "- NÃO diga que o horário 'está confirmado' ou 'agendado' — "
+                "você NÃO tem acesso à agenda da clínica.\n"
+                "- NÃO pergunte sobre documentos, informações adicionais, preparo ou qualquer outro assunto.\n"
+                "- NÃO repita o horário ou nome do paciente antes da pergunta.\n"
+                "- NÃO adicione nenhuma outra frase antes ou depois da pergunta acima.\n"
+                "- NÃO anuncie a transferência — aguarde a resposta do paciente.\n"
+                "- Se ele confirmar: o sistema fará o encaminhamento automaticamente.\n"
+                "- Se ele recusar: continue a conversa normalmente.\n"
+            )
 
         # Language override: appended last so it has highest priority.
         # The funnel instructions above contain Portuguese examples — this
