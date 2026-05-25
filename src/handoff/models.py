@@ -302,31 +302,32 @@ class HandoffServiceConfig(BaseModel):
     # Timeout settings
     handoff_timeout_minutes: int = Field(default=30, ge=5, le=180)
     
-    # Messages
+    # Messages — REGRA: nunca mencionar "humano", "atendente humano" ou "transferir".
+    # Sempre usar "nossa equipe", "equipe especializada" ou "setor especializado".
     default_handoff_messages: dict[str, str] = Field(default_factory=lambda: {
         HandoffReason.USER_REQUEST.value: (
-            "Entendi! Vou transferir você para um atendente humano. "
-            "Por favor, aguarde um momento."
+            "Claro! Vou encaminhar você para nossa equipe agora. "
+            "Em breve alguém dará continuidade ao seu atendimento."
         ),
         HandoffReason.SAFETY_CONCERN.value: (
-            "Para sua segurança, vou encaminhar você para um atendimento especializado. "
+            "Para garantir sua segurança e o melhor cuidado possível, vou encaminhar para nossa equipe especializada. "
             "Um profissional entrará em contato em breve."
         ),
         HandoffReason.MAX_TURNS_EXCEEDED.value: (
-            "Parece que posso ajudá-lo melhor com um atendimento humano. "
-            "Vou transferir você para um de nossos atendentes."
+            "Para te ajudar ainda melhor, vou encaminhar para o setor da nossa equipe "
+            "que poderá dar continuidade ao seu atendimento."
         ),
         HandoffReason.LOW_CONFIDENCE.value: (
-            "Para garantir que você receba a melhor ajuda, "
-            "vou transferir para um atendente especializado."
+            "Para garantir que você receba a orientação mais completa, "
+            "vou encaminhar para nossa equipe especializada."
         ),
         HandoffReason.ESCALATION.value: (
-            "Entendo sua situação. Vou encaminhar para um supervisor "
-            "que poderá ajudá-lo melhor."
+            "Entendo a sua situação. Vou encaminhar para o setor responsável "
+            "da nossa equipe, que poderá ajudá-lo da melhor forma."
         ),
         HandoffReason.COMPLEX_QUERY.value: (
-            "Essa é uma questão que requer atenção especial. "
-            "Vou transferir para um especialista."
+            "Essa questão merece uma atenção mais detalhada. "
+            "Vou encaminhar para a nossa equipe especializada."
         ),
         HandoffReason.SCHEDULING.value: (
             "Vou te encaminhar para a nossa equipe, que dará seguimento "
