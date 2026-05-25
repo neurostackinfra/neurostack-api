@@ -558,9 +558,67 @@ class NormalTemplate(BaseTemplate):
         super().__init__(PromptMode.NORMAL)
 
     def build_system_message(self, variables: PromptVariables):
-        """Override to append emoji and language overrides as the absolute last instructions."""
+        """Override to append scheduling confirmation, emoji, and language as absolute last instructions."""
         msg = super().build_system_message(variables)
-        # Emoji directive — appended last so it has highest priority
+
+        # Scheduling handoff confirmation — injected here so it comes AFTER
+        # get_constraints / get_safety_reminders / _get_response_format_reminder
+        # (all of which are assembled inside super().build_system_message).
+        # Language-specific text avoids contradicting the language override below.
+        if variables.custom.get("handoff_confirmation_pending"):
+            lang = variables.language or "pt-BR"
+            if lang == "en":
+                _q  = "Can I connect you with our scheduling team now?"
+                _no_confirm = "Do NOT say the time 'is confirmed' or 'scheduled' — you do NOT have access to the clinic calendar."
+                _no_docs    = "Do NOT ask about documents, additional information, or any other topic."
+                _no_extra   = "Do NOT add any other sentence before or after the question above."
+                _no_ann     = "Do NOT announce the transfer — wait for the patient's response."
+                _sys_yes    = "If they confirm: the system handles the transfer automatically."
+                _sys_no     = "If they decline: continue the conversation normally."
+                _header     = "⚠️ MANDATORY ACTION — OVERRIDES ALL PREVIOUS INSTRUCTIONS"
+                _collected  = "You have already collected the full name and time preference. Before forwarding, you MUST confirm with the patient."
+                _label      = "Your response must contain ONLY this question:"
+                _prohib     = "STRICTLY PROHIBITED in your response:"
+            elif lang == "es":
+                _q  = "¿Puedo comunicarte con nuestro equipo de citas ahora?"
+                _no_confirm = "NO digas que el horario 'está confirmado' o 'agendado' — NO tienes acceso al calendario de la clínica."
+                _no_docs    = "NO preguntes sobre documentos, información adicional ni ningún otro tema."
+                _no_extra   = "NO añadas ninguna otra frase antes o después de la pregunta."
+                _no_ann     = "NO anuncies la transferencia — espera la respuesta del paciente."
+                _sys_yes    = "Si confirma: el sistema gestiona la transferencia automáticamente."
+                _sys_no     = "Si rechaza: continúa la conversación normalmente."
+                _header     = "⚠️ ACCIÓN OBLIGATORIA — ANULA TODAS LAS INSTRUCCIONES ANTERIORES"
+                _collected  = "Ya recopilaste el nombre completo y la preferencia de horario. Antes de derivar, DEBES confirmar con el paciente."
+                _label      = "Tu respuesta debe contener ÚNICAMENTE esta pregunta:"
+                _prohib     = "ESTRICTAMENTE PROHIBIDO en tu respuesta:"
+            else:  # pt-BR default
+                _q  = "Posso te encaminhar para nossa equipe de agendamento agora?"
+                _no_confirm = "NÃO diga que o horário 'está confirmado' ou 'agendado' — você NÃO tem acesso à agenda da clínica."
+                _no_docs    = "NÃO pergunte sobre documentos, informações adicionais, preparo ou qualquer outro assunto."
+                _no_extra   = "NÃO adicione nenhuma outra frase antes ou depois da pergunta acima."
+                _no_ann     = "NÃO anuncie a transferência — aguarde a resposta do paciente."
+                _sys_yes    = "Se ele confirmar: o sistema fará o encaminhamento automaticamente."
+                _sys_no     = "Se ele recusar: continue a conversa normalmente."
+                _header     = "⚠️ AÇÃO OBRIGATÓRIA — SOBRESCREVE TODAS AS INSTRUÇÕES ANTERIORES"
+                _collected  = "Você já coletou nome completo e preferência de horário. Antes de encaminhar, DEVE confirmar com o paciente."
+                _label      = "Sua resposta deve conter SOMENTE esta pergunta:"
+                _prohib     = "ESTRITAMENTE PROIBIDO na sua resposta:"
+
+            msg.content += (
+                f"\n\n## {_header}\n"
+                f"{_collected}\n\n"
+                f"**{_label}**\n"
+                f"\"{_q}\"\n\n"
+                f"**{_prohib}**\n"
+                f"- {_no_confirm}\n"
+                f"- {_no_docs}\n"
+                f"- {_no_extra}\n"
+                f"- {_no_ann}\n"
+                f"- {_sys_yes}\n"
+                f"- {_sys_no}\n"
+            )
+
+        # Emoji directive — appended after confirmation block
         if variables.custom.get("use_emojis"):
             msg.content += (
                 "\n\n## EMOJI INSTRUCTION (MANDATORY)\n"
@@ -656,28 +714,6 @@ class NormalTemplate(BaseTemplate):
         clinic_info = self._build_clinic_context(variables)
         if clinic_info:
             parts.append(clinic_info)
-
-        # Scheduling handoff confirmation pending — injected LAST so it overrides
-        # all funnel/intent instructions above (recency = highest LLM priority).
-        # When this flag is set, the LLM must ask ONE short confirmation question
-        # and do nothing else — regardless of what the funnel stage says.
-        if variables.custom.get("handoff_confirmation_pending"):
-            parts.append(
-                "\n## ⚠️ AÇÃO OBRIGATÓRIA — SOBRESCREVE TODAS AS INSTRUÇÕES ACIMA\n"
-                "Você já coletou nome completo e preferência de horário. "
-                "Antes de encaminhar, DEVE confirmar com o paciente.\n\n"
-                "**Sua resposta deve conter SOMENTE esta pergunta:**\n"
-                "\"Posso te encaminhar para nossa equipe de agendamento agora?\"\n\n"
-                "**ESTRITAMENTE PROIBIDO na sua resposta:**\n"
-                "- NÃO diga que o horário 'está confirmado' ou 'agendado' — "
-                "você NÃO tem acesso à agenda da clínica.\n"
-                "- NÃO pergunte sobre documentos, informações adicionais, preparo ou qualquer outro assunto.\n"
-                "- NÃO repita o horário ou nome do paciente antes da pergunta.\n"
-                "- NÃO adicione nenhuma outra frase antes ou depois da pergunta acima.\n"
-                "- NÃO anuncie a transferência — aguarde a resposta do paciente.\n"
-                "- Se ele confirmar: o sistema fará o encaminhamento automaticamente.\n"
-                "- Se ele recusar: continue a conversa normalmente.\n"
-            )
 
         # Language override: appended last so it has highest priority.
         # The funnel instructions above contain Portuguese examples — this
