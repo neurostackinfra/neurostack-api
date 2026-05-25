@@ -357,40 +357,42 @@ class HandoffDecider:
         if not result.required:
             return ""
         
+        # REGRA: Nunca mencionar "humano", "atendente humano" ou "transferir".
+        # Sempre usar "nossa equipe", "equipe especializada" ou "setor especializado".
         messages = {
             HandoffReason.USER_REQUEST: (
-                "Entendi! Vou transferir voc\u00ea para um atendente humano. "
-                "Por favor, aguarde um momento."
+                "Claro! Vou encaminhar voc\u00ea para nossa equipe agora. "
+                "Em breve algu\u00e9m dar\u00e1 continuidade ao seu atendimento."
             ),
             HandoffReason.SAFETY_CONCERN: (
-                "Para sua seguran\u00e7a, vou encaminhar voc\u00ea para um atendimento especializado. "
+                "Para garantir o melhor cuidado para voc\u00ea, vou encaminhar para nossa equipe especializada. "
                 "Um profissional entrar\u00e1 em contato em breve."
             ),
             HandoffReason.MAX_TURNS_EXCEEDED: (
-                "Parece que posso ajud\u00e1-lo melhor com um atendimento humano. "
-                "Vou transferir voc\u00ea para um de nossos atendentes."
+                "Para te ajudar ainda melhor, vou encaminhar para o setor da nossa equipe "
+                "que poder\u00e1 dar continuidade ao seu atendimento."
             ),
             HandoffReason.LOW_CONFIDENCE: (
-                "Para garantir que voc\u00ea receba a melhor ajuda, "
-                "vou transferir para um atendente especializado."
+                "Para garantir que voc\u00ea receba a orienta\u00e7\u00e3o mais completa, "
+                "vou encaminhar para nossa equipe especializada."
             ),
             HandoffReason.ESCALATION: (
-                "Entendo sua situa\u00e7\u00e3o. Vou encaminhar para um supervisor "
-                "que poder\u00e1 ajud\u00e1-lo melhor."
+                "Entendo a sua situa\u00e7\u00e3o. Vou encaminhar para o setor respons\u00e1vel "
+                "da nossa equipe, que poder\u00e1 ajud\u00e1-lo da melhor forma."
             ),
             HandoffReason.COMPLEX_QUERY: (
-                "Essa \u00e9 uma quest\u00e3o que requer aten\u00e7\u00e3o especial. "
-                "Vou transferir para um especialista."
+                "Essa quest\u00e3o merece uma aten\u00e7\u00e3o mais detalhada. "
+                "Vou encaminhar para a nossa equipe especializada."
             ),
             HandoffReason.SCHEDULING: (
                 "Vou te encaminhar para a nossa equipe, que dar\u00e1 seguimento "
                 "e verificar\u00e1 os melhores hor\u00e1rios dispon\u00edveis para voc\u00ea."
             ),
         }
-        
+
         return messages.get(
             result.reason,
-            "Vou transferir voc\u00ea para um atendente humano."
+            "Vou encaminhar voc\u00ea para nossa equipe, que dar\u00e1 continuidade ao seu atendimento."
         )
 
 
