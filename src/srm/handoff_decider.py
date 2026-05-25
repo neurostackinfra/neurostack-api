@@ -174,9 +174,12 @@ class HandoffDecider:
 
         # Priority 4: Scheduling — three-step flow with explicit confirmation
         # Step 1 (scheduling_interest not set): LLM collects name + day/time, no handoff
-        # Step 2 (scheduling_interest set, confirmation NOT pending): ask for confirmation
+        # Step 2 (scheduling_interest + scheduling_has_time both set): ask for confirmation
+        #   — gated on scheduling_has_time so a bare name reply ("me chamo Ana") doesn't
+        #     prematurely fire the confirmation prompt before a time preference is given.
         # Step 3 (handoff_confirmation_pending set): user replies yes/no → act accordingly
         already_collecting = flags.get("scheduling_interest", False)
+        has_time = flags.get("scheduling_has_time", False)
         confirmation_pending = flags.get("handoff_confirmation_pending", False)
         is_scheduling = intent in ("agendar", "reagendar", "cancelar") or intent_category == IntentCategory.SCHEDULING
 
@@ -197,8 +200,8 @@ class HandoffDecider:
             # Ambiguous answer — keep confirmation pending
             return HandoffResult(required=False, confirmation_pending=True)
 
-        if already_collecting or (is_scheduling and intent in ("reagendar", "cancelar")):
-            # Data collected, now ask for confirmation before handing off
+        if (already_collecting and has_time) or (is_scheduling and intent in ("reagendar", "cancelar")):
+            # Both scheduling interest and a time preference are present → ask for confirmation
             return HandoffResult(required=False, confirmation_pending=True)
 
         # Priority 5: Escalation keywords → gerencia

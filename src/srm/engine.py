@@ -20,12 +20,26 @@ from src.srm.models import (
     ActionType,
     HandoffReason,
 )
+import re
+
 from src.srm.intent_classifier import IntentClassifier, get_intent_classifier
 from src.srm.funnel_detector import FunnelDetector, get_funnel_detector
 from src.srm.safety_detector import SafetyDetector, get_safety_detector
 from src.srm.handoff_decider import HandoffDecider, get_handoff_decider
 from src.srm.rag_decider import RagDecider, get_rag_decider
 from src.srm.models import SentimentLabel
+
+# Detects a day-of-week or time-of-day reference in a scheduling message.
+# Used to gate handoff_confirmation_pending: we only ask "can I forward you?"
+# once the user has provided a time preference — not just their name.
+_SCHEDULING_HAS_TIME_RE = re.compile(
+    r"\b(segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado|domingo|amanh[aã]|hoje)\b"
+    r"|\b\d{1,2}\s*h\b"          # 9h, 10h
+    r"|\b\d{1,2}:\d{2}\b"        # 9:00, 14:30
+    r"|\b([aà]s?)\s+\d{1,2}\b"   # às 9, as 9
+    r"|\b(manh[aã]|tarde|noite|madrugada)\b",
+    re.IGNORECASE | re.UNICODE,
+)
 
 
 # ============================================
@@ -222,6 +236,7 @@ class SRMEngine:
             funnel_result=funnel_result,
             safety_result=safety_result,
             action=action,
+            message=input_data.message,
         )
         # Scheduling confirmation flow: propagate pending/cancelled flags
         if handoff_result.confirmation_pending:
@@ -229,12 +244,14 @@ class SRMEngine:
         if handoff_result.scheduling_cancelled:
             state_patch.flags["handoff_confirmation_pending"] = False
             state_patch.flags["scheduling_interest"] = False
-        # P2a/P2-fix: when handoff fires, clear both confirmation flags so a resumed
+            state_patch.flags["scheduling_has_time"] = False
+        # P2a/P2-fix: when handoff fires, clear all scheduling flags so a resumed
         # session (e.g. after handoff-pause expires) starts fresh instead of
         # re-entering the confirmation step.
         if handoff_result.required:
             state_patch.flags["handoff_confirmation_pending"] = False
             state_patch.flags["scheduling_interest"] = False
+            state_patch.flags["scheduling_has_time"] = False
 
         # Step 9: Generate reasoning
         reasoning = self._generate_reasoning(
@@ -384,6 +401,7 @@ class SRMEngine:
         funnel_result,
         safety_result,
         action: ActionType,
+        message: str = "",
     ) -> StatePatch:
         """Generate state changes to apply to session (UserState doc)."""
         patch = StatePatch(
@@ -403,14 +421,19 @@ class SRMEngine:
             patch.flags[f"safety_{safety_result.category.value}"] = True
 
         # Update slots and flags (incl. objection_active, authority_done)
-        self._extract_slots(intent_result.intent, patch)
+        self._extract_slots(intent_result.intent, patch, message)
 
         return patch
 
-    def _extract_slots(self, intent: str, patch: StatePatch) -> None:
+    def _extract_slots(self, intent: str, patch: StatePatch, message: str = "") -> None:
         """Extract slot updates based on intent (official 29 intents)."""
         if intent == "agendar":
             patch.flags["scheduling_interest"] = True
+            # Track whether the user has mentioned a specific day/time.
+            # HandoffDecider gates the confirmation prompt on this flag so we
+            # don't ask "Can I forward you?" before collecting the time preference.
+            if _SCHEDULING_HAS_TIME_RE.search(message):
+                patch.flags["scheduling_has_time"] = True
         if intent == "pedido_preco":
             patch.constraints.append("C_SEQUENCE_AUTHORITY_BEFORE_PRICE")
         if intent == "confirmar_presenca":

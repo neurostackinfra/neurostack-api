@@ -149,7 +149,7 @@ INTENT_DEFINITIONS: dict[str, dict] = {
         "patterns": [
             r"\b(agendar|marcar|reservar)\b.*\b(consulta|horário|horario|atendimento|sessão|sessao|avaliação|avaliaçao|procedimento)\b",
             r"\b(quero|preciso|gostaria)\b.*\b(agendar|marcar)\b",
-            r"\b(têm?|há|ha)\b.*\b(horário|horario|vaga|disponibilidade)\b.*\b(disponível|disponivel|livre)?\b",
+            r"\b(tem|têm?|há|ha)\b.*\b(horário|horario|vaga|disponibilidade)\b.*\b(disponível|disponivel|livre)?\b",
             r"\b(agenda)\b",  # bare "agenda" is scheduling-specific
             # Date-specific availability asks (without tem/têm): "qual a disponibilidade para segunda?"
             r"\b(disponibilidade)\b.*\b(para|pra|hoje|amanhã|amanha|segunda|terça|terca|quarta|quinta|sexta|sábado|sabado|domingo)\b",
@@ -178,7 +178,7 @@ INTENT_DEFINITIONS: dict[str, dict] = {
                       "agenda", "disponível", "fim de semana", "sábado",
                       "sabado", "domingo"],
         # NOTE: "disponibilidade" removed from keywords — belongs to disponibilidade_horarios.
-        # "tem disponibilidade?" is still captured by pattern line above (tem|há.*disponibilidade).
+        # "tem disponibilidade?" is captured by the tem|têm?|há pattern above.
         "weight": 1.0,
     },
     "reagendar": {
