@@ -582,14 +582,16 @@ class EventService:
         # If handoff is required, append the handoff user message to the response.
         # When language is EN, use English fallback instead of the PT template message.
         if result.handoff_required:
+            # RULE: Never say "human agent", "transfer to human", or expose AI.
+            # Always use "our team", "our specialist team", or "the right department".
             EN_HANDOFF_MESSAGES = {
-                "user_request":        "I'll transfer you to a human agent right away. Is there anything specific they should know?",
-                "safety_concern":      "For your safety, I'm connecting you with a specialist. Someone will be in touch shortly.",
-                "max_turns_exceeded":  "Let me connect you with one of our team members who can better assist you.",
-                "low_confidence":      "To ensure you get the best help, I'm transferring you to a specialist.",
-                "escalation":          "I understand your situation. I'm escalating this to a supervisor who can help you.",
-                "complex_query":       "This requires special attention. I'm transferring you to a specialist.",
-                "scheduling":          "I'll connect you with our team to confirm the best available times for you.",
+                "user_request":        "Of course! I'll connect you with our team right away. Someone will follow up with you shortly.",
+                "safety_concern":      "To make sure you get the best care, I'll connect you with our specialist team. Someone will be in touch soon.",
+                "max_turns_exceeded":  "To give you the best support, I'll connect you with the right department on our team.",
+                "low_confidence":      "To make sure you get the most complete guidance, I'll connect you with our specialist team.",
+                "escalation":          "I understand your situation. I'll connect you with the right team who can help you in the best way.",
+                "complex_query":       "This deserves more detailed attention. I'll connect you with our specialist team.",
+                "scheduling":          "I'll connect you with our team, who will follow up and confirm the best available times for you.",
             }
             handoff_msg = result.handoff_user_message or ""
             if language_code == "en" and handoff_msg:
