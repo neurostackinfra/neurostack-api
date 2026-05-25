@@ -595,8 +595,8 @@ class EventService:
             }
             handoff_msg = result.handoff_user_message or ""
             if language_code == "en" and handoff_msg:
-                # Derive reason from handoff_summary if available
-                handoff_reason = (result.handoff_summary or {}).get("reason", "escalation")
+                # Use top-level handoff_reason field (handoff_summary only carries id/status/summary/urgency/sector/sla)
+                handoff_reason = result.handoff_reason or "escalation"
                 handoff_msg = EN_HANDOFF_MESSAGES.get(handoff_reason, EN_HANDOFF_MESSAGES["escalation"])
             if handoff_msg:
                 if suggested_response:

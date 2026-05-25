@@ -398,7 +398,7 @@ class HandoffService:
         """Get user-facing message for handoff."""
         return self.config.default_handoff_messages.get(
             reason.value,
-            "Vou transferir você para um atendente humano.",
+            "Vou encaminhar você para nossa equipe, que dará continuidade ao seu atendimento.",
         )
 
     # ============================================
