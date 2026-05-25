@@ -773,18 +773,26 @@ class NormalTemplate(BaseTemplate):
         if custom.get("differentials"):
             section.add(f"**Diferenciais:** {custom['differentials']}")
         # Pricing policy — two clear states: PODE_FALAR (yes) or NÃO_PODE_FALAR (else).
-        # pricing_mode legacy values (RANGE_ALLOWED, EXACT_ALLOWED) map to PODE_FALAR;
-        # CONSULT_ONLY maps to NÃO_PODE_FALAR.
+        # pricing_mode values are normalised to lower-case (pipeline sends range_allowed /
+        # exact_allowed / consult_only).  provide_prices=yes always means exact_allowed.
         provide_prices = custom.get("provide_prices")
-        pricing_mode = custom.get("pricing_mode", "")
-        can_share_price = (
+        pricing_mode = str(custom.get("pricing_mode", "")).lower().strip()
+        is_range_allowed  = pricing_mode == "range_allowed"
+        is_exact_allowed  = (
             provide_prices in (True, "yes", "true", "True")
-            or pricing_mode in ("RANGE_ALLOWED", "EXACT_ALLOWED")
+            or pricing_mode == "exact_allowed"
         )
+        can_share_price = is_range_allowed or is_exact_allowed
+
         if can_share_price:
+            price_detail = (
+                "informe a **faixa de preço** (não o valor exato) conforme configurado"
+                if is_range_allowed
+                else "informe o **valor exato** conforme configurado"
+            )
             section.add(
-                "**Política de preço [PODE_FALAR]:** "
-                "Se o paciente perguntar sobre preço, informe o valor exato conforme configurado. "
+                f"**Política de preço [PODE_FALAR]:** "
+                f"Se o paciente perguntar sobre preço, {price_detail}. "
                 "ATENÇÃO — SOMENTE quando o paciente solicitar diretamente. "
                 "NUNCA mencione preço de forma espontânea, mesmo tendo permissão: "
                 "comercialmente é mais eficaz o paciente descobrir o preço na consulta presencial. "
@@ -955,8 +963,9 @@ class NormalTemplate(BaseTemplate):
 
 1. **Gere autoridade**: mencione brevemente os diferenciais e a qualidade do atendimento.
 
-2a. **Se PODE_FALAR (provide_prices = yes):**
-    Informe o valor exato conforme configurado no Clinic Config.
+2a. **Se PODE_FALAR:**
+    - Se pricing_mode = exact_allowed ou provide_prices = yes → informe o **valor exato** conforme configurado no Clinic Config.
+    - Se pricing_mode = range_allowed → informe a **faixa de preço** (não o valor exato).
 
 2b. **Se NÃO_PODE_FALAR (provide_prices = no ou ausente):**
     Diga: "O orçamento é definido individualmente na consulta — cada caso é único
