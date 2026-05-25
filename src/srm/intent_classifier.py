@@ -473,7 +473,7 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(tem como falar)\b.*\b(pessoa|humano|alguém|alguem)\b",
             # "encaminhar pra equipe / atendente / agendamento" — user asking for handoff
             r"\b(encaminh(ar|e|a|asse|em))\b.*\b(equipe|atendente|pessoa|agendamento|secretaria)\b",
-            r"\b(gostaria|quero|preciso)\b.*\b(encaminh)\b",
+            r"\b(gostaria|quero|preciso)\b.*\bencaminh",
             r"\bme encaminh(e|ar|em)\b",
             # "pode encaminhar agora/?" — context-implied handoff, timing must follow directly
             # Requires ? or timing word immediately after encaminhar (no object in between)

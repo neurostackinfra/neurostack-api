@@ -37,7 +37,9 @@ _SCHEDULING_HAS_TIME_RE = re.compile(
     r"|\b\d{1,2}\s*h\b"          # 9h, 10h
     r"|\b\d{1,2}:\d{2}\b"        # 9:00, 14:30
     r"|\b([aà]s?)\s+\d{1,2}\b"   # às 9, as 9
-    r"|\b(manh[aã]|tarde|noite|madrugada)\b",
+    r"|\b(manh[aã]|tarde|noite|madrugada)\b"
+    r"|\b(dia\s+\d{1,2}|\d{1,2}/\d{1,2})\b"          # dia 12, 12/06
+    r"|\b(semana\s+que\s+vem|pr[oó]xima\s+semana)\b",  # semana que vem
     re.IGNORECASE | re.UNICODE,
 )
 
@@ -238,6 +240,18 @@ class SRMEngine:
             action=action,
             message=input_data.message,
         )
+        # P2 fix: set scheduling_has_time when scheduling_interest is already active
+        # and current message contains a time/date — covers follow-up replies that
+        # are classified as duvida_generica (not "agendar"), e.g. "às 10h", "dia 12",
+        # "semana que vem".  _extract_slots() only sets this flag when intent=="agendar",
+        # so standalone time replies would otherwise never flip it.
+        existing_scheduling_interest = (
+            input_data.flags.get("scheduling_interest", False)
+            or state_patch.flags.get("scheduling_interest", False)
+        )
+        if existing_scheduling_interest and _SCHEDULING_HAS_TIME_RE.search(input_data.message):
+            state_patch.flags["scheduling_has_time"] = True
+
         # Scheduling confirmation flow: propagate pending/cancelled flags
         if handoff_result.confirmation_pending:
             state_patch.flags["handoff_confirmation_pending"] = True

@@ -27,7 +27,26 @@ EXPLICIT_HANDOFF_PATTERNS = [
     r"\b(transferir?|passar?)\b.*\b(para|atendente|humano)\b",
     r"\b(atendente|operador|funcion\u00e1rio)\b.*\b(humano|real|verdadeiro)\b",
     r"^(atendente|humano|pessoa)$",
+    # User-initiated forwarding requests \u2014 mirrors intent_classifier pedido_atendente_humano
+    r"\b(encaminh(ar|e|a|em))\b.*\b(equipe|atendente|pessoa|agendamento|secretaria)\b",
+    r"\b(gostaria|quero|preciso)\b.*\bencaminh",
+    r"\bme encaminh(e|ar|em)\b",
+    r"\b(pode|podes|poderia|podia)\b.*\bencaminh(ar|a|e)\b(?:\s*\?|\s+(?:agora|j\u00e1|ja|logo|direto|ent\u00e3o|entao))",
+    r"\bencaminh(ar|a|e)\b.*\b(agora|j\u00e1|ja|direto|logo|ent\u00e3o|entao)\b",
 ]
+
+# Regex to detect a scheduling time/date preference in the current message.
+# Duplicated from engine.py so handoff_decider has no circular import.
+_SCHEDULING_HAS_TIME_RE = re.compile(
+    r"\b(segunda|ter[c\u00e7]a|quarta|quinta|sexta|s[a\u00e1]bado|domingo|amanh[a\u00e3]|hoje)\b"
+    r"|\b\d{1,2}\s*h\b"
+    r"|\b\d{1,2}:\d{2}\b"
+    r"|\b([a\u00e0]s?)\s+\d{1,2}\b"
+    r"|\b(manh[a\u00e3]|tarde|noite|madrugada)\b"
+    r"|\b(dia\s+\d{1,2}|\d{1,2}/\d{1,2})\b"          # dia 12, 12/06
+    r"|\b(semana\s+que\s+vem|pr[o\u00f3]xima\s+semana)\b",  # semana que vem
+    re.IGNORECASE | re.UNICODE,
+)
 
 # Confirmation response patterns for the scheduling two-step flow.
 #
@@ -182,6 +201,12 @@ class HandoffDecider:
         has_time = flags.get("scheduling_has_time", False)
         confirmation_pending = flags.get("handoff_confirmation_pending", False)
         is_scheduling = intent in ("agendar", "reagendar", "cancelar") or intent_category == IntentCategory.SCHEDULING
+
+        # P1a fix: _extract_slots() runs AFTER decide(), so scheduling_has_time is
+        # not yet persisted for the current turn. Check the current message directly
+        # so both-pieces-in-one-turn and time-only follow-ups work on the same turn.
+        if (already_collecting or is_scheduling) and not has_time:
+            has_time = bool(_SCHEDULING_HAS_TIME_RE.search(message_lower))
 
         if confirmation_pending:
             # User is answering the confirmation question
