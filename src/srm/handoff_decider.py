@@ -31,21 +31,30 @@ EXPLICIT_HANDOFF_PATTERNS = [
 
 # Confirmation response patterns for the scheduling two-step flow.
 #
-# STRONG positives: match regardless of sentence length.
-# WEAK positives: only valid when the whole trimmed message is \u2264 3 words,
-#   so "quero saber os hor\u00e1rios antes" (5 words) never fires the handoff.
+# Three tiers (see _is_positive_confirmation for full rationale):
+#   STRONG   \u2014 match at any message length (sim, claro, confirmo, encaminhe\u2026)
+#   WEAK     \u2014 whole-message anchor, \u2264 3 words (pode, ok, vai, manda\u2026)
+#   SHORT    \u2014 word-boundary, \u2264 4 words (perfeito, \u00f3timo, beleza)
 _STRONG_POSITIVE_RE = re.compile(
     r"\b(sim|s[\u00edi]m|yes|claro|com\s+certeza|confirmo|confirmar|aceito|aceitar"
     r"|encaminhe|encaminha)\b",
     re.IGNORECASE | re.UNICODE,
 )
 # Weak positives only fire when the ENTIRE trimmed message is \u2264 3 words.
-# Moved here from strong: perfeito / \u00f3timo / beleza \u2014 these appear mid-sentence
-# when users describe a preferred time ("segunda \u00e0s 9h fica perfeito pra mim")
-# and must NOT trigger confirmation when the message is longer than 3 words.
+# These are ambiguous single-word replies (pode, ok, vai\u2026) that only count
+# when nothing else is in the message.
 _WEAK_POSITIVE_RE = re.compile(
     r"^(pode|quero|ok|okay|isso|vai|v[a\u00e1]|manda|mande|tudo\s+bem|por\s+favor"
-    r"|certo|exato|exatamente|boa|perfeito|[\u00f3o]timo|beleza)[\s!.,]*$",
+    r"|certo|exato|exatamente|boa)[\s!.,]*$",
+    re.IGNORECASE | re.UNICODE,
+)
+# Short-affirmative positives: perfeito / \u00f3timo / beleza fire via word-boundary
+# search when the message is \u2264 4 words.  This catches "est\u00e1 \u00f3timo", "beleza
+# ent\u00e3o", "perfeito pra mim" (genuine confirmations) while keeping long
+# preference sentences like "segunda \u00e0s 9h fica perfeito pra mim" (10 words)
+# safely blocked.
+_SHORT_AFFIRMATIVE_RE = re.compile(
+    r"\b(perfeito|[\u00f3o]timo|beleza)\b",
     re.IGNORECASE | re.UNICODE,
 )
 _NEGATIVE_RE = re.compile(
@@ -235,15 +244,26 @@ class HandoffDecider:
     def _is_positive_confirmation(self, message: str) -> bool:
         """Return True if user message is a positive confirmation.
 
-        Strong positives (sim, claro, confirmo…) match in any length message.
-        Weak positives (pode, quero, ok, isso…) only match when the entire
-        trimmed message is ≤ 3 words, preventing false positives like
-        "quero saber os horários antes" from triggering a handoff.
+        Three tiers — evaluated in order:
+
+        1. Strong positives (sim, claro, confirmo, encaminhe…): match at any
+           message length.
+        2. Weak positives (pode, ok, vai, manda…): only match when the ENTIRE
+           trimmed message is ≤ 3 words.  These are ambiguous single-word
+           replies that carry no clear meaning in longer sentences.
+        3. Short affirmatives (perfeito, ótimo, beleza): word-boundary search
+           when the message is ≤ 4 words.  This recovers short confirmations
+           like "está ótimo", "beleza então", "perfeito pra mim" that were
+           blocked by the strict whole-message anchor in tier 2, while still
+           rejecting long preference sentences like
+           "segunda às 9h fica perfeito pra mim" (10 words → > 4 → no match).
         """
         if _STRONG_POSITIVE_RE.search(message):
             return True
         words = message.strip().split()
         if len(words) <= 3 and _WEAK_POSITIVE_RE.search(message.strip()):
+            return True
+        if len(words) <= 4 and _SHORT_AFFIRMATIVE_RE.search(message):
             return True
         return False
 
