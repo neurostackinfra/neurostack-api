@@ -775,7 +775,12 @@ class NormalTemplate(BaseTemplate):
         # Pricing policy: provide_prices overrides pricing_mode when set to yes/true
         provide_prices = custom.get("provide_prices")
         if provide_prices in (True, "yes", "true", "True"):
-            section.add("**Política de preço:** Pode informar preços exatos dos serviços quando o paciente solicitar.")
+            section.add(
+                "**Política de preço:** Pode informar preços exatos dos serviços — "
+                "MAS SOMENTE quando o paciente perguntar diretamente sobre valores ou preço. "
+                "NUNCA ofereça o preço espontaneamente se não foi solicitado. "
+                "Siga sempre a sequência: validar → diferenciais → preço."
+            )
         elif custom.get("pricing_mode"):
             mode = custom["pricing_mode"]
             if mode == "RANGE_ALLOWED":

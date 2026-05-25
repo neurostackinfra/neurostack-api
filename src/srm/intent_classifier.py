@@ -37,7 +37,7 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(vocês|voces)\b.*\b(fazem|atendem|têm|tem)\b",
             r"\b(tenho interesse|me interesso)\b",
             r"\b(quero)\b.*\b(tratar|melhorar|cuidar|fazer|entender|saber|marcar)\b",
-            r"\b(vocês|voces)\b.*\b(botox|peeling|clareamento|harmonização|harmonizacao|dermatologia|implante)\b",
+            r"\b(vocês|voces)\b.*\b(botox|peeling|clareamento|harmonização|harmonizacao|dermatologia|implante|faceta)\b",
             r"\b(já fiz|ja fiz|nunca fiz|primeira vez)\b.*\b(botox|procedimento|tratamento|peeling|harmonização|harmonizacao)\b",
             r"^\s*(minha\s+)?primeira vez[!?.]?\s*$",  # "primeira vez" or "minha primeira vez" as full message
             r"\b(tenho|sofro|estou com)\b.*\b(acne|manchas|queda|bruxismo|medo|vergonha|interesse)\b",
@@ -46,7 +46,7 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(quero)\b.*\b(continuar|começar|comecar)\b.*\b(aqui|tratamento)\b",
             r"\b(por onde começo|por onde comeco|como começo|como comeco)\b",
             r"\bnão sei por onde começar\b",
-            r"\bquero saber\b",
+            r"\b(quero|querendo|gostaria de)\s+saber\b",  # catches "querendo saber" (gerund)
             r"\bme (explica|conta)\b",
             r"\b(entender melhor)\b.*\b(antes|decidir)\b",
             r"\b(interfere|pode|posso)\b.*\b(tratamento|procedimento|fazer)\b",
@@ -56,10 +56,18 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(ouvi falar|indicaram|recomendaram)\b",
             r"\b(clínica|clinica)\s*x\b",
             r"\b(fiz|faço|faco)\b.*\b(outro lugar|outra clínica|outra clinica)\b",
+            # Service availability queries: "tem X?", "faz X?", "tem faceta?", "tem clareamento?"
+            r"\b(tem|têm|fazem|fazem)\b.*\b(faceta|clareamento|implante|botox|peeling|harmonização|harmonizacao|prótese|protese|lente|invisalign|ortodontia|bruxismo)\b",
+            r"\b(faceta|lente de contato dental|implante|clareamento|ortodontia|invisalign|bruxismo)\b.*\b(tem|fazem|atendem|oferecem|disponível|disponivel)\b",
+            # Whitening synonyms
+            r"\b(dentes?\s*(mais\s*)?(brancos?|claros?)|clareamento|branquear|clarear)\b",
+            r"\b(deixar|ficar|tornando?)\b.*\b(dentes?\s*(mais\s*)?(brancos?|claros?))\b",
         ],
         "keywords": ["tratamento", "procedimento", "avaliação", "botox", "peeling",
                       "clareamento", "harmonização", "tratar", "quero fazer",
-                      "quero saber", "me explica", "tenho interesse"],
+                      "quero saber", "querendo saber", "me explica", "tenho interesse",
+                      "faceta", "facetas", "lente de contato dental", "implante",
+                      "dentes brancos", "dentes mais brancos", "branquear", "clarear"],
         "weight": 1.0,
     },
     "pedido_preco": {
