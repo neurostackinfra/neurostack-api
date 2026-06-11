@@ -5,7 +5,7 @@ Endpoints for human handoff management and webhook configuration.
 
 import csv
 import io
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -125,10 +125,17 @@ async def _resolve_queue_tenant(
 async def get_handoff_queue(
     request: Request,
     tenant_id: UUID = Query(..., description="Tenant to fetch queue for"),
+    from_date: Optional[date] = Query(None, description="Stats window start (entry date). Defaults to 30 days ago."),
+    to_date: Optional[date] = Query(None, description="Stats window end (entry date). Defaults to today."),
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
 ) -> HandoffQueueResponse:
-    """Active handoffs (pending/accepted) with aggregate stats."""
+    """Active handoffs (pending/accepted) with aggregate stats.
+
+    Stats (avg wait + % within SLA) are computed over handoffs whose *entry*
+    (created_at) falls inside the requested window, so the KPIs match the
+    date-filtered list and stale/old handoffs don't skew the average.
+    """
     effective_tenant_id = await _resolve_queue_tenant(request, tenant_id, tenant, db)
 
     # Active items
@@ -158,8 +165,16 @@ async def get_handoff_queue(
         for r in records
     ]
 
-    # Stats: avg wait + pct within SLA (last 30 days completed)
-    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+    # Stats window: follow the requested date range (entry date), default last 30 days.
+    now_utc = datetime.now(timezone.utc)
+    if from_date or to_date:
+        window_start = datetime.combine(from_date or now_utc.date(), time.min, tzinfo=timezone.utc)
+        window_end = datetime.combine(to_date or now_utc.date(), time.max, tzinfo=timezone.utc)
+    else:
+        window_start = now_utc - timedelta(days=30)
+        window_end = now_utc
+
+    # Stats: avg wait + pct within SLA over completed handoffs created in the window
     stats_q = (
         select(
             sa_func.avg(
@@ -171,7 +186,8 @@ async def get_handoff_queue(
             HandoffRecord.tenant_id == effective_tenant_id,
             HandoffRecord.status == "completed",
             HandoffRecord.data_hora_saida.isnot(None),
-            HandoffRecord.created_at >= thirty_days_ago,
+            HandoffRecord.created_at >= window_start,
+            HandoffRecord.created_at <= window_end,
         )
     )
     stats_result = await db.execute(stats_q)
@@ -202,7 +218,8 @@ async def get_handoff_queue(
                 HandoffRecord.tenant_id == effective_tenant_id,
                 HandoffRecord.status == "completed",
                 HandoffRecord.data_hora_saida.isnot(None),
-                HandoffRecord.created_at >= thirty_days_ago,
+                HandoffRecord.created_at >= window_start,
+                HandoffRecord.created_at <= window_end,
                 sa_func.extract("epoch", HandoffRecord.data_hora_saida - HandoffRecord.created_at) <= sla_seconds,
             )
         )
