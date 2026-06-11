@@ -5,7 +5,7 @@ import {
   Plus, Eye, CheckCircle2, XCircle, Loader2, AlertTriangle,
   Inbox, Paperclip, ChevronDown, ChevronRight, CheckCheck, UserCheck,
   Phone, TrendingUp, TrendingDown, Download, Search, CalendarRange, RefreshCw,
-  RotateCcw, Briefcase, Trash2, Pencil, DollarSign, Info, Receipt, CreditCard,
+  RotateCcw, Briefcase, Trash2, Pencil, DollarSign, Info, Receipt, CreditCard, Unlink,
 } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { useAuth } from "@/context/auth";
@@ -885,6 +885,26 @@ export default function MasterAdmin() {
     }
   };
 
+  const handleUnlinkClinic = async (builderId: number, clinicId: number) => {
+    if (isInvestor) { toast({ title: "Modo Visualização: ação desabilitada." }); return; }
+    try {
+      const res = await fetch(`/v1/admin/builders/${builderId}/unlink-clinic`, {
+        method: "POST", headers: authHeaders(token),
+        body: JSON.stringify({ clinic_id: clinicId }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({})) as { detail?: string };
+        toast({ title: err.detail ?? "Erro ao desvincular clínica", variant: "destructive" });
+        return;
+      }
+      await fetchBuilders();
+      await fetchClinics();
+      toast({ title: "Clínica desvinculada com sucesso!" });
+    } catch {
+      toast({ title: "Erro de rede", variant: "destructive" });
+    }
+  };
+
   const handleConfirmDelete = async () => {
     if (!deleteTarget) return;
     setDeleting(true);
@@ -1654,6 +1674,14 @@ export default function MasterAdmin() {
                                           onClick={() => void handleToggleBuilderClinic(c.clinic_id, c.status === "active" ? "inactive" : "active")}
                                         >
                                           {c.status === "active" ? <ToggleRight className="h-3.5 w-3.5" /> : <ToggleLeft className="h-3.5 w-3.5" />}
+                                        </Button>
+                                        <Button
+                                          variant="ghost" size="sm"
+                                          className="h-6 w-6 p-0 text-muted-foreground hover:text-amber-400"
+                                          title="Desvincular do builder"
+                                          onClick={() => void handleUnlinkClinic(builder.id, c.clinic_id)}
+                                        >
+                                          <Unlink className="h-3 w-3" />
                                         </Button>
                                         <Button
                                           variant="ghost" size="sm"

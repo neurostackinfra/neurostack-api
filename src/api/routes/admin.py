@@ -993,6 +993,52 @@ async def link_clinic_to_builder(
     return {"ok": True}
 
 
+@router.post(
+    "/builders/{builder_id}/unlink-clinic",
+    summary="Unlink Clinic from Builder",
+    description="Unlink a clinic currently linked to this builder. Super admin only.",
+)
+async def unlink_clinic_from_builder(
+    builder_id: str,
+    body: dict,
+    tenant: TenantContext = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
+):
+    from uuid import UUID as _UUID
+
+    try:
+        bid = _UUID(builder_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid builder ID")
+
+    clinic_id = body.get("clinic_id")
+    if not clinic_id:
+        raise HTTPException(status_code=400, detail="clinic_id is required")
+
+    try:
+        cid = _UUID(clinic_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid clinic ID")
+
+    clinic_result = await session.execute(select(Tenant).where(Tenant.id == cid))
+    clinic = clinic_result.scalar_one_or_none()
+    if not clinic:
+        raise HTTPException(status_code=404, detail="Clínica não encontrada")
+
+    if clinic.builder_id is None:
+        raise HTTPException(
+            status_code=409, detail="Esta clínica não está vinculada a nenhum builder"
+        )
+    if clinic.builder_id != bid:
+        raise HTTPException(
+            status_code=409, detail="Esta clínica está vinculada a outro builder"
+        )
+
+    clinic.builder_id = None
+    await session.commit()
+    return {"ok": True}
+
+
 # ============================================
 # Coupons Endpoints
 # ============================================

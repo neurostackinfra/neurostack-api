@@ -629,8 +629,9 @@ class NormalTemplate(BaseTemplate):
                 f"- {_sys_no}\n"
             )
 
-        # Emoji directive — appended after confirmation block
-        if variables.custom.get("use_emojis"):
+        # Emoji directive — suppressed when handoff_confirmation_pending to avoid
+        # conflict with "SOMENTE esta pergunta" constraint in the confirmation block.
+        if variables.custom.get("use_emojis") and not variables.custom.get("handoff_confirmation_pending"):
             msg.content += (
                 "\n\n## EMOJI INSTRUCTION (MANDATORY)\n"
                 "**You MUST include 1-2 relevant emojis in EVERY response.** "

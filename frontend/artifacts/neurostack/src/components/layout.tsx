@@ -13,6 +13,7 @@ import {
   Link2,
   Library,
   Shield,
+  Brain,
   Eye,
   GraduationCap,
   ShieldCheck,
@@ -131,7 +132,8 @@ export function Layout({ children }: LayoutProps) {
     { href: "/onboarding",     label: "Onboarding",            icon: GraduationCap, id: "onboarding",     v: "v2",  hideFor: [] },
     { href: "/seguranca",      label: t("nav_security"),       icon: ShieldCheck,   id: "seguranca",      v: "v2",  hideFor: ["clinic_admin"] },
     { href: "/slm-cortex",     label: "SLM Cortex",            icon: Cpu,           id: "slm-cortex",     v: "v3",  hideFor: ["clinic_admin"] },
-    { href: "/rlhf-audit",     label: t("nav_rlhf"),           icon: FlaskConical,  id: "rlhf-audit",     v: "v3",  hideFor: ["clinic_admin"] },
+    { href: "/rlhf-audit",     label: t("nav_rlhf"),           icon: Brain,         id: "rlhf-audit",     v: "v3",  hideFor: ["clinic_admin", "builder"] },
+
     { href: "/consultoria",    label: t("nav_consulting"),     icon: Lightbulb,     id: "consultoria",    v: "v2",  hideFor: [] },
     { href: "/midias",         label: t("nav_media"),          icon: FolderOpen,    id: "midias",         v: "v3",  hideFor: ["clinic_admin"] },
     { href: "/voice-ai",       label: t("nav_voice"),          icon: Mic,           id: "voice-ai",       v: "v3",  hideFor: ["clinic_admin"] },

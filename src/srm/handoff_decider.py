@@ -62,8 +62,11 @@ _STRONG_POSITIVE_RE = re.compile(
 # Weak positives only fire when the ENTIRE trimmed message is \u2264 3 words.
 # These are ambiguous single-word replies (pode, ok, vai\u2026) that only count
 # when nothing else is in the message.
+# NOTE: "pode encaminhar" is added here (not to STRONG) to avoid bare "encaminhar"
+# matching inside negations like "n\u00e3o encaminhar" or "prefiro n\u00e3o encaminhar agora".
+# The whole-message anchor makes this safe.
 _WEAK_POSITIVE_RE = re.compile(
-    r"^(pode|quero|ok|okay|isso|vai|v[a\u00e1]|manda|mande|tudo\s+bem|por\s+favor"
+    r"^(pode\s+encaminhar|pode|quero|ok|okay|isso|vai|v[a\u00e1]|manda|mande|tudo\s+bem|por\s+favor"
     r"|certo|exato|exatamente|boa)[\s!.,]*$",
     re.IGNORECASE | re.UNICODE,
 )
@@ -209,8 +212,12 @@ class HandoffDecider:
             has_time = bool(_SCHEDULING_HAS_TIME_RE.search(message_lower))
 
         if confirmation_pending:
-            # User is answering the confirmation question
-            if self._is_positive_confirmation(message_lower):
+            # User is answering the confirmation question.
+            # Evaluate NEGATIVE first — a negation word is a hard veto even if
+            # the message also contains an affirmative token (e.g. "não encaminhar").
+            is_negative = self._is_negative_confirmation(message_lower)
+            is_positive = self._is_positive_confirmation(message_lower)
+            if is_positive and not is_negative:
                 return HandoffResult(
                     required=True,
                     reason=HandoffReason.SCHEDULING,
@@ -219,7 +226,7 @@ class HandoffDecider:
                     sector="agendamento",
                     sla="prioritario",
                 )
-            if self._is_negative_confirmation(message_lower):
+            if is_negative:
                 # User declined → clear flags, continue normally
                 return HandoffResult(required=False, scheduling_cancelled=True)
             # Ambiguous answer — keep confirmation pending

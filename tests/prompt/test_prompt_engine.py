@@ -256,7 +256,8 @@ class TestHandoffTemplate:
         
         prompt = template.get_system_prompt(variables)
         
-        assert "Transição" in prompt or "Atendente" in prompt
+        # Template uses team-language ("nossa equipe") instead of "atendente humano"
+        assert "equipe" in prompt.lower() or "Encaminhamento" in prompt
 
     def test_handoff_summary_generation(self):
         """Test handoff summary generation."""

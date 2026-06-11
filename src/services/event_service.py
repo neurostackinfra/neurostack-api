@@ -527,57 +527,65 @@ class EventService:
         )
 
         # Call LLM to generate suggested_response if configured (retry once on empty)
+        # EXCEPTION: when handoff fires, skip the LLM entirely.  The canned message
+        # from HANDOFF_RESPONSES is the correct and complete response; calling the LLM
+        # only risks wrong language ("atendente humano") and unwanted extra questions
+        # ("há algo específico que você gostaria que o atendente soubesse?").
         suggested_response = None
         llm_usage: dict = {}
         llm_model: str = ""
-        try:
-            from src.llm.client import get_tenant_llm_client
-            api_creds = (clinic_config or {}).get("api_credentials", {})
-            llm = get_tenant_llm_client(tenant_id, api_creds)
-            tenant_model = api_creds.get("llm_model_name") or None
-            if llm and user_message:
-                sys_prompt = result.system_prompt or ""
-                language_code = language or "pt-BR"
-                messages = [{"role": "system", "content": sys_prompt}]
-                # Insert conversation history for multi-turn context
-                for msg in (message_history or []):
-                    messages.append(msg)
-                messages.append({"role": "user", "content": user_message})
-                # Reinforce greeting for saudacao intent — LLM tends to echo patient's wrong greeting
-                if result.state_patch.get("last_intent") == "saudacao":
-                    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-                    _h = _dt.now(_tz(_td(hours=-3))).hour
-                    _raw_emojis = (clinic_config or {}).get("identity", {}).get("use_emojis")
-                    _use_emojis = _raw_emojis in (True, "yes", "true", "1", 1)
-                    _emoji_hint = " Use 1-2 emojis na resposta. 😊" if _use_emojis else ""
-                    if language_code == "en":
-                        _g = "Good morning" if _h < 12 else ("Good afternoon" if _h < 18 else "Good evening")
-                        messages.append({"role": "system", "content": f'REMINDER: It is now {_dt.now(_tz(_td(hours=-3))).strftime("%H:%M")} BRT. Start your response with "{_g}!" — do NOT use any other greeting.{_emoji_hint}'})
-                    else:
-                        _g = "Bom dia" if _h < 12 else ("Boa tarde" if _h < 18 else "Boa noite")
-                        messages.append({"role": "system", "content": f'LEMBRETE: Agora são {_dt.now(_tz(_td(hours=-3))).strftime("%H:%M")} BRT. Comece sua resposta com "{_g}!" — NÃO use outra saudação.{_emoji_hint}'})
-                for attempt in range(2):
-                    logger.info("Calling LLM",
-                        attempt=attempt + 1,
-                        prompt_len=len(sys_prompt),
-                        user_msg_len=len(user_message),
-                        mode=result.mode,
-                        tenant_model=tenant_model,
-                    )
-                    llm_result = await llm.generate(messages, model=tenant_model, max_tokens=300)
-                    suggested_response = llm_result.get("content", "")
-                    llm_usage = llm_result.get("usage", {})
-                    llm_model = llm_result.get("model", "")
-                    if suggested_response:
-                        logger.info("LLM response generated", length=len(suggested_response), attempt=attempt + 1)
-                        break
-                    logger.warning("LLM returned empty, retrying" if attempt == 0 else "LLM empty after retry",
-                        mode=result.mode,
-                    )
-            else:
-                logger.warning("LLM skipped", llm_configured=llm is not None, has_message=bool(user_message))
-        except Exception as exc:
-            logger.error("LLM call failed", error=str(exc), exc_info=True)
+        language_code = language or "pt-BR"  # initialised here so handoff block can use it
+        if not result.handoff_required:
+            # Only call LLM when NOT handing off.  When handoff fires, the canned
+            # HANDOFF_RESPONSES message is the correct response — calling the LLM
+            # risks wrong language ("atendente humano") and unwanted questions.
+            try:
+                from src.llm.client import get_tenant_llm_client
+                api_creds = (clinic_config or {}).get("api_credentials", {})
+                llm = get_tenant_llm_client(tenant_id, api_creds)
+                tenant_model = api_creds.get("llm_model_name") or None
+                if llm and user_message:
+                    sys_prompt = result.system_prompt or ""
+                    messages = [{"role": "system", "content": sys_prompt}]
+                    # Insert conversation history for multi-turn context
+                    for msg in (message_history or []):
+                        messages.append(msg)
+                    messages.append({"role": "user", "content": user_message})
+                    # Reinforce greeting for saudacao intent — LLM tends to echo patient's wrong greeting
+                    if result.state_patch.get("last_intent") == "saudacao":
+                        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+                        _h = _dt.now(_tz(_td(hours=-3))).hour
+                        _raw_emojis = (clinic_config or {}).get("identity", {}).get("use_emojis")
+                        _use_emojis = _raw_emojis in (True, "yes", "true", "1", 1)
+                        _emoji_hint = " Use 1-2 emojis na resposta. 😊" if _use_emojis else ""
+                        if language_code == "en":
+                            _g = "Good morning" if _h < 12 else ("Good afternoon" if _h < 18 else "Good evening")
+                            messages.append({"role": "system", "content": f'REMINDER: It is now {_dt.now(_tz(_td(hours=-3))).strftime("%H:%M")} BRT. Start your response with "{_g}!" — do NOT use any other greeting.{_emoji_hint}'})
+                        else:
+                            _g = "Bom dia" if _h < 12 else ("Boa tarde" if _h < 18 else "Boa noite")
+                            messages.append({"role": "system", "content": f'LEMBRETE: Agora são {_dt.now(_tz(_td(hours=-3))).strftime("%H:%M")} BRT. Comece sua resposta com "{_g}!" — NÃO use outra saudação.{_emoji_hint}'})
+                    for attempt in range(2):
+                        logger.info("Calling LLM",
+                            attempt=attempt + 1,
+                            prompt_len=len(sys_prompt),
+                            user_msg_len=len(user_message),
+                            mode=result.mode,
+                            tenant_model=tenant_model,
+                        )
+                        llm_result = await llm.generate(messages, model=tenant_model, max_tokens=300)
+                        suggested_response = llm_result.get("content", "")
+                        llm_usage = llm_result.get("usage", {})
+                        llm_model = llm_result.get("model", "")
+                        if suggested_response:
+                            logger.info("LLM response generated", length=len(suggested_response), attempt=attempt + 1)
+                            break
+                        logger.warning("LLM returned empty, retrying" if attempt == 0 else "LLM empty after retry",
+                            mode=result.mode,
+                        )
+                else:
+                    logger.warning("LLM skipped", llm_configured=llm is not None, has_message=bool(user_message))
+            except Exception as exc:
+                logger.error("LLM call failed", error=str(exc), exc_info=True)
 
         # If handoff is required, append the handoff user message to the response.
         # When language is EN, use English fallback instead of the PT template message.
