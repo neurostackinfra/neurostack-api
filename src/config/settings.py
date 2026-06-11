@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     # ============================================
     # Database (PostgreSQL)
     # ============================================
-    database_url: str = "postgresql+asyncpg://neurostack:neurostack@localhost:5432/neurostack"
+    database_url: str = "postgresql+asyncpg://neurostack:neurostack@localhost:5434/neurostack"
     database_pool_size: int = Field(default=5, ge=1, le=100)
     database_max_overflow: int = Field(default=10, ge=0, le=100)
     database_pool_timeout: int = Field(default=30, ge=1)
@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     # ============================================
     # Redis (State Store)
     # ============================================
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = "redis://localhost:6380/0"
     redis_max_connections: int = Field(default=10, ge=1, le=100)
     redis_socket_timeout: float = Field(default=5.0, ge=0.1)
 

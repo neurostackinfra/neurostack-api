@@ -64,11 +64,11 @@ export default defineConfig({
     allowedHosts: true,
     proxy: {
       "/v1": {
-        target: "http://localhost:8001",
+        target: process.env.VITE_PROXY_TARGET || "http://localhost:8000",
         changeOrigin: true,
       },
       "/api/public": {
-        target: "http://localhost:8001",
+        target: process.env.VITE_PROXY_TARGET || "http://localhost:8000",
         changeOrigin: true,
       },
     },

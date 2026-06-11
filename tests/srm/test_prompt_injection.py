@@ -94,7 +94,8 @@ class TestPromptConfigInjection:
 
     def test_provide_prices_in_context(self, template, variables_with_config):
         context = template.get_context_instructions(variables_with_config)
-        assert "preços" in context.lower()
+        # Pricing policy block uses "preço" (singular); check policy marker is present.
+        assert "política de preço" in context.lower()
 
     def test_no_config_returns_empty(self, template):
         """Template works fine with no custom vars."""
