@@ -1,9 +1,9 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useMemo } from "react";
 import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
 import { useToast } from "@/hooks/use-toast";
 import { Button } from "@/components/ui/button";
-import { Clock, CheckCircle, ExternalLink, Download } from "lucide-react";
+import { Repeat, Gauge, Download, CalendarRange, MessageCircle } from "lucide-react";
 
 interface HandoffQueueItem {
   id: string;
@@ -22,6 +22,9 @@ interface QueueStats {
   pct_within_sla: number;
 }
 
+// % goal target shown on the gauge (matches the design / clinic SLA target).
+const HANDOFF_GOAL_PCT = 85;
+
 function getToken(): string {
   try {
     return (JSON.parse(localStorage.getItem("ns_auth") ?? "{}") as { token?: string }).token ?? "";
@@ -30,28 +33,190 @@ function getToken(): string {
   }
 }
 
-function getSlaColor(seconds: number): string {
-  if (seconds < 300) return "border-green-500 bg-green-50 dark:bg-green-950/30";
-  if (seconds < 600) return "border-yellow-500 bg-yellow-50 dark:bg-yellow-950/30";
-  return "border-red-500 bg-red-50 dark:bg-red-950/30";
+/** Left-border accent class by waiting time (SLA tiers). */
+function slaBorder(seconds: number): string {
+  if (seconds < 300) return "border-l-emerald-500";
+  if (seconds < 600) return "border-l-amber-500";
+  return "border-l-rose-500";
 }
 
 function cleanNumber(s: string): string {
   return s.replace(/\D/g, "");
 }
 
+/** "Aguardando há" formatting → "25m 9s". */
 function formatWait(s: number): string {
   const mins = Math.floor(s / 60);
   const secs = s % 60;
   return `${mins}m ${secs}s`;
 }
 
+/** Average handoff time as HH:MM:SS → "00:02:18". */
+function formatHMS(totalSeconds: number): string {
+  const s = Math.max(0, Math.round(totalSeconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(h)}:${p(m)}:${p(sec)}`;
+}
+
+/** Short display code from a session id (UUID-safe). */
+function shortCode(sessionId: string): string {
+  return sessionId.replace(/-/g, "").slice(0, 9);
+}
+
+/** Local yyyy-mm-dd for a Date. */
+function ymd(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+// ── Investor demo: static mock handoff queue (mirrors the design mock) ──
+// created_at is relative to mount so "Aguardando há" and the SLA colors are live.
+function buildMockHandoffs(): HandoffQueueItem[] {
+  const base = Date.now();
+  const agoMin = (m: number, s = 0) => new Date(base - (m * 60 + s) * 1000).toISOString();
+  return [
+    {
+      id: "mock-1",
+      numero_whatsapp: "553197924877",
+      session_id: "f843ae9f1",
+      intencao_detectada: "scheduling",
+      estagio_atual: "agendamento_solicitado",
+      primeira_linha_mensagem: "Rafaela Quinta de tarde",
+      created_at: agoMin(25, 9),
+      data_hora_saida: null,
+      status: "pending",
+    },
+    {
+      id: "mock-2",
+      numero_whatsapp: "551197334455",
+      session_id: "ff2e3b8eec",
+      intencao_detectada: "scheduling",
+      estagio_atual: "agendamento_solicitado",
+      primeira_linha_mensagem: "Rafaela Quinta de tarde",
+      created_at: agoMin(11, 42),
+      data_hora_saida: null,
+      status: "pending",
+    },
+    {
+      id: "mock-3",
+      numero_whatsapp: "5511988776655",
+      session_id: "9ec721f00",
+      intencao_detectada: "interesse_tratamento",
+      estagio_atual: "em_qualificacao",
+      primeira_linha_mensagem: "Rafaela Quinta de tarde",
+      created_at: agoMin(8, 18),
+      data_hora_saida: null,
+      status: "pending",
+    },
+    {
+      id: "mock-4",
+      numero_whatsapp: "5511966443322",
+      session_id: "83b4e6a1",
+      intencao_detectada: "pedido_preco",
+      estagio_atual: "em_qualificacao",
+      primeira_linha_mensagem: "Rafaela Quinta de tarde",
+      created_at: agoMin(11, 3),
+      data_hora_saida: null,
+      status: "pending",
+    },
+    {
+      id: "mock-5",
+      numero_whatsapp: "5511982233445",
+      session_id: "1bc2f9e7",
+      intencao_detectada: "duvida_gerencia",
+      estagio_atual: "em_qualificacao",
+      primeira_linha_mensagem: "Rafaela Quinta de tarde",
+      created_at: agoMin(3, 27),
+      data_hora_saida: null,
+      status: "pending",
+    },
+    {
+      id: "mock-6",
+      numero_whatsapp: "5511995566778",
+      session_id: "d3a3fffa7",
+      intencao_detectada: "interesse_tratamento",
+      estagio_atual: "agendamento_solicitado",
+      primeira_linha_mensagem: "Rafaela Quinta de tarde",
+      created_at: agoMin(14, 58),
+      data_hora_saida: null,
+      status: "pending",
+    },
+  ];
+}
+
+// ── Semicircular gauge (goal achievement %) ──
+const GAUGE = { cx: 100, cy: 105, r: 80 };
+function polar(angleDeg: number, radius: number = GAUGE.r): { x: number; y: number } {
+  const rad = (angleDeg * Math.PI) / 180;
+  return { x: GAUGE.cx + radius * Math.cos(rad), y: GAUGE.cy - radius * Math.sin(rad) };
+}
+
+function SemiGauge({ value }: { value: number }) {
+  const pct = Math.max(0, Math.min(100, value));
+  const start = polar(180);
+  const end = polar(0);
+  const arcLen = Math.PI * GAUGE.r;
+  const arcPath = `M ${start.x} ${start.y} A ${GAUGE.r} ${GAUGE.r} 0 0 1 ${end.x} ${end.y}`;
+  // 25/50/75 hug the top of the arc; 0/100 sit at the bottom corners (all centered).
+  const ticks: { label: string; x: number; y: number }[] = [
+    { label: "0%", x: 14, y: 116 },
+    { label: "25%", ...polar(135, GAUGE.r + 18) },
+    { label: "50%", ...polar(90, GAUGE.r + 18) },
+    { label: "75%", ...polar(45, GAUGE.r + 18) },
+    { label: "100%", x: 186, y: 116 },
+  ];
+
+  return (
+    <svg viewBox="0 0 200 132" className="w-full max-w-[280px]" role="img" aria-label={`${pct}%`}>
+      <defs>
+        <linearGradient id="handoffGaugeFill" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stopColor="#93c5fd" />
+          <stop offset="100%" stopColor="#2563eb" />
+        </linearGradient>
+      </defs>
+      {/* track */}
+      <path d={arcPath} fill="none" stroke="currentColor" className="text-muted/40" strokeWidth={14} strokeLinecap="round" />
+      {/* value */}
+      <path
+        d={arcPath}
+        fill="none"
+        stroke="url(#handoffGaugeFill)"
+        strokeWidth={14}
+        strokeLinecap="round"
+        strokeDasharray={`${(pct / 100) * arcLen} ${arcLen}`}
+      />
+      {/* tick labels */}
+      {ticks.map((tick) => (
+        <text
+          key={tick.label}
+          x={tick.x}
+          y={tick.y}
+          textAnchor="middle"
+          dominantBaseline="central"
+          className="fill-muted-foreground text-[9px]"
+        >
+          {tick.label}
+        </text>
+      ))}
+      {/* center value */}
+      <text x={GAUGE.cx} y={94} textAnchor="middle" dominantBaseline="central" className="fill-foreground text-[28px] font-bold">
+        {Math.round(pct)}%
+      </text>
+    </svg>
+  );
+}
+
 export default function HandoffQueuePage() {
-  const { tenantId, isBuilder, isSuperAdmin, viewingClinicId } = useAuth();
+  const { tenantId, isBuilder, isSuperAdmin, isInvestor, viewingClinicId } = useAuth();
   const { t } = useI18n();
   const { toast } = useToast();
 
   const effectiveTenantId = (isBuilder || isSuperAdmin) ? viewingClinicId : tenantId;
+
+  // Investor demo: stable mock data, generated once at mount.
+  const [mockHandoffs] = useState<HandoffQueueItem[]>(() => buildMockHandoffs());
 
   const [handoffs, setHandoffs] = useState<HandoffQueueItem[]>([]);
   const [stats, setStats] = useState<QueueStats>({ avg_wait_seconds: 0, pct_within_sla: 0 });
@@ -59,13 +224,18 @@ export default function HandoffQueuePage() {
   const [now, setNow] = useState<Date>(new Date());
   const [fadingIds, setFadingIds] = useState<Set<string>>(new Set());
 
+  // Date range: defaults to today (drives the visible list + CSV export).
+  const today = ymd(new Date());
+  const [startDate, setStartDate] = useState<string>(today);
+  const [endDate, setEndDate] = useState<string>(today);
+
   const fetchQueue = useCallback(async () => {
     if (!effectiveTenantId) return;
     const token = getToken();
     if (!token) return;
     try {
       setLoading(true);
-      const res = await fetch(`/v1/handoff/queue?tenant_id=${effectiveTenantId}`, {
+      const res = await fetch(`/v1/handoffs/queue?tenant_id=${effectiveTenantId}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) return;
@@ -85,18 +255,40 @@ export default function HandoffQueuePage() {
     return () => clearInterval(id);
   }, []);
 
-  // 30-second polling
+  // 30-second polling (investor sees static mock data, no API calls)
   useEffect(() => {
+    if (isInvestor) {
+      setHandoffs(mockHandoffs);
+      setStats({ avg_wait_seconds: 138, pct_within_sla: 82 });
+      return;
+    }
     fetchQueue();
     const id = setInterval(fetchQueue, 30000);
     return () => clearInterval(id);
-  }, [fetchQueue]);
+  }, [fetchQueue, isInvestor, mockHandoffs]);
+
+  // Filter visible list by entry date within [startDate, endDate].
+  const visibleHandoffs = useMemo(() => {
+    return handoffs.filter((h) => {
+      const day = ymd(new Date(h.created_at));
+      return day >= startDate && day <= endDate;
+    });
+  }, [handoffs, startDate, endDate]);
 
   const handleCheckout = async (id: string) => {
+    // Investor demo: remove the card locally, no API call.
+    if (isInvestor) {
+      setFadingIds((prev) => new Set(prev).add(id));
+      setTimeout(() => {
+        setHandoffs((prev) => prev.filter((h) => h.id !== id));
+        setFadingIds((prev) => { const n = new Set(prev); n.delete(id); return n; });
+      }, 300);
+      return;
+    }
     const token = getToken();
     if (!token) return;
     try {
-      const res = await fetch(`/v1/handoff/queue/${id}/checkout`, {
+      const res = await fetch(`/v1/handoffs/queue/${id}/checkout`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
       });
@@ -117,7 +309,7 @@ export default function HandoffQueuePage() {
 
   const handleAtendido = (id: string) => handleCheckout(id);
 
-  const handleWhatsApp = (id: string, numero: string | null) => {
+  const handleAtenderDirecionar = (id: string, numero: string | null) => {
     if (numero) {
       window.open(`https://wa.me/${cleanNumber(numero)}`, "_blank");
     }
@@ -129,7 +321,10 @@ export default function HandoffQueuePage() {
     const token = getToken();
     if (!token) return;
     try {
-      const res = await fetch(`/v1/handoff/queue/export?tenant_id=${effectiveTenantId}`, {
+      const params = new URLSearchParams({ tenant_id: effectiveTenantId });
+      if (startDate) params.set("from_date", startDate);
+      if (endDate) params.set("to_date", endDate);
+      const res = await fetch(`/v1/handoffs/queue/export?${params.toString()}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) return;
@@ -147,7 +342,7 @@ export default function HandoffQueuePage() {
     }
   };
 
-  if (!effectiveTenantId) {
+  if (!effectiveTenantId && !isInvestor) {
     return (
       <div className="flex items-center justify-center h-64">
         <p className="text-muted-foreground">{t("handoff_no_clinic")}</p>
@@ -158,118 +353,170 @@ export default function HandoffQueuePage() {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">{t("handoff_queue_title")}</h1>
-        <Button variant="outline" size="sm" onClick={handleExport} className="gap-1.5">
-          <Download className="h-4 w-4" />
-          {t("handoff_export_csv")}
-        </Button>
-      </div>
-
-      {/* Tab nav */}
-      <div className="flex gap-4 border-b">
-        <button className="pb-2 text-sm font-semibold border-b-2 border-primary">
-          {t("handoff_queue_tab_geral")}
-        </button>
-        <button className="pb-2 text-sm opacity-50 cursor-not-allowed pointer-events-none">
-          {t("handoff_queue_tab_setor")}
-        </button>
-      </div>
-
-      {/* Analytics strip */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        <div className="flex items-center gap-3 rounded-lg border p-4">
-          <Clock className="h-5 w-5 text-muted-foreground" />
-          <div>
-            <p className="text-xs text-muted-foreground">{t("handoff_avg_wait")}</p>
-            <p className="text-lg font-semibold">{formatWait(Math.round(stats.avg_wait_seconds))}</p>
-          </div>
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <h1 className="text-2xl font-bold">{t("handoff_queue_title")}</h1>
+          <p className="text-sm text-muted-foreground mt-1">{t("handoff_subtitle")}</p>
         </div>
-        <div className="flex items-center gap-3 rounded-lg border p-4">
-          <CheckCircle className="h-5 w-5 text-muted-foreground" />
-          <div>
-            <p className="text-xs text-muted-foreground">{t("handoff_pct_sla")}</p>
-            <p className="text-lg font-semibold">{stats.pct_within_sla}%</p>
+
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="space-y-1">
+            <label className="text-[11px] font-medium text-muted-foreground flex items-center gap-1">
+              <CalendarRange className="h-3 w-3" /> {t("handoff_date_start")}
+            </label>
+            <input
+              type="date"
+              value={startDate}
+              max={endDate}
+              onChange={(e) => setStartDate(e.target.value)}
+              className="rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+            />
           </div>
+          <div className="space-y-1">
+            <label className="text-[11px] font-medium text-muted-foreground flex items-center gap-1">
+              <CalendarRange className="h-3 w-3" /> {t("handoff_date_end")}
+            </label>
+            <input
+              type="date"
+              value={endDate}
+              min={startDate}
+              max={today}
+              onChange={(e) => setEndDate(e.target.value)}
+              className="rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+            />
+          </div>
+          <Button variant="outline" size="sm" onClick={handleExport} className="gap-1.5 h-[34px]">
+            <Download className="h-4 w-4" />
+            {t("handoff_export_csv")}
+          </Button>
+        </div>
+      </div>
+
+      {/* Analytics: average time + goal gauge */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Average handoff time */}
+        <div className="relative rounded-xl border bg-card p-5 shadow-sm text-center">
+          <Repeat className="absolute left-5 top-5 h-5 w-5 text-primary" />
+          <p className="text-base font-bold">Tempo médio de handoff</p>
+          <p className="text-xs text-muted-foreground">Average Handoff Time</p>
+          <div className="mx-auto mt-4 w-fit rounded-xl bg-muted/60 px-8 py-3">
+            <span className="font-mono text-5xl font-bold tracking-wider tabular-nums">
+              {formatHMS(stats.avg_wait_seconds)}
+            </span>
+          </div>
+          <p className="text-xs text-muted-foreground mt-3">
+            Tempo médio que o humano demora para atender
+          </p>
+        </div>
+
+        {/* Goal achievement gauge */}
+        <div className="relative rounded-xl border bg-card p-5 shadow-sm text-center">
+          <Gauge className="absolute left-5 top-5 h-5 w-5 text-primary" />
+          <p className="text-base font-bold">Meta de atendimento no handoff</p>
+          <p className="text-xs text-muted-foreground">Handoff Goal Achievement</p>
+          <div className="flex justify-center mt-1">
+            <SemiGauge value={stats.pct_within_sla} />
+          </div>
+          <p className="text-sm font-semibold -mt-2">Meta: ≥ {HANDOFF_GOAL_PCT}%</p>
+          <p className="text-xs text-muted-foreground mt-1">
+            {t("handoff_goal_current")} {formatHMS(stats.avg_wait_seconds)}
+          </p>
+          <p className="text-xs text-muted-foreground mt-1">
+            Porcentagem da meta do tempo de atendimento alcançado
+          </p>
         </div>
       </div>
 
       {/* Color legend */}
-      <div className="flex flex-wrap gap-3 text-xs">
+      <div className="flex flex-wrap gap-4 text-xs">
         <span className="inline-flex items-center gap-1.5">
-          <span className="h-3 w-3 rounded-full bg-green-500" />
+          <span className="h-2.5 w-2.5 rounded-full bg-emerald-500" />
           {t("handoff_legend_green")}
         </span>
         <span className="inline-flex items-center gap-1.5">
-          <span className="h-3 w-3 rounded-full bg-yellow-500" />
+          <span className="h-2.5 w-2.5 rounded-full bg-amber-500" />
           {t("handoff_legend_yellow")}
         </span>
         <span className="inline-flex items-center gap-1.5">
-          <span className="h-3 w-3 rounded-full bg-red-500" />
+          <span className="h-2.5 w-2.5 rounded-full bg-rose-500" />
           {t("handoff_legend_red")}
         </span>
       </div>
 
-      {/* Card grid */}
-      {handoffs.length === 0 && !loading && (
+      {/* Queue list */}
+      {visibleHandoffs.length === 0 && !loading && (
         <p className="text-center text-muted-foreground py-12">{t("handoff_empty")}</p>
       )}
 
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-        {handoffs.map((item) => {
+      <div className="space-y-3">
+        {visibleHandoffs.map((item) => {
           const secondsWaiting = Math.max(0, Math.floor((now.getTime() - new Date(item.created_at).getTime()) / 1000));
           const isFading = fadingIds.has(item.id);
 
           return (
             <div
               key={item.id}
-              className={`border-2 rounded-xl p-4 transition-all duration-300 ${getSlaColor(secondsWaiting)} ${isFading ? "opacity-0" : "opacity-100"}`}
+              className={`rounded-xl border border-l-4 bg-card p-4 shadow-sm transition-all duration-300 ${slaBorder(secondsWaiting)} ${isFading ? "opacity-0" : "opacity-100"}`}
             >
-              {/* WhatsApp number */}
-              <p className="text-2xl font-bold tracking-wide">{item.numero_whatsapp || "—"}</p>
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-3">
+                {/* Number + code */}
+                <div className="min-w-[10rem]">
+                  <p className="text-lg font-bold tracking-wide">{item.numero_whatsapp || "—"}</p>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <span className="text-xs text-muted-foreground">
+                      {t("handoff_session_code")}: {shortCode(item.session_id)}
+                    </span>
+                    <span className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
+                      {item.status}
+                    </span>
+                  </div>
+                </div>
 
-              {/* Session code + status */}
-              <div className="flex items-center gap-2 mt-1">
-                <span className="text-xs text-muted-foreground">
-                  {t("handoff_session_code")}: {item.session_id.slice(0, 8)}
-                </span>
-                <span className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded bg-muted">
-                  {item.status}
-                </span>
-              </div>
+                {/* Intent + stage */}
+                <div className="min-w-[11rem] text-sm space-y-0.5">
+                  {item.intencao_detectada && (
+                    <p><span className="text-muted-foreground">{t("handoff_intent")}:</span> {item.intencao_detectada}</p>
+                  )}
+                  {item.estagio_atual && (
+                    <p><span className="text-muted-foreground">{t("handoff_stage")}:</span> {item.estagio_atual}</p>
+                  )}
+                </div>
 
-              {/* Details */}
-              <div className="mt-3 space-y-1 text-sm">
-                {item.intencao_detectada && (
-                  <p><span className="text-muted-foreground">{t("handoff_intent")}:</span> {item.intencao_detectada}</p>
-                )}
-                {item.estagio_atual && (
-                  <p><span className="text-muted-foreground">{t("handoff_stage")}:</span> {item.estagio_atual}</p>
-                )}
-                <p><span className="text-muted-foreground">{t("handoff_entry_time")}:</span> {new Date(item.created_at).toLocaleString()}</p>
-              </div>
+                {/* Entry + waiting */}
+                <div className="min-w-[12rem] text-sm space-y-0.5">
+                  <p>
+                    <span className="text-muted-foreground">{t("handoff_entry_time")}:</span>{" "}
+                    {new Date(item.created_at).toLocaleString("pt-BR")}
+                  </p>
+                  <p>
+                    <span className="text-muted-foreground">{t("handoff_waiting_since")}</span>{" "}
+                    <span className="font-mono">{formatWait(secondsWaiting)}</span>
+                  </p>
+                </div>
 
-              {/* Countdown */}
-              <p className="text-sm font-mono mt-2">{t("handoff_waiting_since")} {formatWait(secondsWaiting)}</p>
+                {/* First message */}
+                <div className="flex-1 min-w-[6rem] text-sm text-muted-foreground truncate">
+                  {item.primeira_linha_mensagem || ""}
+                </div>
 
-              {/* First message */}
-              {item.primeira_linha_mensagem && (
-                <p className="text-xs text-muted-foreground truncate mt-2">{item.primeira_linha_mensagem}</p>
-              )}
-
-              {/* Buttons */}
-              <div className="flex gap-2 mt-4">
-                <Button size="sm" onClick={() => handleAtendido(item.id)}>
-                  {t("handoff_btn_attended")}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => handleWhatsApp(item.id, item.numero_whatsapp)}
-                >
-                  <ExternalLink className="h-4 w-4 mr-1" />
-                  WhatsApp
-                </Button>
+                {/* Actions */}
+                <div className="flex flex-wrap gap-2 ml-auto shrink-0">
+                  <Button
+                    size="sm"
+                    onClick={() => handleAtendido(item.id)}
+                    className="bg-slate-900 text-white hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white border-transparent"
+                  >
+                    {t("handoff_btn_attended")}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => handleAtenderDirecionar(item.id, item.numero_whatsapp)}
+                  >
+                    <MessageCircle className="h-4 w-4 mr-1" />
+                    {t("handoff_btn_attend_redirect")}
+                  </Button>
+                </div>
               </div>
             </div>
           );
