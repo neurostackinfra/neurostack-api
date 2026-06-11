@@ -235,7 +235,10 @@ export default function HandoffQueuePage() {
     if (!token) return;
     try {
       setLoading(true);
-      const res = await fetch(`/v1/handoffs/queue?tenant_id=${effectiveTenantId}`, {
+      const params = new URLSearchParams({ tenant_id: effectiveTenantId });
+      if (startDate) params.set("from_date", startDate);
+      if (endDate) params.set("to_date", endDate);
+      const res = await fetch(`/v1/handoffs/queue?${params.toString()}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) return;
@@ -247,7 +250,7 @@ export default function HandoffQueuePage() {
     } finally {
       setLoading(false);
     }
-  }, [effectiveTenantId]);
+  }, [effectiveTenantId, startDate, endDate]);
 
   // 1-second global tick
   useEffect(() => {
