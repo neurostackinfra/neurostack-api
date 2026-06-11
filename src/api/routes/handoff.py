@@ -157,7 +157,8 @@ async def get_handoff_queue(
             session_id=r.session_id,
             intencao_detectada=r.intencao_detectada,
             estagio_atual=r.estagio_atual,
-            primeira_linha_mensagem=r.primeira_linha_mensagem,
+            # Privacy: never expose the customer's first WhatsApp line (often their name)
+            primeira_linha_mensagem=None,
             created_at=r.created_at,
             data_hora_saida=r.data_hora_saida,
             status=r.status,

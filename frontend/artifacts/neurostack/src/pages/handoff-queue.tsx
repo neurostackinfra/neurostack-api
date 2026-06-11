@@ -83,7 +83,7 @@ function buildMockHandoffs(): HandoffQueueItem[] {
       session_id: "f843ae9f1",
       intencao_detectada: "scheduling",
       estagio_atual: "agendamento_solicitado",
-      primeira_linha_mensagem: "Rafaela Quinta de tarde",
+      primeira_linha_mensagem: null,
       created_at: agoMin(25, 9),
       data_hora_saida: null,
       status: "pending",
@@ -94,7 +94,7 @@ function buildMockHandoffs(): HandoffQueueItem[] {
       session_id: "ff2e3b8eec",
       intencao_detectada: "scheduling",
       estagio_atual: "agendamento_solicitado",
-      primeira_linha_mensagem: "Rafaela Quinta de tarde",
+      primeira_linha_mensagem: null,
       created_at: agoMin(11, 42),
       data_hora_saida: null,
       status: "pending",
@@ -105,7 +105,7 @@ function buildMockHandoffs(): HandoffQueueItem[] {
       session_id: "9ec721f00",
       intencao_detectada: "interesse_tratamento",
       estagio_atual: "em_qualificacao",
-      primeira_linha_mensagem: "Rafaela Quinta de tarde",
+      primeira_linha_mensagem: null,
       created_at: agoMin(8, 18),
       data_hora_saida: null,
       status: "pending",
@@ -116,7 +116,7 @@ function buildMockHandoffs(): HandoffQueueItem[] {
       session_id: "83b4e6a1",
       intencao_detectada: "pedido_preco",
       estagio_atual: "em_qualificacao",
-      primeira_linha_mensagem: "Rafaela Quinta de tarde",
+      primeira_linha_mensagem: null,
       created_at: agoMin(11, 3),
       data_hora_saida: null,
       status: "pending",
@@ -127,7 +127,7 @@ function buildMockHandoffs(): HandoffQueueItem[] {
       session_id: "1bc2f9e7",
       intencao_detectada: "duvida_gerencia",
       estagio_atual: "em_qualificacao",
-      primeira_linha_mensagem: "Rafaela Quinta de tarde",
+      primeira_linha_mensagem: null,
       created_at: agoMin(3, 27),
       data_hora_saida: null,
       status: "pending",
@@ -138,7 +138,7 @@ function buildMockHandoffs(): HandoffQueueItem[] {
       session_id: "d3a3fffa7",
       intencao_detectada: "interesse_tratamento",
       estagio_atual: "agendamento_solicitado",
-      primeira_linha_mensagem: "Rafaela Quinta de tarde",
+      primeira_linha_mensagem: null,
       created_at: agoMin(14, 58),
       data_hora_saida: null,
       status: "pending",
@@ -497,10 +497,8 @@ export default function HandoffQueuePage() {
                   </p>
                 </div>
 
-                {/* First message */}
-                <div className="flex-1 min-w-[6rem] text-sm text-muted-foreground truncate">
-                  {item.primeira_linha_mensagem || ""}
-                </div>
+                {/* Spacer pushes the actions to the right (no message/name shown for privacy) */}
+                <div className="flex-1 min-w-[2rem]" />
 
                 {/* Actions */}
                 <div className="flex flex-wrap gap-2 ml-auto shrink-0">
