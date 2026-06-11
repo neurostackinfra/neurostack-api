@@ -415,6 +415,11 @@ export const pt: Record<TranslationKey, string> = {
   // ── Handoff Queue ──
   nav_handoff_queue: "Fila de Handoff",
   handoff_queue_title: "Fila de Handoff",
+  handoff_subtitle: "Encaminhamentos aguardando atendimento humano em tempo real.",
+  handoff_date_start: "Data Inicial",
+  handoff_date_end: "Data Final",
+  handoff_goal_current: "Tempo médio atual:",
+  handoff_btn_attend_redirect: "Atender e direcionar",
   handoff_queue_tab_geral: "Geral",
   handoff_queue_tab_setor: "Por Setor (Em breve)",
   handoff_avg_wait: "Tempo Médio na Fila",

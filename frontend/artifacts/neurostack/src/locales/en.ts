@@ -413,6 +413,11 @@ export const en = {
   // ── Handoff Queue ──
   nav_handoff_queue: "Handoff Queue",
   handoff_queue_title: "Handoff Queue",
+  handoff_subtitle: "Handoffs waiting for human attention in real time.",
+  handoff_date_start: "Start Date",
+  handoff_date_end: "End Date",
+  handoff_goal_current: "Current average:",
+  handoff_btn_attend_redirect: "Attend & redirect",
   handoff_queue_tab_geral: "General",
   handoff_queue_tab_setor: "By Sector (Coming Soon)",
   handoff_avg_wait: "Avg. Queue Wait",
