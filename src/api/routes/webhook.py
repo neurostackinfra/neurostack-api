@@ -1117,34 +1117,44 @@ async def uazapi_webhook(
     """
     body: dict[str, Any] = await request.json()
 
-    # ── extract payload identifiers ──
-    data = body.get("data") or {}
-    if not isinstance(data, dict):
+    # ── extract payload identifiers — Uazapi commercial payload schema ──
+    # Uazapi uses top-level "message" and "chat" objects (not the wuzapi
+    # "data" envelope). Field names confirmed from live payload inspection.
+    # Real Uazapi payload uses top-level "message" and "chat" objects, not
+    # the wuzapi "data" envelope we originally assumed.
+    msg = body.get("message") or {}
+    if not isinstance(msg, dict):
         return {"ok": True, "skipped": "invalid_data"}
 
-    msg_type = str(data.get("type") or "")
-    instance_name = str(body.get("instance") or "")
-    raw_from = str(data.get("from") or "")
+    # instanceName (capital N) identifies the Uazapi instance / tenant
+    instance_name = str(body.get("instanceName") or "")
+
+    # sender_pn holds the full JID; fall back to chat.wa_chatid
+    chat = body.get("chat") or {}
+    raw_from = str(msg.get("sender_pn") or chat.get("wa_chatid") or "")
     from_phone = _normalise_phone(
         raw_from.split("@")[0] if "@" in raw_from else raw_from
     )
-    message_text = str(data.get("body") or "")
-    msg_id = str(data.get("id") or "")
+
+    # text / content both carry the message body depending on messageType
+    message_text = str(msg.get("text") or msg.get("content") or "")
+    msg_id = str(msg.get("messageid") or msg.get("id") or "")
+    is_from_me = bool(msg.get("fromMe", False))
+
+    # messageType / type identify media (e.g. "Image", "Audio", "Video")
+    msg_type = str(msg.get("type") or msg.get("messageType") or "")
 
     logger.info(
-        "Uazapi webhook raw: instance=%s from=%s type=%s body_len=%d",
-        instance_name, raw_from, msg_type, len(message_text),
+        "Uazapi webhook: instance=%s from=%s type=%s body_len=%d fromMe=%s",
+        instance_name, raw_from, msg_type, len(message_text), is_from_me,
     )
 
     if not instance_name or not from_phone:
         return {"ok": True, "skipped": "missing_fields"}
 
-    # Blocklist of known binary-media types — skip these regardless of body.
-    # Text-family types vary across Uazapi / wuzapi versions: "text", "chat",
-    # "conversation", "extendedTextMessage", or absent. Rather than allowlisting
-    # every text variant we blocklist known media types so future text variants
-    # are accepted automatically.
-    _MEDIA_TYPES = {"image", "video", "audio", "document", "sticker", "ptt"}
+    # Skip binary media — text messages arrive as "text" or "Conversation"
+    _MEDIA_TYPES = {"image", "Image", "video", "Video", "audio", "Audio",
+                    "document", "Document", "sticker", "Sticker", "ptt"}
     if msg_type in _MEDIA_TYPES or not message_text:
         logger.info("Uazapi webhook: skipping non-text msg_type=%s", msg_type)
         return {"ok": True, "skipped": "non-text"}
@@ -1160,7 +1170,7 @@ async def uazapi_webhook(
         return {"ok": True, "skipped": "unknown_instance"}
 
     # ── echo dedup (fromMe / self-sent) ──
-    if msg_id and _is_ai_sent_message(msg_id):
+    if is_from_me or (msg_id and _is_ai_sent_message(msg_id)):
         return {"ok": True, "skipped": "ai_echo"}
 
     # ── load clinic_config (needed for agent language + downstream checks) ──
