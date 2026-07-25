@@ -4,6 +4,7 @@ Super-admin-only routes for cross-tenant management (clinics + builders).
 """
 
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -529,13 +530,57 @@ async def list_circuit_breakers(
 
 @router.get(
     "/rlhf/pending",
-    summary="Pending RLHF Reviews (stub)",
-    description="Stub endpoint for pending RLHF items. Returns empty list.",
+    summary="Pending RLHF Reviews",
+    description=(
+        "List RLHF feedback suggestions submitted from the chat simulator. "
+        "Super admin only. Optional filter by builder_id."
+    ),
 )
 async def pending_rlhf(
+    builder_id: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
     tenant: TenantContext = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
 ):
-    return []
+    from uuid import UUID as _UUID
+
+    stmt = select(Event).where(Event.event_type == "rlhf.feedback")
+
+    if builder_id:
+        try:
+            builder_uuid = _UUID(builder_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid builder_id",
+            )
+        stmt = stmt.join(Tenant, Tenant.id == Event.tenant_id).where(
+            Tenant.builder_id == builder_uuid
+        )
+
+    stmt = stmt.order_by(Event.created_at.desc()).limit(limit).offset(offset)
+    result = await session.execute(stmt)
+    events = result.scalars().all()
+
+    entries = []
+    for e in events:
+        data = e.event_data or {}
+        entries.append(
+            {
+                "id": str(e.id),
+                "ts": e.created_at.isoformat() if e.created_at else "",
+                "tenant_id": str(e.tenant_id),
+                "submitted_by": data.get("submitted_by"),
+                "user_message": data.get("user_message"),
+                "agent_response": data.get("agent_response"),
+                "suggested_response": data.get("suggested_response"),
+                "status": data.get("status"),
+                "intent": data.get("intent"),
+            }
+        )
+
+    return entries
 
 
 # ============================================
