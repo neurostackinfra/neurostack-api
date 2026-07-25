@@ -57,6 +57,15 @@ interface CredentialStatus {
   evolution_instance_name:  string | null;
   evolution_api_key_set:    boolean;
   evolution_api_key_masked: string | null;
+  // Meta Cloud API (WhatsApp Business — official)
+  meta_phone_number_id?:       string | null;
+  meta_waba_id?:               string | null;
+  meta_permanent_token_set?:   boolean;
+  meta_permanent_token_masked?: string | null;
+  meta_app_secret_set?:        boolean;
+  meta_app_secret_masked?:     string | null;
+  // Verify token is not a secret — the user must copy it into the Meta dashboard.
+  meta_verify_token?:          string | null;
   // LLM
   llm_api_key_set:          boolean;
   llm_api_key_masked:       string | null;
@@ -81,13 +90,50 @@ function StatusDot({ configured }: { configured: boolean }) {
 }
 
 type LlmProvider = "openai" | "dropout" | "slm_cortex" | "outros";
-type WhatsappProvider = "zapi" | "evolution";
+type WhatsappProvider =
+  | "meta_cloud"
+  | "dialog360"
+  | "twilio"
+  | "zapi"
+  | "evolution"
+  | "uazapi";
+type WhatsappProviderGroup = "oficial" | "whatsapp_web";
 type SttProvider = "openai_whisper" | "elevenlabs_scribe" | "google_stt" | "outros";
 
-const WA_PROVIDERS: { id: WhatsappProvider; label: string; sub: string; activeCls: string }[] = [
-  { id: "zapi",      label: "Z-API",        sub: "by Z-API.io",   activeCls: "border-[#25D366]/50 text-[#25D366] bg-[#25D366]/10" },
-  { id: "evolution", label: "Evolution API", sub: "Open Source",   activeCls: "border-purple-500/50 text-purple-400 bg-purple-500/10" },
+// Providers with a functional backend integration. Selecting any provider
+// outside this set still surfaces the credential form (per product design),
+// but saving returns a clear "not implemented" error from the backend.
+const IMPLEMENTED_WA_PROVIDERS: ReadonlySet<WhatsappProvider> = new Set(["meta_cloud", "zapi", "evolution"]);
+
+// Maps the frontend provider id to the webhook URL segment exposed by the
+// backend (e.g. Meta Cloud API is served at `/v1/webhook/meta`, not `/meta_cloud`).
+const WEBHOOK_SEGMENT: Partial<Record<WhatsappProvider, string>> = {
+  meta_cloud: "meta",
+  zapi:       "zapi",
+  evolution:  "evolution",
+};
+
+const WA_PROVIDERS: {
+  id: WhatsappProvider;
+  group: WhatsappProviderGroup;
+  label: string;
+  sub: string;
+  activeCls: string;
+}[] = [
+  // Official WhatsApp Business API providers
+  { id: "meta_cloud", group: "oficial", label: "Meta Cloud API", sub: "by Meta (direct)",       activeCls: "border-[#25D366]/50 text-[#25D366] bg-[#25D366]/10" },
+  { id: "dialog360",  group: "oficial", label: "360dialog",      sub: "BSP oficial",            activeCls: "border-cyan-500/50 text-cyan-400 bg-cyan-500/10" },
+  { id: "twilio",     group: "oficial", label: "Twilio",         sub: "BSP oficial",            activeCls: "border-rose-500/50 text-rose-400 bg-rose-500/10" },
+  // WhatsApp Web / unofficial providers
+  { id: "zapi",       group: "whatsapp_web", label: "Z-API",         sub: "by Z-API.io",  activeCls: "border-emerald-500/50 text-emerald-400 bg-emerald-500/10" },
+  { id: "evolution",  group: "whatsapp_web", label: "Evolution API", sub: "Open Source",  activeCls: "border-purple-500/50 text-purple-400 bg-purple-500/10" },
+  { id: "uazapi",     group: "whatsapp_web", label: "Uazapi",        sub: "WhatsApp Web", activeCls: "border-orange-500/50 text-orange-400 bg-orange-500/10" },
 ];
+
+const WA_PROVIDER_LABEL: Record<WhatsappProvider, string> = WA_PROVIDERS.reduce(
+  (acc, wp) => ({ ...acc, [wp.id]: wp.label }),
+  {} as Record<WhatsappProvider, string>,
+);
 
 const STT_PROVIDERS: { id: SttProvider; label: string; sub: string; activeCls: string }[] = [
   { id: "openai_whisper",    label: "Whisper",   sub: "by OpenAI",       activeCls: "border-amber-500/50 text-amber-400 bg-amber-500/10"   },
@@ -149,6 +195,51 @@ function ApiInput({
   );
 }
 
+function ProviderCard({
+  wp, active, disabled, onClick,
+}: {
+  wp: { id: WhatsappProvider; label: string; sub: string; activeCls: string };
+  active: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={onClick}
+      className={`flex flex-col items-start rounded-lg border px-3 py-2.5 text-left transition-all disabled:opacity-60 disabled:cursor-not-allowed ${
+        active
+          ? wp.activeCls + " border-2"
+          : "border-border text-muted-foreground hover:border-muted-foreground/50"
+      }`}
+    >
+      <span className="text-xs font-bold">{wp.label}</span>
+      <span className="text-[10px] opacity-70 mt-0.5">{wp.sub}</span>
+    </button>
+  );
+}
+
+function UnimplementedProviderNotice({ provider }: { provider: WhatsappProvider }) {
+  const label = WA_PROVIDER_LABEL[provider] ?? provider;
+  return (
+    <div className="rounded-md border border-dashed border-amber-500/40 bg-amber-500/5 px-3 py-3 space-y-1.5">
+      <div className="flex items-center gap-2 text-amber-500">
+        <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+        <p className="text-[11px] font-semibold uppercase tracking-wider">
+          {label} — provedor ainda não implementado
+        </p>
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        Este provedor aparece aqui como opção, mas o backend ainda não implementa a integração.
+        Tentar salvar retornará um erro claro. Use <span className="font-semibold">Meta Cloud API</span>,
+        <span className="font-semibold"> Z-API</span> ou <span className="font-semibold">Evolution API</span>
+        {" "}enquanto isso.
+      </p>
+    </div>
+  );
+}
+
 function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   clinicId: string; isReadOnly: boolean; isSuperAdmin: boolean;
 }) {
@@ -162,6 +253,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   const [saving, setSaving]                 = useState(false);
   const [error, setError]                   = useState<string | null>(null);
   const [copiedWebhook, setCopiedWebhook]   = useState(false);
+  const [copiedVerifyToken, setCopiedVerifyToken] = useState(false);
 
   // WhatsApp provider selector
   const [waProvider, setWaProvider]         = useState<WhatsappProvider>("zapi");
@@ -175,6 +267,12 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   const [evolApiUrl, setEvolApiUrl]           = useState("");
   const [evolInstanceName, setEvolInstanceName] = useState("");
   const [evolApiKey, setEvolApiKey]           = useState("");
+
+  // Meta Cloud API fields
+  const [metaPhoneNumberId, setMetaPhoneNumberId] = useState("");
+  const [metaWabaId, setMetaWabaId]               = useState("");
+  const [metaPermanentToken, setMetaPermanentToken] = useState("");
+  const [metaAppSecret, setMetaAppSecret]         = useState("");
 
   // LLM
   const [llmProvider, setLlmProvider]       = useState<LlmProvider>("openai");
@@ -197,7 +295,9 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   }, [isSuperAdmin]);
 
   const targetId   = isSuperAdmin ? selectedClinicId : clinicId;
-  const webhookUrl = waProvider ? `${window.location.origin}/v1/webhook/${waProvider}` : "";
+  const webhookSegment = WEBHOOK_SEGMENT[waProvider];
+  const webhookUrl = webhookSegment ? `${window.location.origin}/v1/webhook/${webhookSegment}` : "";
+  const providerImplemented = IMPLEMENTED_WA_PROVIDERS.has(waProvider);
 
   const fetchStatus = useCallback(async () => {
     setLoading(true); setError(null);
@@ -214,6 +314,12 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       setZapiInstanceId(data.zapi_instance_id ?? "");
       setEvolApiUrl(data.evolution_api_url ?? "");
       setEvolInstanceName(data.evolution_instance_name ?? "");
+      // Meta Cloud API — non-secret identifiers pre-fill; secret fields stay
+      // empty so the "manter atual" placeholder shows when already saved.
+      setMetaPhoneNumberId(data.meta_phone_number_id ?? "");
+      setMetaWabaId(data.meta_waba_id ?? "");
+      setMetaPermanentToken("");
+      setMetaAppSecret("");
       // LLM
       const inferredProvider = inferProvider(data.llm_base_url);
       setLlmModelName(inferredProvider === "dropout" ? "text" : (data.llm_model_name ?? ""));
@@ -250,11 +356,19 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         if (zapiInstanceId)  body["zapi_instance_id"]  = zapiInstanceId;
         if (zapiToken)       body["zapi_token"]        = zapiToken;
         if (zapiClientToken) body["zapi_client_token"] = zapiClientToken;
-      } else {
+      } else if (waProvider === "evolution") {
         if (evolApiUrl)      body["evolution_api_url"]      = evolApiUrl;
         if (evolInstanceName) body["evolution_instance_name"] = evolInstanceName;
         if (evolApiKey)      body["evolution_api_key"]      = evolApiKey;
+      } else if (waProvider === "meta_cloud") {
+        if (metaPhoneNumberId)  body["meta_phone_number_id"]  = metaPhoneNumberId;
+        if (metaWabaId)         body["meta_waba_id"]          = metaWabaId;
+        if (metaPermanentToken) body["meta_permanent_token"]  = metaPermanentToken;
+        if (metaAppSecret)      body["meta_app_secret"]       = metaAppSecret;
       }
+      // dialog360 / twilio / uazapi: no per-provider fields yet; the backend
+      // will reject the save with a "provider_not_implemented" error handled
+      // in the error branch below (never a silent success).
       // Only send LLM api key if the user actually typed a new one (non-empty)
       if (llmApiKey)      body["llm_api_key"]       = llmApiKey;
       // Always persist the current URL and provider (even if unchanged)
@@ -281,8 +395,34 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${getToken()}` },
         body: JSON.stringify(body),
       });
-      const data = await res.json() as { ok?: boolean; apis_configured?: boolean; error?: string };
-      if (!res.ok) { setError(data.error ?? "Erro ao salvar."); return; }
+      const data = await res.json() as {
+        ok?: boolean;
+        apis_configured?: boolean;
+        error?: string;
+        // FastAPI wraps HTTPException payloads under `detail` — this covers the
+        // structured errors returned by the backend (provider_not_implemented,
+        // meta_phone_number_id_conflict, etc.).
+        detail?: string | { error?: string; message?: string; provider?: string };
+      };
+      if (!res.ok) {
+        let errMsg = data.error ?? "Erro ao salvar.";
+        const detail = data.detail;
+        if (typeof detail === "string") {
+          errMsg = detail;
+        } else if (detail && typeof detail === "object") {
+          if (detail.error === "provider_not_implemented") {
+            const provLabel = detail.provider
+              ? (WA_PROVIDER_LABEL[detail.provider as WhatsappProvider] ?? detail.provider)
+              : "esse provedor";
+            errMsg = `${provLabel}: provedor ainda não implementado. Use Meta Cloud API, Z-API ou Evolution API.`;
+          } else {
+            errMsg = detail.message ?? detail.error ?? errMsg;
+          }
+        }
+        setError(errMsg);
+        toast({ title: "Erro ao salvar", description: errMsg, variant: "destructive" });
+        return;
+      }
       toast({ title: "Configurações salvas!", description: data.apis_configured ? "APIs totalmente configuradas ✓" : "Parcialmente configurado." });
       await fetchStatus();
     } catch { setError("Erro de rede."); }
@@ -293,6 +433,14 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
     navigator.clipboard.writeText(webhookUrl).catch(() => {});
     setCopiedWebhook(true);
     setTimeout(() => setCopiedWebhook(false), 2000);
+  }
+
+  function copyVerifyToken() {
+    const tok = status?.meta_verify_token;
+    if (!tok) return;
+    navigator.clipboard.writeText(tok).catch(() => {});
+    setCopiedVerifyToken(true);
+    setTimeout(() => setCopiedVerifyToken(false), 2000);
   }
 
   const isCortex     = llmProvider === "slm_cortex";
@@ -318,13 +466,13 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         </div>
       )}
 
-      {/* ── Webhook URL (only when provider is selected) ── */}
-      {waProvider && webhookUrl && (
+      {/* ── Webhook URL (only when provider has a functional backend) ── */}
+      {webhookUrl && (
         <div className="rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50/60 dark:bg-blue-950/30 p-4 space-y-3">
           <div className="flex items-center gap-2">
             <Link2 className="h-4 w-4 text-blue-500 shrink-0" />
             <p className="text-[11px] font-semibold uppercase tracking-wider text-blue-700 dark:text-blue-400">
-              Webhook URL - {waProvider === "zapi" ? "Z-API" : "Evolution API"}
+              Webhook URL - {WA_PROVIDER_LABEL[waProvider]}
             </p>
             {status && (
               <span className={`ml-auto text-[10px] font-bold px-2 py-0.5 rounded-full border ${status.apis_configured ? "bg-emerald-500/15 text-emerald-500 border-emerald-500/30" : "bg-amber-500/15 text-amber-500 border-amber-500/30"}`}>
@@ -334,7 +482,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
           </div>
           <div className="space-y-1">
             <label className="text-xs text-muted-foreground">
-              Cole na configuração de webhooks do {waProvider === "zapi" ? "Z-API" : "Evolution API"}
+              Cole na configuração de webhooks do {WA_PROVIDER_LABEL[waProvider]}
             </label>
             <div className="flex gap-2">
               <input
@@ -359,17 +507,31 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       {/* ── Status dots ── */}
       {status && !loading && (
         <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
-          {waProvider === "zapi" ? (
+          {waProvider === "zapi" && (
             <>
               <span className="flex items-center gap-1.5"><StatusDot configured={!!status.zapi_instance_id} /> Z-API Instance</span>
               <span className="flex items-center gap-1.5"><StatusDot configured={status.zapi_token_set} /> Z-API Token</span>
             </>
-          ) : (
+          )}
+          {waProvider === "evolution" && (
             <>
               <span className="flex items-center gap-1.5"><StatusDot configured={!!status.evolution_api_url} /> Evol. API URL</span>
               <span className="flex items-center gap-1.5"><StatusDot configured={!!status.evolution_instance_name} /> Instance Name</span>
               <span className="flex items-center gap-1.5"><StatusDot configured={status.evolution_api_key_set} /> Evol. API Key</span>
             </>
+          )}
+          {waProvider === "meta_cloud" && (
+            <>
+              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.meta_phone_number_id} /> Phone Number ID</span>
+              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.meta_waba_id} /> WABA ID</span>
+              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.meta_permanent_token_set} /> Permanent Token</span>
+              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.meta_verify_token} /> Verify Token</span>
+            </>
+          )}
+          {!providerImplemented && (
+            <span className="flex items-center gap-1.5 text-amber-500">
+              <AlertTriangle className="h-3.5 w-3.5" /> Provedor ainda não implementado
+            </span>
           )}
           <span className="flex items-center gap-1.5"><StatusDot configured={status.llm_api_key_set} /> LLM API Key</span>
           <span className="flex items-center gap-1.5"><StatusDot configured={!!status.llm_base_url} /> LLM URL</span>
@@ -379,8 +541,8 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         </div>
       )}
 
-      {/* ── WhatsApp Provider (Unofficial APIs) ── */}
-      <div className="space-y-4 rounded-lg border border-slate-700/50 bg-muted/20 p-4">
+      {/* ── WhatsApp Providers (6 canais agrupados) ── */}
+      <div className="space-y-5 rounded-lg border border-slate-700/50 bg-muted/20 p-4">
 
         {/* Section header */}
         <div className="flex items-center gap-2">
@@ -389,30 +551,110 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
           <span className="ml-auto text-[10px] font-bold px-1.5 py-0.5 rounded border bg-[#25D366]/10 text-[#25D366] border-[#25D366]/30">Ativo</span>
         </div>
 
-        {/* Provider selector cards */}
-        <div className="grid grid-cols-2 gap-2">
-          {WA_PROVIDERS.map(wp => (
-            <button
-              key={wp.id}
-              type="button"
-              disabled={isReadOnly}
-              onClick={() => {
-                if (waProvider === wp.id) return;
-                setWaProvider(wp.id);
-                setZapiInstanceId(""); setZapiToken("");
-                setEvolApiUrl(""); setEvolInstanceName(""); setEvolApiKey("");
-              }}
-              className={`flex flex-col items-start rounded-lg border px-3 py-2.5 text-left transition-all disabled:opacity-60 disabled:cursor-not-allowed ${
-                waProvider === wp.id
-                  ? wp.activeCls + " border-2"
-                  : "border-border text-muted-foreground hover:border-muted-foreground/50"
-              }`}
-            >
-              <span className="text-xs font-bold">{wp.label}</span>
-              <span className="text-[10px] opacity-70 mt-0.5">{wp.sub}</span>
-            </button>
-          ))}
+        {/* Group: Official WhatsApp Business API */}
+        <div className="space-y-2">
+          <p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground/80">
+            WhatsApp Business API (Oficial)
+          </p>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+            {WA_PROVIDERS.filter(wp => wp.group === "oficial").map(wp => (
+              <ProviderCard
+                key={wp.id}
+                wp={wp}
+                active={waProvider === wp.id}
+                disabled={isReadOnly}
+                onClick={() => {
+                  if (waProvider === wp.id) return;
+                  setWaProvider(wp.id);
+                  // Clear per-provider inputs so we don't accidentally send
+                  // stale fields when switching providers.
+                  setZapiInstanceId(""); setZapiToken(""); setZapiClientToken("");
+                  setEvolApiUrl(""); setEvolInstanceName(""); setEvolApiKey("");
+                  setMetaPermanentToken(""); setMetaAppSecret("");
+                }}
+              />
+            ))}
+          </div>
         </div>
+
+        {/* Group: Unofficial / WhatsApp Web providers */}
+        <div className="space-y-2">
+          <p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground/80">
+            Outros Provedores WhatsApp Web
+          </p>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+            {WA_PROVIDERS.filter(wp => wp.group === "whatsapp_web").map(wp => (
+              <ProviderCard
+                key={wp.id}
+                wp={wp}
+                active={waProvider === wp.id}
+                disabled={isReadOnly}
+                onClick={() => {
+                  if (waProvider === wp.id) return;
+                  setWaProvider(wp.id);
+                  setZapiInstanceId(""); setZapiToken(""); setZapiClientToken("");
+                  setEvolApiUrl(""); setEvolInstanceName(""); setEvolApiKey("");
+                  setMetaPermanentToken(""); setMetaAppSecret("");
+                }}
+              />
+            ))}
+          </div>
+        </div>
+
+        {/* Meta Cloud API fields */}
+        {waProvider === "meta_cloud" && (
+          <div className="grid gap-3 sm:grid-cols-2">
+            <ApiInput label="Phone Number ID" value={metaPhoneNumberId} onChange={setMetaPhoneNumberId}
+              placeholder="123456789012345" disabled={isReadOnly} mono
+              configured={!!status?.meta_phone_number_id} />
+            <ApiInput label="WABA ID" value={metaWabaId} onChange={setMetaWabaId}
+              placeholder="987654321098765" disabled={isReadOnly} mono
+              configured={!!status?.meta_waba_id} />
+            <div className="sm:col-span-2">
+              <ApiInput label="Permanent Token" value={metaPermanentToken} onChange={setMetaPermanentToken} type="password"
+                placeholder={status?.meta_permanent_token_set ? "••••••••• (manter atual)" : "EAAG..."}
+                disabled={isReadOnly} configured={status?.meta_permanent_token_set} />
+            </div>
+            <div className="sm:col-span-2">
+              <ApiInput label="App Secret (opcional)" value={metaAppSecret} onChange={setMetaAppSecret} type="password"
+                placeholder={status?.meta_app_secret_set ? "••••••••• (manter atual)" : "Opcional — para assinar webhooks (X-Hub-Signature-256)"}
+                disabled={isReadOnly} configured={status?.meta_app_secret_set} />
+            </div>
+
+            {/* Verify Token — only shown after Phone Number ID + Permanent Token
+                have been saved at least once (backend auto-generates on first save). */}
+            {status?.meta_verify_token ? (
+              <div className="sm:col-span-2 space-y-1">
+                <label className="text-xs font-medium text-muted-foreground">
+                  Verify Token <span className="text-emerald-400 ml-1.5">● gerado automaticamente</span>
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    readOnly value={status.meta_verify_token}
+                    onClick={e => (e.target as HTMLInputElement).select()}
+                    className="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-mono text-foreground cursor-text focus:outline-none focus:ring-1 focus:ring-accent"
+                  />
+                  <button type="button" onClick={copyVerifyToken}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-blue-300 dark:border-blue-700 bg-white dark:bg-blue-900/20 px-3 py-1.5 text-xs font-medium text-blue-700 dark:text-blue-300 hover:bg-blue-50 dark:hover:bg-blue-900/40 transition-colors shrink-0"
+                  >
+                    {copiedVerifyToken
+                      ? <><Check className="h-3.5 w-3.5 text-emerald-500" /> Copiado!</>
+                      : <><Copy className="h-3.5 w-3.5" /> Copiar</>}
+                  </button>
+                </div>
+                <p className="text-[10px] text-muted-foreground">
+                  Cole este valor em "Verify Token" ao configurar o webhook no Meta App Dashboard.
+                </p>
+              </div>
+            ) : (
+              <div className="sm:col-span-2 rounded-md border border-dashed border-slate-600/60 bg-muted/20 px-3 py-2.5 text-[11px] text-muted-foreground">
+                O <span className="font-mono">Verify Token</span> será gerado automaticamente após salvar
+                <span className="font-semibold"> Phone Number ID</span> e
+                <span className="font-semibold"> Permanent Token</span> pela primeira vez.
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Z-API fields */}
         {waProvider === "zapi" && (
@@ -444,26 +686,14 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
               disabled={isReadOnly} configured={status?.evolution_api_key_set} />
           </div>
         )}
-      </div>
 
-      {/* ── WABA / Official API — Enterprise Em breve ── */}
-      <div className="rounded-lg border border-dashed border-slate-600/60 bg-slate-900/20 p-4 space-y-3 select-none pointer-events-none">
-        <div className="flex items-center gap-2">
-          <MessageSquare className="h-3.5 w-3.5 text-slate-400" />
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">WABA / WhatsApp Business API (Oficial)</p>
-          <span className="ml-auto flex items-center gap-1.5 text-[10px] font-bold px-1.5 py-0.5 rounded border bg-muted text-foreground border-border">
-            <Lock className="h-2.5 w-2.5" /> Enterprise, Em breve
-          </span>
-        </div>
-        <p className="text-xs text-slate-400">Conexão direta via Meta Business Platform. Ideal para grandes redes, conformidade total com LGPD/HIPAA.</p>
-        <div className="grid gap-3 sm:grid-cols-3">
-          {["Phone Number ID", "WABA ID", "Permanent Token"].map(f => (
-            <div key={f} className="space-y-1">
-              <label className="text-xs font-medium text-slate-500">{f}</label>
-              <div className="h-8 rounded-md bg-muted/40 border border-slate-700/50" />
-            </div>
-          ))}
-        </div>
+        {/* dialog360 / twilio / uazapi — visible form + backend rejects on save.
+            No functional fields yet; each provider will get its own wish with
+            the real credential schema. Presenting an empty state keeps the UI
+            visually consistent with the implemented providers. */}
+        {!providerImplemented && (
+          <UnimplementedProviderNotice provider={waProvider} />
+        )}
       </div>
 
       {/* ── LLM Provider selector ── */}
