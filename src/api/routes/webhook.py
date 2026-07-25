@@ -27,6 +27,7 @@ from src.services.meta_service import (
     resolve_meta_media,
     send_meta_cloud_text,
 )
+from src.services.uazapi_service import send_uazapi_text
 from src.services.zapi_service import mark_conversation_unread, mark_message_read, send_evolution_text, send_text_message
 
 logger = logging.getLogger(__name__)
@@ -1073,6 +1074,157 @@ async def evolution_webhook(
         logger.info("Evolution reply sent to %s (%d chars)", phone, len(suggested))
     except Exception:
         logger.exception("Evolution send failed for %s", phone)
+        return {"ok": True, "replied": False, "reason": "send_failed"}
+
+    return {"ok": True, "replied": True}
+
+
+# ── Uazapi webhook endpoint ─────────────────────────────────────────
+
+@router.post(
+    "/uazapi",
+    summary="Uazapi Webhook",
+    description=(
+        "Receives incoming WhatsApp messages from a self-hosted Uazapi "
+        "(wuzapi) gateway and responds automatically. Tenant is resolved by "
+        "``uazapi_instance_name`` (the ``instance`` field on the payload)."
+    ),
+    tags=["Webhook"],
+    status_code=200,
+)
+async def uazapi_webhook(
+    request: Request,
+    db: AsyncSession = Depends(get_db_session_dependency),
+):
+    """
+    Uazapi sends a POST for every incoming message.
+
+    Expected payload (text message):
+    {
+      "instance": "my-instance",
+      "event": "message",
+      "data": {
+        "from": "5511999999999@s.whatsapp.net",
+        "body": "Olá",
+        "type": "text",
+        "id": "3EB0..."
+      }
+    }
+    """
+    body: dict[str, Any] = await request.json()
+
+    # ── extract payload identifiers ──
+    data = body.get("data") or {}
+    if not isinstance(data, dict):
+        return {"ok": True, "skipped": "invalid_data"}
+
+    msg_type = str(data.get("type") or "")
+    instance_name = str(body.get("instance") or "")
+    raw_from = str(data.get("from") or "")
+    from_phone = _normalise_phone(
+        raw_from.split("@")[0] if "@" in raw_from else raw_from
+    )
+    message_text = str(data.get("body") or "")
+    msg_id = str(data.get("id") or "")
+
+    if not instance_name or not from_phone:
+        return {"ok": True, "skipped": "missing_fields"}
+
+    # Accept "text", "chat", and empty type (some wuzapi variants omit it for
+    # plain text messages). Anything else is treated as non-text.
+    if msg_type not in ("text", "chat", "") or not message_text:
+        return {"ok": True, "skipped": "non-text"}
+
+    # ── resolve tenant from instance_name ──
+    tenant_id = await _resolve_tenant_by_credential(
+        "uazapi_instance_name", instance_name, db,
+    )
+    if not tenant_id:
+        logger.warning(
+            "Uazapi webhook: no tenant for instance %s", instance_name,
+        )
+        return {"ok": True, "skipped": "unknown_instance"}
+
+    # ── echo dedup (fromMe / self-sent) ──
+    if msg_id and _is_ai_sent_message(msg_id):
+        return {"ok": True, "skipped": "ai_echo"}
+
+    # ── load clinic_config (needed for agent language + downstream checks) ──
+    service = get_event_service()
+    clinic_config = await service._load_clinic_config(tenant_id)
+
+    # ── bot_active check — if AI is paused, drop silently ──
+    bot_skip = await _check_bot_active(tenant_id, from_phone, db)
+    if bot_skip:
+        await db.commit()
+        return JSONResponse(status_code=202, content=bot_skip)
+
+    # ── pause check for patient messages ──
+    pause_result = await _check_pause_state(tenant_id, from_phone, db)
+    if pause_result:
+        await db.commit()
+        return JSONResponse(status_code=202, content=pause_result)
+
+    # ── get or create a session for this phone ──
+    session_id, _is_new = await _get_or_create_session(tenant_id, from_phone, db)
+    await db.commit()
+
+    logger.info(
+        "Uazapi webhook: msg %s from %s (tenant %s)",
+        msg_id, from_phone, tenant_id,
+    )
+
+    event_request = EventRequest(
+        tenant_id=tenant_id,
+        session_id=session_id,
+        event_type="message.in",
+        payload=EventPayload(
+            content=message_text,
+            channel="whatsapp",
+            user_id=from_phone,
+            language=_get_agent_language(clinic_config),
+            metadata={
+                "phone": from_phone,
+                "messageId": msg_id,
+                "source": "uazapi",
+            },
+        ),
+    )
+
+    response = await service.process_event(event_request, session=db)
+    await db.commit()
+
+    suggested = (
+        response.prompt.suggested_response
+        if response.prompt and response.prompt.suggested_response
+        else None
+    )
+
+    if not suggested:
+        logger.info("Uazapi webhook: no suggested_response for %s", from_phone)
+        return {"ok": True, "replied": False}
+
+    creds = await _load_tenant_credentials(tenant_id, db)
+    u_url = (creds.get("uazapi_api_url") or "").strip()
+    u_token = (creds.get("uazapi_token") or "").strip()
+
+    if not u_url or not u_token:
+        logger.warning("Uazapi credentials missing for tenant %s", tenant_id)
+        return {"ok": True, "replied": False, "reason": "no_credentials"}
+
+    try:
+        send_result = await send_uazapi_text(u_url, u_token, from_phone, suggested)
+        _track_sent_message(send_result)
+        # DB-backed dedup: store reply message ID for cross-worker echo detection
+        reply_mid = send_result.get("MessageID") or send_result.get("id", "")
+        if reply_mid:
+            await _store_ai_msg_id_to_db(session_id, reply_mid, db)
+            await db.commit()  # commit metadata update immediately
+        logger.info(
+            "Uazapi reply sent to %s (%d chars)", from_phone, len(suggested),
+        )
+    except Exception:
+        logger.exception("Uazapi send failed for %s", from_phone)
         return {"ok": True, "replied": False, "reason": "send_failed"}
 
     return {"ok": True, "replied": True}

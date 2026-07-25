@@ -66,6 +66,11 @@ interface CredentialStatus {
   meta_app_secret_masked?:     string | null;
   // Verify token is not a secret — the user must copy it into the Meta dashboard.
   meta_verify_token?:          string | null;
+  // Uazapi (wuzapi-based, WhatsApp Web multi-device)
+  uazapi_api_url?:             string | null;
+  uazapi_instance_name?:       string | null;
+  uazapi_token_set?:           boolean;
+  uazapi_token_masked?:        string | null;
   // LLM
   llm_api_key_set:          boolean;
   llm_api_key_masked:       string | null;
@@ -103,7 +108,7 @@ type SttProvider = "openai_whisper" | "elevenlabs_scribe" | "google_stt" | "outr
 // Providers with a functional backend integration. Selecting any provider
 // outside this set still surfaces the credential form (per product design),
 // but saving returns a clear "not implemented" error from the backend.
-const IMPLEMENTED_WA_PROVIDERS: ReadonlySet<WhatsappProvider> = new Set(["meta_cloud", "zapi", "evolution"]);
+const IMPLEMENTED_WA_PROVIDERS: ReadonlySet<WhatsappProvider> = new Set(["meta_cloud", "zapi", "evolution", "uazapi"]);
 
 // Maps the frontend provider id to the webhook URL segment exposed by the
 // backend (e.g. Meta Cloud API is served at `/v1/webhook/meta`, not `/meta_cloud`).
@@ -111,6 +116,7 @@ const WEBHOOK_SEGMENT: Partial<Record<WhatsappProvider, string>> = {
   meta_cloud: "meta",
   zapi:       "zapi",
   evolution:  "evolution",
+  uazapi:     "uazapi",
 };
 
 const WA_PROVIDERS: {
@@ -274,6 +280,11 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   const [metaPermanentToken, setMetaPermanentToken] = useState("");
   const [metaAppSecret, setMetaAppSecret]         = useState("");
 
+  // Uazapi fields
+  const [uazapiApiUrl, setUazapiApiUrl]               = useState("");
+  const [uazapiToken, setUazapiToken]                 = useState("");
+  const [uazapiInstanceName, setUazapiInstanceName]   = useState("");
+
   // LLM
   const [llmProvider, setLlmProvider]       = useState<LlmProvider>("openai");
   const [llmApiKey, setLlmApiKey]           = useState("");
@@ -320,6 +331,11 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       setMetaWabaId(data.meta_waba_id ?? "");
       setMetaPermanentToken("");
       setMetaAppSecret("");
+      // Uazapi — non-secret identifiers pre-fill; token stays empty so
+      // "manter atual" placeholder shows when already saved.
+      setUazapiApiUrl(data.uazapi_api_url ?? "");
+      setUazapiInstanceName(data.uazapi_instance_name ?? "");
+      setUazapiToken("");
       // LLM
       const inferredProvider = inferProvider(data.llm_base_url);
       setLlmModelName(inferredProvider === "dropout" ? "text" : (data.llm_model_name ?? ""));
@@ -365,8 +381,16 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         if (metaWabaId)         body["meta_waba_id"]          = metaWabaId;
         if (metaPermanentToken) body["meta_permanent_token"]  = metaPermanentToken;
         if (metaAppSecret)      body["meta_app_secret"]       = metaAppSecret;
+      } else if (waProvider === "uazapi") {
+        if (uazapiApiUrl)       body["uazapi_api_url"]        = uazapiApiUrl;
+        if (uazapiInstanceName) body["uazapi_instance_name"]  = uazapiInstanceName;
+        // Skip masked tokens (e.g. "abcd****wxyz") — send only real values
+        // typed by the user so the backend can preserve the existing secret
+        // via COALESCE when the field is omitted.
+        if (uazapiToken && !uazapiToken.includes("*") && !uazapiToken.includes("•"))
+          body["uazapi_token"] = uazapiToken;
       }
-      // dialog360 / twilio / uazapi: no per-provider fields yet; the backend
+      // dialog360 / twilio: no per-provider fields yet; the backend
       // will reject the save with a "provider_not_implemented" error handled
       // in the error branch below (never a silent success).
       // Only send LLM api key if the user actually typed a new one (non-empty)
@@ -528,6 +552,13 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
               <span className="flex items-center gap-1.5"><StatusDot configured={!!status.meta_verify_token} /> Verify Token</span>
             </>
           )}
+          {waProvider === "uazapi" && (
+            <>
+              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.uazapi_api_url} /> Uazapi API URL</span>
+              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.uazapi_instance_name} /> Instance Name</span>
+              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.uazapi_token_set} /> Uazapi Token</span>
+            </>
+          )}
           {!providerImplemented && (
             <span className="flex items-center gap-1.5 text-amber-500">
               <AlertTriangle className="h-3.5 w-3.5" /> Provedor ainda não implementado
@@ -571,6 +602,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
                   setZapiInstanceId(""); setZapiToken(""); setZapiClientToken("");
                   setEvolApiUrl(""); setEvolInstanceName(""); setEvolApiKey("");
                   setMetaPermanentToken(""); setMetaAppSecret("");
+                  setUazapiApiUrl(""); setUazapiInstanceName(""); setUazapiToken("");
                 }}
               />
             ))}
@@ -595,6 +627,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
                   setZapiInstanceId(""); setZapiToken(""); setZapiClientToken("");
                   setEvolApiUrl(""); setEvolInstanceName(""); setEvolApiKey("");
                   setMetaPermanentToken(""); setMetaAppSecret("");
+                  setUazapiApiUrl(""); setUazapiInstanceName(""); setUazapiToken("");
                 }}
               />
             ))}
@@ -687,7 +720,24 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
           </div>
         )}
 
-        {/* dialog360 / twilio / uazapi — visible form + backend rejects on save.
+        {/* Uazapi fields (wuzapi-based, WhatsApp Web multi-device, self-hosted) */}
+        {waProvider === "uazapi" && (
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="sm:col-span-2">
+              <ApiInput label="API URL" value={uazapiApiUrl} onChange={setUazapiApiUrl}
+                placeholder="https://uazapi.seudominio.com" disabled={isReadOnly} mono
+                configured={!!status?.uazapi_api_url} />
+            </div>
+            <ApiInput label="Instance Name" value={uazapiInstanceName} onChange={setUazapiInstanceName}
+              placeholder="minha-clinica-prod" disabled={isReadOnly}
+              configured={!!status?.uazapi_instance_name} />
+            <ApiInput label="Token" value={uazapiToken} onChange={setUazapiToken} type="password"
+              placeholder={status?.uazapi_token_set ? "••••••••• (manter atual)" : "Cole o Token da instância"}
+              disabled={isReadOnly} configured={status?.uazapi_token_set} />
+          </div>
+        )}
+
+        {/* dialog360 / twilio — visible form + backend rejects on save.
             No functional fields yet; each provider will get its own wish with
             the real credential schema. Presenting an empty state keeps the UI
             visually consistent with the implemented providers. */}
