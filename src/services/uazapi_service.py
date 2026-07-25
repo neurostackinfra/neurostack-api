@@ -36,8 +36,8 @@ async def send_uazapi_text(
         Uazapi response dict. The outbound message id is typically returned as
         ``MessageID`` (wuzapi) or ``id`` — callers should probe both keys.
     """
-    url = f"{api_url.rstrip('/')}/chat/send/text"
-    payload = {"Phone": phone, "Body": message}
+    url = f"{api_url.rstrip('/')}/send/text"
+    payload = {"number": phone, "text": message}
     headers = {"Token": token, "Content-Type": "application/json"}
 
     async with httpx.AsyncClient(timeout=15) as client:
