@@ -90,7 +90,8 @@ def _track_sent_message(zapi_response: dict) -> None:
     mid = (
         zapi_response.get("messageId")
         or zapi_response.get("zapiMessageId")
-        or zapi_response.get("MessageID")  # Uazapi / wuzapi capitalisation
+        or zapi_response.get("MessageID")   # wuzapi capitalisation
+        or zapi_response.get("messageid")   # Uazapi commercial
     )
     if not mid:
         return
@@ -1240,7 +1241,7 @@ async def uazapi_webhook(
         send_result = await send_uazapi_text(u_url, u_token, from_phone, suggested)
         _track_sent_message(send_result)
         # DB-backed dedup: store reply message ID for cross-worker echo detection
-        reply_mid = send_result.get("MessageID") or send_result.get("id", "")
+        reply_mid = send_result.get("messageid") or send_result.get("MessageID") or send_result.get("id", "")
         if reply_mid:
             await _store_ai_msg_id_to_db(session_id, reply_mid, db)
             await db.commit()  # commit metadata update immediately
