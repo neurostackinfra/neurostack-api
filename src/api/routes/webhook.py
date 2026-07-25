@@ -87,7 +87,11 @@ def _track_sent_message(zapi_response: dict) -> None:
     Always writes to the in-process dict so echoes are recognised even if Redis
     is temporarily down between _track and _is_ai_sent_message calls.
     """
-    mid = zapi_response.get("messageId") or zapi_response.get("zapiMessageId")
+    mid = (
+        zapi_response.get("messageId")
+        or zapi_response.get("zapiMessageId")
+        or zapi_response.get("MessageID")  # Uazapi / wuzapi capitalisation
+    )
     if not mid:
         return
 
@@ -1127,12 +1131,22 @@ async def uazapi_webhook(
     message_text = str(data.get("body") or "")
     msg_id = str(data.get("id") or "")
 
+    logger.info(
+        "Uazapi webhook raw: instance=%s from=%s type=%s body_len=%d",
+        instance_name, raw_from, msg_type, len(message_text),
+    )
+
     if not instance_name or not from_phone:
         return {"ok": True, "skipped": "missing_fields"}
 
-    # Accept "text", "chat", and empty type (some wuzapi variants omit it for
-    # plain text messages). Anything else is treated as non-text.
-    if msg_type not in ("text", "chat", "") or not message_text:
+    # Blocklist of known binary-media types — skip these regardless of body.
+    # Text-family types vary across Uazapi / wuzapi versions: "text", "chat",
+    # "conversation", "extendedTextMessage", or absent. Rather than allowlisting
+    # every text variant we blocklist known media types so future text variants
+    # are accepted automatically.
+    _MEDIA_TYPES = {"image", "video", "audio", "document", "sticker", "ptt"}
+    if msg_type in _MEDIA_TYPES or not message_text:
+        logger.info("Uazapi webhook: skipping non-text msg_type=%s", msg_type)
         return {"ok": True, "skipped": "non-text"}
 
     # ── resolve tenant from instance_name ──
