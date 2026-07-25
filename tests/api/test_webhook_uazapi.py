@@ -107,15 +107,24 @@ def _uazapi_text_payload(
     message_id: str,
     msg_type: str = "text",
 ) -> dict:
-    """Build a Uazapi/wuzapi incoming text payload."""
+    """Build a real Uazapi commercial payload (instanceName / message / chat schema)."""
     return {
-        "instance": instance,
-        "event": "message",
-        "data": {
-            "from": f"{from_phone}@s.whatsapp.net",
-            "body": body,
+        "instanceName": instance,
+        "EventType": "messages",
+        "owner": "5511940589006",
+        "chat": {
+            "wa_chatid": f"{from_phone}@s.whatsapp.net",
+            "wa_name": "Test User",
+            "phone": f"+{from_phone}",
+        },
+        "message": {
+            "sender_pn": f"{from_phone}@s.whatsapp.net",
+            "text": body,
+            "content": body,
             "type": msg_type,
-            "id": message_id,
+            "messageType": "Conversation" if msg_type == "text" else msg_type,
+            "messageid": message_id,
+            "fromMe": False,
         },
     }
 
