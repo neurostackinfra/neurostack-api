@@ -255,11 +255,12 @@ SECRET_FIELDS = {
     "whisper_api_key",
     "meta_permanent_token",
     "meta_app_secret",
+    "uazapi_token",
 }
 
 # WhatsApp providers accepted in the UI but without a backend integration yet.
 # Saving credentials for these should fail loudly rather than silently succeed.
-UNIMPLEMENTED_WHATSAPP_PROVIDERS = {"dialog360", "twilio", "uazapi"}
+UNIMPLEMENTED_WHATSAPP_PROVIDERS = {"dialog360", "twilio"}
 
 
 def _mask(value: Optional[str]) -> Optional[str]:
@@ -285,6 +286,11 @@ def _build_credential_status(creds: dict[str, Any]) -> dict[str, Any]:
         "evolution_instance_name": creds.get("evolution_instance_name"),
         "evolution_api_key_set": bool(creds.get("evolution_api_key")),
         "evolution_api_key_masked": _mask(creds.get("evolution_api_key")),
+        # Uazapi (wuzapi self-hosted)
+        "uazapi_api_url": creds.get("uazapi_api_url"),
+        "uazapi_instance_name": creds.get("uazapi_instance_name"),
+        "uazapi_token_set": bool(creds.get("uazapi_token")),
+        "uazapi_token_masked": _mask(creds.get("uazapi_token")),
         # Meta Cloud API (WhatsApp Business — official)
         "meta_phone_number_id": creds.get("meta_phone_number_id"),
         "meta_waba_id": creds.get("meta_waba_id"),
@@ -322,6 +328,12 @@ def _is_configured(creds: dict[str, Any]) -> bool:
     elif provider == "meta_cloud":
         whatsapp_ok = bool(
             creds.get("meta_phone_number_id") and creds.get("meta_permanent_token")
+        )
+    elif provider == "uazapi":
+        whatsapp_ok = bool(
+            creds.get("uazapi_api_url")
+            and creds.get("uazapi_token")
+            and creds.get("uazapi_instance_name")
         )
     else:
         whatsapp_ok = bool(
@@ -387,6 +399,7 @@ async def patch_api_credentials(
         "whatsapp_provider", "zapi_instance_id", "zapi_token", "zapi_client_token",
         "evolution_api_url", "evolution_instance_name", "evolution_api_key",
         "meta_phone_number_id", "meta_waba_id", "meta_permanent_token", "meta_app_secret",
+        "uazapi_api_url", "uazapi_token", "uazapi_instance_name",
         "llm_api_key", "llm_api_url", "llm_provider", "llm_model_name",
         "whisper_api_key", "whisper_model",
         "stt_provider", "stt_api_url",
