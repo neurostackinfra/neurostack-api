@@ -5,11 +5,12 @@ CRUD clinic configuration for the admin panel.
 
 import logging
 from typing import Any, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.middleware.auth import TenantContext, get_tenant_context, require_builder_clinic_access
@@ -246,7 +247,19 @@ async def patch_config(
 # API Credentials (WhatsApp + LLM providers)
 # ============================================
 
-SECRET_FIELDS = {"zapi_token", "zapi_client_token", "evolution_api_key", "llm_api_key", "whisper_api_key"}
+SECRET_FIELDS = {
+    "zapi_token",
+    "zapi_client_token",
+    "evolution_api_key",
+    "llm_api_key",
+    "whisper_api_key",
+    "meta_permanent_token",
+    "meta_app_secret",
+}
+
+# WhatsApp providers accepted in the UI but without a backend integration yet.
+# Saving credentials for these should fail loudly rather than silently succeed.
+UNIMPLEMENTED_WHATSAPP_PROVIDERS = {"dialog360", "twilio", "uazapi"}
 
 
 def _mask(value: Optional[str]) -> Optional[str]:
@@ -272,6 +285,16 @@ def _build_credential_status(creds: dict[str, Any]) -> dict[str, Any]:
         "evolution_instance_name": creds.get("evolution_instance_name"),
         "evolution_api_key_set": bool(creds.get("evolution_api_key")),
         "evolution_api_key_masked": _mask(creds.get("evolution_api_key")),
+        # Meta Cloud API (WhatsApp Business — official)
+        "meta_phone_number_id": creds.get("meta_phone_number_id"),
+        "meta_waba_id": creds.get("meta_waba_id"),
+        "meta_permanent_token_set": bool(creds.get("meta_permanent_token")),
+        "meta_permanent_token_masked": _mask(creds.get("meta_permanent_token")),
+        "meta_app_secret_set": bool(creds.get("meta_app_secret")),
+        "meta_app_secret_masked": _mask(creds.get("meta_app_secret")),
+        # Verify token is auto-generated per clinic and must be copyable by the
+        # user for the Meta webhook handshake — it is not a secret credential.
+        "meta_verify_token": creds.get("meta_verify_token"),
         # LLM
         "llm_api_key_set": bool(creds.get("llm_api_key")),
         "llm_api_key_masked": _mask(creds.get("llm_api_key")),
@@ -296,6 +319,10 @@ def _is_configured(creds: dict[str, Any]) -> bool:
     provider = creds.get("whatsapp_provider", "zapi")
     if provider == "zapi":
         whatsapp_ok = bool(creds.get("zapi_instance_id") and creds.get("zapi_token"))
+    elif provider == "meta_cloud":
+        whatsapp_ok = bool(
+            creds.get("meta_phone_number_id") and creds.get("meta_permanent_token")
+        )
     else:
         whatsapp_ok = bool(
             creds.get("evolution_api_url")
@@ -334,6 +361,24 @@ async def patch_api_credentials(
     session: AsyncSession = Depends(get_db_session_dependency),
 ):
     tenant = await _resolve_config_tenant(request, tenant, session)
+
+    # Guard: providers accepted in the UI but without a backend integration
+    # yet must fail loudly instead of silently accepting credentials the
+    # webhook layer cannot honor.
+    incoming_provider = body.get("whatsapp_provider")
+    if incoming_provider in UNIMPLEMENTED_WHATSAPP_PROVIDERS:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={
+                "error": "provider_not_implemented",
+                "provider": incoming_provider,
+                "message": (
+                    f"WhatsApp provider '{incoming_provider}' is not yet supported. "
+                    "Please choose Meta Cloud API, Z-API, or Evolution API."
+                ),
+            },
+        )
+
     row = await _get_or_create_config(session, tenant)
     creds = dict(row.api_credentials or {})
 
@@ -341,6 +386,7 @@ async def patch_api_credentials(
     known_fields = {
         "whatsapp_provider", "zapi_instance_id", "zapi_token", "zapi_client_token",
         "evolution_api_url", "evolution_instance_name", "evolution_api_key",
+        "meta_phone_number_id", "meta_waba_id", "meta_permanent_token", "meta_app_secret",
         "llm_api_key", "llm_api_url", "llm_provider", "llm_model_name",
         "whisper_api_key", "whisper_model",
         "stt_provider", "stt_api_url",
@@ -356,9 +402,82 @@ async def patch_api_credentials(
                 continue
         creds[field] = value
 
+    # Auto-generate the Meta webhook verify token the first time the clinic
+    # provides identifying Meta credentials. The token is not a secret and
+    # must be copyable by the user for the Meta dashboard handshake.
+    if (
+        creds.get("meta_phone_number_id")
+        or creds.get("meta_permanent_token")
+    ) and not creds.get("meta_verify_token"):
+        creds["meta_verify_token"] = uuid4().hex
+
+    # Application-level uniqueness check for meta_phone_number_id — the
+    # webhook resolves the target tenant by this value, so a collision would
+    # route messages across clinics. The Postgres migration adds a partial
+    # unique index that closes the race window; this pre-check keeps the
+    # error message friendly on the common (non-racing) path.
+    new_phone_id = creds.get("meta_phone_number_id")
+    if new_phone_id:
+        stmt = select(ClinicConfigTable.tenant_id).where(
+            ClinicConfigTable.api_credentials["meta_phone_number_id"].astext == str(new_phone_id),
+            ClinicConfigTable.tenant_id != tenant.tenant_id,
+        )
+        conflict = (await session.execute(stmt)).scalar_one_or_none()
+        if conflict is not None:
+            logger.warning(
+                "meta_phone_number_id_conflict tenant=%s attempted_value=%s existing_tenant=%s",
+                tenant.tenant_id,
+                new_phone_id,
+                conflict,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "meta_phone_number_id_conflict",
+                    "message": (
+                        "This Meta Phone Number ID is already registered by another clinic. "
+                        "Each WhatsApp Business number can only be linked to one clinic."
+                    ),
+                },
+            )
+
     row.api_credentials = creds
-    await session.flush()
-    await session.commit()
+    try:
+        await session.flush()
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        # The database-level partial unique index caught a race the app-level
+        # check above missed (two concurrent saves). Surface a friendly error
+        # instead of leaking the raw driver message.
+        message = str(exc.orig) if exc.orig is not None else str(exc)
+        if "meta_phone_number_id" in message:
+            logger.warning(
+                "meta_phone_number_id_conflict_race tenant=%s attempted_value=%s",
+                tenant.tenant_id,
+                new_phone_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "meta_phone_number_id_conflict",
+                    "message": (
+                        "This Meta Phone Number ID is already registered by another clinic. "
+                        "Each WhatsApp Business number can only be linked to one clinic."
+                    ),
+                },
+            )
+        logger.exception(
+            "api_credentials_integrity_error tenant=%s",
+            tenant.tenant_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "credential_conflict",
+                "message": "Failed to save credentials due to a data integrity conflict.",
+            },
+        )
 
     # Invalidate Redis cache so next pipeline run picks up changes
     from src.services.event_service import invalidate_clinic_config_cache
