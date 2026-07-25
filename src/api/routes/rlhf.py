@@ -171,13 +171,15 @@ async def save_feedback(
 # ============================================
 
 
-_ANALYSIS_PROMPT = (
-    "Contexto: o agente respondeu '{agent_response}' à mensagem '{user_message}'. "
-    "O usuário avaliou com nota {rating}/5 e justificou: '{reason}'. "
-    "Com base na metodologia SRM NeuroStack, essa insatisfação é legítima? "
-    'Responda em JSON: {{"status": "agreed" | "disagreed", '
-    '"justification": "<máx 2 frases>"}}'
-)
+def _build_analysis_prompt(rating: int, reason: str, agent_response: str, user_message: str) -> str:
+    # Use f-string so braces inside user-provided values are interpolated safely
+    # and never treated as .format() placeholders (which would raise KeyError).
+    return (
+        f"Contexto: o agente respondeu '{agent_response}' à mensagem '{user_message}'. "
+        f"O usuário avaliou com nota {rating}/5 e justificou: '{reason}'. "
+        "Com base na metodologia SRM NeuroStack, essa insatisfação é legítima? "
+        'Responda em JSON: {"status": "agreed" | "disagreed", "justification": "<máx 2 frases>"}'
+    )
 
 
 def _parse_analysis_content(content: str) -> Optional[dict[str, str]]:
@@ -235,12 +237,7 @@ async def _analyze_rating_async(
         await _update_rating_status(event_id, status_="failed")
         return
 
-    prompt = _ANALYSIS_PROMPT.format(
-        agent_response=agent_response,
-        user_message=user_message,
-        rating=rating,
-        reason=reason,
-    )
+    prompt = _build_analysis_prompt(rating, reason, agent_response, user_message)
 
     try:
         result = await llm_client.generate(
