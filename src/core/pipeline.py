@@ -617,6 +617,24 @@ class CognitivePipeline:
             custom_vars["handoff_confirmation_pending"] = True
         # patch=False → engine explicitly cleared it → leave custom_vars unset
 
+        # ── Convênio vs Particular gating (deterministic in pipeline) ──
+        # The choice of asking / holding prices is code, not LLM reasoning.
+        # Priority: state_patch slot (this turn) overrides stored session slot.
+        _patch_tipo = srm_decision.state_patch.slots.get("atendimento_tipo")
+        atendimento_tipo = _patch_tipo or input_data.slots.get("atendimento_tipo")
+        custom_vars["atendimento_tipo"] = atendimento_tipo or ""
+
+        _accepts_insurance = bool(custom_vars.get("accepts_insurance"))
+        _price_or_schedule_intent = srm_decision.intent in ("pedido_preco", "agendar")
+        custom_vars["ask_convenio_triage"] = (
+            _accepts_insurance
+            and not atendimento_tipo
+            and (input_data.turn_count == 2 or _price_or_schedule_intent)
+        )
+        # Collapses 3 states (convenio / particular / undefined) → 2 (quote / hold).
+        # Prompt only emits monetary values when this is True.
+        custom_vars["can_quote_particular"] = atendimento_tipo == "particular"
+
         # Collect context sources from non-empty custom_vars
         context_sources: list[dict[str, Any]] = []
         if input_data.clinic_config:

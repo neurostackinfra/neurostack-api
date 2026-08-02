@@ -43,6 +43,16 @@ _SCHEDULING_HAS_TIME_RE = re.compile(
     re.IGNORECASE | re.UNICODE,
 )
 
+# Detects the insurance/private-pay modality choice.
+# Reuses the same word-set from intent_classifier.py:262
+# (`\b(particular|convenio|convênio)\b`) — no new intent regex added; this
+# lives in the engine solely to project the existing signal into the
+# `atendimento_tipo` slot without duplicating the intent surface.
+_ATENDIMENTO_TIPO_RE = re.compile(
+    r"\b(particular|conv[eê]nio)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
 
 # ============================================
 # Prometheus Metrics
@@ -239,6 +249,7 @@ class SRMEngine:
             safety_result=safety_result,
             action=action,
             message=input_data.message,
+            input_slots=input_data.slots,
         )
         # P2 fix: set scheduling_has_time when scheduling_interest is already active
         # and current message contains a time/date — covers follow-up replies that
@@ -416,6 +427,7 @@ class SRMEngine:
         safety_result,
         action: ActionType,
         message: str = "",
+        input_slots: Optional[dict[str, Any]] = None,
     ) -> StatePatch:
         """Generate state changes to apply to session (UserState doc)."""
         patch = StatePatch(
@@ -434,12 +446,18 @@ class SRMEngine:
             patch.flags["safety_triggered"] = True
             patch.flags[f"safety_{safety_result.category.value}"] = True
 
-        # Update slots and flags (incl. objection_active, authority_done)
-        self._extract_slots(intent_result.intent, patch, message)
+        # Update slots and flags (incl. objection_active, authority_done, atendimento_tipo)
+        self._extract_slots(intent_result.intent, patch, message, input_slots or {})
 
         return patch
 
-    def _extract_slots(self, intent: str, patch: StatePatch, message: str = "") -> None:
+    def _extract_slots(
+        self,
+        intent: str,
+        patch: StatePatch,
+        message: str = "",
+        input_slots: Optional[dict[str, Any]] = None,
+    ) -> None:
         """Extract slot updates based on intent (official 29 intents)."""
         if intent == "agendar":
             patch.flags["scheduling_interest"] = True
@@ -466,6 +484,18 @@ class SRMEngine:
             patch.flags["handoff_requested"] = True
         if intent == "pos_atendimento_sintomas_preocupantes":
             patch.constraints.append("C_POST_PROCEDURE_SAFETY")
+
+        # atendimento_tipo (convenio-particular-triage): derive from the same
+        # word signal used by intent_classifier.py:262 (`particular|convenio|convênio`)
+        # so we don't duplicate the intent surface. Only write to the patch when the
+        # value would change — silent no-op preserves the existing slot otherwise.
+        tipo_match = _ATENDIMENTO_TIPO_RE.search(message or "")
+        if tipo_match:
+            raw = tipo_match.group(1).lower()
+            new_tipo = "particular" if raw == "particular" else "convenio"
+            previous = (input_slots or {}).get("atendimento_tipo")
+            if new_tipo != previous:
+                patch.slots["atendimento_tipo"] = new_tipo
 
     def _get_action_details(self, action: ActionType, intent: str) -> str:
         """Get detailed description of the action (Action Catalog v0.1)."""
