@@ -229,22 +229,34 @@ async def _analyze_rating_async(
     DB session because the request-scoped one is closed by the time this
     background task runs.
 
-    Resolves LLM credentials from the tenant's ClinicConfigTable so that
-    clinics using their own LLM key work correctly. Falls back to the
-    global client if no tenant key is configured.
+    Resolves LLM credentials using the same chain as the pipeline:
+    Redis-cached config first (already has builder-fallback applied),
+    then direct ClinicConfigTable lookup as cold-cache fallback.
     """
-    # Load tenant api_credentials to use the correct LLM key
+    # Prefer the Redis-cached config (already resolved with builder fallback)
+    # so we use exactly the same credentials as the pipeline does.
     api_credentials: dict = {}
     try:
-        async with get_db_session() as db:
-            row = (await db.execute(
-                select(ClinicConfigTable).where(ClinicConfigTable.tenant_id == tenant_id)
-            )).scalar_one_or_none()
-            if row:
-                api_credentials = row.api_credentials or {}
+        from src.services.event_service import _get_cached_config
+        cached = await _get_cached_config(tenant_id)
+        if cached:
+            api_credentials = cached.get("api_credentials", {})
     except Exception:
-        logger.warning("Could not load tenant config for LLM resolution event_id=%s", event_id)
+        pass
 
+    # Cold-cache fallback: load directly from ClinicConfigTable
+    if not api_credentials:
+        try:
+            async with get_db_session() as db:
+                row = (await db.execute(
+                    select(ClinicConfigTable).where(ClinicConfigTable.tenant_id == tenant_id)
+                )).scalar_one_or_none()
+                if row:
+                    api_credentials = row.api_credentials or {}
+        except Exception:
+            logger.warning("Could not load tenant config for LLM resolution event_id=%s", event_id)
+
+    tenant_model: Optional[str] = api_credentials.get("llm_model_name") or None
     llm_client = get_tenant_llm_client(tenant_id, api_credentials)
     if llm_client is None:
         logger.warning(
@@ -268,6 +280,7 @@ async def _analyze_rating_async(
                 },
                 {"role": "user", "content": prompt},
             ],
+            model=tenant_model,
         )
         parsed = _parse_analysis_content(result.get("content", ""))
 
