@@ -1126,6 +1126,7 @@ export default function ClinicConfig() {
   const [workingHours, setWorkingHours] = useState("");
   const [schedulingHours, setSchedulingHours] = useState("");
   const [serviceFormat, setServiceFormat] = useState("");
+  const [timezone, setTimezone] = useState("America/Sao_Paulo");
   const [onlineServicesDesc, setOnlineServicesDesc] = useState("");
   const [presentialServicesDesc, setPresentialServicesDesc] = useState("");
 
@@ -1189,6 +1190,7 @@ export default function ClinicConfig() {
     setWorkingHours(config.working_hours ?? "");
     setSchedulingHours(config.scheduling_hours ?? "");
     setServiceFormat(config.service_format ?? "");
+    setTimezone(config.timezone ?? "America/Sao_Paulo");
     setDifferentials(config.differentials ?? "");
     setAcceptsInsurance(config.accepts_insurance ?? "no");
     setInsuranceList(config.insurance_list ?? "");
@@ -1314,6 +1316,7 @@ export default function ClinicConfig() {
       working_hours: workingHours.trim() || null,
       scheduling_hours: schedulingHours.trim() || null,
       service_format: serviceFormat || null,
+      timezone: timezone,
       accepts_insurance: acceptsInsurance || null,
       insurance_list: insuranceList.trim() || null,
       initial_consultation: initialConsultation || null,
@@ -1691,6 +1694,38 @@ export default function ClinicConfig() {
                   placeholder={txt("Ex: Seg–Sex: 8h–18h (agendamentos apenas por WhatsApp)", "e.g. Mon–Fri: 8am–6pm (scheduling via WhatsApp only)")}
                   disabled={isReadOnly}
                 />
+              </Field>
+              <Field
+                label={txt("Fuso horário", "Timezone")}
+                hint={txt("Define o horário local usado nas saudações (bom dia / boa tarde / boa noite).", "Sets the local time used for greetings (good morning / afternoon / evening).")}
+              >
+                <Select value={timezone} onValueChange={setTimezone} disabled={isReadOnly}>
+                  <SelectTrigger className="h-9 text-sm">
+                    <SelectValue placeholder={txt("Selecione...", "Select...")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="America/Sao_Paulo">{txt("São Paulo (UTC-3)", "São Paulo (UTC-3)")}</SelectItem>
+                    <SelectItem value="America/Manaus">{txt("Manaus (UTC-4)", "Manaus (UTC-4)")}</SelectItem>
+                    <SelectItem value="America/Rio_Branco">{txt("Rio Branco (UTC-5)", "Rio Branco (UTC-5)")}</SelectItem>
+                    <SelectItem value="America/Noronha">{txt("Fernando de Noronha (UTC-2)", "Fernando de Noronha (UTC-2)")}</SelectItem>
+                    <SelectItem value="America/New_York">{txt("Nova York (UTC-5/-4)", "New York (UTC-5/-4)")}</SelectItem>
+                    <SelectItem value="America/Chicago">{txt("Chicago (UTC-6/-5)", "Chicago (UTC-6/-5)")}</SelectItem>
+                    <SelectItem value="America/Denver">{txt("Denver (UTC-7/-6)", "Denver (UTC-7/-6)")}</SelectItem>
+                    <SelectItem value="America/Los_Angeles">{txt("Los Angeles (UTC-8/-7)", "Los Angeles (UTC-8/-7)")}</SelectItem>
+                    <SelectItem value="America/Mexico_City">{txt("Cidade do México (UTC-6)", "Mexico City (UTC-6)")}</SelectItem>
+                    <SelectItem value="America/Bogota">{txt("Bogotá (UTC-5)", "Bogotá (UTC-5)")}</SelectItem>
+                    <SelectItem value="America/Lima">{txt("Lima (UTC-5)", "Lima (UTC-5)")}</SelectItem>
+                    <SelectItem value="America/Buenos_Aires">{txt("Buenos Aires (UTC-3)", "Buenos Aires (UTC-3)")}</SelectItem>
+                    <SelectItem value="America/Santiago">{txt("Santiago (UTC-4/-3)", "Santiago (UTC-4/-3)")}</SelectItem>
+                    <SelectItem value="Atlantic/Reykjavik">{txt("Reykjavik (UTC+0)", "Reykjavik (UTC+0)")}</SelectItem>
+                    <SelectItem value="Europe/Lisbon">{txt("Lisboa (UTC+0/+1)", "Lisbon (UTC+0/+1)")}</SelectItem>
+                    <SelectItem value="Europe/London">{txt("Londres (UTC+0/+1)", "London (UTC+0/+1)")}</SelectItem>
+                    <SelectItem value="Europe/Madrid">{txt("Madri (UTC+1/+2)", "Madrid (UTC+1/+2)")}</SelectItem>
+                    <SelectItem value="Europe/Paris">{txt("Paris (UTC+1/+2)", "Paris (UTC+1/+2)")}</SelectItem>
+                    <SelectItem value="Europe/Berlin">{txt("Berlim (UTC+1/+2)", "Berlin (UTC+1/+2)")}</SelectItem>
+                    <SelectItem value="Europe/Rome">{txt("Roma (UTC+1/+2)", "Rome (UTC+1/+2)")}</SelectItem>
+                  </SelectContent>
+                </Select>
               </Field>
 
               <SectionLabel>{txt("Formato de Atendimento", "Service Format")}</SectionLabel>

@@ -32,6 +32,7 @@ FIELD_TO_BUCKET: dict[str, str] = {
     "parking_info": "operations",
     "working_hours": "operations",
     "scheduling_hours": "operations",
+    "timezone": "operations",
     "service_format": "operations",
     "online_services_desc": "operations",
     "presential_services_desc": "operations",

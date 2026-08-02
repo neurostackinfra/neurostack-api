@@ -517,6 +517,7 @@ class CognitivePipeline:
                 raw_specs = [s.strip() for s in raw_specs.split(",") if s.strip()]
             custom_vars["clinic_specialties"] = raw_specs
             custom_vars["working_hours"] = operations.get("working_hours", "")
+            custom_vars["timezone"] = operations.get("timezone") or "America/Sao_Paulo"
             custom_vars["full_address"] = operations.get("full_address", "")
             custom_vars["differentials"] = business.get("differentials", "")
             custom_vars["payment_methods"] = business.get("payment_methods", "")

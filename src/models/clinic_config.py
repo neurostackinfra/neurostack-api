@@ -95,6 +95,7 @@ class ClinicOperations(BaseModel):
     parking_info: Optional[str] = None
     working_hours: Optional[str] = None
     scheduling_hours: Optional[str] = None
+    timezone: Optional[str] = None
     service_format: Optional[str] = None
     online_services_desc: Optional[str] = None
     presential_services_desc: Optional[str] = None
