@@ -14,6 +14,7 @@ import { useState } from "react";
 import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
 import type { TranslationKey } from "@/locales/en";
+import { RatingBlock } from "@/components/rating-block";
 
 const INTENT_CLASSNAMES: Record<string, string> = {
   // Greeting / Farewell
@@ -137,7 +138,7 @@ function ctxFieldTitle(field: string, count: string | undefined, t: (k: Translat
 }
 
 export function TraceViewer({ trace }: { trace: DecisionTrace }) {
-  const { isSuperAdmin } = useAuth();
+  const { isSuperAdmin, isInvestor } = useAuth();
   const { t } = useI18n();
   const srm = trace.srmDecision;
   const hasConstraints = srm.constraints && srm.constraints.length > 0;
@@ -363,6 +364,14 @@ export function TraceViewer({ trace }: { trace: DecisionTrace }) {
               {trace.llmResponse}
             </pre>
           </div>
+          {!isInvestor && (
+            <RatingBlock
+              msgId={trace.id}
+              sessionId=""
+              agentResponse={trace.llmResponse}
+              userMessage={trace.userMessage}
+            />
+          )}
         </CardContent>
       </Card>
     </div>
