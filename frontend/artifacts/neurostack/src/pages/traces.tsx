@@ -411,7 +411,7 @@ export default function TracesList() {
                 </div>
 
                 <div className="flex-1 min-w-0">
-                  <div className="text-sm text-foreground truncate font-medium mb-1">
+                  <div className="text-sm text-foreground truncate font-medium mb-1" title={trace.userMessage}>
                     "{trace.userMessage}"
                   </div>
                   <div className="flex items-center gap-3 text-xs text-muted-foreground">

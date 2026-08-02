@@ -10,7 +10,7 @@ import { useI18n } from "@/context/i18n";
 
 function TriggerDocs() {
   const { locale } = useI18n();
-  const txt = (p: string, e: string) => locale === "en" ? e : p;
+  const txt = <T,>(p: T, e: T): T => (locale === "en" ? e : p);
   const [copied, setCopied] = useState<string | null>(null);
 
   const TRIGGERS = [
@@ -92,7 +92,7 @@ function TriggerDocs() {
 
 export default function Agents() {
   const { locale } = useI18n();
-  const txt = (p: string, e: string) => locale === "en" ? e : p;
+  const txt = <T,>(p: T, e: T): T => (locale === "en" ? e : p);
 
   const AGENTS = [
     { icon: Calendar,   name: txt("Agendamento",        "Scheduling"),            color: "text-blue-500"    },

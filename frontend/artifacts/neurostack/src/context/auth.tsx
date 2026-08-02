@@ -108,7 +108,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     });
 
     return () => {
-      setAuthTokenGetter(null);
+      setAuthTokenGetter(() => null);
     };
   }, []);
 

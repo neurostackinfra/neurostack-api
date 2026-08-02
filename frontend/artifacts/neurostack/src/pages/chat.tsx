@@ -720,7 +720,9 @@ export default function Chat() {
       }),
     });
     // Backend returns "id", not "session_id"
-    return resp.session_id ?? resp.id;
+    const sessionId = resp.session_id ?? resp.id;
+    if (!sessionId) throw new Error("Session response did not include an id");
+    return sessionId;
   }, [effectiveTenantId, userId]);
 
   // Send a message via POST /v1/events (cognitive pipeline)

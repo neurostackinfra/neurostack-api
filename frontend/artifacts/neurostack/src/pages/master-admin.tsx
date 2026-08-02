@@ -970,7 +970,7 @@ export default function MasterAdmin() {
   };
 
   const handleViewTraces = (id: number) => {
-    setViewingClinicId(id);
+    setViewingClinicId(String(id));
     navigate("/traces");
   };
 
@@ -1066,7 +1066,7 @@ export default function MasterAdmin() {
     try {
       const res = await fetch(`/v1/support/tickets/${id}/status`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json", ...authHeaders(token) },
+        headers: authHeaders(token),
         body: JSON.stringify({ status: newStatus }),
       });
       if (!res.ok) throw new Error();

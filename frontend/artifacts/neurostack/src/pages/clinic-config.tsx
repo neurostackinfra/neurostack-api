@@ -480,7 +480,7 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
           <label className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Ver clínica</label>
           <select
             value={selectedClinicId}
-            onChange={e => setSelectedClinicId(Number(e.target.value))}
+            onChange={e => setSelectedClinicId(e.target.value)}
             className="w-full rounded-md border border-border bg-background text-sm px-3 py-2 focus:outline-none focus:ring-1 focus:ring-accent"
           >
             {clinics.map(c => (

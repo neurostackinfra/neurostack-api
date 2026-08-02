@@ -14,7 +14,7 @@ const CRM_PLATFORMS = ["RD Station", "HubSpot", "Kommo", "Agendor", "Outro"];
 
 export default function CRMIntegration() {
   const { locale } = useI18n();
-  const txt = (p: string, e: string) => locale === "en" ? e : p;
+  const txt = <T,>(p: T, e: T): T => (locale === "en" ? e : p);
 
   const FUNNEL_STAGES = [
     {
