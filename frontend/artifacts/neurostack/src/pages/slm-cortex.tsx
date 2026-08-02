@@ -22,7 +22,7 @@ function SectionDivider({ num, label }: { num: string; label: string }) {
 
 export default function SlmCortex() {
   const { locale } = useI18n();
-  const txt = (p: string, e: string) => locale === "en" ? e : p;
+  const txt = <T,>(p: T, e: T): T => (locale === "en" ? e : p);
 
   return (
     <div className="space-y-8 max-w-4xl">

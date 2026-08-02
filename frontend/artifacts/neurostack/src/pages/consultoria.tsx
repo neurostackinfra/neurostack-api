@@ -38,7 +38,7 @@ function InsightCallout({ icon: Icon, text }: { icon: React.ElementType; text: R
 
 export default function Consultoria() {
   const { locale } = useI18n();
-  const txt = (p: string, e: string) => locale === "en" ? e : p;
+  const txt = <T,>(p: T, e: T): T => (locale === "en" ? e : p);
 
   return (
     <div className="space-y-8 max-w-4xl">

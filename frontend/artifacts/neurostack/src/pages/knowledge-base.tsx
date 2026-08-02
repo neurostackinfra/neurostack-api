@@ -43,7 +43,7 @@ function StatusBadge({ status }: { status: string }) {
 
 export default function KnowledgeBase() {
   const { locale } = useI18n();
-  const txt = (p: string, e: string) => locale === "en" ? e : p;
+  const txt = <T,>(p: T, e: T): T => (locale === "en" ? e : p);
 
   return (
     <div className="max-w-2xl mx-auto space-y-6 pb-10 relative">
