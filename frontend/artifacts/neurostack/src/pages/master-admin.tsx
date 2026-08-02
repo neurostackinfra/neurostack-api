@@ -556,7 +556,7 @@ const DEMO_DASHBOARD: AdminDashboardData = {
     active_pilots: 170,
     active_builders: 80,
     active_managed_clinics: 170,
-    estimated_mrr: 270000,
+    estimated_mrr: 0,
     safety_flags_7d: 2,
     handoff_count_7d: 48,
     // Extended stats for investor breakdown
@@ -1203,28 +1203,6 @@ export default function MasterAdmin() {
             <p className="text-2xl font-bold text-emerald-400">{activeClinics}</p>
           </CardContent>
         </Card>
-        <Card className="border-violet-500/30 bg-gradient-to-br from-violet-950/30 to-transparent">
-          <CardContent className="pt-4 pb-3">
-            <div className="flex items-center gap-1.5 mb-1">
-              <DollarSign className="h-3.5 w-3.5 text-violet-400" />
-              <p className="text-[11px] text-muted-foreground font-medium">MRR Estimado</p>
-            </div>
-            <p className="text-2xl font-bold text-violet-400">
-              {isInvestor
-                ? "R$ 270.000"
-                : stats?.estimatedMrr != null
-                  ? `R$ ${stats.estimatedMrr.toLocaleString("pt-BR")}`
-                  : "R$ …"}
-            </p>
-            <p className="text-[10px] text-muted-foreground/60 mt-0.5">
-              {isInvestor
-                ? "100 builders × R$2k + 200 clínicas × R$350"
-                : stats
-                  ? `${stats.activeBuilders} builder${stats.activeBuilders !== 1 ? "s" : ""} × R$2k + ${stats.activeManagedClinics} clínica${stats.activeManagedClinics !== 1 ? "s" : ""} × R$350`
-                  : ""}
-            </p>
-          </CardContent>
-        </Card>
         <Card className="border-border bg-gradient-to-br from-blue-950/20 to-transparent">
           <CardContent className="pt-4 pb-3">
             <p className="text-[11px] text-muted-foreground">Consumo API (Mês)</p>
@@ -1428,7 +1406,7 @@ export default function MasterAdmin() {
             )}
           </div>
           <CardDescription className="text-xs">
-            Revendedores e agências. MRR = R$2.000/builder ativo + R$350/clínica ativa gerenciada.
+            Revendedores e agências.
           </CardDescription>
         </CardHeader>
         <CardContent className="pt-0 space-y-2">
@@ -2164,7 +2142,6 @@ export default function MasterAdmin() {
                         <tr className="border-b border-border/50">
                           <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Data</th>
                           <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Builder</th>
-                          <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Valor</th>
                           <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Método</th>
                           <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Ciclo</th>
                           <th className="text-left pb-2 font-medium text-muted-foreground">Cupom</th>
@@ -2177,9 +2154,6 @@ export default function MasterAdmin() {
                               {tx.created_at ? new Date(tx.created_at).toLocaleDateString("pt-BR") : "-"}
                             </td>
                             <td className="py-2 pr-4 font-medium">{tx.builder_name}</td>
-                            <td className="py-2 pr-4 tabular-nums font-medium text-emerald-400">
-                              {(tx.amount_cents / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" })}
-                            </td>
                             <td className="py-2 pr-4">
                               <Badge
                                 className={

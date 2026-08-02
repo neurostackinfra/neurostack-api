@@ -61,10 +61,6 @@ function authHeaders(token: string) {
   return { "Content-Type": "application/json", Authorization: `Bearer ${token}` };
 }
 
-function formatBRL(value: number) {
-  return new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL", minimumFractionDigits: 0 }).format(value);
-}
-
 function SectionDivider({ num, label }: { num: string; label: string }) {
   return (
     <div className="flex items-center gap-3">
@@ -123,21 +119,12 @@ export default function Billing() {
 
   useEffect(() => { void fetchSummary(); }, [fetchSummary]);
 
-  // Pricing
+  // Plan values are intentionally not displayed until pricing is finalized;
+  // the backend still computes the checkout amount.
   const activeClinics = summary?.active_clinics ?? 0;
   const freeTier = summary?.free_tier ?? 2;
   const extraClinics = summary?.extra_clinics ?? 0;
-  const totalMonthly = summary?.total_monthly ?? 2000;
-  const totalAnnual = summary?.total_annual ?? 20400;
   const subscriptionStatus = summary?.subscription_status ?? "trial";
-
-  const displayPrice = billingCycle === "monthly" ? totalMonthly : totalAnnual;
-  const annualSavings = totalMonthly * 12 - totalAnnual;
-
-  // Price with coupon
-  const priceAfterCoupon = couponDiscount
-    ? Math.round(displayPrice * (1 - couponDiscount / 100))
-    : displayPrice;
 
   // Validate coupon
   const handleApplyCoupon = async () => {
@@ -316,23 +303,7 @@ export default function Billing() {
                   <Star className="h-5 w-5 text-emerald-500" />
                   <p className="text-lg font-bold text-foreground">NeuroStack Start</p>
                 </div>
-                <div>
-                  <p className="text-3xl font-bold text-foreground">
-                    {formatBRL(billingCycle === "monthly" ? totalMonthly : totalAnnual)}
-                  </p>
-                  <p className="text-xs text-muted-foreground mt-0.5">
-                    {billingCycle === "monthly"
-                      ? txt("/mês", "/month")
-                      : txt("/ano", "/year")}
-                  </p>
-                  {billingCycle === "annual" && (
-                    <p className="text-xs text-emerald-400 mt-1">
-                      {txt(`Economia de ${formatBRL(annualSavings)}/ano`, `Save ${formatBRL(annualSavings)}/year`)}
-                    </p>
-                  )}
-                </div>
                 <div className="text-xs text-muted-foreground space-y-1.5 border-t border-border/40 pt-3">
-                  <p>+ {formatBRL(350)}{txt("/clínica acima de 2 inclusas", "/clinic above 2 included")}</p>
                   <p className="text-foreground/80 font-medium">
                     {txt(
                       `Você tem ${activeClinics} clínica(s) ativa(s), ${Math.min(activeClinics, freeTier)} inclusa(s), ${extraClinics} cobrada(s)`,
@@ -467,24 +438,6 @@ export default function Billing() {
                 )}
               </div>
 
-              {/* Price summary */}
-              <div className="rounded-lg border border-border/50 bg-muted/20 p-4 space-y-2">
-                <div className="flex justify-between text-sm">
-                  <span className="text-muted-foreground">
-                    NeuroStack Start - {billingCycle === "monthly" ? txt("Mensal", "Monthly") : txt("Anual", "Annual")}
-                  </span>
-                  <span className={`font-semibold ${couponDiscount ? "line-through text-muted-foreground" : "text-foreground"}`}>
-                    {formatBRL(displayPrice)}
-                  </span>
-                </div>
-                {couponDiscount && (
-                  <div className="flex justify-between text-sm">
-                    <span className="text-emerald-400">{txt("Com desconto", "With discount")} ({couponDiscount}%)</span>
-                    <span className="font-bold text-emerald-400">{formatBRL(priceAfterCoupon)}</span>
-                  </div>
-                )}
-              </div>
-
               {/* Payment method selector */}
               <div className="space-y-2">
                 <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
@@ -527,7 +480,7 @@ export default function Billing() {
                   >
                     {Array.from({ length: 12 }, (_, i) => i + 1).map((n) => (
                       <option key={n} value={n}>
-                        {n}x {txt("de", "of")} {formatBRL(Math.round(priceAfterCoupon / n))} {txt("sem juros", "interest-free")}
+                        {n}x {txt("sem juros", "interest-free")}
                       </option>
                     ))}
                   </select>
@@ -573,7 +526,7 @@ export default function Billing() {
                     ) : (
                       <ArrowRight className="h-4 w-4" />
                     )}
-                    {txt("Pagar", "Pay")} {formatBRL(priceAfterCoupon)}
+                    {txt("Pagar", "Pay")}
                   </Button>
                   {checkoutError && (
                     <p className="text-sm text-destructive mt-2">{checkoutError}</p>
