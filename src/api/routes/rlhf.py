@@ -21,7 +21,8 @@ from src.api.middleware.auth import (
     get_tenant_context,
     require_super_admin,
 )
-from src.llm import get_llm_client
+from src.llm import get_llm_client, get_tenant_llm_client
+from src.models.clinic_config_table import ClinicConfigTable
 from src.models.event import Event
 from src.models.tenant import Tenant
 from src.policy.engine import get_policy_engine
@@ -227,8 +228,24 @@ async def _analyze_rating_async(
     evaluating a user's critique, not an agent response. Opens its own
     DB session because the request-scoped one is closed by the time this
     background task runs.
+
+    Resolves LLM credentials from the tenant's ClinicConfigTable so that
+    clinics using their own LLM key work correctly. Falls back to the
+    global client if no tenant key is configured.
     """
-    llm_client = get_llm_client()
+    # Load tenant api_credentials to use the correct LLM key
+    api_credentials: dict = {}
+    try:
+        async with get_db_session() as db:
+            row = (await db.execute(
+                select(ClinicConfigTable).where(ClinicConfigTable.tenant_id == tenant_id)
+            )).scalar_one_or_none()
+            if row:
+                api_credentials = row.api_credentials or {}
+    except Exception:
+        logger.warning("Could not load tenant config for LLM resolution event_id=%s", event_id)
+
+    llm_client = get_tenant_llm_client(tenant_id, api_credentials)
     if llm_client is None:
         logger.warning(
             "LLM client unavailable; marking rating analysis as failed event_id=%s",
