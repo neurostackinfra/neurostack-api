@@ -796,6 +796,7 @@ export default function Chat() {
                           agentResponse={msg.content}
                           userMessage={prevUserMsg}
                           isReadOnly={isReadOnly}
+                          clinicTenantId={effectiveTenantId ?? null}
                         />
                         <FeedbackBlock
                           msg={msg}

@@ -138,7 +138,7 @@ function ctxFieldTitle(field: string, count: string | undefined, t: (k: Translat
 }
 
 export function TraceViewer({ trace }: { trace: DecisionTrace }) {
-  const { isSuperAdmin, isInvestor } = useAuth();
+  const { isSuperAdmin, isInvestor, viewingClinicId } = useAuth();
   const { t } = useI18n();
   const srm = trace.srmDecision;
   const hasConstraints = srm.constraints && srm.constraints.length > 0;
@@ -370,6 +370,7 @@ export function TraceViewer({ trace }: { trace: DecisionTrace }) {
               sessionId=""
               agentResponse={trace.llmResponse}
               userMessage={trace.userMessage}
+              clinicTenantId={viewingClinicId ?? null}
             />
           )}
         </CardContent>
