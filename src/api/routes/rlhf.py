@@ -221,6 +221,7 @@ async def _analyze_rating_async(
     agent_response: str,
     user_message: str,
     tenant_id: UUID,
+    message_id: Optional[str] = None,
 ) -> None:
     """Run LLM analysis for a low-rating event and persist the result.
 
@@ -229,16 +230,38 @@ async def _analyze_rating_async(
     DB session because the request-scoped one is closed by the time this
     background task runs.
 
-    Resolves LLM credentials using the same chain as the pipeline:
-    Redis-cached config first (already has builder-fallback applied),
-    then direct ClinicConfigTable lookup as cold-cache fallback.
+    When message_id is a valid UUID that matches an Event row (e.g. a trace
+    event from the Histórico de Traces), we use that event's tenant_id to
+    resolve LLM credentials — because the pipeline caches credentials keyed
+    by the CLINIC's tenant, not the builder's. Falls back to the rating's own
+    tenant_id (simulator flow, where message_id is a frontend UUID).
     """
-    # Prefer the Redis-cached config (already resolved with builder fallback)
-    # so we use exactly the same credentials as the pipeline does.
+    from src.services.event_service import _get_cached_config
+
+    # Try to resolve the clinic tenant from the rated event (trace flow).
+    # The pipeline's Redis cache is keyed by clinic tenant_id, so using it
+    # gives the same credentials the pipeline used to generate the response.
+    resolve_tenant_id = tenant_id
+    if message_id:
+        try:
+            msg_uuid = UUID(message_id)
+            async with get_db_session() as db:
+                original = (await db.execute(
+                    select(Event).where(Event.id == msg_uuid)
+                )).scalar_one_or_none()
+                if original is not None:
+                    resolve_tenant_id = original.tenant_id
+                    logger.info(
+                        "Rating analysis using clinic tenant event_id=%s clinic_tenant=%s",
+                        event_id, resolve_tenant_id,
+                    )
+        except (ValueError, Exception):
+            pass  # message_id is a frontend UUID — use rating's own tenant
+
+    # Load credentials from Redis-cached config (already has builder fallback applied).
     api_credentials: dict = {}
     try:
-        from src.services.event_service import _get_cached_config
-        cached = await _get_cached_config(tenant_id)
+        cached = await _get_cached_config(resolve_tenant_id)
         if cached:
             api_credentials = cached.get("api_credentials", {})
     except Exception:
@@ -249,7 +272,7 @@ async def _analyze_rating_async(
         try:
             async with get_db_session() as db:
                 row = (await db.execute(
-                    select(ClinicConfigTable).where(ClinicConfigTable.tenant_id == tenant_id)
+                    select(ClinicConfigTable).where(ClinicConfigTable.tenant_id == resolve_tenant_id)
                 )).scalar_one_or_none()
                 if row:
                     api_credentials = row.api_credentials or {}
@@ -257,6 +280,13 @@ async def _analyze_rating_async(
             logger.warning("Could not load tenant config for LLM resolution event_id=%s", event_id)
 
     tenant_model: Optional[str] = api_credentials.get("llm_model_name") or None
+    llm_url = api_credentials.get("llm_api_url", "(none)")
+    llm_key_prefix = (api_credentials.get("llm_api_key") or "")[:8] or "(none)"
+    logger.info(
+        "Rating analysis LLM resolution event_id=%s tenant_id=%s url=%s key_prefix=%s model=%s cache=%s",
+        event_id, tenant_id, llm_url, llm_key_prefix, tenant_model,
+        bool(api_credentials),
+    )
     llm_client = get_tenant_llm_client(tenant_id, api_credentials)
     if llm_client is None:
         logger.warning(
@@ -402,6 +432,7 @@ async def submit_rating(
                 agent_response=body.agent_response,
                 user_message=body.user_message,
                 tenant_id=tenant.tenant_id,
+                message_id=body.message_id,
             )
         )
 
