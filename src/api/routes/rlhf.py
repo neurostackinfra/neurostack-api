@@ -75,6 +75,7 @@ class RatingRequest(BaseModel):
     reason: Optional[str] = None
     agent_response: str
     user_message: str
+    clinic_tenant_id: Optional[str] = None
 
 
 class RatingResponse(BaseModel):
@@ -222,6 +223,7 @@ async def _analyze_rating_async(
     user_message: str,
     tenant_id: UUID,
     message_id: Optional[str] = None,
+    clinic_tenant_id: Optional[str] = None,
 ) -> None:
     """Run LLM analysis for a low-rating event and persist the result.
 
@@ -238,11 +240,19 @@ async def _analyze_rating_async(
     """
     from src.services.event_service import _get_cached_config
 
-    # Try to resolve the clinic tenant from the rated event (trace flow).
-    # The pipeline's Redis cache is keyed by clinic tenant_id, so using it
-    # gives the same credentials the pipeline used to generate the response.
+    # Resolve which tenant's credentials to use for LLM.
+    # Priority: explicit clinic_tenant_id (from frontend) > message_id event lookup > submitter's tenant.
     resolve_tenant_id = tenant_id
-    if message_id:
+    if clinic_tenant_id:
+        try:
+            resolve_tenant_id = UUID(clinic_tenant_id)
+            logger.info(
+                "Rating analysis using explicit clinic_tenant_id event_id=%s clinic_tenant=%s",
+                event_id, resolve_tenant_id,
+            )
+        except ValueError:
+            pass
+    elif message_id:
         try:
             msg_uuid = UUID(message_id)
             async with get_db_session() as db:
@@ -255,8 +265,16 @@ async def _analyze_rating_async(
                         "Rating analysis using clinic tenant event_id=%s clinic_tenant=%s",
                         event_id, resolve_tenant_id,
                     )
-        except (ValueError, Exception):
-            pass  # message_id is a frontend UUID — use rating's own tenant
+                else:
+                    logger.info(
+                        "Rating analysis message_id not found in events, using submitter tenant event_id=%s message_id=%s",
+                        event_id, message_id,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "Rating analysis message_id lookup failed event_id=%s message_id=%s err=%s",
+                event_id, message_id, exc,
+            )
 
     # Load credentials from Redis-cached config (already has builder fallback applied).
     api_credentials: dict = {}
@@ -433,6 +451,7 @@ async def submit_rating(
                 user_message=body.user_message,
                 tenant_id=tenant.tenant_id,
                 message_id=body.message_id,
+                clinic_tenant_id=body.clinic_tenant_id,
             )
         )
 

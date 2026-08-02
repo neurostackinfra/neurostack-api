@@ -19,6 +19,7 @@ export interface RatingBlockProps {
   agentResponse: string;
   userMessage: string;
   isReadOnly?: boolean;
+  clinicTenantId?: string | null;
 }
 
 export function RatingBlock({
@@ -27,6 +28,7 @@ export function RatingBlock({
   agentResponse,
   userMessage,
   isReadOnly = false,
+  clinicTenantId,
 }: RatingBlockProps) {
   const { toast } = useToast();
   const [selected, setSelected] = useState<number | null>(null);
@@ -56,6 +58,7 @@ export function RatingBlock({
           reason: reason.trim() || null,
           agent_response: agentResponse,
           user_message: userMessage,
+          ...(clinicTenantId ? { clinic_tenant_id: clinicTenantId } : {}),
         }),
       });
       setPhase("submitted");
