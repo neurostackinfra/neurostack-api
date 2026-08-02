@@ -6,6 +6,7 @@ Aligned with NeuroStack v0.6 methodology (200-case dataset).
 
 from src.prompt.models import PromptMode, PromptVariables
 from src.prompt.templates.base import BaseTemplate, TemplateSection
+from src.prompt.timeutils import clinic_now
 
 
 # ============================================
@@ -673,10 +674,8 @@ class NormalTemplate(BaseTemplate):
 
     def get_context_instructions(self, variables: PromptVariables) -> str:
         """Get context-specific instructions based on funnel stage and user journey."""
-        from datetime import datetime, timezone, timedelta
-        br_tz = timezone(timedelta(hours=-3))
-        now_br = datetime.now(br_tz)
-        parts = [f"**Data e hora atual:** {now_br.strftime('%d/%m/%Y %H:%M')} (horário de Brasília)"]
+        now_local = clinic_now(variables.custom.get("timezone"))
+        parts = [f"**Data e hora atual:** {now_local.strftime('%d/%m/%Y %H:%M')} (horário local da clínica)"]
 
         # Inject clinic identity for template placeholders in funnel instructions
         agent_name = variables.custom.get("agent_name", "assistente")
@@ -704,7 +703,7 @@ class NormalTemplate(BaseTemplate):
         # Intent-specific instructions
         if variables.last_intent:
             intent_instruction = self._get_intent_instruction(
-                variables.last_intent, agent_name, clinic_name, now_br
+                variables.last_intent, agent_name, clinic_name, now_local
             )
             if intent_instruction:
                 parts.append(intent_instruction)
@@ -904,19 +903,19 @@ class NormalTemplate(BaseTemplate):
 
     def _get_intent_instruction(
         self, intent: str, agent_name: str = "assistente", clinic_name: str = "clínica",
-        now_br=None,
+        now_local=None,
     ) -> str:
         """Get instruction for specific intent — NeuroStack v0.6 methodology."""
-        # Compute correct greeting for current BRT time
-        if now_br is not None:
-            hour = now_br.hour
+        # Compute correct greeting for current clinic-local time
+        if now_local is not None:
+            hour = now_local.hour
             if hour < 12:
                 saudacao_correta = "Bom dia"
             elif hour < 18:
                 saudacao_correta = "Boa tarde"
             else:
                 saudacao_correta = "Boa noite"
-            hora_str = now_br.strftime("%H:%M")
+            hora_str = now_local.strftime("%H:%M")
         else:
             saudacao_correta = "Olá"
             hora_str = ""
@@ -925,7 +924,7 @@ class NormalTemplate(BaseTemplate):
             # ===== SAUDAÇÃO =====
             "saudacao": f"""
 ## Objetivo: Saudação
-- Agora são {hora_str} (horário de Brasília). A saudação correta é: **"{saudacao_correta}"**.
+- Agora são {hora_str} (horário local da clínica). A saudação correta é: **"{saudacao_correta}"**.
 - Você DEVE começar sua resposta com "{saudacao_correta}!" — independentemente do que o paciente disse.
 - NUNCA diga "Bom dia" se for depois das 12h. NUNCA diga "Boa tarde" se for depois das 18h.
 - Apresente-se: "Meu nome é {agent_name}, da {clinic_name}."
