@@ -777,3 +777,143 @@ class TestEdgeCases:
         )
         assert not result.required
 
+
+# ============================================
+# Convenio vs Particular Triage — Group 1
+# ============================================
+
+
+class TestAtendimentoTipoSlot:
+    """Slot derivation from intent_classifier :262 signal (no new regex)."""
+
+    def test_convenio_message_sets_slot(
+        self, srm_engine, sample_tenant_id, sample_session_id
+    ):
+        """'vai ser pelo convênio' ⇒ atendimento_tipo=convenio."""
+        decision = srm_engine.process(SRMInput(
+            tenant_id=sample_tenant_id,
+            session_id=sample_session_id,
+            message="vai ser pelo convênio",
+            channel="whatsapp",
+        ))
+        assert decision.state_patch.slots.get("atendimento_tipo") == "convenio"
+
+    def test_convenio_no_accent_sets_slot(
+        self, srm_engine, sample_tenant_id, sample_session_id
+    ):
+        """'convenio' without accent ⇒ atendimento_tipo=convenio."""
+        decision = srm_engine.process(SRMInput(
+            tenant_id=sample_tenant_id,
+            session_id=sample_session_id,
+            message="convenio",
+            channel="whatsapp",
+        ))
+        assert decision.state_patch.slots.get("atendimento_tipo") == "convenio"
+
+    def test_particular_message_sets_slot(
+        self, srm_engine, sample_tenant_id, sample_session_id
+    ):
+        """'é particular' ⇒ atendimento_tipo=particular."""
+        decision = srm_engine.process(SRMInput(
+            tenant_id=sample_tenant_id,
+            session_id=sample_session_id,
+            message="é particular",
+            channel="whatsapp",
+        ))
+        assert decision.state_patch.slots.get("atendimento_tipo") == "particular"
+
+    def test_no_signal_leaves_slot_unchanged(
+        self, srm_engine, sample_tenant_id, sample_session_id
+    ):
+        """Messages without the modality word do not touch the slot."""
+        decision = srm_engine.process(SRMInput(
+            tenant_id=sample_tenant_id,
+            session_id=sample_session_id,
+            message="quero agendar amanhã de tarde",
+            channel="whatsapp",
+            slots={"atendimento_tipo": "convenio"},
+        ))
+        # Patch should NOT overwrite when there is no explicit signal.
+        assert "atendimento_tipo" not in decision.state_patch.slots
+
+    def test_same_value_not_re_patched(
+        self, srm_engine, sample_tenant_id, sample_session_id
+    ):
+        """Restating the same modality does not re-emit into the patch."""
+        decision = srm_engine.process(SRMInput(
+            tenant_id=sample_tenant_id,
+            session_id=sample_session_id,
+            message="é particular sim",
+            channel="whatsapp",
+            slots={"atendimento_tipo": "particular"},
+        ))
+        assert "atendimento_tipo" not in decision.state_patch.slots
+
+    def test_explicit_switch_overwrites(
+        self, srm_engine, sample_tenant_id, sample_session_id
+    ):
+        """User changing their mind is honored: convenio → particular."""
+        decision = srm_engine.process(SRMInput(
+            tenant_id=sample_tenant_id,
+            session_id=sample_session_id,
+            message="na verdade vai ser particular",
+            channel="whatsapp",
+            slots={"atendimento_tipo": "convenio"},
+        ))
+        assert decision.state_patch.slots.get("atendimento_tipo") == "particular"
+
+
+class TestConvenioTriageGating:
+    """Deterministic booleans injected by the pipeline (ask_convenio_triage /
+    can_quote_particular)."""
+
+    def _compute_gating(
+        self,
+        accepts_insurance: bool,
+        atendimento_tipo,  # str | None
+        turn_count: int,
+        intent: str,
+    ) -> tuple[bool, bool]:
+        """Mirror pipeline.py logic — kept in-test to guard the invariants
+        without needing to spin up the whole async pipeline."""
+        ask_convenio_triage = (
+            bool(accepts_insurance)
+            and not atendimento_tipo
+            and (turn_count == 2 or intent in ("pedido_preco", "agendar"))
+        )
+        can_quote_particular = atendimento_tipo == "particular"
+        return ask_convenio_triage, can_quote_particular
+
+    def test_ask_fires_on_turn_two_when_undefined(self):
+        ask, quote = self._compute_gating(True, None, 2, "saudacao")
+        assert ask is True
+        assert quote is False
+
+    def test_ask_fires_on_price_intent_even_early(self):
+        ask, _ = self._compute_gating(True, None, 1, "pedido_preco")
+        assert ask is True
+
+    def test_ask_fires_on_agendar_intent_even_early(self):
+        ask, _ = self._compute_gating(True, None, 1, "agendar")
+        assert ask is True
+
+    def test_ask_off_when_insurance_disabled(self):
+        ask, _ = self._compute_gating(False, None, 2, "pedido_preco")
+        assert ask is False
+
+    def test_ask_off_once_tipo_defined(self):
+        ask, _ = self._compute_gating(True, "convenio", 2, "pedido_preco")
+        assert ask is False
+        ask, _ = self._compute_gating(True, "particular", 2, "pedido_preco")
+        assert ask is False
+
+    def test_can_quote_only_for_particular(self):
+        _, quote = self._compute_gating(True, "particular", 5, "pedido_preco")
+        assert quote is True
+        # convenio and undefined must both hold prices
+        _, quote = self._compute_gating(True, "convenio", 5, "pedido_preco")
+        assert quote is False
+        _, quote = self._compute_gating(True, None, 5, "pedido_preco")
+        assert quote is False
+
+

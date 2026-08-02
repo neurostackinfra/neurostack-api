@@ -833,6 +833,28 @@ class EventService:
             )
             await event_store.append(prompt_event)
 
+            # convenio-particular-triage: emit when the modality slot is set.
+            # Engine only writes atendimento_tipo into state_patch when the value
+            # changes, so this fires on first set + explicit switches only.
+            _patch_slots = (result.state_patch or {}).get("slots") or {}
+            _new_atendimento_tipo = _patch_slots.get("atendimento_tipo")
+            if _new_atendimento_tipo:
+                tipo_event = EventData(
+                    id=uuid4(),
+                    tenant_id=request.tenant_id,
+                    session_id=request.session_id,
+                    event_type="ns.atendimento_tipo_set",
+                    event_data={
+                        "atendimento_tipo": _new_atendimento_tipo,
+                        "trigger_message": request.payload.content,
+                    },
+                    event_metadata={
+                        "channel": request.payload.channel,
+                        "user_id": request.payload.user_id,
+                    },
+                )
+                await event_store.append(tipo_event)
+
             # CRM integration events (doc MVP v0.5): ns.funnel_stage_changed, ns.handoff_created
             if result.state_patch and result.state_patch.get("funnel_stage"):
                 funnel_crm_event = EventData(
