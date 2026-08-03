@@ -15,7 +15,7 @@ from prometheus_client import Counter, Histogram
 
 from src.config.logging import get_logger
 from src.core.lgpd_utils import resolve_privacy_link
-from src.observability.metrics import check_price_gate
+from src.observability.price_gate import check_price_gate
 from src.core.exceptions import (
     ServiceError,
     PolicyServiceError,
