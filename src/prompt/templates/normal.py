@@ -630,6 +630,69 @@ class NormalTemplate(BaseTemplate):
                 f"- {_sys_no}\n"
             )
 
+        # ── Convênio vs Particular triage (Group 2) ───────────────────
+        # Deterministic booleans injected by the pipeline (Group 1):
+        #   ask_convenio_triage  → clinic accepts insurance, slot undefined,
+        #                          and (turn_count == 2 OR price/schedule intent).
+        #   can_quote_particular → True only when atendimento_tipo == "particular".
+        # This block instructs warm triage + total price hold until the modality
+        # is chosen. The hold is total: no monetary value in ANY block until
+        # can_quote_particular flips to True.
+        if variables.custom.get("ask_convenio_triage"):
+            lang = variables.language or "pt-BR"
+            if lang == "en":
+                msg.content += (
+                    "\n\n## CONVÊNIO / PARTICULAR TRIAGE (MANDATORY)\n"
+                    "Before quoting any price or moving to scheduling, you must know "
+                    "whether the patient will use **insurance (convênio)** or pay "
+                    "**out of pocket (particular)**.\n"
+                    "- Weave the question warmly into the discovery flow — never as a cold "
+                    "interrogation. Example: acknowledge what they shared first, then ask "
+                    "gently: \"Só para eu te orientar melhor, o atendimento seria pelo "
+                    "seu convênio ou particular?\" (translate naturally to English if that "
+                    "is the response language).\n"
+                    "- **HOLD ALL PRICES until the patient chooses.** Do NOT state any "
+                    "monetary value, range, discount, or comparison while the modality is "
+                    "undefined. If they ask for price first: validate their concern, then "
+                    "ask the modality question, then continue.\n"
+                    "- Never say \"I can't tell you the price\" — frame the pause as "
+                    "\"para eu te passar a informação certa, preciso saber se é convênio "
+                    "ou particular\"."
+                )
+            elif lang == "es":
+                msg.content += (
+                    "\n\n## TRIAJE CONVENIO / PARTICULAR (OBLIGATORIO)\n"
+                    "Antes de cotizar cualquier precio o pasar al agendamiento, debes "
+                    "saber si el paciente usará **convenio** o **particular**.\n"
+                    "- Integra la pregunta de forma cálida al descubrimiento — nunca como "
+                    "un interrogatorio. Ejemplo: \"Para orientarte mejor, ¿la atención "
+                    "sería por tu convenio o particular?\".\n"
+                    "- **RETÉN CUALQUIER VALOR mientras el paciente no elija.** No "
+                    "menciones ningún importe, rango ni descuento hasta que la modalidad "
+                    "esté definida.\n"
+                    "- Nunca digas \"no puedo informarte el precio\" — enmarca la pausa "
+                    "como necesidad de saber la modalidad para pasar la información "
+                    "correcta."
+                )
+            else:  # pt-BR default
+                msg.content += (
+                    "\n\n## TRIAGEM CONVÊNIO / PARTICULAR (OBRIGATÓRIO)\n"
+                    "Antes de informar qualquer preço ou avançar para agendamento, você "
+                    "precisa saber se o atendimento será pelo **convênio** ou "
+                    "**particular**.\n"
+                    "- Integre a pergunta de forma acolhedora ao fluxo de descoberta — "
+                    "nunca como interrogatório. Exemplo: reconheça o que o paciente "
+                    "compartilhou e então pergunte com leveza: \"Só para eu te orientar "
+                    "melhor, o atendimento seria pelo seu convênio ou particular?\".\n"
+                    "- **SEGURE QUALQUER VALOR MONETÁRIO até o paciente escolher.** Não "
+                    "informe preço, faixa, desconto nem comparação enquanto a modalidade "
+                    "não estiver definida. Se ele perguntar preço antes: valide a "
+                    "preocupação, faça a pergunta de triagem, e só depois siga.\n"
+                    "- Nunca diga \"não posso informar o preço\" — enquadre a pausa como "
+                    "\"para eu te passar a informação certa, preciso saber se será "
+                    "convênio ou particular\"."
+                )
+
         # Emoji directive — suppressed when handoff_confirmation_pending to avoid
         # conflict with "SOMENTE esta pergunta" constraint in the confirmation block.
         if variables.custom.get("use_emojis") and not variables.custom.get("handoff_confirmation_pending"):
@@ -699,6 +762,44 @@ class NormalTemplate(BaseTemplate):
             instruction = instruction.replace("{{agent_name}}", agent_name)
             instruction = instruction.replace("{{clinic_name}}", clinic_name)
             parts.append(instruction)
+
+            # ── Convenio-scheduling addendum (Group 2) ─────────────────
+            # When the modality is `convenio`, scheduling ALSO collects the
+            # insurance name and card number in writing (never a photo).
+            # This addendum augments the standard scheduling flow; the base
+            # 2-step (nome + preferência) still runs.
+            if (
+                funnel_stage == "agendamento_solicitado"
+                and variables.custom.get("atendimento_tipo") == "convenio"
+            ):
+                if variables.language == "en":
+                    parts.append(
+                        "\n### Additional collection — insurance (convênio) scheduling\n"
+                        "Because the patient chose **insurance (convênio)**, together with "
+                        "full name and day/time preference you MUST also collect:\n"
+                        "1. **Insurance name (convênio)** — e.g. Bradesco Saúde, Unimed.\n"
+                        "2. **Insurance card number (número da carteirinha).**\n\n"
+                        "Ask kindly and explicitly: **please type it in writing, do not send a photo** "
+                        "(\"gentileza enviar por escrito, não por foto\").\n"
+                        "Rules:\n"
+                        "- One question at a time — do NOT ask nome + preferência + convênio + carteirinha in a single message.\n"
+                        "- The card number is sensitive data — only ask it inside this scheduling step and never repeat it back in full.\n"
+                        "- Only hand off after you have: full name + day/time preference + convênio + card number."
+                    )
+                else:
+                    parts.append(
+                        "\n### Coleta adicional — agendamento por convênio\n"
+                        "Como o paciente escolheu **convênio**, além do nome completo e "
+                        "preferência de dia/horário, você DEVE também coletar:\n"
+                        "1. **Nome do convênio** (ex.: Bradesco Saúde, Unimed, SulAmérica).\n"
+                        "2. **Número da carteirinha.**\n\n"
+                        "Peça de forma gentil e explícita: **gentileza enviar por escrito, não por foto** "
+                        "(\"por favor, digite os números da carteirinha aqui na conversa — não envie foto\").\n"
+                        "Regras:\n"
+                        "- Uma pergunta por vez — NÃO peça nome + preferência + convênio + carteirinha na mesma mensagem.\n"
+                        "- O número da carteirinha é dado sensível — colete somente neste passo do agendamento e nunca o repita por extenso na resposta.\n"
+                        "- Só encaminhe quando tiver: nome completo + preferência de dia/horário + convênio + número da carteirinha."
+                    )
 
         # Intent-specific instructions
         if variables.last_intent:
@@ -772,50 +873,77 @@ class NormalTemplate(BaseTemplate):
             section.add(f"**Formas de pagamento:** {custom['payment_methods']}")
         if custom.get("differentials"):
             section.add(f"**Diferenciais:** {custom['differentials']}")
-        # Pricing policy — two clear states: PODE_FALAR (yes) or NÃO_PODE_FALAR (else).
-        # pricing_mode values are normalised to lower-case (pipeline sends range_allowed /
-        # exact_allowed / consult_only).  provide_prices=yes always means exact_allowed.
-        provide_prices = custom.get("provide_prices")
-        pricing_mode = str(custom.get("pricing_mode", "")).lower().strip()
-        is_range_allowed  = pricing_mode == "range_allowed"
-        is_exact_allowed  = (
-            provide_prices in (True, "yes", "true", "True")
-            or pricing_mode == "exact_allowed"
+        # ── Convenio triage gate (Group 2) ──────────────────────────
+        # When the clinic accepts insurance AND the modality has not been
+        # confirmed as `particular` yet (can_quote_particular=False), we must
+        # emit NO monetary value in ANY block below — that includes the pricing
+        # policy AND the consulta-inicial / cortesia block. If accepts_insurance
+        # is off the triage feature is inactive and behavior is unchanged.
+        accepts_ins = custom.get("accepts_insurance")
+        insurance_active = bool(
+            accepts_ins and str(accepts_ins).lower() not in ("no", "false", "0", "none")
         )
-        can_share_price = is_range_allowed or is_exact_allowed
+        hold_price = insurance_active and not custom.get("can_quote_particular")
 
-        if can_share_price:
-            price_detail = (
-                "informe a **faixa de preço** (não o valor exato) conforme configurado"
-                if is_range_allowed
-                else "informe o **valor exato** conforme configurado"
-            )
+        if hold_price:
+            # Convenio-safe pricing policy — no monetary value emitted.
             section.add(
-                f"**Política de preço [PODE_FALAR]:** "
-                f"Se o paciente perguntar sobre preço, {price_detail}. "
-                "ATENÇÃO — SOMENTE quando o paciente solicitar diretamente. "
-                "NUNCA mencione preço de forma espontânea, mesmo tendo permissão: "
-                "comercialmente é mais eficaz o paciente descobrir o preço na consulta presencial. "
-                "Sequência obrigatória quando perguntado: (1) valide a preocupação, "
-                "(2) gere autoridade com diferenciais, (3) informe o preço."
+                "**Política de preço [CONVÊNIO/A DEFINIR — NÃO_PODE_FALAR]:** "
+                "No convênio os valores e a cobertura seguem o plano do paciente; "
+                "a equipe confirma no atendimento. "
+                "Enquanto o tipo de atendimento não estiver definido como *particular*, "
+                "NÃO informe valores, faixas, descontos ou comparações — em nenhuma hipótese. "
+                "Se o paciente perguntar sobre preço: "
+                "(1) valide a preocupação, "
+                "(2) explique que 'no convênio os valores/cobertura seguem seu plano e a equipe "
+                "confirma no atendimento; se for particular, posso te passar o valor', "
+                "(3) faça a pergunta de triagem convênio/particular (se ainda não foi respondida). "
+                "NUNCA diga 'não posso informar o preço' — enquadre como necessidade de saber a modalidade."
             )
         else:
-            section.add(
-                "**Política de preço [NÃO_PODE_FALAR]:** "
-                "Não informe valores monetários em hipótese alguma. "
-                "Se o paciente perguntar sobre preço: "
-                "(1) valide que é natural querer ter uma noção do investimento, "
-                "(2) explique que o orçamento é definido individualmente na consulta — "
-                "o profissional precisa avaliar o caso para indicar o melhor tratamento, "
-                "assim o valor reflete exatamente o que o paciente precisa, "
-                "(3) conduza para o agendamento. "
-                "NUNCA diga 'não posso informar o preço' — enquadre sempre como personalização. "
-                "NUNCA mencione preço espontaneamente."
+            # Pricing policy — two clear states: PODE_FALAR (yes) or NÃO_PODE_FALAR (else).
+            # pricing_mode values are normalised to lower-case (pipeline sends range_allowed /
+            # exact_allowed / consult_only).  provide_prices=yes always means exact_allowed.
+            provide_prices = custom.get("provide_prices")
+            pricing_mode = str(custom.get("pricing_mode", "")).lower().strip()
+            is_range_allowed  = pricing_mode == "range_allowed"
+            is_exact_allowed  = (
+                provide_prices in (True, "yes", "true", "True")
+                or pricing_mode == "exact_allowed"
             )
+            can_share_price = is_range_allowed or is_exact_allowed
+
+            if can_share_price:
+                price_detail = (
+                    "informe a **faixa de preço** (não o valor exato) conforme configurado"
+                    if is_range_allowed
+                    else "informe o **valor exato** conforme configurado"
+                )
+                section.add(
+                    f"**Política de preço [PODE_FALAR]:** "
+                    f"Se o paciente perguntar sobre preço, {price_detail}. "
+                    "ATENÇÃO — SOMENTE quando o paciente solicitar diretamente. "
+                    "NUNCA mencione preço de forma espontânea, mesmo tendo permissão: "
+                    "comercialmente é mais eficaz o paciente descobrir o preço na consulta presencial. "
+                    "Sequência obrigatória quando perguntado: (1) valide a preocupação, "
+                    "(2) gere autoridade com diferenciais, (3) informe o preço."
+                )
+            else:
+                section.add(
+                    "**Política de preço [NÃO_PODE_FALAR]:** "
+                    "Não informe valores monetários em hipótese alguma. "
+                    "Se o paciente perguntar sobre preço: "
+                    "(1) valide que é natural querer ter uma noção do investimento, "
+                    "(2) explique que o orçamento é definido individualmente na consulta — "
+                    "o profissional precisa avaliar o caso para indicar o melhor tratamento, "
+                    "assim o valor reflete exatamente o que o paciente precisa, "
+                    "(3) conduza para o agendamento. "
+                    "NUNCA diga 'não posso informar o preço' — enquadre sempre como personalização. "
+                    "NUNCA mencione preço espontaneamente."
+                )
 
         # Extended config fields
-        accepts_ins = custom.get("accepts_insurance")
-        if accepts_ins and str(accepts_ins).lower() not in ("no", "false", "0", "none"):
+        if insurance_active:
             insurance_text = "**Aceita convênio:** Sim"
             if custom.get("insurance_list"):
                 insurance_text += f" — {custom['insurance_list']}"
@@ -823,49 +951,66 @@ class NormalTemplate(BaseTemplate):
         if custom.get("initial_consultation"):
             ic = custom["initial_consultation"]
             section.add(f"**Tipo de consulta inicial:** {ic}")
-            ic_lower = str(ic).lower()
-            is_cortesia = any(w in ic_lower for w in ("gratuita", "cortesia", "grátis", "free", "complimentary"))
-            consult_price = str(custom.get("consult_service_price", "")).strip()
-            consult_price_num = consult_price.replace("R$", "").replace(",", ".").strip()
-            # Empty string = "not configured", NOT free — only explicit "0" / "0.00" means explicitly free
-            is_explicitly_zero = consult_price_num in ("0", "0.00", "0,00")
-            has_followup_price = consult_price_num != "" and not is_explicitly_zero
 
-            if is_cortesia and is_explicitly_zero:
-                # Cenário 3: Cortesia + preço explicitamente R$0 = todas as consultas são sem custo
+            if hold_price:
+                # Convenio-safe consulta-inicial: NO monetary value in any scenario.
+                # Reframes cortesia / paga alike as "no convênio segue seu plano;
+                # se for particular, informamos o valor após a triagem".
                 section.add(
-                    "⚠️ REGRA OBRIGATÓRIA SOBRE CONSULTAS:\n"
-                    "- TODAS as consultas e avaliações da clínica são SEM CUSTO para o paciente.\n"
-                    "- Quando o paciente perguntar sobre consulta, diga: 'As consultas/avaliações são sem custo para você.'\n"
-                    "- NUNCA mencione valores ou preços ao falar de consultas."
-                )
-            elif is_cortesia and has_followup_price:
-                # Cenário 1: Cortesia + serviço Consulta com preço > 0 = primeira grátis, posteriores pagas
-                section.add(
-                    "⚠️ REGRA OBRIGATÓRIA SOBRE CONSULTA INICIAL:\n"
-                    f"- A PRIMEIRA CONSULTA/AVALIAÇÃO É CORTESIA da clínica (o paciente NÃO paga).\n"
-                    f"- As consultas POSTERIORES (retornos/regulares) têm o valor de {consult_price}.\n"
-                    "- Quando o paciente perguntar sobre a primeira consulta, diga: 'A primeira consulta é uma CORTESIA da clínica.'\n"
-                    f"- Se perguntar sobre valores de consulta em geral, complemente: 'As consultas posteriores têm o valor de {consult_price}.'\n"
-                    "- Use a palavra CORTESIA, nunca 'gratuita' ou 'grátis'.\n"
-                    "- NUNCA mencione o preço ao falar da primeira consulta."
-                )
-            elif is_cortesia:
-                # Cenário 1b: Cortesia sem preço de retorno configurado = apenas primeira grátis, não mencionar valores posteriores
-                section.add(
-                    "⚠️ REGRA OBRIGATÓRIA SOBRE CONSULTA INICIAL:\n"
-                    "- A PRIMEIRA CONSULTA/AVALIAÇÃO É CORTESIA da clínica (o paciente NÃO paga).\n"
-                    "- Quando o paciente perguntar sobre a primeira consulta, diga: 'A primeira consulta é uma CORTESIA da clínica.'\n"
-                    "- Use a palavra CORTESIA, nunca 'gratuita' ou 'grátis'.\n"
-                    "- NÃO mencione valores de consultas posteriores — esse detalhe deve ser tratado na clínica."
+                    "⚠️ REGRA OBRIGATÓRIA SOBRE CONSULTA INICIAL (CONVÊNIO/A DEFINIR):\n"
+                    "- No convênio, os valores e a cobertura seguem o plano do paciente; "
+                    "a equipe confirma no atendimento.\n"
+                    "- Enquanto o tipo de atendimento não estiver definido como *particular*, "
+                    "NÃO informe valor, cortesia, gratuidade nem faixa de preço para a consulta inicial.\n"
+                    "- Se o paciente perguntar sobre a primeira consulta: "
+                    "diga que 'no convênio os valores e a cobertura seguem seu plano e a equipe "
+                    "confirma no atendimento; se for particular, posso te passar o valor da consulta' "
+                    "e faça a pergunta de triagem convênio/particular (se ainda não foi respondida)."
                 )
             else:
-                # Cenário 2: Consulta inicial paga
-                section.add(
-                    "⚠️ REGRA SOBRE CONSULTA INICIAL:\n"
-                    "- A consulta inicial É PAGA.\n"
-                    "- Se existir um serviço 'Consulta' com preço na lista de serviços, informe esse valor ao paciente quando perguntar sobre a primeira consulta."
-                )
+                ic_lower = str(ic).lower()
+                is_cortesia = any(w in ic_lower for w in ("gratuita", "cortesia", "grátis", "free", "complimentary"))
+                consult_price = str(custom.get("consult_service_price", "")).strip()
+                consult_price_num = consult_price.replace("R$", "").replace(",", ".").strip()
+                # Empty string = "not configured", NOT free — only explicit "0" / "0.00" means explicitly free
+                is_explicitly_zero = consult_price_num in ("0", "0.00", "0,00")
+                has_followup_price = consult_price_num != "" and not is_explicitly_zero
+
+                if is_cortesia and is_explicitly_zero:
+                    # Cenário 3: Cortesia + preço explicitamente R$0 = todas as consultas são sem custo
+                    section.add(
+                        "⚠️ REGRA OBRIGATÓRIA SOBRE CONSULTAS:\n"
+                        "- TODAS as consultas e avaliações da clínica são SEM CUSTO para o paciente.\n"
+                        "- Quando o paciente perguntar sobre consulta, diga: 'As consultas/avaliações são sem custo para você.'\n"
+                        "- NUNCA mencione valores ou preços ao falar de consultas."
+                    )
+                elif is_cortesia and has_followup_price:
+                    # Cenário 1: Cortesia + serviço Consulta com preço > 0 = primeira grátis, posteriores pagas
+                    section.add(
+                        "⚠️ REGRA OBRIGATÓRIA SOBRE CONSULTA INICIAL:\n"
+                        f"- A PRIMEIRA CONSULTA/AVALIAÇÃO É CORTESIA da clínica (o paciente NÃO paga).\n"
+                        f"- As consultas POSTERIORES (retornos/regulares) têm o valor de {consult_price}.\n"
+                        "- Quando o paciente perguntar sobre a primeira consulta, diga: 'A primeira consulta é uma CORTESIA da clínica.'\n"
+                        f"- Se perguntar sobre valores de consulta em geral, complemente: 'As consultas posteriores têm o valor de {consult_price}.'\n"
+                        "- Use a palavra CORTESIA, nunca 'gratuita' ou 'grátis'.\n"
+                        "- NUNCA mencione o preço ao falar da primeira consulta."
+                    )
+                elif is_cortesia:
+                    # Cenário 1b: Cortesia sem preço de retorno configurado = apenas primeira grátis, não mencionar valores posteriores
+                    section.add(
+                        "⚠️ REGRA OBRIGATÓRIA SOBRE CONSULTA INICIAL:\n"
+                        "- A PRIMEIRA CONSULTA/AVALIAÇÃO É CORTESIA da clínica (o paciente NÃO paga).\n"
+                        "- Quando o paciente perguntar sobre a primeira consulta, diga: 'A primeira consulta é uma CORTESIA da clínica.'\n"
+                        "- Use a palavra CORTESIA, nunca 'gratuita' ou 'grátis'.\n"
+                        "- NÃO mencione valores de consultas posteriores — esse detalhe deve ser tratado na clínica."
+                    )
+                else:
+                    # Cenário 2: Consulta inicial paga
+                    section.add(
+                        "⚠️ REGRA SOBRE CONSULTA INICIAL:\n"
+                        "- A consulta inicial É PAGA.\n"
+                        "- Se existir um serviço 'Consulta' com preço na lista de serviços, informe esse valor ao paciente quando perguntar sobre a primeira consulta."
+                    )
         if custom.get("parking_info"):
             section.add(f"**Estacionamento:** {custom['parking_info']}")
         if custom.get("scheduling_hours"):

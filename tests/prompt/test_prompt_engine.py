@@ -665,18 +665,272 @@ class TestIntegration:
     async def test_safety_flow(self):
         """Test safety mode flow."""
         engine = PromptEngine()
-        
+
         variables = PromptVariables(
             user_message="Estou passando muito mal",
             safety_category="clinical_risk",
             safety_level=3,
         )
-        
+
         prompt = await engine.generate(PromptMode.SAFETY, variables)
-        
+
         system = prompt.get_system_prompt()
-        
+
         # Should include safety resources
         assert "188" in system or "192" in system
         assert "SEGURANÇA" in system
+
+
+# ============================================
+# Convênio/Particular Triage — Group 2
+# ============================================
+
+
+class TestConvenioTriagePrompt:
+    """Prompt-side coverage for the convenio/particular triage (Group 2).
+
+    Booleans consumed here are injected by the pipeline (Group 1):
+      - ask_convenio_triage    → warm modality question + total price hold
+      - can_quote_particular   → gate for emitting monetary values
+      - atendimento_tipo       → 'convenio' | 'particular' | ''
+    """
+
+    @staticmethod
+    def _build_variables(**custom):
+        """Base variables for a clinic that accepts insurance."""
+        base_custom = {
+            "agent_name": "Ana",
+            "clinic_name": "Clínica Teste",
+            "accepts_insurance": "yes",
+            "insurance_list": "Bradesco Saúde, Unimed",
+            "provide_prices": "yes",
+            "pricing_mode": "exact_allowed",
+            "consult_service_price": "R$ 250,00",
+        }
+        base_custom.update(custom)
+        return PromptVariables(
+            channel="whatsapp",
+            turn_count=2,
+            funnel_stage="em_qualificacao",
+            custom=base_custom,
+        )
+
+    def _render(self, variables):
+        """Return concatenated system + context so we can assert on the whole prompt."""
+        template = NormalTemplate()
+        system = template.build_system_message(variables).content
+        context = template.get_context_instructions(variables)
+        return system + "\n" + context
+
+    # ─────────────────────────────────────────────────────────────
+    # (a) can_quote_particular=false + initial_consultation="paga"
+    #     ⇒ no monetary value anywhere in the prompt.
+    # ─────────────────────────────────────────────────────────────
+
+    def test_hold_price_suppresses_all_monetary_values_when_initial_paga(self):
+        """Convênio + consulta paga must NEVER leak a price into the prompt."""
+        variables = self._build_variables(
+            can_quote_particular=False,
+            atendimento_tipo="convenio",
+            initial_consultation="paga",
+            consult_service_price="R$ 250,00",
+        )
+        rendered = self._render(variables)
+
+        # No R$ symbol, no configured consult price, no "valor exato" instruction.
+        assert "R$" not in rendered, "Convênio must not emit R$ anywhere"
+        assert "250" not in rendered, "The configured consult price leaked"
+        assert "[PODE_FALAR]" not in rendered, "PODE_FALAR policy must be suppressed"
+        assert "valor exato" not in rendered, "'valor exato' policy leaked"
+
+        # Convenio-safe reframing must be present in both blocks.
+        assert "CONVÊNIO/A DEFINIR" in rendered
+        assert "seguem seu plano" in rendered
+        assert "REGRA OBRIGATÓRIA SOBRE CONSULTA INICIAL (CONVÊNIO/A DEFINIR)" in rendered
+        # The old paid-consultation instruction must NOT appear.
+        assert "A consulta inicial É PAGA" not in rendered
+
+    def test_hold_price_suppresses_courtesy_wording(self):
+        """Cortesia + consult_price configured must NOT leak the retorno price."""
+        variables = self._build_variables(
+            can_quote_particular=False,
+            atendimento_tipo="convenio",
+            initial_consultation="cortesia",
+            consult_service_price="R$ 180,00",
+        )
+        rendered = self._render(variables)
+
+        # No monetary value (R$ symbol, configured amount, or the paid-consult copy).
+        assert "R$" not in rendered
+        assert "180" not in rendered
+        # The two normal.py cortesia paragraphs that emit a value must be replaced.
+        assert "A PRIMEIRA CONSULTA/AVALIAÇÃO É CORTESIA da clínica" not in rendered
+        assert "As consultas POSTERIORES" not in rendered
+        # And the convenio-safe reframing must be present in the consulta block.
+        assert "REGRA OBRIGATÓRIA SOBRE CONSULTA INICIAL (CONVÊNIO/A DEFINIR)" in rendered
+
+    def test_hold_price_when_slot_undefined_and_insurance_accepted(self):
+        """Modality undefined + insurance accepted ⇒ hold price applies."""
+        variables = self._build_variables(
+            can_quote_particular=False,
+            atendimento_tipo="",  # undefined
+            initial_consultation="paga",
+            consult_service_price="R$ 300,00",
+        )
+        rendered = self._render(variables)
+
+        assert "R$" not in rendered
+        assert "300" not in rendered
+        assert "CONVÊNIO/A DEFINIR" in rendered
+
+    # ─────────────────────────────────────────────────────────────
+    # (b) can_quote_particular=true ⇒ price + consulta-inicial
+    #     identical to current behavior (byte-for-byte for these blocks).
+    # ─────────────────────────────────────────────────────────────
+
+    def test_particular_preserves_pode_falar_and_paid_consult(self):
+        """Particular ⇒ current PODE_FALAR + paid-consultation instructions intact."""
+        variables = self._build_variables(
+            can_quote_particular=True,
+            atendimento_tipo="particular",
+            initial_consultation="paga",
+        )
+        rendered = self._render(variables)
+
+        # Current policy strings must appear verbatim.
+        assert "**Política de preço [PODE_FALAR]:**" in rendered
+        assert "informe o **valor exato** conforme configurado" in rendered
+        assert "⚠️ REGRA SOBRE CONSULTA INICIAL:" in rendered
+        assert "A consulta inicial É PAGA." in rendered
+
+        # Convenio-safe reframing must NOT leak into the particular path.
+        assert "CONVÊNIO/A DEFINIR" not in rendered
+
+    def test_particular_preserves_cortesia_paths(self):
+        """Particular ⇒ cortesia block still uses the CORTESIA wording."""
+        variables = self._build_variables(
+            can_quote_particular=True,
+            atendimento_tipo="particular",
+            initial_consultation="cortesia",
+            consult_service_price="R$ 180,00",
+        )
+        rendered = self._render(variables)
+
+        assert "CORTESIA da clínica" in rendered
+        assert "R$ 180,00" in rendered
+        assert "CONVÊNIO/A DEFINIR" not in rendered
+
+    def test_insurance_off_preserves_current_behavior(self):
+        """accepts_insurance=false ⇒ triage feature inactive, behavior unchanged."""
+        variables = self._build_variables(
+            accepts_insurance="no",
+            can_quote_particular=False,  # slot undefined, but no gate applies
+            initial_consultation="paga",
+        )
+        rendered = self._render(variables)
+
+        # Standard PODE_FALAR path remains, no convenio reframing appears.
+        assert "**Política de preço [PODE_FALAR]:**" in rendered
+        assert "A consulta inicial É PAGA." in rendered
+        assert "CONVÊNIO/A DEFINIR" not in rendered
+        # "Aceita convênio: Sim" must NOT appear when insurance is off.
+        assert "Aceita convênio" not in rendered
+
+    # ─────────────────────────────────────────────────────────────
+    # (c) ask_convenio_triage=true ⇒ warm triage + price hold copy.
+    # ─────────────────────────────────────────────────────────────
+
+    def test_ask_triage_injects_warm_pt_prompt_block(self):
+        """PT: warm triage question + total price hold in the system message."""
+        variables = self._build_variables(
+            ask_convenio_triage=True,
+            can_quote_particular=False,
+            atendimento_tipo="",
+        )
+        template = NormalTemplate()
+        system = template.build_system_message(variables).content
+
+        assert "TRIAGEM CONVÊNIO / PARTICULAR (OBRIGATÓRIO)" in system
+        assert "convênio ou particular" in system.lower()
+        assert "SEGURE QUALQUER VALOR MONETÁRIO" in system
+        # Must be warm, not a cold interrogation.
+        assert "acolhedora" in system or "leveza" in system
+
+    def test_ask_triage_injects_warm_en_prompt_block(self):
+        """EN: warm triage question + total price hold in the system message."""
+        variables = self._build_variables(
+            ask_convenio_triage=True,
+            can_quote_particular=False,
+            atendimento_tipo="",
+        )
+        variables.language = "en"
+        template = NormalTemplate()
+        system = template.build_system_message(variables).content
+
+        assert "CONVÊNIO / PARTICULAR TRIAGE (MANDATORY)" in system
+        assert "HOLD ALL PRICES" in system
+        assert "warmly" in system
+
+    def test_ask_triage_off_suppresses_the_block(self):
+        """ask_convenio_triage=false ⇒ block absent."""
+        variables = self._build_variables(
+            ask_convenio_triage=False,
+            can_quote_particular=True,
+            atendimento_tipo="particular",
+        )
+        template = NormalTemplate()
+        system = template.build_system_message(variables).content
+
+        assert "TRIAGEM CONVÊNIO / PARTICULAR" not in system
+        assert "CONVÊNIO / PARTICULAR TRIAGE" not in system
+
+    # ─────────────────────────────────────────────────────────────
+    # (d) Convenio scheduling asks for carteirinha "por escrito, não foto".
+    # ─────────────────────────────────────────────────────────────
+
+    def test_convenio_scheduling_collects_carteirinha_por_escrito_pt(self):
+        """PT: agendamento_solicitado + convenio ⇒ ask carteirinha por escrito."""
+        variables = self._build_variables(
+            atendimento_tipo="convenio",
+            can_quote_particular=False,
+        )
+        variables.funnel_stage = "agendamento_solicitado"
+        template = NormalTemplate()
+        context = template.get_context_instructions(variables)
+
+        assert "Coleta adicional — agendamento por convênio" in context
+        assert "Nome do convênio" in context
+        assert "Número da carteirinha" in context
+        assert "por escrito, não por foto" in context
+        # No monetary value must leak in this convenio-scheduling flow either.
+        assert "R$" not in context
+
+    def test_convenio_scheduling_collects_carteirinha_por_escrito_en(self):
+        """EN: agendamento_solicitado + convenio ⇒ ask carteirinha in writing."""
+        variables = self._build_variables(
+            atendimento_tipo="convenio",
+            can_quote_particular=False,
+        )
+        variables.funnel_stage = "agendamento_solicitado"
+        variables.language = "en"
+        template = NormalTemplate()
+        context = template.get_context_instructions(variables)
+
+        assert "Additional collection — insurance (convênio) scheduling" in context
+        assert "Insurance card number (número da carteirinha)" in context
+        assert "in writing, do not send a photo" in context
+
+    def test_particular_scheduling_does_not_ask_carteirinha(self):
+        """Particular scheduling ⇒ no carteirinha addendum."""
+        variables = self._build_variables(
+            atendimento_tipo="particular",
+            can_quote_particular=True,
+        )
+        variables.funnel_stage = "agendamento_solicitado"
+        template = NormalTemplate()
+        context = template.get_context_instructions(variables)
+
+        assert "Coleta adicional" not in context
+        assert "Número da carteirinha" not in context
+        assert "carteirinha" not in context.lower()
 
