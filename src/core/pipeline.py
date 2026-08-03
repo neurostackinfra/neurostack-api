@@ -15,6 +15,7 @@ from prometheus_client import Counter, Histogram
 
 from src.config.logging import get_logger
 from src.core.lgpd_utils import resolve_privacy_link
+from src.observability.metrics import check_price_gate
 from src.core.exceptions import (
     ServiceError,
     PolicyServiceError,
@@ -186,6 +187,11 @@ class PipelineResult(BaseModel):
     # Pause (set by handoff engine when session should be paused)
     should_pause: bool = False
     paused_until: Optional[str] = None  # ISO datetime string or None (permanent)
+
+    # Effective modality slot after merging state_patch with prior state
+    # (convenio-particular-triage) — populated by the pipeline so the
+    # observability layer can consult it without re-loading session slots.
+    atendimento_tipo: Optional[str] = None
     
     # Metadata
     processed_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -981,6 +987,12 @@ class CognitivePipeline:
             "policy_refs": getattr(srm_decision.state_patch, "policy_refs", None) or [],
             "constraints": getattr(srm_decision.state_patch, "constraints", None) or [],
         }
+
+        # Effective modality: SRM only writes atendimento_tipo into the
+        # patch when it changes, so we merge with the prior slot to
+        # expose the current value to the observability guard.
+        _patch_tipo = srm_decision.state_patch.slots.get("atendimento_tipo")
+        _effective_tipo = _patch_tipo or input_data.slots.get("atendimento_tipo")
         
         return PipelineResult(
             event_id=uuid4(),
@@ -1014,6 +1026,7 @@ class CognitivePipeline:
             handoff_user_message=handoff_user_message,
             should_pause=should_pause,
             paused_until=paused_until,
+            atendimento_tipo=_effective_tipo if isinstance(_effective_tipo, str) else None,
             processing_time_ms=total_time,
             stage_timings=stage_timings,
         )
@@ -1024,11 +1037,32 @@ class CognitivePipeline:
             mode=result.mode,
             result="success",
         ).inc()
-        
+
         PIPELINE_LATENCY.observe(result.processing_time_ms / 1000)
-        
+
         for stage, timing in result.stage_timings.items():
             PIPELINE_STAGE_LATENCY.labels(stage=stage).observe(timing / 1000)
+
+    def check_response_price_gate(
+        self,
+        response_text: Optional[str],
+        atendimento_tipo: Optional[str],
+        tenant_id: Optional[UUID] = None,
+    ) -> bool:
+        """Observability hook: flag a price mis-gate in the final response.
+
+        Called by the event service after the LLM response is finalized —
+        the pipeline itself does not invoke the LLM, but this belongs
+        semantically to the pipeline stage (the deterministic gate lives
+        in _run_prompt_engine via custom_vars["can_quote_particular"]).
+
+        Returns True on violation so callers can log/react; never raises.
+        """
+        return check_price_gate(
+            response_text=response_text,
+            atendimento_tipo=atendimento_tipo,
+            tenant_id=str(tenant_id) if tenant_id else None,
+        )
 
 
 # ============================================

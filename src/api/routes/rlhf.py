@@ -25,6 +25,7 @@ from src.llm import get_llm_client, get_tenant_llm_client
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.event import Event
 from src.models.tenant import Tenant
+from src.observability.pii import mask_carteirinha
 from src.policy.engine import get_policy_engine
 from src.repositories import get_db_session, get_db_session_dependency
 
@@ -466,14 +467,17 @@ async def submit_rating(
 
 def _serialize_rating_event(event: Event) -> dict[str, Any]:
     data = event.event_data or {}
+    # Mask carteirinha PII on the training-lake export surface: rating
+    # rows flagged as approved_for_training feed the SLM fine-tuning
+    # dataset, so the raw number must never leave the event store here.
     return {
         "id": str(event.id),
         "ts": event.created_at.isoformat() if event.created_at else "",
         "tenant_id": str(event.tenant_id),
         "rating": int(data.get("rating", 0)),
-        "reason": data.get("reason"),
-        "agent_response": data.get("agent_response"),
-        "user_message": data.get("user_message"),
+        "reason": mask_carteirinha(data.get("reason")),
+        "agent_response": mask_carteirinha(data.get("agent_response")),
+        "user_message": mask_carteirinha(data.get("user_message")),
         "submitted_by": data.get("submitted_by"),
         "ai_analysis": data.get("ai_analysis"),
         "ai_analysis_status": data.get("ai_analysis_status"),
