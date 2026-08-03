@@ -146,7 +146,7 @@ class TestGlobalRules:
         """Test that no-diagnosis rule matches correctly."""
         rules = get_global_rules()
         no_diagnosis = next(
-            (r for r in rules if r.rule_id == "global_no_diagnosis"),
+            (r for r in rules if r.rule_id == "C_MEDICAL_NO_DIAGNOSIS"),
             None,
         )
         
@@ -159,7 +159,7 @@ class TestGlobalRules:
         """Test that no-medication rule matches correctly."""
         rules = get_global_rules()
         no_medication = next(
-            (r for r in rules if r.rule_id == "global_no_medication"),
+            (r for r in rules if r.rule_id == "C_MEDICAL_NO_MED_CHANGE_POSTCARE"),
             None,
         )
         

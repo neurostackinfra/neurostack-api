@@ -549,7 +549,7 @@ class TestCognitiveStateOperations:
             new_state,
         )
         
-        assert result.cognitive_state["funnel_stage"] == "em_qualificacao"
+        assert result.cognitive_state["funnel_stage"] == "consideration"
         assert result.cognitive_state["last_intent"] == "scheduling"
 
     @pytest.mark.asyncio
@@ -585,7 +585,7 @@ class TestCognitiveStateOperations:
         )
         
         cognitive = result.get_cognitive_state_obj()
-        assert cognitive.funnel_stage.value == "qualificado"
+        assert cognitive.funnel_stage == "qualificado"
         assert cognitive.slots["date"] == "2025-01-15"
         assert cognitive.flags["appointment_confirmed"] is True
 
