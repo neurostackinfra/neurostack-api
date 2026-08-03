@@ -50,7 +50,16 @@ def client(test_app) -> Generator[TestClient, None, None]:
 
 @pytest.fixture
 async def async_client(test_app) -> AsyncGenerator[AsyncClient, None]:
-    """Create an asynchronous test client using ASGITransport for httpx >= 0.25."""
+    """Create an asynchronous test client using ASGITransport for httpx >= 0.25.
+
+    ASGITransport does not run the app lifespan, so ensure the database is
+    initialized here (mirroring the lifespan startup). init_database() is
+    idempotent, so leaving the engine up for later tests is safe and matches
+    how the running app keeps a long-lived engine.
+    """
+    from src.repositories import init_database
+
+    await init_database()
     transport = ASGITransport(app=test_app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac

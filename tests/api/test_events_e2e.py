@@ -47,7 +47,16 @@ def auth_headers(valid_api_key):
 
 @pytest.fixture
 async def client():
-    """Create async test client."""
+    """Create async test client.
+
+    ASGITransport does not run the app lifespan, so ensure the database is
+    initialized here (mirroring the lifespan startup). init_database() is
+    idempotent, so leaving the engine up for later tests is safe and matches
+    how the running app keeps a long-lived engine.
+    """
+    from src.repositories import init_database
+
+    await init_database()
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
