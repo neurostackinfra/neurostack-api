@@ -464,7 +464,7 @@ class TestFactoryMethods:
         )
 
         assert event.event_type == EventType.FUNNEL_TRANSITION.value
-        assert event.event_data["from_stage"] == "lead_novo"
+        assert event.event_data["from_stage"] == "awareness"
         assert event.event_data["to_stage"] == "consideration"
 
     def test_create_flow_transition_event(
@@ -934,7 +934,7 @@ class TestEventDataModels:
             trigger_intent="scheduling",
         )
 
-        assert data.from_stage == "lead_novo"
+        assert data.from_stage == "awareness"
         assert data.to_stage == "consideration"
 
 
