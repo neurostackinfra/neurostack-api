@@ -103,6 +103,7 @@ from src.api.schemas.traces import (
     TraceStatsResponse,
 )
 from src.repositories import get_db_session_dependency
+from src.observability.pii import mask_carteirinha
 from src.services.trace_service import (
     _event_to_trace_dict,
     export_traces_csv,
@@ -262,6 +263,11 @@ async def trace_detail(
     event_data = event.event_data or {}
     metadata = event.event_metadata or {}
 
+    # Mask carteirinha PII in the raw debug payload surfaced to the trace
+    # detail view — the user's message content is the main leak vector.
+    if isinstance(event_data.get("content"), str):
+        event_data = {**event_data, "content": mask_carteirinha(event_data["content"])}
+
     # Fetch the associated prompt.generated event for full prompt/context
     full_context = event_data.get("context")
     full_prompt = event_data.get("prompt")
@@ -283,7 +289,7 @@ async def trace_detail(
             full_context = prompt_data.get("context_summary")
             if not prompt_built:
                 prompt_built = prompt_data.get("system_prompt")
-            llm_response = prompt_data.get("suggested_response")
+            llm_response = mask_carteirinha(prompt_data.get("suggested_response"))
             selected_context = prompt_data.get("context_sources", [])
 
     return TraceDetailResponse(

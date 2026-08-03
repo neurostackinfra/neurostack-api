@@ -587,6 +587,29 @@ class EventService:
             except Exception as exc:
                 logger.error("LLM call failed", error=str(exc), exc_info=True)
 
+        # Observability guard: flag when a monetary token appears in the
+        # finalized response while atendimento_tipo != particular.
+        # Increments a Prometheus counter + emits a warning log; stays at
+        # zero on the happy path (particular caller or no price emitted).
+        #
+        # Only armed when the clinic actually runs convenio triage
+        # (accepts_insurance on) — otherwise atendimento_tipo is always
+        # undefined and every legit price for a cash-only clinic would trip
+        # the counter. Uses the effective slot (result.atendimento_tipo),
+        # not the this-turn patch, so a "particular" chosen turns ago still
+        # suppresses the guard.
+        if suggested_response:
+            _accepts_ins = (clinic_config or {}).get("business_rules", {}).get("accepts_insurance")
+            _insurance_active = bool(
+                _accepts_ins and str(_accepts_ins).lower() not in ("no", "false", "0", "none")
+            )
+            if _insurance_active:
+                self._pipeline.check_response_price_gate(
+                    response_text=suggested_response,
+                    atendimento_tipo=result.atendimento_tipo,
+                    tenant_id=tenant_id,
+                )
+
         # If handoff is required, append the handoff user message to the response.
         # When language is EN, use English fallback instead of the PT template message.
         if result.handoff_required:

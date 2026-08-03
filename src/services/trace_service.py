@@ -13,6 +13,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.event import Event
+from src.observability.pii import mask_carteirinha
 
 
 def _base_trace_query(tenant_id: UUID):
@@ -100,13 +101,19 @@ def _event_to_trace_dict(event: Event) -> dict:
             "handoff_required": event_data.get("handoff_required", metadata.get("handoff_required", False)),
         }
 
+    # Mask carteirinha PII in every free-text field surfaced to the trace
+    # view — the raw number stays only in the underlying event store.
     return {
         "id": event.id,
         "timestamp": event.created_at.isoformat() if event.created_at else "",
-        "user_message": event_data.get("content", ""),
+        "user_message": mask_carteirinha(event_data.get("content", "")) or "",
         "srm_decision": srm_decision,
-        "context_summary": event_data.get("context_summary", metadata.get("context_summary")),
-        "prompt_built": event_data.get("prompt_built", metadata.get("prompt_built")),
+        "context_summary": mask_carteirinha(
+            event_data.get("context_summary", metadata.get("context_summary"))
+        ),
+        "prompt_built": mask_carteirinha(
+            event_data.get("prompt_built", metadata.get("prompt_built"))
+        ),
         "processing_time_ms": metadata.get("processing_time_ms"),
         "mode": metadata.get("mode", event_data.get("mode", "normal")),
         "channel": event_data.get("channel", "unknown"),

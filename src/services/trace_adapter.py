@@ -8,6 +8,7 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from src.observability.pii import mask_carteirinha
 from src.srm.models import SRMDecision
 
 
@@ -148,14 +149,19 @@ def build_decision_trace(
     llm_response: str = "",
     processing_time_ms: int = 0,
 ) -> FrontendDecisionTrace:
-    """Build a complete DecisionTrace from SRM output."""
+    """Build a complete DecisionTrace from SRM output.
+
+    Carteirinha numbers are masked in every free-text field that surfaces
+    to the frontend trace view (user message, built prompt, LLM
+    response) so the raw PII never lands in observability artifacts.
+    """
     return FrontendDecisionTrace(
         id=event_id,
         timestamp=datetime.now(timezone.utc).isoformat(),
-        userMessage=message,
+        userMessage=mask_carteirinha(message) or "",
         srmDecision=adapt_srm_decision(decision),
         selectedContext=generate_selected_context(decision),
-        promptBuilt=prompt_built,
-        llmResponse=llm_response,
+        promptBuilt=mask_carteirinha(prompt_built) or "",
+        llmResponse=mask_carteirinha(llm_response) or "",
         processingTimeMs=processing_time_ms,
     )
