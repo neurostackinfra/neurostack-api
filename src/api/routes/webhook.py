@@ -38,13 +38,16 @@ router = APIRouter()
 # Uses Redis for persistence across container restarts and multiple workers.
 # Falls back to an in-process LRU set when Redis is unavailable.
 _SENT_ID_PREFIX = "ai_sent:"
+_INCOMING_ID_PREFIX = "incoming_msg:"
 _SENT_ID_TTL = 300  # 5 minutes — enough for Z-API echo to arrive
+_INCOMING_ID_TTL = 900  # 15 minutes — providers may retry duplicate webhooks
 
 # In-memory fallback: bounded set of (message_id, expiry_epoch) tuples.
 # Used when Redis is down so bot echoes don't trigger false human-takeover.
 import time as _time
 from collections import OrderedDict as _OrderedDict
 _INMEM_SENT: "_OrderedDict[str, float]" = _OrderedDict()
+_INMEM_INCOMING: "_OrderedDict[str, float]" = _OrderedDict()
 _INMEM_MAX = 500  # cap at 500 entries to bound memory
 
 
@@ -143,6 +146,42 @@ def _is_ai_sent_message(message_id: str) -> bool:
             pass
 
     return False
+
+
+def _claim_incoming_message(
+    source: str,
+    tenant_id: UUID,
+    message_id: str,
+) -> bool:
+    """Return True only for the first delivery of an inbound provider message."""
+    if not message_id:
+        return True
+
+    key = f"{source}:{tenant_id}:{message_id}"
+    r = _get_redis()
+    if r:
+        try:
+            claimed = r.set(
+                f"{_INCOMING_ID_PREFIX}{key}",
+                "1",
+                nx=True,
+                ex=_INCOMING_ID_TTL,
+            )
+            return bool(claimed)
+        except Exception:
+            pass
+
+    now = _time.monotonic()
+    expiry = _INMEM_INCOMING.get(key)
+    if expiry and now < expiry:
+        return False
+    if expiry:
+        _INMEM_INCOMING.pop(key, None)
+
+    _INMEM_INCOMING[key] = now + _INCOMING_ID_TTL
+    while len(_INMEM_INCOMING) > _INMEM_MAX:
+        _INMEM_INCOMING.popitem(last=False)
+    return True
 
 
 # ── DB-backed AI message deduplication (cross-worker safe) ───────────
@@ -1173,6 +1212,13 @@ async def uazapi_webhook(
     # ── echo dedup (fromMe / self-sent) ──
     if is_from_me or (msg_id and _is_ai_sent_message(msg_id)):
         return {"ok": True, "skipped": "ai_echo"}
+
+    if msg_id and not _claim_incoming_message("uazapi", tenant_id, msg_id):
+        logger.info(
+            "Uazapi webhook: duplicate msg %s from %s skipped",
+            msg_id, from_phone,
+        )
+        return {"ok": True, "skipped": "duplicate_message"}
 
     # ── load clinic_config (needed for agent language + downstream checks) ──
     service = get_event_service()
