@@ -638,6 +638,83 @@ class TestHandoffService:
         assert "segurança" in response.user_message.lower()
 
     @pytest.mark.asyncio
+    async def test_scheduling_link_handoff_carries_verification_status(
+        self,
+        handoff_service,
+        tenant_id,
+        session_id,
+        sample_messages,
+    ):
+        """Scheduling-link handoff starts pending with link_sent status."""
+        request = HandoffRequest(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            reason=HandoffReason.SCHEDULING,
+            urgency=HandoffUrgency.NORMAL,
+            sector="agendamento",
+            sla="prioritario",
+            funnel_stage="agendamento_solicitado",
+            recent_messages=sample_messages,
+            verification_status="link_sent",
+        )
+
+        response = await handoff_service.initiate_handoff(request)
+        detail = await handoff_service.get_handoff(response.id)
+
+        assert response.verification_status == "link_sent"
+        assert response.summary.verification_status == "link_sent"
+        assert "LINK DE AGENDAMENTO ENVIADO" in response.summary.summary_text
+        assert detail.verification_status == "link_sent"
+        assert detail.sector == "agendamento"
+
+    @pytest.mark.asyncio
+    async def test_enrich_scheduling_verification_updates_same_handoff(
+        self,
+        handoff_service,
+        tenant_id,
+        session_id,
+    ):
+        """Outcome enrichment updates the existing handoff and emits update payload."""
+        request = HandoffRequest(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            reason=HandoffReason.SCHEDULING,
+            urgency=HandoffUrgency.NORMAL,
+            sector="agendamento",
+            sla="prioritario",
+            verification_status="link_sent",
+        )
+        response = await handoff_service.initiate_handoff(request)
+
+        config = WebhookConfig(url="https://example.com/webhook", enabled=True)
+        handoff_service.configure_webhook(tenant_id, config)
+        delivery = WebhookDelivery(
+            handoff_id=response.id,
+            tenant_id=tenant_id,
+            url=config.url,
+            status=WebhookStatus.SENT,
+        )
+        handoff_service.webhook_dispatcher.send = AsyncMock(return_value=delivery)
+
+        updated_id = await handoff_service.enrich_scheduling_verification(
+            session_id=session_id,
+            verification_status="concluiu",
+            handoff_id=response.id,
+        )
+        detail = await handoff_service.get_handoff(response.id)
+        handoffs = await handoff_service.list_handoffs(tenant_id)
+
+        assert updated_id == response.id
+        assert detail.status == HandoffStatus.PENDING
+        assert detail.verification_status == "concluiu"
+        assert len(handoffs) == 1
+
+        payload = handoff_service.webhook_dispatcher.send.await_args.args[1]
+        assert payload.event_type == "handoff.updated"
+        assert payload.handoff_id == response.id
+        assert payload.verification_status == "concluiu"
+
+    @pytest.mark.asyncio
     async def test_get_handoff(
         self,
         handoff_service,
@@ -1065,4 +1142,3 @@ class TestHandoffIntegration:
 
             assert response.webhook_sent is True
             assert response.webhook_status == WebhookStatus.SENT
-

@@ -9,13 +9,16 @@ from uuid import UUID, uuid4
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.middleware.auth import TenantContext, get_tenant_context, require_builder_clinic_access
 from src.api.schemas.config import ConfigPatchRequest, ConfigResponse
+from src.config.logging import get_logger as get_structured_logger
 from src.config.settings import settings
+from src.models.clinic_config import ClinicScheduling
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.tenant import Tenant
 from src.repositories import get_db_session_dependency
@@ -27,6 +30,9 @@ from src.services.config_service import (
 )
 
 logger = logging.getLogger(__name__)
+# Structured logger for audit events (URL egress is untrusted — see
+# scheduling-link-handoff wish, Group 1 deliverable 5).
+_audit_logger = get_structured_logger(__name__)
 
 router = APIRouter()
 
@@ -210,6 +216,13 @@ async def patch_config(
     patch_data = body.model_dump(exclude_unset=True)
     grouped = unflatten_patch(patch_data)
 
+    # Capture the previous scheduling-link URL up-front so we can emit an
+    # audit event AFTER a successful commit if the value actually changed.
+    # The clinic-controlled URL is delivered verbatim to every patient, so
+    # any mutation of it is untrusted-egress that ops needs to see.
+    _prev_scheduling = row.scheduling or {}
+    _prev_link_url = _prev_scheduling.get("scheduling_link_url")
+
     # Merge each bucket
     for bucket_name, new_values in grouped.items():
         if bucket_name in ARRAY_BUCKETS:
@@ -219,10 +232,39 @@ async def patch_config(
             # Dict buckets: merge with existing
             existing = getattr(row, bucket_name, None) or {}
             merged = {**existing, **new_values}
+            # Revalidate the scheduling bucket via pydantic so URL rules
+            # (e.g. https-only for scheduling_link_url) reject bad input
+            # with 422 instead of silently persisting through the raw
+            # dict merge. ConfigPatchRequest is extra="allow" and does
+            # NOT validate per-field, so this is the enforcement point.
+            if bucket_name == "scheduling":
+                try:
+                    validated = ClinicScheduling(**merged)
+                except ValidationError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail=exc.errors(),
+                    )
+                # Persist the validated/normalized form (e.g. empty
+                # strings collapsed to None by the validator).
+                merged = validated.model_dump()
             setattr(row, bucket_name, merged)
 
     await session.flush()
     await session.commit()
+
+    # Audit: scheduling_link_url mutations. Emitted post-commit so the
+    # event reflects a durable state change. `_prev_link_url` may be None
+    # (never set) — treat that as a "created" transition.
+    _new_scheduling = row.scheduling or {}
+    _new_link_url = _new_scheduling.get("scheduling_link_url")
+    if _new_link_url != _prev_link_url:
+        _audit_logger.info(
+            "scheduling_link_url_changed",
+            tenant_id=str(tenant.tenant_id),
+            previous_url=_prev_link_url,
+            new_url=_new_link_url,
+        )
 
     # Warn when lgpd_enabled but mandatory compliance fields are missing
     lgpd_bucket = row.lgpd or {}

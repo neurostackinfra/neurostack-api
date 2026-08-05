@@ -3,10 +3,11 @@ NeuroStack - Core Pipeline Unit Tests
 Tests for the CognitivePipeline orchestrator.
 """
 
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
+from src.core import pipeline as pipeline_module
 from src.core.pipeline import (
     CognitivePipeline,
     PipelineInput,
@@ -14,6 +15,10 @@ from src.core.pipeline import (
     get_cognitive_pipeline,
     process_event,
 )
+from src.handoff.summarizer import ConversationSummarizer
+from src.handoff.webhook import WebhookDispatcher
+from src.services.event_service import EventService
+from src.services.handoff_service import HandoffService
 
 
 # ============================================
@@ -55,6 +60,30 @@ def sample_input(tenant_id, session_id):
         flags={},
         message_history=[],
     )
+
+
+def _scheduling_link_config():
+    return {
+        "scheduling": {
+            "scheduling_link_enabled": True,
+            "scheduling_link_url": "https://clinica.example.com/agendar",
+            "scheduling_link_message": "Finalize seu agendamento pelo link:",
+        },
+        "handoff": {
+            "handoff_active": "yes",
+            "standby_mode": "active",
+            "handoff_period": "permanent",
+        },
+    }
+
+
+def _isolated_pipeline():
+    handoff_service = HandoffService(
+        event_store=None,
+        summarizer=ConversationSummarizer(),
+        webhook_dispatcher=WebhookDispatcher(),
+    )
+    return CognitivePipeline(handoff_service=handoff_service)
 
 
 # ============================================
@@ -203,6 +232,114 @@ class TestCognitivePipeline:
         if result.handoff_required:
             assert result.mode == "handoff"
             assert result.handoff_reason is not None
+
+    @pytest.mark.asyncio
+    async def test_scheduling_link_send_turn_dispatches_handoff_and_exact_response(
+        self,
+        monkeypatch,
+        tenant_id,
+        session_id,
+    ):
+        """Link-send turn creates the pending handoff and fixes patient text."""
+        def _no_db():
+            raise RuntimeError("db disabled in unit test")
+
+        monkeypatch.setattr("src.services.handoff_service.get_db_session", _no_db)
+        info_calls = []
+        monkeypatch.setattr(
+            pipeline_module.logger,
+            "info",
+            lambda *args, **kwargs: info_calls.append((args, kwargs)),
+        )
+        pipeline = _isolated_pipeline()
+        expected = "Finalize seu agendamento pelo link:\n\nhttps://clinica.example.com/agendar"
+
+        result = await pipeline.process(PipelineInput(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            message="sim, pode encaminhar",
+            channel="whatsapp",
+            current_funnel_stage="agendamento_solicitado",
+            turn_count=3,
+            flags={"handoff_confirmation_pending": True},
+            clinic_config=_scheduling_link_config(),
+        ))
+
+        assert result.handoff_required is True
+        assert result.handoff_reason == "scheduling"
+        assert result.should_pause is False
+        assert result.deterministic_response == expected
+        assert result.state_patch["flags"]["scheduling_link_sent"] is True
+        handoff_id = result.state_patch["slots"]["scheduling_link_handoff_id"]
+        assert result.handoff_summary["id"] == handoff_id
+        assert result.handoff_summary["verification_status"] == "link_sent"
+        assert any(kwargs.get("event") == "scheduling_link_sent" for _, kwargs in info_calls)
+
+        response, _, _ = await EventService()._convert_pipeline_result_to_response(
+            result,
+            user_message="sim, pode encaminhar",
+            clinic_config={},
+            tenant_id=tenant_id,
+        )
+        assert response.prompt.suggested_response == expected
+
+    @pytest.mark.asyncio
+    async def test_scheduling_link_enrich_turn_updates_same_handoff(
+        self,
+        monkeypatch,
+        tenant_id,
+        session_id,
+    ):
+        """Outcome turn updates the existing handoff and pauses normally."""
+        def _no_db():
+            raise RuntimeError("db disabled in unit test")
+
+        monkeypatch.setattr("src.services.handoff_service.get_db_session", _no_db)
+        info_calls = []
+        monkeypatch.setattr(
+            pipeline_module.logger,
+            "info",
+            lambda *args, **kwargs: info_calls.append((args, kwargs)),
+        )
+        pipeline = _isolated_pipeline()
+
+        send_result = await pipeline.process(PipelineInput(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            message="sim, pode encaminhar",
+            channel="whatsapp",
+            current_funnel_stage="agendamento_solicitado",
+            turn_count=3,
+            flags={"handoff_confirmation_pending": True},
+            clinic_config=_scheduling_link_config(),
+        ))
+        handoff_id = send_result.state_patch["slots"]["scheduling_link_handoff_id"]
+
+        enrich_result = await pipeline.process(PipelineInput(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            message="consegui agendar pelo link",
+            channel="whatsapp",
+            current_funnel_stage="agendamento_solicitado",
+            turn_count=4,
+            flags={"scheduling_link_sent": True},
+            slots={"scheduling_link_handoff_id": handoff_id},
+            clinic_config=_scheduling_link_config(),
+        ))
+        detail = await pipeline._handoff.get_handoff(UUID(handoff_id))
+        handoffs = await pipeline._handoff.list_handoffs(tenant_id)
+
+        assert enrich_result.handoff_required is False
+        assert enrich_result.state_patch["flags"]["scheduling_link_sent"] is False
+        assert enrich_result.should_pause is True
+        assert detail.verification_status == "concluiu"
+        assert len(handoffs) == 1
+        assert any(
+            kwargs.get("event") == "scheduling_link_verified"
+            and kwargs.get("handoff_id") == handoff_id
+            and kwargs.get("verification_status") == "concluiu"
+            for _, kwargs in info_calls
+        )
 
     @pytest.mark.asyncio
     async def test_stage_timings_recorded(self, pipeline, tenant_id, session_id):
@@ -373,4 +510,3 @@ class TestPromptGeneration:
         # Constraints list should exist
         assert result.constraints is not None
         assert isinstance(result.constraints, list)
-

@@ -96,6 +96,7 @@ class ConversationSummarizer:
         session_start: Optional[datetime] = None,
         sector: Optional[Any] = None,
         sla: Optional[Any] = None,
+        verification_status: Optional[str] = None,
     ) -> ConversationSummary:
         """
         Generate a structured summary of the conversation.
@@ -134,6 +135,12 @@ class ConversationSummarizer:
             reason=reason,
             intents=intents or [],
         )
+
+        if verification_status == "link_sent":
+            summary_text = (
+                "[LINK DE AGENDAMENTO ENVIADO - verificar se o paciente concluiu]\n"
+                + summary_text
+            )
         
         # Get recent messages
         recent = conv_messages[-self.max_recent_messages:] if conv_messages else []
@@ -152,6 +159,7 @@ class ConversationSummarizer:
             urgency=urgency,
             sector=sector,
             sla=sla,
+            verification_status=verification_status,
             safety_flags=safety_flags or [],
             recent_messages=recent,
         )
@@ -403,4 +411,3 @@ def get_summarizer(
             max_summary_length=max_summary_length,
         )
     return _summarizer
-

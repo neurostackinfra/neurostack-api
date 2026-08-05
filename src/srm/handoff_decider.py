@@ -84,6 +84,15 @@ _NEGATIVE_RE = re.compile(
     r"|por\s+enquanto\s+n[a\u00e3]o|cancel|cancela|desist|volta)\b",
     re.IGNORECASE | re.UNICODE,
 )
+# Scheduling-link enrich turn: patient reports the booking outcome. This vocabulary
+# ("consegui", "agendei", "deu certo"\u2026) is distinct from the yes/no confirmation
+# words, so it needs its own positive-completion matcher. Negation is vetoed first,
+# so "n\u00e3o consegui" / "n\u00e3o deu certo" correctly read as NOT concluded.
+_SCHEDULING_COMPLETED_RE = re.compile(
+    r"\b(consegui|agendei|agendad|marquei|marcad|reservei|finalizei|conclu[\u00edi]"
+    r"|deu\s+certo|funcionou|prontinho|pronto)\b",
+    re.IGNORECASE | re.UNICODE,
+)
 
 
 class HandoffDecider:
@@ -136,6 +145,7 @@ class HandoffDecider:
         safety_result: SafetyResult,
         funnel_stage: FunnelStage,
         flags: dict,
+        scheduling_link_enabled: bool = False,
     ) -> HandoffResult:
         """
         Decide if handoff is required. Define setor e SLA conforme doc (MVP v0.5).
@@ -205,6 +215,21 @@ class HandoffDecider:
         confirmation_pending = flags.get("handoff_confirmation_pending", False)
         is_scheduling = intent in ("agendar", "reagendar", "cancelar") or intent_category == IntentCategory.SCHEDULING
 
+        # Scheduling-link enrich turn: the link was delivered last turn (pending handoff
+        # already created). This turn we only read back whether the patient reported
+        # finishing the booking, then annotate the SAME handoff — no new handoff fires.
+        # Negative-first, and default to "nao_concluiu" on ambiguity so a human follows up.
+        if flags.get("scheduling_link_sent", False):
+            is_negative = self._is_negative_confirmation(message_lower)
+            is_positive = self._is_positive_confirmation(message_lower) or bool(
+                _SCHEDULING_COMPLETED_RE.search(message_lower)
+            )
+            concluded = is_positive and not is_negative
+            return HandoffResult(
+                required=False,
+                verification_status="concluiu" if concluded else "nao_concluiu",
+            )
+
         # P1a fix: _extract_slots() runs AFTER decide(), so scheduling_has_time is
         # not yet persisted for the current turn. Check the current message directly
         # so both-pieces-in-one-turn and time-only follow-ups work on the same turn.
@@ -218,6 +243,19 @@ class HandoffDecider:
             is_negative = self._is_negative_confirmation(message_lower)
             is_positive = self._is_positive_confirmation(message_lower)
             if is_positive and not is_negative:
+                # Scheduling-link path: deliver the link and create a PENDING handoff this
+                # same turn (verification_status="link_sent"). Excluded for cancellations —
+                # a booking link is meaningless when the patient wants to cancel.
+                if scheduling_link_enabled and not flags.get("scheduling_cancel_pending", False):
+                    return HandoffResult(
+                        required=True,
+                        reason=HandoffReason.SCHEDULING,
+                        urgency="normal",
+                        summary="Link de agendamento enviado; aguardando o paciente confirmar se concluiu",
+                        sector="agendamento",
+                        sla="prioritario",
+                        verification_status="link_sent",
+                    )
                 return HandoffResult(
                     required=True,
                     reason=HandoffReason.SCHEDULING,

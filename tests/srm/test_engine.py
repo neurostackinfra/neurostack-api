@@ -917,3 +917,161 @@ class TestConvenioTriageGating:
         assert quote is False
 
 
+# ============================================
+# Scheduling-Link Handoff Tests (optional link before ERP integration)
+# ============================================
+
+
+class TestSchedulingLinkHandoff:
+    """Optional scheduling-link flow: send link + pending handoff on the confirm
+    turn, then read back the patient's outcome on the next (enrich) turn."""
+
+    # --- Decider: send turn (confirmation reply) ---
+
+    def test_link_off_confirm_is_plain_handoff(self, handoff_decider):
+        """With link disabled, a positive confirmation is the normal handoff."""
+        result = handoff_decider.decide(
+            message="sim, pode encaminhar",
+            intent="confirmar",
+            intent_category=IntentCategory.SCHEDULING,
+            confidence=0.9,
+            turn_count=3,
+            safety_result=SafetyResult(is_safe=True),
+            funnel_stage=FunnelStage.AGENDAMENTO_SOLICITADO,
+            flags={"handoff_confirmation_pending": True},
+            scheduling_link_enabled=False,
+        )
+        assert result.required is True
+        assert result.reason == HandoffReason.SCHEDULING
+        assert result.verification_status is None
+
+    def test_link_on_confirm_sends_link_pending(self, handoff_decider):
+        """With link enabled, the confirm turn arms a pending link handoff."""
+        result = handoff_decider.decide(
+            message="sim, pode encaminhar",
+            intent="confirmar",
+            intent_category=IntentCategory.SCHEDULING,
+            confidence=0.9,
+            turn_count=3,
+            safety_result=SafetyResult(is_safe=True),
+            funnel_stage=FunnelStage.AGENDAMENTO_SOLICITADO,
+            flags={"handoff_confirmation_pending": True},
+            scheduling_link_enabled=True,
+        )
+        assert result.required is True
+        assert result.reason == HandoffReason.SCHEDULING
+        assert result.sector == "agendamento"
+        assert result.verification_status == "link_sent"
+
+    def test_link_on_cancel_context_stays_plain(self, handoff_decider):
+        """Cancellations never get a booking link even when link is enabled."""
+        result = handoff_decider.decide(
+            message="sim",
+            intent="confirmar",
+            intent_category=IntentCategory.SCHEDULING,
+            confidence=0.9,
+            turn_count=3,
+            safety_result=SafetyResult(is_safe=True),
+            funnel_stage=FunnelStage.AGENDAMENTO_SOLICITADO,
+            flags={"handoff_confirmation_pending": True, "scheduling_cancel_pending": True},
+            scheduling_link_enabled=True,
+        )
+        assert result.required is True
+        assert result.verification_status is None
+
+    # --- Decider: enrich turn (outcome report) ---
+
+    def test_enrich_turn_concluiu(self, handoff_decider):
+        for msg in ("consegui agendar pelo link", "sim, agendei", "deu certo, marquei"):
+            result = handoff_decider.decide(
+                message=msg,
+                intent="duvida_generica",
+                intent_category=IntentCategory.INFORMATION,
+                confidence=0.8,
+                turn_count=4,
+                safety_result=SafetyResult(is_safe=True),
+                funnel_stage=FunnelStage.AGENDAMENTO_SOLICITADO,
+                flags={"scheduling_link_sent": True},
+                scheduling_link_enabled=True,
+            )
+            assert result.required is False, msg
+            assert result.verification_status == "concluiu", msg
+
+    def test_enrich_turn_nao_concluiu(self, handoff_decider):
+        for msg in ("não consegui", "o link não abriu", "ainda não deu certo"):
+            result = handoff_decider.decide(
+                message=msg,
+                intent="duvida_generica",
+                intent_category=IntentCategory.INFORMATION,
+                confidence=0.8,
+                turn_count=4,
+                safety_result=SafetyResult(is_safe=True),
+                funnel_stage=FunnelStage.AGENDAMENTO_SOLICITADO,
+                flags={"scheduling_link_sent": True},
+                scheduling_link_enabled=True,
+            )
+            assert result.required is False, msg
+            assert result.verification_status == "nao_concluiu", msg
+
+    def test_enrich_turn_ambiguous_defaults_nao_concluiu(self, handoff_decider):
+        """Ambiguous replies default to nao_concluiu so a human follows up."""
+        result = handoff_decider.decide(
+            message="tá",
+            intent="duvida_generica",
+            intent_category=IntentCategory.INFORMATION,
+            confidence=0.8,
+            turn_count=4,
+            safety_result=SafetyResult(is_safe=True),
+            funnel_stage=FunnelStage.AGENDAMENTO_SOLICITADO,
+            flags={"scheduling_link_sent": True},
+            scheduling_link_enabled=True,
+        )
+        assert result.verification_status == "nao_concluiu"
+
+    # --- Engine: full state-machine round trip ---
+
+    def _cfg(self, enabled=True, url="https://clinica.example.com/agendar"):
+        return {"scheduling": {"scheduling_link_enabled": enabled, "scheduling_link_url": url}}
+
+    def test_engine_send_turn_arms_link_sent_flag(self, srm_engine, sample_tenant_id, sample_session_id):
+        decision = srm_engine.process(SRMInput(
+            tenant_id=sample_tenant_id,
+            session_id=sample_session_id,
+            message="sim, pode encaminhar",
+            turn_count=3,
+            current_funnel_stage=FunnelStage.AGENDAMENTO_SOLICITADO,
+            flags={"handoff_confirmation_pending": True},
+            clinic_config=self._cfg(),
+        ))
+        assert decision.handoff_required is True
+        assert decision.handoff_verification_status == "link_sent"
+        assert decision.state_patch.flags.get("scheduling_link_sent") is True
+
+    def test_engine_enrich_turn_annotates_and_disarms(self, srm_engine, sample_tenant_id, sample_session_id):
+        decision = srm_engine.process(SRMInput(
+            tenant_id=sample_tenant_id,
+            session_id=sample_session_id,
+            message="consegui agendar pelo link",
+            turn_count=4,
+            current_funnel_stage=FunnelStage.AGENDAMENTO_SOLICITADO,
+            flags={"scheduling_link_sent": True},
+            clinic_config=self._cfg(),
+        ))
+        assert decision.handoff_required is False
+        assert decision.handoff_verification_status == "concluiu"
+        assert decision.state_patch.flags.get("scheduling_link_sent") is False
+
+    def test_engine_enabled_but_no_url_is_plain_handoff(self, srm_engine, sample_tenant_id, sample_session_id):
+        """Enabled with an empty URL must not change the flow (plain handoff)."""
+        decision = srm_engine.process(SRMInput(
+            tenant_id=sample_tenant_id,
+            session_id=sample_session_id,
+            message="sim, pode encaminhar",
+            turn_count=3,
+            current_funnel_stage=FunnelStage.AGENDAMENTO_SOLICITADO,
+            flags={"handoff_confirmation_pending": True},
+            clinic_config=self._cfg(enabled=True, url=None),
+        ))
+        assert decision.handoff_required is True
+        assert decision.handoff_verification_status is None
+        assert decision.state_patch.flags.get("scheduling_link_sent") is not True

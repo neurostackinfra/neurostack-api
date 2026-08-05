@@ -291,6 +291,7 @@ Objetivo: Coletar nome completo e preferência de horário, confirmar com o paci
    - Se o paciente forneceu apenas o dia/horário e não o nome: "Pode me passar seu nome completo?"
 3. Quando tiver os dois, pergunte APENAS: "Posso encaminhar você para nossa equipe de agendamento agora?"
    NUNCA diga "Vou encaminhar", NUNCA diga "está disponível", NUNCA confirme o agendamento — o sistema cuida do encaminhamento após a confirmação do paciente.
+4. Se este for o retorno do paciente após receber um link de agendamento, apenas reconheça se conseguiu ou não conseguiu concluir e diga que a equipe foi atualizada/dará continuidade. NÃO envie link por template.
 
 ### Reagendamento:
 - Se o paciente quer mudar: "Qual novo horário seria melhor para você?"
@@ -471,6 +472,7 @@ Goal: Collect full name and time preference, confirm with the patient, then hand
    - If the patient gave only a day/time but no name: "Could you share your full name?"
 3. When you have both, ask ONLY: "Can I connect you with our scheduling team now?"
    NEVER say "I'll connect you", NEVER say "that time is available", NEVER confirm the appointment — the system handles the transfer after the patient confirms.
+4. If this is the patient's reply after receiving a scheduling link, only acknowledge whether they did or did not finish and say the team has been updated/will follow up. Do NOT send a link through the template.
 
 ### Rescheduling:
 - If the patient wants to change: "What new time would work best for you?"
@@ -692,6 +694,35 @@ class NormalTemplate(BaseTemplate):
                     "\"para eu te passar a informação certa, preciso saber se será "
                     "convênio ou particular\"."
                 )
+
+        if variables.custom.get("scheduling_link_verification_status"):
+            status = variables.custom["scheduling_link_verification_status"]
+            if variables.language == "en":
+                if status == "concluiu":
+                    guidance = (
+                        "Acknowledge briefly that the scheduling step worked and say the team has been updated. "
+                        "Do not resend the link, do not ask for more scheduling details, and do not mention internal handoff status."
+                    )
+                else:
+                    guidance = (
+                        "Acknowledge briefly that the patient could not finish through the link and say the team will follow up. "
+                        "Do not resend the link unless the patient explicitly asks, and do not mention internal handoff status."
+                    )
+            else:
+                if status == "concluiu":
+                    guidance = (
+                        "Reconheça brevemente que deu certo e diga que a equipe já foi atualizada. "
+                        "Não reenvie o link, não peça novos dados de agendamento e não mencione status interno de handoff."
+                    )
+                else:
+                    guidance = (
+                        "Reconheça brevemente que o paciente não conseguiu concluir pelo link e diga que a equipe dará continuidade. "
+                        "Não reenvie o link, a menos que o paciente peça explicitamente, e não mencione status interno de handoff."
+                    )
+            msg.content += (
+                "\n\n## Scheduling Link Outcome (Mandatory)\n"
+                f"{guidance}"
+            )
 
         # Emoji directive — suppressed when handoff_confirmation_pending to avoid
         # conflict with "SOMENTE esta pergunta" constraint in the confirmation block.
@@ -1143,6 +1174,7 @@ class NormalTemplate(BaseTemplate):
 - Entenda a necessidade de mudança.
 - Pergunte nova preferência de dia/turno.
 - Confirme e processe.
+- Se o paciente estiver retornando após receber link de agendamento, apenas reconheça o resultado e diga que a equipe dará continuidade. Não envie link por template.
 """,
             "cancelar": """
 ## Objetivo: Cancelamento

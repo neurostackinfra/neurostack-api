@@ -206,6 +206,12 @@ class SRMEngine:
         )
 
         # Step 4: Check for handoff requirement
+        # Optional scheduling-link handoff is active only when the clinic enabled it AND
+        # a URL is configured — an enabled-but-empty link must not change the flow.
+        _scheduling_cfg = (input_data.clinic_config or {}).get("scheduling", {})
+        scheduling_link_enabled = bool(_scheduling_cfg.get("scheduling_link_enabled")) and bool(
+            _scheduling_cfg.get("scheduling_link_url")
+        )
         handoff_result = self.handoff_decider.decide(
             message=input_data.message,
             intent=intent_result.intent,
@@ -215,6 +221,7 @@ class SRMEngine:
             safety_result=safety_result,
             funnel_stage=input_data.current_funnel_stage,
             flags=input_data.flags,
+            scheduling_link_enabled=scheduling_link_enabled,
         )
 
         # Step 5: Decide on RAG
@@ -266,10 +273,15 @@ class SRMEngine:
         # Scheduling confirmation flow: propagate pending/cancelled flags
         if handoff_result.confirmation_pending:
             state_patch.flags["handoff_confirmation_pending"] = True
+            # Remember whether this confirmation was opened by a cancellation so the
+            # scheduling-link path can exclude it on the confirm turn (intent is then
+            # a bare "sim", no longer "cancelar").
+            state_patch.flags["scheduling_cancel_pending"] = intent_result.intent == "cancelar"
         if handoff_result.scheduling_cancelled:
             state_patch.flags["handoff_confirmation_pending"] = False
             state_patch.flags["scheduling_interest"] = False
             state_patch.flags["scheduling_has_time"] = False
+            state_patch.flags["scheduling_cancel_pending"] = False
         # P2a/P2-fix: when handoff fires, clear all scheduling flags so a resumed
         # session (e.g. after handoff-pause expires) starts fresh instead of
         # re-entering the confirmation step.
@@ -277,6 +289,13 @@ class SRMEngine:
             state_patch.flags["handoff_confirmation_pending"] = False
             state_patch.flags["scheduling_interest"] = False
             state_patch.flags["scheduling_has_time"] = False
+            state_patch.flags["scheduling_cancel_pending"] = False
+        # Scheduling-link lifecycle: the send turn arms scheduling_link_sent so next
+        # turn is the enrich turn; the enrich turn disarms it once the outcome is read.
+        if handoff_result.verification_status == "link_sent":
+            state_patch.flags["scheduling_link_sent"] = True
+        elif handoff_result.verification_status in ("concluiu", "nao_concluiu"):
+            state_patch.flags["scheduling_link_sent"] = False
 
         # Step 9: Generate reasoning
         reasoning = self._generate_reasoning(
@@ -363,6 +382,7 @@ class SRMEngine:
             handoff_urgency=handoff_result.urgency,
             handoff_sector=handoff_result.sector,
             handoff_sla=handoff_result.sla,
+            handoff_verification_status=handoff_result.verification_status,
             state_patch=state_patch,
             reasoning=reasoning,
             processing_time_ms=processing_time_ms,

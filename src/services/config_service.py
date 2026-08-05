@@ -57,6 +57,10 @@ FIELD_TO_BUCKET: dict[str, str] = {
     "dpo_contact": "lgpd",
     "builder_lgpd_consent": "lgpd",
     "builder_slm_training": "lgpd",
+    # scheduling
+    "scheduling_link_enabled": "scheduling",
+    "scheduling_link_url": "scheduling",
+    "scheduling_link_message": "scheduling",
     # handoff
     "handoff_active": "handoff",
     "handoff_period": "handoff",

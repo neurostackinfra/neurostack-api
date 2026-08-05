@@ -169,6 +169,7 @@ class PipelineResult(BaseModel):
     # Prompt
     system_prompt: str
     instructions: str
+    deterministic_response: Optional[str] = None
     constraints: list[str] = Field(default_factory=list)
     context_summary: Optional[str] = None
     
@@ -309,13 +310,61 @@ class CognitivePipeline:
             handoff_response = None
             should_pause = False
             paused_until_iso: Optional[str] = None
+            deterministic_response: Optional[str] = None
+            verification_status = getattr(srm_decision, "handoff_verification_status", None)
             if srm_decision.handoff_required:
                 stage_start = time.perf_counter()
                 handoff_response = await self._run_handoff(input_data, srm_decision)
 
-                # Handoff engine: check config and pause session if allowed
-                should_pause, paused_until_iso = await self._apply_handoff_pause(input_data)
+                if verification_status == "link_sent":
+                    should_pause, paused_until_iso = False, None
+                    deterministic_response = self._build_scheduling_link_response(input_data)
+                    if handoff_response is not None:
+                        srm_decision.state_patch.slots["scheduling_link_handoff_id"] = str(
+                            handoff_response.id
+                        )
+                    logger.info(
+                        "scheduling_link_sent",
+                        event="scheduling_link_sent",
+                        tenant_id=str(input_data.tenant_id),
+                        session_id=str(input_data.session_id),
+                        intent=srm_decision.intent,
+                        handoff_id=str(handoff_response.id) if handoff_response else None,
+                    )
+                else:
+                    # Handoff engine: check config and pause session if allowed
+                    should_pause, paused_until_iso = await self._apply_handoff_pause(input_data)
 
+                stage_timings["handoff"] = (time.perf_counter() - stage_start) * 1000
+            elif verification_status in ("concluiu", "nao_concluiu"):
+                stage_start = time.perf_counter()
+                handoff_id = None
+                raw_handoff_id = input_data.slots.get("scheduling_link_handoff_id")
+                if raw_handoff_id:
+                    try:
+                        handoff_id = UUID(str(raw_handoff_id))
+                    except ValueError:
+                        logger.warning(
+                            "scheduling_link_invalid_handoff_id",
+                            tenant_id=str(input_data.tenant_id),
+                            session_id=str(input_data.session_id),
+                            raw_handoff_id=str(raw_handoff_id),
+                        )
+                enriched_handoff_id = await self._handoff.enrich_scheduling_verification(
+                    input_data.session_id,
+                    verification_status,
+                    handoff_id=handoff_id,
+                )
+                should_pause, paused_until_iso = await self._apply_handoff_pause(input_data)
+                logger.info(
+                    "scheduling_link_verified",
+                    event="scheduling_link_verified",
+                    tenant_id=str(input_data.tenant_id),
+                    session_id=str(input_data.session_id),
+                    intent=srm_decision.intent,
+                    handoff_id=str(enriched_handoff_id) if enriched_handoff_id else None,
+                    verification_status=verification_status,
+                )
                 stage_timings["handoff"] = (time.perf_counter() - stage_start) * 1000
             
             # Build final result
@@ -333,6 +382,7 @@ class CognitivePipeline:
                 context_sources=context_sources,
                 should_pause=should_pause,
                 paused_until=paused_until_iso,
+                deterministic_response=deterministic_response,
             )
             
             # Record metrics
@@ -641,6 +691,10 @@ class CognitivePipeline:
         # Prompt only emits monetary values when this is True.
         custom_vars["can_quote_particular"] = atendimento_tipo == "particular"
 
+        _verification_status = getattr(srm_decision, "handoff_verification_status", None)
+        if _verification_status in ("concluiu", "nao_concluiu"):
+            custom_vars["scheduling_link_verification_status"] = _verification_status
+
         # Collect context sources from non-empty custom_vars
         context_sources: list[dict[str, Any]] = []
         if input_data.clinic_config:
@@ -802,8 +856,21 @@ class CognitivePipeline:
             funnel_stage=input_data.current_funnel_stage,
             recent_messages=recent_messages,
             key_info=key_info,
+            verification_status=getattr(srm_decision, "handoff_verification_status", None),
         )
         return await self._handoff.initiate_handoff(request)
+
+    def _build_scheduling_link_response(self, input_data: PipelineInput) -> Optional[str]:
+        """Build the exact patient-facing scheduling link response from clinic config."""
+        scheduling_cfg = (input_data.clinic_config or {}).get("scheduling", {})
+        url = scheduling_cfg.get("scheduling_link_url")
+        if not url:
+            return None
+        message = (
+            scheduling_cfg.get("scheduling_link_message")
+            or "Para concluir seu agendamento, acesse o link abaixo:"
+        )
+        return f"{str(message).strip()}\n\n{url}"
 
     async def _apply_handoff_pause(
         self,
@@ -923,6 +990,7 @@ class CognitivePipeline:
         context_sources: Optional[list[dict[str, Any]]] = None,
         should_pause: bool = False,
         paused_until: Optional[str] = None,
+        deterministic_response: Optional[str] = None,
     ) -> PipelineResult:
         """Build the final pipeline result."""
         # Extract prompt messages
@@ -966,6 +1034,8 @@ class CognitivePipeline:
                 "urgency": u.value if u and hasattr(u, "value") else (u or "normal"),
                 "sector": sec.value if sec and hasattr(sec, "value") else (sec if isinstance(sec, str) else None),
                 "sla": sla_val.value if sla_val and hasattr(sla_val, "value") else (sla_val if isinstance(sla_val, str) else None),
+                "verification_status": getattr(handoff_response, "verification_status", None)
+                or getattr(s, "verification_status", None),
             }
             handoff_user_message = handoff_response.user_message
         
@@ -1016,6 +1086,7 @@ class CognitivePipeline:
             state_patch=state_patch,
             system_prompt=system_prompt,
             instructions=instructions,
+            deterministic_response=deterministic_response,
             constraints=constraints,
             context_summary=context_response.context.compressed_history if context_response.context else None,
             recent_messages=recent_messages,
@@ -1126,4 +1197,3 @@ async def process_event(
     )
     
     return await pipeline.process(input_data)
-

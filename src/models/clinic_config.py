@@ -5,9 +5,10 @@ Estrutura de configuração da clínica para SRM, handoff e políticas de preço
 
 from enum import Enum
 from typing import Any, Optional
+from urllib.parse import urlparse
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class PricingDisclosureMode(str, Enum):
@@ -42,6 +43,43 @@ class ClinicScheduling(BaseModel):
     """Configuração de agendamento (doc MVP v0.5)."""
     has_scheduling_agent: bool = False
     hours_rag_key: Optional[str] = None
+    # Scheduling-link stopgap (pre-ERP). When enabled, on positive
+    # confirmation the agent delivers `scheduling_link_message` +
+    # `scheduling_link_url` verbatim to the patient and creates a pending
+    # handoff for human verification. See wish scheduling-link-handoff.
+    scheduling_link_enabled: bool = False
+    scheduling_link_url: Optional[str] = None
+    scheduling_link_message: Optional[str] = None
+
+    @field_validator("scheduling_link_url")
+    @classmethod
+    def _validate_https_url(cls, v: Optional[str]) -> Optional[str]:
+        """Require https:// scheme. Reject http:// and any other scheme.
+
+        The clinic-controlled URL is delivered verbatim to every patient,
+        so we treat it as untrusted egress: https-only reduces the
+        phishing/downgrade surface. `HttpUrl` alone would accept `http`,
+        so we validate explicitly.
+        """
+        if v is None:
+            return v
+        if not isinstance(v, str):
+            raise ValueError("scheduling_link_url must be a string")
+        candidate = v.strip()
+        if candidate == "":
+            # Treat empty string as "unset" — mirrors the frontend clearing
+            # the field via patch. Persist as None so `flatten_config`
+            # exposes it consistently.
+            return None
+        parsed = urlparse(candidate)
+        if parsed.scheme != "https":
+            raise ValueError(
+                "scheduling_link_url must use https:// scheme "
+                f"(got {parsed.scheme or 'no scheme'!r})"
+            )
+        if not parsed.netloc:
+            raise ValueError("scheduling_link_url must include a host")
+        return candidate
 
 
 class ClinicPricing(BaseModel):

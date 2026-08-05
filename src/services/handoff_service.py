@@ -166,7 +166,10 @@ class HandoffService:
                 "status": HandoffStatus.PENDING,
                 "urgency": request.urgency,
                 "reason": request.reason,
+                "sector": request.sector,
+                "sla": request.sla,
                 "summary": summary,
+                "verification_status": request.verification_status,
                 "webhook_sent": False,
                 "webhook_status": None,
                 "assigned_to": None,
@@ -204,13 +207,17 @@ class HandoffService:
                         if request.key_info else None
                     )
 
+                    context = dict(request.key_info or {})
+                    if request.verification_status:
+                        context["verification_status"] = request.verification_status
+
                     orm_record = HandoffRecordORM(
                         id=handoff_id,
                         tenant_id=request.tenant_id,
                         session_id=request.session_id,
                         reason=request.reason.value,
                         summary=summary.summary_text if summary else None,
-                        context=request.key_info or {},
+                        context=context,
                         urgency=request.urgency.value,
                         status=HandoffStatus.PENDING.value,
                         numero_whatsapp=whatsapp_num,
@@ -292,6 +299,7 @@ class HandoffService:
                 webhook_sent=webhook_sent,
                 webhook_status=webhook_status,
                 user_message=user_message,
+                verification_status=request.verification_status,
             )
 
         except HandoffServiceError as e:
@@ -331,6 +339,7 @@ class HandoffService:
             slots=request.key_info,
             sector=request.sector,
             sla=request.sla,
+            verification_status=request.verification_status,
         )
 
     async def _log_handoff_event(
@@ -383,6 +392,7 @@ class HandoffService:
             reason=request.reason,
             summary=summary.summary_text,
             key_info=summary.key_info.model_dump(),
+            verification_status=summary.verification_status,
             turn_count=summary.turn_count,
             funnel_stage=summary.funnel_stage,
             recent_messages=[
@@ -400,6 +410,110 @@ class HandoffService:
             reason.value,
             "Vou encaminhar você para nossa equipe, que dará continuidade ao seu atendimento.",
         )
+
+    async def enrich_scheduling_verification(
+        self,
+        session_id: UUID,
+        verification_status: str,
+        handoff_id: Optional[UUID] = None,
+    ) -> Optional[UUID]:
+        """Annotate the active scheduling-link handoff with the patient's outcome."""
+        handoff = None
+        if handoff_id is not None:
+            candidate = self._handoffs.get(handoff_id)
+            if (
+                candidate
+                and candidate["session_id"] == session_id
+                and candidate["status"] in (
+                    HandoffStatus.PENDING,
+                    HandoffStatus.ACCEPTED,
+                    HandoffStatus.IN_PROGRESS,
+                )
+            ):
+                handoff = candidate
+
+        if handoff is None:
+            for candidate in self._handoffs.values():
+                if (
+                    candidate["session_id"] == session_id
+                    and candidate["status"] in (
+                        HandoffStatus.PENDING,
+                        HandoffStatus.ACCEPTED,
+                        HandoffStatus.IN_PROGRESS,
+                    )
+                ):
+                    handoff = candidate
+                    break
+
+        if handoff is None:
+            logger.warning(
+                "scheduling_link_enrich_no_handoff",
+                session_id=str(session_id),
+                verification_status=verification_status,
+            )
+            return None
+
+        handoff["verification_status"] = verification_status
+        handoff["updated_at"] = datetime.now(timezone.utc)
+        summary = handoff.get("summary")
+        if summary is not None and hasattr(summary, "verification_status"):
+            summary.verification_status = verification_status
+
+        try:
+            db = get_db_session()
+            async with db:
+                orm_record = await db.get(HandoffRecordORM, handoff["id"])
+                if orm_record is not None:
+                    context = dict(orm_record.context or {})
+                    context["verification_status"] = verification_status
+                    orm_record.context = context
+                    await db.commit()
+        except Exception as db_err:
+            logger.warning(
+                "Failed to persist scheduling-link verification to HandoffRecord",
+                handoff_id=str(handoff["id"]),
+                verification_status=verification_status,
+                error=str(db_err),
+            )
+
+        if self.webhook_dispatcher.is_configured(handoff["tenant_id"]):
+            try:
+                recent_messages = []
+                if summary is not None and hasattr(summary, "recent_messages"):
+                    recent_messages = [
+                        {"role": m.role, "content": m.content}
+                        for m in summary.recent_messages
+                    ]
+                payload = self.webhook_dispatcher.create_payload(
+                    handoff_id=handoff["id"],
+                    tenant_id=handoff["tenant_id"],
+                    session_id=handoff["session_id"],
+                    status=handoff["status"],
+                    urgency=handoff["urgency"],
+                    reason=handoff["reason"],
+                    summary=summary.summary_text if summary is not None else "",
+                    key_info=(
+                        summary.key_info.model_dump()
+                        if summary is not None and hasattr(summary, "key_info")
+                        else {}
+                    ),
+                    verification_status=verification_status,
+                    turn_count=summary.turn_count if summary is not None else 0,
+                    funnel_stage=summary.funnel_stage if summary is not None else "unknown",
+                    recent_messages=recent_messages,
+                    sector=handoff.get("sector"),
+                    sla=handoff.get("sla"),
+                )
+                payload.event_type = "handoff.updated"
+                await self.webhook_dispatcher.send(handoff["tenant_id"], payload)
+            except WebhookError as e:
+                logger.warning(
+                    "scheduling_link_enrich_webhook_failed",
+                    handoff_id=str(handoff["id"]),
+                    error=str(e),
+                )
+
+        return handoff["id"]
 
     # ============================================
     # Handoff Status Management
@@ -434,6 +548,12 @@ class HandoffService:
         
         if update.notes:
             handoff["resolution_notes"] = update.notes
+
+        if update.verification_status:
+            handoff["verification_status"] = update.verification_status
+            summary = handoff.get("summary")
+            if summary is not None and hasattr(summary, "verification_status"):
+                summary.verification_status = update.verification_status
         
         # Set resolved_at for terminal states
         if update.status in (
@@ -573,6 +693,7 @@ class HandoffService:
             reason=handoff["reason"],
             summary=summary.summary_text if hasattr(summary, 'summary_text') else str(summary),
             key_info={},
+            verification_status=handoff.get("verification_status"),
             turn_count=0,
             funnel_stage="unknown",
             sector=handoff.get("sector"),
@@ -676,6 +797,7 @@ class HandoffService:
             reason=handoff["reason"],
             sector=handoff.get("sector"),
             sla=handoff.get("sla"),
+            verification_status=handoff.get("verification_status"),
             summary=summary.summary_text if hasattr(summary, 'summary_text') else "",
             key_info=summary.key_info.model_dump() if summary and hasattr(summary, 'key_info') else {},
             recent_messages=[
@@ -709,6 +831,7 @@ class HandoffService:
             reason=handoff["reason"],
             sector=handoff.get("sector"),
             sla=handoff.get("sla"),
+            verification_status=handoff.get("verification_status"),
             summary_preview=summary_preview,
             created_at=handoff["created_at"],
             assigned_to=handoff.get("assigned_to"),
@@ -765,4 +888,3 @@ async def close_handoff_service() -> None:
         if _service.webhook_dispatcher:
             await _service.webhook_dispatcher.close()
         _service = None
-

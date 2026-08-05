@@ -241,6 +241,8 @@ class HandoffResult(BaseModel):
     # Two-step scheduling confirmation flow
     confirmation_pending: bool = False   # ask user to confirm before triggering handoff
     scheduling_cancelled: bool = False   # user declined — clear scheduling_interest flag
+    # Optional scheduling-link handoff: "link_sent" on the send turn, "concluiu"/"nao_concluiu" on the enrich turn
+    verification_status: Optional[str] = None
 
 
 class RagResult(BaseModel):
@@ -328,7 +330,8 @@ class SRMDecision(BaseModel):
     handoff_urgency: str = "normal"
     handoff_sector: Optional[str] = None
     handoff_sla: Optional[str] = None
-    
+    handoff_verification_status: Optional[str] = None  # scheduling-link: link_sent / concluiu / nao_concluiu
+
     # State changes
     state_patch: StatePatch = Field(default_factory=StatePatch)
     
