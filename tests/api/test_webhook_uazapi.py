@@ -222,6 +222,55 @@ class TestUazapiWebhookTextFlow:
         assert msg_id in receipt_logs[0].getMessage()
 
 
+class TestUazapiWebhookDuplicateMessage:
+    def test_duplicate_message_id_skips_pipeline_and_reply(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        from src.api.routes import webhook as webhook_module
+
+        webhook_module._INMEM_INCOMING.clear()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        msg_id = f"3EB0_dup_{uuid4().hex[:8]}"
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511988887777",
+            body="Olá",
+            message_id=msg_id,
+        )
+
+        with patch(
+            "src.api.routes.webhook._get_redis",
+            return_value=None,
+        ), patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service, patch(
+            "src.api.routes.webhook.send_uazapi_text",
+            new=AsyncMock(return_value=_fake_uazapi_send_result()),
+        ) as mock_send:
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Claro, posso ajudar.")
+            )
+            mock_get_service.return_value = service
+
+            first = client.post(WEBHOOK_PATH, json=payload)
+            second = client.post(WEBHOOK_PATH, json=payload)
+
+        assert first.status_code == 200, first.text
+        assert first.json() == {"ok": True, "replied": True}
+        assert second.status_code == 200, second.text
+        assert second.json() == {"ok": True, "skipped": "duplicate_message"}
+        assert service.process_event.await_count == 1
+        assert mock_send.await_count == 1
+
+        webhook_module._INMEM_INCOMING.clear()
+
+
 class TestUazapiWebhookUnknownInstance:
     def test_unknown_instance_warns_and_skips(
         self,
