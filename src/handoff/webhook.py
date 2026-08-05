@@ -199,6 +199,7 @@ class WebhookDispatcher:
         recent_messages: Optional[list[dict[str, str]]] = None,
         sector: Optional[HandoffSector] = None,
         sla: Optional[HandoffSLA] = None,
+        verification_status: Optional[str] = None,
     ) -> WebhookPayload:
         """
         Create a webhook payload (doc: setor + SLA).
@@ -216,6 +217,7 @@ class WebhookDispatcher:
             sla=sla,
             summary=summary,
             key_info=key_info or {},
+            verification_status=verification_status,
             turn_count=turn_count,
             funnel_stage=funnel_stage,
             recent_messages=recent_messages or [],
@@ -568,4 +570,3 @@ async def close_webhook_dispatcher() -> None:
     if _dispatcher is not None:
         await _dispatcher.close()
         _dispatcher = None
-

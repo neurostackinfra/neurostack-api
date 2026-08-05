@@ -526,16 +526,14 @@ class EventService:
             flags=result.state_patch.get("flags", {}),
         )
 
-        # Call LLM to generate suggested_response if configured (retry once on empty)
-        # EXCEPTION: when handoff fires, skip the LLM entirely.  The canned message
-        # from HANDOFF_RESPONSES is the correct and complete response; calling the LLM
-        # only risks wrong language ("atendente humano") and unwanted extra questions
-        # ("há algo específico que você gostaria que o atendente soubesse?").
         suggested_response = None
         llm_usage: dict = {}
         llm_model: str = ""
         language_code = language or "pt-BR"  # initialised here so handoff block can use it
-        if not result.handoff_required:
+        deterministic_response = getattr(result, "deterministic_response", None)
+        if deterministic_response is not None:
+            suggested_response = deterministic_response
+        elif not result.handoff_required:
             # Only call LLM when NOT handing off.  When handoff fires, the canned
             # HANDOFF_RESPONSES message is the correct response — calling the LLM
             # risks wrong language ("atendente humano") and unwanted questions.
@@ -612,7 +610,7 @@ class EventService:
 
         # If handoff is required, append the handoff user message to the response.
         # When language is EN, use English fallback instead of the PT template message.
-        if result.handoff_required:
+        if result.handoff_required and deterministic_response is None:
             # RULE: Never say "human agent", "transfer to human", or expose AI.
             # Always use "our team", "our specialist team", or "the right department".
             EN_HANDOFF_MESSAGES = {

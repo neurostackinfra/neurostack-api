@@ -169,7 +169,8 @@ class ConversationSummary(BaseModel):
     urgency: HandoffUrgency = HandoffUrgency.NORMAL
     sector: Optional[HandoffSector] = None
     sla: Optional[HandoffSLA] = None
-    
+    verification_status: Optional[str] = None
+
     # Safety
     safety_flags: list[str] = Field(default_factory=list)
     
@@ -198,7 +199,8 @@ class HandoffRequest(BaseModel):
     # Optional pre-built summary
     summary: Optional[str] = None
     key_info: dict[str, Any] = Field(default_factory=dict)
-    
+    verification_status: Optional[str] = None
+
     # Session context
     funnel_stage: str = "unknown"
     turn_count: int = 0
@@ -228,7 +230,8 @@ class HandoffResponse(BaseModel):
     
     # Message to show user
     user_message: str
-    
+    verification_status: Optional[str] = None
+
     # Timestamps
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -240,6 +243,7 @@ class HandoffUpdate(BaseModel):
     status: HandoffStatus
     assigned_to: Optional[str] = None
     notes: Optional[str] = None
+    verification_status: Optional[str] = None
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -266,7 +270,8 @@ class WebhookPayload(BaseModel):
     # Summary
     summary: str
     key_info: dict[str, Any] = Field(default_factory=dict)
-    
+    verification_status: Optional[str] = None
+
     # Context
     turn_count: int
     funnel_stage: str
@@ -388,6 +393,7 @@ class HandoffListItem(BaseModel):
     reason: HandoffReason
     sector: Optional[HandoffSector] = None
     sla: Optional[HandoffSLA] = None
+    verification_status: Optional[str] = None
     summary_preview: str
     created_at: datetime
     assigned_to: Optional[str] = None
@@ -406,7 +412,8 @@ class HandoffDetail(BaseModel):
     reason: HandoffReason
     sector: Optional[HandoffSector] = None
     sla: Optional[HandoffSLA] = None
-    
+    verification_status: Optional[str] = None
+
     # Content
     summary: str
     key_info: dict[str, Any] = Field(default_factory=dict)
@@ -426,4 +433,3 @@ class HandoffDetail(BaseModel):
     
     # Resolution
     resolution_notes: Optional[str] = None
-

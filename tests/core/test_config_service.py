@@ -14,7 +14,9 @@ these tests would fail.
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
+from src.models.clinic_config import ClinicScheduling
 from src.services.config_service import (
     ALL_BUCKETS,
     ARRAY_BUCKETS,
@@ -88,3 +90,135 @@ class TestTimezoneConfigRoutingAndRoundTrip:
         flat = flatten_config(row)
 
         assert flat["timezone"] == "America/New_York"
+
+
+class TestSchedulingLinkConfigRoutingAndRoundTrip:
+    """Scheduling-link fields must live on the `scheduling` bucket.
+
+    These three flat fields (`scheduling_link_enabled`,
+    `scheduling_link_url`, `scheduling_link_message`) are the first
+    keys to travel through the `scheduling` JSONB bucket via the patch
+    API — before this feature, `scheduling` was only used internally by
+    the SRM. This test locks the round-trip so a future refactor that
+    accidentally drops the mapping surfaces immediately.
+    """
+
+    def test_scheduling_link_fields_map_to_scheduling_bucket(self):
+        assert FIELD_TO_BUCKET["scheduling_link_enabled"] == "scheduling"
+        assert FIELD_TO_BUCKET["scheduling_link_url"] == "scheduling"
+        assert FIELD_TO_BUCKET["scheduling_link_message"] == "scheduling"
+
+    def test_unflatten_patch_routes_scheduling_link_fields(self):
+        grouped = unflatten_patch(
+            {
+                "scheduling_link_enabled": True,
+                "scheduling_link_url": "https://clinica.example/agendar",
+                "scheduling_link_message": "Use o link para agendar:",
+            }
+        )
+
+        assert "scheduling" in grouped
+        assert grouped["scheduling"] == {
+            "scheduling_link_enabled": True,
+            "scheduling_link_url": "https://clinica.example/agendar",
+            "scheduling_link_message": "Use o link para agendar:",
+        }
+
+    def test_unflatten_patch_does_not_leak_scheduling_link_fields(self):
+        grouped = unflatten_patch(
+            {
+                "scheduling_link_enabled": True,
+                "scheduling_link_url": "https://clinica.example/agendar",
+                "scheduling_link_message": "Use o link para agendar:",
+            }
+        )
+
+        for bucket, payload in grouped.items():
+            if bucket == "scheduling" or bucket in ARRAY_BUCKETS:
+                continue
+            for field in (
+                "scheduling_link_enabled",
+                "scheduling_link_url",
+                "scheduling_link_message",
+            ):
+                assert field not in payload, (
+                    f"{field} leaked into non-scheduling bucket {bucket!r}"
+                )
+
+    def test_flatten_config_surfaces_scheduling_link_fields(self):
+        row = _empty_config_row(
+            scheduling={
+                "scheduling_link_enabled": True,
+                "scheduling_link_url": "https://clinica.example/agendar",
+                "scheduling_link_message": "Use o link para agendar:",
+            }
+        )
+
+        flat = flatten_config(row)
+
+        assert flat["scheduling_link_enabled"] is True
+        assert flat["scheduling_link_url"] == "https://clinica.example/agendar"
+        assert flat["scheduling_link_message"] == "Use o link para agendar:"
+
+    def test_round_trip_patch_then_flatten_preserves_scheduling_link(self):
+        """Simulate PATCH -> persist scheduling bucket -> GET flat config."""
+        grouped = unflatten_patch(
+            {
+                "scheduling_link_enabled": True,
+                "scheduling_link_url": "https://clinica.example/agendar",
+                "scheduling_link_message": "Use o link para agendar:",
+            }
+        )
+
+        row = _empty_config_row()
+        for bucket, payload in grouped.items():
+            setattr(row, bucket, payload)
+
+        flat = flatten_config(row)
+
+        assert flat["scheduling_link_enabled"] is True
+        assert flat["scheduling_link_url"] == "https://clinica.example/agendar"
+        assert flat["scheduling_link_message"] == "Use o link para agendar:"
+
+
+class TestSchedulingLinkUrlValidation:
+    """`ClinicScheduling.scheduling_link_url` must be https-only.
+
+    This validator is the enforcement point behind the `patch_config`
+    revalidation of the merged `scheduling` bucket — HTTP or other
+    schemes must raise `ValidationError` so the API surfaces 422 instead
+    of persisting an unsafe URL that would be delivered to patients.
+    """
+
+    def test_https_url_is_accepted(self):
+        model = ClinicScheduling(scheduling_link_url="https://clinica.example/agendar")
+        assert model.scheduling_link_url == "https://clinica.example/agendar"
+
+    def test_none_is_accepted(self):
+        model = ClinicScheduling(scheduling_link_url=None)
+        assert model.scheduling_link_url is None
+
+    def test_empty_string_is_normalized_to_none(self):
+        model = ClinicScheduling(scheduling_link_url="")
+        assert model.scheduling_link_url is None
+
+    def test_http_url_is_rejected(self):
+        with pytest.raises(ValidationError) as exc:
+            ClinicScheduling(scheduling_link_url="http://clinica.example/agendar")
+        assert "https" in str(exc.value)
+
+    def test_ftp_url_is_rejected(self):
+        with pytest.raises(ValidationError):
+            ClinicScheduling(scheduling_link_url="ftp://clinica.example/agendar")
+
+    def test_bare_string_is_rejected(self):
+        with pytest.raises(ValidationError):
+            ClinicScheduling(scheduling_link_url="clinica.example/agendar")
+
+    def test_javascript_scheme_is_rejected(self):
+        with pytest.raises(ValidationError):
+            ClinicScheduling(scheduling_link_url="javascript:alert(1)")
+
+    def test_https_without_host_is_rejected(self):
+        with pytest.raises(ValidationError):
+            ClinicScheduling(scheduling_link_url="https://")

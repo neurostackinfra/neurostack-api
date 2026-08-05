@@ -1125,6 +1125,10 @@ export default function ClinicConfig() {
   const [parkingInfo, setParkingInfo] = useState("");
   const [workingHours, setWorkingHours] = useState("");
   const [schedulingHours, setSchedulingHours] = useState("");
+  const [schedulingLinkEnabled, setSchedulingLinkEnabled] = useState(false);
+  const [schedulingLinkUrl, setSchedulingLinkUrl] = useState("");
+  const [schedulingLinkMessage, setSchedulingLinkMessage] = useState("");
+  const [schedulingLinkErrors, setSchedulingLinkErrors] = useState<Record<string, string>>({});
   const [serviceFormat, setServiceFormat] = useState("");
   const [timezone, setTimezone] = useState("America/Sao_Paulo");
   const [onlineServicesDesc, setOnlineServicesDesc] = useState("");
@@ -1189,6 +1193,13 @@ export default function ClinicConfig() {
     setParkingInfo(config.parking_info ?? "");
     setWorkingHours(config.working_hours ?? "");
     setSchedulingHours(config.scheduling_hours ?? "");
+    setSchedulingLinkEnabled(
+      config.scheduling_link_enabled === true ||
+      config.scheduling_link_enabled === "yes" ||
+      config.scheduling_link_enabled === "true",
+    );
+    setSchedulingLinkUrl(config.scheduling_link_url ?? "");
+    setSchedulingLinkMessage(config.scheduling_link_message ?? "");
     setServiceFormat(config.service_format ?? "");
     setTimezone(config.timezone ?? "America/Sao_Paulo");
     setDifferentials(config.differentials ?? "");
@@ -1296,6 +1307,39 @@ export default function ClinicConfig() {
     }
     setLgpdErrors({});
 
+    // Scheduling link — https-only URL validation (aligned with backend)
+    const schedulingLinkValidationErrors: Record<string, string> = {};
+    const trimmedSchedulingLinkUrl = schedulingLinkUrl.trim();
+    if (schedulingLinkEnabled) {
+      if (!trimmedSchedulingLinkUrl) {
+        schedulingLinkValidationErrors.scheduling_link_url = txt(
+          "Informe a URL do link de agendamento (https://…).",
+          "Provide the scheduling link URL (https://…).",
+        );
+      } else {
+        let parsed: URL | null = null;
+        try { parsed = new URL(trimmedSchedulingLinkUrl); } catch { parsed = null; }
+        if (!parsed || parsed.protocol !== "https:") {
+          schedulingLinkValidationErrors.scheduling_link_url = txt(
+            "A URL deve começar com https:// (http:// e outros esquemas não são aceitos).",
+            "The URL must start with https:// (http:// and other schemes are not accepted).",
+          );
+        }
+      }
+    }
+    if (Object.keys(schedulingLinkValidationErrors).length > 0) {
+      setSchedulingLinkErrors(schedulingLinkValidationErrors);
+      toast({
+        title: txt(
+          "URL do link de agendamento inválida.",
+          "Invalid scheduling link URL.",
+        ),
+        variant: "destructive",
+      });
+      return;
+    }
+    setSchedulingLinkErrors({});
+
     setIsSaving(true);
     const payload: Record<string, any> = {
       clinic_name: clinicName.trim(),
@@ -1315,6 +1359,9 @@ export default function ClinicConfig() {
       parking_info: parkingInfo.trim() || null,
       working_hours: workingHours.trim() || null,
       scheduling_hours: schedulingHours.trim() || null,
+      scheduling_link_enabled: schedulingLinkEnabled,
+      scheduling_link_url: schedulingLinkEnabled ? (trimmedSchedulingLinkUrl || null) : null,
+      scheduling_link_message: schedulingLinkEnabled ? (schedulingLinkMessage.trim() || null) : null,
       service_format: serviceFormat || null,
       timezone: timezone,
       accepts_insurance: acceptsInsurance || null,
@@ -1695,6 +1742,69 @@ export default function ClinicConfig() {
                   disabled={isReadOnly}
                 />
               </Field>
+
+              {/* Scheduling link (stopgap pré-ERP) */}
+              <SwitchRow
+                label={txt("Link de Agendamento", "Scheduling Link")}
+                hint={txt(
+                  "Quando ativo, a IA envia o link (definido abaixo) ao paciente na confirmação do agendamento e cria um handoff pendente de verificação.",
+                  "When enabled, the AI sends the link (defined below) to the patient on scheduling confirmation and creates a pending-verification handoff.",
+                )}
+                checked={schedulingLinkEnabled}
+                onCheckedChange={(v) => {
+                  setSchedulingLinkEnabled(v);
+                  setSchedulingLinkErrors((prev) => { const n = { ...prev }; delete n.scheduling_link_url; return n; });
+                }}
+                disabled={isReadOnly}
+              />
+              {schedulingLinkEnabled && (
+                <>
+                  <Field
+                    label={txt("URL do Link de Agendamento", "Scheduling Link URL")}
+                    hint={txt(
+                      "Somente https:// é aceito. Esta URL é entregue exatamente como configurada ao paciente.",
+                      "Only https:// is accepted. This URL is delivered to the patient exactly as configured.",
+                    )}
+                  >
+                    <Input
+                      value={schedulingLinkUrl}
+                      onChange={(e) => {
+                        setSchedulingLinkUrl(e.target.value);
+                        setSchedulingLinkErrors((prev) => { const n = { ...prev }; delete n.scheduling_link_url; return n; });
+                      }}
+                      placeholder="https://agenda.suaclinica.com.br/marcar"
+                      type="url"
+                      className={`text-sm font-mono${schedulingLinkErrors.scheduling_link_url ? " border-red-500" : ""}`}
+                      disabled={isReadOnly}
+                      data-testid="input-scheduling-link-url"
+                    />
+                    {schedulingLinkErrors.scheduling_link_url && (
+                      <p className="text-xs text-red-400 mt-1">{schedulingLinkErrors.scheduling_link_url}</p>
+                    )}
+                  </Field>
+                  <Field
+                    label={txt("Mensagem do Link de Agendamento", "Scheduling Link Message")}
+                    hint={txt(
+                      "Texto enviado ao paciente antes do link. A URL será adicionada logo abaixo.",
+                      "Text sent to the patient before the link. The URL will be appended right below.",
+                    )}
+                  >
+                    <Textarea
+                      value={schedulingLinkMessage}
+                      onChange={(e) => setSchedulingLinkMessage(e.target.value)}
+                      placeholder={txt(
+                        "Ex: Perfeito! Para concluir seu agendamento, acesse o link abaixo e escolha o horário desejado. Depois me avise se conseguiu confirmar. 😊",
+                        "e.g. Great! To finish scheduling, use the link below and pick a time. Let me know once you've confirmed. 😊",
+                      )}
+                      rows={3}
+                      className="resize-none text-sm"
+                      disabled={isReadOnly}
+                      data-testid="input-scheduling-link-message"
+                    />
+                  </Field>
+                </>
+              )}
+
               <Field
                 label={txt("Fuso horário", "Timezone")}
                 hint={txt("Define o horário local usado nas saudações (bom dia / boa tarde / boa noite).", "Sets the local time used for greetings (good morning / afternoon / evening).")}
