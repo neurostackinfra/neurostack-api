@@ -65,6 +65,14 @@ class SupportTicket(Base):
         server_default=func.now(),
         nullable=False,
     )
+    routed_to: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True,
+    )
+    routed_to_builder_id: Mapped[Optional[UUID]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        nullable=True,
+    )
 
     def __repr__(self) -> str:
         return f"<SupportTicket(id={self.id}, email='{self.email}', tipo='{self.tipo}')>"
