@@ -49,6 +49,7 @@ pre-commit = "^3.6.0"
 faker = "^22.0.0"
 factory-boy = "^3.3.0"
 locust = "^2.22.0"
+aiosqlite = "^0.22.1"
 
 [tool.poetry.group.docs.dependencies]
 mkdocs = "^1.5.3"

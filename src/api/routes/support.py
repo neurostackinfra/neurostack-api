@@ -10,14 +10,18 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
 
+import aiosmtplib
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import String, cast, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.middleware.auth import TenantContext, get_tenant_context
 from src.config.settings import settings
+from src.models.builder import Builder
 from src.models.support_ticket import SupportTicket
+from src.models.tenant import Tenant
+from src.models.user import User
 from src.repositories import get_db_session_dependency
 
 logger = logging.getLogger(__name__)
@@ -50,6 +54,7 @@ class SupportTicketOut(BaseModel):
     file_type: Optional[str] = None
     status: str
     created_at: str
+    routed_to: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -98,7 +103,6 @@ async def create_support_ticket(
     clinic_name = None
     try:
         if jwt_info["builder_id"]:
-            from src.models.builder import Builder
             from uuid import UUID as PyUUID
             builder_stmt = select(Builder.name).where(
                 Builder.id == PyUUID(jwt_info["builder_id"])
@@ -119,6 +123,66 @@ async def create_support_ticket(
     except Exception:
         pass
 
+    # Resolve routing destination: builder email vs central support inbox.
+    # Rules:
+    #  - financeiro tickets always go to central
+    #  - clinics whose tenant has a builder_id AND that builder is active
+    #    AND there's a role=builder user record for that builder → route to
+    #    that user's email; else central fallback
+    recipient_email = settings.support_email_to
+    routed_to = "central"
+    routed_to_builder_id = None
+    routing_reason = "default"
+
+    if body.tipo == "financeiro":
+        routing_reason = "financeiro ticket"
+    else:
+        tenant_row = (
+            await db.execute(select(Tenant).where(Tenant.id == tenant.tenant_id))
+        ).scalar_one_or_none()
+
+        if tenant_row is None or tenant_row.builder_id is None:
+            routing_reason = "no builder linked"
+        else:
+            builder_status = (
+                await db.execute(
+                    select(Builder.status).where(Builder.id == tenant_row.builder_id)
+                )
+            ).scalar_one_or_none()
+
+            if builder_status is None:
+                routing_reason = "builder not found"
+            elif builder_status != "active":
+                routing_reason = "builder inactive"
+            else:
+                builder_user = (
+                    await db.execute(
+                        select(User).where(
+                            User.builder_id == tenant_row.builder_id,
+                            cast(User.role, String) == "builder",
+                        )
+                    )
+                ).scalar_one_or_none()
+
+                if builder_user is None:
+                    routing_reason = "no builder user found"
+                else:
+                    recipient_email = builder_user.email
+                    routed_to = "builder"
+                    routed_to_builder_id = tenant_row.builder_id
+                    routing_reason = "active builder"
+
+    if routed_to == "builder":
+        logger.info(
+            "Support ticket routing: builder (%s → %s)",
+            routing_reason, recipient_email,
+        )
+    else:
+        logger.info(
+            "Support ticket routing: central (%s → %s)",
+            routing_reason, recipient_email,
+        )
+
     # Persist ticket to DB
     ticket = SupportTicket(
         tenant_id=tenant.tenant_id,
@@ -130,6 +194,8 @@ async def create_support_ticket(
         filename=body.filename,
         file_type=body.file_type,
         status="open",
+        routed_to=routed_to,
+        routed_to_builder_id=routed_to_builder_id,
     )
     db.add(ticket)
     await db.flush()
@@ -143,7 +209,7 @@ async def create_support_ticket(
         try:
             msg = MIMEMultipart()
             msg["From"] = settings.smtp_user or f"noreply@{settings.smtp_host}"
-            msg["To"] = settings.support_email_to
+            msg["To"] = recipient_email
             msg["Subject"] = f"[NeuroStack Suporte] {tipo_label} — {sender_email}"
 
             email_body = (
@@ -170,7 +236,6 @@ async def create_support_ticket(
                 except Exception:
                     logger.warning("Failed to decode file attachment, skipping")
 
-            import aiosmtplib
             await aiosmtplib.send(
                 msg,
                 hostname=settings.smtp_host,
@@ -180,7 +245,7 @@ async def create_support_ticket(
                 start_tls=True,
             )
             email_sent = True
-            logger.info("Support ticket emailed to %s from %s", settings.support_email_to, sender_email)
+            logger.info("Support ticket emailed to %s from %s", recipient_email, sender_email)
         except Exception as exc:
             logger.error("Failed to send support email: %s", exc, exc_info=True)
     else:
@@ -220,6 +285,7 @@ async def list_support_tickets(
             file_type=t.file_type,
             status=t.status,
             created_at=t.created_at.isoformat(),
+            routed_to=t.routed_to,
         )
         for t in tickets
     ]
