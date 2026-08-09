@@ -12,8 +12,31 @@ from uuid import UUID
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.models.clinic_config_table import ClinicConfigTable
 from src.models.event import Event
 from src.observability.pii import mask_carteirinha
+from src.services.business_hours import summarize_outside_hours
+
+
+_CONVERSATIONAL_MARKERS = (
+    "intent",
+    "intent_category",
+    "funnel_stage",
+    "action",
+    "confidence",
+)
+
+
+def _is_conversational_trace(event_data: object, event_metadata: object) -> bool:
+    """Whether a message event carries a positive conversational marker."""
+    data = event_data if isinstance(event_data, dict) else {}
+    metadata = event_metadata if isinstance(event_metadata, dict) else {}
+
+    if "decision" in data or any(
+        marker in data for marker in _CONVERSATIONAL_MARKERS
+    ):
+        return True
+    return any(marker in metadata for marker in _CONVERSATIONAL_MARKERS)
 
 
 def _base_trace_query(tenant_id: UUID):
@@ -259,6 +282,23 @@ async def get_trace_stats(
     result = await db.execute(base)
     events = list(result.scalars().all())
 
+    operations_result = await db.execute(
+        select(ClinicConfigTable.operations).where(
+            ClinicConfigTable.tenant_id == tenant_id
+        )
+    )
+    operations = operations_result.scalar_one_or_none()
+
+    conversational_created_ats = [
+        event.created_at
+        for event in events
+        if _is_conversational_trace(event.event_data, event.event_metadata)
+    ]
+    outside_hours_summary = summarize_outside_hours(
+        conversational_created_ats,
+        operations,
+    )
+
     total = len(events)
     processing_times = []
     safety_count = 0
@@ -322,6 +362,8 @@ async def get_trace_stats(
         "intent_distribution": intent_dist,
         "period_start": start_date.isoformat(),
         "period_end": end_date.isoformat(),
+        "conversational_trace_count": len(conversational_created_ats),
+        **outside_hours_summary,
     }
 
 

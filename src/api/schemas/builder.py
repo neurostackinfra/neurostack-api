@@ -45,6 +45,10 @@ class BuilderClinicResponse(BaseModel):
     trace_count_7d: int = 0
     safety_flags_7d: int = 0
     handoff_count_7d: int = 0
+    outside_hours_count_7d: int = 0
+    outside_hours_pct_7d: Optional[float] = None
+    conversational_trace_count_7d: int = 0
+    business_hours_configured: bool = False
     config_completeness: int = 0
 
 

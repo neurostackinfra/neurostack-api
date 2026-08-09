@@ -3,6 +3,7 @@ NeuroStack - ClinicConfig (documentação MVP v0.5)
 Estrutura de configuração da clínica para SRM, handoff e políticas de preço.
 """
 
+import re
 from enum import Enum
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -128,15 +129,51 @@ class ClinicIdentity(BaseModel):
 
 
 class ClinicOperations(BaseModel):
-    """Operations bucket — address, hours, service formats."""
+    """Operations bucket — address, hours, service formats.
+
+    Business hours describe a same-day window.  The model deliberately does
+    not reject ``close <= open``; consumers treat that combination as
+    unconfigured rather than assuming an overnight window.
+    """
+
     full_address: Optional[str] = None
     parking_info: Optional[str] = None
     working_hours: Optional[str] = None
     scheduling_hours: Optional[str] = None
     timezone: Optional[str] = None
+    business_hours_enabled: bool = False
+    business_hours_open: Optional[str] = None
+    business_hours_close: Optional[str] = None
+    business_hours_days: Optional[list[str]] = None
     service_format: Optional[str] = None
     online_services_desc: Optional[str] = None
     presential_services_desc: Optional[str] = None
+
+    @field_validator("business_hours_open", "business_hours_close", mode="before")
+    @classmethod
+    def _validate_business_hour(cls, value: Any) -> Optional[str]:
+        if value is None or value == "":
+            return None
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value) is None
+        ):
+            raise ValueError("business hours must use HH:MM (00:00-23:59)")
+        return value
+
+    @field_validator("business_hours_days")
+    @classmethod
+    def _validate_business_days(cls, value: Optional[list[str]]) -> Optional[list[str]]:
+        if not value:
+            return None
+        valid_days = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+        normalized = [day.lower() for day in value]
+        invalid = [day for day in normalized if day not in valid_days]
+        if invalid:
+            raise ValueError(
+                "business hours days must use mon, tue, wed, thu, fri, sat, or sun"
+            )
+        return normalized
 
 
 class ClinicBusinessRules(BaseModel):

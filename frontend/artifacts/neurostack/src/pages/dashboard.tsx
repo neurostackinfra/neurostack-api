@@ -134,15 +134,23 @@ interface KpiStats {
   totalTokensSum: number;
   modelBreakdown: { model: string; tokens: number }[];
   byIntent: Record<string, number>;
+  outsideHoursCount: number;
+  outsideHoursPct: number | null;
+  conversationalTraceCount: number;
+  businessHoursConfigured: boolean;
 }
 
 // -- Technical KPI cards ---
 
-function KpiCards({ stats, t }: { stats: KpiStats; t: (k: TranslationKey) => string }) {
+function KpiCards({ stats, t, locale }: { stats: KpiStats; t: (k: TranslationKey) => string; locale: string }) {
   const maxModelTokens = stats.modelBreakdown[0]?.tokens ?? 0;
+  const txt = (pt: string, en: string) => locale === "en" ? en : pt;
+  const outsideHoursHasData = stats.businessHoursConfigured
+    && stats.conversationalTraceCount > 0
+    && stats.outsideHoursPct !== null;
 
   return (
-    <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-5">
+    <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-6">
       <Card data-testid="stat-total-traces">
         <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
           <CardTitle className="text-sm font-medium">{t("dash_total")}</CardTitle>
@@ -184,6 +192,29 @@ function KpiCards({ stats, t }: { stats: KpiStats; t: (k: TranslationKey) => str
         <CardContent>
           <div className="text-2xl font-bold text-foreground">{stats.handoffCount.toLocaleString("pt-BR")}</div>
           <p className="text-xs text-muted-foreground mt-0.5">transferencias para humano</p>
+        </CardContent>
+      </Card>
+
+      <Card data-testid="stat-outside-hours">
+        <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+          <CardTitle className="text-sm font-medium">{txt("Fora do horário", "Outside hours")}</CardTitle>
+          <CalendarRange className="h-4 w-4 text-violet-400" />
+        </CardHeader>
+        <CardContent>
+          {!stats.businessHoursConfigured ? (
+            <div className="text-base font-semibold text-amber-400">{txt("Configure o horário", "Configure business hours")}</div>
+          ) : outsideHoursHasData ? (
+            <div className="text-2xl font-bold text-foreground">
+              {stats.outsideHoursPct!.toLocaleString(locale === "en" ? "en-US" : "pt-BR", { maximumFractionDigits: 1 })}%
+            </div>
+          ) : (
+            <div className="text-base font-semibold text-muted-foreground">{txt("Sem dados", "No data")}</div>
+          )}
+          {stats.businessHoursConfigured && (
+            <p className="text-xs text-muted-foreground mt-0.5 tabular-nums">
+              {stats.outsideHoursCount.toLocaleString(locale === "en" ? "en-US" : "pt-BR")} / {stats.conversationalTraceCount.toLocaleString(locale === "en" ? "en-US" : "pt-BR")} {txt("conversas", "conversations")}
+            </p>
+          )}
         </CardContent>
       </Card>
 
@@ -364,10 +395,14 @@ const INVESTOR_MOCK_STATS: KpiStats = {
     reclamacao: 12,
     pos_atendimento_duvida: 31,
   },
+  outsideHoursCount: 24,
+  outsideHoursPct: 8.2,
+  conversationalTraceCount: 291,
+  businessHoursConfigured: true,
 };
 
 export default function Dashboard() {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const { isBuilder, isSuperAdmin, isInvestor, viewingClinicId } = useAuth();
   const { startDate: defStart, endDate: defEnd } = defaultDates();
   const [startDate, setStartDate] = useState(defStart);
@@ -402,6 +437,10 @@ export default function Dashboard() {
         totalTokensSum: data.total_tokens_sum ?? data.totalTokensSum ?? 0,
         modelBreakdown: data.model_breakdown ?? data.modelBreakdown ?? [],
         byIntent: data.intent_distribution ?? data.byIntent ?? {},
+        outsideHoursCount: data.outside_hours_count ?? 0,
+        outsideHoursPct: data.outside_hours_pct ?? null,
+        conversationalTraceCount: data.conversational_trace_count ?? 0,
+        businessHoursConfigured: data.business_hours_configured === true,
       } as KpiStats;
     },
     staleTime: 30_000,
@@ -421,8 +460,8 @@ export default function Dashboard() {
       </div>
 
       {isLoading && (
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-5">
-          {[1, 2, 3, 4, 5].map(i => (
+        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-6">
+          {[1, 2, 3, 4, 5, 6].map(i => (
             <Card key={i}>
               <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                 <Skeleton className="h-4 w-24" />
@@ -444,7 +483,7 @@ export default function Dashboard() {
 
       {stats && !isLoading && (
         <>
-          <KpiCards stats={stats} t={t} />
+          <KpiCards stats={stats} t={t} locale={locale} />
           <IntentBreakdown
             byIntent={stats.byIntent} t={t}
             intentFilter={intentFilter} onIntentFilterChange={setIntentFilter}
