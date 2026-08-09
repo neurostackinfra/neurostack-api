@@ -12,10 +12,17 @@ these tests would fail.
 """
 
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock
+from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
+from src.api.middleware.auth import TenantContext
+from src.api.routes.config import patch_config
+from src.api.schemas.config import ConfigPatchRequest
 from src.models.clinic_config import ClinicScheduling
 from src.services.config_service import (
     ALL_BUCKETS,
@@ -36,10 +43,7 @@ def _empty_config_row(**overrides):
     row = SimpleNamespace(
         clinic_id=None,
         version=1,
-        **{
-            bucket: ([] if bucket in ARRAY_BUCKETS else {})
-            for bucket in ALL_BUCKETS
-        },
+        **{bucket: ([] if bucket in ARRAY_BUCKETS else {}) for bucket in ALL_BUCKETS},
     )
     for key, value in overrides.items():
         setattr(row, key, value)
@@ -64,9 +68,9 @@ class TestTimezoneConfigRoutingAndRoundTrip:
         for bucket, payload in grouped.items():
             if bucket == "operations" or bucket in ARRAY_BUCKETS:
                 continue
-            assert "timezone" not in payload, (
-                f"timezone leaked into non-operations bucket {bucket!r}"
-            )
+            assert (
+                "timezone" not in payload
+            ), f"timezone leaked into non-operations bucket {bucket!r}"
 
     def test_flatten_config_surfaces_timezone_at_top_level(self):
         row = _empty_config_row(
@@ -141,9 +145,9 @@ class TestSchedulingLinkConfigRoutingAndRoundTrip:
                 "scheduling_link_url",
                 "scheduling_link_message",
             ):
-                assert field not in payload, (
-                    f"{field} leaked into non-scheduling bucket {bucket!r}"
-                )
+                assert (
+                    field not in payload
+                ), f"{field} leaked into non-scheduling bucket {bucket!r}"
 
     def test_flatten_config_surfaces_scheduling_link_fields(self):
         row = _empty_config_row(
@@ -222,3 +226,94 @@ class TestSchedulingLinkUrlValidation:
     def test_https_without_host_is_rejected(self):
         with pytest.raises(ValidationError):
             ClinicScheduling(scheduling_link_url="https://")
+
+
+class TestSchedulingLinkPatchBoundary:
+    """The PATCH boundary validates merged state and audits URL changes."""
+
+    @staticmethod
+    def _row(**scheduling: Any) -> SimpleNamespace:
+        return _empty_config_row(scheduling=scheduling)
+
+    @staticmethod
+    def _session() -> SimpleNamespace:
+        async def flush() -> None:
+            pass
+
+        async def commit() -> None:
+            pass
+
+        return SimpleNamespace(flush=flush, commit=commit)
+
+    @pytest.mark.asyncio
+    async def test_non_https_patch_returns_422_without_persisting(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tenant = TenantContext(tenant_id=uuid4(), role="clinic_admin")
+        row = self._row(
+            scheduling_link_enabled=True,
+            scheduling_link_url="https://old.example/agendar",
+            scheduling_link_message="Agende aqui:",
+        )
+
+        async def keep_tenant(*args: Any, **kwargs: Any) -> TenantContext:
+            return tenant
+
+        async def get_row(*args: Any, **kwargs: Any) -> SimpleNamespace:
+            return row
+
+        monkeypatch.setattr("src.api.routes.config._resolve_config_tenant", keep_tenant)
+        monkeypatch.setattr("src.api.routes.config._get_or_create_config", get_row)
+
+        with pytest.raises(HTTPException) as exc:
+            await patch_config(
+                request=SimpleNamespace(query_params={}),
+                body=ConfigPatchRequest(
+                    scheduling_link_url="http://unsafe.example/agendar"
+                ),
+                tenant=tenant,
+                session=self._session(),  # type: ignore[arg-type]
+            )
+
+        assert exc.value.status_code == 422
+        assert row.scheduling["scheduling_link_url"] == "https://old.example/agendar"
+
+    @pytest.mark.asyncio
+    async def test_url_change_persists_and_emits_structured_audit_event(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tenant = TenantContext(tenant_id=uuid4(), role="clinic_admin")
+        row = self._row(scheduling_link_url="https://old.example/agendar")
+        audit_info = Mock()
+
+        async def keep_tenant(*args: Any, **kwargs: Any) -> TenantContext:
+            return tenant
+
+        async def get_row(*args: Any, **kwargs: Any) -> SimpleNamespace:
+            return row
+
+        async def no_cache(*args: Any, **kwargs: Any) -> None:
+            pass
+
+        monkeypatch.setattr("src.api.routes.config._resolve_config_tenant", keep_tenant)
+        monkeypatch.setattr("src.api.routes.config._get_or_create_config", get_row)
+        monkeypatch.setattr("src.api.routes.config._audit_logger.info", audit_info)
+        monkeypatch.setattr(
+            "src.services.event_service.invalidate_clinic_config_cache", no_cache
+        )
+
+        response = await patch_config(
+            request=SimpleNamespace(query_params={}),
+            body=ConfigPatchRequest(scheduling_link_url="https://new.example/agendar"),
+            tenant=tenant,
+            session=self._session(),  # type: ignore[arg-type]
+        )
+
+        assert row.scheduling["scheduling_link_url"] == "https://new.example/agendar"
+        assert response.scheduling_link_url == "https://new.example/agendar"
+        audit_info.assert_called_once_with(
+            "scheduling_link_url_changed",
+            tenant_id=str(tenant.tenant_id),
+            previous_url="https://old.example/agendar",
+            new_url="https://new.example/agendar",
+        )

@@ -2,12 +2,38 @@
 NeuroStack - STT Transcription Service
 OpenAI-compatible audio transcription client.
 Supports Groq, OpenAI Whisper, and any other OpenAI-compatible STT endpoint.
+
+All outbound HTTP flows through :mod:`src.services.safe_egress`. Provider
+kinds are picked from the destination host: Groq/OpenAI use pinned host
+allowlists, everything else uses the ``outros`` custom-public policy.
 """
 
 import httpx
 
+from src.services.safe_egress import (
+    STT_GROQ_HOSTS,
+    STT_OPENAI_HOSTS,
+    UnsafeEgressError,
+    parse_public_https_url,
+    safe_async_client,
+)
+
 GROQ_API_BASE = "https://api.groq.com/openai/v1"
 OPENAI_API_BASE = "https://api.openai.com/v1"
+
+
+def _stt_kind_for_url(base_url: str) -> str:
+    """Return the safe-egress kind label for a given STT base URL."""
+
+    try:
+        parsed = parse_public_https_url(base_url)
+    except UnsafeEgressError:
+        return "stt_outros"
+    if parsed.hostname in STT_GROQ_HOSTS:
+        return "stt_groq"
+    if parsed.hostname in STT_OPENAI_HOSTS:
+        return "stt_openai"
+    return "stt_outros"
 
 
 async def transcribe_audio(
@@ -30,12 +56,21 @@ async def transcribe_audio(
                   Examples: GROQ_API_BASE, OPENAI_API_BASE, or a custom URL.
     """
     api_base = (base_url or "").rstrip("/") or GROQ_API_BASE
-    async with httpx.AsyncClient(timeout=60) as client:
+    kind = _stt_kind_for_url(api_base)
+    target_url = f"{api_base}/audio/transcriptions"
+    async with safe_async_client(
+        target_url,
+        kind=kind,
+        timeout=httpx.Timeout(60.0, connect=10.0),
+    ) as (client, validated):
         files = {"file": ("audio.ogg", audio_bytes, mimetype)}
         data = {"model": model, "language": language, "response_format": "text"}
-        headers = {"Authorization": f"Bearer {api_key}"}
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Host": validated.sni_host,
+        }
         resp = await client.post(
-            f"{api_base}/audio/transcriptions",
+            validated.url,
             headers=headers,
             files=files,
             data=data,

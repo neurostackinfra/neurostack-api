@@ -146,7 +146,7 @@ export const en = {
   config_saved: "Configuration saved",
   config_saved_desc: "The pipeline will use the updated config immediately.",
   config_save_fail: "Save failed",
-  config_save_fail_desc: "Check that all required fields are filled in.",
+  config_save_fail_desc: "The configuration could not be saved.",
 
   // Clinic Config — Integrations
   config_integrations: "Integrations (BYOK)",
@@ -174,7 +174,7 @@ export const en = {
   support_subtitle: "NeuroStack support and feedback center",
   support_ticket_heading: "Open Ticket",
   support_active_badge: "ACTIVE",
-  support_response_hint: "Our team will respond within 24 business hours via",
+  support_response_hint: "Your ticket will be routed to the responsible team, who will respond within 24 business hours.",
   support_tipo_label: "Type",
   support_tipo_ph: "Select type…",
   support_tipo_request: "Request",

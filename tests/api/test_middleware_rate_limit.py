@@ -8,9 +8,6 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-import sys
-sys.path.insert(0, "/home/jairomendes/neurostack/neurostack-api")
-
 from src.api.middleware.rate_limit import rate_limit_store
 
 
@@ -207,4 +204,3 @@ class TestRateLimitMiddlewareAsync:
 
         assert response.status_code == 200
         assert "X-RateLimit-Limit" in response.headers
-

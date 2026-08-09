@@ -3,24 +3,18 @@ NeuroStack API - Authentication Middleware
 JWT and API Key based authentication for tenant identification.
 """
 
-import sys
-from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional, cast
 from uuid import UUID
 
 import jwt
 from fastapi import Depends, HTTPException, Query, Request, status
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.responses import JSONResponse
 from passlib.context import CryptContext
 from passlib.exc import InvalidHashError
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.types import ASGIApp, Receive, Scope, Send
-
-# Add the project root to sys.path for local module resolution
-project_root = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(project_root))
 
 from src.config.logging import get_logger
 from src.config.settings import settings
@@ -74,7 +68,7 @@ class TenantContext:
 class APIKeyStore:
     """
     API Key store for validating and retrieving tenant information.
-    
+
     Validates API keys against the database using TenantRepository.
     Falls back to development mode behavior if database validation fails.
     """
@@ -103,14 +97,14 @@ class APIKeyStore:
     async def validate_api_key(cls, api_key: str) -> Optional[TenantContext]:
         """
         Validate API key and return tenant context.
-        
+
         First attempts to validate against database by checking all tenants
         and comparing API key hash. Falls back to development keys if
         database validation fails in development mode.
-        
+
         Args:
             api_key: The API key to validate
-            
+
         Returns:
             TenantContext if valid, None otherwise
         """
@@ -121,13 +115,13 @@ class APIKeyStore:
             # Try to validate against database
             async with get_db_session() as session:
                 repo = TenantRepository(session)
-                
+
                 # Get all active tenants
                 # NOTE: bcrypt uses salt, so we can't do direct hash lookup.
                 # TODO: Optimize with Redis cache for validated API keys in production
                 # Cache key: f"api_key:{api_key}" -> tenant_id with TTL
                 tenants = await repo.find_active(limit=1000)
-                
+
                 # Check each tenant's API key hash
                 for tenant in tenants:
                     try:
@@ -162,9 +156,9 @@ class APIKeyStore:
                             error_type=type(e).__name__,
                         )
                         continue
-                
+
                 # No commit needed - this is a read-only operation
-        
+
         except SQLAlchemyError as e:
             # Database error - fall back to development mode if enabled
             logger.warning(
@@ -172,11 +166,11 @@ class APIKeyStore:
                 error=str(e),
                 error_type=type(e).__name__,
             )
-            
+
             # Allow fallback in non-production environments (development and test)
             if not settings.is_production:
                 return cls._fallback_to_dev_keys(api_key)
-            
+
             # In production, fail securely
             return None
         except Exception as e:
@@ -187,26 +181,26 @@ class APIKeyStore:
                 error_type=type(e).__name__,
                 exc_info=True,
             )
-            
+
             # Allow fallback in non-production environments (development and test)
             if not settings.is_production:
                 return cls._fallback_to_dev_keys(api_key)
-            
+
             # In production, fail securely
             return None
-        
+
         # If we get here, API key didn't match any tenant
         # Try fallback in non-production environments
         if not settings.is_production:
             return cls._fallback_to_dev_keys(api_key)
-        
+
         return None
-    
+
     @classmethod
     def _fallback_to_dev_keys(cls, api_key: str) -> Optional[TenantContext]:
         """
         Fallback to development keys if database validation fails.
-        
+
         Only used in development mode.
         """
         # Check known development keys
@@ -446,9 +440,9 @@ class AuthMiddleware:
 def get_tenant_context(request: Request) -> TenantContext:
     """
     FastAPI dependency for getting authenticated tenant context.
-    
+
     Use this in route handlers to access tenant information:
-    
+
         @router.get("/my-endpoint")
         async def my_endpoint(tenant: TenantContext = Depends(get_tenant_context)):
             # Access tenant information
@@ -460,7 +454,24 @@ def get_tenant_context(request: Request) -> TenantContext:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
         )
-    return request.state.tenant
+    return cast(TenantContext, request.state.tenant)
+
+
+def require_credentials_jwt(request: Request) -> TenantContext:
+    """Require a JWT role authorized to read or mutate provider credentials."""
+
+    tenant = get_tenant_context(request)
+    if tenant.api_key or tenant.user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "credentials_jwt_required"},
+        )
+    if tenant.role not in {"clinic_admin", "builder", "super_admin"}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "credentials_role_forbidden"},
+        )
+    return tenant
 
 
 def require_super_admin(request: Request) -> TenantContext:
@@ -608,4 +619,3 @@ def get_optional_tenant_context(request: Request) -> Optional[TenantContext]:
     that behave differently for authenticated users).
     """
     return getattr(request.state, "tenant", None)
-

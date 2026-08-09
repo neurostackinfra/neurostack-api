@@ -3,18 +3,151 @@ NeuroStack API - Pytest Configuration and Fixtures
 """
 
 import asyncio
+import threading
 from collections.abc import AsyncGenerator, Generator
+from contextlib import suppress
 from typing import Any
 from uuid import UUID
 
 import pytest
-from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
-import sys
-sys.path.insert(0, "/home/jairomendes/neurostack/neurostack-api")
-
 from src.api.main import app
+
+
+async def _keep_event_loop_responsive() -> None:
+    """Prevent lost thread-safe wakeups from stalling aiosqlite in tests."""
+    while True:
+        await asyncio.sleep(0.01)
+
+
+class LifespanTestClient:
+    """Synchronous facade with a continuously running application event loop."""
+
+    def __init__(self, application: Any) -> None:
+        self.application = application
+        self.lifespan_started = False
+        policy_local = getattr(asyncio.get_event_loop_policy(), "_local", None)
+        self._previous_loop: asyncio.AbstractEventLoop | None = getattr(
+            policy_local, "_loop", None
+        )
+        self._runner = asyncio.Runner()
+        self._loop = self._runner.get_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever,
+            name="lifespan-test-client",
+            daemon=True,
+        )
+        self._client: AsyncClient | None = None
+        self._lifespan: Any = None
+        self._heartbeat: asyncio.Task[None] | None = None
+        self._baseline_tasks: set[asyncio.Task[Any]] = set()
+
+    async def _start(self) -> None:
+        self._baseline_tasks = set(asyncio.all_tasks())
+        self._heartbeat = asyncio.create_task(_keep_event_loop_responsive())
+        self._lifespan = self.application.router.lifespan_context(self.application)
+        await self._lifespan.__aenter__()
+        transport = ASGITransport(
+            app=self.application,
+            client=("testclient", 50000),
+        )
+        self._client = AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            follow_redirects=True,
+        )
+        await self._client.__aenter__()
+        self.lifespan_started = True
+
+    async def _stop(self) -> None:
+        if self._client is not None:
+            await self._client.__aexit__(None, None, None)
+        if self._lifespan is not None:
+            await self._lifespan.__aexit__(None, None, None)
+        current = asyncio.current_task()
+        leaked_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if task not in self._baseline_tasks
+            and task is not current
+            and task is not self._heartbeat
+            and not task.done()
+        ]
+        for task in leaked_tasks:
+            task.cancel()
+        if leaked_tasks:
+            await asyncio.gather(*leaked_tasks, return_exceptions=True)
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.shutdown_asyncgens()
+            await loop.shutdown_default_executor()
+        finally:
+            if self._heartbeat is not None:
+                self._heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._heartbeat
+        self.lifespan_started = False
+        if leaked_tasks:
+            leaked = ", ".join(sorted(task.get_name() for task in leaked_tasks))
+            raise AssertionError(f"application task leak: {leaked}")
+
+    def _submit(self, coroutine: Any) -> Any:
+        return asyncio.run_coroutine_threadsafe(coroutine, self._loop).result()
+
+    def __enter__(self) -> "LifespanTestClient":
+        try:
+            self._runner.run(self._start())
+        except BaseException:
+            try:
+                self._runner.close()
+            finally:
+                self._restore_current_loop()
+            raise
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        cleanup_error: BaseException | None = None
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join()
+        try:
+            self._runner.run(self._stop())
+        except BaseException as error:
+            cleanup_error = error
+        finally:
+            try:
+                self._runner.close()
+            finally:
+                self._restore_current_loop()
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    def _restore_current_loop(self) -> None:
+        if self._previous_loop is not None and not self._previous_loop.is_closed():
+            asyncio.set_event_loop(self._previous_loop)
+        else:
+            asyncio.set_event_loop(None)
+
+    def request(self, method: str, url: str, **kwargs: Any) -> Any:
+        if self._client is None:
+            raise RuntimeError("Test client has not been started")
+        return self._submit(self._client.request(method, url, **kwargs))
+
+    def get(self, url: str, **kwargs: Any) -> Any:
+        return self.request("GET", url, **kwargs)
+
+    def options(self, url: str, **kwargs: Any) -> Any:
+        return self.request("OPTIONS", url, **kwargs)
+
+    def post(self, url: str, **kwargs: Any) -> Any:
+        return self.request("POST", url, **kwargs)
+
+    def patch(self, url: str, **kwargs: Any) -> Any:
+        return self.request("PATCH", url, **kwargs)
+
+    def delete(self, url: str, **kwargs: Any) -> Any:
+        return self.request("DELETE", url, **kwargs)
 
 
 # ============================================
@@ -36,33 +169,38 @@ def event_loop() -> Generator[asyncio.AbstractEventLoop, None, None]:
 
 
 @pytest.fixture(scope="session")
-def test_app():
+def test_app() -> Any:
     """Get the test application instance."""
     return app
 
 
 @pytest.fixture
-def client(test_app) -> Generator[TestClient, None, None]:
-    """Create a synchronous test client."""
-    with TestClient(test_app) as c:
+def client(test_app: Any) -> Generator[LifespanTestClient, None, None]:
+    """Create a synchronous client with explicit application lifespan."""
+    with LifespanTestClient(test_app) as c:
         yield c
 
 
 @pytest.fixture
-async def async_client(test_app) -> AsyncGenerator[AsyncClient, None]:
-    """Create an asynchronous test client using ASGITransport for httpx >= 0.25.
-
-    ASGITransport does not run the app lifespan, so ensure the database is
-    initialized here (mirroring the lifespan startup). init_database() is
-    idempotent, so leaving the engine up for later tests is safe and matches
-    how the running app keeps a long-lived engine.
-    """
-    from src.repositories import init_database
-
-    await init_database()
-    transport = ASGITransport(app=test_app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        yield ac
+async def async_client(test_app: Any) -> AsyncGenerator[AsyncClient, None]:
+    """Create an async client while running the real application lifespan."""
+    heartbeat = asyncio.create_task(_keep_event_loop_responsive())
+    try:
+        async with test_app.router.lifespan_context(test_app):
+            transport = ASGITransport(
+                app=test_app,
+                client=("testclient", 50000),
+            )
+            async with AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+                follow_redirects=True,
+            ) as ac:
+                yield ac
+    finally:
+        heartbeat.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat
 
 
 # ============================================
@@ -148,7 +286,7 @@ def api_headers() -> dict[str, str]:
 
 
 @pytest.fixture
-async def db_session():
+async def db_session() -> AsyncGenerator[None, None]:
     """
     Database session fixture.
     TODO: Implement when database is set up.
@@ -157,10 +295,9 @@ async def db_session():
 
 
 @pytest.fixture
-async def redis_client():
+async def redis_client() -> AsyncGenerator[None, None]:
     """
     Redis client fixture.
     TODO: Implement when Redis is set up.
     """
     yield None
-

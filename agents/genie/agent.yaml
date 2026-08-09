@@ -1,0 +1,4 @@
+promptMode: append
+model: opus
+description: Workspace concierge and orchestrator — guides new users, manages agents, runs pipelines.
+color: cyan

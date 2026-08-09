@@ -62,8 +62,12 @@ USER neurostack
 # Expose port
 EXPOSE 8000
 
-# Development command with reload
-CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# Development command with reload.
+# ``--no-access-log`` is defence-in-depth: :mod:`src.config.logging` also
+# disables uvicorn's access logger. The application emits a post-routing
+# access log via RequestIdMiddleware that uses the route template instead
+# of the raw path so the Z-API capability token cannot leak.
+CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--no-access-log"]
 
 # ============================================
 # Stage 4: Production image
@@ -92,6 +96,10 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Production command with workers
-CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+# Production command with workers.
+# ``--no-access-log`` is defence-in-depth: :mod:`src.config.logging` also
+# disables uvicorn's access logger. The application emits a post-routing
+# access log via RequestIdMiddleware that uses the route template instead
+# of the raw path so the Z-API capability token cannot leak.
+CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--no-access-log"]
 

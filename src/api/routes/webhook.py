@@ -4,8 +4,11 @@ Receives WhatsApp messages from Z-API and Evolution API, processes them
 through the cognitive pipeline, and sends the LLM response back.
 """
 
+import hashlib
+import hmac
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import UUID
@@ -15,20 +18,50 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.middleware.rate_limit import (
+    check_webhook_rate_limit,
+    webhook_rate_limit_response,
+)
 from src.api.schemas.events import EventPayload, EventRequest
+from src.config.settings import settings
 from src.core.lgpd_utils import resolve_privacy_link
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.tenant import Tenant as TenantModel
 from src.repositories import SessionRepository, get_db_session_dependency
 from src.services.event_service import get_event_service
 from src.services.meta_service import (
-    download_meta_media,
+    download_meta_media_audio,
     extract_meta_message_id,
     resolve_meta_media,
     send_meta_cloud_text,
 )
+from src.services.safe_egress import UnsafeEgressError, safe_download_audio
 from src.services.uazapi_service import send_uazapi_text
-from src.services.zapi_service import mark_conversation_unread, mark_message_read, send_evolution_text, send_text_message
+from src.services.zapi_service import (
+    mark_conversation_unread,
+    mark_message_read,
+    send_evolution_text,
+    send_text_message,
+)
+
+# ── Constants for webhook authenticity ──
+# Z-API capability token: 32 random bytes encoded as base64url without
+# padding == 43 ASCII characters from [A-Za-z0-9_-].
+ZAPI_CAPABILITY_TOKEN_LEN = 43
+ZAPI_CAPABILITY_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{43}$")
+
+# Meta webhook HMAC header (case-insensitive).
+META_SIGNATURE_HEADER = "X-Hub-Signature-256"
+
+# STT providers with no runtime adapter: they must skip before any
+# download / request / reply / handoff / session mutation happens.
+UNSUPPORTED_STT_PROVIDERS = frozenset(
+    {"elevenlabs_scribe", "google_stt", "deepgram_stt", "microsoft_stt"}
+)
+
+# Replay claim retention: 31 days covers Z-API's documented 30-day media
+# availability plus one extra day of dedup guarantee.
+REPLAY_TTL_SECONDS = 31 * 24 * 60 * 60  # 2_678_400
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +79,7 @@ _INCOMING_ID_TTL = 900  # 15 minutes — providers may retry duplicate webhooks
 # Used when Redis is down so bot echoes don't trigger false human-takeover.
 import time as _time
 from collections import OrderedDict as _OrderedDict
+
 _INMEM_SENT: "_OrderedDict[str, float]" = _OrderedDict()
 _INMEM_INCOMING: "_OrderedDict[str, float]" = _OrderedDict()
 _INMEM_MAX = 500  # cap at 500 entries to bound memory
@@ -77,8 +111,10 @@ def _get_agent_language(clinic_config: Optional[dict]) -> str:
 def _get_redis():
     """Get Redis client (lazy import to avoid circular deps)."""
     try:
-        from src.config.settings import settings
         import redis
+
+        from src.config.settings import settings
+
         return redis.from_url(settings.redis_url, decode_responses=True)
     except Exception:
         return None
@@ -93,8 +129,8 @@ def _track_sent_message(zapi_response: dict) -> None:
     mid = (
         zapi_response.get("messageId")
         or zapi_response.get("zapiMessageId")
-        or zapi_response.get("MessageID")   # wuzapi capitalisation
-        or zapi_response.get("messageid")   # Uazapi commercial
+        or zapi_response.get("MessageID")  # wuzapi capitalisation
+        or zapi_response.get("messageid")  # Uazapi commercial
     )
     if not mid:
         return
@@ -148,12 +184,32 @@ def _is_ai_sent_message(message_id: str) -> bool:
     return False
 
 
+class ReplayStoreUnavailable(RuntimeError):
+    """Raised when the replay store cannot be consulted in production.
+
+    Production requires the Redis-backed 31-day dedup window because we
+    run multiple Uvicorn workers; when Redis is unavailable the webhook
+    must fail closed with HTTP 503, never quietly fall back to the
+    per-process in-memory store (which would only cover one worker).
+    """
+
+
 def _claim_incoming_message(
     source: str,
     tenant_id: UUID,
     message_id: str,
 ) -> bool:
-    """Return True only for the first delivery of an inbound provider message."""
+    """Return True only for the first delivery of an inbound provider message.
+
+    Uses Redis ``SET NX EX 2678400`` (31 days) as the authoritative claim
+    store shared across workers. When Redis is unavailable in production
+    the caller must translate the raised :class:`ReplayStoreUnavailable`
+    into an HTTP 503 fail-closed response.
+
+    In test / development environments with a single worker, an in-memory
+    fallback is permitted so tests keep running without a live Redis; it
+    is explicitly not durable and not distributed.
+    """
     if not message_id:
         return True
 
@@ -165,11 +221,16 @@ def _claim_incoming_message(
                 f"{_INCOMING_ID_PREFIX}{key}",
                 "1",
                 nx=True,
-                ex=_INCOMING_ID_TTL,
+                ex=REPLAY_TTL_SECONDS,
             )
             return bool(claimed)
-        except Exception:
-            pass
+        except Exception as exc:
+            if settings.is_production:
+                raise ReplayStoreUnavailable(str(exc)) from exc
+            # non-production single-worker fallback: fall through to memory
+    else:
+        if settings.is_production:
+            raise ReplayStoreUnavailable("redis_unavailable")
 
     now = _time.monotonic()
     expiry = _INMEM_INCOMING.get(key)
@@ -178,13 +239,175 @@ def _claim_incoming_message(
     if expiry:
         _INMEM_INCOMING.pop(key, None)
 
-    _INMEM_INCOMING[key] = now + _INCOMING_ID_TTL
+    _INMEM_INCOMING[key] = now + REPLAY_TTL_SECONDS
     while len(_INMEM_INCOMING) > _INMEM_MAX:
         _INMEM_INCOMING.popitem(last=False)
     return True
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Authenticity primitives (Z-API capability + Meta HMAC)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _is_canonical_zapi_token(raw_token: str) -> bool:
+    """Reject any non-canonical Z-API capability token form.
+
+    The wire format is exactly 43 ASCII characters from ``[A-Za-z0-9_-]``
+    (32 random bytes base64url-encoded without padding). Percent-encoded,
+    padded, Unicode, wrong-length, and decoded-only tokens all fail here
+    before we ever touch the database or Redis.
+    """
+
+    if not isinstance(raw_token, str):
+        return False
+    if len(raw_token) != ZAPI_CAPABILITY_TOKEN_LEN:
+        return False
+    # Explicitly reject any percent-encoded byte — these would round-trip
+    # to a 43-char string only after decoding, which the wish forbids.
+    if "%" in raw_token:
+        return False
+    return bool(ZAPI_CAPABILITY_TOKEN_PATTERN.fullmatch(raw_token))
+
+
+def _zapi_token_digest(raw_token: str) -> str:
+    """Return the lowercase-hex SHA-256 of the exact raw token bytes."""
+
+    return hashlib.sha256(raw_token.encode("ascii")).hexdigest()
+
+
+async def _resolve_tenant_by_zapi_digest(
+    digest: str,
+    session: AsyncSession,
+) -> Optional[tuple[UUID, dict]]:
+    """Return the single tenant + credentials matching the token digest.
+
+    Zero or multiple matches yield ``None`` — the caller translates that
+    into a generic 401 without leaking which case triggered.
+    """
+
+    stmt = select(
+        ClinicConfigTable.tenant_id,
+        ClinicConfigTable.api_credentials,
+    ).where(
+        ClinicConfigTable.api_credentials["zapi_inbound_token_digest"].astext == digest,
+    )
+    result = await session.execute(stmt)
+    rows = result.all()
+    if len(rows) != 1:
+        return None
+    tenant_id, creds = rows[0]
+    return tenant_id, dict(creds or {})
+
+
+def _extract_meta_message_bearing_phone_ids(body: dict[str, Any]) -> list[str]:
+    """Collect every ``phone_number_id`` whose change carries at least one message.
+
+    Only ``changes`` whose ``field == "messages"`` and whose ``value.messages``
+    is a non-empty list are considered. Status-only entries never contribute
+    to the tenant binding, so the wish's "exactly one message-bearing phone
+    id" rule stays independent of delivery/read receipts.
+    """
+
+    seen: list[str] = []
+    entries = body.get("entry") or []
+    if not isinstance(entries, list):
+        return seen
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        for change in entry.get("changes", []) or []:
+            if not isinstance(change, dict):
+                continue
+            if change.get("field") != "messages":
+                continue
+            value = change.get("value") or {}
+            if not isinstance(value, dict):
+                continue
+            messages = value.get("messages") or []
+            if not isinstance(messages, list) or not messages:
+                continue
+            metadata = value.get("metadata") or {}
+            pnid = str((metadata or {}).get("phone_number_id") or "").strip()
+            if pnid and pnid not in seen:
+                seen.append(pnid)
+    return seen
+
+
+async def _resolve_tenant_by_meta_phone_number_id(
+    phone_number_id: str,
+    session: AsyncSession,
+) -> Optional[tuple[UUID, dict]]:
+    """Return the single tenant + credentials that own a Meta phone id."""
+
+    stmt = select(
+        ClinicConfigTable.tenant_id,
+        ClinicConfigTable.api_credentials,
+    ).where(
+        ClinicConfigTable.api_credentials["meta_phone_number_id"].astext
+        == phone_number_id,
+    )
+    result = await session.execute(stmt)
+    rows = result.all()
+    if len(rows) != 1:
+        return None
+    tenant_id, creds = rows[0]
+    return tenant_id, dict(creds or {})
+
+
+def _verify_meta_signature(
+    signature_header: Optional[str],
+    body_bytes: bytes,
+    app_secret: str,
+) -> bool:
+    """Return True iff ``X-Hub-Signature-256`` matches the raw body HMAC.
+
+    The comparison uses :func:`hmac.compare_digest` so no timing leak
+    reveals partial matches. Any malformed header, missing algorithm
+    prefix, or non-hex digest returns ``False``.
+    """
+
+    if not signature_header or not isinstance(signature_header, str):
+        return False
+    if not app_secret or not isinstance(app_secret, str):
+        return False
+    prefix = "sha256="
+    if not signature_header.startswith(prefix):
+        return False
+    provided = signature_header[len(prefix) :].strip().lower()
+    if len(provided) != 64:
+        return False
+    try:
+        int(provided, 16)
+    except ValueError:
+        return False
+    expected = hmac.new(
+        app_secret.encode("utf-8"), body_bytes, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, provided)
+
+
+def _stt_canonical_provider(raw_provider: Optional[str]) -> str:
+    """Resolve the canonical STT provider id, defaulting to ``outros``.
+
+    Group 2's ``api_credentials`` module owns the allowlist; here we only
+    normalise empty/None values to the ``outros`` default that preserves
+    the historical pipeline.
+    """
+
+    if not raw_provider or not isinstance(raw_provider, str):
+        return "outros"
+    return raw_provider.strip() or "outros"
+
+
+def _stt_skip_envelope(provider: str) -> dict[str, Any]:
+    """Return the exact response body for an unsupported STT provider."""
+
+    return {"ok": True, "skipped": "stt_provider_unsupported", "provider": provider}
+
+
 # ── DB-backed AI message deduplication (cross-worker safe) ───────────
+
 
 def _session_has_ai_msg_id(session: Any, message_id: str) -> bool:
     """Return True (and consume the entry) if message_id is a recent bot-sent ID.
@@ -229,6 +452,7 @@ async def _store_ai_msg_id_to_db(
         return
     try:
         from src.repositories.session import SessionRepository as _SR
+
         repo = _SR(db)
         sess = await repo.get_by_id(session_id)
         if not sess:
@@ -249,6 +473,7 @@ async def _store_ai_msg_id_to_db(
 
 # ── helpers ──────────────────────────────────────────────────────────
 
+
 async def _resolve_tenant_by_credential(
     key: str,
     value: str,
@@ -264,7 +489,13 @@ async def _resolve_tenant_by_credential(
 
 def _normalise_phone(raw: str) -> str:
     """Strip non-digits and leading '+' so we get a clean E.164-ish number."""
-    return raw.lstrip("+").replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
+    return (
+        raw.lstrip("+")
+        .replace("-", "")
+        .replace(" ", "")
+        .replace("(", "")
+        .replace(")", "")
+    )
 
 
 async def _resolve_phone_from_lid(
@@ -274,6 +505,7 @@ async def _resolve_phone_from_lid(
 ) -> Optional[str]:
     """Resolve a real phone number from a WhatsApp LID using session metadata."""
     from sqlalchemy import text as sa_text
+
     result = await db.execute(
         sa_text(
             "SELECT user_id FROM sessions "
@@ -295,6 +527,7 @@ async def _save_lid_mapping(
 ) -> None:
     """Save chatLid in session metadata so fromMe=true messages can resolve the real phone."""
     from sqlalchemy import text as sa_text
+
     await db.execute(
         sa_text(
             "UPDATE sessions SET metadata = jsonb_set(COALESCE(metadata, '{}'), '{chat_lid}', to_jsonb(CAST(:lid AS text))) "
@@ -327,6 +560,7 @@ async def _get_or_create_session(
         return sessions[0].id, False
 
     from src.models.session import CognitiveStateData
+
     initial_state = CognitiveStateData(
         funnel_stage="lead_novo",
         intent_history=[],
@@ -476,7 +710,11 @@ async def _check_pause_state(
             "session_id": str(session.id),
             "tenant_id": str(tenant_id),
             "phone": phone,
-            "paused_until": session.paused_until.isoformat() if session.paused_until else "permanent",
+            "paused_until": (
+                session.paused_until.isoformat()
+                if session.paused_until
+                else "permanent"
+            ),
         },
     )
     return {"ok": True, "skipped": "session_paused"}
@@ -554,16 +792,21 @@ async def _handle_clinic_message(
 
     handoff_active = str(handoff_cfg.get("handoff_active", "yes")).lower()
     import re as _re
+
     def _normalize_for_match(s: str) -> str:
         """Normalize: lowercase, collapse whitespace, remove spaces around punctuation."""
         s = " ".join(s.strip().lower().split())
-        s = _re.sub(r'\s*([,;:.!?])\s*', r'\1', s)
+        s = _re.sub(r"\s*([,;:.!?])\s*", r"\1", s)
         return s
 
-    trigger_msg = _normalize_for_match(str(handoff_cfg.get(
-        "trigger_message",
-        "Precisando de algo mais,estamos a disposição.",
-    )))
+    trigger_msg = _normalize_for_match(
+        str(
+            handoff_cfg.get(
+                "trigger_message",
+                "Precisando de algo mais,estamos a disposição.",
+            )
+        )
+    )
     reactivation_hours = int(handoff_cfg.get("reactivation_delay_hours", 1))
 
     normalized_text = _normalize_for_match(message_text)
@@ -571,7 +814,9 @@ async def _handle_clinic_message(
     # Check if message contains the trigger phrase (flexible match, punctuation-tolerant)
     if trigger_msg in normalized_text:
         if session.is_paused:
-            session.paused_until = datetime.now(timezone.utc) + timedelta(hours=reactivation_hours)
+            session.paused_until = datetime.now(timezone.utc) + timedelta(
+                hours=reactivation_hours
+            )
             await db.flush()
             logger.info(
                 "trigger_reactivation",
@@ -600,7 +845,9 @@ async def _handle_clinic_message(
     handoff_period = str(handoff_cfg.get("handoff_period", "permanent")).lower()
     if standby_mode == "inactive":
         fallback_hours = int(handoff_cfg.get("handoff_inactive_default_hours", 24))
-        session.paused_until = datetime.now(timezone.utc) + timedelta(hours=fallback_hours)
+        session.paused_until = datetime.now(timezone.utc) + timedelta(
+            hours=fallback_hours
+        )
     elif handoff_period == "cycle":
         cycle_days = int(handoff_cfg.get("handoff_cycle_days", 7))
         session.paused_until = datetime.now(timezone.utc) + timedelta(days=cycle_days)
@@ -616,7 +863,9 @@ async def _handle_clinic_message(
             "session_id": str(session.id),
             "tenant_id": str(tenant_id),
             "phone": phone,
-            "paused_until": session.paused_until.isoformat() if session.paused_until else None,
+            "paused_until": (
+                session.paused_until.isoformat() if session.paused_until else None
+            ),
         },
     )
     return {"ok": True, "action": "human_takeover"}
@@ -624,14 +873,47 @@ async def _handle_clinic_message(
 
 # ── Z-API webhook endpoint ──────────────────────────────────────────
 
+
 @router.post(
     "/zapi",
-    summary="Z-API Webhook",
-    description="Receives incoming WhatsApp messages from Z-API and responds automatically.",
+    summary="Z-API Legacy Webhook (deprecated)",
+    description=(
+        "Legacy Z-API webhook without capability authentication. "
+        "Returns 200 with ``{'skipped': 'legacy'}`` and does not perform any "
+        "downstream processing — clinics must register the "
+        "``/zapi/{capability_token}`` URL instead."
+    ),
+    tags=["Webhook"],
+    status_code=200,
+)
+async def zapi_webhook_legacy(request: Request) -> dict[str, Any]:
+    """Legacy Z-API path returns a 200 sentinel with zero downstream effects.
+
+    We deliberately consume the body so upstream retries stop; nothing about
+    the payload is inspected, logged, or forwarded.
+    """
+
+    try:
+        await request.body()
+    except Exception:  # pragma: no cover — body reads are cheap in tests
+        pass
+    return {"ok": True, "skipped": "legacy"}
+
+
+@router.post(
+    "/zapi/{capability_token}",
+    summary="Z-API Webhook (capability URL)",
+    description=(
+        "Receives incoming WhatsApp messages from Z-API through the "
+        "capability-authenticated URL registered by the clinic. The "
+        "canonical token is 43 base64url characters — non-canonical forms "
+        "are rejected before any database or Redis lookup."
+    ),
     tags=["Webhook"],
     status_code=200,
 )
 async def zapi_webhook(
+    capability_token: str,
     request: Request,
     db: AsyncSession = Depends(get_db_session_dependency),
 ):
@@ -649,26 +931,97 @@ async def zapi_webhook(
       "senderName": "João"
     }
     """
-    body: dict[str, Any] = await request.json()
+    # ── 1) Canonical token validation (before any DB / Redis lookup) ──
+    if not _is_canonical_zapi_token(capability_token):
+        return JSONResponse(
+            status_code=401,
+            content={"error": "invalid_webhook_auth"},
+        )
 
-    # ── extract payload identifiers ──
+    # ── 2) Read raw body once so authenticity stays bound to the exact bytes ──
+    raw_body = await request.body()
+    try:
+        import json as _json
+
+        body: dict[str, Any] = _json.loads(raw_body or b"{}")
+    except Exception:
+        return JSONResponse(
+            status_code=401,
+            content={"error": "invalid_webhook_auth"},
+        )
+    if not isinstance(body, dict):
+        return JSONResponse(
+            status_code=401,
+            content={"error": "invalid_webhook_auth"},
+        )
+
+    # ── 3) Digest lookup — exactly one tenant must match ──
+    digest = _zapi_token_digest(capability_token)
+    resolved = await _resolve_tenant_by_zapi_digest(digest, db)
+    if resolved is None:
+        return JSONResponse(
+            status_code=401,
+            content={"error": "invalid_webhook_auth"},
+        )
+    tenant_id, tenant_creds = resolved
+
+    # ── 4) Body instanceId must match the resolved tenant ──
+    body_instance_id = str(body.get("instanceId") or "").strip()
+    expected_instance_id = str(tenant_creds.get("zapi_instance_id") or "").strip()
+    if not body_instance_id or body_instance_id != expected_instance_id:
+        return JSONResponse(
+            status_code=401,
+            content={"error": "invalid_webhook_auth"},
+        )
+
+    # ── 5) Rate limit (after auth, before replay) ──
+    rate_decision = check_webhook_rate_limit(str(tenant_id), "zapi")
+    if not rate_decision.allowed:
+        return webhook_rate_limit_response(rate_decision)
+
+    # ── 6) messageId presence + replay claim ──
+    webhook_msg_id = str(body.get("messageId") or "").strip()
+    if not webhook_msg_id:
+        return {"ok": True, "skipped": "missing_message_id"}
+    try:
+        first_delivery = _claim_incoming_message("zapi", tenant_id, webhook_msg_id)
+    except ReplayStoreUnavailable:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "replay_store_unavailable"},
+        )
+    if not first_delivery:
+        return {"ok": True, "skipped": "duplicate_message"}
+
+    # ── downstream processing (session / media / reply / handoff) ──
+    return await _process_zapi_authenticated_body(
+        body=body,
+        tenant_id=tenant_id,
+        db=db,
+    )
+
+
+async def _process_zapi_authenticated_body(
+    *,
+    body: dict[str, Any],
+    tenant_id: UUID,
+    db: AsyncSession,
+) -> Any:
+    """Downstream Z-API processing for an already authenticated request.
+
+    Callers must have verified: canonical token, digest match, ``instanceId``
+    binding, rate limit, ``messageId`` presence and replay-store claim.
+    """
     text_obj = body.get("text")
     audio_obj = body.get("audio")
 
-    instance_id = body.get("instanceId", "")
     raw_phone = body.get("phone", "")
     phone = _normalise_phone(raw_phone)
     chat_lid = body.get("chatLid", "")
     sender_name = body.get("senderName", "")
 
-    if not instance_id or not phone:
+    if not phone:
         return {"ok": True, "skipped": "missing_fields"}
-
-    # ── resolve tenant from instance_id ──
-    tenant_id = await _resolve_tenant_by_credential("zapi_instance_id", instance_id, db)
-    if not tenant_id:
-        logger.warning("Z-API webhook: no tenant for instance %s", instance_id)
-        return {"ok": True, "skipped": "unknown_instance"}
 
     # ── load clinic_config early so audio/text handling can use credentials ──
     service = get_event_service()
@@ -685,16 +1038,23 @@ async def zapi_webhook(
         mimetype = audio_obj.get("mimeType") or "audio/ogg"
         if audio_url and clinic_config:
             creds = (clinic_config or {}).get("api_credentials", {}) or {}
-            whisper_key = creds.get("whisper_api_key")
-            stt_provider = (creds.get("stt_provider") or "outros").strip()
+            whisper_key = creds.get("whisper_api_key") or creds.get("stt_api_key")
+            stt_provider = _stt_canonical_provider(creds.get("stt_provider"))
             stt_api_url = (creds.get("stt_api_url") or "").strip()
+
+            # STT providers without a runtime adapter must NOT download the
+            # audio, hit any STT endpoint, reply, hand off, or mutate the
+            # session — return the exact skip envelope immediately.
+            if stt_provider in UNSUPPORTED_STT_PROVIDERS:
+                return _stt_skip_envelope(stt_provider)
+
             # Per-provider model defaults — avoid sending Groq model names to OpenAI
             _STT_DEFAULT_MODELS: dict[str, str] = {
-                "openai_whisper":    "whisper-1",
-                "elevenlabs_scribe": "scribe_v1",
+                "openai_whisper": "whisper-1",
             }
             whisper_model = (
-                creds.get("whisper_model")
+                creds.get("stt_model_name")
+                or creds.get("whisper_model")
                 or _STT_DEFAULT_MODELS.get(stt_provider, "whisper-large-v3-turbo")
             )
             agent_lang = _get_agent_language(clinic_config)
@@ -719,30 +1079,57 @@ async def zapi_webhook(
                                 "Recebi seu áudio! 🎙️ Como ele é mais longo, vou encaminhar para a nossa equipe, "
                                 "que vai ouvir e te responder com atenção. 😊"
                             )
-                        await send_text_message(z_inst, z_tok, phone, handoff_msg, client_token=z_ct)
+                        await send_text_message(
+                            z_inst, z_tok, phone, handoff_msg, client_token=z_ct
+                        )
                         # Mark conversation as unread so the clinic team sees the pending audio
-                        await mark_conversation_unread(z_inst, z_tok, phone, client_token=z_ct)
+                        await mark_conversation_unread(
+                            z_inst, z_tok, phone, client_token=z_ct
+                        )
                     logger.info(
                         "Audio too long (%ds > %ds limit), skipping transcription for %s",
-                        audio_seconds, audio_max_seconds, phone,
+                        audio_seconds,
+                        audio_max_seconds,
+                        phone,
                     )
                     return {"ok": True, "skipped": "audio_too_long"}
 
+                # Bound the streaming download by the same audio_max_seconds
+                # window the config exposes; safe_download_audio enforces MIME,
+                # host, and Content-Length policy uniformly.
+                max_bytes = min(
+                    audio_max_seconds * 16 * 1024,
+                    10 * 1024 * 1024,
+                )
                 try:
-                    import httpx
-                    async with httpx.AsyncClient(timeout=30) as hx:
-                        audio_resp = await hx.get(audio_url)
-                        audio_resp.raise_for_status()
-                    audio_bytes = audio_resp.content
-                    logger.info(
-                        "Audio received for transcription: size=%d bytes, mimetype=%s",
-                        len(audio_bytes), mimetype,
+                    download = await safe_download_audio(audio_url, max_bytes=max_bytes)
+                except UnsafeEgressError as exc:
+                    logger.warning(
+                        "Z-API audio egress rejected: %s",
+                        exc.code,
                     )
+                    envelope = {
+                        "unsafe_api_url": "unsafe_audio_url",
+                        "audio_too_large": "audio_too_large",
+                        "unsupported_audio_mime": "unsupported_audio_mime",
+                        "audio_download_failed": "audio_download_failed",
+                        "redirect_forbidden": "unsafe_audio_url",
+                    }.get(exc.code, "audio_download_failed")
+                    return {"ok": True, "skipped": envelope}
+                audio_bytes = download.content
+                effective_mime = download.mime_type or mimetype
+                logger.info(
+                    "Audio received for transcription: size=%d bytes, mimetype=%s",
+                    len(audio_bytes),
+                    effective_mime,
+                )
+                try:
                     from src.services.groq_service import (
                         GROQ_API_BASE,
                         OPENAI_API_BASE,
                         transcribe_audio,
                     )
+
                     # Resolve STT base URL: use the saved URL (set by the UI for
                     # any provider), fall back to known defaults, then Groq as
                     # last resort for legacy configs without a saved URL.
@@ -750,20 +1137,12 @@ async def zapi_webhook(
                         stt_base_url = stt_api_url
                     elif stt_provider == "openai_whisper":
                         stt_base_url = OPENAI_API_BASE
-                    elif stt_provider == "elevenlabs_scribe":
-                        stt_base_url = "https://api.elevenlabs.io/v1"
                     else:
-                        stt_base_url = GROQ_API_BASE  # outros / google_stt / legacy
-                    if stt_provider in ("elevenlabs_scribe", "google_stt"):
-                        logger.warning(
-                            "STT provider %r is not yet fully implemented in runtime — "
-                            "transcription will attempt the configured endpoint but may fail.",
-                            stt_provider,
-                        )
+                        stt_base_url = GROQ_API_BASE  # outros / legacy
                     message_text = await transcribe_audio(
                         api_key=whisper_key,
                         audio_bytes=audio_bytes,
-                        mimetype=mimetype,
+                        mimetype=effective_mime,
                         model=whisper_model,
                         language=lang_hint,
                         base_url=stt_base_url,
@@ -790,7 +1169,10 @@ async def zapi_webhook(
         if "@lid" in raw_phone:
             effective_phone = await _resolve_phone_from_lid(tenant_id, raw_phone, db)
             if not effective_phone:
-                logger.warning("zapi_lid_unresolved", extra={"lid": raw_phone, "tenant_id": str(tenant_id)})
+                logger.warning(
+                    "zapi_lid_unresolved",
+                    extra={"lid": raw_phone, "tenant_id": str(tenant_id)},
+                )
                 return {"ok": True, "skipped": "lid_unresolved"}
         # Pass message_id for DB-backed cross-worker dedup inside _handle_clinic_message
         result = await _handle_clinic_message(
@@ -848,15 +1230,28 @@ async def zapi_webhook(
             z_ct = creds_lgpd.get("zapi_client_token", "").strip()
             if z_inst and z_tok:
                 try:
-                    _clinic_name = (clinic_config or {}).get("identity", {}).get("clinic_name", "")
-                    privacy_msg = _build_lgpd_message(lgpd_cfg, clinic_id=str(tenant_id), clinic_name=_clinic_name, agent_language=_get_agent_language(clinic_config))
+                    _clinic_name = (
+                        (clinic_config or {}).get("identity", {}).get("clinic_name", "")
+                    )
+                    privacy_msg = _build_lgpd_message(
+                        lgpd_cfg,
+                        clinic_id=str(tenant_id),
+                        clinic_name=_clinic_name,
+                        agent_language=_get_agent_language(clinic_config),
+                    )
                     send_result = await send_text_message(
-                        z_inst, z_tok, phone, privacy_msg, client_token=z_ct,
+                        z_inst,
+                        z_tok,
+                        phone,
+                        privacy_msg,
+                        client_token=z_ct,
                     )
                     _track_sent_message(send_result)
                     # DB-backed dedup: store LGPD message ID so its fromMe echo is
                     # recognised as a bot echo across all Uvicorn workers
-                    _lgpd_mid = send_result.get("messageId") or send_result.get("zapiMessageId", "")
+                    _lgpd_mid = send_result.get("messageId") or send_result.get(
+                        "zapiMessageId", ""
+                    )
                     if _lgpd_mid:
                         await _store_ai_msg_id_to_db(session_id, _lgpd_mid, db)
                     logger.info("Z-API LGPD privacy message sent to %s", phone)
@@ -911,21 +1306,32 @@ async def zapi_webhook(
         return {"ok": True, "replied": False, "reason": "no_credentials"}
 
     try:
-        send_result = await send_text_message(zapi_inst, zapi_token, phone, suggested, client_token=zapi_client_token)
+        send_result = await send_text_message(
+            zapi_inst, zapi_token, phone, suggested, client_token=zapi_client_token
+        )
         _track_sent_message(send_result)
         # DB-backed dedup: store reply message ID so its fromMe echo is recognised
         # as a bot echo across all Uvicorn workers (works even when Redis is down)
-        _reply_mid = send_result.get("messageId") or send_result.get("zapiMessageId", "")
+        _reply_mid = send_result.get("messageId") or send_result.get(
+            "zapiMessageId", ""
+        )
         if _reply_mid:
             await _store_ai_msg_id_to_db(session_id, _reply_mid, db)
             await db.commit()  # commit the metadata update immediately
         logger.info("Z-API reply sent to %s (%d chars)", phone, len(suggested))
     except Exception as exc:
         logger.exception("Z-API send failed for %s — %s", phone, exc)
-        return {"ok": True, "replied": False, "reason": "send_failed", "error": str(exc)}
+        return {
+            "ok": True,
+            "replied": False,
+            "reason": "send_failed",
+            "error": str(exc),
+        }
 
     # ── mark conversation as unread (green dot) after handoff message ──
-    _handoff = response.handoff_summary or (response.decision and response.decision.handoff_required)
+    _handoff = response.handoff_summary or (
+        response.decision and response.decision.handoff_required
+    )
     logger.info(
         "Z-API handoff check for %s: handoff_summary=%s, decision.handoff_required=%s → mark_unread=%s",
         phone,
@@ -935,7 +1341,9 @@ async def zapi_webhook(
     )
     if _handoff:
         try:
-            await mark_conversation_unread(zapi_inst, zapi_token, phone, client_token=zapi_client_token)
+            await mark_conversation_unread(
+                zapi_inst, zapi_token, phone, client_token=zapi_client_token
+            )
             logger.info("Z-API mark_unread SUCCESS after handoff for %s", phone)
         except Exception as exc:
             logger.warning("Z-API mark_unread FAILED for %s — %s", phone, exc)
@@ -944,6 +1352,7 @@ async def zapi_webhook(
 
 
 # ── Evolution API webhook endpoint ───────────────────────────────────
+
 
 @router.post(
     "/evolution",
@@ -987,9 +1396,13 @@ async def evolution_webhook(
     # ── extract message text ──
     msg_obj = data.get("message", {})
     message_text = (
-        msg_obj.get("conversation")
-        or msg_obj.get("extendedTextMessage", {}).get("text", "")
-    ).strip() if isinstance(msg_obj, dict) else ""
+        (
+            msg_obj.get("conversation")
+            or msg_obj.get("extendedTextMessage", {}).get("text", "")
+        ).strip()
+        if isinstance(msg_obj, dict)
+        else ""
+    )
 
     if not message_text:
         return {"ok": True, "skipped": "non-text"}
@@ -1004,7 +1417,9 @@ async def evolution_webhook(
         return {"ok": True, "skipped": "missing_fields"}
 
     # ── resolve tenant from instance_name ──
-    tenant_id = await _resolve_tenant_by_credential("evolution_instance_name", instance_name, db)
+    tenant_id = await _resolve_tenant_by_credential(
+        "evolution_instance_name", instance_name, db
+    )
     if not tenant_id:
         logger.warning("Evolution webhook: no tenant for instance %s", instance_name)
         return {"ok": True, "skipped": "unknown_instance"}
@@ -1052,14 +1467,27 @@ async def evolution_webhook(
             e_key = creds_lgpd.get("evolution_api_key", "")
             if e_url and e_name and e_key:
                 try:
-                    _clinic_name = (clinic_config or {}).get("identity", {}).get("clinic_name", "")
-                    privacy_msg = _build_lgpd_message(lgpd_cfg, clinic_id=str(tenant_id), clinic_name=_clinic_name, agent_language=_get_agent_language(clinic_config))
+                    _clinic_name = (
+                        (clinic_config or {}).get("identity", {}).get("clinic_name", "")
+                    )
+                    privacy_msg = _build_lgpd_message(
+                        lgpd_cfg,
+                        clinic_id=str(tenant_id),
+                        clinic_name=_clinic_name,
+                        agent_language=_get_agent_language(clinic_config),
+                    )
                     send_result = await send_evolution_text(
-                        e_url, e_name, e_key, phone, privacy_msg,
+                        e_url,
+                        e_name,
+                        e_key,
+                        phone,
+                        privacy_msg,
                     )
                     _track_sent_message(send_result)
                     # DB-backed dedup: store LGPD message ID for cross-worker echo detection
-                    _lgpd_mid = send_result.get("messageId") or send_result.get("id", "")
+                    _lgpd_mid = send_result.get("messageId") or send_result.get(
+                        "id", ""
+                    )
                     if _lgpd_mid:
                         await _store_ai_msg_id_to_db(session_id, _lgpd_mid, db)
                     logger.info("Evolution LGPD privacy message sent to %s", phone)
@@ -1108,7 +1536,9 @@ async def evolution_webhook(
         return {"ok": True, "replied": False, "reason": "no_credentials"}
 
     try:
-        send_result = await send_evolution_text(evol_url, evol_name, evol_key, phone, suggested)
+        send_result = await send_evolution_text(
+            evol_url, evol_name, evol_key, phone, suggested
+        )
         _track_sent_message(send_result)
         # DB-backed dedup: store reply message ID for cross-worker echo detection
         _reply_mid = send_result.get("messageId") or send_result.get("id", "")
@@ -1124,6 +1554,7 @@ async def evolution_webhook(
 
 
 # ── Uazapi webhook endpoint ─────────────────────────────────────────
+
 
 @router.post(
     "/uazapi",
@@ -1186,26 +1617,44 @@ async def uazapi_webhook(
 
     logger.info(
         "Uazapi webhook: instance=%s from=%s type=%s body_len=%d fromMe=%s",
-        instance_name, raw_from, msg_type, len(message_text), is_from_me,
+        instance_name,
+        raw_from,
+        msg_type,
+        len(message_text),
+        is_from_me,
     )
 
     if not instance_name or not from_phone:
         return {"ok": True, "skipped": "missing_fields"}
 
     # Skip binary media — text messages arrive as "text" or "Conversation"
-    _MEDIA_TYPES = {"image", "Image", "video", "Video", "audio", "Audio",
-                    "document", "Document", "sticker", "Sticker", "ptt"}
+    _MEDIA_TYPES = {
+        "image",
+        "Image",
+        "video",
+        "Video",
+        "audio",
+        "Audio",
+        "document",
+        "Document",
+        "sticker",
+        "Sticker",
+        "ptt",
+    }
     if msg_type in _MEDIA_TYPES or not message_text:
         logger.info("Uazapi webhook: skipping non-text msg_type=%s", msg_type)
         return {"ok": True, "skipped": "non-text"}
 
     # ── resolve tenant from instance_name ──
     tenant_id = await _resolve_tenant_by_credential(
-        "uazapi_instance_name", instance_name, db,
+        "uazapi_instance_name",
+        instance_name,
+        db,
     )
     if not tenant_id:
         logger.warning(
-            "Uazapi webhook: no tenant for instance %s", instance_name,
+            "Uazapi webhook: no tenant for instance %s",
+            instance_name,
         )
         return {"ok": True, "skipped": "unknown_instance"}
 
@@ -1216,7 +1665,8 @@ async def uazapi_webhook(
     if msg_id and not _claim_incoming_message("uazapi", tenant_id, msg_id):
         logger.info(
             "Uazapi webhook: duplicate msg %s from %s skipped",
-            msg_id, from_phone,
+            msg_id,
+            from_phone,
         )
         return {"ok": True, "skipped": "duplicate_message"}
 
@@ -1242,7 +1692,9 @@ async def uazapi_webhook(
 
     logger.info(
         "Uazapi webhook: msg %s from %s (tenant %s)",
-        msg_id, from_phone, tenant_id,
+        msg_id,
+        from_phone,
+        tenant_id,
     )
 
     event_request = EventRequest(
@@ -1287,12 +1739,18 @@ async def uazapi_webhook(
         send_result = await send_uazapi_text(u_url, u_token, from_phone, suggested)
         _track_sent_message(send_result)
         # DB-backed dedup: store reply message ID for cross-worker echo detection
-        reply_mid = send_result.get("messageid") or send_result.get("MessageID") or send_result.get("id", "")
+        reply_mid = (
+            send_result.get("messageid")
+            or send_result.get("MessageID")
+            or send_result.get("id", "")
+        )
         if reply_mid:
             await _store_ai_msg_id_to_db(session_id, reply_mid, db)
             await db.commit()  # commit metadata update immediately
         logger.info(
-            "Uazapi reply sent to %s (%d chars)", from_phone, len(suggested),
+            "Uazapi reply sent to %s (%d chars)",
+            from_phone,
+            len(suggested),
         )
     except Exception:
         logger.exception("Uazapi send failed for %s", from_phone)
@@ -1302,6 +1760,7 @@ async def uazapi_webhook(
 
 
 # ── Meta Cloud API webhook endpoints ────────────────────────────────
+
 
 async def _resolve_tenant_by_meta_verify_token(
     token: str,
@@ -1356,10 +1815,20 @@ _META_AUDIO_APPROX_BYTES_PER_SECOND = 16000
 # lowercased text, so short variants ("encaminh", "envia") catch conjugated
 # forms without a full NLP pass.
 _META_FORWARD_KEYWORDS: tuple[str, ...] = (
-    "encaminh", "encaminha", "encaminhar",
-    "envia", "enviar", "manda", "mandar",
-    "equipe", "atendent", "human",
-    "forward", "team", "please forward", "send it",
+    "encaminh",
+    "encaminha",
+    "encaminhar",
+    "envia",
+    "enviar",
+    "manda",
+    "mandar",
+    "equipe",
+    "atendent",
+    "human",
+    "forward",
+    "team",
+    "please forward",
+    "send it",
 )
 
 _FILE_ACK_MSG_PT = (
@@ -1437,9 +1906,8 @@ async def _meta_set_pending_file_review(
     JSONB syntax.
     """
     from src.models.session import Session as SessionModel
-    result = await db.execute(
-        select(SessionModel).where(SessionModel.id == session_id)
-    )
+
+    result = await db.execute(select(SessionModel).where(SessionModel.id == session_id))
     sess = result.scalars().first()
     if not sess:
         return
@@ -1455,6 +1923,7 @@ async def _meta_get_pending_file_review(
 ) -> bool:
     """Check whether the session is awaiting a decision on a received file."""
     from src.models.session import Session as SessionModel
+
     result = await db.execute(
         select(SessionModel.session_metadata).where(
             SessionModel.id == session_id,
@@ -1470,9 +1939,8 @@ async def _meta_clear_pending_file_review(
 ) -> None:
     """Clear the pending-file-review flag on the session."""
     from src.models.session import Session as SessionModel
-    result = await db.execute(
-        select(SessionModel).where(SessionModel.id == session_id)
-    )
+
+    result = await db.execute(select(SessionModel).where(SessionModel.id == session_id))
     sess = result.scalars().first()
     if not sess:
         return
@@ -1486,6 +1954,7 @@ async def _meta_clear_pending_file_review(
 async def _meta_load_lead_name(session_id: UUID, db: AsyncSession) -> str:
     """Read ``cognitive_state.slots.lead_name`` from a session, or "" if unset."""
     from src.models.session import Session as SessionModel
+
     result = await db.execute(
         select(SessionModel.cognitive_state).where(
             SessionModel.id == session_id,
@@ -1528,12 +1997,16 @@ async def _meta_initiate_file_handoff(
         await handoff_service.initiate_handoff(request)
         logger.info(
             "Meta file handoff initiated for %s (session=%s, note=%s)",
-            from_phone, session_id, note,
+            from_phone,
+            session_id,
+            note,
         )
     except Exception as exc:
         logger.exception(
             "Meta file handoff init failed for %s (session=%s) — %s",
-            from_phone, session_id, exc,
+            from_phone,
+            session_id,
+            exc,
         )
 
 
@@ -1549,7 +2022,9 @@ async def _meta_transcribe_audio(
     configured. Raises the underlying exception on transcription failure so
     the caller can log it via ``logger.exception``.
     """
-    whisper_key = (creds.get("whisper_api_key") or "").strip()
+    whisper_key = (creds.get("whisper_api_key") or "").strip() or (
+        creds.get("stt_api_key") or ""
+    ).strip()
     if not whisper_key:
         return None
 
@@ -1559,14 +2034,14 @@ async def _meta_transcribe_audio(
         transcribe_audio,
     )
 
-    stt_provider = (creds.get("stt_provider") or "outros").strip()
+    stt_provider = _stt_canonical_provider(creds.get("stt_provider"))
     stt_api_url = (creds.get("stt_api_url") or "").strip()
     _STT_DEFAULT_MODELS: dict[str, str] = {
         "openai_whisper": "whisper-1",
-        "elevenlabs_scribe": "scribe_v1",
     }
     whisper_model = (
-        creds.get("whisper_model")
+        creds.get("stt_model_name")
+        or creds.get("whisper_model")
         or _STT_DEFAULT_MODELS.get(stt_provider, "whisper-large-v3-turbo")
     )
     lang_hint = "en" if agent_language == "en" else "pt"
@@ -1575,8 +2050,6 @@ async def _meta_transcribe_audio(
         stt_base_url = stt_api_url
     elif stt_provider == "openai_whisper":
         stt_base_url = OPENAI_API_BASE
-    elif stt_provider == "elevenlabs_scribe":
-        stt_base_url = "https://api.elevenlabs.io/v1"
     else:
         stt_base_url = GROQ_API_BASE
 
@@ -1674,7 +2147,23 @@ async def meta_webhook(
       }]
     }
     """
-    body: dict[str, Any] = await request.json()
+    # ── 1) Read the exact raw bytes BEFORE anything else so HMAC can bind
+    # to them (json parsing does not preserve byte-for-byte). ──
+    raw_body = await request.body()
+    try:
+        import json as _json
+
+        body: dict[str, Any] = _json.loads(raw_body or b"{}")
+    except Exception:
+        return JSONResponse(
+            status_code=401,
+            content={"error": "invalid_webhook_auth"},
+        )
+    if not isinstance(body, dict):
+        return JSONResponse(
+            status_code=401,
+            content={"error": "invalid_webhook_auth"},
+        )
 
     if body.get("object") != "whatsapp_business_account":
         return {"ok": True, "skipped": "unknown_object"}
@@ -1683,6 +2172,113 @@ async def meta_webhook(
     if not entries:
         return {"ok": True, "skipped": "no_entry"}
 
+    # ── 2) Extract every phone_number_id whose change carries a message.
+    # The wish requires exactly one distinct message-bearing phone id, and
+    # the whole request must be resolved to that single tenant/app secret
+    # BEFORE any session/media/reply/handoff/session mutation. ──
+    message_bearing_phone_ids = _extract_meta_message_bearing_phone_ids(body)
+    if not message_bearing_phone_ids:
+        # No messages at all — this is a status-only or empty envelope. The
+        # existing tests expect the specific ``status_only``/``no_entry``
+        # sentinels for those cases, so preserve them.
+        first_change = None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            for change in entry.get("changes", []) or []:
+                if not isinstance(change, dict):
+                    continue
+                if change.get("field") == "messages":
+                    first_change = change
+                    break
+            if first_change is not None:
+                break
+        if first_change is None:
+            return {"ok": True, "skipped": "no_entry"}
+        value = first_change.get("value") or {}
+        if not (value.get("metadata") or {}).get("phone_number_id"):
+            return {"ok": True, "skipped": "missing_phone_number_id"}
+        return {"ok": True, "skipped": "status_only"}
+
+    if len(message_bearing_phone_ids) != 1:
+        # Zero or multiple message-bearing phone ids — fail closed with a
+        # generic error so multi-tenant confusion cannot bleed downstream.
+        return JSONResponse(
+            status_code=401,
+            content={"error": "invalid_webhook_auth"},
+        )
+
+    phone_number_id = message_bearing_phone_ids[0]
+
+    # ── 3) Resolve exactly one tenant + credentials for that phone id ──
+    resolved = await _resolve_tenant_by_meta_phone_number_id(phone_number_id, db)
+    if resolved is None:
+        logger.warning(
+            "Meta webhook: no tenant for phone_number_id %s",
+            phone_number_id,
+        )
+        return {"ok": True, "skipped": "unknown_phone_number_id"}
+    tenant_id, tenant_creds = resolved
+
+    # ── 4) HMAC-SHA256 authenticity over the raw body bytes ──
+    app_secret = str(tenant_creds.get("meta_app_secret") or "").strip()
+    signature_header = request.headers.get(
+        META_SIGNATURE_HEADER
+    ) or request.headers.get(META_SIGNATURE_HEADER.lower())
+    if not app_secret or not _verify_meta_signature(
+        signature_header, raw_body, app_secret
+    ):
+        return JSONResponse(
+            status_code=401,
+            content={"error": "invalid_webhook_auth"},
+        )
+
+    # ── 5) Rate limit (after auth, before replay/session/media/reply) ──
+    rate_decision = check_webhook_rate_limit(str(tenant_id), "meta")
+    if not rate_decision.allowed:
+        return webhook_rate_limit_response(rate_decision)
+
+    # ── 6) messageId presence + replay claim (before any downstream effect) ──
+    # We need the first message id from the single message-bearing change.
+    change_for_processing: dict[str, Any] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        for change in entry.get("changes", []) or []:
+            if not isinstance(change, dict) or change.get("field") != "messages":
+                continue
+            value = change.get("value") or {}
+            metadata = value.get("metadata") or {}
+            if (
+                str((metadata or {}).get("phone_number_id") or "").strip()
+                != phone_number_id
+            ):
+                continue
+            messages = value.get("messages") or []
+            if not messages:
+                continue
+            change_for_processing = change
+            break
+        if change_for_processing:
+            break
+
+    value = change_for_processing.get("value") or {}
+    messages = value.get("messages") or []
+    msg = messages[0] if isinstance(messages[0], dict) else {}
+    first_message_id = str(msg.get("id") or "").strip()
+    if not first_message_id:
+        return {"ok": True, "skipped": "missing_message_id"}
+    try:
+        first_delivery = _claim_incoming_message("meta", tenant_id, first_message_id)
+    except ReplayStoreUnavailable:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "replay_store_unavailable"},
+        )
+    if not first_delivery:
+        return {"ok": True, "skipped": "duplicate_message"}
+
+    # ── downstream processing (bound to the authenticated tenant/phone id) ──
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -1694,28 +2290,18 @@ async def meta_webhook(
 
             value = change.get("value") or {}
             metadata = value.get("metadata") or {}
-            phone_number_id = str(metadata.get("phone_number_id") or "").strip()
-            messages = value.get("messages") or []
-
-            if not messages:
-                # Pure status update (delivered/read/sent) — silently ignore
-                return {"ok": True, "skipped": "status_only"}
-
-            if not phone_number_id:
-                return {"ok": True, "skipped": "missing_phone_number_id"}
-
-            # ── resolve tenant from phone_number_id (unique across clinics) ──
-            tenant_id = await _resolve_tenant_by_credential(
-                "meta_phone_number_id", phone_number_id, db,
-            )
-            if not tenant_id:
-                # Parity with Z-API/Evolution warning so ops can grep for the
-                # same signal across all three channels
-                logger.warning(
-                    "Meta webhook: no tenant for phone_number_id %s",
-                    phone_number_id,
+            entry_pnid = str((metadata or {}).get("phone_number_id") or "").strip()
+            # Any change referencing a different phone id under the same
+            # (authenticated) body is a mixed-tenant attempt — reject the
+            # whole request rather than partially processing it.
+            if entry_pnid and entry_pnid != phone_number_id:
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": "invalid_webhook_auth"},
                 )
-                return {"ok": True, "skipped": "unknown_phone_number_id"}
+            messages = value.get("messages") or []
+            if not messages:
+                continue
 
             # ── contact / sender metadata ──
             contacts = value.get("contacts") or []
@@ -1735,7 +2321,10 @@ async def meta_webhook(
             # the Meta dashboard
             logger.info(
                 "Meta webhook received message id=%s type=%s from=%s tenant=%s",
-                message_id, msg_type, from_phone, tenant_id,
+                message_id,
+                msg_type,
+                from_phone,
+                tenant_id,
             )
 
             if not from_phone:
@@ -1797,29 +2386,38 @@ async def meta_webhook(
                 if await _meta_get_pending_file_review(session_id, db):
                     if _detect_forward_intent(message_text):
                         await _meta_initiate_file_handoff(
-                            tenant_id, session_id, from_phone,
+                            tenant_id,
+                            session_id,
+                            from_phone,
                             "file_pending_review",
                         )
                         await _meta_clear_pending_file_review(session_id, db)
                         await db.commit()
                         if meta_pnid and meta_token:
                             confirm_msg = (
-                                _FILE_FORWARDED_MSG_EN if agent_lang == "en"
+                                _FILE_FORWARDED_MSG_EN
+                                if agent_lang == "en"
                                 else _FILE_FORWARDED_MSG_PT
                             )
                             try:
                                 send_result = await send_meta_cloud_text(
-                                    meta_pnid, meta_token, from_phone, confirm_msg,
+                                    meta_pnid,
+                                    meta_token,
+                                    from_phone,
+                                    confirm_msg,
                                 )
                                 _track_meta_sent_message(send_result)
                                 _fwd_mid = extract_meta_message_id(send_result)
                                 if _fwd_mid:
-                                    await _store_ai_msg_id_to_db(session_id, _fwd_mid, db)
+                                    await _store_ai_msg_id_to_db(
+                                        session_id, _fwd_mid, db
+                                    )
                                     await db.commit()
                             except Exception as exc:
                                 logger.exception(
                                     "Meta file-forward confirmation send failed for %s — %s",
-                                    from_phone, exc,
+                                    from_phone,
+                                    exc,
                                 )
                         return {
                             "ok": True,
@@ -1834,9 +2432,7 @@ async def meta_webhook(
             elif msg_type in _META_AUDIO_TYPES:
                 audio_obj = msg.get("audio") or msg.get("voice") or {}
                 media_id = str(audio_obj.get("id") or "")
-                mime_type = str(
-                    audio_obj.get("mime_type") or "audio/ogg"
-                )
+                mime_type = str(audio_obj.get("mime_type") or "audio/ogg")
 
                 if not media_id:
                     return {"ok": True, "skipped": "missing_media_id"}
@@ -1847,13 +2443,21 @@ async def meta_webhook(
                     )
                     return {"ok": True, "skipped": "no_credentials"}
 
+                # Gate: STT providers without a runtime adapter must not
+                # produce any effect — skip before resolve/download/STT/reply.
+                _meta_stt_provider = _stt_canonical_provider(creds.get("stt_provider"))
+                if _meta_stt_provider in UNSUPPORTED_STT_PROVIDERS:
+                    return _stt_skip_envelope(_meta_stt_provider)
+
                 # 1) Resolve media_id → signed URL (+ file_size / mime)
                 try:
                     media_info = await resolve_meta_media(media_id, meta_token)
                 except Exception as exc:
                     logger.warning(
                         "Meta media resolve failed for %s tenant=%s — %s",
-                        media_id, tenant_id, exc,
+                        media_id,
+                        tenant_id,
+                        exc,
                     )
                     return {"ok": True, "skipped": "media_resolve_failed"}
 
@@ -1861,7 +2465,8 @@ async def meta_webhook(
                 if not media_url:
                     logger.warning(
                         "Meta media resolve returned no url for %s tenant=%s",
-                        media_id, tenant_id,
+                        media_id,
+                        tenant_id,
                     )
                     return {"ok": True, "skipped": "media_resolve_failed"}
 
@@ -1875,51 +2480,70 @@ async def meta_webhook(
                 max_bytes = audio_max_seconds * _META_AUDIO_APPROX_BYTES_PER_SECOND
                 if file_size and file_size > max_bytes:
                     handoff_msg = (
-                        _AUDIO_TOO_LONG_MSG_EN if agent_lang == "en"
+                        _AUDIO_TOO_LONG_MSG_EN
+                        if agent_lang == "en"
                         else _AUDIO_TOO_LONG_MSG_PT
                     )
                     if meta_pnid and meta_token:
                         try:
                             await send_meta_cloud_text(
-                                meta_pnid, meta_token, from_phone, handoff_msg,
+                                meta_pnid,
+                                meta_token,
+                                from_phone,
+                                handoff_msg,
                             )
                         except Exception as exc:
                             logger.warning(
                                 "Meta audio-too-long ack send failed for %s — %s",
-                                from_phone, exc,
+                                from_phone,
+                                exc,
                             )
                     await _meta_initiate_file_handoff(
-                        tenant_id, session_id, from_phone, "audio_too_long",
+                        tenant_id,
+                        session_id,
+                        from_phone,
+                        "audio_too_long",
                     )
                     logger.info(
                         "Meta audio too long (%d bytes > ~%ds*%dB) for %s — handoff",
-                        file_size, audio_max_seconds,
-                        _META_AUDIO_APPROX_BYTES_PER_SECOND, from_phone,
+                        file_size,
+                        audio_max_seconds,
+                        _META_AUDIO_APPROX_BYTES_PER_SECOND,
+                        from_phone,
                     )
                     return {"ok": True, "skipped": "audio_too_long"}
 
-                # 3) Download bytes (authenticated GET)
+                # 3) Download bytes — streaming with MIME allowlist + byte cap
+                # (max_bytes already computed for the size-check above)
                 try:
-                    audio_bytes = await download_meta_media(media_url, meta_token)
+                    audio_bytes = await download_meta_media_audio(
+                        media_url, meta_token, max_bytes=max_bytes
+                    )
                 except Exception as exc:
                     logger.warning(
                         "Meta audio download failed for %s tenant=%s — %s",
-                        media_id, tenant_id, exc,
+                        media_id,
+                        tenant_id,
+                        exc,
                     )
                     return {"ok": True, "skipped": "media_download_failed"}
 
                 # 4) Transcribe via the same Whisper/STT client used by Z-API
                 try:
-                    message_text = await _meta_transcribe_audio(
-                        audio_bytes=audio_bytes,
-                        mime_type=mime_type,
-                        creds=creds,
-                        agent_language=agent_lang,
-                    ) or ""
+                    message_text = (
+                        await _meta_transcribe_audio(
+                            audio_bytes=audio_bytes,
+                            mime_type=mime_type,
+                            creds=creds,
+                            agent_language=agent_lang,
+                        )
+                        or ""
+                    )
                 except Exception as exc:
                     logger.exception(
                         "Meta audio transcription failed for %s — %s",
-                        from_phone, exc,
+                        from_phone,
+                        exc,
                     )
                     return {"ok": True, "skipped": "transcription_failed"}
 
@@ -1944,7 +2568,10 @@ async def meta_webhook(
 
                 try:
                     send_result = await send_meta_cloud_text(
-                        meta_pnid, meta_token, from_phone, ack_msg,
+                        meta_pnid,
+                        meta_token,
+                        from_phone,
+                        ack_msg,
                     )
                     _track_meta_sent_message(send_result)
                     _ack_mid = extract_meta_message_id(send_result)
@@ -1953,11 +2580,15 @@ async def meta_webhook(
                     await _meta_set_pending_file_review(session_id, db)
                     await db.commit()
                     logger.info(
-                        "Meta file ack sent to %s (type=%s)", from_phone, msg_type,
+                        "Meta file ack sent to %s (type=%s)",
+                        from_phone,
+                        msg_type,
                     )
                 except Exception as exc:
                     logger.exception(
-                        "Meta file ack send failed for %s — %s", from_phone, exc,
+                        "Meta file ack send failed for %s — %s",
+                        from_phone,
+                        exc,
                     )
                     return {
                         "ok": True,
@@ -1981,8 +2612,13 @@ async def meta_webhook(
                 lgpd_cfg = (clinic_config or {}).get("lgpd") or {}
                 if _is_enabled(lgpd_cfg.get("lgpd_enabled")):
                     try:
-                        _clinic_name = (clinic_config or {}).get("identity", {}).get(
-                            "clinic_name", "",
+                        _clinic_name = (
+                            (clinic_config or {})
+                            .get("identity", {})
+                            .get(
+                                "clinic_name",
+                                "",
+                            )
                         )
                         privacy_msg = _build_lgpd_message(
                             lgpd_cfg,
@@ -1991,7 +2627,10 @@ async def meta_webhook(
                             agent_language=_get_agent_language(clinic_config),
                         )
                         send_result = await send_meta_cloud_text(
-                            meta_pnid, meta_token, from_phone, privacy_msg,
+                            meta_pnid,
+                            meta_token,
+                            from_phone,
+                            privacy_msg,
                         )
                         _track_meta_sent_message(send_result)
                         _lgpd_mid = extract_meta_message_id(send_result)
@@ -2000,7 +2639,9 @@ async def meta_webhook(
                         logger.info("Meta LGPD privacy message sent to %s", from_phone)
                     except Exception as exc:
                         logger.warning(
-                            "Meta LGPD send failed for %s — %s", from_phone, exc,
+                            "Meta LGPD send failed for %s — %s",
+                            from_phone,
+                            exc,
                         )
 
             # ── pipeline ──
@@ -2041,7 +2682,10 @@ async def meta_webhook(
 
             try:
                 send_result = await send_meta_cloud_text(
-                    meta_pnid, meta_token, from_phone, suggested,
+                    meta_pnid,
+                    meta_token,
+                    from_phone,
+                    suggested,
                 )
                 _track_meta_sent_message(send_result)
                 _reply_mid = extract_meta_message_id(send_result)
@@ -2049,7 +2693,9 @@ async def meta_webhook(
                     await _store_ai_msg_id_to_db(session_id, _reply_mid, db)
                     await db.commit()  # commit metadata update immediately
                 logger.info(
-                    "Meta reply sent to %s (%d chars)", from_phone, len(suggested),
+                    "Meta reply sent to %s (%d chars)",
+                    from_phone,
+                    len(suggested),
                 )
             except Exception as exc:
                 logger.exception("Meta send failed for %s — %s", from_phone, exc)

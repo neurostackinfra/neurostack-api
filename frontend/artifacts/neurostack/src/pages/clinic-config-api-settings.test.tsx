@@ -1,0 +1,358 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { render, screen, waitFor, cleanup, fireEvent, within } from "@testing-library/react";
+import type { ReactNode } from "react";
+
+import {
+  ApiCredentialsForm,
+  describeConfigSaveFailure,
+  PROVIDERS,
+  SELECTABLE_LLM_PROVIDERS,
+  STT_PROVIDERS,
+  TTS_PROVIDERS,
+} from "./clinic-config";
+import { I18nProvider } from "@/context/i18n";
+
+// Backend canonical STT allowlist. Mirror of
+// `PROVIDER_ALLOWLISTS["stt"]` in `src/services/api_credentials.py`.
+// Any drift here breaks credential save/load parity.
+const BACKEND_STT_IDS: readonly string[] = [
+  "outros",
+  "openai_whisper",
+  "elevenlabs_scribe",
+  "google_stt",
+  "deepgram_stt",
+  "microsoft_stt",
+];
+
+// Backend canonical LLM allowlist (excluding `slm_cortex` which the backend
+// rejects for writes — see `_llm_operational`). The frontend must never send
+// `slm_cortex` in a PATCH body.
+const BACKEND_LLM_OPERATIONAL: readonly string[] = ["openai", "dropout", "outros"];
+const BACKEND_TTS_IDS: readonly string[] = ["elevenlabs", "google"];
+
+function Wrapper({ children }: { children: ReactNode }) {
+  return <I18nProvider>{children}</I18nProvider>;
+}
+
+interface FetchResponse {
+  ok: boolean;
+  status: number;
+  json: () => Promise<unknown>;
+}
+
+function jsonResponse(body: unknown, ok = true, status = 200): FetchResponse {
+  return {
+    ok,
+    status,
+    json: async () => body,
+  };
+}
+
+describe("describeConfigSaveFailure", () => {
+  it("identifies invalid backend fields without exposing their submitted values", () => {
+    const description = describeConfigSaveFailure({
+      detail: [{
+        type: "value_error",
+        loc: ["scheduling_link_url"],
+        msg: "Value error",
+        input: "sensitive-value-that-must-not-be-rendered",
+      }],
+    }, 422, "pt");
+
+    expect(description).toContain("link de agendamento");
+    expect(description).not.toContain("sensitive-value-that-must-not-be-rendered");
+  });
+
+  it("lists every invalid business-hours field using friendly labels", () => {
+    const description = describeConfigSaveFailure({
+      detail: [
+        { loc: ["business_hours_open"], input: "99:99" },
+        { loc: ["business_hours_days"], input: ["invalid-day"] },
+      ],
+    }, 422, "pt");
+
+    expect(description).toContain("horário de abertura");
+    expect(description).toContain("dias de atendimento");
+    expect(description).not.toContain("99:99");
+    expect(description).not.toContain("invalid-day");
+  });
+
+  it("translates authorization failures from their stable backend code", () => {
+    expect(describeConfigSaveFailure({
+      detail: { error: "target_tenant_forbidden" },
+    }, 403, "pt")).toBe("Você não tem permissão para alterar a configuração desta clínica.");
+  });
+
+  it("provides a useful fallback for server failures", () => {
+    expect(describeConfigSaveFailure(null, 500, "en"))
+      .toBe("The server could not save the configuration. Try again in a few moments.");
+  });
+});
+
+describe("Backend / frontend STT provider parity", () => {
+  it("STT_PROVIDERS covers every canonical id from the backend allowlist", () => {
+    const uiIds = STT_PROVIDERS.map(p => p.id).sort();
+    const backendIds = [...BACKEND_STT_IDS].sort();
+    expect(uiIds).toEqual(backendIds);
+  });
+
+  it("has exactly one entry per canonical id (no duplicates)", () => {
+    const ids = STT_PROVIDERS.map(p => p.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+});
+
+describe("LLM provider selection", () => {
+  it("declares slm_cortex only as a display-only (comingSoon) card", () => {
+    const cortex = PROVIDERS.find(p => p.id === "slm_cortex");
+    expect(cortex).toBeDefined();
+    expect(cortex?.comingSoon).toBe(true);
+  });
+
+  it("excludes slm_cortex from the selectable providers set", () => {
+    expect(SELECTABLE_LLM_PROVIDERS.has("slm_cortex")).toBe(false);
+  });
+
+  it("selectable set matches the backend operational allowlist", () => {
+    const selectable = [...SELECTABLE_LLM_PROVIDERS].sort();
+    const backend = [...BACKEND_LLM_OPERATIONAL].sort();
+    expect(selectable).toEqual(backend);
+  });
+});
+
+describe("Backend / frontend TTS provider parity", () => {
+  it("offers exactly ElevenLabs and Google Cloud TTS", () => {
+    expect(TTS_PROVIDERS.map(p => p.id).sort()).toEqual([...BACKEND_TTS_IDS].sort());
+    expect(TTS_PROVIDERS).toHaveLength(2);
+  });
+});
+
+describe("<ApiCredentialsForm /> — strict credential payload", () => {
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    localStorage.setItem("ns_auth", JSON.stringify({ token: "test-token" }));
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    localStorage.clear();
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("scopes the clinic through the query string without leaking clinic_id into the PATCH body", async () => {
+    const status = {
+      whatsapp_provider: "zapi",
+      zapi_instance_id: null,
+      zapi_token_set: false,
+      zapi_token_masked: null,
+      evolution_api_url: null,
+      evolution_instance_name: null,
+      evolution_api_key_set: false,
+      evolution_api_key_masked: null,
+      llm_api_key_set: false,
+      llm_api_key_masked: null,
+      llm_base_url: null,
+      llm_model_name: null,
+      tts_provider: "elevenlabs",
+      tts_api_url: "https://api.elevenlabs.io/v1",
+      tts_api_key_set: true,
+      tts_api_key_masked: "••••••••",
+      tts_model_name: "eleven_multilingual_v2",
+      apis_configured: false,
+    };
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PATCH") {
+        return jsonResponse({ ok: true, apis_configured: false });
+      }
+      return jsonResponse(status);
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="42" isReadOnly={false} isSuperAdmin={false} />
+      </Wrapper>,
+    );
+
+    const saveButton = await screen.findByRole("button", { name: /salvar configurações de api/i });
+    fireEvent.click(saveButton);
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(true);
+    });
+    const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    expect(patchCall).toBeDefined();
+    expect(String(patchCall?.[0])).toBe("/v1/config/api-credentials?clinic_id=42");
+    const payload = JSON.parse(String(patchCall?.[1]?.body));
+    expect(payload).not.toHaveProperty("clinic_id");
+    expect(payload).not.toHaveProperty("tts_provider");
+  });
+
+  it("renders both TTS choices and submits a Google Cloud configuration", async () => {
+    const status = {
+      whatsapp_provider: "zapi",
+      zapi_instance_id: null,
+      zapi_token_set: false,
+      zapi_token_masked: null,
+      evolution_api_url: null,
+      evolution_instance_name: null,
+      evolution_api_key_set: false,
+      evolution_api_key_masked: null,
+      llm_api_key_set: false,
+      llm_api_key_masked: null,
+      llm_base_url: null,
+      llm_model_name: null,
+      tts_provider: null,
+      tts_api_url: null,
+      tts_api_key_set: false,
+      tts_api_key_masked: null,
+      tts_model_name: null,
+      apis_configured: false,
+    };
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PATCH") {
+        return jsonResponse({ ok: true, apis_configured: false });
+      }
+      return jsonResponse(status);
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="42" isReadOnly={false} isSuperAdmin={false} />
+      </Wrapper>,
+    );
+
+    const ttsSection = await screen.findByTestId("tts-settings-section");
+    expect(within(ttsSection).getByTestId("tts-provider-elevenlabs")).toBeInTheDocument();
+    expect(within(ttsSection).getByTestId("tts-provider-google")).toBeInTheDocument();
+    expect(within(ttsSection).queryByTestId("tts-provider-microsoft")).not.toBeInTheDocument();
+
+    fireEvent.click(within(ttsSection).getByTestId("tts-provider-google"));
+    fireEvent.change(within(ttsSection).getByPlaceholderText("AIza..."), {
+      target: { value: "synthetic-google-tts-key" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /salvar/i }));
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(true);
+    });
+    const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const payload = JSON.parse(String(patchCall?.[1]?.body));
+    expect(payload).toMatchObject({
+      tts_provider: "google",
+      tts_api_url: "https://texttospeech.googleapis.com/v1",
+      tts_api_key: "synthetic-google-tts-key",
+      tts_model_name: "pt-BR-Neural2-A",
+    });
+  });
+});
+
+describe("<ApiCredentialsForm /> — Meta signature_pending banner", () => {
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    // Provide a JSON mock so the component's fetch(...) resolves.
+    globalThis.fetch = vi.fn() as unknown as typeof fetch;
+    // Provide a minimal localStorage stub for the getToken() helper.
+    if (!globalThis.localStorage) {
+      let store: Record<string, string> = {};
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).localStorage = {
+        getItem: (k: string) => store[k] ?? null,
+        setItem: (k: string, v: string) => { store[k] = String(v); },
+        removeItem: (k: string) => { delete store[k]; },
+        clear: () => { store = {}; },
+      };
+    }
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("renders the signature_pending banner when meta_app_secret_set is false and identity is configured", async () => {
+    // fetchStatus returns a Meta-configured tenant WITHOUT app secret.
+    (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      jsonResponse({
+        zapi_instance_id: null,
+        zapi_token_set: false,
+        zapi_token_masked: null,
+        whatsapp_provider: "meta_cloud",
+        evolution_api_url: null,
+        evolution_instance_name: null,
+        evolution_api_key_set: false,
+        evolution_api_key_masked: null,
+        meta_phone_number_id: "1234567890",
+        meta_waba_id: "9876543210",
+        meta_permanent_token_set: true,
+        meta_permanent_token_masked: "EAAG****abcd",
+        meta_app_secret_set: false,
+        meta_app_secret_masked: null,
+        meta_verify_token: null,
+        llm_api_key_set: false,
+        llm_api_key_masked: null,
+        llm_base_url: null,
+        llm_model_name: null,
+        apis_configured: false,
+      }),
+    );
+
+    render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="42" isReadOnly={false} isSuperAdmin={false} />
+      </Wrapper>,
+    );
+
+    // The banner is only shown after fetchStatus resolves.
+    await waitFor(() => {
+      expect(screen.getByTestId("meta-signature-pending-banner")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("meta-signature-pending-badge")).toBeInTheDocument();
+    // Meta App Secret field is rendered (marked required indirectly via label).
+    expect(screen.getByTestId("meta-app-secret-field")).toBeInTheDocument();
+  });
+
+  it("does NOT render the banner when meta_app_secret_set is true", async () => {
+    (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      jsonResponse({
+        zapi_instance_id: null,
+        zapi_token_set: false,
+        zapi_token_masked: null,
+        whatsapp_provider: "meta_cloud",
+        evolution_api_url: null,
+        evolution_instance_name: null,
+        evolution_api_key_set: false,
+        evolution_api_key_masked: null,
+        meta_phone_number_id: "1234567890",
+        meta_waba_id: "9876543210",
+        meta_permanent_token_set: true,
+        meta_permanent_token_masked: "EAAG****abcd",
+        meta_app_secret_set: true,
+        meta_app_secret_masked: "shhh****",
+        meta_verify_token: "verify_xxx",
+        llm_api_key_set: false,
+        llm_api_key_masked: null,
+        llm_base_url: null,
+        llm_model_name: null,
+        apis_configured: true,
+      }),
+    );
+
+    render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="42" isReadOnly={false} isSuperAdmin={false} />
+      </Wrapper>,
+    );
+
+    // Wait for load to complete so the banner would have appeared if applicable.
+    await waitFor(() => {
+      expect(screen.getByTestId("meta-app-secret-field")).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("meta-signature-pending-banner")).not.toBeInTheDocument();
+  });
+});

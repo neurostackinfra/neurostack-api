@@ -8,7 +8,6 @@ from typing import Any, Union
 
 from src.models.clinic_config_table import ClinicConfigTable
 
-
 # ============================================
 # Field-to-Bucket Mapping
 # ============================================
@@ -79,22 +78,6 @@ FIELD_TO_BUCKET: dict[str, str] = {
     # top-level array buckets (field name == bucket name)
     "professionals": "professionals",
     "services": "services",
-    # api_credentials
-    "whatsapp_provider": "api_credentials",
-    "zapi_instance_id": "api_credentials",
-    "zapi_token": "api_credentials",
-    "evolution_api_url": "api_credentials",
-    "evolution_instance_name": "api_credentials",
-    "evolution_api_key": "api_credentials",
-    "llm_api_key": "api_credentials",
-    "llm_api_url": "api_credentials",
-    "llm_provider": "api_credentials",
-    "llm_model_name": "api_credentials",
-    "whisper_api_key": "api_credentials",
-    "whisper_model": "api_credentials",
-    "audio_max_seconds": "api_credentials",
-    "stt_provider": "api_credentials",
-    "stt_api_url": "api_credentials",
 }
 
 # All JSONB bucket column names on ClinicConfigTable
@@ -110,7 +93,6 @@ ALL_BUCKETS = [
     "lgpd",
     "professionals",
     "services",
-    "api_credentials",
 ]
 
 # Buckets that are stored as arrays (not dicts)
@@ -131,7 +113,9 @@ def flatten_config(config_row: ClinicConfigTable) -> dict[str, Any]:
     }
 
     for bucket in ALL_BUCKETS:
-        data = getattr(config_row, bucket, None) or ({} if bucket not in ARRAY_BUCKETS else [])
+        data = getattr(config_row, bucket, None) or (
+            {} if bucket not in ARRAY_BUCKETS else []
+        )
         if bucket in ARRAY_BUCKETS:
             # Array buckets go directly as a top-level key
             flat[bucket] = data
@@ -143,7 +127,9 @@ def flatten_config(config_row: ClinicConfigTable) -> dict[str, Any]:
     return flat
 
 
-def unflatten_patch(patch: dict[str, Any]) -> dict[str, Union[dict[str, Any], list]]:
+def unflatten_patch(
+    patch: dict[str, Any],
+) -> dict[str, Union[dict[str, Any], list[Any]]]:
     """
     Group patch fields by their target JSONB bucket.
 

@@ -4,7 +4,7 @@ Business logic for event processing and management.
 """
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,13 +23,19 @@ from src.api.schemas.events import (
     SRMDecision,
     StatePatch,
 )
-
+from src.config.logging import get_logger
+from src.core.exceptions import EventStoreError
 from src.memory import EventData, get_event_store
+from src.models.session import CognitiveStateData
 from src.repositories import EventRepository
 from src.repositories.session import SessionRepository
-from src.models.session import CognitiveStateData
-from src.core.exceptions import EventStoreError
-from src.config.logging import get_logger
+from src.services.api_credentials import (
+    LLM_OVERLAY_FIELDS,
+    build_cache_payload,
+    compose_llm_credentials,
+    config_cache_key,
+    is_cache_v2_payload,
+)
 
 logger = get_logger(__name__)
 
@@ -70,7 +76,11 @@ def _filter_relevant_sources(
         # Check if any significant word from the content appears in the combined text
         # Split content into tokens, check tokens >= 3 chars to avoid noise
         content_lower = content.lower()
-        tokens = [t for t in content_lower.replace(",", " ").replace("-", " ").split() if len(t) >= 3]
+        tokens = [
+            t
+            for t in content_lower.replace(",", " ").replace("-", " ").split()
+            if len(t) >= 3
+        ]
 
         if not tokens:
             continue
@@ -87,11 +97,28 @@ def _filter_relevant_sources(
         if content_lower in ("yes", "no", "true", "false", "both", "sim", "não"):
             # Map field to related keywords
             _FIELD_KEYWORDS: dict[str, list[str]] = {
-                "business_rules.provide_prices": ["preço", "preco", "valor", "custo", "price", "quanto custa"],
-                "business_rules.accepts_insurance": ["convênio", "convenio", "plano", "insurance"],
+                "business_rules.provide_prices": [
+                    "preço",
+                    "preco",
+                    "valor",
+                    "custo",
+                    "price",
+                    "quanto custa",
+                ],
+                "business_rules.accepts_insurance": [
+                    "convênio",
+                    "convenio",
+                    "plano",
+                    "insurance",
+                ],
                 "persona.use_emojis": ["emoji"],
                 "persona.language_policy": ["idioma", "língua", "lingua", "language"],
-                "operations.service_format": ["formato", "presencial", "online", "teleconsulta"],
+                "operations.service_format": [
+                    "formato",
+                    "presencial",
+                    "online",
+                    "teleconsulta",
+                ],
             }
             keywords = _FIELD_KEYWORDS.get(field, [])
             if any(kw in combined for kw in keywords):
@@ -107,61 +134,242 @@ def _filter_relevant_sources(
 
 
 # ============================================
-# Clinic Config Cache (Redis, TTL-based)
+# Clinic Config Cache (Redis, v2 marker + projected credentials only)
 # ============================================
 _CONFIG_CACHE_TTL = 900  # 15 minutes
-_CONFIG_CACHE_PREFIX = "neurostack:clinic_config"
+
+
+async def _open_redis() -> Optional[Any]:
+    """Return a Redis client or None if the module/URL is unavailable."""
+    try:
+        import redis.asyncio as aioredis  # noqa: WPS433 (local import for testability)
+
+        from src.config.settings import get_settings
+
+        client: Any = aioredis.from_url(get_settings().redis_url, decode_responses=True)
+        return client
+    except Exception:
+        return None
+
+
+async def _delete_cache_entry(tenant_id: UUID) -> bool:
+    """Delete a stale cache entry. Returns True on confirmed delete, False on error."""
+    client = await _open_redis()
+    if client is None:
+        return False
+    try:
+        await client.delete(config_cache_key(tenant_id))
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
 
 
 async def _get_cached_config(tenant_id: UUID) -> Optional[dict]:
-    """Try to load clinic config from Redis cache."""
-    try:
-        import redis.asyncio as aioredis
-        import json
-        from src.config.settings import get_settings
-        r = aioredis.from_url(get_settings().redis_url, decode_responses=True)
+    """Return the cached config only when the v2 marker matches.
+
+    Any other outcome (missing entry, invalid JSON, stale marker) causes a DEL
+    attempt. If the DEL fails, the caller must NOT reuse or renew the entry —
+    we return ``None`` in every non-v2 case so the loader falls through to DB.
+    """
+    client = await _open_redis()
+    raw: Optional[str] = None
+    if client is not None:
         try:
-            raw = await r.get(f"{_CONFIG_CACHE_PREFIX}:{tenant_id}")
-            if raw:
-                return json.loads(raw)
+            raw = await client.get(config_cache_key(tenant_id))
+        except Exception:
+            raw = None
         finally:
-            await r.aclose()
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+    if raw is None:
+        # Missing entry: no need to DEL, no reuse.
+        return None
+
+    try:
+        import json
+
+        payload = json.loads(raw)
     except Exception:
-        pass
+        payload = None
+
+    if is_cache_v2_payload(payload):
+        return dict(payload) if isinstance(payload, dict) else None
+
+    # Marker absent/invalid: DEL before any DB load. Failure to delete does not
+    # allow reuse or renew — the loader will refuse to SET after DB load.
+    await _delete_cache_entry(tenant_id)
     return None
 
 
-async def _set_cached_config(tenant_id: UUID, config: dict) -> None:
-    """Store clinic config in Redis cache with TTL."""
+async def _set_cached_config(tenant_id: UUID, config: dict) -> bool:
+    """Store the v2-projected snapshot. Returns True on confirmed write.
+
+    Callers must project via ``build_cache_payload`` (or a helper that already
+    did) BEFORE invoking this function. This function refuses to write anything
+    without the schema marker present.
+    """
+    if not is_cache_v2_payload(config):
+        # Defensive: never write an unmarked/legacy payload.
+        return False
+    client = await _open_redis()
+    if client is None:
+        return False
     try:
-        import redis.asyncio as aioredis
         import json
-        from src.config.settings import get_settings
-        r = aioredis.from_url(get_settings().redis_url, decode_responses=True)
-        try:
-            await r.set(
-                f"{_CONFIG_CACHE_PREFIX}:{tenant_id}",
-                json.dumps(config),
-                ex=_CONFIG_CACHE_TTL,
-            )
-        finally:
-            await r.aclose()
+
+        await client.set(
+            config_cache_key(tenant_id),
+            json.dumps(config),
+            ex=_CONFIG_CACHE_TTL,
+        )
+        return True
     except Exception:
-        pass
+        return False
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
 
 
 async def invalidate_clinic_config_cache(tenant_id: UUID) -> None:
     """Invalidate cached clinic config for a tenant. Call after config updates."""
+    await _delete_cache_entry(tenant_id)
+
+
+# ============================================
+# DB-only loader (no JWT, no cache) with builder-owner resolution
+# ============================================
+
+
+async def _resolve_builder_owner_tenant_id(
+    db_session: Any, tenant_id: UUID
+) -> Optional[UUID]:
+    """Resolve the single builder-owner tenant for the given clinic tenant.
+
+    Rules (see WISH Group 3 deliverable 1):
+      * Tenant.builder_id must be set.
+      * Owner candidates are users where ``User.builder_id == Tenant.builder_id``
+        AND ``User.role == "builder"``.
+      * Group by distinct ``User.tenant_id``. Cardinality must be exactly 1;
+        zero or multiple distinct tenants is ``builder_llm_owner_ambiguous``
+        and returns ``None`` without any secret exposure.
+    """
+    from sqlalchemy import select
+
+    from src.models.tenant import Tenant
+    from src.models.user import User
+
+    tenant_row = (
+        await db_session.execute(select(Tenant).where(Tenant.id == tenant_id))
+    ).scalar_one_or_none()
+    if tenant_row is None or tenant_row.builder_id is None:
+        return None
+
+    distinct_stmt = (
+        select(User.tenant_id)
+        .where(
+            User.builder_id == tenant_row.builder_id,
+            User.role == "builder",
+        )
+        .distinct()
+    )
+    distinct_result = await db_session.execute(distinct_stmt)
+    owner_tenant_ids = [row for row in distinct_result.scalars().all() if row]
+
+    if len(owner_tenant_ids) != 1:
+        logger.warning(
+            "builder_llm_owner_ambiguous",
+            tenant_id=str(tenant_id),
+            builder_id=str(tenant_row.builder_id),
+            candidate_count=len(owner_tenant_ids),
+        )
+        return None
+    resolved: UUID = owner_tenant_ids[0]
+    return resolved
+
+
+async def _load_config_from_db(tenant_id: UUID) -> Optional[dict]:
+    """Load a clinic config row with composed LLM overlay applied.
+
+    Returns the flat dict WITH raw ``api_credentials`` (secrets present).
+    Internal use only: callers must either project via ``build_cache_payload``
+    before caching, or use ``_load_runtime_llm_credentials`` which keeps raw
+    only in memory for the outbound call.
+    """
     try:
-        import redis.asyncio as aioredis
-        from src.config.settings import get_settings
-        r = aioredis.from_url(get_settings().redis_url, decode_responses=True)
-        try:
-            await r.delete(f"{_CONFIG_CACHE_PREFIX}:{tenant_id}")
-        finally:
-            await r.aclose()
-    except Exception:
-        pass
+        from sqlalchemy import select
+
+        from src.models.clinic_config_table import ClinicConfigTable
+        from src.repositories import get_db_session
+
+        async with get_db_session() as db_session:
+            row = (
+                await db_session.execute(
+                    select(ClinicConfigTable).where(
+                        ClinicConfigTable.tenant_id == tenant_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+
+            clinic_creds: dict = dict(row.api_credentials or {})
+            builder_creds: Optional[dict] = None
+
+            owner_tenant_id = await _resolve_builder_owner_tenant_id(
+                db_session, tenant_id
+            )
+            if owner_tenant_id is not None and owner_tenant_id != tenant_id:
+                builder_row = (
+                    await db_session.execute(
+                        select(ClinicConfigTable).where(
+                            ClinicConfigTable.tenant_id == owner_tenant_id
+                        )
+                    )
+                ).scalar_one_or_none()
+                if builder_row is not None:
+                    builder_creds = dict(builder_row.api_credentials or {})
+
+            composed = compose_llm_credentials(clinic_creds, builder_creds)
+
+            return {
+                "identity": row.identity or {},
+                "persona": row.persona or {},
+                "operations": row.operations or {},
+                "business_rules": row.business_rules or {},
+                "services": row.services or {},
+                "pricing": row.pricing or {},
+                "handoff": row.handoff or {},
+                "professionals": row.professionals or [],
+                "api_credentials": composed,
+                "lgpd": row.lgpd or {},
+            }
+    except Exception as exc:
+        logger.warning("Failed to load clinic config", error=str(exc))
+        return None
+
+
+async def _load_runtime_llm_credentials(tenant_id: UUID) -> dict:
+    """Return exactly the four LLM fields needed for an outbound LLM call.
+
+    JWT-free, DB-only. Raw key stays in the returned dict for the duration of
+    the caller's request; it is NEVER cached, projected, or reserialized.
+    Returns an empty dict if the tenant/config is missing or resolution fails.
+    """
+    loaded = await _load_config_from_db(tenant_id)
+    if loaded is None:
+        return {}
+    creds = loaded.get("api_credentials") or {}
+    return {field: creds.get(field) for field in LLM_OVERLAY_FIELDS if creds.get(field)}
 
 
 class EventService:
@@ -182,84 +390,36 @@ class EventService:
         # Lazy import to avoid circular dependency
         if pipeline is None:
             from src.core.pipeline import get_cognitive_pipeline
+
             pipeline = get_cognitive_pipeline()
         self._pipeline = pipeline
         self._event_repo = event_repo
 
     async def _load_clinic_config(self, tenant_id: UUID) -> Optional[dict]:
-        """Load clinic config, hitting Redis cache first, then DB."""
-        # Check cache first
+        """Load projected clinic config from cache or DB.
+
+        Public callers receive the v2 projected snapshot: ``api_credentials``
+        never contains raw secrets. When a runtime consumer needs LLM key
+        material for an outbound call, it MUST use
+        ``_load_runtime_llm_credentials`` instead.
+        """
         cached = await _get_cached_config(tenant_id)
         if cached is not None:
             return cached
 
-        try:
-            from src.repositories import get_db_session
-            from src.models.clinic_config_table import ClinicConfigTable
-            from sqlalchemy import select
+        loaded = await _load_config_from_db(tenant_id)
+        if loaded is None:
+            return None
 
-            from src.models.tenant import Tenant
-
-            async with get_db_session() as db_session:
-                stmt = select(ClinicConfigTable).where(
-                    ClinicConfigTable.tenant_id == tenant_id
-                )
-                result = await db_session.execute(stmt)
-                row = result.scalar_one_or_none()
-                if row:
-                    api_creds = row.api_credentials or {}
-
-                    # Fallback: if clinic has no LLM credentials, inherit from builder's tenant
-                    if not api_creds.get("llm_api_key"):
-                        from src.models.user import User
-
-                        tenant_stmt = select(Tenant).where(Tenant.id == tenant_id)
-                        tenant_result = await db_session.execute(tenant_stmt)
-                        tenant_row = tenant_result.scalar_one_or_none()
-                        if tenant_row and tenant_row.builder_id:
-                            # Find builder user's tenant via users table
-                            builder_user_stmt = (
-                                select(User.tenant_id)
-                                .where(User.role == "builder")
-                                .join(Tenant, User.tenant_id == Tenant.id)
-                                .limit(1)
-                            )
-                            builder_user_result = await db_session.execute(builder_user_stmt)
-                            builder_tenant_id = builder_user_result.scalar_one_or_none()
-                            if builder_tenant_id:
-                                builder_config_stmt = select(ClinicConfigTable).where(
-                                    ClinicConfigTable.tenant_id == builder_tenant_id
-                                )
-                                builder_config_result = await db_session.execute(builder_config_stmt)
-                                builder_config_row = builder_config_result.scalar_one_or_none()
-                                if builder_config_row and (builder_config_row.api_credentials or {}).get("llm_api_key"):
-                                    api_creds = builder_config_row.api_credentials
-                                    logger.info(
-                                        "Using builder LLM credentials for clinic",
-                                        tenant_id=str(tenant_id),
-                                        builder_tenant_id=str(builder_tenant_id),
-                                    )
-
-                    config = {
-                        "identity": row.identity or {},
-                        "persona": row.persona or {},
-                        "operations": row.operations or {},
-                        "business_rules": row.business_rules or {},
-                        "services": row.services or {},
-                        "pricing": row.pricing or {},
-                        "handoff": row.handoff or {},
-                        "professionals": row.professionals or [],
-                        "api_credentials": api_creds,
-                        "lgpd": row.lgpd or {},
-                    }
-                    await _set_cached_config(tenant_id, config)
-                    return config
-        except Exception as exc:
-            logger.warning("Failed to load clinic config", error=str(exc))
-        return None
+        payload = build_cache_payload(loaded)
+        # SET is best-effort: failure never falls back to legacy formats.
+        await _set_cached_config(tenant_id, payload)
+        return payload
 
     async def _load_session_state(
-        self, session_id: UUID, db: Optional[AsyncSession],
+        self,
+        session_id: UUID,
+        db: Optional[AsyncSession],
     ) -> CognitiveStateData:
         """Load cognitive state from PG Session, fallback to default."""
         if db:
@@ -268,19 +428,33 @@ class EventService:
                 session_row = await repo.get_by_id(session_id)
                 if session_row and session_row.cognitive_state:
                     state = session_row.get_cognitive_state()
-                    logger.info("session_state_loaded",
-                        state_source="pg", session_id=str(session_id),
-                        turn_count=state.turn_count, funnel_stage=state.funnel_stage)
+                    logger.info(
+                        "session_state_loaded",
+                        state_source="pg",
+                        session_id=str(session_id),
+                        turn_count=state.turn_count,
+                        funnel_stage=state.funnel_stage,
+                    )
                     return state
             except Exception as exc:
-                logger.warning("Failed to load session state from PG",
-                    session_id=str(session_id), error=str(exc))
-        logger.info("session_state_loaded",
-            state_source="default", session_id=str(session_id), turn_count=0)
+                logger.warning(
+                    "Failed to load session state from PG",
+                    session_id=str(session_id),
+                    error=str(exc),
+                )
+        logger.info(
+            "session_state_loaded",
+            state_source="default",
+            session_id=str(session_id),
+            turn_count=0,
+        )
         return CognitiveStateData()
 
     async def _persist_session_state(
-        self, session_id: UUID, result: "PipelineResult", db: Optional[AsyncSession],
+        self,
+        session_id: UUID,
+        result: "PipelineResult",
+        db: Optional[AsyncSession],
     ) -> None:
         """Persist pipeline result back to PG Session cognitive_state.
 
@@ -314,7 +488,9 @@ class EventService:
                 if result.paused_until:
                     from datetime import datetime
 
-                    session_row.paused_until = datetime.fromisoformat(result.paused_until)
+                    session_row.paused_until = datetime.fromisoformat(
+                        result.paused_until
+                    )
                 else:
                     session_row.paused_until = None
                 logger.info(
@@ -328,14 +504,20 @@ class EventService:
             await db.flush()
 
     async def _load_message_history(
-        self, tenant_id: UUID, session_id: UUID, db: Optional[AsyncSession], limit: int = 20,
+        self,
+        tenant_id: UUID,
+        session_id: UUID,
+        db: Optional[AsyncSession],
+        limit: int = 20,
     ) -> list[dict[str, str]]:
         """Reconstruct conversation history from Event Store for multi-turn LLM context."""
         if not db:
             return []
         try:
-            from sqlalchemy import select, or_
+            from sqlalchemy import or_, select
+
             from src.models.event import Event as EventModel
+
             stmt = (
                 select(EventModel)
                 .where(
@@ -367,13 +549,20 @@ class EventService:
                         history.append({"role": "assistant", "content": resp})
 
             if total_available >= limit:
-                logger.info("history_truncated",
-                    history_truncated=True, session_id=str(session_id),
-                    messages_available=total_available, messages_sent=len(history))
+                logger.info(
+                    "history_truncated",
+                    history_truncated=True,
+                    session_id=str(session_id),
+                    messages_available=total_available,
+                    messages_sent=len(history),
+                )
             return history
         except Exception as exc:
-            logger.warning("Failed to load message history",
-                session_id=str(session_id), error=str(exc))
+            logger.warning(
+                "Failed to load message history",
+                session_id=str(session_id),
+                error=str(exc),
+            )
             return []
 
     async def run_pipeline(
@@ -403,7 +592,8 @@ class EventService:
 
         # Load message history from Event Store
         message_history = await self._load_message_history(
-            request.tenant_id, request.session_id, session)
+            request.tenant_id, request.session_id, session
+        )
 
         # Build pipeline input with loaded state
         from src.core.pipeline import PipelineInput
@@ -449,10 +639,15 @@ class EventService:
         committed, so the connection is already released when this runs.
         """
         # Convert pipeline result to API response (LLM call happens here)
-        response, llm_usage, llm_model = await self._convert_pipeline_result_to_response(
-            result, user_message=request.payload.content, clinic_config=clinic_config,
-            tenant_id=request.tenant_id, message_history=message_history,
-            language=request.payload.language,
+        response, llm_usage, llm_model = (
+            await self._convert_pipeline_result_to_response(
+                result,
+                user_message=request.payload.content,
+                clinic_config=clinic_config,
+                tenant_id=request.tenant_id,
+                message_history=message_history,
+                language=request.payload.language,
+            )
         )
 
         # Save events to Event Store (separate DB connections, committed independently)
@@ -460,7 +655,8 @@ class EventService:
         if response.prompt and response.prompt.suggested_response:
             suggested_response = response.prompt.suggested_response
         await self._save_events_to_store(
-            request, result,
+            request,
+            result,
             suggested_response=suggested_response,
             llm_usage=llm_usage,
             llm_model=llm_model,
@@ -480,14 +676,21 @@ class EventService:
         The /v1/events route handler calls run_pipeline() + finish_response()
         directly so it can commit between the two phases.
         """
-        result, clinic_config, message_history = await self.run_pipeline(request, session)
+        result, clinic_config, message_history = await self.run_pipeline(
+            request, session
+        )
         # When session is provided the caller must commit — here we don't have
         # that responsibility, so just proceed to finish (stateless path).
-        return await self.finish_response(request, result, clinic_config, message_history)
+        return await self.finish_response(
+            request, result, clinic_config, message_history
+        )
 
     async def _convert_pipeline_result_to_response(
-        self, result: "PipelineResult", user_message: str = "",
-        clinic_config: Optional[dict] = None, tenant_id: Optional[UUID] = None,
+        self,
+        result: "PipelineResult",
+        user_message: str = "",
+        clinic_config: Optional[dict] = None,
+        tenant_id: Optional[UUID] = None,
         message_history: Optional[list[dict[str, str]]] = None,
         language: str = "pt-BR",
     ) -> tuple[EventResponse, dict, str]:
@@ -529,7 +732,9 @@ class EventService:
         suggested_response = None
         llm_usage: dict = {}
         llm_model: str = ""
-        language_code = language or "pt-BR"  # initialised here so handoff block can use it
+        language_code = (
+            language or "pt-BR"
+        )  # initialised here so handoff block can use it
         deterministic_response = getattr(result, "deterministic_response", None)
         if deterministic_response is not None:
             suggested_response = deterministic_response
@@ -539,49 +744,96 @@ class EventService:
             # risks wrong language ("atendente humano") and unwanted questions.
             try:
                 from src.llm.client import get_tenant_llm_client
-                api_creds = (clinic_config or {}).get("api_credentials", {})
+
+                # Runtime LLM call: cached config only contains the non-secret
+                # projection, so we resolve raw creds DB-only for this call.
+                # Raw key stays in-memory for the outbound request only.
+                api_creds = (
+                    await _load_runtime_llm_credentials(tenant_id) if tenant_id else {}
+                )
                 llm = get_tenant_llm_client(tenant_id, api_creds)
                 tenant_model = api_creds.get("llm_model_name") or None
                 if llm and user_message:
                     sys_prompt = result.system_prompt or ""
                     messages = [{"role": "system", "content": sys_prompt}]
                     # Insert conversation history for multi-turn context
-                    for msg in (message_history or []):
+                    for msg in message_history or []:
                         messages.append(msg)
                     messages.append({"role": "user", "content": user_message})
                     # Reinforce greeting for saudacao intent — LLM tends to echo patient's wrong greeting
                     if result.state_patch.get("last_intent") == "saudacao":
-                        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+                        from datetime import datetime as _dt
+                        from datetime import timedelta as _td
+                        from datetime import timezone as _tz
+
                         _h = _dt.now(_tz(_td(hours=-3))).hour
-                        _raw_emojis = (clinic_config or {}).get("identity", {}).get("use_emojis")
+                        _raw_emojis = (
+                            (clinic_config or {}).get("identity", {}).get("use_emojis")
+                        )
                         _use_emojis = _raw_emojis in (True, "yes", "true", "1", 1)
-                        _emoji_hint = " Use 1-2 emojis na resposta. 😊" if _use_emojis else ""
+                        _emoji_hint = (
+                            " Use 1-2 emojis na resposta. 😊" if _use_emojis else ""
+                        )
                         if language_code == "en":
-                            _g = "Good morning" if _h < 12 else ("Good afternoon" if _h < 18 else "Good evening")
-                            messages.append({"role": "system", "content": f'REMINDER: It is now {_dt.now(_tz(_td(hours=-3))).strftime("%H:%M")} BRT. Start your response with "{_g}!" — do NOT use any other greeting.{_emoji_hint}'})
+                            _g = (
+                                "Good morning"
+                                if _h < 12
+                                else ("Good afternoon" if _h < 18 else "Good evening")
+                            )
+                            messages.append(
+                                {
+                                    "role": "system",
+                                    "content": f'REMINDER: It is now {_dt.now(_tz(_td(hours=-3))).strftime("%H:%M")} BRT. Start your response with "{_g}!" — do NOT use any other greeting.{_emoji_hint}',
+                                }
+                            )
                         else:
-                            _g = "Bom dia" if _h < 12 else ("Boa tarde" if _h < 18 else "Boa noite")
-                            messages.append({"role": "system", "content": f'LEMBRETE: Agora são {_dt.now(_tz(_td(hours=-3))).strftime("%H:%M")} BRT. Comece sua resposta com "{_g}!" — NÃO use outra saudação.{_emoji_hint}'})
+                            _g = (
+                                "Bom dia"
+                                if _h < 12
+                                else ("Boa tarde" if _h < 18 else "Boa noite")
+                            )
+                            messages.append(
+                                {
+                                    "role": "system",
+                                    "content": f'LEMBRETE: Agora são {_dt.now(_tz(_td(hours=-3))).strftime("%H:%M")} BRT. Comece sua resposta com "{_g}!" — NÃO use outra saudação.{_emoji_hint}',
+                                }
+                            )
                     for attempt in range(2):
-                        logger.info("Calling LLM",
+                        logger.info(
+                            "Calling LLM",
                             attempt=attempt + 1,
                             prompt_len=len(sys_prompt),
                             user_msg_len=len(user_message),
                             mode=result.mode,
                             tenant_model=tenant_model,
                         )
-                        llm_result = await llm.generate(messages, model=tenant_model, max_tokens=300)
+                        llm_result = await llm.generate(
+                            messages, model=tenant_model, max_tokens=300
+                        )
                         suggested_response = llm_result.get("content", "")
                         llm_usage = llm_result.get("usage", {})
                         llm_model = llm_result.get("model", "")
                         if suggested_response:
-                            logger.info("LLM response generated", length=len(suggested_response), attempt=attempt + 1)
+                            logger.info(
+                                "LLM response generated",
+                                length=len(suggested_response),
+                                attempt=attempt + 1,
+                            )
                             break
-                        logger.warning("LLM returned empty, retrying" if attempt == 0 else "LLM empty after retry",
+                        logger.warning(
+                            (
+                                "LLM returned empty, retrying"
+                                if attempt == 0
+                                else "LLM empty after retry"
+                            ),
                             mode=result.mode,
                         )
                 else:
-                    logger.warning("LLM skipped", llm_configured=llm is not None, has_message=bool(user_message))
+                    logger.warning(
+                        "LLM skipped",
+                        llm_configured=llm is not None,
+                        has_message=bool(user_message),
+                    )
             except Exception as exc:
                 logger.error("LLM call failed", error=str(exc), exc_info=True)
 
@@ -597,9 +849,12 @@ class EventService:
         # not the this-turn patch, so a "particular" chosen turns ago still
         # suppresses the guard.
         if suggested_response:
-            _accepts_ins = (clinic_config or {}).get("business_rules", {}).get("accepts_insurance")
+            _accepts_ins = (
+                (clinic_config or {}).get("business_rules", {}).get("accepts_insurance")
+            )
             _insurance_active = bool(
-                _accepts_ins and str(_accepts_ins).lower() not in ("no", "false", "0", "none")
+                _accepts_ins
+                and str(_accepts_ins).lower() not in ("no", "false", "0", "none")
             )
             if _insurance_active:
                 self._pipeline.check_response_price_gate(
@@ -614,19 +869,21 @@ class EventService:
             # RULE: Never say "human agent", "transfer to human", or expose AI.
             # Always use "our team", "our specialist team", or "the right department".
             EN_HANDOFF_MESSAGES = {
-                "user_request":        "Of course! I'll connect you with our team right away. Someone will follow up with you shortly.",
-                "safety_concern":      "To make sure you get the best care, I'll connect you with our specialist team. Someone will be in touch soon.",
-                "max_turns_exceeded":  "To give you the best support, I'll connect you with the right department on our team.",
-                "low_confidence":      "To make sure you get the most complete guidance, I'll connect you with our specialist team.",
-                "escalation":          "I understand your situation. I'll connect you with the right team who can help you in the best way.",
-                "complex_query":       "This deserves more detailed attention. I'll connect you with our specialist team.",
-                "scheduling":          "I'll connect you with our team, who will follow up and confirm the best available times for you.",
+                "user_request": "Of course! I'll connect you with our team right away. Someone will follow up with you shortly.",
+                "safety_concern": "To make sure you get the best care, I'll connect you with our specialist team. Someone will be in touch soon.",
+                "max_turns_exceeded": "To give you the best support, I'll connect you with the right department on our team.",
+                "low_confidence": "To make sure you get the most complete guidance, I'll connect you with our specialist team.",
+                "escalation": "I understand your situation. I'll connect you with the right team who can help you in the best way.",
+                "complex_query": "This deserves more detailed attention. I'll connect you with our specialist team.",
+                "scheduling": "I'll connect you with our team, who will follow up and confirm the best available times for you.",
             }
             handoff_msg = result.handoff_user_message or ""
             if language_code == "en" and handoff_msg:
                 # Use top-level handoff_reason field (handoff_summary only carries id/status/summary/urgency/sector/sla)
                 handoff_reason = result.handoff_reason or "escalation"
-                handoff_msg = EN_HANDOFF_MESSAGES.get(handoff_reason, EN_HANDOFF_MESSAGES["escalation"])
+                handoff_msg = EN_HANDOFF_MESSAGES.get(
+                    handoff_reason, EN_HANDOFF_MESSAGES["escalation"]
+                )
             if handoff_msg:
                 if suggested_response:
                     suggested_response = f"{suggested_response}\n\n{handoff_msg}"
@@ -658,9 +915,7 @@ class EventService:
         context = ContextOutput(
             recent_messages=recent_messages,
             session_summary=result.context_summary,
-            context_sources=[
-                ContextSource(**src) for src in filtered_sources
-            ],
+            context_sources=[ContextSource(**src) for src in filtered_sources],
             turn_count=result.turn_count,
         )
 
@@ -683,20 +938,26 @@ class EventService:
                 urgency=result.handoff_summary.get("urgency", "normal"),
             )
 
-        return EventResponse(
-            event_id=result.event_id,
-            decision=decision,
-            state_patch=state_patch,
-            prompt=prompt,
-            context=context,
-            mode=flow_mode,
-            handoff_summary=handoff_summary,
-            processed_at=result.processed_at,
-            processing_time_ms=result.processing_time_ms,
-        ), llm_usage, llm_model
+        return (
+            EventResponse(
+                event_id=result.event_id,
+                decision=decision,
+                state_patch=state_patch,
+                prompt=prompt,
+                context=context,
+                mode=flow_mode,
+                handoff_summary=handoff_summary,
+                processed_at=result.processed_at,
+                processing_time_ms=result.processing_time_ms,
+            ),
+            llm_usage,
+            llm_model,
+        )
 
     async def _save_events_to_store(
-        self, request: EventRequest, result: "PipelineResult",
+        self,
+        request: EventRequest,
+        result: "PipelineResult",
         suggested_response: Optional[str] = None,
         llm_usage: Optional[dict] = None,
         llm_model: str = "",
@@ -752,8 +1013,11 @@ class EventService:
                     "llm_usage": llm_usage or {},
                     "funnel_stage": result.funnel_stage,
                     # Audio transcription metadata (from webhook payload)
-                    **{k: v for k, v in (request.payload.metadata or {}).items()
-                       if k in ("whisper_model", "is_audio", "audio_seconds")},
+                    **{
+                        k: v
+                        for k, v in (request.payload.metadata or {}).items()
+                        if k in ("whisper_model", "is_audio", "audio_seconds")
+                    },
                 },
             )
             await event_store.append(message_event)
@@ -765,12 +1029,20 @@ class EventService:
                 "abuse_risk": False,
                 "compliance_risk": False,
                 "reputacao_risco": False,
-                "urgencia_clinica": result.safety_category == "clinical_risk" if result.safety_category else False,
+                "urgencia_clinica": (
+                    result.safety_category == "clinical_risk"
+                    if result.safety_category
+                    else False
+                ),
                 "lead_irritado": False,
                 "pedido_promessa_resultado": False,
             }
             policy_refs = (result.state_patch or {}).get("policy_refs") or []
-            constraints = result.constraints if hasattr(result, "constraints") and result.constraints else (result.state_patch or {}).get("constraints") or []
+            constraints = (
+                result.constraints
+                if hasattr(result, "constraints") and result.constraints
+                else (result.state_patch or {}).get("constraints") or []
+            )
 
             decision_event = EventData(
                 id=result.event_id,
@@ -780,10 +1052,19 @@ class EventService:
                 event_data={
                     "version": 1,
                     "event_id": str(result.event_id),
-                    "timestamp": result.processed_at or datetime.now(timezone.utc).isoformat(),
+                    "timestamp": result.processed_at
+                    or datetime.now(timezone.utc).isoformat(),
                     "clinic_id": str(request.tenant_id),
-                    "user_id": getattr(request.payload, "user_id", None) if hasattr(request, "payload") else None,
-                    "channel": getattr(request.payload, "channel", "unknown") if hasattr(request, "payload") else "unknown",
+                    "user_id": (
+                        getattr(request.payload, "user_id", None)
+                        if hasattr(request, "payload")
+                        else None
+                    ),
+                    "channel": (
+                        getattr(request.payload, "channel", "unknown")
+                        if hasattr(request, "payload")
+                        else "unknown"
+                    ),
                     "message_id": None,
                     "intent": result.intent,
                     "action": result.action,
@@ -799,11 +1080,15 @@ class EventService:
                         "confidence": result.confidence,
                         "mode": result.mode,
                     },
-                    "handoff": {
-                        "handoff_required": result.handoff_required,
-                        "handoff_reason": result.handoff_reason,
-                        "handoff_summary": result.handoff_summary,
-                    } if result.handoff_required else None,
+                    "handoff": (
+                        {
+                            "handoff_required": result.handoff_required,
+                            "handoff_reason": result.handoff_reason,
+                            "handoff_summary": result.handoff_summary,
+                        }
+                        if result.handoff_required
+                        else None
+                    ),
                     "entities": {},
                     "justificativa_curta": result.reasoning,
                     "intent_category": result.intent_category,
@@ -820,7 +1105,9 @@ class EventService:
                 },
                 event_metadata={
                     "processing_time_ms": result.processing_time_ms,
-                    "processed_at": result.processed_at if result.processed_at else None,
+                    "processed_at": (
+                        result.processed_at if result.processed_at else None
+                    ),
                 },
             )
             await event_store.append(decision_event)
@@ -848,7 +1135,9 @@ class EventService:
                 },
                 event_metadata={
                     "processing_time_ms": result.processing_time_ms,
-                    "processed_at": result.processed_at if result.processed_at else None,
+                    "processed_at": (
+                        result.processed_at if result.processed_at else None
+                    ),
                     "stage_timings": result.stage_timings,
                 },
             )

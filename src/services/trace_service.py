@@ -14,9 +14,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.event import Event
+from src.models.session import Session
 from src.observability.pii import mask_carteirinha
 from src.services.business_hours import summarize_outside_hours
-
 
 _CONVERSATIONAL_MARKERS = (
     "intent",
@@ -32,9 +32,7 @@ def _is_conversational_trace(event_data: object, event_metadata: object) -> bool
     data = event_data if isinstance(event_data, dict) else {}
     metadata = event_metadata if isinstance(event_metadata, dict) else {}
 
-    if "decision" in data or any(
-        marker in data for marker in _CONVERSATIONAL_MARKERS
-    ):
+    if "decision" in data or any(marker in data for marker in _CONVERSATIONAL_MARKERS):
         return True
     return any(marker in metadata for marker in _CONVERSATIONAL_MARKERS)
 
@@ -57,11 +55,29 @@ def _base_trace_query(tenant_id: UUID):
     )
 
 
+def _user_identity_expression():
+    """Resolve the external phone/username attached to a message event."""
+    event_user_id = func.nullif(
+        func.trim(Event.event_data["user_id"].as_string()),
+        "",
+    )
+    session_user_id = func.nullif(func.trim(Session.user_id), "")
+    return func.coalesce(event_user_id, session_user_id)
+
+
+def _database_timestamp_utc(value: datetime) -> datetime:
+    """Normalize timestamps returned by PostgreSQL or SQLite to aware UTC."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _to_utc(dt: datetime) -> datetime:
     """Convert naive datetime (assumed BRT / UTC-3) to UTC-aware."""
     if dt.tzinfo is not None:
         return dt
-    from datetime import timezone, timedelta
+    from datetime import timedelta, timezone
+
     brt = timezone(timedelta(hours=-3))
     return dt.replace(tzinfo=brt).astimezone(timezone.utc)
 
@@ -93,9 +109,7 @@ def _apply_filters(
             Event.event_metadata["handoff_required"].as_boolean() == handoff_required
         )
     if channel is not None:
-        query = query.where(
-            Event.event_data["channel"].as_string() == channel
-        )
+        query = query.where(Event.event_data["channel"].as_string() == channel)
     return query
 
 
@@ -116,12 +130,20 @@ def _event_to_trace_dict(event: Event) -> dict:
         # Build decision from top-level keys in event_data
         srm_decision = {
             "intent": event_data.get("intent", metadata.get("intent", "unknown")),
-            "intent_category": event_data.get("intent_category", metadata.get("intent_category", "unknown")),
-            "funnel_stage": event_data.get("funnel_stage", metadata.get("funnel_stage", "unknown")),
+            "intent_category": event_data.get(
+                "intent_category", metadata.get("intent_category", "unknown")
+            ),
+            "funnel_stage": event_data.get(
+                "funnel_stage", metadata.get("funnel_stage", "unknown")
+            ),
             "action": event_data.get("action", metadata.get("action", "unknown")),
             "confidence": event_data.get("confidence", metadata.get("confidence", 0.0)),
-            "safety_concern": event_data.get("safety_concern", metadata.get("safety_concern", False)),
-            "handoff_required": event_data.get("handoff_required", metadata.get("handoff_required", False)),
+            "safety_concern": event_data.get(
+                "safety_concern", metadata.get("safety_concern", False)
+            ),
+            "handoff_required": event_data.get(
+                "handoff_required", metadata.get("handoff_required", False)
+            ),
         }
 
     # Mask carteirinha PII in every free-text field surfaced to the trace
@@ -172,7 +194,9 @@ async def list_traces(
         Tuple of (list of Event objects, total count)
     """
     base = _base_trace_query(tenant_id)
-    base = _apply_filters(base, start_date, end_date, safety_flag, handoff_required, channel)
+    base = _apply_filters(
+        base, start_date, end_date, safety_flag, handoff_required, channel
+    )
 
     # Count query
     count_query = select(func.count()).select_from(base.subquery())
@@ -272,15 +296,82 @@ async def get_trace_stats(
     else:
         start_date = _to_utc(start_date)
 
-    base = _base_trace_query(tenant_id)
-    base = base.where(
-        Event.created_at >= start_date,
-        Event.created_at <= end_date,
+    user_identity = _user_identity_expression().label("user_identity")
+    base = (
+        select(Event, user_identity)
+        .select_from(Event)
+        .outerjoin(Session, Session.id == Event.session_id)
+        .where(
+            Event.tenant_id == tenant_id,
+            Event.event_type == "message.in",
+            Event.created_at >= start_date,
+            Event.created_at <= end_date,
+        )
+        .order_by(Event.created_at.desc())
     )
 
-    # Fetch all matching events for aggregation
+    # Fetch all matching events and their external phone/username.
     result = await db.execute(base)
-    events = list(result.scalars().all())
+    period_rows = list(result.all())
+    events = [row[0] for row in period_rows]
+    period_identities = [row[1] for row in period_rows]
+
+    # First-ever inbound interaction per identity, scoped to the clinic. This
+    # deliberately looks beyond the selected period so returning users cannot
+    # be counted as new merely because the dashboard date filter changed.
+    historical_identity = _user_identity_expression()
+    first_seen_result = await db.execute(
+        select(
+            historical_identity.label("user_identity"),
+            func.min(Event.created_at).label("first_seen_at"),
+        )
+        .select_from(Event)
+        .outerjoin(Session, Session.id == Event.session_id)
+        .where(
+            Event.tenant_id == tenant_id,
+            Event.event_type == "message.in",
+            historical_identity.is_not(None),
+        )
+        .group_by(historical_identity)
+    )
+    first_seen_by_identity = {
+        identity: _database_timestamp_utc(first_seen_at)
+        for identity, first_seen_at in first_seen_result.all()
+        if identity and first_seen_at
+    }
+
+    new_user_identities: set[str] = set()
+    returning_user_identities: set[str] = set()
+    new_user_interactions = 0
+    returning_user_interactions = 0
+
+    for identity in period_identities:
+        if not identity:
+            continue
+        first_seen_at = first_seen_by_identity.get(identity)
+        if first_seen_at is None:
+            continue
+        if first_seen_at >= start_date:
+            new_user_identities.add(identity)
+            new_user_interactions += 1
+        else:
+            returning_user_identities.add(identity)
+            returning_user_interactions += 1
+
+    identified_interactions = new_user_interactions + returning_user_interactions
+    unidentified_interactions = len(events) - identified_interactions
+    if identified_interactions:
+        new_user_interaction_pct = round(
+            new_user_interactions / identified_interactions * 100,
+            1,
+        )
+        returning_user_interaction_pct = round(
+            returning_user_interactions / identified_interactions * 100,
+            1,
+        )
+    else:
+        new_user_interaction_pct = None
+        returning_user_interaction_pct = None
 
     operations_result = await db.execute(
         select(ClinicConfigTable.operations).where(
@@ -318,17 +409,25 @@ async def get_trace_stats(
             processing_times.append(pt)
 
         # Safety flags
-        safety = decision.get("safety_concern", event_data.get("safety_concern", metadata.get("safety_concern", False)))
+        safety = decision.get(
+            "safety_concern",
+            event_data.get("safety_concern", metadata.get("safety_concern", False)),
+        )
         if safety:
             safety_count += 1
 
         # Handoff
-        ho = decision.get("handoff_required", event_data.get("handoff_required", metadata.get("handoff_required", False)))
+        ho = decision.get(
+            "handoff_required",
+            event_data.get("handoff_required", metadata.get("handoff_required", False)),
+        )
         if ho:
             handoff_count += 1
 
         # Intent distribution
-        intent = decision.get("intent", event_data.get("intent", metadata.get("intent", "unknown")))
+        intent = decision.get(
+            "intent", event_data.get("intent", metadata.get("intent", "unknown"))
+        )
         intent_dist[intent] = intent_dist.get(intent, 0) + 1
 
         # Token usage (LLM)
@@ -343,13 +442,19 @@ async def get_trace_stats(
         whisper_model = metadata.get("whisper_model")
         if whisper_model and metadata.get("is_audio"):
             audio_sec = int(metadata.get("audio_seconds") or 0)
-            model_tokens[f"🎙️ {whisper_model}"] = model_tokens.get(f"🎙️ {whisper_model}", 0) + max(audio_sec, 1)
+            model_tokens[f"🎙️ {whisper_model}"] = model_tokens.get(
+                f"🎙️ {whisper_model}", 0
+            ) + max(audio_sec, 1)
 
-    avg_pt = (sum(processing_times) / len(processing_times)) if processing_times else 0.0
+    avg_pt = (
+        (sum(processing_times) / len(processing_times)) if processing_times else 0.0
+    )
 
     model_breakdown = [
         {"model": model, "tokens": toks}
-        for model, toks in sorted(model_tokens.items(), key=lambda x: x[1], reverse=True)
+        for model, toks in sorted(
+            model_tokens.items(), key=lambda x: x[1], reverse=True
+        )
     ]
 
     return {
@@ -360,6 +465,14 @@ async def get_trace_stats(
         "total_tokens_sum": total_tokens_sum,
         "model_breakdown": model_breakdown,
         "intent_distribution": intent_dist,
+        "new_users_count": len(new_user_identities),
+        "returning_users_count": len(returning_user_identities),
+        "new_user_interactions": new_user_interactions,
+        "returning_user_interactions": returning_user_interactions,
+        "new_user_interaction_pct": new_user_interaction_pct,
+        "returning_user_interaction_pct": returning_user_interaction_pct,
+        "identified_user_interactions": identified_interactions,
+        "unidentified_user_interactions": unidentified_interactions,
         "period_start": start_date.isoformat(),
         "period_end": end_date.isoformat(),
         "conversational_trace_count": len(conversational_created_ats),
@@ -392,7 +505,9 @@ async def export_traces_csv(
         CSV formatted string with trace data
     """
     base = _base_trace_query(tenant_id)
-    base = _apply_filters(base, start_date, end_date, safety_flag, handoff_required, channel)
+    base = _apply_filters(
+        base, start_date, end_date, safety_flag, handoff_required, channel
+    )
 
     result = await db.execute(base)
     events = list(result.scalars().all())
@@ -401,39 +516,43 @@ async def export_traces_csv(
     writer = csv.writer(output)
 
     # Header row
-    writer.writerow([
-        "id",
-        "timestamp",
-        "user_message",
-        "intent",
-        "intent_category",
-        "funnel_stage",
-        "action",
-        "confidence",
-        "safety_concern",
-        "handoff_required",
-        "processing_time_ms",
-        "mode",
-        "context_summary",
-    ])
+    writer.writerow(
+        [
+            "id",
+            "timestamp",
+            "user_message",
+            "intent",
+            "intent_category",
+            "funnel_stage",
+            "action",
+            "confidence",
+            "safety_concern",
+            "handoff_required",
+            "processing_time_ms",
+            "mode",
+            "context_summary",
+        ]
+    )
 
     for event in events:
         trace = _event_to_trace_dict(event)
         decision = trace["srm_decision"]
-        writer.writerow([
-            str(trace["id"]),
-            trace["timestamp"],
-            trace["user_message"],
-            decision.get("intent", ""),
-            decision.get("intent_category", ""),
-            decision.get("funnel_stage", ""),
-            decision.get("action", ""),
-            decision.get("confidence", ""),
-            decision.get("safety_concern", ""),
-            decision.get("handoff_required", ""),
-            trace["processing_time_ms"] or "",
-            trace["mode"],
-            trace["context_summary"] or "",
-        ])
+        writer.writerow(
+            [
+                str(trace["id"]),
+                trace["timestamp"],
+                trace["user_message"],
+                decision.get("intent", ""),
+                decision.get("intent_category", ""),
+                decision.get("funnel_stage", ""),
+                decision.get("action", ""),
+                decision.get("confidence", ""),
+                decision.get("safety_concern", ""),
+                decision.get("handoff_required", ""),
+                trace["processing_time_ms"] or "",
+                trace["mode"],
+                trace["context_summary"] or "",
+            ]
+        )
 
     return output.getvalue()

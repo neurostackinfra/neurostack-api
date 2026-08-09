@@ -148,7 +148,7 @@ export const pt: Record<TranslationKey, string> = {
   config_saved: "Configuração salva",
   config_saved_desc: "O pipeline usará os dados atualizados imediatamente.",
   config_save_fail: "Falha ao salvar",
-  config_save_fail_desc: "Verifique se todos os campos obrigatórios estão preenchidos.",
+  config_save_fail_desc: "Não foi possível salvar a configuração.",
 
   // Clinic Config — Integrations
   config_integrations: "Integrações (BYOK)",
@@ -176,7 +176,7 @@ export const pt: Record<TranslationKey, string> = {
   support_subtitle: "Central de atendimento e suporte da NeuroStack",
   support_ticket_heading: "Abrir Chamado / Ticket",
   support_active_badge: "ATIVO",
-  support_response_hint: "Nossa equipe responderá em até 24h úteis via",
+  support_response_hint: "O chamado será direcionado à equipe responsável, que responderá em até 24h úteis.",
   support_tipo_label: "Tipo",
   support_tipo_ph: "Selecione o tipo…",
   support_tipo_request: "Solicitação",

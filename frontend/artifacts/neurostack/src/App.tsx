@@ -1,4 +1,5 @@
-import { Switch, Route, Router as WouterRouter } from "wouter";
+import { useEffect } from "react";
+import { Switch, Route, Router as WouterRouter, useLocation } from "wouter";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -23,7 +24,6 @@ import SlmCortex from "@/pages/slm-cortex";
 import Consultoria from "@/pages/consultoria";
 import Midias from "@/pages/midias";
 import Billing from "@/pages/billing";
-import VoiceAI from "@/pages/voice-ai";
 import Suporte from "@/pages/suporte";
 import PortalParceiros from "@/pages/portal-parceiros";
 import RlhfAudit from "@/pages/rlhf-audit";
@@ -32,6 +32,22 @@ import BuilderPanel from "@/pages/builder";
 import HandoffQueuePage from "@/pages/handoff-queue";
 
 const queryClient = new QueryClient();
+
+/**
+ * Legacy `/voice-ai` route redirect.
+ *
+ * The dedicated Voice AI page was retired in favor of the API-provider
+ * settings tab inside `/config`. Wouter v3 does not ship a built-in
+ * <Redirect /> component, so we perform the client-side navigation in an
+ * effect and render nothing while the location swaps.
+ */
+function VoiceAiRedirect() {
+  const [, setLocation] = useLocation();
+  useEffect(() => {
+    setLocation("/config?tab=integracoes", { replace: true });
+  }, [setLocation]);
+  return null;
+}
 
 function Router() {
   const { isAuthenticated, isSuperAdmin, isInvestor, leadSubmitted } = useAuth();
@@ -76,7 +92,7 @@ function AuthenticatedRouter() {
         <Route path="/consultoria" component={Consultoria} />
         <Route path="/midias" component={Midias} />
         <Route path="/billing" component={Billing} />
-        <Route path="/voice-ai" component={VoiceAI} />
+        <Route path="/voice-ai" component={VoiceAiRedirect} />
         <Route path="/suporte" component={Suporte} />
         <Route path="/portal-parceiros" component={PortalParceiros} />
         <Route path="/handoff-queue" component={HandoffQueuePage} />

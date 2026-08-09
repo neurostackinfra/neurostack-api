@@ -4,7 +4,7 @@ import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
 import type { TranslationKey } from "@/locales/en";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { AlertTriangle, Clock, ListChecks, ActivitySquare, Zap, CalendarRange } from "lucide-react";
+import { AlertTriangle, Clock, ListChecks, ActivitySquare, Zap, CalendarRange, UserPlus } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from "recharts";
 import { format } from "date-fns";
@@ -138,6 +138,14 @@ interface KpiStats {
   outsideHoursPct: number | null;
   conversationalTraceCount: number;
   businessHoursConfigured: boolean;
+  newUsersCount: number;
+  returningUsersCount: number;
+  newUserInteractions: number;
+  returningUserInteractions: number;
+  newUserInteractionPct: number | null;
+  returningUserInteractionPct: number | null;
+  identifiedUserInteractions: number;
+  unidentifiedUserInteractions: number;
 }
 
 // -- Technical KPI cards ---
@@ -375,6 +383,130 @@ function IntentBreakdown({
   );
 }
 
+// -- Commercial audience growth ---
+
+function UserAcquisitionMetrics({ stats, locale }: { stats: KpiStats; locale: string }) {
+  const txt = (pt: string, en: string) => locale === "en" ? en : pt;
+  const numberLocale = locale === "en" ? "en-US" : "pt-BR";
+  const hasIdentifiedInteractions = stats.identifiedUserInteractions > 0;
+  const chartData = [
+    {
+      name: txt("Novos usuários", "New users"),
+      value: stats.newUserInteractions,
+      pct: stats.newUserInteractionPct ?? 0,
+      hex: "#10b981",
+    },
+    {
+      name: txt("Usuários recorrentes", "Returning users"),
+      value: stats.returningUserInteractions,
+      pct: stats.returningUserInteractionPct ?? 0,
+      hex: "#3b82f6",
+    },
+  ];
+
+  return (
+    <Card data-testid="user-acquisition-metrics">
+      <CardHeader className="pb-2">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <CardTitle className="text-base">{txt("Crescimento de usuários", "User growth")}</CardTitle>
+            <p className="text-xs text-muted-foreground mt-1">
+              {txt(
+                "Usuário novo é o número ou username cuja primeira interação histórica ocorreu no período selecionado.",
+                "A new user is a phone number or username whose first-ever interaction occurred in the selected period.",
+              )}
+            </p>
+          </div>
+          <UserPlus className="h-5 w-5 text-emerald-500 shrink-0" />
+        </div>
+      </CardHeader>
+      <CardContent>
+        <div className="grid gap-6 lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)] items-center">
+          <div className="rounded-xl border border-emerald-500/25 bg-emerald-500/5 p-5">
+            <p className="text-xs font-semibold uppercase tracking-wider text-emerald-500">
+              {txt("Novos usuários no período", "New users in period")}
+            </p>
+            <div className="mt-2 text-4xl font-bold text-foreground tabular-nums" data-testid="stat-new-users">
+              {stats.newUsersCount.toLocaleString(numberLocale)}
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {txt("primeira interação registrada na NeuroStack", "first interaction recorded in NeuroStack")}
+            </p>
+            <div className="mt-4 border-t border-border/70 pt-3 flex items-center justify-between gap-3 text-xs">
+              <span className="text-muted-foreground">{txt("Usuários recorrentes ativos", "Active returning users")}</span>
+              <span className="font-semibold text-foreground tabular-nums">
+                {stats.returningUsersCount.toLocaleString(numberLocale)}
+              </span>
+            </div>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-[220px_minmax(0,1fr)] items-center">
+            <div className="relative mx-auto w-full max-w-[220px]">
+              <ResponsiveContainer width="100%" height={210}>
+                <PieChart>
+                  <Pie
+                    data={hasIdentifiedInteractions ? chartData : [{ name: txt("Sem dados", "No data"), value: 1, pct: 0, hex: "#334155" }]}
+                    dataKey="value"
+                    nameKey="name"
+                    cx="50%"
+                    cy="50%"
+                    innerRadius={62}
+                    outerRadius={92}
+                    strokeWidth={0}
+                    paddingAngle={hasIdentifiedInteractions ? 2 : 0}
+                    startAngle={90}
+                    endAngle={-270}
+                  >
+                    {(hasIdentifiedInteractions ? chartData : [{ hex: "#334155" }]).map((entry, index) => (
+                      <Cell key={index} fill={entry.hex} />
+                    ))}
+                  </Pie>
+                  {hasIdentifiedInteractions && <Tooltip content={<DonutTooltip />} />}
+                </PieChart>
+              </ResponsiveContainer>
+              <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+                <span className="text-2xl font-bold text-foreground tabular-nums">
+                  {stats.identifiedUserInteractions.toLocaleString(numberLocale)}
+                </span>
+                <span className="mt-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                  {txt("interações", "interactions")}
+                </span>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              {chartData.map((item) => (
+                <div key={item.name} className="rounded-lg border border-border/70 bg-muted/15 p-3" data-testid={`audience-${item.hex === "#10b981" ? "new" : "returning"}`}>
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="h-2.5 w-2.5 rounded-full shrink-0" style={{ backgroundColor: item.hex }} />
+                      <span className="text-xs font-medium text-foreground truncate">{item.name}</span>
+                    </div>
+                    <span className="text-lg font-bold text-foreground tabular-nums">
+                      {hasIdentifiedInteractions ? `${item.pct.toLocaleString(numberLocale, { maximumFractionDigits: 1 })}%` : "—"}
+                    </span>
+                  </div>
+                  <p className="mt-1 pl-[18px] text-[11px] text-muted-foreground tabular-nums">
+                    {item.value.toLocaleString(numberLocale)} {txt("interações", "interactions")}
+                  </p>
+                </div>
+              ))}
+              {stats.unidentifiedUserInteractions > 0 && (
+                <p className="text-[11px] text-muted-foreground">
+                  {stats.unidentifiedUserInteractions.toLocaleString(numberLocale)} {txt(
+                    "interações sem número/username foram excluídas dos percentuais.",
+                    "interactions without a phone/username were excluded from percentages.",
+                  )}
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 // -- Main Dashboard ---
 
 // ── Investor mock stats ──
@@ -399,6 +531,14 @@ const INVESTOR_MOCK_STATS: KpiStats = {
   outsideHoursPct: 8.2,
   conversationalTraceCount: 291,
   businessHoursConfigured: true,
+  newUsersCount: 47,
+  returningUsersCount: 83,
+  newUserInteractions: 116,
+  returningUserInteractions: 175,
+  newUserInteractionPct: 39.9,
+  returningUserInteractionPct: 60.1,
+  identifiedUserInteractions: 291,
+  unidentifiedUserInteractions: 0,
 };
 
 export default function Dashboard() {
@@ -441,6 +581,14 @@ export default function Dashboard() {
         outsideHoursPct: data.outside_hours_pct ?? null,
         conversationalTraceCount: data.conversational_trace_count ?? 0,
         businessHoursConfigured: data.business_hours_configured === true,
+        newUsersCount: data.new_users_count ?? 0,
+        returningUsersCount: data.returning_users_count ?? 0,
+        newUserInteractions: data.new_user_interactions ?? 0,
+        returningUserInteractions: data.returning_user_interactions ?? 0,
+        newUserInteractionPct: data.new_user_interaction_pct ?? null,
+        returningUserInteractionPct: data.returning_user_interaction_pct ?? null,
+        identifiedUserInteractions: data.identified_user_interactions ?? 0,
+        unidentifiedUserInteractions: data.unidentified_user_interactions ?? 0,
       } as KpiStats;
     },
     staleTime: 30_000,
@@ -484,6 +632,7 @@ export default function Dashboard() {
       {stats && !isLoading && (
         <>
           <KpiCards stats={stats} t={t} locale={locale} />
+          <UserAcquisitionMetrics stats={stats} locale={locale} />
           <IntentBreakdown
             byIntent={stats.byIntent} t={t}
             intentFilter={intentFilter} onIntentFilterChange={setIntentFilter}

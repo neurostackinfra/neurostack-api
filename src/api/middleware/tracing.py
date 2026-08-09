@@ -3,20 +3,20 @@ NeuroStack API - OpenTelemetry Tracing Middleware
 Distributed tracing for observability.
 """
 
+import sys
 import uuid
+from pathlib import Path
 from typing import Callable, Optional
 
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
-
-import sys
-from pathlib import Path
+from starlette.responses import Response
 
 # Add the project root to sys.path for local module resolution
 project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.config.logging import get_logger, bind_context, clear_context
+from src.config.logging import bind_context, clear_context, get_logger
 from src.config.settings import settings
 
 logger = get_logger(__name__)
@@ -30,7 +30,7 @@ logger = get_logger(__name__)
 def configure_tracing() -> None:
     """
     Configure OpenTelemetry tracing for the application.
-    
+
     This sets up:
     - Trace provider with configurable sampling
     - FastAPI instrumentation
@@ -43,17 +43,19 @@ def configure_tracing() -> None:
 
     try:
         from opentelemetry import trace
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.sampling import TraceIdRatioBased
-        from opentelemetry.sdk.resources import Resource
-        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
         # Create resource with service information
-        resource = Resource.create({
-            "service.name": settings.app_name,
-            "service.version": settings.app_version,
-            "deployment.environment": settings.environment,
-        })
+        resource = Resource.create(
+            {
+                "service.name": settings.app_name,
+                "service.version": settings.app_version,
+                "deployment.environment": settings.environment,
+            }
+        )
 
         # Configure sampler based on settings
         sampler = TraceIdRatioBased(settings.tracing_sample_rate)
@@ -87,7 +89,7 @@ def configure_tracing() -> None:
 def instrument_fastapi(app) -> None:
     """
     Instrument FastAPI application with OpenTelemetry.
-    
+
     Args:
         app: FastAPI application instance
     """
@@ -167,12 +169,18 @@ def instrument_sqlalchemy() -> None:
 class RequestIdMiddleware(BaseHTTPMiddleware):
     """
     Middleware to add unique request ID to each request.
-    
+
     The request ID is:
     - Generated for each request (or extracted from X-Request-ID header)
     - Added to request state for access in handlers
     - Added to response headers
     - Bound to logging context for correlation
+
+    After the downstream handler resolves a route, the middleware also
+    emits a single structured "access log" record whose ``endpoint`` field
+    is the route template (never the raw path). This is the sole
+    application-side access log — the Uvicorn raw access log is disabled
+    in :func:`src.config.logging.configure_logging`.
     """
 
     HEADER_NAME = "X-Request-ID"
@@ -183,7 +191,7 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
         call_next: Callable,
     ):
         """Add request ID to request and response."""
-        
+
         # Get existing request ID from header or generate new one
         request_id = request.headers.get(self.HEADER_NAME)
         if not request_id:
@@ -202,11 +210,54 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
             # Add request ID to response headers
             response.headers[self.HEADER_NAME] = request_id
 
+            # Post-routing access log with the route template only.
+            _log_route_template_access(request, response)
+
             return response
 
         finally:
             # Clear logging context
             clear_context()
+
+
+def _log_route_template_access(request: Request, response: Response) -> None:
+    """Emit a single structured access log with the route template.
+
+    The raw path is deliberately never logged: for the Z-API webhook the
+    capability token would leak into every access record. The template
+    (e.g. ``/v1/webhook/zapi/{capability_token}``) is safe to log because
+    the dynamic segment is a placeholder name.
+    """
+
+    try:
+        route = request.scope.get("route")
+        template = getattr(route, "path", None) if route is not None else None
+        endpoint = (
+            template
+            if isinstance(template, str) and template
+            else _redact_raw_path(request.url.path)
+        )
+        logger.info(
+            "http_request",
+            method=request.method,
+            endpoint=endpoint,
+            status=response.status_code,
+        )
+    except Exception:
+        # Access logging is never allowed to break the response cycle.
+        return
+
+
+def _redact_raw_path(path: str) -> str:
+    """Redact the Z-API capability path when no route template resolved."""
+
+    import re
+
+    return re.sub(
+        r"(/v1/webhook/zapi)/[A-Za-z0-9_-]{20,}",
+        r"\1/{capability_token}",
+        path,
+    )
 
 
 # ============================================
@@ -217,10 +268,10 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
 def get_tracer(name: str = "neurostack"):
     """
     Get a tracer instance for creating spans.
-    
+
     Args:
         name: Name for the tracer (module name recommended)
-        
+
     Returns:
         OpenTelemetry tracer or NoOpTracer if tracing disabled
     """
@@ -229,6 +280,7 @@ def get_tracer(name: str = "neurostack"):
 
     try:
         from opentelemetry import trace
+
         return trace.get_tracer(name, settings.app_version)
     except ImportError:
         return NoOpTracer()
@@ -274,20 +326,22 @@ class NoOpTracer:
 def trace_function(name: Optional[str] = None):
     """
     Decorator to trace a function with OpenTelemetry.
-    
+
     Usage:
         @trace_function("process_event")
         async def process_event(event):
             ...
     """
+
     def decorator(func):
         span_name = name or func.__name__
 
         if settings.tracing_enabled:
             try:
-                from opentelemetry import trace
-                from functools import wraps
                 import asyncio
+                from functools import wraps
+
+                from opentelemetry import trace
 
                 tracer = trace.get_tracer("neurostack")
 
@@ -320,7 +374,7 @@ def trace_function(name: Optional[str] = None):
 def add_span_attributes(**attributes) -> None:
     """
     Add attributes to the current span.
-    
+
     Usage:
         add_span_attributes(
             tenant_id=str(tenant.id),
@@ -336,7 +390,14 @@ def add_span_attributes(**attributes) -> None:
         span = trace.get_current_span()
         for key, value in attributes.items():
             if value is not None:
-                span.set_attribute(key, str(value) if not isinstance(value, (str, int, float, bool)) else value)
+                span.set_attribute(
+                    key,
+                    (
+                        str(value)
+                        if not isinstance(value, (str, int, float, bool))
+                        else value
+                    ),
+                )
 
     except ImportError:
         pass
@@ -369,4 +430,3 @@ def record_span_exception(exception: Exception) -> None:
             error=str(e),
             error_type=type(e).__name__,
         )
-

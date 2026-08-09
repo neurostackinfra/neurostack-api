@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
+import { useSearch, useLocation } from "wouter";
 import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
 
@@ -38,8 +39,9 @@ import {
   Sliders, Plus, Trash2, Save, Loader2, Plug, User, Building2,
   Shield, PhoneForwarded, Boxes,
   Copy, Check, KeyRound, AlertTriangle, CheckCircle2, XCircle, Link2,
-  Cpu, MessageSquare, Lock, ChevronDown, ExternalLink, FileText, Mic2,
+  Cpu, MessageSquare, Lock, ChevronDown, ExternalLink, FileText, Mic2, Volume2,
 } from "lucide-react";
+import { ProviderCredentialCard } from "@/components/api-settings/provider-credential-card";
 
 // ── API Credentials (Tab 6) ───────────────────────────────────────────────────
 
@@ -50,11 +52,134 @@ function getToken(): string {
   catch { return ""; }
 }
 
+type ConfigSaveErrorLocale = "en" | "pt";
+
+const CONFIG_SAVE_FIELD_LABELS: Record<string, Record<ConfigSaveErrorLocale, string>> = {
+  clinic_name: { pt: "nome da clínica", en: "clinic name" },
+  agent_name: { pt: "nome do agente", en: "agent name" },
+  clinic_legal_name: { pt: "razão social", en: "legal clinic name" },
+  clinic_cnpj: { pt: "CNPJ", en: "tax ID (CNPJ)" },
+  clinic_contact: { pt: "contato da clínica", en: "clinic contact" },
+  dpo_name: { pt: "nome do encarregado de dados (DPO)", en: "data protection officer (DPO) name" },
+  dpo_contact: { pt: "contato do encarregado de dados (DPO)", en: "data protection officer (DPO) contact" },
+  builder_lgpd_consent: { pt: "confirmação do contrato LGPD", en: "LGPD contract confirmation" },
+  lgpd_custom_link: { pt: "link personalizado de privacidade", en: "custom privacy link" },
+  scheduling_link_url: { pt: "link de agendamento", en: "scheduling link" },
+  scheduling_link_message: { pt: "mensagem do link de agendamento", en: "scheduling link message" },
+  timezone: { pt: "fuso horário", en: "timezone" },
+  business_hours_open: { pt: "horário de abertura", en: "opening time" },
+  business_hours_close: { pt: "horário de fechamento", en: "closing time" },
+  business_hours_days: { pt: "dias de atendimento", en: "business days" },
+  handoff_cycle_days: { pt: "dias do ciclo de handoff", en: "handoff cycle days" },
+  handoff_inactive_default_hours: { pt: "horas de inatividade do handoff", en: "handoff inactivity hours" },
+  meta_minutos_atendimento: { pt: "meta de minutos para atendimento", en: "service-time target in minutes" },
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function safeConfigFieldLabel(field: unknown, locale: ConfigSaveErrorLocale): string | null {
+  if (typeof field !== "string" || !/^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(field)) return null;
+  return CONFIG_SAVE_FIELD_LABELS[field]?.[locale] ?? field.replaceAll("_", " ");
+}
+
+function configSaveErrorFields(detail: unknown, locale: ConfigSaveErrorLocale): string[] {
+  const issues = Array.isArray(detail)
+    ? detail
+    : isRecord(detail) && Array.isArray(detail.fields)
+      ? detail.fields
+      : [];
+  const fields = issues.flatMap((issue) => {
+    if (typeof issue === "string") return [issue];
+    if (!isRecord(issue)) return [];
+    if (typeof issue.field === "string") return [issue.field];
+    if (Array.isArray(issue.loc)) return [issue.loc.at(-1)];
+    return [];
+  });
+  return [...new Set(fields.map((field) => safeConfigFieldLabel(field, locale)).filter((field): field is string => Boolean(field)))];
+}
+
+/**
+ * Convert structured API failures into actionable copy without ever echoing
+ * submitted values or arbitrary backend messages into the UI.
+ */
+export function describeConfigSaveFailure(
+  payload: unknown,
+  status: number,
+  requestedLocale: string,
+): string {
+  const locale: ConfigSaveErrorLocale = requestedLocale === "en" ? "en" : "pt";
+  const detail = isRecord(payload) && "detail" in payload ? payload.detail : payload;
+  const detailRecord = isRecord(detail) ? detail : null;
+  const errorCode = typeof detailRecord?.error === "string" ? detailRecord.error : null;
+
+  const knownErrors: Record<string, Record<ConfigSaveErrorLocale, string>> = {
+    credential_endpoint_required: {
+      pt: "Credenciais de API devem ser salvas na aba Integrações.",
+      en: "API credentials must be saved in the Integrations tab.",
+    },
+    invalid_credentials_payload: {
+      pt: "Os dados de credenciais são inválidos. Revise os campos da aba Integrações.",
+      en: "The credential data is invalid. Review the fields in the Integrations tab.",
+    },
+    unsafe_api_url: {
+      pt: "A URL da API informada não é permitida. Use um endereço HTTPS público.",
+      en: "The API URL is not allowed. Use a public HTTPS address.",
+    },
+    target_tenant_forbidden: {
+      pt: "Você não tem permissão para alterar a configuração desta clínica.",
+      en: "You do not have permission to change this clinic's configuration.",
+    },
+    invalid_target_tenant: {
+      pt: "A clínica selecionada é inválida. Selecione novamente e tente salvar.",
+      en: "The selected clinic is invalid. Select it again and retry saving.",
+    },
+    target_tenant_not_found: {
+      pt: "A clínica selecionada não foi encontrada.",
+      en: "The selected clinic was not found.",
+    },
+  };
+  if (errorCode && knownErrors[errorCode]) return knownErrors[errorCode][locale];
+
+  const fields = configSaveErrorFields(detail, locale);
+  if (fields.length > 0) {
+    return locale === "en"
+      ? `Review the following fields: ${fields.join(", ")}.`
+      : `Revise os seguintes campos: ${fields.join(", ")}.`;
+  }
+
+  if (status === 401) return locale === "en"
+    ? "Your session has expired. Sign in again before saving."
+    : "Sua sessão expirou. Entre novamente antes de salvar.";
+  if (status === 403) return locale === "en"
+    ? "You do not have permission to change this configuration."
+    : "Você não tem permissão para alterar esta configuração.";
+  if (status === 404) return locale === "en"
+    ? "The clinic configuration was not found."
+    : "A configuração da clínica não foi encontrada.";
+  if (status === 409) return locale === "en"
+    ? "The configuration was changed elsewhere. Reload the page and try again."
+    : "A configuração foi alterada em outro local. Atualize a página e tente novamente.";
+  if (status === 422) return locale === "en"
+    ? "Some configuration data is invalid. Review the highlighted fields."
+    : "Alguns dados da configuração são inválidos. Revise os campos destacados.";
+  if (status >= 500) return locale === "en"
+    ? "The server could not save the configuration. Try again in a few moments."
+    : "O servidor não conseguiu salvar a configuração. Tente novamente em alguns instantes.";
+  return locale === "en"
+    ? `The configuration could not be saved (error ${status}).`
+    : `Não foi possível salvar a configuração (erro ${status}).`;
+}
+
 interface CredentialStatus {
   // Z-API
   zapi_instance_id:         string | null;
   zapi_token_set:           boolean;
   zapi_token_masked:        string | null;
+  // Z-API inbound capability token (one-time URL). The backend stores a
+  // salted SHA-256 digest so the raw token is never returned by the API.
+  zapi_inbound_token_digest_set?: boolean;
   // Evolution API
   whatsapp_provider:        string | null;
   evolution_api_url:        string | null;
@@ -88,6 +213,13 @@ interface CredentialStatus {
   stt_provider?:            string | null;
   stt_api_url?:             string | null;
   audio_max_seconds?:       number | null;
+  // TTS provider (configuration only; runtime adapters are not active yet)
+  tts_provider?:            string | null;
+  tts_api_url?:             string | null;
+  tts_api_key_set?:         boolean;
+  tts_api_key_masked?:      string | null;
+  tts_model_name?:          string | null;
+  tts_readiness?:           string;
   apis_configured:          boolean;
 }
 interface ClinicSlim { clinic_id: number; clinic_name: string; }
@@ -107,7 +239,21 @@ type WhatsappProvider =
   | "evolution"
   | "uazapi";
 type WhatsappProviderGroup = "oficial" | "whatsapp_web";
-type SttProvider = "openai_whisper" | "elevenlabs_scribe" | "google_stt" | "outros";
+type SttProvider =
+  | "openai_whisper"
+  | "elevenlabs_scribe"
+  | "google_stt"
+  | "deepgram_stt"
+  | "microsoft_stt"
+  | "outros";
+type TtsProvider = "elevenlabs" | "google";
+
+// Providers with operational runtime support today. Others are stored as
+// configuration only and surface a "Configuração apenas" badge in the UI.
+export const OPERATIONAL_STT_PROVIDERS: ReadonlySet<SttProvider> = new Set([
+  "outros",
+  "openai_whisper",
+]);
 
 // Providers with a functional backend integration. Selecting any provider
 // outside this set still surfaces the credential form (per product design),
@@ -145,12 +291,35 @@ const WA_PROVIDER_LABEL: Record<WhatsappProvider, string> = WA_PROVIDERS.reduce(
   {} as Record<WhatsappProvider, string>,
 );
 
-const STT_PROVIDERS: { id: SttProvider; label: string; sub: string; activeCls: string }[] = [
-  { id: "openai_whisper",    label: "Whisper",   sub: "by OpenAI",       activeCls: "border-amber-500/50 text-amber-400 bg-amber-500/10"   },
-  { id: "elevenlabs_scribe", label: "Scribe",    sub: "by ElevenLabs",   activeCls: "border-orange-500/50 text-orange-400 bg-orange-500/10" },
-  { id: "google_stt",        label: "Cloud STT", sub: "by Google",       activeCls: "border-sky-500/50 text-sky-400 bg-sky-500/10"          },
-  { id: "outros",            label: "Outros",    sub: "Groq / OpenRouter", activeCls: "border-slate-500/50 text-slate-300 bg-slate-500/10"  },
+// Every canonical STT provider id declared in the backend allowlist
+// (`PROVIDER_ALLOWLISTS["stt"]` in `src/services/api_credentials.py`) must be
+// represented here. Missing an id would break credential save/load parity.
+export const STT_PROVIDERS: { id: SttProvider; label: string; sub: string; activeCls: string }[] = [
+  { id: "openai_whisper",    label: "Whisper",    sub: "by OpenAI",         activeCls: "border-amber-500/50 text-amber-400 bg-amber-500/10"    },
+  { id: "elevenlabs_scribe", label: "Scribe",     sub: "by ElevenLabs",     activeCls: "border-orange-500/50 text-orange-400 bg-orange-500/10" },
+  { id: "google_stt",        label: "Cloud STT",  sub: "by Google",         activeCls: "border-sky-500/50 text-sky-400 bg-sky-500/10"          },
+  { id: "deepgram_stt",      label: "Deepgram",   sub: "by Deepgram",       activeCls: "border-emerald-500/50 text-emerald-400 bg-emerald-500/10" },
+  { id: "microsoft_stt",     label: "Azure STT",  sub: "by Microsoft",      activeCls: "border-blue-500/50 text-blue-400 bg-blue-500/10"       },
+  { id: "outros",            label: "Outros",     sub: "Groq / OpenRouter", activeCls: "border-slate-500/50 text-slate-300 bg-slate-500/10"    },
 ];
+
+// TTS is intentionally configuration-only until each provider adapter is
+// validated end-to-end inside the voice application.
+export const TTS_PROVIDERS: { id: TtsProvider; label: string; sub: string; activeCls: string }[] = [
+  { id: "elevenlabs", label: "ElevenLabs",      sub: "Voz natural e humana", activeCls: "border-violet-500/50 text-violet-400 bg-violet-500/10" },
+  { id: "google",     label: "Google Cloud TTS", sub: "Escala e bom custo",   activeCls: "border-sky-500/50 text-sky-400 bg-sky-500/10"       },
+];
+
+const TTS_PROVIDER_DEFAULTS: Record<TtsProvider, { apiUrl: string; modelName: string }> = {
+  elevenlabs: {
+    apiUrl: "https://api.elevenlabs.io/v1",
+    modelName: "eleven_multilingual_v2",
+  },
+  google: {
+    apiUrl: "https://texttospeech.googleapis.com/v1",
+    modelName: "pt-BR-Neural2-A",
+  },
+};
 
 const PROVIDER_DEFAULT_STT_URL: Partial<Record<SttProvider, string>> = {
   openai_whisper:    "https://api.openai.com/v1",
@@ -159,12 +328,29 @@ const PROVIDER_DEFAULT_STT_URL: Partial<Record<SttProvider, string>> = {
   // outros: user-provided — no default
 };
 
-const PROVIDERS: { id: LlmProvider; label: string; sub: string; activeCls: string }[] = [
-  { id: "slm_cortex", label: "SLM Cortex", sub: "by NeuroStack", activeCls: "border-violet-500/50 text-violet-400 bg-violet-500/10"  },
+// `comingSoon` providers are display-only: they render a "Em breve" badge,
+// cannot be selected and are never included in a PATCH body. The backend
+// rejects `slm_cortex` writes today (see `_llm_operational` in
+// `src/services/api_credentials.py`), so the UI must not send it either.
+export const PROVIDERS: {
+  id: LlmProvider;
+  label: string;
+  sub: string;
+  activeCls: string;
+  comingSoon?: boolean;
+}[] = [
+  { id: "slm_cortex", label: "SLM Cortex", sub: "by NeuroStack", activeCls: "border-violet-500/50 text-violet-400 bg-violet-500/10",  comingSoon: true },
   { id: "dropout",    label: "Dropout",    sub: "by Neuralake",  activeCls: "border-blue-500/50 text-blue-400 bg-blue-500/10"         },
   { id: "openai",     label: "GPT",        sub: "by OpenAI",     activeCls: "border-emerald-500/50 text-emerald-400 bg-emerald-500/10"},
   { id: "outros",     label: "Outros",     sub: "Custom / OSS",  activeCls: "border-slate-500/50 text-slate-300 bg-slate-500/10"     },
 ];
+
+// Set of LLM provider ids that can be selected AND sent in a PATCH body.
+// Anything outside this set (currently `slm_cortex`) is treated as unset and
+// silently dropped from the PATCH payload.
+export const SELECTABLE_LLM_PROVIDERS: ReadonlySet<LlmProvider> = new Set(
+  PROVIDERS.filter(p => !p.comingSoon).map(p => p.id),
+);
 
 function inferProvider(url: string | null): LlmProvider {
   if (!url) return "openai";
@@ -216,6 +402,8 @@ function ProviderCard({
   return (
     <button
       type="button"
+      data-testid={`whatsapp-card-${wp.id}`}
+      data-provider-id={wp.id}
       disabled={disabled}
       onClick={onClick}
       className={`flex flex-col items-start rounded-lg border px-3 py-2.5 text-left transition-all disabled:opacity-60 disabled:cursor-not-allowed ${
@@ -250,7 +438,29 @@ function UnimplementedProviderNotice({ provider }: { provider: WhatsappProvider 
   );
 }
 
-function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
+/**
+ * Generate a URL-safe base64 token and its SHA-256 hex digest using the Web
+ * Crypto API. The raw token is intended to be displayed to the operator
+ * exactly once — the digest is what we PATCH to the backend so the plaintext
+ * value never leaves the browser.
+ */
+async function generateZapiCapabilityToken(): Promise<{ rawToken: string; digest: string }> {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  // Convert to a URL-safe base64 string without padding.
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  const rawToken = btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=/g, "");
+  const hashBuf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(rawToken));
+  const digest = Array.from(new Uint8Array(hashBuf))
+    .map(b => b.toString(16).padStart(2, "0"))
+    .join("");
+  return { rawToken, digest };
+}
+
+export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   clinicId: string; isReadOnly: boolean; isSuperAdmin: boolean;
 }) {
   const { toast } = useToast();
@@ -272,6 +482,12 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   const [zapiInstanceId, setZapiInstanceId] = useState("");
   const [zapiToken, setZapiToken]           = useState("");
   const [zapiClientToken, setZapiClientToken] = useState("");
+  // One-time capability URL for inbound Z-API webhooks. The raw token is
+  // generated in the browser, hashed to SHA-256, and only the hex digest is
+  // sent to the backend. The raw value is displayed exactly once and then
+  // cleared from memory. We deliberately do NOT persist it to
+  // localStorage/sessionStorage/URL/history so the token cannot be recovered.
+  const [zapiInboundRawToken, setZapiInboundRawToken] = useState<string>("");
 
   // Evolution API fields
   const [evolApiUrl, setEvolApiUrl]           = useState("");
@@ -302,6 +518,13 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   const [sttApiUrl, setSttApiUrl]           = useState("");
   const [sttModelName, setSttModelName]     = useState("");
   const [audioMaxSeconds, setAudioMaxSeconds] = useState(60);
+
+  // TTS (configuration only; no synthesis request is made by this screen)
+  const [ttsProvider, setTtsProvider]         = useState<TtsProvider>("elevenlabs");
+  const [ttsApiKey, setTtsApiKey]             = useState("");
+  const [ttsApiUrl, setTtsApiUrl]             = useState("");
+  const [ttsModelName, setTtsModelName]       = useState("");
+  const [ttsDirty, setTtsDirty]               = useState(false);
 
   useEffect(() => {
     if (!isSuperAdmin) return;
@@ -340,11 +563,16 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       setUazapiApiUrl(data.uazapi_api_url ?? "");
       setUazapiInstanceName(data.uazapi_instance_name ?? "");
       setUazapiToken("");
-      // LLM
+      // LLM — coerce any non-selectable provider (e.g. slm_cortex, coming
+      // soon) to the safe default so the UI never enters an unreachable state
+      // and the PATCH body never carries a rejected provider id.
       const inferredProvider = inferProvider(data.llm_base_url);
-      setLlmModelName(inferredProvider === "dropout" ? "text" : (data.llm_model_name ?? ""));
-      setLlmProvider(inferredProvider);
-      setLlmApiUrl(data.llm_base_url ?? PROVIDER_DEFAULT_URL[inferredProvider]);
+      const effectiveLlmProvider: LlmProvider = SELECTABLE_LLM_PROVIDERS.has(inferredProvider)
+        ? inferredProvider
+        : "openai";
+      setLlmModelName(effectiveLlmProvider === "dropout" ? "text" : (data.llm_model_name ?? ""));
+      setLlmProvider(effectiveLlmProvider);
+      setLlmApiUrl(data.llm_base_url ?? PROVIDER_DEFAULT_URL[effectiveLlmProvider]);
       // WhatsApp secret fields: left empty so the placeholder "••••••••• (manter atual)"
       // appears when a token is already set. On save, empty = not sent → COALESCE
       // in the UPDATE preserves the existing encrypted value in the DB.
@@ -360,6 +588,17 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       setSttApiUrl(data.stt_api_url || PROVIDER_DEFAULT_STT_URL[savedSttProvider] || "");
       setSttModelName(data.whisper_model ?? "");
       setAudioMaxSeconds(Number(data.audio_max_seconds) || 60);
+      // TTS secrets never pre-fill. Unknown/retired provider ids fall back to
+      // ElevenLabs without silently submitting a new TTS configuration.
+      const hasSavedTtsProvider = TTS_PROVIDERS.some(p => p.id === data.tts_provider);
+      const savedTtsProvider = hasSavedTtsProvider
+        ? data.tts_provider as TtsProvider
+        : "elevenlabs";
+      setTtsProvider(savedTtsProvider);
+      setTtsApiKey("");
+      setTtsApiUrl(hasSavedTtsProvider ? (data.tts_api_url ?? TTS_PROVIDER_DEFAULTS[savedTtsProvider].apiUrl) : "");
+      setTtsModelName(hasSavedTtsProvider ? (data.tts_model_name ?? "") : "");
+      setTtsDirty(false);
     } catch { setError("Erro de rede."); }
     finally { setLoading(false); }
   }, [targetId]);
@@ -368,14 +607,29 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
 
   const handleSave = async () => {
     setSaving(true); setError(null);
+    // Pre-generated Z-API capability token (raw + digest). Kept in the local
+    // scope of this save call so the raw token is only ever surfaced through
+    // the "one-time URL" panel below on success and never leaks otherwise.
+    let generatedZapiCapability: { rawToken: string; digest: string } | null = null;
     try {
-      const body: Record<string, string | number> = { clinic_id: targetId };
+      // Clinic scope belongs exclusively to the query string. Sending
+      // clinic_id in this strict credential payload is rejected as an extra
+      // field by the backend.
+      const body: Record<string, string | number> = {};
       // WhatsApp provider selection — always send to persist the chosen provider
       body["whatsapp_provider"] = waProvider;
       if (waProvider === "zapi") {
         if (zapiInstanceId)  body["zapi_instance_id"]  = zapiInstanceId;
         if (zapiToken)       body["zapi_token"]        = zapiToken;
         if (zapiClientToken) body["zapi_client_token"] = zapiClientToken;
+        // Rotate the inbound capability token whenever the user saves a new
+        // Z-API instance token. The raw value is only kept in the closure so
+        // the "one-time URL" panel can render it on success — nothing is ever
+        // written to localStorage/sessionStorage/URL/history.
+        if (zapiToken) {
+          generatedZapiCapability = await generateZapiCapabilityToken();
+          body["zapi_inbound_token_digest"] = generatedZapiCapability.digest;
+        }
       } else if (waProvider === "evolution") {
         if (evolApiUrl)      body["evolution_api_url"]      = evolApiUrl;
         if (evolInstanceName) body["evolution_instance_name"] = evolInstanceName;
@@ -399,13 +653,15 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       // in the error branch below (never a silent success).
       // Only send LLM api key if the user actually typed a new one (non-empty)
       if (llmApiKey)      body["llm_api_key"]       = llmApiKey;
-      // Always persist the current URL and provider (even if unchanged)
-      if (llmProvider !== "slm_cortex") {
+      // Never send non-selectable providers (slm_cortex is display-only and
+      // the backend rejects the write). Silently skip the LLM block entirely
+      // when the current selection is not operational.
+      if (SELECTABLE_LLM_PROVIDERS.has(llmProvider)) {
         body["llm_api_url"]  = llmApiUrl || PROVIDER_DEFAULT_URL[llmProvider];
         body["llm_provider"] = llmProvider;
+        if (llmProvider === "dropout") body["llm_model_name"] = "text";
+        else if (llmModelName && (llmProvider === "openai" || llmProvider === "outros")) body["llm_model_name"] = llmModelName;
       }
-      if (llmProvider === "dropout") body["llm_model_name"] = "text";
-      else if (llmModelName && (llmProvider === "openai" || llmProvider === "outros"))  body["llm_model_name"] = llmModelName;
       // STT (audio transcription)
       body["stt_provider"]     = sttProvider;
       body["whisper_model"]    = sttModelName;
@@ -415,6 +671,16 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       // Always send stt_api_url so the backend can clear a stale value.
       // For google_stt: clear any previously saved endpoint (different API format).
       body["stt_api_url"] = sttProvider !== "google_stt" ? sttApiUrl : "";
+      // TTS remains configuration-only. Submit it only after the user edits
+      // this capability, so an unrelated API save preserves the stored bundle
+      // without creating an implicit provider selection or rotating a key.
+      if (ttsDirty) {
+        body["tts_provider"] = ttsProvider;
+        body["tts_api_url"] = ttsApiUrl || TTS_PROVIDER_DEFAULTS[ttsProvider].apiUrl;
+        if (ttsApiKey && !ttsApiKey.includes("â€¢") && !ttsApiKey.includes("*"))
+          body["tts_api_key"] = ttsApiKey;
+        body["tts_model_name"] = ttsModelName || TTS_PROVIDER_DEFAULTS[ttsProvider].modelName;
+      }
       const saveUrl = targetId
         ? `/v1/config/api-credentials?clinic_id=${targetId}`
         : `/v1/config/api-credentials`;
@@ -452,10 +718,23 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         return;
       }
       toast({ title: "Configurações salvas!", description: data.apis_configured ? "APIs totalmente configuradas ✓" : "Parcialmente configurado." });
+      // Surface the raw capability token ONCE, only after the PATCH succeeded.
+      // The digest was already persisted server-side, so the raw value is
+      // useless to anyone but the operator viewing this exact response.
+      if (generatedZapiCapability) {
+        setZapiInboundRawToken(generatedZapiCapability.rawToken);
+      }
       await fetchStatus();
     } catch { setError("Erro de rede."); }
     finally { setSaving(false); }
   };
+
+  /**
+   * Explicit dismiss of the one-time Z-API capability URL panel. Clears the
+   * raw token from React state so it cannot be re-rendered or read from a
+   * DOM inspector after the panel unmounts.
+   */
+  const dismissZapiInboundRawToken = () => setZapiInboundRawToken("");
 
   function copyWebhook() {
     navigator.clipboard.writeText(webhookUrl).catch(() => {});
@@ -471,12 +750,15 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
     setTimeout(() => setCopiedVerifyToken(false), 2000);
   }
 
-  const isCortex     = llmProvider === "slm_cortex";
+  // `slm_cortex` is display-only and forcibly coerced to a real provider at
+  // load-time; the two flags below remain as `false` sentinels because a
+  // handful of downstream branches used to depend on them.
+  const isCortex     = false;
   const isOutros     = llmProvider === "outros";
-  const isComingSoon = isCortex;
+  const isComingSoon = false;
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-5" data-testid="api-settings-section">
 
       {/* ── Super admin clinic picker ── */}
       {isSuperAdmin && clinics.length > 0 && (
@@ -641,6 +923,44 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         {/* Meta Cloud API fields */}
         {waProvider === "meta_cloud" && (
           <div className="grid gap-3 sm:grid-cols-2">
+            {/* signature_pending banner — identity is configured but the App Secret
+                is missing. Without HMAC we cannot authenticate inbound webhooks. */}
+            {(() => {
+              const identityReady =
+                !!status?.meta_phone_number_id && !!status?.meta_permanent_token_set;
+              const signaturePending = identityReady && status?.meta_app_secret_set === false;
+              if (!signaturePending) return null;
+              return (
+                <div
+                  data-testid="meta-signature-pending-banner"
+                  className="sm:col-span-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2.5 flex items-start gap-2"
+                >
+                  <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500 mt-0.5" />
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-500">
+                        {txt(
+                          "HMAC pendente — mensagens não podem ser autenticadas",
+                          "HMAC pending — messages cannot be authenticated",
+                        )}
+                      </p>
+                      <span
+                        data-testid="meta-signature-pending-badge"
+                        className="text-[9px] font-bold px-1.5 py-0.5 rounded border bg-amber-500/15 text-amber-500 border-amber-500/40"
+                      >
+                        {txt("Assinatura pendente", "Signature pending")}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-muted-foreground">
+                      {txt(
+                        "Informe o App Secret abaixo e salve para começar a verificar as assinaturas X-Hub-Signature-256 do Meta.",
+                        "Enter the App Secret below and save to start verifying Meta's X-Hub-Signature-256 signatures.",
+                      )}
+                    </p>
+                  </div>
+                </div>
+              );
+            })()}
             <ApiInput label="Phone Number ID" value={metaPhoneNumberId} onChange={setMetaPhoneNumberId}
               placeholder="123456789012345" disabled={isReadOnly} mono
               configured={!!status?.meta_phone_number_id} />
@@ -652,10 +972,27 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
                 placeholder={status?.meta_permanent_token_set ? "••••••••• (manter atual)" : "EAAG..."}
                 disabled={isReadOnly} configured={status?.meta_permanent_token_set} />
             </div>
-            <div className="sm:col-span-2">
-              <ApiInput label="App Secret (opcional)" value={metaAppSecret} onChange={setMetaAppSecret} type="password"
-                placeholder={status?.meta_app_secret_set ? "••••••••• (manter atual)" : "Opcional — para assinar webhooks (X-Hub-Signature-256)"}
-                disabled={isReadOnly} configured={status?.meta_app_secret_set} />
+            <div className="sm:col-span-2" data-testid="meta-app-secret-field">
+              <ApiInput
+                label={
+                  status?.meta_phone_number_id && status?.meta_permanent_token_set && !status?.meta_app_secret_set
+                    ? txt("App Secret *", "App Secret *")
+                    : "App Secret"
+                }
+                value={metaAppSecret}
+                onChange={setMetaAppSecret}
+                type="password"
+                placeholder={
+                  status?.meta_app_secret_set
+                    ? "••••••••• (manter atual)"
+                    : txt(
+                        "Obrigatório — assina webhooks (X-Hub-Signature-256)",
+                        "Required — signs webhooks (X-Hub-Signature-256)",
+                      )
+                }
+                disabled={isReadOnly}
+                configured={status?.meta_app_secret_set}
+              />
             </div>
 
             {/* Verify Token — only shown after Phone Number ID + Permanent Token
@@ -706,6 +1043,57 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
                 placeholder="Cole o Client-Token da aba Segurança do Z-API"
                 disabled={isReadOnly} />
             </div>
+
+            {/* Inbound capability URL — one-time-only display.
+                A new URL is generated locally each time the user saves the
+                Z-API token. Once dismissed, the raw value is cleared from
+                React state and can never be recovered. */}
+            {zapiInboundRawToken ? (
+              <div
+                data-testid="zapi-inbound-token-panel"
+                className="sm:col-span-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-3 space-y-2"
+              >
+                <div className="flex items-center gap-2">
+                  <Lock className="h-4 w-4 shrink-0 text-amber-500" />
+                  <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-500">
+                    {txt("Webhook URL (exibida uma única vez)", "Webhook URL (shown only once)")}
+                  </p>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  {txt(
+                    "Copie esta URL agora. Ela não será exibida novamente.",
+                    "Copy this URL now. It will not be shown again.",
+                  )}
+                </p>
+                <pre
+                  data-testid="zapi-inbound-token-url"
+                  className="text-[11px] font-mono text-foreground bg-background border border-border rounded px-3 py-2 whitespace-pre-wrap break-all select-all"
+                >{`${window.location.origin}/v1/webhook/zapi/${zapiInboundRawToken}`}</pre>
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    data-testid="zapi-inbound-token-dismiss"
+                    onClick={dismissZapiInboundRawToken}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground hover:bg-muted/40 transition-colors"
+                  >
+                    {txt("Já copiei — descartar", "I copied it — dismiss")}
+                  </button>
+                </div>
+              </div>
+            ) : status?.zapi_inbound_token_digest_set ? (
+              <div
+                data-testid="zapi-inbound-token-configured"
+                className="sm:col-span-2 rounded-md border border-dashed border-emerald-500/40 bg-emerald-500/5 px-3 py-2.5 text-[11px] text-muted-foreground flex items-center gap-2"
+              >
+                <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                <span>
+                  {txt(
+                    "Token configurado. URL exibida apenas uma vez.",
+                    "Token configured. URL was shown only once.",
+                  )}
+                </span>
+              </div>
+            ) : null}
           </div>
         )}
 
@@ -761,28 +1149,49 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         </div>
 
         {/* Provider toggle group */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2" data-testid="llm-provider-list">
           {PROVIDERS.map(p => {
-            const active = llmProvider === p.id;
+            // `comingSoon` providers can never be the active selection —
+            // treat any stored value that matches as unset so the card is
+            // rendered as disabled instead of "active".
+            const active     = llmProvider === p.id && !p.comingSoon;
+            const comingSoon = !!p.comingSoon;
             return (
               <button
                 key={p.id}
                 type="button"
-                disabled={isReadOnly}
+                data-testid={`llm-provider-${p.id}`}
+                data-provider-id={p.id}
+                data-coming-soon={comingSoon ? "true" : undefined}
+                disabled={isReadOnly || comingSoon}
+                aria-disabled={comingSoon || undefined}
                 onClick={() => {
+                  if (comingSoon) return; // never let the user select coming-soon providers
                   if (llmProvider === p.id) return; // no-op if same tab
                   setLlmProvider(p.id);
                   setLlmApiUrl(PROVIDER_DEFAULT_URL[p.id]);
                   setLlmApiKey(""); // clear key — different providers use different keys
                   setLlmModelName(p.id === "dropout" ? "text" : "");
                 }}
-                className={`relative flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2.5 text-left transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
+                className={`relative flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2.5 text-left transition-all disabled:cursor-not-allowed ${
+                  comingSoon ? "pointer-events-none opacity-50" : ""
+                } ${
                   active
                     ? p.activeCls
                     : "border-border bg-background text-muted-foreground hover:border-slate-500"
-                }`}
+                } disabled:opacity-50`}
               >
-                <span className="text-xs font-bold">{p.label}</span>
+                <div className="flex w-full items-center justify-between gap-1">
+                  <span className="text-xs font-bold">{p.label}</span>
+                  {comingSoon && (
+                    <span
+                      data-testid={`llm-coming-soon-${p.id}`}
+                      className="text-[9px] font-bold px-1 py-0.5 rounded border bg-violet-500/10 text-violet-400 border-violet-500/30"
+                    >
+                      {txt("Em breve", "Coming soon")}
+                    </span>
+                  )}
+                </div>
                 <span className="text-[10px] opacity-70">{p.sub}</span>
                 {active && <span className="absolute top-2 right-2 h-1.5 w-1.5 rounded-full bg-current opacity-80" />}
               </button>
@@ -885,13 +1294,16 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         </div>
 
         {/* Provider toggle group */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2" data-testid="stt-provider-list">
           {STT_PROVIDERS.map(p => {
-            const active = sttProvider === p.id;
+            const active     = sttProvider === p.id;
+            const configOnly = !OPERATIONAL_STT_PROVIDERS.has(p.id);
             return (
               <button
                 key={p.id}
                 type="button"
+                data-testid={`stt-provider-${p.id}`}
+                data-provider-id={p.id}
                 disabled={isReadOnly}
                 onClick={() => {
                   if (sttProvider === p.id) return;
@@ -906,7 +1318,17 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
                     : "border-border bg-background text-muted-foreground hover:border-slate-500"
                 }`}
               >
-                <span className="text-xs font-bold">{p.label}</span>
+                <div className="flex w-full items-center justify-between gap-1">
+                  <span className="text-xs font-bold">{p.label}</span>
+                  {configOnly && (
+                    <span
+                      data-testid={`stt-config-only-${p.id}`}
+                      className="text-[9px] font-bold px-1 py-0.5 rounded border bg-slate-500/10 text-slate-400 border-slate-500/30"
+                    >
+                      {txt("Configuração apenas", "Config only")}
+                    </span>
+                  )}
+                </div>
                 <span className="text-[10px] opacity-70">{p.sub}</span>
                 {active && <span className="absolute top-2 right-2 h-1.5 w-1.5 rounded-full bg-current opacity-80" />}
               </button>
@@ -922,6 +1344,8 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
                 placeholder={
                   sttProvider === "openai_whisper"    ? "https://api.openai.com/v1" :
                   sttProvider === "elevenlabs_scribe" ? "https://api.elevenlabs.io/v1" :
+                  sttProvider === "deepgram_stt"      ? "https://api.deepgram.com/v1" :
+                  sttProvider === "microsoft_stt"     ? "https://<region>.stt.speech.microsoft.com" :
                   "https://api.groq.com/openai/v1"
                 }
                 disabled={isReadOnly} mono />
@@ -933,6 +1357,8 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
               sttProvider === "openai_whisper" ? "sk-..." :
               sttProvider === "elevenlabs_scribe" ? "sk_..." :
               sttProvider === "google_stt" ? "AIza..." :
+              sttProvider === "deepgram_stt" ? "Deepgram API key" :
+              sttProvider === "microsoft_stt" ? "Azure Speech key" :
               "gsk_..."
             }
             disabled={isReadOnly} configured={status?.whisper_api_key_set} />
@@ -941,6 +1367,8 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
               sttProvider === "openai_whisper" ? "whisper-1" :
               sttProvider === "elevenlabs_scribe" ? "scribe_v1" :
               sttProvider === "google_stt" ? "latest_long" :
+              sttProvider === "deepgram_stt" ? "nova-2" :
+              sttProvider === "microsoft_stt" ? "phi-4-multimodal" :
               "distil-whisper-large-v3-en"
             }
             disabled={isReadOnly} mono />
@@ -958,6 +1386,93 @@ function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
               className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
             />
           </div>
+        </div>
+      </div>
+
+      {/* ── TTS - Text to Speech (configuration only) ── */}
+      <div
+        className="space-y-4 rounded-lg border border-slate-700/50 bg-muted/20 p-4"
+        data-testid="tts-settings-section"
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <Volume2 className="h-3.5 w-3.5 text-accent" />
+          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            TTS - Text to Speech
+          </p>
+          <span className="ml-auto text-[9px] font-bold px-1.5 py-0.5 rounded border bg-slate-500/10 text-slate-400 border-slate-500/30">
+            {txt("Configuração apenas", "Config only")}
+          </span>
+        </div>
+
+        <p className="text-[11px] text-muted-foreground">
+          {txt(
+            "Configure o provedor de voz. O funcionamento dentro da aplicação será validado em uma etapa futura.",
+            "Configure the voice provider. In-app operation will be validated in a future stage.",
+          )}
+        </p>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2" data-testid="tts-provider-list">
+          {TTS_PROVIDERS.map(p => {
+            const active = ttsProvider === p.id;
+            return (
+              <button
+                key={p.id}
+                type="button"
+                data-testid={`tts-provider-${p.id}`}
+                data-provider-id={p.id}
+                disabled={isReadOnly}
+                onClick={() => {
+                  if (ttsProvider === p.id) return;
+                  setTtsProvider(p.id);
+                  setTtsApiKey("");
+                  setTtsApiUrl(TTS_PROVIDER_DEFAULTS[p.id].apiUrl);
+                  setTtsModelName(TTS_PROVIDER_DEFAULTS[p.id].modelName);
+                  setTtsDirty(true);
+                }}
+                className={`relative flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2.5 text-left transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
+                  active
+                    ? p.activeCls
+                    : "border-border bg-background text-muted-foreground hover:border-slate-500"
+                }`}
+              >
+                <span className="text-xs font-bold">{p.label}</span>
+                <span className="text-[10px] opacity-70">{p.sub}</span>
+                {active && <span className="absolute top-2 right-2 h-1.5 w-1.5 rounded-full bg-current opacity-80" />}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="sm:col-span-2">
+            <ApiInput
+              label="API URL"
+              value={ttsApiUrl}
+              onChange={(value) => { setTtsApiUrl(value); setTtsDirty(true); }}
+              placeholder={TTS_PROVIDER_DEFAULTS[ttsProvider].apiUrl}
+              disabled={isReadOnly}
+              mono
+            />
+          </div>
+          <ApiInput
+            label="API Key"
+            value={ttsApiKey}
+            onChange={(value) => { setTtsApiKey(value); setTtsDirty(true); }}
+            type="password"
+            placeholder={status?.tts_api_key_set
+              ? "••••••••• (manter atual)"
+              : ttsProvider === "elevenlabs" ? "sk_..." : "AIza..."}
+            disabled={isReadOnly}
+            configured={status?.tts_api_key_set}
+          />
+          <ApiInput
+            label={txt("Modelo / Voz", "Model / Voice")}
+            value={ttsModelName}
+            onChange={(value) => { setTtsModelName(value); setTtsDirty(true); }}
+            placeholder={TTS_PROVIDER_DEFAULTS[ttsProvider].modelName}
+            disabled={isReadOnly}
+            mono
+          />
         </div>
       </div>
 
@@ -1087,6 +1602,8 @@ export default function ClinicConfig() {
   const { t, locale } = useI18n();
   const txt = (p: string, e: string) => locale === "en" ? e : p;
   const { toast } = useToast();
+  const search = useSearch();
+  const [, setLocation] = useLocation();
 
   const [config, setConfig] = useState<any>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -1345,7 +1862,12 @@ export default function ClinicConfig() {
       } else {
         let parsed: URL | null = null;
         try { parsed = new URL(trimmedSchedulingLinkUrl); } catch { parsed = null; }
-        if (!parsed || parsed.protocol !== "https:") {
+        if (
+          !parsed ||
+          parsed.protocol !== "https:" ||
+          !parsed.hostname ||
+          !trimmedSchedulingLinkUrl.toLowerCase().startsWith("https://")
+        ) {
           schedulingLinkValidationErrors.scheduling_link_url = txt(
             "A URL deve começar com https:// (http:// e outros esquemas não são aceitos).",
             "The URL must start with https:// (http:// and other schemes are not accepted).",
@@ -1469,12 +1991,27 @@ export default function ClinicConfig() {
         },
         body: JSON.stringify(payload),
       });
-      if (!res.ok) throw new Error(`Save failed: ${res.status}`);
-      const updated = await res.json();
+      const responseBody: unknown = await res.json().catch(() => null);
+      if (!res.ok) {
+        toast({
+          title: t("config_save_fail"),
+          description: describeConfigSaveFailure(responseBody, res.status, locale),
+          variant: "destructive",
+        });
+        return;
+      }
+      const updated = responseBody;
       setConfig(updated);
       toast({ title: t("config_saved"), description: t("config_saved_desc") });
     } catch {
-      toast({ title: t("config_save_fail"), description: t("config_save_fail_desc"), variant: "destructive" });
+      toast({
+        title: t("config_save_fail"),
+        description: txt(
+          "Não foi possível conectar ao servidor. Verifique sua conexão e tente novamente.",
+          "Could not connect to the server. Check your connection and try again.",
+        ),
+        variant: "destructive",
+      });
     } finally {
       setIsSaving(false);
     }
@@ -1490,6 +2027,29 @@ export default function ClinicConfig() {
 
   const cardShell = "border-border shadow-sm";
   const cardHead = "pb-3 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border";
+
+  // ── Tab state controlled by `?tab=...` query string ─────────────────────────
+  // Wouter's `useSearch()` returns the raw query string (without the leading
+  // `?`). When a requested tab is not allowed for the current role, we fall
+  // back to the first tab that IS allowed rather than silently exposing a
+  // hidden tab or crashing. Any state change writes back to the URL via
+  // `setLocation` so deep-links (e.g. `/voice-ai` → `/config?tab=integracoes`)
+  // land exactly where the user expects.
+  const ALL_TABS = [
+    { value: "identidade",  clinicHidden: false },
+    { value: "operacao",    clinicHidden: false },
+    { value: "negocio",     clinicHidden: false },
+    { value: "handoff",     clinicHidden: true  },
+    { value: "servicos",    clinicHidden: false },
+    { value: "integracoes", clinicHidden: true  },
+  ];
+  const allowedTabValues = ALL_TABS.filter(
+    (tab) => !(isClinicAdmin && tab.clinicHidden),
+  ).map((tab) => tab.value);
+  const requestedTab = new URLSearchParams(search).get("tab") ?? "identidade";
+  const activeTab = allowedTabValues.includes(requestedTab)
+    ? requestedTab
+    : (allowedTabValues[0] ?? "identidade");
 
   return (
     <div className="max-w-2xl mx-auto space-y-5">
@@ -1544,7 +2104,11 @@ export default function ClinicConfig() {
       )}
 
       {/* Tabs */}
-      <Tabs defaultValue="identidade" className="w-full">
+      <Tabs
+        value={activeTab}
+        onValueChange={(v) => setLocation(`/config?tab=${v}`)}
+        className="w-full"
+      >
         <TabsList className={`w-full grid h-auto p-1 bg-muted/50 border border-border rounded-lg ${isClinicAdmin ? "grid-cols-4" : "grid-cols-6"}`}>
           {[
             { value: "identidade", icon: User,          label: t("config_tab_identidade"), clinicHidden: false },

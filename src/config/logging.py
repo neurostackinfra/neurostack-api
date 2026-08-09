@@ -58,8 +58,23 @@ def configure_logging() -> None:
         level=getattr(logging, settings.log_level),
     )
 
-    # Reduce noise from third-party libraries
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    # Reduce noise from third-party libraries.
+    #
+    # ``uvicorn.access`` is fully silenced (not merely raised to WARNING)
+    # because its default formatter logs the raw request path. The
+    # Z-API webhook path
+    # ``/v1/webhook/zapi/{capability_token}`` embeds the capability token
+    # in the segment, so any raw-path record — even at DEBUG in a rescued
+    # production incident — is a secret leak. The application emits its
+    # own post-routing access log through
+    # :class:`src.api.middleware.tracing.RequestIdMiddleware`, which uses
+    # the route template instead of the raw path.
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.setLevel(logging.CRITICAL + 1)
+    access_logger.disabled = True
+    access_logger.propagate = False
+    for handler in list(access_logger.handlers):
+        access_logger.removeHandler(handler)
     logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -98,4 +113,3 @@ def unbind_context(*keys: str) -> None:
 def clear_context() -> None:
     """Clear all context variables."""
     structlog.contextvars.clear_contextvars()
-

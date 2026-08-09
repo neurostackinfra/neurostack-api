@@ -1,0 +1,17 @@
+# Pinned Playwright browser image so baseline PNGs remain byte-stable across
+# CI runs and local machines. Bump alongside the `@playwright/test` version
+# in package.json (both must match).
+FROM mcr.microsoft.com/playwright:v1.49.0-jammy
+
+WORKDIR /app
+# Copy workspace root files needed for pnpm install and TypeScript resolution
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json tsconfig.json ./
+# Copy all workspace packages so pnpm can resolve workspace: deps
+COPY artifacts/ ./artifacts/
+COPY lib/ ./lib/
+COPY scripts/ ./scripts/
+COPY attached_assets/ ./attached_assets/
+RUN npm install -g pnpm@10 && pnpm install --frozen-lockfile
+ENV PORT=3001
+ENV BASE_PATH=/
+CMD ["pnpm", "--filter", "@workspace/neurostack", "test:e2e"]

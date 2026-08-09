@@ -193,3 +193,26 @@ alembic/versions/*.pyc
 
 # Replit artifacts
 .replit-artifact/
+.genie/genie.db
+.genie/genie.db-wal
+.genie/genie.db-shm
+.genie/launch/
+
+# API provider preflight raw evidence (must also live outside the worktree)
+*.raw.json
+*raw-evidence*.json
+
+# Playwright reports, traces, and test-results (output to /tmp/neurostack-playwright)
+frontend/artifacts/neurostack/playwright-report/
+frontend/artifacts/neurostack/test-results/
+frontend/artifacts/neurostack/blob-report/
+/tmp/neurostack-playwright/
+# Keep only committed E2E baseline snapshots
+# (tests/e2e/**-snapshots/**.png remain tracked)
+
+# Local coding-agent and package-manager state
+.codex/
+.warp/
+.pnpm-store/
+.mcp.json
+*.bak

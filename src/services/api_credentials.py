@@ -1,0 +1,482 @@
+"""Pure policy for API-provider credentials.
+
+This module deliberately has no FastAPI, database, Redis, or logging imports.
+It is the single credential contract used by public routes and runtime callers.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
+MASKED_SECRET = "••••••••"
+
+PROVIDER_ALLOWLISTS: dict[str, frozenset[str]] = {
+    "whatsapp": frozenset(
+        {"meta_cloud", "dialog360", "twilio", "zapi", "evolution", "uazapi"}
+    ),
+    "llm": frozenset({"openai", "dropout", "outros", "slm_cortex"}),
+    "multimodal": frozenset({"openrouter", "groq", "openai"}),
+    "stt": frozenset(
+        {
+            "outros",
+            "openai_whisper",
+            "elevenlabs_scribe",
+            "google_stt",
+            "deepgram_stt",
+            "microsoft_stt",
+        }
+    ),
+    "tts": frozenset({"elevenlabs", "google"}),
+}
+
+OPERATIONAL_LLM_PROVIDERS = frozenset({"openai", "dropout", "outros"})
+OPERATIONAL_STT_PROVIDERS = frozenset({"outros", "openai_whisper"})
+UNIMPLEMENTED_WHATSAPP_PROVIDERS = frozenset({"dialog360", "twilio"})
+
+READINESS_IDS = frozenset(
+    {"active", "incomplete", "signature_pending", "configuration_only"}
+)
+WIRE_ERROR_CODES = frozenset(
+    {
+        "credential_endpoint_required",
+        "credentials_jwt_required",
+        "credentials_role_forbidden",
+        "fresh_api_key_required",
+        "invalid_credentials_payload",
+        "invalid_provider_for_capability",
+        "provider_not_implemented",
+        "provider_not_operational",
+        "unsafe_api_url",
+    }
+)
+
+WHATSAPP_FIELDS = frozenset(
+    {
+        "whatsapp_provider",
+        "zapi_instance_id",
+        "zapi_token",
+        "zapi_client_token",
+        "zapi_inbound_token_digest",
+        "evolution_api_url",
+        "evolution_instance_name",
+        "evolution_api_key",
+        "meta_phone_number_id",
+        "meta_waba_id",
+        "meta_permanent_token",
+        "meta_app_secret",
+        "meta_verify_token",
+        "uazapi_api_url",
+        "uazapi_instance_name",
+        "uazapi_token",
+    }
+)
+LLM_FIELDS = frozenset({"llm_provider", "llm_api_url", "llm_api_key", "llm_model_name"})
+MULTIMODAL_FIELDS = frozenset(
+    {
+        "multimodal_provider",
+        "multimodal_api_url",
+        "multimodal_api_key",
+        "multimodal_model_name",
+    }
+)
+STT_FIELDS = frozenset(
+    {
+        "stt_provider",
+        "stt_api_url",
+        "stt_api_key",
+        "stt_model_name",
+        "whisper_api_key",
+        "whisper_model",
+        "audio_max_seconds",
+    }
+)
+TTS_FIELDS = frozenset({"tts_provider", "tts_api_url", "tts_api_key", "tts_model_name"})
+
+API_CREDENTIAL_FIELDS = frozenset(
+    WHATSAPP_FIELDS | LLM_FIELDS | MULTIMODAL_FIELDS | STT_FIELDS | TTS_FIELDS
+)
+LEGACY_CREDENTIAL_ALIASES = frozenset(
+    {"llm_base_url", "whisper_api_key", "whisper_model"}
+)
+CREDENTIAL_PREFIXES = (
+    "whatsapp_",
+    "zapi_",
+    "evolution_",
+    "meta_",
+    "uazapi_",
+    "dialog360_",
+    "twilio_",
+    "llm_",
+    "multimodal_",
+    "stt_",
+    "tts_",
+    "whisper_",
+)
+
+# Generic clinic configuration fields that happen to share a provider prefix.
+# Keep this allowlist explicit: the broad prefix checks below still close the
+# boundary against future credential aliases without blocking legitimate data.
+GENERIC_CONFIG_PREFIX_EXCEPTIONS = frozenset({"meta_minutos_atendimento"})
+
+SECRET_FIELDS = frozenset(
+    {
+        "zapi_token",
+        "zapi_client_token",
+        "zapi_inbound_token_digest",
+        "evolution_api_key",
+        "meta_permanent_token",
+        "meta_app_secret",
+        "meta_verify_token",
+        "uazapi_token",
+        "llm_api_key",
+        "multimodal_api_key",
+        "stt_api_key",
+        "whisper_api_key",
+        "tts_api_key",
+    }
+)
+
+
+class CredentialPolicyError(ValueError):
+    """Stable, secret-free domain error translated by the HTTP boundary."""
+
+    def __init__(self, error: str, **context: Any) -> None:
+        self.detail: dict[str, Any] = {"error": error, **context}
+        super().__init__(error)
+
+
+def is_masked_secret(value: Any) -> bool:
+    """Whether a submitted value is a UI mask rather than fresh key material."""
+
+    return isinstance(value, str) and ("••••" in value or "****" in value)
+
+
+def credential_boundary_fields(fields: Mapping[str, Any]) -> list[str]:
+    """Return sorted generic-config fields that belong to the credential boundary."""
+
+    return sorted(
+        field
+        for field in fields
+        if field not in GENERIC_CONFIG_PREFIX_EXCEPTIONS
+        and (
+            field in API_CREDENTIAL_FIELDS
+            or field in LEGACY_CREDENTIAL_ALIASES
+            or field == "api_credentials"
+            or field.startswith(CREDENTIAL_PREFIXES)
+        )
+    )
+
+
+def validate_provider(capability: str, provider: Any) -> None:
+    """Validate a wire provider id without leaking any secret field."""
+
+    if provider is None:
+        return
+    if not isinstance(provider, str) or provider not in PROVIDER_ALLOWLISTS[capability]:
+        raise CredentialPolicyError(
+            "invalid_provider_for_capability",
+            capability=capability,
+        )
+    if capability == "llm" and provider == "slm_cortex":
+        raise CredentialPolicyError(
+            "provider_not_operational",
+            capability="llm",
+            provider="slm_cortex",
+        )
+    if capability == "whatsapp" and provider in UNIMPLEMENTED_WHATSAPP_PROVIDERS:
+        raise CredentialPolicyError(
+            "provider_not_implemented",
+            capability="whatsapp",
+            provider=provider,
+        )
+
+
+def _fresh_key(patch: Mapping[str, Any], field: str) -> bool:
+    value = patch.get(field)
+    return isinstance(value, str) and bool(value) and not is_masked_secret(value)
+
+
+def _require_fresh_keys(existing: Mapping[str, Any], patch: Mapping[str, Any]) -> None:
+    definitions = {
+        "llm": ("llm_provider", "llm_api_url", "llm_api_key"),
+        "multimodal": (
+            "multimodal_provider",
+            "multimodal_api_url",
+            "multimodal_api_key",
+        ),
+        "stt": ("stt_provider", "stt_api_url", "stt_api_key"),
+        "tts": ("tts_provider", "tts_api_url", "tts_api_key"),
+    }
+    for capability, (provider_field, url_field, key_field) in definitions.items():
+        provider_changed = provider_field in patch and patch[
+            provider_field
+        ] != existing.get(provider_field)
+        url_changed = url_field in patch and patch[url_field] != existing.get(url_field)
+        if provider_changed and not _fresh_key(patch, key_field):
+            raise CredentialPolicyError(
+                "fresh_api_key_required",
+                capability=capability,
+                reason="provider_changed",
+            )
+        if url_changed and not _fresh_key(patch, key_field):
+            raise CredentialPolicyError(
+                "fresh_api_key_required",
+                capability=capability,
+                reason="api_url_changed",
+            )
+
+
+def merge_credentials(
+    existing: Mapping[str, Any], patch: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Validate and atomically merge one flat credential patch."""
+
+    unknown = sorted(set(patch) - API_CREDENTIAL_FIELDS)
+    if unknown:
+        raise CredentialPolicyError(
+            "invalid_credentials_payload",
+            fields=[{"field": field, "code": "extra_forbidden"} for field in unknown],
+        )
+    for capability in PROVIDER_ALLOWLISTS:
+        provider_field = (
+            "whatsapp_provider"
+            if capability == "whatsapp"
+            else f"{capability}_provider"
+        )
+        if provider_field in patch:
+            validate_provider(capability, patch[provider_field])
+    _require_fresh_keys(existing, patch)
+
+    merged = dict(existing)
+    for field, value in patch.items():
+        if field in SECRET_FIELDS and (
+            value is None or value == "" or is_masked_secret(value)
+        ):
+            continue
+        merged[field] = value
+    if "stt_api_key" in patch and _fresh_key(patch, "stt_api_key"):
+        merged.pop("whisper_api_key", None)
+    if "stt_model_name" in patch:
+        merged.pop("whisper_model", None)
+    return merged
+
+
+def resolve_stt_credentials(credentials: Mapping[str, Any]) -> dict[str, Any]:
+    """Return canonical-first STT fields while retaining unrelated credentials."""
+
+    resolved = dict(credentials)
+    if not resolved.get("stt_api_key") and resolved.get("whisper_api_key"):
+        resolved["stt_api_key"] = resolved["whisper_api_key"]
+    if not resolved.get("stt_model_name") and resolved.get("whisper_model"):
+        resolved["stt_model_name"] = resolved["whisper_model"]
+    has_stt_configuration = any(
+        resolved.get(field) not in (None, "")
+        for field in (
+            "stt_provider",
+            "stt_api_url",
+            "stt_api_key",
+            "stt_model_name",
+            "whisper_api_key",
+            "whisper_model",
+        )
+    )
+    if has_stt_configuration:
+        if not resolved.get("stt_provider"):
+            resolved["stt_provider"] = "outros"
+        if resolved.get("audio_max_seconds") is None:
+            resolved["audio_max_seconds"] = 60
+    return resolved
+
+
+LLM_OVERLAY_FIELDS: tuple[str, str, str, str] = (
+    "llm_provider",
+    "llm_api_url",
+    "llm_api_key",
+    "llm_model_name",
+)
+
+
+def _llm_bundle_complete(candidate: Mapping[str, Any] | None) -> bool:
+    if not candidate:
+        return False
+    if candidate.get("llm_provider") not in OPERATIONAL_LLM_PROVIDERS:
+        return False
+    return all(candidate.get(field) for field in LLM_OVERLAY_FIELDS[1:])
+
+
+def compose_llm_credentials(
+    clinic: Mapping[str, Any], builder: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Overlay exactly the four LLM fields when clinic LLM is incomplete."""
+
+    result = dict(clinic)
+    if _llm_bundle_complete(clinic):
+        return result
+    if builder is not None and _llm_bundle_complete(builder):
+        for field in LLM_OVERLAY_FIELDS:
+            result[field] = builder[field]
+    return result
+
+
+# ============================================
+# Cache v2 marker and payload wrapping
+# ============================================
+
+CONFIG_CACHE_SCHEMA_VERSION = 2
+CONFIG_CACHE_VERSION_FIELD = "config_cache_schema_version"
+CONFIG_CACHE_KEY_PREFIX = "neurostack:clinic_config"
+
+
+def config_cache_key(tenant_id: Any) -> str:
+    """Deterministic cache key for a tenant configuration entry."""
+
+    return f"{CONFIG_CACHE_KEY_PREFIX}:{tenant_id}"
+
+
+def is_cache_v2_payload(payload: Any) -> bool:
+    """Return True only when the payload carries the current schema marker."""
+
+    if not isinstance(payload, Mapping):
+        return False
+    return payload.get(CONFIG_CACHE_VERSION_FIELD) == CONFIG_CACHE_SCHEMA_VERSION
+
+
+def build_cache_payload(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Wrap a clinic config snapshot with the v2 marker and projected creds."""
+
+    raw_credentials = config.get("api_credentials") or {}
+    projected = runtime_projection(raw_credentials)
+    payload = {key: value for key, value in config.items() if key != "api_credentials"}
+    payload["api_credentials"] = projected
+    payload[CONFIG_CACHE_VERSION_FIELD] = CONFIG_CACHE_SCHEMA_VERSION
+    return payload
+
+
+def mask_secret(value: Any) -> str | None:
+    """Return a constant mask so response length never reveals secret length."""
+
+    return MASKED_SECRET if isinstance(value, str) and bool(value) else None
+
+
+def _complete(credentials: Mapping[str, Any], fields: tuple[str, ...]) -> bool:
+    return all(bool(credentials.get(field)) for field in fields)
+
+
+def _whatsapp_readiness(credentials: Mapping[str, Any]) -> str:
+    provider = credentials.get("whatsapp_provider")
+    if provider == "meta_cloud":
+        identity_ready = _complete(
+            credentials, ("meta_phone_number_id", "meta_permanent_token")
+        )
+        if identity_ready and not credentials.get("meta_app_secret"):
+            return "signature_pending"
+        return (
+            "active"
+            if identity_ready and credentials.get("meta_app_secret")
+            else "incomplete"
+        )
+    requirements = {
+        "zapi": ("zapi_instance_id", "zapi_token", "zapi_inbound_token_digest"),
+        "evolution": (
+            "evolution_api_url",
+            "evolution_instance_name",
+            "evolution_api_key",
+        ),
+        "uazapi": ("uazapi_api_url", "uazapi_instance_name", "uazapi_token"),
+    }
+    fields = requirements.get(str(provider))
+    return "active" if fields and _complete(credentials, fields) else "incomplete"
+
+
+def credential_status(credentials: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the secret-free public GET/PATCH response contract."""
+
+    resolved = resolve_stt_credentials(credentials)
+    result: dict[str, Any] = {}
+    for field in sorted(API_CREDENTIAL_FIELDS - SECRET_FIELDS):
+        if field in {"whisper_model"}:
+            continue
+        result[field] = resolved.get(field)
+    for field in sorted(SECRET_FIELDS):
+        public_name = (
+            "zapi_inbound_token" if field == "zapi_inbound_token_digest" else field
+        )
+        secret_value = (
+            resolved.get("stt_api_key")
+            if field == "stt_api_key"
+            else credentials.get(field)
+        )
+        result[f"{public_name}_set"] = bool(secret_value)
+        if field != "zapi_inbound_token_digest":
+            result[f"{public_name}_masked"] = mask_secret(secret_value)
+
+    llm_ready = credentials.get(
+        "llm_provider"
+    ) in OPERATIONAL_LLM_PROVIDERS and _complete(
+        credentials, ("llm_api_url", "llm_api_key", "llm_model_name")
+    )
+    multimodal_complete = _complete(
+        credentials,
+        (
+            "multimodal_provider",
+            "multimodal_api_url",
+            "multimodal_api_key",
+            "multimodal_model_name",
+        ),
+    )
+    stt_provider = resolved.get("stt_provider", "outros")
+    stt_complete = _complete(resolved, ("stt_api_url", "stt_api_key", "stt_model_name"))
+    tts_complete = _complete(
+        credentials, ("tts_provider", "tts_api_url", "tts_api_key", "tts_model_name")
+    )
+    whatsapp_readiness = _whatsapp_readiness(credentials)
+    result.update(
+        {
+            "audio_max_seconds": resolved.get("audio_max_seconds", 60),
+            "llm_base_url": resolved.get("llm_api_url"),
+            "whisper_api_key_set": bool(resolved.get("stt_api_key")),
+            "whisper_api_key_masked": mask_secret(resolved.get("stt_api_key")),
+            "whisper_model": resolved.get("stt_model_name"),
+            "whatsapp_readiness": whatsapp_readiness,
+            "llm_readiness": "active" if llm_ready else "incomplete",
+            "multimodal_readiness": (
+                "configuration_only" if multimodal_complete else "incomplete"
+            ),
+            "stt_readiness": (
+                "active"
+                if stt_complete and stt_provider in OPERATIONAL_STT_PROVIDERS
+                else "configuration_only" if stt_complete else "incomplete"
+            ),
+            "tts_readiness": "configuration_only" if tts_complete else "incomplete",
+            "apis_configured": whatsapp_readiness == "active" or llm_ready,
+        }
+    )
+    return result
+
+
+def runtime_projection(credentials: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the strictly non-secret API credential projection allowed in cache."""
+
+    resolved = resolve_stt_credentials(credentials)
+    allowed = {
+        "whatsapp_provider",
+        "zapi_instance_id",
+        "evolution_api_url",
+        "evolution_instance_name",
+        "meta_phone_number_id",
+        "meta_waba_id",
+        "uazapi_api_url",
+        "uazapi_instance_name",
+        "llm_provider",
+        "llm_api_url",
+        "llm_model_name",
+        "stt_provider",
+        "audio_max_seconds",
+    }
+    projected = {field: resolved[field] for field in allowed if field in resolved}
+    if resolved.get("stt_provider") in OPERATIONAL_STT_PROVIDERS:
+        for field in ("stt_api_url", "stt_model_name"):
+            if field in resolved:
+                projected[field] = resolved[field]
+    return projected
