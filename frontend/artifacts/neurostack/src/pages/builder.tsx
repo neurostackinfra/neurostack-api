@@ -4,6 +4,7 @@ import {
   Wrench, Building2, Activity, Plus, CheckCircle2, XCircle, Zap,
   Loader2, AlertTriangle, AlertCircle, Info, KeyRound, ToggleLeft, ToggleRight,
   Sliders, Inbox, ChevronDown, ChevronUp, TrendingUp, TrendingDown, ExternalLink,
+  Clock,
 } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { useAuth } from "@/context/auth";
@@ -36,6 +37,10 @@ interface BuilderClinic {
   trace_count_7d: number;
   safety_flags_7d: number;
   handoff_count_7d: number;
+  outside_hours_count_7d: number;
+  outside_hours_pct_7d: number | null;
+  conversational_trace_count_7d: number;
+  business_hours_configured: boolean;
   config_completeness: number;
 }
 
@@ -131,6 +136,36 @@ function HealthDot({ status }: { status: string }) {
   return <span className={`inline-block w-2 h-2 rounded-full ${color}`} />;
 }
 
+function OutsideHoursClinicMetric({ clinic, locale }: { clinic: BuilderClinic; locale: string }) {
+  const txt = (pt: string, en: string) => locale === "en" ? en : pt;
+  const hasData = clinic.business_hours_configured
+    && clinic.conversational_trace_count_7d > 0
+    && clinic.outside_hours_pct_7d !== null;
+  const numberLocale = locale === "en" ? "en-US" : "pt-BR";
+
+  return (
+    <div className="text-center p-2 rounded-lg bg-muted/30" data-testid={`clinic-outside-hours-${clinic.id}`}>
+      <div className="flex items-center justify-center gap-1 text-[10px] text-muted-foreground">
+        <Clock className="h-3 w-3" /> {txt("Fora do horário (7d)", "Outside hours (7d)")}
+      </div>
+      {!clinic.business_hours_configured ? (
+        <p className="mt-1 text-xs font-semibold text-amber-400">{txt("Não configurado", "Not configured")}</p>
+      ) : hasData ? (
+        <p className="mt-1 text-lg font-bold text-violet-400">
+          {clinic.outside_hours_pct_7d!.toLocaleString(numberLocale, { maximumFractionDigits: 1 })}%
+        </p>
+      ) : (
+        <p className="mt-1 text-xs font-semibold text-muted-foreground">{txt("Sem dados", "No data")}</p>
+      )}
+      {clinic.business_hours_configured && (
+        <p className="text-[10px] text-muted-foreground tabular-nums">
+          {clinic.outside_hours_count_7d.toLocaleString(numberLocale)} / {clinic.conversational_trace_count_7d.toLocaleString(numberLocale)}
+        </p>
+      )}
+    </div>
+  );
+}
+
 // ── Chart Tooltip ─────────────────────────────────────────────────────────────
 
 function ChartTooltip({ active, payload }: { active?: boolean; payload?: { value: number; payload: { date: string } }[] }) {
@@ -168,7 +203,7 @@ function relativeTime(dateStr: string | null, neverLabel: string, daysLabel: str
 // ── Builder Panel ─────────────────────────────────────────────────────────────
 
 export default function BuilderPanel() {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const { isBuilder, setViewingClinicId } = useAuth();
   const [, navigate] = useLocation();
   const token = useBuilderToken();
@@ -774,7 +809,7 @@ export default function BuilderPanel() {
                         {/* Expandable detail */}
                         <CollapsibleContent className="space-y-3 pt-2 border-t border-border">
                           {/* Mini stats row */}
-                          <div className="grid grid-cols-3 gap-2">
+                          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                             <div className="text-center p-2 rounded-lg bg-muted/30">
                               <p className="text-lg font-bold text-foreground">{clinic.trace_count_7d}</p>
                               <p className="text-[10px] text-muted-foreground">{t("builder_traces_7d")}</p>
@@ -787,6 +822,7 @@ export default function BuilderPanel() {
                               <p className="text-lg font-bold text-blue-400">{clinic.handoff_count_7d}</p>
                               <p className="text-[10px] text-muted-foreground">{t("builder_handoffs_7d")}</p>
                             </div>
+                            <OutsideHoursClinicMetric clinic={clinic} locale={locale} />
                           </div>
 
                           {/* Config completeness */}

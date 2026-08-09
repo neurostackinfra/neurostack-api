@@ -14,6 +14,10 @@ interface ClinicService {
   price?: string;
   authority_notes?: string;
 }
+
+type BusinessDay = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
+
+const BUSINESS_DAYS: BusinessDay[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 import { useToast } from "@/hooks/use-toast";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -1008,12 +1012,14 @@ function Field({
 function SwitchRow({
   label,
   hint,
+  ariaLabel,
   checked,
   onCheckedChange,
   disabled,
 }: {
   label: string;
   hint?: string;
+  ariaLabel?: string;
   checked: boolean;
   onCheckedChange: (v: boolean) => void;
   disabled?: boolean;
@@ -1024,7 +1030,7 @@ function SwitchRow({
         <p className="text-sm font-medium text-foreground">{label}</p>
         {hint && <p className="text-xs text-muted-foreground mt-0.5">{hint}</p>}
       </div>
-      <Switch checked={checked} onCheckedChange={onCheckedChange} disabled={disabled} className="shrink-0" />
+      <Switch aria-label={ariaLabel} checked={checked} onCheckedChange={onCheckedChange} disabled={disabled} className="shrink-0" />
     </div>
   );
 }
@@ -1049,6 +1055,11 @@ const INVESTOR_MOCK_CONFIG = {
   parking_info: "Estacionamento conveniado no Shopping Paulista, entrada pela Av. Brasil",
   working_hours: "Seg–Sex: 9h–19h | Sáb: 9h–14h | Dom: fechado",
   scheduling_hours: "Seg–Sex: 8h–18h",
+  timezone: "America/Sao_Paulo",
+  business_hours_enabled: true,
+  business_hours_open: "09:00",
+  business_hours_close: "19:00",
+  business_hours_days: ["mon", "tue", "wed", "thu", "fri", "sat"],
   service_format: "both",
   online_services_desc: "Consulta de avaliação, acompanhamento pós-procedimento, orientações nutricionais",
   presential_services_desc: "Aplicação de toxina botulínica, preenchimento labial, limpeza de pele profunda, harmonização facial",
@@ -1131,6 +1142,11 @@ export default function ClinicConfig() {
   const [schedulingLinkErrors, setSchedulingLinkErrors] = useState<Record<string, string>>({});
   const [serviceFormat, setServiceFormat] = useState("");
   const [timezone, setTimezone] = useState("America/Sao_Paulo");
+  const [businessHoursEnabled, setBusinessHoursEnabled] = useState(false);
+  const [businessHoursOpen, setBusinessHoursOpen] = useState("");
+  const [businessHoursClose, setBusinessHoursClose] = useState("");
+  const [businessHoursDays, setBusinessHoursDays] = useState<BusinessDay[]>([]);
+  const [businessHoursErrors, setBusinessHoursErrors] = useState<Record<string, string>>({});
   const [onlineServicesDesc, setOnlineServicesDesc] = useState("");
   const [presentialServicesDesc, setPresentialServicesDesc] = useState("");
 
@@ -1202,6 +1218,16 @@ export default function ClinicConfig() {
     setSchedulingLinkMessage(config.scheduling_link_message ?? "");
     setServiceFormat(config.service_format ?? "");
     setTimezone(config.timezone ?? "America/Sao_Paulo");
+    setBusinessHoursEnabled(config.business_hours_enabled === true);
+    setBusinessHoursOpen(config.business_hours_open ?? "");
+    setBusinessHoursClose(config.business_hours_close ?? "");
+    setBusinessHoursDays(
+      Array.isArray(config.business_hours_days)
+        ? config.business_hours_days.filter((day: unknown): day is BusinessDay =>
+            typeof day === "string" && BUSINESS_DAYS.includes(day as BusinessDay),
+          )
+        : [],
+    );
     setDifferentials(config.differentials ?? "");
     setAcceptsInsurance(config.accepts_insurance ?? "no");
     setInsuranceList(config.insurance_list ?? "");
@@ -1340,6 +1366,40 @@ export default function ClinicConfig() {
     }
     setSchedulingLinkErrors({});
 
+    const businessHoursValidationErrors: Record<string, string> = {};
+    if (businessHoursEnabled) {
+      if (!businessHoursOpen) {
+        businessHoursValidationErrors.business_hours_open = txt("Informe a hora de abertura.", "Provide the opening time.");
+      }
+      if (!businessHoursClose) {
+        businessHoursValidationErrors.business_hours_close = txt("Informe a hora de fechamento.", "Provide the closing time.");
+      } else if (businessHoursOpen && businessHoursClose <= businessHoursOpen) {
+        businessHoursValidationErrors.business_hours_close = txt(
+          "O fechamento deve ser posterior à abertura.",
+          "Closing time must be later than opening time.",
+        );
+      }
+      if (businessHoursDays.length === 0) {
+        businessHoursValidationErrors.business_hours_days = txt(
+          "Selecione pelo menos um dia de atendimento.",
+          "Select at least one business day.",
+        );
+      }
+    }
+    if (Object.keys(businessHoursValidationErrors).length > 0) {
+      setBusinessHoursErrors(businessHoursValidationErrors);
+      toast({
+        title: txt("Revise o horário de atendimento.", "Review the business hours."),
+        description: txt(
+          "Preencha abertura, fechamento e dias; o fechamento deve ser posterior à abertura.",
+          "Provide opening, closing, and days; closing must be later than opening.",
+        ),
+        variant: "destructive",
+      });
+      return;
+    }
+    setBusinessHoursErrors({});
+
     setIsSaving(true);
     const payload: Record<string, any> = {
       clinic_name: clinicName.trim(),
@@ -1364,6 +1424,10 @@ export default function ClinicConfig() {
       scheduling_link_message: schedulingLinkEnabled ? (schedulingLinkMessage.trim() || null) : null,
       service_format: serviceFormat || null,
       timezone: timezone,
+      business_hours_enabled: businessHoursEnabled,
+      business_hours_open: businessHoursEnabled ? businessHoursOpen : null,
+      business_hours_close: businessHoursEnabled ? businessHoursClose : null,
+      business_hours_days: businessHoursEnabled ? businessHoursDays : null,
       accepts_insurance: acceptsInsurance || null,
       insurance_list: insuranceList.trim() || null,
       initial_consultation: initialConsultation || null,
@@ -1807,7 +1871,7 @@ export default function ClinicConfig() {
 
               <Field
                 label={txt("Fuso horário", "Timezone")}
-                hint={txt("Define o horário local usado nas saudações (bom dia / boa tarde / boa noite).", "Sets the local time used for greetings (good morning / afternoon / evening).")}
+                hint={txt("Define o horário local usado nas saudações e na métrica fora do horário.", "Sets the local time used for greetings and the outside-hours metric.")}
               >
                 <Select value={timezone} onValueChange={setTimezone} disabled={isReadOnly}>
                   <SelectTrigger className="h-9 text-sm">
@@ -1837,6 +1901,129 @@ export default function ClinicConfig() {
                   </SelectContent>
                 </Select>
               </Field>
+
+              <SwitchRow
+                label={txt("Métrica de atendimentos fora do horário", "Outside-hours metric")}
+                ariaLabel={txt("Ativar métrica de atendimentos fora do horário", "Enable outside-hours metric")}
+                hint={txt(
+                  "Use um horário estruturado para medir conversas recebidas fora do período de atendimento.",
+                  "Use structured hours to measure conversations received outside business hours.",
+                )}
+                checked={businessHoursEnabled}
+                onCheckedChange={(enabled) => {
+                  setBusinessHoursEnabled(enabled);
+                  setBusinessHoursErrors({});
+                }}
+                disabled={isReadOnly}
+              />
+              {businessHoursEnabled && (
+                <div className="space-y-4 rounded-md border border-border bg-muted/10 p-3">
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <Field label={txt("Abertura", "Opening time")}>
+                      <Input
+                        type="time"
+                        aria-label={txt("Hora de abertura", "Opening time")}
+                        aria-invalid={Boolean(businessHoursErrors.business_hours_open)}
+                        aria-describedby={businessHoursErrors.business_hours_open ? "business-hours-open-error" : undefined}
+                        value={businessHoursOpen}
+                        onChange={(e) => {
+                          setBusinessHoursOpen(e.target.value);
+                          setBusinessHoursErrors((prev) => {
+                            const next = { ...prev };
+                            delete next.business_hours_open;
+                            delete next.business_hours_close;
+                            return next;
+                          });
+                        }}
+                        className={businessHoursErrors.business_hours_open ? "border-red-500" : ""}
+                        disabled={isReadOnly}
+                        data-testid="input-business-hours-open"
+                      />
+                      {businessHoursErrors.business_hours_open && (
+                        <p id="business-hours-open-error" role="alert" className="text-xs text-red-400 mt-1">
+                          {businessHoursErrors.business_hours_open}
+                        </p>
+                      )}
+                    </Field>
+                    <Field label={txt("Fechamento", "Closing time")}>
+                      <Input
+                        type="time"
+                        aria-label={txt("Hora de fechamento", "Closing time")}
+                        aria-invalid={Boolean(businessHoursErrors.business_hours_close)}
+                        aria-describedby={businessHoursErrors.business_hours_close ? "business-hours-close-error" : undefined}
+                        value={businessHoursClose}
+                        onChange={(e) => {
+                          setBusinessHoursClose(e.target.value);
+                          setBusinessHoursErrors((prev) => {
+                            const next = { ...prev };
+                            delete next.business_hours_close;
+                            return next;
+                          });
+                        }}
+                        className={businessHoursErrors.business_hours_close ? "border-red-500" : ""}
+                        disabled={isReadOnly}
+                        data-testid="input-business-hours-close"
+                      />
+                      {businessHoursErrors.business_hours_close && (
+                        <p id="business-hours-close-error" role="alert" className="text-xs text-red-400 mt-1">
+                          {businessHoursErrors.business_hours_close}
+                        </p>
+                      )}
+                    </Field>
+                  </div>
+                  <Field
+                    label={txt("Dias de atendimento", "Business days")}
+                    hint={txt("Selecione todos os dias em que a clínica atende.", "Select every day the clinic is open.")}
+                  >
+                    <div
+                      role="group"
+                      aria-label={txt("Dias de atendimento", "Business days")}
+                      className="grid grid-cols-4 gap-2 sm:grid-cols-7"
+                      aria-invalid={Boolean(businessHoursErrors.business_hours_days)}
+                      aria-describedby={businessHoursErrors.business_hours_days ? "business-hours-days-error" : undefined}
+                    >
+                      {BUSINESS_DAYS.map((day, index) => {
+                        const selected = businessHoursDays.includes(day);
+                        const labels = [
+                          txt("Seg", "Mon"), txt("Ter", "Tue"), txt("Qua", "Wed"), txt("Qui", "Thu"),
+                          txt("Sex", "Fri"), txt("Sáb", "Sat"), txt("Dom", "Sun"),
+                        ];
+                        return (
+                          <button
+                            key={day}
+                            type="button"
+                            aria-pressed={selected}
+                            onClick={() => {
+                              setBusinessHoursDays((prev) =>
+                                selected ? prev.filter((value) => value !== day) : [...prev, day],
+                              );
+                              setBusinessHoursErrors((prev) => {
+                                const next = { ...prev };
+                                delete next.business_hours_days;
+                                return next;
+                              });
+                            }}
+                            disabled={isReadOnly}
+                            data-testid={`toggle-business-day-${day}`}
+                            className={`rounded-md border px-2 py-2 text-xs font-medium transition-colors disabled:opacity-50 ${
+                              selected
+                                ? "border-accent bg-accent text-accent-foreground"
+                                : "border-border bg-background text-muted-foreground hover:text-foreground"
+                            }`}
+                          >
+                            {labels[index]}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {businessHoursErrors.business_hours_days && (
+                      <p id="business-hours-days-error" role="alert" className="text-xs text-red-400 mt-1">
+                        {businessHoursErrors.business_hours_days}
+                      </p>
+                    )}
+                  </Field>
+                </div>
+              )}
 
               <SectionLabel>{txt("Formato de Atendimento", "Service Format")}</SectionLabel>
               <Field label={txt("Modalidade", "Modality")}>

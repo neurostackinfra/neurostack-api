@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -18,7 +19,7 @@ from src.api.middleware.auth import TenantContext, get_tenant_context, require_b
 from src.api.schemas.config import ConfigPatchRequest, ConfigResponse
 from src.config.logging import get_logger as get_structured_logger
 from src.config.settings import settings
-from src.models.clinic_config import ClinicScheduling
+from src.models.clinic_config import ClinicOperations, ClinicScheduling
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.tenant import Tenant
 from src.repositories import get_db_session_dependency
@@ -232,22 +233,34 @@ async def patch_config(
             # Dict buckets: merge with existing
             existing = getattr(row, bucket_name, None) or {}
             merged = {**existing, **new_values}
-            # Revalidate the scheduling bucket via pydantic so URL rules
-            # (e.g. https-only for scheduling_link_url) reject bad input
-            # with 422 instead of silently persisting through the raw
-            # dict merge. ConfigPatchRequest is extra="allow" and does
-            # NOT validate per-field, so this is the enforcement point.
-            if bucket_name == "scheduling":
+            # Revalidate buckets with field-level rules after merging. The
+            # request schema allows extra fields, so this is the enforcement
+            # point for scheduling URLs and structured business hours.
+            bucket_model = {
+                "scheduling": ClinicScheduling,
+                "operations": ClinicOperations,
+            }.get(bucket_name)
+            if bucket_model is not None:
                 try:
-                    validated = ClinicScheduling(**merged)
+                    validated = bucket_model(**merged)
                 except ValidationError as exc:
                     raise HTTPException(
                         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                        detail=exc.errors(),
+                        detail=jsonable_encoder(exc.errors()),
                     )
-                # Persist the validated/normalized form (e.g. empty
-                # strings collapsed to None by the validator).
-                merged = validated.model_dump()
+                validated_dump = validated.model_dump()
+                dropped_keys = sorted(set(merged) - set(validated_dump))
+                if dropped_keys:
+                    logger.warning(
+                        "config bucket validation dropped undeclared keys "
+                        "tenant=%s bucket=%s keys=%s",
+                        tenant.tenant_id,
+                        bucket_name,
+                        dropped_keys,
+                    )
+                # Persist the validated/normalized form (e.g. empty strings
+                # collapsed to None by validators).
+                merged = validated_dump
             setattr(row, bucket_name, merged)
 
     await session.flush()

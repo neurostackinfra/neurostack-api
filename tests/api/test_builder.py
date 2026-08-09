@@ -202,6 +202,71 @@ class TestBuilderListClinics:
         assert response.status_code == 200
         assert isinstance(response.json(), list)
 
+    def test_new_outside_hours_fields_have_safe_defaults(
+        self, client: TestClient, builder_a_headers
+    ):
+        from types import SimpleNamespace
+
+        from src.repositories import get_db_session_dependency
+
+        tenant_id = uuid4()
+        tenant = SimpleNamespace(
+            id=tenant_id,
+            name="Outside Hours Defaults",
+            slug="outside-hours-defaults",
+            is_active=True,
+            plan_type="pilot",
+            created_at=None,
+            clinic_config_row=SimpleNamespace(
+                identity={},
+                operations={},
+                business_rules={},
+                persona={},
+                services=[],
+                professionals=[],
+            ),
+        )
+
+        class _Result:
+            def __init__(self, tenants=None):
+                self._tenants = tenants or []
+
+            def scalars(self):
+                return self
+
+            def all(self):
+                return self._tenants
+
+            def __iter__(self):
+                return iter(())
+
+        class _Session:
+            def __init__(self):
+                self.call_count = 0
+
+            async def execute(self, _statement):
+                self.call_count += 1
+                return _Result([tenant] if self.call_count == 1 else [])
+
+        async def _override_session():
+            yield _Session()
+
+        client.application.dependency_overrides[get_db_session_dependency] = (
+            _override_session
+        )
+        try:
+            response = client.get("/v1/builder/clinics", headers=builder_a_headers)
+        finally:
+            client.application.dependency_overrides.pop(get_db_session_dependency, None)
+
+        assert response.status_code == 200
+        clinic = response.json()[0]
+        assert clinic["id"] == str(tenant_id)
+        assert clinic["outside_hours_count_7d"] == 0
+        assert clinic["outside_hours_pct_7d"] is None
+        assert clinic["conversational_trace_count_7d"] == 0
+        assert clinic["business_hours_configured"] is False
+
 
 class TestBuilderProfile:
     """Test GET /v1/builder/me."""

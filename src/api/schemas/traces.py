@@ -238,6 +238,26 @@ class TraceStatsResponse(BaseModel):
         default_factory=dict,
         description="Distribution of intents across traces",
     )
+    outside_hours_count: int = Field(
+        default=0,
+        ge=0,
+        description="Conversational traces received outside configured business hours",
+    )
+    outside_hours_pct: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=100.0,
+        description="Percentage of conversational traces received outside business hours",
+    )
+    conversational_trace_count: int = Field(
+        default=0,
+        ge=0,
+        description="Message traces carrying conversational decision markers",
+    )
+    business_hours_configured: bool = Field(
+        default=False,
+        description="Whether valid structured business hours are configured",
+    )
     period_start: str = Field(
         ...,
         description="ISO 8601 start of the statistics period",

@@ -38,6 +38,8 @@ from src.models.event import Event
 from src.models.tenant import Tenant
 from src.models.user import User, UserRole
 from src.repositories import get_db_session_dependency
+from src.services.business_hours import summarize_outside_hours
+from src.services.trace_service import _is_conversational_trace
 
 router = APIRouter()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
@@ -176,11 +178,37 @@ async def list_clinics(
     handoff_result = await session.execute(handoff_stmt)
     handoff_map = {row.tenant_id: row.count for row in handoff_result}
 
+    # Batch query: conversational message.in events per authorized tenant
+    outside_hours_stmt = select(
+        Event.tenant_id,
+        Event.created_at,
+        Event.event_data,
+        Event.event_metadata,
+    ).where(
+        Event.tenant_id.in_(tenant_ids),
+        Event.event_type == "message.in",
+        Event.created_at >= seven_days_ago,
+    )
+    outside_hours_result = await session.execute(outside_hours_stmt)
+    conversational_created_ats: dict[UUID, list[datetime]] = {
+        tenant_id: [] for tenant_id in tenant_ids
+    }
+    for row in outside_hours_result:
+        if _is_conversational_trace(row.event_data, row.event_metadata):
+            conversational_created_ats[row.tenant_id].append(row.created_at)
+
     clinics = []
     for t in tenants:
         last_trace = last_trace_map.get(t.id)
         health = _compute_health_status(last_trace, t.is_active)
         completeness = _compute_config_completeness(t.clinic_config_row)
+        operations = (
+            t.clinic_config_row.operations if t.clinic_config_row is not None else None
+        )
+        outside_hours = summarize_outside_hours(
+            conversational_created_ats[t.id],
+            operations,
+        )
 
         clinics.append(
             BuilderClinicResponse(
@@ -196,6 +224,10 @@ async def list_clinics(
                 trace_count_7d=trace_7d_map.get(t.id, 0),
                 safety_flags_7d=safety_map.get(t.id, 0),
                 handoff_count_7d=handoff_map.get(t.id, 0),
+                outside_hours_count_7d=outside_hours["outside_hours_count"],
+                outside_hours_pct_7d=outside_hours["outside_hours_pct"],
+                conversational_trace_count_7d=len(conversational_created_ats[t.id]),
+                business_hours_configured=outside_hours["business_hours_configured"],
                 config_completeness=completeness,
             ).model_dump(mode="json")
         )
