@@ -18,7 +18,6 @@ import {
 } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
 import { useI18n } from "@/context/i18n";
-import { useAuth } from "@/context/auth";
 
 const MAX_BYTES = 5 * 1024 * 1024;
 const ALLOWED = ["image/png", "image/jpeg", "application/pdf"];
@@ -51,7 +50,6 @@ function formatBytes(bytes: number) {
 
 export default function Suporte() {
   const { t } = useI18n();
-  const { isClinicAdmin } = useAuth();
   const { toast } = useToast();
   const [tipo, setTipo] = useState("");
   const [mensagem, setMensagem] = useState("");
@@ -115,39 +113,6 @@ export default function Suporte() {
     }
   };
 
-  if (isClinicAdmin) {
-    return (
-      <div className="space-y-6">
-        <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-muted border border-border">
-            <HelpCircle className="h-5 w-5 text-foreground/70" />
-          </div>
-          <div>
-            <h1 className="text-2xl font-bold tracking-tight text-foreground">{t("support_title")}</h1>
-            <p className="text-sm font-medium text-foreground/65 mt-0.5">
-              {t("support_subtitle")}
-            </p>
-          </div>
-        </div>
-        <Card className="border-border/70 shadow-sm">
-          <CardHeader className="pb-3">
-            <div className="flex items-center justify-between">
-              <CardTitle className="text-sm font-semibold text-foreground">Suporte</CardTitle>
-              <Badge variant="outline" className="border-amber-500/40 text-amber-500 text-[10px] font-semibold">
-                Em breve
-              </Badge>
-            </div>
-          </CardHeader>
-          <CardContent>
-            <p className="text-sm text-muted-foreground">
-              Sistema de tickets em breve. Entre em contato com seu builder para suporte.
-            </p>
-          </CardContent>
-        </Card>
-      </div>
-    );
-  }
-
   return (
     <div className="space-y-6">
 
@@ -184,8 +149,7 @@ export default function Suporte() {
               </Badge>
             </div>
             <p className="text-xs font-medium text-foreground/55 mt-1">
-              {t("support_response_hint")}{" "}
-              <span className="text-foreground/75">info@neurostack.global</span>
+              {t("support_response_hint")}
             </p>
           </CardHeader>
           <CardContent className="pt-5">
