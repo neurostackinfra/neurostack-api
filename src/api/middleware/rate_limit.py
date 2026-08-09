@@ -3,17 +3,15 @@ NeuroStack API - Rate Limiting Middleware
 Token bucket rate limiting per tenant.
 """
 
+import sys
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Optional
 
 from fastapi import Request, status
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
-
-import sys
-from pathlib import Path
 
 # Add the project root to sys.path for local module resolution
 project_root = Path(__file__).resolve().parent.parent.parent
@@ -34,7 +32,7 @@ logger = get_logger(__name__)
 class TokenBucket:
     """
     Token bucket for rate limiting.
-    
+
     Implements a token bucket algorithm where tokens are added at a fixed rate
     and consumed by requests. When the bucket is empty, requests are rejected.
     """
@@ -51,10 +49,10 @@ class TokenBucket:
     def consume(self, tokens: int = 1) -> bool:
         """
         Attempt to consume tokens from the bucket.
-        
+
         Args:
             tokens: Number of tokens to consume
-            
+
         Returns:
             True if tokens were consumed, False if bucket is empty
         """
@@ -97,7 +95,7 @@ class TokenBucket:
 class RateLimitStore:
     """
     In-memory rate limit store.
-    
+
     TODO: Replace with Redis-backed implementation for distributed rate limiting
     in Task 5.0. This in-memory implementation works for single-instance deployments.
     """
@@ -113,11 +111,11 @@ class RateLimitStore:
     ) -> TokenBucket:
         """
         Get or create a token bucket for a tenant.
-        
+
         Args:
             tenant_id: Unique tenant identifier
             rate_limit: Custom rate limit (requests per minute)
-            
+
         Returns:
             TokenBucket for the tenant
         """
@@ -156,7 +154,7 @@ rate_limit_store = RateLimitStore()
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """
     FastAPI middleware for rate limiting.
-    
+
     Implements per-tenant rate limiting using token bucket algorithm.
     Rate limits are configurable per tenant and include burst allowance.
     """
@@ -262,6 +260,93 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 # ============================================
+# Webhook Rate Limit Helper
+# ============================================
+
+
+@dataclass(frozen=True)
+class WebhookRateLimitDecision:
+    """Rate-limit decision for a webhook request.
+
+    ``allowed`` is False when the tenant+channel bucket ran out of tokens.
+    ``limit``/``remaining``/``reset``/``retry_after`` mirror the header values
+    the caller must return either on the 200 fast path (informational headers)
+    or the 429 rejection body.
+    """
+
+    allowed: bool
+    limit: int
+    remaining: int
+    reset: int
+    retry_after: int
+
+
+def check_webhook_rate_limit(
+    tenant_id: str,
+    channel: str,
+) -> WebhookRateLimitDecision:
+    """Consume one token for a tenant+channel webhook bucket.
+
+    Used by the webhook handlers *after* authenticity/tenant resolution and
+    *before* replay/session/media. Reuses the process-wide
+    :data:`rate_limit_store` so quota and burst come from the same settings as
+    the request-scoped ``RateLimitMiddleware``.
+
+    When ``settings.rate_limit_enabled`` is False the call is a no-op that
+    reports ``allowed=True`` with the default limits, so the caller can still
+    surface informational headers without accidentally rejecting traffic.
+    """
+
+    limit = settings.rate_limit_requests_per_minute
+    reset = int(time.time()) + 60
+    if not settings.rate_limit_enabled:
+        return WebhookRateLimitDecision(
+            allowed=True,
+            limit=limit,
+            remaining=limit,
+            reset=reset,
+            retry_after=0,
+        )
+
+    bucket_key = f"webhook:{tenant_id}:{channel}"
+    bucket = rate_limit_store.get_or_create_bucket(bucket_key)
+    allowed = bucket.consume()
+    remaining = bucket.get_remaining()
+    reset = bucket.get_reset_time()
+    retry_after = max(1, reset - int(time.time())) if not allowed else 0
+    return WebhookRateLimitDecision(
+        allowed=allowed,
+        limit=limit,
+        remaining=remaining,
+        reset=reset,
+        retry_after=retry_after,
+    )
+
+
+def webhook_rate_limit_response(
+    decision: WebhookRateLimitDecision,
+) -> JSONResponse:
+    """Build the exact 429 response the wish requires for webhook rejects."""
+
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={
+            "error": "rate_limited",
+            "message": (
+                f"Rate limit exceeded. Try again in {decision.retry_after} seconds."
+            ),
+            "retry_after": decision.retry_after,
+        },
+        headers={
+            "X-RateLimit-Limit": str(decision.limit),
+            "X-RateLimit-Remaining": "0",
+            "X-RateLimit-Reset": str(decision.reset),
+            "Retry-After": str(decision.retry_after),
+        },
+    )
+
+
+# ============================================
 # Utility Functions
 # ============================================
 
@@ -269,7 +354,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 def get_rate_limit_info(request: Request) -> dict:
     """
     Get rate limit information for the current request.
-    
+
     Useful for exposing rate limit status in API responses.
     """
     tenant_context = getattr(request.state, "tenant", None)
@@ -292,4 +377,3 @@ def get_rate_limit_info(request: Request) -> dict:
         "remaining": bucket.get_remaining(),
         "reset": bucket.get_reset_time(),
     }
-

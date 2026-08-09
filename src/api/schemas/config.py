@@ -3,9 +3,140 @@ NeuroStack API - Config Schemas
 Pydantic schemas for clinic configuration CRUD endpoints.
 """
 
-from typing import Any
+import ipaddress
+from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints
+
+
+def _normalize_https_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or (parsed.port is not None and parsed.port != 443)
+        or parsed.hostname.lower() == "localhost"
+    ):
+        raise ValueError("unsafe_api_url")
+    hostname = parsed.hostname.lower()
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        raise ValueError("unsafe_api_url")
+    netloc = f"[{hostname}]" if ":" in hostname else hostname
+    path = parsed.path.rstrip("/")
+    return urlunsplit(("https", netloc, path, parsed.query, ""))
+
+
+Identifier = Annotated[
+    str,
+    StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=255),
+]
+Secret = Annotated[str, StringConstraints(strict=True, min_length=1, max_length=8192)]
+ApiUrl = Annotated[
+    str,
+    StringConstraints(
+        strict=True, strip_whitespace=True, min_length=1, max_length=2048
+    ),
+    AfterValidator(_normalize_https_url),
+]
+CapabilityDigest = Annotated[
+    str,
+    StringConstraints(
+        strict=True, pattern=r"^[0-9a-f]{64}$", min_length=64, max_length=64
+    ),
+]
+
+
+class WhatsAppCredentialsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    whatsapp_provider: (
+        Literal["meta_cloud", "dialog360", "twilio", "zapi", "evolution", "uazapi"]
+        | None
+    ) = None
+    zapi_instance_id: Identifier | None = None
+    zapi_token: Secret | None = None
+    zapi_client_token: Secret | None = None
+    zapi_inbound_token_digest: CapabilityDigest | None = None
+    evolution_api_url: ApiUrl | None = None
+    evolution_instance_name: Identifier | None = None
+    evolution_api_key: Secret | None = None
+    meta_phone_number_id: Identifier | None = None
+    meta_waba_id: Identifier | None = None
+    meta_permanent_token: Secret | None = None
+    meta_app_secret: Secret | None = None
+    meta_verify_token: Secret | None = None
+    uazapi_api_url: ApiUrl | None = None
+    uazapi_instance_name: Identifier | None = None
+    uazapi_token: Secret | None = None
+
+
+class LlmCredentialsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    llm_provider: Literal["openai", "dropout", "outros", "slm_cortex"] | None = None
+    llm_api_url: ApiUrl | None = None
+    llm_api_key: Secret | None = None
+    llm_model_name: Identifier | None = None
+
+
+class MultimodalCredentialsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    multimodal_provider: Literal["openrouter", "groq", "openai"] | None = None
+    multimodal_api_url: ApiUrl | None = None
+    multimodal_api_key: Secret | None = None
+    multimodal_model_name: Identifier | None = None
+
+
+class SttCredentialsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    stt_provider: (
+        Literal[
+            "outros",
+            "openai_whisper",
+            "elevenlabs_scribe",
+            "google_stt",
+            "deepgram_stt",
+            "microsoft_stt",
+        ]
+        | None
+    ) = None
+    stt_api_url: ApiUrl | None = None
+    stt_api_key: Secret | None = None
+    stt_model_name: Identifier | None = None
+    whisper_api_key: Secret | None = None
+    whisper_model: Identifier | None = None
+    audio_max_seconds: Annotated[int, Field(strict=True, ge=10, le=300)] | None = None
+
+
+class TtsCredentialsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    tts_provider: Literal["elevenlabs", "google"] | None = None
+    tts_api_url: ApiUrl | None = None
+    tts_api_key: Secret | None = None
+    tts_model_name: Identifier | None = None
+
+
+class ApiCredentialsPatch(
+    WhatsAppCredentialsPatch,
+    LlmCredentialsPatch,
+    MultimodalCredentialsPatch,
+    SttCredentialsPatch,
+    TtsCredentialsPatch,
+):
+    """Flat, backwards-compatible patch composed from capability schemas."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 class ConfigResponse(BaseModel):

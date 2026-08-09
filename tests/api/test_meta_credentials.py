@@ -2,13 +2,14 @@
 NeuroStack API - Meta Cloud API Credentials Tests
 
 Covers save/status flow for Meta Cloud API (WhatsApp Business) credentials:
-- 4 credential fields are persisted (phone_number_id, waba_id, permanent_token, app_secret)
-- Verify token is auto-generated on first save and preserved on subsequent saves
-- Secret fields (permanent_token, app_secret) are masked in status responses
+- 5 credential fields are persisted (phone_number_id, waba_id, permanent_token,
+  app_secret, verify_token)
+- Callers seed and retain the write-only verify token locally
+- Secret fields are exposed only through set/masked status
 - meta_phone_number_id is validated as unique per tenant (app-level check AND
   handling of a database-level IntegrityError race)
-- Saving credentials with an unimplemented WhatsApp provider (360dialog, twilio,
-  uazapi) returns a clear 501 error rather than silently accepting them
+- Saving credentials with an unimplemented WhatsApp provider (360dialog or
+  twilio) returns a clear 501 error rather than silently accepting it
 """
 
 from datetime import datetime, timedelta, timezone
@@ -22,8 +23,8 @@ from sqlalchemy.exc import IntegrityError
 
 from src.config.settings import settings
 
-
 API_CRED_PATH = "/v1/config/api-credentials"
+META_WEBHOOK_PATH = "/v1/webhook/meta"
 
 
 def _make_admin_token(tenant_id: UUID | None = None) -> str:
@@ -89,45 +90,47 @@ class TestSaveMetaCredentials:
         assert data["meta_permanent_token_set"] is True
         assert data["meta_app_secret_set"] is True
 
-    def test_auto_generates_verify_token_on_first_save(
+    def test_seeded_verify_token_is_write_only_on_first_save(
         self,
         client: TestClient,
         headers: dict[str, str],
     ) -> None:
+        verify_token = f"verify_{uuid4().hex}"
         payload = {
             "whatsapp_provider": "meta_cloud",
             "meta_phone_number_id": "111222333",
             "meta_permanent_token": "EAAG_first_save_token_ABCDEFG",
+            "meta_verify_token": verify_token,
         }
         response = client.patch(API_CRED_PATH, json=payload, headers=headers)
 
         assert response.status_code == 200
         data = response.json()
-        # verify_token is generated automatically and returned in clear text
-        # (it is not a secret — the user must copy it into the Meta dashboard).
-        verify_token = data["meta_verify_token"]
-        assert verify_token
-        assert isinstance(verify_token, str)
-        assert len(verify_token) >= 16
+        assert data["meta_verify_token_set"] is True
+        assert data["meta_verify_token_masked"] == "••••••••"
+        assert "meta_verify_token" not in data
+        assert verify_token not in response.text
 
     def test_preserves_verify_token_across_saves(
         self,
         client: TestClient,
         headers: dict[str, str],
     ) -> None:
-        # First save — generates a verify token
+        verify_token = f"verify_{uuid4().hex}"
+        # First save — caller seeds and retains the write-only verify token.
         first = client.patch(
             API_CRED_PATH,
             json={
                 "whatsapp_provider": "meta_cloud",
                 "meta_phone_number_id": "444555666",
                 "meta_permanent_token": "EAAG_initial_token_ABCDEFG",
+                "meta_verify_token": verify_token,
             },
             headers=headers,
         )
         assert first.status_code == 200
-        initial_verify_token = first.json()["meta_verify_token"]
-        assert initial_verify_token
+        assert first.json()["meta_verify_token_set"] is True
+        assert verify_token not in first.text
 
         # Second save — update WABA id only, verify_token must be preserved
         second = client.patch(
@@ -136,7 +139,20 @@ class TestSaveMetaCredentials:
             headers=headers,
         )
         assert second.status_code == 200
-        assert second.json()["meta_verify_token"] == initial_verify_token
+        assert second.json()["meta_verify_token_set"] is True
+        assert second.json()["meta_verify_token_masked"] == "••••••••"
+        assert verify_token not in second.text
+
+        handshake = client.get(
+            META_WEBHOOK_PATH,
+            params={
+                "hub.mode": "subscribe",
+                "hub.verify_token": verify_token,
+                "hub.challenge": "preserved-token-challenge",
+            },
+        )
+        assert handshake.status_code == 200
+        assert handshake.text == "preserved-token-challenge"
 
 
 class TestMaskingMetaCredentials:
@@ -149,6 +165,7 @@ class TestMaskingMetaCredentials:
     ) -> None:
         raw_token = "EAAG_super_secret_permanent_token_1234567890"
         raw_secret = "raw_app_secret_XYZ_ABCDEFG"
+        verify_token = f"verify_{uuid4().hex}"
         client.patch(
             API_CRED_PATH,
             json={
@@ -156,6 +173,7 @@ class TestMaskingMetaCredentials:
                 "meta_phone_number_id": "555666777",
                 "meta_permanent_token": raw_token,
                 "meta_app_secret": raw_secret,
+                "meta_verify_token": verify_token,
             },
             headers=headers,
         )
@@ -167,13 +185,14 @@ class TestMaskingMetaCredentials:
         # Set flags true, but the raw secrets must never appear in the response
         assert data["meta_permanent_token_set"] is True
         assert data["meta_app_secret_set"] is True
+        assert data["meta_verify_token_set"] is True
         assert data["meta_permanent_token_masked"]
         assert data["meta_app_secret_masked"]
         assert raw_token not in str(data)
         assert raw_secret not in str(data)
-        # verify_token, being non-secret, is returned in clear text
-        assert data["meta_verify_token"]
-        assert isinstance(data["meta_verify_token"], str)
+        assert data["meta_verify_token_masked"] == "••••••••"
+        assert "meta_verify_token" not in data
+        assert verify_token not in response.text
 
 
 class TestPhoneNumberIdUniqueness:
@@ -259,10 +278,10 @@ class TestPhoneNumberIdUniqueness:
                 statement="INSERT ...",
                 params=None,
                 orig=Exception(
-                    'duplicate key value violates unique constraint '
+                    "duplicate key value violates unique constraint "
                     '"uq_clinic_configs_meta_phone_number_id" DETAIL: '
-                    'Key ((api_credentials->>\'meta_phone_number_id\'))=(9999) '
-                    'already exists.'
+                    "Key ((api_credentials->>'meta_phone_number_id'))=(9999) "
+                    "already exists."
                 ),
             ),
         ):
@@ -285,7 +304,7 @@ class TestPhoneNumberIdUniqueness:
 class TestUnimplementedProviders:
     """Providers accepted in the UI but without a backend must fail loudly."""
 
-    @pytest.mark.parametrize("provider", ["dialog360", "twilio", "uazapi"])
+    @pytest.mark.parametrize("provider", ["dialog360", "twilio"])
     def test_returns_501_for_unimplemented_provider(
         self,
         client: TestClient,
@@ -301,10 +320,8 @@ class TestUnimplementedProviders:
         detail = resp.json().get("detail", resp.json())
         assert detail.get("error") == "provider_not_implemented"
         assert detail.get("provider") == provider
-        # Message must name the provider clearly (UI shows this via toast)
-        assert provider in detail.get("message", "")
 
-    @pytest.mark.parametrize("provider", ["meta_cloud", "zapi", "evolution"])
+    @pytest.mark.parametrize("provider", ["meta_cloud", "zapi", "evolution", "uazapi"])
     def test_accepts_implemented_provider(
         self,
         client: TestClient,

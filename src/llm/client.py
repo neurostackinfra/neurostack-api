@@ -1,22 +1,61 @@
 """
 NeuroStack - LLM Client
 Async client for OpenAI-compatible chat completion APIs.
+
+All outbound HTTP goes through :mod:`src.services.safe_egress`, so every
+request is pinned to a validated public HTTPS destination (SSRF-safe) and
+never follows a redirect. Provider pinning is derived from the caller's
+``base_url``: exact host allowlists for OpenAI/Dropout, custom-public
+validation for the ``outros`` provider.
 """
 
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
 from src.config.logging import get_logger
 from src.config.settings import settings
+from src.services.safe_egress import (
+    LLM_DROPOUT_HOSTS,
+    LLM_OPENAI_HOSTS,
+    UnsafeEgressError,
+    parse_public_https_url,
+    safe_async_client,
+)
 
 logger = get_logger(__name__)
 
 _client: Optional["LLMClient"] = None
 
 
+def _llm_kind_for_url(base_url: str) -> str:
+    """Return the safe-egress kind label for a given LLM base URL.
+
+    OpenAI/Dropout have pinned host allowlists; everything else (the
+    ``outros`` provider) falls back to the custom-public policy.
+    """
+
+    try:
+        parsed = parse_public_https_url(base_url)
+    except UnsafeEgressError:
+        # Delegate the failure to the transport call so the caller sees
+        # the same UnsafeEgressError as any downstream validation.
+        return "llm_outros"
+    if parsed.hostname in LLM_OPENAI_HOSTS:
+        return "llm_openai"
+    if parsed.hostname in LLM_DROPOUT_HOSTS:
+        return "llm_dropout"
+    return "llm_outros"
+
+
 class LLMClient:
-    """Async LLM client for OpenAI-compatible APIs."""
+    """Async LLM client for OpenAI-compatible APIs.
+
+    Constructs one validated safe transport per outbound call. httpx
+    ``AsyncClient`` is deliberately created per call rather than pooled,
+    which mirrors the existing per-tenant pattern and avoids keeping a
+    live socket to a possibly rotated provider URL.
+    """
 
     def __init__(
         self,
@@ -26,14 +65,8 @@ class LLMClient:
     ):
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
-        self._http = httpx.AsyncClient(
-            base_url=self._base_url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=httpx.Timeout(timeout, connect=10.0),
-        )
+        self._timeout = timeout
+        self._kind = _llm_kind_for_url(self._base_url)
 
     # Reasoning models use max_completion_tokens and don't accept temperature
     REASONING_PREFIXES = ("o1", "o3", "o4")
@@ -61,7 +94,7 @@ class LLMClient:
         effective_model = model or settings.llm_model
         tokens = max_tokens or settings.llm_max_tokens
 
-        payload: dict = {
+        payload: dict[str, Any] = {
             "model": effective_model,
             "messages": messages,
         }
@@ -69,19 +102,37 @@ class LLMClient:
         if self._is_reasoning_model(effective_model):
             payload["max_completion_tokens"] = tokens
         else:
-            payload["temperature"] = temperature if temperature is not None else settings.llm_temperature
+            payload["temperature"] = (
+                temperature if temperature is not None else settings.llm_temperature
+            )
             payload["max_tokens"] = tokens
 
         logger.debug("LLM request", model=effective_model, messages_count=len(messages))
-        resp = await self._http.post("/chat/completions", json=payload)
-        resp.raise_for_status()
+        target_url = f"{self._base_url}/chat/completions"
+        async with safe_async_client(
+            target_url,
+            kind=self._kind,
+            timeout=httpx.Timeout(self._timeout, connect=10.0),
+        ) as (client, validated):
+            resp = await client.post(
+                validated.url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                    "Host": validated.sni_host,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
-        data = resp.json()
         choice = data.get("choices", [{}])[0]
         content = choice.get("message", {}).get("content")
         finish = choice.get("finish_reason")
         usage = data.get("usage", {})
-        reasoning_tokens = usage.get("completion_tokens_details", {}).get("reasoning_tokens", 0)
+        reasoning_tokens = usage.get("completion_tokens_details", {}).get(
+            "reasoning_tokens", 0
+        )
 
         if not content:
             logger.warning(
@@ -94,8 +145,10 @@ class LLMClient:
             return {"content": "", "usage": usage, "model": effective_model}
         return {"content": content, "usage": usage, "model": effective_model}
 
-    async def close(self):
-        await self._http.aclose()
+    async def close(self) -> None:
+        """Compatibility no-op; every call uses a per-request client."""
+
+        return None
 
 
 def get_llm_client() -> Optional[LLMClient]:
@@ -123,12 +176,12 @@ def get_llm_client() -> Optional[LLMClient]:
     return _client
 
 
-def get_tenant_llm_client(tenant_id, api_credentials: dict) -> Optional[LLMClient]:
+def get_tenant_llm_client(tenant_id: Any, api_credentials: dict) -> Optional[LLMClient]:
     """
     Create an LLM client for a specific tenant using their saved API credentials.
 
     If the tenant has no llm_api_key configured, falls back to the global client.
-    Creates a new client on each call (no cache — httpx.AsyncClient is lightweight).
+    Creates a new client on each call (safe-egress transports are per-call).
     """
     api_key = api_credentials.get("llm_api_key")
     if not api_key:

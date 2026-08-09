@@ -20,11 +20,10 @@ from threading import Lock
 from typing import Callable, Optional
 
 from fastapi import Request, Response
-from prometheus_client import Counter, Histogram, Gauge
+from prometheus_client import Counter, Gauge, Histogram
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from src.config.logging import get_logger
-
 
 logger = get_logger(__name__)
 
@@ -69,9 +68,11 @@ CACHE_MISSES = Counter(
 # In-Memory LRU Cache
 # ============================================
 
+
 @dataclass
 class CacheEntry:
     """Cache entry with expiration."""
+
     value: bytes
     content_type: str
     status_code: int
@@ -82,15 +83,15 @@ class CacheEntry:
 class LRUCache:
     """
     Thread-safe LRU cache for response caching.
-    
+
     Used for caching idempotent GET responses to reduce
     database/computation load.
     """
-    
+
     def __init__(self, max_size: int = 1000, default_ttl: float = 60.0):
         """
         Initialize LRU cache.
-        
+
         Args:
             max_size: Maximum number of entries
             default_ttl: Default time-to-live in seconds
@@ -99,28 +100,28 @@ class LRUCache:
         self.default_ttl = default_ttl
         self._cache: OrderedDict[str, CacheEntry] = OrderedDict()
         self._lock = Lock()
-    
+
     def get(self, key: str) -> Optional[CacheEntry]:
         """
         Get value from cache.
-        
+
         Returns None if key doesn't exist or is expired.
         """
         with self._lock:
             if key not in self._cache:
                 return None
-            
+
             entry = self._cache[key]
-            
+
             # Check expiration
             if time.time() > entry.expires_at:
                 del self._cache[key]
                 return None
-            
+
             # Move to end (most recently used)
             self._cache.move_to_end(key)
             return entry
-    
+
     def set(
         self,
         key: str,
@@ -131,7 +132,7 @@ class LRUCache:
     ) -> None:
         """
         Set value in cache.
-        
+
         Args:
             key: Cache key
             value: Response body bytes
@@ -140,26 +141,26 @@ class LRUCache:
             ttl: Time-to-live in seconds (uses default if None)
         """
         ttl = ttl if ttl is not None else self.default_ttl
-        
+
         with self._lock:
             # Remove oldest entries if at capacity
             while len(self._cache) >= self.max_size:
                 self._cache.popitem(last=False)
-            
+
             self._cache[key] = CacheEntry(
                 value=value,
                 content_type=content_type,
                 status_code=status_code,
                 expires_at=time.time() + ttl,
             )
-    
+
     def invalidate(self, pattern: Optional[str] = None) -> int:
         """
         Invalidate cache entries.
-        
+
         Args:
             pattern: Key pattern to match (None clears all)
-            
+
         Returns:
             Number of entries invalidated
         """
@@ -168,17 +169,14 @@ class LRUCache:
                 count = len(self._cache)
                 self._cache.clear()
                 return count
-            
+
             # Invalidate matching keys
-            keys_to_remove = [
-                k for k in self._cache.keys() 
-                if pattern in k
-            ]
+            keys_to_remove = [k for k in self._cache.keys() if pattern in k]
             for key in keys_to_remove:
                 del self._cache[key]
-            
+
             return len(keys_to_remove)
-    
+
     @property
     def size(self) -> int:
         """Current cache size."""
@@ -193,16 +191,17 @@ response_cache = LRUCache(max_size=1000, default_ttl=60.0)
 # Performance Monitoring Middleware
 # ============================================
 
+
 class PerformanceMiddleware(BaseHTTPMiddleware):
     """
     Middleware for collecting performance metrics.
-    
+
     Tracks:
     - Request latency (histogram)
     - Request count by status
     - Active requests gauge
     """
-    
+
     async def dispatch(
         self,
         request: Request,
@@ -210,49 +209,84 @@ class PerformanceMiddleware(BaseHTTPMiddleware):
     ) -> Response:
         """Process request and collect metrics."""
         method = request.method
-        path = self._normalize_path(request.url.path)
-        
+
         # Track active requests
         ACTIVE_REQUESTS.labels(method=method).inc()
-        
+
         start_time = time.perf_counter()
-        
+
         try:
             response = await call_next(request)
-            
+
+            # Route template first (after routing), raw-path normalisation as
+            # a last resort. Capability tokens like
+            # /v1/webhook/zapi/{capability_token} never carry secrets into the
+            # metrics label because the template — not the raw segment —
+            # becomes the endpoint value.
+            endpoint = self._endpoint_label(request, response)
+
             # Record metrics
             latency = time.perf_counter() - start_time
             status = str(response.status_code)
-            
+
             REQUEST_LATENCY.labels(
                 method=method,
-                endpoint=path,
+                endpoint=endpoint,
                 status=status,
             ).observe(latency)
-            
+
             REQUEST_COUNT.labels(
                 method=method,
-                endpoint=path,
+                endpoint=endpoint,
                 status=status,
             ).inc()
-            
+
             # Add timing header for debugging
             response.headers["X-Response-Time"] = f"{latency * 1000:.2f}ms"
-            
+
             return response
-            
+
         finally:
             ACTIVE_REQUESTS.labels(method=method).dec()
-    
+
+    def _endpoint_label(self, request: Request, response: Response) -> str:
+        """Return the metrics label for a request.
+
+        Prefer the FastAPI route template resolved by ``call_next`` so
+        capability tokens never enter the Prometheus label set. Fall back
+        to a redacted raw-path normalisation only when no route matched
+        (404 / unknown endpoint).
+        """
+
+        route = getattr(request.scope, "get", lambda _k: None)("route")
+        # ``request.scope`` is a Mapping[str, Any]; support both plain dict
+        # access and the Starlette ``Route`` object exposed under ``route``.
+        if route is None:
+            route = request.scope.get("route")
+        template = getattr(route, "path", None) if route is not None else None
+        if isinstance(template, str) and template:
+            return template
+        return self._normalize_path(request.url.path)
+
     def _normalize_path(self, path: str) -> str:
         """
         Normalize path for metrics labels.
-        
+
         Replaces dynamic segments (UUIDs, IDs) with placeholders
-        to prevent label explosion.
+        to prevent label explosion. Also redacts the base64url capability
+        token that appears at ``/v1/webhook/zapi/{token}`` for the rare case
+        where no route template resolved (e.g. an unmatched 404).
         """
         import re
-        
+
+        # Explicitly redact the Z-API capability path even without a matched
+        # route so the raw base64url segment cannot reach any metric label.
+        path = re.sub(
+            r"(/v1/webhook/zapi)/[A-Za-z0-9_-]{20,}",
+            r"\1/{capability_token}",
+            path,
+        )
+
         # Replace UUIDs
         path = re.sub(
             r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
@@ -260,10 +294,10 @@ class PerformanceMiddleware(BaseHTTPMiddleware):
             path,
             flags=re.IGNORECASE,
         )
-        
+
         # Replace numeric IDs
         path = re.sub(r"/\d+(?=/|$)", "/{id}", path)
-        
+
         return path
 
 
@@ -271,33 +305,34 @@ class PerformanceMiddleware(BaseHTTPMiddleware):
 # Response Caching Middleware
 # ============================================
 
+
 class CachingMiddleware(BaseHTTPMiddleware):
     """
     Middleware for caching GET responses.
-    
+
     Caches responses based on:
     - URL path
     - Query parameters
     - Tenant ID header
-    
+
     Only caches successful GET requests.
     """
-    
+
     # Paths that should be cached
     CACHEABLE_PATHS = {
-        "/health": 10.0,      # 10 seconds
-        "/ready": 5.0,        # 5 seconds
-        "/live": 1.0,         # 1 second
-        "/v1/policies": 60.0, # 1 minute
+        "/health": 10.0,  # 10 seconds
+        "/ready": 5.0,  # 5 seconds
+        "/live": 1.0,  # 1 second
+        "/v1/policies": 60.0,  # 1 minute
     }
-    
+
     # Paths that should never be cached
     NEVER_CACHE = {
         "/v1/events",  # Always dynamic
         "/v1/sessions",  # State changes
         "/metrics",  # Real-time metrics
     }
-    
+
     async def dispatch(
         self,
         request: Request,
@@ -307,34 +342,34 @@ class CachingMiddleware(BaseHTTPMiddleware):
         # Only cache GET requests
         if request.method != "GET":
             return await call_next(request)
-        
+
         path = request.url.path
-        
+
         # Check if path should never be cached
         for never_cache_path in self.NEVER_CACHE:
             if path.startswith(never_cache_path):
                 return await call_next(request)
-        
+
         # Generate cache key
         cache_key = self._generate_cache_key(request)
-        
+
         # Try to get from cache
         cached = response_cache.get(cache_key)
         if cached is not None:
             CACHE_HITS.labels(cache_type="response").inc()
-            
+
             return Response(
                 content=cached.value,
                 status_code=cached.status_code,
                 media_type=cached.content_type,
                 headers={"X-Cache": "HIT"},
             )
-        
+
         CACHE_MISSES.labels(cache_type="response").inc()
-        
+
         # Get response from handler
         response = await call_next(request)
-        
+
         # Only cache successful responses
         if response.status_code == 200:
             ttl = self._get_ttl_for_path(path)
@@ -343,7 +378,7 @@ class CachingMiddleware(BaseHTTPMiddleware):
                 body = b""
                 async for chunk in response.body_iterator:
                     body += chunk
-                
+
                 # Cache the response
                 response_cache.set(
                     key=cache_key,
@@ -352,7 +387,7 @@ class CachingMiddleware(BaseHTTPMiddleware):
                     status_code=response.status_code,
                     ttl=ttl,
                 )
-                
+
                 # Return new response with body
                 return Response(
                     content=body,
@@ -360,10 +395,10 @@ class CachingMiddleware(BaseHTTPMiddleware):
                     media_type=response.media_type,
                     headers={**dict(response.headers), "X-Cache": "MISS"},
                 )
-        
+
         response.headers["X-Cache"] = "BYPASS"
         return response
-    
+
     def _generate_cache_key(self, request: Request) -> str:
         """Generate cache key from request."""
         # Include path, query, and tenant
@@ -372,10 +407,10 @@ class CachingMiddleware(BaseHTTPMiddleware):
             str(sorted(request.query_params.items())),
             request.headers.get("X-Tenant-ID", ""),
         ]
-        
+
         key_str = "|".join(parts)
         return hashlib.md5(key_str.encode()).hexdigest()
-    
+
     def _get_ttl_for_path(self, path: str) -> float:
         """Get TTL for a path."""
         for cache_path, ttl in self.CACHEABLE_PATHS.items():
@@ -388,16 +423,17 @@ class CachingMiddleware(BaseHTTPMiddleware):
 # Connection Optimization
 # ============================================
 
+
 class ConnectionOptimizationMiddleware(BaseHTTPMiddleware):
     """
     Middleware for connection optimization.
-    
+
     Adds headers for:
     - Keep-alive connections
     - Compression hints
     - Performance optimization
     """
-    
+
     async def dispatch(
         self,
         request: Request,
@@ -405,14 +441,14 @@ class ConnectionOptimizationMiddleware(BaseHTTPMiddleware):
     ) -> Response:
         """Process request with connection optimization."""
         response = await call_next(request)
-        
+
         # Keep-alive header
         response.headers["Connection"] = "keep-alive"
         response.headers["Keep-Alive"] = "timeout=30, max=1000"
-        
+
         # Performance hints
         response.headers["X-Content-Type-Options"] = "nosniff"
-        
+
         return response
 
 
@@ -420,10 +456,11 @@ class ConnectionOptimizationMiddleware(BaseHTTPMiddleware):
 # Performance Statistics
 # ============================================
 
+
 @dataclass
 class PerformanceStats:
     """Performance statistics collector."""
-    
+
     requests_total: int = 0
     errors_total: int = 0
     latency_sum: float = 0.0
@@ -431,35 +468,35 @@ class PerformanceStats:
     min_latency: float = float("inf")
     max_latency: float = 0.0
     last_reset: datetime = field(default_factory=datetime.utcnow)
-    
+
     _lock: Lock = field(default_factory=Lock, repr=False)
-    
+
     def record(self, latency_ms: float, success: bool = True) -> None:
         """Record a request."""
         with self._lock:
             self.requests_total += 1
             if not success:
                 self.errors_total += 1
-            
+
             self.latency_sum += latency_ms
             self.latency_count += 1
             self.min_latency = min(self.min_latency, latency_ms)
             self.max_latency = max(self.max_latency, latency_ms)
-    
+
     @property
     def avg_latency(self) -> float:
         """Average latency in ms."""
         if self.latency_count == 0:
             return 0.0
         return self.latency_sum / self.latency_count
-    
+
     @property
     def error_rate(self) -> float:
         """Error rate percentage."""
         if self.requests_total == 0:
             return 0.0
         return (self.errors_total / self.requests_total) * 100
-    
+
     def reset(self) -> dict:
         """Reset stats and return current values."""
         with self._lock:
@@ -467,12 +504,14 @@ class PerformanceStats:
                 "requests_total": self.requests_total,
                 "errors_total": self.errors_total,
                 "avg_latency_ms": self.avg_latency,
-                "min_latency_ms": self.min_latency if self.min_latency != float("inf") else 0,
+                "min_latency_ms": (
+                    self.min_latency if self.min_latency != float("inf") else 0
+                ),
                 "max_latency_ms": self.max_latency,
                 "error_rate_percent": self.error_rate,
                 "period_seconds": (datetime.utcnow() - self.last_reset).total_seconds(),
             }
-            
+
             # Reset
             self.requests_total = 0
             self.errors_total = 0
@@ -481,10 +520,9 @@ class PerformanceStats:
             self.min_latency = float("inf")
             self.max_latency = 0.0
             self.last_reset = datetime.utcnow()
-            
+
             return stats
 
 
 # Global stats instance
 performance_stats = PerformanceStats()
-

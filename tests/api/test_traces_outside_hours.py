@@ -14,7 +14,6 @@ from src.models.event import Event
 from src.models.tenant import Tenant
 from src.repositories import get_db_session
 
-
 _CLINIC_TZ = ZoneInfo("America/Sao_Paulo")
 _OPERATIONS = {
     "timezone": "America/Sao_Paulo",
@@ -114,6 +113,14 @@ async def test_configured_clinic_with_no_events_has_null_percentage(
     assert data["total_tokens_sum"] == 0
     assert data["model_breakdown"] == []
     assert data["intent_distribution"] == {}
+    assert data["new_users_count"] == 0
+    assert data["returning_users_count"] == 0
+    assert data["new_user_interactions"] == 0
+    assert data["returning_user_interactions"] == 0
+    assert data["new_user_interaction_pct"] is None
+    assert data["returning_user_interaction_pct"] is None
+    assert data["identified_user_interactions"] == 0
+    assert data["unidentified_user_interactions"] == 0
     assert "period_start" in data
     assert "period_end" in data
 

@@ -22,7 +22,6 @@ from src.api.middleware.auth import (
     require_super_admin,
 )
 from src.llm import get_llm_client, get_tenant_llm_client
-from src.models.clinic_config_table import ClinicConfigTable
 from src.models.event import Event
 from src.models.tenant import Tenant
 from src.observability.pii import mask_carteirinha
@@ -57,7 +56,7 @@ class ValidateResponse(BaseModel):
 
 
 class FeedbackRequest(BaseModel):
-    session_id: str
+    session_id: UUID
     user_message: str
     agent_response: str
     suggested_response: str
@@ -127,7 +126,9 @@ async def validate_suggestion(
         ViolationItem(
             rule=v.rule_name,
             message=v.message,
-            category=v.category.value if hasattr(v.category, "value") else str(v.category),
+            category=(
+                v.category.value if hasattr(v.category, "value") else str(v.category)
+            ),
         )
         for v in result.violations
     ]
@@ -174,7 +175,9 @@ async def save_feedback(
 # ============================================
 
 
-def _build_analysis_prompt(rating: int, reason: str, agent_response: str, user_message: str) -> str:
+def _build_analysis_prompt(
+    rating: int, reason: str, agent_response: str, user_message: str
+) -> str:
     # Use f-string so braces inside user-provided values are interpolated safely
     # and never treated as .format() placeholders (which would raise KeyError).
     return (
@@ -235,11 +238,12 @@ async def _analyze_rating_async(
 
     When message_id is a valid UUID that matches an Event row (e.g. a trace
     event from the Histórico de Traces), we use that event's tenant_id to
-    resolve LLM credentials — because the pipeline caches credentials keyed
-    by the CLINIC's tenant, not the builder's. Falls back to the rating's own
+    resolve LLM credentials — because the runtime cache only stores the
+    non-secret projection, so raw key resolution runs DB-only against the
+    CLINIC's tenant, not the builder's. Falls back to the rating's own
     tenant_id (simulator flow, where message_id is a frontend UUID).
     """
-    from src.services.event_service import _get_cached_config
+    from src.services.event_service import _load_runtime_llm_credentials
 
     # Resolve which tenant's credentials to use for LLM.
     # Priority: explicit clinic_tenant_id (from frontend) > message_id event lookup > submitter's tenant.
@@ -249,7 +253,8 @@ async def _analyze_rating_async(
             resolve_tenant_id = UUID(clinic_tenant_id)
             logger.info(
                 "Rating analysis using explicit clinic_tenant_id event_id=%s clinic_tenant=%s",
-                event_id, resolve_tenant_id,
+                event_id,
+                resolve_tenant_id,
             )
         except ValueError:
             pass
@@ -257,56 +262,52 @@ async def _analyze_rating_async(
         try:
             msg_uuid = UUID(message_id)
             async with get_db_session() as db:
-                original = (await db.execute(
-                    select(Event).where(Event.id == msg_uuid)
-                )).scalar_one_or_none()
+                original = (
+                    await db.execute(select(Event).where(Event.id == msg_uuid))
+                ).scalar_one_or_none()
                 if original is not None:
                     resolve_tenant_id = original.tenant_id
                     logger.info(
                         "Rating analysis using clinic tenant event_id=%s clinic_tenant=%s",
-                        event_id, resolve_tenant_id,
+                        event_id,
+                        resolve_tenant_id,
                     )
                 else:
                     logger.info(
                         "Rating analysis message_id not found in events, using submitter tenant event_id=%s message_id=%s",
-                        event_id, message_id,
+                        event_id,
+                        message_id,
                     )
         except Exception as exc:
             logger.warning(
                 "Rating analysis message_id lookup failed event_id=%s message_id=%s err=%s",
-                event_id, message_id, exc,
+                event_id,
+                message_id,
+                exc,
             )
 
-    # Load credentials from Redis-cached config (already has builder fallback applied).
+    # DB-only resolver: returns ONLY the four LLM overlay fields (raw key held
+    # in-memory for this call), builder-owner composition already applied.
     api_credentials: dict = {}
     try:
-        cached = await _get_cached_config(resolve_tenant_id)
-        if cached:
-            api_credentials = cached.get("api_credentials", {})
+        api_credentials = await _load_runtime_llm_credentials(resolve_tenant_id)
     except Exception:
-        pass
-
-    # Cold-cache fallback: load directly from ClinicConfigTable
-    if not api_credentials:
-        try:
-            async with get_db_session() as db:
-                row = (await db.execute(
-                    select(ClinicConfigTable).where(ClinicConfigTable.tenant_id == resolve_tenant_id)
-                )).scalar_one_or_none()
-                if row:
-                    api_credentials = row.api_credentials or {}
-        except Exception:
-            logger.warning("Could not load tenant config for LLM resolution event_id=%s", event_id)
+        logger.warning(
+            "Could not load tenant LLM credentials for rating analysis event_id=%s",
+            event_id,
+        )
 
     tenant_model: Optional[str] = api_credentials.get("llm_model_name") or None
-    llm_url = api_credentials.get("llm_api_url", "(none)")
-    llm_key_prefix = (api_credentials.get("llm_api_key") or "")[:8] or "(none)"
+    # Structured log MUST NOT contain any secret material or prefix — only the
+    # public presence bit and the non-secret model id are safe to emit.
     logger.info(
-        "Rating analysis LLM resolution event_id=%s tenant_id=%s url=%s key_prefix=%s model=%s cache=%s",
-        event_id, tenant_id, llm_url, llm_key_prefix, tenant_model,
+        "Rating analysis LLM resolution event_id=%s tenant_id=%s model=%s credentials_present=%s",
+        event_id,
+        resolve_tenant_id,
+        tenant_model,
         bool(api_credentials),
     )
-    llm_client = get_tenant_llm_client(tenant_id, api_credentials)
+    llm_client = get_tenant_llm_client(resolve_tenant_id, api_credentials)
     if llm_client is None:
         logger.warning(
             "LLM client unavailable; marking rating analysis as failed event_id=%s",
@@ -369,9 +370,7 @@ async def _update_rating_status(
     """Update the rating event's ai_analysis_status (and optionally ai_analysis)."""
     try:
         async with get_db_session() as session:
-            result = await session.execute(
-                select(Event).where(Event.id == event_id)
-            )
+            result = await session.execute(select(Event).where(Event.id == event_id))
             event = result.scalar_one_or_none()
             if event is None:
                 logger.warning(

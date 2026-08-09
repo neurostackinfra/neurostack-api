@@ -21,7 +21,6 @@ import {
   Lightbulb,
   FolderOpen,
   CreditCard,
-  Mic,
   HelpCircle,
   Briefcase,
   FlaskConical,
@@ -30,7 +29,6 @@ import {
   Users2,
 } from "lucide-react";
 import logoSrc from "@assets/logo_png_1775411054369.png";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import { useAuth } from "@/context/auth";
@@ -121,7 +119,7 @@ export function Layout({ children }: LayoutProps) {
     { href: "/traces",   label: t("nav_traces"),    icon: Activity,       id: "trace-history",  hideFor: [] },
     { href: "/dashboard",label: t("nav_dashboard"), icon: LayoutDashboard,id: "dashboard",      hideFor: [] },
     { href: "/config",   label: t("nav_config"),    icon: Sliders,        id: "clinic-config",  hideFor: [] },
-    { href: "/suporte",  label: t("nav_support"),    icon: HelpCircle,    id: "suporte",        hideFor: ["super_admin"], badge: isClinicAdmin ? t("badge_coming_soon") : undefined },
+    { href: "/suporte",  label: t("nav_support"),    icon: HelpCircle,    id: "suporte",        hideFor: ["super_admin"] },
     { href: "/billing",  label: t("nav_billing"),    icon: CreditCard,    id: "billing",        hideFor: ["clinic_admin", "super_admin", "investor"] },
   ].filter(item => !(item.hideFor as string[]).includes(role));
 
@@ -136,7 +134,6 @@ export function Layout({ children }: LayoutProps) {
 
     { href: "/consultoria",    label: t("nav_consulting"),     icon: Lightbulb,     id: "consultoria",    v: "v2",  hideFor: [] },
     { href: "/midias",         label: t("nav_media"),          icon: FolderOpen,    id: "midias",         v: "v3",  hideFor: ["clinic_admin"] },
-    { href: "/voice-ai",       label: t("nav_voice"),          icon: Mic,           id: "voice-ai",       v: "v3",  hideFor: ["clinic_admin"] },
     { href: "/portal-parceiros",label: t("nav_partners"),      icon: Briefcase,     id: "portal-parceiros",v: "v3", hideFor: ["clinic_admin"] },
   ].filter(item => !item.hideFor.includes(role));
 
@@ -246,11 +243,6 @@ export function Layout({ children }: LayoutProps) {
               >
                 <item.icon className="h-4 w-4" />
                 {item.label}
-                {"badge" in item && item.badge && (
-                  <Badge variant="outline" className="ml-auto text-[9px] px-1.5 py-0 border-amber-500/40 text-amber-500">
-                    {item.badge}
-                  </Badge>
-                )}
               </Button>
             </Link>
           ))}

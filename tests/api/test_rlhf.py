@@ -4,7 +4,6 @@ Tests for POST /v1/rlhf/rating, GET /v1/rlhf/ratings, PATCH /v1/rlhf/ratings/{id
 and GET /v1/admin/rlhf/pending (implemented from stub).
 """
 
-import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 from uuid import UUID, uuid4
@@ -14,7 +13,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.config.settings import settings
-
 
 TEST_TENANT_ID = UUID("a0000000-0000-0000-0000-000000000001")
 
@@ -146,9 +144,7 @@ class TestPostRating:
         assert matched[0].get("ai_analysis_status") is None
         assert not mock_analyze.called
 
-    def test_rejects_out_of_range_rating(
-        self, client: TestClient, api_key_headers
-    ):
+    def test_rejects_out_of_range_rating(self, client: TestClient, api_key_headers):
         response = client.post(
             "/v1/rlhf/rating",
             headers=api_key_headers,
@@ -170,9 +166,7 @@ class TestPostRating:
 
 
 class TestListRatings:
-    def test_returns_own_tenant_ratings(
-        self, client: TestClient, api_key_headers
-    ):
+    def test_returns_own_tenant_ratings(self, client: TestClient, api_key_headers):
         # Create one rating first
         client.post(
             "/v1/rlhf/rating",
@@ -228,10 +222,12 @@ class TestPatchRating:
         self, client: TestClient, api_key_headers, super_admin_headers
     ):
         # Seed a rating
+        # Keep the approval contract independent from the asynchronous
+        # low-rating analysis flow, which has dedicated coverage below.
         post = client.post(
             "/v1/rlhf/rating",
             headers=api_key_headers,
-            json=_rating_payload(2, "Muito seco"),
+            json=_rating_payload(3),
         )
         event_id = post.json()["event_id"]
 
@@ -277,6 +273,113 @@ class TestPatchRating:
 # ============================================
 
 
+class TestRatingAnalysisRuntimeCredentials:
+    """Rating analysis uses the DB-only runtime resolver and never logs secret prefixes."""
+
+    @pytest.mark.asyncio
+    async def test_analyze_uses_db_only_loader_and_no_secret_logged(
+        self, caplog
+    ) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import patch as ptch
+
+        from src.api.routes import rlhf
+
+        raw_key = "SECRET-LLM-KEY-XYZ"
+
+        async def _fake_runtime_creds(_tenant_id):
+            return {
+                "llm_provider": "openai",
+                "llm_api_url": "https://api.openai.com/v1",
+                "llm_api_key": raw_key,
+                "llm_model_name": "gpt-model",
+            }
+
+        fake_llm = MagicMock()
+        fake_llm.generate = AsyncMock(
+            return_value={
+                "content": '{"status": "agreed", "justification": "ok"}',
+                "usage": {},
+                "model": "gpt-model",
+            }
+        )
+
+        with (
+            ptch(
+                "src.services.event_service._load_runtime_llm_credentials",
+                new=_fake_runtime_creds,
+            ),
+            ptch(
+                "src.api.routes.rlhf.get_tenant_llm_client",
+                return_value=fake_llm,
+            ),
+            ptch(
+                "src.api.routes.rlhf._update_rating_status",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            with caplog.at_level("INFO"):
+                await rlhf._analyze_rating_async(
+                    event_id=uuid4(),
+                    rating=1,
+                    reason="motivo",
+                    agent_response="ok",
+                    user_message="por que?",
+                    tenant_id=uuid4(),
+                )
+
+        # The raw key MUST NOT appear in any log record — no prefix, no substring.
+        for rec in caplog.records:
+            text = rec.getMessage()
+            assert raw_key not in text
+            # Also confirm no 8-char prefix leaked (the previous impl exposed 8 chars).
+            assert raw_key[:8] not in text
+
+        # LLM was invoked with the DB-only resolved credentials.
+        assert fake_llm.generate.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_analyze_marks_failed_when_no_credentials(self) -> None:
+        from unittest.mock import AsyncMock
+        from unittest.mock import patch as ptch
+
+        from src.api.routes import rlhf
+
+        async def _empty_creds(_tenant_id):
+            return {}
+
+        update_status = AsyncMock(return_value=None)
+        with (
+            ptch(
+                "src.services.event_service._load_runtime_llm_credentials",
+                new=_empty_creds,
+            ),
+            ptch(
+                "src.api.routes.rlhf.get_tenant_llm_client",
+                return_value=None,
+            ),
+            ptch(
+                "src.api.routes.rlhf._update_rating_status",
+                new=update_status,
+            ),
+        ):
+            await rlhf._analyze_rating_async(
+                event_id=uuid4(),
+                rating=2,
+                reason="motivo",
+                agent_response="ok",
+                user_message="por que?",
+                tenant_id=uuid4(),
+            )
+        # When no LLM client resolvable, status flips to failed — no crash and
+        # no secret ever handled.
+        assert update_status.await_count == 1
+        args, kwargs = update_status.await_args
+        assert kwargs.get("status_") == "failed" or (
+            len(args) >= 2 and args[1] == "failed"
+        )
+
+
 class TestAdminRlhfPending:
     def test_returns_real_feedback_events(
         self, client: TestClient, api_key_headers, super_admin_headers
@@ -291,9 +394,7 @@ class TestAdminRlhfPending:
         }
         client.post("/v1/rlhf/feedback", headers=api_key_headers, json=payload)
 
-        response = client.get(
-            "/v1/admin/rlhf/pending", headers=super_admin_headers
-        )
+        response = client.get("/v1/admin/rlhf/pending", headers=super_admin_headers)
         assert response.status_code == 200
         entries = response.json()
         assert isinstance(entries, list)

@@ -254,6 +254,48 @@ class TraceStatsResponse(BaseModel):
         ge=0,
         description="Message traces carrying conversational decision markers",
     )
+    new_users_count: int = Field(
+        default=0,
+        ge=0,
+        description="Distinct external users whose first-ever interaction occurred in the period",
+    )
+    returning_users_count: int = Field(
+        default=0,
+        ge=0,
+        description="Distinct external users first seen before the period who interacted in it",
+    )
+    new_user_interactions: int = Field(
+        default=0,
+        ge=0,
+        description="Interactions in the period made by users first seen during the period",
+    )
+    returning_user_interactions: int = Field(
+        default=0,
+        ge=0,
+        description="Interactions in the period made by users first seen before the period",
+    )
+    new_user_interaction_pct: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=100.0,
+        description="Percentage of identified interactions made by new users",
+    )
+    returning_user_interaction_pct: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=100.0,
+        description="Percentage of identified interactions made by returning users",
+    )
+    identified_user_interactions: int = Field(
+        default=0,
+        ge=0,
+        description="Interactions carrying a phone/username that can be classified",
+    )
+    unidentified_user_interactions: int = Field(
+        default=0,
+        ge=0,
+        description="Interactions without a phone/username, excluded from audience percentages",
+    )
     business_hours_configured: bool = Field(
         default=False,
         description="Whether valid structured business hours are configured",

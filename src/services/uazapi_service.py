@@ -6,11 +6,17 @@ Uazapi is a self-hosted WhatsApp Web multi-device gateway (Go, based on
 wuzapi). Authentication is done via a per-instance ``Token`` header and the
 send-text endpoint follows the ``POST /chat/send/text`` shape with a
 ``{"Phone": ..., "Body": ...}`` payload.
+
+All outbound HTTP flows through :mod:`src.services.safe_egress`. Uazapi is
+self-hosted, so we use the custom-public HTTPS policy (arbitrary hostname
+but public unicast IPs only, no redirects, timeout enforced).
 """
 
 import logging
 
 import httpx
+
+from src.services.safe_egress import safe_async_client
 
 logger = logging.getLogger(__name__)
 
@@ -38,13 +44,21 @@ async def send_uazapi_text(
     """
     url = f"{api_url.rstrip('/')}/send/text"
     payload = {"number": phone, "text": message}
-    headers = {"Token": token, "Content-Type": "application/json"}
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(url, json=payload, headers=headers)
+    async with safe_async_client(
+        url, kind="uazapi", timeout=httpx.Timeout(15.0, connect=5.0)
+    ) as (client, validated):
+        headers = {
+            "Token": token,
+            "Content-Type": "application/json",
+            "Host": validated.sni_host,
+        }
+        resp = await client.post(validated.url, json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json()
         logger.info(
-            "Uazapi send_text to %s — status %s", phone, resp.status_code,
+            "Uazapi send_text to %s — status %s",
+            phone,
+            resp.status_code,
         )
         return data

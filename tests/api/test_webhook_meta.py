@@ -26,6 +26,9 @@ Group 4 additions (media handling):
   failures, ``logger.exception`` on transcription failures
 """
 
+import hashlib
+import hmac
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -37,9 +40,42 @@ from fastapi.testclient import TestClient
 
 from src.config.settings import settings
 
-
 API_CRED_PATH = "/v1/config/api-credentials"
 WEBHOOK_PATH = "/v1/webhook/meta"
+
+# Global test-only app secret shared by every seeded Meta tenant so tests
+# can sign payloads deterministically.
+META_APP_SECRET = "meta_test_app_secret_shared_across_all_tests"
+
+
+def _sign_meta_body(body: dict, secret: str = META_APP_SECRET) -> tuple[str, bytes]:
+    """Serialise ``body`` and compute the exact ``X-Hub-Signature-256`` header."""
+    raw = json.dumps(body).encode("utf-8")
+    digest = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    return f"sha256={digest}", raw
+
+
+def _signed_headers(body: dict, secret: str = META_APP_SECRET) -> dict[str, str]:
+    """Build ``Content-Type`` + signed ``X-Hub-Signature-256`` headers."""
+    signature, _raw = _sign_meta_body(body, secret)
+    return {
+        "Content-Type": "application/json",
+        "X-Hub-Signature-256": signature,
+    }
+
+
+def _post_meta(client: TestClient, body: dict, *, secret: str = META_APP_SECRET):
+    """POST a Meta payload with an HMAC signature matching the given secret."""
+    _sig, raw = _sign_meta_body(body, secret)
+    return client.request(
+        "POST",
+        WEBHOOK_PATH,
+        content=raw,
+        headers={
+            "Content-Type": "application/json",
+            "X-Hub-Signature-256": _sig,
+        },
+    )
 
 
 # ============================================
@@ -77,7 +113,8 @@ def _seed_meta_credentials(
     tenant_id: UUID,
     phone_number_id: str,
 ) -> str:
-    """Save Meta Cloud API credentials for a tenant and return the auto-generated verify_token."""
+    """Seed Meta credentials and retain the write-only verify token locally."""
+    verify_token = f"verify_{uuid4().hex}"
     resp = client.patch(
         API_CRED_PATH,
         json={
@@ -85,12 +122,16 @@ def _seed_meta_credentials(
             "meta_phone_number_id": phone_number_id,
             "meta_waba_id": f"waba_{uuid4().hex[:8]}",
             "meta_permanent_token": f"EAAG_test_token_{uuid4().hex}",
+            "meta_verify_token": verify_token,
+            "meta_app_secret": META_APP_SECRET,
         },
         headers=_admin_headers(tenant_id),
     )
     assert resp.status_code == 200, resp.text
-    verify_token = resp.json()["meta_verify_token"]
-    assert verify_token
+    assert resp.json()["meta_verify_token_set"] is True
+    assert resp.json()["meta_verify_token_masked"] == "••••••••"
+    assert "meta_verify_token" not in resp.json()
+    assert verify_token not in resp.text
     return verify_token
 
 
@@ -222,7 +263,9 @@ class TestMetaWebhookVerify:
         tenant_id: UUID,
     ):
         verify_token = _seed_meta_credentials(
-            client, tenant_id, f"pn_{uuid4().hex[:8]}",
+            client,
+            tenant_id,
+            f"pn_{uuid4().hex[:8]}",
         )
         # ``hub.mode`` must equal ``subscribe`` — anything else is rejected
         resp = client.get(
@@ -259,12 +302,15 @@ class TestMetaWebhookTextFlow:
             message_id=wamid,
         )
 
-        with patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_meta_cloud_text",
-            new=AsyncMock(return_value=_fake_meta_send_result()),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock(
@@ -273,7 +319,7 @@ class TestMetaWebhookTextFlow:
             mock_get_service.return_value = service
 
             with caplog.at_level("INFO", logger="src.api.routes.webhook"):
-                resp = client.post(WEBHOOK_PATH, json=payload)
+                resp = _post_meta(client, payload)
 
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -296,7 +342,8 @@ class TestMetaWebhookTextFlow:
 
         # The Meta message id is captured on the receipt log line for tracing
         receipt_logs = [
-            rec for rec in caplog.records
+            rec
+            for rec in caplog.records
             if "Meta webhook received message" in rec.getMessage()
         ]
         assert receipt_logs, "expected a receipt log line"
@@ -321,15 +368,16 @@ class TestMetaWebhookTextFlow:
         )
 
         with caplog.at_level("WARNING", logger="src.api.routes.webhook"):
-            resp = client.post(WEBHOOK_PATH, json=payload)
+            resp = _post_meta(client, payload)
 
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "skipped": "unknown_phone_number_id"}
         # Parity with Z-API/Evolution "no tenant for" warning
-        warn_msgs = [rec.getMessage() for rec in caplog.records if rec.levelname == "WARNING"]
+        warn_msgs = [
+            rec.getMessage() for rec in caplog.records if rec.levelname == "WARNING"
+        ]
         assert any(
-            "no tenant for phone_number_id" in m and stranger_pn in m
-            for m in warn_msgs
+            "no tenant for phone_number_id" in m and stranger_pn in m for m in warn_msgs
         ), warn_msgs
 
     def test_audio_without_media_id_is_skipped(
@@ -351,7 +399,7 @@ class TestMetaWebhookTextFlow:
         payload["entry"][0]["changes"][0]["value"]["messages"][0]["type"] = "audio"
         payload["entry"][0]["changes"][0]["value"]["messages"][0].pop("text", None)
 
-        resp = client.post(WEBHOOK_PATH, json=payload)
+        resp = _post_meta(client, payload)
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "skipped": "missing_media_id"}
 
@@ -373,7 +421,7 @@ class TestMetaWebhookTextFlow:
         payload["entry"][0]["changes"][0]["value"]["messages"][0]["type"] = "location"
         payload["entry"][0]["changes"][0]["value"]["messages"][0].pop("text", None)
 
-        resp = client.post(WEBHOOK_PATH, json=payload)
+        resp = _post_meta(client, payload)
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "skipped": "non-text"}
 
@@ -414,7 +462,7 @@ class TestMetaWebhookTextFlow:
                 }
             ],
         }
-        resp = client.post(WEBHOOK_PATH, json=payload)
+        resp = _post_meta(client, payload)
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "skipped": "status_only"}
 
@@ -434,11 +482,14 @@ class TestMetaWebhookTextFlow:
             message_id=f"wamid.fail_{uuid4().hex[:8]}",
         )
 
-        with patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_meta_cloud_text",
-            new=AsyncMock(side_effect=RuntimeError("graph.facebook.com 500")),
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(side_effect=RuntimeError("graph.facebook.com 500")),
+            ),
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
@@ -448,7 +499,7 @@ class TestMetaWebhookTextFlow:
             mock_get_service.return_value = service
 
             with caplog.at_level("ERROR", logger="src.api.routes.webhook"):
-                resp = client.post(WEBHOOK_PATH, json=payload)
+                resp = _post_meta(client, payload)
 
         assert resp.status_code == 200
         body = resp.json()
@@ -459,9 +510,7 @@ class TestMetaWebhookTextFlow:
         # logger.exception → ERROR level with stack trace attached
         error_records = [rec for rec in caplog.records if rec.levelname == "ERROR"]
         assert error_records, "expected an ERROR-level log for send failure"
-        assert any(
-            "Meta send failed" in rec.getMessage() for rec in error_records
-        )
+        assert any("Meta send failed" in rec.getMessage() for rec in error_records)
 
 
 # ============================================
@@ -492,12 +541,15 @@ class TestMetaWebhookEchoDedup:
             message_id=echo_id,
         )
 
-        with patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_meta_cloud_text",
-            new=AsyncMock(return_value=_fake_meta_send_result()),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock(
@@ -505,7 +557,7 @@ class TestMetaWebhookEchoDedup:
             )
             mock_get_service.return_value = service
 
-            resp = client.post(WEBHOOK_PATH, json=payload)
+            resp = _post_meta(client, payload)
 
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "skipped": "ai_echo"}
@@ -536,15 +588,19 @@ class TestMetaWebhookBotActiveAndPause:
             message_id=f"wamid.paused_{uuid4().hex[:8]}",
         )
 
-        with patch(
-            "src.api.routes.webhook._check_bot_active",
-            new=AsyncMock(return_value={"ok": True, "skipped": "bot_paused"}),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_meta_cloud_text",
-            new=AsyncMock(return_value=_fake_meta_send_result()),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook._check_bot_active",
+                new=AsyncMock(return_value={"ok": True, "skipped": "bot_paused"}),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock(
@@ -552,7 +608,7 @@ class TestMetaWebhookBotActiveAndPause:
             )
             mock_get_service.return_value = service
 
-            resp = client.post(WEBHOOK_PATH, json=payload)
+            resp = _post_meta(client, payload)
 
         # Same 202 semantics as Z-API/Evolution when bot is paused
         assert resp.status_code == 202
@@ -576,17 +632,21 @@ class TestMetaWebhookBotActiveAndPause:
             message_id=f"wamid.session_paused_{uuid4().hex[:8]}",
         )
 
-        with patch(
-            "src.api.routes.webhook._check_pause_state",
-            new=AsyncMock(
-                return_value={"ok": True, "skipped": "session_paused"},
+        with (
+            patch(
+                "src.api.routes.webhook._check_pause_state",
+                new=AsyncMock(
+                    return_value={"ok": True, "skipped": "session_paused"},
+                ),
             ),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_meta_cloud_text",
-            new=AsyncMock(return_value=_fake_meta_send_result()),
-        ) as mock_send:
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock(
@@ -594,7 +654,7 @@ class TestMetaWebhookBotActiveAndPause:
             )
             mock_get_service.return_value = service
 
-            resp = client.post(WEBHOOK_PATH, json=payload)
+            resp = _post_meta(client, payload)
 
         assert resp.status_code == 202
         assert resp.json() == {"ok": True, "skipped": "session_paused"}
@@ -731,6 +791,7 @@ def _seed_meta_credentials_with_whisper(
     audio_max_seconds: int = 60,
 ) -> str:
     """Save Meta credentials + Whisper key + audio_max_seconds for a tenant."""
+    verify_token = f"verify_{uuid4().hex}"
     resp = client.patch(
         API_CRED_PATH,
         json={
@@ -738,13 +799,19 @@ def _seed_meta_credentials_with_whisper(
             "meta_phone_number_id": phone_number_id,
             "meta_waba_id": f"waba_{uuid4().hex[:8]}",
             "meta_permanent_token": f"EAAG_test_token_{uuid4().hex}",
+            "meta_verify_token": verify_token,
+            "meta_app_secret": META_APP_SECRET,
             "whisper_api_key": whisper_key,
             "audio_max_seconds": audio_max_seconds,
         },
         headers=_admin_headers(tenant_id),
     )
     assert resp.status_code == 200, resp.text
-    return resp.json()["meta_verify_token"]
+    assert resp.json()["meta_verify_token_set"] is True
+    assert resp.json()["meta_verify_token_masked"] == "••••••••"
+    assert "meta_verify_token" not in resp.json()
+    assert verify_token not in resp.text
+    return verify_token
 
 
 class TestMetaWebhookAudioFlow:
@@ -775,21 +842,27 @@ class TestMetaWebhookAudioFlow:
         }
         fake_audio_bytes = b"OggS\x00\x02" + b"\x00" * (5 * 16000 - 6)
 
-        with patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.resolve_meta_media",
-            new=AsyncMock(return_value=fake_media_info),
-        ) as mock_resolve, patch(
-            "src.api.routes.webhook.download_meta_media",
-            new=AsyncMock(return_value=fake_audio_bytes),
-        ) as mock_download, patch(
-            "src.api.routes.webhook._meta_transcribe_audio",
-            new=AsyncMock(return_value="Quero remarcar minha consulta"),
-        ) as mock_transcribe, patch(
-            "src.api.routes.webhook.send_meta_cloud_text",
-            new=AsyncMock(return_value=_fake_meta_send_result()),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(return_value=fake_media_info),
+            ) as mock_resolve,
+            patch(
+                "src.api.routes.webhook.download_meta_media_audio",
+                new=AsyncMock(return_value=fake_audio_bytes),
+            ) as mock_download,
+            patch(
+                "src.api.routes.webhook._meta_transcribe_audio",
+                new=AsyncMock(return_value="Quero remarcar minha consulta"),
+            ) as mock_transcribe,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock(
@@ -797,7 +870,7 @@ class TestMetaWebhookAudioFlow:
             )
             mock_get_service.return_value = service
 
-            resp = client.post(WEBHOOK_PATH, json=payload)
+            resp = _post_meta(client, payload)
 
         assert resp.status_code == 200, resp.text
         assert resp.json() == {"ok": True, "replied": True}
@@ -853,31 +926,38 @@ class TestMetaWebhookAudioFlow:
 
         handoff_mock = AsyncMock()
 
-        with patch(
-            "src.api.routes.webhook.resolve_meta_media",
-            new=AsyncMock(return_value=fake_media_info),
-        ), patch(
-            "src.api.routes.webhook.download_meta_media",
-            new=AsyncMock(),
-        ) as mock_download, patch(
-            "src.api.routes.webhook._meta_transcribe_audio",
-            new=AsyncMock(),
-        ) as mock_transcribe, patch(
-            "src.api.routes.webhook.send_meta_cloud_text",
-            new=AsyncMock(return_value=_fake_meta_send_result()),
-        ) as mock_send, patch(
-            "src.api.routes.webhook._meta_initiate_file_handoff",
-            new=handoff_mock,
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service:
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(return_value=fake_media_info),
+            ),
+            patch(
+                "src.api.routes.webhook.download_meta_media_audio",
+                new=AsyncMock(),
+            ) as mock_download,
+            patch(
+                "src.api.routes.webhook._meta_transcribe_audio",
+                new=AsyncMock(),
+            ) as mock_transcribe,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ) as mock_send,
+            patch(
+                "src.api.routes.webhook._meta_initiate_file_handoff",
+                new=handoff_mock,
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock()
             mock_get_service.return_value = service
 
             with caplog.at_level("INFO", logger="src.api.routes.webhook"):
-                resp = client.post(WEBHOOK_PATH, json=payload)
+                resp = _post_meta(client, payload)
 
         # No 500, no download, no transcription
         assert resp.status_code == 200
@@ -915,26 +995,27 @@ class TestMetaWebhookAudioFlow:
             message_id=f"wamid.audio_resolve_fail_{uuid4().hex[:8]}",
         )
 
-        with patch(
-            "src.api.routes.webhook.resolve_meta_media",
-            new=AsyncMock(side_effect=RuntimeError("expired media_id")),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service:
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(side_effect=RuntimeError("expired media_id")),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock()
             mock_get_service.return_value = service
 
             with caplog.at_level("WARNING", logger="src.api.routes.webhook"):
-                resp = client.post(WEBHOOK_PATH, json=payload)
+                resp = _post_meta(client, payload)
 
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "skipped": "media_resolve_failed"}
 
-        warn_msgs = [
-            r.getMessage() for r in caplog.records if r.levelname == "WARNING"
-        ]
+        warn_msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
         assert any(
             "Meta media resolve failed" in m and media_id in m for m in warn_msgs
         ), warn_msgs
@@ -964,25 +1045,30 @@ class TestMetaWebhookAudioFlow:
             "file_size": 5 * 16000,
         }
 
-        with patch(
-            "src.api.routes.webhook.resolve_meta_media",
-            new=AsyncMock(return_value=fake_media_info),
-        ), patch(
-            "src.api.routes.webhook.download_meta_media",
-            new=AsyncMock(return_value=b"OggS\x00\x02" + b"\x00" * 100),
-        ), patch(
-            "src.api.routes.webhook._meta_transcribe_audio",
-            new=AsyncMock(side_effect=RuntimeError("groq 503")),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service:
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(return_value=fake_media_info),
+            ),
+            patch(
+                "src.api.routes.webhook.download_meta_media_audio",
+                new=AsyncMock(return_value=b"OggS\x00\x02" + b"\x00" * 100),
+            ),
+            patch(
+                "src.api.routes.webhook._meta_transcribe_audio",
+                new=AsyncMock(side_effect=RuntimeError("groq 503")),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock()
             mock_get_service.return_value = service
 
             with caplog.at_level("ERROR", logger="src.api.routes.webhook"):
-                resp = client.post(WEBHOOK_PATH, json=payload)
+                resp = _post_meta(client, payload)
 
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "skipped": "transcription_failed"}
@@ -990,8 +1076,7 @@ class TestMetaWebhookAudioFlow:
         error_records = [r for r in caplog.records if r.levelname == "ERROR"]
         assert error_records, "expected an ERROR log for transcription failure"
         assert any(
-            "Meta audio transcription failed" in r.getMessage()
-            for r in error_records
+            "Meta audio transcription failed" in r.getMessage() for r in error_records
         )
 
 
@@ -1039,24 +1124,29 @@ class TestMetaWebhookFileFlow:
             filename=filename,
         )
 
-        with patch(
-            "src.api.routes.webhook.resolve_meta_media",
-            new=AsyncMock(),
-        ) as mock_resolve, patch(
-            "src.api.routes.webhook.download_meta_media",
-            new=AsyncMock(),
-        ) as mock_download, patch(
-            "src.api.routes.webhook.send_meta_cloud_text",
-            new=AsyncMock(return_value=_fake_meta_send_result()),
-        ) as mock_send, patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service:
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(),
+            ) as mock_resolve,
+            patch(
+                "src.api.routes.webhook.download_meta_media_audio",
+                new=AsyncMock(),
+            ) as mock_download,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ) as mock_send,
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock()
             mock_get_service.return_value = service
 
-            resp = client.post(WEBHOOK_PATH, json=payload)
+            resp = _post_meta(client, payload)
 
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -1074,10 +1164,7 @@ class TestMetaWebhookFileFlow:
         sent_body = mock_send.await_args.args[3]
         # Portuguese default when no lead_name is known
         assert "arquivo" in sent_body.lower()
-        assert (
-            "encaminh" in sent_body.lower()
-            or "equipe" in sent_body.lower()
-        )
+        assert "encaminh" in sent_body.lower() or "equipe" in sent_body.lower()
 
     def test_file_ack_personalises_with_lead_name_when_known(
         self,
@@ -1098,21 +1185,25 @@ class TestMetaWebhookFileFlow:
             msg_type="image",
         )
 
-        with patch(
-            "src.api.routes.webhook._meta_load_lead_name",
-            new=AsyncMock(return_value="Ana Maria Silva"),
-        ), patch(
-            "src.api.routes.webhook.send_meta_cloud_text",
-            new=AsyncMock(return_value=_fake_meta_send_result()),
-        ) as mock_send, patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service:
+        with (
+            patch(
+                "src.api.routes.webhook._meta_load_lead_name",
+                new=AsyncMock(return_value="Ana Maria Silva"),
+            ),
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ) as mock_send,
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock()
             mock_get_service.return_value = service
 
-            resp = client.post(WEBHOOK_PATH, json=payload)
+            resp = _post_meta(client, payload)
 
         assert resp.status_code == 200
         assert resp.json()["action"] == "file_ack"
@@ -1142,24 +1233,29 @@ class TestMetaWebhookFileFlow:
             filename="exame_hemograma.pdf",
         )
 
-        with patch(
-            "src.api.routes.webhook.resolve_meta_media",
-            new=AsyncMock(),
-        ) as mock_resolve, patch(
-            "src.api.routes.webhook.download_meta_media",
-            new=AsyncMock(),
-        ) as mock_download, patch(
-            "src.api.routes.webhook.send_meta_cloud_text",
-            new=AsyncMock(return_value=_fake_meta_send_result()),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service:
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(),
+            ) as mock_resolve,
+            patch(
+                "src.api.routes.webhook.download_meta_media_audio",
+                new=AsyncMock(),
+            ) as mock_download,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock()
             mock_get_service.return_value = service
 
-            resp = client.post(WEBHOOK_PATH, json=payload)
+            resp = _post_meta(client, payload)
 
         assert resp.status_code == 200
         assert mock_resolve.await_count == 0
@@ -1194,21 +1290,27 @@ class TestMetaWebhookFileForwardChoice:
         handoff_mock = AsyncMock()
         clear_mock = AsyncMock()
 
-        with patch(
-            "src.api.routes.webhook._meta_get_pending_file_review",
-            new=AsyncMock(return_value=True),
-        ), patch(
-            "src.api.routes.webhook._meta_clear_pending_file_review",
-            new=clear_mock,
-        ), patch(
-            "src.api.routes.webhook._meta_initiate_file_handoff",
-            new=handoff_mock,
-        ), patch(
-            "src.api.routes.webhook.send_meta_cloud_text",
-            new=AsyncMock(return_value=_fake_meta_send_result()),
-        ) as mock_send, patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service:
+        with (
+            patch(
+                "src.api.routes.webhook._meta_get_pending_file_review",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "src.api.routes.webhook._meta_clear_pending_file_review",
+                new=clear_mock,
+            ),
+            patch(
+                "src.api.routes.webhook._meta_initiate_file_handoff",
+                new=handoff_mock,
+            ),
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ) as mock_send,
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock(
@@ -1216,7 +1318,7 @@ class TestMetaWebhookFileForwardChoice:
             )
             mock_get_service.return_value = service
 
-            resp = client.post(WEBHOOK_PATH, json=payload)
+            resp = _post_meta(client, payload)
 
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -1262,21 +1364,27 @@ class TestMetaWebhookFileForwardChoice:
         handoff_mock = AsyncMock()
         clear_mock = AsyncMock()
 
-        with patch(
-            "src.api.routes.webhook._meta_get_pending_file_review",
-            new=AsyncMock(return_value=True),
-        ), patch(
-            "src.api.routes.webhook._meta_clear_pending_file_review",
-            new=clear_mock,
-        ), patch(
-            "src.api.routes.webhook._meta_initiate_file_handoff",
-            new=handoff_mock,
-        ), patch(
-            "src.api.routes.webhook.send_meta_cloud_text",
-            new=AsyncMock(return_value=_fake_meta_send_result()),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service:
+        with (
+            patch(
+                "src.api.routes.webhook._meta_get_pending_file_review",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "src.api.routes.webhook._meta_clear_pending_file_review",
+                new=clear_mock,
+            ),
+            patch(
+                "src.api.routes.webhook._meta_initiate_file_handoff",
+                new=handoff_mock,
+            ),
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock(
@@ -1284,7 +1392,7 @@ class TestMetaWebhookFileForwardChoice:
             )
             mock_get_service.return_value = service
 
-            resp = client.post(WEBHOOK_PATH, json=payload)
+            resp = _post_meta(client, payload)
 
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "replied": True}
@@ -1299,3 +1407,454 @@ class TestMetaWebhookFileForwardChoice:
             service.process_event.await_args.args[0].payload.content
             == "Na verdade queria saber o valor da consulta"
         )
+
+
+# ============================================
+# POST /v1/webhook/meta — HMAC authenticity (Group 5)
+# ============================================
+
+
+class TestMetaWebhookHmacAuthenticity:
+    def _clear_replay_store(self) -> None:
+        from src.api.routes.webhook import _INMEM_INCOMING
+
+        _INMEM_INCOMING.clear()
+
+    def setup_method(self) -> None:
+        self._clear_replay_store()
+
+    def test_missing_signature_returns_401_and_no_effects(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        """No ``X-Hub-Signature-256`` → generic 401, no pipeline, no send."""
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+        payload = _meta_text_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900011111",
+            text_body="hi",
+            message_id=f"wamid.nosig_{uuid4().hex[:8]}",
+        )
+
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(),
+            ) as mock_send,
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock()
+            mock_get_service.return_value = service
+
+            resp = client.post(
+                WEBHOOK_PATH,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert resp.status_code == 401
+        assert resp.json() == {"error": "invalid_webhook_auth"}
+        assert service.process_event.await_count == 0
+        assert mock_send.await_count == 0
+
+    def test_invalid_signature_returns_401_and_no_effects(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        """A well-formed but wrong HMAC digest returns 401."""
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+        payload = _meta_text_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900022222",
+            text_body="hi",
+            message_id=f"wamid.badsig_{uuid4().hex[:8]}",
+        )
+        bad_sig = "sha256=" + ("0" * 64)
+
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(),
+            ) as mock_send,
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock()
+            mock_get_service.return_value = service
+
+            resp = client.post(
+                WEBHOOK_PATH,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Hub-Signature-256": bad_sig,
+                },
+            )
+
+        assert resp.status_code == 401
+        assert resp.json() == {"error": "invalid_webhook_auth"}
+        assert service.process_event.await_count == 0
+        assert mock_send.await_count == 0
+
+    def test_hmac_signed_with_wrong_tenant_secret_returns_401(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        """A payload signed with tenant A's secret but targeting tenant B's
+        phone_number_id must fail authenticity (mixed-tenant attempt)."""
+        phone_id_b = f"pn_b_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id_b)
+
+        payload = _meta_text_payload(
+            phone_number_id=phone_id_b,
+            from_phone="5511900033333",
+            text_body="hi",
+            message_id=f"wamid.mixed_{uuid4().hex[:8]}",
+        )
+
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(),
+            ) as mock_send,
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock()
+            mock_get_service.return_value = service
+
+            # Signature computed with a DIFFERENT (wrong) secret
+            resp = _post_meta(client, payload, secret="another_tenant_secret")
+
+        assert resp.status_code == 401
+        assert resp.json() == {"error": "invalid_webhook_auth"}
+        assert service.process_event.await_count == 0
+        assert mock_send.await_count == 0
+
+    def test_zero_message_bearing_phone_ids_after_signature(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        """Empty messages array is treated as status_only (no auth binding
+        possible), returning the existing sentinel — never 500."""
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+        # Build a payload with an empty messages array
+        payload = _meta_text_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900044444",
+            text_body="ignored",
+            message_id="wamid.status",
+        )
+        payload["entry"][0]["changes"][0]["value"]["messages"] = []
+
+        # Signing with the tenant secret — the auth still won't attach
+        # because we don't have a bearing phone id.
+        resp = _post_meta(client, payload)
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "skipped": "status_only"}
+
+    def test_multiple_message_bearing_phone_ids_return_401(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        """A body carrying messages from TWO different phone_number_ids fails."""
+        phone_id_a = f"pn_a_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id_a)
+
+        payload_a = _meta_text_payload(
+            phone_number_id=phone_id_a,
+            from_phone="5511900055555",
+            text_body="from a",
+            message_id=f"wamid.a_{uuid4().hex[:8]}",
+        )
+        # Append a second entry targeting a DIFFERENT phone id
+        payload_a["entry"].append(
+            {
+                "id": f"waba_{uuid4().hex[:8]}",
+                "changes": [
+                    {
+                        "field": "messages",
+                        "value": {
+                            "messaging_product": "whatsapp",
+                            "metadata": {
+                                "display_phone_number": "5511900055555",
+                                "phone_number_id": f"pn_other_{uuid4().hex[:8]}",
+                            },
+                            "messages": [
+                                {
+                                    "from": "5511900055555",
+                                    "id": f"wamid.b_{uuid4().hex[:8]}",
+                                    "type": "text",
+                                    "text": {"body": "from b"},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        )
+
+        resp = _post_meta(client, payload_a)
+        assert resp.status_code == 401
+        assert resp.json() == {"error": "invalid_webhook_auth"}
+
+    def test_missing_meta_app_secret_returns_401(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        """A tenant without ``meta_app_secret`` cannot authenticate — any
+        signature is rejected (readiness ``signature_pending``)."""
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        # Manually seed the tenant WITHOUT app secret using generic PATCH
+        verify_token = f"verify_{uuid4().hex}"
+        resp = client.patch(
+            API_CRED_PATH,
+            json={
+                "whatsapp_provider": "meta_cloud",
+                "meta_phone_number_id": phone_id,
+                "meta_waba_id": f"waba_{uuid4().hex[:8]}",
+                "meta_permanent_token": f"EAAG_{uuid4().hex}",
+                "meta_verify_token": verify_token,
+                # NOTE: no meta_app_secret
+            },
+            headers=_admin_headers(tenant_id),
+        )
+        assert resp.status_code == 200
+
+        payload = _meta_text_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900066666",
+            text_body="hi",
+            message_id=f"wamid.legacy_{uuid4().hex[:8]}",
+        )
+        # Sign with anything at all — no server-side secret to compare against
+        resp = _post_meta(client, payload, secret="anything")
+        assert resp.status_code == 401
+        assert resp.json() == {"error": "invalid_webhook_auth"}
+
+
+class TestMetaWebhookReplay:
+    def setup_method(self) -> None:
+        from src.api.routes.webhook import _INMEM_INCOMING
+
+        _INMEM_INCOMING.clear()
+
+    def test_missing_message_id_returns_missing_message_id_before_effects(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+
+        payload = _meta_text_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900077777",
+            text_body="hi",
+            message_id="",  # missing
+        )
+
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(),
+            ) as mock_send,
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock()
+            mock_get_service.return_value = service
+
+            resp = _post_meta(client, payload)
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "skipped": "missing_message_id"}
+        assert service.process_event.await_count == 0
+        assert mock_send.await_count == 0
+
+    def test_duplicate_message_id_returns_duplicate_message_before_effects(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+        wamid = f"wamid.dup_{uuid4().hex[:8]}"
+
+        payload = _meta_text_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900088888",
+            text_body="dup test",
+            message_id=wamid,
+        )
+
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ) as mock_send,
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("first"),
+            )
+            mock_get_service.return_value = service
+
+            first = _post_meta(client, payload)
+            assert first.status_code == 200
+            assert first.json() == {"ok": True, "replied": True}
+
+            # Reset the pipeline mock: second post must not invoke it.
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("should never fire"),
+            )
+            mock_send.reset_mock()
+
+            second = _post_meta(client, payload)
+
+        assert second.status_code == 200
+        assert second.json() == {"ok": True, "skipped": "duplicate_message"}
+        assert service.process_event.await_count == 0
+        assert mock_send.await_count == 0
+
+    def test_redis_unavailable_returns_503_in_production(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+
+        payload = _meta_text_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900099999",
+            text_body="prod redis down",
+            message_id=f"wamid.503_{uuid4().hex[:8]}",
+        )
+
+        # Force production semantics + no Redis client so the claim fails
+        # closed with HTTP 503 fail-closed.
+        with (
+            patch(
+                "src.api.routes.webhook.settings",
+                SimpleNamespace(
+                    is_production=True,
+                    rate_limit_enabled=True,
+                    rate_limit_requests_per_minute=60,
+                    rate_limit_burst=10,
+                ),
+            ),
+            patch(
+                "src.api.routes.webhook._get_redis",
+                return_value=None,
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(),
+            ) as mock_send,
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock()
+            mock_get_service.return_value = service
+
+            resp = _post_meta(client, payload)
+
+        assert resp.status_code == 503
+        assert resp.json() == {"error": "replay_store_unavailable"}
+        assert service.process_event.await_count == 0
+        assert mock_send.await_count == 0
+
+
+class TestMetaWebhookRateLimit:
+    def setup_method(self) -> None:
+        from src.api.middleware.rate_limit import rate_limit_store
+        from src.api.routes.webhook import _INMEM_INCOMING
+
+        rate_limit_store._buckets.clear()
+        rate_limit_store._tenant_limits.clear()
+        _INMEM_INCOMING.clear()
+
+    def test_rate_limit_after_auth_and_before_replay(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        """A tenant exhausting its webhook bucket receives the exact 429 body
+        and headers required by the wish. Rate limiting happens BEFORE the
+        replay claim so a duplicate message can never bypass the quota."""
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+
+        # Pre-drain the tenant+channel bucket so the very next call is 429.
+        from src.api.middleware.rate_limit import rate_limit_store
+
+        bucket = rate_limit_store.get_or_create_bucket(f"webhook:{tenant_id}:meta")
+        while bucket.consume():
+            pass
+
+        payload = _meta_text_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900011122",
+            text_body="rate limited",
+            message_id=f"wamid.rl_{uuid4().hex[:8]}",
+        )
+
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(),
+            ) as mock_send,
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock()
+            mock_get_service.return_value = service
+
+            resp = _post_meta(client, payload)
+
+        assert resp.status_code == 429
+        body = resp.json()
+        assert body["error"] == "rate_limited"
+        assert "retry_after" in body
+        assert body["retry_after"] >= 1
+        assert "Rate limit exceeded" in body["message"]
+        assert resp.headers["X-RateLimit-Limit"] == str(
+            settings.rate_limit_requests_per_minute
+        )
+        assert resp.headers["X-RateLimit-Remaining"] == "0"
+        assert resp.headers["Retry-After"] == str(body["retry_after"])
+        assert service.process_event.await_count == 0
+        assert mock_send.await_count == 0
