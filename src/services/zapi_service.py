@@ -7,6 +7,7 @@ All outbound HTTP goes through :mod:`src.services.safe_egress`. Z-API pins
 public HTTPS host with the DNS/IP filter).
 """
 
+import base64
 import logging
 
 import httpx
@@ -68,6 +69,40 @@ async def send_text_message(
             raise _sanitize_http_status_error(exc) from None
         data = resp.json()
         logger.info("Z-API send_text to %s — status %s", phone, resp.status_code)
+        return data
+
+
+async def send_zapi_audio(
+    instance_id: str,
+    token: str,
+    phone: str,
+    audio_bytes: bytes,
+    *,
+    mime_type: str = "audio/mpeg",
+    client_token: str = "",
+) -> dict:
+    """Send synthesized audio as a WhatsApp voice message through Z-API."""
+
+    url = f"{ZAPI_BASE}/instances/{instance_id}/token/{token}/send-audio"
+    encoded = base64.b64encode(audio_bytes).decode("ascii")
+    payload = {
+        "phone": phone,
+        "audio": f"data:{mime_type};base64,{encoded}",
+        "waveform": True,
+    }
+    async with safe_async_client(
+        url, kind="zapi", timeout=httpx.Timeout(30.0, connect=5.0)
+    ) as (client, validated):
+        headers = {"Content-Type": "application/json", "Host": validated.sni_host}
+        if client_token:
+            headers["Client-Token"] = client_token
+        resp = await client.post(validated.url, json=payload, headers=headers)
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise _sanitize_http_status_error(exc) from None
+        data = resp.json()
+        logger.info("Z-API send_audio to %s - status %s", phone, resp.status_code)
         return data
 
 
@@ -196,4 +231,37 @@ async def send_evolution_text(
             raise _sanitize_http_status_error(exc) from None
         data = resp.json()
         logger.info("Evolution send_text to %s — status %s", phone, resp.status_code)
+        return data
+
+
+async def send_evolution_audio(
+    api_url: str,
+    instance_name: str,
+    api_key: str,
+    phone: str,
+    audio_bytes: bytes,
+) -> dict:
+    """Send synthesized MP3 audio through an Evolution API instance."""
+
+    url = f"{api_url.rstrip('/')}/message/sendWhatsAppAudio/{instance_name}"
+    payload = {
+        "number": phone,
+        "audio": base64.b64encode(audio_bytes).decode("ascii"),
+        "encoding": True,
+    }
+    async with safe_async_client(
+        url, kind="evolution", timeout=httpx.Timeout(30.0, connect=5.0)
+    ) as (client, validated):
+        headers = {
+            "apikey": api_key,
+            "Content-Type": "application/json",
+            "Host": validated.sni_host,
+        }
+        resp = await client.post(validated.url, json=payload, headers=headers)
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise _sanitize_http_status_error(exc) from None
+        data = resp.json()
+        logger.info("Evolution send_audio to %s - status %s", phone, resp.status_code)
         return data

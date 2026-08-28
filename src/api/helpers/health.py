@@ -82,6 +82,7 @@ async def _get_time_series(
         )
         .where(
             Event.tenant_id.in_(tenant_ids),
+            Event.event_type == "message.in",
             Event.created_at >= start,
         )
         .group_by(text("1"))
@@ -132,13 +133,16 @@ async def _compute_alerts(
 
     tenant_ids = [t.id for t in tenants]
 
-    # Last event per tenant
+    # Last trace (processed inbound message) per tenant
     last_event_stmt = (
         select(
             Event.tenant_id,
             func.max(Event.created_at).label("last_event_at"),
         )
-        .where(Event.tenant_id.in_(tenant_ids))
+        .where(
+            Event.tenant_id.in_(tenant_ids),
+            Event.event_type == "message.in",
+        )
         .group_by(Event.tenant_id)
     )
     last_event_result = await session.execute(last_event_stmt)

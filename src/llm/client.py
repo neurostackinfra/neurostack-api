@@ -28,6 +28,15 @@ logger = get_logger(__name__)
 _client: Optional["LLMClient"] = None
 
 
+def _chat_completions_url(base_url: str) -> str:
+    """Accept either an API base URL or the complete chat endpoint."""
+
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/chat/completions"):
+        return normalized
+    return f"{normalized}/chat/completions"
+
+
 def _llm_kind_for_url(base_url: str) -> str:
     """Return the safe-egress kind label for a given LLM base URL.
 
@@ -70,9 +79,16 @@ class LLMClient:
 
     # Reasoning models use max_completion_tokens and don't accept temperature
     REASONING_PREFIXES = ("o1", "o3", "o4")
+    GPT_OSS_PREFIXES = ("openai/gpt-oss-",)
 
     def _is_reasoning_model(self, model: str) -> bool:
-        return any(model.startswith(p) for p in self.REASONING_PREFIXES)
+        return any(
+            model.startswith(prefix)
+            for prefix in (*self.REASONING_PREFIXES, *self.GPT_OSS_PREFIXES)
+        )
+
+    def _is_gpt_oss_model(self, model: str) -> bool:
+        return any(model.startswith(prefix) for prefix in self.GPT_OSS_PREFIXES)
 
     async def generate(
         self,
@@ -100,7 +116,16 @@ class LLMClient:
         }
 
         if self._is_reasoning_model(effective_model):
-            payload["max_completion_tokens"] = tokens
+            is_gpt_oss = self._is_gpt_oss_model(effective_model)
+            # GPT-OSS includes hidden reasoning in the completion budget. The
+            # pipeline's concise 300-token response limit can therefore be
+            # exhausted before the model emits any visible content.
+            payload["max_completion_tokens"] = (
+                max(tokens, 1024) if is_gpt_oss else tokens
+            )
+            if is_gpt_oss:
+                payload["reasoning_effort"] = "low"
+                payload["reasoning_format"] = "hidden"
         else:
             payload["temperature"] = (
                 temperature if temperature is not None else settings.llm_temperature
@@ -108,7 +133,7 @@ class LLMClient:
             payload["max_tokens"] = tokens
 
         logger.debug("LLM request", model=effective_model, messages_count=len(messages))
-        target_url = f"{self._base_url}/chat/completions"
+        target_url = _chat_completions_url(self._base_url)
         async with safe_async_client(
             target_url,
             kind=self._kind,

@@ -155,17 +155,25 @@ def test_sequential_saves_preserve_capabilities_and_clean_stt_aliases() -> None:
     assert "whisper_model" not in cleaned
 
 
-@pytest.mark.parametrize("provider", ["elevenlabs", "google"])
-def test_tts_configuration_is_persisted_but_never_projected_to_runtime(
-    provider: str,
+@pytest.mark.parametrize(
+    ("provider", "api_url", "voice_id"),
+    [
+        ("elevenlabs", "https://api.elevenlabs.io/v1", "voice-123"),
+        ("google", "https://texttospeech.googleapis.com/v1", None),
+    ],
+)
+def test_tts_configuration_is_operational_but_never_projected_to_cache(
+    provider: str, api_url: str, voice_id: str | None,
 ) -> None:
     credentials = merge_credentials(
         {},
         {
             "tts_provider": provider,
-            "tts_api_url": "https://tts.example/v1",
+            "tts_api_url": api_url,
             "tts_api_key": "tts-secret",
             "tts_model_name": "pt-br-voice",
+            "tts_voice_id": voice_id,
+            "tts_enabled": True,
         },
     )
 
@@ -173,11 +181,76 @@ def test_tts_configuration_is_persisted_but_never_projected_to_runtime(
     assert status["tts_provider"] == provider
     assert status["tts_api_key_set"] is True
     assert status["tts_api_key_masked"] == "••••••••"
-    assert status["tts_readiness"] == "configuration_only"
+    assert status["tts_enabled"] is True
+    assert status["tts_voice_id"] == voice_id
+    assert status["tts_readiness"] == "active"
     assert not any(
         field.startswith("tts_") for field in runtime_projection(credentials)
     )
     assert "tts-secret" not in repr(status)
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected_readiness"),
+    [
+        # Measured against the live API: only OpenRouter transcribes the
+        # OGG/Opus WhatsApp delivers, so only it may claim `active`.
+        ("openrouter", "active"),
+        ("groq", "configuration_only"),
+        ("openai", "configuration_only"),
+    ],
+)
+def test_multimodal_readiness_is_active_only_for_operational_providers(
+    provider: str, expected_readiness: str
+) -> None:
+    credentials = merge_credentials(
+        {},
+        {
+            "multimodal_provider": provider,
+            "multimodal_api_url": "https://multimodal.example/v1",
+            "multimodal_api_key": "fake-multimodal-key",
+            "multimodal_model_name": "some-audio-model",
+        },
+    )
+
+    status = credential_status(credentials)
+    assert status["multimodal_readiness"] == expected_readiness
+    assert status["multimodal_provider"] == provider
+    assert status["multimodal_api_key_set"] is True
+    assert status["multimodal_api_key_masked"] == "••••••••"
+    assert "fake-multimodal-key" not in repr(status)
+    # Readiness never widens the runtime projection: even an `active` bundle
+    # stays out of the cache payload.
+    assert not any(
+        field.startswith("multimodal_") for field in runtime_projection(credentials)
+    )
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "multimodal_provider",
+        "multimodal_api_url",
+        "multimodal_api_key",
+        "multimodal_model_name",
+    ],
+)
+def test_multimodal_readiness_is_incomplete_until_every_field_is_present(
+    missing_field: str,
+) -> None:
+    # Built directly instead of through `merge_credentials`: dropping the key
+    # while changing provider/url is a different policy (fresh_api_key_required)
+    # and would mask the readiness branch under test.
+    credentials = {
+        "multimodal_provider": "openrouter",
+        "multimodal_api_url": "https://openrouter.ai/api/v1",
+        "multimodal_api_key": "fake-multimodal-key",
+        "multimodal_model_name": "some-audio-model",
+    }
+    credentials.pop(missing_field)
+
+    status = credential_status(credentials)
+    assert status["multimodal_readiness"] == "incomplete"
 
 
 def test_status_and_runtime_projection_never_expose_secrets_or_digest() -> None:

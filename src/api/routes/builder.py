@@ -125,7 +125,10 @@ async def list_clinics(
             Event.tenant_id,
             func.max(Event.created_at).label("last_trace_at"),
         )
-        .where(Event.tenant_id.in_(tenant_ids))
+        .where(
+            Event.tenant_id.in_(tenant_ids),
+            Event.event_type == "message.in",
+        )
         .group_by(Event.tenant_id)
     )
     last_trace_result = await session.execute(last_trace_stmt)
@@ -139,6 +142,7 @@ async def list_clinics(
         )
         .where(
             Event.tenant_id.in_(tenant_ids),
+            Event.event_type == "message.in",
             Event.created_at >= seven_days_ago,
         )
         .group_by(Event.tenant_id)
@@ -390,7 +394,10 @@ async def builder_stats(
     # Total traces across builder's clinics
     tenant_ids_stmt = select(Tenant.id).where(Tenant.builder_id == builder_id)
     trace_result = await session.execute(
-        select(func.count(Event.id)).where(Event.tenant_id.in_(tenant_ids_stmt))
+        select(func.count(Event.id)).where(
+            Event.tenant_id.in_(tenant_ids_stmt),
+            Event.event_type == "message.in",
+        )
     )
     total_traces = trace_result.scalar() or 0
 
@@ -426,7 +433,10 @@ async def _get_builder_stats(
 
     tenant_ids_stmt = select(Tenant.id).where(Tenant.builder_id == builder_id)
     trace_result = await session.execute(
-        select(func.count(Event.id)).where(Event.tenant_id.in_(tenant_ids_stmt))
+        select(func.count(Event.id)).where(
+            Event.tenant_id.in_(tenant_ids_stmt),
+            Event.event_type == "message.in",
+        )
     )
     total_traces = trace_result.scalar() or 0
 
