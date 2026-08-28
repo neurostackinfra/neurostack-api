@@ -1,8 +1,7 @@
 import { useEffect, useState } from "react";
 import { customFetch } from "@workspace/api-client-react";
 import {
-  Brain, ShieldAlert, CheckCircle2, Filter, Download, FlaskConical,
-  Zap, Loader2, AlertTriangle, Clock,
+  Brain, ShieldAlert, CheckCircle2, Filter, Zap, Loader2, AlertTriangle, Clock,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -13,18 +12,6 @@ import {
 } from "recharts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
-
-interface SuggestionEntry {
-  id: string;
-  ts: string;
-  tenant_id: string;
-  submitted_by?: string;
-  user_message?: string;
-  agent_response?: string;
-  suggested_response?: string;
-  status?: "aligned" | "forced";
-  intent?: string;
-}
 
 interface RatingEntry {
   id: string;
@@ -44,19 +31,11 @@ interface RatingEntry {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 const RATING_META: Record<number, { label: string; color: string; tailwind: string }> = {
-  1: { label: "Péssimo",      color: "#ef4444", tailwind: "bg-red-500"    },
-  2: { label: "Ruim",         color: "#fb7185", tailwind: "bg-rose-400"   },
-  3: { label: "Regular",      color: "#facc15", tailwind: "bg-yellow-400" },
-  4: { label: "Boa resposta", color: "#4ade80", tailwind: "bg-green-400"  },
-  5: { label: "Ótima",        color: "#22c55e", tailwind: "bg-green-500"  },
-};
-
-const INTENT_LABELS: Record<string, string> = {
-  pedido_preco: "Pedido de Preço",
-  interesse_tratamento: "Interesse Tratamento",
-  reclamacao: "Reclamação",
-  agendar: "Agendamento",
-  duvida_pos_procedimento: "Pós-Procedimento",
+  1: { label: "Péssimo", color: "#ef4444", tailwind: "bg-red-500"    },
+  2: { label: "Ruim",    color: "#fb7185", tailwind: "bg-rose-400"   },
+  3: { label: "Regular", color: "#facc15", tailwind: "bg-yellow-400" },
+  4: { label: "Bom",     color: "#4ade80", tailwind: "bg-green-400"  },
+  5: { label: "Ótimo",   color: "#22c55e", tailwind: "bg-green-500"  },
 };
 
 function RatingBadge({ rating }: { rating: number }) {
@@ -116,138 +95,7 @@ function AiAnalysisCell({ entry }: { entry: RatingEntry }) {
   return null;
 }
 
-// ── Tab: Sugestões RLHF ──────────────────────────────────────────────────────
-
-function SuggestionsTab() {
-  const [entries, setEntries]   = useState<SuggestionEntry[]>([]);
-  const [loading, setLoading]   = useState(true);
-
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const raw = localStorage.getItem("ns_auth");
-        const token = (() => { try { return (JSON.parse(raw ?? "{}") as { token?: string }).token ?? ""; } catch { return ""; } })();
-        const res = await fetch("/v1/admin/rlhf/pending?limit=100", {
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        });
-        if (res.ok) {
-          const data = await res.json();
-          setEntries(Array.isArray(data) ? data : (data.entries ?? []));
-        }
-      } catch { /* silently degrade */ } finally {
-        setLoading(false);
-      }
-    };
-    void load();
-  }, []);
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center py-16 text-muted-foreground gap-2">
-        <Loader2 className="h-4 w-4 animate-spin" />
-        <span className="text-sm">Carregando sugestões...</span>
-      </div>
-    );
-  }
-
-  if (entries.length === 0) {
-    return (
-      <div className="text-center py-16 text-sm text-muted-foreground">
-        Nenhuma sugestão de correção registrada ainda.
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-3">
-      {/* Table header */}
-      <div className="hidden md:grid grid-cols-[1.2fr_0.9fr_2.2fr_0.9fr] gap-4 px-4 py-2 rounded-md bg-muted/50 border border-border">
-        {["Clínica / Usuário", "Status", "Resposta vs. Sugestão", "Intenção"].map((h) => (
-          <span key={h} className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">{h}</span>
-        ))}
-      </div>
-
-      {entries.map((entry) => (
-        <Card key={entry.id} className="border-border shadow-sm overflow-hidden">
-          <div className="flex items-center justify-between px-4 py-2.5 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
-            <span className="text-xs font-mono text-muted-foreground">{entry.id.slice(0, 8)}...</span>
-            <div className="flex items-center gap-2">
-              <Badge
-                variant="outline"
-                className={`text-[10px] py-0 gap-1 ${
-                  entry.status === "aligned"
-                    ? "bg-green-500/10 text-green-400 border-green-500/30"
-                    : "bg-red-500/10 text-red-400 border-red-500/30"
-                }`}
-              >
-                {entry.status === "aligned"
-                  ? <><CheckCircle2 className="h-2.5 w-2.5" /> Alinhado</>
-                  : <><ShieldAlert className="h-2.5 w-2.5" /> Forçado</>}
-              </Badge>
-              <span className="text-[10px] text-muted-foreground hidden sm:block">
-                {entry.ts ? new Date(entry.ts).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" }) : ""}
-              </span>
-            </div>
-          </div>
-          <CardContent className="pt-4 pb-4">
-            <div className="grid grid-cols-1 md:grid-cols-[1.2fr_0.9fr_2.2fr_0.9fr] gap-4 items-start">
-              <div>
-                <p className="text-sm font-semibold text-foreground">{entry.tenant_id.slice(0, 8)}...</p>
-                <p className="text-[11px] text-muted-foreground mt-0.5">{entry.submitted_by ?? "—"}</p>
-              </div>
-              <div>
-                {entry.status === "aligned" ? (
-                  <div className="flex items-center gap-1.5 text-green-400">
-                    <CheckCircle2 className="h-4 w-4 shrink-0" />
-                    <div>
-                      <p className="text-xs font-bold">Alinhado</p>
-                      <p className="text-[10px] text-green-400/70">Conforme SRM</p>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-1.5 text-red-400">
-                    <ShieldAlert className="h-4 w-4 shrink-0" />
-                    <div>
-                      <p className="text-xs font-bold">Override Forçado</p>
-                      <p className="text-[10px] text-red-400/70">Fere Metodologia</p>
-                    </div>
-                  </div>
-                )}
-              </div>
-              <div className="space-y-2">
-                <div>
-                  <p className="text-[10px] font-bold text-muted-foreground mb-0.5 uppercase tracking-wider">Resposta Original</p>
-                  <p className="text-xs italic bg-muted rounded px-2.5 py-1.5 border border-border text-foreground/80">
-                    {entry.agent_response ?? "—"}
-                  </p>
-                </div>
-                <div>
-                  <p className={`text-[10px] font-bold mb-0.5 uppercase tracking-wider ${entry.status === "aligned" ? "text-emerald-600" : "text-rose-600"}`}>
-                    {entry.status === "aligned" ? "✅ Sugestão Alinhada" : "⚠️ Sugestão Forçada"}
-                  </p>
-                  <p className={`text-xs rounded px-2.5 py-1.5 border font-medium ${
-                    entry.status === "aligned"
-                      ? "text-emerald-950 dark:text-emerald-100 bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800/40"
-                      : "text-rose-950 dark:text-rose-100 bg-rose-50 dark:bg-rose-950/30 border-rose-200 dark:border-rose-800/40"
-                  }`}>
-                    {entry.suggested_response ?? "—"}
-                  </p>
-                </div>
-              </div>
-              <div>
-                <Badge variant="outline" className="text-[9px] py-0 text-blue-400 border-blue-400/30 bg-blue-500/10">
-                  {INTENT_LABELS[entry.intent ?? ""] ?? (entry.intent ?? "—")}
-                </Badge>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      ))}
-    </div>
-  );
-}
-
-// ── Tab: Avaliações 1-5 ───────────────────────────────────────────────────────
+// ── Avaliações 1-5 ───────────────────────────────────────────────────────────
 
 function RatingsTab() {
   const { toast } = useToast();
@@ -483,8 +331,6 @@ function RatingsTab() {
 // ── Main Page ────────────────────────────────────────────────────────────────
 
 export default function RlhfAudit() {
-  const [tab, setTab] = useState<"suggestions" | "ratings">("suggestions");
-
   return (
     <div className="space-y-7 max-w-6xl mx-auto">
 
@@ -505,14 +351,10 @@ export default function RlhfAudit() {
             </div>
           </div>
           <p className="text-sm text-muted-foreground max-w-2xl">
-            Registro centralizado de sugestões de correção e avaliações de resposta enviadas pelos builders.
+            Registro centralizado de avaliações de resposta enviadas pelos builders.
             Cada entrada representa um sinal de alinhamento comportamental para fine-tuning do agente.
           </p>
         </div>
-        <Button variant="outline" size="sm" className="gap-2 text-xs shrink-0">
-          <Download className="h-3.5 w-3.5" />
-          Exportar Dataset
-        </Button>
       </div>
 
       {/* Restricted badge */}
@@ -523,30 +365,7 @@ export default function RlhfAudit() {
         </span>
       </div>
 
-      {/* Tabs */}
-      <div className="flex gap-1 border-b border-border">
-        {(["suggestions", "ratings"] as const).map((t) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            className={[
-              "flex items-center gap-1.5 px-4 py-2 text-xs font-semibold uppercase tracking-wider border-b-2 transition-colors",
-              tab === t
-                ? "border-violet-500 text-violet-400"
-                : "border-transparent text-muted-foreground hover:text-foreground",
-            ].join(" ")}
-          >
-            {t === "suggestions" ? (
-              <><FlaskConical className="h-3.5 w-3.5" /> Sugestões RLHF</>
-            ) : (
-              <><Brain className="h-3.5 w-3.5" /> Avaliações 1–5</>
-            )}
-          </button>
-        ))}
-      </div>
-
-      {/* Tab Content */}
-      {tab === "suggestions" ? <SuggestionsTab /> : <RatingsTab />}
+      <RatingsTab />
     </div>
   );
 }

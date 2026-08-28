@@ -141,6 +141,15 @@ class Settings(BaseSettings):
     abacatepay_webhook_secret: str = ""
 
     # ============================================
+    # Subscription plan usage limits
+    # ============================================
+    # The product currently sells only the Start plan. Keep its entitlements
+    # configurable so new commercial limits do not require a code release.
+    start_plan_monthly_trace_limit: int = Field(default=10_000, ge=0)
+    start_plan_rag_storage_limit_mb: int = Field(default=500, ge=0)
+    start_plan_media_storage_limit_mb: int = Field(default=500, ge=0)
+
+    # ============================================
     # LLM Provider (OpenAI-compatible)
     # ============================================
     llm_base_url: str = ""

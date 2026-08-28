@@ -9,6 +9,8 @@ proving the egress path via an in-memory ``httpx.MockTransport``.
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import socket
 from contextlib import contextmanager
 from typing import Any
@@ -97,6 +99,54 @@ class TestSendTextMessage:
                     )
                 )
         assert excinfo.value.code == "unsafe_api_url"
+
+
+class TestSendAudio:
+    def test_zapi_audio_uses_data_uri_and_waveform(self) -> None:
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(200, json={"messageId": "audio-1"})
+
+        with egress_env(make_resolver(ZAPI_PUBLIC_IP), httpx.MockTransport(handler)):
+            data = asyncio.run(
+                zapi_service.send_zapi_audio(
+                    "INSTANCE",
+                    "TOKEN",
+                    "5511",
+                    b"mp3",
+                    client_token="CLIENT",
+                )
+            )
+        assert data == {"messageId": "audio-1"}
+        assert seen[0].url.path.endswith("/send-audio")
+        assert seen[0].headers["Client-Token"] == "CLIENT"
+        assert json.loads(seen[0].content) == {
+            "phone": "5511",
+            "audio": "data:audio/mpeg;base64," + base64.b64encode(b"mp3").decode(),
+            "waveform": True,
+        }
+
+    def test_evolution_audio_uses_whatsapp_audio_endpoint(self) -> None:
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(200, json={"key": {"id": "audio-2"}})
+
+        with egress_env(make_resolver("1.1.1.1"), httpx.MockTransport(handler)):
+            asyncio.run(
+                zapi_service.send_evolution_audio(
+                    "https://evo.customer.example", "clinic", "KEY", "5511", b"mp3"
+                )
+            )
+        assert seen[0].url.path == "/message/sendWhatsAppAudio/clinic"
+        assert json.loads(seen[0].content) == {
+            "number": "5511",
+            "audio": base64.b64encode(b"mp3").decode(),
+            "encoding": True,
+        }
 
     def test_mixed_ips_rejected(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:

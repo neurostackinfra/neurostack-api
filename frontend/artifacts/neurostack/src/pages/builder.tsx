@@ -21,6 +21,10 @@ import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useToast } from "@/hooks/use-toast";
 import { useI18n } from "@/context/i18n";
+import {
+  PlanUsageSummary,
+  type BillingUsage,
+} from "@/components/plan-usage-summary";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -213,6 +217,7 @@ export default function BuilderPanel() {
   const [profile, setProfile] = useState<BuilderProfile | null>(null);
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [clinics, setClinics] = useState<BuilderClinic[]>([]);
+  const [usage, setUsage] = useState<BillingUsage | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -241,12 +246,14 @@ export default function BuilderPanel() {
   async function fetchAll() {
     setLoading(true);
     setError(null);
+    setUsage(null);
     try {
       const headers = authHeaders(token);
-      const [profileRes, dashboardRes, clinicsRes] = await Promise.all([
+      const [profileRes, dashboardRes, clinicsRes, usageRes] = await Promise.all([
         fetch("/v1/builder/me", { headers }),
         fetch("/v1/builder/dashboard", { headers }),
         fetch("/v1/builder/clinics", { headers }),
+        fetch("/v1/billing/usage", { headers }),
       ]);
 
       const errors: string[] = [];
@@ -269,9 +276,15 @@ export default function BuilderPanel() {
         errors.push(`clinics: ${clinicsRes.status}`);
       }
 
+      if (usageRes.ok) {
+        setUsage(await usageRes.json() as BillingUsage);
+      } else {
+        errors.push(`usage: ${usageRes.status}`);
+      }
+
       if (errors.length > 0) {
         console.warn("[Builder] Fetch errors:", errors);
-        if (errors.length === 3) {
+        if (errors.length === 4) {
           setError("Erro ao carregar dados");
         }
       }
@@ -459,6 +472,8 @@ export default function BuilderPanel() {
               VISAO GLOBAL TAB
              ══════════════════════════════════════════════════════════════════ */}
           <TabsContent value="overview" className="space-y-6 mt-4">
+            {usage && <PlanUsageSummary usage={usage} locale={locale} />}
+
             {/* KPI row — 4 cards with trend */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
               <Card className="border-border">

@@ -6,12 +6,17 @@ import { CheckCircle2, Loader2 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
 const RATING_META: Record<number, { label: string; bg: string; ring: string }> = {
-  1: { label: "Péssimo",       bg: "bg-red-500",    ring: "ring-red-500"    },
-  2: { label: "Ruim",          bg: "bg-rose-400",   ring: "ring-rose-400"   },
-  3: { label: "Regular",       bg: "bg-yellow-400", ring: "ring-yellow-400" },
-  4: { label: "Boa resposta",  bg: "bg-green-400",  ring: "ring-green-400"  },
-  5: { label: "Ótima",         bg: "bg-green-500",  ring: "ring-green-500"  },
+  1: { label: "Péssimo", bg: "bg-red-500",    ring: "ring-red-500"    },
+  2: { label: "Ruim",    bg: "bg-rose-400",   ring: "ring-rose-400"   },
+  3: { label: "Regular", bg: "bg-yellow-400", ring: "ring-yellow-400" },
+  4: { label: "Bom",     bg: "bg-green-400",  ring: "ring-green-400"  },
+  5: { label: "Ótimo",   bg: "bg-green-500",  ring: "ring-green-500"  },
 };
+
+// Minimum characters (after trimming) required for a rating 1-3 critique to
+// count as substantive. Mirrors the `has_reason` threshold in
+// `src/api/routes/rlhf.py::submit_rating`.
+const MIN_REASON_LENGTH = 8;
 
 export interface RatingBlockProps {
   msgId: string;
@@ -35,8 +40,8 @@ export function RatingBlock({
   const [reason, setReason]     = useState("");
   const [phase, setPhase]       = useState<"idle" | "submitting" | "submitted">("idle");
 
-  const needsReason = selected !== null && selected <= 2;
-  const canSubmit   = selected !== null && (!needsReason || reason.trim().length > 0);
+  const needsReason = selected !== null && selected <= 3;
+  const canSubmit   = selected !== null && (!needsReason || reason.trim().length >= MIN_REASON_LENGTH);
 
   const submit = async () => {
     if (!canSubmit || phase !== "idle") return;

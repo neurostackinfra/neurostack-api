@@ -148,10 +148,14 @@ def _clear_process_state():
     from src.api.routes.webhook import (
         _INMEM_INCOMING,
         _INMEM_SENT,
+        _INMEM_STT_NOTICE,
     )
 
     _INMEM_INCOMING.clear()
     _INMEM_SENT.clear()
+    # The 6h reroute-notice window is per-process state too: leaving it set
+    # makes every test after the first one assert zero sends.
+    _INMEM_STT_NOTICE.clear()
     rate_limit_store._buckets.clear()
     rate_limit_store._tenant_limits.clear()
     yield
@@ -608,3 +612,786 @@ class TestZapiRateLimit:
         assert resp.headers["X-RateLimit-Limit"] == str(
             settings.rate_limit_requests_per_minute
         )
+
+
+# ============================================
+# STT fallback chain (fallback-texto, Group 3)
+# ============================================
+#
+# Decision 5: text is always the last rung — an audio never ends in silence.
+# Decision 6: "never configured" and "failed right now" are distinct messages.
+# Decision 12: one notice per patient per 6h window, keyed by phone.
+# Decision 14: "multimodal operante" = complete creds AND an operational
+#              provider (a configured-but-unproven provider is not capability).
+
+
+def _seed_zapi_audio_tenant(
+    client: TestClient,
+    tenant_id: UUID,
+    instance_id: str,
+    raw_token: str,
+    *,
+    stt: bool = False,
+    stt_provider: str | None = None,
+    multimodal: bool = False,
+    multimodal_provider: str = "openrouter",
+    audio_max_seconds: int | None = None,
+) -> None:
+    """Seed a real credential row for the audio path.
+
+    Deliberately no mocking of ``_load_clinic_config`` /
+    ``_load_tenant_credentials``: the whole point of Group 1 was that the
+    webhook reads raw credentials from the DB, and a patched loader would
+    hide a regression there. Keys are per-test unique and obviously fake.
+
+    ``stt_provider`` always travels with a fresh key: the credentials
+    endpoint rejects a provider change that reuses the previous secret.
+    """
+    payload: dict = {
+        "whatsapp_provider": "zapi",
+        "zapi_instance_id": instance_id,
+        "zapi_token": f"zt_{uuid4().hex}",
+        "zapi_client_token": f"ct_{uuid4().hex}",
+        "zapi_inbound_token_digest": _digest_for(raw_token),
+    }
+    if stt or stt_provider is not None:
+        payload.update(
+            {
+                "stt_provider": stt_provider or "outros",
+                "stt_api_key": f"sk-fake-stt-{uuid4().hex}",
+                "stt_api_url": "https://api.groq.com/openai/v1",
+                "stt_model_name": "whisper-large-v3-turbo",
+            }
+        )
+    if multimodal:
+        payload.update(
+            {
+                "multimodal_provider": multimodal_provider,
+                "multimodal_api_url": "https://openrouter.ai/api/v1",
+                "multimodal_api_key": f"sk-fake-mm-{uuid4().hex}",
+                "multimodal_model_name": "google/gemini-2.5-flash",
+            }
+        )
+    if audio_max_seconds is not None:
+        payload["audio_max_seconds"] = audio_max_seconds
+
+    resp = client.patch(
+        API_CRED_PATH,
+        json=payload,
+        headers=_admin_headers(tenant_id),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def _zapi_audio_body(
+    *,
+    instance_id: str,
+    message_id: str,
+    phone: str = "5511900000003",
+    seconds: int = 5,
+    audio_url: str = "https://cdn.example.com/voice.ogg",
+) -> dict:
+    return {
+        "instanceId": instance_id,
+        "phone": phone,
+        "messageId": message_id,
+        "fromMe": False,
+        "audio": {
+            "url": audio_url,
+            "mimeType": "audio/ogg",
+            "seconds": seconds,
+        },
+        "momment": 1_711_900_000_000,
+        "senderName": "Paciente",
+    }
+
+
+def _set_agent_language(client: TestClient, tenant_id: UUID, language: str) -> None:
+    """Write ``business_rules.agent_language`` straight onto the config row.
+
+    No API endpoint exposes this field, so the row is edited directly and the
+    projection cache invalidated — the webhook still reads it through the real
+    ``_load_clinic_config``.
+    """
+    from sqlalchemy import select
+
+    from src.models.clinic_config_table import ClinicConfigTable
+    from src.repositories.database import get_db_session
+    from src.services.event_service import invalidate_clinic_config_cache
+
+    async def _run() -> None:
+        db = get_db_session()
+        try:
+            row = (
+                await db.execute(
+                    select(ClinicConfigTable).where(
+                        ClinicConfigTable.tenant_id == tenant_id
+                    )
+                )
+            ).scalar_one()
+            rules = dict(row.business_rules or {})
+            rules["agent_language"] = language
+            row.business_rules = rules
+            await db.commit()
+        finally:
+            await db.close()
+        await invalidate_clinic_config_cache(tenant_id)
+
+    client._submit(_run())  # type: ignore[attr-defined]
+
+
+class _NoReplyResponse:
+    """Pipeline result shaped so the webhook replies nothing."""
+
+    prompt = None
+    handoff_summary = None
+    decision = SimpleNamespace(handoff_required=False)
+
+
+class TestZapiSttFallbackChain:
+    """The chain and its text reroute on the Z-API channel."""
+
+    def _download_ok(self):
+        from src.services.safe_egress import SafeDownload
+
+        return AsyncMock(
+            return_value=SafeDownload(content=b"OggS_fake", mime_type="audio/ogg")
+        )
+
+    def test_stt_failure_without_multimodal_reroutes_to_text(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """STT raises, no second rung — the patient is asked to type."""
+        from src.api.routes.webhook import _STT_TEMPORARY_FAILURE_MSG_PT
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_audio_tenant(client, tenant_id, instance_id, raw_token, stt=True)
+
+        send_mock = AsyncMock(return_value=_fake_send_result())
+        unread_mock = AsyncMock(return_value={})
+        mm_mock = AsyncMock()
+
+        with (
+            patch("src.api.routes.webhook.safe_download_audio", self._download_ok()),
+            patch(
+                "src.services.groq_service.transcribe_audio",
+                new=AsyncMock(side_effect=RuntimeError("stt 503")),
+            ),
+            patch(
+                "src.services.multimodal_service.transcribe_audio_multimodal", mm_mock
+            ),
+            patch("src.api.routes.webhook.send_text_message", send_mock),
+            patch("src.api.routes.webhook.mark_conversation_unread", unread_mock),
+        ):
+            resp = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_audio_body(
+                    instance_id=instance_id, message_id=f"mid_{uuid4().hex[:10]}"
+                ),
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "stt_fallback"}
+        assert send_mock.await_count == 1
+        assert send_mock.await_args.args[3] == _STT_TEMPORARY_FAILURE_MSG_PT
+        # Decision 5's Z-API-only affordance: the clinic sees the pending voice note
+        assert unread_mock.await_count == 1
+        # No multimodal configured — the second rung was never attempted
+        mm_mock.assert_not_called()
+
+    def test_stt_failure_with_multimodal_success_never_reroutes(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Rung 2 rescues rung 1: the transcript reaches the pipeline."""
+        from src.services.event_service import EventService
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_audio_tenant(
+            client, tenant_id, instance_id, raw_token, stt=True, multimodal=True
+        )
+
+        captured: dict = {}
+
+        async def _capture(self, event_request, session=None):
+            captured["content"] = event_request.payload.content
+            return _NoReplyResponse()
+
+        send_mock = AsyncMock(return_value=_fake_send_result())
+
+        with (
+            patch("src.api.routes.webhook.safe_download_audio", self._download_ok()),
+            patch(
+                "src.services.groq_service.transcribe_audio",
+                new=AsyncMock(side_effect=RuntimeError("stt 503")),
+            ),
+            patch(
+                "src.services.multimodal_service.transcribe_audio_multimodal",
+                new=AsyncMock(return_value="quero remarcar minha consulta"),
+            ),
+            patch("src.api.routes.webhook.send_text_message", send_mock),
+            patch("src.api.routes.webhook.mark_message_read", AsyncMock()),
+            patch.object(EventService, "process_event", _capture),
+        ):
+            resp = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_audio_body(
+                    instance_id=instance_id, message_id=f"mid_{uuid4().hex[:10]}"
+                ),
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json().get("action") != "stt_fallback", resp.json()
+        assert captured["content"] == "quero remarcar minha consulta"
+        send_mock.assert_not_called()
+
+    def test_both_rungs_failing_reroutes_to_text(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Decision 5: text is the last rung even when multimodal fails."""
+        from src.api.routes.webhook import _STT_TEMPORARY_FAILURE_MSG_PT
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_audio_tenant(
+            client, tenant_id, instance_id, raw_token, stt=True, multimodal=True
+        )
+
+        send_mock = AsyncMock(return_value=_fake_send_result())
+
+        with (
+            patch("src.api.routes.webhook.safe_download_audio", self._download_ok()),
+            patch(
+                "src.services.groq_service.transcribe_audio",
+                new=AsyncMock(side_effect=RuntimeError("stt 503")),
+            ),
+            patch(
+                "src.services.multimodal_service.transcribe_audio_multimodal",
+                new=AsyncMock(side_effect=RuntimeError("openrouter 429")),
+            ),
+            patch("src.api.routes.webhook.send_text_message", send_mock),
+            patch("src.api.routes.webhook.mark_conversation_unread", AsyncMock()),
+        ):
+            resp = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_audio_body(
+                    instance_id=instance_id, message_id=f"mid_{uuid4().hex[:10]}"
+                ),
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "stt_fallback"}
+        assert send_mock.await_args.args[3] == _STT_TEMPORARY_FAILURE_MSG_PT
+
+    def test_no_capability_reroutes_without_downloading(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Decision 6's honest variant, and not one byte of audio downloaded."""
+        from src.api.routes.webhook import _STT_NEVER_CONFIGURED_MSG_PT
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_audio_tenant(client, tenant_id, instance_id, raw_token)
+
+        download_mock = AsyncMock()
+        send_mock = AsyncMock(return_value=_fake_send_result())
+        unread_mock = AsyncMock(return_value={})
+
+        with (
+            patch("src.api.routes.webhook.safe_download_audio", download_mock),
+            patch("src.api.routes.webhook.send_text_message", send_mock),
+            patch("src.api.routes.webhook.mark_conversation_unread", unread_mock),
+        ):
+            resp = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_audio_body(
+                    instance_id=instance_id, message_id=f"mid_{uuid4().hex[:10]}"
+                ),
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "stt_fallback"}
+        assert send_mock.await_args.args[3] == _STT_NEVER_CONFIGURED_MSG_PT
+        assert unread_mock.await_count == 1
+        # Capability gate: nothing to transcribe with means nothing to fetch
+        download_mock.assert_not_called()
+
+    def test_multimodal_only_downloads_and_transcribes(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """No STT key at all, operational multimodal — audio still gets read."""
+        from src.services.event_service import EventService
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_audio_tenant(
+            client, tenant_id, instance_id, raw_token, multimodal=True
+        )
+
+        download_mock = self._download_ok()
+        stt_mock = AsyncMock()
+        captured: dict = {}
+
+        async def _capture(self, event_request, session=None):
+            captured["content"] = event_request.payload.content
+            return _NoReplyResponse()
+
+        send_mock = AsyncMock(return_value=_fake_send_result())
+
+        with (
+            patch("src.api.routes.webhook.safe_download_audio", download_mock),
+            patch("src.services.groq_service.transcribe_audio", stt_mock),
+            patch(
+                "src.services.multimodal_service.transcribe_audio_multimodal",
+                new=AsyncMock(return_value="bom dia, gostaria de agendar"),
+            ),
+            patch("src.api.routes.webhook.send_text_message", send_mock),
+            patch("src.api.routes.webhook.mark_message_read", AsyncMock()),
+            patch.object(EventService, "process_event", _capture),
+        ):
+            resp = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_audio_body(
+                    instance_id=instance_id, message_id=f"mid_{uuid4().hex[:10]}"
+                ),
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert download_mock.await_count == 1
+        stt_mock.assert_not_called()
+        assert captured["content"] == "bom dia, gostaria de agendar"
+        send_mock.assert_not_called()
+
+    def test_non_operational_multimodal_provider_is_not_capability(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Decision 14: complete creds on an unproven provider is not capability."""
+        from src.api.routes.webhook import _STT_NEVER_CONFIGURED_MSG_PT
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_audio_tenant(
+            client,
+            tenant_id,
+            instance_id,
+            raw_token,
+            multimodal=True,
+            multimodal_provider="groq",
+        )
+
+        download_mock = AsyncMock()
+        mm_mock = AsyncMock()
+        send_mock = AsyncMock(return_value=_fake_send_result())
+
+        with (
+            patch("src.api.routes.webhook.safe_download_audio", download_mock),
+            patch(
+                "src.services.multimodal_service.transcribe_audio_multimodal", mm_mock
+            ),
+            patch("src.api.routes.webhook.send_text_message", send_mock),
+            patch("src.api.routes.webhook.mark_conversation_unread", AsyncMock()),
+        ):
+            resp = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_audio_body(
+                    instance_id=instance_id, message_id=f"mid_{uuid4().hex[:10]}"
+                ),
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "stt_fallback"}
+        assert send_mock.await_args.args[3] == _STT_NEVER_CONFIGURED_MSG_PT
+        download_mock.assert_not_called()
+        mm_mock.assert_not_called()
+
+    def test_empty_transcript_enters_the_chain(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """STT returning ``""`` is a failure, not a silent success."""
+        from src.api.routes.webhook import _STT_TEMPORARY_FAILURE_MSG_PT
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_audio_tenant(client, tenant_id, instance_id, raw_token, stt=True)
+
+        send_mock = AsyncMock(return_value=_fake_send_result())
+
+        with (
+            patch("src.api.routes.webhook.safe_download_audio", self._download_ok()),
+            patch(
+                "src.services.groq_service.transcribe_audio",
+                new=AsyncMock(return_value="   "),
+            ),
+            patch("src.api.routes.webhook.send_text_message", send_mock),
+            patch("src.api.routes.webhook.mark_conversation_unread", AsyncMock()),
+        ):
+            resp = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_audio_body(
+                    instance_id=instance_id, message_id=f"mid_{uuid4().hex[:10]}"
+                ),
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "stt_fallback"}
+        assert send_mock.await_args.args[3] == _STT_TEMPORARY_FAILURE_MSG_PT
+
+    def test_long_audio_without_capability_still_hands_off(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """The duration branch outranks the capability gate on both channels."""
+        from src.api.routes.webhook import (
+            _AUDIO_TOO_LONG_MSG_PT,
+            _STT_NEVER_CONFIGURED_MSG_PT,
+        )
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_audio_tenant(
+            client, tenant_id, instance_id, raw_token, audio_max_seconds=60
+        )
+
+        send_mock = AsyncMock(return_value=_fake_send_result())
+        unread_mock = AsyncMock(return_value={})
+        download_mock = AsyncMock()
+
+        with (
+            patch("src.api.routes.webhook.safe_download_audio", download_mock),
+            patch("src.api.routes.webhook.send_text_message", send_mock),
+            patch("src.api.routes.webhook.mark_conversation_unread", unread_mock),
+        ):
+            resp = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_audio_body(
+                    instance_id=instance_id,
+                    message_id=f"mid_{uuid4().hex[:10]}",
+                    seconds=180,
+                ),
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "skipped": "audio_too_long"}
+        assert send_mock.await_count == 1
+        assert send_mock.await_args.args[3] == _AUDIO_TOO_LONG_MSG_PT
+        assert send_mock.await_args.args[3] != _STT_NEVER_CONFIGURED_MSG_PT
+        assert unread_mock.await_count == 1
+        download_mock.assert_not_called()
+
+    def test_english_clinic_gets_english_copy(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        from src.api.routes.webhook import (
+            _STT_NEVER_CONFIGURED_MSG_EN,
+            _STT_NEVER_CONFIGURED_MSG_PT,
+        )
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_audio_tenant(client, tenant_id, instance_id, raw_token)
+        _set_agent_language(client, tenant_id, "en")
+
+        send_mock = AsyncMock(return_value=_fake_send_result())
+
+        with (
+            patch("src.api.routes.webhook.send_text_message", send_mock),
+            patch("src.api.routes.webhook.mark_conversation_unread", AsyncMock()),
+        ):
+            resp = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_audio_body(
+                    instance_id=instance_id, message_id=f"mid_{uuid4().hex[:10]}"
+                ),
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert send_mock.await_args.args[3] == _STT_NEVER_CONFIGURED_MSG_EN
+        assert send_mock.await_args.args[3] != _STT_NEVER_CONFIGURED_MSG_PT
+
+    def test_five_consecutive_audios_send_exactly_one_notice(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Decision 12: one notice per patient per 6h window."""
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_audio_tenant(client, tenant_id, instance_id, raw_token)
+
+        send_mock = AsyncMock(return_value=_fake_send_result())
+        unread_mock = AsyncMock(return_value={})
+        actions: list[str] = []
+
+        with (
+            patch("src.api.routes.webhook.send_text_message", send_mock),
+            patch("src.api.routes.webhook.mark_conversation_unread", unread_mock),
+        ):
+            for _ in range(5):
+                resp = client.post(
+                    f"/v1/webhook/zapi/{raw_token}",
+                    json=_zapi_audio_body(
+                        instance_id=instance_id,
+                        message_id=f"mid_{uuid4().hex[:10]}",
+                    ),
+                )
+                assert resp.status_code == 200, resp.text
+                actions.append(resp.json().get("action"))
+
+        assert actions[0] == "stt_fallback"
+        assert actions[1:] == ["stt_fallback_suppressed"] * 4
+        assert send_mock.await_count == 1
+        assert unread_mock.await_count == 1
+
+    def test_notice_returns_after_the_window_expires(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """The window bounds the silence: it is suppression, not a mute.
+
+        Redis is switched off here so the in-memory fallback is the only
+        store — that is the branch a single-worker deployment without Redis
+        actually runs, and it is the one whose expiry can be simulated
+        without waiting six hours.
+        """
+        from src.api.routes.webhook import (
+            _INMEM_STT_NOTICE,
+            _stt_fallback_notice_key,
+        )
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        phone = "5511900000004"
+        _seed_zapi_audio_tenant(client, tenant_id, instance_id, raw_token)
+
+        send_mock = AsyncMock(return_value=_fake_send_result())
+
+        with (
+            patch("src.api.routes.webhook._get_redis", return_value=None),
+            patch("src.api.routes.webhook.send_text_message", send_mock),
+            patch("src.api.routes.webhook.mark_conversation_unread", AsyncMock()),
+        ):
+            first = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_audio_body(
+                    instance_id=instance_id,
+                    message_id=f"mid_{uuid4().hex[:10]}",
+                    phone=phone,
+                ),
+            )
+            assert first.json()["action"] == "stt_fallback"
+
+            # Expire the window instead of waiting six hours for it
+            key = _stt_fallback_notice_key(tenant_id, phone)
+            assert key in _INMEM_STT_NOTICE
+            _INMEM_STT_NOTICE[key] = 0.0
+
+            second = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_audio_body(
+                    instance_id=instance_id,
+                    message_id=f"mid_{uuid4().hex[:10]}",
+                    phone=phone,
+                ),
+            )
+
+        assert second.json()["action"] == "stt_fallback"
+        assert send_mock.await_count == 2
+
+    def test_notice_key_and_ttl_are_written_to_redis(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Decision 12's literal key shape and 21600s TTL, on the SETEX call."""
+        from src.api.routes.webhook import _STT_FALLBACK_NOTICE_PREFIX
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        phone = "5511900000005"
+        _seed_zapi_audio_tenant(client, tenant_id, instance_id, raw_token)
+
+        redis_mock = MagicMock()
+        redis_mock.exists.return_value = 0
+        redis_mock.set.return_value = True
+
+        with (
+            patch("src.api.routes.webhook._get_redis", return_value=redis_mock),
+            patch(
+                "src.api.routes.webhook.send_text_message",
+                new=AsyncMock(return_value=_fake_send_result()),
+            ),
+            patch("src.api.routes.webhook.mark_conversation_unread", AsyncMock()),
+        ):
+            resp = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_audio_body(
+                    instance_id=instance_id,
+                    message_id=f"mid_{uuid4().hex[:10]}",
+                    phone=phone,
+                ),
+            )
+
+        assert resp.json()["action"] == "stt_fallback"
+        notice_calls = [
+            call
+            for call in redis_mock.setex.call_args_list
+            if str(call.args[0]).startswith(_STT_FALLBACK_NOTICE_PREFIX)
+        ]
+        assert len(notice_calls) == 1, redis_mock.setex.call_args_list
+        assert notice_calls[0].args[0] == f"stt_fallback_notice:{tenant_id}:{phone}"
+        assert notice_calls[0].args[1] == 21600
+
+    def test_empty_text_message_still_skips_silently(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """The reroute is scoped to audio: an empty text body sends nothing."""
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_audio_tenant(client, tenant_id, instance_id, raw_token, stt=True)
+
+        send_mock = AsyncMock(return_value=_fake_send_result())
+
+        with patch("src.api.routes.webhook.send_text_message", send_mock):
+            resp = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_body(
+                    instance_id=instance_id,
+                    message_id=f"mid_{uuid4().hex[:10]}",
+                    text="",
+                ),
+            )
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "skipped": "empty"}
+        send_mock.assert_not_called()
+
+    def test_audio_without_url_skips_silently(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Decision 11: media that never materialised is not a chain failure."""
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_audio_tenant(client, tenant_id, instance_id, raw_token, stt=True)
+
+        send_mock = AsyncMock(return_value=_fake_send_result())
+        download_mock = AsyncMock()
+
+        body = _zapi_audio_body(
+            instance_id=instance_id, message_id=f"mid_{uuid4().hex[:10]}"
+        )
+        body["audio"].pop("url")
+
+        with (
+            patch("src.api.routes.webhook.send_text_message", send_mock),
+            patch("src.api.routes.webhook.safe_download_audio", download_mock),
+        ):
+            resp = client.post(f"/v1/webhook/zapi/{raw_token}", json=body)
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "skipped": "empty"}
+        send_mock.assert_not_called()
+        download_mock.assert_not_called()
+
+    def test_download_rejection_does_not_reroute(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Decision 11: an egress rejection keeps its own skip envelope."""
+        from src.services.safe_egress import UnsafeEgressError
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_audio_tenant(client, tenant_id, instance_id, raw_token, stt=True)
+
+        send_mock = AsyncMock(return_value=_fake_send_result())
+
+        with (
+            patch(
+                "src.api.routes.webhook.safe_download_audio",
+                new=AsyncMock(side_effect=UnsafeEgressError("audio_too_large")),
+            ),
+            patch("src.api.routes.webhook.send_text_message", send_mock),
+        ):
+            resp = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_audio_body(
+                    instance_id=instance_id, message_id=f"mid_{uuid4().hex[:10]}"
+                ),
+            )
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "skipped": "audio_too_large"}
+        send_mock.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "provider",
+        ["elevenlabs_scribe", "google_stt", "deepgram_stt", "microsoft_stt"],
+    )
+    def test_unsupported_provider_never_reroutes(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        provider: str,
+    ):
+        """Decision 10 carve-out: these exit before download and send nothing."""
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_audio_tenant(
+            client,
+            tenant_id,
+            instance_id,
+            raw_token,
+            stt=True,
+            stt_provider=provider,
+            multimodal=True,
+        )
+
+        download_mock = AsyncMock()
+        send_mock = AsyncMock(return_value=_fake_send_result())
+        unread_mock = AsyncMock(return_value={})
+
+        with (
+            patch("src.api.routes.webhook.safe_download_audio", download_mock),
+            patch("src.api.routes.webhook.send_text_message", send_mock),
+            patch("src.api.routes.webhook.mark_conversation_unread", unread_mock),
+        ):
+            resp = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_audio_body(
+                    instance_id=instance_id, message_id=f"mid_{uuid4().hex[:10]}"
+                ),
+            )
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "ok": True,
+            "skipped": "stt_provider_unsupported",
+            "provider": provider,
+        }
+        download_mock.assert_not_called()
+        send_mock.assert_not_called()
+        unread_mock.assert_not_called()

@@ -9,6 +9,52 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
+class UsagePeriodResponse(BaseModel):
+    start: datetime
+    end: datetime
+    timezone: str = "UTC"
+
+
+class TraceUsageResponse(BaseModel):
+    used: int = 0
+    included: int = 0
+    extra_credits: int = 0
+    available: int = 0
+    overage: int = 0
+    percent_used: float = 0.0
+
+
+class StorageUsageResponse(BaseModel):
+    used_bytes: int = 0
+    used_mb: float = 0.0
+    limit_bytes: int = 0
+    limit_mb: int = 0
+    available_bytes: int = 0
+    available_mb: float = 0.0
+    overage_bytes: int = 0
+    overage_mb: float = 0.0
+    percent_used: float = 0.0
+
+
+class StorageBreakdownResponse(BaseModel):
+    rag: StorageUsageResponse
+    media: StorageUsageResponse
+
+
+class CreditAvailabilityResponse(BaseModel):
+    purchase_enabled: bool = False
+    coming_soon: bool = True
+
+
+class BillingUsageResponse(BaseModel):
+    plan: Optional[str] = None
+    as_of: datetime
+    trace_period: UsagePeriodResponse
+    traces: TraceUsageResponse
+    storage: StorageBreakdownResponse
+    credits: CreditAvailabilityResponse
+
+
 class BillingSummaryResponse(BaseModel):
     plan: Optional[str] = None
     active_clinics: int = 0
@@ -21,6 +67,7 @@ class BillingSummaryResponse(BaseModel):
     discount_pct: int = 15
     subscription_status: str = "trial"
     billing_cycle: str = "monthly"
+    usage: BillingUsageResponse
 
 
 class CheckoutRequest(BaseModel):

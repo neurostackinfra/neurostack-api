@@ -127,7 +127,10 @@ async def list_clinics(
     # Batch-load trace counts
     trace_stmt = (
         select(Event.tenant_id, func.count(Event.id))
-        .where(Event.tenant_id.in_(tenant_ids))
+        .where(
+            Event.tenant_id.in_(tenant_ids),
+            Event.event_type == "message.in",
+        )
         .group_by(Event.tenant_id)
     )
     trace_result = await session.execute(trace_stmt)
@@ -139,7 +142,10 @@ async def list_clinics(
             Event.tenant_id,
             func.max(Event.created_at).label("last_trace_at"),
         )
-        .where(Event.tenant_id.in_(tenant_ids))
+        .where(
+            Event.tenant_id.in_(tenant_ids),
+            Event.event_type == "message.in",
+        )
         .group_by(Event.tenant_id)
     )
     last_trace_result = await session.execute(last_trace_stmt)
@@ -368,8 +374,10 @@ async def admin_stats(
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
 ):
-    # Total traces (events)
-    trace_count_result = await session.execute(select(func.count(Event.id)))
+    # Total processed inbound messages (one trace per message.in event)
+    trace_count_result = await session.execute(
+        select(func.count(Event.id)).where(Event.event_type == "message.in")
+    )
     total_traces = trace_count_result.scalar() or 0
 
     # Active pilots
@@ -426,7 +434,9 @@ async def admin_dashboard(
     seven_days_ago = now - timedelta(days=7)
 
     # Total traces
-    trace_count_result = await session.execute(select(func.count(Event.id)))
+    trace_count_result = await session.execute(
+        select(func.count(Event.id)).where(Event.event_type == "message.in")
+    )
     total_traces = trace_count_result.scalar() or 0
 
     # Active pilots
@@ -456,6 +466,7 @@ async def admin_dashboard(
     # Safety flags 7d (platform-wide)
     safety_result = await session.execute(
         select(func.count(Event.id)).where(
+            Event.event_type == "message.in",
             Event.created_at >= seven_days_ago,
             cast(Event.event_metadata["safety_concern"].as_string(), String) == "true",
         )
@@ -528,61 +539,6 @@ async def list_circuit_breakers(
     return []
 
 
-@router.get(
-    "/rlhf/pending",
-    summary="Pending RLHF Reviews",
-    description=(
-        "List RLHF feedback suggestions submitted from the chat simulator. "
-        "Super admin only. Optional filter by builder_id."
-    ),
-)
-async def pending_rlhf(
-    builder_id: Optional[str] = None,
-    limit: int = 50,
-    offset: int = 0,
-    tenant: TenantContext = Depends(require_super_admin),
-    session: AsyncSession = Depends(get_db_session_dependency),
-):
-    from uuid import UUID as _UUID
-
-    stmt = select(Event).where(Event.event_type == "rlhf.feedback")
-
-    if builder_id:
-        try:
-            builder_uuid = _UUID(builder_id)
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid builder_id",
-            )
-        stmt = stmt.join(Tenant, Tenant.id == Event.tenant_id).where(
-            Tenant.builder_id == builder_uuid
-        )
-
-    stmt = stmt.order_by(Event.created_at.desc()).limit(limit).offset(offset)
-    result = await session.execute(stmt)
-    events = result.scalars().all()
-
-    entries = []
-    for e in events:
-        data = e.event_data or {}
-        entries.append(
-            {
-                "id": str(e.id),
-                "ts": e.created_at.isoformat() if e.created_at else "",
-                "tenant_id": str(e.tenant_id),
-                "submitted_by": data.get("submitted_by"),
-                "user_message": data.get("user_message"),
-                "agent_response": data.get("agent_response"),
-                "suggested_response": data.get("suggested_response"),
-                "status": data.get("status"),
-                "intent": data.get("intent"),
-            }
-        )
-
-    return entries
-
-
 # ============================================
 # Builders Endpoints (Group 4)
 # ============================================
@@ -626,7 +582,10 @@ async def list_builders(
     if tenant_ids:
         trace_stmt = (
             select(Event.tenant_id, func.count(Event.id))
-            .where(Event.tenant_id.in_(tenant_ids))
+            .where(
+                Event.tenant_id.in_(tenant_ids),
+                Event.event_type == "message.in",
+            )
             .group_by(Event.tenant_id)
         )
         trace_result = await session.execute(trace_stmt)
@@ -638,7 +597,10 @@ async def list_builders(
                 Event.tenant_id,
                 func.max(Event.created_at).label("last_trace_at"),
             )
-            .where(Event.tenant_id.in_(tenant_ids))
+            .where(
+                Event.tenant_id.in_(tenant_ids),
+                Event.event_type == "message.in",
+            )
             .group_by(Event.tenant_id)
         )
         last_trace_result = await session.execute(last_trace_stmt)

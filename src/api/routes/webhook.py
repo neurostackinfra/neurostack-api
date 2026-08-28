@@ -10,12 +10,12 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.middleware.rate_limit import (
@@ -28,19 +28,29 @@ from src.core.lgpd_utils import resolve_privacy_link
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.tenant import Tenant as TenantModel
 from src.repositories import SessionRepository, get_db_session_dependency
+from src.services.api_credentials import OPERATIONAL_MULTIMODAL_PROVIDERS
 from src.services.event_service import get_event_service
 from src.services.meta_service import (
     download_meta_media_audio,
     extract_meta_message_id,
     resolve_meta_media,
+    send_meta_cloud_audio,
     send_meta_cloud_text,
 )
 from src.services.safe_egress import UnsafeEgressError, safe_download_audio
-from src.services.uazapi_service import send_uazapi_text
+from src.services.tts_service import synthesize_speech
+from src.services.uazapi_service import (
+    UazapiMediaDownloadError,
+    download_uazapi_media,
+    send_uazapi_audio,
+    send_uazapi_text,
+)
 from src.services.zapi_service import (
     mark_conversation_unread,
     mark_message_read,
+    send_evolution_audio,
     send_evolution_text,
+    send_zapi_audio,
     send_text_message,
 )
 
@@ -63,6 +73,47 @@ UNSUPPORTED_STT_PROVIDERS = frozenset(
 # availability plus one extra day of dedup guarantee.
 REPLAY_TTL_SECONDS = 31 * 24 * 60 * 60  # 2_678_400
 
+# ── Audio fallback chain (STT → multimodal → text reroute) ──
+#
+# Failure reasons returned by ``_transcribe_audio_chain``. The empty string
+# means "a usable transcript was produced"; the two non-empty values are the
+# only causes that reach the patient, and they map 1:1 onto the two message
+# variants below. They are deliberately distinct (Decision 6): telling a
+# clinic that never configured speech-to-text that we are "temporarily
+# unable" would be false.
+STT_CHAIN_OK = ""
+STT_CHAIN_NO_CAPABILITY = "no_capability"
+STT_CHAIN_FAILED = "transcription_failed"
+
+# Reroute notice throttle (Decision 12): one notice per patient per 6h
+# window, keyed by tenant + phone on both channels.
+_STT_FALLBACK_NOTICE_PREFIX = "stt_fallback_notice:"
+_STT_FALLBACK_NOTICE_TTL = 21600  # 6 hours
+
+# Patient-facing reroute copy. Two variants, both in PT and EN, resolved
+# through ``_get_agent_language`` exactly like the long-audio handoff text.
+_STT_NEVER_CONFIGURED_MSG_PT = (
+    "Recebi seu áudio! 🎙️ Ainda não consigo ouvir mensagens de voz por aqui. "
+    "Você pode me escrever o que precisa? Assim consigo te ajudar agora "
+    "mesmo. 😊"
+)
+
+_STT_NEVER_CONFIGURED_MSG_EN = (
+    "I got your voice message! 🎙️ I'm not able to listen to voice messages "
+    "here yet. Could you type what you need? That way I can help you right "
+    "away. 😊"
+)
+
+_STT_TEMPORARY_FAILURE_MSG_PT = (
+    "Recebi seu áudio! 🎙️ Não consegui ouvir sua mensagem agora. Você pode "
+    "me escrever o que precisa? Assim consigo te ajudar sem demora. 😊"
+)
+
+_STT_TEMPORARY_FAILURE_MSG_EN = (
+    "I got your voice message! 🎙️ I couldn't listen to it right now. Could "
+    "you type what you need? That way I can help you without delay. 😊"
+)
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -82,6 +133,11 @@ from collections import OrderedDict as _OrderedDict
 
 _INMEM_SENT: "_OrderedDict[str, float]" = _OrderedDict()
 _INMEM_INCOMING: "_OrderedDict[str, float]" = _OrderedDict()
+# Reroute notices already delivered inside the current 6h window. Same
+# Redis-with-in-memory-fallback shape as _INMEM_SENT; tests that clear the
+# other two stores must clear this one too or the notice suppression leaks
+# from one test into the next.
+_INMEM_STT_NOTICE: "_OrderedDict[str, float]" = _OrderedDict()
 _INMEM_MAX = 500  # cap at 500 entries to bound memory
 
 
@@ -108,7 +164,56 @@ def _get_agent_language(clinic_config: Optional[dict]) -> str:
     return business.get("agent_language") or "pt-BR"
 
 
-def _get_redis():
+async def _send_reply_with_optional_tts(
+    *,
+    credentials: dict[str, Any],
+    text: str,
+    language_code: str,
+    channel: str,
+    phone: str,
+    send_audio: Callable[[bytes, str], Awaitable[dict]],
+    send_text: Callable[[], Awaitable[dict]],
+) -> tuple[dict, bool]:
+    """Deliver an agent reply as audio when enabled, otherwise as text.
+
+    TTS is deliberately best-effort: an incomplete configuration, provider
+    outage or channel upload failure falls back to the original text so the
+    patient never loses the agent's response.
+    """
+
+    if not _is_enabled(credentials.get("tts_enabled")):
+        return await send_text(), False
+
+    try:
+        audio = await synthesize_speech(
+            text,
+            credentials,
+            language_code=language_code,
+        )
+    except Exception as exc:
+        error_code = getattr(exc, "code", type(exc).__name__)
+        logger.warning(
+            "%s TTS synthesis failed for %s (reason=%s); using text fallback",
+            channel,
+            phone,
+            error_code,
+        )
+        return await send_text(), False
+
+    try:
+        return await send_audio(audio.content, audio.mime_type), True
+    except Exception as exc:
+        error_code = getattr(exc, "code", type(exc).__name__)
+        logger.warning(
+            "%s audio delivery failed for %s (reason=%s); using text fallback",
+            channel,
+            phone,
+            error_code,
+        )
+        return await send_text(), False
+
+
+def _get_redis() -> Any:
     """Get Redis client (lazy import to avoid circular deps)."""
     try:
         import redis
@@ -182,6 +287,55 @@ def _is_ai_sent_message(message_id: str) -> bool:
             pass
 
     return False
+
+
+def _stt_fallback_notice_key(tenant_id: UUID, phone: str) -> str:
+    """Decision 12's notice key: ``stt_fallback_notice:{tenant_id}:{phone}``."""
+    return f"{_STT_FALLBACK_NOTICE_PREFIX}{tenant_id}:{phone}"
+
+
+def _stt_fallback_notice_pending(tenant_id: UUID, phone: str) -> bool:
+    """Whether this patient may receive a reroute notice right now.
+
+    Mirrors :func:`_is_ai_sent_message`: in-memory first (always available),
+    then Redis (authoritative across workers). Unlike that function this one
+    does **not** consume the entry — the window has to keep suppressing until
+    it expires on its own.
+    """
+    key = _stt_fallback_notice_key(tenant_id, phone)
+    expiry = _INMEM_STT_NOTICE.get(key)
+    if expiry is not None:
+        if _time.monotonic() < expiry:
+            return False
+        _INMEM_STT_NOTICE.pop(key, None)
+
+    r = _get_redis()
+    if r:
+        try:
+            if r.exists(key):
+                return False
+        except Exception:
+            pass  # Redis failure is non-fatal — in-memory already answered
+    return True
+
+
+def _mark_stt_fallback_notice_sent(tenant_id: UUID, phone: str) -> None:
+    """Open a 6h suppression window after a reroute notice was delivered.
+
+    Called only once the send succeeded, so a provider outage does not cost
+    the patient six hours of silence.
+    """
+    key = _stt_fallback_notice_key(tenant_id, phone)
+    _INMEM_STT_NOTICE[key] = _time.monotonic() + _STT_FALLBACK_NOTICE_TTL
+    while len(_INMEM_STT_NOTICE) > _INMEM_MAX:
+        _INMEM_STT_NOTICE.popitem(last=False)
+
+    r = _get_redis()
+    if r:
+        try:
+            r.setex(key, _STT_FALLBACK_NOTICE_TTL, "1")
+        except Exception:
+            pass  # Redis failure is non-fatal — in-memory bounds the window
 
 
 class ReplayStoreUnavailable(RuntimeError):
@@ -412,10 +566,15 @@ def _stt_skip_envelope(provider: str) -> dict[str, Any]:
 def _session_has_ai_msg_id(session: Any, message_id: str) -> bool:
     """Return True (and consume the entry) if message_id is a recent bot-sent ID.
 
-    Stored in session.metadata["ai_msg_ids"] as [[id, monotonic_ts], ...].
+    Stored in session.session_metadata["ai_msg_ids"] as [[id, monotonic_ts], ...].
     This is shared across all Uvicorn workers via PostgreSQL.
+
+    The mapped attribute is ``session_metadata`` — ``Session.metadata`` is
+    SQLAlchemy's declarative ``MetaData`` object, and reading it here raised
+    ``TypeError: 'MetaData' object is not iterable`` for every fromMe message
+    that had an active session.
     """
-    meta = dict(session.metadata or {})
+    meta = dict(getattr(session, "session_metadata", None) or {})
     entries: list = meta.get("ai_msg_ids", [])
     if not entries:
         return False
@@ -434,7 +593,7 @@ def _session_has_ai_msg_id(session: Any, message_id: str) -> bool:
         # expired entries are silently dropped
     if found:
         meta["ai_msg_ids"] = remaining
-        session.metadata = meta
+        session.session_metadata = meta
     return found
 
 
@@ -457,7 +616,7 @@ async def _store_ai_msg_id_to_db(
         sess = await repo.get_by_id(session_id)
         if not sess:
             return
-        meta = dict(sess.metadata or {})
+        meta = dict(getattr(sess, "session_metadata", None) or {})
         entries: list = meta.get("ai_msg_ids", [])
         now = _time.monotonic()
         # Prune expired, cap at 20
@@ -465,10 +624,10 @@ async def _store_ai_msg_id_to_db(
         entries.append([message_id, now])
         entries = entries[-20:]
         meta["ai_msg_ids"] = entries
-        sess.metadata = meta
+        sess.session_metadata = meta
         await db.flush()
     except Exception as _exc:
-        logger.debug("_store_ai_msg_id_to_db failed (non-fatal): %s", _exc)
+        logger.warning("_store_ai_msg_id_to_db failed (non-fatal): %s", _exc)
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -496,6 +655,30 @@ def _normalise_phone(raw: str) -> str:
         .replace("(", "")
         .replace(")", "")
     )
+
+
+def _extract_uazapi_text_value(value: Any) -> Optional[str]:
+    """Return Uazapi text when the field is a string or a nested text object."""
+    if isinstance(value, str):
+        return value if value else None
+    if isinstance(value, dict):
+        nested_text = value.get("text")
+        if isinstance(nested_text, str):
+            return nested_text if nested_text else None
+    return None
+
+
+def _extract_uazapi_message_text(msg: dict[str, Any]) -> Optional[str]:
+    """Defensive text extraction for Uazapi ``text`` / ``content`` variants."""
+    direct_text = _extract_uazapi_text_value(msg.get("text"))
+    if direct_text is not None:
+        return direct_text
+    return _extract_uazapi_text_value(msg.get("content"))
+
+
+def _is_uazapi_group_chat(chat_jid: str) -> bool:
+    """Group conversations are out of scope for the Uazapi text pipeline."""
+    return isinstance(chat_jid, str) and chat_jid.endswith("@g.us")
 
 
 async def _resolve_phone_from_lid(
@@ -637,6 +820,99 @@ def _build_lgpd_message(
         message = message.replace("{{clinic_name}}", clinic_name)
         message = message.replace("[Nome da Clínica]", clinic_name)
     return message
+
+
+def _extract_normalised_send_id(send_result: Any) -> str:
+    """Return the outbound message id in the shape the provider's echo carries.
+
+    - Reads ``messageid`` / ``MessageID`` / ``messageId`` / ``zapiMessageId``
+      / ``id`` (in that order) — the union of every key the four channels
+      have ever returned.
+    - Normalises composite ids of the form ``owner:MSGID`` produced by
+      Uazapi's ``id`` field by stripping everything up to the last ``:``.
+      The pure ``messageid`` value (what actually comes back on the echo)
+      is what dedup layers need to store.
+    - Returns ``""`` when nothing usable was found. Never raises — callers
+      use this on fire-and-forget tracking paths.
+
+    Fixes the divergence flagged by Decisions 4 and 11 in ``uazapi-parity``:
+    before this helper Uazapi could store ``owner:MSGID`` (never matches the
+    echo) and Evolution stored ``id`` in one dedup layer while
+    ``_track_sent_message`` never read that key at all.
+    """
+    if not isinstance(send_result, dict):
+        return ""
+    for key in ("messageid", "MessageID", "messageId", "zapiMessageId", "id"):
+        candidate = send_result.get(key)
+        if isinstance(candidate, str) and candidate:
+            # Uazapi's ``id`` arrives as ``owner:MSGID``; the echo only
+            # carries the tail ``MSGID`` in ``messageid``. Strip once, at
+            # the last ``:``, so we always store the same value the echo
+            # will produce.
+            return candidate.rsplit(":", 1)[-1] if ":" in candidate else candidate
+    return ""
+
+
+async def _send_privacy_notice(
+    *,
+    channel_label: str,
+    is_new: bool,
+    lgpd_cfg: dict[str, Any],
+    clinic_config: Optional[dict[str, Any]],
+    tenant_id: UUID,
+    session_id: UUID,
+    to_phone: str,
+    db: AsyncSession,
+    send: Callable[[str], Awaitable[dict[str, Any]]],
+    id_extractor: Callable[[dict[str, Any]], str] = _extract_normalised_send_id,
+) -> None:
+    """Send the LGPD privacy notice once, on the very first turn of a session.
+
+    Encapsulates the block that four channels (Z-API, Evolution, Uazapi, Meta)
+    would otherwise repeat verbatim:
+
+    - Bail early when the session already exists or ``lgpd_enabled`` is off.
+    - Build the localised message via ``_build_lgpd_message`` +
+      ``_get_agent_language``.
+    - Invoke the channel-specific ``send`` callable with the ready-to-ship
+      copy; the caller closes over the provider credentials so this helper
+      never learns about any of them.
+    - Track the outbound id (``_track_sent_message`` + ``_store_ai_msg_id_to_db``)
+      using the **normalised** value from ``id_extractor`` — the same value on
+      both dedup layers, satisfying Decisions 4 and 11 of ``uazapi-parity``.
+    - Commit immediately (Decision 2) so the id survives even if the pipeline
+      that runs after crashes: without the commit the echo of the notice
+      arrives inside a window where nothing in the DB matches.
+    - Any exception is logged and swallowed. The privacy notice is
+      never allowed to break the patient's actual reply.
+    """
+    if not is_new:
+        return
+    if not _is_enabled(lgpd_cfg.get("lgpd_enabled")):
+        return
+    try:
+        clinic_name = (
+            (clinic_config or {}).get("identity", {}).get("clinic_name", "")
+        )
+        privacy_msg = _build_lgpd_message(
+            lgpd_cfg,
+            clinic_id=str(tenant_id),
+            clinic_name=clinic_name,
+            agent_language=_get_agent_language(clinic_config),
+        )
+        send_result = await send(privacy_msg)
+        mid = id_extractor(send_result or {})
+        if mid:
+            _track_sent_message({"messageid": mid})
+            await _store_ai_msg_id_to_db(session_id, mid, db)
+            await db.commit()
+        logger.info(
+            "%s LGPD privacy message sent to %s", channel_label, to_phone,
+        )
+    except Exception as exc:
+        logger.warning(
+            "%s LGPD send failed for %s — %s", channel_label, to_phone, exc,
+        )
 
 
 async def _load_tenant_credentials(
@@ -871,6 +1147,362 @@ async def _handle_clinic_message(
     return {"ok": True, "action": "human_takeover"}
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Audio fallback chain — shared by Z-API and Meta Cloud API
+#
+# One chain, two channels (Decision 9): speech-to-text, then a multimodal
+# chat model, then — when neither produced a transcript — a text reroute
+# asking the patient to type. Parity is about the message the patient gets
+# and the cause it was chosen for, not about the internal ordering each
+# channel uses to reach the chain.
+# ─────────────────────────────────────────────────────────────────────
+
+# Per-provider STT model defaults — never send a Groq model name to OpenAI.
+_STT_DEFAULT_MODELS: dict[str, str] = {
+    "openai_whisper": "whisper-1",
+}
+
+
+def _resolve_stt_model(credentials: dict[str, Any]) -> str:
+    """Canonical-first STT model name with a per-provider default."""
+    provider = _stt_canonical_provider(credentials.get("stt_provider"))
+    model = credentials.get("stt_model_name") or credentials.get("whisper_model")
+    return str(model or _STT_DEFAULT_MODELS.get(provider, "whisper-large-v3-turbo"))
+
+
+def _multimodal_operational(credentials: dict[str, Any]) -> bool:
+    """Decision 14's "multimodal operante" predicate.
+
+    Complete multimodal credentials **and** a provider proven to transcribe
+    the OGG/Opus WhatsApp actually delivers. Mirrors ``multimodal_complete``
+    in :mod:`src.services.api_credentials`; only the provider frozenset is
+    imported, so this stays a local read of a shared constant rather than a
+    shared helper that two concurrent groups would both be editing.
+    """
+    if credentials.get("multimodal_provider") not in OPERATIONAL_MULTIMODAL_PROVIDERS:
+        return False
+    return all(
+        bool(credentials.get(field))
+        for field in (
+            "multimodal_api_url",
+            "multimodal_api_key",
+            "multimodal_model_name",
+        )
+    )
+
+
+async def _stt_transcribe_audio(
+    audio_bytes: bytes,
+    mime_type: str,
+    creds: dict[str, Any],
+    agent_language: str,
+) -> Optional[str]:
+    """First rung: the dedicated speech-to-text provider.
+
+    Returns the transcript (possibly empty for silent or unintelligible
+    audio), or ``None`` when no STT key is configured at all. Raises the
+    underlying exception on transcription failure so the chain can log it
+    with a stack trace and move to the next rung.
+
+    Key resolution is canonical-first, matching ``resolve_stt_credentials``:
+    a legacy ``whisper_api_key`` is only a fallback for rows written before
+    ``stt_api_key`` existed.
+    """
+    whisper_key = (creds.get("stt_api_key") or "").strip() or (
+        creds.get("whisper_api_key") or ""
+    ).strip()
+    if not whisper_key:
+        return None
+
+    from src.services.groq_service import (
+        GROQ_API_BASE,
+        OPENAI_API_BASE,
+        transcribe_audio,
+    )
+
+    stt_provider = _stt_canonical_provider(creds.get("stt_provider"))
+    stt_api_url = (creds.get("stt_api_url") or "").strip()
+    lang_hint = "en" if agent_language == "en" else "pt"
+
+    # Resolve STT base URL: use the saved URL (set by the UI for any
+    # provider), fall back to known defaults, then Groq as last resort for
+    # legacy configs without a saved URL.
+    if stt_api_url:
+        stt_base_url = stt_api_url
+    elif stt_provider == "openai_whisper":
+        stt_base_url = OPENAI_API_BASE
+    else:
+        stt_base_url = GROQ_API_BASE
+
+    return await transcribe_audio(
+        api_key=whisper_key,
+        audio_bytes=audio_bytes,
+        mimetype=mime_type,
+        model=_resolve_stt_model(creds),
+        language=lang_hint,
+        base_url=stt_base_url,
+    )
+
+
+async def _multimodal_transcribe_audio(
+    audio_bytes: bytes,
+    mime_type: str,
+    creds: dict[str, Any],
+) -> str:
+    """Second rung: a multimodal chat model reading the audio directly.
+
+    WhatsApp's OGG/Opus is passed through untouched — OpenRouter accepts it
+    verbatim, so no transcoding step exists anywhere in this chain.
+    """
+    from src.services.multimodal_service import transcribe_audio_multimodal
+
+    return await transcribe_audio_multimodal(
+        api_key=str(creds.get("multimodal_api_key") or ""),
+        audio_bytes=audio_bytes,
+        mimetype=mime_type,
+        model=str(creds.get("multimodal_model_name") or ""),
+        base_url=str(creds.get("multimodal_api_url") or ""),
+    )
+
+
+async def _transcribe_audio_chain(
+    audio_bytes: Optional[bytes],
+    credentials: dict[str, Any],
+    *,
+    mime_type: str,
+    agent_language: str,
+    channel: str,
+) -> tuple[str, str]:
+    """Run the audio fallback chain. Returns ``(transcript, failure_reason)``.
+
+    ``failure_reason`` is :data:`STT_CHAIN_OK` (the empty string) exactly
+    when ``transcript`` is usable. Otherwise the transcript is empty and the
+    reason is one of :data:`STT_CHAIN_NO_CAPABILITY` (nothing was ever
+    configured — Decision 6's honest variant) or :data:`STT_CHAIN_FAILED`
+    (something was configured and did not deliver a transcript just now).
+
+    ``audio_bytes=None`` is a legitimate input, not an error: it is the
+    no-capability path where the caller deliberately downloaded nothing. It
+    keeps the message choice in the same place on both channels instead of
+    forking inside the helper on one and outside it on the other.
+
+    An empty transcript is a failure, not a success: ``transcribe_audio``
+    returns ``""`` for silent or unintelligible audio, and letting that
+    through would drop the patient into a silent skip with no fallback.
+    """
+    has_stt = bool(
+        (credentials.get("stt_api_key") or "").strip()
+        or (credentials.get("whisper_api_key") or "").strip()
+    )
+    has_multimodal = _multimodal_operational(credentials)
+
+    if not has_stt and not has_multimodal:
+        return "", STT_CHAIN_NO_CAPABILITY
+
+    if audio_bytes is None:
+        # A configured clinic always downloads before reaching the chain;
+        # arriving here without bytes means the media never materialised.
+        logger.warning("%s audio fallback chain reached with no bytes", channel)
+        return "", STT_CHAIN_FAILED
+
+    if has_stt:
+        try:
+            stt_text = await _stt_transcribe_audio(
+                audio_bytes=audio_bytes,
+                mime_type=mime_type,
+                creds=credentials,
+                agent_language=agent_language,
+            )
+        except Exception as exc:
+            logger.exception(
+                "%s audio transcription failed at the STT rung — %s", channel, exc
+            )
+        else:
+            if stt_text and stt_text.strip():
+                return stt_text.strip(), STT_CHAIN_OK
+            logger.info("%s STT rung returned an empty transcript", channel)
+
+    if has_multimodal:
+        try:
+            mm_text = await _multimodal_transcribe_audio(
+                audio_bytes=audio_bytes,
+                mime_type=mime_type,
+                creds=credentials,
+            )
+        except Exception as exc:
+            logger.exception(
+                "%s audio transcription failed at the multimodal rung — %s",
+                channel,
+                exc,
+            )
+        else:
+            from src.services.multimodal_service import NO_SPEECH_MARKER
+
+            cleaned = mm_text.strip()
+            # The adapter's prompt asks for this exact marker when the audio
+            # carries no intelligible speech. Forwarding it would make the
+            # marker itself the patient's message; treat it as "no usable
+            # transcript" so the text reroute takes over instead.
+            if cleaned and cleaned != NO_SPEECH_MARKER:
+                return cleaned, STT_CHAIN_OK
+            logger.info("%s multimodal rung returned no intelligible speech", channel)
+
+    return "", STT_CHAIN_FAILED
+
+
+def _stt_fallback_message(failure_reason: str, agent_language: str) -> str:
+    """Pick the reroute copy for a chain failure, in the agent's language."""
+    if failure_reason == STT_CHAIN_NO_CAPABILITY:
+        return (
+            _STT_NEVER_CONFIGURED_MSG_EN
+            if agent_language == "en"
+            else _STT_NEVER_CONFIGURED_MSG_PT
+        )
+    return (
+        _STT_TEMPORARY_FAILURE_MSG_EN
+        if agent_language == "en"
+        else _STT_TEMPORARY_FAILURE_MSG_PT
+    )
+
+
+async def _send_zapi_stt_fallback(
+    *,
+    tenant_id: UUID,
+    phone: str,
+    z_inst: str,
+    z_tok: str,
+    z_ct: str,
+    agent_language: str,
+    failure_reason: str,
+) -> dict[str, Any]:
+    """Deliver the Z-API text reroute and mark the conversation unread.
+
+    No handoff and no session mutation: the patient is being asked to type,
+    not escalated. The unread mark is a Z-API-only affordance so the clinic
+    sees there is a voice note it may want to listen to.
+    """
+    message = _stt_fallback_message(failure_reason, agent_language)
+
+    if not z_inst or not z_tok:
+        logger.warning(
+            "Z-API STT fallback undeliverable for %s — send credentials missing",
+            phone,
+        )
+        return {"ok": True, "replied": False, "action": "stt_fallback_undeliverable"}
+
+    if not _stt_fallback_notice_pending(tenant_id, phone):
+        logger.info("Z-API STT fallback suppressed for %s (6h window open)", phone)
+        return {"ok": True, "replied": False, "action": "stt_fallback_suppressed"}
+
+    try:
+        send_result = await send_text_message(
+            z_inst, z_tok, phone, message, client_token=z_ct
+        )
+        _track_sent_message(send_result)
+    except Exception as exc:
+        logger.warning("Z-API STT fallback send failed for %s — %s", phone, exc)
+        return {"ok": True, "replied": False, "action": "stt_fallback_send_failed"}
+
+    _mark_stt_fallback_notice_sent(tenant_id, phone)
+
+    try:
+        await mark_conversation_unread(z_inst, z_tok, phone, client_token=z_ct)
+    except Exception as exc:
+        logger.warning("Z-API STT fallback mark_unread failed for %s — %s", phone, exc)
+
+    logger.info("Z-API STT fallback sent to %s (reason=%s)", phone, failure_reason)
+    return {"ok": True, "replied": True, "action": "stt_fallback"}
+
+
+async def _send_meta_stt_fallback(
+    *,
+    tenant_id: UUID,
+    from_phone: str,
+    meta_pnid: str,
+    meta_token: str,
+    agent_language: str,
+    failure_reason: str,
+) -> dict[str, Any]:
+    """Deliver the Meta Cloud API text reroute — the complete effect there.
+
+    The Cloud API has no unread primitive, so unlike Z-API this sends the
+    message and nothing else: no handoff, no session mutation.
+    """
+    message = _stt_fallback_message(failure_reason, agent_language)
+
+    # ``meta_token`` needs no handling: its absence already exited with
+    # ``{"skipped": "no_credentials"}`` before the audio was ever resolved.
+    if not meta_pnid:
+        logger.warning(
+            "Meta STT fallback undeliverable for %s — phone_number_id missing",
+            from_phone,
+        )
+        return {"ok": True, "replied": False, "action": "stt_fallback_undeliverable"}
+
+    if not _stt_fallback_notice_pending(tenant_id, from_phone):
+        logger.info("Meta STT fallback suppressed for %s (6h window open)", from_phone)
+        return {"ok": True, "replied": False, "action": "stt_fallback_suppressed"}
+
+    try:
+        send_result = await send_meta_cloud_text(
+            meta_pnid,
+            meta_token,
+            from_phone,
+            message,
+        )
+        _track_meta_sent_message(send_result)
+    except Exception as exc:
+        logger.warning("Meta STT fallback send failed for %s — %s", from_phone, exc)
+        return {"ok": True, "replied": False, "action": "stt_fallback_send_failed"}
+
+    _mark_stt_fallback_notice_sent(tenant_id, from_phone)
+
+    logger.info("Meta STT fallback sent to %s (reason=%s)", from_phone, failure_reason)
+    return {"ok": True, "replied": True, "action": "stt_fallback"}
+
+
+async def _send_uazapi_stt_fallback(
+    *,
+    tenant_id: UUID,
+    phone: str,
+    u_url: str,
+    u_token: str,
+    agent_language: str,
+    failure_reason: str,
+) -> dict[str, Any]:
+    """Deliver the Uazapi text reroute — parity with Z-API/Meta fallbacks.
+
+    Uazapi has no ``mark_unread`` primitive confirmed in the spec, so this
+    only sends the reroute text. No handoff, no session mutation, no DB
+    echo storage — parity with the Z-API and Meta variants (both of which
+    also skip DB storage; only the main AI reply persists ids).
+    """
+    message = _stt_fallback_message(failure_reason, agent_language)
+
+    if not u_url or not u_token:
+        logger.warning(
+            "Uazapi STT fallback undeliverable for %s — credentials missing",
+            phone,
+        )
+        return {"ok": True, "replied": False, "action": "stt_fallback_undeliverable"}
+
+    if not _stt_fallback_notice_pending(tenant_id, phone):
+        logger.info("Uazapi STT fallback suppressed for %s (6h window open)", phone)
+        return {"ok": True, "replied": False, "action": "stt_fallback_suppressed"}
+
+    try:
+        send_result = await send_uazapi_text(u_url, u_token, phone, message)
+        _track_sent_message(send_result)
+    except Exception as exc:
+        logger.warning("Uazapi STT fallback send failed for %s — %s", phone, exc)
+        return {"ok": True, "replied": False, "action": "stt_fallback_send_failed"}
+
+    _mark_stt_fallback_notice_sent(tenant_id, phone)
+
+    logger.info("Uazapi STT fallback sent to %s (reason=%s)", phone, failure_reason)
+    return {"ok": True, "replied": True, "action": "stt_fallback"}
+
+
 # ── Z-API webhook endpoint ──────────────────────────────────────────
 
 
@@ -1027,73 +1659,115 @@ async def _process_zapi_authenticated_body(
     service = get_event_service()
     clinic_config = await service._load_clinic_config(tenant_id)
 
+    # ``clinic_config`` is the cached *runtime projection* — by design it never
+    # carries secrets (stt_api_key, zapi_token, zapi_client_token are stripped
+    # by ``runtime_projection``). Every site in this request that needs a raw
+    # credential must read the row directly; this memo makes that read happen
+    # at most once per request without paying for it on early-skip paths.
+    _raw_creds_memo: Optional[dict[str, Any]] = None
+
+    async def _tenant_creds() -> dict[str, Any]:
+        """Return the tenant's raw ``api_credentials``, loading it once."""
+        nonlocal _raw_creds_memo
+        if _raw_creds_memo is None:
+            _raw_creds_memo = await _load_tenant_credentials(tenant_id, db)
+        return _raw_creds_memo
+
     # ── extract message text (from text payload or audio transcription) ──
     message_text = ""
     if text_obj and isinstance(text_obj, dict):
         message_text = (text_obj.get("message") or "").strip()
 
-    # Handle audio/voice messages
-    if audio_obj and not message_text:
+    is_from_me = bool(body.get("fromMe", False))
+
+    # A clinic staff voice note. It must never be downloaded, transcribed
+    # (real STT cost on the clinic's own audio) or answered, but it still has
+    # to reach the fromMe handling below so an active human takeover pauses
+    # the AI — a secretary replying by voice is as much a takeover as one
+    # replying by text.
+    staff_audio = bool(audio_obj) and not message_text and is_from_me
+
+    # Handle audio/voice messages.
+    # ``not is_from_me`` sits in the block condition — not merely above the
+    # download — so no branch inside the block (download, STT, handoff, reply)
+    # is reachable at all for the clinic's own audio.
+    #
+    # The metadata block near the end of this handler reads ``whisper_model``
+    # under a *different* guard (``audio_obj and message_text``), which is also
+    # true for payloads carrying both text and audio, so it must stay bound.
+    whisper_model: Optional[str] = None
+    if audio_obj and not message_text and not is_from_me:
         audio_url = audio_obj.get("url") or audio_obj.get("audioUrl")
         mimetype = audio_obj.get("mimeType") or "audio/ogg"
+        # Everything that follows is guarded by this *inner* condition, and
+        # so is the fallback chain. That is deliberate: ``audio_obj`` present
+        # with no ``audio_url``, or a tenant with no config row, is media that
+        # never existed rather than a transcription failure, and it keeps
+        # falling through to the ``{"skipped": "empty"}`` exit below with no
+        # message sent — as does a *text* message with an empty body.
         if audio_url and clinic_config:
-            creds = (clinic_config or {}).get("api_credentials", {}) or {}
-            whisper_key = creds.get("whisper_api_key") or creds.get("stt_api_key")
+            # Raw read: the cached projection deliberately withholds
+            # stt_api_key / zapi_token / zapi_client_token.
+            creds = await _tenant_creds()
+            # Canonical-first, matching ``resolve_stt_credentials``: a legacy
+            # ``whisper_api_key`` is only a fallback for rows written before
+            # ``stt_api_key`` existed.
+            whisper_key = creds.get("stt_api_key") or creds.get("whisper_api_key")
             stt_provider = _stt_canonical_provider(creds.get("stt_provider"))
-            stt_api_url = (creds.get("stt_api_url") or "").strip()
 
             # STT providers without a runtime adapter must NOT download the
             # audio, hit any STT endpoint, reply, hand off, or mutate the
-            # session — return the exact skip envelope immediately.
+            # session — return the exact skip envelope immediately. This gate
+            # stays above everything below it, including the reroute: it is an
+            # explicit carve-out from the "always answer" rule.
             if stt_provider in UNSUPPORTED_STT_PROVIDERS:
                 return _stt_skip_envelope(stt_provider)
 
-            # Per-provider model defaults — avoid sending Groq model names to OpenAI
-            _STT_DEFAULT_MODELS: dict[str, str] = {
-                "openai_whisper": "whisper-1",
-            }
-            whisper_model = (
-                creds.get("stt_model_name")
-                or creds.get("whisper_model")
-                or _STT_DEFAULT_MODELS.get(stt_provider, "whisper-large-v3-turbo")
-            )
+            whisper_model = _resolve_stt_model(creds)
             agent_lang = _get_agent_language(clinic_config)
-            lang_hint = "en" if agent_lang == "en" else "pt"
-            if whisper_key:
-                z_inst = (creds.get("zapi_instance_id") or "").strip()
-                z_tok = (creds.get("zapi_token") or "").strip()
-                z_ct = (creds.get("zapi_client_token") or "").strip()
 
-                # Duration-based limit: long audios trigger human handoff instead of transcription
-                audio_max_seconds = int((creds or {}).get("audio_max_seconds") or 60)
-                audio_seconds = int(audio_obj.get("seconds") or 0)
-                if audio_seconds > audio_max_seconds:
-                    if z_inst and z_tok:
-                        if agent_lang == "en":
-                            handoff_msg = (
-                                "I received your voice message! 🎙️ Since it's a bit longer, I'll forward it to our team, "
-                                "who will listen and get back to you shortly. 😊"
-                            )
-                        else:
-                            handoff_msg = (
-                                "Recebi seu áudio! 🎙️ Como ele é mais longo, vou encaminhar para a nossa equipe, "
-                                "que vai ouvir e te responder com atenção. 😊"
-                            )
-                        await send_text_message(
-                            z_inst, z_tok, phone, handoff_msg, client_token=z_ct
-                        )
-                        # Mark conversation as unread so the clinic team sees the pending audio
-                        await mark_conversation_unread(
-                            z_inst, z_tok, phone, client_token=z_ct
-                        )
-                    logger.info(
-                        "Audio too long (%ds > %ds limit), skipping transcription for %s",
-                        audio_seconds,
-                        audio_max_seconds,
-                        phone,
+            # Send tokens are read here, above the capability gate, so the
+            # branch that downloads nothing can still deliver the reroute.
+            z_inst = (creds.get("zapi_instance_id") or "").strip()
+            z_tok = (creds.get("zapi_token") or "").strip()
+            z_ct = (creds.get("zapi_client_token") or "").strip()
+
+            # Duration-based limit: long audios trigger human handoff instead
+            # of transcription. It runs above the capability gate too, because
+            # Meta's long-audio handoff runs before anything is known about
+            # STT; leaving it inside the gate would give the same 3-minute
+            # audio a handoff on Meta and "please type" on Z-API. The duration
+            # comes from the payload, so this costs no download.
+            audio_max_seconds = int((creds or {}).get("audio_max_seconds") or 60)
+            audio_seconds = int(audio_obj.get("seconds") or 0)
+            if audio_seconds > audio_max_seconds:
+                if z_inst and z_tok:
+                    handoff_msg = (
+                        _AUDIO_TOO_LONG_MSG_EN
+                        if agent_lang == "en"
+                        else _AUDIO_TOO_LONG_MSG_PT
                     )
-                    return {"ok": True, "skipped": "audio_too_long"}
+                    await send_text_message(
+                        z_inst, z_tok, phone, handoff_msg, client_token=z_ct
+                    )
+                    # Mark conversation as unread so the clinic team sees the pending audio
+                    await mark_conversation_unread(
+                        z_inst, z_tok, phone, client_token=z_ct
+                    )
+                logger.info(
+                    "Audio too long (%ds > %ds limit), skipping transcription for %s",
+                    audio_seconds,
+                    audio_max_seconds,
+                    phone,
+                )
+                return {"ok": True, "skipped": "audio_too_long"}
 
+            # Capability gate: download when *either* rung of the chain can
+            # use the bytes. With neither, nothing is downloaded at all and
+            # the chain reports "never configured" from ``audio_bytes=None``.
+            audio_bytes: Optional[bytes] = None
+            effective_mime = mimetype
+            if whisper_key or _multimodal_operational(creds):
                 # Bound the streaming download by the same audio_max_seconds
                 # window the config exposes; safe_download_audio enforces MIME,
                 # host, and Content-Length policy uniformly.
@@ -1104,6 +1778,9 @@ async def _process_zapi_authenticated_body(
                 try:
                     download = await safe_download_audio(audio_url, max_bytes=max_bytes)
                 except UnsafeEgressError as exc:
+                    # Media acquisition failure never enters the chain: there
+                    # is no transcription to reroute from, and this exit also
+                    # covers hosts we refuse to talk to.
                     logger.warning(
                         "Z-API audio egress rejected: %s",
                         exc.code,
@@ -1123,43 +1800,36 @@ async def _process_zapi_authenticated_body(
                     len(audio_bytes),
                     effective_mime,
                 )
-                try:
-                    from src.services.groq_service import (
-                        GROQ_API_BASE,
-                        OPENAI_API_BASE,
-                        transcribe_audio,
-                    )
 
-                    # Resolve STT base URL: use the saved URL (set by the UI for
-                    # any provider), fall back to known defaults, then Groq as
-                    # last resort for legacy configs without a saved URL.
-                    if stt_api_url:
-                        stt_base_url = stt_api_url
-                    elif stt_provider == "openai_whisper":
-                        stt_base_url = OPENAI_API_BASE
-                    else:
-                        stt_base_url = GROQ_API_BASE  # outros / legacy
-                    message_text = await transcribe_audio(
-                        api_key=whisper_key,
-                        audio_bytes=audio_bytes,
-                        mimetype=effective_mime,
-                        model=whisper_model,
-                        language=lang_hint,
-                        base_url=stt_base_url,
-                    )
-                except Exception as exc:
-                    logger.warning("Audio transcription failed: %s", exc)
-                    return {"ok": True, "skipped": "transcription_failed"}
-            else:
-                return {"ok": True, "skipped": "no_whisper_key"}
+            message_text, chain_failure = await _transcribe_audio_chain(
+                audio_bytes,
+                creds,
+                mime_type=effective_mime,
+                agent_language=agent_lang,
+                channel="Z-API",
+            )
+            if chain_failure:
+                return await _send_zapi_stt_fallback(
+                    tenant_id=tenant_id,
+                    phone=phone,
+                    z_inst=z_inst,
+                    z_tok=z_tok,
+                    z_ct=z_ct,
+                    agent_language=agent_lang,
+                    failure_reason=chain_failure,
+                )
 
     if not text_obj and not audio_obj:
         return {"ok": True, "skipped": "non-text"}
-    if not message_text:
+    # ``staff_audio`` is the one case allowed past the empty-text guard: the
+    # audio was deliberately left untranscribed, and the fromMe block below
+    # routes it to _handle_clinic_message with empty text — empty text cannot
+    # match the trigger phrase, so it falls through to human takeover.
+    if not message_text and not staff_audio:
         return {"ok": True, "skipped": "empty"}
 
     # ── fromMe=true: check if AI-sent echo or real clinic message ──
-    if body.get("fromMe", False):
+    if is_from_me:
         webhook_msg_id = body.get("messageId", "")
         # Fast path: in-memory + Redis check (same worker, Redis available)
         if webhook_msg_id and _is_ai_sent_message(webhook_msg_id):
@@ -1183,11 +1853,7 @@ async def _process_zapi_authenticated_body(
 
     # ── mark message as read (blue checkmarks) ──
     try:
-        _cr = await db.execute(
-            text("SELECT api_credentials FROM clinic_configs WHERE tenant_id = :tid"),
-            {"tid": str(tenant_id)},
-        )
-        _creds = (_cr.first() or [None])[0] or {}
+        _creds = await _tenant_creds()
         _inst = _creds.get("zapi_instance_id", "")
         _tok = _creds.get("zapi_token", "")
         _ct = _creds.get("zapi_client_token", "")
@@ -1223,40 +1889,31 @@ async def _process_zapi_authenticated_body(
     # ── send LGPD privacy notice as the very first message of a new session ──
     if is_new:
         lgpd_cfg = (clinic_config or {}).get("lgpd") or {}
-        if _is_enabled(lgpd_cfg.get("lgpd_enabled")):
-            creds_lgpd = await _load_tenant_credentials(tenant_id, db)
-            z_inst = creds_lgpd.get("zapi_instance_id", "").strip()
-            z_tok = creds_lgpd.get("zapi_token", "").strip()
-            z_ct = creds_lgpd.get("zapi_client_token", "").strip()
-            if z_inst and z_tok:
-                try:
-                    _clinic_name = (
-                        (clinic_config or {}).get("identity", {}).get("clinic_name", "")
-                    )
-                    privacy_msg = _build_lgpd_message(
-                        lgpd_cfg,
-                        clinic_id=str(tenant_id),
-                        clinic_name=_clinic_name,
-                        agent_language=_get_agent_language(clinic_config),
-                    )
-                    send_result = await send_text_message(
-                        z_inst,
-                        z_tok,
-                        phone,
-                        privacy_msg,
-                        client_token=z_ct,
-                    )
-                    _track_sent_message(send_result)
-                    # DB-backed dedup: store LGPD message ID so its fromMe echo is
-                    # recognised as a bot echo across all Uvicorn workers
-                    _lgpd_mid = send_result.get("messageId") or send_result.get(
-                        "zapiMessageId", ""
-                    )
-                    if _lgpd_mid:
-                        await _store_ai_msg_id_to_db(session_id, _lgpd_mid, db)
-                    logger.info("Z-API LGPD privacy message sent to %s", phone)
-                except Exception as exc:
-                    logger.warning("Z-API LGPD send failed for %s — %s", phone, exc)
+        creds_lgpd = await _tenant_creds()
+        z_inst = creds_lgpd.get("zapi_instance_id", "").strip()
+        z_tok = creds_lgpd.get("zapi_token", "").strip()
+        z_ct = creds_lgpd.get("zapi_client_token", "").strip()
+        if z_inst and z_tok:
+            async def _send_zapi_privacy(msg: str) -> dict[str, Any]:
+                return await send_text_message(
+                    z_inst,
+                    z_tok,
+                    phone,
+                    msg,
+                    client_token=z_ct,
+                )
+
+            await _send_privacy_notice(
+                channel_label="Z-API",
+                is_new=is_new,
+                lgpd_cfg=lgpd_cfg,
+                clinic_config=clinic_config,
+                tenant_id=tenant_id,
+                session_id=session_id,
+                to_phone=phone,
+                db=db,
+                send=_send_zapi_privacy,
+            )
     _event_metadata: dict = {
         "phone": phone,
         "senderName": sender_name,
@@ -1264,7 +1921,16 @@ async def _process_zapi_authenticated_body(
         "source": "zapi",
     }
     if audio_obj and message_text:
-        _event_metadata["whisper_model"] = creds.get("whisper_model") or "whisper-large-v3-turbo"  # type: ignore[possibly-undefined]
+        _audio_creds = await _tenant_creds()
+        # Reuse the model the STT call actually used; the re-derivation below is
+        # only for payloads that never entered the audio block (text+audio, or
+        # audio without a url), where whisper_model is still None.
+        _event_metadata["whisper_model"] = (
+            whisper_model
+            or _audio_creds.get("stt_model_name")
+            or _audio_creds.get("whisper_model")
+            or "whisper-large-v3-turbo"
+        )
         _event_metadata["audio_seconds"] = audio_obj.get("seconds") or 0
         _event_metadata["is_audio"] = True
     event_request = EventRequest(
@@ -1296,7 +1962,7 @@ async def _process_zapi_authenticated_body(
 
     logger.info("Z-API webhook: LLM generated %d chars for %s", len(suggested), phone)
 
-    creds = await _load_tenant_credentials(tenant_id, db)
+    creds = await _tenant_creds()
     zapi_token = creds.get("zapi_token", "").strip()
     zapi_inst = creds.get("zapi_instance_id", "").strip()
     zapi_client_token = creds.get("zapi_client_token", "").strip()
@@ -1306,8 +1972,27 @@ async def _process_zapi_authenticated_body(
         return {"ok": True, "replied": False, "reason": "no_credentials"}
 
     try:
-        send_result = await send_text_message(
-            zapi_inst, zapi_token, phone, suggested, client_token=zapi_client_token
+        send_result, sent_as_audio = await _send_reply_with_optional_tts(
+            credentials=creds,
+            text=suggested,
+            language_code=_get_agent_language(clinic_config),
+            channel="Z-API",
+            phone=phone,
+            send_audio=lambda audio, mime: send_zapi_audio(
+                zapi_inst,
+                zapi_token,
+                phone,
+                audio,
+                mime_type=mime,
+                client_token=zapi_client_token,
+            ),
+            send_text=lambda: send_text_message(
+                zapi_inst,
+                zapi_token,
+                phone,
+                suggested,
+                client_token=zapi_client_token,
+            ),
         )
         _track_sent_message(send_result)
         # DB-backed dedup: store reply message ID so its fromMe echo is recognised
@@ -1318,7 +2003,12 @@ async def _process_zapi_authenticated_body(
         if _reply_mid:
             await _store_ai_msg_id_to_db(session_id, _reply_mid, db)
             await db.commit()  # commit the metadata update immediately
-        logger.info("Z-API reply sent to %s (%d chars)", phone, len(suggested))
+        logger.info(
+            "Z-API reply sent to %s (%d chars, format=%s)",
+            phone,
+            len(suggested),
+            "audio" if sent_as_audio else "text",
+        )
     except Exception as exc:
         logger.exception("Z-API send failed for %s — %s", phone, exc)
         return {
@@ -1460,39 +2150,31 @@ async def evolution_webhook(
     # ── send LGPD privacy notice as the very first message of a new session ──
     if is_new:
         lgpd_cfg = (clinic_config or {}).get("lgpd") or {}
-        if _is_enabled(lgpd_cfg.get("lgpd_enabled")):
-            creds_lgpd = await _load_tenant_credentials(tenant_id, db)
-            e_url = creds_lgpd.get("evolution_api_url", "")
-            e_name = creds_lgpd.get("evolution_instance_name", "")
-            e_key = creds_lgpd.get("evolution_api_key", "")
-            if e_url and e_name and e_key:
-                try:
-                    _clinic_name = (
-                        (clinic_config or {}).get("identity", {}).get("clinic_name", "")
-                    )
-                    privacy_msg = _build_lgpd_message(
-                        lgpd_cfg,
-                        clinic_id=str(tenant_id),
-                        clinic_name=_clinic_name,
-                        agent_language=_get_agent_language(clinic_config),
-                    )
-                    send_result = await send_evolution_text(
-                        e_url,
-                        e_name,
-                        e_key,
-                        phone,
-                        privacy_msg,
-                    )
-                    _track_sent_message(send_result)
-                    # DB-backed dedup: store LGPD message ID for cross-worker echo detection
-                    _lgpd_mid = send_result.get("messageId") or send_result.get(
-                        "id", ""
-                    )
-                    if _lgpd_mid:
-                        await _store_ai_msg_id_to_db(session_id, _lgpd_mid, db)
-                    logger.info("Evolution LGPD privacy message sent to %s", phone)
-                except Exception as exc:
-                    logger.warning("Evolution LGPD send failed for %s — %s", phone, exc)
+        creds_lgpd = await _load_tenant_credentials(tenant_id, db)
+        e_url = creds_lgpd.get("evolution_api_url", "")
+        e_name = creds_lgpd.get("evolution_instance_name", "")
+        e_key = creds_lgpd.get("evolution_api_key", "")
+        if e_url and e_name and e_key:
+            async def _send_evolution_privacy(msg: str) -> dict[str, Any]:
+                return await send_evolution_text(
+                    e_url,
+                    e_name,
+                    e_key,
+                    phone,
+                    msg,
+                )
+
+            await _send_privacy_notice(
+                channel_label="Evolution",
+                is_new=is_new,
+                lgpd_cfg=lgpd_cfg,
+                clinic_config=clinic_config,
+                tenant_id=tenant_id,
+                session_id=session_id,
+                to_phone=phone,
+                db=db,
+                send=_send_evolution_privacy,
+            )
 
     event_request = EventRequest(
         tenant_id=tenant_id,
@@ -1536,16 +2218,36 @@ async def evolution_webhook(
         return {"ok": True, "replied": False, "reason": "no_credentials"}
 
     try:
-        send_result = await send_evolution_text(
-            evol_url, evol_name, evol_key, phone, suggested
+        send_result, sent_as_audio = await _send_reply_with_optional_tts(
+            credentials=creds,
+            text=suggested,
+            language_code=_get_agent_language(clinic_config),
+            channel="Evolution",
+            phone=phone,
+            send_audio=lambda audio, _mime: send_evolution_audio(
+                evol_url, evol_name, evol_key, phone, audio
+            ),
+            send_text=lambda: send_evolution_text(
+                evol_url, evol_name, evol_key, phone, suggested
+            ),
         )
-        _track_sent_message(send_result)
-        # DB-backed dedup: store reply message ID for cross-worker echo detection
-        _reply_mid = send_result.get("messageId") or send_result.get("id", "")
+        # Normalise the outbound id (Decisions 4 + 11): both dedup layers
+        # receive the same value, and Evolution's ``id`` — the only key it
+        # used to write to ``_store_ai_msg_id_to_db`` — no longer diverges
+        # from what ``_track_sent_message`` looks for.
+        _reply_mid = _extract_normalised_send_id(send_result)
         if _reply_mid:
+            _track_sent_message({"messageid": _reply_mid})
             await _store_ai_msg_id_to_db(session_id, _reply_mid, db)
             await db.commit()  # commit the metadata update immediately
-        logger.info("Evolution reply sent to %s (%d chars)", phone, len(suggested))
+        else:
+            _track_sent_message(send_result)
+        logger.info(
+            "Evolution reply sent to %s (%d chars, format=%s)",
+            phone,
+            len(suggested),
+            "audio" if sent_as_audio else "text",
+        )
     except Exception:
         logger.exception("Evolution send failed for %s", phone)
         return {"ok": True, "replied": False, "reason": "send_failed"}
@@ -1600,32 +2302,54 @@ async def uazapi_webhook(
     # instanceName (capital N) identifies the Uazapi instance / tenant
     instance_name = str(body.get("instanceName") or "")
 
-    # sender_pn holds the full JID; fall back to chat.wa_chatid
     chat = body.get("chat") or {}
-    raw_from = str(msg.get("sender_pn") or chat.get("wa_chatid") or "")
+    chat_jid = str(chat.get("wa_chatid") or msg.get("chatid") or "")
+    is_from_me = bool(msg.get("fromMe", False))
+    # Decision 8: the provider's ``wasSentByApi`` flag is a *reinforcing*
+    # dedup signal — cheap, id-independent — but never a substitute. It
+    # covers the exact hole the id-based claim leaves open when a fromMe
+    # echo arrives without a ``messageid``: without it, every re-delivery
+    # of that same idless echo would slip through and pause the session.
+    was_sent_by_api = bool(msg.get("wasSentByApi", False))
+
+    # Counterparty resolution (Decision 3): when the clinic replies from
+    # its own WhatsApp, ``sender_pn`` is the clinic's own number and
+    # ``chat.wa_chatid`` / ``chatid`` is the patient we must pause. For
+    # patient-originated messages we keep ``sender_pn`` as the primary
+    # source with ``chat.wa_chatid`` as fallback, matching the pre-Group-3
+    # behaviour.
+    if is_from_me:
+        raw_from = str(chat.get("wa_chatid") or msg.get("chatid") or "")
+    else:
+        raw_from = str(msg.get("sender_pn") or chat.get("wa_chatid") or "")
     from_phone = _normalise_phone(
         raw_from.split("@")[0] if "@" in raw_from else raw_from
     )
 
     # text / content both carry the message body depending on messageType
-    message_text = str(msg.get("text") or msg.get("content") or "")
+    message_text = _extract_uazapi_message_text(msg)
     msg_id = str(msg.get("messageid") or msg.get("id") or "")
-    is_from_me = bool(msg.get("fromMe", False))
 
     # messageType / type identify media (e.g. "Image", "Audio", "Video")
     msg_type = str(msg.get("type") or msg.get("messageType") or "")
+    media_type = str(msg.get("mediaType") or "")
 
     logger.info(
-        "Uazapi webhook: instance=%s from=%s type=%s body_len=%d fromMe=%s",
+        "Uazapi webhook: instance=%s from=%s type=%s mediaType=%s body_len=%d fromMe=%s",
         instance_name,
         raw_from,
         msg_type,
-        len(message_text),
+        media_type,
+        len(message_text or ""),
         is_from_me,
     )
 
     if not instance_name or not from_phone:
         return {"ok": True, "skipped": "missing_fields"}
+
+    if _is_uazapi_group_chat(chat_jid):
+        logger.info("Uazapi webhook: skipping group chat %s", chat_jid)
+        return {"ok": True, "skipped": "group_chat"}
 
     # Skip binary media — text messages arrive as "text" or "Conversation"
     _MEDIA_TYPES = {
@@ -1641,9 +2365,14 @@ async def uazapi_webhook(
         "Sticker",
         "ptt",
     }
-    if msg_type in _MEDIA_TYPES or not message_text:
-        logger.info("Uazapi webhook: skipping non-text msg_type=%s", msg_type)
-        return {"ok": True, "skipped": "non-text"}
+    is_media_message = (
+        msg_type == "media" or msg_type in _MEDIA_TYPES or media_type in _MEDIA_TYPES
+    )
+    is_audio_media = (
+        msg_type in {"audio", "Audio", "ptt"}
+        or media_type in {"audio", "Audio", "ptt"}
+        or bool(msg.get("ptt"))
+    )
 
     # ── resolve tenant from instance_name ──
     tenant_id = await _resolve_tenant_by_credential(
@@ -1658,10 +2387,46 @@ async def uazapi_webhook(
         )
         return {"ok": True, "skipped": "unknown_instance"}
 
-    # ── echo dedup (fromMe / self-sent) ──
-    if is_from_me or (msg_id and _is_ai_sent_message(msg_id)):
-        return {"ok": True, "skipped": "ai_echo"}
+    # Media-gate carve-outs:
+    #   * ``is_from_me and is_audio_media`` — staff voice note. Group 3 routes
+    #     it through ``_handle_clinic_message`` so it can pause the session;
+    #     the audio bytes are never downloaded or transcribed (real STT cost
+    #     on the clinic's own voice, same rationale as Z-API).
+    #   * ``is_audio_media and not is_from_me`` — patient voice note. Group 4
+    #     transcribes it below (STT → multimodal → text reroute chain shared
+    #     with Z-API and Meta). Without this carve-out patient audio would be
+    #     silently dropped as ``non-text``.
+    #
+    # Any other media (image, video, document, sticker) still exits as
+    # ``non-text`` — Z-API reference, not Meta's file-ack path (out of scope
+    # for this wish).
+    audio_is_transcribable = is_audio_media and not is_from_me
+    if is_media_message and not (is_from_me and is_audio_media) and not audio_is_transcribable:
+        logger.info(
+            "Uazapi webhook: skipping non-text msg_type=%s mediaType=%s",
+            msg_type,
+            media_type,
+        )
+        return {"ok": True, "skipped": "non-text"}
 
+    if (
+        message_text is None
+        and not (is_from_me and is_audio_media)
+        and not audio_is_transcribable
+    ):
+        logger.info(
+            "Uazapi webhook: skipping non-text missing textual content type=%s mediaType=%s",
+            msg_type,
+            media_type,
+        )
+        return {"ok": True, "skipped": "non-text"}
+
+    # ── replay claim (Decision 9, lower bound) ──
+    # The claim runs *before* the fromMe routing so a re-delivery of the
+    # same echo is barred here — the id-based echo layers below consume
+    # on match, so without this ordering the second delivery would slip
+    # past them and pause the session. The claim is ``SET NX EX`` with a
+    # 31-day retention: claim-and-hold, not consume.
     if msg_id and not _claim_incoming_message("uazapi", tenant_id, msg_id):
         logger.info(
             "Uazapi webhook: duplicate msg %s from %s skipped",
@@ -1670,9 +2435,151 @@ async def uazapi_webhook(
         )
         return {"ok": True, "skipped": "duplicate_message"}
 
+    # ── fromMe=true: AI-sent echo or real clinic message ──
+    # Routing lives between the claim (lower bound) and _check_pause_state
+    # (upper bound): the reactivation branch inside _handle_clinic_message
+    # only fires when the session is already paused, and _check_pause_state
+    # returns 202 in exactly that state — routing after it would make the
+    # trigger-phrase reactivation permanently unreachable.
+    if is_from_me:
+        # ``wasSentByApi`` (Decision 8) is the id-independent guard that
+        # covers idless echoes; ``_is_ai_sent_message`` still handles the
+        # id-based case (and consumes the entry so repeats can't leak).
+        if was_sent_by_api:
+            return {"ok": True, "skipped": "ai_echo"}
+        if msg_id and _is_ai_sent_message(msg_id):
+            return {"ok": True, "skipped": "ai_echo"}
+        # Pass message_id so _handle_clinic_message can consult the
+        # session's DB-backed ai_msg_ids list — this is how the LGPD
+        # aviso echo is recognised across worker/container boundaries.
+        result = await _handle_clinic_message(
+            tenant_id, from_phone, message_text or "", db, message_id=msg_id
+        )
+        await db.commit()
+        return result
+
     # ── load clinic_config (needed for agent language + downstream checks) ──
     service = get_event_service()
     clinic_config = await service._load_clinic_config(tenant_id)
+
+    # Raw credentials memo: the audio path below needs Uazapi send tokens +
+    # STT/multimodal fields, and the LGPD/reply path near the bottom needs
+    # the same row. Load once and reuse — the cached ``clinic_config`` is a
+    # runtime projection that strips ``stt_api_key``/``uazapi_token``, so we
+    # must read the raw row for either use.
+    _raw_creds_memo: Optional[dict[str, Any]] = None
+
+    async def _tenant_creds() -> dict[str, Any]:
+        nonlocal _raw_creds_memo
+        if _raw_creds_memo is None:
+            _raw_creds_memo = await _load_tenant_credentials(tenant_id, db)
+        return _raw_creds_memo
+
+    # ── patient audio: transcribe via STT → multimodal → text reroute ──
+    # Mirrors the Z-API audio block (webhook.py: ``_process_zapi_authenticated_body``)
+    # gate order: STT-provider-unsupported → duration → capability →
+    # download → chain → reroute on failure. This block only runs for
+    # patient audio (``is_audio_media and not is_from_me``); staff voice
+    # notes were already routed above and returned before this point.
+    if audio_is_transcribable:
+        creds = await _tenant_creds()
+        u_url = (creds.get("uazapi_api_url") or "").strip()
+        u_token = (creds.get("uazapi_token") or "").strip()
+        stt_provider = _stt_canonical_provider(creds.get("stt_provider"))
+        agent_lang = _get_agent_language(clinic_config)
+
+        # STT-provider-unsupported gate: same skip envelope as Z-API/Meta.
+        # This gate is deliberate — some providers have no runtime adapter
+        # and must not attempt download / transcription / reroute.
+        if stt_provider in UNSUPPORTED_STT_PROVIDERS:
+            return _stt_skip_envelope(stt_provider)
+
+        # Duration gate: field name confirmed against the captured evidence
+        # (media-payload.json: ``message.content.seconds`` is an int). This
+        # runs above the capability gate so a 3-minute audio hands off
+        # instead of getting "please type" on Uazapi — matching Z-API/Meta.
+        content_obj = msg.get("content") or {}
+        audio_seconds = 0
+        if isinstance(content_obj, dict):
+            audio_seconds = int(content_obj.get("seconds") or 0)
+        audio_max_seconds = int(creds.get("audio_max_seconds") or 60)
+        if audio_seconds > audio_max_seconds:
+            if u_url and u_token:
+                handoff_msg = (
+                    _AUDIO_TOO_LONG_MSG_EN
+                    if agent_lang == "en"
+                    else _AUDIO_TOO_LONG_MSG_PT
+                )
+                try:
+                    await send_uazapi_text(u_url, u_token, from_phone, handoff_msg)
+                except Exception:
+                    logger.exception(
+                        "Uazapi long-audio handoff send failed for %s",
+                        from_phone,
+                    )
+            logger.info(
+                "Uazapi audio too long (%ds > %ds limit), skipping transcription for %s",
+                audio_seconds,
+                audio_max_seconds,
+                from_phone,
+            )
+            return {"ok": True, "skipped": "audio_too_long"}
+
+        # Capability gate: download only when at least one chain rung can
+        # actually use the bytes. Matches Z-API — no bytes fetched from
+        # WhatsApp / Uazapi when the tenant has neither STT nor multimodal.
+        whisper_key = (
+            creds.get("stt_api_key") or creds.get("whisper_api_key") or ""
+        ).strip()
+        audio_bytes: Optional[bytes] = None
+        effective_mime = str(
+            (content_obj.get("mimetype") if isinstance(content_obj, dict) else None)
+            or "audio/ogg"
+        )
+        if whisper_key or _multimodal_operational(creds):
+            try:
+                audio_bytes, downloaded_mime = await download_uazapi_media(
+                    u_url, u_token, msg_id
+                )
+            except UazapiMediaDownloadError as exc:
+                # Media never materialised — Uazapi's download endpoint
+                # rejected the request or returned garbage. There is no
+                # transcription to reroute from; skip with a distinct label
+                # so operators can grep for it in logs.
+                logger.warning(
+                    "Uazapi media download failed for %s — %s",
+                    msg_id,
+                    exc,
+                )
+                return {"ok": True, "skipped": "audio_download_failed"}
+            if downloaded_mime:
+                effective_mime = downloaded_mime
+            logger.info(
+                "Uazapi audio received for transcription: size=%d bytes, mimetype=%s",
+                len(audio_bytes),
+                effective_mime,
+            )
+
+        transcript, chain_failure = await _transcribe_audio_chain(
+            audio_bytes,
+            creds,
+            mime_type=effective_mime,
+            agent_language=agent_lang,
+            channel="Uazapi",
+        )
+        if chain_failure:
+            return await _send_uazapi_stt_fallback(
+                tenant_id=tenant_id,
+                phone=from_phone,
+                u_url=u_url,
+                u_token=u_token,
+                agent_language=agent_lang,
+                failure_reason=chain_failure,
+            )
+        # Success: feed the transcript into the normal pipeline. The
+        # load-bearing ``assert message_text is not None`` below is now
+        # satisfied on the patient-audio path.
+        message_text = transcript
 
     # ── bot_active check — if AI is paused, drop silently ──
     bot_skip = await _check_bot_active(tenant_id, from_phone, db)
@@ -1687,7 +2594,7 @@ async def uazapi_webhook(
         return JSONResponse(status_code=202, content=pause_result)
 
     # ── get or create a session for this phone ──
-    session_id, _is_new = await _get_or_create_session(tenant_id, from_phone, db)
+    session_id, is_new = await _get_or_create_session(tenant_id, from_phone, db)
     await db.commit()
 
     logger.info(
@@ -1697,6 +2604,35 @@ async def uazapi_webhook(
         tenant_id,
     )
 
+    # ── load tenant credentials early so the LGPD aviso can precede the
+    # AI reply. Deliverable 5 of the ``uazapi-parity`` wish: the aviso is
+    # the very first outbound message on a new session, so credentials
+    # cannot wait until after the pipeline finishes. Reuses the same memo
+    # the audio path (above) already populated on the transcribe branch.
+    creds = await _tenant_creds()
+    u_url = (creds.get("uazapi_api_url") or "").strip()
+    u_token = (creds.get("uazapi_token") or "").strip()
+
+    # ── send LGPD privacy notice as the very first message of a new session ──
+    if is_new:
+        lgpd_cfg = (clinic_config or {}).get("lgpd") or {}
+        if u_url and u_token:
+            async def _send_uazapi_privacy(msg: str) -> dict[str, Any]:
+                return await send_uazapi_text(u_url, u_token, from_phone, msg)
+
+            await _send_privacy_notice(
+                channel_label="Uazapi",
+                is_new=is_new,
+                lgpd_cfg=lgpd_cfg,
+                clinic_config=clinic_config,
+                tenant_id=tenant_id,
+                session_id=session_id,
+                to_phone=from_phone,
+                db=db,
+                send=_send_uazapi_privacy,
+            )
+
+    assert message_text is not None
     event_request = EventRequest(
         tenant_id=tenant_id,
         session_id=session_id,
@@ -1727,30 +2663,43 @@ async def uazapi_webhook(
         logger.info("Uazapi webhook: no suggested_response for %s", from_phone)
         return {"ok": True, "replied": False}
 
-    creds = await _load_tenant_credentials(tenant_id, db)
-    u_url = (creds.get("uazapi_api_url") or "").strip()
-    u_token = (creds.get("uazapi_token") or "").strip()
-
     if not u_url or not u_token:
         logger.warning("Uazapi credentials missing for tenant %s", tenant_id)
         return {"ok": True, "replied": False, "reason": "no_credentials"}
 
     try:
-        send_result = await send_uazapi_text(u_url, u_token, from_phone, suggested)
-        _track_sent_message(send_result)
-        # DB-backed dedup: store reply message ID for cross-worker echo detection
-        reply_mid = (
-            send_result.get("messageid")
-            or send_result.get("MessageID")
-            or send_result.get("id", "")
+        send_result, sent_as_audio = await _send_reply_with_optional_tts(
+            credentials=creds,
+            text=suggested,
+            language_code=_get_agent_language(clinic_config),
+            channel="Uazapi",
+            phone=from_phone,
+            send_audio=lambda audio, mime: send_uazapi_audio(
+                u_url,
+                u_token,
+                from_phone,
+                audio,
+                mime_type=mime,
+            ),
+            send_text=lambda: send_uazapi_text(
+                u_url, u_token, from_phone, suggested
+            ),
         )
+        # Normalise the outbound id (Decisions 4 + 11): Uazapi's ``id``
+        # arrives as ``owner:MSGID`` and never matches the echo, which only
+        # carries the tail. Both dedup layers now receive the same value.
+        reply_mid = _extract_normalised_send_id(send_result)
         if reply_mid:
+            _track_sent_message({"messageid": reply_mid})
             await _store_ai_msg_id_to_db(session_id, reply_mid, db)
             await db.commit()  # commit metadata update immediately
+        else:
+            _track_sent_message(send_result)
         logger.info(
-            "Uazapi reply sent to %s (%d chars)",
+            "Uazapi reply sent to %s (%d chars, format=%s)",
             from_phone,
             len(suggested),
+            "audio" if sent_as_audio else "text",
         )
     except Exception:
         logger.exception("Uazapi send failed for %s", from_phone)
@@ -2008,59 +2957,6 @@ async def _meta_initiate_file_handoff(
             session_id,
             exc,
         )
-
-
-async def _meta_transcribe_audio(
-    audio_bytes: bytes,
-    mime_type: str,
-    creds: dict,
-    agent_language: str,
-) -> Optional[str]:
-    """Transcribe Meta audio bytes reusing the same Whisper pipeline as Z-API.
-
-    Returns the transcribed text, or ``None`` when no ``whisper_api_key`` is
-    configured. Raises the underlying exception on transcription failure so
-    the caller can log it via ``logger.exception``.
-    """
-    whisper_key = (creds.get("whisper_api_key") or "").strip() or (
-        creds.get("stt_api_key") or ""
-    ).strip()
-    if not whisper_key:
-        return None
-
-    from src.services.groq_service import (
-        GROQ_API_BASE,
-        OPENAI_API_BASE,
-        transcribe_audio,
-    )
-
-    stt_provider = _stt_canonical_provider(creds.get("stt_provider"))
-    stt_api_url = (creds.get("stt_api_url") or "").strip()
-    _STT_DEFAULT_MODELS: dict[str, str] = {
-        "openai_whisper": "whisper-1",
-    }
-    whisper_model = (
-        creds.get("stt_model_name")
-        or creds.get("whisper_model")
-        or _STT_DEFAULT_MODELS.get(stt_provider, "whisper-large-v3-turbo")
-    )
-    lang_hint = "en" if agent_language == "en" else "pt"
-
-    if stt_api_url:
-        stt_base_url = stt_api_url
-    elif stt_provider == "openai_whisper":
-        stt_base_url = OPENAI_API_BASE
-    else:
-        stt_base_url = GROQ_API_BASE
-
-    return await transcribe_audio(
-        api_key=whisper_key,
-        audio_bytes=audio_bytes,
-        mimetype=mime_type,
-        model=whisper_model,
-        language=lang_hint,
-        base_url=stt_base_url,
-    )
 
 
 @router.get(
@@ -2528,27 +3424,27 @@ async def meta_webhook(
                     )
                     return {"ok": True, "skipped": "media_download_failed"}
 
-                # 4) Transcribe via the same Whisper/STT client used by Z-API
-                try:
-                    message_text = (
-                        await _meta_transcribe_audio(
-                            audio_bytes=audio_bytes,
-                            mime_type=mime_type,
-                            creds=creds,
-                            agent_language=agent_lang,
-                        )
-                        or ""
+                # 4) Run the same fallback chain Z-API runs: STT, then a
+                # multimodal model, then a text reroute. The ``(text, reason)``
+                # pair is what separates "the key is missing" from "STT ran and
+                # returned nothing" — the old ``or ""`` collapsed both into
+                # ``no_whisper_key``.
+                message_text, chain_failure = await _transcribe_audio_chain(
+                    audio_bytes,
+                    creds,
+                    mime_type=mime_type,
+                    agent_language=agent_lang,
+                    channel="Meta",
+                )
+                if chain_failure:
+                    return await _send_meta_stt_fallback(
+                        tenant_id=tenant_id,
+                        from_phone=from_phone,
+                        meta_pnid=meta_pnid,
+                        meta_token=meta_token,
+                        agent_language=agent_lang,
+                        failure_reason=chain_failure,
                     )
-                except Exception as exc:
-                    logger.exception(
-                        "Meta audio transcription failed for %s — %s",
-                        from_phone,
-                        exc,
-                    )
-                    return {"ok": True, "skipped": "transcription_failed"}
-
-                if not message_text:
-                    return {"ok": True, "skipped": "no_whisper_key"}
 
                 # Falls through to the shared text pipeline below.
 
@@ -2610,39 +3506,30 @@ async def meta_webhook(
             # ── send LGPD privacy notice on new sessions ──
             if is_new and meta_pnid and meta_token:
                 lgpd_cfg = (clinic_config or {}).get("lgpd") or {}
-                if _is_enabled(lgpd_cfg.get("lgpd_enabled")):
-                    try:
-                        _clinic_name = (
-                            (clinic_config or {})
-                            .get("identity", {})
-                            .get(
-                                "clinic_name",
-                                "",
-                            )
-                        )
-                        privacy_msg = _build_lgpd_message(
-                            lgpd_cfg,
-                            clinic_id=str(tenant_id),
-                            clinic_name=_clinic_name,
-                            agent_language=_get_agent_language(clinic_config),
-                        )
-                        send_result = await send_meta_cloud_text(
-                            meta_pnid,
-                            meta_token,
-                            from_phone,
-                            privacy_msg,
-                        )
-                        _track_meta_sent_message(send_result)
-                        _lgpd_mid = extract_meta_message_id(send_result)
-                        if _lgpd_mid:
-                            await _store_ai_msg_id_to_db(session_id, _lgpd_mid, db)
-                        logger.info("Meta LGPD privacy message sent to %s", from_phone)
-                    except Exception as exc:
-                        logger.warning(
-                            "Meta LGPD send failed for %s — %s",
-                            from_phone,
-                            exc,
-                        )
+
+                async def _send_meta_privacy(msg: str) -> dict[str, Any]:
+                    return await send_meta_cloud_text(
+                        meta_pnid,
+                        meta_token,
+                        from_phone,
+                        msg,
+                    )
+
+                # Meta wraps the outbound id inside ``messages[0].id`` — use
+                # ``extract_meta_message_id`` here instead of the default
+                # top-level ``messageid`` lookup used by the other channels.
+                await _send_privacy_notice(
+                    channel_label="Meta",
+                    is_new=is_new,
+                    lgpd_cfg=lgpd_cfg,
+                    clinic_config=clinic_config,
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    to_phone=from_phone,
+                    db=db,
+                    send=_send_meta_privacy,
+                    id_extractor=lambda r: extract_meta_message_id(r) or "",
+                )
 
             # ── pipeline ──
             event_request = EventRequest(
@@ -2681,11 +3568,25 @@ async def meta_webhook(
                 return {"ok": True, "replied": False, "reason": "no_credentials"}
 
             try:
-                send_result = await send_meta_cloud_text(
-                    meta_pnid,
-                    meta_token,
-                    from_phone,
-                    suggested,
+                send_result, sent_as_audio = await _send_reply_with_optional_tts(
+                    credentials=creds,
+                    text=suggested,
+                    language_code=_get_agent_language(clinic_config),
+                    channel="Meta",
+                    phone=from_phone,
+                    send_audio=lambda audio, mime: send_meta_cloud_audio(
+                        meta_pnid,
+                        meta_token,
+                        from_phone,
+                        audio,
+                        mime_type=mime,
+                    ),
+                    send_text=lambda: send_meta_cloud_text(
+                        meta_pnid,
+                        meta_token,
+                        from_phone,
+                        suggested,
+                    ),
                 )
                 _track_meta_sent_message(send_result)
                 _reply_mid = extract_meta_message_id(send_result)
@@ -2693,9 +3594,10 @@ async def meta_webhook(
                     await _store_ai_msg_id_to_db(session_id, _reply_mid, db)
                     await db.commit()  # commit metadata update immediately
                 logger.info(
-                    "Meta reply sent to %s (%d chars)",
+                    "Meta reply sent to %s (%d chars, format=%s)",
                     from_phone,
                     len(suggested),
+                    "audio" if sent_as_audio else "text",
                 )
             except Exception as exc:
                 logger.exception("Meta send failed for %s — %s", from_phone, exc)
