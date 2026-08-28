@@ -7,9 +7,19 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    String,
+    Text,
+    event,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.engine import Connection
+from sqlalchemy.orm import Mapped, Mapper, mapped_column, relationship
 
 from src.models.base import Base, TimestampMixin
 
@@ -103,6 +113,15 @@ class KnowledgeDocument(Base, TimestampMixin):
         nullable=False,
     )
 
+    # Logical size of the original RAG payload. Persist bytes instead of a
+    # derived MB float so billing calculations remain exact and inexpensive.
+    size_bytes: Mapped[int] = mapped_column(
+        BigInteger,
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
+
     # Error tracking
     index_error: Mapped[Optional[str]] = mapped_column(
         Text,
@@ -176,3 +195,13 @@ class KnowledgeDocument(Base, TimestampMixin):
         indexed = "indexed" if self.is_indexed else "not indexed"
         return f"<KnowledgeDocument(id={self.id}, title='{self.title[:30]}...', {indexed})>"
 
+
+@event.listens_for(KnowledgeDocument, "before_insert")
+@event.listens_for(KnowledgeDocument, "before_update")
+def _sync_knowledge_document_size(
+    _mapper: Mapper[KnowledgeDocument],
+    _connection: Connection,
+    target: KnowledgeDocument,
+) -> None:
+    """Keep the persisted logical size aligned with UTF-8 document content."""
+    target.size_bytes = len((target.content or "").encode("utf-8"))

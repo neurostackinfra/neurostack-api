@@ -9,10 +9,8 @@ import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
 import {
   Send, User, Bot, Loader2, Activity, RotateCcw,
-  SlidersHorizontal, ShieldAlert, CheckCircle2, Lightbulb, X, ArrowDown,
 } from "lucide-react";
 import { TraceViewer } from "@/components/trace-viewer";
 import { RatingBlock } from "@/components/rating-block";
@@ -130,233 +128,6 @@ interface Message {
   decision?: CognitiveDecision;
 }
 
-type FeedbackPhase = "idle" | "input" | "analyzing" | "red" | "green";
-
-// --- FeedbackBlock ---
-
-interface FeedbackBlockProps {
-  msg: Message;
-  sessionId?: string | null;
-  userMessage?: string;
-  defaultPhase?: FeedbackPhase;
-  defaultText?: string;
-  isReadOnly?: boolean;
-  showArrow?: boolean;
-}
-
-function FeedbackBlock({ msg, sessionId, userMessage = "", defaultPhase = "idle", defaultText = "", isReadOnly = false, showArrow = false }: FeedbackBlockProps) {
-  const { toast } = useToast();
-  const [phase, setPhase] = useState<FeedbackPhase>(defaultPhase);
-  const [text, setText]   = useState(defaultText);
-
-  const openFb  = () => { setPhase("input"); setText(""); };
-  const closeFb = () => { setPhase("idle");  setText(""); };
-
-  const analyze = async () => {
-    if (!text.trim()) return;
-    setPhase("analyzing");
-    if (isReadOnly) {
-      // Demo mode: simulate analysis without API call
-      await new Promise(r => setTimeout(r, 1500));
-      setPhase(Math.random() > 0.5 ? "green" : "red");
-      return;
-    }
-    try {
-      const res = await customFetch<{ status: string; violations: { rule: string; message: string; category: string }[] }>("/v1/rlhf/validate", {
-        method: "POST",
-        body: JSON.stringify({
-          suggestion: text,
-          original_message: userMessage,
-          agent_response: msg.content,
-        }),
-      });
-      setPhase(res.status === "aligned" ? "green" : "red");
-    } catch {
-      toast({ title: "Erro ao validar sugestao", variant: "destructive" });
-      setPhase("input");
-    }
-  };
-
-  const saveFeedback = async (status: "aligned" | "forced") => {
-    if (isReadOnly) {
-      toast({ title: "Feedback registrado!", description: "Obrigado pelo feedback. (Demonstração)" });
-      closeFb();
-      return;
-    }
-    try {
-      await customFetch("/v1/rlhf/feedback", {
-        method: "POST",
-        body: JSON.stringify({
-          session_id: sessionId || "",
-          user_message: userMessage,
-          agent_response: msg.content,
-          suggested_response: text,
-          status,
-        }),
-      });
-      toast({ title: "Feedback salvo com sucesso." });
-    } catch {
-      toast({ title: "Erro ao salvar feedback", variant: "destructive" });
-    }
-    closeFb();
-  };
-
-  if (phase === "idle") {
-    return (
-      <div className="mt-1.5 ml-1 flex flex-col gap-0.5">
-        {showArrow && (
-          <div className="flex items-center gap-1 text-red-500 text-[11px] font-bold animate-bounce mb-0.5">
-            <ArrowDown className="h-3 w-3" />
-            <span>clique aqui</span>
-          </div>
-        )}
-        <button
-          onClick={openFb}
-          className={`inline-flex items-center gap-1.5 text-[11px] font-medium transition-colors ${showArrow ? "text-red-500 hover:text-red-400 font-bold" : "text-muted-foreground hover:text-violet-400"}`}
-          data-testid={`btn-open-feedback-${msg.id}`}
-        >
-          <Lightbulb className="h-3 w-3" />
-          Corrigir / Enviar Feedback
-        </button>
-      </div>
-    );
-  }
-
-  return (
-    <div className="mt-2 rounded-lg border border-border bg-background overflow-hidden shadow-sm">
-      {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2 bg-slate-50 dark:bg-slate-900/60 border-b border-border">
-        <div className="flex items-center gap-1.5">
-          <SlidersHorizontal className="h-3.5 w-3.5 text-violet-400" />
-          <span className="text-[11px] font-bold uppercase tracking-widest text-violet-400">
-            RLHF - Feedback de Abordagem
-          </span>
-        </div>
-        {phase !== "analyzing" && (
-          <button onClick={closeFb} className="text-muted-foreground hover:text-foreground">
-            <X className="h-3.5 w-3.5" />
-          </button>
-        )}
-      </div>
-
-      <div className="p-3 space-y-3">
-
-        {/* INPUT + ANALYZING */}
-        {(phase === "input" || phase === "analyzing") && (
-          <>
-            <div>
-              <label className="text-[11px] font-semibold text-foreground/70 mb-1.5 block">
-                Como o agente deveria ter respondido para alinhar com a metodologia?
-              </label>
-              <Textarea
-                value={text}
-                onChange={(e) => setText(e.target.value)}
-                placeholder="Digite a abordagem ideal que o agente deveria usar..."
-                className="resize-none text-xs min-h-[80px] border-border"
-                disabled={phase === "analyzing"}
-                data-testid={`textarea-feedback-${msg.id}`}
-              />
-            </div>
-            <div className="flex justify-end">
-              {phase === "analyzing" ? (
-                <div className="flex items-center gap-2 text-xs text-violet-400 font-medium">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  Validando com a Metodologia SRM NeuroStack...
-                </div>
-              ) : (
-                <Button
-                  size="sm"
-                  className="text-xs h-7 bg-violet-600 hover:bg-violet-500 text-white gap-1.5"
-                  onClick={analyze}
-                  disabled={!text.trim()}
-                  data-testid={`btn-analyze-${msg.id}`}
-                >
-                  <SlidersHorizontal className="h-3 w-3" />
-                  Analisar Sugestao
-                </Button>
-              )}
-            </div>
-          </>
-        )}
-
-        {/* RED FLAG */}
-        {phase === "red" && (
-          <div className="space-y-3">
-            <div className="flex items-start gap-2 rounded-md bg-red-500/8 border border-red-500/25 px-3 py-2.5">
-              <ShieldAlert className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
-              <div>
-                <p className="text-xs font-bold text-red-400 mb-0.5">
-                  Alerta: Esta sugestao fere a metodologia SRM NeuroStack.
-                </p>
-                <p className="text-[11px] text-red-400/70">
-                  A abordagem sugerida desvia do Padrao Ouro de conversao e seguranca clinica.
-                </p>
-              </div>
-            </div>
-            <div className="bg-muted rounded px-2.5 py-2 text-[11px] text-foreground/60 italic border border-border line-clamp-2">
-              "{text}"
-            </div>
-            <div className="flex justify-end gap-2">
-              <Button
-                size="sm"
-                className="text-xs h-7 bg-violet-600 hover:bg-violet-500 text-white gap-1.5"
-                onClick={closeFb}
-                data-testid={`btn-keep-srm-${msg.id}`}
-              >
-                <CheckCircle2 className="h-3 w-3" />
-                Manter Padrao SRM NeuroStack
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                className="text-xs h-7 border-red-500/40 text-red-400 hover:bg-red-500/10 gap-1.5"
-                onClick={() => saveFeedback("forced")}
-                data-testid={`btn-force-${msg.id}`}
-              >
-                <ShieldAlert className="h-3 w-3" />
-                Aplicar Sugestao Pessoal
-              </Button>
-            </div>
-          </div>
-        )}
-
-        {/* GREEN FLAG */}
-        {phase === "green" && (
-          <div className="space-y-3">
-            <div className="flex items-start gap-2 rounded-md bg-green-500/8 border border-green-500/25 px-3 py-2.5">
-              <CheckCircle2 className="h-4 w-4 text-green-400 shrink-0 mt-0.5" />
-              <div>
-                <p className="text-xs font-bold text-green-400 mb-0.5">
-                  Sugestao alinhada com a metodologia.
-                </p>
-                <p className="text-[11px] text-green-400/70">
-                  A abordagem proposta esta em conformidade com o Padrao Ouro SRM NeuroStack.
-                </p>
-              </div>
-            </div>
-            <div className="bg-muted rounded px-2.5 py-2 text-[11px] text-foreground/70 italic border border-border line-clamp-2">
-              "{text}"
-            </div>
-            <div className="flex justify-end">
-              <Button
-                size="sm"
-                className="text-xs h-7 bg-green-600 hover:bg-green-500 text-white gap-1.5"
-                onClick={() => saveFeedback("aligned")}
-                data-testid={`btn-apply-green-${msg.id}`}
-              >
-                <CheckCircle2 className="h-3 w-3" />
-                Aplicar Sugestao Pessoal
-              </Button>
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// --- Chat ---
-
 // ── Investor Mock Chat ──
 
 function InvestorMockChat() {
@@ -389,10 +160,7 @@ function InvestorMockChat() {
 
         <ScrollArea className="flex-1 p-4">
           <div className="space-y-5 pb-4">
-            {conv.messages.map((msg, idx) => {
-              const isFirstAssistant = msg.role === "assistant" && !conv.messages.slice(0, idx).some(m => m.role === "assistant");
-              const prevUserMsg = msg.role === "assistant" && idx > 0 && conv.messages[idx - 1].role === "user"
-                ? conv.messages[idx - 1].content : "";
+            {conv.messages.map((msg) => {
               return (
                 <div
                   key={msg.id}
@@ -413,16 +181,6 @@ function InvestorMockChat() {
                       >
                         {msg.content}
                       </div>
-                      <FeedbackBlock
-                        msg={msg as Message}
-                        sessionId={null}
-                        userMessage={prevUserMsg}
-                        defaultPhase="idle"
-                        defaultText=""
-                        isReadOnly={true}
-                        showArrow={isFirstAssistant}
-                      />
-                      <p className="text-[10px] text-muted-foreground/60 italic ml-1 mt-0.5">(Apenas demonstração, feature em breve)</p>
                     </div>
                   ) : (
                     <div className="max-w-[80%] rounded-lg px-4 py-3 text-sm bg-primary text-primary-foreground">
@@ -700,7 +458,7 @@ export default function Chat() {
 
       const assistantContent =
         resp.prompt?.suggested_response ??
-        "No response generated.";
+        "Não foi possível gerar uma resposta. Verifique a integração de IA da clínica e tente novamente.";
 
       const trace = mapToTrace(resp, messageText);
 
@@ -764,8 +522,6 @@ export default function Chat() {
               </div>
             ) : (
               messages.map((msg, idx) => {
-                // For the demo last message, pre-open RLHF block with seed text
-                const isDemoPreOpened = false;
                 // Find the user message this assistant response is replying to
                 const prevUserMsg = msg.role === "assistant" && idx > 0 && messages[idx - 1].role === "user"
                   ? messages[idx - 1].content : "";
@@ -797,15 +553,6 @@ export default function Chat() {
                           userMessage={prevUserMsg}
                           isReadOnly={isReadOnly}
                           clinicTenantId={effectiveTenantId ?? null}
-                        />
-                        <FeedbackBlock
-                          msg={msg}
-                          sessionId={sessionId}
-                          userMessage={prevUserMsg}
-                          defaultPhase={isDemoPreOpened ? "input" : "idle"}
-                          defaultText=""
-                          isReadOnly={isReadOnly}
-                          showArrow={false}
                         />
                       </div>
                     ) : (

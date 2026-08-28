@@ -1,13 +1,14 @@
 """
 NeuroStack API - RLHF Endpoints
-Validate feedback suggestions against SRM methodology and persist approved feedback.
-Also captures per-response ratings (1-5) with async AI analysis for low scores.
+Capture per-response ratings (1-5) with async AI analysis triggered for
+ratings 1-3 that ship with a substantive written critique.
 """
 
 import asyncio
 import json
 import logging
 import re
+from datetime import datetime
 from typing import Any, Literal, Optional
 from uuid import UUID, uuid4
 
@@ -22,11 +23,12 @@ from src.api.middleware.auth import (
     require_super_admin,
 )
 from src.llm import get_llm_client, get_tenant_llm_client
+from src.models.builder import Builder
 from src.models.event import Event
 from src.models.tenant import Tenant
 from src.observability.pii import mask_carteirinha
-from src.policy.engine import get_policy_engine
 from src.repositories import get_db_session, get_db_session_dependency
+from src.services.trace_service import _to_utc
 
 logger = logging.getLogger(__name__)
 
@@ -36,36 +38,6 @@ router = APIRouter()
 # ============================================
 # Schemas
 # ============================================
-
-
-class ValidateRequest(BaseModel):
-    suggestion: str = Field(..., min_length=1)
-    original_message: Optional[str] = None
-    agent_response: Optional[str] = None
-
-
-class ViolationItem(BaseModel):
-    rule: str
-    message: str
-    category: str
-
-
-class ValidateResponse(BaseModel):
-    status: str  # "aligned" | "violation"
-    violations: list[ViolationItem] = []
-
-
-class FeedbackRequest(BaseModel):
-    session_id: UUID
-    user_message: str
-    agent_response: str
-    suggested_response: str
-    status: str = Field(..., description="aligned | forced")
-
-
-class FeedbackResponse(BaseModel):
-    ok: bool = True
-    event_id: str
 
 
 class RatingRequest(BaseModel):
@@ -103,74 +75,6 @@ class RatingActionRequest(BaseModel):
 
 
 # ============================================
-# Endpoints (existing)
-# ============================================
-
-
-@router.post("/validate", response_model=ValidateResponse)
-async def validate_suggestion(
-    body: ValidateRequest,
-    tenant: TenantContext = Depends(get_tenant_context),
-):
-    """Validate a feedback suggestion against SRM methodology rules."""
-    engine = get_policy_engine()
-    result = await engine.validate_response(
-        tenant_id=tenant.tenant_id,
-        response=body.suggestion,
-    )
-
-    if result.passed:
-        return ValidateResponse(status="aligned")
-
-    violations = [
-        ViolationItem(
-            rule=v.rule_name,
-            message=v.message,
-            category=(
-                v.category.value if hasattr(v.category, "value") else str(v.category)
-            ),
-        )
-        for v in result.violations
-    ]
-    return ValidateResponse(status="violation", violations=violations)
-
-
-@router.post("/feedback", response_model=FeedbackResponse)
-async def save_feedback(
-    body: FeedbackRequest,
-    tenant: TenantContext = Depends(get_tenant_context),
-    session: AsyncSession = Depends(get_db_session_dependency),
-):
-    """Persist RLHF feedback as an event in the events table."""
-    event_id = uuid4()
-
-    event = Event(
-        id=event_id,
-        tenant_id=tenant.tenant_id,
-        session_id=body.session_id if body.session_id else None,
-        event_type="rlhf.feedback",
-        event_data={
-            "user_message": body.user_message,
-            "agent_response": body.agent_response,
-            "suggested_response": body.suggested_response,
-            "status": body.status,
-            "submitted_by": str(tenant.user_id) if tenant.user_id else None,
-            "role": tenant.role,
-        },
-        event_metadata={
-            "source": "chat_simulator",
-        },
-    )
-
-    session.add(event)
-    await session.flush()
-    await session.commit()
-
-    logger.info("RLHF feedback saved: event_id=%s status=%s", event_id, body.status)
-    return FeedbackResponse(event_id=str(event_id))
-
-
-# ============================================
 # Rating Endpoints
 # ============================================
 
@@ -180,10 +84,16 @@ def _build_analysis_prompt(
 ) -> str:
     # Use f-string so braces inside user-provided values are interpolated safely
     # and never treated as .format() placeholders (which would raise KeyError).
+    #
+    # The prompt is deliberately neutral: it asks whether the written critique
+    # is justified given the assigned rating, without presupposing dissatisfaction
+    # or agreement. The anchor to "metodologia SRM NeuroStack" is preserved so
+    # the auditor still evaluates against the same rubric.
     return (
         f"Contexto: o agente respondeu '{agent_response}' à mensagem '{user_message}'. "
-        f"O usuário avaliou com nota {rating}/5 e justificou: '{reason}'. "
-        "Com base na metodologia SRM NeuroStack, essa insatisfação é legítima? "
+        f"O usuário atribuiu a nota {rating}/5 e escreveu a seguinte crítica: '{reason}'. "
+        "Com base na metodologia SRM NeuroStack, a crítica escrita se justifica "
+        "para a nota atribuída? "
         'Responda em JSON: {"status": "agreed" | "disagreed", "justification": "<máx 2 frases>"}'
     )
 
@@ -247,18 +157,51 @@ async def _analyze_rating_async(
 
     # Resolve which tenant's credentials to use for LLM.
     # Priority: explicit clinic_tenant_id (from frontend) > message_id event lookup > submitter's tenant.
+    #
+    # clinic_tenant_id must (a) parse as a UUID AND (b) match a real Tenant row
+    # before we trust it — otherwise a caller could point analysis at any
+    # syntactically valid UUID and pick which tenant's LLM credentials are
+    # loaded for this call. Mirrors the validation in submit_rating. When the
+    # UUID is well-formed but no Tenant matches, fall through to the message_id
+    # lookup rather than silently staying on the submitter tenant, preserving
+    # the declared priority order.
     resolve_tenant_id = tenant_id
+    clinic_tenant_resolved = False
     if clinic_tenant_id:
         try:
-            resolve_tenant_id = UUID(clinic_tenant_id)
-            logger.info(
-                "Rating analysis using explicit clinic_tenant_id event_id=%s clinic_tenant=%s",
-                event_id,
-                resolve_tenant_id,
-            )
+            candidate = UUID(clinic_tenant_id)
         except ValueError:
-            pass
-    elif message_id:
+            candidate = None
+        if candidate is not None:
+            try:
+                async with get_db_session() as db:
+                    exists = (
+                        await db.execute(
+                            select(Tenant.id).where(Tenant.id == candidate)
+                        )
+                    ).scalar_one_or_none()
+                if exists is not None:
+                    resolve_tenant_id = candidate
+                    clinic_tenant_resolved = True
+                    logger.info(
+                        "Rating analysis using explicit clinic_tenant_id event_id=%s clinic_tenant=%s",
+                        event_id,
+                        resolve_tenant_id,
+                    )
+                else:
+                    logger.info(
+                        "Rating analysis clinic_tenant_id not found in tenants, falling back event_id=%s clinic_tenant=%s",
+                        event_id,
+                        candidate,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Rating analysis clinic_tenant_id lookup failed event_id=%s clinic_tenant=%s err=%s",
+                    event_id,
+                    candidate,
+                    exc,
+                )
+    if not clinic_tenant_resolved and message_id:
         try:
             msg_uuid = UUID(message_id)
             async with get_db_session() as db:
@@ -401,13 +344,42 @@ async def submit_rating(
 ):
     """Persist a rating (1-5) for an agent response.
 
-    For ratings <= 2 with a reason, a background LLM analysis is triggered
-    to evaluate whether the user critique is legitimate. Status is tracked
-    via `ai_analysis_status` (pending/done/failed).
+    For ratings 1-3 that ship with a substantive written critique
+    (reason of at least 8 characters after trimming), a background LLM
+    analysis is triggered to evaluate whether the critique is justified
+    given the assigned rating. Status is tracked via `ai_analysis_status`
+    (pending/done/failed).
     """
     event_id = uuid4()
     reason = (body.reason or "").strip() or None
-    triggers_analysis = body.rating <= 2 and bool(reason)
+    # Analysis threshold: rating 1-3 AND a written critique with substance
+    # (>=8 chars). Kept as a well-named local so subsequent groups can lift it
+    # into a shared helper when the aggregation site (list_ratings) needs the
+    # same predicate.
+    has_reason = len((reason or "").strip()) >= 8
+    triggers_analysis = body.rating <= 3 and has_reason
+
+    # subject_tenant_id records WHICH clinic the rating is *about*, so that
+    # per-clinic filtering on the audit report (Group 4) actually resolves to
+    # a real tenant. It is separate from Event.tenant_id (the rater's own
+    # tenant, i.e. the record owner). We only trust body.clinic_tenant_id when
+    # it (a) parses as a UUID AND (b) matches a real Tenant row — clinic_admin
+    # callers can send a business slug from ClinicConfigTable, and a syntactic
+    # UUID that doesn't exist in Tenant would also mislead the report. Any
+    # failure falls back to the rater's own tenant so the field is never null
+    # nor a dangling reference.
+    subject_tenant_id: UUID = tenant.tenant_id
+    if body.clinic_tenant_id:
+        try:
+            candidate = UUID(body.clinic_tenant_id)
+        except (ValueError, AttributeError):
+            candidate = None
+        if candidate is not None:
+            exists = await session.execute(
+                select(Tenant.id).where(Tenant.id == candidate)
+            )
+            if exists.scalar_one_or_none() is not None:
+                subject_tenant_id = candidate
 
     event_data: dict[str, Any] = {
         "message_id": body.message_id,
@@ -417,6 +389,7 @@ async def submit_rating(
         "user_message": body.user_message,
         "submitted_by": str(tenant.user_id) if tenant.user_id else None,
         "role": tenant.role,
+        "subject_tenant_id": str(subject_tenant_id),
     }
     if triggers_analysis:
         event_data["ai_analysis_status"] = "pending"
@@ -464,11 +437,37 @@ async def submit_rating(
     return RatingResponse(event_id=str(event_id))
 
 
-def _serialize_rating_event(event: Event) -> dict[str, Any]:
+def _serialize_rating_event(
+    event: Event,
+    tenant_map: Optional[dict[UUID, tuple[str, Optional[UUID], Optional[str]]]] = None,
+) -> dict[str, Any]:
     data = event.event_data or {}
     # Mask carteirinha PII on the training-lake export surface: rating
     # rows flagged as approved_for_training feed the SLM fine-tuning
     # dataset, so the raw number must never leave the event store here.
+    #
+    # subject_tenant_id records the clinic the rating is *about* (see Group 3);
+    # older rows lack it, so fall back to Event.tenant_id (the record owner)
+    # for display and filtering — this is what keeps pre-Group-3 ratings from
+    # silently vanishing from the report.
+    subject_raw = data.get("subject_tenant_id")
+    subject_uuid: Optional[UUID] = None
+    if subject_raw is not None:
+        try:
+            subject_uuid = UUID(str(subject_raw))
+        except (ValueError, AttributeError):
+            subject_uuid = None
+    if subject_uuid is None:
+        subject_uuid = event.tenant_id
+
+    subject_clinic_name: Optional[str] = None
+    builder_name: Optional[str] = None
+    if tenant_map is not None:
+        entry = tenant_map.get(subject_uuid)
+        if entry is not None:
+            subject_clinic_name = entry[0]
+            builder_name = entry[2]
+
     return {
         "id": str(event.id),
         "ts": event.created_at.isoformat() if event.created_at else "",
@@ -482,6 +481,9 @@ def _serialize_rating_event(event: Event) -> dict[str, Any]:
         "ai_analysis_status": data.get("ai_analysis_status"),
         "approved_for_training": bool(data.get("approved_for_training", False)),
         "ignored": bool(data.get("ignored", False)),
+        "subject_tenant_id": str(subject_uuid),
+        "subject_clinic_name": subject_clinic_name,
+        "builder_name": builder_name,
     }
 
 
@@ -489,38 +491,221 @@ def _serialize_rating_event(event: Event) -> dict[str, Any]:
 async def list_ratings(
     builder_id: Optional[UUID] = Query(None),
     tenant_id: Optional[UUID] = Query(None),
+    start_date: Optional[datetime] = Query(
+        default=None, description="Start of period (ISO 8601)"
+    ),
+    end_date: Optional[datetime] = Query(
+        default=None, description="End of period (ISO 8601)"
+    ),
+    only_accepted: bool = Query(False),
+    only_with_reason: bool = Query(False),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
-) -> list[dict[str, Any]]:
-    """List rating events. Super admin may filter by builder_id / tenant_id.
+) -> dict[str, Any]:
+    """Return the rating audit report as `{ summary, facets, entries }`.
 
-    For non-super-admin callers, `builder_id` and `tenant_id` are ignored
-    silently: results are always scoped to the caller's own tenant.
+    The response shape (and the handler's fixed execution order) is what makes
+    the report honest: KPIs are computed server-side over the filtered cut,
+    facets are derived from the data actually seen (not from the /admin/*
+    cadastres, which omit the tenants where simulator ratings land), and
+    filtering matches the *subject* of the rating (`subject_tenant_id`) rather
+    than the record owner (`Event.tenant_id`).
+
+    Execution order (contract — see wish Group 4):
+
+    1. SQL filters: `event_type`, tenant isolation for non-super-admin, and
+       the date window. Only real columns — never `event_data` — so the query
+       runs on SQLite (test suite) and Postgres (prod) identically.
+    2. Python loads the full ordered result set and resolves a batched map
+       `tenant_id -> (name, builder_id, builder_name)` for the distinct
+       subject tenants seen (2 queries total, never N+1).
+    3. Facets are computed BEFORE any builder/clinic narrowing, so selecting
+       a builder in the panel does not shrink its own dropdown.
+    4. Builder/clinic narrowing matches `subject_tenant_id` with a fallback to
+       `Event.tenant_id` for rows that predate Group 3.
+    5. Summary is computed over the result of step 4.
+    6. `only_accepted` and `only_with_reason` filter entries only — they do
+       not change the summary or facets.
+    7. `limit`/`offset` slice AFTER step 6 so pagination never returns
+       incomplete pages silently.
     """
     is_super = tenant.role == "super_admin"
 
+    # -- Step 1: SQL filters on real columns only --------------------------
     stmt = select(Event).where(Event.event_type == "rlhf.rating")
 
-    if is_super:
-        if tenant_id is not None:
-            stmt = stmt.where(Event.tenant_id == tenant_id)
-        elif builder_id is not None:
-            # Join through tenants to filter by builder
-            stmt = stmt.join(Tenant, Tenant.id == Event.tenant_id).where(
-                Tenant.builder_id == builder_id
-            )
-        # else: return all tenants
-    else:
-        # Non-super-admin: ignore filters silently, scope to own tenant
+    if not is_super:
+        # Tenant isolation: non-super-admins can only see rows THEY own.
+        # For super_admin, tenant/builder filtering happens in step 4 against
+        # subject_tenant_id — a SQL clause on Event.tenant_id here would AND
+        # owner-match with subject-match and return zero rows in the main
+        # case (a builder rating a clinic's agent).
         stmt = stmt.where(Event.tenant_id == tenant.tenant_id)
 
-    stmt = stmt.order_by(Event.created_at.desc()).limit(limit).offset(offset)
-    result = await session.execute(stmt)
-    events = result.scalars().all()
+    # Date window: reuse the exact convention from
+    # `src/services/trace_service.py:_apply_filters` — end_date at midnight
+    # widens to 23:59:59 so the final day isn't dropped (the panel's default
+    # end_date is "today"), and both ends pass through `_to_utc` which treats
+    # naive datetimes as BRT (UTC-3). Event.created_at is DateTime(timezone=
+    # True), so comparing naive against tz-aware passes on SQLite (test) but
+    # shifts 3 hours on Postgres (prod).
+    if start_date is not None:
+        stmt = stmt.where(Event.created_at >= _to_utc(start_date))
+    if end_date is not None:
+        if end_date.hour == 0 and end_date.minute == 0 and end_date.second == 0:
+            end_date = end_date.replace(hour=23, minute=59, second=59)
+        stmt = stmt.where(Event.created_at <= _to_utc(end_date))
 
-    return [_serialize_rating_event(e) for e in events]
+    stmt = stmt.order_by(Event.created_at.desc())
+    result = await session.execute(stmt)
+    events = list(result.scalars().all())
+
+    # -- Step 2: batched resolution of subject tenants ---------------------
+    # subject_tenant_id lives in event_data (see Group 3). Read it in Python
+    # to keep the query dialect-agnostic (JSON operators are Postgres-only).
+    # Fall back to Event.tenant_id for pre-Group-3 rows so they still show up
+    # named in the report instead of vanishing.
+    def _subject_of(event: Event) -> UUID:
+        data = event.event_data or {}
+        raw = data.get("subject_tenant_id")
+        if raw:
+            try:
+                return UUID(str(raw))
+            except (ValueError, AttributeError):
+                pass
+        return event.tenant_id
+
+    subject_ids: set[UUID] = {_subject_of(e) for e in events}
+    tenant_map: dict[UUID, tuple[str, Optional[UUID], Optional[str]]] = {}
+    builder_name_map: dict[UUID, str] = {}
+    if subject_ids:
+        tenants_result = await session.execute(
+            select(Tenant.id, Tenant.name, Tenant.builder_id).where(
+                Tenant.id.in_(subject_ids)
+            )
+        )
+        rows = tenants_result.all()
+        builder_ids: set[UUID] = {
+            row.builder_id for row in rows if row.builder_id is not None
+        }
+        if builder_ids:
+            builders_result = await session.execute(
+                select(Builder.id, Builder.name).where(Builder.id.in_(builder_ids))
+            )
+            builder_name_map = {b.id: b.name for b in builders_result.all()}
+        for row in rows:
+            b_name = (
+                builder_name_map.get(row.builder_id)
+                if row.builder_id is not None
+                else None
+            )
+            tenant_map[row.id] = (row.name, row.builder_id, b_name)
+
+    # -- Step 3: facets computed BEFORE builder/clinic narrowing -----------
+    # Distinct builders and clinics seen among the subjects of this cut.
+    # Clinics carry `builder_id` so the panel can narrow the clinic dropdown
+    # client-side without a second HTTP round-trip.
+    facet_clinics: dict[UUID, dict[str, Any]] = {}
+    facet_builders: dict[UUID, dict[str, Any]] = {}
+    for sid in subject_ids:
+        entry = tenant_map.get(sid)
+        if entry is not None:
+            clinic_name, clinic_builder_id, clinic_builder_name = entry
+        else:
+            # Subject tenant not found in the Tenant table (e.g. deleted).
+            # Emit a stable placeholder so the row still faces up.
+            clinic_name = str(sid)
+            clinic_builder_id = None
+            clinic_builder_name = None
+        facet_clinics[sid] = {
+            "id": str(sid),
+            "name": clinic_name,
+            "builder_id": str(clinic_builder_id) if clinic_builder_id else None,
+        }
+        if clinic_builder_id is not None and clinic_builder_id not in facet_builders:
+            facet_builders[clinic_builder_id] = {
+                "id": str(clinic_builder_id),
+                "name": clinic_builder_name or str(clinic_builder_id),
+            }
+
+    facets = {
+        "builders": sorted(
+            facet_builders.values(), key=lambda b: (b["name"] or "").lower()
+        ),
+        "clinics": sorted(
+            facet_clinics.values(), key=lambda c: (c["name"] or "").lower()
+        ),
+    }
+
+    # -- Step 4: apply builder/clinic narrowing against subject_tenant_id --
+    def _matches_narrowing(event: Event) -> bool:
+        sid = _subject_of(event)
+        if tenant_id is not None and sid != tenant_id:
+            return False
+        if builder_id is not None:
+            entry = tenant_map.get(sid)
+            row_builder_id = entry[1] if entry is not None else None
+            if row_builder_id != builder_id:
+                return False
+        return True
+
+    if not is_super:
+        # Non-super-admin: `tenant_id` / `builder_id` query params were also
+        # ignored in the pre-Group-4 handler; keep that contract (their
+        # tenant-isolation clause in step 1 already scopes the row set).
+        cut = list(events)
+    else:
+        cut = [e for e in events if _matches_narrowing(e)]
+
+    # -- Step 5: summary over the cut (before only_* toggles) --------------
+    def _has_reason(event: Event) -> bool:
+        data = event.event_data or {}
+        reason = data.get("reason")
+        return len((reason or "").strip()) >= 8
+
+    def _is_accepted(event: Event) -> bool:
+        data = event.event_data or {}
+        return bool(data.get("approved_for_training", False))
+
+    distribution: dict[str, int] = {str(i): 0 for i in range(1, 6)}
+    total = 0
+    rating_sum = 0
+    accepted_count = 0
+    for event in cut:
+        data = event.event_data or {}
+        try:
+            rating_value = int(data.get("rating", 0))
+        except (TypeError, ValueError):
+            rating_value = 0
+        if 1 <= rating_value <= 5:
+            distribution[str(rating_value)] += 1
+            total += 1
+            rating_sum += rating_value
+        if _is_accepted(event):
+            accepted_count += 1
+
+    average = round(rating_sum / total, 1) if total > 0 else 0.0
+    summary = {
+        "total": total,
+        "average": average,
+        "accepted_count": accepted_count,
+        "distribution": distribution,
+    }
+
+    # -- Step 6: only_accepted / only_with_reason (entries only) -----------
+    filtered = cut
+    if only_accepted:
+        filtered = [e for e in filtered if _is_accepted(e)]
+    if only_with_reason:
+        filtered = [e for e in filtered if _has_reason(e)]
+
+    # -- Step 7: paginate AFTER filtering ----------------------------------
+    page = filtered[offset : offset + limit]
+    entries = [_serialize_rating_event(e, tenant_map=tenant_map) for e in page]
+
+    return {"summary": summary, "facets": facets, "entries": entries}
 
 
 @router.patch("/ratings/{event_id}")

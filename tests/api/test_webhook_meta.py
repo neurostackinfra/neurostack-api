@@ -213,6 +213,28 @@ def tenant_id() -> UUID:
     return uuid4()
 
 
+@pytest.fixture(autouse=True)
+def _clear_webhook_process_state():
+    """Reset the per-process webhook stores between tests.
+
+    This module has no other autouse fixture: replay state is cleared by
+    ``setup_method`` in three classes only, so anything stored by a class
+    without one leaks forward. The 6h reroute-notice window is process state
+    of exactly that kind — without this fixture the first test to trigger the
+    fallback chain sends, and every later one asserts zero sends.
+    """
+    from src.api.routes.webhook import (
+        _INMEM_INCOMING,
+        _INMEM_SENT,
+        _INMEM_STT_NOTICE,
+    )
+
+    _INMEM_INCOMING.clear()
+    _INMEM_SENT.clear()
+    _INMEM_STT_NOTICE.clear()
+    yield
+
+
 # ============================================
 # GET /v1/webhook/meta — handshake
 # ============================================
@@ -855,7 +877,7 @@ class TestMetaWebhookAudioFlow:
                 new=AsyncMock(return_value=fake_audio_bytes),
             ) as mock_download,
             patch(
-                "src.api.routes.webhook._meta_transcribe_audio",
+                "src.api.routes.webhook._stt_transcribe_audio",
                 new=AsyncMock(return_value="Quero remarcar minha consulta"),
             ) as mock_transcribe,
             patch(
@@ -936,7 +958,7 @@ class TestMetaWebhookAudioFlow:
                 new=AsyncMock(),
             ) as mock_download,
             patch(
-                "src.api.routes.webhook._meta_transcribe_audio",
+                "src.api.routes.webhook._stt_transcribe_audio",
                 new=AsyncMock(),
             ) as mock_transcribe,
             patch(
@@ -1027,7 +1049,12 @@ class TestMetaWebhookAudioFlow:
         caplog: pytest.LogCaptureFixture,
     ):
         """Transcription errors are logged via ``logger.exception`` (ERROR + stack)
-        matching the send-failure log parity requirement."""
+        matching the send-failure log parity requirement.
+
+        The clinic has STT and no multimodal, so the chain runs out of rungs
+        and reroutes to text — the log parity requirement is unchanged by
+        that: the STT failure still has to surface with a stack trace.
+        """
         phone_id = f"pn_{uuid4().hex[:8]}"
         _seed_meta_credentials_with_whisper(client, tenant_id, phone_id)
 
@@ -1055,8 +1082,12 @@ class TestMetaWebhookAudioFlow:
                 new=AsyncMock(return_value=b"OggS\x00\x02" + b"\x00" * 100),
             ),
             patch(
-                "src.api.routes.webhook._meta_transcribe_audio",
+                "src.api.routes.webhook._stt_transcribe_audio",
                 new=AsyncMock(side_effect=RuntimeError("groq 503")),
+            ),
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
             ),
             patch(
                 "src.api.routes.webhook.get_event_service",
@@ -1071,7 +1102,11 @@ class TestMetaWebhookAudioFlow:
                 resp = _post_meta(client, payload)
 
         assert resp.status_code == 200
-        assert resp.json() == {"ok": True, "skipped": "transcription_failed"}
+        assert resp.json() == {
+            "ok": True,
+            "replied": True,
+            "action": "stt_fallback",
+        }
 
         error_records = [r for r in caplog.records if r.levelname == "ERROR"]
         assert error_records, "expected an ERROR log for transcription failure"
@@ -1858,3 +1893,573 @@ class TestMetaWebhookRateLimit:
         assert resp.headers["Retry-After"] == str(body["retry_after"])
         assert service.process_event.await_count == 0
         assert mock_send.await_count == 0
+
+
+# ============================================
+# STT fallback chain (fallback-texto, Group 3)
+# ============================================
+#
+# Same chain helper as Z-API, so the assertions here are about the *Meta*
+# half of the parity: the delivered message and its cause, plus the fact
+# that the reroute is the complete effect (no handoff, no session mutation).
+
+
+def _seed_meta_audio_tenant(
+    client: TestClient,
+    tenant_id: UUID,
+    phone_number_id: str,
+    *,
+    stt: bool = False,
+    stt_provider: str | None = None,
+    multimodal: bool = False,
+    multimodal_provider: str = "openrouter",
+    audio_max_seconds: int | None = None,
+) -> None:
+    """Seed a real Meta credential row for the audio path.
+
+    No credential loader is mocked anywhere in this class: the row is the
+    only source of truth, exactly as in production. ``stt_provider`` always
+    travels with a fresh key because the endpoint refuses a provider change
+    that reuses the previous secret.
+    """
+    payload: dict = {
+        "whatsapp_provider": "meta_cloud",
+        "meta_phone_number_id": phone_number_id,
+        "meta_waba_id": f"waba_{uuid4().hex[:8]}",
+        "meta_permanent_token": f"EAAG_test_token_{uuid4().hex}",
+        "meta_verify_token": f"verify_{uuid4().hex}",
+        "meta_app_secret": META_APP_SECRET,
+    }
+    if stt or stt_provider is not None:
+        payload.update(
+            {
+                "stt_provider": stt_provider or "outros",
+                "stt_api_key": f"sk-fake-stt-{uuid4().hex}",
+                "stt_api_url": "https://api.groq.com/openai/v1",
+                "stt_model_name": "whisper-large-v3-turbo",
+            }
+        )
+    if multimodal:
+        payload.update(
+            {
+                "multimodal_provider": multimodal_provider,
+                "multimodal_api_url": "https://openrouter.ai/api/v1",
+                "multimodal_api_key": f"sk-fake-mm-{uuid4().hex}",
+                "multimodal_model_name": "google/gemini-2.5-flash",
+            }
+        )
+    if audio_max_seconds is not None:
+        payload["audio_max_seconds"] = audio_max_seconds
+
+    resp = client.patch(
+        API_CRED_PATH,
+        json=payload,
+        headers=_admin_headers(tenant_id),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def _meta_set_agent_language(
+    client: TestClient,
+    tenant_id: UUID,
+    language: str,
+) -> None:
+    """Write ``business_rules.agent_language`` straight onto the config row.
+
+    No API endpoint exposes this field, so the row is edited directly and the
+    projection cache invalidated — the webhook still reads it through the
+    real ``_load_clinic_config``.
+    """
+    from sqlalchemy import select
+
+    from src.models.clinic_config_table import ClinicConfigTable
+    from src.repositories.database import get_db_session
+    from src.services.event_service import invalidate_clinic_config_cache
+
+    async def _run() -> None:
+        db = get_db_session()
+        try:
+            row = (
+                await db.execute(
+                    select(ClinicConfigTable).where(
+                        ClinicConfigTable.tenant_id == tenant_id
+                    )
+                )
+            ).scalar_one()
+            rules = dict(row.business_rules or {})
+            rules["agent_language"] = language
+            row.business_rules = rules
+            await db.commit()
+        finally:
+            await db.close()
+        await invalidate_clinic_config_cache(tenant_id)
+
+    client._submit(_run())  # type: ignore[attr-defined]
+
+
+_META_MEDIA_INFO = {
+    "url": "https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=chain",
+    "mime_type": "audio/ogg; codecs=opus",
+    "file_size": 5 * 16000,
+}
+_META_AUDIO_BYTES = b"OggS_fake_meta_audio"
+
+
+class _NoReplyResponse:
+    """Pipeline result shaped so the webhook replies nothing."""
+
+    prompt = None
+    handoff_summary = None
+    decision = SimpleNamespace(handoff_required=False)
+
+
+class TestMetaSttFallbackChain:
+    def test_stt_failure_without_multimodal_reroutes_and_does_not_hand_off(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Decision 5 on Meta: the reroute is the whole effect."""
+        from src.api.routes.webhook import _STT_TEMPORARY_FAILURE_MSG_PT
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_audio_tenant(client, tenant_id, phone_id, stt=True)
+
+        payload = _meta_audio_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900003333",
+            media_id=f"media_{uuid4().hex[:12]}",
+            message_id=f"wamid.chain_{uuid4().hex[:10]}",
+        )
+
+        send_mock = AsyncMock(return_value=_fake_meta_send_result())
+        handoff_mock = AsyncMock()
+        mm_mock = AsyncMock()
+
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(return_value=dict(_META_MEDIA_INFO)),
+            ),
+            patch(
+                "src.api.routes.webhook.download_meta_media_audio",
+                new=AsyncMock(return_value=_META_AUDIO_BYTES),
+            ),
+            patch(
+                "src.services.groq_service.transcribe_audio",
+                new=AsyncMock(side_effect=RuntimeError("stt 503")),
+            ),
+            patch(
+                "src.services.multimodal_service.transcribe_audio_multimodal", mm_mock
+            ),
+            patch("src.api.routes.webhook.send_meta_cloud_text", send_mock),
+            patch("src.api.routes.webhook._meta_initiate_file_handoff", handoff_mock),
+        ):
+            resp = _post_meta(client, payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "stt_fallback"}
+        assert send_mock.await_count == 1
+        assert send_mock.await_args.args[3] == _STT_TEMPORARY_FAILURE_MSG_PT
+        # The patient is being asked to type, not escalated
+        handoff_mock.assert_not_called()
+        mm_mock.assert_not_called()
+
+    def test_no_capability_reroutes_with_never_configured_copy(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Decision 6: nothing was ever configured, so say so honestly."""
+        from src.api.routes.webhook import (
+            _STT_NEVER_CONFIGURED_MSG_PT,
+            _STT_TEMPORARY_FAILURE_MSG_PT,
+        )
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_audio_tenant(client, tenant_id, phone_id)
+
+        payload = _meta_audio_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900004444",
+            media_id=f"media_{uuid4().hex[:12]}",
+            message_id=f"wamid.chain_{uuid4().hex[:10]}",
+        )
+
+        send_mock = AsyncMock(return_value=_fake_meta_send_result())
+        handoff_mock = AsyncMock()
+
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(return_value=dict(_META_MEDIA_INFO)),
+            ),
+            patch(
+                "src.api.routes.webhook.download_meta_media_audio",
+                new=AsyncMock(return_value=_META_AUDIO_BYTES),
+            ),
+            patch("src.api.routes.webhook.send_meta_cloud_text", send_mock),
+            patch("src.api.routes.webhook._meta_initiate_file_handoff", handoff_mock),
+        ):
+            resp = _post_meta(client, payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "stt_fallback"}
+        assert send_mock.await_args.args[3] == _STT_NEVER_CONFIGURED_MSG_PT
+        assert send_mock.await_args.args[3] != _STT_TEMPORARY_FAILURE_MSG_PT
+        handoff_mock.assert_not_called()
+
+    def test_empty_transcript_enters_the_chain_not_no_whisper_key(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """The old ``or ""`` collapsed this into ``no_whisper_key`` silence."""
+        from src.api.routes.webhook import _STT_TEMPORARY_FAILURE_MSG_PT
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_audio_tenant(client, tenant_id, phone_id, stt=True)
+
+        payload = _meta_audio_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900005555",
+            media_id=f"media_{uuid4().hex[:12]}",
+            message_id=f"wamid.chain_{uuid4().hex[:10]}",
+        )
+
+        send_mock = AsyncMock(return_value=_fake_meta_send_result())
+
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(return_value=dict(_META_MEDIA_INFO)),
+            ),
+            patch(
+                "src.api.routes.webhook.download_meta_media_audio",
+                new=AsyncMock(return_value=_META_AUDIO_BYTES),
+            ),
+            patch(
+                "src.services.groq_service.transcribe_audio",
+                new=AsyncMock(return_value="  "),
+            ),
+            patch("src.api.routes.webhook.send_meta_cloud_text", send_mock),
+        ):
+            resp = _post_meta(client, payload)
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body == {"ok": True, "replied": True, "action": "stt_fallback"}
+        assert body.get("skipped") != "no_whisper_key"
+        assert send_mock.await_args.args[3] == _STT_TEMPORARY_FAILURE_MSG_PT
+
+    def test_multimodal_only_transcribes_and_proceeds(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """No STT key at all, operational multimodal — the audio is read."""
+        from src.services.event_service import EventService
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_audio_tenant(client, tenant_id, phone_id, multimodal=True)
+
+        payload = _meta_audio_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900006666",
+            media_id=f"media_{uuid4().hex[:12]}",
+            message_id=f"wamid.chain_{uuid4().hex[:10]}",
+        )
+
+        stt_mock = AsyncMock()
+        send_mock = AsyncMock(return_value=_fake_meta_send_result())
+        captured: dict = {}
+
+        async def _capture(self, event_request, session=None):
+            captured["content"] = event_request.payload.content
+            return _NoReplyResponse()
+
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(return_value=dict(_META_MEDIA_INFO)),
+            ),
+            patch(
+                "src.api.routes.webhook.download_meta_media_audio",
+                new=AsyncMock(return_value=_META_AUDIO_BYTES),
+            ),
+            patch("src.services.groq_service.transcribe_audio", stt_mock),
+            patch(
+                "src.services.multimodal_service.transcribe_audio_multimodal",
+                new=AsyncMock(return_value="preciso remarcar"),
+            ),
+            patch("src.api.routes.webhook.send_meta_cloud_text", send_mock),
+            patch.object(EventService, "process_event", _capture),
+        ):
+            resp = _post_meta(client, payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json().get("action") != "stt_fallback", resp.json()
+        stt_mock.assert_not_called()
+        assert captured["content"] == "preciso remarcar"
+        send_mock.assert_not_called()
+
+    def test_long_audio_without_capability_still_hands_off(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Duration outranks capability on Meta too — handoff, not "please type"."""
+        from src.api.routes.webhook import (
+            _AUDIO_TOO_LONG_MSG_PT,
+            _STT_NEVER_CONFIGURED_MSG_PT,
+        )
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_audio_tenant(client, tenant_id, phone_id, audio_max_seconds=60)
+
+        payload = _meta_audio_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900007777",
+            media_id=f"media_{uuid4().hex[:12]}",
+            message_id=f"wamid.chain_{uuid4().hex[:10]}",
+        )
+
+        long_media = dict(_META_MEDIA_INFO)
+        long_media["file_size"] = 300 * 16000
+
+        send_mock = AsyncMock(return_value=_fake_meta_send_result())
+        handoff_mock = AsyncMock()
+        download_mock = AsyncMock()
+
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(return_value=long_media),
+            ),
+            patch("src.api.routes.webhook.download_meta_media_audio", download_mock),
+            patch("src.api.routes.webhook.send_meta_cloud_text", send_mock),
+            patch("src.api.routes.webhook._meta_initiate_file_handoff", handoff_mock),
+        ):
+            resp = _post_meta(client, payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "skipped": "audio_too_long"}
+        assert send_mock.await_args.args[3] == _AUDIO_TOO_LONG_MSG_PT
+        assert send_mock.await_args.args[3] != _STT_NEVER_CONFIGURED_MSG_PT
+        assert handoff_mock.await_count == 1
+        download_mock.assert_not_called()
+
+    def test_english_clinic_gets_english_copy(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        from src.api.routes.webhook import (
+            _STT_NEVER_CONFIGURED_MSG_EN,
+            _STT_NEVER_CONFIGURED_MSG_PT,
+        )
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_audio_tenant(client, tenant_id, phone_id)
+        _meta_set_agent_language(client, tenant_id, "en")
+
+        payload = _meta_audio_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900008888",
+            media_id=f"media_{uuid4().hex[:12]}",
+            message_id=f"wamid.chain_{uuid4().hex[:10]}",
+        )
+
+        send_mock = AsyncMock(return_value=_fake_meta_send_result())
+
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(return_value=dict(_META_MEDIA_INFO)),
+            ),
+            patch(
+                "src.api.routes.webhook.download_meta_media_audio",
+                new=AsyncMock(return_value=_META_AUDIO_BYTES),
+            ),
+            patch("src.api.routes.webhook.send_meta_cloud_text", send_mock),
+        ):
+            resp = _post_meta(client, payload)
+
+        assert resp.status_code == 200, resp.text
+        assert send_mock.await_args.args[3] == _STT_NEVER_CONFIGURED_MSG_EN
+        assert send_mock.await_args.args[3] != _STT_NEVER_CONFIGURED_MSG_PT
+
+    def test_five_consecutive_audios_send_exactly_one_notice(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Decision 12 on Meta, keyed by the patient's phone."""
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_audio_tenant(client, tenant_id, phone_id)
+
+        send_mock = AsyncMock(return_value=_fake_meta_send_result())
+        actions: list[str] = []
+
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(return_value=dict(_META_MEDIA_INFO)),
+            ),
+            patch(
+                "src.api.routes.webhook.download_meta_media_audio",
+                new=AsyncMock(return_value=_META_AUDIO_BYTES),
+            ),
+            patch("src.api.routes.webhook.send_meta_cloud_text", send_mock),
+        ):
+            for _ in range(5):
+                resp = _post_meta(
+                    client,
+                    _meta_audio_payload(
+                        phone_number_id=phone_id,
+                        from_phone="5511900009999",
+                        media_id=f"media_{uuid4().hex[:12]}",
+                        message_id=f"wamid.chain_{uuid4().hex[:10]}",
+                    ),
+                )
+                assert resp.status_code == 200, resp.text
+                actions.append(resp.json().get("action"))
+
+        assert actions[0] == "stt_fallback"
+        assert actions[1:] == ["stt_fallback_suppressed"] * 4
+        assert send_mock.await_count == 1
+
+    def test_missing_phone_number_id_is_undeliverable_and_sends_nothing(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """The defensive branch: no send target, so no send and no claim.
+
+        This state is unreachable through the webhook — the Cloud API route
+        resolves the tenant *by* ``meta_phone_number_id``, so a row without
+        one never reaches the audio path. The helper is therefore called
+        directly rather than faking a credential row the loader would never
+        return.
+        """
+        from src.api.routes.webhook import (
+            _INMEM_STT_NOTICE,
+            _send_meta_stt_fallback,
+            _stt_fallback_notice_key,
+        )
+
+        send_mock = AsyncMock(return_value=_fake_meta_send_result())
+
+        with patch("src.api.routes.webhook.send_meta_cloud_text", send_mock):
+            result = client._submit(  # type: ignore[attr-defined]
+                _send_meta_stt_fallback(
+                    tenant_id=tenant_id,
+                    from_phone="5511900001010",
+                    meta_pnid="",
+                    meta_token=f"EAAG_test_token_{uuid4().hex}",
+                    agent_language="pt-BR",
+                    failure_reason="transcription_failed",
+                )
+            )
+
+        assert result == {
+            "ok": True,
+            "replied": False,
+            "action": "stt_fallback_undeliverable",
+        }
+        send_mock.assert_not_called()
+        # An undeliverable notice must not burn the 6h window
+        key = _stt_fallback_notice_key(tenant_id, "5511900001010")
+        assert key not in _INMEM_STT_NOTICE
+
+    @pytest.mark.parametrize(
+        "provider",
+        ["elevenlabs_scribe", "google_stt", "deepgram_stt", "microsoft_stt"],
+    )
+    def test_unsupported_provider_never_reroutes(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        provider: str,
+    ):
+        """Decision 10 carve-out: exit before resolve/download, send nothing."""
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_audio_tenant(
+            client,
+            tenant_id,
+            phone_id,
+            stt=True,
+            stt_provider=provider,
+            multimodal=True,
+        )
+
+        payload = _meta_audio_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900001111",
+            media_id=f"media_{uuid4().hex[:12]}",
+            message_id=f"wamid.chain_{uuid4().hex[:10]}",
+        )
+
+        resolve_mock = AsyncMock()
+        download_mock = AsyncMock()
+        send_mock = AsyncMock(return_value=_fake_meta_send_result())
+        handoff_mock = AsyncMock()
+
+        with (
+            patch("src.api.routes.webhook.resolve_meta_media", resolve_mock),
+            patch("src.api.routes.webhook.download_meta_media_audio", download_mock),
+            patch("src.api.routes.webhook.send_meta_cloud_text", send_mock),
+            patch("src.api.routes.webhook._meta_initiate_file_handoff", handoff_mock),
+        ):
+            resp = _post_meta(client, payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {
+            "ok": True,
+            "skipped": "stt_provider_unsupported",
+            "provider": provider,
+        }
+        resolve_mock.assert_not_called()
+        download_mock.assert_not_called()
+        send_mock.assert_not_called()
+        handoff_mock.assert_not_called()
+
+    def test_missing_permanent_token_keeps_the_no_credentials_envelope(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """The four media envelopes are frozen: this one exits before the chain."""
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        resp = client.patch(
+            API_CRED_PATH,
+            json={
+                "whatsapp_provider": "meta_cloud",
+                "meta_phone_number_id": phone_id,
+                "meta_app_secret": META_APP_SECRET,
+                "meta_verify_token": f"verify_{uuid4().hex}",
+            },
+            headers=_admin_headers(tenant_id),
+        )
+        assert resp.status_code == 200, resp.text
+
+        payload = _meta_audio_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900001212",
+            media_id=f"media_{uuid4().hex[:12]}",
+            message_id=f"wamid.chain_{uuid4().hex[:10]}",
+        )
+
+        resolve_mock = AsyncMock()
+        send_mock = AsyncMock(return_value=_fake_meta_send_result())
+
+        with (
+            patch("src.api.routes.webhook.resolve_meta_media", resolve_mock),
+            patch("src.api.routes.webhook.send_meta_cloud_text", send_mock),
+        ):
+            resp = _post_meta(client, payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "skipped": "no_credentials"}
+        resolve_mock.assert_not_called()
+        send_mock.assert_not_called()

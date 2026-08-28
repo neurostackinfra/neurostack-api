@@ -40,6 +40,7 @@ import {
   Shield, PhoneForwarded, Boxes,
   Copy, Check, KeyRound, AlertTriangle, CheckCircle2, XCircle, Link2,
   Cpu, MessageSquare, Lock, ChevronDown, ExternalLink, FileText, Mic2, Volume2,
+  AudioLines,
 } from "lucide-react";
 import { ProviderCredentialCard } from "@/components/api-settings/provider-credential-card";
 
@@ -213,12 +214,21 @@ interface CredentialStatus {
   stt_provider?:            string | null;
   stt_api_url?:             string | null;
   audio_max_seconds?:       number | null;
-  // TTS provider (configuration only; runtime adapters are not active yet)
+  // Multimodal transcription (chat model that accepts audio directly)
+  multimodal_provider?:     string | null;
+  multimodal_api_url?:      string | null;
+  multimodal_model_name?:   string | null;
+  multimodal_api_key_set?:  boolean;
+  multimodal_api_key_masked?: string | null;
+  multimodal_readiness?:    string;
+  // TTS provider (operational for agent replies)
   tts_provider?:            string | null;
   tts_api_url?:             string | null;
   tts_api_key_set?:         boolean;
   tts_api_key_masked?:      string | null;
   tts_model_name?:          string | null;
+  tts_voice_id?:            string | null;
+  tts_enabled?:             boolean | null;
   tts_readiness?:           string;
   apis_configured:          boolean;
 }
@@ -247,6 +257,7 @@ type SttProvider =
   | "microsoft_stt"
   | "outros";
 type TtsProvider = "elevenlabs" | "google";
+type MultimodalProvider = "openrouter" | "groq" | "openai";
 
 // Providers with operational runtime support today. Others are stored as
 // configuration only and surface a "Configuração apenas" badge in the UI.
@@ -254,6 +265,50 @@ export const OPERATIONAL_STT_PROVIDERS: ReadonlySet<SttProvider> = new Set([
   "outros",
   "openai_whisper",
 ]);
+
+// Mirror of `OPERATIONAL_MULTIMODAL_PROVIDERS` in
+// `src/services/api_credentials.py`. Only OpenRouter was measured against the
+// live API accepting the OGG/Opus WhatsApp delivers; the other two are stored
+// as configuration only, so only OpenRouter carries the "recommended" badge.
+export const OPERATIONAL_MULTIMODAL_PROVIDERS: ReadonlySet<MultimodalProvider> = new Set([
+  "openrouter",
+]);
+
+// Every canonical multimodal provider id declared in the backend allowlist
+// (`PROVIDER_ALLOWLISTS["multimodal"]` in `src/services/api_credentials.py`).
+export const MULTIMODAL_PROVIDERS: {
+  id: MultimodalProvider; label: string; sub: string; activeCls: string;
+}[] = [
+  { id: "openrouter", label: "OpenRouter", sub: "Gemini / GPT-4o audio", activeCls: "border-emerald-500/50 text-emerald-400 bg-emerald-500/10" },
+  { id: "groq",       label: "Groq",       sub: "LPU inference",         activeCls: "border-orange-500/50 text-orange-400 bg-orange-500/10"   },
+  { id: "openai",     label: "OpenAI",     sub: "GPT-4o audio",          activeCls: "border-slate-500/50 text-slate-300 bg-slate-500/10"     },
+];
+
+// The multimodal API URL is DERIVED from the provider, never typed. Egress is
+// pinned to exactly these three hosts (`MULTIMODAL_*_HOSTS` in
+// `src/services/safe_egress.py`), so a free-text field could only ever hold one
+// of these values — and any other value would be accepted by PATCH and then
+// fail at runtime with `unsafe_api_url`. Deriving it removes that trap.
+export const MULTIMODAL_PROVIDER_API_URL: Record<MultimodalProvider, string> = {
+  openrouter: "https://openrouter.ai/api/v1",
+  groq:       "https://api.groq.com/openai/v1",
+  openai:     "https://api.openai.com/v1",
+};
+
+// Capability labels for the backend's stable `fresh_api_key_required` error,
+// which names the capability but never a human-readable message.
+const CAPABILITY_LABELS: Record<string, { pt: string; en: string }> = {
+  llm:        { pt: "do LLM",                     en: "for the LLM"                     },
+  multimodal: { pt: "do provedor multimodal",     en: "for the multimodal provider"     },
+  stt:        { pt: "do provedor de transcrição", en: "for the transcription provider"  },
+  tts:        { pt: "do provedor de voz",         en: "for the voice provider"          },
+};
+
+const MULTIMODAL_PROVIDER_MODEL_PLACEHOLDER: Record<MultimodalProvider, string> = {
+  openrouter: "google/gemini-2.5-flash",
+  groq:       "whisper-large-v3",
+  openai:     "gpt-4o-audio-preview",
+};
 
 // Providers with a functional backend integration. Selecting any provider
 // outside this set still surfaces the credential form (per product design),
@@ -303,21 +358,21 @@ export const STT_PROVIDERS: { id: SttProvider; label: string; sub: string; activ
   { id: "outros",            label: "Outros",     sub: "Groq / OpenRouter", activeCls: "border-slate-500/50 text-slate-300 bg-slate-500/10"    },
 ];
 
-// TTS is intentionally configuration-only until each provider adapter is
-// validated end-to-end inside the voice application.
 export const TTS_PROVIDERS: { id: TtsProvider; label: string; sub: string; activeCls: string }[] = [
   { id: "elevenlabs", label: "ElevenLabs",      sub: "Voz natural e humana", activeCls: "border-violet-500/50 text-violet-400 bg-violet-500/10" },
   { id: "google",     label: "Google Cloud TTS", sub: "Escala e bom custo",   activeCls: "border-sky-500/50 text-sky-400 bg-sky-500/10"       },
 ];
 
-const TTS_PROVIDER_DEFAULTS: Record<TtsProvider, { apiUrl: string; modelName: string }> = {
+const TTS_PROVIDER_DEFAULTS: Record<TtsProvider, { apiUrl: string; modelName: string; voiceId: string }> = {
   elevenlabs: {
     apiUrl: "https://api.elevenlabs.io/v1",
     modelName: "eleven_multilingual_v2",
+    voiceId: "JBFqnCBsd6RMkjVDRZzb",
   },
   google: {
     apiUrl: "https://texttospeech.googleapis.com/v1",
     modelName: "pt-BR-Neural2-A",
+    voiceId: "",
   },
 };
 
@@ -519,11 +574,25 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   const [sttModelName, setSttModelName]     = useState("");
   const [audioMaxSeconds, setAudioMaxSeconds] = useState(60);
 
-  // TTS (configuration only; no synthesis request is made by this screen)
+  // Multimodal transcription. The API URL is derived from the provider and
+  // never edited, so there is no `multimodalApiUrl` state to keep in sync.
+  const [multimodalProvider, setMultimodalProvider] = useState<MultimodalProvider>("openrouter");
+  const [multimodalApiKey, setMultimodalApiKey]     = useState("");
+  const [multimodalModelName, setMultimodalModelName] = useState("");
+  const [multimodalDirty, setMultimodalDirty]      = useState(false);
+  // True once the user switched providers on an already-saved bundle: the
+  // backend then demands a fresh key (`fresh_api_key_required`), so the UI has
+  // to say so before the save is attempted.
+  const [multimodalNeedsFreshKey, setMultimodalNeedsFreshKey] = useState(false);
+
+  // TTS for agent replies. Disabled by default so saving credentials alone
+  // never changes the patient experience.
   const [ttsProvider, setTtsProvider]         = useState<TtsProvider>("elevenlabs");
   const [ttsApiKey, setTtsApiKey]             = useState("");
   const [ttsApiUrl, setTtsApiUrl]             = useState("");
   const [ttsModelName, setTtsModelName]       = useState("");
+  const [ttsVoiceId, setTtsVoiceId]           = useState("");
+  const [ttsEnabled, setTtsEnabled]           = useState(false);
   const [ttsDirty, setTtsDirty]               = useState(false);
 
   useEffect(() => {
@@ -588,6 +657,18 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       setSttApiUrl(data.stt_api_url || PROVIDER_DEFAULT_STT_URL[savedSttProvider] || "");
       setSttModelName(data.whisper_model ?? "");
       setAudioMaxSeconds(Number(data.audio_max_seconds) || 60);
+      // Multimodal — an unknown/absent provider falls back to the recommended
+      // one without implying a saved configuration (see `multimodalDirty`).
+      // The masked key is echoed back so the operator can see a key is stored;
+      // the mask is stripped from the PATCH body on save.
+      const hasSavedMultimodalProvider = MULTIMODAL_PROVIDERS.some(p => p.id === data.multimodal_provider);
+      setMultimodalProvider(hasSavedMultimodalProvider
+        ? data.multimodal_provider as MultimodalProvider
+        : "openrouter");
+      setMultimodalApiKey(data.multimodal_api_key_masked ?? "");
+      setMultimodalModelName(hasSavedMultimodalProvider ? (data.multimodal_model_name ?? "") : "");
+      setMultimodalDirty(false);
+      setMultimodalNeedsFreshKey(false);
       // TTS secrets never pre-fill. Unknown/retired provider ids fall back to
       // ElevenLabs without silently submitting a new TTS configuration.
       const hasSavedTtsProvider = TTS_PROVIDERS.some(p => p.id === data.tts_provider);
@@ -598,6 +679,8 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       setTtsApiKey("");
       setTtsApiUrl(hasSavedTtsProvider ? (data.tts_api_url ?? TTS_PROVIDER_DEFAULTS[savedTtsProvider].apiUrl) : "");
       setTtsModelName(hasSavedTtsProvider ? (data.tts_model_name ?? "") : "");
+      setTtsVoiceId(data.tts_voice_id ?? TTS_PROVIDER_DEFAULTS[savedTtsProvider].voiceId);
+      setTtsEnabled(data.tts_enabled === true);
       setTtsDirty(false);
     } catch { setError("Erro de rede."); }
     finally { setLoading(false); }
@@ -615,7 +698,10 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       // Clinic scope belongs exclusively to the query string. Sending
       // clinic_id in this strict credential payload is rejected as an extra
       // field by the backend.
-      const body: Record<string, string | number> = {};
+      // `null` is a meaningful value here, not an absence: `exclude_unset` on
+      // the backend keeps an explicit null in the patch, so it clears a stored
+      // field, whereas an omitted key preserves it.
+      const body: Record<string, string | number | boolean | null> = {};
       // WhatsApp provider selection — always send to persist the chosen provider
       body["whatsapp_provider"] = waProvider;
       if (waProvider === "zapi") {
@@ -664,22 +750,74 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       }
       // STT (audio transcription)
       body["stt_provider"]     = sttProvider;
-      body["whisper_model"]    = sttModelName;
+      // Canonical field, never the legacy `whisper_model` alias: the backend
+      // only clears the stale alias when the patch carries `stt_model_name`
+      // (`api_credentials.py:277-278`), so sending the alias here would let an
+      // old canonical value silently keep winning. `null`, not "", because the
+      // field is `Identifier` with min_length=1 and a brand-new clinic that
+      // never touched STT has this state empty — that empty string 422s on
+      // every save, including saves unrelated to STT.
+      body["stt_model_name"]   = sttModelName || null;
       body["audio_max_seconds"] = audioMaxSeconds;
       if (sttApiKey && !sttApiKey.includes("•") && !sttApiKey.includes("*"))
         body["whisper_api_key"] = sttApiKey;
       // Always send stt_api_url so the backend can clear a stale value.
-      // For google_stt: clear any previously saved endpoint (different API format).
-      body["stt_api_url"] = sttProvider !== "google_stt" ? sttApiUrl : "";
-      // TTS remains configuration-only. Submit it only after the user edits
-      // this capability, so an unrelated API save preserves the stored bundle
-      // without creating an implicit provider selection or rotating a key.
+      // `null`, not "", for the same min_length=1 reason as stt_model_name
+      // above — both the empty and the google_stt (no URL) case need `null`.
+      body["stt_api_url"] = sttProvider !== "google_stt" ? (sttApiUrl || null) : null;
+      // Multimodal transcription. Submitted only after the user edits this
+      // capability so an unrelated API save never creates an implicit provider
+      // selection. The URL is derived from the provider, never typed.
+      if (multimodalDirty) {
+        const freshMultimodalKey = multimodalApiKey
+          && !multimodalApiKey.includes("•")
+          && !multimodalApiKey.includes("*");
+        // Changing the provider changes the derived URL too, so the backend
+        // requires fresh key material (`fresh_api_key_required`). Say it here
+        // in plain language instead of letting the operator hit a 422.
+        if (multimodalNeedsFreshKey && !freshMultimodalKey) {
+          const msg = txt(
+            "Informe a API Key do novo provedor multimodal — trocar de provedor exige uma chave nova.",
+            "Enter the API key for the new multimodal provider — switching providers requires a new key.",
+          );
+          setError(msg);
+          toast({ title: txt("Erro ao salvar", "Could not save"), description: msg, variant: "destructive" });
+          return;
+        }
+        body["multimodal_provider"] = multimodalProvider;
+        body["multimodal_api_url"] = MULTIMODAL_PROVIDER_API_URL[multimodalProvider];
+        if (freshMultimodalKey) body["multimodal_api_key"] = multimodalApiKey;
+        // Always send the model name — like `stt_api_url` above — so the
+        // backend can clear a stale value. Switching provider resets this
+        // field to "", and omitting it would let the previous provider's model
+        // survive the merge, producing a bundle that looks `active` but fails
+        // on the first real voice note. `null` (never "") is what clears it:
+        // the field is `Identifier` with min_length=1, so "" would 422 while
+        // None merges through and drops readiness to an honest `incomplete`.
+        body["multimodal_model_name"] = multimodalModelName || null;
+      }
+      // Submit TTS only after an explicit edit so unrelated saves preserve the
+      // existing bundle. `tts_enabled` makes voice replies opt-in.
       if (ttsDirty) {
+        const hasTtsKey = Boolean(ttsApiKey) || Boolean(status?.tts_api_key_set);
+        const effectiveModel = ttsModelName || TTS_PROVIDER_DEFAULTS[ttsProvider].modelName;
+        const effectiveVoiceId = ttsVoiceId || TTS_PROVIDER_DEFAULTS[ttsProvider].voiceId;
+        if (ttsEnabled && (!hasTtsKey || !effectiveModel || (ttsProvider === "elevenlabs" && !effectiveVoiceId))) {
+          const msg = txt(
+            "Complete a API Key, o modelo e a voz antes de ativar respostas em áudio.",
+            "Complete the API key, model and voice before enabling audio replies.",
+          );
+          setError(msg);
+          toast({ title: txt("Erro ao salvar", "Could not save"), description: msg, variant: "destructive" });
+          return;
+        }
         body["tts_provider"] = ttsProvider;
         body["tts_api_url"] = ttsApiUrl || TTS_PROVIDER_DEFAULTS[ttsProvider].apiUrl;
         if (ttsApiKey && !ttsApiKey.includes("â€¢") && !ttsApiKey.includes("*"))
           body["tts_api_key"] = ttsApiKey;
-        body["tts_model_name"] = ttsModelName || TTS_PROVIDER_DEFAULTS[ttsProvider].modelName;
+        body["tts_model_name"] = effectiveModel;
+        body["tts_voice_id"] = ttsProvider === "elevenlabs" ? effectiveVoiceId : null;
+        body["tts_enabled"] = ttsEnabled;
       }
       const saveUrl = targetId
         ? `/v1/config/api-credentials?clinic_id=${targetId}`
@@ -696,7 +834,7 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         // FastAPI wraps HTTPException payloads under `detail` — this covers the
         // structured errors returned by the backend (provider_not_implemented,
         // meta_phone_number_id_conflict, etc.).
-        detail?: string | { error?: string; message?: string; provider?: string };
+        detail?: string | { error?: string; message?: string; provider?: string; capability?: string };
       };
       if (!res.ok) {
         let errMsg = data.error ?? "Erro ao salvar.";
@@ -709,6 +847,17 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
               ? (WA_PROVIDER_LABEL[detail.provider as WhatsappProvider] ?? detail.provider)
               : "esse provedor";
             errMsg = `${provLabel}: provedor ainda não implementado. Use Meta Cloud API, Z-API ou Evolution API.`;
+          } else if (detail.error === "fresh_api_key_required") {
+            // The backend refuses to carry a key across a provider/URL change.
+            // Translate the stable code so the operator never sees it raw.
+            const capability = CAPABILITY_LABELS[detail.capability ?? ""];
+            const capabilityLabel = capability
+              ? txt(capability.pt, capability.en)
+              : txt("desta integração", "of this integration");
+            errMsg = txt(
+              `Informe uma nova API Key ${capabilityLabel}: trocar de provedor ou de endpoint exige uma chave nova.`,
+              `Enter a new API key ${capabilityLabel}: switching provider or endpoint requires a new key.`,
+            );
           } else {
             errMsg = detail.message ?? detail.error ?? errMsg;
           }
@@ -1389,7 +1538,127 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         </div>
       </div>
 
-      {/* ── TTS - Text to Speech (configuration only) ── */}
+      {/* ── Multimodal transcription (chat model that accepts audio) ── */}
+      <div
+        className="space-y-4 rounded-lg border border-slate-700/50 bg-muted/20 p-4"
+        data-testid="multimodal-settings-section"
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <AudioLines className="h-3.5 w-3.5 text-accent" />
+          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            {txt("Transcrição Multimodal", "Multimodal Transcription")}
+          </p>
+          <span
+            data-testid="multimodal-recommended-badge"
+            className="ml-auto text-[9px] font-bold px-1.5 py-0.5 rounded border bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+          >
+            {txt("RECOMENDÁVEL", "RECOMMENDED")}
+          </span>
+        </div>
+
+        <p className="text-[11px] text-muted-foreground">
+          {txt(
+            "Modelo de chat que recebe o áudio direto do WhatsApp, sem transcrição separada. Usado como alternativa quando o STT falha.",
+            "Chat model that takes WhatsApp audio directly, with no separate transcription step. Used as a fallback when STT fails.",
+          )}
+        </p>
+
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2" data-testid="multimodal-provider-list">
+          {MULTIMODAL_PROVIDERS.map(p => {
+            const active     = multimodalProvider === p.id;
+            const configOnly = !OPERATIONAL_MULTIMODAL_PROVIDERS.has(p.id);
+            return (
+              <button
+                key={p.id}
+                type="button"
+                data-testid={`multimodal-provider-${p.id}`}
+                data-provider-id={p.id}
+                disabled={isReadOnly}
+                onClick={() => {
+                  if (multimodalProvider === p.id) return;
+                  setMultimodalProvider(p.id);
+                  // Different provider ⇒ different derived URL ⇒ the stored key
+                  // can no longer be reused. Clear it and demand a new one.
+                  setMultimodalApiKey("");
+                  setMultimodalModelName("");
+                  setMultimodalDirty(true);
+                  setMultimodalNeedsFreshKey(true);
+                }}
+                className={`relative flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2.5 text-left transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
+                  active
+                    ? p.activeCls
+                    : "border-border bg-background text-muted-foreground hover:border-slate-500"
+                }`}
+              >
+                <div className="flex w-full items-center justify-between gap-1">
+                  <span className="text-xs font-bold">{p.label}</span>
+                  {configOnly && (
+                    <span
+                      data-testid={`multimodal-config-only-${p.id}`}
+                      className="text-[9px] font-bold px-1 py-0.5 rounded border bg-slate-500/10 text-slate-400 border-slate-500/30"
+                    >
+                      {txt("Configuração apenas", "Config only")}
+                    </span>
+                  )}
+                </div>
+                <span className="text-[10px] opacity-70">{p.sub}</span>
+                {active && <span className="absolute top-2 right-2 h-1.5 w-1.5 rounded-full bg-current opacity-80" />}
+              </button>
+            );
+          })}
+        </div>
+
+        {multimodalNeedsFreshKey && (
+          <p
+            data-testid="multimodal-fresh-key-hint"
+            className="flex items-center gap-1.5 text-[11px] text-amber-400"
+          >
+            <AlertTriangle className="h-3 w-3 shrink-0" />
+            {txt(
+              "Trocar de provedor exige uma nova API Key.",
+              "Switching providers requires a new API key.",
+            )}
+          </p>
+        )}
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="sm:col-span-2 space-y-1">
+            <label className="text-xs font-medium text-muted-foreground" htmlFor="multimodal-api-url">
+              {txt("API URL (definida pelo provedor)", "API URL (set by the provider)")}
+            </label>
+            <input
+              id="multimodal-api-url"
+              data-testid="multimodal-api-url"
+              readOnly
+              value={MULTIMODAL_PROVIDER_API_URL[multimodalProvider]}
+              className="w-full rounded-md border border-border bg-muted/40 px-3 py-1.5 text-xs font-mono text-muted-foreground cursor-not-allowed focus:outline-none"
+            />
+          </div>
+          <ApiInput
+            label="API Key"
+            value={multimodalApiKey}
+            onChange={(value) => { setMultimodalApiKey(value); setMultimodalDirty(true); }}
+            type="password"
+            placeholder={status?.multimodal_api_key_set
+              ? "••••••••• (manter atual)"
+              : multimodalProvider === "openrouter" ? "sk-or-..."
+              : multimodalProvider === "groq" ? "gsk_..."
+              : "sk-..."}
+            disabled={isReadOnly}
+            configured={status?.multimodal_api_key_set}
+          />
+          <ApiInput
+            label={txt("Nome do Modelo", "Model Name")}
+            value={multimodalModelName}
+            onChange={(value) => { setMultimodalModelName(value); setMultimodalDirty(true); }}
+            placeholder={MULTIMODAL_PROVIDER_MODEL_PLACEHOLDER[multimodalProvider]}
+            disabled={isReadOnly}
+            mono
+          />
+        </div>
+      </div>
+
+      {/* ── TTS - Text to Speech ── */}
       <div
         className="space-y-4 rounded-lg border border-slate-700/50 bg-muted/20 p-4"
         data-testid="tts-settings-section"
@@ -1399,17 +1668,35 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
           <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
             TTS - Text to Speech
           </p>
-          <span className="ml-auto text-[9px] font-bold px-1.5 py-0.5 rounded border bg-slate-500/10 text-slate-400 border-slate-500/30">
-            {txt("Configuração apenas", "Config only")}
+          <span className={`ml-auto text-[9px] font-bold px-1.5 py-0.5 rounded border ${
+            ttsEnabled && status?.tts_readiness === "active"
+              ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+              : "bg-slate-500/10 text-slate-400 border-slate-500/30"
+          }`}>
+            {ttsEnabled
+              ? status?.tts_readiness === "active" ? txt("Ativo", "Active") : txt("Incompleto", "Incomplete")
+              : txt("Desativado", "Disabled")}
           </span>
         </div>
 
         <p className="text-[11px] text-muted-foreground">
           {txt(
-            "Configure o provedor de voz. O funcionamento dentro da aplicação será validado em uma etapa futura.",
-            "Configure the voice provider. In-app operation will be validated in a future stage.",
+            "Quando ativado, as respostas do agente são sintetizadas e enviadas como áudio no WhatsApp. Se o provedor falhar, a resposta é enviada em texto.",
+            "When enabled, agent replies are synthesized and sent as WhatsApp audio. If the provider fails, the reply is sent as text.",
           )}
         </p>
+
+        <SwitchRow
+          label={txt("Responder em áudio", "Reply with audio")}
+          hint={txt(
+            "Converte automaticamente as respostas normais do agente em mensagens de voz.",
+            "Automatically converts regular agent replies into voice messages.",
+          )}
+          ariaLabel={txt("Ativar respostas em áudio", "Enable audio replies")}
+          checked={ttsEnabled}
+          onCheckedChange={(checked) => { setTtsEnabled(checked); setTtsDirty(true); }}
+          disabled={isReadOnly}
+        />
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2" data-testid="tts-provider-list">
           {TTS_PROVIDERS.map(p => {
@@ -1427,6 +1714,7 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
                   setTtsApiKey("");
                   setTtsApiUrl(TTS_PROVIDER_DEFAULTS[p.id].apiUrl);
                   setTtsModelName(TTS_PROVIDER_DEFAULTS[p.id].modelName);
+                  setTtsVoiceId(TTS_PROVIDER_DEFAULTS[p.id].voiceId);
                   setTtsDirty(true);
                 }}
                 className={`relative flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2.5 text-left transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
@@ -1466,13 +1754,25 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
             configured={status?.tts_api_key_set}
           />
           <ApiInput
-            label={txt("Modelo / Voz", "Model / Voice")}
+            label={ttsProvider === "elevenlabs" ? txt("Modelo", "Model") : txt("Nome da voz", "Voice name")}
             value={ttsModelName}
             onChange={(value) => { setTtsModelName(value); setTtsDirty(true); }}
             placeholder={TTS_PROVIDER_DEFAULTS[ttsProvider].modelName}
             disabled={isReadOnly}
             mono
           />
+          {ttsProvider === "elevenlabs" && (
+            <div className="sm:col-span-2">
+              <ApiInput
+                label="Voice ID"
+                value={ttsVoiceId}
+                onChange={(value) => { setTtsVoiceId(value); setTtsDirty(true); }}
+                placeholder={TTS_PROVIDER_DEFAULTS.elevenlabs.voiceId}
+                disabled={isReadOnly}
+                mono
+              />
+            </div>
+          )}
         </div>
       </div>
 

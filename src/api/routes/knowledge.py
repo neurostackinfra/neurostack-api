@@ -92,6 +92,7 @@ async def upload_document(
         },
         is_indexed=False,
         chunk_count=0,
+        size_bytes=len(request.content.encode("utf-8")),
     )
     
     # TODO: Trigger indexing job (Task 19.0)
@@ -317,4 +318,3 @@ async def delete_document(
         )
     
     # TODO: Delete from vector database (Task 19.0)
-

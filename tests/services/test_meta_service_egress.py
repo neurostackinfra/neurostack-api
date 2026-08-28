@@ -147,6 +147,33 @@ class TestSendMetaCloudText:
                 assert SECRET not in payload
 
 
+class TestSendMetaCloudAudio:
+    def test_uploads_then_sends_media_id(self) -> None:
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            if request.url.path.endswith("/media"):
+                return httpx.Response(200, json={"id": "MEDIA-1"})
+            return httpx.Response(200, json={"messages": [{"id": "wamid.audio"}]})
+
+        with egress_env(make_resolver(META_PUBLIC_IP), httpx.MockTransport(handler)):
+            data = asyncio.run(
+                meta_service.send_meta_cloud_audio(
+                    "123", "TOKEN", "5511", b"mp3-audio"
+                )
+            )
+        assert data == {"messages": [{"id": "wamid.audio"}]}
+        assert [request.url.path for request in seen] == [
+            "/v18.0/123/media",
+            "/v18.0/123/messages",
+        ]
+        assert b"mp3-audio" in seen[0].content
+        assert seen[0].headers["Authorization"] == "Bearer TOKEN"
+        assert b'"type":"audio"' in seen[1].content
+        assert b'"id":"MEDIA-1"' in seen[1].content
+
+
 class TestResolveMetaMedia:
     def test_pins_to_graph_facebook_com(self) -> None:
         captured: dict[str, Any] = {}

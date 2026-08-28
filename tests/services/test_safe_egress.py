@@ -24,9 +24,14 @@ from src.services.safe_egress import (
     LLM_DROPOUT_HOSTS,
     LLM_OPENAI_HOSTS,
     META_ALLOWED_HOSTS,
+    MULTIMODAL_GROQ_HOSTS,
+    MULTIMODAL_OPENAI_HOSTS,
+    MULTIMODAL_OPENROUTER_HOSTS,
     PROVIDER_POLICIES,
     STT_GROQ_HOSTS,
     STT_OPENAI_HOSTS,
+    TTS_ELEVENLABS_HOSTS,
+    TTS_GOOGLE_HOSTS,
     ZAPI_ALLOWED_HOSTS,
     ParsedUrl,
     UnsafeEgressError,
@@ -217,6 +222,34 @@ class TestEnforceHostAllowlist:
         with pytest.raises(UnsafeEgressError):
             enforce_host_allowlist(self._parsed("api.groqcloud.com"), STT_GROQ_HOSTS)
 
+    def test_multimodal_pinning(self) -> None:
+        enforce_host_allowlist(
+            self._parsed("openrouter.ai"), MULTIMODAL_OPENROUTER_HOSTS
+        )
+        enforce_host_allowlist(self._parsed("api.groq.com"), MULTIMODAL_GROQ_HOSTS)
+        enforce_host_allowlist(self._parsed("api.openai.com"), MULTIMODAL_OPENAI_HOSTS)
+        for host, allowlist in (
+            ("openrouter.ai.attacker.tld", MULTIMODAL_OPENROUTER_HOSTS),
+            ("api.openrouter.ai", MULTIMODAL_OPENROUTER_HOSTS),
+            ("api.groqcloud.com", MULTIMODAL_GROQ_HOSTS),
+            ("api.openai.com.evil", MULTIMODAL_OPENAI_HOSTS),
+        ):
+            with pytest.raises(UnsafeEgressError):
+                enforce_host_allowlist(self._parsed(host), allowlist)
+
+    def test_tts_pinning(self) -> None:
+        enforce_host_allowlist(
+            self._parsed("api.elevenlabs.io"), TTS_ELEVENLABS_HOSTS
+        )
+        enforce_host_allowlist(
+            self._parsed("texttospeech.googleapis.com"), TTS_GOOGLE_HOSTS
+        )
+        with pytest.raises(UnsafeEgressError):
+            enforce_host_allowlist(
+                self._parsed("api.elevenlabs.io.attacker.tld"),
+                TTS_ELEVENLABS_HOSTS,
+            )
+
 
 # ---------------------------------------------------------------------------
 # resolve_public_ips — the TOCTOU-safe DNS boundary
@@ -342,12 +375,49 @@ class TestProviderPolicies:
         assert PROVIDER_POLICIES["stt_openai"].allowed_hosts == STT_OPENAI_HOSTS
         assert PROVIDER_POLICIES["stt_groq"].allowed_hosts == STT_GROQ_HOSTS
 
+    def test_every_multimodal_kind_resolves_with_a_pinned_host(self) -> None:
+        # The multimodal credential allowlist has no `outros` entry, so all
+        # three providers are known and none may accept an arbitrary host.
+        expected = {
+            "multimodal_openai": MULTIMODAL_OPENAI_HOSTS,
+            "multimodal_groq": MULTIMODAL_GROQ_HOSTS,
+            "multimodal_openrouter": MULTIMODAL_OPENROUTER_HOSTS,
+        }
+        for kind, hosts in expected.items():
+            policy = resolve_policy(kind)
+            assert policy.kind == kind
+            assert policy.allowed_hosts == hosts
+
+    def test_every_tts_kind_resolves_with_a_pinned_host(self) -> None:
+        assert resolve_policy("tts_elevenlabs").allowed_hosts == TTS_ELEVENLABS_HOSTS
+        assert resolve_policy("tts_google").allowed_hosts == TTS_GOOGLE_HOSTS
+
+    def test_multimodal_kinds_reject_hosts_outside_the_allowlist(self) -> None:
+        resolver = make_resolver("104.18.2.1")
+        for kind, good_host in (
+            ("multimodal_openrouter", "openrouter.ai"),
+            ("multimodal_groq", "api.groq.com"),
+            ("multimodal_openai", "api.openai.com"),
+        ):
+            validated = validate_url(
+                f"https://{good_host}/v1/chat/completions",
+                kind=kind,
+                resolver=resolver,
+            )
+            assert validated.parsed.hostname == good_host
+            with pytest.raises(UnsafeEgressError):
+                validate_url(
+                    "https://proxy.attacker.tld/v1/chat/completions",
+                    kind=kind,
+                    resolver=resolver,
+                )
+
     def test_custom_public_kinds_have_no_allowlist(self) -> None:
         for name in ("llm_outros", "stt_outros", "evolution", "uazapi", "audio_url"):
             assert PROVIDER_POLICIES[name].allowed_hosts is None
 
     def test_no_config_only_provider_registered(self) -> None:
-        # Config-only providers (Microsoft, ElevenLabs, Google, Deepgram) never
+        # Config-only providers (Microsoft and Deepgram) never
         # go through this transport, so they must not have entries here.
         for forbidden in (
             "microsoft",

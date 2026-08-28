@@ -234,6 +234,11 @@ describe("<ApiCredentialsForm /> — strict credential payload", () => {
     fireEvent.change(within(ttsSection).getByPlaceholderText("AIza..."), {
       target: { value: "synthetic-google-tts-key" },
     });
+    fireEvent.click(
+      within(ttsSection).getByRole("switch", {
+        name: /ativar respostas em áudio|enable audio replies/i,
+      }),
+    );
     fireEvent.click(screen.getByRole("button", { name: /salvar/i }));
 
     await waitFor(() => {
@@ -246,7 +251,53 @@ describe("<ApiCredentialsForm /> — strict credential payload", () => {
       tts_api_url: "https://texttospeech.googleapis.com/v1",
       tts_api_key: "synthetic-google-tts-key",
       tts_model_name: "pt-BR-Neural2-A",
+      tts_voice_id: null,
+      tts_enabled: true,
     });
+  });
+
+  it("saves a brand-new clinic that never touched STT without 422-ing on empty fields", async () => {
+    // A clinic that has never configured STT: the GET status carries no STT
+    // fields at all, so `sttApiUrl`/`sttModelName` stay at their initial "".
+    // Regression for a production 422 — `stt_api_url`/`stt_model_name` are
+    // `Identifier`/`ApiUrl` with min_length=1 on the backend, so sending ""
+    // for either rejected every save, including saves unrelated to STT.
+    const status = {
+      whatsapp_provider: "zapi",
+      zapi_instance_id: null,
+      zapi_token_set: false,
+      zapi_token_masked: null,
+      llm_api_key_set: false,
+      llm_api_key_masked: null,
+      llm_base_url: null,
+      llm_model_name: null,
+      apis_configured: false,
+    };
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PATCH") {
+        return jsonResponse({ ok: true, apis_configured: false });
+      }
+      return jsonResponse(status);
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="42" isReadOnly={false} isSuperAdmin={false} />
+      </Wrapper>,
+    );
+
+    const saveButton = await screen.findByRole("button", { name: /salvar configurações de api/i });
+    fireEvent.click(saveButton);
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(true);
+    });
+    const patchCall = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const payload = JSON.parse(String(patchCall?.[1]?.body));
+    expect(payload).not.toHaveProperty("whisper_model");
+    expect(payload.stt_model_name).toBeNull();
+    expect(payload.stt_api_url).toBeNull();
   });
 });
 

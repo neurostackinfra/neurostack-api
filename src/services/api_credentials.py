@@ -32,6 +32,14 @@ PROVIDER_ALLOWLISTS: dict[str, frozenset[str]] = {
 
 OPERATIONAL_LLM_PROVIDERS = frozenset({"openai", "dropout", "outros"})
 OPERATIONAL_STT_PROVIDERS = frozenset({"outros", "openai_whisper"})
+# Multimodal providers whose chat-completions endpoint was measured against
+# the live API and proven to transcribe the OGG/Opus that WhatsApp actually
+# delivers. Evidence:
+# `.genie/wishes/fallback-texto/evidence/multimodal-format-probe.md`.
+# `groq` rejects the `input_audio` content block outright; `openai` only
+# accepts `wav`/`mp3` and refuses OGG both by enum and by sniffing, so
+# neither can serve a voice note without transcoding.
+OPERATIONAL_MULTIMODAL_PROVIDERS = frozenset({"openrouter"})
 UNIMPLEMENTED_WHATSAPP_PROVIDERS = frozenset({"dialog360", "twilio"})
 
 READINESS_IDS = frozenset(
@@ -91,7 +99,16 @@ STT_FIELDS = frozenset(
         "audio_max_seconds",
     }
 )
-TTS_FIELDS = frozenset({"tts_provider", "tts_api_url", "tts_api_key", "tts_model_name"})
+TTS_FIELDS = frozenset(
+    {
+        "tts_provider",
+        "tts_api_url",
+        "tts_api_key",
+        "tts_model_name",
+        "tts_voice_id",
+        "tts_enabled",
+    }
+)
 
 API_CREDENTIAL_FIELDS = frozenset(
     WHATSAPP_FIELDS | LLM_FIELDS | MULTIMODAL_FIELDS | STT_FIELDS | TTS_FIELDS
@@ -416,6 +433,7 @@ def credential_status(credentials: Mapping[str, Any]) -> dict[str, Any]:
     ) in OPERATIONAL_LLM_PROVIDERS and _complete(
         credentials, ("llm_api_url", "llm_api_key", "llm_model_name")
     )
+    multimodal_provider = credentials.get("multimodal_provider")
     multimodal_complete = _complete(
         credentials,
         (
@@ -427,9 +445,16 @@ def credential_status(credentials: Mapping[str, Any]) -> dict[str, Any]:
     )
     stt_provider = resolved.get("stt_provider", "outros")
     stt_complete = _complete(resolved, ("stt_api_url", "stt_api_key", "stt_model_name"))
-    tts_complete = _complete(
-        credentials, ("tts_provider", "tts_api_url", "tts_api_key", "tts_model_name")
-    )
+    tts_provider = credentials.get("tts_provider")
+    tts_required_fields = [
+        "tts_provider",
+        "tts_api_url",
+        "tts_api_key",
+        "tts_model_name",
+    ]
+    if tts_provider == "elevenlabs":
+        tts_required_fields.append("tts_voice_id")
+    tts_complete = _complete(credentials, tuple(tts_required_fields))
     whatsapp_readiness = _whatsapp_readiness(credentials)
     result.update(
         {
@@ -440,15 +465,24 @@ def credential_status(credentials: Mapping[str, Any]) -> dict[str, Any]:
             "whisper_model": resolved.get("stt_model_name"),
             "whatsapp_readiness": whatsapp_readiness,
             "llm_readiness": "active" if llm_ready else "incomplete",
+            # A complete bundle is only `active` when the selected provider was
+            # measured against the live API and proven to transcribe WhatsApp's
+            # OGG/Opus. Everything else stays `configuration_only`: the write
+            # allowlist is deliberately wider than the operational set, so
+            # announcing `active` there would promise a runtime the multimodal
+            # adapter cannot deliver.
             "multimodal_readiness": (
-                "configuration_only" if multimodal_complete else "incomplete"
+                "active"
+                if multimodal_complete
+                and multimodal_provider in OPERATIONAL_MULTIMODAL_PROVIDERS
+                else "configuration_only" if multimodal_complete else "incomplete"
             ),
             "stt_readiness": (
                 "active"
                 if stt_complete and stt_provider in OPERATIONAL_STT_PROVIDERS
                 else "configuration_only" if stt_complete else "incomplete"
             ),
-            "tts_readiness": "configuration_only" if tts_complete else "incomplete",
+            "tts_readiness": "active" if tts_complete else "incomplete",
             "apis_configured": whatsapp_readiness == "active" or llm_ready,
         }
     )
