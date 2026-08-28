@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.middleware.auth import require_builder
 from src.api.schemas.billing import (
     BillingSummaryResponse,
+    BillingUsageResponse,
     CheckoutRequest,
     CheckoutResponse,
     CouponValidationResponse,
@@ -25,6 +26,10 @@ from src.models.tenant import Tenant
 from src.models.transaction import Transaction
 from src.repositories import get_db_session_dependency
 from src.services.abacatepay import AbacatePayClient
+from src.services.billing_usage_service import (
+    PlanUsageLimits,
+    get_builder_billing_usage,
+)
 
 logger = get_logger(__name__)
 
@@ -54,6 +59,36 @@ async def _count_active_clinics(builder_id: UUID, db: AsyncSession) -> int:
     return result.scalar() or 0
 
 
+def _start_plan_usage_limits() -> PlanUsageLimits:
+    """Resolve Start-plan limits from deployment configuration."""
+    return PlanUsageLimits(
+        monthly_traces=settings.start_plan_monthly_trace_limit,
+        rag_storage_mb=settings.start_plan_rag_storage_limit_mb,
+        media_storage_mb=settings.start_plan_media_storage_limit_mb,
+    )
+
+
+async def _get_builder(builder_id: UUID, db: AsyncSession) -> Builder:
+    result = await db.execute(select(Builder).where(Builder.id == builder_id))
+    builder = result.scalar_one_or_none()
+    if not builder:
+        raise HTTPException(status_code=404, detail="Builder not found")
+    return builder
+
+
+async def _get_usage(
+    builder: Builder,
+    db: AsyncSession,
+) -> BillingUsageResponse:
+    usage = await get_builder_billing_usage(
+        db,
+        builder.id,
+        builder.subscription_plan,
+        _start_plan_usage_limits(),
+    )
+    return BillingUsageResponse.model_validate(usage)
+
+
 def _calc_pricing(active_clinics: int) -> dict:
     extra = max(0, active_clinics - FREE_TIER)
     extra_price = extra * EXTRA_PER_CLINIC
@@ -80,20 +115,33 @@ async def billing_summary(
     builder_id: UUID = Depends(require_builder),
     db: AsyncSession = Depends(get_db_session_dependency),
 ):
-    result = await db.execute(select(Builder).where(Builder.id == builder_id))
-    builder = result.scalar_one_or_none()
-    if not builder:
-        raise HTTPException(status_code=404, detail="Builder not found")
+    builder = await _get_builder(builder_id, db)
 
     active_clinics = await _count_active_clinics(builder_id, db)
     pricing = _calc_pricing(active_clinics)
+    usage = await _get_usage(builder, db)
 
     return BillingSummaryResponse(
         plan=builder.subscription_plan,
         subscription_status=builder.subscription_status,
         billing_cycle=builder.billing_cycle,
+        usage=usage,
         **pricing,
     )
+
+
+@router.get(
+    "/usage",
+    summary="Builder Plan Usage",
+    response_model=BillingUsageResponse,
+)
+async def billing_usage(
+    builder_id: UUID = Depends(require_builder),
+    db: AsyncSession = Depends(get_db_session_dependency),
+):
+    """Return monthly trace and current storage usage for the builder."""
+    builder = await _get_builder(builder_id, db)
+    return await _get_usage(builder, db)
 
 
 async def _validate_coupon(code: str, db: AsyncSession) -> Coupon:

@@ -124,10 +124,9 @@ class TestStubEndpoints:
         assert response.status_code == 200
         assert response.json() == []
 
-    def test_rlhf_pending_stub(self, client: TestClient, super_admin_headers):
-        response = client.get("/v1/admin/rlhf/pending", headers=super_admin_headers)
-        assert response.status_code == 200
-        assert response.json() == []
+    def test_removed_rlhf_pending_route_returns_404(self, client: TestClient, super_admin_headers):
+        response = client.get("/v1/admin/rlhf/" + "pending", headers=super_admin_headers)
+        assert response.status_code == 404
 
 
 class TestCreateClinicValidation:

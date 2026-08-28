@@ -11,9 +11,7 @@ Implements Task 13.3-13.5:
 from uuid import uuid4
 
 import pytest
-from httpx import AsyncClient, ASGITransport
-
-from src.api.main import app
+from httpx import AsyncClient
 
 
 # ============================================
@@ -46,20 +44,9 @@ def auth_headers(valid_api_key):
 
 
 @pytest.fixture
-async def client():
-    """Create async test client.
-
-    ASGITransport does not run the app lifespan, so ensure the database is
-    initialized here (mirroring the lifespan startup). init_database() is
-    idempotent, so leaving the engine up for later tests is safe and matches
-    how the running app keeps a long-lived engine.
-    """
-    from src.repositories import init_database
-
-    await init_database()
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        yield ac
+async def client(async_client: AsyncClient):
+    """Expose the shared lifespan-aware async client under the local name."""
+    yield async_client
 
 
 # ============================================
@@ -328,7 +315,7 @@ class TestHandoffFlowEndToEnd:
     async def test_atendente_keyword_handoff(
         self, client: AsyncClient, tenant_id, session_id, auth_headers
     ):
-        """Test 'atendente' keyword triggers handoff."""
+        """Test an explicit attendant request triggers HANDOFF mode."""
         response = await client.post(
             "/v1/events",
             headers=auth_headers,
@@ -337,7 +324,7 @@ class TestHandoffFlowEndToEnd:
                 "session_id": str(session_id),
                 "event_type": "message.in",
                 "payload": {
-                    "content": "Preciso de um atendente",
+                    "content": "Preciso de um atendente real",
                     "channel": "telegram",
                     "user_id": "user-telegram",
                 },
@@ -347,9 +334,10 @@ class TestHandoffFlowEndToEnd:
         assert response.status_code == 200
         data = response.json()
 
-        # Should detect handoff request
         decision = data["decision"]
-        assert decision["intent_category"] in ["complaint", "unknown", "information"]
+        assert decision["handoff_required"] is True
+        assert data["mode"] == "handoff"
+        assert decision["handoff_reason"] is not None
 
     @pytest.mark.asyncio
     async def test_complaint_escalation(
@@ -590,4 +578,3 @@ class TestPerformance:
         # Also check reported processing time
         data = response.json()
         assert data["processing_time_ms"] < 1000  # Processing should be under 1s
-

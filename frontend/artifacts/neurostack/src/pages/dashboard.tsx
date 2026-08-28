@@ -267,28 +267,31 @@ function KpiCards({ stats, t, locale }: { stats: KpiStats; t: (k: TranslationKey
 
 const VISIBLE_INTENTS = ["pedido_preco", "agendar", "interesse_tratamento", "reclamacao", "pos_atendimento_duvida"];
 
-function IntentBreakdown({
-  byIntent, t, intentFilter, onIntentFilterChange,
+export function IntentBreakdown({
+  byIntent, t, locale, intentFilter, onIntentFilterChange,
 }: {
   byIntent: Record<string, number>;
   t: (k: TranslationKey) => string;
+  locale: string;
   intentFilter: string;
   onIntentFilterChange: (v: string) => void;
 }) {
   const baseIntent = Object.fromEntries(
     VISIBLE_INTENTS.map(k => [k, byIntent[k] ?? 0])
   );
+  const periodIntentTotal = Object.values(baseIntent).reduce((s, n) => s + n, 0);
   const visibleIntent = Object.fromEntries(
     Object.entries(baseIntent).filter(([k]) => !intentFilter || k === intentFilter)
   );
-  const intentTotal = Object.values(visibleIntent).reduce((s, n) => s + n, 0);
+  const visibleIntentTotal = Object.values(visibleIntent).reduce((s, n) => s + n, 0);
+  const numberLocale = locale === "en" ? "en-US" : "pt-BR";
   const chartData = Object.entries(visibleIntent)
     .map(([intent, count]) => ({
       key: intent,
       name: getIntentLabel(intent, t),
       value: count,
       hex: INTENT_META[intent]?.hex ?? "#64748b",
-      pct: intentTotal > 0 ? (count / intentTotal) * 100 : 0,
+      pct: periodIntentTotal > 0 ? (count / periodIntentTotal) * 100 : 0,
     }));
   const emptyChart = chartData.length === 0;
 
@@ -313,7 +316,7 @@ function IntentBreakdown({
         <div className="grid gap-8 sm:grid-cols-2 items-center">
           <div className="space-y-3.5">
             {Object.entries(visibleIntent).map(([intent, count]) => {
-              const pct = intentTotal > 0 ? (count / intentTotal) * 100 : 0;
+              const pct = periodIntentTotal > 0 ? (count / periodIntentTotal) * 100 : 0;
               const m = INTENT_META[intent] ?? { bar: "bg-accent", dot: "bg-accent" };
               return (
                 <div key={intent} className="space-y-1" data-testid={`stat-intent-${intent}`}>
@@ -322,7 +325,12 @@ function IntentBreakdown({
                       <span className={`h-2 w-2 rounded-full shrink-0 ${m.dot}`} />
                       <span className="text-xs font-medium text-foreground truncate">{getIntentLabel(intent, t)}</span>
                     </div>
-                    <span className="text-xs font-bold text-foreground shrink-0 tabular-nums">{count}</span>
+                    <span className="text-xs font-bold text-foreground shrink-0 tabular-nums">
+                      {count.toLocaleString(numberLocale)}
+                      <span className="ml-1 font-medium text-muted-foreground">
+                        {"\u00b7 "}{pct.toLocaleString(numberLocale, { maximumFractionDigits: 1 })}%
+                      </span>
+                    </span>
                   </div>
                   <div className="h-1.5 w-full rounded-full bg-muted overflow-hidden">
                     <div className={`h-full ${m.bar} rounded-full transition-all duration-500`} style={{ width: `${pct}%` }} />
@@ -330,7 +338,7 @@ function IntentBreakdown({
                 </div>
               );
             })}
-            {intentTotal === 0 && (
+            {visibleIntentTotal === 0 && (
               <div className="text-sm text-muted-foreground">{t("dash_no_intents")}</div>
             )}
           </div>
@@ -360,7 +368,7 @@ function IntentBreakdown({
                 </PieChart>
               </ResponsiveContainer>
               <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-                <span className="text-2xl font-bold text-foreground tabular-nums leading-none">{intentTotal}</span>
+                <span className="text-2xl font-bold text-foreground tabular-nums leading-none">{visibleIntentTotal}</span>
                 <span className="text-[10px] text-muted-foreground uppercase tracking-wider font-medium mt-1">
                   {intentFilter ? getIntentLabel(intentFilter, t).split(" ")[0] : t("dash_intent_total")}
                 </span>
@@ -634,7 +642,7 @@ export default function Dashboard() {
           <KpiCards stats={stats} t={t} locale={locale} />
           <UserAcquisitionMetrics stats={stats} locale={locale} />
           <IntentBreakdown
-            byIntent={stats.byIntent} t={t}
+            byIntent={stats.byIntent} t={t} locale={locale}
             intentFilter={intentFilter} onIntentFilterChange={setIntentFilter}
           />
         </>

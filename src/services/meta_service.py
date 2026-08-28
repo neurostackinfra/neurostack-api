@@ -86,6 +86,69 @@ async def send_meta_cloud_text(
         return data
 
 
+async def send_meta_cloud_audio(
+    phone_number_id: str,
+    access_token: str,
+    to_phone: str,
+    audio_bytes: bytes,
+    *,
+    mime_type: str = "audio/mpeg",
+) -> dict:
+    """Upload synthesized audio and send it through Meta Cloud API."""
+
+    upload_url = f"{META_GRAPH_BASE}/{phone_number_id}/media"
+    async with safe_async_client(
+        upload_url, kind="meta", timeout=httpx.Timeout(30.0, connect=5.0)
+    ) as (client, validated):
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Host": validated.sni_host,
+        }
+        response = await client.post(
+            validated.url,
+            headers=headers,
+            data={"messaging_product": "whatsapp"},
+            files={"file": ("reply.mp3", audio_bytes, mime_type)},
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise _sanitize_http_status_error(exc) from None
+        try:
+            upload_payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError("invalid_upstream_response") from exc
+
+    media_id = upload_payload.get("id") if isinstance(upload_payload, dict) else None
+    if not isinstance(media_id, str) or not media_id:
+        raise RuntimeError("missing_uploaded_media_id")
+
+    send_url = f"{META_GRAPH_BASE}/{phone_number_id}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to_phone,
+        "type": "audio",
+        "audio": {"id": media_id},
+    }
+    async with safe_async_client(
+        send_url, kind="meta", timeout=httpx.Timeout(15.0, connect=5.0)
+    ) as (client, validated):
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Host": validated.sni_host,
+        }
+        response = await client.post(validated.url, headers=headers, json=payload)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise _sanitize_http_status_error(exc) from None
+        data = response.json()
+        logger.info("Meta send_audio to %s - status %s", to_phone, response.status_code)
+        return data
+
+
 def extract_meta_message_id(send_result: dict) -> Optional[str]:
     """Return the outbound `wamid.*` from a Graph API send response.
 

@@ -20,11 +20,16 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useI18n } from "@/context/i18n";
+import {
+  PlanUsageSummary,
+  type BillingUsage,
+} from "@/components/plan-usage-summary";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface BillingSummary {
   plan: string | null;
+  usage: BillingUsage | null;
   active_clinics: number;
   free_tier: number;
   extra_clinics: number;
@@ -359,6 +364,8 @@ export default function Billing() {
           </div>
         )}
       </div>
+
+      {summary?.usage && <PlanUsageSummary usage={summary.usage} locale={locale} />}
 
       {/* ── Section 02: Credits (skeleton) ────────────────────────────────── */}
       <div className="space-y-3">

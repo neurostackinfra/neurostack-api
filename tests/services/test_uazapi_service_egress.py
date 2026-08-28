@@ -9,6 +9,7 @@ public host is honoured.
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 from contextlib import contextmanager
 from typing import Any
@@ -78,6 +79,27 @@ class TestSendUazapiText:
         assert "/send/text" in captured["url"]
         assert captured["token"] == "UAZAPI-TOKEN"
         assert captured["host"] == "uazapi.customer.example"
+
+    def test_audio_is_sent_as_ptt_media(self) -> None:
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(200, json={"id": "owner:MID"})
+
+        with egress_env(make_resolver("1.1.1.1"), httpx.MockTransport(handler)):
+            data = asyncio.run(
+                uazapi_service.send_uazapi_audio(
+                    "https://uazapi.customer.example", "TOKEN", "5511", b"mp3"
+                )
+            )
+        assert data == {"id": "owner:MID"}
+        assert seen[0].url.path == "/send/media"
+        payload = json.loads(seen[0].content)
+        assert payload["number"] == "5511"
+        assert payload["type"] == "ptt"
+        assert payload["mimetype"] == "audio/mpeg"
+        assert payload["file"].startswith("data:audio/mpeg;base64,")
 
     def test_strips_trailing_slash(self) -> None:
         captured: dict[str, Any] = {}

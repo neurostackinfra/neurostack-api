@@ -125,6 +125,8 @@ class TtsCredentialsPatch(BaseModel):
     tts_api_url: ApiUrl | None = None
     tts_api_key: Secret | None = None
     tts_model_name: Identifier | None = None
+    tts_voice_id: Identifier | None = None
+    tts_enabled: bool | None = None
 
 
 class ApiCredentialsPatch(

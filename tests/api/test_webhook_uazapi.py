@@ -10,9 +10,16 @@ Covers Groups 2 + 4 of the uazapi-integration wish:
   pipeline or the send helper
 - A tenant with resolved instance but no ``uazapi_api_url``/``uazapi_token``
   logs a warning and returns ``replied=False`` with ``reason=no_credentials``
+- Group 4: patient audio is transcribed via the STT chain or falls back to
+  the text reroute; media tests load the real captured payload from
+  ``.genie/wishes/uazapi-parity/evidence/media-payload.json``
 """
 
+import copy
+import json
+import pathlib
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
@@ -22,6 +29,37 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.config.settings import settings
+
+
+# Real captured Uazapi webhook payloads (audio + image), redacted only for
+# the per-tenant webhook token. Group 4 acceptance criterion: media tests
+# MUST use these instead of hand-written fixtures.
+_MEDIA_PAYLOAD_PATH = (
+    pathlib.Path(__file__).resolve().parents[2]
+    / ".genie"
+    / "wishes"
+    / "uazapi-parity"
+    / "evidence"
+    / "media-payload.json"
+)
+
+
+def _load_media_evidence(kind: str) -> dict:
+    """Deep-copy the captured ``audio`` or ``image`` webhook body from disk.
+
+    Deep-copy so per-test mutations (instanceName, fromMe, messageid) never
+    leak into the next test. Raises if the evidence file is missing so a
+    stale copy of the repo fails loudly rather than silently.
+    """
+    if not _MEDIA_PAYLOAD_PATH.exists():
+        raise FileNotFoundError(
+            f"Missing captured evidence at {_MEDIA_PAYLOAD_PATH}. "
+            "Group 4 tests refuse to hand-write media fixtures."
+        )
+    doc = json.loads(_MEDIA_PAYLOAD_PATH.read_text(encoding="utf-8"))
+    if kind not in doc:
+        raise KeyError(f"media-payload.json has no '{kind}' entry")
+    return copy.deepcopy(doc[kind])
 
 
 API_CRED_PATH = "/v1/config/api-credentials"
@@ -103,29 +141,54 @@ def _uazapi_text_payload(
     *,
     instance: str,
     from_phone: str,
-    body: str,
+    body: Any,
     message_id: str,
     msg_type: str = "text",
+    media_type: str | None = None,
+    text: Any | None = None,
+    content: Any | None = None,
+    from_me: bool = False,
+    chat_jid: str | None = None,
+    ptt: bool | None = None,
+    sender_pn: str | None = None,
+    was_sent_by_api: bool | None = None,
 ) -> dict:
-    """Build a real Uazapi commercial payload (instanceName / message / chat schema)."""
+    """Build a real Uazapi commercial payload (instanceName / message / chat schema).
+
+    ``sender_pn`` defaults to ``from_phone``; pass an explicit value when the
+    test needs ``chat.wa_chatid`` and ``message.sender_pn`` to differ — the
+    fromMe path resolves the counterparty from ``chat.wa_chatid`` and would
+    silently match the wrong phone if both fields carried the same number.
+    """
+    resolved_sender_pn = (
+        sender_pn if sender_pn is not None else f"{from_phone}@s.whatsapp.net"
+    )
+    message = {
+        "sender_pn": resolved_sender_pn,
+        "text": body if text is None else text,
+        "content": body if content is None else content,
+        "type": msg_type,
+        "messageType": "Conversation" if msg_type == "text" else msg_type,
+        "messageid": message_id,
+        "fromMe": from_me,
+    }
+    if media_type is not None:
+        message["mediaType"] = media_type
+    if ptt is not None:
+        message["ptt"] = ptt
+    if was_sent_by_api is not None:
+        message["wasSentByApi"] = was_sent_by_api
+
     return {
         "instanceName": instance,
         "EventType": "messages",
         "owner": "5511940589006",
         "chat": {
-            "wa_chatid": f"{from_phone}@s.whatsapp.net",
+            "wa_chatid": chat_jid or f"{from_phone}@s.whatsapp.net",
             "wa_name": "Test User",
             "phone": f"+{from_phone}",
         },
-        "message": {
-            "sender_pn": f"{from_phone}@s.whatsapp.net",
-            "text": body,
-            "content": body,
-            "type": msg_type,
-            "messageType": "Conversation" if msg_type == "text" else msg_type,
-            "messageid": message_id,
-            "fromMe": False,
-        },
+        "message": message,
     }
 
 
@@ -304,14 +367,42 @@ class TestUazapiWebhookUnknownInstance:
             for m in warn_msgs
         ), warn_msgs
 
-
-class TestUazapiWebhookNonText:
-    def test_image_event_is_skipped_as_non_text(
+    def test_unknown_instance_media_skips_before_non_text(
         self,
         client: TestClient,
         tenant_id: UUID,
     ):
-        """Uazapi payloads with ``data.type`` outside text/chat are ignored."""
+        _seed_uazapi_credentials(
+            client, tenant_id, f"owned_{uuid4().hex[:8]}",
+        )
+
+        payload = _uazapi_text_payload(
+            instance=f"stranger_{uuid4().hex[:8]}",
+            from_phone="5511900000002",
+            body="[caption]",
+            text="[caption]",
+            content="[caption]",
+            message_id=f"3EB0_media_{uuid4().hex[:8]}",
+            msg_type="media",
+            media_type="image",
+        )
+
+        with patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service:
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "skipped": "unknown_instance"}
+        assert mock_get_service.call_count == 0
+
+
+class TestUazapiWebhookNonText:
+    def test_media_image_with_caption_is_skipped_as_non_text(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
         instance = f"clinica_{uuid4().hex[:8]}"
         _seed_uazapi_credentials(client, tenant_id, instance)
 
@@ -320,7 +411,8 @@ class TestUazapiWebhookNonText:
             from_phone="5511900000010",
             body="[image caption]",
             message_id=f"3EB0_img_{uuid4().hex[:8]}",
-            msg_type="image",
+            msg_type="media",
+            media_type="image",
         )
 
         with patch(
@@ -341,6 +433,210 @@ class TestUazapiWebhookNonText:
         # Never touched the pipeline or the send helper
         assert service.process_event.await_count == 0
         assert mock_send.await_count == 0
+
+    def test_media_audio_predicate_wins_even_with_text_present(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Group 4 update: patient audio no longer exits as ``non-text``.
+
+        Instead it enters the STT chain. With no STT/multimodal capability
+        seeded, the chain returns ``STT_CHAIN_NO_CAPABILITY`` and the text
+        reroute takes over — Decision 6's honest variant, same as Z-API's
+        ``test_no_capability_reroutes_without_downloading``.
+        """
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000011",
+            body="voice note with caption",
+            message_id=f"3EB0_audio_{uuid4().hex[:8]}",
+            msg_type="media",
+            media_type="audio",
+            ptt=True,
+        )
+
+        send_mock = AsyncMock(return_value=_fake_uazapi_send_result())
+        with patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service, patch(
+            "src.api.routes.webhook.send_uazapi_text", send_mock
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            mock_get_service.return_value = service
+
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "stt_fallback"}
+        # Capability gate held — nothing pipeline-side ran
+        assert send_mock.await_count == 1
+
+    def test_from_me_audio_bypasses_media_gate_and_reaches_clinic_handler(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Group 3 update: the fromMe audio carve-out from Group 2 now
+        reaches ``_handle_clinic_message``. Without an existing session for
+        the counterparty, the helper returns ``no_session`` — same shape as
+        the Z-API reference (``test_from_me_audio_skips_before_download_and_stt``).
+        """
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000012",  # sender_pn / clinic
+            body="",
+            text="",
+            content="",
+            message_id=f"3EB0_staff_audio_{uuid4().hex[:8]}",
+            msg_type="media",
+            media_type="audio",
+            ptt=True,
+            from_me=True,
+            # counterparty patient on a *different* number so the fromMe
+            # routing resolves to the patient, not the clinic
+            chat_jid="5516900000012@s.whatsapp.net",
+        )
+
+        with patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service:
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "action": "no_session"}
+        assert mock_get_service.call_count == 0
+
+    def test_from_me_image_still_exits_in_media_gate(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000013",
+            body="[staff image]",
+            message_id=f"3EB0_staff_image_{uuid4().hex[:8]}",
+            msg_type="media",
+            media_type="image",
+            from_me=True,
+        )
+
+        with patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service:
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "skipped": "non-text"}
+        assert mock_get_service.call_count == 0
+
+
+class TestUazapiWebhookContentExtraction:
+    def test_content_object_text_reaches_pipeline_without_dict_repr(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000014",
+            body="",
+            text="",
+            content={"text": "texto real do content"},
+            message_id=f"3EB0_content_{uuid4().hex[:8]}",
+        )
+
+        with patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service, patch(
+            "src.api.routes.webhook.send_uazapi_text",
+            new=AsyncMock(return_value=_fake_uazapi_send_result()),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("ok"),
+            )
+            mock_get_service.return_value = service
+
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True}
+        event_arg = service.process_event.await_args.args[0]
+        assert event_arg.payload.content == "texto real do content"
+        assert not event_arg.payload.content.startswith("{")
+
+    def test_unknown_content_object_is_skipped_as_non_text(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000015",
+            body="",
+            text="",
+            content={"caption": "sem texto reconhecido"},
+            message_id=f"3EB0_content_unknown_{uuid4().hex[:8]}",
+        )
+
+        with patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service:
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "skipped": "non-text"}
+        assert mock_get_service.call_count == 0
+
+
+class TestUazapiWebhookGroupChat:
+    def test_group_chat_is_skipped_without_creating_session(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000016",
+            body="mensagem no grupo",
+            message_id=f"3EB0_group_{uuid4().hex[:8]}",
+            chat_jid="120363000000000000@g.us",
+        )
+
+        with patch(
+            "src.api.routes.webhook._get_or_create_session",
+            new=AsyncMock(return_value=(uuid4(), True)),
+        ) as mock_get_or_create_session, patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service:
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "skipped": "group_chat"}
+        assert mock_get_or_create_session.await_count == 0
+        assert mock_get_service.call_count == 0
 
 
 class TestUazapiWebhookBotPaused:
@@ -439,3 +735,1683 @@ class TestUazapiWebhookMissingCredentials:
         assert any(
             "Uazapi credentials missing" in m for m in warn_msgs
         ), warn_msgs
+
+
+# ============================================
+# uazapi-parity Group 1b — Privacy notice + echo identity
+# ============================================
+
+
+def _lgpd_config(enabled: bool = True, message_pt: str | None = None) -> dict:
+    """Build a clinic_config dict with an LGPD section for testing."""
+    lgpd_section: dict[str, Any] = {"lgpd_enabled": enabled}
+    if message_pt is not None:
+        lgpd_section["lgpd_message"] = message_pt
+    return {"lgpd": lgpd_section, "identity": {"clinic_name": "Clínica Teste"}}
+
+
+class TestUazapiPrivacyNoticeSend:
+    """Group 1b Deliverable 4 + Acceptance: new session + lgpd_enabled sends."""
+
+    def test_new_session_with_lgpd_enabled_sends_notice_before_reply(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        from src.api.routes import webhook as webhook_module
+
+        webhook_module._INMEM_SENT.clear()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000100",
+            body="Primeiro contato",
+            message_id=f"3EB0_first_{uuid4().hex[:8]}",
+        )
+
+        privacy_send = _fake_uazapi_send_result(
+            message_id=f"3EB0_privacy_{uuid4().hex[:8]}",
+        )
+        reply_send = _fake_uazapi_send_result(
+            message_id=f"3EB0_reply_{uuid4().hex[:8]}",
+        )
+
+        # Mock _get_or_create_session so is_new=True is deterministic
+        with patch(
+            "src.api.routes.webhook._get_or_create_session",
+            new=AsyncMock(return_value=(uuid4(), True)),
+        ), patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service, patch(
+            "src.api.routes.webhook.send_uazapi_text",
+            new=AsyncMock(side_effect=[privacy_send, reply_send]),
+        ) as mock_send:
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(
+                return_value=_lgpd_config(enabled=True),
+            )
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Reply body"),
+            )
+            mock_get_service.return_value = service
+
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True}
+
+        # Two sends: the aviso first, then the AI reply
+        assert mock_send.await_count == 2, "expected LGPD aviso + reply"
+        first_text = mock_send.await_args_list[0].args[3]
+        second_text = mock_send.await_args_list[1].args[3]
+        # First call is the LGPD notice (default PT copy contains "LGPD")
+        assert "LGPD" in first_text or "Política de Privacidade" in first_text
+        assert second_text == "Reply body"
+
+    def test_existing_session_never_sends_privacy_notice(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000101",
+            body="Segunda mensagem",
+            message_id=f"3EB0_second_{uuid4().hex[:8]}",
+        )
+
+        reply_send = _fake_uazapi_send_result()
+
+        with patch(
+            "src.api.routes.webhook._get_or_create_session",
+            new=AsyncMock(return_value=(uuid4(), False)),
+        ), patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service, patch(
+            "src.api.routes.webhook.send_uazapi_text",
+            new=AsyncMock(return_value=reply_send),
+        ) as mock_send:
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(
+                return_value=_lgpd_config(enabled=True),
+            )
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Reply body"),
+            )
+            mock_get_service.return_value = service
+
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True}
+        # Only the reply — no aviso for existing session
+        assert mock_send.await_count == 1
+        assert mock_send.await_args_list[0].args[3] == "Reply body"
+
+    def test_lgpd_disabled_new_session_does_not_send_notice(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000102",
+            body="Primeiro contato sem LGPD",
+            message_id=f"3EB0_nolgpd_{uuid4().hex[:8]}",
+        )
+
+        with patch(
+            "src.api.routes.webhook._get_or_create_session",
+            new=AsyncMock(return_value=(uuid4(), True)),
+        ), patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service, patch(
+            "src.api.routes.webhook.send_uazapi_text",
+            new=AsyncMock(return_value=_fake_uazapi_send_result()),
+        ) as mock_send:
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(
+                return_value=_lgpd_config(enabled=False),
+            )
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Reply body"),
+            )
+            mock_get_service.return_value = service
+
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True}
+        # Only the reply — LGPD disabled means no aviso
+        assert mock_send.await_count == 1
+        assert mock_send.await_args_list[0].args[3] == "Reply body"
+
+    def test_missing_uazapi_credentials_does_not_break_reply_path(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """AC: 'credenciais Uazapi ausentes: nenhum aviso, nenhuma exceção
+        propagada — falha no envio do aviso não impede a resposta normal'.
+        With no url/token, the aviso block is skipped silently and the
+        handler eventually returns replied=False + no_credentials for the
+        AI reply itself (the pipeline still runs).
+        """
+        instance = f"partial_{uuid4().hex[:8]}"
+        # Seed the instance_name only so tenant resolves, but no url/token
+        _seed_uazapi_credentials_missing_secrets(client, tenant_id, instance)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000103",
+            body="Sem credenciais",
+            message_id=f"3EB0_nocred_lgpd_{uuid4().hex[:8]}",
+        )
+
+        with patch(
+            "src.api.routes.webhook._get_or_create_session",
+            new=AsyncMock(return_value=(uuid4(), True)),
+        ), patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service, patch(
+            "src.api.routes.webhook.send_uazapi_text",
+            new=AsyncMock(return_value=_fake_uazapi_send_result()),
+        ) as mock_send:
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(
+                return_value=_lgpd_config(enabled=True),
+            )
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Reply body"),
+            )
+            mock_get_service.return_value = service
+
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # AI reply path bails on no_credentials, aviso never attempted
+        assert body["replied"] is False
+        assert body["reason"] == "no_credentials"
+        # send_uazapi_text was never called (no url/token)
+        assert mock_send.await_count == 0
+
+    def test_privacy_notice_language_pt_default(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000104",
+            body="Oi",
+            message_id=f"3EB0_pt_{uuid4().hex[:8]}",
+        )
+
+        with patch(
+            "src.api.routes.webhook._get_or_create_session",
+            new=AsyncMock(return_value=(uuid4(), True)),
+        ), patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service, patch(
+            "src.api.routes.webhook.send_uazapi_text",
+            new=AsyncMock(
+                side_effect=[
+                    _fake_uazapi_send_result(),
+                    _fake_uazapi_send_result(),
+                ],
+            ),
+        ) as mock_send:
+            service = MagicMock()
+            # No agent_language override → default is pt-BR
+            service._load_clinic_config = AsyncMock(
+                return_value=_lgpd_config(enabled=True),
+            )
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Resposta"),
+            )
+            mock_get_service.return_value = service
+
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        first_text = mock_send.await_args_list[0].args[3]
+        # PT default text mentions "LGPD" — the EN default does not
+        assert "LGPD" in first_text
+
+    def test_privacy_notice_language_en_selected(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000105",
+            body="Hi",
+            message_id=f"3EB0_en_{uuid4().hex[:8]}",
+        )
+
+        en_clinic_config = {
+            "lgpd": {"lgpd_enabled": True},
+            "identity": {"clinic_name": "Test Clinic"},
+            "business_rules": {"agent_language": "en"},
+        }
+
+        with patch(
+            "src.api.routes.webhook._get_or_create_session",
+            new=AsyncMock(return_value=(uuid4(), True)),
+        ), patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service, patch(
+            "src.api.routes.webhook.send_uazapi_text",
+            new=AsyncMock(
+                side_effect=[
+                    _fake_uazapi_send_result(),
+                    _fake_uazapi_send_result(),
+                ],
+            ),
+        ) as mock_send:
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(
+                return_value=en_clinic_config,
+            )
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Reply"),
+            )
+            mock_get_service.return_value = service
+
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        first_text = mock_send.await_args_list[0].args[3]
+        # EN default text starts with "Hello!" — PT starts with "Olá!"
+        assert first_text.startswith("Hello")
+
+    def test_privacy_send_failure_does_not_break_ai_reply(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """AC: 'falha no envio do aviso não impede a resposta normal da IA
+        ao paciente'. The privacy send raises, the aviso helper swallows
+        and logs, and the AI reply pipeline still runs.
+        """
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000106",
+            body="Continua respondendo",
+            message_id=f"3EB0_privfail_{uuid4().hex[:8]}",
+        )
+
+        reply_send = _fake_uazapi_send_result()
+
+        # First call (aviso) raises; second call (reply) succeeds
+        send_mock = AsyncMock(
+            side_effect=[RuntimeError("boom"), reply_send],
+        )
+
+        with patch(
+            "src.api.routes.webhook._get_or_create_session",
+            new=AsyncMock(return_value=(uuid4(), True)),
+        ), patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service, patch(
+            "src.api.routes.webhook.send_uazapi_text",
+            new=send_mock,
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(
+                return_value=_lgpd_config(enabled=True),
+            )
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Reply body"),
+            )
+            mock_get_service.return_value = service
+
+            with caplog.at_level("WARNING", logger="src.api.routes.webhook"):
+                resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True}
+        # aviso attempted (raised) + reply (succeeded)
+        assert send_mock.await_count == 2
+        # Warning line for the failed aviso is present
+        warn_msgs = [
+            rec.getMessage() for rec in caplog.records if rec.levelname == "WARNING"
+        ]
+        assert any(
+            "Uazapi LGPD send failed" in m for m in warn_msgs
+        ), warn_msgs
+
+
+class TestUazapiEchoIdNormalisation:
+    """Group 1b Deliverable 6 + AC: composite ``owner:MSGID`` is normalised."""
+
+    def test_composite_id_stored_without_owner_prefix(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """AC: Given send_result carrying only ``id='owner:MSGID'``, the
+        value stored is ``MSGID`` (no prefix) and ``_track_sent_message``
+        receives ``{"messageid": MSGID}``.
+        """
+        from src.api.routes import webhook as webhook_module
+
+        webhook_module._INMEM_SENT.clear()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        session_id = uuid4()
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000110",
+            body="ping",
+            message_id=f"3EB0_ping_{uuid4().hex[:8]}",
+        )
+
+        # send_result ONLY contains ``id`` in the composite form. This is
+        # the exact payload shape captured from the live Uazapi instance.
+        composite_send_result = {
+            "id": "5511940589006:3EB08AA1C8596FA5A17973",
+        }
+
+        stored_ids: list[str] = []
+
+        async def _store_spy(sid, mid, db):
+            stored_ids.append(mid)
+
+        with patch(
+            "src.api.routes.webhook._get_or_create_session",
+            new=AsyncMock(return_value=(session_id, False)),
+        ), patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service, patch(
+            "src.api.routes.webhook.send_uazapi_text",
+            new=AsyncMock(return_value=composite_send_result),
+        ), patch(
+            "src.api.routes.webhook._store_ai_msg_id_to_db",
+            new=AsyncMock(side_effect=_store_spy),
+        ), patch(
+            "src.api.routes.webhook._track_sent_message",
+        ) as mock_track:
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Reply"),
+            )
+            mock_get_service.return_value = service
+
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True}
+
+        # The stored id must be the tail — never the composite form
+        assert stored_ids == ["3EB08AA1C8596FA5A17973"], stored_ids
+        assert all(":" not in v for v in stored_ids)
+
+        # _track_sent_message received {"messageid": <normalized>}
+        assert mock_track.call_count == 1
+        tracked_arg = mock_track.call_args.args[0]
+        assert tracked_arg == {"messageid": "3EB08AA1C8596FA5A17973"}
+        # And critically — the value inside carries no colon
+        assert ":" not in tracked_arg["messageid"]
+
+    def test_privacy_notice_composite_id_normalised(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Same normalisation applies to the aviso send path, not just the
+        reply. The aviso helper writes {"messageid": <normalized>} into
+        _track_sent_message and stores the tail-only id in the DB.
+        """
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        session_id = uuid4()
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000111",
+            body="Novo paciente",
+            message_id=f"3EB0_newp_{uuid4().hex[:8]}",
+        )
+
+        # Aviso send result carries only composite ``id``; reply gets a
+        # normal top-level ``messageid``.
+        composite_aviso = {"id": "owner:PRIVACY_ID_TAIL"}
+        reply_send = {"messageid": "REPLY_ID"}
+
+        stored_ids: list[str] = []
+
+        async def _store_spy(sid, mid, db):
+            stored_ids.append(mid)
+
+        with patch(
+            "src.api.routes.webhook._get_or_create_session",
+            new=AsyncMock(return_value=(session_id, True)),
+        ), patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service, patch(
+            "src.api.routes.webhook.send_uazapi_text",
+            new=AsyncMock(side_effect=[composite_aviso, reply_send]),
+        ), patch(
+            "src.api.routes.webhook._store_ai_msg_id_to_db",
+            new=AsyncMock(side_effect=_store_spy),
+        ), patch(
+            "src.api.routes.webhook._track_sent_message",
+        ) as mock_track:
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(
+                return_value=_lgpd_config(enabled=True),
+            )
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Reply"),
+            )
+            mock_get_service.return_value = service
+
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+
+        # Both dedup layers agree on the aviso id and the reply id
+        assert stored_ids == ["PRIVACY_ID_TAIL", "REPLY_ID"], stored_ids
+        # None carry a colon — critical invariant
+        assert all(":" not in v for v in stored_ids)
+
+        # _track_sent_message called for aviso and reply, always with the
+        # normalised messageid form
+        tracked_calls = [c.args[0] for c in mock_track.call_args_list]
+        assert tracked_calls == [
+            {"messageid": "PRIVACY_ID_TAIL"},
+            {"messageid": "REPLY_ID"},
+        ]
+        assert all(":" not in c["messageid"] for c in tracked_calls)
+
+
+# ============================================
+# uazapi-parity Group 3 — Human takeover via ``fromMe``
+# ============================================
+
+
+def _create_session(client: TestClient, tenant_id: UUID, phone: str) -> UUID:
+    """Create an active session for ``phone`` on the app's own event loop.
+
+    Mirrors the helper in ``test_webhook_egress.py``: takeover tests need a
+    real session in the same DB the request handler will read, otherwise the
+    fromMe path bottoms out in ``no_session`` and there's nothing to pause.
+    """
+    from src.api.routes.webhook import _get_or_create_session, _normalise_phone
+    from src.repositories.database import get_db_session
+
+    async def _run() -> UUID:
+        db = get_db_session()
+        try:
+            session_id, _ = await _get_or_create_session(
+                tenant_id, _normalise_phone(phone), db
+            )
+            await db.commit()
+            return session_id
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _session_row(client: TestClient, session_id: UUID):
+    """Load the raw session row in a *new* AsyncSession so assertions see the
+    committed state, not the in-memory object the request handler mutated.
+    """
+    from sqlalchemy import select
+    from src.models.session import Session as SessionRow
+    from src.repositories.database import get_db_session
+
+    async def _run():
+        db = get_db_session()
+        try:
+            row = await db.execute(
+                select(
+                    SessionRow.is_paused, SessionRow.paused_until
+                ).where(SessionRow.id == session_id)
+            )
+            r = row.one()
+            return {"is_paused": bool(r.is_paused), "paused_until": r.paused_until}
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _session_metadata(client: TestClient, session_id: UUID) -> dict:
+    """Load ``session_metadata`` in a new AsyncSession — used by the aviso
+    echo end-to-end test, which needs to plant the aviso id server-side."""
+    from sqlalchemy import select
+    from src.models.session import Session as SessionRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> dict:
+        db = get_db_session()
+        try:
+            row = await db.execute(
+                select(SessionRow.session_metadata).where(SessionRow.id == session_id)
+            )
+            return dict(row.scalar_one() or {})
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _seed_handoff_active(
+    client: TestClient,
+    tenant_id: UUID,
+    *,
+    active: str = "yes",
+) -> None:
+    """Save the handoff bucket so ``_load_handoff_config`` returns real data.
+
+    Without an explicit save the row inherits ``{}`` and ``handoff_active``
+    resolves to its default ``"yes"``. The tests that need the default
+    behaviour therefore don't need to call this; the ``handoff_inactive``
+    test does.
+    """
+    from sqlalchemy import update
+    from src.models.clinic_config_table import ClinicConfigTable
+    from src.repositories.database import get_db_session
+
+    async def _run() -> None:
+        db = get_db_session()
+        try:
+            await db.execute(
+                update(ClinicConfigTable)
+                .where(ClinicConfigTable.tenant_id == tenant_id)
+                .values(handoff={"handoff_active": active})
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    client._submit(_run())  # type: ignore[attr-defined]
+
+
+class TestUazapiFromMeHumanTakeover:
+    """Group 3 AC: a real clinic message via fromMe pauses the *patient's* session.
+
+    Decision 3 governs the counterparty resolution — the patient is on the
+    ``chat.wa_chatid`` side, never on ``sender_pn`` (which holds the clinic's
+    own number when the clinic replies from its phone).
+    """
+
+    def _clear_state(self) -> None:
+        from src.api.routes import webhook as webhook_module
+
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+
+    def test_from_me_pauses_patient_session_resolved_by_chatid(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        clinic_number = "5511940589006"  # sender_pn — the clinic's own line
+        patient_number = "5516994420645"  # chatid — the patient we must pause
+
+        # Session exists ONLY for the patient. No session exists for the
+        # clinic number — asserted after the call.
+        patient_session_id = _create_session(client, tenant_id, patient_number)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone=clinic_number,  # ignored for the fromMe path
+            body="Vou te ligar em 5 min",
+            message_id=f"3EB0_takeover_{uuid4().hex[:8]}",
+            from_me=True,
+            sender_pn=f"{clinic_number}@s.whatsapp.net",
+            chat_jid=f"{patient_number}@s.whatsapp.net",
+        )
+
+        with patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service, patch(
+            "src.api.routes.webhook.send_uazapi_text",
+            new=AsyncMock(return_value=_fake_uazapi_send_result()),
+        ) as mock_send:
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json().get("action") == "human_takeover", resp.json()
+
+        # DB round-trip: fresh AsyncSession, not the in-memory session obj —
+        # this is the acceptance criterion that would fail without the
+        # ``await db.commit()`` after ``_handle_clinic_message``.
+        row = _session_row(client, patient_session_id)
+        assert row["is_paused"] is True, row
+
+        # Zero pipeline / send touch — takeover never enters the LLM path
+        assert mock_get_service.call_count == 0
+        assert mock_send.await_count == 0
+
+    def test_from_me_never_creates_session_for_clinic_number(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Deliverable 1 AC: the fromMe path resolves the patient via
+        chatid, so no session is ever seeded for the clinic's own number.
+        """
+        from sqlalchemy import select
+        from src.models.session import Session as SessionRow
+        from src.repositories.database import get_db_session
+        from src.api.routes.webhook import _normalise_phone
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        clinic_number = "5511940589006"
+        patient_number = "5516994420600"
+        # Pre-seed only the patient's session
+        _create_session(client, tenant_id, patient_number)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone=clinic_number,
+            body="mensagem da secretária",
+            message_id=f"3EB0_noclinic_{uuid4().hex[:8]}",
+            from_me=True,
+            sender_pn=f"{clinic_number}@s.whatsapp.net",
+            chat_jid=f"{patient_number}@s.whatsapp.net",
+        )
+
+        with patch(
+            "src.api.routes.webhook.get_event_service",
+        ), patch(
+            "src.api.routes.webhook.send_uazapi_text",
+            new=AsyncMock(return_value=_fake_uazapi_send_result()),
+        ):
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+
+        async def _count_clinic_sessions() -> int:
+            db = get_db_session()
+            try:
+                row = await db.execute(
+                    select(SessionRow.id).where(
+                        SessionRow.tenant_id == tenant_id,
+                        SessionRow.user_id == _normalise_phone(clinic_number),
+                    )
+                )
+                return len(row.all())
+            finally:
+                await db.close()
+
+        clinic_session_count = client._submit(_count_clinic_sessions())  # type: ignore[attr-defined]
+        assert clinic_session_count == 0, (
+            "fromMe path must never create a session for the clinic's own number"
+        )
+
+
+class TestUazapiFromMeAiEcho:
+    """AC: an AI-sent reply echo is still recognised — no pause, no takeover."""
+
+    def _clear_state(self) -> None:
+        from src.api.routes import webhook as webhook_module
+
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+
+    def test_reply_echo_is_dedup_dropped_and_does_not_pause(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        from src.api.routes.webhook import _track_sent_message
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        clinic_number = "5511940589006"
+        patient_number = "5516994420601"
+        patient_session_id = _create_session(client, tenant_id, patient_number)
+
+        # Simulate an outbound AI reply whose id will echo back
+        echo_id = f"3EB0_echo_{uuid4().hex[:12]}"
+        _track_sent_message({"messageid": echo_id})
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone=clinic_number,
+            body="Bot reply echoed back",
+            message_id=echo_id,
+            from_me=True,
+            sender_pn=f"{clinic_number}@s.whatsapp.net",
+            chat_jid=f"{patient_number}@s.whatsapp.net",
+        )
+
+        resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "skipped": "ai_echo"}
+        row = _session_row(client, patient_session_id)
+        assert row["is_paused"] is False
+
+    def test_privacy_notice_echo_end_to_end_does_not_pause(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """AC: sends the aviso (Group 1b commits its id), then simulates the
+        aviso's own fromMe echo returning through the same webhook — nothing
+        pauses. This is the exact scenario Decision 2 prevents.
+        """
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        clinic_number = "5511940589006"
+        patient_number = "5516994420602"
+
+        privacy_mid = f"3EB0_priv_echo_{uuid4().hex[:12]}"
+        privacy_send = _fake_uazapi_send_result(message_id=privacy_mid)
+        reply_send = _fake_uazapi_send_result()
+
+        first_payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone=patient_number,
+            body="Primeiro contato",
+            message_id=f"3EB0_first_{uuid4().hex[:8]}",
+        )
+
+        with patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service, patch(
+            "src.api.routes.webhook.send_uazapi_text",
+            new=AsyncMock(side_effect=[privacy_send, reply_send]),
+        ) as mock_send:
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(
+                return_value=_lgpd_config(enabled=True),
+            )
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Reply body"),
+            )
+            mock_get_service.return_value = service
+
+            first_resp = client.post(WEBHOOK_PATH, json=first_payload)
+
+        assert first_resp.status_code == 200, first_resp.text
+        assert mock_send.await_count == 2  # aviso + reply
+
+        # The aviso id was committed to session_metadata by Group 1b —
+        # verify from a NEW DB session (not the request's).
+        from src.api.routes.webhook import _normalise_phone
+        from sqlalchemy import select
+        from src.models.session import Session as SessionRow
+        from src.repositories.database import get_db_session
+
+        async def _find_patient_session() -> UUID:
+            db = get_db_session()
+            try:
+                row = await db.execute(
+                    select(SessionRow.id).where(
+                        SessionRow.tenant_id == tenant_id,
+                        SessionRow.user_id == _normalise_phone(patient_number),
+                    )
+                )
+                return row.scalar_one()
+            finally:
+                await db.close()
+
+        session_id = client._submit(_find_patient_session())  # type: ignore[attr-defined]
+        meta = _session_metadata(client, session_id)
+        ids = [entry[0] for entry in (meta.get("ai_msg_ids") or [])]
+        assert privacy_mid in ids, (
+            f"expected the aviso id in session_metadata, got {meta!r}"
+        )
+
+        # Now the aviso's own echo returns as a fromMe delivery.
+        # Sender_pn = clinic (owner of the echo), chatid = patient. The
+        # _INMEM_SENT store was cleared by the first request's echo layer
+        # (or was never written, since the aviso path stores via
+        # _store_ai_msg_id_to_db). The DB-backed dedup inside
+        # _handle_clinic_message is what has to catch this.
+        echo_payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone=clinic_number,
+            body="[echoed LGPD notice]",
+            message_id=privacy_mid,
+            from_me=True,
+            sender_pn=f"{clinic_number}@s.whatsapp.net",
+            chat_jid=f"{patient_number}@s.whatsapp.net",
+        )
+
+        with patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service2:
+            echo_resp = client.post(WEBHOOK_PATH, json=echo_payload)
+
+        assert echo_resp.status_code == 200, echo_resp.text
+        # Either the in-memory ``ai_echo`` skip or the DB-backed
+        # ``ai_echo_db`` inside _handle_clinic_message — both mean the
+        # echo was recognised and nothing paused.
+        body = echo_resp.json()
+        assert body.get("skipped") in {"ai_echo", "ai_echo_db"}, body
+
+        row = _session_row(client, session_id)
+        assert row["is_paused"] is False, (
+            "the aviso echo must never pause the session it just opened"
+        )
+        assert mock_get_service2.call_count == 0
+
+    def test_duplicate_delivery_of_same_echo_is_dropped_by_claim(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """AC (Decision 9): the provider re-delivers each message; the second
+        delivery of the same fromMe echo must not sneak past the id-based
+        layers (which *consume* on match) and pause the session. The lower
+        bound of the ordering — claim before route — closes this window.
+        """
+        from src.api.routes.webhook import _track_sent_message
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        clinic_number = "5511940589006"
+        patient_number = "5516994420603"
+        patient_session_id = _create_session(client, tenant_id, patient_number)
+
+        echo_id = f"3EB0_dup_echo_{uuid4().hex[:12]}"
+        _track_sent_message({"messageid": echo_id})
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone=clinic_number,
+            body="Bot reply",
+            message_id=echo_id,
+            from_me=True,
+            sender_pn=f"{clinic_number}@s.whatsapp.net",
+            chat_jid=f"{patient_number}@s.whatsapp.net",
+        )
+
+        # Force in-memory claim path so the test isolates behaviour from a
+        # possibly-real Redis (which the test env may or may not have).
+        with patch(
+            "src.api.routes.webhook._get_redis",
+            return_value=None,
+        ):
+            first = client.post(WEBHOOK_PATH, json=payload)
+            second = client.post(WEBHOOK_PATH, json=payload)
+
+        assert first.status_code == 200
+        assert first.json() == {"ok": True, "skipped": "ai_echo"}
+        assert second.status_code == 200
+        # Second delivery is barred by the claim (lower bound of Decision 9).
+        # Without the reorder the id-based layers would have consumed the
+        # entry on the first call and this delivery would pause the session.
+        assert second.json() == {"ok": True, "skipped": "duplicate_message"}
+        row = _session_row(client, patient_session_id)
+        assert row["is_paused"] is False
+
+
+class TestUazapiFromMeStaffAudioTakeover:
+    """AC: the Group 2 audio carve-out finally produces a pause on Group 3."""
+
+    def _clear_state(self) -> None:
+        from src.api.routes import webhook as webhook_module
+
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+
+    def test_staff_voice_note_pauses_session(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        clinic_number = "5511940589006"
+        patient_number = "5516994420604"
+        patient_session_id = _create_session(client, tenant_id, patient_number)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone=clinic_number,
+            body="",
+            text="",
+            content="",
+            message_id=f"3EB0_staff_ptt_{uuid4().hex[:8]}",
+            msg_type="media",
+            media_type="audio",
+            ptt=True,
+            from_me=True,
+            sender_pn=f"{clinic_number}@s.whatsapp.net",
+            chat_jid=f"{patient_number}@s.whatsapp.net",
+        )
+
+        resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json().get("action") == "human_takeover", resp.json()
+        row = _session_row(client, patient_session_id)
+        assert row["is_paused"] is True
+
+
+class TestUazapiFromMeWasSentByApiGuard:
+    """AC: fromMe *without* a messageid is not a takeover if wasSentByApi=True.
+
+    The claim is conditional on ``msg_id`` (``if msg_id and not
+    _claim_incoming_message(...)``); an idless fromMe would slip past it and
+    also past ``_is_ai_sent_message`` (which needs an id). Decision 8's
+    ``wasSentByApi`` is the guard that covers this exact hole.
+    """
+
+    def _clear_state(self) -> None:
+        from src.api.routes import webhook as webhook_module
+
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+
+    def test_idless_echo_with_was_sent_by_api_true_is_dropped(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        clinic_number = "5511940589006"
+        patient_number = "5516994420605"
+        patient_session_id = _create_session(client, tenant_id, patient_number)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone=clinic_number,
+            body="idless echo",
+            message_id="",  # exact hole the guard covers
+            from_me=True,
+            sender_pn=f"{clinic_number}@s.whatsapp.net",
+            chat_jid=f"{patient_number}@s.whatsapp.net",
+            was_sent_by_api=True,
+        )
+
+        # Re-deliver the same payload — without wasSentByApi both deliveries
+        # would pause; with it, both must be dropped as ai_echo.
+        first = client.post(WEBHOOK_PATH, json=payload)
+        second = client.post(WEBHOOK_PATH, json=payload)
+
+        assert first.status_code == 200
+        assert first.json() == {"ok": True, "skipped": "ai_echo"}
+        assert second.status_code == 200
+        assert second.json() == {"ok": True, "skipped": "ai_echo"}
+
+        row = _session_row(client, patient_session_id)
+        assert row["is_paused"] is False, (
+            "idless echo with wasSentByApi must never pause the session"
+        )
+
+
+class TestUazapiFromMeTriggerReactivation:
+    """AC: trigger phrase from the clinic re-arms the session (paused_until in
+    future). Only reachable because fromMe routing runs *before*
+    _check_pause_state — the upper bound of Decision 9's ordering.
+    """
+
+    def _clear_state(self) -> None:
+        from src.api.routes import webhook as webhook_module
+
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+
+    def _pause_session(self, client: TestClient, session_id: UUID) -> None:
+        from sqlalchemy import update
+        from src.models.session import Session as SessionRow
+        from src.repositories.database import get_db_session
+
+        async def _run() -> None:
+            db = get_db_session()
+            try:
+                await db.execute(
+                    update(SessionRow)
+                    .where(SessionRow.id == session_id)
+                    .values(is_paused=True, paused_until=None)
+                )
+                await db.commit()
+            finally:
+                await db.close()
+
+        client._submit(_run())  # type: ignore[attr-defined]
+
+    def test_trigger_phrase_reactivates_paused_session(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        clinic_number = "5511940589006"
+        patient_number = "5516994420606"
+        patient_session_id = _create_session(client, tenant_id, patient_number)
+        self._pause_session(client, patient_session_id)
+
+        # The default trigger from _handle_clinic_message is
+        # "Precisando de algo mais,estamos a disposição." — normalization
+        # collapses spaces and strips whitespace around punctuation, so an
+        # extra space here is tolerated.
+        trigger_text = "Precisando de algo mais, estamos a disposição."
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone=clinic_number,
+            body=trigger_text,
+            message_id=f"3EB0_trigger_{uuid4().hex[:8]}",
+            from_me=True,
+            sender_pn=f"{clinic_number}@s.whatsapp.net",
+            chat_jid=f"{patient_number}@s.whatsapp.net",
+        )
+
+        resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json().get("action") == "trigger_reactivation", resp.json()
+
+        row = _session_row(client, patient_session_id)
+        assert row["is_paused"] is True  # still paused, but with a future clock
+        paused_until = row["paused_until"]
+        assert paused_until is not None
+        # SQLite drops the tz info; the production DB (Postgres) preserves it.
+        # Normalize so the assertion is meaningful on both — what matters is
+        # the wall clock, not the tzinfo attribute.
+        if paused_until.tzinfo is None:
+            paused_until = paused_until.replace(tzinfo=timezone.utc)
+        assert paused_until > datetime.now(timezone.utc)
+
+
+class TestUazapiFromMeHandoffInactive:
+    """AC: when the tenant disabled handoff, fromMe never pauses the session."""
+
+    def _clear_state(self) -> None:
+        from src.api.routes import webhook as webhook_module
+
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+
+    def test_handoff_inactive_leaves_session_alone(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+        _seed_handoff_active(client, tenant_id, active="no")
+
+        clinic_number = "5511940589006"
+        patient_number = "5516994420607"
+        patient_session_id = _create_session(client, tenant_id, patient_number)
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone=clinic_number,
+            body="secretaria falando",
+            message_id=f"3EB0_hoff_off_{uuid4().hex[:8]}",
+            from_me=True,
+            sender_pn=f"{clinic_number}@s.whatsapp.net",
+            chat_jid=f"{patient_number}@s.whatsapp.net",
+        )
+
+        resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "skipped": "handoff_inactive"}
+        row = _session_row(client, patient_session_id)
+        assert row["is_paused"] is False
+
+
+class TestUazapiPatientMessageUnchanged:
+    """AC: a normal patient message (fromMe=false) keeps today's behaviour."""
+
+    def _clear_state(self) -> None:
+        from src.api.routes import webhook as webhook_module
+
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+
+    def test_patient_message_still_dispatches_pipeline(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        msg_id = f"3EB0_pat_{uuid4().hex[:10]}"
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511988887710",
+            body="Quero agendar",
+            message_id=msg_id,
+        )
+
+        with patch(
+            "src.api.routes.webhook.get_event_service",
+        ) as mock_get_service, patch(
+            "src.api.routes.webhook.send_uazapi_text",
+            new=AsyncMock(return_value=_fake_uazapi_send_result()),
+        ) as mock_send:
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Claro!"),
+            )
+            mock_get_service.return_value = service
+
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True}
+        assert service.process_event.await_count == 1
+        assert mock_send.await_count == 1
+
+
+# ============================================
+# Group 4 — Patient audio ingestion (media-payload.json driven)
+# ============================================
+
+
+def _seed_uazapi_audio_tenant(
+    client: TestClient,
+    tenant_id: UUID,
+    instance_name: str,
+    *,
+    stt: bool = False,
+    stt_provider: str | None = None,
+    multimodal: bool = False,
+    multimodal_provider: str = "openrouter",
+    audio_max_seconds: int | None = None,
+    api_url: str = "https://uazapi.example.com",
+    token: str | None = None,
+) -> None:
+    """Seed a real credential row for the Uazapi audio path.
+
+    Mirrors ``_seed_zapi_audio_tenant`` in ``test_webhook_zapi.py``: no
+    mocking of ``_load_tenant_credentials`` — the point is that the webhook
+    reads raw credentials from the DB. Keys are per-test unique and
+    obviously fake.
+    """
+    payload: dict = {
+        "whatsapp_provider": "uazapi",
+        "uazapi_api_url": api_url,
+        "uazapi_token": token or f"uz_token_{uuid4().hex}",
+        "uazapi_instance_name": instance_name,
+    }
+    if stt or stt_provider is not None:
+        payload.update(
+            {
+                "stt_provider": stt_provider or "outros",
+                "stt_api_key": f"sk-fake-stt-{uuid4().hex}",
+                "stt_api_url": "https://api.groq.com/openai/v1",
+                "stt_model_name": "whisper-large-v3-turbo",
+            }
+        )
+    if multimodal:
+        payload.update(
+            {
+                "multimodal_provider": multimodal_provider,
+                "multimodal_api_url": "https://openrouter.ai/api/v1",
+                "multimodal_api_key": f"sk-fake-mm-{uuid4().hex}",
+                "multimodal_model_name": "google/gemini-2.5-flash",
+            }
+        )
+    if audio_max_seconds is not None:
+        payload["audio_max_seconds"] = audio_max_seconds
+
+    resp = client.patch(
+        API_CRED_PATH,
+        json=payload,
+        headers=_admin_headers(tenant_id),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def _build_uazapi_media_body(
+    kind: str,
+    *,
+    instance: str,
+    message_id: str | None = None,
+    from_me: bool | None = None,
+    seconds_override: int | None = None,
+) -> dict:
+    """Return the real captured Uazapi webhook body with minimal edits.
+
+    Only ``instanceName`` (required to route the test's tenant) and the
+    optional ``fromMe`` / ``messageid`` / ``content.seconds`` are touched;
+    everything else is the untouched shape captured against the live
+    Uazapi instance (see ``.genie/wishes/uazapi-parity/evidence/``).
+    """
+    body = _load_media_evidence(kind)
+    body["instanceName"] = instance
+    if message_id is not None:
+        body["message"]["messageid"] = message_id
+        # ``id`` is the composite ``owner:MSGID`` form; keep the tail
+        # aligned so any downstream normalisation stays consistent.
+        owner = body["message"].get("owner") or body.get("owner") or ""
+        body["message"]["id"] = f"{owner}:{message_id}" if owner else message_id
+    if from_me is not None:
+        body["message"]["fromMe"] = from_me
+    if seconds_override is not None:
+        content = body["message"].setdefault("content", {})
+        content["seconds"] = seconds_override
+    return body
+
+
+class TestUazapiGroup4MediaEvidenceShape:
+    """Sanity-check the loaded evidence so downstream asserts have a firm base."""
+
+    def test_evidence_file_shape_matches_group_expectations(self):
+        audio = _load_media_evidence("audio")
+        image = _load_media_evidence("image")
+
+        # Real captured payload identifiers Group 4 depends on
+        assert audio["message"]["fromMe"] is False
+        assert audio["message"]["mediaType"] == "ptt"
+        assert audio["message"]["type"] == "media"
+        assert audio["message"]["content"]["mimetype"] == "audio/ogg; codecs=opus"
+        assert isinstance(audio["message"]["content"]["seconds"], int)
+        assert audio["message"]["messageid"]  # non-empty id
+
+        assert image["message"]["fromMe"] is False
+        assert image["message"]["mediaType"] == "image"
+        assert image["message"]["type"] == "media"
+        assert image["message"]["content"]["mimetype"] == "image/jpeg"
+
+
+class TestUazapiGroup4NonAudioMedia:
+    """Non-audio media exits as ``non-text`` (Z-API reference, not Meta's
+    file-ack). Uses the real captured *image* payload."""
+
+    def _clear_state(self) -> None:
+        from src.api.routes import webhook as webhook_module
+
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+        webhook_module._INMEM_STT_NOTICE.clear()
+
+    def test_patient_image_exits_as_non_text_without_download(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(
+            client, tenant_id, instance, stt=True, multimodal=True
+        )
+
+        payload = _build_uazapi_media_body(
+            "image",
+            instance=instance,
+            message_id=f"3EB0_img_{uuid4().hex[:10]}",
+        )
+
+        download_mock = AsyncMock()
+        send_mock = AsyncMock(return_value=_fake_uazapi_send_result())
+        with (
+            patch("src.api.routes.webhook.download_uazapi_media", download_mock),
+            patch("src.api.routes.webhook.send_uazapi_text", send_mock),
+            patch("src.api.routes.webhook.get_event_service") as mock_get_service,
+        ):
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "skipped": "non-text"}
+        download_mock.assert_not_called()
+        send_mock.assert_not_called()
+        assert mock_get_service.call_count == 0
+
+
+class TestUazapiGroup4UnknownInstanceStopsBeforeDownload:
+    """AC: media from an unknown instance never triggers a download."""
+
+    def _clear_state(self) -> None:
+        from src.api.routes import webhook as webhook_module
+
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+        webhook_module._INMEM_STT_NOTICE.clear()
+
+    def test_unknown_instance_audio_never_downloads(
+        self,
+        client: TestClient,
+        tenant_id: UUID,  # unused: the point is that the tenant isn't wired
+    ):
+        self._clear_state()
+        # No _seed_uazapi_audio_tenant call — the instanceName below never
+        # matches any credential row, so tenant resolution returns None.
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=f"unknown_{uuid4().hex[:8]}",
+            message_id=f"3EB0_orphan_{uuid4().hex[:10]}",
+        )
+
+        download_mock = AsyncMock()
+        send_mock = AsyncMock(return_value=_fake_uazapi_send_result())
+        with (
+            patch("src.api.routes.webhook.download_uazapi_media", download_mock),
+            patch("src.api.routes.webhook.send_uazapi_text", send_mock),
+        ):
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "skipped": "unknown_instance"}
+        download_mock.assert_not_called()
+        send_mock.assert_not_called()
+
+
+class TestUazapiGroup4PatientAudioTranscription:
+    """AC: patient audio is transcribed and reaches the pipeline; on chain
+    failure the text reroute takes over — never silence."""
+
+    def _clear_state(self) -> None:
+        from src.api.routes import webhook as webhook_module
+
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+        webhook_module._INMEM_STT_NOTICE.clear()
+
+    def test_patient_audio_transcript_feeds_pipeline(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """STT succeeds: transcript is what the pipeline sees, no reroute."""
+        from src.services.event_service import EventService
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(client, tenant_id, instance, stt=True)
+
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_pttok_{uuid4().hex[:10]}",
+        )
+
+        captured: dict = {}
+
+        async def _capture(self, event_request, session=None):
+            captured["content"] = event_request.payload.content
+            return SimpleNamespace(
+                prompt=None,
+                handoff_summary=None,
+                decision=SimpleNamespace(handoff_required=False),
+            )
+
+        download_mock = AsyncMock(
+            return_value=(b"OggS_fake_bytes", "audio/ogg; codecs=opus")
+        )
+        send_mock = AsyncMock(return_value=_fake_uazapi_send_result())
+
+        with (
+            patch("src.api.routes.webhook.download_uazapi_media", download_mock),
+            patch(
+                "src.services.groq_service.transcribe_audio",
+                new=AsyncMock(return_value="quero remarcar minha consulta"),
+            ),
+            patch("src.api.routes.webhook.send_uazapi_text", send_mock),
+            patch.object(EventService, "process_event", _capture),
+        ):
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        # No prompt.suggested_response -> replied=False, but no fallback either
+        assert resp.json().get("action") != "stt_fallback", resp.json()
+        assert download_mock.await_count == 1
+        assert captured.get("content") == "quero remarcar minha consulta"
+        send_mock.assert_not_called()
+
+    def test_patient_audio_chain_failure_triggers_text_reroute(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Both rungs fail — the patient gets the ``fallback-texto`` copy."""
+        from src.api.routes.webhook import _STT_TEMPORARY_FAILURE_MSG_PT
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(
+            client, tenant_id, instance, stt=True, multimodal=True
+        )
+
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_pttfail_{uuid4().hex[:10]}",
+        )
+
+        download_mock = AsyncMock(
+            return_value=(b"OggS_fake_bytes", "audio/ogg; codecs=opus")
+        )
+        send_mock = AsyncMock(return_value=_fake_uazapi_send_result())
+
+        with (
+            patch("src.api.routes.webhook.download_uazapi_media", download_mock),
+            patch(
+                "src.services.groq_service.transcribe_audio",
+                new=AsyncMock(side_effect=RuntimeError("stt 503")),
+            ),
+            patch(
+                "src.services.multimodal_service.transcribe_audio_multimodal",
+                new=AsyncMock(side_effect=RuntimeError("mm 429")),
+            ),
+            patch("src.api.routes.webhook.send_uazapi_text", send_mock),
+        ):
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "stt_fallback"}
+        assert send_mock.await_count == 1
+        assert send_mock.await_args.args[3] == _STT_TEMPORARY_FAILURE_MSG_PT
+
+    def test_patient_audio_download_error_skips_with_labelled_reason(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Uazapi ``download_uazapi_media`` failure: no chain, distinct skip."""
+        from src.services.uazapi_service import UazapiMediaDownloadError
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(client, tenant_id, instance, stt=True)
+
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_pttdl_{uuid4().hex[:10]}",
+        )
+
+        download_mock = AsyncMock(
+            side_effect=UazapiMediaDownloadError("http_error: 500")
+        )
+        send_mock = AsyncMock(return_value=_fake_uazapi_send_result())
+        stt_mock = AsyncMock()
+
+        with (
+            patch("src.api.routes.webhook.download_uazapi_media", download_mock),
+            patch("src.services.groq_service.transcribe_audio", stt_mock),
+            patch("src.api.routes.webhook.send_uazapi_text", send_mock),
+        ):
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "skipped": "audio_download_failed"}
+        stt_mock.assert_not_called()
+        send_mock.assert_not_called()
+
+    def test_patient_audio_long_duration_hands_off_without_downloading(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Duration gate outranks capability: no download, handoff message."""
+        from src.api.routes.webhook import _AUDIO_TOO_LONG_MSG_PT
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(
+            client, tenant_id, instance, stt=True, audio_max_seconds=60
+        )
+
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_pttlong_{uuid4().hex[:10]}",
+            seconds_override=180,
+        )
+
+        download_mock = AsyncMock()
+        send_mock = AsyncMock(return_value=_fake_uazapi_send_result())
+
+        with (
+            patch("src.api.routes.webhook.download_uazapi_media", download_mock),
+            patch("src.api.routes.webhook.send_uazapi_text", send_mock),
+        ):
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "skipped": "audio_too_long"}
+        download_mock.assert_not_called()
+        assert send_mock.await_count == 1
+        assert send_mock.await_args.args[3] == _AUDIO_TOO_LONG_MSG_PT
+
+    def test_patient_audio_no_capability_reroutes_without_downloading(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Decision 6 honest variant: capability gate holds, chain reports it."""
+        from src.api.routes.webhook import _STT_NEVER_CONFIGURED_MSG_PT
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(client, tenant_id, instance)  # neither STT nor MM
+
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_pttnocap_{uuid4().hex[:10]}",
+        )
+
+        download_mock = AsyncMock()
+        send_mock = AsyncMock(return_value=_fake_uazapi_send_result())
+        with (
+            patch("src.api.routes.webhook.download_uazapi_media", download_mock),
+            patch("src.api.routes.webhook.send_uazapi_text", send_mock),
+        ):
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "stt_fallback"}
+        # Capability gate: not one byte fetched from Uazapi
+        download_mock.assert_not_called()
+        assert send_mock.await_count == 1
+        assert send_mock.await_args.args[3] == _STT_NEVER_CONFIGURED_MSG_PT
+
+
+class TestUazapiGroup4FromMeAudioUntouched:
+    """AC: fromMe audio (staff voice note) never downloads / transcribes /
+    reroutes AND still pauses the session. Both halves asserted here."""
+
+    def _clear_state(self) -> None:
+        from src.api.routes import webhook as webhook_module
+
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+        webhook_module._INMEM_STT_NOTICE.clear()
+
+    def test_from_me_audio_bypasses_download_and_pauses_session(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(
+            client, tenant_id, instance, stt=True, multimodal=True
+        )
+
+        clinic_number = "5511940589006"
+        patient_number = "5516994420699"
+        patient_session_id = _create_session(client, tenant_id, patient_number)
+
+        # Real audio evidence, retargeted to fromMe with the clinic as sender
+        # and the patient as counterparty (matches Group 3's fromMe routing).
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_staff_evidence_{uuid4().hex[:10]}",
+            from_me=True,
+        )
+        payload["message"]["sender_pn"] = f"{clinic_number}@s.whatsapp.net"
+        payload["chat"]["wa_chatid"] = f"{patient_number}@s.whatsapp.net"
+        payload["message"]["chatid"] = f"{patient_number}@s.whatsapp.net"
+
+        download_mock = AsyncMock()
+        stt_mock = AsyncMock()
+        mm_mock = AsyncMock()
+        send_mock = AsyncMock(return_value=_fake_uazapi_send_result())
+
+        with (
+            patch("src.api.routes.webhook.download_uazapi_media", download_mock),
+            patch("src.services.groq_service.transcribe_audio", stt_mock),
+            patch(
+                "src.services.multimodal_service.transcribe_audio_multimodal", mm_mock
+            ),
+            patch("src.api.routes.webhook.send_uazapi_text", send_mock),
+        ):
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json().get("action") == "human_takeover", resp.json()
+        # Half 1: no download / STT / MM / reroute happened
+        download_mock.assert_not_called()
+        stt_mock.assert_not_called()
+        mm_mock.assert_not_called()
+        send_mock.assert_not_called()
+        # Half 2: the patient's session got paused
+        row = _session_row(client, patient_session_id)
+        assert row["is_paused"] is True
