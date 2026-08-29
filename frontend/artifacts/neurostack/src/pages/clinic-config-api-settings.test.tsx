@@ -3,6 +3,7 @@ import { render, screen, waitFor, cleanup, fireEvent, within } from "@testing-li
 import type { ReactNode } from "react";
 
 import {
+  API_CAPABILITIES,
   ApiCredentialsForm,
   describeConfigSaveFailure,
   PROVIDERS,
@@ -81,6 +82,83 @@ describe("describeConfigSaveFailure", () => {
     expect(describeConfigSaveFailure({
       detail: { error: "target_tenant_forbidden" },
     }, 403, "pt")).toBe("Você não tem permissão para alterar a configuração desta clínica.");
+  });
+
+  it("translates provider_not_implemented with its capability and provider label", () => {
+    const description = describeConfigSaveFailure({
+      detail: { error: "provider_not_implemented", capability: "whatsapp", provider: "twilio" },
+    }, 501, "pt");
+
+    expect(description).toContain("API WhatsApp");
+    expect(description).toContain("Twilio");
+    expect(description).not.toContain("provider_not_implemented");
+  });
+
+  it("translates fresh_api_key_required with the capability prefix", () => {
+    const description = describeConfigSaveFailure({
+      detail: { error: "fresh_api_key_required", capability: "llm", reason: "api_url_changed" },
+    }, 422, "pt");
+
+    expect(description).toContain("API LLM: informe uma nova API Key");
+    expect(description).toContain("trocar de provedor ou de endpoint exige uma chave nova");
+    expect(description).not.toContain("fresh_api_key_required");
+  });
+
+  it("prefixes invalid providers and Meta phone conflicts with their capability", () => {
+    const invalidProvider = describeConfigSaveFailure({
+      detail: { error: "invalid_provider_for_capability", capability: "stt" },
+    }, 422, "pt");
+    const phoneConflict = describeConfigSaveFailure({
+      detail: { error: "meta_phone_number_id_conflict", capability: "whatsapp", message: "backend-only detail" },
+    }, 409, "pt");
+
+    expect(invalidProvider).toContain("API STT:");
+    expect(invalidProvider).toContain("O provedor selecionado não é válido");
+    expect(invalidProvider).not.toContain("invalid_provider_for_capability");
+    expect(phoneConflict).toContain("API WhatsApp:");
+    expect(phoneConflict).toContain("Phone Number ID da Meta");
+    expect(phoneConflict).not.toContain("meta_phone_number_id_conflict");
+    expect(phoneConflict).not.toContain("backend-only detail");
+  });
+
+  it("keeps a safe human fallback when a capability is absent", () => {
+    const phoneConflict = describeConfigSaveFailure({
+      detail: { error: "meta_phone_number_id_conflict", message: "backend-only detail" },
+    }, 409, "pt");
+
+    expect(phoneConflict).toContain("Phone Number ID da Meta");
+    expect(phoneConflict).not.toContain("meta_phone_number_id_conflict");
+    expect(phoneConflict).not.toContain("backend-only detail");
+  });
+
+  it("does not expose backend details for capability errors", () => {
+    expect(describeConfigSaveFailure({
+      detail: { error: "meta_phone_number_id_conflict", message: "backend-only detail" },
+    }, 409, "pt")).not.toContain("backend-only detail");
+  });
+
+  it("prefixes URL and payload errors with the capability inferred from fields", () => {
+    const unsafeUrl = describeConfigSaveFailure({
+      detail: { error: "unsafe_api_url", field: "llm_api_url" },
+    }, 422, "pt");
+    const invalidPayload = describeConfigSaveFailure({
+      detail: { error: "invalid_credentials_payload", fields: [{ field: "tts_api_key", code: "string_type" }] },
+    }, 422, "pt");
+
+    expect(unsafeUrl).toContain("API LLM:");
+    expect(unsafeUrl).toContain("URL da API do LLM");
+    expect(invalidPayload).toContain("API TTS:");
+    expect(invalidPayload).toContain("API Key de voz");
+  });
+
+  it("falls back to a safe human label for an unknown credential field", () => {
+    const description = describeConfigSaveFailure({
+      detail: { error: "invalid_credentials_payload", fields: [{ field: "future_credential_field", input: "secret" }] },
+    }, 422, "pt");
+
+    expect(description).toContain("future credential field");
+    expect(description).not.toContain("invalid_credentials_payload");
+    expect(description).not.toContain("secret");
   });
 
   it("provides a useful fallback for server failures", () => {
@@ -405,5 +483,184 @@ describe("<ApiCredentialsForm /> — Meta signature_pending banner", () => {
       expect(screen.getByTestId("meta-app-secret-field")).toBeInTheDocument();
     });
     expect(screen.queryByTestId("meta-signature-pending-banner")).not.toBeInTheDocument();
+  });
+});
+
+describe("API capability headers driven by the shared registry", () => {
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    localStorage.setItem("ns_auth", JSON.stringify({ token: "test-token" }));
+    localStorage.setItem("ns_locale", "pt");
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    localStorage.clear();
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  const EMPTY_STATUS = {
+    whatsapp_provider: "zapi",
+    zapi_instance_id: null,
+    zapi_token_set: false,
+    zapi_token_masked: null,
+    evolution_api_url: null,
+    evolution_instance_name: null,
+    evolution_api_key_set: false,
+    evolution_api_key_masked: null,
+    llm_api_key_set: false,
+    llm_api_key_masked: null,
+    llm_base_url: null,
+    llm_model_name: null,
+    multimodal_provider: null,
+    multimodal_api_url: null,
+    multimodal_model_name: null,
+    multimodal_api_key_set: false,
+    multimodal_api_key_masked: null,
+    multimodal_readiness: "incomplete",
+    tts_provider: null,
+    tts_api_url: null,
+    tts_api_key_set: false,
+    tts_api_key_masked: null,
+    tts_model_name: null,
+    tts_readiness: "incomplete",
+    apis_configured: false,
+  };
+
+  function mockStatus(status: unknown) {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PATCH") {
+        return jsonResponse({ ok: true, apis_configured: false });
+      }
+      return jsonResponse(status);
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    return fetchMock;
+  }
+
+  it("declares the 5 canonical capability entries in the registry", () => {
+    const ids = API_CAPABILITIES.map(c => c.id).sort();
+    expect(ids).toEqual(["llm", "multimodal", "stt", "tts", "whatsapp"]);
+    const required = API_CAPABILITIES.filter(c => c.required).map(c => c.id).sort();
+    expect(required).toEqual(["llm", "whatsapp"]);
+  });
+
+  it("pins the exact labels, descriptions, and required values in the registry", () => {
+    expect(API_CAPABILITIES).toEqual([
+      {
+        id: "whatsapp",
+        short: "API WhatsApp",
+        desc: {
+          pt: "Canal de mensagens (recebe e envia no WhatsApp)",
+          en: "Messaging channel (receives and sends on WhatsApp)",
+        },
+        required: true,
+      },
+      {
+        id: "llm",
+        short: "API LLM",
+        desc: {
+          pt: "Large Language Model (gera as respostas em texto)",
+          en: "Large Language Model (generates the text replies)",
+        },
+        required: true,
+      },
+      {
+        id: "stt",
+        short: "API STT",
+        desc: {
+          pt: "Speech to Text (transcrição de áudio)",
+          en: "Speech to Text (audio transcription)",
+        },
+        required: false,
+      },
+      {
+        id: "multimodal",
+        short: "API STT Fall Back",
+        desc: {
+          pt: "Multimodal (modelo que ouve o áudio direto)",
+          en: "Multimodal (model that listens to the audio directly)",
+        },
+        required: false,
+      },
+      {
+        id: "tts",
+        short: "API TTS",
+        desc: {
+          pt: "Text to Speech (gerar áudio)",
+          en: "Text to Speech (generate audio)",
+        },
+        required: false,
+      },
+    ]);
+  });
+
+  it("renders every short header name, description paragraph, and requirement marker in PT", async () => {
+    mockStatus(EMPTY_STATUS);
+
+    render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="42" isReadOnly={false} isSuperAdmin={false} />
+      </Wrapper>,
+    );
+
+    // Wait until the form has finished loading (a stable landmark).
+    await screen.findByRole("button", { name: /salvar configurações de api/i });
+
+    // Short names - one per block, from the registry.
+    expect(screen.getByText("API WhatsApp")).toBeInTheDocument();
+    expect(screen.getByText("API LLM")).toBeInTheDocument();
+    expect(screen.getByText("API STT")).toBeInTheDocument();
+    expect(screen.getByText("API STT Fall Back")).toBeInTheDocument();
+    expect(screen.getByText("API TTS")).toBeInTheDocument();
+
+    // Final PT paragraphs from the acceptance table.
+    expect(screen.getByText("Canal de mensagens (recebe e envia no WhatsApp)")).toBeInTheDocument();
+    expect(screen.getByText("Large Language Model (gera as respostas em texto)")).toBeInTheDocument();
+    expect(screen.getByText("Speech to Text (transcrição de áudio)")).toBeInTheDocument();
+    expect(screen.getByText(
+      "Multimodal (modelo que ouve o áudio direto). Usado como alternativa quando o STT falha.",
+    )).toBeInTheDocument();
+    expect(screen.getByText(
+      "Text to Speech (gerar áudio). Quando ativado, as respostas do agente são sintetizadas e enviadas como áudio no WhatsApp. Se o provedor falhar, a resposta é enviada em texto.",
+    )).toBeInTheDocument();
+
+    // Required vs optional markers, keyed by capability id.
+    expect(screen.getByTestId("capability-requirement-whatsapp")).toHaveTextContent("obrigatório");
+    expect(screen.getByTestId("capability-requirement-llm")).toHaveTextContent("obrigatório");
+    expect(screen.getByTestId("capability-requirement-stt")).toHaveTextContent("opcional");
+    expect(screen.getByTestId("capability-requirement-multimodal")).toHaveTextContent("opcional");
+    expect(screen.getByTestId("capability-requirement-tts")).toHaveTextContent("opcional");
+  });
+
+  it("renders the requirement marker in English when locale is en", async () => {
+    localStorage.setItem("ns_locale", "en");
+    mockStatus(EMPTY_STATUS);
+
+    render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="42" isReadOnly={false} isSuperAdmin={false} />
+      </Wrapper>,
+    );
+
+    await screen.findByRole("button", { name: /salvar configurações de api/i });
+
+    expect(screen.getByTestId("capability-requirement-whatsapp")).toHaveTextContent("Required");
+    expect(screen.getByTestId("capability-requirement-llm")).toHaveTextContent("Required");
+    expect(screen.getByTestId("capability-requirement-stt")).toHaveTextContent("Optional");
+    expect(screen.getByTestId("capability-requirement-multimodal")).toHaveTextContent("Optional");
+    expect(screen.getByTestId("capability-requirement-tts")).toHaveTextContent("Optional");
+
+    expect(screen.getByText("Messaging channel (receives and sends on WhatsApp)")).toBeInTheDocument();
+    expect(screen.getByText("Large Language Model (generates the text replies)")).toBeInTheDocument();
+    expect(screen.getByText("Speech to Text (audio transcription)")).toBeInTheDocument();
+    expect(screen.getByText(
+      "Multimodal (model that listens to the audio directly). Used as a fallback when STT fails.",
+    )).toBeInTheDocument();
+    expect(screen.getByText(
+      "Text to Speech (generate audio). When enabled, agent replies are synthesized and sent as WhatsApp audio. If the provider fails, the reply is sent as text.",
+    )).toBeInTheDocument();
   });
 });
