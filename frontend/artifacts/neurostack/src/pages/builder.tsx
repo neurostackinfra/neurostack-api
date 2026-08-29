@@ -196,12 +196,16 @@ function computeTrend(timeSeries: TraceTimeSeriesPoint[]): { diff: number; direc
 
 // ── Relative time ─────────────────────────────────────────────────────────────
 
-function relativeTime(dateStr: string | null, neverLabel: string, daysLabel: string): string {
-  if (!dateStr) return neverLabel;
+function relativeTime(dateStr: string | null, locale: string): string {
+  if (!dateStr) return locale === "pt" ? "nunca" : "never";
+  const formatter = new Intl.RelativeTimeFormat(locale === "pt" ? "pt-BR" : "en", { numeric: "auto" });
   const diff = Date.now() - new Date(dateStr).getTime();
-  const days = Math.floor(diff / 86400000);
-  if (days < 1) return "< 1 dia";
-  return `${days} ${daysLabel}`;
+  const minutes = Math.floor(diff / 60_000);
+  if (minutes < 1) return formatter.format(0, "minute");
+  if (minutes < 60) return formatter.format(-minutes, "minute");
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return formatter.format(-hours, "hour");
+  return formatter.format(-Math.floor(hours / 24), "day");
 }
 
 // ── Builder Panel ─────────────────────────────────────────────────────────────
@@ -638,7 +642,7 @@ export default function BuilderPanel() {
               </CardContent>
             </Card>
 
-            {/* Clinic health grid */}
+            {/* Compact clinic health list */}
             {clinics.length > 0 && (
               <Card className="border-border">
                 <CardHeader className="pb-2">
@@ -646,18 +650,18 @@ export default function BuilderPanel() {
                   <CardDescription className="text-[10px]">{t("builder_health_legend")}</CardDescription>
                 </CardHeader>
                 <CardContent>
-                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  <div className="divide-y divide-border/50 rounded-md border border-border/50">
                     {sortedClinics.map((clinic) => (
                       <button
                         key={clinic.id}
-                        className="flex items-center gap-2 p-2.5 rounded-lg border border-border hover:bg-muted/50 transition-colors text-left"
+                        className="flex w-full items-center gap-2 px-2.5 py-2 hover:bg-muted/50 transition-colors text-left"
                         onClick={() => { setActiveTab("clinics"); setExpandedClinicId(clinic.id); }}
                       >
                         <HealthDot status={clinic.health_status} />
                         <div className="min-w-0">
                           <p className="text-xs font-medium truncate">{clinic.name}</p>
                           <p className="text-[10px] text-muted-foreground">
-                            {t("builder_last_trace")}: {relativeTime(clinic.last_trace_at, t("builder_never"), t("builder_days_ago"))}
+                            {t("builder_last_trace")}: {relativeTime(clinic.last_trace_at, locale)}
                           </p>
                         </div>
                       </button>
@@ -790,7 +794,7 @@ export default function BuilderPanel() {
                             <div className="min-w-0">
                               <CardTitle className="text-sm truncate">{clinic.name}</CardTitle>
                               <CardDescription className="text-[10px]">
-                                {t("builder_last_trace")}: {relativeTime(clinic.last_trace_at, t("builder_never"), t("builder_days_ago"))}
+                                {t("builder_last_trace")}: {relativeTime(clinic.last_trace_at, locale)}
                               </CardDescription>
                             </div>
                           </div>
@@ -848,39 +852,39 @@ export default function BuilderPanel() {
                             </div>
                             <Progress value={clinic.config_completeness} className="h-2" />
                           </div>
-                        </CollapsibleContent>
 
-                        {/* Actions */}
-                        <div className="flex items-center gap-2 pt-1">
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="h-7 text-xs gap-1.5 flex-1"
-                            onClick={() => void handleToggleStatus(clinic.id, clinic.status)}
-                          >
-                            {clinic.status === "active" ? (
-                              <><ToggleRight className="h-3.5 w-3.5 text-emerald-400" /> {t("admin_toggle_deactivate")}</>
-                            ) : (
-                              <><ToggleLeft className="h-3.5 w-3.5" /> {t("admin_toggle_activate")}</>
-                            )}
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-7 text-xs gap-1.5 flex-1"
-                            onClick={() => handleAccessClinicPanel(clinic.id)}
-                          >
-                            <ExternalLink className="h-3.5 w-3.5" /> Acessar Painel
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-7 text-xs gap-1.5 flex-1"
-                            onClick={() => handleConfigureClinic(clinic.id)}
-                          >
-                            <Sliders className="h-3.5 w-3.5" /> {t("builder_configure")}
-                          </Button>
-                        </div>
+                          {/* Actions stay hidden with the clinic details. */}
+                          <div className="flex items-center gap-2 pt-1">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-7 text-xs gap-1.5 flex-1"
+                              onClick={() => void handleToggleStatus(clinic.id, clinic.status)}
+                            >
+                              {clinic.status === "active" ? (
+                                <><ToggleRight className="h-3.5 w-3.5 text-emerald-400" /> {t("admin_toggle_deactivate")}</>
+                              ) : (
+                                <><ToggleLeft className="h-3.5 w-3.5" /> {t("admin_toggle_activate")}</>
+                              )}
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 text-xs gap-1.5 flex-1"
+                              onClick={() => handleAccessClinicPanel(clinic.id)}
+                            >
+                              <ExternalLink className="h-3.5 w-3.5" /> Acessar Painel
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 text-xs gap-1.5 flex-1"
+                              onClick={() => handleConfigureClinic(clinic.id)}
+                            >
+                              <Sliders className="h-3.5 w-3.5" /> {t("builder_configure")}
+                            </Button>
+                          </div>
+                        </CollapsibleContent>
                       </CardContent>
                     </Card>
                   </Collapsible>
