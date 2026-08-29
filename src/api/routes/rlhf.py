@@ -8,7 +8,7 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 from uuid import UUID, uuid4
 
@@ -26,6 +26,7 @@ from src.llm import get_llm_client, get_tenant_llm_client
 from src.models.builder import Builder
 from src.models.event import Event
 from src.models.tenant import Tenant
+from src.models.user import User
 from src.observability.pii import mask_carteirinha
 from src.repositories import get_db_session, get_db_session_dependency
 from src.services.trace_service import _to_utc
@@ -96,6 +97,13 @@ def _build_analysis_prompt(
         "para a nota atribuída? "
         'Responda em JSON: {"status": "agreed" | "disagreed", "justification": "<máx 2 frases>"}'
     )
+
+
+def _has_reason(reason: Optional[str]) -> bool:
+    """Single definition of the reason-floor predicate (wish decision #3):
+    reused by the analysis trigger, `only_with_reason`, and (Group 5/6)
+    `accepted_count` and the accept-action 422 guard."""
+    return len((reason or "").strip()) >= 8
 
 
 def _parse_analysis_content(content: str) -> Optional[dict[str, str]]:
@@ -352,11 +360,8 @@ async def submit_rating(
     """
     event_id = uuid4()
     reason = (body.reason or "").strip() or None
-    # Analysis threshold: rating 1-3 AND a written critique with substance
-    # (>=8 chars). Kept as a well-named local so subsequent groups can lift it
-    # into a shared helper when the aggregation site (list_ratings) needs the
-    # same predicate.
-    has_reason = len((reason or "").strip()) >= 8
+    # Analysis threshold: rating 1-3 AND a written critique with substance.
+    has_reason = _has_reason(reason)
     triggers_analysis = body.rating <= 3 and has_reason
 
     # subject_tenant_id records WHICH clinic the rating is *about*, so that
@@ -440,6 +445,7 @@ async def submit_rating(
 def _serialize_rating_event(
     event: Event,
     tenant_map: Optional[dict[UUID, tuple[str, Optional[UUID], Optional[str]]]] = None,
+    accepted_email_map: Optional[dict[UUID, str]] = None,
 ) -> dict[str, Any]:
     data = event.event_data or {}
     # Mask carteirinha PII on the training-lake export surface: rating
@@ -468,6 +474,21 @@ def _serialize_rating_event(
             subject_clinic_name = entry[0]
             builder_name = entry[2]
 
+    # Group 5: accept-audit trail. `accepted_by` / `accepted_at` are stamped
+    # by the PATCH approve action (see `update_rating_action`); legacy rows
+    # approved before this wish carry no stamp and surface as `None`, which
+    # the panel renders as "—" (no migration, per acceptance criterion).
+    accepted_by_raw = data.get("accepted_by")
+    accepted_by_uuid: Optional[UUID] = None
+    if accepted_by_raw is not None:
+        try:
+            accepted_by_uuid = UUID(str(accepted_by_raw))
+        except (ValueError, AttributeError):
+            accepted_by_uuid = None
+    accepted_by_email: Optional[str] = None
+    if accepted_by_uuid is not None and accepted_email_map is not None:
+        accepted_by_email = accepted_email_map.get(accepted_by_uuid)
+
     return {
         "id": str(event.id),
         "ts": event.created_at.isoformat() if event.created_at else "",
@@ -484,6 +505,9 @@ def _serialize_rating_event(
         "subject_tenant_id": str(subject_uuid),
         "subject_clinic_name": subject_clinic_name,
         "builder_name": builder_name,
+        "accepted_by": str(accepted_by_uuid) if accepted_by_uuid is not None else None,
+        "accepted_at": data.get("accepted_at"),
+        "accepted_by_email": accepted_by_email,
     }
 
 
@@ -660,10 +684,9 @@ async def list_ratings(
         cut = [e for e in events if _matches_narrowing(e)]
 
     # -- Step 5: summary over the cut (before only_* toggles) --------------
-    def _has_reason(event: Event) -> bool:
+    def _row_has_reason(event: Event) -> bool:
         data = event.event_data or {}
-        reason = data.get("reason")
-        return len((reason or "").strip()) >= 8
+        return _has_reason(data.get("reason"))
 
     def _is_accepted(event: Event) -> bool:
         data = event.event_data or {}
@@ -683,7 +706,12 @@ async def list_ratings(
             distribution[str(rating_value)] += 1
             total += 1
             rating_sum += rating_value
-        if _is_accepted(event):
+        # Group 5: `accepted_count` counts only entries that are BOTH
+        # approved AND carry a qualifying reason. This mirrors the ONE archive
+        # the panel actually surfaces (`only_with_reason=true&only_accepted=true`)
+        # and excludes legacy approvals that predate this wish and have no
+        # written critique on file.
+        if _is_accepted(event) and _row_has_reason(event):
             accepted_count += 1
 
     average = round(rating_sum / total, 1) if total > 0 else 0.0
@@ -699,11 +727,36 @@ async def list_ratings(
     if only_accepted:
         filtered = [e for e in filtered if _is_accepted(e)]
     if only_with_reason:
-        filtered = [e for e in filtered if _has_reason(e)]
+        filtered = [e for e in filtered if _row_has_reason(e)]
 
     # -- Step 7: paginate AFTER filtering ----------------------------------
     page = filtered[offset : offset + limit]
-    entries = [_serialize_rating_event(e, tenant_map=tenant_map) for e in page]
+
+    # Batched email resolution for `accepted_by` on the already-paginated page
+    # (never one query per row — see wish Group 5, deliverable 4). Runs over
+    # the page — not the full cut — because the panel only ever displays the
+    # emails it renders.
+    accepted_by_ids: set[UUID] = set()
+    for event in page:
+        raw = (event.event_data or {}).get("accepted_by")
+        if raw:
+            try:
+                accepted_by_ids.add(UUID(str(raw)))
+            except (ValueError, AttributeError):
+                pass
+    accepted_email_map: dict[UUID, str] = {}
+    if accepted_by_ids:
+        users_result = await session.execute(
+            select(User.id, User.email).where(User.id.in_(accepted_by_ids))
+        )
+        accepted_email_map = {row.id: row.email for row in users_result.all()}
+
+    entries = [
+        _serialize_rating_event(
+            e, tenant_map=tenant_map, accepted_email_map=accepted_email_map
+        )
+        for e in page
+    ]
 
     return {"summary": summary, "facets": facets, "entries": entries}
 
@@ -734,9 +787,27 @@ async def update_rating_action(
 
     data = dict(event.event_data or {})
     if body.action == "approve":
+        # Group 5 guard: accepting an opinion is an act OVER written feedback.
+        # Ratings without a qualifying reason (empty or under 8 chars) cannot
+        # be approved — the training-lake export only ever contains rows the
+        # operator explicitly endorsed the critique of, so silently accepting
+        # a reasonless entry would poison the dataset with meaningless labels.
+        if not _has_reason(data.get("reason")):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Cannot approve rating without a qualifying reason",
+            )
         data["approved_for_training"] = True
+        # Audit trail: stamp who accepted and when so the panel can render
+        # authorship. `accepted_at` is ISO-8601 UTC to stay dialect-agnostic
+        # (event_data is a JSON blob — no timestamptz coercion happens).
+        data["accepted_by"] = str(tenant.user_id) if tenant.user_id else None
+        data["accepted_at"] = datetime.now(timezone.utc).isoformat()
         data.pop("ignored", None)
     else:
+        # `ignore` unchanged (per wish Group 5, deliverable 6): no stamping,
+        # no reason guard — ignoring a low-value rating is orthogonal to the
+        # accept flow's dataset-curation semantics.
         data["ignored"] = True
         data.pop("approved_for_training", None)
 
