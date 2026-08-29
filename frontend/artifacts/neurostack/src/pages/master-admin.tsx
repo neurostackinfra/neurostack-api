@@ -1,11 +1,12 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useLocation } from "wouter";
 import {
-  Shield, Building2, Users, ToggleLeft, ToggleRight,
+  Shield, Building2, ToggleLeft, ToggleRight,
   Plus, Eye, CheckCircle2, XCircle, Loader2, AlertTriangle,
-  Inbox, Paperclip, ChevronDown, ChevronRight, CheckCheck, UserCheck,
+  Inbox, Paperclip, ChevronDown, ChevronRight, ChevronUp, CheckCheck, UserCheck,
   Phone, TrendingUp, TrendingDown, Download, Search, CalendarRange, RefreshCw,
   RotateCcw, Briefcase, Trash2, Pencil, DollarSign, Info, Receipt, CreditCard, Unlink,
+  ExternalLink, Sliders,
 } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { useAuth } from "@/context/auth";
@@ -13,6 +14,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
   Card, CardContent, CardDescription, CardHeader, CardTitle,
 } from "@/components/ui/card";
@@ -60,6 +63,8 @@ interface AdminStats {
   activeBuilders: number;
   activeManagedClinics: number;
   estimatedMrr: number;
+  totalClinics: number;
+  totalBuilders: number;
 }
 
 interface AdminTimeSeriesPoint {
@@ -85,6 +90,9 @@ interface AdminDashboardData {
     estimated_mrr: number;
     safety_flags_7d: number;
     handoff_count_7d: number;
+    total_clinics: number;
+    active_clinics: number;
+    total_builders: number;
     [key: string]: number;
   };
   time_series: AdminTimeSeriesPoint[];
@@ -99,8 +107,8 @@ interface BuilderClinic {
   status: "active" | "inactive";
   plan_type: string;
   builder_id: number;
-  traceCount: number;
-  apisConfigured: boolean;
+  trace_count: number;
+  apis_configured: boolean;
   health_status?: "healthy" | "warning" | "critical";
   last_trace_at?: string | null;
   config_completeness?: number;
@@ -111,8 +119,15 @@ interface BuilderWithClinics {
   name: string;
   admin_email?: string | null;
   status: "active" | "inactive";
+  subscription_status: string;
   created_at: string;
   clinics: BuilderClinic[];
+}
+
+const ACTIVE_BUILDER_SUBSCRIPTION_STATUSES = new Set(["trial", "pilot", "active"]);
+
+function builderCountsAsActive(builder: BuilderWithClinics): boolean {
+  return builder.status === "active" && ACTIVE_BUILDER_SUBSCRIPTION_STATUSES.has(builder.subscription_status);
 }
 
 interface ClinicSlot {
@@ -122,10 +137,21 @@ interface ClinicSlot {
   slug: string | null;
   status: "active" | "inactive";
   plan_type: "pilot" | "demo" | "admin";
-  traceCount: number;
-  apisConfigured: boolean;
-  zapiInstanceId: string | null;
+  trace_count: number;
+  apis_configured: boolean;
   users: { id: number; email: string; role: string }[];
+  health_status?: "healthy" | "warning" | "critical";
+  last_trace_at?: string | null;
+  config_completeness?: number;
+}
+
+interface ClinicRowData {
+  clinic_id: number;
+  clinic_name: string;
+  admin_email?: string | null;
+  slug: string | null;
+  status: "active" | "inactive";
+  plan_type: string;
   health_status?: "healthy" | "warning" | "critical";
   last_trace_at?: string | null;
   config_completeness?: number;
@@ -189,6 +215,7 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 function PlanBadge({ plan }: { plan: string }) {
+  const { t } = useI18n();
   const styles: Record<string, string> = {
     clinic: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
     pilot: "bg-blue-500/15 text-blue-400 border-blue-500/30",
@@ -197,30 +224,31 @@ function PlanBadge({ plan }: { plan: string }) {
   };
   return (
     <Badge className={`${styles[plan] ?? styles.pilot} text-[10px]`}>
-      {plan.toUpperCase()}
+      {plan === "pilot" || plan === "clinic" ? t("admin_plan_clinic") : plan.toUpperCase()}
     </Badge>
   );
 }
 
 // ── Relative Time Helper ─────────────────────────────────────────────────────
 
-function relativeTime(iso: string | null | undefined): string {
-  if (!iso) return "never";
+function relativeTime(iso: string | null | undefined, locale: string): string {
+  const formatter = new Intl.RelativeTimeFormat(locale === "pt" ? "pt-BR" : "en", { numeric: "auto" });
+  if (!iso) return locale === "pt" ? "nunca" : "never";
   const diff = Date.now() - new Date(iso).getTime();
-  if (diff < 0) return "just now";
+  if (diff < 0) return formatter.format(0, "minute");
   const mins = Math.floor(diff / 60_000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
+  if (mins < 1) return formatter.format(0, "minute");
+  if (mins < 60) return formatter.format(-mins, "minute");
   const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
+  if (hours < 24) return formatter.format(-hours, "hour");
   const days = Math.floor(hours / 24);
-  return `${days}d ago`;
+  return formatter.format(-days, "day");
 }
 
 // ── Alerts Section ───────────────────────────────────────────────────────────
 
 function AlertsSection({ alerts }: { alerts: AdminAlert[] }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   if (alerts.length === 0) return null;
   return (
     <Card className="border-border">
@@ -235,6 +263,11 @@ function AlertsSection({ alerts }: { alerts: AdminAlert[] }) {
       </CardHeader>
       <CardContent className="pt-0 space-y-1.5">
         {alerts.map((alert, i) => {
+          const alertMessage = alert.type === "no_traces"
+            ? t("admin_demo_alert_no_traces")
+            : alert.type === "low_config"
+              ? t("admin_demo_alert_low_config")
+              : alert.message;
           const iconColor =
             alert.severity === "critical" ? "text-rose-400" :
             alert.severity === "warning"  ? "text-amber-400" :
@@ -251,10 +284,10 @@ function AlertsSection({ alerts }: { alerts: AdminAlert[] }) {
               <Icon className={`h-3.5 w-3.5 shrink-0 mt-0.5 ${iconColor}`} />
               <div className="flex-1 min-w-0">
                 <span className="font-medium text-foreground">{alert.clinic_name}</span>
-                <span className="text-muted-foreground ml-1.5">{alert.message}</span>
+                <span className="text-muted-foreground ml-1.5">{alertMessage}</span>
               </div>
               <span className="text-[10px] text-muted-foreground shrink-0">
-                {relativeTime(alert.detected_at)}
+                {relativeTime(alert.detected_at, locale)}
               </span>
             </div>
           );
@@ -305,7 +338,7 @@ function TraceChart({ data }: { data: AdminTimeSeriesPoint[] }) {
 
 // ── Create Pilot Dialog ───────────────────────────────────────────────────────
 
-function CreatePilotDialog({ token, onCreated }: { token: string; onCreated: () => void }) {
+function CreatePilotDialog({ token, onCreated }: { token: string; onCreated: () => Promise<void> }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
@@ -334,7 +367,7 @@ function CreatePilotDialog({ token, onCreated }: { token: string; onCreated: () 
       toast({ title: t("admin_create_ok_title"), description: `${t("admin_create_ok_desc_prefix")} "${name}" ID ${newId}.` });
       setOpen(false);
       setName(""); setEmail(""); setPassword("");
-      onCreated();
+      await onCreated();
     } catch {
       setError(t("admin_create_err_network"));
     } finally {
@@ -386,112 +419,107 @@ function CreatePilotDialog({ token, onCreated }: { token: string; onCreated: () 
   );
 }
 
-// ── Clinic Card ───────────────────────────────────────────────────────────────
+// ── Clinic Row (list-style, expandable) ─────────────────────────────────────
 
-function ClinicCard({
-  clinic, token, onToggle, onViewTraces, onDelete, isReadOnly = false,
+function HealthDot({ status }: { status?: "healthy" | "warning" | "critical" }) {
+  const color =
+    status === "critical" ? "bg-rose-500" :
+    status === "warning"  ? "bg-amber-500" :
+    status === "healthy"  ? "bg-emerald-500" :
+    "bg-slate-500";
+  return <span className={`h-2 w-2 rounded-full shrink-0 ${color}`} title={status ?? "sem dados"} />;
+}
+
+function ClinicRow({
+  clinic, isExpanded, onToggleExpand, canManage,
+  onRename, onToggleStatus, onUnlink, onDelete,
+  onViewTraces, onAccessPanel, onConfigure,
 }: {
-  clinic: ClinicSlot;
-  token: string;
-  onToggle: (id: number, newStatus: "active" | "inactive") => Promise<void>;
-  onViewTraces: (id: number) => void;
-  onDelete?: (id: number, name: string) => void;
-  isReadOnly?: boolean;
+  clinic: ClinicRowData;
+  isExpanded: boolean;
+  onToggleExpand: () => void;
+  canManage: boolean;
+  onRename?: () => void;
+  onToggleStatus: () => void;
+  onUnlink?: () => void;
+  onDelete?: () => void;
+  onViewTraces: () => void;
+  onAccessPanel: () => void;
+  onConfigure: () => void;
 }) {
-  const { t } = useI18n();
-  const { toast } = useToast();
-  const [toggling, setToggling] = useState(false);
-  const isEmpty = !clinic.clinic_name || clinic.clinic_name.startsWith("Piloto Slot") || clinic.clinic_name.startsWith("Slot");
-  const adminUser = clinic.users.find((u) => u.role === "clinic_admin" || u.role === "investor");
-
-  const handleToggle = async () => {
-    if (isReadOnly) {
-      toast({ title: "Modo Visualização: Ações de administrador desabilitadas nesta conta." });
-      return;
-    }
-    setToggling(true);
-    const next = clinic.status === "active" ? "inactive" : "active";
-    await onToggle(clinic.clinic_id, next);
-    setToggling(false);
-  };
-
+  const { t, locale } = useI18n();
   return (
-    <Card className={`border ${clinic.status === "active" ? "border-border" : "border-dashed border-slate-700 opacity-60"}`}>
-      <CardHeader className="pb-2">
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-center gap-2 min-w-0">
-            <Building2 className="h-4 w-4 text-muted-foreground shrink-0" />
-            <div className="min-w-0">
-              <CardTitle className="text-sm truncate">
-                {isEmpty ? <span className="text-muted-foreground italic">{t("admin_slot_available")}</span> : clinic.clinic_name}
-              </CardTitle>
-              <CardDescription className="text-[10px]">
-                ID {clinic.clinic_id} {clinic.slug ? `· /${clinic.slug}` : ""}
-              </CardDescription>
+    <Collapsible open={isExpanded} onOpenChange={onToggleExpand}>
+      <div className={`rounded-md border transition-colors ${clinic.status === "active" ? "bg-background/60 border-border/40" : "bg-muted/20 border-dashed border-slate-700 opacity-60"}`}>
+        <div className="flex items-center gap-2.5 px-2.5 py-2 text-xs">
+          <HealthDot status={clinic.health_status} />
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="font-medium truncate">{clinic.clinic_name}</span>
+              {clinic.admin_email && <span className="text-[10px] text-muted-foreground truncate">{clinic.admin_email}</span>}
+              {clinic.slug && <span className="text-muted-foreground font-mono text-[10px]">/{clinic.slug}</span>}
             </div>
+            <p className="text-[10px] text-muted-foreground mt-0.5">
+              {t("admin_health_last_trace")}: {relativeTime(clinic.last_trace_at, locale)}
+            </p>
           </div>
-          <div className="flex items-center gap-1.5 shrink-0">
-            <PlanBadge plan={clinic.plan_type} />
-            <StatusBadge status={clinic.status} />
-          </div>
-        </div>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        <div className="flex items-center gap-3 text-xs text-muted-foreground">
-          <span className="flex items-center gap-1">
-            <Users className="h-3 w-3" />
-            {clinic.users.length} {clinic.users.length === 1 ? t("admin_users_label") : t("admin_users_label_pl")}
-          </span>
-        </div>
-        {clinic.zapiInstanceId && (
-          <p className="text-[10px] font-mono text-muted-foreground/60 truncate">
-            Z-API: {clinic.zapiInstanceId.slice(0, 12)}…
-          </p>
-        )}
-        {adminUser && (
-          <p className="text-[11px] text-muted-foreground truncate">
-            <span className="text-foreground">{adminUser.email}</span>
-          </p>
-        )}
-        <div className="flex items-center gap-2 pt-1">
-          <Button
-            variant="outline"
-            size="sm"
-            className={`h-7 text-xs gap-1.5 flex-1 ${isReadOnly ? "opacity-50 cursor-not-allowed" : ""}`}
-            onClick={handleToggle}
-            disabled={toggling}
-          >
-            {toggling ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : clinic.status === "active" ? (
-              <><ToggleRight className="h-3.5 w-3.5 text-emerald-400" /> {t("admin_toggle_deactivate")}</>
-            ) : (
-              <><ToggleLeft className="h-3.5 w-3.5" /> {t("admin_toggle_activate")}</>
-            )}
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 text-xs gap-1.5 flex-1"
-            onClick={() => onViewTraces(clinic.clinic_id)}
-            disabled={isEmpty}
-          >
-            <Eye className="h-3.5 w-3.5" /> {t("admin_view_traces")}
-          </Button>
-          {onDelete && !isReadOnly && (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-7 w-7 p-0 text-muted-foreground hover:text-destructive shrink-0"
-              title="Excluir clínica"
-              onClick={() => onDelete(clinic.clinic_id, clinic.clinic_name)}
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-            </Button>
+          <PlanBadge plan={clinic.plan_type} />
+          <StatusBadge status={clinic.status} />
+          {canManage && (
+            <div className="flex items-center gap-0.5 shrink-0">
+              {onRename && (
+                <Button variant="ghost" size="sm" className="h-6 w-6 p-0 text-muted-foreground hover:text-foreground" title="Renomear" onClick={onRename}>
+                  <Pencil className="h-3 w-3" />
+                </Button>
+              )}
+              <Button
+                variant="ghost" size="sm"
+                className={`h-6 w-6 p-0 ${clinic.status === "active" ? "text-emerald-400 hover:text-emerald-300" : "text-muted-foreground hover:text-foreground"}`}
+                title={clinic.status === "active" ? "Desativar clínica" : "Ativar clínica"}
+                onClick={onToggleStatus}
+              >
+                {clinic.status === "active" ? <ToggleRight className="h-3.5 w-3.5" /> : <ToggleLeft className="h-3.5 w-3.5" />}
+              </Button>
+              {onUnlink && (
+                <Button variant="ghost" size="sm" className="h-6 w-6 p-0 text-muted-foreground hover:text-amber-400" title="Desvincular do builder" onClick={onUnlink}>
+                  <Unlink className="h-3 w-3" />
+                </Button>
+              )}
+              {onDelete && (
+                <Button variant="ghost" size="sm" className="h-6 w-6 p-0 text-muted-foreground hover:text-destructive" title="Excluir clínica" onClick={onDelete}>
+                  <Trash2 className="h-3 w-3" />
+                </Button>
+              )}
+            </div>
           )}
+          <CollapsibleTrigger asChild>
+            <Button variant="ghost" size="sm" className="h-6 w-6 p-0 text-muted-foreground shrink-0">
+              {isExpanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+            </Button>
+          </CollapsibleTrigger>
         </div>
-      </CardContent>
-    </Card>
+        <CollapsibleContent className="px-2.5 pb-2.5 space-y-2.5 border-t border-border/40 pt-2.5">
+          <div className="space-y-1">
+            <div className="flex items-center justify-between text-[11px]">
+              <span className="text-muted-foreground">{t("admin_health_config_completeness")}</span>
+              <span className="font-medium">{clinic.config_completeness ?? 0}%</span>
+            </div>
+            <Progress value={clinic.config_completeness ?? 0} className="h-1.5" />
+          </div>
+          <div className="flex items-center gap-1.5">
+            <Button variant="outline" size="sm" className="h-7 text-[11px] gap-1.5 flex-1" onClick={onViewTraces}>
+              <Eye className="h-3.5 w-3.5" /> {t("admin_view_traces")}
+            </Button>
+            <Button variant="outline" size="sm" className="h-7 text-[11px] gap-1.5 flex-1" onClick={onAccessPanel}>
+              <ExternalLink className="h-3.5 w-3.5" /> {t("admin_access_panel")}
+            </Button>
+            <Button variant="outline" size="sm" className="h-7 text-[11px] gap-1.5 flex-1" onClick={onConfigure}>
+              <Sliders className="h-3.5 w-3.5" /> {t("builder_configure")}
+            </Button>
+          </div>
+        </CollapsibleContent>
+      </div>
+    </Collapsible>
   );
 }
 
@@ -500,29 +528,29 @@ function ClinicCard({
 const DEMO_CLINICS: ClinicSlot[] = [
   {
     clinic_id: 1, clinic_name: "Clínica Odonto Prime", agent_name: "Odonto Prime",
-    slug: "piloto-1", status: "active", plan_type: "pilot", traceCount: 12_500,
-    apisConfigured: true,  zapiInstanceId: "inst_a1b2c3",
+    slug: "clinica-1", status: "active", plan_type: "pilot", trace_count: 12_500,
+    apis_configured: true,
     users: [{ id: 10, email: "pilot1@clinic.com", role: "clinic_admin" }],
     health_status: "healthy", last_trace_at: "2026-05-02T08:30:00Z", config_completeness: 95,
   },
   {
     clinic_id: 2, clinic_name: "Instituto Face SP", agent_name: "Face SP",
-    slug: "piloto-2", status: "active", plan_type: "pilot", traceCount: 5_200,
-    apisConfigured: true,  zapiInstanceId: "inst_e5f6g7",
+    slug: "clinica-2", status: "active", plan_type: "pilot", trace_count: 5_200,
+    apis_configured: true,
     users: [{ id: 11, email: "pilot2@clinic.com", role: "clinic_admin" }],
     health_status: "healthy", last_trace_at: "2026-05-01T22:15:00Z", config_completeness: 88,
   },
   {
     clinic_id: 3, clinic_name: "Estética Rio Norte", agent_name: "Rio Norte",
-    slug: "piloto-3", status: "active", plan_type: "pilot", traceCount: 1_100,
-    apisConfigured: false, zapiInstanceId: null,
+    slug: "clinica-3", status: "active", plan_type: "pilot", trace_count: 1_100,
+    apis_configured: false,
     users: [{ id: 12, email: "pilot3@clinic.com", role: "clinic_admin" }],
     health_status: "warning", last_trace_at: "2026-04-28T14:00:00Z", config_completeness: 42,
   },
   {
     clinic_id: 5, clinic_name: "Lumina Derma Clinic", agent_name: "Lumina Derma",
-    slug: "piloto-4", status: "active", plan_type: "pilot", traceCount: 8_400,
-    apisConfigured: true,  zapiInstanceId: "inst_i9j0k1",
+    slug: "clinica-4", status: "active", plan_type: "pilot", trace_count: 8_400,
+    apis_configured: true,
     users: [{ id: 13, email: "pilot4@clinic.com", role: "clinic_admin" }],
     health_status: "critical", last_trace_at: null, config_completeness: 70,
   },
@@ -532,18 +560,18 @@ const DEMO_CLINICS: ClinicSlot[] = [
 
 const DEMO_BUILDERS: BuilderWithClinics[] = [
   {
-    id: 1, name: "Builder Alfa", status: "active", created_at: "2026-01-15T10:00:00Z",
+    id: 1, name: "Builder Alfa", status: "active", subscription_status: "active", created_at: "2026-01-15T10:00:00Z",
     clinics: [
-      { clinic_id: 8,  clinic_name: "Clínica Alfa 1", slug: "alfa-1", status: "active", plan_type: "pilot", builder_id: 1, traceCount: 3200, apisConfigured: true, health_status: "healthy", last_trace_at: "2026-05-02T07:00:00Z", config_completeness: 100 },
-      { clinic_id: 9,  clinic_name: "Clínica Alfa 2", slug: "alfa-2", status: "active", plan_type: "pilot", builder_id: 1, traceCount: 1800, apisConfigured: true, health_status: "healthy", last_trace_at: "2026-05-01T18:30:00Z", config_completeness: 85 },
-      { clinic_id: 10, clinic_name: "Clínica Alfa 3", slug: "alfa-3", status: "active", plan_type: "pilot", builder_id: 1, traceCount: 950,  apisConfigured: false, health_status: "warning", last_trace_at: "2026-04-27T10:00:00Z", config_completeness: 35 },
+      { clinic_id: 8,  clinic_name: "Clínica Alfa 1", slug: "alfa-1", status: "active", plan_type: "pilot", builder_id: 1, trace_count: 3200, apis_configured: true, health_status: "healthy", last_trace_at: "2026-05-02T07:00:00Z", config_completeness: 100 },
+      { clinic_id: 9,  clinic_name: "Clínica Alfa 2", slug: "alfa-2", status: "active", plan_type: "pilot", builder_id: 1, trace_count: 1800, apis_configured: true, health_status: "healthy", last_trace_at: "2026-05-01T18:30:00Z", config_completeness: 85 },
+      { clinic_id: 10, clinic_name: "Clínica Alfa 3", slug: "alfa-3", status: "active", plan_type: "pilot", builder_id: 1, trace_count: 950,  apis_configured: false, health_status: "warning", last_trace_at: "2026-04-27T10:00:00Z", config_completeness: 35 },
     ],
   },
   {
-    id: 2, name: "Builder Beta", status: "active", created_at: "2026-02-01T10:00:00Z",
+    id: 2, name: "Builder Beta", status: "active", subscription_status: "trial", created_at: "2026-02-01T10:00:00Z",
     clinics: [
-      { clinic_id: 11, clinic_name: "Clínica Beta 1", slug: "beta-1", status: "active", plan_type: "pilot", builder_id: 2, traceCount: 2100, apisConfigured: true, health_status: "healthy", last_trace_at: "2026-05-02T06:45:00Z", config_completeness: 92 },
-      { clinic_id: 12, clinic_name: "Clínica Beta 2", slug: "beta-2", status: "active", plan_type: "pilot", builder_id: 2, traceCount: 890,  apisConfigured: false, health_status: "critical", last_trace_at: null, config_completeness: 20 },
+      { clinic_id: 11, clinic_name: "Clínica Beta 1", slug: "beta-1", status: "active", plan_type: "pilot", builder_id: 2, trace_count: 2100, apis_configured: true, health_status: "healthy", last_trace_at: "2026-05-02T06:45:00Z", config_completeness: 92 },
+      { clinic_id: 12, clinic_name: "Clínica Beta 2", slug: "beta-2", status: "active", plan_type: "pilot", builder_id: 2, trace_count: 890,  apis_configured: false, health_status: "critical", last_trace_at: null, config_completeness: 20 },
     ],
   },
 ];
@@ -553,17 +581,18 @@ const DEMO_BUILDERS: BuilderWithClinics[] = [
 const DEMO_DASHBOARD: AdminDashboardData = {
   stats: {
     total_traces: 27200,
-    active_pilots: 170,
-    active_builders: 80,
-    active_managed_clinics: 170,
+    active_pilots: DEMO_CLINICS.filter((clinic) => clinic.status === "active").length,
+    active_builders: DEMO_BUILDERS.filter(builderCountsAsActive).length,
+    active_managed_clinics: DEMO_BUILDERS.flatMap((builder) => builder.clinics).filter((clinic) => clinic.status === "active").length,
     estimated_mrr: 0,
     safety_flags_7d: 2,
     handoff_count_7d: 48,
-    // Extended stats for investor breakdown
-    total_clinics: 200,
-    inactive_clinics: 30,
-    total_builders: 100,
-    inactive_builders: 20,
+    total_clinics: DEMO_CLINICS.length + DEMO_BUILDERS.reduce((count, builder) => count + builder.clinics.length, 0),
+    active_clinics: DEMO_CLINICS.filter((clinic) => clinic.status === "active").length + DEMO_BUILDERS.reduce(
+      (count, builder) => count + builder.clinics.filter((clinic) => clinic.status === "active").length,
+      0,
+    ),
+    total_builders: DEMO_BUILDERS.length,
   },
   time_series: Array.from({ length: 31 }, (_, i) => {
     const d = new Date("2026-04-02");
@@ -579,7 +608,7 @@ const DEMO_DASHBOARD: AdminDashboardData = {
 // ── Master Admin Page ─────────────────────────────────────────────────────────
 
 export default function MasterAdmin() {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const { isSuperAdmin, isInvestor, setViewingClinicId } = useAuth();
   const [, navigate] = useLocation();
   const token = useAdminToken();
@@ -608,12 +637,14 @@ export default function MasterAdmin() {
 
   // Alert filter state
   const [alertSeverityFilter, setAlertSeverityFilter] = useState<string>("all");
-  const [alertBuilderFilter, setAlertBuilderFilter] = useState<string>("all");
+  const [alertClinicFilter, setAlertClinicFilter] = useState<string>("all");
 
   // Builders state
   const [builders, setBuilders] = useState<BuilderWithClinics[]>(isInvestor ? DEMO_BUILDERS : []);
   const [buildersLoaded, setBuildersLoaded] = useState(isInvestor);
+  const [builderSearchQuery, setBuilderSearchQuery] = useState("");
   const [expandedBuilderId, setExpandedBuilderId] = useState<number | null>(null);
+  const [expandedClinicId, setExpandedClinicId] = useState<number | null>(null);
   const [newBuilderName, setNewBuilderName] = useState("");
   const [newBuilderEmail, setNewBuilderEmail] = useState("");
   const [newBuilderPassword, setNewBuilderPassword] = useState("");
@@ -659,11 +690,11 @@ export default function MasterAdmin() {
       if (!res.ok) { setError(t("admin_err_clinics")); return; }
       const data = await res.json() as ClinicSlot[];
       setClinics(data);
-      setLoaded(true);
     } catch {
       setError(t("admin_err_network"));
     } finally {
       setLoading(false);
+      setLoaded(true);
     }
   };
 
@@ -672,8 +703,8 @@ export default function MasterAdmin() {
       const res = await fetch(`/v1/admin/builders`, { headers: authHeaders(token) });
       if (!res.ok) return;
       setBuilders(await res.json() as BuilderWithClinics[]);
-      setBuildersLoaded(true);
     } catch { /* silent */ }
+    finally { setBuildersLoaded(true); }
   };
 
   const fetchCoupons = async () => {
@@ -748,7 +779,7 @@ export default function MasterAdmin() {
       });
       if (!res.ok) { const err = await res.json().catch(() => ({})) as { detail?: string }; toast({ title: err.detail ?? "Erro ao criar builder", variant: "destructive" }); return; }
       setNewBuilderName(""); setNewBuilderEmail(""); setNewBuilderPassword("");
-      await fetchBuilders();
+      await Promise.all([fetchBuilders(), refreshKpis()]);
       toast({ title: "Builder criado com sucesso!" });
     } catch {
       toast({ title: "Erro de rede", variant: "destructive" });
@@ -766,6 +797,7 @@ export default function MasterAdmin() {
       });
       if (!res.ok) { toast({ title: "Erro ao alterar status", variant: "destructive" }); return; }
       setBuilders((prev) => prev.map((b) => b.id === id ? { ...b, status: newStatus } : b));
+      await refreshKpis();
       toast({ title: newStatus === "active" ? "Builder ativado" : "Builder desativado", description: `ID ${id}` });
     } catch {
       toast({ title: "Erro de rede", variant: "destructive" });
@@ -835,32 +867,11 @@ export default function MasterAdmin() {
       }
       setNewClinicName(""); setNewClinicEmail(""); setNewClinicPassword("");
       setAddingClinicToBuilderId(null);
-      await fetchBuilders();
+      await Promise.all([fetchBuilders(), fetchClinics(), refreshKpis()]);
       toast({ title: "Clínica criada com sucesso!" });
     } catch {
       toast({ title: "Erro de rede", variant: "destructive" });
     }
-  };
-
-  const handleToggleBuilderClinic = async (clinicId: number, newStatus: "active" | "inactive") => {
-    if (isInvestor) { toast({ title: "Modo Visualização: ação desabilitada." }); return; }
-    try {
-      const res = await fetch(`/v1/admin/clinics/${clinicId}/status`, {
-        method: "PATCH", headers: authHeaders(token),
-        body: JSON.stringify({ status: newStatus }),
-      });
-      if (!res.ok) { toast({ title: "Erro ao alterar status da clínica", variant: "destructive" }); return; }
-      setBuilders((prev) => prev.map((b) => ({
-        ...b,
-        clinics: b.clinics.map((c) => c.clinic_id === clinicId ? { ...c, status: newStatus } : c),
-      })));
-    } catch {
-      toast({ title: "Erro de rede", variant: "destructive" });
-    }
-  };
-
-  const handleDeleteBuilderClinic = (clinicId: number, clinicName: string) => {
-    setDeleteTarget({ type: "clinic", id: clinicId, name: clinicName });
   };
 
   const handleLinkClinic = async (builderId: number) => {
@@ -877,8 +888,7 @@ export default function MasterAdmin() {
       }
       setSelectedLinkClinicId("");
       setLinkingClinicToBuilderId(null);
-      await fetchBuilders();
-      await fetchClinics();
+      await Promise.all([fetchBuilders(), fetchClinics(), refreshKpis()]);
       toast({ title: "Clínica vinculada com sucesso!" });
     } catch {
       toast({ title: "Erro de rede", variant: "destructive" });
@@ -897,8 +907,7 @@ export default function MasterAdmin() {
         toast({ title: err.detail ?? "Erro ao desvincular clínica", variant: "destructive" });
         return;
       }
-      await fetchBuilders();
-      await fetchClinics();
+      await Promise.all([fetchBuilders(), fetchClinics(), refreshKpis()]);
       toast({ title: "Clínica desvinculada com sucesso!" });
     } catch {
       toast({ title: "Erro de rede", variant: "destructive" });
@@ -923,6 +932,7 @@ export default function MasterAdmin() {
         setClinics((prev) => prev.filter((c) => c.clinic_id !== id));
         setBuilders((prev) => prev.map((b) => ({ ...b, clinics: b.clinics.filter((c) => c.clinic_id !== id) })));
       }
+      await refreshKpis();
       toast({ title: `${type === "builder" ? "Builder" : "Clínica"} "${name}" excluído(a).` });
     } catch {
       toast({ title: "Erro de rede", variant: "destructive" });
@@ -932,9 +942,87 @@ export default function MasterAdmin() {
     }
   };
 
+  const fetchTickets = async () => {
+    try {
+      const res = await fetch(`/v1/support/tickets`, { headers: authHeaders(token) });
+      if (!res.ok) return;
+      setTickets(await res.json() as SupportTicket[]);
+    } catch { /* silent */ }
+    finally { setTicketsLoaded(true); }
+  };
+
+  const fetchLeads = async () => {
+    try {
+      const res = await fetch(`/v1/demo-leads`, { headers: authHeaders(token) });
+      if (!res.ok) return;
+      setLeads(await res.json() as DemoLead[]);
+    } catch { /* silent */ }
+    finally { setLeadsLoaded(true); }
+  };
+
+  const fetchStats = async () => {
+    try {
+      const res = await fetch(`/v1/admin/stats`, { headers: authHeaders(token) });
+      if (!res.ok) { setStats(null); return; }
+      const raw = await res.json() as Record<string, unknown>;
+      setStats({
+        totalTraces: (raw.total_traces ?? raw.totalTraces ?? 0) as number,
+        totalTokens: (raw.total_tokens ?? raw.totalTokens ?? 0) as number,
+        openTickets: (raw.open_tickets ?? raw.openTickets ?? 0) as number,
+        activeClinics: (raw.active_clinics ?? raw.activeClinics ?? 0) as number,
+        activeBuilders: (raw.active_builders ?? raw.activeBuilders ?? 0) as number,
+        activeManagedClinics: (raw.active_managed_clinics ?? raw.activeManagedClinics ?? 0) as number,
+        estimatedMrr: (raw.estimated_mrr ?? raw.estimatedMrr ?? 0) as number,
+        totalClinics: (raw.total_clinics ?? raw.totalClinics ?? 0) as number,
+        totalBuilders: (raw.total_builders ?? raw.totalBuilders ?? 0) as number,
+      });
+    } catch { setStats(null); }
+    finally { setStatsLoaded(true); }
+  };
+
+  const fetchDashboard = async () => {
+    try {
+      const res = await fetch(`/v1/admin/dashboard`, { headers: authHeaders(token) });
+      if (!res.ok) { setDashboard(null); return; }
+      setDashboard(await res.json() as AdminDashboardData);
+    } catch { setDashboard(null); }
+    finally { setDashboardLoaded(true); }
+  };
+
+  const refreshKpis = async () => {
+    await Promise.all([fetchStats(), fetchDashboard()]);
+  };
+
   // Only real admins hit the network
-  if (!isInvestor && !loaded && !loading) { void fetchClinics(); }
-  if (!isInvestor && !buildersLoaded) { void fetchBuilders(); }
+  useEffect(() => {
+    if (isSuperAdmin && !loaded && !loading) void fetchClinics();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSuperAdmin, loaded, loading]);
+
+  useEffect(() => {
+    if (isSuperAdmin && !buildersLoaded) void fetchBuilders();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSuperAdmin, buildersLoaded]);
+
+  useEffect(() => {
+    if (isSuperAdmin && !ticketsLoaded) void fetchTickets();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSuperAdmin, ticketsLoaded]);
+
+  useEffect(() => {
+    if (!leadsLoaded && isSuperAdmin) void fetchLeads();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [leadsLoaded, isSuperAdmin]);
+
+  useEffect(() => {
+    if (!statsLoaded && isSuperAdmin) void fetchStats();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statsLoaded, isSuperAdmin]);
+
+  useEffect(() => {
+    if (isSuperAdmin && !dashboardLoaded) void fetchDashboard();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dashboardLoaded, isSuperAdmin]);
 
   if (!isSuperAdmin && !isInvestor) {
     return (
@@ -944,7 +1032,9 @@ export default function MasterAdmin() {
     );
   }
 
-  const handleToggle = async (id: number, newStatus: "active" | "inactive") => {
+  const handleToggleClinicStatus = async (id: number, currentStatus: "active" | "inactive") => {
+    if (isInvestor) { toast({ title: "Modo Visualização: ação desabilitada." }); return; }
+    const newStatus = currentStatus === "active" ? "inactive" : "active";
     try {
       const res = await fetch(`/v1/admin/clinics/${id}/status`, {
         method: "PATCH",
@@ -956,6 +1046,11 @@ export default function MasterAdmin() {
         return;
       }
       setClinics((prev) => prev.map((c) => c.clinic_id === id ? { ...c, status: newStatus } : c));
+      setBuilders((prev) => prev.map((b) => ({
+        ...b,
+        clinics: b.clinics.map((c) => c.clinic_id === id ? { ...c, status: newStatus } : c),
+      })));
+      await refreshKpis();
       toast({
         title: newStatus === "active" ? t("admin_toggle_ok_on") : t("admin_toggle_ok_off"),
         description: `ID ${id}`,
@@ -974,55 +1069,15 @@ export default function MasterAdmin() {
     navigate("/traces");
   };
 
-  const fetchTickets = async () => {
-    try {
-      const res = await fetch(`/v1/support/tickets`, { headers: authHeaders(token) });
-      if (!res.ok) return;
-      setTickets(await res.json() as SupportTicket[]);
-      setTicketsLoaded(true);
-    } catch { /* silent */ }
+  const handleConfigureClinic = (id: number) => {
+    setViewingClinicId(String(id));
+    navigate("/config");
   };
 
-  const fetchLeads = async () => {
-    try {
-      const res = await fetch(`/v1/demo-leads`, { headers: authHeaders(token) });
-      if (!res.ok) return;
-      setLeads(await res.json() as DemoLead[]);
-      setLeadsLoaded(true);
-    } catch { /* silent */ }
+  const handleAccessClinicPanel = (id: number) => {
+    setViewingClinicId(String(id));
+    navigate("/");
   };
-
-  const fetchStats = async () => {
-    try {
-      const res = await fetch(`/v1/admin/stats`, { headers: authHeaders(token) });
-      if (!res.ok) return;
-      const raw = await res.json() as Record<string, unknown>;
-      setStats({
-        totalTraces: (raw.total_traces ?? raw.totalTraces ?? 0) as number,
-        totalTokens: (raw.total_tokens ?? raw.totalTokens ?? 0) as number,
-        openTickets: (raw.open_tickets ?? raw.openTickets ?? 0) as number,
-        activeClinics: (raw.active_pilots ?? raw.activeClinics ?? 0) as number,
-        activeBuilders: (raw.active_builders ?? raw.activeBuilders ?? 0) as number,
-        activeManagedClinics: (raw.active_managed_clinics ?? raw.activeManagedClinics ?? 0) as number,
-        estimatedMrr: (raw.estimated_mrr ?? raw.estimatedMrr ?? 0) as number,
-      });
-      setStatsLoaded(true);
-    } catch { /* silent */ }
-  };
-
-  const fetchDashboard = async () => {
-    try {
-      const res = await fetch(`/v1/admin/dashboard`, { headers: authHeaders(token) });
-      if (!res.ok) return;
-      setDashboard(await res.json() as AdminDashboardData);
-      setDashboardLoaded(true);
-    } catch { /* silent */ }
-  };
-
-  if (!ticketsLoaded) { void fetchTickets(); }
-  if (!leadsLoaded && isSuperAdmin) { void fetchLeads(); }
-  if (!statsLoaded && isSuperAdmin) { void fetchStats(); }
-  if (!dashboardLoaded && !isInvestor) { void fetchDashboard(); }
 
   // ── Lead filtering & export ────────────────────────────────────────────────
 
@@ -1130,9 +1185,12 @@ export default function MasterAdmin() {
     URL.revokeObjectURL(url);
   };
 
-  // Investors see impressive demo numbers; real admins see live DB stats
-  const totalClinics  = isInvestor ? 200 : clinics.filter((c) => c.plan_type === "pilot").length;
-  const activeClinics  = isInvestor ? 170 : (stats?.activeClinics ?? clinics.filter((c) => c.plan_type === "pilot" && c.status === "active").length);
+  // Platform KPIs come from the dashboard stats endpoint (server-computed truth),
+  // not from the client-side clinics/builders lists, which only hold what's been fetched.
+  const totalClinics   = dashboard?.stats.total_clinics ?? stats?.totalClinics ?? "…";
+  const activeClinics  = dashboard?.stats.active_clinics ?? stats?.activeClinics ?? "…";
+  const totalBuilders  = dashboard?.stats.total_builders ?? stats?.totalBuilders ?? "…";
+  const activeBuilders = dashboard?.stats.active_builders ?? stats?.activeBuilders ?? "…";
   const totalTraces   = isInvestor ? "27.2K" : (stats ? stats.totalTraces.toLocaleString("pt-BR") : "...");
   const tokenDisplay  = isInvestor ? "2.4M" : (stats ? `${(stats.totalTokens / 1_000_000).toFixed(1)}M` : "...");
   const openTicketCnt = isInvestor ? 0 : (ticketsLoaded ? tickets.filter((t) => t.status === "open").length : (stats?.openTickets ?? 0));
@@ -1148,12 +1206,23 @@ export default function MasterAdmin() {
     return { direction: pct >= 0 ? "up" as const : "down" as const, pct: Math.abs(pct) };
   })();
 
+  // Clinics already linked to a builder — used to build the "unlinked" list and the link-picker
+  const linkedClinicIds = new Set(builders.flatMap((b) => b.clinics.map((c) => c.clinic_id)));
+  const unlinkedClinics = clinics.filter((c) => !linkedClinicIds.has(c.clinic_id));
+
+  const filteredBuilders = builderSearchQuery.trim()
+    ? builders.filter((b) =>
+        b.name.toLowerCase().includes(builderSearchQuery.trim().toLowerCase()) ||
+        (b.admin_email ?? "").toLowerCase().includes(builderSearchQuery.trim().toLowerCase())
+      )
+    : builders;
+
   // ── Alert filtering (client-side) ────────────────────────────────────────
   const allAlerts = dashboard?.alerts ?? [];
-  const alertBuilderNames = Array.from(new Set(allAlerts.map((a) => a.clinic_name))).sort();
+  const alertClinicNames = Array.from(new Set(allAlerts.map((a) => a.clinic_name))).sort();
   const filteredAlerts = allAlerts.filter((a) => {
     if (alertSeverityFilter !== "all" && a.severity !== alertSeverityFilter) return false;
-    if (alertBuilderFilter !== "all" && a.clinic_name !== alertBuilderFilter) return false;
+    if (alertClinicFilter !== "all" && a.clinic_name !== alertClinicFilter) return false;
     return true;
   });
 
@@ -1173,7 +1242,7 @@ export default function MasterAdmin() {
             )}
           </div>
           <p className="text-sm text-muted-foreground mt-0.5">
-            {t("admin_infra_desc")} · {totalClinics} slots · {activeClinics} {t("admin_pilots_label")}
+            {t("admin_infra_desc")} · {totalClinics} clínicas · {activeClinics} {t("admin_pilots_label")}
           </p>
         </div>
         {isInvestor ? (
@@ -1185,108 +1254,61 @@ export default function MasterAdmin() {
             <Plus className="h-4 w-4" /> {t("admin_create_btn")}
           </Button>
         ) : (
-          <CreatePilotDialog token={token} onCreated={fetchClinics} />
+          <CreatePilotDialog
+            token={token}
+            onCreated={async () => { await Promise.all([fetchClinics(), refreshKpis()]); }}
+          />
         )}
       </div>
 
-      {/* Stats row */}
+      {/* Platform KPIs: builders + clinics, total created vs. currently active */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <Card className="border-border">
           <CardContent className="pt-4 pb-3">
-            <p className="text-[11px] text-muted-foreground">{t("admin_stat_total")}</p>
+            <div className="flex items-center gap-1.5 mb-1">
+              <Briefcase className="h-3.5 w-3.5 text-indigo-400" />
+              <p className="text-[11px] text-muted-foreground">{t("admin_kpi_total_builders")}</p>
+            </div>
+            <p className="text-2xl font-bold text-foreground">{totalBuilders}</p>
+          </CardContent>
+        </Card>
+        <Card className="border-border">
+          <CardContent className="pt-4 pb-3">
+            <div className="flex items-center gap-1.5 mb-1">
+              <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+              <p className="text-[11px] text-muted-foreground">{t("admin_kpi_active_builders")}</p>
+            </div>
+            <p className="text-2xl font-bold text-emerald-400">{activeBuilders}</p>
+          </CardContent>
+        </Card>
+        <Card className="border-border">
+          <CardContent className="pt-4 pb-3">
+            <div className="flex items-center gap-1.5 mb-1">
+              <Building2 className="h-3.5 w-3.5 text-blue-400" />
+              <p className="text-[11px] text-muted-foreground">{t("admin_stat_total")}</p>
+            </div>
             <p className="text-2xl font-bold text-foreground">{totalClinics}</p>
           </CardContent>
         </Card>
         <Card className="border-border">
           <CardContent className="pt-4 pb-3">
-            <p className="text-[11px] text-muted-foreground">{t("admin_stat_active")}</p>
+            <div className="flex items-center gap-1.5 mb-1">
+              <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+              <p className="text-[11px] text-muted-foreground">{t("admin_stat_active")}</p>
+            </div>
             <p className="text-2xl font-bold text-emerald-400">{activeClinics}</p>
-          </CardContent>
-        </Card>
-        <Card className="border-border bg-gradient-to-br from-blue-950/20 to-transparent">
-          <CardContent className="pt-4 pb-3">
-            <p className="text-[11px] text-muted-foreground">Consumo API (Mês)</p>
-            <p className="text-2xl font-bold text-blue-400">
-              {tokenDisplay} <span className="text-base font-medium">Tokens</span>
-            </p>
           </CardContent>
         </Card>
       </div>
 
-      {/* Investor breakdown: clinics + builders totals */}
-      {isInvestor && (
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          {/* Clinics breakdown */}
-          <Card className="border-border">
-            <CardHeader className="pb-2">
-              <div className="flex items-center gap-2">
-                <Building2 className="h-4 w-4 text-blue-400" />
-                <CardTitle className="text-sm font-semibold">Clínicas</CardTitle>
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-muted-foreground">Total Clínicas</span>
-                <span className="text-xl font-bold text-foreground">200</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-muted-foreground flex items-center gap-1.5">
-                  <CheckCircle2 className="h-3 w-3 text-emerald-400" /> Clínicas Ativas
-                </span>
-                <span className="text-lg font-bold text-emerald-400">170</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-muted-foreground flex items-center gap-1.5">
-                  <XCircle className="h-3 w-3 text-slate-400" /> Clínicas Inativas
-                </span>
-                <span className="text-lg font-bold text-slate-400">30</span>
-              </div>
-              <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
-                <div className="h-full bg-emerald-500 rounded-full" style={{ width: "85%" }} />
-              </div>
-            </CardContent>
-          </Card>
-          {/* Builders breakdown */}
-          <Card className="border-border">
-            <CardHeader className="pb-2">
-              <div className="flex items-center gap-2">
-                <Users className="h-4 w-4 text-indigo-400" />
-                <CardTitle className="text-sm font-semibold">Builders</CardTitle>
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-muted-foreground">Total Builders</span>
-                <span className="text-xl font-bold text-foreground">100</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-muted-foreground flex items-center gap-1.5">
-                  <CheckCircle2 className="h-3 w-3 text-emerald-400" /> Builders Ativos
-                </span>
-                <span className="text-lg font-bold text-emerald-400">80</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-muted-foreground flex items-center gap-1.5">
-                  <XCircle className="h-3 w-3 text-slate-400" /> Builders Inativos
-                </span>
-                <span className="text-lg font-bold text-slate-400">20</span>
-              </div>
-              <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
-                <div className="h-full bg-indigo-500 rounded-full" style={{ width: "80%" }} />
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      )}
-
       {/* Real-data metrics row (super_admin only) */}
       {isSuperAdmin && (
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <Card className="border-border bg-gradient-to-br from-emerald-950/20 to-transparent">
             <CardContent className="pt-4 pb-3">
               <div className="flex items-center gap-1.5 mb-1">
                 <TrendingUp className="h-3.5 w-3.5 text-emerald-400" />
-                <p className="text-[11px] text-muted-foreground">Total de Traces (Pilotos)</p>
+                <p className="text-[11px] text-muted-foreground">Total de Traces (Clínicas)</p>
               </div>
               <div className="flex items-center gap-2">
                 <p className="text-2xl font-bold text-emerald-400">{totalTraces}</p>
@@ -1297,6 +1319,17 @@ export default function MasterAdmin() {
                   </span>
                 )}
               </div>
+            </CardContent>
+          </Card>
+          <Card className="border-border bg-gradient-to-br from-blue-950/20 to-transparent">
+            <CardContent className="pt-4 pb-3">
+              <div className="flex items-center gap-1.5 mb-1">
+                <DollarSign className="h-3.5 w-3.5 text-blue-400" />
+                <p className="text-[11px] text-muted-foreground">Consumo API (Mês)</p>
+              </div>
+              <p className="text-2xl font-bold text-blue-400">
+                {tokenDisplay} <span className="text-sm font-medium">Tokens</span>
+              </p>
             </CardContent>
           </Card>
           <Card className="border-border bg-gradient-to-br from-rose-950/20 to-transparent">
@@ -1335,12 +1368,12 @@ export default function MasterAdmin() {
               <option value="info">Info</option>
             </select>
             <select
-              value={alertBuilderFilter}
-              onChange={(e) => setAlertBuilderFilter(e.target.value)}
+              value={alertClinicFilter}
+              onChange={(e) => setAlertClinicFilter(e.target.value)}
               className="h-8 rounded-md border border-border bg-background px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent"
             >
-              <option value="all">{t("admin_filter_builder")}: {t("admin_filter_all")}</option>
-              {alertBuilderNames.map((name) => (
+              <option value="all">{t("admin_filter_clinic")}: {t("admin_filter_all")}</option>
+              {alertClinicNames.map((name) => (
                 <option key={name} value={name}>{name}</option>
               ))}
             </select>
@@ -1370,7 +1403,7 @@ export default function MasterAdmin() {
               <Briefcase className="h-4 w-4 text-violet-400" />
               <CardTitle className="text-sm font-semibold">Gestão de Builders</CardTitle>
               <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-violet-500/15 text-violet-400 border border-violet-500/30">
-                {builders.filter((b) => b.status === "active").length} ativo{builders.filter((b) => b.status === "active").length !== 1 ? "s" : ""}
+                {builders.filter(builderCountsAsActive).length} ativo{builders.filter(builderCountsAsActive).length !== 1 ? "s" : ""}
               </span>
             </div>
             {isSuperAdmin && (
@@ -1410,17 +1443,33 @@ export default function MasterAdmin() {
           </CardDescription>
         </CardHeader>
         <CardContent className="pt-0 space-y-2">
+          {builders.length > 0 && (
+            <div className="relative mb-1">
+              <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+              <Input
+                value={builderSearchQuery}
+                onChange={(e) => setBuilderSearchQuery(e.target.value)}
+                placeholder="Buscar builder por nome ou e-mail..."
+                className="h-8 text-xs pl-8"
+              />
+            </div>
+          )}
           {builders.length === 0 ? (
             <div className="flex flex-col items-center py-8 text-muted-foreground gap-2">
               <Briefcase className="h-8 w-8 opacity-25" />
               <p className="text-xs">Nenhum builder cadastrado ainda.</p>
             </div>
+          ) : filteredBuilders.length === 0 ? (
+            <div className="flex flex-col items-center py-8 text-muted-foreground gap-2">
+              <Search className="h-8 w-8 opacity-25" />
+              <p className="text-xs">Nenhum builder encontrado para &quot;{builderSearchQuery}&quot;.</p>
+            </div>
           ) : (
-            builders.map((builder) => {
+            filteredBuilders.map((builder) => {
               const isExpanded = expandedBuilderId === builder.id;
               const isEditing = editingBuilderId === builder.id;
               const isAddingClinic = addingClinicToBuilderId === builder.id;
-              const activeClinics = builder.clinics.filter((c) => c.status === "active").length;
+              const builderActiveClinics = builder.clinics.filter((c) => c.status === "active").length;
               const totalClinicCount = builder.clinics.length;
 
 
@@ -1476,7 +1525,7 @@ export default function MasterAdmin() {
 
                     <div className="flex items-center gap-1.5 shrink-0 ml-auto">
                       <span className="text-[11px] text-muted-foreground">
-                        {builder.clinics.length} clínica{builder.clinics.length !== 1 ? "s" : ""} · {activeClinics} ativa{activeClinics !== 1 ? "s" : ""}
+                        {builder.clinics.length} clínica{builder.clinics.length !== 1 ? "s" : ""} · {builderActiveClinics} ativa{builderActiveClinics !== 1 ? "s" : ""}
                       </span>
 
 
@@ -1560,8 +1609,7 @@ export default function MasterAdmin() {
 
                       {/* Link existing clinic form */}
                       {linkingClinicToBuilderId === builder.id && (() => {
-                        const linkedIds = new Set(builders.flatMap((b) => b.clinics.map((c) => c.clinic_id)));
-                        const available = clinics.filter((c) => !linkedIds.has(c.clinic_id));
+                        const available = unlinkedClinics;
                         return (
                           <div className="rounded-md border border-dashed border-emerald-500/40 bg-emerald-500/5 p-3 space-y-2">
                             <p className="text-[11px] font-medium text-emerald-400">Vincular clínica existente a {builder.name}</p>
@@ -1595,85 +1643,56 @@ export default function MasterAdmin() {
                         <div className="space-y-1">
                           {builder.clinics.map((c) => {
                             const isEditingClinic = editingClinicId === c.clinic_id;
-                            return (
-                            <div key={c.clinic_id} className={`rounded-md px-2.5 py-2 text-xs transition-colors ${c.status === "active" ? "bg-background/60 border border-border/40" : "bg-muted/20 border border-dashed border-slate-700 opacity-60"}`}>
-                              {isEditingClinic ? (
-                                <div className="flex items-center gap-1.5 flex-wrap">
-                                  <Building2 className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                                  <Input
-                                    value={editClinicName}
-                                    onChange={(e) => setEditClinicName(e.target.value)}
-                                    className="h-7 text-xs w-32"
-                                    placeholder="Nome"
-                                    autoFocus
-                                    onKeyDown={(e) => { if (e.key === "Enter") void handleSaveClinic(c.clinic_id); if (e.key === "Escape") setEditingClinicId(null); }}
-                                  />
-                                  <Input
-                                    value={editClinicEmail}
-                                    onChange={(e) => setEditClinicEmail(e.target.value)}
-                                    className="h-7 text-xs w-40"
-                                    placeholder="Email"
-                                    type="email"
-                                    onKeyDown={(e) => { if (e.key === "Enter") void handleSaveClinic(c.clinic_id); if (e.key === "Escape") setEditingClinicId(null); }}
-                                  />
-                                  <Input
-                                    value={editClinicPassword}
-                                    onChange={(e) => setEditClinicPassword(e.target.value)}
-                                    className="h-7 text-xs w-28"
-                                    placeholder="Nova senha"
-                                    type="password"
-                                    onKeyDown={(e) => { if (e.key === "Enter") void handleSaveClinic(c.clinic_id); if (e.key === "Escape") setEditingClinicId(null); }}
-                                  />
-                                  <Button size="sm" className="h-7 text-xs px-2" onClick={() => void handleSaveClinic(c.clinic_id)}>Salvar</Button>
-                                  <Button size="sm" variant="ghost" className="h-7 text-xs px-2" onClick={() => { setEditingClinicId(null); setEditClinicPassword(""); }}>✕</Button>
-                                </div>
-                              ) : (
-                                <div className="flex items-center gap-3">
-                                  <Building2 className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                                  <span className="font-medium truncate">{c.clinic_name}</span>
-                                  {c.admin_email && <span className="text-[10px] text-muted-foreground truncate">{c.admin_email}</span>}
-                                  {c.slug && <span className="text-muted-foreground font-mono text-[10px]">/{c.slug}</span>}
-
-                                  <div className="ml-auto flex items-center gap-1 shrink-0">
-                                    <StatusBadge status={c.status} />
-                                    {isSuperAdmin && (
-                                      <>
-                                        <Button
-                                          variant="ghost" size="sm"
-                                          className="h-6 w-6 p-0 text-muted-foreground hover:text-foreground"
-                                          title="Editar clínica"
-                                          onClick={() => { setEditingClinicId(c.clinic_id); setEditClinicName(c.clinic_name); setEditClinicEmail(c.admin_email ?? ""); setEditClinicPassword(""); }}
-                                        >
-                                          <Pencil className="h-3 w-3" />
-                                        </Button>
-                                        <Button
-                                          variant="ghost" size="sm"
-                                          className={`h-6 w-6 p-0 ${c.status === "active" ? "text-emerald-400 hover:text-emerald-300" : "text-muted-foreground"}`}
-                                          onClick={() => void handleToggleBuilderClinic(c.clinic_id, c.status === "active" ? "inactive" : "active")}
-                                        >
-                                          {c.status === "active" ? <ToggleRight className="h-3.5 w-3.5" /> : <ToggleLeft className="h-3.5 w-3.5" />}
-                                        </Button>
-                                        <Button
-                                          variant="ghost" size="sm"
-                                          className="h-6 w-6 p-0 text-muted-foreground hover:text-amber-400"
-                                          title="Desvincular do builder"
-                                          onClick={() => void handleUnlinkClinic(builder.id, c.clinic_id)}
-                                        >
-                                          <Unlink className="h-3 w-3" />
-                                        </Button>
-                                        <Button
-                                          variant="ghost" size="sm"
-                                          className="h-6 w-6 p-0 text-muted-foreground hover:text-destructive"
-                                          onClick={() => void handleDeleteBuilderClinic(c.clinic_id, c.clinic_name)}
-                                        >
-                                          <Trash2 className="h-3 w-3" />
-                                        </Button>
-                                      </>
-                                    )}
+                            if (isEditingClinic) {
+                              return (
+                                <div key={c.clinic_id} className="rounded-md px-2.5 py-2 text-xs bg-background/60 border border-border/40">
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    <Building2 className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                                    <Input
+                                      value={editClinicName}
+                                      onChange={(e) => setEditClinicName(e.target.value)}
+                                      className="h-7 text-xs w-32"
+                                      placeholder="Nome"
+                                      autoFocus
+                                      onKeyDown={(e) => { if (e.key === "Enter") void handleSaveClinic(c.clinic_id); if (e.key === "Escape") setEditingClinicId(null); }}
+                                    />
+                                    <Input
+                                      value={editClinicEmail}
+                                      onChange={(e) => setEditClinicEmail(e.target.value)}
+                                      className="h-7 text-xs w-40"
+                                      placeholder="Email"
+                                      type="email"
+                                      onKeyDown={(e) => { if (e.key === "Enter") void handleSaveClinic(c.clinic_id); if (e.key === "Escape") setEditingClinicId(null); }}
+                                    />
+                                    <Input
+                                      value={editClinicPassword}
+                                      onChange={(e) => setEditClinicPassword(e.target.value)}
+                                      className="h-7 text-xs w-28"
+                                      placeholder="Nova senha"
+                                      type="password"
+                                      onKeyDown={(e) => { if (e.key === "Enter") void handleSaveClinic(c.clinic_id); if (e.key === "Escape") setEditingClinicId(null); }}
+                                    />
+                                    <Button size="sm" className="h-7 text-xs px-2" onClick={() => void handleSaveClinic(c.clinic_id)}>Salvar</Button>
+                                    <Button size="sm" variant="ghost" className="h-7 text-xs px-2" onClick={() => { setEditingClinicId(null); setEditClinicPassword(""); }}>✕</Button>
                                   </div>
                                 </div>
-                              )}
-                            </div>
+                              );
+                            }
+                            return (
+                              <ClinicRow
+                                key={c.clinic_id}
+                                clinic={c}
+                                isExpanded={expandedClinicId === c.clinic_id}
+                                onToggleExpand={() => setExpandedClinicId(expandedClinicId === c.clinic_id ? null : c.clinic_id)}
+                                canManage={isSuperAdmin}
+                                onRename={() => { setEditingClinicId(c.clinic_id); setEditClinicName(c.clinic_name); setEditClinicEmail(c.admin_email ?? ""); setEditClinicPassword(""); }}
+                                onToggleStatus={() => void handleToggleClinicStatus(c.clinic_id, c.status)}
+                                onUnlink={() => void handleUnlinkClinic(builder.id, c.clinic_id)}
+                                onDelete={() => handleDeleteClinic(c.clinic_id, c.clinic_name)}
+                                onViewTraces={() => handleViewTraces(c.clinic_id)}
+                                onAccessPanel={() => handleAccessClinicPanel(c.clinic_id)}
+                                onConfigure={() => handleConfigureClinic(c.clinic_id)}
+                              />
                             );
                           })}
                         </div>
@@ -1687,7 +1706,7 @@ export default function MasterAdmin() {
         </CardContent>
       </Card>
 
-      {/* Clinic grid */}
+      {/* Clinics without a builder remain available in the same compact format. */}
       {loading && (
         <div className="flex items-center gap-2 text-muted-foreground py-8 justify-center">
           <Loader2 className="h-5 w-5 animate-spin" /> {t("admin_loading")}
@@ -1699,19 +1718,33 @@ export default function MasterAdmin() {
         </div>
       )}
       {!loading && loaded && (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {clinics.map((c) => (
-            <ClinicCard
-              key={c.clinic_id}
-              clinic={c}
-              token={token}
-              onToggle={handleToggle}
-              onViewTraces={handleViewTraces}
-              onDelete={isSuperAdmin ? handleDeleteClinic : undefined}
-              isReadOnly={isInvestor}
-            />
-          ))}
-        </div>
+        <Card className="border-border">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">{t("admin_unlinked_title")}</CardTitle>
+            <CardDescription className="text-xs">{t("admin_unlinked_desc")}</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-1">
+            {unlinkedClinics.length === 0 ? (
+              <p className="py-3 text-center text-xs text-muted-foreground">{t("admin_unlinked_empty")}</p>
+            ) : unlinkedClinics.map((clinic) => {
+              const adminEmail = clinic.users.find((user) => user.role === "clinic_admin")?.email;
+              return (
+                <ClinicRow
+                  key={clinic.clinic_id}
+                  clinic={{ ...clinic, admin_email: adminEmail }}
+                  isExpanded={expandedClinicId === clinic.clinic_id}
+                  onToggleExpand={() => setExpandedClinicId(expandedClinicId === clinic.clinic_id ? null : clinic.clinic_id)}
+                  canManage={isSuperAdmin}
+                  onToggleStatus={() => void handleToggleClinicStatus(clinic.clinic_id, clinic.status)}
+                  onDelete={() => handleDeleteClinic(clinic.clinic_id, clinic.clinic_name)}
+                  onViewTraces={() => handleViewTraces(clinic.clinic_id)}
+                  onAccessPanel={() => handleAccessClinicPanel(clinic.clinic_id)}
+                  onConfigure={() => handleConfigureClinic(clinic.clinic_id)}
+                />
+              );
+            })}
+          </CardContent>
+        </Card>
       )}
 
       {/* ── Support Tickets Inbox ─────────────────────────────────────────── */}
@@ -2116,7 +2149,7 @@ export default function MasterAdmin() {
                             </td>
                             <td className="py-2 pr-4 text-muted-foreground capitalize">{s.billing_cycle}</td>
                             <td className="py-2 text-muted-foreground">
-                              {s.updated_at ? relativeTime(s.updated_at) : "-"}
+                              {s.updated_at ? relativeTime(s.updated_at, locale) : "-"}
                             </td>
                           </tr>
                         ))}
@@ -2324,26 +2357,6 @@ export default function MasterAdmin() {
         </Card>
       )}
 
-      {/* Webhook reference */}
-      <Card className="border-dashed border-violet-500/30 bg-violet-500/5">
-        <CardHeader className="pb-2">
-          <CardTitle className="text-sm text-violet-400">{t("admin_webhook_title")}</CardTitle>
-          <CardDescription className="text-xs">{t("admin_webhook_desc")}</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-1">
-            {clinics.filter((c) => c.status === "active" && c.plan_type !== "demo").map((c) => (
-              <div key={c.clinic_id} className="flex items-center gap-2 text-[11px] font-mono bg-slate-900 rounded px-2 py-1">
-                <span className="text-violet-400 shrink-0">POST</span>
-                <span className="text-muted-foreground truncate">/api/whatsapp/webhook?clinic_id={c.clinic_id}</span>
-                <Badge variant="outline" className="ml-auto text-[9px] shrink-0">
-                  {c.clinic_name.split(" ").slice(0, 2).join(" ")}
-                </Badge>
-              </div>
-            ))}
-          </div>
-        </CardContent>
-      </Card>
     </div>
 
     <AlertDialog open={!!deleteTarget} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}>

@@ -34,7 +34,6 @@ class ClinicSlotResponse(BaseModel):
     plan_type: str = "pilot"
     trace_count: int = 0
     apis_configured: bool = False
-    zapi_instance_id: Optional[str] = None
     users: list[ClinicUserResponse] = Field(default_factory=list)
     # Health fields (enriched)
     health_status: Optional[str] = None
@@ -62,6 +61,9 @@ class AdminStatsResponse(BaseModel):
     active_builders: int = 0
     active_managed_clinics: int = 0
     estimated_mrr: float = 0.0
+    total_clinics: int = 0
+    active_clinics: int = 0
+    total_builders: int = 0
 
 
 # ============================================
@@ -118,6 +120,7 @@ class BuilderWithClinicsResponse(BaseModel):
     name: str
     admin_email: Optional[str] = None
     status: str
+    subscription_status: str
     created_at: datetime
     clinics: list[BuilderClinicResponse] = Field(default_factory=list)
 
@@ -145,6 +148,9 @@ class AdminDashboardStatsResponse(BaseModel):
     active_builders: int = 0
     active_managed_clinics: int = 0
     estimated_mrr: float = 0.0
+    total_clinics: int = 0
+    active_clinics: int = 0
+    total_builders: int = 0
     safety_flags_7d: int = 0
     handoff_count_7d: int = 0
 

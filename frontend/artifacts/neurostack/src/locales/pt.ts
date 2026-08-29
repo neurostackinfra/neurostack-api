@@ -225,20 +225,17 @@ export const pt: Record<TranslationKey, string> = {
 
   // ── Master Admin ──────────────────────────────────────────────────────────
   admin_infra_desc: "Infraestrutura multi-tenant",
-  admin_slots_label: "slots",
   admin_pilots_label: "clínicas ativas",
   admin_stat_total: "Total Clínicas",
   admin_stat_active: "Clínicas Ativas",
-  admin_stat_free: "Slots Livres",
   admin_stat_traces: "Total Traces",
-  admin_create_btn: "Criar Piloto",
+  admin_create_btn: "Criar Clínica",
   admin_loading: "Carregando clínicas...",
   admin_err_clinics: "Erro ao carregar clínicas.",
   admin_err_network: "Erro de rede.",
   admin_restricted: "Acesso restrito ao Super Admin.",
   admin_status_active: "Ativo",
   admin_status_inactive: "Inativo",
-  admin_slot_available: "Slot disponível",
   admin_toggle_activate: "Ativar",
   admin_toggle_deactivate: "Desativar",
   admin_view_traces: "Ver Traces",
@@ -248,8 +245,6 @@ export const pt: Record<TranslationKey, string> = {
   admin_toggle_ok_on: "Clínica ativada",
   admin_toggle_ok_off: "Clínica desativada",
   admin_toggle_err: "Não foi possível alterar o status.",
-  admin_webhook_title: "Webhook Z-API por Clínica",
-  admin_webhook_desc: "Configure no painel Z-API de cada instância",
   admin_tickets_heading: "Tickets de Suporte",
   admin_tickets_open_badge: "abertos",
   admin_tickets_refresh: "Atualizar",
@@ -263,8 +258,8 @@ export const pt: Record<TranslationKey, string> = {
   admin_ticket_tipo_request: "Solicitação",
   admin_ticket_tipo_feedback: "Feedback",
   admin_ticket_tipo_financial: "Financeiro",
-  admin_create_title: "Novo Piloto",
-  admin_create_desc: "Cria uma nova clínica piloto e o primeiro usuário administrador.",
+  admin_create_title: "Nova Clínica",
+  admin_create_desc: "Cria uma nova clínica e o primeiro usuário administrador.",
   admin_create_name_label: "Nome da Clínica",
   admin_create_name_ph: "Ex: Clínica Vita",
   admin_create_email_label: "Email do Admin",
@@ -274,13 +269,20 @@ export const pt: Record<TranslationKey, string> = {
   admin_create_submit: "Criar",
   admin_create_loading: "Criando…",
   admin_create_required: "Todos os campos são obrigatórios.",
-  admin_create_ok_title: "Piloto criado!",
+  admin_create_ok_title: "Clínica criada!",
   admin_create_err_generic: "Erro desconhecido.",
   admin_create_err_network: "Erro de rede.",
 
   // Chaves adicionais para o diálogo do master-admin
   admin_create_ok_desc_prefix: "Clínica",
   admin_toggle_err_title: "Erro",
+  admin_plan_clinic: "Clínica",
+  admin_access_panel: "Acessar Painel",
+  admin_kpi_total_builders: "Builders (total)",
+  admin_kpi_active_builders: "Builders ativos",
+  admin_unlinked_title: "Clínicas sem builder",
+  admin_unlinked_desc: "Clínicas disponíveis para gestão ou vinculação.",
+  admin_unlinked_empty: "Nenhuma clínica sem builder.",
 
   // ── Trace History — seção Relatórios e Exportação ────────────────────────
   traces_report_title: "Relatórios e Exportação",
@@ -409,8 +411,10 @@ export const pt: Record<TranslationKey, string> = {
 
   // ── Admin Filters ──
   admin_filter_severity: "Severidade",
-  admin_filter_builder: "Builder",
+  admin_filter_clinic: "Clínica",
   admin_filter_all: "Todos",
+  admin_demo_alert_no_traces: "Sem traces nos últimos 7 dias",
+  admin_demo_alert_low_config: "Configuração abaixo de 50%",
 
   // ── Handoff Queue ──
   nav_handoff_queue: "Fila de Handoff",
