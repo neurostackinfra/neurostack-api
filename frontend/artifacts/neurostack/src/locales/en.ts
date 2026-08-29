@@ -223,20 +223,17 @@ export const en = {
 
   // ── Master Admin ──────────────────────────────────────────────────────────
   admin_infra_desc: "Multi-tenant infrastructure",
-  admin_slots_label: "slots",
   admin_pilots_label: "active clinics",
   admin_stat_total: "Total Clinics",
   admin_stat_active: "Active Clinics",
-  admin_stat_free: "Free Slots",
   admin_stat_traces: "Total Traces",
-  admin_create_btn: "Create Pilot",
+  admin_create_btn: "Create Clinic",
   admin_loading: "Loading clinics…",
   admin_err_clinics: "Failed to load clinics.",
   admin_err_network: "Network error.",
   admin_restricted: "Access restricted to Super Admin.",
   admin_status_active: "Active",
   admin_status_inactive: "Inactive",
-  admin_slot_available: "Slot available",
   admin_toggle_activate: "Activate",
   admin_toggle_deactivate: "Deactivate",
   admin_view_traces: "View Traces",
@@ -246,8 +243,6 @@ export const en = {
   admin_toggle_ok_on: "Clinic activated",
   admin_toggle_ok_off: "Clinic deactivated",
   admin_toggle_err: "Failed to change status.",
-  admin_webhook_title: "Z-API Webhook per Clinic",
-  admin_webhook_desc: "Configure in each Z-API instance dashboard",
   admin_tickets_heading: "Support Tickets",
   admin_tickets_open_badge: "open",
   admin_tickets_refresh: "Refresh",
@@ -261,8 +256,8 @@ export const en = {
   admin_ticket_tipo_request: "Request",
   admin_ticket_tipo_feedback: "Feedback",
   admin_ticket_tipo_financial: "Financial",
-  admin_create_title: "New Pilot",
-  admin_create_desc: "Provision a new pilot clinic and its first admin user.",
+  admin_create_title: "New Clinic",
+  admin_create_desc: "Provision a new clinic and its first admin user.",
   admin_create_name_label: "Clinic Name",
   admin_create_name_ph: "e.g. Vita Clinic",
   admin_create_email_label: "Admin Email",
@@ -272,13 +267,20 @@ export const en = {
   admin_create_submit: "Create",
   admin_create_loading: "Creating…",
   admin_create_required: "All fields are required.",
-  admin_create_ok_title: "Pilot created!",
+  admin_create_ok_title: "Clinic created!",
   admin_create_err_generic: "Unknown error.",
   admin_create_err_network: "Network error.",
 
   // Additional keys for master-admin dialog
   admin_create_ok_desc_prefix: "Clinic",
   admin_toggle_err_title: "Error",
+  admin_plan_clinic: "Clinic",
+  admin_access_panel: "Access Panel",
+  admin_kpi_total_builders: "Builders (total)",
+  admin_kpi_active_builders: "Active builders",
+  admin_unlinked_title: "Clinics without a builder",
+  admin_unlinked_desc: "Clinics available for management or linking.",
+  admin_unlinked_empty: "No clinics without a builder.",
 
   // ── Trace History — Reports & Export section ──────────────────────────────
   traces_report_title: "Reports & Export",
@@ -407,8 +409,10 @@ export const en = {
 
   // ── Admin Filters ──
   admin_filter_severity: "Severity",
-  admin_filter_builder: "Builder",
+  admin_filter_clinic: "Clinic",
   admin_filter_all: "All",
+  admin_demo_alert_no_traces: "No traces in the last 7 days",
+  admin_demo_alert_low_config: "Configuration below 50%",
 
   // ── Handoff Queue ──
   nav_handoff_queue: "Handoff Queue",
