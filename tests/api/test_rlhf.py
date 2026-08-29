@@ -450,15 +450,21 @@ class TestPatchRating:
     def test_super_admin_can_approve(
         self, client: TestClient, api_key_headers, super_admin_headers
     ):
-        # Seed a rating
-        # Keep the approval contract independent from the asynchronous
-        # low-rating analysis flow, which has dedicated coverage below.
-        post = client.post(
-            "/v1/rlhf/rating",
-            headers=api_key_headers,
-            json=_rating_payload(3),
+        # Seed a rating with a qualifying reason so the Group 5 has_reason
+        # guard on the accept action lets the PATCH through — we're covering
+        # the happy path here, not the guard (that has its own test below).
+        event_id = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=event_id,
+                tenant_id=TEST_TENANT_ID,
+                rating=3,
+                reason="motivo suficientemente longo",
+                subject_tenant_id=TEST_TENANT_ID,
+            )
         )
-        event_id = post.json()["event_id"]
+        # Ensure the tenant exists so serialization/filtering works.
+        client._submit(_seed_tenant_full(TEST_TENANT_ID, "Approve Tenant"))
 
         response = client.patch(
             f"/v1/rlhf/ratings/{event_id}",
@@ -475,7 +481,7 @@ class TestPatchRating:
             f"/v1/rlhf/ratings?tenant_id={TEST_TENANT_ID}",
             headers=super_admin_headers,
         )
-        matched = [e for e in list_resp.json()["entries"] if e["id"] == event_id]
+        matched = [e for e in list_resp.json()["entries"] if e["id"] == str(event_id)]
         assert matched
         assert matched[0]["approved_for_training"] is True
 
@@ -495,6 +501,388 @@ class TestPatchRating:
             json={"action": "approve"},
         )
         assert response.status_code == 403
+
+
+class TestPatchRatingAcceptAudit:
+    """Group 5: `PATCH ... action=approve` stamps `accepted_by` / `accepted_at`,
+    refuses entries without a qualifying reason, and leaves `ignore` unchanged.
+
+    All coverage goes through the HTTP surface — no direct handler-function
+    calls — so the LifespanTestClient/asyncio deadlock warned about in the
+    wish's Group 3 fix section does not apply here.
+    """
+
+    def _super_admin_headers_for(self, user_id: UUID) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {_make_jwt('super_admin', user_id=user_id)}",
+            "Content-Type": "application/json",
+        }
+
+    def test_approve_stamps_accepted_by_and_accepted_at(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        """AC: `PATCH ... action=approve` persists `accepted_by` and
+        `accepted_at` in addition to `approved_for_training`."""
+        # Extract the same user_id from the fixture's JWT so the stamp value
+        # matches what we can assert.
+        import jwt as _jwt
+
+        token = super_admin_headers["Authorization"].removeprefix("Bearer ")
+        acting_user_id = UUID(
+            _jwt.decode(token, settings.secret_key, algorithms=["HS256"])["sub"]
+        )
+        subject_id = uuid4()
+        event_id = uuid4()
+        client._submit(_seed_tenant_full(subject_id, "Audit Clinic"))
+        client._submit(
+            _seed_rating_event(
+                event_id=event_id,
+                tenant_id=TEST_TENANT_ID,
+                rating=2,
+                reason="motivo escrito válido",
+                subject_tenant_id=subject_id,
+            )
+        )
+
+        before_iso = datetime.now(timezone.utc).isoformat()
+        response = client.patch(
+            f"/v1/rlhf/ratings/{event_id}",
+            headers=super_admin_headers,
+            json={"action": "approve"},
+        )
+        assert response.status_code == 200
+
+        # Read back via GET to prove the stamp landed on event_data through
+        # the serializer contract (not via ORM introspection).
+        list_resp = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subject_id}",
+            headers=super_admin_headers,
+        )
+        matched = [
+            e for e in list_resp.json()["entries"] if e["id"] == str(event_id)
+        ]
+        assert matched
+        entry = matched[0]
+        assert entry["approved_for_training"] is True
+        assert entry["accepted_by"] == str(acting_user_id)
+        assert entry["accepted_at"] is not None
+        # The stamp is ISO-8601 UTC and lands AFTER we snapshotted `before_iso`.
+        assert entry["accepted_at"] >= before_iso
+
+    def test_approve_rejects_entry_without_qualifying_reason(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        """AC: `PATCH ... action=approve` on an entry with no qualifying
+        reason (or a reason under 8 chars) returns 422."""
+        subject_id = uuid4()
+        client._submit(_seed_tenant_full(subject_id, "No-Reason Clinic"))
+        # 7-char reason — just under the floor, proves the boundary.
+        short_id = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=short_id,
+                tenant_id=TEST_TENANT_ID,
+                rating=3,
+                reason="abcdefg",
+                subject_tenant_id=subject_id,
+            )
+        )
+        # Whitespace-only reason (strip drops it below the floor).
+        blank_id = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=blank_id,
+                tenant_id=TEST_TENANT_ID,
+                rating=3,
+                reason="   ",
+                subject_tenant_id=subject_id,
+            )
+        )
+        # Missing reason altogether.
+        none_id = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=none_id,
+                tenant_id=TEST_TENANT_ID,
+                rating=3,
+                reason=None,
+                subject_tenant_id=subject_id,
+            )
+        )
+
+        for eid in (short_id, blank_id, none_id):
+            resp = client.patch(
+                f"/v1/rlhf/ratings/{eid}",
+                headers=super_admin_headers,
+                json={"action": "approve"},
+            )
+            assert resp.status_code == 422, (
+                f"expected 422 for {eid}, got {resp.status_code}: {resp.text}"
+            )
+
+        # Confirm none of them were flipped to approved despite the failed PATCH.
+        list_resp = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subject_id}",
+            headers=super_admin_headers,
+        )
+        by_id = {e["id"]: e for e in list_resp.json()["entries"]}
+        for eid in (short_id, blank_id, none_id):
+            assert by_id[str(eid)]["approved_for_training"] is False
+            assert by_id[str(eid)]["accepted_by"] is None
+
+    def test_ignore_action_unchanged_no_stamp_no_guard(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        """AC (deliverable 6): the `ignore` action does not stamp or guard —
+        entries without a reason still ignore successfully.
+        """
+        subject_id = uuid4()
+        client._submit(_seed_tenant_full(subject_id, "Ignore Clinic"))
+        event_id = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=event_id,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason=None,  # No reason, would 422 under `approve`
+                subject_tenant_id=subject_id,
+            )
+        )
+        resp = client.patch(
+            f"/v1/rlhf/ratings/{event_id}",
+            headers=super_admin_headers,
+            json={"action": "ignore"},
+        )
+        assert resp.status_code == 200
+
+        list_resp = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subject_id}",
+            headers=super_admin_headers,
+        )
+        matched = [
+            e for e in list_resp.json()["entries"] if e["id"] == str(event_id)
+        ]
+        assert matched
+        entry = matched[0]
+        assert entry["ignored"] is True
+        assert entry["accepted_by"] is None
+        assert entry["accepted_at"] is None
+
+
+class TestListRatingsAcceptedByEmail:
+    """Group 5: GET response carries `accepted_by`, `accepted_at` and
+    `accepted_by_email`; email resolution is one batched query."""
+
+    def test_accepted_entries_return_email_via_batched_lookup(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        """AC: `GET /v1/rlhf/ratings` returns `accepted_by`, `accepted_at`
+        and `accepted_by_email` on accepted entries.
+        """
+        subject_id = uuid4()
+        acting_user_id = uuid4()
+        client._submit(_seed_tenant_full(subject_id, "Email Clinic"))
+        client._submit(
+            _seed_user(acting_user_id, "auditor@example.com", subject_id)
+        )
+        event_id = uuid4()
+        stamp_iso = datetime.now(timezone.utc).isoformat()
+        client._submit(
+            _seed_rating_event(
+                event_id=event_id,
+                tenant_id=TEST_TENANT_ID,
+                rating=3,
+                reason="crítica escrita",
+                subject_tenant_id=subject_id,
+                approved_for_training=True,
+                accepted_by=acting_user_id,
+                accepted_at=stamp_iso,
+            )
+        )
+        response = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subject_id}",
+            headers=super_admin_headers,
+        )
+        assert response.status_code == 200
+        matched = [e for e in response.json()["entries"] if e["id"] == str(event_id)]
+        assert matched
+        entry = matched[0]
+        assert entry["accepted_by"] == str(acting_user_id)
+        assert entry["accepted_at"] == stamp_iso
+        assert entry["accepted_by_email"] == "auditor@example.com"
+
+    def test_legacy_approved_row_without_stamp_shows_none_authorship(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        """AC: entries approved before this change remain accepted and
+        surface `accepted_by`/`accepted_by_email` as `None` — the panel
+        renders that as "—" with no migration.
+        """
+        subject_id = uuid4()
+        client._submit(_seed_tenant_full(subject_id, "Legacy Clinic"))
+        event_id = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=event_id,
+                tenant_id=TEST_TENANT_ID,
+                rating=2,
+                reason="crítica escrita",
+                subject_tenant_id=subject_id,
+                approved_for_training=True,
+                # No accepted_by / accepted_at — this is a pre-Group-5 row.
+            )
+        )
+        response = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subject_id}",
+            headers=super_admin_headers,
+        )
+        assert response.status_code == 200
+        matched = [e for e in response.json()["entries"] if e["id"] == str(event_id)]
+        assert matched
+        entry = matched[0]
+        assert entry["approved_for_training"] is True
+        assert entry["accepted_by"] is None
+        assert entry["accepted_at"] is None
+        assert entry["accepted_by_email"] is None
+
+    def test_email_resolution_is_batched_not_per_row(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        """AC: email resolution is ONE batched query, never one per entry.
+
+        Seed 20 accepted entries each authored by a different user (worst
+        case for N+1), then count SQL execute calls during the handler. A
+        batched `.in_(...)` lookup adds exactly one query beyond the tenant
+        + builder batches; a per-row implementation would add 20.
+        """
+        from sqlalchemy import event as sa_event
+
+        subject_id = uuid4()
+        client._submit(_seed_tenant_full(subject_id, "Batch Email Clinic"))
+        for i in range(20):
+            user_id = uuid4()
+            client._submit(_seed_user(user_id, f"user{i}@example.com", subject_id))
+            client._submit(
+                _seed_rating_event(
+                    event_id=uuid4(),
+                    tenant_id=TEST_TENANT_ID,
+                    rating=3,
+                    reason="crítica escrita",
+                    subject_tenant_id=subject_id,
+                    approved_for_training=True,
+                    accepted_by=user_id,
+                    accepted_at=datetime.now(timezone.utc).isoformat(),
+                )
+            )
+
+        from src.repositories import get_db_engine
+
+        query_count = {"n": 0}
+
+        def _on_execute(conn, clauseelement, multiparams, params, execution_options):
+            query_count["n"] += 1
+
+        engine = get_db_engine().sync_engine
+        sa_event.listen(engine, "before_execute", _on_execute)
+        try:
+            response = client.get(
+                f"/v1/rlhf/ratings?tenant_id={subject_id}&limit=500",
+                headers=super_admin_headers,
+            )
+        finally:
+            sa_event.remove(engine, "before_execute", _on_execute)
+
+        assert response.status_code == 200
+        # Main SELECT + Tenant batch + (no builder batch — no builder set) +
+        # 1 User batch = 3 core queries. Allow small connection-setup headroom.
+        # A per-row regression would push this to ~23.
+        assert query_count["n"] <= 6, (
+            f"expected batched user lookup, got {query_count['n']} queries"
+        )
+
+        # And prove all 20 emails actually resolved, so we're counting a
+        # real single-query batch — not a silently empty one.
+        entries = response.json()["entries"]
+        resolved = [e for e in entries if e["accepted_by_email"] is not None]
+        assert len(resolved) == 20
+
+
+class TestListRatingsAcceptedCount:
+    """Group 5: `summary.accepted_count` counts only entries that are BOTH
+    approved AND satisfy `_has_reason` — excluding legacy no-reason approvals.
+    """
+
+    def test_accepted_count_excludes_legacy_no_reason_approvals(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        """AC: for a cut with N entries and `limit >= N`,
+        `summary.accepted_count` equals exactly the number returned by
+        `only_with_reason=true&only_accepted=true`; both exclude legacy
+        no-reason approvals.
+        """
+        subject_id = uuid4()
+        client._submit(_seed_tenant_full(subject_id, "Count Clinic"))
+
+        # 3 approved WITH reason — should be counted.
+        for _ in range(3):
+            client._submit(
+                _seed_rating_event(
+                    event_id=uuid4(),
+                    tenant_id=TEST_TENANT_ID,
+                    rating=3,
+                    reason="crítica escrita",
+                    subject_tenant_id=subject_id,
+                    approved_for_training=True,
+                )
+            )
+        # 2 legacy approved WITHOUT reason — must NOT be counted.
+        for _ in range(2):
+            client._submit(
+                _seed_rating_event(
+                    event_id=uuid4(),
+                    tenant_id=TEST_TENANT_ID,
+                    rating=4,
+                    reason=None,
+                    subject_tenant_id=subject_id,
+                    approved_for_training=True,
+                )
+            )
+        # 1 approved with a 7-char reason (below floor) — must NOT be counted.
+        client._submit(
+            _seed_rating_event(
+                event_id=uuid4(),
+                tenant_id=TEST_TENANT_ID,
+                rating=2,
+                reason="abcdefg",
+                subject_tenant_id=subject_id,
+                approved_for_training=True,
+            )
+        )
+        # 1 unapproved with a long reason — irrelevant to the count.
+        client._submit(
+            _seed_rating_event(
+                event_id=uuid4(),
+                tenant_id=TEST_TENANT_ID,
+                rating=5,
+                reason="motivo longo mas não aprovado",
+                subject_tenant_id=subject_id,
+                approved_for_training=False,
+            )
+        )
+
+        base = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subject_id}&limit=500",
+            headers=super_admin_headers,
+        ).json()
+        assert base["summary"]["accepted_count"] == 3
+
+        filtered = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subject_id}"
+            "&only_with_reason=true&only_accepted=true&limit=500",
+            headers=super_admin_headers,
+        ).json()
+        # The archive-view count MUST equal the summary count.
+        assert len(filtered["entries"]) == base["summary"]["accepted_count"]
 
 
 # ============================================
@@ -886,6 +1274,31 @@ async def _seed_tenant_full(
         await session.close()
 
 
+async def _seed_user(user_id: UUID, email: str, tenant_id: UUID) -> None:
+    """Insert a User row so accepted_by_email resolution can find a match.
+
+    The audit trail (Group 5) stores the acting user's UUID on the event and
+    the report resolves it to an email via a batched User lookup — this helper
+    lets tests populate that lookup deterministically.
+    """
+    from src.models.user import User, UserRole
+
+    session = get_db_session()
+    try:
+        session.add(
+            User(
+                id=user_id,
+                tenant_id=tenant_id,
+                email=email,
+                password_hash="x",
+                role=UserRole.super_admin,
+            )
+        )
+        await session.commit()
+    finally:
+        await session.close()
+
+
 async def _seed_rating_event(
     *,
     event_id: UUID,
@@ -894,6 +1307,8 @@ async def _seed_rating_event(
     reason: str | None = None,
     subject_tenant_id: UUID | None = None,
     approved_for_training: bool = False,
+    accepted_by: UUID | None = None,
+    accepted_at: str | None = None,
     created_at: datetime | None = None,
 ) -> None:
     """Insert a rlhf.rating Event row directly, bypassing the endpoint.
@@ -914,6 +1329,10 @@ async def _seed_rating_event(
             event_data["subject_tenant_id"] = str(subject_tenant_id)
         if approved_for_training:
             event_data["approved_for_training"] = True
+        if accepted_by is not None:
+            event_data["accepted_by"] = str(accepted_by)
+        if accepted_at is not None:
+            event_data["accepted_at"] = accepted_at
         event = Event(
             id=event_id,
             tenant_id=tenant_id,
