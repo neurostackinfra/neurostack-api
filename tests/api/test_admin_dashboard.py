@@ -288,3 +288,408 @@ class TestHealthHelperImports:
         from src.api.routes.builder import CONFIG_COMPLETENESS_BUCKETS
         assert isinstance(CONFIG_COMPLETENESS_BUCKETS, list)
         assert len(CONFIG_COMPLETENESS_BUCKETS) == 6
+
+
+# ============================================
+# api_error alert unit tests (readiness-driven)
+# ============================================
+
+_COMPLETE_LLM = {
+    "llm_provider": "openai",
+    "llm_api_url": "https://api.openai.com/v1",
+    "llm_api_key": "sk-live",
+    "llm_model_name": "gpt-4o-mini",
+}
+
+_COMPLETE_META_WHATSAPP = {
+    "whatsapp_provider": "meta_cloud",
+    "meta_phone_number_id": "1234567890",
+    "meta_permanent_token": "EAA-token",
+    "meta_app_secret": "super-secret",
+}
+
+_COMPLETE_UAZAPI_WHATSAPP = {
+    "whatsapp_provider": "uazapi",
+    "uazapi_api_url": "https://uazapi.example.com",
+    "uazapi_instance_name": "clinic-inst",
+    "uazapi_token": "uaz-token",
+}
+
+_COMPLETE_ZAPI_WHATSAPP = {
+    "whatsapp_provider": "zapi",
+    "zapi_instance_id": "zapi-inst",
+    "zapi_token": "zapi-tok",
+    "zapi_inbound_token_digest": "digest-sha256",
+}
+
+
+def _seed_tenant_and_config(session, *, builder_id, tenant_id, name, api_credentials):
+    """Seed a builder, tenant and (optionally) a clinic_config row.
+
+    We deliberately do not seed a recent Event: SQLite drops tz info from
+    DateTime columns and `_compute_alerts` compares tz-aware ``created_at``
+    against a tz-aware "now". Skipping the event lets every clinic pick up an
+    additional ``inactivity`` alert, which we then filter out of assertions by
+    matching on ``type == 'api_error'`` and ``clinic_id``.
+    """
+    from src.models.builder import Builder
+    from src.models.clinic_config_table import ClinicConfigTable
+    from src.models.tenant import Tenant
+
+    session.add_all(
+        [
+            Builder(id=builder_id, name=f"Builder {name}", status="active",
+                    is_active=True),
+            Tenant(
+                id=tenant_id,
+                name=name,
+                slug=f"clinic-{tenant_id.hex}",
+                api_key_hash=f"hash-{tenant_id.hex}",
+                is_active=True,
+                bot_active=True,
+                builder_id=builder_id,
+                plan_type="pilot",
+                config={},
+            ),
+        ]
+    )
+    if api_credentials is not None:
+        session.add(
+            ClinicConfigTable(
+                tenant_id=tenant_id,
+                clinic_id=tenant_id,
+                api_credentials=api_credentials,
+            )
+        )
+
+
+async def _run_alerts(builder_id):
+    from src.api.helpers.health import _compute_alerts
+    from src.repositories import get_db_session
+
+    session = get_db_session()
+    try:
+        return await _compute_alerts(builder_id, session)
+    finally:
+        await session.close()
+
+
+def _api_error_alerts_for(alerts, clinic_id):
+    return [a for a in alerts if a.type == "api_error" and a.clinic_id == clinic_id]
+
+
+class TestApiErrorAlertReadiness:
+    """`_compute_alerts` derives api_error from credential readiness, one per clinic."""
+
+    @pytest.mark.asyncio
+    async def test_meta_cloud_complete_no_alert(self, async_client):
+        from src.repositories import get_db_session
+        builder_id = uuid4()
+        tenant_id = uuid4()
+        session = get_db_session()
+        try:
+            _seed_tenant_and_config(
+                session,
+                builder_id=builder_id,
+                tenant_id=tenant_id,
+                name="Meta Complete",
+                api_credentials={**_COMPLETE_META_WHATSAPP, **_COMPLETE_LLM},
+            )
+            await session.commit()
+        finally:
+            await session.close()
+
+        alerts = await _run_alerts(builder_id)
+        assert _api_error_alerts_for(alerts, tenant_id) == []
+
+    @pytest.mark.asyncio
+    async def test_uazapi_complete_no_alert(self, async_client):
+        from src.repositories import get_db_session
+        builder_id = uuid4()
+        tenant_id = uuid4()
+        session = get_db_session()
+        try:
+            _seed_tenant_and_config(
+                session,
+                builder_id=builder_id,
+                tenant_id=tenant_id,
+                name="Uazapi Complete",
+                api_credentials={**_COMPLETE_UAZAPI_WHATSAPP, **_COMPLETE_LLM},
+            )
+            await session.commit()
+        finally:
+            await session.close()
+
+        alerts = await _run_alerts(builder_id)
+        assert _api_error_alerts_for(alerts, tenant_id) == []
+
+    @pytest.mark.asyncio
+    async def test_zapi_complete_no_alert(self, async_client):
+        from src.repositories import get_db_session
+        builder_id = uuid4()
+        tenant_id = uuid4()
+        session = get_db_session()
+        try:
+            _seed_tenant_and_config(
+                session,
+                builder_id=builder_id,
+                tenant_id=tenant_id,
+                name="Zapi Complete",
+                api_credentials={**_COMPLETE_ZAPI_WHATSAPP, **_COMPLETE_LLM},
+            )
+            await session.commit()
+        finally:
+            await session.close()
+
+        alerts = await _run_alerts(builder_id)
+        assert _api_error_alerts_for(alerts, tenant_id) == []
+
+    @pytest.mark.asyncio
+    async def test_missing_llm_only_one_alert_naming_llm(self, async_client):
+        from src.repositories import get_db_session
+        builder_id = uuid4()
+        tenant_id = uuid4()
+        session = get_db_session()
+        try:
+            _seed_tenant_and_config(
+                session,
+                builder_id=builder_id,
+                tenant_id=tenant_id,
+                name="No LLM",
+                api_credentials=dict(_COMPLETE_META_WHATSAPP),
+            )
+            await session.commit()
+        finally:
+            await session.close()
+
+        alerts = await _run_alerts(builder_id)
+        my = _api_error_alerts_for(alerts, tenant_id)
+        assert len(my) == 1
+        assert my[0].severity == "info"
+        assert "API LLM" in my[0].message
+        assert "API WhatsApp" not in my[0].message
+
+    @pytest.mark.asyncio
+    async def test_missing_whatsapp_and_llm_single_alert_lists_both(self, async_client):
+        from src.repositories import get_db_session
+        builder_id = uuid4()
+        tenant_id = uuid4()
+        session = get_db_session()
+        try:
+            _seed_tenant_and_config(
+                session,
+                builder_id=builder_id,
+                tenant_id=tenant_id,
+                name="Empty Creds",
+                api_credentials={},
+            )
+            await session.commit()
+        finally:
+            await session.close()
+
+        alerts = await _run_alerts(builder_id)
+        my = _api_error_alerts_for(alerts, tenant_id)
+        assert len(my) == 1
+        msg = my[0].message
+        assert "API WhatsApp" in msg
+        assert "API LLM" in msg
+        # Single "sem" clause listing both, joined with " e ".
+        assert msg.startswith("sem ")
+        assert " e " in msg
+
+    @pytest.mark.asyncio
+    async def test_signature_pending_message_cites_app_secret(self, async_client):
+        from src.repositories import get_db_session
+        builder_id = uuid4()
+        tenant_id = uuid4()
+        session = get_db_session()
+        try:
+            _seed_tenant_and_config(
+                session,
+                builder_id=builder_id,
+                tenant_id=tenant_id,
+                name="Meta Sig Pending",
+                api_credentials={
+                    "whatsapp_provider": "meta_cloud",
+                    "meta_phone_number_id": "1234567890",
+                    "meta_permanent_token": "EAA-token",
+                    # meta_app_secret intentionally missing
+                    **_COMPLETE_LLM,
+                },
+            )
+            await session.commit()
+        finally:
+            await session.close()
+
+        alerts = await _run_alerts(builder_id)
+        my = _api_error_alerts_for(alerts, tenant_id)
+        assert len(my) == 1
+        msg = my[0].message
+        assert "App Secret" in msg
+        assert "sem API WhatsApp" not in msg
+
+    @pytest.mark.asyncio
+    async def test_stt_key_without_model_flags_incomplete(self, async_client):
+        from src.repositories import get_db_session
+        builder_id = uuid4()
+        tenant_id = uuid4()
+        session = get_db_session()
+        try:
+            _seed_tenant_and_config(
+                session,
+                builder_id=builder_id,
+                tenant_id=tenant_id,
+                name="STT Missing Model",
+                api_credentials={
+                    **_COMPLETE_META_WHATSAPP,
+                    **_COMPLETE_LLM,
+                    "stt_provider": "openai_whisper",
+                    "stt_api_url": "https://api.openai.com/v1",
+                    "stt_api_key": "sk-stt",
+                    # stt_model_name missing
+                },
+            )
+            await session.commit()
+        finally:
+            await session.close()
+
+        alerts = await _run_alerts(builder_id)
+        my = _api_error_alerts_for(alerts, tenant_id)
+        assert len(my) == 1
+        assert "API STT incompleta: falta URL ou modelo" in my[0].message
+
+    @pytest.mark.asyncio
+    async def test_stt_configuration_only_provider_flagged(self, async_client):
+        from src.repositories import get_db_session
+        builder_id = uuid4()
+        tenant_id = uuid4()
+        session = get_db_session()
+        try:
+            _seed_tenant_and_config(
+                session,
+                builder_id=builder_id,
+                tenant_id=tenant_id,
+                name="STT google_stt",
+                api_credentials={
+                    **_COMPLETE_META_WHATSAPP,
+                    **_COMPLETE_LLM,
+                    "stt_provider": "google_stt",
+                    "stt_api_url": "https://speech.googleapis.com",
+                    "stt_api_key": "goog-key",
+                    "stt_model_name": "latest_long",
+                },
+            )
+            await session.commit()
+        finally:
+            await session.close()
+
+        alerts = await _run_alerts(builder_id)
+        my = _api_error_alerts_for(alerts, tenant_id)
+        assert len(my) == 1
+        assert "API STT incompleta: provedor nao homologado" in my[0].message
+
+    @pytest.mark.asyncio
+    async def test_stt_no_key_absent_from_message(self, async_client):
+        from src.repositories import get_db_session
+        builder_id = uuid4()
+        tenant_id = uuid4()
+        session = get_db_session()
+        try:
+            _seed_tenant_and_config(
+                session,
+                builder_id=builder_id,
+                tenant_id=tenant_id,
+                name="Missing LLM Only",
+                api_credentials=dict(_COMPLETE_META_WHATSAPP),
+            )
+            await session.commit()
+        finally:
+            await session.close()
+
+        alerts = await _run_alerts(builder_id)
+        my = _api_error_alerts_for(alerts, tenant_id)
+        assert len(my) == 1
+        assert "API STT" not in my[0].message
+
+    @pytest.mark.asyncio
+    async def test_legacy_whisper_alias_without_url_alerts(self, async_client):
+        from src.repositories import get_db_session
+        builder_id = uuid4()
+        tenant_id = uuid4()
+        session = get_db_session()
+        try:
+            _seed_tenant_and_config(
+                session,
+                builder_id=builder_id,
+                tenant_id=tenant_id,
+                name="Legacy whisper alias",
+                api_credentials={
+                    **_COMPLETE_META_WHATSAPP,
+                    **_COMPLETE_LLM,
+                    # legacy alias for stt_api_key, no stt_api_url.
+                    "whisper_api_key": "sk-legacy",
+                },
+            )
+            await session.commit()
+        finally:
+            await session.close()
+
+        alerts = await _run_alerts(builder_id)
+        my = _api_error_alerts_for(alerts, tenant_id)
+        assert len(my) == 1
+        assert "API STT" in my[0].message
+
+    @pytest.mark.asyncio
+    async def test_legacy_whisper_alias_with_url_resolves_active(self, async_client):
+        # Same alias flows through resolve_stt_credentials which defaults
+        # stt_provider to "outros" (operational) when a URL is also present,
+        # so readiness resolves `active` and no alert should be produced.
+        from src.repositories import get_db_session
+        builder_id = uuid4()
+        tenant_id = uuid4()
+        session = get_db_session()
+        try:
+            _seed_tenant_and_config(
+                session,
+                builder_id=builder_id,
+                tenant_id=tenant_id,
+                name="Legacy whisper alias complete",
+                api_credentials={
+                    **_COMPLETE_META_WHATSAPP,
+                    **_COMPLETE_LLM,
+                    "whisper_api_key": "sk-legacy",
+                    "stt_api_url": "https://api.openai.com/v1",
+                    "stt_model_name": "whisper-1",
+                },
+            )
+            await session.commit()
+        finally:
+            await session.close()
+
+        alerts = await _run_alerts(builder_id)
+        assert _api_error_alerts_for(alerts, tenant_id) == []
+
+    @pytest.mark.asyncio
+    async def test_no_config_row_yields_single_alert_with_both_names(self, async_client):
+        from src.repositories import get_db_session
+        builder_id = uuid4()
+        tenant_id = uuid4()
+        session = get_db_session()
+        try:
+            _seed_tenant_and_config(
+                session,
+                builder_id=builder_id,
+                tenant_id=tenant_id,
+                name="No Config",
+                api_credentials=None,  # do not seed ClinicConfigTable
+            )
+            await session.commit()
+        finally:
+            await session.close()
+
+        alerts = await _run_alerts(builder_id)
+        my = _api_error_alerts_for(alerts, tenant_id)
+        assert len(my) == 1
+        msg = my[0].message
+        assert "API WhatsApp" in msg
+        assert "API LLM" in msg

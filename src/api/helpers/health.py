@@ -17,6 +17,20 @@ from src.api.schemas.builder import BuilderAlertResponse, TraceTimeSeriesPoint
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.event import Event
 from src.models.tenant import Tenant
+from src.services.api_credentials import credential_status
+
+# Short capability names surfaced in the api_error message. Kept local because
+# they are UI copy for the master dashboard, not part of the credential policy.
+_CAPABILITY_LABEL_WHATSAPP = "API WhatsApp"
+_CAPABILITY_LABEL_LLM = "API LLM"
+_CAPABILITY_LABEL_STT = "API STT"
+_STT_INCOMPLETE_MESSAGE = f"{_CAPABILITY_LABEL_STT} incompleta: falta URL ou modelo"
+_STT_CONFIG_ONLY_MESSAGE = (
+    f"{_CAPABILITY_LABEL_STT} incompleta: provedor nao homologado"
+)
+_WHATSAPP_SIGNATURE_MESSAGE = (
+    f"{_CAPABILITY_LABEL_WHATSAPP} incompleta: falta o App Secret"
+)
 
 # Explicit list of config buckets used for completeness calculation.
 # Must stay in sync with ClinicConfigTable fields — update this list when
@@ -179,30 +193,46 @@ async def _compute_alerts(
                 )
             )
 
-        # Type 3: api_error (info)
+        # Type 3: api_error (info). At most one alert per clinic, derived from
+        # the shared readiness contract so that meta_cloud/uazapi/zapi clinics
+        # are all evaluated by the same rule.
         config_row = t.clinic_config_row
-        if config_row:
-            creds = config_row.api_credentials or {}
-            if not creds.get("zapi_instance_id"):
-                alerts.append(
-                    BuilderAlertResponse(
-                        type="api_error",
-                        severity="info",
-                        clinic_id=t.id,
-                        clinic_name=t.name,
-                        message=f"Clinica {t.name} sem integracao de API configurada",
-                        detected_at=now,
-                    )
-                )
-        else:
-            # No config row at all -> api_error
+        creds = (config_row.api_credentials or {}) if config_row else {}
+        status = credential_status(creds)
+        whatsapp_readiness = status["whatsapp_readiness"]
+        llm_readiness = status["llm_readiness"]
+        stt_readiness = status["stt_readiness"]
+        stt_key_set = status["stt_api_key_set"]
+
+        missing_names: list = []
+        if whatsapp_readiness == "incomplete":
+            missing_names.append(_CAPABILITY_LABEL_WHATSAPP)
+        if llm_readiness == "incomplete":
+            missing_names.append(_CAPABILITY_LABEL_LLM)
+
+        clauses: list = []
+        if missing_names:
+            if len(missing_names) == 1:
+                joined = missing_names[0]
+            else:
+                joined = ", ".join(missing_names[:-1]) + " e " + missing_names[-1]
+            clauses.append(f"sem {joined}")
+        if whatsapp_readiness == "signature_pending":
+            clauses.append(_WHATSAPP_SIGNATURE_MESSAGE)
+        if stt_key_set and stt_readiness != "active":
+            if stt_readiness == "incomplete":
+                clauses.append(_STT_INCOMPLETE_MESSAGE)
+            elif stt_readiness == "configuration_only":
+                clauses.append(_STT_CONFIG_ONLY_MESSAGE)
+
+        if clauses:
             alerts.append(
                 BuilderAlertResponse(
                     type="api_error",
                     severity="info",
                     clinic_id=t.id,
                     clinic_name=t.name,
-                    message=f"Clinica {t.name} sem integracao de API configurada",
+                    message="; ".join(clauses),
                     detected_at=now,
                 )
             )
