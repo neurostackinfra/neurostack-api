@@ -6,6 +6,7 @@
 
 ## Ready
 
+- [Gatilhos de resposta por voz](brainstorms/voice-response-triggers/DESIGN.md) - WRS 100/100; duas políticas exclusivas, com `audio_input` como default seguro.
 - [Templates Meta para follow-up](brainstorms/meta-templates-followup/DESIGN.md) - Infra de templates da Meta Cloud API para futuros agentes ativos de follow-up.
 - [Disponibilidade honesta de provedores](brainstorms/api-provider-availability/DESIGN.md) - Só o testado aceita credencial; o resto fica visível, bloqueado e marcado `(em breve)` em vermelho.
 
