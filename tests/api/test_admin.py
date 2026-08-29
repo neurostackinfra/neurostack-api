@@ -104,6 +104,9 @@ class TestAdminStats:
         assert "total_traces" in data
         assert "active_pilots" in data
         assert "active_builders" in data
+        assert "total_clinics" in data
+        assert "active_clinics" in data
+        assert "total_builders" in data
         assert "estimated_mrr" in data
 
 

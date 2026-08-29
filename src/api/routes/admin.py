@@ -66,10 +66,8 @@ def _build_clinic_slot(
     config_completeness: int = 0,
 ) -> dict:
     identity = {}
-    api_creds = {}
     if tenant.clinic_config_row:
         identity = tenant.clinic_config_row.identity or {}
-        api_creds = tenant.clinic_config_row.api_credentials or {}
 
     return ClinicSlotResponse(
         clinic_id=tenant.id,
@@ -79,8 +77,7 @@ def _build_clinic_slot(
         status="active" if tenant.is_active else "inactive",
         plan_type=tenant.plan_type,
         trace_count=trace_count,
-        apis_configured=bool(api_creds.get("zapi_instance_id")),
-        zapi_instance_id=api_creds.get("zapi_instance_id"),
+        apis_configured=apis_configured,
         users=[
             ClinicUserResponse(id=u.id, email=u.email, role=u.role.value)
             for u in users
@@ -89,6 +86,71 @@ def _build_clinic_slot(
         last_trace_at=last_trace_at,
         config_completeness=config_completeness,
     ).model_dump(mode="json")
+
+
+# ============================================
+# Helper: platform-wide totals (KPI cards)
+# ============================================
+
+# Roles that mark a tenant as internal tooling (builder HQ, admin, investor
+# demo) rather than a real clinic.
+_NON_CLINIC_ROLES = (UserRole.builder, UserRole.super_admin, UserRole.investor)
+
+# Builder subscription states that count as "active" for billing purposes:
+# still on a free pilot/trial, or paying. Anything else (e.g. "past_due",
+# "canceled") is not active even if the row hasn't been manually deactivated.
+_ACTIVE_BUILDER_SUBSCRIPTION_STATUSES = ("trial", "pilot", "active")
+
+
+def _real_clinic_tenant_filter():
+    """Whereclause selecting tenants that represent an actual clinic.
+
+    Excludes tenants whose only users are builder/super_admin/investor
+    accounts (builder HQ shells, internal admin tenants). A tenant with no
+    users yet (freshly provisioned, not onboarded) still counts as a clinic —
+    mirrors the skip condition in ``list_clinics`` below.
+    """
+    has_users = select(User.id).where(User.tenant_id == Tenant.id).exists()
+    has_clinic_user = (
+        select(User.id)
+        .where(User.tenant_id == Tenant.id, ~User.role.in_(_NON_CLINIC_ROLES))
+        .exists()
+    )
+    return ~(has_users & ~has_clinic_user)
+
+
+async def _compute_platform_totals(session: AsyncSession) -> dict:
+    """Shared clinic/builder totals for the admin stats + dashboard KPI cards."""
+    clinic_filter = _real_clinic_tenant_filter()
+
+    total_clinics_result = await session.execute(
+        select(func.count(Tenant.id)).where(clinic_filter)
+    )
+    total_clinics = total_clinics_result.scalar() or 0
+
+    active_clinics_result = await session.execute(
+        select(func.count(Tenant.id)).where(Tenant.is_active.is_(True), clinic_filter)
+    )
+    active_clinics = active_clinics_result.scalar() or 0
+
+    total_builders_result = await session.execute(select(func.count(Builder.id)))
+    total_builders = total_builders_result.scalar() or 0
+
+    active_builders_result = await session.execute(
+        select(func.count(Builder.id)).where(
+            Builder.is_active.is_(True),
+            Builder.status == "active",
+            Builder.subscription_status.in_(_ACTIVE_BUILDER_SUBSCRIPTION_STATUSES),
+        )
+    )
+    active_builders = active_builders_result.scalar() or 0
+
+    return {
+        "total_clinics": total_clinics,
+        "active_clinics": active_clinics,
+        "total_builders": total_builders,
+        "active_builders": active_builders,
+    }
 
 
 # ============================================
@@ -164,13 +226,18 @@ async def list_clinics(
         last_trace = last_trace_map.get(t.id)
         health = _compute_health_status(last_trace, t.is_active)
         completeness = _compute_config_completeness(t.clinic_config_row)
+        api_creds = (
+            (t.clinic_config_row.api_credentials or {})
+            if t.clinic_config_row
+            else {}
+        )
 
         clinics.append(
             _build_clinic_slot(
                 t,
                 tenant_users,
                 trace_counts.get(t.id, 0),
-                False,
+                bool(api_creds.get("zapi_instance_id")),
                 health_status=health,
                 last_trace_at=last_trace,
                 config_completeness=completeness,
@@ -380,20 +447,16 @@ async def admin_stats(
     )
     total_traces = trace_count_result.scalar() or 0
 
-    # Active pilots
-    pilot_result = await session.execute(
+    totals = await _compute_platform_totals(session)
+
+    # Preserve the legacy pilot metric independently from the broader clinic KPI.
+    active_pilots_result = await session.execute(
         select(func.count(Tenant.id)).where(
             Tenant.is_active.is_(True),
-            Tenant.plan_type.in_(["pilot", "clinic"]),
+            Tenant.plan_type.in_(("pilot", "clinic")),
         )
     )
-    active_pilots = pilot_result.scalar() or 0
-
-    # Active builders
-    builder_result = await session.execute(
-        select(func.count(Builder.id)).where(Builder.is_active.is_(True))
-    )
-    active_builders = builder_result.scalar() or 0
+    active_pilots = active_pilots_result.scalar() or 0
 
     # Active managed clinics (have a builder_id)
     managed_result = await session.execute(
@@ -409,9 +472,12 @@ async def admin_stats(
         total_tokens=0,  # stub — token tracking not yet implemented
         open_tickets=0,  # stub — ticket system not yet implemented
         active_pilots=active_pilots,
-        active_builders=active_builders,
+        active_builders=totals["active_builders"],
         active_managed_clinics=active_managed,
         estimated_mrr=0.0,  # stub — billing not yet implemented
+        total_clinics=totals["total_clinics"],
+        active_clinics=totals["active_clinics"],
+        total_builders=totals["total_builders"],
     )
 
 
@@ -439,20 +505,16 @@ async def admin_dashboard(
     )
     total_traces = trace_count_result.scalar() or 0
 
-    # Active pilots
-    pilot_result = await session.execute(
+    totals = await _compute_platform_totals(session)
+
+    # Preserve the legacy pilot metric independently from the broader clinic KPI.
+    active_pilots_result = await session.execute(
         select(func.count(Tenant.id)).where(
             Tenant.is_active.is_(True),
-            Tenant.plan_type.in_(["pilot", "clinic"]),
+            Tenant.plan_type.in_(("pilot", "clinic")),
         )
     )
-    active_pilots = pilot_result.scalar() or 0
-
-    # Active builders
-    builder_result = await session.execute(
-        select(func.count(Builder.id)).where(Builder.is_active.is_(True))
-    )
-    active_builders = builder_result.scalar() or 0
+    active_pilots = active_pilots_result.scalar() or 0
 
     # Active managed clinics
     managed_result = await session.execute(
@@ -487,9 +549,12 @@ async def admin_dashboard(
         total_tokens=0,
         open_tickets=0,
         active_pilots=active_pilots,
-        active_builders=active_builders,
+        active_builders=totals["active_builders"],
         active_managed_clinics=active_managed,
         estimated_mrr=0.0,
+        total_clinics=totals["total_clinics"],
+        active_clinics=totals["active_clinics"],
+        total_builders=totals["total_builders"],
         safety_flags_7d=safety_flags_7d,
         handoff_count_7d=handoff_count_7d,
     )
@@ -565,7 +630,6 @@ async def list_builders(
         .options(selectinload(Tenant.clinic_config_row))
         .where(
             Tenant.builder_id.in_(builder_ids),
-            Tenant.is_active.is_(True),
             Tenant.plan_type != "admin",
         )
     )
@@ -660,6 +724,7 @@ async def list_builders(
                 name=b.name,
                 admin_email=builder_email_map.get(b.id),
                 status=b.status,
+                subscription_status=b.subscription_status,
                 created_at=b.created_at,
                 clinics=clinics,
             ).model_dump(mode="json")

@@ -126,6 +126,9 @@ class TestAdminDashboard:
         assert "total_traces" in stats
         assert "active_pilots" in stats
         assert "active_builders" in stats
+        assert "total_clinics" in stats
+        assert "active_clinics" in stats
+        assert "total_builders" in stats
         assert "active_managed_clinics" in stats
         assert "estimated_mrr" in stats
         assert "safety_flags_7d" in stats
@@ -146,6 +149,176 @@ class TestAdminDashboard:
         response = client.get("/v1/admin/dashboard", headers=super_admin_headers)
         assert response.status_code == 200
         assert isinstance(response.json()["alerts"], list)
+
+    @pytest.mark.asyncio
+    async def test_stats_and_dashboard_share_real_clinic_and_active_builder_totals(
+        self, async_client, super_admin_headers, monkeypatch
+    ):
+        """KPI endpoints use the clinic-list population and billing-active builders."""
+        from src.api.routes.admin import _compute_platform_totals
+        from src.models.builder import Builder
+        from src.models.tenant import Tenant
+        from src.models.user import User, UserRole
+        from src.repositories import get_db_session
+        from sqlalchemy import func, select
+
+        async def _empty_time_series(*args, **kwargs):
+            return []
+
+        async def _empty_alerts(*args, **kwargs):
+            return []
+
+        # Keep this KPI contract test independent of PostgreSQL-specific
+        # time-series aggregation and alert computation.
+        monkeypatch.setattr("src.api.routes.admin._get_time_series", _empty_time_series)
+        monkeypatch.setattr("src.api.routes.admin._compute_alerts", _empty_alerts)
+
+        session = get_db_session()
+        try:
+            baseline = await _compute_platform_totals(session)
+            baseline_active_pilots_result = await session.execute(
+                select(func.count(Tenant.id)).where(
+                    Tenant.is_active.is_(True),
+                    Tenant.plan_type.in_(("pilot", "clinic")),
+                )
+            )
+            baseline_active_pilots = baseline_active_pilots_result.scalar() or 0
+
+            active_clinic_id = uuid4()
+            inactive_clinic_id = uuid4()
+            internal_tenant_id = uuid4()
+            builder_tenant_id = uuid4()
+            investor_tenant_id = uuid4()
+            session.add_all(
+                [
+                    Tenant(
+                        id=active_clinic_id,
+                        name="KPI Active Clinic",
+                        slug=f"kpi-active-{active_clinic_id.hex}",
+                        api_key_hash=f"kpi-active-hash-{active_clinic_id.hex}",
+                        is_active=True,
+                        config={},
+                    ),
+                    Tenant(
+                        id=inactive_clinic_id,
+                        name="KPI Inactive Clinic",
+                        slug=f"kpi-inactive-{inactive_clinic_id.hex}",
+                        api_key_hash=f"kpi-inactive-hash-{inactive_clinic_id.hex}",
+                        is_active=False,
+                        config={},
+                    ),
+                    Tenant(
+                        id=internal_tenant_id,
+                        name="KPI Internal Tenant",
+                        slug=f"kpi-internal-{internal_tenant_id.hex}",
+                        api_key_hash=f"kpi-internal-hash-{internal_tenant_id.hex}",
+                        is_active=True,
+                        config={},
+                    ),
+                    Tenant(
+                        id=builder_tenant_id,
+                        name="KPI Builder Tenant",
+                        slug=f"kpi-builder-{builder_tenant_id.hex}",
+                        api_key_hash=f"kpi-builder-hash-{builder_tenant_id.hex}",
+                        is_active=True,
+                        config={},
+                    ),
+                    Tenant(
+                        id=investor_tenant_id,
+                        name="KPI Investor Tenant",
+                        slug=f"kpi-investor-{investor_tenant_id.hex}",
+                        api_key_hash=f"kpi-investor-hash-{investor_tenant_id.hex}",
+                        is_active=True,
+                        config={},
+                    ),
+                    User(
+                        tenant_id=active_clinic_id,
+                        email=f"clinic-{active_clinic_id.hex}@test.local",
+                        password_hash="test",
+                        role=UserRole.clinic_admin,
+                        is_active=True,
+                    ),
+                    User(
+                        tenant_id=internal_tenant_id,
+                        email=f"admin-{internal_tenant_id.hex}@test.local",
+                        password_hash="test",
+                        role=UserRole.super_admin,
+                        is_active=True,
+                    ),
+                    User(
+                        tenant_id=builder_tenant_id,
+                        email=f"builder-{builder_tenant_id.hex}@test.local",
+                        password_hash="test",
+                        role=UserRole.builder,
+                        is_active=True,
+                    ),
+                    User(
+                        tenant_id=investor_tenant_id,
+                        email=f"investor-{investor_tenant_id.hex}@test.local",
+                        password_hash="test",
+                        role=UserRole.investor,
+                        is_active=True,
+                    ),
+                ]
+            )
+
+            toggle_builder_id = uuid4()
+            for builder_id, subscription_status, is_active, builder_status in [
+                (uuid4(), "trial", True, "active"),
+                (uuid4(), "pilot", True, "active"),
+                (toggle_builder_id, "active", True, "active"),
+                (uuid4(), "past_due", True, "active"),
+                (uuid4(), "canceled", True, "active"),
+                (uuid4(), "active", False, "active"),
+                (uuid4(), "active", True, "inactive"),
+            ]:
+                session.add(
+                    Builder(
+                        id=builder_id,
+                        name=f"KPI Builder {subscription_status} {uuid4().hex}",
+                        status=builder_status,
+                        is_active=is_active,
+                        subscription_status=subscription_status,
+                    )
+                )
+            await session.commit()
+        finally:
+            await session.close()
+
+        stats_response = await async_client.get("/v1/admin/stats", headers=super_admin_headers)
+        dashboard_response = await async_client.get("/v1/admin/dashboard", headers=super_admin_headers)
+        assert stats_response.status_code == 200
+        assert dashboard_response.status_code == 200
+
+        stats = stats_response.json()
+        dashboard_stats = dashboard_response.json()["stats"]
+        expected = {
+            "total_clinics": baseline["total_clinics"] + 2,
+            "active_clinics": baseline["active_clinics"] + 1,
+            "total_builders": baseline["total_builders"] + 7,
+            "active_builders": baseline["active_builders"] + 3,
+        }
+        assert {field: stats[field] for field in expected} == expected
+        assert {field: dashboard_stats[field] for field in expected} == expected
+        assert stats["active_pilots"] == baseline_active_pilots + 4
+        assert dashboard_stats["active_pilots"] == baseline_active_pilots + 4
+
+        patch_response = await async_client.patch(
+            f"/v1/admin/builders/{toggle_builder_id}",
+            headers=super_admin_headers,
+            json={"status": "inactive"},
+        )
+        assert patch_response.status_code == 200
+
+        stats_after = (await async_client.get("/v1/admin/stats", headers=super_admin_headers)).json()
+        dashboard_after = (
+            await async_client.get("/v1/admin/dashboard", headers=super_admin_headers)
+        ).json()["stats"]
+        expected_after = {**expected, "active_builders": expected["active_builders"] - 1}
+        assert {field: stats_after[field] for field in expected_after} == expected_after
+        assert {field: dashboard_after[field] for field in expected_after} == expected_after
+        assert stats_after["active_pilots"] == stats["active_pilots"]
+        assert dashboard_after["active_pilots"] == dashboard_stats["active_pilots"]
 
 
 # ============================================
@@ -202,6 +375,64 @@ class TestAdminEnrichedClinics:
                 assert "health_status" in clinic
                 assert "last_trace_at" in clinic
                 assert "config_completeness" in clinic
+
+    @pytest.mark.asyncio
+    async def test_builders_keeps_inactive_linked_clinic_manageable(
+        self, async_client, super_admin_headers
+    ):
+        from src.models.builder import Builder
+        from src.models.clinic_config_table import ClinicConfigTable
+        from src.models.tenant import Tenant
+        from src.repositories import get_db_session
+
+        builder_id = uuid4()
+        clinic_id = uuid4()
+        session = get_db_session()
+        try:
+            session.add_all(
+                [
+                    Builder(
+                        id=builder_id,
+                        name="Inactive Clinic Builder",
+                        status="active",
+                        is_active=True,
+                        subscription_status="active",
+                    ),
+                    Tenant(
+                        id=clinic_id,
+                        name="Inactive Linked Clinic",
+                        slug=f"inactive-linked-{clinic_id.hex}",
+                        api_key_hash=f"inactive-linked-hash-{clinic_id.hex}",
+                        is_active=False,
+                        plan_type="clinic",
+                        builder_id=builder_id,
+                        config={},
+                    ),
+                    ClinicConfigTable(
+                        tenant_id=clinic_id,
+                        clinic_id=clinic_id,
+                        api_credentials={"zapi_instance_id": "configured-instance"},
+                    ),
+                ]
+            )
+            await session.commit()
+        finally:
+            await session.close()
+
+        response = await async_client.get("/v1/admin/builders", headers=super_admin_headers)
+        assert response.status_code == 200
+        builder = next(item for item in response.json() if item["id"] == str(builder_id))
+        clinic = next(item for item in builder["clinics"] if item["clinic_id"] == str(clinic_id))
+        assert clinic["status"] == "inactive"
+        assert clinic["apis_configured"] is True
+
+        clinics_response = await async_client.get("/v1/admin/clinics", headers=super_admin_headers)
+        assert clinics_response.status_code == 200
+        admin_clinic = next(
+            item for item in clinics_response.json() if item["clinic_id"] == str(clinic_id)
+        )
+        assert admin_clinic["apis_configured"] is True
+        assert "zapi_instance_id" not in admin_clinic
 
 
 # ============================================
