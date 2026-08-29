@@ -1,34 +1,80 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { customFetch } from "@workspace/api-client-react";
+import { format } from "date-fns";
 import {
-  Brain, ShieldAlert, CheckCircle2, Filter, Zap, Loader2, AlertTriangle, Clock,
+  Brain, ShieldAlert, CheckCircle2, Zap, Loader2, AlertTriangle, Clock, MessageSquare,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/hooks/use-toast";
+import { DateRangePicker } from "@/components/date-range-picker";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
 } from "recharts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-interface RatingEntry {
+export interface RatingEntry {
   id: string;
   ts: string;
   tenant_id: string;
   rating: number;
-  reason?: string;
-  agent_response?: string;
-  user_message?: string;
-  submitted_by?: string;
-  ai_analysis?: { status: "agreed" | "disagreed"; justification: string };
-  ai_analysis_status?: "pending" | "done" | "failed";
+  reason: string | null;
+  agent_response: string | null;
+  user_message: string | null;
+  submitted_by: string | null;
+  ai_analysis: { status: "agreed" | "disagreed"; justification: string } | null;
+  ai_analysis_status: "pending" | "done" | "failed" | null;
   approved_for_training: boolean;
   ignored: boolean;
+  subject_tenant_id: string;
+  subject_clinic_name: string | null;
+  builder_name: string | null;
+  accepted_by: string | null;
+  accepted_at: string | null;
+  accepted_by_email: string | null;
+}
+
+export interface RatingSummary {
+  total: number;
+  average: number;
+  accepted_count: number;
+  distribution: Record<"1" | "2" | "3" | "4" | "5", number>;
+}
+
+export interface RatingFacetBuilder {
+  id: string;
+  name: string;
+}
+
+export interface RatingFacetClinic {
+  id: string;
+  name: string;
+  builder_id: string | null;
+}
+
+export interface RatingsResponse {
+  summary: RatingSummary;
+  facets: {
+    builders: RatingFacetBuilder[];
+    clinics: RatingFacetClinic[];
+  };
+  entries: RatingEntry[];
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+// Minimum characters (after trimming) for a critique to be a candidate for
+// acceptance into the training dataset. Mirrors the `_has_reason` threshold in
+// `src/api/routes/rlhf.py`; the backend PATCH .../ratings/{id} action="approve"
+// returns 422 when a reason falls short, so we gate the button here to avoid a
+// doomed request.
+const MIN_REASON_LENGTH = 8;
+
+function hasQualifyingReason(entry: Pick<RatingEntry, "reason">): boolean {
+  return typeof entry.reason === "string" && entry.reason.trim().length >= MIN_REASON_LENGTH;
+}
 
 const RATING_META: Record<number, { label: string; color: string; tailwind: string }> = {
   1: { label: "Péssimo", color: "#ef4444", tailwind: "bg-red-500"    },
@@ -37,6 +83,15 @@ const RATING_META: Record<number, { label: string; color: string; tailwind: stri
   4: { label: "Bom",     color: "#4ade80", tailwind: "bg-green-400"  },
   5: { label: "Ótimo",   color: "#22c55e", tailwind: "bg-green-500"  },
 };
+
+const ALL_BUILDERS = "__all_builders__";
+const ALL_CLINICS  = "__all_clinics__";
+
+function defaultDates() {
+  const today       = format(new Date(), "yyyy-MM-dd");
+  const thirtyAgo   = format(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000), "yyyy-MM-dd");
+  return { startDate: thirtyAgo, endDate: today };
+}
 
 function RatingBadge({ rating }: { rating: number }) {
   const meta = RATING_META[rating] ?? RATING_META[3];
@@ -95,32 +150,432 @@ function AiAnalysisCell({ entry }: { entry: RatingEntry }) {
   return null;
 }
 
-// ── Avaliações 1-5 ───────────────────────────────────────────────────────────
+// ── KPI cards ────────────────────────────────────────────────────────────────
 
-function RatingsTab() {
+function pct(numerator: number, total: number): number {
+  if (total <= 0) return 0;
+  return Math.round((numerator / total) * 1000) / 10;
+}
+
+function formatNumber(value: number): string {
+  return value.toLocaleString("pt-BR");
+}
+
+function KpiCards({ summary }: { summary: RatingSummary }) {
+  const total       = summary.total;
+  const satisfied   = (summary.distribution["4"] ?? 0) + (summary.distribution["5"] ?? 0);
+  const unsatisfied = (summary.distribution["1"] ?? 0) + (summary.distribution["2"] ?? 0);
+  const pctSat      = pct(satisfied, total);
+  const pctUnsat    = pct(unsatisfied, total);
+
+  const cards: { label: string; value: string; sub: string; color: string; testId: string }[] = [
+    {
+      label: "Total de Avaliações",
+      value: formatNumber(total),
+      sub: "Todas as clínicas no período",
+      color: "text-foreground",
+      testId: "kpi-total",
+    },
+    {
+      label: "Nota média",
+      value: summary.average.toLocaleString("pt-BR", { minimumFractionDigits: 1, maximumFractionDigits: 1 }),
+      sub: "Escala 1 a 5",
+      color: "text-foreground",
+      testId: "kpi-average",
+    },
+    {
+      label: "% Satisfação",
+      value: `${pctSat.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`,
+      sub: "Notas 4 ou 5",
+      color: "text-green-400",
+      testId: "kpi-satisfaction",
+    },
+    {
+      label: "% Insatisfação",
+      value: `${pctUnsat.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`,
+      sub: "Notas 1 ou 2",
+      color: "text-red-400",
+      testId: "kpi-unsatisfaction",
+    },
+    {
+      label: "Opiniões aceitas",
+      value: formatNumber(summary.accepted_count),
+      sub: "Gravadas no dataset",
+      color: "text-violet-400",
+      testId: "kpi-accepted",
+    },
+  ];
+
+  return (
+    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
+      {cards.map((s) => (
+        <Card key={s.label} className="border-border bg-card shadow-sm" data-testid={s.testId}>
+          <CardContent className="pt-4 pb-4">
+            <div className={`text-3xl font-bold ${s.color}`}>{s.value}</div>
+            <div className="text-xs font-semibold text-foreground/80 mt-0.5">{s.label}</div>
+            <div className="text-[10px] text-muted-foreground">{s.sub}</div>
+          </CardContent>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+// ── Distribution chart ───────────────────────────────────────────────────────
+
+function DistributionChart({ summary }: { summary: RatingSummary }) {
+  const total = summary.total;
+  const chartData = [1, 2, 3, 4, 5].map((n) => {
+    const key = String(n) as "1" | "2" | "3" | "4" | "5";
+    const count = summary.distribution[key] ?? 0;
+    return {
+      name: RATING_META[n].label,
+      count,
+      color: RATING_META[n].color,
+      pct: pct(count, total),
+    };
+  });
+
+  return (
+    <Card className="border-border shadow-sm">
+      <CardContent className="pt-4 pb-2">
+        <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground mb-3">
+          Distribuição de Notas
+        </p>
+        <ResponsiveContainer width="100%" height={140}>
+          <BarChart data={chartData} layout="vertical" margin={{ left: 8, right: 24 }}>
+            <XAxis type="number" tick={{ fontSize: 10 }} />
+            <YAxis type="category" dataKey="name" tick={{ fontSize: 10 }} width={80} />
+            <Tooltip
+              formatter={(_v: number, _name: string, props: { payload?: { count: number; pct: number } }) => {
+                const p = props.payload;
+                if (!p) return ["", ""];
+                return [`${p.count} (${p.pct.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%)`, "Total"];
+              }}
+              contentStyle={{ fontSize: 11 }}
+            />
+            <Bar dataKey="count" radius={[0, 4, 4, 0]}>
+              {chartData.map((entry) => (
+                <Cell key={entry.name} fill={entry.color} />
+              ))}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+        <div className="mt-2 grid grid-cols-5 gap-2 px-2">
+          {chartData.map((d) => (
+            <div key={d.name} className="text-center" data-testid={`dist-${d.name}`}>
+              <div className="text-xs font-semibold text-foreground tabular-nums">
+                {formatNumber(d.count)}
+              </div>
+              <div className="text-[10px] text-muted-foreground tabular-nums">
+                {d.pct.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%
+              </div>
+            </div>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// ── Filters ──────────────────────────────────────────────────────────────────
+
+interface FiltersState {
+  builderId: string;   // "" (todos) or a real facet id
+  clinicId: string;    // "" (todas) or a real facet id
+  startDate: string;
+  endDate: string;
+  onlyAccepted: boolean;
+}
+
+function Filters({
+  filters,
+  onChange,
+  facets,
+}: {
+  filters: FiltersState;
+  onChange: (next: FiltersState) => void;
+  facets: RatingsResponse["facets"];
+}) {
+  // Client-side narrowing: only clinics whose builder_id matches the currently
+  // selected builder appear. When "Todos" is selected (empty string), clinics
+  // with a null builder_id are also included; otherwise they are hidden.
+  const visibleClinics = useMemo(() => {
+    if (!filters.builderId) return facets.clinics;
+    return facets.clinics.filter((c) => c.builder_id === filters.builderId);
+  }, [facets.clinics, filters.builderId]);
+
+  const onBuilderChange = (raw: string) => {
+    const next: FiltersState = {
+      ...filters,
+      builderId: raw === ALL_BUILDERS ? "" : raw,
+      // Reset clinic when builder changes so the two filters stay consistent.
+      clinicId: "",
+    };
+    onChange(next);
+  };
+
+  const onClinicChange = (raw: string) => {
+    onChange({ ...filters, clinicId: raw === ALL_CLINICS ? "" : raw });
+  };
+
+  return (
+    <div className="flex flex-col gap-3 md:flex-row md:flex-wrap md:items-end">
+      <div className="space-y-1">
+        <label className="text-[11px] font-medium text-muted-foreground">Builder</label>
+        <select
+          data-testid="filter-builder"
+          value={filters.builderId || ALL_BUILDERS}
+          onChange={(e) => onBuilderChange(e.target.value)}
+          className="h-9 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent w-56"
+        >
+          <option value={ALL_BUILDERS}>Todos os builders</option>
+          {facets.builders.map((b) => (
+            <option key={b.id} value={b.id}>{b.name}</option>
+          ))}
+        </select>
+      </div>
+
+      <div className="space-y-1">
+        <label className="text-[11px] font-medium text-muted-foreground">Clínica</label>
+        <select
+          data-testid="filter-clinic"
+          value={filters.clinicId || ALL_CLINICS}
+          onChange={(e) => onClinicChange(e.target.value)}
+          className="h-9 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent w-56"
+        >
+          <option value={ALL_CLINICS}>Todas as clínicas</option>
+          {visibleClinics.map((c) => (
+            <option key={c.id} value={c.id}>{c.name}</option>
+          ))}
+        </select>
+      </div>
+
+      <DateRangePicker
+        startDate={filters.startDate}
+        endDate={filters.endDate}
+        onStartChange={(v) => onChange({ ...filters, startDate: v })}
+        onEndChange={(v) => onChange({ ...filters, endDate: v })}
+      />
+
+      <label className="flex items-center gap-2 h-9 text-xs text-foreground cursor-pointer select-none">
+        <input
+          data-testid="filter-only-accepted"
+          type="checkbox"
+          className="h-4 w-4 rounded border-border accent-violet-500"
+          checked={filters.onlyAccepted}
+          onChange={(e) => onChange({ ...filters, onlyAccepted: e.target.checked })}
+        />
+        Somente aceitas
+      </label>
+    </div>
+  );
+}
+
+// ── Written feedback section ─────────────────────────────────────────────────
+
+function formatAcceptedAt(iso: string | null): string {
+  if (!iso) return "—";
+  try {
+    return new Date(iso).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" });
+  } catch {
+    return "—";
+  }
+}
+
+function WrittenFeedbackList({
+  entries,
+  onAction,
+  actioningId,
+}: {
+  entries: RatingEntry[];
+  onAction: (entryId: string, action: "approve" | "ignore") => void;
+  actioningId: string | null;
+}) {
+  const written = entries.filter((e) => e.reason && e.reason.trim().length > 0);
+
+  return (
+    <Card className="border-border shadow-sm">
+      <CardContent className="pt-4 pb-4 space-y-3">
+        <div className="flex items-center gap-2">
+          <MessageSquare className="h-4 w-4 text-violet-400" />
+          <h2 className="text-sm font-bold uppercase tracking-widest text-foreground">
+            Feedbacks escritos
+          </h2>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Opiniões com texto do cliente. Somente aqui é possível aceitar e gravar a opinião no dataset.
+        </p>
+
+        {written.length === 0 ? (
+          <div
+            data-testid="written-empty"
+            className="text-center py-8 text-sm text-muted-foreground"
+          >
+            Nenhum feedback escrito para os filtros atuais.
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {written.map((entry) => {
+              const acceptable  = hasQualifyingReason(entry);
+              const isProcessing = actioningId === entry.id;
+              return (
+                <Card
+                  key={entry.id}
+                  data-testid={`written-entry-${entry.id}`}
+                  className={`border-border shadow-sm overflow-hidden transition-opacity ${entry.ignored ? "opacity-40" : ""}`}
+                >
+                  <div className="flex items-center justify-between px-4 py-2 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
+                    <div className="flex items-center gap-2">
+                      <RatingBadge rating={entry.rating} />
+                      <span className="text-[11px] text-muted-foreground">
+                        {RATING_META[entry.rating]?.label}
+                      </span>
+                    </div>
+                    <span className="text-[10px] text-muted-foreground">
+                      {entry.ts ? new Date(entry.ts).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" }) : ""}
+                    </span>
+                  </div>
+
+                  <CardContent className="pt-3 pb-3 space-y-3">
+                    <div>
+                      <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground mb-1">
+                        Opinião do cliente
+                      </p>
+                      <p className="text-xs italic text-foreground/80 bg-muted rounded px-2 py-1.5 border border-border">
+                        "{entry.reason}"
+                      </p>
+                    </div>
+
+                    <div>
+                      <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground mb-1">
+                        Opinião da IA
+                      </p>
+                      <AiAnalysisCell entry={entry} />
+                    </div>
+
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <div>
+                        <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground mb-0.5">
+                          Clínica / Usuário
+                        </p>
+                        <p className="text-[11px] font-semibold text-foreground">
+                          {entry.subject_clinic_name ?? entry.subject_tenant_id.slice(0, 8) + "..."}
+                        </p>
+                        <p className="text-[10px] text-muted-foreground">
+                          {entry.submitted_by ?? "—"}
+                          {entry.builder_name ? ` · Builder: ${entry.builder_name}` : ""}
+                        </p>
+                      </div>
+
+                      <div className="flex flex-col items-start sm:items-end gap-1.5">
+                        {entry.approved_for_training ? (
+                          <>
+                            <Badge className="text-[9px] bg-violet-500/15 text-violet-400 border border-violet-500/30 flex items-center gap-1 w-fit py-0">
+                              <Zap className="h-2.5 w-2.5" /> No Dataset
+                            </Badge>
+                            <p
+                              data-testid={`accepted-meta-${entry.id}`}
+                              className="text-[10px] text-muted-foreground text-right"
+                            >
+                              Aceito por {entry.accepted_by_email ?? "—"}
+                              <br />em {formatAcceptedAt(entry.accepted_at)}
+                            </p>
+                          </>
+                        ) : entry.ignored ? (
+                          <span className="text-[10px] text-muted-foreground">Ignorado</span>
+                        ) : (
+                          <>
+                            {acceptable && (
+                              <Button
+                                data-testid={`accept-btn-${entry.id}`}
+                                size="sm"
+                                className="text-[10px] h-7 bg-violet-600 hover:bg-violet-500 text-white gap-1 px-2"
+                                onClick={() => onAction(entry.id, "approve")}
+                                disabled={isProcessing}
+                              >
+                                <Zap className="h-2.5 w-2.5" />
+                                Aceitar e gravar opinião
+                              </Button>
+                            )}
+                            <Button
+                              data-testid={`ignore-btn-${entry.id}`}
+                              size="sm"
+                              variant="outline"
+                              className="text-[10px] h-7 gap-1 px-2 text-muted-foreground"
+                              onClick={() => onAction(entry.id, "ignore")}
+                              disabled={isProcessing}
+                            >
+                              Ignorar
+                            </Button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+              );
+            })}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ── Panel ────────────────────────────────────────────────────────────────────
+
+const EMPTY_RESPONSE: RatingsResponse = {
+  summary: { total: 0, average: 0, accepted_count: 0, distribution: { "1": 0, "2": 0, "3": 0, "4": 0, "5": 0 } },
+  facets: { builders: [], clinics: [] },
+  entries: [],
+};
+
+export function RatingsPanel() {
   const { toast } = useToast();
-  const [entries, setEntries]     = useState<RatingEntry[]>([]);
-  const [loading, setLoading]     = useState(true);
-  const [builderId, setBuilderId] = useState("");
+  const initial = defaultDates();
+  const [filters, setFilters] = useState<FiltersState>({
+    builderId: "",
+    clinicId: "",
+    startDate: initial.startDate,
+    endDate: initial.endDate,
+    onlyAccepted: false,
+  });
+  const [data, setData] = useState<RatingsResponse>(EMPTY_RESPONSE);
+  const [loading, setLoading] = useState(true);
   const [actioningId, setActioningId] = useState<string | null>(null);
 
-  const loadRatings = async (bid?: string) => {
+  const load = async (current: FiltersState) => {
     setLoading(true);
     try {
-      const qs = new URLSearchParams({ limit: "100" });
-      if (bid) qs.set("builder_id", bid);
-      const data = await customFetch<RatingEntry[]>(`/v1/rlhf/ratings?${qs}`);
-      setEntries(Array.isArray(data) ? data : []);
+      const qs = new URLSearchParams({
+        start_date: current.startDate,
+        end_date: current.endDate,
+        limit: "100",
+        only_with_reason: "true",
+      });
+      if (current.builderId) qs.set("builder_id", current.builderId);
+      if (current.clinicId)  qs.set("tenant_id", current.clinicId);
+      if (current.onlyAccepted) qs.set("only_accepted", "true");
+      const response = await customFetch<RatingsResponse>(`/v1/rlhf/ratings?${qs}`);
+      // Defensive: if the backend ever returns a partial payload, keep shape stable.
+      setData({
+        summary: response?.summary ?? EMPTY_RESPONSE.summary,
+        facets: response?.facets ?? EMPTY_RESPONSE.facets,
+        entries: Array.isArray(response?.entries) ? response.entries : [],
+      });
     } catch {
       toast({ title: "Erro ao carregar avaliações", variant: "destructive" });
+      setData(EMPTY_RESPONSE);
     } finally {
       setLoading(false);
     }
   };
 
-  useEffect(() => { void loadRatings(); }, []);
-
-  const applyFilter = () => loadRatings(builderId.trim() || undefined);
+  useEffect(() => {
+    void load(filters);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filters.builderId, filters.clinicId, filters.startDate, filters.endDate, filters.onlyAccepted]);
 
   const takeAction = async (entryId: string, action: "approve" | "ignore") => {
     setActioningId(entryId);
@@ -129,18 +584,11 @@ function RatingsTab() {
         method: "PATCH",
         body: JSON.stringify({ action }),
       });
-      setEntries((prev) =>
-        prev.map((e) =>
-          e.id === entryId
-            ? {
-                ...e,
-                approved_for_training: action === "approve",
-                ignored: action === "ignore",
-              }
-            : e
-        )
-      );
-      toast({ title: action === "approve" ? "Aprovado para Dataset" : "Ignorado" });
+      toast({ title: action === "approve" ? "Opinião aceita e gravada no dataset" : "Ignorado" });
+      // Re-fetch so summary.accepted_count and accepted_by_email refresh in
+      // one round trip — no client-side mutation that would drift from the
+      // authoritative summary.
+      await load(filters);
     } catch {
       toast({ title: "Erro ao executar ação", variant: "destructive" });
     } finally {
@@ -148,181 +596,25 @@ function RatingsTab() {
     }
   };
 
-  // KPIs
-  const total       = entries.length;
-  const satisfied   = entries.filter((e) => e.rating >= 3).length;
-  const unsatisfied = entries.filter((e) => e.rating <= 2).length;
-  const approved    = entries.filter((e) => e.approved_for_training).length;
-  const pctSat      = total > 0 ? Math.round((satisfied / total) * 100) : 0;
-
-  // Chart data
-  const chartData = [1, 2, 3, 4, 5].map((n) => ({
-    name: RATING_META[n].label,
-    count: entries.filter((e) => e.rating === n).length,
-    color: RATING_META[n].color,
-  }));
-
   return (
     <div className="space-y-6">
-      {/* Filters */}
-      <div className="flex items-center gap-2 flex-wrap">
-        <input
-          type="text"
-          value={builderId}
-          onChange={(e) => setBuilderId(e.target.value)}
-          placeholder="Builder ID (super admin)"
-          className="h-8 text-xs border border-border rounded px-2 bg-background text-foreground placeholder:text-muted-foreground w-64"
-          onKeyDown={(e) => e.key === "Enter" && applyFilter()}
-        />
-        <Button size="sm" variant="outline" className="h-8 gap-1.5 text-xs" onClick={applyFilter}>
-          <Filter className="h-3 w-3" />
-          Filtrar
-        </Button>
-        {builderId && (
-          <Button size="sm" variant="ghost" className="h-8 text-xs text-muted-foreground" onClick={() => { setBuilderId(""); loadRatings(); }}>
-            Limpar
-          </Button>
-        )}
-      </div>
+      <Filters filters={filters} onChange={setFilters} facets={data.facets} />
 
-      {/* KPI Cards */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-        {[
-          { label: "Total de Avaliações", value: total,       sub: "Todas as clínicas",     color: "text-foreground"  },
-          { label: "% Satisfação",        value: `${pctSat}%`,sub: "Notas ≥ 3",             color: "text-green-400"   },
-          { label: "Insatisfação",        value: unsatisfied, sub: "Notas 1 ou 2",           color: "text-red-400"     },
-          { label: "Aprovados p/ Dataset",value: approved,    sub: "Prontos para fine-tuning",color: "text-violet-400" },
-        ].map((s) => (
-          <Card key={s.label} className="border-border bg-card shadow-sm">
-            <CardContent className="pt-4 pb-4">
-              <div className={`text-3xl font-bold ${s.color}`}>{s.value}</div>
-              <div className="text-xs font-semibold text-foreground/80 mt-0.5">{s.label}</div>
-              <div className="text-[10px] text-muted-foreground">{s.sub}</div>
-            </CardContent>
-          </Card>
-        ))}
-      </div>
+      <KpiCards summary={data.summary} />
 
-      {/* Distribution Chart */}
-      {total > 0 && (
-        <Card className="border-border shadow-sm">
-          <CardContent className="pt-4 pb-2">
-            <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground mb-3">
-              Distribuição de Notas
-            </p>
-            <ResponsiveContainer width="100%" height={120}>
-              <BarChart data={chartData} layout="vertical" margin={{ left: 8, right: 24 }}>
-                <XAxis type="number" tick={{ fontSize: 10 }} />
-                <YAxis type="category" dataKey="name" tick={{ fontSize: 10 }} width={80} />
-                <Tooltip
-                  formatter={(v: number) => [`${v} avaliações`, "Total"]}
-                  contentStyle={{ fontSize: 11 }}
-                />
-                <Bar dataKey="count" radius={[0, 4, 4, 0]}>
-                  {chartData.map((entry) => (
-                    <Cell key={entry.name} fill={entry.color} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
-      )}
+      <DistributionChart summary={data.summary} />
 
-      {/* Entries List */}
       {loading ? (
         <div className="flex items-center justify-center py-12 gap-2 text-muted-foreground">
           <Loader2 className="h-4 w-4 animate-spin" />
           <span className="text-sm">Carregando avaliações...</span>
         </div>
-      ) : entries.length === 0 ? (
-        <div className="text-center py-12 text-sm text-muted-foreground">
-          Nenhuma avaliação registrada ainda.
-        </div>
       ) : (
-        <div className="space-y-3">
-          <div className="hidden md:grid grid-cols-[0.6fr_1.8fr_1.5fr_1fr_0.9fr] gap-4 px-4 py-2 rounded-md bg-muted/50 border border-border">
-            {["Nota", "Motivo", "Análise IA", "Clínica / Usuário", "Ação"].map((h) => (
-              <span key={h} className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">{h}</span>
-            ))}
-          </div>
-
-          {entries.map((entry) => (
-            <Card
-              key={entry.id}
-              className={`border-border shadow-sm overflow-hidden transition-opacity ${entry.ignored ? "opacity-40" : ""}`}
-            >
-              <div className="flex items-center justify-between px-4 py-2 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
-                <span className="text-xs font-mono text-muted-foreground">{entry.id.slice(0, 8)}...</span>
-                <span className="text-[10px] text-muted-foreground">
-                  {entry.ts ? new Date(entry.ts).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" }) : ""}
-                </span>
-              </div>
-
-              <CardContent className="pt-3 pb-3">
-                <div className="grid grid-cols-1 md:grid-cols-[0.6fr_1.8fr_1.5fr_1fr_0.9fr] gap-4 items-start">
-                  {/* Nota */}
-                  <div className="flex items-center gap-1.5">
-                    <RatingBadge rating={entry.rating} />
-                    <span className="text-[10px] text-muted-foreground">{RATING_META[entry.rating]?.label}</span>
-                  </div>
-
-                  {/* Motivo */}
-                  <div>
-                    {entry.reason ? (
-                      <p className="text-xs italic text-foreground/80 bg-muted rounded px-2 py-1 border border-border">
-                        "{entry.reason}"
-                      </p>
-                    ) : (
-                      <span className="text-[10px] text-muted-foreground">Sem motivo</span>
-                    )}
-                  </div>
-
-                  {/* Análise IA */}
-                  <AiAnalysisCell entry={entry} />
-
-                  {/* Clínica / Usuário */}
-                  <div>
-                    <p className="text-[11px] font-semibold text-foreground">{entry.tenant_id.slice(0, 8)}...</p>
-                    <p className="text-[10px] text-muted-foreground">{entry.submitted_by ?? "—"}</p>
-                  </div>
-
-                  {/* Ação */}
-                  <div className="flex flex-col gap-1.5">
-                    {entry.approved_for_training ? (
-                      <Badge className="text-[9px] bg-violet-500/15 text-violet-400 border border-violet-500/30 flex items-center gap-1 w-fit py-0">
-                        <Zap className="h-2.5 w-2.5" /> No Dataset
-                      </Badge>
-                    ) : entry.ignored ? (
-                      <span className="text-[10px] text-muted-foreground">Ignorado</span>
-                    ) : (
-                      <>
-                        <Button
-                          size="sm"
-                          className="text-[10px] h-6 bg-violet-600 hover:bg-violet-500 text-white gap-1 px-2"
-                          onClick={() => takeAction(entry.id, "approve")}
-                          disabled={actioningId === entry.id}
-                        >
-                          <Zap className="h-2.5 w-2.5" />
-                          Aprovar p/ Dataset
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="text-[10px] h-6 gap-1 px-2 text-muted-foreground"
-                          onClick={() => takeAction(entry.id, "ignore")}
-                          disabled={actioningId === entry.id}
-                        >
-                          Ignorar
-                        </Button>
-                      </>
-                    )}
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          ))}
-        </div>
+        <WrittenFeedbackList
+          entries={data.entries}
+          onAction={takeAction}
+          actioningId={actioningId}
+        />
       )}
     </div>
   );
@@ -365,7 +657,7 @@ export default function RlhfAudit() {
         </span>
       </div>
 
-      <RatingsTab />
+      <RatingsPanel />
     </div>
   );
 }
