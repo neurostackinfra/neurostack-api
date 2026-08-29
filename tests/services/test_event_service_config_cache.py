@@ -627,3 +627,147 @@ class TestBuilderComposeInDBLoader:
         # No inheritance — provider stays partial
         assert creds["llm_provider"] == "openai"
         assert "llm_api_key" not in creds
+
+
+# ============================================
+# Private multimodal-fallback loader (Wave 1, deliverable 3)
+# ============================================
+#
+# The separate private loader for the `multimodal-text` fallback exposes only
+# the allowlisted `primary` (four llm_* fields) and `multimodal_text` (four
+# multimodal_* fields + the opt-in gate) bundles. Every other credential —
+# whatsapp/stt/tts/etc. — must be dropped so a future addition to
+# `api_credentials` cannot silently reach the fallback factory.
+
+
+class TestMultimodalFallbackLoader:
+    def test_returns_only_allowlisted_bundles_and_drops_everything_else(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _fake_load(_tenant_id: UUID) -> dict[str, Any]:
+            return {
+                "identity": {},
+                "api_credentials": {
+                    # Both allowlisted bundles present:
+                    "llm_provider": "openai",
+                    "llm_api_url": "https://api.openai.com/v1",
+                    "llm_api_key": "PRIMARY-LLM-KEY",
+                    "llm_model_name": "gpt-model",
+                    "multimodal_provider": "openrouter",
+                    "multimodal_api_url": "https://openrouter.ai/api/v1",
+                    "multimodal_api_key": "MULTIMODAL-KEY",
+                    "multimodal_model_name": "google/gemini-2.5-flash",
+                    "multimodal_text_fallback_enabled": True,
+                    # Every other capability MUST be dropped by the loader:
+                    "whatsapp_provider": "zapi",
+                    "zapi_token": "ZAPI-SECRET-MUST-NOT-LEAK",
+                    "stt_provider": "outros",
+                    "stt_api_key": "STT-SECRET-MUST-NOT-LEAK",
+                    "tts_provider": "elevenlabs",
+                    "tts_api_key": "TTS-SECRET-MUST-NOT-LEAK",
+                    "meta_permanent_token": "META-SECRET-MUST-NOT-LEAK",
+                },
+            }
+
+        monkeypatch.setattr(event_service, "_load_config_from_db", _fake_load)
+        result = asyncio.get_event_loop().run_until_complete(
+            event_service._load_multimodal_fallback_credentials(TENANT)
+        )
+
+        # Exactly the union of the two allowlisted bundles — nothing else.
+        assert set(result.keys()) == {
+            "llm_provider",
+            "llm_api_url",
+            "llm_api_key",
+            "llm_model_name",
+            "multimodal_provider",
+            "multimodal_api_url",
+            "multimodal_api_key",
+            "multimodal_model_name",
+            "multimodal_text_fallback_enabled",
+        }
+        # Raw values preserved for both bundles (loader must not reserialize).
+        assert result["llm_api_key"] == "PRIMARY-LLM-KEY"
+        assert result["multimodal_api_key"] == "MULTIMODAL-KEY"
+        assert result["multimodal_text_fallback_enabled"] is True
+        # Zero bleed from any non-allowlisted capability.
+        assert "ZAPI-SECRET-MUST-NOT-LEAK" not in json.dumps(result)
+        assert "STT-SECRET-MUST-NOT-LEAK" not in json.dumps(result)
+        assert "TTS-SECRET-MUST-NOT-LEAK" not in json.dumps(result)
+        assert "META-SECRET-MUST-NOT-LEAK" not in json.dumps(result)
+
+    def test_returns_empty_when_config_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _no_config(_tenant_id: UUID) -> Optional[dict]:
+            return None
+
+        monkeypatch.setattr(event_service, "_load_config_from_db", _no_config)
+        result = asyncio.get_event_loop().run_until_complete(
+            event_service._load_multimodal_fallback_credentials(TENANT)
+        )
+        assert result == {}
+
+    def test_partial_bundle_returns_only_the_present_fields(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Loader must not synthesise defaults for missing fields — the
+        factory relies on absence to fail closed, so a fabricated `None`
+        entry would let a downstream `isinstance(..., str)` check silently
+        change its answer."""
+
+        async def _partial(_tenant_id: UUID) -> dict[str, Any]:
+            return {
+                "identity": {},
+                "api_credentials": {
+                    "llm_provider": "openai",
+                    # Only the gate present, provider/url/key/model absent.
+                    "multimodal_text_fallback_enabled": True,
+                },
+            }
+
+        monkeypatch.setattr(event_service, "_load_config_from_db", _partial)
+        result = asyncio.get_event_loop().run_until_complete(
+            event_service._load_multimodal_fallback_credentials(TENANT)
+        )
+        assert result == {
+            "llm_provider": "openai",
+            "multimodal_text_fallback_enabled": True,
+        }
+
+    def test_loader_never_uses_cache(
+        self, monkeypatch: pytest.MonkeyPatch, fake_redis: _FakeRedis
+    ) -> None:
+        """DB-only path: no cache read, no cache write.
+
+        The multimodal bundle is deliberately not in `runtime_projection`, so
+        the private loader must NOT go through the cache codepath — every
+        call reloads from DB.
+        """
+
+        call_count = {"n": 0}
+
+        async def _counting_load(_tenant_id: UUID) -> dict[str, Any]:
+            call_count["n"] += 1
+            return {
+                "identity": {},
+                "api_credentials": {
+                    "multimodal_provider": "openrouter",
+                    "multimodal_api_url": "https://openrouter.ai/api/v1",
+                    "multimodal_api_key": "K",
+                    "multimodal_model_name": "M",
+                    "multimodal_text_fallback_enabled": True,
+                },
+            }
+
+        monkeypatch.setattr(event_service, "_load_config_from_db", _counting_load)
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            event_service._load_multimodal_fallback_credentials(TENANT)
+        )
+        loop.run_until_complete(
+            event_service._load_multimodal_fallback_credentials(TENANT)
+        )
+        # Two calls => two DB loads (no cache reuse) and no Redis writes.
+        assert call_count["n"] == 2
+        assert fake_redis.set_calls == []
