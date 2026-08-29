@@ -6,6 +6,7 @@ import type { TranslationKey } from "@/locales/en";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { AlertTriangle, Clock, ListChecks, ActivitySquare, Zap, CalendarRange, UserPlus } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
+import { DateRangePicker } from "@/components/date-range-picker";
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from "recharts";
 import { format } from "date-fns";
 
@@ -79,47 +80,6 @@ function DonutTooltip({ active, payload }: { active?: boolean; payload?: { name:
     <div className="rounded-lg border border-border bg-popover px-3 py-2 text-xs shadow-lg">
       <p className="font-semibold text-foreground">{d.name}</p>
       <p className="text-muted-foreground mt-0.5">{d.value} · {d.payload.pct.toFixed(1)}%</p>
-    </div>
-  );
-}
-
-// -- Date Range Picker ---
-
-function DateRangePicker({
-  startDate, endDate,
-  onStartChange, onEndChange,
-}: {
-  startDate: string; endDate: string;
-  onStartChange: (v: string) => void; onEndChange: (v: string) => void;
-}) {
-  const today = format(new Date(), "yyyy-MM-dd");
-  return (
-    <div className="flex flex-col sm:flex-row items-end gap-2 shrink-0">
-      <div className="space-y-1">
-        <label className="text-[11px] font-medium text-muted-foreground flex items-center gap-1">
-          <CalendarRange className="h-3 w-3" /> Data Inicial
-        </label>
-        <input
-          type="date"
-          value={startDate}
-          max={endDate}
-          onChange={e => onStartChange(e.target.value)}
-          className="rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent h-9 w-36"
-        />
-      </div>
-      <div className="space-y-1">
-        <label className="text-[11px] font-medium text-muted-foreground flex items-center gap-1">
-          <CalendarRange className="h-3 w-3" /> Data Final
-        </label>
-        <input
-          type="date"
-          value={endDate}
-          min={startDate}
-          max={today}
-          onChange={e => onEndChange(e.target.value)}
-          className="rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent h-9 w-36"
-        />
-      </div>
     </div>
   );
 }
