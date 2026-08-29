@@ -2048,3 +2048,69 @@ class TestListRatingsQueryCount:
         assert query_count["n"] <= 5, (
             f"expected batched queries (main + tenants + builders), got {query_count['n']}"
         )
+
+
+# ============================================
+# Loader isolation — RLHF must never see the multimodal bundle
+# ============================================
+#
+# The RLHF consumer imports `_load_runtime_llm_credentials` directly (see
+# `src/api/routes/rlhf.py`), and Group 1 adds a SEPARATE private loader for
+# the multimodal-text fallback. This test proves the split: the RLHF loader
+# still returns exactly the four LLM fields even when the DB row is loaded
+# with a complete multimodal bundle AND the opt-in gate set. If it ever
+# started leaking multimodal fields or the gate, the fallback capability
+# would silently reach the RLHF LLM call path.
+
+
+class TestRlhfLoaderNeverSeesMultimodalBundle:
+    @pytest.mark.asyncio
+    async def test_rlhf_loader_returns_exactly_four_llm_fields_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.services import event_service
+
+        async def _fake_load(_tenant_id: UUID) -> dict[str, Any]:
+            return {
+                "identity": {},
+                # Full multimodal bundle + opt-in gate present alongside the
+                # LLM credentials. The RLHF loader MUST drop every one of
+                # them and return only the four llm_* fields.
+                "api_credentials": {
+                    "llm_provider": "openai",
+                    "llm_api_url": "https://api.openai.com/v1",
+                    "llm_api_key": "RLHF-LLM-KEY",
+                    "llm_model_name": "gpt-model",
+                    "multimodal_provider": "openrouter",
+                    "multimodal_api_url": "https://openrouter.ai/api/v1",
+                    "multimodal_api_key": "MULTIMODAL-KEY-MUST-NOT-LEAK",
+                    "multimodal_model_name": "google/gemini-2.5-flash",
+                    "multimodal_text_fallback_enabled": True,
+                    "tts_api_key": "TTS-KEY-MUST-NOT-LEAK",
+                },
+            }
+
+        monkeypatch.setattr(event_service, "_load_config_from_db", _fake_load)
+
+        result = await event_service._load_runtime_llm_credentials(uuid4())
+
+        # Exactly four fields, all llm_*.
+        assert set(result.keys()) == {
+            "llm_provider",
+            "llm_api_url",
+            "llm_api_key",
+            "llm_model_name",
+        }
+        # Multimodal bundle and gate must be entirely absent — not even the
+        # non-secret gate leaks.
+        assert "multimodal_provider" not in result
+        assert "multimodal_api_url" not in result
+        assert "multimodal_api_key" not in result
+        assert "multimodal_model_name" not in result
+        assert "multimodal_text_fallback_enabled" not in result
+        # Zero secret bleed from any adjacent capability.
+        import json
+
+        serialized = json.dumps(result)
+        assert "MULTIMODAL-KEY-MUST-NOT-LEAK" not in serialized
+        assert "TTS-KEY-MUST-NOT-LEAK" not in serialized

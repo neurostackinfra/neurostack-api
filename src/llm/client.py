@@ -15,6 +15,8 @@ import httpx
 
 from src.config.logging import get_logger
 from src.config.settings import settings
+from src.services.api_credentials import OPERATIONAL_MULTIMODAL_PROVIDERS
+from src.services.multimodal_service import multimodal_kind_for_url
 from src.services.safe_egress import (
     LLM_DROPOUT_HOSTS,
     LLM_OPENAI_HOSTS,
@@ -71,11 +73,19 @@ class LLMClient:
         base_url: str,
         api_key: str,
         timeout: float = 30.0,
+        *,
+        egress_kind: Optional[str] = None,
     ):
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._timeout = timeout
-        self._kind = _llm_kind_for_url(self._base_url)
+        # Egress kind is derived from the URL for the ordinary LLM path, but
+        # the multimodal fallback factory needs to *pin* a specific
+        # safe-egress policy label (``multimodal_openrouter``) that the LLM
+        # URL heuristics would never emit on their own. Passing it in keeps
+        # the transport selection under the factory's control instead of
+        # tacking a second URL classifier onto the LLM shape.
+        self._kind = egress_kind or _llm_kind_for_url(self._base_url)
 
     # Reasoning models use max_completion_tokens and don't accept temperature
     REASONING_PREFIXES = ("o1", "o3", "o4")
@@ -219,3 +229,83 @@ def get_tenant_llm_client(tenant_id: Any, api_credentials: dict) -> Optional[LLM
         base_url=base_url,
     )
     return LLMClient(base_url=base_url, api_key=api_key)
+
+
+# Multimodal-text bundle field names — replicated locally instead of imported
+# so the factory documents its own contract (four provider fields + gate) and
+# stays decoupled from the credential schema's frozenset iteration order.
+_MULTIMODAL_BUNDLE_FIELDS: tuple[str, str, str, str] = (
+    "multimodal_provider",
+    "multimodal_api_url",
+    "multimodal_api_key",
+    "multimodal_model_name",
+)
+
+
+def get_multimodal_text_llm_client(
+    tenant_id: Any, api_credentials: dict[str, Any]
+) -> Optional[LLMClient]:
+    """Build the fail-closed multimodal-text fallback LLM client.
+
+    Returns ``None`` (and never raises) whenever any precondition fails, so
+    the hot path can fall through to the primary provider without leaking a
+    secret through an exception. The order of the checks is deliberate — the
+    cheapest, secret-free ones fail first:
+
+    1. Opt-in gate (``multimodal_text_fallback_enabled``) MUST be exactly
+       ``True``. A missing gate is legacy-default disabled.
+    2. Provider MUST be in :data:`OPERATIONAL_MULTIMODAL_PROVIDERS`
+       (currently only ``openrouter``), which is the same allowlist the
+       audio adapter enforces. ``groq`` / ``openai`` / ``outros`` / custom
+       are refused before touching the key.
+    3. URL MUST resolve through ``multimodal_kind_for_url`` to
+       ``multimodal_openrouter``. This closes the provider/host divergence
+       case (openrouter provider but a groq/openai URL) at the egress
+       boundary rather than at request time.
+    4. The complete four-field bundle MUST be populated (provider, URL, key,
+       model). We only look up the API key AFTER (1)-(3) pass so the
+       preceding negatives never reach into secret material.
+    """
+
+    gate = api_credentials.get("multimodal_text_fallback_enabled")
+    if gate is not True:
+        return None
+
+    provider = api_credentials.get("multimodal_provider")
+    if provider not in OPERATIONAL_MULTIMODAL_PROVIDERS:
+        return None
+
+    base_url = api_credentials.get("multimodal_api_url")
+    if not isinstance(base_url, str) or not base_url:
+        return None
+    try:
+        kind = multimodal_kind_for_url(base_url)
+    except UnsafeEgressError:
+        return None
+    if kind != "multimodal_openrouter":
+        return None
+
+    # Provider/host consistency: the wire provider says ``openrouter`` and
+    # the URL resolves to the OpenRouter host allowlist. Explicit check so a
+    # future OperationalMultimodalProviders widening cannot silently unlock a
+    # divergent pairing.
+    if provider != "openrouter":
+        return None
+
+    # Only now do we look at the key/model — after every non-secret check has
+    # already passed, so a refusal never had to inspect secret material.
+    for field in _MULTIMODAL_BUNDLE_FIELDS:
+        value = api_credentials.get(field)
+        if not isinstance(value, str) or not value:
+            return None
+
+    logger.debug(
+        "Creating per-tenant multimodal-text LLM client",
+        tenant_id=str(tenant_id),
+        base_url=base_url,
+    )
+    return LLMClient(
+        base_url=base_url,
+        api_key=api_credentials["multimodal_api_key"],
+        egress_kind="multimodal_openrouter",
+    )

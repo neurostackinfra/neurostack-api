@@ -86,6 +86,10 @@ MULTIMODAL_FIELDS = frozenset(
         "multimodal_api_url",
         "multimodal_api_key",
         "multimodal_model_name",
+        # HTTP opt-in gate for the text-only multimodal fallback. Non-secret
+        # (default `false` legacy, must round-trip verbatim through the GET
+        # projection alongside the rest of the non-secret credential fields).
+        "multimodal_text_fallback_enabled",
     }
 )
 STT_FIELDS = frozenset(
@@ -414,7 +418,13 @@ def credential_status(credentials: Mapping[str, Any]) -> dict[str, Any]:
     for field in sorted(API_CREDENTIAL_FIELDS - SECRET_FIELDS):
         if field in {"whisper_model"}:
             continue
-        result[field] = resolved.get(field)
+        value = resolved.get(field)
+        # Legacy default: tenants that never opted in must see the fallback
+        # gate as an explicit `false` rather than `null`, so the UI can bind
+        # a boolean control directly and the wire contract is unambiguous.
+        if field == "multimodal_text_fallback_enabled" and value is None:
+            value = False
+        result[field] = value
     for field in sorted(SECRET_FIELDS):
         public_name = (
             "zapi_inbound_token" if field == "zapi_inbound_token_digest" else field

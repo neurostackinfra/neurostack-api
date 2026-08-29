@@ -372,6 +372,50 @@ async def _load_runtime_llm_credentials(tenant_id: UUID) -> dict:
     return {field: creds.get(field) for field in LLM_OVERLAY_FIELDS if creds.get(field)}
 
 
+# Allowlisted bundles the private multimodal-fallback loader is allowed to
+# return. Kept as an explicit constant so any drift is a wish-level change
+# rather than a silent widening of the outbound payload. The RLHF consumer
+# keeps using ``_load_runtime_llm_credentials`` — this loader is separate on
+# purpose so the "exactly four LLM fields" invariant that route relies on
+# stays byte-for-byte identical.
+_MULTIMODAL_FALLBACK_BUNDLES: dict[str, tuple[str, ...]] = {
+    "primary": (
+        "llm_provider",
+        "llm_api_url",
+        "llm_api_key",
+        "llm_model_name",
+    ),
+    "multimodal_text": (
+        "multimodal_provider",
+        "multimodal_api_url",
+        "multimodal_api_key",
+        "multimodal_model_name",
+        "multimodal_text_fallback_enabled",
+    ),
+}
+
+
+async def _load_multimodal_fallback_credentials(tenant_id: UUID) -> dict[str, Any]:
+    """Return only the allowlisted `primary` + `multimodal_text` bundles.
+
+    JWT-free, DB-only, no cache, no reserialization. Every returned field is
+    named explicitly in :data:`_MULTIMODAL_FALLBACK_BUNDLES`; any other
+    credential — from any capability — is dropped, so a future addition to
+    ``api_credentials`` cannot silently reach the fallback factory. Returns an
+    empty dict when the tenant/config is missing.
+    """
+    loaded = await _load_config_from_db(tenant_id)
+    if loaded is None:
+        return {}
+    creds = loaded.get("api_credentials") or {}
+    result: dict[str, Any] = {}
+    for fields in _MULTIMODAL_FALLBACK_BUNDLES.values():
+        for field in fields:
+            if field in creds:
+                result[field] = creds[field]
+    return result
+
+
 class EventService:
     """Service for processing and managing events."""
 

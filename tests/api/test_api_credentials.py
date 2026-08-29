@@ -499,3 +499,137 @@ def test_target_tenant_is_authorized_before_credential_bucket_load(
         assert response.json()["detail"] == {"error": "target_tenant_forbidden"}
     if expected_status == 404:
         assert response.json()["detail"] == {"error": "target_tenant_not_found"}
+
+
+# ============================================
+# multimodal_text_fallback_enabled (Wave 1, deliverable 2)
+# ============================================
+#
+# The HTTP surface for the opt-in fallback gate. Six cases below cover
+# (1) legacy default, (2)+(3) round-trip both booleans, (4)-(6) atomic 422
+# rejection of `null` / string / number, and (7) preservation under an
+# unrelated PATCH. Every response body is scanned so the gate never leaks
+# secret material, and the merge is asserted to remain atomic (a rejected
+# PATCH must NOT flip the stored value halfway).
+
+
+def test_multimodal_text_fallback_gate_defaults_to_false_and_is_secret_free(
+    client: TestClient,
+) -> None:
+    """Legacy tenant has no gate value; GET must project `false` explicitly."""
+    headers = _jwt_headers("clinic_admin")
+    read = client.get(PATH, headers=headers)
+    assert read.status_code == 200, read.text
+    data = read.json()
+    assert data["multimodal_text_fallback_enabled"] is False
+    # The gate is a non-secret boolean; the GET must not carry a `_set` /
+    # `_masked` twin (those are reserved for the SECRET_FIELDS projection).
+    assert "multimodal_text_fallback_enabled_set" not in data
+    assert "multimodal_text_fallback_enabled_masked" not in data
+
+
+def test_multimodal_text_fallback_gate_round_trips_true_and_false(
+    client: TestClient,
+) -> None:
+    headers = _jwt_headers("clinic_admin")
+    enabled = client.patch(
+        PATH,
+        headers=headers,
+        json={"multimodal_text_fallback_enabled": True},
+    )
+    assert enabled.status_code == 200, enabled.text
+    assert enabled.json()["multimodal_text_fallback_enabled"] is True
+    assert client.get(PATH, headers=headers).json()[
+        "multimodal_text_fallback_enabled"
+    ] is True
+
+    disabled = client.patch(
+        PATH,
+        headers=headers,
+        json={"multimodal_text_fallback_enabled": False},
+    )
+    assert disabled.status_code == 200, disabled.text
+    assert disabled.json()["multimodal_text_fallback_enabled"] is False
+    assert client.get(PATH, headers=headers).json()[
+        "multimodal_text_fallback_enabled"
+    ] is False
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        None,   # explicit `null` in the JSON body
+        "true",  # string never silently coerced to bool
+        1,       # number never silently coerced to bool
+    ],
+)
+def test_multimodal_text_fallback_gate_rejects_null_and_wrong_type_atomically(
+    client: TestClient, bad_value: Any
+) -> None:
+    """422 with no partial write: a rejected patch keeps the previous value.
+
+    First enable the gate, then submit a bad type, then confirm GET still
+    reports `true` — proving the rejection is atomic and did not overwrite
+    the stored value halfway.
+    """
+    headers = _jwt_headers("clinic_admin")
+    setup = client.patch(
+        PATH,
+        headers=headers,
+        json={"multimodal_text_fallback_enabled": True},
+    )
+    assert setup.status_code == 200, setup.text
+
+    refused = client.patch(
+        PATH,
+        headers=headers,
+        json={"multimodal_text_fallback_enabled": bad_value},
+    )
+    assert refused.status_code == 422, refused.text
+    detail = refused.json()["detail"]
+    # Stable, secret-free error surface — matches the rest of the credential
+    # boundary rather than leaking the raw Pydantic field path or the sent
+    # value.
+    assert detail["error"] == "invalid_credentials_payload"
+    assert any(
+        entry.get("field") == "multimodal_text_fallback_enabled"
+        for entry in detail["fields"]
+    )
+    # No mutation: the stored value stayed `true`.
+    assert client.get(PATH, headers=headers).json()[
+        "multimodal_text_fallback_enabled"
+    ] is True
+
+
+def test_multimodal_text_fallback_gate_preserved_by_unrelated_patch(
+    client: TestClient,
+) -> None:
+    """A patch touching an unrelated capability must not flip or clear the gate."""
+    headers = _jwt_headers("clinic_admin")
+    on = client.patch(
+        PATH,
+        headers=headers,
+        json={"multimodal_text_fallback_enabled": True},
+    )
+    assert on.status_code == 200, on.text
+
+    unrelated = client.patch(
+        PATH,
+        headers=headers,
+        json={
+            "llm_provider": "openai",
+            "llm_api_url": "https://api.openai.com/v1",
+            "llm_api_key": "unrelated-llm-secret",
+            "llm_model_name": "gpt-model",
+        },
+    )
+    assert unrelated.status_code == 200, unrelated.text
+    data = unrelated.json()
+    # Gate unchanged
+    assert data["multimodal_text_fallback_enabled"] is True
+    # And the LLM patch actually landed
+    assert data["llm_provider"] == "openai"
+    assert data["llm_api_key_set"] is True
+
+    reread = client.get(PATH, headers=headers).json()
+    assert reread["multimodal_text_fallback_enabled"] is True

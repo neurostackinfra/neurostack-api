@@ -597,6 +597,51 @@ def test_operational_stt_projection_scoped_to_url_and_model_only() -> None:
     assert "stt_api_key" not in projection
 
 
+def test_multimodal_text_fallback_gate_lives_in_credential_bucket_only() -> None:
+    """The opt-in gate is a credential field even though it is non-secret.
+
+    Wire contract:
+      * It IS in `API_CREDENTIAL_FIELDS` (so the capability schema owns it
+        and the generic /v1/config endpoint refuses it via the boundary).
+      * It is NOT in `SECRET_FIELDS` (round-trips verbatim on GET; no
+        `_set` / `_masked` twin).
+      * It is NOT in the runtime cache projection (bundle stays DB-only via
+        the private multimodal-fallback loader — see event_service).
+    """
+
+    assert "multimodal_text_fallback_enabled" in API_CREDENTIAL_FIELDS
+    assert "multimodal_text_fallback_enabled" not in SECRET_FIELDS
+
+    # Default legacy: absent from credentials => `false` in the projected
+    # response so the UI can bind a boolean control directly.
+    legacy_status = credential_status({})
+    assert legacy_status["multimodal_text_fallback_enabled"] is False
+    # Non-secret projection: no `_set` / `_masked` twin.
+    assert "multimodal_text_fallback_enabled_set" not in legacy_status
+    assert "multimodal_text_fallback_enabled_masked" not in legacy_status
+
+    # Round-trip: both booleans preserved verbatim in the response.
+    enabled_status = credential_status({"multimodal_text_fallback_enabled": True})
+    assert enabled_status["multimodal_text_fallback_enabled"] is True
+    disabled_status = credential_status({"multimodal_text_fallback_enabled": False})
+    assert disabled_status["multimodal_text_fallback_enabled"] is False
+
+    # merge_credentials round-trips both booleans without triggering
+    # fresh-key policy (the gate is orthogonal to provider/url changes).
+    merged_on = merge_credentials({}, {"multimodal_text_fallback_enabled": True})
+    assert merged_on["multimodal_text_fallback_enabled"] is True
+    merged_off = merge_credentials(
+        {"multimodal_text_fallback_enabled": True},
+        {"multimodal_text_fallback_enabled": False},
+    )
+    assert merged_off["multimodal_text_fallback_enabled"] is False
+
+    # Runtime cache projection MUST stay silent about the gate — the bundle
+    # is loaded DB-only through the private multimodal-fallback loader.
+    projection = runtime_projection({"multimodal_text_fallback_enabled": True})
+    assert "multimodal_text_fallback_enabled" not in projection
+
+
 def test_generic_boundary_covers_exact_fields_aliases_and_future_prefixes() -> None:
     candidates: dict[str, object] = {field: None for field in API_CREDENTIAL_FIELDS}
     candidates.update(

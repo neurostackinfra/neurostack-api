@@ -7,7 +7,14 @@ import ipaddress
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+)
 
 
 def _normalize_https_url(value: str) -> str:
@@ -94,6 +101,21 @@ class MultimodalCredentialsPatch(BaseModel):
     multimodal_api_url: ApiUrl | None = None
     multimodal_api_key: Secret | None = None
     multimodal_model_name: Identifier | None = None
+    # Opt-in gate for the text-only multimodal fallback: legacy default is
+    # `false`, so an existing tenant sees no behaviour change until they
+    # explicitly flip it on. Strict boolean so `null` / string / number
+    # payloads are rejected atomically at the boundary rather than silently
+    # coerced. Omission (PATCH) is fine because `exclude_unset=True` drops
+    # the field before it reaches the merge; the validator below only fires
+    # when the caller sent an explicit `null`.
+    multimodal_text_fallback_enabled: bool | None = None
+
+    @field_validator("multimodal_text_fallback_enabled", mode="before")
+    @classmethod
+    def _reject_null_fallback_gate(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("bool_type")
+        return value
 
 
 class SttCredentialsPatch(BaseModel):

@@ -67,6 +67,12 @@ def test_generic_get_omits_credential_bucket_fields_and_secrets(
         "llm_api_key",
         "llm_base_url",
         "multimodal_api_key",
+        # The fallback opt-in gate is a credential-bucket field even though
+        # it is non-secret: the generic /v1/config endpoint must refuse it
+        # too, so operators are forced through the capability endpoint
+        # (`/v1/config/api-credentials`) where the strict Pydantic validator
+        # and the merge policy apply.
+        "multimodal_text_fallback_enabled",
         "stt_api_key",
         "whisper_api_key",
         "whisper_model",
