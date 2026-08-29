@@ -74,6 +74,44 @@ const CONFIG_SAVE_FIELD_LABELS: Record<string, Record<ConfigSaveErrorLocale, str
   handoff_cycle_days: { pt: "dias do ciclo de handoff", en: "handoff cycle days" },
   handoff_inactive_default_hours: { pt: "horas de inatividade do handoff", en: "handoff inactivity hours" },
   meta_minutos_atendimento: { pt: "meta de minutos para atendimento", en: "service-time target in minutes" },
+  whatsapp_provider: { pt: "provedor do WhatsApp", en: "WhatsApp provider" },
+  zapi_instance_id: { pt: "ID da instância Z-API", en: "Z-API instance ID" },
+  zapi_token: { pt: "token da Z-API", en: "Z-API token" },
+  zapi_client_token: { pt: "token de cliente da Z-API", en: "Z-API client token" },
+  zapi_inbound_token_digest: { pt: "token de entrada da Z-API", en: "Z-API inbound token" },
+  evolution_api_url: { pt: "URL da Evolution API", en: "Evolution API URL" },
+  evolution_instance_name: { pt: "nome da instância Evolution", en: "Evolution instance name" },
+  evolution_api_key: { pt: "API Key da Evolution API", en: "Evolution API key" },
+  meta_phone_number_id: { pt: "Phone Number ID da Meta", en: "Meta Phone Number ID" },
+  meta_waba_id: { pt: "WABA ID da Meta", en: "Meta WABA ID" },
+  meta_permanent_token: { pt: "token permanente da Meta", en: "Meta permanent token" },
+  meta_app_secret: { pt: "App Secret da Meta", en: "Meta App Secret" },
+  meta_verify_token: { pt: "token de verificação da Meta", en: "Meta verification token" },
+  uazapi_api_url: { pt: "URL da Uazapi", en: "Uazapi URL" },
+  uazapi_instance_name: { pt: "nome da instância Uazapi", en: "Uazapi instance name" },
+  uazapi_token: { pt: "token da Uazapi", en: "Uazapi token" },
+  llm_provider: { pt: "provedor de LLM", en: "LLM provider" },
+  llm_api_key: { pt: "API Key do LLM", en: "LLM API key" },
+  llm_api_url: { pt: "URL da API do LLM", en: "LLM API URL" },
+  llm_base_url: { pt: "URL base do LLM", en: "LLM base URL" },
+  llm_model_name: { pt: "modelo do LLM", en: "LLM model" },
+  stt_provider: { pt: "provedor de transcrição", en: "transcription provider" },
+  stt_api_key: { pt: "API Key de transcrição", en: "transcription API key" },
+  stt_api_url: { pt: "URL da API de transcrição", en: "transcription API URL" },
+  stt_model_name: { pt: "modelo de transcrição", en: "transcription model" },
+  whisper_api_key: { pt: "API Key do Whisper", en: "Whisper API key" },
+  whisper_model: { pt: "modelo do Whisper", en: "Whisper model" },
+  audio_max_seconds: { pt: "duração máxima do áudio", en: "maximum audio duration" },
+  multimodal_provider: { pt: "provedor multimodal", en: "multimodal provider" },
+  multimodal_api_key: { pt: "API Key multimodal", en: "multimodal API key" },
+  multimodal_api_url: { pt: "URL da API multimodal", en: "multimodal API URL" },
+  multimodal_model_name: { pt: "modelo multimodal", en: "multimodal model" },
+  tts_provider: { pt: "provedor de voz", en: "voice provider" },
+  tts_api_key: { pt: "API Key de voz", en: "voice API key" },
+  tts_api_url: { pt: "URL da API de voz", en: "voice API URL" },
+  tts_model_name: { pt: "modelo de voz", en: "voice model" },
+  tts_voice_id: { pt: "voz", en: "voice" },
+  tts_enabled: { pt: "respostas em áudio", en: "audio replies" },
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -85,20 +123,27 @@ function safeConfigFieldLabel(field: unknown, locale: ConfigSaveErrorLocale): st
   return CONFIG_SAVE_FIELD_LABELS[field]?.[locale] ?? field.replaceAll("_", " ");
 }
 
-function configSaveErrorFields(detail: unknown, locale: ConfigSaveErrorLocale): string[] {
+function configSaveErrorFieldNames(detail: unknown): string[] {
   const issues = Array.isArray(detail)
     ? detail
     : isRecord(detail) && Array.isArray(detail.fields)
       ? detail.fields
-      : [];
-  const fields = issues.flatMap((issue) => {
+      : isRecord(detail) && typeof detail.field === "string"
+        ? [detail.field]
+        : [];
+  return [...new Set(issues.flatMap((issue) => {
     if (typeof issue === "string") return [issue];
     if (!isRecord(issue)) return [];
     if (typeof issue.field === "string") return [issue.field];
     if (Array.isArray(issue.loc)) return [issue.loc.at(-1)];
     return [];
-  });
-  return [...new Set(fields.map((field) => safeConfigFieldLabel(field, locale)).filter((field): field is string => Boolean(field)))];
+  }).filter((field): field is string => typeof field === "string"))];
+}
+
+function configSaveErrorFields(detail: unknown, locale: ConfigSaveErrorLocale): string[] {
+  return configSaveErrorFieldNames(detail)
+    .map((field) => safeConfigFieldLabel(field, locale))
+    .filter((field): field is string => Boolean(field));
 }
 
 /**
@@ -114,6 +159,7 @@ export function describeConfigSaveFailure(
   const detail = isRecord(payload) && "detail" in payload ? payload.detail : payload;
   const detailRecord = isRecord(detail) ? detail : null;
   const errorCode = typeof detailRecord?.error === "string" ? detailRecord.error : null;
+  const fieldNames = configSaveErrorFieldNames(detail);
 
   const knownErrors: Record<string, Record<ConfigSaveErrorLocale, string>> = {
     credential_endpoint_required: {
@@ -128,6 +174,14 @@ export function describeConfigSaveFailure(
       pt: "A URL da API informada não é permitida. Use um endereço HTTPS público.",
       en: "The API URL is not allowed. Use a public HTTPS address.",
     },
+    invalid_provider_for_capability: {
+      pt: "O provedor selecionado não é válido para esta capacidade de API.",
+      en: "The selected provider is not valid for this API capability.",
+    },
+    meta_phone_number_id_conflict: {
+      pt: "Este Phone Number ID da Meta já está vinculado a outra clínica. Use um número diferente.",
+      en: "This Meta Phone Number ID is already linked to another clinic. Use a different number.",
+    },
     target_tenant_forbidden: {
       pt: "Você não tem permissão para alterar a configuração desta clínica.",
       en: "You do not have permission to change this clinic's configuration.",
@@ -141,9 +195,49 @@ export function describeConfigSaveFailure(
       en: "The selected clinic was not found.",
     },
   };
-  if (errorCode && knownErrors[errorCode]) return knownErrors[errorCode][locale];
 
   const fields = configSaveErrorFields(detail, locale);
+  const capabilityForFields = configSaveCapability(fieldNames);
+  const capabilityFromDetail = apiCapabilityId(detailRecord?.capability);
+  const capability = capabilityFromDetail ?? capabilityForFields;
+  const capabilityPrefix = capability ? `${apiCapability(capability).short}: ` : "";
+
+  if (errorCode === "provider_not_implemented") {
+    const provider = typeof detailRecord?.provider === "string" ? detailRecord.provider : null;
+    const providerLabel = provider && WA_PROVIDER_LABEL[provider as WhatsappProvider]
+      ? WA_PROVIDER_LABEL[provider as WhatsappProvider]
+      : txtForLocale(locale, "este provedor", "this provider");
+    return locale === "en"
+      ? `${capabilityPrefix}${providerLabel} is not implemented yet. Use Meta Cloud API, Z-API, or Evolution API.`
+      : `${capabilityPrefix}${providerLabel} ainda não está implementado. Use Meta Cloud API, Z-API ou Evolution API.`;
+  }
+
+  if (errorCode === "fresh_api_key_required") {
+    const multimodalSuffix = capability === "multimodal"
+      ? txtForLocale(locale, " do provedor multimodal", " for the multimodal provider")
+      : "";
+    return locale === "en"
+      ? `${capabilityPrefix}enter a new API key${multimodalSuffix} - switching providers or endpoints requires a new key.`
+      : `${capabilityPrefix}informe uma nova API Key${multimodalSuffix} - trocar de provedor ou de endpoint exige uma chave nova.`;
+  }
+
+  if (errorCode === "unsafe_api_url" || errorCode === "invalid_credentials_payload") {
+    const base = knownErrors[errorCode][locale];
+    if (fields.length > 0) {
+      const fieldSuffix = locale === "en"
+        ? ` Fields: ${fields.join(", ")}.`
+        : ` Campos: ${fields.join(", ")}.`;
+      return `${capabilityPrefix}${base}${fieldSuffix}`;
+    }
+    return `${capabilityPrefix}${base}`;
+  }
+
+  if (errorCode === "invalid_provider_for_capability" || errorCode === "meta_phone_number_id_conflict") {
+    return `${capabilityPrefix}${knownErrors[errorCode][locale]}`;
+  }
+
+  if (errorCode && knownErrors[errorCode]) return knownErrors[errorCode][locale];
+
   if (fields.length > 0) {
     return locale === "en"
       ? `Review the following fields: ${fields.join(", ")}.`
@@ -295,14 +389,103 @@ export const MULTIMODAL_PROVIDER_API_URL: Record<MultimodalProvider, string> = {
   openai:     "https://api.openai.com/v1",
 };
 
-// Capability labels for the backend's stable `fresh_api_key_required` error,
-// which names the capability but never a human-readable message.
-const CAPABILITY_LABELS: Record<string, { pt: string; en: string }> = {
-  llm:        { pt: "do LLM",                     en: "for the LLM"                     },
-  multimodal: { pt: "do provedor multimodal",     en: "for the multimodal provider"     },
-  stt:        { pt: "do provedor de transcrição", en: "for the transcription provider"  },
-  tts:        { pt: "do provedor de voz",         en: "for the voice provider"          },
-};
+// Single source of truth for the 5 API capability blocks in the clinic-config
+// "API" tab. Each entry drives the block's short header name, its inline
+// description paragraph, and the required/optional marker that sits next to
+// the header. Any drift from this registry means the UI is showing something
+// the product spec never promised.
+export type ApiCapabilityId = "whatsapp" | "llm" | "stt" | "multimodal" | "tts";
+export const API_CAPABILITIES: readonly {
+  id: ApiCapabilityId;
+  short: string;
+  desc: { pt: string; en: string };
+  required: boolean;
+}[] = [
+  {
+    id: "whatsapp",
+    short: "API WhatsApp",
+    desc: {
+      pt: "Canal de mensagens (recebe e envia no WhatsApp)",
+      en: "Messaging channel (receives and sends on WhatsApp)",
+    },
+    required: true,
+  },
+  {
+    id: "llm",
+    short: "API LLM",
+    desc: {
+      pt: "Large Language Model (gera as respostas em texto)",
+      en: "Large Language Model (generates the text replies)",
+    },
+    required: true,
+  },
+  {
+    id: "stt",
+    short: "API STT",
+    desc: {
+      pt: "Speech to Text (transcrição de áudio)",
+      en: "Speech to Text (audio transcription)",
+    },
+    required: false,
+  },
+  {
+    id: "multimodal",
+    short: "API STT Fall Back",
+    desc: {
+      pt: "Multimodal (modelo que ouve o áudio direto)",
+      en: "Multimodal (model that listens to the audio directly)",
+    },
+    required: false,
+  },
+  {
+    id: "tts",
+    short: "API TTS",
+    desc: {
+      pt: "Text to Speech (gerar áudio)",
+      en: "Text to Speech (generate audio)",
+    },
+    required: false,
+  },
+];
+
+function apiCapability(id: ApiCapabilityId) {
+  const entry = API_CAPABILITIES.find(c => c.id === id);
+  if (!entry) throw new Error(`Unknown API capability: ${id}`);
+  return entry;
+}
+
+function txtForLocale(locale: ConfigSaveErrorLocale, pt: string, en: string): string {
+  return locale === "en" ? en : pt;
+}
+
+function apiCapabilityId(value: unknown): ApiCapabilityId | null {
+  return typeof value === "string" && API_CAPABILITIES.some(c => c.id === value)
+    ? value as ApiCapabilityId
+    : null;
+}
+
+// Keep the more specific credential prefixes explicit and ordered so a field
+// can be mapped to the same capability used by the API tab's shared registry.
+const CONFIG_SAVE_CAPABILITY_PREFIXES: readonly (readonly [string, ApiCapabilityId])[] = [
+  ["whatsapp_", "whatsapp"],
+  ["zapi_", "whatsapp"],
+  ["evolution_", "whatsapp"],
+  ["meta_", "whatsapp"],
+  ["uazapi_", "whatsapp"],
+  ["llm_", "llm"],
+  ["stt_", "stt"],
+  ["whisper_", "stt"],
+  ["multimodal_", "multimodal"],
+  ["tts_", "tts"],
+  ["audio_max_seconds", "stt"],
+];
+
+function configSaveCapability(fieldNames: readonly string[]): ApiCapabilityId | null {
+  for (const [prefix, capability] of CONFIG_SAVE_CAPABILITY_PREFIXES) {
+    if (fieldNames.some(field => field.startsWith(prefix))) return capability;
+  }
+  return null;
+}
 
 const MULTIMODAL_PROVIDER_MODEL_PLACEHOLDER: Record<MultimodalProvider, string> = {
   openrouter: "google/gemini-2.5-flash",
@@ -834,34 +1017,17 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         // FastAPI wraps HTTPException payloads under `detail` — this covers the
         // structured errors returned by the backend (provider_not_implemented,
         // meta_phone_number_id_conflict, etc.).
-        detail?: string | { error?: string; message?: string; provider?: string; capability?: string };
+        detail?: string | {
+          error?: string;
+          message?: string;
+          provider?: string;
+          capability?: string;
+          field?: string;
+          fields?: unknown[];
+        };
       };
       if (!res.ok) {
-        let errMsg = data.error ?? "Erro ao salvar.";
-        const detail = data.detail;
-        if (typeof detail === "string") {
-          errMsg = detail;
-        } else if (detail && typeof detail === "object") {
-          if (detail.error === "provider_not_implemented") {
-            const provLabel = detail.provider
-              ? (WA_PROVIDER_LABEL[detail.provider as WhatsappProvider] ?? detail.provider)
-              : "esse provedor";
-            errMsg = `${provLabel}: provedor ainda não implementado. Use Meta Cloud API, Z-API ou Evolution API.`;
-          } else if (detail.error === "fresh_api_key_required") {
-            // The backend refuses to carry a key across a provider/URL change.
-            // Translate the stable code so the operator never sees it raw.
-            const capability = CAPABILITY_LABELS[detail.capability ?? ""];
-            const capabilityLabel = capability
-              ? txt(capability.pt, capability.en)
-              : txt("desta integração", "of this integration");
-            errMsg = txt(
-              `Informe uma nova API Key ${capabilityLabel}: trocar de provedor ou de endpoint exige uma chave nova.`,
-              `Enter a new API key ${capabilityLabel}: switching provider or endpoint requires a new key.`,
-            );
-          } else {
-            errMsg = detail.message ?? detail.error ?? errMsg;
-          }
-        }
+        const errMsg = describeConfigSaveFailure(data, res.status, locale);
         setError(errMsg);
         toast({ title: "Erro ao salvar", description: errMsg, variant: "destructive" });
         return;
@@ -1007,15 +1173,25 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         </div>
       )}
 
-      {/* ── WhatsApp Providers (6 canais agrupados) ── */}
+      {/* ── API WhatsApp ── */}
       <div className="space-y-5 rounded-lg border border-slate-700/50 bg-muted/20 p-4">
 
         {/* Section header */}
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <MessageSquare className="h-3.5 w-3.5 text-[#25D366]" />
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">WhatsApp - Provedor Ativo</p>
+          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">{apiCapability("whatsapp").short}</p>
+          <span
+            data-testid="capability-requirement-whatsapp"
+            className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/80"
+          >
+            {apiCapability("whatsapp").required ? txt("obrigatório", "Required") : txt("opcional", "Optional")}
+          </span>
           <span className="ml-auto text-[10px] font-bold px-1.5 py-0.5 rounded border bg-[#25D366]/10 text-[#25D366] border-[#25D366]/30">Ativo</span>
         </div>
+
+        <p className="text-[11px] text-muted-foreground">
+          {txt(apiCapability("whatsapp").desc.pt, apiCapability("whatsapp").desc.en)}
+        </p>
 
         {/* Group: Official WhatsApp Business API */}
         <div className="space-y-2">
@@ -1287,15 +1463,25 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         )}
       </div>
 
-      {/* ── LLM Provider selector ── */}
+      {/* ── API LLM ── */}
       <div className="space-y-4 rounded-lg border border-slate-700/50 bg-muted/20 p-4">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Cpu className="h-3.5 w-3.5 text-accent" />
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">AI Provider - LLM</p>
+          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">{apiCapability("llm").short}</p>
+          <span
+            data-testid="capability-requirement-llm"
+            className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/80"
+          >
+            {apiCapability("llm").required ? txt("obrigatório", "Required") : txt("opcional", "Optional")}
+          </span>
           {isComingSoon && (
             <span className="ml-auto text-[10px] font-bold px-1.5 py-0.5 rounded border bg-violet-500/10 text-violet-400 border-violet-500/30">Em breve</span>
           )}
         </div>
+
+        <p className="text-[11px] text-muted-foreground">
+          {txt(apiCapability("llm").desc.pt, apiCapability("llm").desc.en)}
+        </p>
 
         {/* Provider toggle group */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2" data-testid="llm-provider-list">
@@ -1435,12 +1621,22 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         )}
       </div>
 
-      {/* ── Provider Speech to Text ── */}
+      {/* ── API STT ── */}
       <div className="space-y-4 rounded-lg border border-slate-700/50 bg-muted/20 p-4">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Mic2 className="h-3.5 w-3.5 text-accent" />
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Provider Speech to Text</p>
+          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">{apiCapability("stt").short}</p>
+          <span
+            data-testid="capability-requirement-stt"
+            className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/80"
+          >
+            {apiCapability("stt").required ? txt("obrigatório", "Required") : txt("opcional", "Optional")}
+          </span>
         </div>
+
+        <p className="text-[11px] text-muted-foreground">
+          {txt(apiCapability("stt").desc.pt, apiCapability("stt").desc.en)}
+        </p>
 
         {/* Provider toggle group */}
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-2" data-testid="stt-provider-list">
@@ -1538,7 +1734,7 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         </div>
       </div>
 
-      {/* ── Multimodal transcription (chat model that accepts audio) ── */}
+      {/* ── API STT Fall Back ── */}
       <div
         className="space-y-4 rounded-lg border border-slate-700/50 bg-muted/20 p-4"
         data-testid="multimodal-settings-section"
@@ -1546,8 +1742,14 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         <div className="flex flex-wrap items-center gap-2">
           <AudioLines className="h-3.5 w-3.5 text-accent" />
           <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-            {txt("Transcrição Multimodal", "Multimodal Transcription")}
+            {apiCapability("multimodal").short}
           </p>
+          <span
+            data-testid="capability-requirement-multimodal"
+            className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/80"
+          >
+            {apiCapability("multimodal").required ? txt("obrigatório", "Required") : txt("opcional", "Optional")}
+          </span>
           <span
             data-testid="multimodal-recommended-badge"
             className="ml-auto text-[9px] font-bold px-1.5 py-0.5 rounded border bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
@@ -1558,8 +1760,8 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
 
         <p className="text-[11px] text-muted-foreground">
           {txt(
-            "Modelo de chat que recebe o áudio direto do WhatsApp, sem transcrição separada. Usado como alternativa quando o STT falha.",
-            "Chat model that takes WhatsApp audio directly, with no separate transcription step. Used as a fallback when STT fails.",
+            "Multimodal (modelo que ouve o áudio direto). Usado como alternativa quando o STT falha.",
+            "Multimodal (model that listens to the audio directly). Used as a fallback when STT fails.",
           )}
         </p>
 
@@ -1658,7 +1860,7 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         </div>
       </div>
 
-      {/* ── TTS - Text to Speech ── */}
+      {/* ── API TTS ── */}
       <div
         className="space-y-4 rounded-lg border border-slate-700/50 bg-muted/20 p-4"
         data-testid="tts-settings-section"
@@ -1666,8 +1868,14 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         <div className="flex flex-wrap items-center gap-2">
           <Volume2 className="h-3.5 w-3.5 text-accent" />
           <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-            TTS - Text to Speech
+            {apiCapability("tts").short}
           </p>
+          <span
+            data-testid="capability-requirement-tts"
+            className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/80"
+          >
+            {apiCapability("tts").required ? txt("obrigatório", "Required") : txt("opcional", "Optional")}
+          </span>
           <span className={`ml-auto text-[9px] font-bold px-1.5 py-0.5 rounded border ${
             ttsEnabled && status?.tts_readiness === "active"
               ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
@@ -1681,8 +1889,8 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
 
         <p className="text-[11px] text-muted-foreground">
           {txt(
-            "Quando ativado, as respostas do agente são sintetizadas e enviadas como áudio no WhatsApp. Se o provedor falhar, a resposta é enviada em texto.",
-            "When enabled, agent replies are synthesized and sent as WhatsApp audio. If the provider fails, the reply is sent as text.",
+            "Text to Speech (gerar áudio). Quando ativado, as respostas do agente são sintetizadas e enviadas como áudio no WhatsApp. Se o provedor falhar, a resposta é enviada em texto.",
+            "Text to Speech (generate audio). When enabled, agent replies are synthesized and sent as WhatsApp audio. If the provider fails, the reply is sent as text.",
           )}
         </p>
 
