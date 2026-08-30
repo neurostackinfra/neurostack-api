@@ -12,19 +12,31 @@ Sessions track the cognitive state of a conversation, including:
 from typing import Optional
 from uuid import UUID
 
+import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
-
-import jwt as pyjwt
 
 from src.api.middleware.auth import (
     TenantContext,
     get_tenant_context,
     require_builder_clinic_access,
 )
+from src.api.schemas.base import ErrorResponse
+from src.api.schemas.sessions import (
+    CognitiveState,
+    InactiveSessionsResponse,
+    SessionCreateRequest,
+    SessionEventsResponse,
+    SessionListResponse,
+    SessionReactivationResponse,
+    SessionResponse,
+    SessionUpdateRequest,
+)
 from src.config.logging import get_logger
 from src.config.settings import settings
-from src.api.schemas.base import ErrorResponse
+from src.repositories import get_db_session_dependency
+from src.services import get_session_service
+from src.services.session_service import SessionReactivationError
 
 _logger = get_logger(__name__)
 
@@ -55,7 +67,8 @@ async def _resolve_tenant(
         token = auth_header[7:]
         try:
             payload = pyjwt.decode(
-                token, settings.secret_key,
+                token,
+                settings.secret_key,
                 algorithms=["HS256"],
                 options={"require": ["sub", "tenant_id", "exp"]},
             )
@@ -64,28 +77,109 @@ async def _resolve_tenant(
             pass
 
     if not builder_id_str:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Builder ID not found in token")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Builder ID not found in token",
+        )
 
-    builder_id = UUID(builder_id_str)
-    _logger.info("builder_clinic_override", extra={"builder_id": str(builder_id), "tenant_id": str(override_tenant_id), "endpoint": request.url.path})
+    try:
+        builder_id = UUID(builder_id_str)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid builder ID in token",
+        )
+    _logger.info(
+        "builder_clinic_override",
+        extra={
+            "builder_id": str(builder_id),
+            "tenant_id": str(override_tenant_id),
+            "endpoint": request.url.path,
+        },
+    )
     return await require_builder_clinic_access(override_tenant_id, builder_id, db)
-from src.api.schemas.sessions import (
-    CognitiveState,
-    SessionCreateRequest,
-    SessionEventsResponse,
-    SessionListResponse,
-    SessionResponse,
-    SessionUpdateRequest,
-)
-from src.repositories import get_db_session_dependency
-from src.services import SessionService, get_session_service
+
 
 router = APIRouter()
+
+_OPERATIONAL_ROLES = {"clinic_admin", "builder", "super_admin"}
+
+
+def _require_operational_role(tenant: TenantContext) -> None:
+    """Restrict queue operations to explicitly authorized JWT roles."""
+    if tenant.role not in _OPERATIONAL_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Operational role required",
+        )
 
 
 # ============================================
 # Endpoints
 # ============================================
+
+
+@router.get(
+    "/inactive",
+    response_model=InactiveSessionsResponse,
+    summary="List Permanently Paused Sessions",
+    tags=["Sessions"],
+)
+async def list_inactive_sessions(
+    request: Request,
+    tenant_id: Optional[UUID] = Query(
+        default=None,
+        description="Clinic tenant override for builder or super admin",
+    ),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: AsyncSession = Depends(get_db_session_dependency),
+) -> InactiveSessionsResponse:
+    """List the effective permanently paused sessions for one tenant."""
+    _require_operational_role(tenant)
+    effective_tenant_id = await _resolve_tenant(request, tenant, tenant_id, db)
+    return await get_session_service().list_inactive_sessions(
+        tenant_id=effective_tenant_id,
+        db=db,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.post(
+    "/{session_id}/reactivate",
+    response_model=SessionReactivationResponse,
+    summary="Reactivate Permanently Paused Session",
+    tags=["Sessions"],
+)
+async def reactivate_session(
+    session_id: UUID,
+    request: Request,
+    tenant_id: Optional[UUID] = Query(
+        default=None,
+        description="Clinic tenant override for builder or super admin",
+    ),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: AsyncSession = Depends(get_db_session_dependency),
+) -> SessionReactivationResponse:
+    """Return control to AI for the authorized effective active session."""
+    _require_operational_role(tenant)
+    effective_tenant_id = await _resolve_tenant(request, tenant, tenant_id, db)
+    try:
+        response = await get_session_service().reactivate_session(
+            tenant_id=effective_tenant_id,
+            session_id=session_id,
+            db=db,
+        )
+        await db.commit()
+        return response
+    except SessionReactivationError as error:
+        if error.code == "not_found":
+            response_status = status.HTTP_404_NOT_FOUND
+        else:
+            response_status = status.HTTP_409_CONFLICT
+        raise HTTPException(status_code=response_status, detail=error.code)
 
 
 @router.post(
@@ -396,7 +490,9 @@ async def get_session_events(
     session_id: UUID,
     request: Request,
     tenant_id: UUID = Query(..., description="Tenant ID"),
-    limit: int = Query(default=50, ge=1, le=200, description="Maximum events to return"),
+    limit: int = Query(
+        default=50, ge=1, le=200, description="Maximum events to return"
+    ),
     offset: int = Query(default=0, ge=0, description="Offset for pagination"),
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),

@@ -30,6 +30,7 @@ import RlhfAudit from "@/pages/rlhf-audit";
 import Privacidade from "@/pages/privacidade";
 import BuilderPanel from "@/pages/builder";
 import HandoffQueuePage from "@/pages/handoff-queue";
+import InactiveQueuePage from "@/pages/inactive-queue";
 
 const queryClient = new QueryClient();
 
@@ -96,6 +97,7 @@ function AuthenticatedRouter() {
         <Route path="/suporte" component={Suporte} />
         <Route path="/portal-parceiros" component={PortalParceiros} />
         <Route path="/handoff-queue" component={HandoffQueuePage} />
+        {!isInvestor && <Route path="/inactive-queue" component={InactiveQueuePage} />}
         <Route component={NotFound} />
       </Switch>
     </Layout>
