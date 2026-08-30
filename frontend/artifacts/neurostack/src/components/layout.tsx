@@ -27,6 +27,7 @@ import {
   Wrench,
   ChevronDown,
   Users2,
+  UserX,
 } from "lucide-react";
 import logoSrc from "../../../../attached_assets/logo_png_1775411054369.png";
 import { Button } from "@/components/ui/button";
@@ -158,6 +159,7 @@ export function Layout({ children }: LayoutProps) {
   const navItems = [
     { href: "/",         label: t("nav_chat"),      icon: MessageSquare,  id: "chat-simulator", hideFor: [] },
     { href: "/handoff-queue", label: t("nav_handoff_queue"), icon: Users2, id: "handoff-queue", hideFor: [] },
+    { href: "/inactive-queue", label: t("nav_inactive_queue"), icon: UserX, id: "inactive-queue", hideFor: ["investor"] },
     { href: "/traces",   label: t("nav_traces"),    icon: Activity,       id: "trace-history",  hideFor: [] },
     { href: "/dashboard",label: t("nav_dashboard"), icon: LayoutDashboard,id: "dashboard",      hideFor: [] },
     { href: "/config",   label: t("nav_config"),    icon: Sliders,        id: "clinic-config",  hideFor: [] },

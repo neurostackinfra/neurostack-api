@@ -11,19 +11,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.schemas.sessions import (
     CognitiveState,
     FunnelStage,
+    InactiveSessionItem,
+    InactiveSessionsResponse,
     SessionCreateRequest,
     SessionEventResponse,
     SessionEventsResponse,
     SessionListResponse,
+    SessionReactivationResponse,
     SessionResponse,
     SessionUpdateRequest,
 )
 from src.models.session import CognitiveStateData, Session
-from src.repositories import (
-    EventRepository,
-    SessionRepository,
-    TenantRepository,
-)
+from src.repositories import EventRepository, SessionRepository, TenantRepository
 
 
 class SessionService:
@@ -82,8 +81,12 @@ class SessionService:
                 lead=getattr(cognitive_state_data, "lead", {}),
                 sales=getattr(cognitive_state_data, "sales", {}),
                 last=getattr(cognitive_state_data, "last", {}),
-                first_contact_at=getattr(cognitive_state_data, "first_contact_at", None),
-                pos_atendimento_started_at=getattr(cognitive_state_data, "pos_atendimento_started_at", None),
+                first_contact_at=getattr(
+                    cognitive_state_data, "first_contact_at", None
+                ),
+                pos_atendimento_started_at=getattr(
+                    cognitive_state_data, "pos_atendimento_started_at", None
+                ),
                 last_message_at=getattr(cognitive_state_data, "last_message_at", None),
             ),
             is_active=session.is_active,
@@ -93,6 +96,70 @@ class SessionService:
             handoff_status=session.handoff_status,
             metadata=session.session_metadata,
         )
+
+    @staticmethod
+    def _session_to_inactive_item(session: Session) -> InactiveSessionItem:
+        """Project only queue-safe fields from the session state."""
+        state = session.cognitive_state
+        if not isinstance(state, dict):
+            state = {}
+        last_intent = state.get("last_intent")
+        funnel_stage = state.get("funnel_stage", FunnelStage.LEAD_NOVO.value)
+        return InactiveSessionItem(
+            session_id=session.id,
+            contact_identifier=session.user_id,
+            channel=session.channel,
+            last_intent=last_intent if isinstance(last_intent, str) else None,
+            funnel_stage=(
+                funnel_stage
+                if isinstance(funnel_stage, str)
+                else FunnelStage.LEAD_NOVO.value
+            ),
+            last_activity_at=session.last_activity_at,
+        )
+
+    async def list_inactive_sessions(
+        self,
+        tenant_id: UUID,
+        db: AsyncSession,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> InactiveSessionsResponse:
+        """List effective active sessions in permanent pause."""
+        session_repo = SessionRepository(db)
+        skip = (page - 1) * page_size
+        sessions = await session_repo.find_inactive_effective(
+            tenant_id=tenant_id,
+            skip=skip,
+            limit=page_size,
+        )
+        total = await session_repo.count_inactive_effective(tenant_id)
+        return InactiveSessionsResponse(
+            items=[self._session_to_inactive_item(item) for item in sessions],
+            total=total,
+            page=page,
+            page_size=page_size,
+            has_next=skip + page_size < total,
+            has_previous=page > 1,
+        )
+
+    async def reactivate_session(
+        self,
+        tenant_id: UUID,
+        session_id: UUID,
+        db: AsyncSession,
+    ) -> SessionReactivationResponse:
+        """Reactivate the effective active session without touching handoffs."""
+        result = await SessionRepository(db).reactivate_effective(
+            tenant_id=tenant_id,
+            session_id=session_id,
+        )
+        if result in ("reactivated", "already_active"):
+            return SessionReactivationResponse(
+                session_id=session_id,
+                status=result,
+            )
+        raise SessionReactivationError(result)
 
     async def create_session(
         self, request: SessionCreateRequest, db: AsyncSession
@@ -144,9 +211,7 @@ class SessionService:
 
         return self._session_to_response(new_session)
 
-    async def get_session(
-        self, session_id: UUID, db: AsyncSession
-    ) -> SessionResponse:
+    async def get_session(self, session_id: UUID, db: AsyncSession) -> SessionResponse:
         """
         Retrieve session details by ID.
 
@@ -249,7 +314,7 @@ class SessionService:
         """
         session_repo = SessionRepository(db)
 
-        update_data = {}
+        update_data: dict[str, object] = {}
         if request.metadata is not None:
             update_data["session_metadata"] = request.metadata
         if request.is_active is not None:
@@ -262,9 +327,7 @@ class SessionService:
 
         return self._session_to_response(updated_session)
 
-    async def end_session(
-        self, session_id: UUID, db: AsyncSession
-    ) -> None:
+    async def end_session(self, session_id: UUID, db: AsyncSession) -> None:
         """
         End a session (mark as inactive).
 
@@ -376,7 +439,9 @@ class SessionService:
             sales=getattr(cognitive_state_data, "sales", {}),
             last=getattr(cognitive_state_data, "last", {}),
             first_contact_at=getattr(cognitive_state_data, "first_contact_at", None),
-            pos_atendimento_started_at=getattr(cognitive_state_data, "pos_atendimento_started_at", None),
+            pos_atendimento_started_at=getattr(
+                cognitive_state_data, "pos_atendimento_started_at", None
+            ),
             last_message_at=getattr(cognitive_state_data, "last_message_at", None),
         )
 
@@ -391,3 +456,11 @@ def get_session_service() -> SessionService:
     if _session_service is None:
         _session_service = SessionService()
     return _session_service
+
+
+class SessionReactivationError(ValueError):
+    """Expected domain rejection for the reactivation command."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
