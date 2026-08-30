@@ -8,6 +8,7 @@ from src.services.api_credentials import (
     API_CREDENTIAL_FIELDS,
     CONFIG_CACHE_SCHEMA_VERSION,
     CONFIG_CACHE_VERSION_FIELD,
+    PROVIDER_AVAILABILITY,
     PROVIDER_ALLOWLISTS,
     READINESS_IDS,
     SECRET_FIELDS,
@@ -22,28 +23,53 @@ from src.services.api_credentials import (
     merge_credentials,
     resolve_stt_credentials,
     runtime_projection,
+    validate_provider_availability,
 )
 
 
-def test_wire_ids_readiness_and_errors_match_design() -> None:
-    assert PROVIDER_ALLOWLISTS == {
-        "whatsapp": frozenset(
-            {"meta_cloud", "dialog360", "twilio", "zapi", "evolution", "uazapi"}
-        ),
-        "llm": frozenset({"openai", "dropout", "outros", "slm_cortex"}),
-        "multimodal": frozenset({"openrouter", "groq", "openai"}),
-        "stt": frozenset(
-            {
-                "outros",
-                "openai_whisper",
-                "elevenlabs_scribe",
-                "google_stt",
-                "deepgram_stt",
-                "microsoft_stt",
-            }
-        ),
-        "tts": frozenset({"elevenlabs", "google"}),
+def test_provider_availability_is_the_exact_all_coming_soon_contract() -> None:
+    assert PROVIDER_AVAILABILITY == {
+        "whatsapp": {
+            "meta_cloud": "coming_soon",
+            "zapi": "coming_soon",
+            "uazapi": "coming_soon",
+            "evolution": "coming_soon",
+            "dialog360": "coming_soon",
+            "twilio": "coming_soon",
+        },
+        "llm": {
+            "dropout": "coming_soon",
+            "openai": "coming_soon",
+            "outros": "coming_soon",
+            "slm_cortex": "coming_soon",
+        },
+        "multimodal": {"openrouter": "coming_soon"},
+        "stt": {
+            "outros": "coming_soon",
+            "openai_whisper": "coming_soon",
+            "elevenlabs_scribe": "coming_soon",
+            "google_stt": "coming_soon",
+            "deepgram_stt": "coming_soon",
+            "microsoft_stt": "coming_soon",
+        },
+        "tts": {"elevenlabs": "coming_soon", "google": "coming_soon"},
     }
+    assert sum(len(providers) for providers in PROVIDER_AVAILABILITY.values()) == 19
+    assert all(
+        availability == "coming_soon"
+        for providers in PROVIDER_AVAILABILITY.values()
+        for availability in providers.values()
+    )
+    assert PROVIDER_ALLOWLISTS == {
+        capability: frozenset(providers)
+        for capability, providers in PROVIDER_AVAILABILITY.items()
+    }
+    assert "groq" not in PROVIDER_ALLOWLISTS["multimodal"]
+    assert "openai" not in PROVIDER_ALLOWLISTS["multimodal"]
+    assert "microsoft" not in PROVIDER_ALLOWLISTS["tts"]
+
+
+def test_wire_ids_readiness_and_errors_match_design() -> None:
     assert READINESS_IDS == {
         "active",
         "incomplete",
@@ -54,10 +80,9 @@ def test_wire_ids_readiness_and_errors_match_design() -> None:
         "credential_endpoint_required",
         "credentials_jwt_required",
         "credentials_role_forbidden",
-        "fresh_api_key_required",
         "invalid_credentials_payload",
         "invalid_provider_for_capability",
-        "provider_not_operational",
+        "provider_not_available",
     }.issubset(WIRE_ERROR_CODES)
 
 
@@ -70,14 +95,9 @@ def test_wire_ids_readiness_and_errors_match_design() -> None:
             {"capability": "llm"},
         ),
         (
-            {"llm_provider": "slm_cortex"},
-            "provider_not_operational",
-            {"capability": "llm", "provider": "slm_cortex"},
-        ),
-        (
-            {"llm_provider": "openai"},
-            "fresh_api_key_required",
-            {"capability": "llm", "reason": "provider_changed"},
+            {"multimodal_provider": "groq"},
+            "invalid_provider_for_capability",
+            {"capability": "multimodal"},
         ),
     ],
 )
@@ -92,29 +112,36 @@ def test_merge_errors_are_exact_and_atomic(
     assert existing == snapshot
 
 
-def test_fresh_key_precedence_and_model_only_preservation() -> None:
+def test_post_merge_availability_rejects_effective_changes_and_allows_masked_echo() -> None:
     existing = {
         "llm_provider": "openai",
         "llm_api_url": "https://api.openai.com/v1",
         "llm_api_key": "secret-one",
         "llm_model_name": "old-model",
     }
-    with pytest.raises(CredentialPolicyError) as caught:
-        merge_credentials(
-            existing,
-            {
-                "llm_provider": "dropout",
-                "llm_api_url": "https://api.neuralake.cloud/v1",
-            },
-        )
-    assert caught.value.detail["reason"] == "provider_changed"
-
-    updated = merge_credentials(
+    changed = merge_credentials(
         existing,
         {"llm_model_name": "new-model", "llm_api_key": "••••••••"},
     )
-    assert updated["llm_api_key"] == "secret-one"
-    assert updated["llm_model_name"] == "new-model"
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(existing, changed)
+    assert caught.value.detail == {
+        "error": "provider_not_available",
+        "capability": "llm",
+        "provider": "openai",
+    }
+
+    echoed = merge_credentials(
+        existing,
+        {
+            "llm_provider": "openai",
+            "llm_api_url": "https://api.openai.com/v1",
+            "llm_api_key": "••••••••",
+            "llm_model_name": "old-model",
+        },
+    )
+    assert echoed == existing
+    validate_provider_availability(existing, echoed)
 
 
 def test_sequential_saves_preserve_capabilities_and_clean_stt_aliases() -> None:
@@ -203,15 +230,15 @@ def test_tts_configuration_is_operational_but_never_projected_to_cache(
 def test_multimodal_readiness_is_active_only_for_operational_providers(
     provider: str, expected_readiness: str
 ) -> None:
-    credentials = merge_credentials(
-        {},
-        {
-            "multimodal_provider": provider,
-            "multimodal_api_url": "https://multimodal.example/v1",
-            "multimodal_api_key": "fake-multimodal-key",
-            "multimodal_model_name": "some-audio-model",
-        },
-    )
+    # Readiness is deliberately outside the provider availability contract:
+    # preserve its legacy behavior for existing stored credentials, including
+    # removed providers that can no longer be submitted through the schema.
+    credentials = {
+        "multimodal_provider": provider,
+        "multimodal_api_url": "https://multimodal.example/v1",
+        "multimodal_api_key": "fake-multimodal-key",
+        "multimodal_model_name": "some-audio-model",
+    }
 
     status = credential_status(credentials)
     assert status["multimodal_readiness"] == expected_readiness

@@ -62,18 +62,29 @@ def _seed_evolution_credentials(
     tenant_id: UUID,
     instance_name: str,
 ) -> None:
-    """Save Evolution credentials for a tenant."""
-    resp = client.patch(
-        API_CRED_PATH,
-        json={
-            "whatsapp_provider": "evolution",
-            "evolution_api_url": "https://evolution.example.com",
-            "evolution_instance_name": instance_name,
-            "evolution_api_key": f"evk_{uuid4().hex}",
-        },
-        headers=_admin_headers(tenant_id),
-    )
-    assert resp.status_code == 200, resp.text
+    """Seed a persisted legacy Evolution credential row for webhook coverage."""
+    from src.models.clinic_config_table import ClinicConfigTable
+    from src.repositories.database import get_db_session
+
+    async def _run() -> None:
+        db = get_db_session()
+        try:
+            db.add(
+                ClinicConfigTable(
+                    tenant_id=tenant_id,
+                    api_credentials={
+                        "whatsapp_provider": "evolution",
+                        "evolution_api_url": "https://evolution.example.com",
+                        "evolution_instance_name": instance_name,
+                        "evolution_api_key": f"evk_{uuid4().hex}",
+                    },
+                )
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    client._submit(_run())  # type: ignore[attr-defined]
 
 
 def _evolution_text_payload(
@@ -182,15 +193,19 @@ class TestEvolutionPrivacyNotice:
         privacy_send = _fake_evolution_send_result("evo_privacy_id")
         reply_send = _fake_evolution_send_result("evo_reply_id")
 
-        with patch(
-            "src.api.routes.webhook._get_or_create_session",
-            new=AsyncMock(return_value=(uuid4(), True)),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_evolution_text",
-            new=AsyncMock(side_effect=[privacy_send, reply_send]),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), True)),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_evolution_text",
+                new=AsyncMock(side_effect=[privacy_send, reply_send]),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=True),
@@ -230,15 +245,19 @@ class TestEvolutionPrivacyNotice:
             message_id=f"evo_msg_{uuid4().hex[:8]}",
         )
 
-        with patch(
-            "src.api.routes.webhook._get_or_create_session",
-            new=AsyncMock(return_value=(uuid4(), False)),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_evolution_text",
-            new=AsyncMock(return_value=_fake_evolution_send_result()),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), False)),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_evolution_text",
+                new=AsyncMock(return_value=_fake_evolution_send_result()),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=True),
@@ -274,15 +293,19 @@ class TestEvolutionPrivacyNotice:
             message_id=f"evo_msg_{uuid4().hex[:8]}",
         )
 
-        with patch(
-            "src.api.routes.webhook._get_or_create_session",
-            new=AsyncMock(return_value=(uuid4(), True)),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_evolution_text",
-            new=AsyncMock(return_value=_fake_evolution_send_result()),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), True)),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_evolution_text",
+                new=AsyncMock(return_value=_fake_evolution_send_result()),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=False),
@@ -331,20 +354,26 @@ class TestEvolutionReplyIdNormalisation:
         async def _store_spy(sid, mid, db):
             stored_ids.append(mid)
 
-        with patch(
-            "src.api.routes.webhook._get_or_create_session",
-            new=AsyncMock(return_value=(uuid4(), False)),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_evolution_text",
-            new=AsyncMock(return_value=composite_send),
-        ), patch(
-            "src.api.routes.webhook._store_ai_msg_id_to_db",
-            new=AsyncMock(side_effect=_store_spy),
-        ), patch(
-            "src.api.routes.webhook._track_sent_message",
-        ) as mock_track:
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), False)),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_evolution_text",
+                new=AsyncMock(return_value=composite_send),
+            ),
+            patch(
+                "src.api.routes.webhook._store_ai_msg_id_to_db",
+                new=AsyncMock(side_effect=_store_spy),
+            ),
+            patch(
+                "src.api.routes.webhook._track_sent_message",
+            ) as mock_track,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock(

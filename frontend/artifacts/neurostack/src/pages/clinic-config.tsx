@@ -267,73 +267,6 @@ export function describeConfigSaveFailure(
     : `Não foi possível salvar a configuração (erro ${status}).`;
 }
 
-interface CredentialStatus {
-  // Z-API
-  zapi_instance_id:         string | null;
-  zapi_token_set:           boolean;
-  zapi_token_masked:        string | null;
-  // Z-API inbound capability token (one-time URL). The backend stores a
-  // salted SHA-256 digest so the raw token is never returned by the API.
-  zapi_inbound_token_digest_set?: boolean;
-  // Evolution API
-  whatsapp_provider:        string | null;
-  evolution_api_url:        string | null;
-  evolution_instance_name:  string | null;
-  evolution_api_key_set:    boolean;
-  evolution_api_key_masked: string | null;
-  // Meta Cloud API (WhatsApp Business — official)
-  meta_phone_number_id?:       string | null;
-  meta_waba_id?:               string | null;
-  meta_permanent_token_set?:   boolean;
-  meta_permanent_token_masked?: string | null;
-  meta_app_secret_set?:        boolean;
-  meta_app_secret_masked?:     string | null;
-  // Verify token is not a secret — the user must copy it into the Meta dashboard.
-  meta_verify_token?:          string | null;
-  // Uazapi (wuzapi-based, WhatsApp Web multi-device)
-  uazapi_api_url?:             string | null;
-  uazapi_instance_name?:       string | null;
-  uazapi_token_set?:           boolean;
-  uazapi_token_masked?:        string | null;
-  // LLM
-  llm_api_key_set:          boolean;
-  llm_api_key_masked:       string | null;
-  llm_base_url:             string | null;
-  llm_model_name:           string | null;
-  // Whisper (audio transcription)
-  whisper_api_key_set?:     boolean;
-  whisper_api_key_masked?:  string | null;
-  whisper_model?:           string | null;
-  // STT provider
-  stt_provider?:            string | null;
-  stt_api_url?:             string | null;
-  audio_max_seconds?:       number | null;
-  // Multimodal transcription (chat model that accepts audio directly)
-  multimodal_provider?:     string | null;
-  multimodal_api_url?:      string | null;
-  multimodal_model_name?:   string | null;
-  multimodal_api_key_set?:  boolean;
-  multimodal_api_key_masked?: string | null;
-  multimodal_readiness?:    string;
-  // TTS provider (operational for agent replies)
-  tts_provider?:            string | null;
-  tts_api_url?:             string | null;
-  tts_api_key_set?:         boolean;
-  tts_api_key_masked?:      string | null;
-  tts_model_name?:          string | null;
-  tts_voice_id?:            string | null;
-  tts_enabled?:             boolean | null;
-  tts_readiness?:           string;
-  apis_configured:          boolean;
-}
-interface ClinicSlim { clinic_id: number; clinic_name: string; }
-
-function StatusDot({ configured }: { configured: boolean }) {
-  return configured
-    ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
-    : <XCircle      className="h-3.5 w-3.5 text-slate-500 shrink-0" />;
-}
-
 type LlmProvider = "openai" | "dropout" | "slm_cortex" | "outros";
 type WhatsappProvider =
   | "meta_cloud"
@@ -342,7 +275,6 @@ type WhatsappProvider =
   | "zapi"
   | "evolution"
   | "uazapi";
-type WhatsappProviderGroup = "oficial" | "whatsapp_web";
 type SttProvider =
   | "openai_whisper"
   | "elevenlabs_scribe"
@@ -351,43 +283,15 @@ type SttProvider =
   | "microsoft_stt"
   | "outros";
 type TtsProvider = "elevenlabs" | "google";
-type MultimodalProvider = "openrouter" | "groq" | "openai";
-
-// Providers with operational runtime support today. Others are stored as
-// configuration only and surface a "Configuração apenas" badge in the UI.
-export const OPERATIONAL_STT_PROVIDERS: ReadonlySet<SttProvider> = new Set([
-  "outros",
-  "openai_whisper",
-]);
-
-// Mirror of `OPERATIONAL_MULTIMODAL_PROVIDERS` in
-// `src/services/api_credentials.py`. Only OpenRouter was measured against the
-// live API accepting the OGG/Opus WhatsApp delivers; the other two are stored
-// as configuration only, so only OpenRouter carries the "recommended" badge.
-export const OPERATIONAL_MULTIMODAL_PROVIDERS: ReadonlySet<MultimodalProvider> = new Set([
-  "openrouter",
-]);
+type MultimodalProvider = "openrouter";
 
 // Every canonical multimodal provider id declared in the backend allowlist
 // (`PROVIDER_ALLOWLISTS["multimodal"]` in `src/services/api_credentials.py`).
 export const MULTIMODAL_PROVIDERS: {
-  id: MultimodalProvider; label: string; sub: string; activeCls: string;
+  id: MultimodalProvider; label: string; sub: string;
 }[] = [
-  { id: "openrouter", label: "OpenRouter", sub: "Gemini / GPT-4o audio", activeCls: "border-emerald-500/50 text-emerald-400 bg-emerald-500/10" },
-  { id: "groq",       label: "Groq",       sub: "LPU inference",         activeCls: "border-orange-500/50 text-orange-400 bg-orange-500/10"   },
-  { id: "openai",     label: "OpenAI",     sub: "GPT-4o audio",          activeCls: "border-slate-500/50 text-slate-300 bg-slate-500/10"     },
+  { id: "openrouter", label: "OpenRouter", sub: "Gemini / GPT-4o audio" },
 ];
-
-// The multimodal API URL is DERIVED from the provider, never typed. Egress is
-// pinned to exactly these three hosts (`MULTIMODAL_*_HOSTS` in
-// `src/services/safe_egress.py`), so a free-text field could only ever hold one
-// of these values — and any other value would be accepted by PATCH and then
-// fail at runtime with `unsafe_api_url`. Deriving it removes that trap.
-export const MULTIMODAL_PROVIDER_API_URL: Record<MultimodalProvider, string> = {
-  openrouter: "https://openrouter.ai/api/v1",
-  groq:       "https://api.groq.com/openai/v1",
-  openai:     "https://api.openai.com/v1",
-};
 
 // Single source of truth for the 5 API capability blocks in the clinic-config
 // "API" tab. Each entry drives the block's short header name, its inline
@@ -395,6 +299,50 @@ export const MULTIMODAL_PROVIDER_API_URL: Record<MultimodalProvider, string> = {
 // the header. Any drift from this registry means the UI is showing something
 // the product spec never promised.
 export type ApiCapabilityId = "whatsapp" | "llm" | "stt" | "multimodal" | "tts";
+
+export type ProviderAvailability = "coming_soon";
+
+/**
+ * Frontend mirror of `PROVIDER_AVAILABILITY` in
+ * `src/services/api_credentials.py`.
+ *
+ * This literal is deliberately a closed 0/19 matrix: every displayed pair is
+ * unavailable for new configuration, and a future promotion must change both
+ * contracts together. Keeping it capability-keyed prevents a provider id
+ * being accidentally rendered under a different credential shape.
+ */
+export const API_PROVIDER_AVAILABILITY = {
+  whatsapp: {
+    meta_cloud: "coming_soon",
+    zapi: "coming_soon",
+    uazapi: "coming_soon",
+    evolution: "coming_soon",
+    dialog360: "coming_soon",
+    twilio: "coming_soon",
+  },
+  llm: {
+    dropout: "coming_soon",
+    openai: "coming_soon",
+    outros: "coming_soon",
+    slm_cortex: "coming_soon",
+  },
+  multimodal: {
+    openrouter: "coming_soon",
+  },
+  stt: {
+    outros: "coming_soon",
+    openai_whisper: "coming_soon",
+    elevenlabs_scribe: "coming_soon",
+    google_stt: "coming_soon",
+    deepgram_stt: "coming_soon",
+    microsoft_stt: "coming_soon",
+  },
+  tts: {
+    elevenlabs: "coming_soon",
+    google: "coming_soon",
+  },
+} as const satisfies Record<ApiCapabilityId, Readonly<Record<string, ProviderAvailability>>>;
+
 export const API_CAPABILITIES: readonly {
   id: ApiCapabilityId;
   short: string;
@@ -487,41 +435,19 @@ function configSaveCapability(fieldNames: readonly string[]): ApiCapabilityId | 
   return null;
 }
 
-const MULTIMODAL_PROVIDER_MODEL_PLACEHOLDER: Record<MultimodalProvider, string> = {
-  openrouter: "google/gemini-2.5-flash",
-  groq:       "whisper-large-v3",
-  openai:     "gpt-4o-audio-preview",
-};
-
-// Providers with a functional backend integration. Selecting any provider
-// outside this set still surfaces the credential form (per product design),
-// but saving returns a clear "not implemented" error from the backend.
-const IMPLEMENTED_WA_PROVIDERS: ReadonlySet<WhatsappProvider> = new Set(["meta_cloud", "zapi", "evolution", "uazapi"]);
-
-// Maps the frontend provider id to the webhook URL segment exposed by the
-// backend (e.g. Meta Cloud API is served at `/v1/webhook/meta`, not `/meta_cloud`).
-const WEBHOOK_SEGMENT: Partial<Record<WhatsappProvider, string>> = {
-  meta_cloud: "meta",
-  zapi:       "zapi",
-  evolution:  "evolution",
-  uazapi:     "uazapi",
-};
-
-const WA_PROVIDERS: {
+export const WA_PROVIDERS: {
   id: WhatsappProvider;
-  group: WhatsappProviderGroup;
   label: string;
   sub: string;
-  activeCls: string;
 }[] = [
   // Official WhatsApp Business API providers
-  { id: "meta_cloud", group: "oficial", label: "Meta Cloud API", sub: "by Meta (direct)",       activeCls: "border-[#25D366]/50 text-[#25D366] bg-[#25D366]/10" },
-  { id: "dialog360",  group: "oficial", label: "360dialog",      sub: "BSP oficial",            activeCls: "border-cyan-500/50 text-cyan-400 bg-cyan-500/10" },
-  { id: "twilio",     group: "oficial", label: "Twilio",         sub: "BSP oficial",            activeCls: "border-rose-500/50 text-rose-400 bg-rose-500/10" },
+  { id: "meta_cloud", label: "Meta Cloud API", sub: "by Meta (direct)" },
+  { id: "dialog360", label: "360dialog",      sub: "BSP oficial" },
+  { id: "twilio", label: "Twilio",         sub: "BSP oficial" },
   // WhatsApp Web / unofficial providers
-  { id: "zapi",       group: "whatsapp_web", label: "Z-API",         sub: "by Z-API.io",  activeCls: "border-emerald-500/50 text-emerald-400 bg-emerald-500/10" },
-  { id: "evolution",  group: "whatsapp_web", label: "Evolution API", sub: "Open Source",  activeCls: "border-purple-500/50 text-purple-400 bg-purple-500/10" },
-  { id: "uazapi",     group: "whatsapp_web", label: "Uazapi",        sub: "WhatsApp Web", activeCls: "border-orange-500/50 text-orange-400 bg-orange-500/10" },
+  { id: "zapi", label: "Z-API",         sub: "by Z-API.io" },
+  { id: "evolution", label: "Evolution API", sub: "Open Source" },
+  { id: "uazapi", label: "Uazapi",        sub: "WhatsApp Web" },
 ];
 
 const WA_PROVIDER_LABEL: Record<WhatsappProvider, string> = WA_PROVIDERS.reduce(
@@ -532,1473 +458,111 @@ const WA_PROVIDER_LABEL: Record<WhatsappProvider, string> = WA_PROVIDERS.reduce(
 // Every canonical STT provider id declared in the backend allowlist
 // (`PROVIDER_ALLOWLISTS["stt"]` in `src/services/api_credentials.py`) must be
 // represented here. Missing an id would break credential save/load parity.
-export const STT_PROVIDERS: { id: SttProvider; label: string; sub: string; activeCls: string }[] = [
-  { id: "openai_whisper",    label: "Whisper",    sub: "by OpenAI",         activeCls: "border-amber-500/50 text-amber-400 bg-amber-500/10"    },
-  { id: "elevenlabs_scribe", label: "Scribe",     sub: "by ElevenLabs",     activeCls: "border-orange-500/50 text-orange-400 bg-orange-500/10" },
-  { id: "google_stt",        label: "Cloud STT",  sub: "by Google",         activeCls: "border-sky-500/50 text-sky-400 bg-sky-500/10"          },
-  { id: "deepgram_stt",      label: "Deepgram",   sub: "by Deepgram",       activeCls: "border-emerald-500/50 text-emerald-400 bg-emerald-500/10" },
-  { id: "microsoft_stt",     label: "Azure STT",  sub: "by Microsoft",      activeCls: "border-blue-500/50 text-blue-400 bg-blue-500/10"       },
-  { id: "outros",            label: "Outros",     sub: "Groq / OpenRouter", activeCls: "border-slate-500/50 text-slate-300 bg-slate-500/10"    },
+export const STT_PROVIDERS: { id: SttProvider; label: string; sub: string }[] = [
+  { id: "openai_whisper",    label: "Whisper",    sub: "by OpenAI"    },
+  { id: "elevenlabs_scribe", label: "Scribe",     sub: "by ElevenLabs" },
+  { id: "google_stt",        label: "Cloud STT",  sub: "by Google"          },
+  { id: "deepgram_stt",      label: "Deepgram",   sub: "by Deepgram" },
+  { id: "microsoft_stt",     label: "Azure STT",  sub: "by Microsoft"       },
+  { id: "outros",            label: "Outros",     sub: "Groq / OpenRouter"    },
 ];
 
-export const TTS_PROVIDERS: { id: TtsProvider; label: string; sub: string; activeCls: string }[] = [
-  { id: "elevenlabs", label: "ElevenLabs",      sub: "Voz natural e humana", activeCls: "border-violet-500/50 text-violet-400 bg-violet-500/10" },
-  { id: "google",     label: "Google Cloud TTS", sub: "Escala e bom custo",   activeCls: "border-sky-500/50 text-sky-400 bg-sky-500/10"       },
+export const TTS_PROVIDERS: { id: TtsProvider; label: string; sub: string }[] = [
+  { id: "elevenlabs", label: "ElevenLabs",      sub: "Voz natural e humana" },
+  { id: "google",     label: "Google Cloud TTS", sub: "Escala e bom custo"       },
 ];
 
-const TTS_PROVIDER_DEFAULTS: Record<TtsProvider, { apiUrl: string; modelName: string; voiceId: string }> = {
-  elevenlabs: {
-    apiUrl: "https://api.elevenlabs.io/v1",
-    modelName: "eleven_multilingual_v2",
-    voiceId: "JBFqnCBsd6RMkjVDRZzb",
-  },
-  google: {
-    apiUrl: "https://texttospeech.googleapis.com/v1",
-    modelName: "pt-BR-Neural2-A",
-    voiceId: "",
-  },
-};
-
-const PROVIDER_DEFAULT_STT_URL: Partial<Record<SttProvider, string>> = {
-  openai_whisper:    "https://api.openai.com/v1",
-  elevenlabs_scribe: "https://api.elevenlabs.io/v1",
-  // google_stt: incompatible API format — no default URL
-  // outros: user-provided — no default
-};
-
-// `comingSoon` providers are display-only: they render a "Em breve" badge,
-// cannot be selected and are never included in a PATCH body. The backend
-// rejects `slm_cortex` writes today (see `_llm_operational` in
-// `src/services/api_credentials.py`), so the UI must not send it either.
+// The display catalog is intentionally availability-agnostic: the canonical
+// all-coming-soon state lives in API_PROVIDER_AVAILABILITY above.
 export const PROVIDERS: {
   id: LlmProvider;
   label: string;
   sub: string;
-  activeCls: string;
-  comingSoon?: boolean;
 }[] = [
-  { id: "slm_cortex", label: "SLM Cortex", sub: "by NeuroStack", activeCls: "border-violet-500/50 text-violet-400 bg-violet-500/10",  comingSoon: true },
-  { id: "dropout",    label: "Dropout",    sub: "by Neuralake",  activeCls: "border-blue-500/50 text-blue-400 bg-blue-500/10"         },
-  { id: "openai",     label: "GPT",        sub: "by OpenAI",     activeCls: "border-emerald-500/50 text-emerald-400 bg-emerald-500/10"},
-  { id: "outros",     label: "Outros",     sub: "Custom / OSS",  activeCls: "border-slate-500/50 text-slate-300 bg-slate-500/10"     },
+  { id: "slm_cortex", label: "SLM Cortex", sub: "by NeuroStack" },
+  { id: "dropout",    label: "Dropout",    sub: "by Neuralake" },
+  { id: "openai",     label: "GPT",        sub: "by OpenAI" },
+  { id: "outros",     label: "Outros",     sub: "Custom / OSS" },
 ];
 
-// Set of LLM provider ids that can be selected AND sent in a PATCH body.
-// Anything outside this set (currently `slm_cortex`) is treated as unset and
-// silently dropped from the PATCH payload.
-export const SELECTABLE_LLM_PROVIDERS: ReadonlySet<LlmProvider> = new Set(
-  PROVIDERS.filter(p => !p.comingSoon).map(p => p.id),
-);
+type ProviderDisplay = { id: string; label: string; sub: string };
 
-function inferProvider(url: string | null): LlmProvider {
-  if (!url) return "openai";
-  if (url.includes("neuralake")) return "dropout";
-  if (url.includes("neurostack") || url.includes("cortex")) return "slm_cortex";
-  if (url.includes("openai.com")) return "openai";
-  return "outros";
+function providersForCapability(capability: ApiCapabilityId): readonly ProviderDisplay[] {
+  switch (capability) {
+    case "whatsapp": return WA_PROVIDERS;
+    case "llm": return PROVIDERS;
+    case "stt": return STT_PROVIDERS;
+    case "multimodal": return MULTIMODAL_PROVIDERS;
+    case "tts": return TTS_PROVIDERS;
+  }
 }
 
-const PROVIDER_DEFAULT_URL: Record<LlmProvider, string> = {
-  openai:     "https://api.openai.com/v1",
-  dropout:    "https://api.neuralake.cloud/v1",
-  slm_cortex: "",
-  outros:     "",
-};
-
-function ApiInput({
-  label, value, onChange, type = "text", placeholder, disabled, configured, mono,
-}: {
-  label: string; value: string; onChange?: (v: string) => void; type?: string;
-  placeholder?: string; disabled?: boolean; configured?: boolean; mono?: boolean;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-        {configured && <span className="text-emerald-400 ml-1.5">● configurado</span>}
-      </label>
-      <input
-        type={type}
-        value={value}
-        onChange={e => onChange?.(e.target.value)}
-        placeholder={placeholder}
-        disabled={disabled}
-        className={`w-full rounded-md border border-border bg-background px-3 py-1.5 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent disabled:opacity-50 disabled:cursor-not-allowed transition-opacity ${mono ? "font-mono" : ""}`}
-      />
-    </div>
-  );
-}
-
-function ProviderCard({
-  wp, active, disabled, onClick,
-}: {
-  wp: { id: WhatsappProvider; label: string; sub: string; activeCls: string };
-  active: boolean;
-  disabled?: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      data-testid={`whatsapp-card-${wp.id}`}
-      data-provider-id={wp.id}
-      disabled={disabled}
-      onClick={onClick}
-      className={`flex flex-col items-start rounded-lg border px-3 py-2.5 text-left transition-all disabled:opacity-60 disabled:cursor-not-allowed ${
-        active
-          ? wp.activeCls + " border-2"
-          : "border-border text-muted-foreground hover:border-muted-foreground/50"
-      }`}
-    >
-      <span className="text-xs font-bold">{wp.label}</span>
-      <span className="text-[10px] opacity-70 mt-0.5">{wp.sub}</span>
-    </button>
-  );
-}
-
-function UnimplementedProviderNotice({ provider }: { provider: WhatsappProvider }) {
-  const label = WA_PROVIDER_LABEL[provider] ?? provider;
-  return (
-    <div className="rounded-md border border-dashed border-amber-500/40 bg-amber-500/5 px-3 py-3 space-y-1.5">
-      <div className="flex items-center gap-2 text-amber-500">
-        <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-        <p className="text-[11px] font-semibold uppercase tracking-wider">
-          {label} — provedor ainda não implementado
-        </p>
-      </div>
-      <p className="text-[11px] text-muted-foreground">
-        Este provedor aparece aqui como opção, mas o backend ainda não implementa a integração.
-        Tentar salvar retornará um erro claro. Use <span className="font-semibold">Meta Cloud API</span>,
-        <span className="font-semibold"> Z-API</span> ou <span className="font-semibold">Evolution API</span>
-        {" "}enquanto isso.
-      </p>
-    </div>
-  );
-}
-
-/**
- * Generate a URL-safe base64 token and its SHA-256 hex digest using the Web
- * Crypto API. The raw token is intended to be displayed to the operator
- * exactly once — the digest is what we PATCH to the backend so the plaintext
- * value never leaves the browser.
- */
-async function generateZapiCapabilityToken(): Promise<{ rawToken: string; digest: string }> {
-  const bytes = crypto.getRandomValues(new Uint8Array(32));
-  // Convert to a URL-safe base64 string without padding.
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  const rawToken = btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=/g, "");
-  const hashBuf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(rawToken));
-  const digest = Array.from(new Uint8Array(hashBuf))
-    .map(b => b.toString(16).padStart(2, "0"))
-    .join("");
-  return { rawToken, digest };
-}
-
-export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
+export function ApiCredentialsForm(_: {
   clinicId: string; isReadOnly: boolean; isSuperAdmin: boolean;
 }) {
-  const { toast } = useToast();
   const { locale } = useI18n();
-  const txt = (p: string, e: string) => locale === "en" ? e : p;
-  const [clinics, setClinics]               = useState<ClinicSlim[]>([]);
-  const [selectedClinicId, setSelectedClinicId] = useState<string>(clinicId);
-  const [status, setStatus]                 = useState<CredentialStatus | null>(null);
-  const [loading, setLoading]               = useState(false);
-  const [saving, setSaving]                 = useState(false);
-  const [error, setError]                   = useState<string | null>(null);
-  const [copiedWebhook, setCopiedWebhook]   = useState(false);
-  const [copiedVerifyToken, setCopiedVerifyToken] = useState(false);
+  const comingSoonLabel = locale === "en" ? "COMING SOON" : "EM BREVE";
 
-  // WhatsApp provider selector
-  const [waProvider, setWaProvider]         = useState<WhatsappProvider>("zapi");
-
-  // Z-API fields
-  const [zapiInstanceId, setZapiInstanceId] = useState("");
-  const [zapiToken, setZapiToken]           = useState("");
-  const [zapiClientToken, setZapiClientToken] = useState("");
-  // One-time capability URL for inbound Z-API webhooks. The raw token is
-  // generated in the browser, hashed to SHA-256, and only the hex digest is
-  // sent to the backend. The raw value is displayed exactly once and then
-  // cleared from memory. We deliberately do NOT persist it to
-  // localStorage/sessionStorage/URL/history so the token cannot be recovered.
-  const [zapiInboundRawToken, setZapiInboundRawToken] = useState<string>("");
-
-  // Evolution API fields
-  const [evolApiUrl, setEvolApiUrl]           = useState("");
-  const [evolInstanceName, setEvolInstanceName] = useState("");
-  const [evolApiKey, setEvolApiKey]           = useState("");
-
-  // Meta Cloud API fields
-  const [metaPhoneNumberId, setMetaPhoneNumberId] = useState("");
-  const [metaWabaId, setMetaWabaId]               = useState("");
-  const [metaPermanentToken, setMetaPermanentToken] = useState("");
-  const [metaAppSecret, setMetaAppSecret]         = useState("");
-
-  // Uazapi fields
-  const [uazapiApiUrl, setUazapiApiUrl]               = useState("");
-  const [uazapiToken, setUazapiToken]                 = useState("");
-  const [uazapiInstanceName, setUazapiInstanceName]   = useState("");
-
-  // LLM
-  const [llmProvider, setLlmProvider]       = useState<LlmProvider>("openai");
-  const [llmApiKey, setLlmApiKey]           = useState("");
-  const [llmApiUrl, setLlmApiUrl]           = useState("");
-  const [llmModelName, setLlmModelName]     = useState("");
-  const [llmFallback, setLlmFallback]       = useState<"openai" | "dropout">("dropout");
-
-  // STT (audio transcription)
-  const [sttProvider, setSttProvider]       = useState<SttProvider>("outros");
-  const [sttApiKey, setSttApiKey]           = useState("");
-  const [sttApiUrl, setSttApiUrl]           = useState("");
-  const [sttModelName, setSttModelName]     = useState("");
-  const [audioMaxSeconds, setAudioMaxSeconds] = useState(60);
-
-  // Multimodal transcription. The API URL is derived from the provider and
-  // never edited, so there is no `multimodalApiUrl` state to keep in sync.
-  const [multimodalProvider, setMultimodalProvider] = useState<MultimodalProvider>("openrouter");
-  const [multimodalApiKey, setMultimodalApiKey]     = useState("");
-  const [multimodalModelName, setMultimodalModelName] = useState("");
-  const [multimodalDirty, setMultimodalDirty]      = useState(false);
-  // True once the user switched providers on an already-saved bundle: the
-  // backend then demands a fresh key (`fresh_api_key_required`), so the UI has
-  // to say so before the save is attempted.
-  const [multimodalNeedsFreshKey, setMultimodalNeedsFreshKey] = useState(false);
-
-  // TTS for agent replies. Disabled by default so saving credentials alone
-  // never changes the patient experience.
-  const [ttsProvider, setTtsProvider]         = useState<TtsProvider>("elevenlabs");
-  const [ttsApiKey, setTtsApiKey]             = useState("");
-  const [ttsApiUrl, setTtsApiUrl]             = useState("");
-  const [ttsModelName, setTtsModelName]       = useState("");
-  const [ttsVoiceId, setTtsVoiceId]           = useState("");
-  const [ttsEnabled, setTtsEnabled]           = useState(false);
-  const [ttsDirty, setTtsDirty]               = useState(false);
-
-  useEffect(() => {
-    if (!isSuperAdmin) return;
-    void fetch(`/v1/admin/clinics`, { headers: { Authorization: `Bearer ${getToken()}` } })
-      .then(r => r.json()).then((d: ClinicSlim[]) => setClinics(d)).catch(() => {});
-  }, [isSuperAdmin]);
-
-  const targetId   = isSuperAdmin ? selectedClinicId : clinicId;
-  const webhookSegment = WEBHOOK_SEGMENT[waProvider];
-  const webhookUrl = webhookSegment ? `${window.location.origin}/v1/webhook/${webhookSegment}` : "";
-  const providerImplemented = IMPLEMENTED_WA_PROVIDERS.has(waProvider);
-
-  const fetchStatus = useCallback(async () => {
-    setLoading(true); setError(null);
-    try {
-      const res = await fetch(`/v1/config/api-credentials?clinic_id=${targetId}`, {
-        headers: { Authorization: `Bearer ${getToken()}` },
-      });
-      if (!res.ok) { setError("Erro ao carregar configurações."); return; }
-      const data = await res.json() as CredentialStatus;
-      setStatus(data);
-      // WhatsApp provider + fields
-      const savedWaProvider = (data.whatsapp_provider ?? "zapi") as WhatsappProvider;
-      setWaProvider(savedWaProvider);
-      setZapiInstanceId(data.zapi_instance_id ?? "");
-      setEvolApiUrl(data.evolution_api_url ?? "");
-      setEvolInstanceName(data.evolution_instance_name ?? "");
-      // Meta Cloud API — non-secret identifiers pre-fill; secret fields stay
-      // empty so the "manter atual" placeholder shows when already saved.
-      setMetaPhoneNumberId(data.meta_phone_number_id ?? "");
-      setMetaWabaId(data.meta_waba_id ?? "");
-      setMetaPermanentToken("");
-      setMetaAppSecret("");
-      // Uazapi — non-secret identifiers pre-fill; token stays empty so
-      // "manter atual" placeholder shows when already saved.
-      setUazapiApiUrl(data.uazapi_api_url ?? "");
-      setUazapiInstanceName(data.uazapi_instance_name ?? "");
-      setUazapiToken("");
-      // LLM — coerce any non-selectable provider (e.g. slm_cortex, coming
-      // soon) to the safe default so the UI never enters an unreachable state
-      // and the PATCH body never carries a rejected provider id.
-      const inferredProvider = inferProvider(data.llm_base_url);
-      const effectiveLlmProvider: LlmProvider = SELECTABLE_LLM_PROVIDERS.has(inferredProvider)
-        ? inferredProvider
-        : "openai";
-      setLlmModelName(effectiveLlmProvider === "dropout" ? "text" : (data.llm_model_name ?? ""));
-      setLlmProvider(effectiveLlmProvider);
-      setLlmApiUrl(data.llm_base_url ?? PROVIDER_DEFAULT_URL[effectiveLlmProvider]);
-      // WhatsApp secret fields: left empty so the placeholder "••••••••• (manter atual)"
-      // appears when a token is already set. On save, empty = not sent → COALESCE
-      // in the UPDATE preserves the existing encrypted value in the DB.
-      setZapiToken("");
-      setEvolApiKey("");
-      // LLM API key: send partial mask (sk-pro****9xyz) so the user can visually
-      // confirm which key is configured. Backend detects "****" and skips update.
-      setLlmApiKey(data.llm_api_key_masked ?? "");
-      // STT (audio transcription)
-      const savedSttProvider = (data.stt_provider as SttProvider) ?? "outros";
-      setSttProvider(savedSttProvider);
-      setSttApiKey(data.whisper_api_key_masked ?? "");
-      setSttApiUrl(data.stt_api_url || PROVIDER_DEFAULT_STT_URL[savedSttProvider] || "");
-      setSttModelName(data.whisper_model ?? "");
-      setAudioMaxSeconds(Number(data.audio_max_seconds) || 60);
-      // Multimodal — an unknown/absent provider falls back to the recommended
-      // one without implying a saved configuration (see `multimodalDirty`).
-      // The masked key is echoed back so the operator can see a key is stored;
-      // the mask is stripped from the PATCH body on save.
-      const hasSavedMultimodalProvider = MULTIMODAL_PROVIDERS.some(p => p.id === data.multimodal_provider);
-      setMultimodalProvider(hasSavedMultimodalProvider
-        ? data.multimodal_provider as MultimodalProvider
-        : "openrouter");
-      setMultimodalApiKey(data.multimodal_api_key_masked ?? "");
-      setMultimodalModelName(hasSavedMultimodalProvider ? (data.multimodal_model_name ?? "") : "");
-      setMultimodalDirty(false);
-      setMultimodalNeedsFreshKey(false);
-      // TTS secrets never pre-fill. Unknown/retired provider ids fall back to
-      // ElevenLabs without silently submitting a new TTS configuration.
-      const hasSavedTtsProvider = TTS_PROVIDERS.some(p => p.id === data.tts_provider);
-      const savedTtsProvider = hasSavedTtsProvider
-        ? data.tts_provider as TtsProvider
-        : "elevenlabs";
-      setTtsProvider(savedTtsProvider);
-      setTtsApiKey("");
-      setTtsApiUrl(hasSavedTtsProvider ? (data.tts_api_url ?? TTS_PROVIDER_DEFAULTS[savedTtsProvider].apiUrl) : "");
-      setTtsModelName(hasSavedTtsProvider ? (data.tts_model_name ?? "") : "");
-      setTtsVoiceId(data.tts_voice_id ?? TTS_PROVIDER_DEFAULTS[savedTtsProvider].voiceId);
-      setTtsEnabled(data.tts_enabled === true);
-      setTtsDirty(false);
-    } catch { setError("Erro de rede."); }
-    finally { setLoading(false); }
-  }, [targetId]);
-
-  useEffect(() => { void fetchStatus(); }, [fetchStatus]);
-
-  const handleSave = async () => {
-    setSaving(true); setError(null);
-    // Pre-generated Z-API capability token (raw + digest). Kept in the local
-    // scope of this save call so the raw token is only ever surfaced through
-    // the "one-time URL" panel below on success and never leaks otherwise.
-    let generatedZapiCapability: { rawToken: string; digest: string } | null = null;
-    try {
-      // Clinic scope belongs exclusively to the query string. Sending
-      // clinic_id in this strict credential payload is rejected as an extra
-      // field by the backend.
-      // `null` is a meaningful value here, not an absence: `exclude_unset` on
-      // the backend keeps an explicit null in the patch, so it clears a stored
-      // field, whereas an omitted key preserves it.
-      const body: Record<string, string | number | boolean | null> = {};
-      // WhatsApp provider selection — always send to persist the chosen provider
-      body["whatsapp_provider"] = waProvider;
-      if (waProvider === "zapi") {
-        if (zapiInstanceId)  body["zapi_instance_id"]  = zapiInstanceId;
-        if (zapiToken)       body["zapi_token"]        = zapiToken;
-        if (zapiClientToken) body["zapi_client_token"] = zapiClientToken;
-        // Rotate the inbound capability token whenever the user saves a new
-        // Z-API instance token. The raw value is only kept in the closure so
-        // the "one-time URL" panel can render it on success — nothing is ever
-        // written to localStorage/sessionStorage/URL/history.
-        if (zapiToken) {
-          generatedZapiCapability = await generateZapiCapabilityToken();
-          body["zapi_inbound_token_digest"] = generatedZapiCapability.digest;
-        }
-      } else if (waProvider === "evolution") {
-        if (evolApiUrl)      body["evolution_api_url"]      = evolApiUrl;
-        if (evolInstanceName) body["evolution_instance_name"] = evolInstanceName;
-        if (evolApiKey)      body["evolution_api_key"]      = evolApiKey;
-      } else if (waProvider === "meta_cloud") {
-        if (metaPhoneNumberId)  body["meta_phone_number_id"]  = metaPhoneNumberId;
-        if (metaWabaId)         body["meta_waba_id"]          = metaWabaId;
-        if (metaPermanentToken) body["meta_permanent_token"]  = metaPermanentToken;
-        if (metaAppSecret)      body["meta_app_secret"]       = metaAppSecret;
-      } else if (waProvider === "uazapi") {
-        if (uazapiApiUrl)       body["uazapi_api_url"]        = uazapiApiUrl;
-        if (uazapiInstanceName) body["uazapi_instance_name"]  = uazapiInstanceName;
-        // Skip masked tokens (e.g. "abcd****wxyz") — send only real values
-        // typed by the user so the backend can preserve the existing secret
-        // via COALESCE when the field is omitted.
-        if (uazapiToken && !uazapiToken.includes("*") && !uazapiToken.includes("•"))
-          body["uazapi_token"] = uazapiToken;
-      }
-      // dialog360 / twilio: no per-provider fields yet; the backend
-      // will reject the save with a "provider_not_implemented" error handled
-      // in the error branch below (never a silent success).
-      // Only send LLM api key if the user actually typed a new one (non-empty)
-      if (llmApiKey)      body["llm_api_key"]       = llmApiKey;
-      // Never send non-selectable providers (slm_cortex is display-only and
-      // the backend rejects the write). Silently skip the LLM block entirely
-      // when the current selection is not operational.
-      if (SELECTABLE_LLM_PROVIDERS.has(llmProvider)) {
-        body["llm_api_url"]  = llmApiUrl || PROVIDER_DEFAULT_URL[llmProvider];
-        body["llm_provider"] = llmProvider;
-        if (llmProvider === "dropout") body["llm_model_name"] = "text";
-        else if (llmModelName && (llmProvider === "openai" || llmProvider === "outros")) body["llm_model_name"] = llmModelName;
-      }
-      // STT (audio transcription)
-      body["stt_provider"]     = sttProvider;
-      // Canonical field, never the legacy `whisper_model` alias: the backend
-      // only clears the stale alias when the patch carries `stt_model_name`
-      // (`api_credentials.py:277-278`), so sending the alias here would let an
-      // old canonical value silently keep winning. `null`, not "", because the
-      // field is `Identifier` with min_length=1 and a brand-new clinic that
-      // never touched STT has this state empty — that empty string 422s on
-      // every save, including saves unrelated to STT.
-      body["stt_model_name"]   = sttModelName || null;
-      body["audio_max_seconds"] = audioMaxSeconds;
-      if (sttApiKey && !sttApiKey.includes("•") && !sttApiKey.includes("*"))
-        body["whisper_api_key"] = sttApiKey;
-      // Always send stt_api_url so the backend can clear a stale value.
-      // `null`, not "", for the same min_length=1 reason as stt_model_name
-      // above — both the empty and the google_stt (no URL) case need `null`.
-      body["stt_api_url"] = sttProvider !== "google_stt" ? (sttApiUrl || null) : null;
-      // Multimodal transcription. Submitted only after the user edits this
-      // capability so an unrelated API save never creates an implicit provider
-      // selection. The URL is derived from the provider, never typed.
-      if (multimodalDirty) {
-        const freshMultimodalKey = multimodalApiKey
-          && !multimodalApiKey.includes("•")
-          && !multimodalApiKey.includes("*");
-        // Changing the provider changes the derived URL too, so the backend
-        // requires fresh key material (`fresh_api_key_required`). Say it here
-        // in plain language instead of letting the operator hit a 422.
-        if (multimodalNeedsFreshKey && !freshMultimodalKey) {
-          const msg = txt(
-            "Informe a API Key do novo provedor multimodal — trocar de provedor exige uma chave nova.",
-            "Enter the API key for the new multimodal provider — switching providers requires a new key.",
-          );
-          setError(msg);
-          toast({ title: txt("Erro ao salvar", "Could not save"), description: msg, variant: "destructive" });
-          return;
-        }
-        body["multimodal_provider"] = multimodalProvider;
-        body["multimodal_api_url"] = MULTIMODAL_PROVIDER_API_URL[multimodalProvider];
-        if (freshMultimodalKey) body["multimodal_api_key"] = multimodalApiKey;
-        // Always send the model name — like `stt_api_url` above — so the
-        // backend can clear a stale value. Switching provider resets this
-        // field to "", and omitting it would let the previous provider's model
-        // survive the merge, producing a bundle that looks `active` but fails
-        // on the first real voice note. `null` (never "") is what clears it:
-        // the field is `Identifier` with min_length=1, so "" would 422 while
-        // None merges through and drops readiness to an honest `incomplete`.
-        body["multimodal_model_name"] = multimodalModelName || null;
-      }
-      // Submit TTS only after an explicit edit so unrelated saves preserve the
-      // existing bundle. `tts_enabled` makes voice replies opt-in.
-      if (ttsDirty) {
-        const hasTtsKey = Boolean(ttsApiKey) || Boolean(status?.tts_api_key_set);
-        const effectiveModel = ttsModelName || TTS_PROVIDER_DEFAULTS[ttsProvider].modelName;
-        const effectiveVoiceId = ttsVoiceId || TTS_PROVIDER_DEFAULTS[ttsProvider].voiceId;
-        if (ttsEnabled && (!hasTtsKey || !effectiveModel || (ttsProvider === "elevenlabs" && !effectiveVoiceId))) {
-          const msg = txt(
-            "Complete a API Key, o modelo e a voz antes de ativar respostas em áudio.",
-            "Complete the API key, model and voice before enabling audio replies.",
-          );
-          setError(msg);
-          toast({ title: txt("Erro ao salvar", "Could not save"), description: msg, variant: "destructive" });
-          return;
-        }
-        body["tts_provider"] = ttsProvider;
-        body["tts_api_url"] = ttsApiUrl || TTS_PROVIDER_DEFAULTS[ttsProvider].apiUrl;
-        if (ttsApiKey && !ttsApiKey.includes("â€¢") && !ttsApiKey.includes("*"))
-          body["tts_api_key"] = ttsApiKey;
-        body["tts_model_name"] = effectiveModel;
-        body["tts_voice_id"] = ttsProvider === "elevenlabs" ? effectiveVoiceId : null;
-        body["tts_enabled"] = ttsEnabled;
-      }
-      const saveUrl = targetId
-        ? `/v1/config/api-credentials?clinic_id=${targetId}`
-        : `/v1/config/api-credentials`;
-      const res = await fetch(saveUrl, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${getToken()}` },
-        body: JSON.stringify(body),
-      });
-      const data = await res.json() as {
-        ok?: boolean;
-        apis_configured?: boolean;
-        error?: string;
-        // FastAPI wraps HTTPException payloads under `detail` — this covers the
-        // structured errors returned by the backend (provider_not_implemented,
-        // meta_phone_number_id_conflict, etc.).
-        detail?: string | {
-          error?: string;
-          message?: string;
-          provider?: string;
-          capability?: string;
-          field?: string;
-          fields?: unknown[];
-        };
-      };
-      if (!res.ok) {
-        const errMsg = describeConfigSaveFailure(data, res.status, locale);
-        setError(errMsg);
-        toast({ title: "Erro ao salvar", description: errMsg, variant: "destructive" });
-        return;
-      }
-      toast({ title: "Configurações salvas!", description: data.apis_configured ? "APIs totalmente configuradas ✓" : "Parcialmente configurado." });
-      // Surface the raw capability token ONCE, only after the PATCH succeeded.
-      // The digest was already persisted server-side, so the raw value is
-      // useless to anyone but the operator viewing this exact response.
-      if (generatedZapiCapability) {
-        setZapiInboundRawToken(generatedZapiCapability.rawToken);
-      }
-      await fetchStatus();
-    } catch { setError("Erro de rede."); }
-    finally { setSaving(false); }
-  };
-
-  /**
-   * Explicit dismiss of the one-time Z-API capability URL panel. Clears the
-   * raw token from React state so it cannot be re-rendered or read from a
-   * DOM inspector after the panel unmounts.
-   */
-  const dismissZapiInboundRawToken = () => setZapiInboundRawToken("");
-
-  function copyWebhook() {
-    navigator.clipboard.writeText(webhookUrl).catch(() => {});
-    setCopiedWebhook(true);
-    setTimeout(() => setCopiedWebhook(false), 2000);
-  }
-
-  function copyVerifyToken() {
-    const tok = status?.meta_verify_token;
-    if (!tok) return;
-    navigator.clipboard.writeText(tok).catch(() => {});
-    setCopiedVerifyToken(true);
-    setTimeout(() => setCopiedVerifyToken(false), 2000);
-  }
-
-  // `slm_cortex` is display-only and forcibly coerced to a real provider at
-  // load-time; the two flags below remain as `false` sentinels because a
-  // handful of downstream branches used to depend on them.
-  const isCortex     = false;
-  const isOutros     = llmProvider === "outros";
-  const isComingSoon = false;
-
+  // This surface intentionally has no credential fetch or PATCH workflow.
+  // A legacy saved provider is never normalized to a new default, so viewing
+  // this tab cannot turn a read into an accidental state transition.
   return (
-    <div className="space-y-5" data-testid="api-settings-section">
+    <section className="space-y-5" data-testid="api-settings-section">
+      <p className="text-sm text-muted-foreground" data-testid="api-settings-legacy-state-note">
+        {locale === "en"
+          ? "Existing API settings are preserved. New provider configuration is coming soon."
+          : "As configurações de API existentes são preservadas. A configuração de novos provedores estará disponível em breve."}
+      </p>
 
-      {/* ── Super admin clinic picker ── */}
-      {isSuperAdmin && clinics.length > 0 && (
-        <div className="space-y-1.5">
-          <label className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Ver clínica</label>
-          <select
-            value={selectedClinicId}
-            onChange={e => setSelectedClinicId(e.target.value)}
-            className="w-full rounded-md border border-border bg-background text-sm px-3 py-2 focus:outline-none focus:ring-1 focus:ring-accent"
+      {API_CAPABILITIES.map((capability) => {
+        const providers = providersForCapability(capability.id);
+        const availability = API_PROVIDER_AVAILABILITY[capability.id];
+
+        return (
+          <div
+            key={capability.id}
+            className="space-y-3 rounded-lg border border-slate-700/50 bg-muted/20 p-4"
+            data-testid={`api-capability-${capability.id}`}
           >
-            {clinics.map(c => (
-              <option key={c.clinic_id} value={c.clinic_id}>{c.clinic_name} (ID {c.clinic_id})</option>
-            ))}
-          </select>
-        </div>
-      )}
-
-      {/* ── Webhook URL (only when provider has a functional backend) ── */}
-      {webhookUrl && (
-        <div className="rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50/60 dark:bg-blue-950/30 p-4 space-y-3">
-          <div className="flex items-center gap-2">
-            <Link2 className="h-4 w-4 text-blue-500 shrink-0" />
-            <p className="text-[11px] font-semibold uppercase tracking-wider text-blue-700 dark:text-blue-400">
-              Webhook URL - {WA_PROVIDER_LABEL[waProvider]}
-            </p>
-            {status && (
-              <span className={`ml-auto text-[10px] font-bold px-2 py-0.5 rounded-full border ${status.apis_configured ? "bg-emerald-500/15 text-emerald-500 border-emerald-500/30" : "bg-amber-500/15 text-amber-500 border-amber-500/30"}`}>
-                {status.apis_configured ? "Configurado" : "Pendente"}
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                {capability.short}
+              </p>
+              <span
+                data-testid={`capability-requirement-${capability.id}`}
+                className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/80"
+              >
+                {capability.required
+                  ? locale === "en" ? "Required" : "obrigatório"
+                  : locale === "en" ? "Optional" : "opcional"}
               </span>
-            )}
-          </div>
-          <div className="space-y-1">
-            <label className="text-xs text-muted-foreground">
-              Cole na configuração de webhooks do {WA_PROVIDER_LABEL[waProvider]}
-            </label>
-            <div className="flex gap-2">
-              <input
-                readOnly value={webhookUrl}
-                onClick={e => (e.target as HTMLInputElement).select()}
-                className="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-mono text-foreground cursor-text focus:outline-none focus:ring-1 focus:ring-accent"
-              />
-              <button type="button" onClick={copyWebhook}
-                className="inline-flex items-center gap-1.5 rounded-md border border-blue-300 dark:border-blue-700 bg-white dark:bg-blue-900/20 px-3 py-1.5 text-xs font-medium text-blue-700 dark:text-blue-300 hover:bg-blue-50 dark:hover:bg-blue-900/40 transition-colors shrink-0"
-              >
-                {copiedWebhook
-                  ? <><Check className="h-3.5 w-3.5 text-emerald-500" /> Copiado!</>
-                  : <><Copy className="h-3.5 w-3.5" /> Copiar URL</>}
-              </button>
             </div>
-          </div>
-        </div>
-      )}
-
-      {loading && <div className="flex items-center gap-2 text-muted-foreground text-sm"><Loader2 className="h-4 w-4 animate-spin" /> Carregando...</div>}
-
-      {/* ── Status dots ── */}
-      {status && !loading && (
-        <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
-          {waProvider === "zapi" && (
-            <>
-              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.zapi_instance_id} /> Z-API Instance</span>
-              <span className="flex items-center gap-1.5"><StatusDot configured={status.zapi_token_set} /> Z-API Token</span>
-            </>
-          )}
-          {waProvider === "evolution" && (
-            <>
-              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.evolution_api_url} /> Evol. API URL</span>
-              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.evolution_instance_name} /> Instance Name</span>
-              <span className="flex items-center gap-1.5"><StatusDot configured={status.evolution_api_key_set} /> Evol. API Key</span>
-            </>
-          )}
-          {waProvider === "meta_cloud" && (
-            <>
-              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.meta_phone_number_id} /> Phone Number ID</span>
-              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.meta_waba_id} /> WABA ID</span>
-              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.meta_permanent_token_set} /> Permanent Token</span>
-              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.meta_verify_token} /> Verify Token</span>
-            </>
-          )}
-          {waProvider === "uazapi" && (
-            <>
-              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.uazapi_api_url} /> Uazapi API URL</span>
-              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.uazapi_instance_name} /> Instance Name</span>
-              <span className="flex items-center gap-1.5"><StatusDot configured={!!status.uazapi_token_set} /> Uazapi Token</span>
-            </>
-          )}
-          {!providerImplemented && (
-            <span className="flex items-center gap-1.5 text-amber-500">
-              <AlertTriangle className="h-3.5 w-3.5" /> Provedor ainda não implementado
-            </span>
-          )}
-          <span className="flex items-center gap-1.5"><StatusDot configured={status.llm_api_key_set} /> LLM API Key</span>
-          <span className="flex items-center gap-1.5"><StatusDot configured={!!status.llm_base_url} /> LLM URL</span>
-          {llmProvider === "openai" && (
-            <span className="flex items-center gap-1.5"><StatusDot configured={!!status.llm_model_name} /> Model Name</span>
-          )}
-        </div>
-      )}
-
-      {/* ── API WhatsApp ── */}
-      <div className="space-y-5 rounded-lg border border-slate-700/50 bg-muted/20 p-4">
-
-        {/* Section header */}
-        <div className="flex flex-wrap items-center gap-2">
-          <MessageSquare className="h-3.5 w-3.5 text-[#25D366]" />
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">{apiCapability("whatsapp").short}</p>
-          <span
-            data-testid="capability-requirement-whatsapp"
-            className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/80"
-          >
-            {apiCapability("whatsapp").required ? txt("obrigatório", "Required") : txt("opcional", "Optional")}
-          </span>
-          <span className="ml-auto text-[10px] font-bold px-1.5 py-0.5 rounded border bg-[#25D366]/10 text-[#25D366] border-[#25D366]/30">Ativo</span>
-        </div>
-
-        <p className="text-[11px] text-muted-foreground">
-          {txt(apiCapability("whatsapp").desc.pt, apiCapability("whatsapp").desc.en)}
-        </p>
-
-        {/* Group: Official WhatsApp Business API */}
-        <div className="space-y-2">
-          <p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground/80">
-            WhatsApp Business API (Oficial)
-          </p>
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-            {WA_PROVIDERS.filter(wp => wp.group === "oficial").map(wp => (
-              <ProviderCard
-                key={wp.id}
-                wp={wp}
-                active={waProvider === wp.id}
-                disabled={isReadOnly}
-                onClick={() => {
-                  if (waProvider === wp.id) return;
-                  setWaProvider(wp.id);
-                  // Clear per-provider inputs so we don't accidentally send
-                  // stale fields when switching providers.
-                  setZapiInstanceId(""); setZapiToken(""); setZapiClientToken("");
-                  setEvolApiUrl(""); setEvolInstanceName(""); setEvolApiKey("");
-                  setMetaPermanentToken(""); setMetaAppSecret("");
-                  setUazapiApiUrl(""); setUazapiInstanceName(""); setUazapiToken("");
-                }}
-              />
-            ))}
-          </div>
-        </div>
-
-        {/* Group: Unofficial / WhatsApp Web providers */}
-        <div className="space-y-2">
-          <p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground/80">
-            Outros Provedores WhatsApp Web
-          </p>
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-            {WA_PROVIDERS.filter(wp => wp.group === "whatsapp_web").map(wp => (
-              <ProviderCard
-                key={wp.id}
-                wp={wp}
-                active={waProvider === wp.id}
-                disabled={isReadOnly}
-                onClick={() => {
-                  if (waProvider === wp.id) return;
-                  setWaProvider(wp.id);
-                  setZapiInstanceId(""); setZapiToken(""); setZapiClientToken("");
-                  setEvolApiUrl(""); setEvolInstanceName(""); setEvolApiKey("");
-                  setMetaPermanentToken(""); setMetaAppSecret("");
-                  setUazapiApiUrl(""); setUazapiInstanceName(""); setUazapiToken("");
-                }}
-              />
-            ))}
-          </div>
-        </div>
-
-        {/* Meta Cloud API fields */}
-        {waProvider === "meta_cloud" && (
-          <div className="grid gap-3 sm:grid-cols-2">
-            {/* signature_pending banner — identity is configured but the App Secret
-                is missing. Without HMAC we cannot authenticate inbound webhooks. */}
-            {(() => {
-              const identityReady =
-                !!status?.meta_phone_number_id && !!status?.meta_permanent_token_set;
-              const signaturePending = identityReady && status?.meta_app_secret_set === false;
-              if (!signaturePending) return null;
-              return (
-                <div
-                  data-testid="meta-signature-pending-banner"
-                  className="sm:col-span-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2.5 flex items-start gap-2"
-                >
-                  <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500 mt-0.5" />
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-2">
-                      <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-500">
-                        {txt(
-                          "HMAC pendente — mensagens não podem ser autenticadas",
-                          "HMAC pending — messages cannot be authenticated",
-                        )}
-                      </p>
-                      <span
-                        data-testid="meta-signature-pending-badge"
-                        className="text-[9px] font-bold px-1.5 py-0.5 rounded border bg-amber-500/15 text-amber-500 border-amber-500/40"
-                      >
-                        {txt("Assinatura pendente", "Signature pending")}
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-muted-foreground">
-                      {txt(
-                        "Informe o App Secret abaixo e salve para começar a verificar as assinaturas X-Hub-Signature-256 do Meta.",
-                        "Enter the App Secret below and save to start verifying Meta's X-Hub-Signature-256 signatures.",
-                      )}
-                    </p>
-                  </div>
-                </div>
-              );
-            })()}
-            <ApiInput label="Phone Number ID" value={metaPhoneNumberId} onChange={setMetaPhoneNumberId}
-              placeholder="123456789012345" disabled={isReadOnly} mono
-              configured={!!status?.meta_phone_number_id} />
-            <ApiInput label="WABA ID" value={metaWabaId} onChange={setMetaWabaId}
-              placeholder="987654321098765" disabled={isReadOnly} mono
-              configured={!!status?.meta_waba_id} />
-            <div className="sm:col-span-2">
-              <ApiInput label="Permanent Token" value={metaPermanentToken} onChange={setMetaPermanentToken} type="password"
-                placeholder={status?.meta_permanent_token_set ? "••••••••• (manter atual)" : "EAAG..."}
-                disabled={isReadOnly} configured={status?.meta_permanent_token_set} />
-            </div>
-            <div className="sm:col-span-2" data-testid="meta-app-secret-field">
-              <ApiInput
-                label={
-                  status?.meta_phone_number_id && status?.meta_permanent_token_set && !status?.meta_app_secret_set
-                    ? txt("App Secret *", "App Secret *")
-                    : "App Secret"
+            <p className="text-[11px] text-muted-foreground">
+              {locale === "en" ? capability.desc.en : capability.desc.pt}
+            </p>
+            <div
+              className="grid grid-cols-2 gap-2 sm:grid-cols-3"
+              data-testid={`${capability.id}-provider-list`}
+            >
+              {providers.map((provider) => {
+                if (availability[provider.id as keyof typeof availability] !== "coming_soon") {
+                  return null;
                 }
-                value={metaAppSecret}
-                onChange={setMetaAppSecret}
-                type="password"
-                placeholder={
-                  status?.meta_app_secret_set
-                    ? "••••••••• (manter atual)"
-                    : txt(
-                        "Obrigatório — assina webhooks (X-Hub-Signature-256)",
-                        "Required — signs webhooks (X-Hub-Signature-256)",
-                      )
-                }
-                disabled={isReadOnly}
-                configured={status?.meta_app_secret_set}
-              />
-            </div>
-
-            {/* Verify Token — only shown after Phone Number ID + Permanent Token
-                have been saved at least once (backend auto-generates on first save). */}
-            {status?.meta_verify_token ? (
-              <div className="sm:col-span-2 space-y-1">
-                <label className="text-xs font-medium text-muted-foreground">
-                  Verify Token <span className="text-emerald-400 ml-1.5">● gerado automaticamente</span>
-                </label>
-                <div className="flex gap-2">
-                  <input
-                    readOnly value={status.meta_verify_token}
-                    onClick={e => (e.target as HTMLInputElement).select()}
-                    className="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-mono text-foreground cursor-text focus:outline-none focus:ring-1 focus:ring-accent"
+                return (
+                  <ProviderCredentialCard
+                    key={provider.id}
+                    id={`${capability.id}-${provider.id}`}
+                    label={provider.label}
+                    sub={provider.sub}
+                    comingSoonLabel={comingSoonLabel}
                   />
-                  <button type="button" onClick={copyVerifyToken}
-                    className="inline-flex items-center gap-1.5 rounded-md border border-blue-300 dark:border-blue-700 bg-white dark:bg-blue-900/20 px-3 py-1.5 text-xs font-medium text-blue-700 dark:text-blue-300 hover:bg-blue-50 dark:hover:bg-blue-900/40 transition-colors shrink-0"
-                  >
-                    {copiedVerifyToken
-                      ? <><Check className="h-3.5 w-3.5 text-emerald-500" /> Copiado!</>
-                      : <><Copy className="h-3.5 w-3.5" /> Copiar</>}
-                  </button>
-                </div>
-                <p className="text-[10px] text-muted-foreground">
-                  Cole este valor em "Verify Token" ao configurar o webhook no Meta App Dashboard.
-                </p>
-              </div>
-            ) : (
-              <div className="sm:col-span-2 rounded-md border border-dashed border-slate-600/60 bg-muted/20 px-3 py-2.5 text-[11px] text-muted-foreground">
-                O <span className="font-mono">Verify Token</span> será gerado automaticamente após salvar
-                <span className="font-semibold"> Phone Number ID</span> e
-                <span className="font-semibold"> Permanent Token</span> pela primeira vez.
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Z-API fields */}
-        {waProvider === "zapi" && (
-          <div className="grid gap-3 sm:grid-cols-2">
-            <ApiInput label="ID da Instância" value={zapiInstanceId} onChange={setZapiInstanceId}
-              placeholder="3F13596C8ABCA2F740884AC8C214C6FF" disabled={isReadOnly} mono />
-            <ApiInput label="Token da Instância" value={zapiToken} onChange={setZapiToken} type="password"
-              placeholder={status?.zapi_token_set ? "••••••••• (manter atual)" : "Cole o token da instância"}
-              disabled={isReadOnly} configured={status?.zapi_token_set} />
-            <div className="sm:col-span-2">
-              <ApiInput label="Client-Token (Segurança)" value={zapiClientToken} onChange={setZapiClientToken} type="password"
-                placeholder="Cole o Client-Token da aba Segurança do Z-API"
-                disabled={isReadOnly} />
-            </div>
-
-            {/* Inbound capability URL — one-time-only display.
-                A new URL is generated locally each time the user saves the
-                Z-API token. Once dismissed, the raw value is cleared from
-                React state and can never be recovered. */}
-            {zapiInboundRawToken ? (
-              <div
-                data-testid="zapi-inbound-token-panel"
-                className="sm:col-span-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-3 space-y-2"
-              >
-                <div className="flex items-center gap-2">
-                  <Lock className="h-4 w-4 shrink-0 text-amber-500" />
-                  <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-500">
-                    {txt("Webhook URL (exibida uma única vez)", "Webhook URL (shown only once)")}
-                  </p>
-                </div>
-                <p className="text-[11px] text-muted-foreground">
-                  {txt(
-                    "Copie esta URL agora. Ela não será exibida novamente.",
-                    "Copy this URL now. It will not be shown again.",
-                  )}
-                </p>
-                <pre
-                  data-testid="zapi-inbound-token-url"
-                  className="text-[11px] font-mono text-foreground bg-background border border-border rounded px-3 py-2 whitespace-pre-wrap break-all select-all"
-                >{`${window.location.origin}/v1/webhook/zapi/${zapiInboundRawToken}`}</pre>
-                <div className="flex justify-end">
-                  <button
-                    type="button"
-                    data-testid="zapi-inbound-token-dismiss"
-                    onClick={dismissZapiInboundRawToken}
-                    className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground hover:bg-muted/40 transition-colors"
-                  >
-                    {txt("Já copiei — descartar", "I copied it — dismiss")}
-                  </button>
-                </div>
-              </div>
-            ) : status?.zapi_inbound_token_digest_set ? (
-              <div
-                data-testid="zapi-inbound-token-configured"
-                className="sm:col-span-2 rounded-md border border-dashed border-emerald-500/40 bg-emerald-500/5 px-3 py-2.5 text-[11px] text-muted-foreground flex items-center gap-2"
-              >
-                <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
-                <span>
-                  {txt(
-                    "Token configurado. URL exibida apenas uma vez.",
-                    "Token configured. URL was shown only once.",
-                  )}
-                </span>
-              </div>
-            ) : null}
-          </div>
-        )}
-
-        {/* Evolution API fields */}
-        {waProvider === "evolution" && (
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="sm:col-span-2">
-              <ApiInput label="Global API URL" value={evolApiUrl} onChange={setEvolApiUrl}
-                placeholder="https://api.seudominio.com" disabled={isReadOnly} mono />
-            </div>
-            <ApiInput label="Instance Name" value={evolInstanceName} onChange={setEvolInstanceName}
-              placeholder="minha-clinica-prod" disabled={isReadOnly} />
-            <ApiInput label="API Key" value={evolApiKey} onChange={setEvolApiKey} type="password"
-              placeholder={status?.evolution_api_key_set ? "••••••••• (manter atual)" : "Cole a API Key"}
-              disabled={isReadOnly} configured={status?.evolution_api_key_set} />
-          </div>
-        )}
-
-        {/* Uazapi fields (wuzapi-based, WhatsApp Web multi-device, self-hosted) */}
-        {waProvider === "uazapi" && (
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="sm:col-span-2">
-              <ApiInput label="API URL" value={uazapiApiUrl} onChange={setUazapiApiUrl}
-                placeholder="https://uazapi.seudominio.com" disabled={isReadOnly} mono
-                configured={!!status?.uazapi_api_url} />
-            </div>
-            <ApiInput label="Instance Name" value={uazapiInstanceName} onChange={setUazapiInstanceName}
-              placeholder="minha-clinica-prod" disabled={isReadOnly}
-              configured={!!status?.uazapi_instance_name} />
-            <ApiInput label="Token" value={uazapiToken} onChange={setUazapiToken} type="password"
-              placeholder={status?.uazapi_token_set ? "••••••••• (manter atual)" : "Cole o Token da instância"}
-              disabled={isReadOnly} configured={status?.uazapi_token_set} />
-          </div>
-        )}
-
-        {/* dialog360 / twilio — visible form + backend rejects on save.
-            No functional fields yet; each provider will get its own wish with
-            the real credential schema. Presenting an empty state keeps the UI
-            visually consistent with the implemented providers. */}
-        {!providerImplemented && (
-          <UnimplementedProviderNotice provider={waProvider} />
-        )}
-      </div>
-
-      {/* ── API LLM ── */}
-      <div className="space-y-4 rounded-lg border border-slate-700/50 bg-muted/20 p-4">
-        <div className="flex flex-wrap items-center gap-2">
-          <Cpu className="h-3.5 w-3.5 text-accent" />
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">{apiCapability("llm").short}</p>
-          <span
-            data-testid="capability-requirement-llm"
-            className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/80"
-          >
-            {apiCapability("llm").required ? txt("obrigatório", "Required") : txt("opcional", "Optional")}
-          </span>
-          {isComingSoon && (
-            <span className="ml-auto text-[10px] font-bold px-1.5 py-0.5 rounded border bg-violet-500/10 text-violet-400 border-violet-500/30">Em breve</span>
-          )}
-        </div>
-
-        <p className="text-[11px] text-muted-foreground">
-          {txt(apiCapability("llm").desc.pt, apiCapability("llm").desc.en)}
-        </p>
-
-        {/* Provider toggle group */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2" data-testid="llm-provider-list">
-          {PROVIDERS.map(p => {
-            // `comingSoon` providers can never be the active selection —
-            // treat any stored value that matches as unset so the card is
-            // rendered as disabled instead of "active".
-            const active     = llmProvider === p.id && !p.comingSoon;
-            const comingSoon = !!p.comingSoon;
-            return (
-              <button
-                key={p.id}
-                type="button"
-                data-testid={`llm-provider-${p.id}`}
-                data-provider-id={p.id}
-                data-coming-soon={comingSoon ? "true" : undefined}
-                disabled={isReadOnly || comingSoon}
-                aria-disabled={comingSoon || undefined}
-                onClick={() => {
-                  if (comingSoon) return; // never let the user select coming-soon providers
-                  if (llmProvider === p.id) return; // no-op if same tab
-                  setLlmProvider(p.id);
-                  setLlmApiUrl(PROVIDER_DEFAULT_URL[p.id]);
-                  setLlmApiKey(""); // clear key — different providers use different keys
-                  setLlmModelName(p.id === "dropout" ? "text" : "");
-                }}
-                className={`relative flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2.5 text-left transition-all disabled:cursor-not-allowed ${
-                  comingSoon ? "pointer-events-none opacity-50" : ""
-                } ${
-                  active
-                    ? p.activeCls
-                    : "border-border bg-background text-muted-foreground hover:border-slate-500"
-                } disabled:opacity-50`}
-              >
-                <div className="flex w-full items-center justify-between gap-1">
-                  <span className="text-xs font-bold">{p.label}</span>
-                  {comingSoon && (
-                    <span
-                      data-testid={`llm-coming-soon-${p.id}`}
-                      className="text-[9px] font-bold px-1 py-0.5 rounded border bg-violet-500/10 text-violet-400 border-violet-500/30"
-                    >
-                      {txt("Em breve", "Coming soon")}
-                    </span>
-                  )}
-                </div>
-                <span className="text-[10px] opacity-70">{p.sub}</span>
-                {active && <span className="absolute top-2 right-2 h-1.5 w-1.5 rounded-full bg-current opacity-80" />}
-              </button>
-            );
-          })}
-        </div>
-
-        {/* ── Provider: OpenAI ── */}
-        {llmProvider === "openai" && (
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="sm:col-span-2">
-              <ApiInput label="API URL" value={llmApiUrl} onChange={setLlmApiUrl}
-                placeholder="https://api.openai.com/v1" disabled={isReadOnly} mono />
-            </div>
-            <ApiInput label="API Key" value={llmApiKey} onChange={setLlmApiKey} type="password"
-              placeholder={status?.llm_api_key_set ? "••••••••• (manter atual)" : "sk-..."}
-              disabled={isReadOnly} configured={status?.llm_api_key_set} />
-            <ApiInput label="Model Name" value={llmModelName} onChange={setLlmModelName}
-              placeholder="gpt-4o-mini" disabled={isReadOnly} mono />
-          </div>
-        )}
-
-        {/* ── Provider: Dropout / Neuralake ── */}
-        {llmProvider === "dropout" && (
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="sm:col-span-2">
-              <ApiInput label="API URL" value={llmApiUrl} onChange={setLlmApiUrl}
-                placeholder="https://api.neuralake.cloud/v1" disabled={isReadOnly} mono />
-            </div>
-            <ApiInput label="API Key" value={llmApiKey} onChange={setLlmApiKey} type="password"
-              placeholder={status?.llm_api_key_set ? "••••••••• (manter atual)" : "ns-live-..."}
-              disabled={isReadOnly} configured={status?.llm_api_key_set} />
-            <ApiInput label="Model Name" value="text" onChange={() => {}}
-              disabled mono />
-            <p className="text-[10px] font-mono text-foreground tracking-wide sm:col-span-2">OpenAI SDK Compatible</p>
-          </div>
-        )}
-
-        {/* ── Provider: SLM Cortex (coming soon) ── */}
-        {llmProvider === "slm_cortex" && (
-          <div className="space-y-3 opacity-60 pointer-events-none">
-            <div className="flex items-start gap-2 rounded-md border border-slate-600 bg-slate-900 px-3 py-2.5 text-xs text-white">
-              <Cpu className="h-3.5 w-3.5 mt-0.5 shrink-0 text-violet-400" />
-              <p>O SLM Cortex é o modelo sovereign da NeuroStack, treinado com dados clínicos anonimizados em ambiente isolado. A URL de inferência é gerenciada internamente.</p>
-            </div>
-            <ApiInput label="API Key (NeuroStack)" value={llmApiKey} onChange={setLlmApiKey} type="password"
-              placeholder="ns-cortex-..." configured={status?.llm_api_key_set} />
-            <div className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground flex items-center gap-2">
-                Sistema de Fallback
-                <ChevronDown className="h-3 w-3 opacity-50" />
-              </label>
-              <select
-                value={llmFallback}
-                onChange={e => setLlmFallback(e.target.value as "openai" | "dropout")}
-                className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-xs text-foreground focus:outline-none"
-              >
-                <option value="dropout">Dropout by Neuralake</option>
-                <option value="openai">GPT by OpenAI</option>
-              </select>
+                );
+              })}
             </div>
           </div>
-        )}
-
-        {/* ── Provider: Outros (Custom / OSS) ── */}
-        {isOutros && (
-          <div className="space-y-3">
-            <ApiInput label="API URL" value={llmApiUrl} onChange={setLlmApiUrl}
-              placeholder="https://openrouter.ai/api/v1" disabled={isReadOnly} mono />
-            <ApiInput label="API Key" value={llmApiKey} onChange={setLlmApiKey} type="password"
-              placeholder={status?.llm_api_key_set ? "••••••••• (manter atual)" : "sk-or-..."}
-              disabled={isReadOnly} configured={status?.llm_api_key_set} />
-            <ApiInput label="Nome do Modelo" value={llmModelName} onChange={setLlmModelName}
-              placeholder="ex: qwen/qwen3-235b-a22b" disabled={isReadOnly} mono />
-            <div className="rounded-md border border-border bg-muted/30 px-3 py-2.5 space-y-1.5">
-              <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">Recomendados no momento:</p>
-              <ol className="space-y-0.5 list-none">
-                {[
-                  "Qwen 3.5-35B-A3B by Alibaba",
-                  "Mistral Small 4 by Mistral",
-                  "Qwen 3-235B-A22B by Alibaba",
-                  "Llama 4 Maverick by Meta",
-                  "DeepSeek V3.2 by DeepSeek",
-                ].map((model, i) => (
-                  <li key={i} className="text-[11px] text-muted-foreground">
-                    {i + 1}) {model}
-                  </li>
-                ))}
-              </ol>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* ── API STT ── */}
-      <div className="space-y-4 rounded-lg border border-slate-700/50 bg-muted/20 p-4">
-        <div className="flex flex-wrap items-center gap-2">
-          <Mic2 className="h-3.5 w-3.5 text-accent" />
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">{apiCapability("stt").short}</p>
-          <span
-            data-testid="capability-requirement-stt"
-            className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/80"
-          >
-            {apiCapability("stt").required ? txt("obrigatório", "Required") : txt("opcional", "Optional")}
-          </span>
-        </div>
-
-        <p className="text-[11px] text-muted-foreground">
-          {txt(apiCapability("stt").desc.pt, apiCapability("stt").desc.en)}
-        </p>
-
-        {/* Provider toggle group */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2" data-testid="stt-provider-list">
-          {STT_PROVIDERS.map(p => {
-            const active     = sttProvider === p.id;
-            const configOnly = !OPERATIONAL_STT_PROVIDERS.has(p.id);
-            return (
-              <button
-                key={p.id}
-                type="button"
-                data-testid={`stt-provider-${p.id}`}
-                data-provider-id={p.id}
-                disabled={isReadOnly}
-                onClick={() => {
-                  if (sttProvider === p.id) return;
-                  setSttProvider(p.id);
-                  setSttApiKey("");
-                  setSttModelName("");
-                  setSttApiUrl(PROVIDER_DEFAULT_STT_URL[p.id] ?? "");
-                }}
-                className={`relative flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2.5 text-left transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
-                  active
-                    ? p.activeCls
-                    : "border-border bg-background text-muted-foreground hover:border-slate-500"
-                }`}
-              >
-                <div className="flex w-full items-center justify-between gap-1">
-                  <span className="text-xs font-bold">{p.label}</span>
-                  {configOnly && (
-                    <span
-                      data-testid={`stt-config-only-${p.id}`}
-                      className="text-[9px] font-bold px-1 py-0.5 rounded border bg-slate-500/10 text-slate-400 border-slate-500/30"
-                    >
-                      {txt("Configuração apenas", "Config only")}
-                    </span>
-                  )}
-                </div>
-                <span className="text-[10px] opacity-70">{p.sub}</span>
-                {active && <span className="absolute top-2 right-2 h-1.5 w-1.5 rounded-full bg-current opacity-80" />}
-              </button>
-            );
-          })}
-        </div>
-
-        {/* Conditional fields based on sttProvider */}
-        <div className="grid gap-3 sm:grid-cols-2">
-          {sttProvider !== "google_stt" && (
-            <div className="sm:col-span-2">
-              <ApiInput label="API URL" value={sttApiUrl} onChange={setSttApiUrl}
-                placeholder={
-                  sttProvider === "openai_whisper"    ? "https://api.openai.com/v1" :
-                  sttProvider === "elevenlabs_scribe" ? "https://api.elevenlabs.io/v1" :
-                  sttProvider === "deepgram_stt"      ? "https://api.deepgram.com/v1" :
-                  sttProvider === "microsoft_stt"     ? "https://<region>.stt.speech.microsoft.com" :
-                  "https://api.groq.com/openai/v1"
-                }
-                disabled={isReadOnly} mono />
-            </div>
-          )}
-          <ApiInput label="API Key" value={sttApiKey} onChange={setSttApiKey} type="password"
-            placeholder={
-              status?.whisper_api_key_set ? "••••••••• (manter atual)" :
-              sttProvider === "openai_whisper" ? "sk-..." :
-              sttProvider === "elevenlabs_scribe" ? "sk_..." :
-              sttProvider === "google_stt" ? "AIza..." :
-              sttProvider === "deepgram_stt" ? "Deepgram API key" :
-              sttProvider === "microsoft_stt" ? "Azure Speech key" :
-              "gsk_..."
-            }
-            disabled={isReadOnly} configured={status?.whisper_api_key_set} />
-          <ApiInput label="Model Name" value={sttModelName} onChange={setSttModelName}
-            placeholder={
-              sttProvider === "openai_whisper" ? "whisper-1" :
-              sttProvider === "elevenlabs_scribe" ? "scribe_v1" :
-              sttProvider === "google_stt" ? "latest_long" :
-              sttProvider === "deepgram_stt" ? "nova-2" :
-              sttProvider === "microsoft_stt" ? "phi-4-multimodal" :
-              "distil-whisper-large-v3-en"
-            }
-            disabled={isReadOnly} mono />
-          <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
-              {txt("Duração Máxima (segundos)", "Max Duration (seconds)")}
-            </label>
-            <input
-              type="number"
-              min={10}
-              max={300}
-              value={audioMaxSeconds}
-              onChange={(e) => setAudioMaxSeconds(Number(e.target.value))}
-              disabled={isReadOnly}
-              className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
-            />
-          </div>
-        </div>
-      </div>
-
-      {/* ── API STT Fall Back ── */}
-      <div
-        className="space-y-4 rounded-lg border border-slate-700/50 bg-muted/20 p-4"
-        data-testid="multimodal-settings-section"
-      >
-        <div className="flex flex-wrap items-center gap-2">
-          <AudioLines className="h-3.5 w-3.5 text-accent" />
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-            {apiCapability("multimodal").short}
-          </p>
-          <span
-            data-testid="capability-requirement-multimodal"
-            className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/80"
-          >
-            {apiCapability("multimodal").required ? txt("obrigatório", "Required") : txt("opcional", "Optional")}
-          </span>
-          <span
-            data-testid="multimodal-recommended-badge"
-            className="ml-auto text-[9px] font-bold px-1.5 py-0.5 rounded border bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
-          >
-            {txt("RECOMENDÁVEL", "RECOMMENDED")}
-          </span>
-        </div>
-
-        <p className="text-[11px] text-muted-foreground">
-          {txt(
-            "Multimodal (modelo que ouve o áudio direto). Usado como alternativa quando o STT falha.",
-            "Multimodal (model that listens to the audio directly). Used as a fallback when STT fails.",
-          )}
-        </p>
-
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2" data-testid="multimodal-provider-list">
-          {MULTIMODAL_PROVIDERS.map(p => {
-            const active     = multimodalProvider === p.id;
-            const configOnly = !OPERATIONAL_MULTIMODAL_PROVIDERS.has(p.id);
-            return (
-              <button
-                key={p.id}
-                type="button"
-                data-testid={`multimodal-provider-${p.id}`}
-                data-provider-id={p.id}
-                disabled={isReadOnly}
-                onClick={() => {
-                  if (multimodalProvider === p.id) return;
-                  setMultimodalProvider(p.id);
-                  // Different provider ⇒ different derived URL ⇒ the stored key
-                  // can no longer be reused. Clear it and demand a new one.
-                  setMultimodalApiKey("");
-                  setMultimodalModelName("");
-                  setMultimodalDirty(true);
-                  setMultimodalNeedsFreshKey(true);
-                }}
-                className={`relative flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2.5 text-left transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
-                  active
-                    ? p.activeCls
-                    : "border-border bg-background text-muted-foreground hover:border-slate-500"
-                }`}
-              >
-                <div className="flex w-full items-center justify-between gap-1">
-                  <span className="text-xs font-bold">{p.label}</span>
-                  {configOnly && (
-                    <span
-                      data-testid={`multimodal-config-only-${p.id}`}
-                      className="text-[9px] font-bold px-1 py-0.5 rounded border bg-slate-500/10 text-slate-400 border-slate-500/30"
-                    >
-                      {txt("Configuração apenas", "Config only")}
-                    </span>
-                  )}
-                </div>
-                <span className="text-[10px] opacity-70">{p.sub}</span>
-                {active && <span className="absolute top-2 right-2 h-1.5 w-1.5 rounded-full bg-current opacity-80" />}
-              </button>
-            );
-          })}
-        </div>
-
-        {multimodalNeedsFreshKey && (
-          <p
-            data-testid="multimodal-fresh-key-hint"
-            className="flex items-center gap-1.5 text-[11px] text-amber-400"
-          >
-            <AlertTriangle className="h-3 w-3 shrink-0" />
-            {txt(
-              "Trocar de provedor exige uma nova API Key.",
-              "Switching providers requires a new API key.",
-            )}
-          </p>
-        )}
-
-        <div className="grid gap-3 sm:grid-cols-2">
-          <div className="sm:col-span-2 space-y-1">
-            <label className="text-xs font-medium text-muted-foreground" htmlFor="multimodal-api-url">
-              {txt("API URL (definida pelo provedor)", "API URL (set by the provider)")}
-            </label>
-            <input
-              id="multimodal-api-url"
-              data-testid="multimodal-api-url"
-              readOnly
-              value={MULTIMODAL_PROVIDER_API_URL[multimodalProvider]}
-              className="w-full rounded-md border border-border bg-muted/40 px-3 py-1.5 text-xs font-mono text-muted-foreground cursor-not-allowed focus:outline-none"
-            />
-          </div>
-          <ApiInput
-            label="API Key"
-            value={multimodalApiKey}
-            onChange={(value) => { setMultimodalApiKey(value); setMultimodalDirty(true); }}
-            type="password"
-            placeholder={status?.multimodal_api_key_set
-              ? "••••••••• (manter atual)"
-              : multimodalProvider === "openrouter" ? "sk-or-..."
-              : multimodalProvider === "groq" ? "gsk_..."
-              : "sk-..."}
-            disabled={isReadOnly}
-            configured={status?.multimodal_api_key_set}
-          />
-          <ApiInput
-            label={txt("Nome do Modelo", "Model Name")}
-            value={multimodalModelName}
-            onChange={(value) => { setMultimodalModelName(value); setMultimodalDirty(true); }}
-            placeholder={MULTIMODAL_PROVIDER_MODEL_PLACEHOLDER[multimodalProvider]}
-            disabled={isReadOnly}
-            mono
-          />
-        </div>
-      </div>
-
-      {/* ── API TTS ── */}
-      <div
-        className="space-y-4 rounded-lg border border-slate-700/50 bg-muted/20 p-4"
-        data-testid="tts-settings-section"
-      >
-        <div className="flex flex-wrap items-center gap-2">
-          <Volume2 className="h-3.5 w-3.5 text-accent" />
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-            {apiCapability("tts").short}
-          </p>
-          <span
-            data-testid="capability-requirement-tts"
-            className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/80"
-          >
-            {apiCapability("tts").required ? txt("obrigatório", "Required") : txt("opcional", "Optional")}
-          </span>
-          <span className={`ml-auto text-[9px] font-bold px-1.5 py-0.5 rounded border ${
-            ttsEnabled && status?.tts_readiness === "active"
-              ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
-              : "bg-slate-500/10 text-slate-400 border-slate-500/30"
-          }`}>
-            {ttsEnabled
-              ? status?.tts_readiness === "active" ? txt("Ativo", "Active") : txt("Incompleto", "Incomplete")
-              : txt("Desativado", "Disabled")}
-          </span>
-        </div>
-
-        <p className="text-[11px] text-muted-foreground">
-          {txt(
-            "Text to Speech (gerar áudio). Quando ativado, as respostas do agente são sintetizadas e enviadas como áudio no WhatsApp. Se o provedor falhar, a resposta é enviada em texto.",
-            "Text to Speech (generate audio). When enabled, agent replies are synthesized and sent as WhatsApp audio. If the provider fails, the reply is sent as text.",
-          )}
-        </p>
-
-        <SwitchRow
-          label={txt("Responder em áudio", "Reply with audio")}
-          hint={txt(
-            "Converte automaticamente as respostas normais do agente em mensagens de voz.",
-            "Automatically converts regular agent replies into voice messages.",
-          )}
-          ariaLabel={txt("Ativar respostas em áudio", "Enable audio replies")}
-          checked={ttsEnabled}
-          onCheckedChange={(checked) => { setTtsEnabled(checked); setTtsDirty(true); }}
-          disabled={isReadOnly}
-        />
-
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2" data-testid="tts-provider-list">
-          {TTS_PROVIDERS.map(p => {
-            const active = ttsProvider === p.id;
-            return (
-              <button
-                key={p.id}
-                type="button"
-                data-testid={`tts-provider-${p.id}`}
-                data-provider-id={p.id}
-                disabled={isReadOnly}
-                onClick={() => {
-                  if (ttsProvider === p.id) return;
-                  setTtsProvider(p.id);
-                  setTtsApiKey("");
-                  setTtsApiUrl(TTS_PROVIDER_DEFAULTS[p.id].apiUrl);
-                  setTtsModelName(TTS_PROVIDER_DEFAULTS[p.id].modelName);
-                  setTtsVoiceId(TTS_PROVIDER_DEFAULTS[p.id].voiceId);
-                  setTtsDirty(true);
-                }}
-                className={`relative flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2.5 text-left transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
-                  active
-                    ? p.activeCls
-                    : "border-border bg-background text-muted-foreground hover:border-slate-500"
-                }`}
-              >
-                <span className="text-xs font-bold">{p.label}</span>
-                <span className="text-[10px] opacity-70">{p.sub}</span>
-                {active && <span className="absolute top-2 right-2 h-1.5 w-1.5 rounded-full bg-current opacity-80" />}
-              </button>
-            );
-          })}
-        </div>
-
-        <div className="grid gap-3 sm:grid-cols-2">
-          <div className="sm:col-span-2">
-            <ApiInput
-              label="API URL"
-              value={ttsApiUrl}
-              onChange={(value) => { setTtsApiUrl(value); setTtsDirty(true); }}
-              placeholder={TTS_PROVIDER_DEFAULTS[ttsProvider].apiUrl}
-              disabled={isReadOnly}
-              mono
-            />
-          </div>
-          <ApiInput
-            label="API Key"
-            value={ttsApiKey}
-            onChange={(value) => { setTtsApiKey(value); setTtsDirty(true); }}
-            type="password"
-            placeholder={status?.tts_api_key_set
-              ? "••••••••• (manter atual)"
-              : ttsProvider === "elevenlabs" ? "sk_..." : "AIza..."}
-            disabled={isReadOnly}
-            configured={status?.tts_api_key_set}
-          />
-          <ApiInput
-            label={ttsProvider === "elevenlabs" ? txt("Modelo", "Model") : txt("Nome da voz", "Voice name")}
-            value={ttsModelName}
-            onChange={(value) => { setTtsModelName(value); setTtsDirty(true); }}
-            placeholder={TTS_PROVIDER_DEFAULTS[ttsProvider].modelName}
-            disabled={isReadOnly}
-            mono
-          />
-          {ttsProvider === "elevenlabs" && (
-            <div className="sm:col-span-2">
-              <ApiInput
-                label="Voice ID"
-                value={ttsVoiceId}
-                onChange={(value) => { setTtsVoiceId(value); setTtsDirty(true); }}
-                placeholder={TTS_PROVIDER_DEFAULTS.elevenlabs.voiceId}
-                disabled={isReadOnly}
-                mono
-              />
-            </div>
-          )}
-        </div>
-      </div>
-
-      {error && <p className="flex items-center gap-1.5 text-sm text-destructive"><AlertTriangle className="h-3.5 w-3.5" />{error}</p>}
-
-      <div className="flex items-center justify-between pt-1">
-        {isReadOnly && <span className="text-xs text-amber-400 flex items-center gap-1.5"><AlertTriangle className="h-3 w-3" /> Modo somente leitura</span>}
-        <button
-          type="button"
-          onClick={handleSave}
-          disabled={saving || isReadOnly || isComingSoon}
-          className="ml-auto inline-flex items-center gap-2 rounded-md bg-accent px-4 py-2 text-sm font-medium text-accent-foreground hover:bg-accent/90 disabled:opacity-40 transition-colors"
-        >
-          {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <KeyRound className="h-3.5 w-3.5" />}
-          {isComingSoon ? "Em breve" : "Salvar Configurações de API"}
-        </button>
-      </div>
-    </div>
+        );
+      })}
+    </section>
   );
 }
 
