@@ -454,7 +454,11 @@ def _install_primary_and_fallback(
 
 @pytest.fixture
 def service() -> EventService:
-    return EventService(pipeline=SimpleNamespace())
+    return EventService(
+        pipeline=SimpleNamespace(
+            check_response_scheduling_gate=lambda *args, **kwargs: (None, None)
+        )
+    )
 
 
 @pytest.mark.asyncio

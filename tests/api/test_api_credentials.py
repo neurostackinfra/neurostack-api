@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from src.api.schemas.config import ApiCredentialsPatch
 from src.config.settings import settings
 from src.repositories import get_db_session_dependency
+from src.services.api_credentials import PROVIDER_AVAILABILITY
 
 PATH = "/v1/config/api-credentials"
 
@@ -490,8 +491,10 @@ def test_multimodal_text_fallback_gate_rejects_null_and_wrong_type_atomically(
 
 def test_multimodal_text_fallback_gate_preserved_by_unrelated_patch(
     client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A patch touching an unrelated capability must not flip or clear the gate."""
+    monkeypatch.setitem(PROVIDER_AVAILABILITY["llm"], "openai", "active")
     headers = _jwt_headers("clinic_admin")
     on = client.patch(
         PATH,
