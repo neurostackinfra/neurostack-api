@@ -7,27 +7,47 @@ It is the single credential contract used by public routes and runtime callers.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
 MASKED_SECRET = "••••••••"
 
+ProviderAvailability = Literal["active", "coming_soon"]
+
+# This is the public credential-write contract.  It intentionally does not
+# describe runtime support: legacy credentials continue to feed the untouched
+# runtime/readiness paths, while every newly effective write is fail-closed.
+PROVIDER_AVAILABILITY: dict[str, dict[str, ProviderAvailability]] = {
+    "whatsapp": {
+        "meta_cloud": "coming_soon",
+        "zapi": "coming_soon",
+        "uazapi": "coming_soon",
+        "evolution": "coming_soon",
+        "dialog360": "coming_soon",
+        "twilio": "coming_soon",
+    },
+    "llm": {
+        "dropout": "coming_soon",
+        "openai": "coming_soon",
+        "outros": "coming_soon",
+        "slm_cortex": "coming_soon",
+    },
+    "multimodal": {"openrouter": "coming_soon"},
+    "stt": {
+        "outros": "coming_soon",
+        "openai_whisper": "coming_soon",
+        "elevenlabs_scribe": "coming_soon",
+        "google_stt": "coming_soon",
+        "deepgram_stt": "coming_soon",
+        "microsoft_stt": "coming_soon",
+    },
+    "tts": {"elevenlabs": "coming_soon", "google": "coming_soon"},
+}
+
+# The allowlist remains the request-universe boundary.  Deriving it from the
+# availability matrix makes the 19 displayable pairs impossible to drift.
 PROVIDER_ALLOWLISTS: dict[str, frozenset[str]] = {
-    "whatsapp": frozenset(
-        {"meta_cloud", "dialog360", "twilio", "zapi", "evolution", "uazapi"}
-    ),
-    "llm": frozenset({"openai", "dropout", "outros", "slm_cortex"}),
-    "multimodal": frozenset({"openrouter", "groq", "openai"}),
-    "stt": frozenset(
-        {
-            "outros",
-            "openai_whisper",
-            "elevenlabs_scribe",
-            "google_stt",
-            "deepgram_stt",
-            "microsoft_stt",
-        }
-    ),
-    "tts": frozenset({"elevenlabs", "google"}),
+    capability: frozenset(providers)
+    for capability, providers in PROVIDER_AVAILABILITY.items()
 }
 
 OPERATIONAL_LLM_PROVIDERS = frozenset({"openai", "dropout", "outros"})
@@ -40,8 +60,6 @@ OPERATIONAL_STT_PROVIDERS = frozenset({"outros", "openai_whisper"})
 # accepts `wav`/`mp3` and refuses OGG both by enum and by sniffing, so
 # neither can serve a voice note without transcoding.
 OPERATIONAL_MULTIMODAL_PROVIDERS = frozenset({"openrouter"})
-UNIMPLEMENTED_WHATSAPP_PROVIDERS = frozenset({"dialog360", "twilio"})
-
 READINESS_IDS = frozenset(
     {"active", "incomplete", "signature_pending", "configuration_only"}
 )
@@ -50,11 +68,9 @@ WIRE_ERROR_CODES = frozenset(
         "credential_endpoint_required",
         "credentials_jwt_required",
         "credentials_role_forbidden",
-        "fresh_api_key_required",
         "invalid_credentials_payload",
         "invalid_provider_for_capability",
-        "provider_not_implemented",
-        "provider_not_operational",
+        "provider_not_available",
         "unsafe_api_url",
     }
 )
@@ -113,6 +129,13 @@ TTS_FIELDS = frozenset(
 API_CREDENTIAL_FIELDS = frozenset(
     WHATSAPP_FIELDS | LLM_FIELDS | MULTIMODAL_FIELDS | STT_FIELDS | TTS_FIELDS
 )
+CAPABILITY_CREDENTIAL_FIELDS: dict[str, frozenset[str]] = {
+    "whatsapp": WHATSAPP_FIELDS,
+    "llm": LLM_FIELDS,
+    "multimodal": MULTIMODAL_FIELDS,
+    "stt": STT_FIELDS,
+    "tts": TTS_FIELDS,
+}
 LEGACY_CREDENTIAL_ALIASES = frozenset(
     {"llm_base_url", "whisper_api_key", "whisper_model"}
 )
@@ -169,6 +192,12 @@ def is_masked_secret(value: Any) -> bool:
     return isinstance(value, str) and ("••••" in value or "****" in value)
 
 
+def is_fresh_secret(value: Any) -> bool:
+    """Whether a submitted secret replaces stored secret material."""
+
+    return isinstance(value, str) and bool(value) and not is_masked_secret(value)
+
+
 def credential_boundary_fields(fields: Mapping[str, Any]) -> list[str]:
     """Return sorted generic-config fields that belong to the credential boundary."""
 
@@ -195,53 +224,6 @@ def validate_provider(capability: str, provider: Any) -> None:
             "invalid_provider_for_capability",
             capability=capability,
         )
-    if capability == "llm" and provider == "slm_cortex":
-        raise CredentialPolicyError(
-            "provider_not_operational",
-            capability="llm",
-            provider="slm_cortex",
-        )
-    if capability == "whatsapp" and provider in UNIMPLEMENTED_WHATSAPP_PROVIDERS:
-        raise CredentialPolicyError(
-            "provider_not_implemented",
-            capability="whatsapp",
-            provider=provider,
-        )
-
-
-def _fresh_key(patch: Mapping[str, Any], field: str) -> bool:
-    value = patch.get(field)
-    return isinstance(value, str) and bool(value) and not is_masked_secret(value)
-
-
-def _require_fresh_keys(existing: Mapping[str, Any], patch: Mapping[str, Any]) -> None:
-    definitions = {
-        "llm": ("llm_provider", "llm_api_url", "llm_api_key"),
-        "multimodal": (
-            "multimodal_provider",
-            "multimodal_api_url",
-            "multimodal_api_key",
-        ),
-        "stt": ("stt_provider", "stt_api_url", "stt_api_key"),
-        "tts": ("tts_provider", "tts_api_url", "tts_api_key"),
-    }
-    for capability, (provider_field, url_field, key_field) in definitions.items():
-        provider_changed = provider_field in patch and patch[
-            provider_field
-        ] != existing.get(provider_field)
-        url_changed = url_field in patch and patch[url_field] != existing.get(url_field)
-        if provider_changed and not _fresh_key(patch, key_field):
-            raise CredentialPolicyError(
-                "fresh_api_key_required",
-                capability=capability,
-                reason="provider_changed",
-            )
-        if url_changed and not _fresh_key(patch, key_field):
-            raise CredentialPolicyError(
-                "fresh_api_key_required",
-                capability=capability,
-                reason="api_url_changed",
-            )
 
 
 def merge_credentials(
@@ -263,7 +245,6 @@ def merge_credentials(
         )
         if provider_field in patch:
             validate_provider(capability, patch[provider_field])
-    _require_fresh_keys(existing, patch)
 
     merged = dict(existing)
     for field, value in patch.items():
@@ -272,11 +253,43 @@ def merge_credentials(
         ):
             continue
         merged[field] = value
-    if "stt_api_key" in patch and _fresh_key(patch, "stt_api_key"):
+    if "stt_api_key" in patch and is_fresh_secret(patch["stt_api_key"]):
         merged.pop("whisper_api_key", None)
     if "stt_model_name" in patch:
         merged.pop("whisper_model", None)
     return merged
+
+
+def validate_provider_availability(
+    existing: Mapping[str, Any], candidate: Mapping[str, Any]
+) -> None:
+    """Reject an effective write to a provider that is not available yet.
+
+    This runs strictly after :func:`merge_credentials`.  Comparing the merged
+    candidate with the stored values makes a masked, normalized legacy echo a
+    no-op, while any resulting provider capability mutation stays atomic at
+    the HTTP boundary.
+    """
+
+    for capability, providers in PROVIDER_AVAILABILITY.items():
+        provider_field = (
+            "whatsapp_provider"
+            if capability == "whatsapp"
+            else f"{capability}_provider"
+        )
+        provider = candidate.get(provider_field)
+        if (
+            providers.get(provider) == "coming_soon"
+            and any(
+                candidate.get(field) != existing.get(field)
+                for field in CAPABILITY_CREDENTIAL_FIELDS[capability]
+            )
+        ):
+            raise CredentialPolicyError(
+                "provider_not_available",
+                capability=capability,
+                provider=provider,
+            )
 
 
 def resolve_stt_credentials(credentials: Mapping[str, Any]) -> dict[str, Any]:

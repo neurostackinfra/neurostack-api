@@ -8,18 +8,16 @@ Covers save/status flow for Meta Cloud API (WhatsApp Business) credentials:
 - Secret fields are exposed only through set/masked status
 - meta_phone_number_id is validated as unique per tenant (app-level check AND
   handling of a database-level IntegrityError race)
-- Saving credentials with an unimplemented WhatsApp provider (360dialog or
-  twilio) returns a clear 501 error rather than silently accepting it
+- Legacy Meta credentials remain readable, while public provider writes fail
+  closed until availability is enabled.
 """
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import jwt
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy.exc import IntegrityError
 
 from src.config.settings import settings
 
@@ -52,6 +50,24 @@ def _headers(tenant_id: UUID | None = None) -> dict[str, str]:
     }
 
 
+def _seed_legacy_credentials(
+    client: TestClient, tenant_id: UUID, credentials: dict[str, str]
+) -> None:
+    """Persist legacy runtime credentials without using the public PATCH API."""
+    from src.models.clinic_config_table import ClinicConfigTable
+    from src.repositories.database import get_db_session
+
+    async def _run() -> None:
+        db = get_db_session()
+        try:
+            db.add(ClinicConfigTable(tenant_id=tenant_id, api_credentials=credentials))
+            await db.commit()
+        finally:
+            await db.close()
+
+    client._submit(_run())  # type: ignore[attr-defined]
+
+
 @pytest.fixture
 def tenant_id() -> UUID:
     """Fresh tenant_id per test so each test's ClinicConfigTable row is isolated."""
@@ -63,8 +79,8 @@ def headers(tenant_id: UUID) -> dict[str, str]:
     return _headers(tenant_id)
 
 
-class TestSaveMetaCredentials:
-    """PATCH /v1/config/api-credentials — Meta Cloud API fields."""
+class TestMetaProviderAvailability:
+    """PATCH /v1/config/api-credentials fails closed for Meta Cloud API."""
 
     def test_saves_all_four_meta_fields(
         self,
@@ -80,15 +96,9 @@ class TestSaveMetaCredentials:
         }
         response = client.patch(API_CRED_PATH, json=payload, headers=headers)
 
-        assert response.status_code == 200, response.text
-        data = response.json()
-        assert data["ok"] is True
-        assert data["whatsapp_provider"] == "meta_cloud"
-        assert data["meta_phone_number_id"] == "1234567890"
-        assert data["meta_waba_id"] == "9876543210"
-        # Set flags indicate the secrets were stored
-        assert data["meta_permanent_token_set"] is True
-        assert data["meta_app_secret_set"] is True
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"]["error"] == "provider_not_available"
+        assert response.json()["detail"]["provider"] == "meta_cloud"
 
     def test_seeded_verify_token_is_write_only_on_first_save(
         self,
@@ -104,43 +114,37 @@ class TestSaveMetaCredentials:
         }
         response = client.patch(API_CRED_PATH, json=payload, headers=headers)
 
-        assert response.status_code == 200
-        data = response.json()
-        assert data["meta_verify_token_set"] is True
-        assert data["meta_verify_token_masked"] == "••••••••"
-        assert "meta_verify_token" not in data
+        assert response.status_code == 422
+        assert response.json()["detail"]["error"] == "provider_not_available"
         assert verify_token not in response.text
 
     def test_preserves_verify_token_across_saves(
         self,
         client: TestClient,
         headers: dict[str, str],
+        tenant_id: UUID,
     ) -> None:
         verify_token = f"verify_{uuid4().hex}"
-        # First save — caller seeds and retains the write-only verify token.
-        first = client.patch(
-            API_CRED_PATH,
-            json={
+        # Legacy state is seeded directly; public updates stay fail closed.
+        _seed_legacy_credentials(
+            client,
+            tenant_id,
+            {
                 "whatsapp_provider": "meta_cloud",
                 "meta_phone_number_id": "444555666",
                 "meta_permanent_token": "EAAG_initial_token_ABCDEFG",
                 "meta_verify_token": verify_token,
             },
-            headers=headers,
         )
-        assert first.status_code == 200
-        assert first.json()["meta_verify_token_set"] is True
-        assert verify_token not in first.text
 
-        # Second save — update WABA id only, verify_token must be preserved
+        # Update WABA id is rejected without modifying the legacy token.
         second = client.patch(
             API_CRED_PATH,
             json={"meta_waba_id": "777888999"},
             headers=headers,
         )
-        assert second.status_code == 200
-        assert second.json()["meta_verify_token_set"] is True
-        assert second.json()["meta_verify_token_masked"] == "••••••••"
+        assert second.status_code == 422
+        assert second.json()["detail"]["error"] == "provider_not_available"
         assert verify_token not in second.text
 
         handshake = client.get(
@@ -162,20 +166,21 @@ class TestMaskingMetaCredentials:
         self,
         client: TestClient,
         headers: dict[str, str],
+        tenant_id: UUID,
     ) -> None:
         raw_token = "EAAG_super_secret_permanent_token_1234567890"
         raw_secret = "raw_app_secret_XYZ_ABCDEFG"
         verify_token = f"verify_{uuid4().hex}"
-        client.patch(
-            API_CRED_PATH,
-            json={
+        _seed_legacy_credentials(
+            client,
+            tenant_id,
+            {
                 "whatsapp_provider": "meta_cloud",
                 "meta_phone_number_id": "555666777",
                 "meta_permanent_token": raw_token,
                 "meta_app_secret": raw_secret,
                 "meta_verify_token": verify_token,
             },
-            headers=headers,
         )
 
         response = client.get(API_CRED_PATH, headers=headers)
@@ -195,117 +200,62 @@ class TestMaskingMetaCredentials:
         assert verify_token not in response.text
 
 
-class TestPhoneNumberIdUniqueness:
-    """meta_phone_number_id must be unique across tenants."""
+class TestMetaProviderAvailabilityPrecedesPersistence:
+    """Unavailable Meta writes never reach uniqueness or commit handling."""
 
     def test_second_tenant_rejects_duplicate_phone_number_id(
         self,
         client: TestClient,
     ) -> None:
-        shared_phone_id = f"dup_phone_{uuid4().hex[:8]}"
-
-        # Tenant A saves first
-        headers_a = _headers(uuid4())
-        resp_a = client.patch(
-            API_CRED_PATH,
-            json={
-                "whatsapp_provider": "meta_cloud",
-                "meta_phone_number_id": shared_phone_id,
-                "meta_permanent_token": "EAAG_tenant_a_token_ABCDEF",
-            },
-            headers=headers_a,
-        )
-        assert resp_a.status_code == 200, resp_a.text
-
-        # Tenant B tries to reuse the same phone_number_id
-        headers_b = _headers(uuid4())
         resp_b = client.patch(
             API_CRED_PATH,
             json={
                 "whatsapp_provider": "meta_cloud",
-                "meta_phone_number_id": shared_phone_id,
+                "meta_phone_number_id": f"dup_phone_{uuid4().hex[:8]}",
                 "meta_permanent_token": "EAAG_tenant_b_token_ABCDEF",
             },
-            headers=headers_b,
+            headers=_headers(uuid4()),
         )
-        assert resp_b.status_code == 409, resp_b.text
-        body = resp_b.json()
-        detail = body.get("detail", body)
-        assert detail.get("error") == "meta_phone_number_id_conflict"
-        # Friendly message, never a raw driver traceback
-        assert "already registered" in detail.get("message", "").lower()
+        assert resp_b.status_code == 422, resp_b.text
+        assert resp_b.json()["detail"]["error"] == "provider_not_available"
 
     def test_same_tenant_can_update_own_phone_number_id(
         self,
         client: TestClient,
     ) -> None:
         headers_a = _headers(uuid4())
-        phone_id = f"self_update_{uuid4().hex[:8]}"
-        first = client.patch(
-            API_CRED_PATH,
-            json={
-                "whatsapp_provider": "meta_cloud",
-                "meta_phone_number_id": phone_id,
-                "meta_permanent_token": "EAAG_self_token_ABCDEF",
-            },
-            headers=headers_a,
-        )
-        assert first.status_code == 200
-
-        # Re-saving the same phone_number_id for the same tenant is allowed.
         second = client.patch(
             API_CRED_PATH,
-            json={"meta_phone_number_id": phone_id},
+            json={"whatsapp_provider": "meta_cloud", "meta_phone_number_id": "self"},
             headers=headers_a,
         )
-        assert second.status_code == 200
+        assert second.status_code == 422
+        assert second.json()["detail"]["error"] == "provider_not_available"
 
     def test_race_integrity_error_is_translated_to_friendly_409(
         self,
         client: TestClient,
     ) -> None:
-        """
-        If two saves race past the app-level check, the Postgres partial
-        unique index catches the second one. The endpoint must translate the
-        IntegrityError into a friendly 409 instead of leaking the raw driver
-        error (which the SQLite test backend cannot enforce, so we simulate).
-        """
+        """Availability rejection occurs before persistence can be attempted."""
         headers = _headers(uuid4())
-
-        with patch(
-            "src.api.routes.config.AsyncSession.commit",
-            side_effect=IntegrityError(
-                statement="INSERT ...",
-                params=None,
-                orig=Exception(
-                    "duplicate key value violates unique constraint "
-                    '"uq_clinic_configs_meta_phone_number_id" DETAIL: '
-                    "Key ((api_credentials->>'meta_phone_number_id'))=(9999) "
-                    "already exists."
-                ),
-            ),
-        ):
-            resp = client.patch(
-                API_CRED_PATH,
-                json={
-                    "whatsapp_provider": "meta_cloud",
-                    "meta_phone_number_id": f"race_{uuid4().hex[:8]}",
-                    "meta_permanent_token": "EAAG_race_token_ABCDEFG",
-                },
-                headers=headers,
-            )
-
-        assert resp.status_code == 409, resp.text
-        detail = resp.json().get("detail", resp.json())
-        assert detail.get("error") == "meta_phone_number_id_conflict"
-        assert "duplicate key value" not in detail.get("message", "").lower()
+        resp = client.patch(
+            API_CRED_PATH,
+            json={
+                "whatsapp_provider": "meta_cloud",
+                "meta_phone_number_id": f"race_{uuid4().hex[:8]}",
+                "meta_permanent_token": "EAAG_race_token_ABCDEFG",
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["detail"]["error"] == "provider_not_available"
 
 
-class TestUnimplementedProviders:
-    """Providers accepted in the UI but without a backend must fail loudly."""
+class TestUnavailableProviders:
+    """Every public WhatsApp provider write reports availability uniformly."""
 
     @pytest.mark.parametrize("provider", ["dialog360", "twilio"])
-    def test_returns_501_for_unimplemented_provider(
+    def test_returns_provider_not_available_for_dialog360_and_twilio(
         self,
         client: TestClient,
         provider: str,
@@ -316,13 +266,13 @@ class TestUnimplementedProviders:
             json={"whatsapp_provider": provider},
             headers=headers,
         )
-        assert resp.status_code == 501, resp.text
+        assert resp.status_code == 422, resp.text
         detail = resp.json().get("detail", resp.json())
-        assert detail.get("error") == "provider_not_implemented"
+        assert detail.get("error") == "provider_not_available"
         assert detail.get("provider") == provider
 
     @pytest.mark.parametrize("provider", ["meta_cloud", "zapi", "evolution", "uazapi"])
-    def test_accepts_implemented_provider(
+    def test_returns_provider_not_available_for_legacy_provider(
         self,
         client: TestClient,
         provider: str,
@@ -333,5 +283,7 @@ class TestUnimplementedProviders:
             json={"whatsapp_provider": provider},
             headers=headers,
         )
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["whatsapp_provider"] == provider
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "provider_not_available"
+        assert detail["provider"] == provider

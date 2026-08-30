@@ -40,7 +40,7 @@ from src.services.api_credentials import (
     credential_boundary_fields,
     credential_status,
     merge_credentials,
-    validate_provider,
+    validate_provider_availability,
 )
 from src.services.config_service import ARRAY_BUCKETS, flatten_config, unflatten_patch
 
@@ -459,7 +459,10 @@ async def get_api_credentials(
 @credentials_router.patch(
     "/api-credentials",
     summary="Update API Credentials",
-    description="Save WhatsApp and LLM provider credentials. Empty secret fields preserve existing values.",
+    description=(
+        "Validate a credential patch. Effective writes to providers that are "
+        "not available yet are rejected; empty secret fields preserve existing values."
+    ),
 )
 async def patch_api_credentials(
     request: Request,
@@ -468,33 +471,17 @@ async def patch_api_credentials(
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> dict[str, Any]:
     patch = body.model_dump(exclude_unset=True)
-    try:
-        for capability in ("whatsapp", "llm", "multimodal", "stt", "tts"):
-            provider_field = (
-                "whatsapp_provider"
-                if capability == "whatsapp"
-                else f"{capability}_provider"
-            )
-            if provider_field in patch:
-                validate_provider(capability, patch[provider_field])
-    except CredentialPolicyError as exc:
-        error_status = (
-            status.HTTP_501_NOT_IMPLEMENTED
-            if exc.detail["error"] == "provider_not_implemented"
-            else status.HTTP_422_UNPROCESSABLE_ENTITY
-        )
-        raise HTTPException(status_code=error_status, detail=exc.detail) from exc
     tenant = await _resolve_config_tenant(request, tenant, session)
     row = await _load_config(session, tenant)
+    existing = row.api_credentials or {} if row else {}
     try:
-        creds = merge_credentials(row.api_credentials or {} if row else {}, patch)
+        creds = merge_credentials(existing, patch)
+        validate_provider_availability(existing, creds)
     except CredentialPolicyError as exc:
-        error_status = (
-            status.HTTP_501_NOT_IMPLEMENTED
-            if exc.detail["error"] == "provider_not_implemented"
-            else status.HTTP_422_UNPROCESSABLE_ENTITY
-        )
-        raise HTTPException(status_code=error_status, detail=exc.detail) from exc
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=exc.detail,
+        ) from exc
 
     if row is None:
         row = _new_config(tenant)

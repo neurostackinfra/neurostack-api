@@ -108,16 +108,35 @@ def _admin_headers(tenant_id: UUID) -> dict[str, str]:
     }
 
 
+def _seed_legacy_meta_credentials(
+    client: TestClient, tenant_id: UUID, credentials: dict
+) -> None:
+    """Insert legacy credential state without reopening public provisioning."""
+    from src.models.clinic_config_table import ClinicConfigTable
+    from src.repositories.database import get_db_session
+
+    async def _run() -> None:
+        db = get_db_session()
+        try:
+            db.add(ClinicConfigTable(tenant_id=tenant_id, api_credentials=credentials))
+            await db.commit()
+        finally:
+            await db.close()
+
+    client._submit(_run())  # type: ignore[attr-defined]
+
+
 def _seed_meta_credentials(
     client: TestClient,
     tenant_id: UUID,
     phone_number_id: str,
 ) -> str:
-    """Seed Meta credentials and retain the write-only verify token locally."""
+    """Seed legacy Meta credentials and retain its local verify token."""
     verify_token = f"verify_{uuid4().hex}"
-    resp = client.patch(
-        API_CRED_PATH,
-        json={
+    _seed_legacy_meta_credentials(
+        client,
+        tenant_id,
+        {
             "whatsapp_provider": "meta_cloud",
             "meta_phone_number_id": phone_number_id,
             "meta_waba_id": f"waba_{uuid4().hex[:8]}",
@@ -125,13 +144,7 @@ def _seed_meta_credentials(
             "meta_verify_token": verify_token,
             "meta_app_secret": META_APP_SECRET,
         },
-        headers=_admin_headers(tenant_id),
     )
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["meta_verify_token_set"] is True
-    assert resp.json()["meta_verify_token_masked"] == "••••••••"
-    assert "meta_verify_token" not in resp.json()
-    assert verify_token not in resp.text
     return verify_token
 
 
@@ -812,11 +825,12 @@ def _seed_meta_credentials_with_whisper(
     whisper_key: str = "gsk_test_whisper_key",
     audio_max_seconds: int = 60,
 ) -> str:
-    """Save Meta credentials + Whisper key + audio_max_seconds for a tenant."""
+    """Seed legacy Meta credentials + Whisper settings for a tenant."""
     verify_token = f"verify_{uuid4().hex}"
-    resp = client.patch(
-        API_CRED_PATH,
-        json={
+    _seed_legacy_meta_credentials(
+        client,
+        tenant_id,
+        {
             "whatsapp_provider": "meta_cloud",
             "meta_phone_number_id": phone_number_id,
             "meta_waba_id": f"waba_{uuid4().hex[:8]}",
@@ -826,13 +840,7 @@ def _seed_meta_credentials_with_whisper(
             "whisper_api_key": whisper_key,
             "audio_max_seconds": audio_max_seconds,
         },
-        headers=_admin_headers(tenant_id),
     )
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["meta_verify_token_set"] is True
-    assert resp.json()["meta_verify_token_masked"] == "••••••••"
-    assert "meta_verify_token" not in resp.json()
-    assert verify_token not in resp.text
     return verify_token
 
 
@@ -1659,11 +1667,12 @@ class TestMetaWebhookHmacAuthenticity:
         """A tenant without ``meta_app_secret`` cannot authenticate — any
         signature is rejected (readiness ``signature_pending``)."""
         phone_id = f"pn_{uuid4().hex[:8]}"
-        # Manually seed the tenant WITHOUT app secret using generic PATCH
+        # Manually seed the tenant WITHOUT app secret.
         verify_token = f"verify_{uuid4().hex}"
-        resp = client.patch(
-            API_CRED_PATH,
-            json={
+        _seed_legacy_meta_credentials(
+            client,
+            tenant_id,
+            {
                 "whatsapp_provider": "meta_cloud",
                 "meta_phone_number_id": phone_id,
                 "meta_waba_id": f"waba_{uuid4().hex[:8]}",
@@ -1671,9 +1680,7 @@ class TestMetaWebhookHmacAuthenticity:
                 "meta_verify_token": verify_token,
                 # NOTE: no meta_app_secret
             },
-            headers=_admin_headers(tenant_id),
         )
-        assert resp.status_code == 200
 
         payload = _meta_text_payload(
             phone_number_id=phone_id,
@@ -1919,8 +1926,7 @@ def _seed_meta_audio_tenant(
 
     No credential loader is mocked anywhere in this class: the row is the
     only source of truth, exactly as in production. ``stt_provider`` always
-    travels with a fresh key because the endpoint refuses a provider change
-    that reuses the previous secret.
+    carries the credential material required by the untouched runtime.
     """
     payload: dict = {
         "whatsapp_provider": "meta_cloud",
@@ -1951,12 +1957,7 @@ def _seed_meta_audio_tenant(
     if audio_max_seconds is not None:
         payload["audio_max_seconds"] = audio_max_seconds
 
-    resp = client.patch(
-        API_CRED_PATH,
-        json=payload,
-        headers=_admin_headers(tenant_id),
-    )
-    assert resp.status_code == 200, resp.text
+    _seed_legacy_meta_credentials(client, tenant_id, payload)
 
 
 def _meta_set_agent_language(
@@ -2431,17 +2432,16 @@ class TestMetaSttFallbackChain:
     ):
         """The four media envelopes are frozen: this one exits before the chain."""
         phone_id = f"pn_{uuid4().hex[:8]}"
-        resp = client.patch(
-            API_CRED_PATH,
-            json={
+        _seed_legacy_meta_credentials(
+            client,
+            tenant_id,
+            {
                 "whatsapp_provider": "meta_cloud",
                 "meta_phone_number_id": phone_id,
                 "meta_app_secret": META_APP_SECRET,
                 "meta_verify_token": f"verify_{uuid4().hex}",
             },
-            headers=_admin_headers(tenant_id),
         )
-        assert resp.status_code == 200, resp.text
 
         payload = _meta_audio_payload(
             phone_number_id=phone_id,
