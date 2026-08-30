@@ -19,8 +19,8 @@ import copy
 import json
 import pathlib
 from datetime import datetime, timedelta, timezone
-from typing import Any
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
@@ -29,7 +29,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.config.settings import settings
-
 
 # Real captured Uazapi webhook payloads (audio + image), redacted only for
 # the per-tenant webhook token. Group 4 acceptance criterion: media tests
@@ -1356,6 +1355,7 @@ def _session_row(client: TestClient, session_id: UUID):
     committed state, not the in-memory object the request handler mutated.
     """
     from sqlalchemy import select
+
     from src.models.session import Session as SessionRow
     from src.repositories.database import get_db_session
 
@@ -1379,6 +1379,7 @@ def _session_metadata(client: TestClient, session_id: UUID) -> dict:
     """Load ``session_metadata`` in a new AsyncSession — used by the aviso
     echo end-to-end test, which needs to plant the aviso id server-side."""
     from sqlalchemy import select
+
     from src.models.session import Session as SessionRow
     from src.repositories.database import get_db_session
 
@@ -1409,6 +1410,7 @@ def _seed_handoff_active(
     test does.
     """
     from sqlalchemy import update
+
     from src.models.clinic_config_table import ClinicConfigTable
     from src.repositories.database import get_db_session
 
@@ -1500,9 +1502,10 @@ class TestUazapiFromMeHumanTakeover:
         chatid, so no session is ever seeded for the clinic's own number.
         """
         from sqlalchemy import select
+
+        from src.api.routes.webhook import _normalise_phone
         from src.models.session import Session as SessionRow
         from src.repositories.database import get_db_session
-        from src.api.routes.webhook import _normalise_phone
 
         self._clear_state()
         instance = f"clinica_{uuid4().hex[:8]}"
@@ -1652,8 +1655,9 @@ class TestUazapiFromMeAiEcho:
 
         # The aviso id was committed to session_metadata by Group 1b —
         # verify from a NEW DB session (not the request's).
-        from src.api.routes.webhook import _normalise_phone
         from sqlalchemy import select
+
+        from src.api.routes.webhook import _normalise_phone
         from src.models.session import Session as SessionRow
         from src.repositories.database import get_db_session
 
@@ -1878,6 +1882,7 @@ class TestUazapiFromMeTriggerReactivation:
 
     def _pause_session(self, client: TestClient, session_id: UUID) -> None:
         from sqlalchemy import update
+
         from src.models.session import Session as SessionRow
         from src.repositories.database import get_db_session
 
@@ -2496,3 +2501,96 @@ class TestUazapiGroup4FromMeAudioUntouched:
         # Half 2: the patient's session got paused
         row = _session_row(client, patient_session_id)
         assert row["is_paused"] is True
+
+
+class TestInactiveQueueReactivationRuntimeRegression:
+    """The queue command and common webhook pause lookup choose the same row."""
+
+    def test_reactivated_effective_duplicate_continues_to_ai_pipeline(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        from sqlalchemy import update
+
+        from src.api.routes import webhook as webhook_module
+        from src.models.session import Session as SessionRow
+        from src.repositories.database import get_db_session
+
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+        phone = "5511988887722"
+        old_session_id = _create_session(client, tenant_id, phone)
+        effective_session_id = UUID(int=old_session_id.int + 1)
+        now = datetime.now(timezone.utc)
+
+        async def _seed_duplicate() -> None:
+            db = get_db_session()
+            try:
+                await db.execute(
+                    update(SessionRow)
+                    .where(SessionRow.id == old_session_id)
+                    .values(
+                        is_paused=True,
+                        paused_until=None,
+                        last_activity_at=now,
+                    )
+                )
+                db.add(
+                    SessionRow(
+                        id=effective_session_id,
+                        tenant_id=tenant_id,
+                        user_id=phone,
+                        channel="whatsapp",
+                        cognitive_state={"funnel_stage": "lead_novo"},
+                        session_metadata={"source": "webhook"},
+                        last_activity_at=now,
+                        is_active=True,
+                        is_paused=True,
+                        paused_until=None,
+                    )
+                )
+                await db.commit()
+            finally:
+                await db.close()
+
+        client._submit(_seed_duplicate())  # type: ignore[attr-defined]
+
+        reactivated = client.post(
+            f"/v1/sessions/{effective_session_id}/reactivate",
+            headers=_admin_headers(tenant_id),
+        )
+        assert reactivated.status_code == 200, reactivated.text
+        assert reactivated.json()["status"] == "reactivated"
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone=phone,
+            body="Quero continuar o atendimento",
+            message_id=f"3EB0_reactivated_{uuid4().hex[:8]}",
+        )
+        with (
+            patch("src.api.routes.webhook.get_event_service") as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(return_value=_fake_uazapi_send_result()),
+            ),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Atendimento retomado"),
+            )
+            mock_get_service.return_value = service
+
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "replied": True}
+        assert service.process_event.await_count == 1
+        event = service.process_event.await_args.args[0]
+        assert event.session_id == effective_session_id
+        assert _session_row(client, effective_session_id)["is_paused"] is False
+        assert _session_row(client, old_session_id)["is_paused"] is True

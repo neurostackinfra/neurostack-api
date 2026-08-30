@@ -5,7 +5,7 @@ Contracts for session management endpoints (/v1/sessions).
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -121,9 +121,15 @@ class CognitiveState(BaseModel):
         default_factory=dict,
         description="Last decision: intent, action, policy_refs, constraints (doc MVP v0.5)",
     )
-    first_contact_at: Optional[str] = Field(default=None, description="First contact timestamp")
-    pos_atendimento_started_at: Optional[str] = Field(default=None, description="Pós-atendimento start")
-    last_message_at: Optional[str] = Field(default=None, description="Last message timestamp")
+    first_contact_at: Optional[str] = Field(
+        default=None, description="First contact timestamp"
+    )
+    pos_atendimento_started_at: Optional[str] = Field(
+        default=None, description="Pós-atendimento start"
+    )
+    last_message_at: Optional[str] = Field(
+        default=None, description="Last message timestamp"
+    )
 
 
 class SessionResponse(BaseModel):
@@ -334,6 +340,35 @@ class SessionListResponse(BaseModel):
     )
 
 
+class InactiveSessionItem(BaseModel):
+    """Minimal projection for the permanent-pause operations queue."""
+
+    session_id: UUID
+    contact_identifier: Optional[str] = None
+    channel: str
+    last_intent: Optional[str] = None
+    funnel_stage: str
+    last_activity_at: datetime
+
+
+class InactiveSessionsResponse(BaseModel):
+    """Paginated effective sessions in permanent pause."""
+
+    items: list[InactiveSessionItem]
+    total: int = Field(..., ge=0)
+    page: int = Field(..., ge=1)
+    page_size: int = Field(..., ge=1)
+    has_next: bool
+    has_previous: bool
+
+
+class SessionReactivationResponse(BaseModel):
+    """Result of an idempotent session reactivation command."""
+
+    session_id: UUID
+    status: Literal["reactivated", "already_active"]
+
+
 class SessionEventResponse(BaseModel):
     """
     Event associated with a session.
@@ -380,4 +415,3 @@ class SessionEventsResponse(BaseModel):
     total: int = Field(..., ge=0, description="Total number of events")
     limit: int = Field(..., ge=1, description="Limit applied")
     offset: int = Field(..., ge=0, description="Offset applied")
-
