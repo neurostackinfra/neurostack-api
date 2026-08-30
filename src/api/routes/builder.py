@@ -14,6 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.types import String
 
+from src.api.helpers.health import (
+    CONFIG_COMPLETENESS_BUCKETS,
+    _compute_alerts,
+    _compute_config_completeness,
+    _compute_health_status,
+    _get_time_series,
+)
 from src.api.middleware.auth import require_builder
 from src.api.schemas.builder import (
     BuilderAlertResponse,
@@ -24,13 +31,6 @@ from src.api.schemas.builder import (
     CreateBuilderClinicRequest,
     ToggleClinicStatusRequest,
     TraceTimeSeriesPoint,
-)
-from src.api.helpers.health import (
-    CONFIG_COMPLETENESS_BUCKETS,
-    _compute_alerts,
-    _compute_config_completeness,
-    _compute_health_status,
-    _get_time_series,
 )
 from src.models.builder import Builder
 from src.models.clinic_config_table import ClinicConfigTable
@@ -61,9 +61,7 @@ async def builder_profile(
     session: AsyncSession = Depends(get_db_session_dependency),
 ):
     # Fetch builder
-    result = await session.execute(
-        select(Builder).where(Builder.id == builder_id)
-    )
+    result = await session.execute(select(Builder).where(Builder.id == builder_id))
     builder = result.scalar_one_or_none()
     if not builder:
         raise HTTPException(
@@ -255,9 +253,7 @@ async def create_clinic(
     session: AsyncSession = Depends(get_db_session_dependency),
 ):
     # Check email uniqueness
-    existing = await session.execute(
-        select(User).where(User.email == body.admin_email)
-    )
+    existing = await session.execute(select(User).where(User.email == body.admin_email))
     if existing.scalar_one_or_none():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -456,18 +452,20 @@ async def _get_builder_stats(
         if tokens:
             total_tokens += tokens
         for llm_model, model_tokens_used in llm_model_entries:
-            model_tokens[llm_model] = (
-                model_tokens.get(llm_model, 0) + model_tokens_used
-            )
+            model_tokens[llm_model] = model_tokens.get(llm_model, 0) + model_tokens_used
         # Track audio transcriptions (whisper) — use audio_seconds as the metric unit
         whisper_model = metadata.get("whisper_model")
         if whisper_model and metadata.get("is_audio"):
             audio_sec = int(metadata.get("audio_seconds") or 0)
-            model_tokens[f"🎙️ {whisper_model}"] = model_tokens.get(f"🎙️ {whisper_model}", 0) + max(audio_sec, 1)
+            model_tokens[f"🎙️ {whisper_model}"] = model_tokens.get(
+                f"🎙️ {whisper_model}", 0
+            ) + max(audio_sec, 1)
 
     model_breakdown = [
         {"model": model, "tokens": toks}
-        for model, toks in sorted(model_tokens.items(), key=lambda x: x[1], reverse=True)
+        for model, toks in sorted(
+            model_tokens.items(), key=lambda x: x[1], reverse=True
+        )
     ]
 
     return BuilderStatsResponse(

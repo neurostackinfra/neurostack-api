@@ -12,12 +12,12 @@ Todas as métricas são expostas via Prometheus e podem ser
 visualizadas no Grafana.
 """
 
-from prometheus_client import Counter, Histogram, Gauge, Summary
-from typing import Optional
 from enum import Enum
+from typing import Optional
+
+from prometheus_client import Counter, Gauge, Histogram, Summary
 
 from src.config.logging import get_logger
-
 
 logger = get_logger(__name__)
 
@@ -245,9 +245,10 @@ LLM_GENERATION_ATTEMPTS_TOTAL = Counter(
 # Helper Classes for Metric Collection
 # ============================================
 
+
 class SRMMetrics:
     """Helper class para coletar métricas do SRM."""
-    
+
     @staticmethod
     def record_decision(
         tenant_id: str,
@@ -263,23 +264,23 @@ class SRMMetrics:
                 tenant_id=tenant_id,
                 flow_mode=flow_mode,
             ).inc()
-            
+
             INTENT_CLASSIFICATIONS_TOTAL.labels(
                 intent=intent,
                 tenant_id=tenant_id,
             ).inc()
-            
+
             INTENT_CONFIDENCE.labels(intent=intent).set(intent_confidence)
-            
+
             FUNNEL_STAGE_TOTAL.labels(
                 stage=funnel_stage,
                 tenant_id=tenant_id,
             ).inc()
-            
+
             SRM_PROCESSING_TIME.labels(component="total").observe(
                 processing_time_ms / 1000
             )
-            
+
             logger.debug(
                 "SRM decision recorded",
                 tenant_id=tenant_id,
@@ -293,7 +294,7 @@ class SRMMetrics:
                 error=str(e),
                 error_type=type(e).__name__,
             )
-    
+
     @staticmethod
     def record_component_time(component: str, time_ms: float) -> None:
         """Registra tempo de um componente específico do SRM."""
@@ -302,7 +303,7 @@ class SRMMetrics:
 
 class SafetyMetrics:
     """Helper class para coletar métricas de safety."""
-    
+
     @staticmethod
     def record_trigger(
         category: str,
@@ -316,14 +317,14 @@ class SafetyMetrics:
                 category=category,
                 tenant_id=tenant_id,
             ).inc()
-            
+
             SAFETY_CONFIDENCE.labels(category=category).observe(confidence)
-            
+
             SAFETY_SEVERITY.labels(
                 severity=severity,
                 category=category,
             ).inc()
-            
+
             logger.info(
                 "Safety trigger recorded",
                 category=category,
@@ -342,7 +343,7 @@ class SafetyMetrics:
 
 class FlowMetrics:
     """Helper class para coletar métricas de flow."""
-    
+
     @staticmethod
     def record_transition(
         from_mode: str,
@@ -357,10 +358,10 @@ class FlowMetrics:
                 to_mode=to_mode,
                 tenant_id=tenant_id,
             ).inc()
-            
+
             if duration_seconds is not None:
                 FLOW_MODE_DURATION.labels(mode=from_mode).observe(duration_seconds)
-            
+
             logger.debug(
                 "Flow transition recorded",
                 from_mode=from_mode,
@@ -374,7 +375,7 @@ class FlowMetrics:
                 error=str(e),
                 error_type=type(e).__name__,
             )
-    
+
     @staticmethod
     def update_active_sessions(mode: str, count: int) -> None:
         """Atualiza contagem de sessões ativas por modo."""
@@ -383,7 +384,7 @@ class FlowMetrics:
 
 class HandoffMetrics:
     """Helper class para coletar métricas de handoff."""
-    
+
     @staticmethod
     def record_handoff(
         reason: str,
@@ -396,9 +397,9 @@ class HandoffMetrics:
                 reason=reason,
                 tenant_id=tenant_id,
             ).inc()
-            
+
             HANDOFF_TURN_COUNT.labels(reason=reason).observe(turn_count)
-            
+
             logger.info(
                 "Handoff recorded",
                 reason=reason,
@@ -412,12 +413,12 @@ class HandoffMetrics:
                 error=str(e),
                 error_type=type(e).__name__,
             )
-    
+
     @staticmethod
     def record_webhook(status: str, tenant_id: str) -> None:
         """Registra resultado de webhook de handoff."""
         HANDOFF_WEBHOOKS.labels(status=status, tenant_id=tenant_id).inc()
-    
+
     @staticmethod
     def record_response_time(tenant_id: str, response_time_seconds: float) -> None:
         """Registra tempo de resposta do humano."""
@@ -426,7 +427,7 @@ class HandoffMetrics:
 
 class RAGMetrics:
     """Helper class para coletar métricas de RAG."""
-    
+
     @staticmethod
     def record_query(
         tenant_id: str,
@@ -438,7 +439,7 @@ class RAGMetrics:
             RAG_QUERIES_TOTAL.labels(tenant_id=tenant_id).inc()
             RAG_RESULTS_COUNT.labels(tenant_id=tenant_id).observe(result_count)
             RAG_LATENCY.observe(latency_ms / 1000)
-            
+
             logger.debug(
                 "RAG query recorded",
                 tenant_id=tenant_id,
@@ -456,7 +457,7 @@ class RAGMetrics:
 
 class PolicyMetrics:
     """Helper class para coletar métricas de policy."""
-    
+
     @staticmethod
     def record_application(policy_type: str, tenant_id: str) -> None:
         """Registra aplicação de política."""
@@ -464,7 +465,7 @@ class PolicyMetrics:
             policy_type=policy_type,
             tenant_id=tenant_id,
         ).inc()
-    
+
     @staticmethod
     def record_violation(rule_id: str, tenant_id: str) -> None:
         """Registra violação de política."""
@@ -472,7 +473,7 @@ class PolicyMetrics:
             rule_id=rule_id,
             tenant_id=tenant_id,
         ).inc()
-        
+
         logger.warning(
             "Policy violation recorded",
             rule_id=rule_id,
@@ -482,12 +483,12 @@ class PolicyMetrics:
 
 class PipelineMetrics:
     """Helper class para coletar métricas do pipeline."""
-    
+
     @staticmethod
     def record_total_time(tenant_id: str, time_ms: float) -> None:
         """Registra tempo total do pipeline."""
         PIPELINE_TOTAL_TIME.labels(tenant_id=tenant_id).observe(time_ms / 1000)
-    
+
     @staticmethod
     def record_stage_time(stage: str, time_ms: float) -> None:
         """Registra tempo de um estágio do pipeline."""
@@ -497,10 +498,10 @@ class PipelineMetrics:
 class BusinessMetrics:
     """
     Facade class que agrupa todas as métricas de negócio.
-    
+
     Usage:
         from src.observability.metrics import BusinessMetrics
-        
+
         # Registrar decisão do SRM
         BusinessMetrics.srm.record_decision(
             tenant_id="tenant_123",
@@ -510,7 +511,7 @@ class BusinessMetrics:
             funnel_stage="consideration",
             processing_time_ms=45.5,
         )
-        
+
         # Registrar safety trigger
         BusinessMetrics.safety.record_trigger(
             category="clinical",
@@ -519,7 +520,7 @@ class BusinessMetrics:
             severity="high",
         )
     """
-    
+
     srm = SRMMetrics()
     safety = SafetyMetrics()
     flow = FlowMetrics()
@@ -532,11 +533,11 @@ class BusinessMetrics:
 def get_metrics_summary() -> dict:
     """
     Retorna um resumo das métricas de negócio atuais.
-    
+
     Útil para endpoints de status e debugging.
     """
     from prometheus_client import REGISTRY
-    
+
     summary = {
         "srm": {},
         "safety": {},
@@ -544,7 +545,7 @@ def get_metrics_summary() -> dict:
         "handoff": {},
         "rag": {},
     }
-    
+
     try:
         # Coletar valores atuais das métricas
         for metric in REGISTRY.collect():
@@ -565,5 +566,5 @@ def get_metrics_summary() -> dict:
             error_type=type(e).__name__,
             exc_info=True,
         )
-    
+
     return summary
