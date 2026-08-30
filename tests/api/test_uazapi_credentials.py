@@ -6,8 +6,8 @@ Covers save/status flow for Uazapi (wuzapi self-hosted) credentials:
   uazapi_instance_name)
 - The secret field (uazapi_token) is masked in status responses
 - ``apis_configured`` becomes true when the three Uazapi fields are set
-- Uazapi is now a first-class provider (removed from
-  ``UNIMPLEMENTED_WHATSAPP_PROVIDERS``); dialog360 and twilio still 501
+- Legacy Uazapi credentials remain readable, while public provider writes
+  fail closed until availability is enabled.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -48,6 +48,24 @@ def _headers(tenant_id: UUID | None = None) -> dict[str, str]:
     }
 
 
+def _seed_legacy_credentials(
+    client: TestClient, tenant_id: UUID, credentials: dict[str, str]
+) -> None:
+    """Persist legacy runtime credentials without using the public PATCH API."""
+    from src.models.clinic_config_table import ClinicConfigTable
+    from src.repositories.database import get_db_session
+
+    async def _run() -> None:
+        db = get_db_session()
+        try:
+            db.add(ClinicConfigTable(tenant_id=tenant_id, api_credentials=credentials))
+            await db.commit()
+        finally:
+            await db.close()
+
+    client._submit(_run())  # type: ignore[attr-defined]
+
+
 @pytest.fixture
 def tenant_id() -> UUID:
     """Fresh tenant_id per test so each ClinicConfigTable row is isolated."""
@@ -59,8 +77,8 @@ def headers(tenant_id: UUID) -> dict[str, str]:
     return _headers(tenant_id)
 
 
-class TestSaveUazapiCredentials:
-    """PATCH /v1/config/api-credentials — Uazapi fields."""
+class TestUazapiProviderAvailability:
+    """PATCH /v1/config/api-credentials fails closed for Uazapi."""
 
     def test_saves_all_three_uazapi_fields(
         self,
@@ -75,21 +93,18 @@ class TestSaveUazapiCredentials:
         }
         response = client.patch(API_CRED_PATH, json=payload, headers=headers)
 
-        assert response.status_code == 200, response.text
-        data = response.json()
-        assert data["ok"] is True
-        assert data["whatsapp_provider"] == "uazapi"
-        assert data["uazapi_api_url"] == "https://uazapi.example.com"
-        assert data["uazapi_instance_name"] == "clinica-x"
-        # Secret is persisted → set flag true; raw value not returned
-        assert data["uazapi_token_set"] is True
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"] == {
+            "error": "provider_not_available",
+            "capability": "whatsapp",
+            "provider": "uazapi",
+        }
 
     def test_patch_without_uazapi_does_not_break_other_providers(
         self,
         client: TestClient,
     ) -> None:
-        """A PATCH targeting Z-API must still succeed even after Uazapi became
-        a first-class provider — no regression on the Z-API save path."""
+        """Every unavailable WhatsApp provider fails closed at this boundary."""
         headers = _headers(uuid4())
         resp = client.patch(
             API_CRED_PATH,
@@ -100,10 +115,9 @@ class TestSaveUazapiCredentials:
             },
             headers=headers,
         )
-        assert resp.status_code == 200, resp.text
-        data = resp.json()
-        assert data["whatsapp_provider"] == "zapi"
-        assert data["zapi_token_set"] is True
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["detail"]["error"] == "provider_not_available"
+        assert resp.json()["detail"]["provider"] == "zapi"
 
 
 class TestMaskingUazapiCredentials:
@@ -113,17 +127,18 @@ class TestMaskingUazapiCredentials:
         self,
         client: TestClient,
         headers: dict[str, str],
+        tenant_id: UUID,
     ) -> None:
         raw_token = "uz_super_secret_token_1234567890ABCDEF"
-        client.patch(
-            API_CRED_PATH,
-            json={
+        _seed_legacy_credentials(
+            client,
+            tenant_id,
+            {
                 "whatsapp_provider": "uazapi",
                 "uazapi_api_url": "https://uazapi.example.com",
                 "uazapi_token": raw_token,
                 "uazapi_instance_name": "clinica-y",
             },
-            headers=headers,
         )
 
         response = client.get(API_CRED_PATH, headers=headers)
@@ -146,16 +161,17 @@ class TestUazapiIsConfigured:
         self,
         client: TestClient,
         headers: dict[str, str],
+        tenant_id: UUID,
     ) -> None:
-        client.patch(
-            API_CRED_PATH,
-            json={
+        _seed_legacy_credentials(
+            client,
+            tenant_id,
+            {
                 "whatsapp_provider": "uazapi",
                 "uazapi_api_url": "https://uazapi.example.com",
                 "uazapi_token": "uz_token_1234567890",
                 "uazapi_instance_name": "clinica-z",
             },
-            headers=headers,
         )
         resp = client.get(API_CRED_PATH, headers=headers)
         assert resp.status_code == 200
@@ -165,28 +181,29 @@ class TestUazapiIsConfigured:
         self,
         client: TestClient,
         headers: dict[str, str],
+        tenant_id: UUID,
     ) -> None:
         """Missing any of the three fields must keep ``apis_configured`` false
         (unless the LLM credentials are set, which they aren't in this test)."""
-        client.patch(
-            API_CRED_PATH,
-            json={
+        _seed_legacy_credentials(
+            client,
+            tenant_id,
+            {
                 "whatsapp_provider": "uazapi",
                 "uazapi_api_url": "https://uazapi.example.com",
                 "uazapi_token": "uz_token_missing_instance",
             },
-            headers=headers,
         )
         resp = client.get(API_CRED_PATH, headers=headers)
         assert resp.status_code == 200
         assert resp.json()["apis_configured"] is False
 
 
-class TestUnimplementedRemains:
-    """Uazapi is now supported; dialog360 and twilio must still 501."""
+class TestUnavailableProviders:
+    """Public writes report the same availability state for every provider."""
 
     @pytest.mark.parametrize("provider", ["dialog360", "twilio"])
-    def test_still_returns_501_for_dialog360_and_twilio(
+    def test_returns_provider_not_available_for_dialog360_and_twilio(
         self,
         client: TestClient,
         provider: str,
@@ -197,15 +214,16 @@ class TestUnimplementedRemains:
             json={"whatsapp_provider": provider},
             headers=headers,
         )
-        assert resp.status_code == 501, resp.text
+        assert resp.status_code == 422, resp.text
         detail = resp.json().get("detail", resp.json())
-        assert detail.get("error") == "provider_not_implemented"
+        assert detail.get("error") == "provider_not_available"
         assert detail.get("provider") == provider
 
     @pytest.mark.parametrize(
-        "provider", ["meta_cloud", "zapi", "evolution", "uazapi"],
+        "provider",
+        ["meta_cloud", "zapi", "evolution", "uazapi"],
     )
-    def test_accepts_implemented_providers_including_uazapi(
+    def test_returns_provider_not_available_for_legacy_providers(
         self,
         client: TestClient,
         provider: str,
@@ -216,5 +234,7 @@ class TestUnimplementedRemains:
             json={"whatsapp_provider": provider},
             headers=headers,
         )
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["whatsapp_provider"] == provider
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "provider_not_available"
+        assert detail["provider"] == provider

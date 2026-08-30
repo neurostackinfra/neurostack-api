@@ -97,7 +97,7 @@ class LlmCredentialsPatch(BaseModel):
 class MultimodalCredentialsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    multimodal_provider: Literal["openrouter", "groq", "openai"] | None = None
+    multimodal_provider: Literal["openrouter"] | None = None
     multimodal_api_url: ApiUrl | None = None
     multimodal_api_key: Secret | None = None
     multimodal_model_name: Identifier | None = None

@@ -104,18 +104,17 @@ def _seed_uazapi_credentials(
     api_url: str = "https://uazapi.example.com",
     token: str | None = None,
 ) -> None:
-    """Save Uazapi credentials for a tenant."""
-    resp = client.patch(
-        API_CRED_PATH,
-        json={
+    """Seed persisted legacy Uazapi credentials for webhook coverage."""
+    _seed_legacy_uazapi_credentials(
+        client,
+        tenant_id,
+        {
             "whatsapp_provider": "uazapi",
             "uazapi_api_url": api_url,
             "uazapi_token": token or f"uz_token_{uuid4().hex}",
             "uazapi_instance_name": instance_name,
         },
-        headers=_admin_headers(tenant_id),
     )
-    assert resp.status_code == 200, resp.text
 
 
 def _seed_uazapi_credentials_missing_secrets(
@@ -125,16 +124,29 @@ def _seed_uazapi_credentials_missing_secrets(
 ) -> None:
     """Save only the instance_name so the tenant is resolvable but has no
     URL/token — used to exercise the ``no_credentials`` branch."""
-    resp = client.patch(
-        API_CRED_PATH,
-        json={
-            # Provide a real provider so the 501 guard doesn't fire.
-            "whatsapp_provider": "zapi",
-            "uazapi_instance_name": instance_name,
-        },
-        headers=_admin_headers(tenant_id),
+    _seed_legacy_uazapi_credentials(
+        client,
+        tenant_id,
+        {"whatsapp_provider": "uazapi", "uazapi_instance_name": instance_name},
     )
-    assert resp.status_code == 200, resp.text
+
+
+def _seed_legacy_uazapi_credentials(
+    client: TestClient, tenant_id: UUID, credentials: dict[str, Any]
+) -> None:
+    """Insert legacy credential state without reopening public provisioning."""
+    from src.models.clinic_config_table import ClinicConfigTable
+    from src.repositories.database import get_db_session
+
+    async def _run() -> None:
+        db = get_db_session()
+        try:
+            db.add(ClinicConfigTable(tenant_id=tenant_id, api_credentials=credentials))
+            await db.commit()
+        finally:
+            await db.close()
+
+    client._submit(_run())  # type: ignore[attr-defined]
 
 
 def _uazapi_text_payload(
@@ -241,12 +253,15 @@ class TestUazapiWebhookTextFlow:
             message_id=msg_id,
         )
 
-        with patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(return_value=_fake_uazapi_send_result()),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(return_value=_fake_uazapi_send_result()),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock(
@@ -278,8 +293,7 @@ class TestUazapiWebhookTextFlow:
 
         # The Uazapi msg id and phone appear in the receipt log
         receipt_logs = [
-            rec for rec in caplog.records
-            if "Uazapi webhook: msg" in rec.getMessage()
+            rec for rec in caplog.records if "Uazapi webhook: msg" in rec.getMessage()
         ]
         assert receipt_logs, "expected a receipt log line for the incoming msg"
         assert msg_id in receipt_logs[0].getMessage()
@@ -305,15 +319,19 @@ class TestUazapiWebhookDuplicateMessage:
             message_id=msg_id,
         )
 
-        with patch(
-            "src.api.routes.webhook._get_redis",
-            return_value=None,
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(return_value=_fake_uazapi_send_result()),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook._get_redis",
+                return_value=None,
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(return_value=_fake_uazapi_send_result()),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock(
@@ -343,7 +361,9 @@ class TestUazapiWebhookUnknownInstance:
     ):
         # Seed a clinic with a *different* instance
         _seed_uazapi_credentials(
-            client, tenant_id, f"owned_{uuid4().hex[:8]}",
+            client,
+            tenant_id,
+            f"owned_{uuid4().hex[:8]}",
         )
 
         stranger_instance = f"stranger_{uuid4().hex[:8]}"
@@ -363,8 +383,7 @@ class TestUazapiWebhookUnknownInstance:
             rec.getMessage() for rec in caplog.records if rec.levelname == "WARNING"
         ]
         assert any(
-            "no tenant for instance" in m and stranger_instance in m
-            for m in warn_msgs
+            "no tenant for instance" in m and stranger_instance in m for m in warn_msgs
         ), warn_msgs
 
     def test_unknown_instance_media_skips_before_non_text(
@@ -373,7 +392,9 @@ class TestUazapiWebhookUnknownInstance:
         tenant_id: UUID,
     ):
         _seed_uazapi_credentials(
-            client, tenant_id, f"owned_{uuid4().hex[:8]}",
+            client,
+            tenant_id,
+            f"owned_{uuid4().hex[:8]}",
         )
 
         payload = _uazapi_text_payload(
@@ -415,12 +436,15 @@ class TestUazapiWebhookNonText:
             media_type="image",
         )
 
-        with patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(return_value=_fake_uazapi_send_result()),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(return_value=_fake_uazapi_send_result()),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock()
@@ -460,10 +484,11 @@ class TestUazapiWebhookNonText:
         )
 
         send_mock = AsyncMock(return_value=_fake_uazapi_send_result())
-        with patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text", send_mock
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch("src.api.routes.webhook.send_uazapi_text", send_mock),
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
@@ -560,11 +585,14 @@ class TestUazapiWebhookContentExtraction:
             message_id=f"3EB0_content_{uuid4().hex[:8]}",
         )
 
-        with patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(return_value=_fake_uazapi_send_result()),
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(return_value=_fake_uazapi_send_result()),
+            ),
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
@@ -625,12 +653,15 @@ class TestUazapiWebhookGroupChat:
             chat_jid="120363000000000000@g.us",
         )
 
-        with patch(
-            "src.api.routes.webhook._get_or_create_session",
-            new=AsyncMock(return_value=(uuid4(), True)),
-        ) as mock_get_or_create_session, patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service:
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), True)),
+            ) as mock_get_or_create_session,
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+        ):
             resp = client.post(WEBHOOK_PATH, json=payload)
 
         assert resp.status_code == 200
@@ -656,15 +687,19 @@ class TestUazapiWebhookBotPaused:
             message_id=f"3EB0_paused_{uuid4().hex[:8]}",
         )
 
-        with patch(
-            "src.api.routes.webhook._check_bot_active",
-            new=AsyncMock(return_value={"ok": True, "skipped": "bot_paused"}),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(return_value=_fake_uazapi_send_result()),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook._check_bot_active",
+                new=AsyncMock(return_value={"ok": True, "skipped": "bot_paused"}),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(return_value=_fake_uazapi_send_result()),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock(
@@ -703,12 +738,15 @@ class TestUazapiWebhookMissingCredentials:
             message_id=f"3EB0_nocred_{uuid4().hex[:8]}",
         )
 
-        with patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(return_value=_fake_uazapi_send_result()),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(return_value=_fake_uazapi_send_result()),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock(
@@ -732,9 +770,7 @@ class TestUazapiWebhookMissingCredentials:
         warn_msgs = [
             rec.getMessage() for rec in caplog.records if rec.levelname == "WARNING"
         ]
-        assert any(
-            "Uazapi credentials missing" in m for m in warn_msgs
-        ), warn_msgs
+        assert any("Uazapi credentials missing" in m for m in warn_msgs), warn_msgs
 
 
 # ============================================
@@ -779,15 +815,19 @@ class TestUazapiPrivacyNoticeSend:
         )
 
         # Mock _get_or_create_session so is_new=True is deterministic
-        with patch(
-            "src.api.routes.webhook._get_or_create_session",
-            new=AsyncMock(return_value=(uuid4(), True)),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(side_effect=[privacy_send, reply_send]),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), True)),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(side_effect=[privacy_send, reply_send]),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=True),
@@ -827,15 +867,19 @@ class TestUazapiPrivacyNoticeSend:
 
         reply_send = _fake_uazapi_send_result()
 
-        with patch(
-            "src.api.routes.webhook._get_or_create_session",
-            new=AsyncMock(return_value=(uuid4(), False)),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(return_value=reply_send),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), False)),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(return_value=reply_send),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=True),
@@ -868,15 +912,19 @@ class TestUazapiPrivacyNoticeSend:
             message_id=f"3EB0_nolgpd_{uuid4().hex[:8]}",
         )
 
-        with patch(
-            "src.api.routes.webhook._get_or_create_session",
-            new=AsyncMock(return_value=(uuid4(), True)),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(return_value=_fake_uazapi_send_result()),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), True)),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(return_value=_fake_uazapi_send_result()),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=False),
@@ -916,15 +964,19 @@ class TestUazapiPrivacyNoticeSend:
             message_id=f"3EB0_nocred_lgpd_{uuid4().hex[:8]}",
         )
 
-        with patch(
-            "src.api.routes.webhook._get_or_create_session",
-            new=AsyncMock(return_value=(uuid4(), True)),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(return_value=_fake_uazapi_send_result()),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), True)),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(return_value=_fake_uazapi_send_result()),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=True),
@@ -959,20 +1011,24 @@ class TestUazapiPrivacyNoticeSend:
             message_id=f"3EB0_pt_{uuid4().hex[:8]}",
         )
 
-        with patch(
-            "src.api.routes.webhook._get_or_create_session",
-            new=AsyncMock(return_value=(uuid4(), True)),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(
-                side_effect=[
-                    _fake_uazapi_send_result(),
-                    _fake_uazapi_send_result(),
-                ],
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), True)),
             ),
-        ) as mock_send:
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(
+                    side_effect=[
+                        _fake_uazapi_send_result(),
+                        _fake_uazapi_send_result(),
+                    ],
+                ),
+            ) as mock_send,
+        ):
             service = MagicMock()
             # No agent_language override → default is pt-BR
             service._load_clinic_config = AsyncMock(
@@ -1011,20 +1067,24 @@ class TestUazapiPrivacyNoticeSend:
             "business_rules": {"agent_language": "en"},
         }
 
-        with patch(
-            "src.api.routes.webhook._get_or_create_session",
-            new=AsyncMock(return_value=(uuid4(), True)),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(
-                side_effect=[
-                    _fake_uazapi_send_result(),
-                    _fake_uazapi_send_result(),
-                ],
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), True)),
             ),
-        ) as mock_send:
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(
+                    side_effect=[
+                        _fake_uazapi_send_result(),
+                        _fake_uazapi_send_result(),
+                    ],
+                ),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(
                 return_value=en_clinic_config,
@@ -1068,14 +1128,18 @@ class TestUazapiPrivacyNoticeSend:
             side_effect=[RuntimeError("boom"), reply_send],
         )
 
-        with patch(
-            "src.api.routes.webhook._get_or_create_session",
-            new=AsyncMock(return_value=(uuid4(), True)),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=send_mock,
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), True)),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=send_mock,
+            ),
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(
@@ -1097,9 +1161,7 @@ class TestUazapiPrivacyNoticeSend:
         warn_msgs = [
             rec.getMessage() for rec in caplog.records if rec.levelname == "WARNING"
         ]
-        assert any(
-            "Uazapi LGPD send failed" in m for m in warn_msgs
-        ), warn_msgs
+        assert any("Uazapi LGPD send failed" in m for m in warn_msgs), warn_msgs
 
 
 class TestUazapiEchoIdNormalisation:
@@ -1139,20 +1201,26 @@ class TestUazapiEchoIdNormalisation:
         async def _store_spy(sid, mid, db):
             stored_ids.append(mid)
 
-        with patch(
-            "src.api.routes.webhook._get_or_create_session",
-            new=AsyncMock(return_value=(session_id, False)),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(return_value=composite_send_result),
-        ), patch(
-            "src.api.routes.webhook._store_ai_msg_id_to_db",
-            new=AsyncMock(side_effect=_store_spy),
-        ), patch(
-            "src.api.routes.webhook._track_sent_message",
-        ) as mock_track:
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(session_id, False)),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(return_value=composite_send_result),
+            ),
+            patch(
+                "src.api.routes.webhook._store_ai_msg_id_to_db",
+                new=AsyncMock(side_effect=_store_spy),
+            ),
+            patch(
+                "src.api.routes.webhook._track_sent_message",
+            ) as mock_track,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock(
@@ -1206,20 +1274,26 @@ class TestUazapiEchoIdNormalisation:
         async def _store_spy(sid, mid, db):
             stored_ids.append(mid)
 
-        with patch(
-            "src.api.routes.webhook._get_or_create_session",
-            new=AsyncMock(return_value=(session_id, True)),
-        ), patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(side_effect=[composite_aviso, reply_send]),
-        ), patch(
-            "src.api.routes.webhook._store_ai_msg_id_to_db",
-            new=AsyncMock(side_effect=_store_spy),
-        ), patch(
-            "src.api.routes.webhook._track_sent_message",
-        ) as mock_track:
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(session_id, True)),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(side_effect=[composite_aviso, reply_send]),
+            ),
+            patch(
+                "src.api.routes.webhook._store_ai_msg_id_to_db",
+                new=AsyncMock(side_effect=_store_spy),
+            ),
+            patch(
+                "src.api.routes.webhook._track_sent_message",
+            ) as mock_track,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=True),
@@ -1289,9 +1363,9 @@ def _session_row(client: TestClient, session_id: UUID):
         db = get_db_session()
         try:
             row = await db.execute(
-                select(
-                    SessionRow.is_paused, SessionRow.paused_until
-                ).where(SessionRow.id == session_id)
+                select(SessionRow.is_paused, SessionRow.paused_until).where(
+                    SessionRow.id == session_id
+                )
             )
             r = row.one()
             return {"is_paused": bool(r.is_paused), "paused_until": r.paused_until}
@@ -1393,12 +1467,15 @@ class TestUazapiFromMeHumanTakeover:
             chat_jid=f"{patient_number}@s.whatsapp.net",
         )
 
-        with patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(return_value=_fake_uazapi_send_result()),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(return_value=_fake_uazapi_send_result()),
+            ) as mock_send,
+        ):
             resp = client.post(WEBHOOK_PATH, json=payload)
 
         assert resp.status_code == 200, resp.text
@@ -1446,11 +1523,14 @@ class TestUazapiFromMeHumanTakeover:
             chat_jid=f"{patient_number}@s.whatsapp.net",
         )
 
-        with patch(
-            "src.api.routes.webhook.get_event_service",
-        ), patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(return_value=_fake_uazapi_send_result()),
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ),
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(return_value=_fake_uazapi_send_result()),
+            ),
         ):
             resp = client.post(WEBHOOK_PATH, json=payload)
 
@@ -1470,9 +1550,9 @@ class TestUazapiFromMeHumanTakeover:
                 await db.close()
 
         clinic_session_count = client._submit(_count_clinic_sessions())  # type: ignore[attr-defined]
-        assert clinic_session_count == 0, (
-            "fromMe path must never create a session for the clinic's own number"
-        )
+        assert (
+            clinic_session_count == 0
+        ), "fromMe path must never create a session for the clinic's own number"
 
 
 class TestUazapiFromMeAiEcho:
@@ -1547,12 +1627,15 @@ class TestUazapiFromMeAiEcho:
             message_id=f"3EB0_first_{uuid4().hex[:8]}",
         )
 
-        with patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(side_effect=[privacy_send, reply_send]),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(side_effect=[privacy_send, reply_send]),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=True),
@@ -1590,9 +1673,9 @@ class TestUazapiFromMeAiEcho:
         session_id = client._submit(_find_patient_session())  # type: ignore[attr-defined]
         meta = _session_metadata(client, session_id)
         ids = [entry[0] for entry in (meta.get("ai_msg_ids") or [])]
-        assert privacy_mid in ids, (
-            f"expected the aviso id in session_metadata, got {meta!r}"
-        )
+        assert (
+            privacy_mid in ids
+        ), f"expected the aviso id in session_metadata, got {meta!r}"
 
         # Now the aviso's own echo returns as a fromMe delivery.
         # Sender_pn = clinic (owner of the echo), chatid = patient. The
@@ -1623,9 +1706,9 @@ class TestUazapiFromMeAiEcho:
         assert body.get("skipped") in {"ai_echo", "ai_echo_db"}, body
 
         row = _session_row(client, session_id)
-        assert row["is_paused"] is False, (
-            "the aviso echo must never pause the session it just opened"
-        )
+        assert (
+            row["is_paused"] is False
+        ), "the aviso echo must never pause the session it just opened"
         assert mock_get_service2.call_count == 0
 
     def test_duplicate_delivery_of_same_echo_is_dropped_by_claim(
@@ -1776,9 +1859,9 @@ class TestUazapiFromMeWasSentByApiGuard:
         assert second.json() == {"ok": True, "skipped": "ai_echo"}
 
         row = _session_row(client, patient_session_id)
-        assert row["is_paused"] is False, (
-            "idless echo with wasSentByApi must never pause the session"
-        )
+        assert (
+            row["is_paused"] is False
+        ), "idless echo with wasSentByApi must never pause the session"
 
 
 class TestUazapiFromMeTriggerReactivation:
@@ -1925,12 +2008,15 @@ class TestUazapiPatientMessageUnchanged:
             message_id=msg_id,
         )
 
-        with patch(
-            "src.api.routes.webhook.get_event_service",
-        ) as mock_get_service, patch(
-            "src.api.routes.webhook.send_uazapi_text",
-            new=AsyncMock(return_value=_fake_uazapi_send_result()),
-        ) as mock_send:
+        with (
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(return_value=_fake_uazapi_send_result()),
+            ) as mock_send,
+        ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
             service.process_event = AsyncMock(
@@ -1998,12 +2084,7 @@ def _seed_uazapi_audio_tenant(
     if audio_max_seconds is not None:
         payload["audio_max_seconds"] = audio_max_seconds
 
-    resp = client.patch(
-        API_CRED_PATH,
-        json=payload,
-        headers=_admin_headers(tenant_id),
-    )
-    assert resp.status_code == 200, resp.text
+    _seed_legacy_uazapi_credentials(client, tenant_id, payload)
 
 
 def _build_uazapi_media_body(
