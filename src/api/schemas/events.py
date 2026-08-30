@@ -396,6 +396,15 @@ class PromptOutput(BaseModel):
         default=None,
         description="Optional suggested response (for simple cases)",
     )
+    deterministic: bool = Field(
+        default=False,
+        description=(
+            "True when suggested_response was produced by a deterministic "
+            "path (e.g. scheduling link) rather than the LLM. Downstream "
+            "channels use this to force text delivery and bypass TTS so the "
+            "response stays clickable."
+        ),
+    )
 
 
 class MessageHistory(BaseModel):

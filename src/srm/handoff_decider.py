@@ -422,48 +422,15 @@ class HandoffDecider:
             or low_confidence_count >= 2
         )
 
-    def generate_handoff_message(self, result: HandoffResult) -> str:
-        """Generate a message explaining the handoff to the user."""
-        if not result.required:
-            return ""
-        
-        # REGRA: Nunca mencionar "humano", "atendente humano" ou "transferir".
-        # Sempre usar "nossa equipe", "equipe especializada" ou "setor especializado".
-        messages = {
-            HandoffReason.USER_REQUEST: (
-                "Claro! Vou encaminhar voc\u00ea para nossa equipe agora. "
-                "Em breve algu\u00e9m dar\u00e1 continuidade ao seu atendimento."
-            ),
-            HandoffReason.SAFETY_CONCERN: (
-                "Para garantir o melhor cuidado para voc\u00ea, vou encaminhar para nossa equipe especializada. "
-                "Um profissional entrar\u00e1 em contato em breve."
-            ),
-            HandoffReason.MAX_TURNS_EXCEEDED: (
-                "Para te ajudar ainda melhor, vou encaminhar para o setor da nossa equipe "
-                "que poder\u00e1 dar continuidade ao seu atendimento."
-            ),
-            HandoffReason.LOW_CONFIDENCE: (
-                "Para garantir que voc\u00ea receba a orienta\u00e7\u00e3o mais completa, "
-                "vou encaminhar para nossa equipe especializada."
-            ),
-            HandoffReason.ESCALATION: (
-                "Entendo a sua situa\u00e7\u00e3o. Vou encaminhar para o setor respons\u00e1vel "
-                "da nossa equipe, que poder\u00e1 ajud\u00e1-lo da melhor forma."
-            ),
-            HandoffReason.COMPLEX_QUERY: (
-                "Essa quest\u00e3o merece uma aten\u00e7\u00e3o mais detalhada. "
-                "Vou encaminhar para a nossa equipe especializada."
-            ),
-            HandoffReason.SCHEDULING: (
-                "Vou te encaminhar para a nossa equipe, que dar\u00e1 seguimento "
-                "e verificar\u00e1 os melhores hor\u00e1rios dispon\u00edveis para voc\u00ea."
-            ),
-        }
-
-        return messages.get(
-            result.reason,
-            "Vou encaminhar voc\u00ea para nossa equipe, que dar\u00e1 continuidade ao seu atendimento."
-        )
+    # NOTE: A ``generate_handoff_message`` method used to live here with a
+    # per-reason PT message dict, but it had zero callers anywhere in
+    # ``src/`` or ``tests/`` (the live path uses
+    # ``handoff.models.HandoffServiceConfig.default_handoff_messages`` and
+    # ``flow.handlers.handoff.HANDOFF_RESPONSES``). Kept as dead code, its
+    # copy of the scheduling literal silently drifted from those two
+    # sources; per Group 4 of the scheduling-agent-guardrails wish it was
+    # removed so there is only one production PT scheduling literal to
+    # keep coherent.
 
 
 # ============================================
@@ -485,4 +452,3 @@ def get_handoff_decider(
             min_confidence=min_confidence,
         )
     return _decider
-

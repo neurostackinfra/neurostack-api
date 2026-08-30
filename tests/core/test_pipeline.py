@@ -6,6 +6,7 @@ Tests for the CognitivePipeline orchestrator.
 from uuid import UUID, uuid4
 
 import pytest
+import structlog
 
 from src.core import pipeline as pipeline_module
 from src.core.pipeline import (
@@ -245,25 +246,22 @@ class TestCognitivePipeline:
             raise RuntimeError("db disabled in unit test")
 
         monkeypatch.setattr("src.services.handoff_service.get_db_session", _no_db)
-        info_calls = []
-        monkeypatch.setattr(
-            pipeline_module.logger,
-            "info",
-            lambda *args, **kwargs: info_calls.append((args, kwargs)),
-        )
         pipeline = _isolated_pipeline()
-        expected = "Finalize seu agendamento pelo link:\n\nhttps://clinica.example.com/agendar"
+        clinic_config = _scheduling_link_config()
+        clinic_config["scheduling"]["scheduling_link_message"] = "  Finalize seu agendamento pelo link:  "
+        expected = "  Finalize seu agendamento pelo link:  \n\nhttps://clinica.example.com/agendar"
 
-        result = await pipeline.process(PipelineInput(
-            tenant_id=tenant_id,
-            session_id=session_id,
-            message="sim, pode encaminhar",
-            channel="whatsapp",
-            current_funnel_stage="agendamento_solicitado",
-            turn_count=3,
-            flags={"handoff_confirmation_pending": True},
-            clinic_config=_scheduling_link_config(),
-        ))
+        with structlog.testing.capture_logs() as log_records:
+            result = await pipeline.process(PipelineInput(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                message="sim, pode encaminhar",
+                channel="whatsapp",
+                current_funnel_stage="agendamento_solicitado",
+                turn_count=3,
+                flags={"handoff_confirmation_pending": True},
+                clinic_config=clinic_config,
+            ))
 
         assert result.handoff_required is True
         assert result.handoff_reason == "scheduling"
@@ -273,7 +271,7 @@ class TestCognitivePipeline:
         handoff_id = result.state_patch["slots"]["scheduling_link_handoff_id"]
         assert result.handoff_summary["id"] == handoff_id
         assert result.handoff_summary["verification_status"] == "link_sent"
-        assert any(kwargs.get("event") == "scheduling_link_sent" for _, kwargs in info_calls)
+        assert any(record.get("event") == "scheduling_link_sent" for record in log_records)
 
         response, _, _ = await EventService()._convert_pipeline_result_to_response(
             result,
@@ -295,37 +293,32 @@ class TestCognitivePipeline:
             raise RuntimeError("db disabled in unit test")
 
         monkeypatch.setattr("src.services.handoff_service.get_db_session", _no_db)
-        info_calls = []
-        monkeypatch.setattr(
-            pipeline_module.logger,
-            "info",
-            lambda *args, **kwargs: info_calls.append((args, kwargs)),
-        )
         pipeline = _isolated_pipeline()
 
-        send_result = await pipeline.process(PipelineInput(
-            tenant_id=tenant_id,
-            session_id=session_id,
-            message="sim, pode encaminhar",
-            channel="whatsapp",
-            current_funnel_stage="agendamento_solicitado",
-            turn_count=3,
-            flags={"handoff_confirmation_pending": True},
-            clinic_config=_scheduling_link_config(),
-        ))
-        handoff_id = send_result.state_patch["slots"]["scheduling_link_handoff_id"]
+        with structlog.testing.capture_logs() as log_records:
+            send_result = await pipeline.process(PipelineInput(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                message="sim, pode encaminhar",
+                channel="whatsapp",
+                current_funnel_stage="agendamento_solicitado",
+                turn_count=3,
+                flags={"handoff_confirmation_pending": True},
+                clinic_config=_scheduling_link_config(),
+            ))
+            handoff_id = send_result.state_patch["slots"]["scheduling_link_handoff_id"]
 
-        enrich_result = await pipeline.process(PipelineInput(
-            tenant_id=tenant_id,
-            session_id=session_id,
-            message="consegui agendar pelo link",
-            channel="whatsapp",
-            current_funnel_stage="agendamento_solicitado",
-            turn_count=4,
-            flags={"scheduling_link_sent": True},
-            slots={"scheduling_link_handoff_id": handoff_id},
-            clinic_config=_scheduling_link_config(),
-        ))
+            enrich_result = await pipeline.process(PipelineInput(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                message="consegui agendar pelo link",
+                channel="whatsapp",
+                current_funnel_stage="agendamento_solicitado",
+                turn_count=4,
+                flags={"scheduling_link_sent": True},
+                slots={"scheduling_link_handoff_id": handoff_id},
+                clinic_config=_scheduling_link_config(),
+            ))
         detail = await pipeline._handoff.get_handoff(UUID(handoff_id))
         handoffs = await pipeline._handoff.list_handoffs(tenant_id)
 
@@ -335,10 +328,10 @@ class TestCognitivePipeline:
         assert detail.verification_status == "concluiu"
         assert len(handoffs) == 1
         assert any(
-            kwargs.get("event") == "scheduling_link_verified"
-            and kwargs.get("handoff_id") == handoff_id
-            and kwargs.get("verification_status") == "concluiu"
-            for _, kwargs in info_calls
+            record.get("event") == "scheduling_link_verified"
+            and record.get("handoff_id") == handoff_id
+            and record.get("verification_status") == "concluiu"
+            for record in log_records
         )
 
     @pytest.mark.asyncio
@@ -360,6 +353,47 @@ class TestCognitivePipeline:
         for stage in expected_stages:
             if stage in result.stage_timings:
                 assert result.stage_timings[stage] >= 0
+
+    @pytest.mark.asyncio
+    async def test_scheduling_link_send_turn_uses_real_logger(
+        self,
+        monkeypatch,
+        tenant_id,
+        session_id,
+    ):
+        """Regression: the link-send turn must complete under the real structlog logger.
+
+        Previously, tests replaced ``pipeline_module.logger.info`` with a permissive
+        ``lambda *args, **kwargs`` that silently swallowed a duplicated ``event`` kwarg.
+        The real structlog ``BoundLogger.info`` uses ``event`` as its first positional
+        parameter, so ``logger.info("scheduling_link_sent", event="scheduling_link_sent")``
+        raises ``TypeError: meth() got multiple values for argument 'event'``. That
+        TypeError was then wrapped as :class:`EventServiceError` and the patient never
+        received the link.
+
+        This test does NOT monkeypatch ``logger.info`` — reintroducing the ``event=``
+        kwarg at the link-send site will fail this test by construction.
+        """
+        def _no_db():
+            raise RuntimeError("db disabled in unit test")
+
+        monkeypatch.setattr("src.services.handoff_service.get_db_session", _no_db)
+        pipeline = _isolated_pipeline()
+        expected = "Finalize seu agendamento pelo link:\n\nhttps://clinica.example.com/agendar"
+
+        result = await pipeline.process(PipelineInput(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            message="sim, pode encaminhar",
+            channel="whatsapp",
+            current_funnel_stage="agendamento_solicitado",
+            turn_count=3,
+            flags={"handoff_confirmation_pending": True},
+            clinic_config=_scheduling_link_config(),
+        ))
+
+        assert result.handoff_required is True
+        assert result.deterministic_response == expected
 
 
 class TestConvenienceFunctions:

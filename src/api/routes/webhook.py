@@ -173,15 +173,21 @@ async def _send_reply_with_optional_tts(
     phone: str,
     send_audio: Callable[[bytes, str], Awaitable[dict]],
     send_text: Callable[[], Awaitable[dict]],
+    force_text: bool = False,
 ) -> tuple[dict, bool]:
     """Deliver an agent reply as audio when enabled, otherwise as text.
 
     TTS is deliberately best-effort: an incomplete configuration, provider
     outage or channel upload failure falls back to the original text so the
     patient never loses the agent's response.
+
+    When ``force_text`` is True the reply is always sent as text and TTS is
+    skipped entirely, regardless of the clinic's ``tts_enabled`` setting.
+    Callers use this to protect deterministic responses (e.g. scheduling
+    links) whose text form must stay clickable for the patient.
     """
 
-    if not _is_enabled(credentials.get("tts_enabled")):
+    if force_text or not _is_enabled(credentials.get("tts_enabled")):
         return await send_text(), False
 
     try:
@@ -1993,6 +1999,7 @@ async def _process_zapi_authenticated_body(
                 suggested,
                 client_token=zapi_client_token,
             ),
+            force_text=bool(response.prompt and getattr(response.prompt, "deterministic", False)),
         )
         _track_sent_message(send_result)
         # DB-backed dedup: store reply message ID so its fromMe echo is recognised
@@ -2230,6 +2237,7 @@ async def evolution_webhook(
             send_text=lambda: send_evolution_text(
                 evol_url, evol_name, evol_key, phone, suggested
             ),
+            force_text=bool(response.prompt and getattr(response.prompt, "deterministic", False)),
         )
         # Normalise the outbound id (Decisions 4 + 11): both dedup layers
         # receive the same value, and Evolution's ``id`` — the only key it
@@ -2684,6 +2692,7 @@ async def uazapi_webhook(
             send_text=lambda: send_uazapi_text(
                 u_url, u_token, from_phone, suggested
             ),
+            force_text=bool(response.prompt and getattr(response.prompt, "deterministic", False)),
         )
         # Normalise the outbound id (Decisions 4 + 11): Uazapi's ``id``
         # arrives as ``owner:MSGID`` and never matches the echo, which only
@@ -3587,6 +3596,7 @@ async def meta_webhook(
                         from_phone,
                         suggested,
                     ),
+                    force_text=bool(response.prompt and getattr(response.prompt, "deterministic", False)),
                 )
                 _track_meta_sent_message(send_result)
                 _reply_mid = extract_meta_message_id(send_result)
