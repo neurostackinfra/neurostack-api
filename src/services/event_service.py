@@ -41,6 +41,41 @@ from src.services.api_credentials import (
 
 logger = get_logger(__name__)
 
+# These replies bypass the LLM when a handoff is required. Keep this mapping
+# at module scope so the production literal has one inspectable source for the
+# scheduling-gate corpus. The scheduling message deliberately leaves calendar
+# validation to the team; it never says that this agent confirmed a slot.
+EN_HANDOFF_MESSAGES = {
+    "user_request": (
+        "Of course! I'll connect you with our team right away. "
+        "Someone will follow up with you shortly."
+    ),
+    "safety_concern": (
+        "To make sure you get the best care, I'll connect you with our "
+        "specialist team. Someone will be in touch soon."
+    ),
+    "max_turns_exceeded": (
+        "To give you the best support, I'll connect you with the right "
+        "department on our team."
+    ),
+    "low_confidence": (
+        "To make sure you get the most complete guidance, I'll connect you "
+        "with our specialist team."
+    ),
+    "escalation": (
+        "I understand your situation. I'll connect you with the right team "
+        "who can help you in the best way."
+    ),
+    "complex_query": (
+        "This deserves more detailed attention. I'll connect you with our "
+        "specialist team."
+    ),
+    "scheduling": (
+        "I'll connect you with our team, who will follow up and share the "
+        "best times with you."
+    ),
+}
+
 # ============================================
 # Context Source Relevance Filter
 # ============================================
@@ -1266,20 +1301,31 @@ class EventService:
                     tenant_id=tenant_id,
                 )
 
+            # Scheduling gate (Group 4): the agent has no ERP/calendar, so
+            # any claim of confirmed appointment, available time slot, or
+            # processed cancellation/reschedule is unfulfillable. We rewrite
+            # the response before it leaves. Sibling of the insurance
+            # branch — NOT nested inside — because this failure mode is
+            # independent of whether the clinic accepts insurance.
+            # Skipped for deterministic responses (link builder etc.) since
+            # those are literal, LLM-free strings authored by the pipeline.
+            if deterministic_response is None:
+                _sched_category, _sched_replacement = (
+                    self._pipeline.check_response_scheduling_gate(
+                        response_text=suggested_response,
+                        tenant_id=tenant_id,
+                        language=language_code,
+                        funnel_stage=result.funnel_stage,
+                    )
+                )
+                if _sched_replacement is not None:
+                    suggested_response = _sched_replacement
+
         # If handoff is required, append the handoff user message to the response.
         # When language is EN, use English fallback instead of the PT template message.
         if result.handoff_required and deterministic_response is None:
             # RULE: Never say "human agent", "transfer to human", or expose AI.
             # Always use "our team", "our specialist team", or "the right department".
-            EN_HANDOFF_MESSAGES = {
-                "user_request": "Of course! I'll connect you with our team right away. Someone will follow up with you shortly.",
-                "safety_concern": "To make sure you get the best care, I'll connect you with our specialist team. Someone will be in touch soon.",
-                "max_turns_exceeded": "To give you the best support, I'll connect you with the right department on our team.",
-                "low_confidence": "To make sure you get the most complete guidance, I'll connect you with our specialist team.",
-                "escalation": "I understand your situation. I'll connect you with the right team who can help you in the best way.",
-                "complex_query": "This deserves more detailed attention. I'll connect you with our specialist team.",
-                "scheduling": "I'll connect you with our team, who will follow up and confirm the best available times for you.",
-            }
             handoff_msg = result.handoff_user_message or ""
             if language_code == "en" and handoff_msg:
                 # Use top-level handoff_reason field (handoff_summary only carries id/status/summary/urgency/sector/sla)
@@ -1299,6 +1345,7 @@ class EventService:
             constraints=result.constraints,
             context_summary=result.context_summary,
             suggested_response=suggested_response,
+            deterministic=deterministic_response is not None,
         )
 
         recent_messages = [
