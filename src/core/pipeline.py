@@ -16,6 +16,12 @@ from prometheus_client import Counter, Histogram
 from src.config.logging import get_logger
 from src.core.lgpd_utils import resolve_privacy_link
 from src.observability.price_gate import check_price_gate
+from src.observability.scheduling_gate import (
+    check_scheduling_gate,
+    get_safe_replacement,
+    resolve_gate_mode,
+    GATE_MODE_OBSERVE,
+)
 from src.core.exceptions import (
     ServiceError,
     PolicyServiceError,
@@ -325,7 +331,6 @@ class CognitivePipeline:
                         )
                     logger.info(
                         "scheduling_link_sent",
-                        event="scheduling_link_sent",
                         tenant_id=str(input_data.tenant_id),
                         session_id=str(input_data.session_id),
                         intent=srm_decision.intent,
@@ -358,7 +363,6 @@ class CognitivePipeline:
                 should_pause, paused_until_iso = await self._apply_handoff_pause(input_data)
                 logger.info(
                     "scheduling_link_verified",
-                    event="scheduling_link_verified",
                     tenant_id=str(input_data.tenant_id),
                     session_id=str(input_data.session_id),
                     intent=srm_decision.intent,
@@ -870,7 +874,7 @@ class CognitivePipeline:
             scheduling_cfg.get("scheduling_link_message")
             or "Para concluir seu agendamento, acesse o link abaixo:"
         )
-        return f"{str(message).strip()}\n\n{url}"
+        return f"{message}\n\n{url}"
 
     async def _apply_handoff_pause(
         self,
@@ -1134,6 +1138,45 @@ class CognitivePipeline:
             atendimento_tipo=atendimento_tipo,
             tenant_id=str(tenant_id) if tenant_id else None,
         )
+
+    def check_response_scheduling_gate(
+        self,
+        response_text: Optional[str],
+        tenant_id: Optional[UUID] = None,
+        language: Optional[str] = None,
+        funnel_stage: Optional[str] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Observability hook: flag+rewrite scheduling claims in the final response.
+
+        Returns ``(category, safe_replacement)``:
+          * ``(None, None)`` when the response is clean or empty.
+          * ``(category, safe_text)`` in enforce mode — caller should
+            substitute the response with ``safe_text``.
+          * ``(category, None)`` in observe mode — violation was
+            counted+logged but the caller must keep the original response.
+
+        Same import discipline as :meth:`check_response_price_gate`:
+        stays out of the ``observability.metrics`` import graph so the
+        pipeline import graph does not pick up the counter collisions
+        that module has with ``srm.engine`` (see ``price_gate.py`` module
+        docstring). Never raises.
+        """
+        category = check_scheduling_gate(
+            response_text=response_text,
+            tenant_id=str(tenant_id) if tenant_id else None,
+        )
+        if category is None:
+            return None, None
+        if resolve_gate_mode() == GATE_MODE_OBSERVE:
+            # Observe mode: still counted+logged upstream, but the caller
+            # must keep the original text (emergency rollback lever).
+            return category, None
+        safe_text = get_safe_replacement(
+            category=category,
+            language=language,
+            funnel_stage=funnel_stage,
+        )
+        return category, safe_text
 
 
 # ============================================
