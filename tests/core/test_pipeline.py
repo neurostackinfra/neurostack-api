@@ -273,7 +273,7 @@ class TestCognitivePipeline:
         assert result.handoff_summary["verification_status"] == "link_sent"
         assert any(record.get("event") == "scheduling_link_sent" for record in log_records)
 
-        response, _, _ = await EventService()._convert_pipeline_result_to_response(
+        response, *_ = await EventService()._convert_pipeline_result_to_response(
             result,
             user_message="sim, pode encaminhar",
             clinic_config={},
