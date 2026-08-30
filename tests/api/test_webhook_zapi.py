@@ -90,21 +90,38 @@ def _seed_zapi_tenant(
 
     Returns the raw capability token (which callers use as the URL segment).
     Signals the wish's "digest only" contract: the raw token never lives in
-    the DB — we compute the digest client-side and PATCH just that field.
+    the DB — we compute the digest client-side and seed only that field.
     """
     digest = _digest_for(zapi_token_raw)
-    resp = client.patch(
-        API_CRED_PATH,
-        json={
+    _seed_legacy_zapi_credentials(
+        client,
+        tenant_id,
+        {
             "whatsapp_provider": "zapi",
             "zapi_instance_id": instance_id,
             "zapi_token": f"zt_{uuid4().hex}",
             "zapi_inbound_token_digest": digest,
         },
-        headers=_admin_headers(tenant_id),
     )
-    assert resp.status_code == 200, resp.text
     return zapi_token_raw
+
+
+def _seed_legacy_zapi_credentials(
+    client: TestClient, tenant_id: UUID, credentials: dict
+) -> None:
+    """Insert legacy credential state without reopening public provisioning."""
+    from src.models.clinic_config_table import ClinicConfigTable
+    from src.repositories.database import get_db_session
+
+    async def _run() -> None:
+        db = get_db_session()
+        try:
+            db.add(ClinicConfigTable(tenant_id=tenant_id, api_credentials=credentials))
+            await db.commit()
+        finally:
+            await db.close()
+
+    client._submit(_run())  # type: ignore[attr-defined]
 
 
 def _zapi_body(
@@ -348,14 +365,32 @@ class TestZapiDigestRotation:
         first_token = _new_canonical_token()
         _seed_zapi_tenant(client, tenant_id, instance_id, first_token)
 
-        # Rotate: PATCH the digest field with the new digest only.
+        # Rotate the persisted legacy digest only.
         second_token = _new_canonical_token()
-        resp = client.patch(
-            API_CRED_PATH,
-            json={"zapi_inbound_token_digest": _digest_for(second_token)},
-            headers=_admin_headers(tenant_id),
-        )
-        assert resp.status_code == 200, resp.text
+        from sqlalchemy import select
+
+        from src.models.clinic_config_table import ClinicConfigTable
+        from src.repositories.database import get_db_session
+
+        async def _rotate() -> None:
+            db = get_db_session()
+            try:
+                row = (
+                    await db.execute(
+                        select(ClinicConfigTable).where(
+                            ClinicConfigTable.tenant_id == tenant_id
+                        )
+                    )
+                ).scalar_one()
+                row.api_credentials = {
+                    **(row.api_credentials or {}),
+                    "zapi_inbound_token_digest": _digest_for(second_token),
+                }
+                await db.commit()
+            finally:
+                await db.close()
+
+        client._submit(_rotate())  # type: ignore[attr-defined]
 
         # Old token immediately fails
         old_resp = client.post(
@@ -675,12 +710,7 @@ def _seed_zapi_audio_tenant(
     if audio_max_seconds is not None:
         payload["audio_max_seconds"] = audio_max_seconds
 
-    resp = client.patch(
-        API_CRED_PATH,
-        json=payload,
-        headers=_admin_headers(tenant_id),
-    )
-    assert resp.status_code == 200, resp.text
+    _seed_legacy_zapi_credentials(client, tenant_id, payload)
 
 
 def _zapi_audio_body(

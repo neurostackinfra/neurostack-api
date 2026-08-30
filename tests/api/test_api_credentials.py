@@ -41,26 +41,10 @@ def _jwt_headers(
 
 
 @pytest.mark.parametrize("role", ["clinic_admin", "builder", "super_admin"])
-def test_allowed_jwt_roles_can_read_and_patch_own_credentials(
+def test_allowed_jwt_roles_can_read_own_credentials(
     client: TestClient, role: str
 ) -> None:
     headers = _jwt_headers(role, builder_id=uuid4() if role == "builder" else None)
-    response = client.patch(
-        PATH,
-        headers=headers,
-        json={
-            "llm_provider": "openai",
-            "llm_api_url": "HTTPS://API.OPENAI.COM:443/v1/",
-            "llm_api_key": "provider-key-value",
-            "llm_model_name": "gpt-model",
-        },
-    )
-    assert response.status_code == 200, response.text
-    data = response.json()
-    assert data["llm_api_url"] == "https://api.openai.com/v1"
-    assert data["llm_api_key_set"] is True
-    assert data["llm_api_key_masked"] == "••••••••"
-    assert "provider-key-value" not in response.text
     assert client.get(PATH, headers=headers).status_code == 200
 
 
@@ -92,33 +76,44 @@ def test_clinic_admin_cannot_override_another_tenant(client: TestClient) -> None
 
 
 @pytest.mark.parametrize(
-    ("payload", "detail"),
+    ("capability", "provider"),
     [
-        (
-            {"llm_provider": "made_up"},
-            {
-                "error": "invalid_credentials_payload",
-                "fields": [{"field": "llm_provider", "code": "literal_error"}],
-            },
-        ),
-        (
-            {"llm_provider": "slm_cortex"},
-            {
-                "error": "provider_not_operational",
-                "capability": "llm",
-                "provider": "slm_cortex",
-            },
-        ),
+        ("whatsapp", "meta_cloud"),
+        ("whatsapp", "zapi"),
+        ("whatsapp", "uazapi"),
+        ("whatsapp", "evolution"),
+        ("whatsapp", "dialog360"),
+        ("whatsapp", "twilio"),
+        ("llm", "dropout"),
+        ("llm", "openai"),
+        ("llm", "outros"),
+        ("llm", "slm_cortex"),
+        ("multimodal", "openrouter"),
+        ("stt", "outros"),
+        ("stt", "openai_whisper"),
+        ("stt", "elevenlabs_scribe"),
+        ("stt", "google_stt"),
+        ("stt", "deepgram_stt"),
+        ("stt", "microsoft_stt"),
+        ("tts", "elevenlabs"),
+        ("tts", "google"),
     ],
 )
-def test_provider_errors_are_exact_and_atomic(
-    client: TestClient, payload: dict[str, str], detail: dict[str, str]
+def test_all_displayable_provider_changes_are_exact_and_atomic(
+    client: TestClient, capability: str, provider: str
 ) -> None:
     headers = _jwt_headers("clinic_admin")
-    response = client.patch(PATH, headers=headers, json=payload)
-    assert response.status_code == 422
-    assert response.json()["detail"] == detail
-    assert client.get(PATH, headers=headers).json()["llm_provider"] is None
+    provider_field = (
+        "whatsapp_provider" if capability == "whatsapp" else f"{capability}_provider"
+    )
+    response = client.patch(PATH, headers=headers, json={provider_field: provider})
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == {
+        "error": "provider_not_available",
+        "capability": capability,
+        "provider": provider,
+    }
+    assert client.get(PATH, headers=headers).json()[provider_field] is None
 
 
 def test_invalid_payload_and_unsafe_url_return_stable_secret_free_422(
@@ -156,162 +151,76 @@ def test_invalid_payload_and_unsafe_url_return_stable_secret_free_422(
     assert sentinel not in unsafe.text
 
 
-def test_zapi_digest_is_write_only_and_readiness_only(client: TestClient) -> None:
-    headers = _jwt_headers("clinic_admin")
-    digest = "b" * 64
-    response = client.patch(
-        PATH,
-        headers=headers,
-        json={
-            "whatsapp_provider": "zapi",
-            "zapi_instance_id": "instance-42",
-            "zapi_token": "outbound-zapi-token",
-            "zapi_inbound_token_digest": digest,
-        },
-    )
-    assert response.status_code == 200, response.text
-    data = response.json()
-    assert data["zapi_inbound_token_set"] is True
-    assert data["whatsapp_readiness"] == "active"
-    assert digest not in response.text
-    assert "zapi_inbound_token_digest" not in data
-
-    read = client.get(PATH, headers=headers)
-    assert read.status_code == 200
-    assert digest not in read.text
-    assert "zapi_inbound_token_digest" not in read.json()
-
-
-@pytest.mark.parametrize(
-    ("provider", "api_url", "model_name"),
-    [
-        ("elevenlabs", "https://api.elevenlabs.io/v1", "eleven_multilingual_v2"),
-        ("google", "https://texttospeech.googleapis.com/v1", "pt-BR-Neural2-A"),
-    ],
-)
-def test_tts_credentials_are_saved_masked_and_operational(
+def test_normalized_legacy_echo_is_allowed_but_a_change_is_atomic(
     client: TestClient,
-    provider: str,
-    api_url: str,
-    model_name: str,
+    test_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    headers = _jwt_headers("clinic_admin")
-    secret = f"{provider}-tts-secret"
-    voice_id = "voice-123" if provider == "elevenlabs" else None
-    response = client.patch(
-        PATH,
-        headers=headers,
-        json={
-            "tts_provider": provider,
-            "tts_api_url": api_url,
-            "tts_api_key": secret,
-            "tts_model_name": model_name,
-            "tts_voice_id": voice_id,
-            "tts_enabled": True,
-        },
-    )
-
-    assert response.status_code == 200, response.text
-    data = response.json()
-    assert data["tts_provider"] == provider
-    assert data["tts_api_url"] == api_url
-    assert data["tts_model_name"] == model_name
-    assert data["tts_api_key_set"] is True
-    assert data["tts_api_key_masked"] == "••••••••"
-    assert data["tts_voice_id"] == voice_id
-    assert data["tts_enabled"] is True
-    assert data["tts_readiness"] == "active"
-    assert secret not in response.text
-
-    read = client.get(PATH, headers=headers)
-    assert read.status_code == 200
-    assert read.json()["tts_provider"] == provider
-    assert secret not in read.text
-
-
-@pytest.mark.parametrize(
-    ("provider", "api_url", "expected_readiness"),
-    [
-        ("openrouter", "https://openrouter.ai/api/v1", "active"),
-        ("groq", "https://api.groq.com/openai/v1", "configuration_only"),
-        ("openai", "https://api.openai.com/v1", "configuration_only"),
-    ],
-)
-def test_multimodal_credentials_round_trip_masked_with_operational_readiness(
-    client: TestClient,
-    provider: str,
-    api_url: str,
-    expected_readiness: str,
-) -> None:
-    headers = _jwt_headers("clinic_admin")
-    secret = f"fake-{provider}-multimodal-key"
-    response = client.patch(
-        PATH,
-        headers=headers,
-        json={
-            "multimodal_provider": provider,
-            "multimodal_api_url": api_url,
-            "multimodal_api_key": secret,
-            "multimodal_model_name": "some-audio-model",
-        },
-    )
-
-    assert response.status_code == 200, response.text
-    data = response.json()
-    assert data["multimodal_provider"] == provider
-    assert data["multimodal_api_url"] == api_url
-    assert data["multimodal_model_name"] == "some-audio-model"
-    assert data["multimodal_api_key_set"] is True
-    assert data["multimodal_api_key_masked"] == "••••••••"
-    assert data["multimodal_readiness"] == expected_readiness
-    assert secret not in response.text
-
-    read = client.get(PATH, headers=headers)
-    assert read.status_code == 200
-    reread = read.json()
-    assert reread["multimodal_provider"] == provider
-    assert reread["multimodal_api_url"] == api_url
-    assert reread["multimodal_readiness"] == expected_readiness
-    assert secret not in read.text
-
-
-def test_multimodal_provider_change_without_fresh_key_is_refused(
-    client: TestClient,
-) -> None:
-    """The UI must clear the key on a provider switch; the backend enforces it."""
-
-    headers = _jwt_headers("clinic_admin")
-    first = client.patch(
-        PATH,
-        headers=headers,
-        json={
-            "multimodal_provider": "openrouter",
-            "multimodal_api_url": "https://openrouter.ai/api/v1",
-            "multimodal_api_key": "fake-openrouter-multimodal-key",
-            "multimodal_model_name": "some-audio-model",
-        },
-    )
-    assert first.status_code == 200, first.text
-
-    refused = client.patch(
-        PATH,
-        headers=headers,
-        json={
-            "multimodal_provider": "groq",
-            "multimodal_api_url": "https://api.groq.com/openai/v1",
-            "multimodal_model_name": "some-audio-model",
-        },
-    )
-    assert refused.status_code == 422, refused.text
-    assert refused.json()["detail"] == {
-        "error": "fresh_api_key_required",
-        "capability": "multimodal",
-        "reason": "provider_changed",
+    existing = {
+        "llm_provider": "openai",
+        "llm_api_url": "https://api.openai.com/v1",
+        "llm_api_key": "legacy-secret",
+        "llm_model_name": "legacy-model",
     }
+    row = SimpleNamespace(api_credentials=dict(existing))
+    calls: list[str] = []
 
-    unchanged = client.get(PATH, headers=headers).json()
-    assert unchanged["multimodal_provider"] == "openrouter"
-    assert unchanged["multimodal_readiness"] == "active"
+    class SessionSpy:
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+
+    async def override_session() -> Any:
+        yield SessionSpy()
+
+    async def load_existing(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        return row
+
+    async def no_cache_invalidation(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr("src.api.routes.config._load_config", load_existing)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache",
+        no_cache_invalidation,
+    )
+    test_app.dependency_overrides[get_db_session_dependency] = override_session
+    headers = _jwt_headers("clinic_admin")
+    try:
+        echo = client.patch(
+            PATH,
+            headers=headers,
+            json={
+                "llm_provider": "openai",
+                "llm_api_url": "HTTPS://API.OPENAI.COM:443/v1/",
+                "llm_api_key": "••••••••",
+                "llm_model_name": "legacy-model",
+            },
+        )
+        assert echo.status_code == 200, echo.text
+        assert echo.json()["llm_api_url"] == "https://api.openai.com/v1"
+        assert calls == ["flush", "commit"]
+        assert row.api_credentials == existing
+
+        calls.clear()
+        changed = client.patch(
+            PATH,
+            headers=headers,
+            json={"llm_model_name": "new-model"},
+        )
+    finally:
+        test_app.dependency_overrides.pop(get_db_session_dependency, None)
+
+    assert changed.status_code == 422, changed.text
+    assert changed.json()["detail"] == {
+        "error": "provider_not_available",
+        "capability": "llm",
+        "provider": "openai",
+    }
+    assert calls == []
+    assert row.api_credentials == existing
 
 
 def test_openapi_uses_typed_credential_patch_and_validation_never_echoes_input(
@@ -362,6 +271,8 @@ def test_pydantic_credential_types_and_bounds_are_strict() -> None:
         {"stt_api_key": "k" * 8193},
         {"stt_api_url": valid_url + "x"},
         {"stt_provider": 7},
+        {"multimodal_provider": "groq"},
+        {"multimodal_provider": "openai"},
         {"tts_provider": "microsoft"},
         {"zapi_inbound_token_digest": "A" * 64},
         {"zapi_inbound_token_digest": "a" * 63},
@@ -369,33 +280,6 @@ def test_pydantic_credential_types_and_bounds_are_strict() -> None:
     for payload in invalid_payloads:
         with pytest.raises(ValidationError):
             ApiCredentialsPatch.model_validate(payload)
-
-
-def test_meta_verify_token_is_write_only_across_patch_and_get(
-    client: TestClient,
-) -> None:
-    headers = _jwt_headers("clinic_admin")
-    sentinel = "meta-verify-token-sentinel"
-    response = client.patch(
-        PATH,
-        headers=headers,
-        json={
-            "whatsapp_provider": "meta_cloud",
-            "meta_phone_number_id": "phone-42",
-            "meta_permanent_token": "permanent-secret",
-            "meta_app_secret": "signature-secret",
-            "meta_verify_token": sentinel,
-        },
-    )
-    assert response.status_code == 200, response.text
-    assert response.json()["meta_verify_token_set"] is True
-    assert response.json()["meta_verify_token_masked"] == "••••••••"
-    assert sentinel not in response.text
-
-    read = client.get(PATH, headers=headers)
-    assert read.status_code == 200
-    assert read.json()["meta_verify_token_set"] is True
-    assert sentinel not in read.text
 
 
 def test_invalid_merge_does_not_create_or_flush_missing_config(
@@ -435,9 +319,9 @@ def test_invalid_merge_does_not_create_or_flush_missing_config(
         test_app.dependency_overrides.pop(get_db_session_dependency, None)
     assert response.status_code == 422
     assert response.json()["detail"] == {
-        "error": "fresh_api_key_required",
+        "error": "provider_not_available",
         "capability": "llm",
-        "reason": "provider_changed",
+        "provider": "openai",
     }
     assert calls == []
 

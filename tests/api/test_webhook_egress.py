@@ -65,6 +65,24 @@ def _digest(token: str) -> str:
     return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
+def _seed_legacy_credentials(
+    client: TestClient, tenant_id: UUID, credentials: dict[str, Any]
+) -> None:
+    """Insert legacy runtime credentials without reopening public writes."""
+    from src.models.clinic_config_table import ClinicConfigTable
+    from src.repositories.database import get_db_session
+
+    async def _run() -> None:
+        db = get_db_session()
+        try:
+            db.add(ClinicConfigTable(tenant_id=tenant_id, api_credentials=credentials))
+            await db.commit()
+        finally:
+            await db.close()
+
+    client._submit(_run())  # type: ignore[attr-defined]
+
+
 def _seed_zapi_with_stt(
     client: TestClient,
     tenant_id: UUID,
@@ -74,9 +92,10 @@ def _seed_zapi_with_stt(
     *,
     whisper_key: str = "sk-test-whisper-key",
 ) -> None:
-    resp = client.patch(
-        API_CRED_PATH,
-        json={
+    _seed_legacy_credentials(
+        client,
+        tenant_id,
+        {
             "whatsapp_provider": "zapi",
             "zapi_instance_id": instance_id,
             "zapi_token": f"zt_{uuid4().hex}",
@@ -84,9 +103,7 @@ def _seed_zapi_with_stt(
             "stt_provider": stt_provider,
             "stt_api_key": whisper_key,
         },
-        headers=_admin_headers(tenant_id),
     )
-    assert resp.status_code == 200, resp.text
 
 
 def _audio_body(
@@ -249,7 +266,7 @@ class TestZapiAudioEgressRejection:
 
         # No credential loader is patched — neither _load_clinic_config nor
         # _load_tenant_credentials. The whisper key must come from the row
-        # seeded through PATCH /v1/config/api-credentials.
+        # seeded directly in the persisted clinic_configs row.
         with (
             patch(
                 "src.api.routes.webhook.safe_download_audio",
@@ -691,9 +708,10 @@ class TestMetaAudioEgressRejection:
         tenant_id: UUID,
         phone_number_id: str,
     ) -> None:
-        resp = client.patch(
-            API_CRED_PATH,
-            json={
+        _seed_legacy_credentials(
+            client,
+            tenant_id,
+            {
                 "whatsapp_provider": "meta_cloud",
                 "meta_phone_number_id": phone_number_id,
                 "meta_app_secret": self.META_APP_SECRET,
@@ -702,9 +720,7 @@ class TestMetaAudioEgressRejection:
                 # can pass the no_credentials guard and reach the download step.
                 "meta_permanent_token": f"EAA{uuid4().hex}",
             },
-            headers=_admin_headers(tenant_id),
         )
-        assert resp.status_code == 200, resp.text
 
     @staticmethod
     def _meta_audio_body(phone_number_id: str, message_id: str, media_id: str) -> dict:
@@ -801,23 +817,20 @@ class TestMetaUnsupportedSttSkipBeforeResolve:
         phone_number_id: str,
         stt_provider: str,
     ) -> None:
-        resp = client.patch(
-            API_CRED_PATH,
-            json={
+        _seed_legacy_credentials(
+            client,
+            tenant_id,
+            {
                 "whatsapp_provider": "meta_cloud",
                 "meta_phone_number_id": phone_number_id,
                 "meta_app_secret": self.META_APP_SECRET,
                 "meta_verify_token": f"vt_{uuid4().hex}",
                 "meta_permanent_token": f"EAA{uuid4().hex}",
                 "stt_provider": stt_provider,
-                # fresh_api_key_required policy fires on provider change;
-                # unsupported providers have no runtime key but the policy
-                # still demands one on first write.
+                # The runtime still receives an explicit legacy STT key.
                 "stt_api_key": f"sk-dummy-{uuid4().hex}",
             },
-            headers=_admin_headers(tenant_id),
         )
-        assert resp.status_code == 200, resp.text
 
     @staticmethod
     def _meta_audio_body(phone_number_id: str, message_id: str, media_id: str) -> dict:
@@ -927,10 +940,7 @@ class TestCrossChannelSttFallbackParity:
         if with_stt:
             payload["stt_provider"] = "outros"
             payload["stt_api_key"] = f"sk-fake-stt-{uuid4().hex}"
-        resp = client.patch(
-            API_CRED_PATH, json=payload, headers=_admin_headers(tenant_id)
-        )
-        assert resp.status_code == 200, resp.text
+        _seed_legacy_credentials(client, tenant_id, payload)
 
     def _seed_zapi(
         self,
@@ -951,10 +961,7 @@ class TestCrossChannelSttFallbackParity:
         if with_stt:
             payload["stt_provider"] = "outros"
             payload["stt_api_key"] = f"sk-fake-stt-{uuid4().hex}"
-        resp = client.patch(
-            API_CRED_PATH, json=payload, headers=_admin_headers(tenant_id)
-        )
-        assert resp.status_code == 200, resp.text
+        _seed_legacy_credentials(client, tenant_id, payload)
 
     @staticmethod
     def _meta_audio_body(phone_number_id: str, message_id: str, media_id: str) -> dict:
