@@ -25,6 +25,9 @@ export const en = {
   nav_partners: "Partners Portal",
   badge_coming_soon: "Coming soon",
   label_select_clinic: "Select Clinic",
+  label_search_clinics: "Search clinics",
+  placeholder_search_clinics: "Search by clinic name",
+  clinic_search_no_results: "No clinics found",
   label_read_only_mode: "Read-only mode",
 
   // Login
