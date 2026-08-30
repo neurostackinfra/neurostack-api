@@ -39,7 +39,7 @@ from src.models.tenant import Tenant
 from src.models.user import User, UserRole
 from src.repositories import get_db_session_dependency
 from src.services.business_hours import summarize_outside_hours
-from src.services.trace_service import _is_conversational_trace
+from src.services.trace_service import _is_conversational_trace, _llm_usage_for_stats
 
 router = APIRouter()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
@@ -452,13 +452,13 @@ async def _get_builder_stats(
     for (metadata,) in events_result.all():
         if not metadata:
             continue
-        llm_usage = metadata.get("llm_usage", {})
-        llm_model = metadata.get("llm_model", "")
-        tokens = llm_usage.get("total_tokens", 0) if llm_usage else 0
+        tokens, llm_model_entries = _llm_usage_for_stats(metadata)
         if tokens:
             total_tokens += tokens
-            if llm_model:
-                model_tokens[llm_model] = model_tokens.get(llm_model, 0) + tokens
+        for llm_model, model_tokens_used in llm_model_entries:
+            model_tokens[llm_model] = (
+                model_tokens.get(llm_model, 0) + model_tokens_used
+            )
         # Track audio transcriptions (whisper) — use audio_seconds as the metric unit
         whisper_model = metadata.get("whisper_model")
         if whisper_model and metadata.get("is_audio"):

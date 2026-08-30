@@ -28,8 +28,11 @@ logger = get_logger(__name__)
 
 # Total de decisões do SRM
 SRM_DECISIONS_TOTAL = Counter(
-    "neurostack_srm_decisions_total",
-    "Total de decisões tomadas pelo SRM",
+    # ``src.srm.engine`` owns ``neurostack_srm_decisions_total`` for the
+    # runtime decision metric.  This legacy business view has different
+    # labels, so it needs a distinct Prometheus identity to remain importable.
+    "neurostack_business_srm_decisions_total",
+    "Total de decisões de negócio tomadas pelo SRM",
     ["tenant_id", "flow_mode"],
 )
 
@@ -96,8 +99,10 @@ SAFETY_SEVERITY = Counter(
 
 # Transições de flow
 FLOW_TRANSITIONS_TOTAL = Counter(
-    "neurostack_flow_transitions_total",
-    "Total de transições de flow",
+    # ``src.flow.manager`` owns the runtime transition metric with a
+    # different label contract; keep this legacy business view distinct.
+    "neurostack_business_flow_transitions_total",
+    "Total de transições de flow de negócio",
     ["from_mode", "to_mode", "tenant_id"],
 )
 
@@ -193,8 +198,10 @@ POLICIES_APPLIED_TOTAL = Counter(
 
 # Violações de política
 POLICY_VIOLATIONS_TOTAL = Counter(
-    "neurostack_policy_violations_total",
-    "Total de violações de política detectadas",
+    # ``src.policy.engine`` owns the runtime violation metric with a
+    # different label contract; keep this legacy business view distinct.
+    "neurostack_business_policy_violations_total",
+    "Total de violações de política de negócio detectadas",
     ["rule_id", "tenant_id"],
 )
 
@@ -217,6 +224,20 @@ PIPELINE_STAGE_TIME = Histogram(
     "Tempo de processamento por estágio do pipeline",
     ["stage"],  # srm, ctx, flow, prompt
     buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1.0],
+)
+
+
+# ============================================
+# LLM Generation Metrics
+# ============================================
+
+# One increment is emitted only after an LLM call has a final outcome.  Keep
+# labels deliberately bounded: provider, model and attempt ordinal belong in
+# structured logs, never in Prometheus label values.
+LLM_GENERATION_ATTEMPTS_TOTAL = Counter(
+    "neurostack_llm_generation_attempts_total",
+    "Total completed LLM generation attempts by tier and outcome",
+    ["tier", "outcome"],
 )
 
 
@@ -546,4 +567,3 @@ def get_metrics_summary() -> dict:
         )
     
     return summary
-

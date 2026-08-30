@@ -106,6 +106,10 @@ const CONFIG_SAVE_FIELD_LABELS: Record<string, Record<ConfigSaveErrorLocale, str
   multimodal_api_key: { pt: "API Key multimodal", en: "multimodal API key" },
   multimodal_api_url: { pt: "URL da API multimodal", en: "multimodal API URL" },
   multimodal_model_name: { pt: "modelo multimodal", en: "multimodal model" },
+  multimodal_text_fallback_enabled: {
+    pt: "fallback textual multimodal",
+    en: "multimodal text fallback",
+  },
   tts_provider: { pt: "provedor de voz", en: "voice provider" },
   tts_api_key: { pt: "API Key de voz", en: "voice API key" },
   tts_api_url: { pt: "URL da API de voz", en: "voice API URL" },
@@ -315,6 +319,12 @@ interface CredentialStatus {
   multimodal_api_key_set?:  boolean;
   multimodal_api_key_masked?: string | null;
   multimodal_readiness?:    string;
+  // Fail-closed textual opt-in gate for the multimodal fallback. When true,
+  // the primary-LLM failure path sends the prompt and conversation history to
+  // the configured multimodal provider. Legacy default is `false`; the
+  // backend projects an explicit boolean here even when the raw DB row is
+  // absent (see `credential_status()` in `src/services/api_credentials.py`).
+  multimodal_text_fallback_enabled?: boolean | null;
   // TTS provider (operational for agent replies)
   tts_provider?:            string | null;
   tts_api_url?:             string | null;
@@ -430,10 +440,10 @@ export const API_CAPABILITIES: readonly {
   },
   {
     id: "multimodal",
-    short: "API STT Fall Back",
+    short: "FallBack LLM Multimodal",
     desc: {
-      pt: "Multimodal (modelo que ouve o áudio direto)",
-      en: "Multimodal (model that listens to the audio directly)",
+      pt: "Fallback multimodal para duas contingências: quando o LLM primário falhar (com prompt e histórico enviados ao provedor multimodal) e quando o STT falhar (o modelo ouve o áudio direto).",
+      en: "Multimodal fallback for two contingencies: when the primary LLM fails (prompt and history are sent to the multimodal provider) and when STT fails (the model listens to the audio directly).",
     },
     required: false,
   },
@@ -767,6 +777,13 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
   // backend then demands a fresh key (`fresh_api_key_required`), so the UI has
   // to say so before the save is attempted.
   const [multimodalNeedsFreshKey, setMultimodalNeedsFreshKey] = useState(false);
+  // Fail-closed textual opt-in for the multimodal fallback. Defaults to
+  // `false` for legacy tenants (see `credential_status()` projection) and
+  // is submitted through its own minimal PATCH so an unrelated field edit
+  // never bundles the flip and vice-versa.
+  const [multimodalTextFallbackEnabled, setMultimodalTextFallbackEnabled] = useState(false);
+  const [multimodalTextFallbackDirty, setMultimodalTextFallbackDirty]     = useState(false);
+  const [multimodalTextFallbackSaving, setMultimodalTextFallbackSaving]   = useState(false);
 
   // TTS for agent replies. Disabled by default so saving credentials alone
   // never changes the patient experience.
@@ -852,6 +869,12 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
       setMultimodalModelName(hasSavedMultimodalProvider ? (data.multimodal_model_name ?? "") : "");
       setMultimodalDirty(false);
       setMultimodalNeedsFreshKey(false);
+      // Legacy tenants get `false`; the backend already projects an explicit
+      // boolean when the row is present, so a strict `=== true` check keeps
+      // an unexpected non-boolean value (defensive) from silently enabling
+      // the fallback in the UI.
+      setMultimodalTextFallbackEnabled(data.multimodal_text_fallback_enabled === true);
+      setMultimodalTextFallbackDirty(false);
       // TTS secrets never pre-fill. Unknown/retired provider ids fall back to
       // ElevenLabs without silently submitting a new TTS configuration.
       const hasSavedTtsProvider = TTS_PROVIDERS.some(p => p.id === data.tts_provider);
@@ -1050,6 +1073,65 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
    * DOM inspector after the panel unmounts.
    */
   const dismissZapiInboundRawToken = () => setZapiInboundRawToken("");
+
+  /**
+   * Fire a minimal PATCH containing ONLY the boolean fallback gate. Called
+   * from the toggle's `onCheckedChange`, so the flip is never bundled with an
+   * unrelated field edit (and vice-versa — saving other fields never touches
+   * this gate). Optimistically updates local state and rolls back on failure
+   * so the switch never lies about the persisted value.
+   */
+  const handleMultimodalTextFallbackToggle = async (nextEnabled: boolean) => {
+    if (isReadOnly) return;
+    const previous = multimodalTextFallbackEnabled;
+    if (nextEnabled === previous) return;
+    setMultimodalTextFallbackEnabled(nextEnabled);
+    setMultimodalTextFallbackDirty(true);
+    setMultimodalTextFallbackSaving(true);
+    setError(null);
+    try {
+      const saveUrl = targetId
+        ? `/v1/config/api-credentials?clinic_id=${targetId}`
+        : `/v1/config/api-credentials`;
+      const res = await fetch(saveUrl, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${getToken()}` },
+        body: JSON.stringify({ multimodal_text_fallback_enabled: nextEnabled }),
+      });
+      const data = await res.json().catch(() => ({})) as {
+        ok?: boolean;
+        detail?: unknown;
+      };
+      if (!res.ok) {
+        setMultimodalTextFallbackEnabled(previous);
+        setMultimodalTextFallbackDirty(false);
+        const errMsg = describeConfigSaveFailure(data, res.status, locale);
+        setError(errMsg);
+        toast({ title: txt("Erro ao salvar", "Could not save"), description: errMsg, variant: "destructive" });
+        return;
+      }
+      setMultimodalTextFallbackDirty(false);
+      toast({
+        title: txt("Configurações salvas!", "Settings saved!"),
+        description: nextEnabled
+          ? txt(
+              "Fallback textual multimodal ativado.",
+              "Multimodal text fallback enabled.",
+            )
+          : txt(
+              "Fallback textual multimodal desativado.",
+              "Multimodal text fallback disabled.",
+            ),
+      });
+      await fetchStatus();
+    } catch {
+      setMultimodalTextFallbackEnabled(previous);
+      setMultimodalTextFallbackDirty(false);
+      setError(txt("Erro de rede.", "Network error."));
+    } finally {
+      setMultimodalTextFallbackSaving(false);
+    }
+  };
 
   function copyWebhook() {
     navigator.clipboard.writeText(webhookUrl).catch(() => {});
@@ -1734,7 +1816,7 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
         </div>
       </div>
 
-      {/* ── API STT Fall Back ── */}
+      {/* ── FallBack LLM Multimodal ── */}
       <div
         className="space-y-4 rounded-lg border border-slate-700/50 bg-muted/20 p-4"
         data-testid="multimodal-settings-section"
@@ -1760,10 +1842,28 @@ export function ApiCredentialsForm({ clinicId, isReadOnly, isSuperAdmin }: {
 
         <p className="text-[11px] text-muted-foreground">
           {txt(
-            "Multimodal (modelo que ouve o áudio direto). Usado como alternativa quando o STT falha.",
-            "Multimodal (model that listens to the audio directly). Used as a fallback when STT fails.",
+            "Fallback multimodal para duas contingências: quando o LLM primário falhar (com prompt e histórico enviados ao provedor multimodal) e quando o STT falhar (o modelo ouve o áudio direto).",
+            "Multimodal fallback for two contingencies: when the primary LLM fails (prompt and history are sent to the multimodal provider) and when STT fails (the model listens to the audio directly).",
           )}
         </p>
+
+        <SwitchRow
+          label={txt(
+            "Autorizar fallback textual multimodal",
+            "Authorize multimodal text fallback",
+          )}
+          hint={txt(
+            "Quando o LLM primário falhar, o prompt do agente e o histórico da conversa serão enviados ao provedor multimodal configurado acima para gerar a resposta em texto. Autorização opcional e desligada por padrão; a alternativa multimodal para o STT (áudio direto) permanece disponível independentemente desta opção.",
+            "When the primary LLM fails, the agent prompt and conversation history will be sent to the multimodal provider configured above to generate the text reply. Opt-in and off by default; the multimodal alternative for STT failure (direct audio) remains available regardless of this option.",
+          )}
+          ariaLabel={txt(
+            "Autorizar fallback textual multimodal",
+            "Authorize multimodal text fallback",
+          )}
+          checked={multimodalTextFallbackEnabled}
+          onCheckedChange={handleMultimodalTextFallbackToggle}
+          disabled={isReadOnly || loading || saving || multimodalTextFallbackSaving || multimodalTextFallbackDirty}
+        />
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-2" data-testid="multimodal-provider-list">
           {MULTIMODAL_PROVIDERS.map(p => {

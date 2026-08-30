@@ -3,6 +3,7 @@ NeuroStack API - Event Service
 Business logic for event processing and management.
 """
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID, uuid4
@@ -27,6 +28,7 @@ from src.config.logging import get_logger
 from src.core.exceptions import EventStoreError
 from src.memory import EventData, get_event_store
 from src.models.session import CognitiveStateData
+from src.observability.metrics import LLM_GENERATION_ATTEMPTS_TOTAL
 from src.repositories import EventRepository
 from src.repositories.session import SessionRepository
 from src.services.api_credentials import (
@@ -416,6 +418,173 @@ async def _load_multimodal_fallback_credentials(tenant_id: UUID) -> dict[str, An
     return result
 
 
+# ============================================
+# LLM attempts contract (Wave 2, Group 3)
+# ============================================
+#
+# The three functions below own the deterministic parts of the generation
+# accounting contract so the routing loop in
+# ``_convert_pipeline_result_to_response`` stays readable. They are pure and
+# module-level on purpose: the tests exercise them directly and any drift
+# would be a wish-level change rather than a silent contract widening.
+#
+# ``_is_usable_llm_content`` is the sole predicate that decides whether an
+# LLM response can enter the accepted trio (``suggested_response`` /
+# ``llm_usage`` / ``llm_model``). Empty / whitespace / non-string / non-dict
+# never accepts, and never blocks the corresponding usage from entering the
+# breakdown/fold.
+#
+# ``_normalize_llm_usage`` returns a ``(status, normalized)`` pair. The
+# normalized dict only contains the three canonical integer fields — nothing
+# else is copied, nothing missing is synthesised. Booleans are rejected up
+# front because Python's ``bool`` is a subclass of ``int``.
+#
+# ``_fold_llm_usage_total`` is the ONLY writer of ``llm_usage_total``. It
+# folds strictly across attempts with ``usage_status == "reported"``. No
+# other code path may increment or mutate the aggregate.
+
+_USAGE_FIELDS: tuple[str, str, str] = (
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+)
+
+
+def _is_usable_llm_content(llm_result: Any) -> bool:
+    """Return True iff ``llm_result`` is a mapping with a non-empty stripped
+    ``content: str``. Any other shape (missing, wrong type, empty string,
+    whitespace-only) is unusable and never enters the accepted trio.
+    """
+    if not isinstance(llm_result, Mapping):
+        return False
+    content = llm_result.get("content")
+    if not isinstance(content, str):
+        return False
+    return bool(content.strip())
+
+
+def _normalize_llm_usage(raw: Any) -> tuple[str, dict[str, int]]:
+    """Return ``(usage_status, normalized_usage)``.
+
+    * ``reported``  — ``raw`` is a mapping and every present canonical field
+      is a non-negative integer (booleans rejected). Missing fields stay
+      absent; they are NEVER synthesised (in particular ``total_tokens`` is
+      never computed from ``prompt_tokens + completion_tokens``).
+    * ``invalid``   — a present non-mapping usage payload, or a mapping with
+      at least one canonical field that failed the integer / non-negative /
+      non-bool check.
+    * ``unavailable`` — absent usage (``None``), or a mapping with no
+      canonical fields present.
+    """
+    if raw is None:
+        return "unavailable", {}
+    if not isinstance(raw, Mapping):
+        return "invalid", {}
+
+    present: dict[str, int] = {}
+    seen = False
+    for field in _USAGE_FIELDS:
+        if field not in raw:
+            continue
+        seen = True
+        value = raw[field]
+        # Reject bool explicitly: Python `bool` is a subclass of `int`.
+        if isinstance(value, bool):
+            return "invalid", {}
+        if not isinstance(value, int):
+            return "invalid", {}
+        if value < 0:
+            return "invalid", {}
+        present[field] = value
+
+    if not seen:
+        # Mapping with none of the canonical fields present — no reported
+        # usage was carried at all.
+        return "unavailable", {}
+    return "reported", present
+
+
+def _fold_llm_usage_total(attempts: list[dict[str, Any]]) -> dict[str, int]:
+    """Deterministic fold of ``usage_status=="reported"`` entries.
+
+    Sums each canonical field only across attempts that carry a reported
+    usage. Fields present in some attempts and absent in others contribute
+    their present values without being inferred anywhere else. Returns an
+    empty dict when no attempt reported anything.
+    """
+    total: dict[str, int] = {}
+    for entry in attempts:
+        if entry.get("usage_status") != "reported":
+            continue
+        usage = entry.get("usage") or {}
+        for field in _USAGE_FIELDS:
+            value = usage.get(field)
+            if isinstance(value, bool):
+                # Defensive: normalise should have filtered this already, but
+                # never let a stray bool enter the fold.
+                continue
+            if isinstance(value, int) and value >= 0:
+                total[field] = total.get(field, 0) + value
+    return total
+
+
+def _model_for_breakdown(requested: Optional[str], reported: Any) -> str:
+    """Return ``reported`` when it is a non-empty string; else ``requested``.
+
+    Used for the per-attempt model attribution in ``llm_attempts`` so the
+    downstream breakdown can prefer the provider-reported model identity and
+    fall back to what the caller requested when the provider omitted it.
+    """
+    if isinstance(reported, str) and reported.strip():
+        return reported
+    return requested or ""
+
+
+def _reported_model_or_none(reported: Any) -> Optional[str]:
+    """Keep only a provider-reported model that is meaningful for attribution."""
+    if isinstance(reported, str) and reported.strip():
+        return reported
+    return None
+
+
+def _record_llm_generation_attempt(entry: Mapping[str, Any]) -> None:
+    """Emit bounded metrics and a safe structured event for one closed call.
+
+    The caller invokes this only after the attempt has its final outcome.
+    Prompt text, generated content and credentials are intentionally absent
+    from this event; the provider/model fields are diagnostics for logs only.
+    """
+    tier = str(entry["tier"])
+    outcome = str(entry["outcome"])
+    try:
+        LLM_GENERATION_ATTEMPTS_TOTAL.labels(tier=tier, outcome=outcome).inc()
+    except Exception as exc:  # noqa: BLE001 - telemetry must not fail generation
+        logger.error(
+            "Failed to record LLM generation attempt metric",
+            error_type=type(exc).__name__,
+        )
+
+    logger.info(
+        "llm_generation_attempt",
+        tier=tier,
+        ordinal=entry["attempt"],
+        provider=entry["provider"],
+        requested_model=entry["requested_model"],
+        reported_model=entry["reported_model"],
+        outcome=outcome,
+        accepted=entry["accepted"],
+        usage_status=entry["usage_status"],
+    )
+
+
+def _append_llm_attempt(
+    attempts: list[dict[str, Any]], entry: dict[str, Any]
+) -> None:
+    """Store and observe a final LLM attempt exactly once."""
+    attempts.append(entry)
+    _record_llm_generation_attempt(entry)
+
+
 class EventService:
     """Service for processing and managing events."""
 
@@ -683,15 +852,19 @@ class EventService:
         committed, so the connection is already released when this runs.
         """
         # Convert pipeline result to API response (LLM call happens here)
-        response, llm_usage, llm_model = (
-            await self._convert_pipeline_result_to_response(
-                result,
-                user_message=request.payload.content,
-                clinic_config=clinic_config,
-                tenant_id=request.tenant_id,
-                message_history=message_history,
-                language=request.payload.language,
-            )
+        (
+            response,
+            llm_usage,
+            llm_model,
+            llm_attempts,
+            llm_usage_total,
+        ) = await self._convert_pipeline_result_to_response(
+            result,
+            user_message=request.payload.content,
+            clinic_config=clinic_config,
+            tenant_id=request.tenant_id,
+            message_history=message_history,
+            language=request.payload.language,
         )
 
         # Save events to Event Store (separate DB connections, committed independently)
@@ -704,6 +877,8 @@ class EventService:
             suggested_response=suggested_response,
             llm_usage=llm_usage,
             llm_model=llm_model,
+            llm_attempts=llm_attempts,
+            llm_usage_total=llm_usage_total,
         )
 
         return response
@@ -737,18 +912,29 @@ class EventService:
         tenant_id: Optional[UUID] = None,
         message_history: Optional[list[dict[str, str]]] = None,
         language: str = "pt-BR",
-    ) -> tuple[EventResponse, dict, str]:
+    ) -> tuple[EventResponse, dict, str, list[dict[str, Any]], dict[str, int]]:
         """
         Convert pipeline result to API response.
 
         If an LLM provider is configured, calls it to generate suggested_response.
+        On unusable primary output (empty/whitespace/non-string/non-mapping),
+        or on primary transport/HTTP/JSON exceptions, this method also invokes
+        the multimodal-text fallback exactly once with the same ``messages``
+        and ``max_tokens`` when the tenant has opted in via
+        ``multimodal_text_fallback_enabled`` and holds an operational
+        provider bundle. See :func:`_is_usable_llm_content`,
+        :func:`_normalize_llm_usage` and :func:`_fold_llm_usage_total` for
+        the accepted trio / attempts / total contract.
 
         Args:
             result: Pipeline result
             user_message: Original user message for LLM context
 
         Returns:
-            Event response
+            ``(response, llm_usage, llm_model, llm_attempts, llm_usage_total)``
+            where the legacy trio attributes ONLY the accepted result and the
+            two new fields carry the full attempt history + deterministic
+            fold of every ``usage_status=="reported"`` entry.
         """
         decision = SRMDecision(
             intent=result.intent,
@@ -776,6 +962,7 @@ class EventService:
         suggested_response = None
         llm_usage: dict = {}
         llm_model: str = ""
+        llm_attempts: list[dict[str, Any]] = []
         language_code = (
             language or "pt-BR"
         )  # initialised here so handoff block can use it
@@ -787,7 +974,10 @@ class EventService:
             # HANDOFF_RESPONSES message is the correct response — calling the LLM
             # risks wrong language ("atendente humano") and unwanted questions.
             try:
-                from src.llm.client import get_tenant_llm_client
+                from src.llm.client import (
+                    get_multimodal_text_llm_client,
+                    get_tenant_llm_client,
+                )
 
                 # Runtime LLM call: cached config only contains the non-secret
                 # projection, so we resolve raw creds DB-only for this call.
@@ -797,6 +987,7 @@ class EventService:
                 )
                 llm = get_tenant_llm_client(tenant_id, api_creds)
                 tenant_model = api_creds.get("llm_model_name") or None
+                primary_provider = api_creds.get("llm_provider") or "unknown"
                 if llm and user_message:
                     sys_prompt = result.system_prompt or ""
                     messages = [{"role": "system", "content": sys_prompt}]
@@ -842,6 +1033,13 @@ class EventService:
                                     "content": f'LEMBRETE: Agora são {_dt.now(_tz(_td(hours=-3))).strftime("%H:%M")} BRT. Comece sua resposta com "{_g}!" — NÃO use outra saudação.{_emoji_hint}',
                                 }
                             )
+
+                    # ---- Primary attempts (up to 2 on unusable content) ----
+                    # An exception on the primary (transport/HTTP/JSON) does
+                    # NOT trigger a second primary attempt; it goes straight
+                    # to the fallback path so the SAME messages/max_tokens
+                    # cross exactly one alternate provider boundary.
+                    primary_exception_bailed = False
                     for attempt in range(2):
                         logger.info(
                             "Calling LLM",
@@ -851,19 +1049,75 @@ class EventService:
                             mode=result.mode,
                             tenant_model=tenant_model,
                         )
-                        llm_result = await llm.generate(
-                            messages, model=tenant_model, max_tokens=300
+                        entry: dict[str, Any] = {
+                            "tier": "primary",
+                            "attempt": attempt + 1,
+                            "provider": primary_provider,
+                            "requested_model": tenant_model,
+                            "reported_model": None,
+                            "outcome": "error",
+                            "accepted": False,
+                            "usage_status": "unavailable",
+                            "usage": {},
+                        }
+                        try:
+                            llm_result = await llm.generate(
+                                messages, model=tenant_model, max_tokens=300
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "LLM primary call failed",
+                                attempt=attempt + 1,
+                                error=str(exc),
+                                exc_info=True,
+                            )
+                            # outcome/error, usage_unavailable — no tokens invented.
+                            _append_llm_attempt(llm_attempts, entry)
+                            primary_exception_bailed = True
+                            break
+
+                        # Successful await — populate the entry from what we got.
+                        reported = (
+                            llm_result.get("model")
+                            if isinstance(llm_result, Mapping)
+                            else None
                         )
-                        suggested_response = llm_result.get("content", "")
-                        llm_usage = llm_result.get("usage", {})
-                        llm_model = llm_result.get("model", "")
-                        if suggested_response:
+                        entry["reported_model"] = _reported_model_or_none(reported)
+                        raw_usage = (
+                            llm_result.get("usage")
+                            if isinstance(llm_result, Mapping)
+                            else None
+                        )
+                        status, normalized = _normalize_llm_usage(raw_usage)
+                        entry["usage_status"] = status
+                        entry["usage"] = normalized
+                        usable = _is_usable_llm_content(llm_result)
+                        if usable:
+                            entry["outcome"] = "response"
+                            entry["accepted"] = True
+                            _append_llm_attempt(llm_attempts, entry)
+                            content_str = llm_result["content"]
+                            suggested_response = content_str
+                            llm_usage = dict(normalized)
+                            llm_model = _model_for_breakdown(tenant_model, reported)
                             logger.info(
                                 "LLM response generated",
-                                length=len(suggested_response),
+                                length=len(content_str),
                                 attempt=attempt + 1,
                             )
                             break
+
+                        # Unusable content — decide invalid vs empty for
+                        # observability. ``invalid`` = wrong shape/type;
+                        # ``empty`` = mapping with str content that stripped
+                        # down to nothing (the canonical retry trigger).
+                        if not isinstance(llm_result, Mapping) or not isinstance(
+                            llm_result.get("content"), str
+                        ):
+                            entry["outcome"] = "invalid"
+                        else:
+                            entry["outcome"] = "empty"
+                        _append_llm_attempt(llm_attempts, entry)
                         logger.warning(
                             (
                                 "LLM returned empty, retrying"
@@ -872,6 +1126,102 @@ class EventService:
                             ),
                             mode=result.mode,
                         )
+
+                    # ---- Multimodal-text fallback (at most one call) ----
+                    # Runs when the primary did not produce an accepted
+                    # response. Fail-closed factory: opt-in gate, operational
+                    # provider, provider↔host coherence and complete bundle
+                    # all validated inside ``get_multimodal_text_llm_client``.
+                    # ``None`` → silently skip (no attempt entry).
+                    if not any(a.get("accepted") for a in llm_attempts):
+                        fallback_creds = (
+                            await _load_multimodal_fallback_credentials(tenant_id)
+                            if tenant_id
+                            else {}
+                        )
+                        fb_client = get_multimodal_text_llm_client(
+                            tenant_id, fallback_creds
+                        )
+                        if fb_client is not None:
+                            fb_requested = fallback_creds.get("multimodal_model_name")
+                            fb_provider = (
+                                fallback_creds.get("multimodal_provider") or "unknown"
+                            )
+                            logger.info(
+                                "Calling multimodal-text fallback LLM",
+                                mode=result.mode,
+                                requested_model=fb_requested,
+                                after_primary_exception=primary_exception_bailed,
+                            )
+                            fb_entry: dict[str, Any] = {
+                                "tier": "multimodal_fallback",
+                                "attempt": 1,
+                                "provider": fb_provider,
+                                "requested_model": fb_requested,
+                                "reported_model": None,
+                                "outcome": "error",
+                                "accepted": False,
+                                "usage_status": "unavailable",
+                                "usage": {},
+                            }
+                            try:
+                                fb_result = await fb_client.generate(
+                                    messages,
+                                    model=fb_requested,
+                                    max_tokens=300,
+                                )
+                            except Exception as exc:
+                                logger.error(
+                                    "Multimodal-text fallback LLM call failed",
+                                    error=str(exc),
+                                    exc_info=True,
+                                )
+                                _append_llm_attempt(llm_attempts, fb_entry)
+                            else:
+                                fb_reported = (
+                                    fb_result.get("model")
+                                    if isinstance(fb_result, Mapping)
+                                    else None
+                                )
+                                fb_entry["reported_model"] = _reported_model_or_none(
+                                    fb_reported
+                                )
+                                fb_raw_usage = (
+                                    fb_result.get("usage")
+                                    if isinstance(fb_result, Mapping)
+                                    else None
+                                )
+                                fb_status, fb_normalized = _normalize_llm_usage(
+                                    fb_raw_usage
+                                )
+                                fb_entry["usage_status"] = fb_status
+                                fb_entry["usage"] = fb_normalized
+                                if _is_usable_llm_content(fb_result):
+                                    fb_entry["outcome"] = "response"
+                                    fb_entry["accepted"] = True
+                                    _append_llm_attempt(llm_attempts, fb_entry)
+                                    fb_content = fb_result["content"]
+                                    suggested_response = fb_content
+                                    llm_usage = dict(fb_normalized)
+                                    llm_model = _model_for_breakdown(
+                                        fb_requested, fb_reported
+                                    )
+                                    logger.info(
+                                        "Multimodal-text fallback response generated",
+                                        length=len(fb_content),
+                                    )
+                                else:
+                                    if not isinstance(
+                                        fb_result, Mapping
+                                    ) or not isinstance(fb_result.get("content"), str):
+                                        fb_entry["outcome"] = "invalid"
+                                    else:
+                                        fb_entry["outcome"] = "empty"
+                                    _append_llm_attempt(llm_attempts, fb_entry)
+                                    logger.warning(
+                                        "Multimodal-text fallback returned unusable content",
+                                        outcome=fb_entry["outcome"],
+                                    )
                 else:
                     logger.warning(
                         "LLM skipped",
@@ -879,7 +1229,16 @@ class EventService:
                         has_message=bool(user_message),
                     )
             except Exception as exc:
+                # Defensive: the primary/fallback bodies catch their own
+                # transport errors and record attempt entries; this outer
+                # except protects credential resolution and factory import
+                # from failing silently.
                 logger.error("LLM call failed", error=str(exc), exc_info=True)
+
+        # Deterministic fold — the ONLY writer of ``llm_usage_total``.
+        # Computed once after all attempts are collected so no code path can
+        # increment or mutate the aggregate in parallel.
+        llm_usage_total: dict[str, int] = _fold_llm_usage_total(llm_attempts)
 
         # Observability guard: flag when a monetary token appears in the
         # finalized response while atendimento_tipo != particular.
@@ -996,6 +1355,8 @@ class EventService:
             ),
             llm_usage,
             llm_model,
+            llm_attempts,
+            llm_usage_total,
         )
 
     async def _save_events_to_store(
@@ -1005,6 +1366,8 @@ class EventService:
         suggested_response: Optional[str] = None,
         llm_usage: Optional[dict] = None,
         llm_model: str = "",
+        llm_attempts: Optional[list[dict[str, Any]]] = None,
+        llm_usage_total: Optional[dict[str, int]] = None,
     ) -> None:
         """
         Save events to Event Store (non-blocking).
@@ -1013,6 +1376,12 @@ class EventService:
             request: Original event request
             result: Pipeline result
             suggested_response: LLM-generated response (if available)
+            llm_usage: Usage from the ACCEPTED result only (legacy trio).
+            llm_model: Model attribution for the ACCEPTED result only.
+            llm_attempts: Full attempt history (primary + fallback), ordered,
+                one entry per initiated call. Serialised as-is into
+                ``message.in`` metadata for downstream consumers.
+            llm_usage_total: Deterministic fold over the ``reported`` entries.
         """
         try:
             event_store = await get_event_store()
@@ -1052,9 +1421,15 @@ class EventService:
                     "safety_concern": result.safety_concern,
                     "handoff_required": result.handoff_required,
                     "intent": result.intent,
-                    # LLM token usage
+                    # LLM token usage — legacy accepted trio (unchanged
+                    # contract: attribution of ONLY the accepted result).
                     "llm_model": llm_model,
                     "llm_usage": llm_usage or {},
+                    # Full attempt history + deterministic fold. Group 4
+                    # trace/builder consumers prefer these over the trio when
+                    # present, and fall back to the trio for legacy events.
+                    "llm_attempts": list(llm_attempts or []),
+                    "llm_usage_total": dict(llm_usage_total or {}),
                     "funnel_stage": result.funnel_stage,
                     # Audio transcription metadata (from webhook payload)
                     **{
