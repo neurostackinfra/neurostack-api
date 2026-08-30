@@ -12,7 +12,6 @@ from fastapi.testclient import TestClient
 
 from src.config.settings import settings
 
-
 # ============================================
 # Token Helpers
 # ============================================
@@ -140,23 +139,33 @@ class TestBuilderAuthEnforcement:
         response = client.get("/v1/builder/stats")
         assert response.status_code == 401
 
-    def test_clinics_returns_403_for_clinic_admin(self, client: TestClient, clinic_admin_headers):
+    def test_clinics_returns_403_for_clinic_admin(
+        self, client: TestClient, clinic_admin_headers
+    ):
         response = client.get("/v1/builder/clinics", headers=clinic_admin_headers)
         assert response.status_code == 403
 
-    def test_clinics_returns_403_for_super_admin(self, client: TestClient, super_admin_headers):
+    def test_clinics_returns_403_for_super_admin(
+        self, client: TestClient, super_admin_headers
+    ):
         response = client.get("/v1/builder/clinics", headers=super_admin_headers)
         assert response.status_code == 403
 
-    def test_me_returns_403_for_clinic_admin(self, client: TestClient, clinic_admin_headers):
+    def test_me_returns_403_for_clinic_admin(
+        self, client: TestClient, clinic_admin_headers
+    ):
         response = client.get("/v1/builder/me", headers=clinic_admin_headers)
         assert response.status_code == 403
 
-    def test_stats_returns_403_for_super_admin(self, client: TestClient, super_admin_headers):
+    def test_stats_returns_403_for_super_admin(
+        self, client: TestClient, super_admin_headers
+    ):
         response = client.get("/v1/builder/stats", headers=super_admin_headers)
         assert response.status_code == 403
 
-    def test_403_has_descriptive_error_message(self, client: TestClient, clinic_admin_headers):
+    def test_403_has_descriptive_error_message(
+        self, client: TestClient, clinic_admin_headers
+    ):
         response = client.get("/v1/builder/clinics", headers=clinic_admin_headers)
         assert response.status_code == 403
         data = response.json()
@@ -167,7 +176,9 @@ class TestBuilderAuthEnforcement:
         else:
             assert "Builder profile not found" in str(detail)
 
-    def test_create_clinic_returns_403_for_non_builder(self, client: TestClient, clinic_admin_headers):
+    def test_create_clinic_returns_403_for_non_builder(
+        self, client: TestClient, clinic_admin_headers
+    ):
         response = client.post(
             "/v1/builder/clinics",
             headers=clinic_admin_headers,
@@ -179,7 +190,9 @@ class TestBuilderAuthEnforcement:
         )
         assert response.status_code == 403
 
-    def test_toggle_status_returns_403_for_non_builder(self, client: TestClient, super_admin_headers):
+    def test_toggle_status_returns_403_for_non_builder(
+        self, client: TestClient, super_admin_headers
+    ):
         fake_id = str(uuid4())
         response = client.patch(
             f"/v1/builder/clinics/{fake_id}/status",
@@ -277,7 +290,9 @@ class TestBuilderProfile:
         # Without a real builder in DB, we expect 404; validates endpoint is reachable and auth works
         assert response.status_code in (200, 404)
 
-    def test_returns_403_for_non_builder(self, client: TestClient, clinic_admin_headers):
+    def test_returns_403_for_non_builder(
+        self, client: TestClient, clinic_admin_headers
+    ):
         response = client.get("/v1/builder/me", headers=clinic_admin_headers)
         assert response.status_code == 403
 
@@ -340,7 +355,9 @@ class TestBuilderCreateClinic:
 class TestBuilderToggleClinicStatus:
     """Test PATCH /v1/builder/clinics/{id}/status."""
 
-    def test_returns_404_for_nonexistent_clinic(self, client: TestClient, builder_a_headers):
+    def test_returns_404_for_nonexistent_clinic(
+        self, client: TestClient, builder_a_headers
+    ):
         fake_id = str(uuid4())
         response = client.patch(
             f"/v1/builder/clinics/{fake_id}/status",
@@ -473,7 +490,9 @@ class TestBuilderDashboard:
         response = client.get("/v1/builder/dashboard")
         assert response.status_code == 401
 
-    def test_returns_403_for_clinic_admin(self, client: TestClient, clinic_admin_headers):
+    def test_returns_403_for_clinic_admin(
+        self, client: TestClient, clinic_admin_headers
+    ):
         response = client.get("/v1/builder/dashboard", headers=clinic_admin_headers)
         assert response.status_code == 403
 
@@ -513,7 +532,9 @@ class TestBuilderEnrichedClinics:
             assert clinic["health_status"] in ("healthy", "warning", "critical")
             assert 0 <= clinic["config_completeness"] <= 100
 
-    def test_enriched_response_schema_has_all_fields(self, client: TestClient, builder_a_headers):
+    def test_enriched_response_schema_has_all_fields(
+        self, client: TestClient, builder_a_headers
+    ):
         """Verify the enriched clinic response schema includes all health fields.
         Even if empty, the endpoint should return 200 with the right structure."""
         response = client.get("/v1/builder/clinics", headers=builder_a_headers)

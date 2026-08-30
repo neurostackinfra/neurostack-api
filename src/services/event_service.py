@@ -612,9 +612,7 @@ def _record_llm_generation_attempt(entry: Mapping[str, Any]) -> None:
     )
 
 
-def _append_llm_attempt(
-    attempts: list[dict[str, Any]], entry: dict[str, Any]
-) -> None:
+def _append_llm_attempt(attempts: list[dict[str, Any]], entry: dict[str, Any]) -> None:
     """Store and observe a final LLM attempt exactly once."""
     attempts.append(entry)
     _record_llm_generation_attempt(entry)

@@ -46,7 +46,6 @@ from src.services.event_service import (
     _normalize_llm_usage,
 )
 
-
 # ============================================
 # Pure-function tests: predicate, normalizer, fold
 # ============================================
@@ -177,7 +176,6 @@ class TestFoldLLMUsageTotal:
             {"usage_status": "unavailable", "usage": {"prompt_tokens": 99}},
         ]
         assert _fold_llm_usage_total(attempts) == {}
-
 
     def test_only_invalid_entries_folds_to_empty(self) -> None:
         attempts = [{"usage_status": "invalid", "usage": {"prompt_tokens": 5}}]

@@ -423,9 +423,10 @@ def test_multimodal_text_fallback_gate_round_trips_true_and_false(
     )
     assert enabled.status_code == 200, enabled.text
     assert enabled.json()["multimodal_text_fallback_enabled"] is True
-    assert client.get(PATH, headers=headers).json()[
-        "multimodal_text_fallback_enabled"
-    ] is True
+    assert (
+        client.get(PATH, headers=headers).json()["multimodal_text_fallback_enabled"]
+        is True
+    )
 
     disabled = client.patch(
         PATH,
@@ -434,17 +435,18 @@ def test_multimodal_text_fallback_gate_round_trips_true_and_false(
     )
     assert disabled.status_code == 200, disabled.text
     assert disabled.json()["multimodal_text_fallback_enabled"] is False
-    assert client.get(PATH, headers=headers).json()[
-        "multimodal_text_fallback_enabled"
-    ] is False
+    assert (
+        client.get(PATH, headers=headers).json()["multimodal_text_fallback_enabled"]
+        is False
+    )
 
 
 @pytest.mark.parametrize(
     "bad_value",
     [
-        None,   # explicit `null` in the JSON body
+        None,  # explicit `null` in the JSON body
         "true",  # string never silently coerced to bool
-        1,       # number never silently coerced to bool
+        1,  # number never silently coerced to bool
     ],
 )
 def test_multimodal_text_fallback_gate_rejects_null_and_wrong_type_atomically(
@@ -480,9 +482,10 @@ def test_multimodal_text_fallback_gate_rejects_null_and_wrong_type_atomically(
         for entry in detail["fields"]
     )
     # No mutation: the stored value stayed `true`.
-    assert client.get(PATH, headers=headers).json()[
-        "multimodal_text_fallback_enabled"
-    ] is True
+    assert (
+        client.get(PATH, headers=headers).json()["multimodal_text_fallback_enabled"]
+        is True
+    )
 
 
 def test_multimodal_text_fallback_gate_preserved_by_unrelated_patch(

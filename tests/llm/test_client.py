@@ -23,15 +23,15 @@ def test_chat_completions_url_appends_path_to_base_url() -> None:
 
 def test_chat_completions_url_preserves_complete_endpoint() -> None:
     assert (
-        _chat_completions_url(
-            "https://api.neuralake.cloud/v1/chat/completions/"
-        )
+        _chat_completions_url("https://api.neuralake.cloud/v1/chat/completions/")
         == "https://api.neuralake.cloud/v1/chat/completions"
     )
 
 
 @pytest.mark.asyncio
-async def test_gpt_oss_reserves_visible_output_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_gpt_oss_reserves_visible_output_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured: dict[str, Any] = {}
 
     class FakeResponse:
@@ -124,10 +124,10 @@ def test_multimodal_factory_happy_path_pins_openrouter_egress_kind() -> None:
 @pytest.mark.parametrize(
     "gate_value",
     [
-        None,       # legacy default: gate absent
-        False,      # explicit opt-out
-        "true",     # truthy string never coerced to True
-        1,          # truthy int never coerced to True
+        None,  # legacy default: gate absent
+        False,  # explicit opt-out
+        "true",  # truthy string never coerced to True
+        1,  # truthy int never coerced to True
     ],
 )
 def test_multimodal_factory_refuses_without_explicit_true_gate(gate_value: Any) -> None:
@@ -161,15 +161,15 @@ def test_multimodal_factory_refuses_non_operational_or_custom_provider(
 @pytest.mark.parametrize(
     "bad_url",
     [
-        "https://api.groq.com/openai/v1",       # divergent host, right scheme
-        "https://api.openai.com/v1",             # divergent host, right scheme
-        "https://evil.example.com/v1",           # arbitrary public host
-        "http://openrouter.ai/api/v1",           # non-HTTPS
-        "https://openrouter.ai:8443/api/v1",     # non-443 port
-        "https://user:pass@openrouter.ai/v1",    # userinfo
-        "https://localhost/v1",                  # localhost
-        "",                                       # empty
-        None,                                     # missing
+        "https://api.groq.com/openai/v1",  # divergent host, right scheme
+        "https://api.openai.com/v1",  # divergent host, right scheme
+        "https://evil.example.com/v1",  # arbitrary public host
+        "http://openrouter.ai/api/v1",  # non-HTTPS
+        "https://openrouter.ai:8443/api/v1",  # non-443 port
+        "https://user:pass@openrouter.ai/v1",  # userinfo
+        "https://localhost/v1",  # localhost
+        "",  # empty
+        None,  # missing
     ],
 )
 def test_multimodal_factory_refuses_provider_host_divergence_and_unsafe_urls(

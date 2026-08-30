@@ -436,9 +436,7 @@ class TestListRatings:
         # fall back to Event.tenant_id, and TEST_TENANT_ID is the api-key
         # tenant most fixtures use — so the record-owner check remains a
         # meaningful assertion for the shape returned here.
-        assert all(
-            e["subject_tenant_id"] == str(TEST_TENANT_ID) for e in entries
-        )
+        assert all(e["subject_tenant_id"] == str(TEST_TENANT_ID) for e in entries)
 
 
 # ============================================
@@ -558,9 +556,7 @@ class TestPatchRatingAcceptAudit:
             f"/v1/rlhf/ratings?tenant_id={subject_id}",
             headers=super_admin_headers,
         )
-        matched = [
-            e for e in list_resp.json()["entries"] if e["id"] == str(event_id)
-        ]
+        matched = [e for e in list_resp.json()["entries"] if e["id"] == str(event_id)]
         assert matched
         entry = matched[0]
         assert entry["approved_for_training"] is True
@@ -616,9 +612,9 @@ class TestPatchRatingAcceptAudit:
                 headers=super_admin_headers,
                 json={"action": "approve"},
             )
-            assert resp.status_code == 422, (
-                f"expected 422 for {eid}, got {resp.status_code}: {resp.text}"
-            )
+            assert (
+                resp.status_code == 422
+            ), f"expected 422 for {eid}, got {resp.status_code}: {resp.text}"
 
         # Confirm none of them were flipped to approved despite the failed PATCH.
         list_resp = client.get(
@@ -659,9 +655,7 @@ class TestPatchRatingAcceptAudit:
             f"/v1/rlhf/ratings?tenant_id={subject_id}",
             headers=super_admin_headers,
         )
-        matched = [
-            e for e in list_resp.json()["entries"] if e["id"] == str(event_id)
-        ]
+        matched = [e for e in list_resp.json()["entries"] if e["id"] == str(event_id)]
         assert matched
         entry = matched[0]
         assert entry["ignored"] is True
@@ -682,9 +676,7 @@ class TestListRatingsAcceptedByEmail:
         subject_id = uuid4()
         acting_user_id = uuid4()
         client._submit(_seed_tenant_full(subject_id, "Email Clinic"))
-        client._submit(
-            _seed_user(acting_user_id, "auditor@example.com", subject_id)
-        )
+        client._submit(_seed_user(acting_user_id, "auditor@example.com", subject_id))
         event_id = uuid4()
         stamp_iso = datetime.now(timezone.utc).isoformat()
         client._submit(
@@ -796,9 +788,9 @@ class TestListRatingsAcceptedByEmail:
         # Main SELECT + Tenant batch + (no builder batch — no builder set) +
         # 1 User batch = 3 core queries. Allow small connection-setup headroom.
         # A per-row regression would push this to ~23.
-        assert query_count["n"] <= 6, (
-            f"expected batched user lookup, got {query_count['n']} queries"
-        )
+        assert (
+            query_count["n"] <= 6
+        ), f"expected batched user lookup, got {query_count['n']} queries"
 
         # And prove all 20 emails actually resolved, so we're counting a
         # real single-query batch — not a silently empty one.
@@ -1013,7 +1005,11 @@ class TestRatingAnalysisClinicTenantIdValidation:
         the other runs on the test's loop mixes two live event loops over
         the same StaticPool sqlite connection and deadlocks.
         """
-        from src.repositories.database import close_database, get_db_engine, init_database
+        from src.repositories.database import (
+            close_database,
+            get_db_engine,
+            init_database,
+        )
 
         created = False
         try:
@@ -1478,9 +1474,9 @@ class TestListRatingsDateWindow:
             )
         )
         # Panel default: end_date = today at midnight BRT.
-        today_brt = now_utc.astimezone(
-            timezone(timedelta(hours=-3))
-        ).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+        today_brt = now_utc.astimezone(timezone(timedelta(hours=-3))).replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=None
+        )
         response = client.get(
             "/v1/rlhf/ratings",
             headers=super_admin_headers,
@@ -1528,9 +1524,9 @@ class TestListRatingsDateWindow:
         )
         assert response_D.status_code == 200
         ids_D = [e["id"] for e in response_D.json()["entries"]]
-        assert str(event_id) in ids_D, (
-            "22h BRT rating on day D must be visible when end_date=D"
-        )
+        assert (
+            str(event_id) in ids_D
+        ), "22h BRT rating on day D must be visible when end_date=D"
 
         response_prev = client.get(
             "/v1/rlhf/ratings",
@@ -1543,9 +1539,9 @@ class TestListRatingsDateWindow:
         )
         assert response_prev.status_code == 200
         ids_prev = [e["id"] for e in response_prev.json()["entries"]]
-        assert str(event_id) not in ids_prev, (
-            "22h BRT rating on day D must NOT appear when end_date=D-1"
-        )
+        assert (
+            str(event_id) not in ids_prev
+        ), "22h BRT rating on day D must NOT appear when end_date=D-1"
 
     def test_out_of_window_ratings_excluded_from_summary_facets_entries(
         self, client: TestClient, super_admin_headers
@@ -1911,9 +1907,9 @@ class TestListRatingsFacets:
             )
 
         # Unfiltered call: facets contain both clinics.
-        base = client.get(
-            "/v1/rlhf/ratings", headers=super_admin_headers
-        ).json()["facets"]
+        base = client.get("/v1/rlhf/ratings", headers=super_admin_headers).json()[
+            "facets"
+        ]
         base_clinic_ids = {c["id"] for c in base["clinics"]}
         assert {str(clinic_a), str(clinic_b)} <= base_clinic_ids
 
@@ -1933,9 +1929,7 @@ class TestListRatingsFacets:
         with_builder = uuid4()
         without_builder = uuid4()
         client._submit(_seed_builder(builder_id, "B1"))
-        client._submit(
-            _seed_tenant_full(with_builder, "WB", builder_id=builder_id)
-        )
+        client._submit(_seed_tenant_full(with_builder, "WB", builder_id=builder_id))
         client._submit(_seed_tenant_full(without_builder, "NB"))
         for sub in (with_builder, without_builder):
             client._submit(
@@ -1946,9 +1940,7 @@ class TestListRatingsFacets:
                     subject_tenant_id=sub,
                 )
             )
-        response = client.get(
-            "/v1/rlhf/ratings", headers=super_admin_headers
-        )
+        response = client.get("/v1/rlhf/ratings", headers=super_admin_headers)
         clinics = response.json()["facets"]["clinics"]
         by_id = {c["id"]: c for c in clinics}
         assert by_id[str(with_builder)]["builder_id"] == str(builder_id)
@@ -2009,9 +2001,7 @@ class TestListRatingsQueryCount:
             builder_id = uuid4()
             clinic_id = uuid4()
             client._submit(_seed_builder(builder_id, f"B{i}"))
-            client._submit(
-                _seed_tenant_full(clinic_id, f"C{i}", builder_id=builder_id)
-            )
+            client._submit(_seed_tenant_full(clinic_id, f"C{i}", builder_id=builder_id))
             clinic_ids.append(clinic_id)
         # 50 events distributed round-robin across the 10 clinics.
         for i in range(50):
@@ -2045,9 +2035,9 @@ class TestListRatingsQueryCount:
         # Main SELECT + batched Tenant lookup + batched Builder lookup = 3.
         # Anything more indicates an N+1 regression per row/subject.
         # Allow a small headroom (up to 4) for connection setup queries.
-        assert query_count["n"] <= 5, (
-            f"expected batched queries (main + tenants + builders), got {query_count['n']}"
-        )
+        assert (
+            query_count["n"] <= 5
+        ), f"expected batched queries (main + tenants + builders), got {query_count['n']}"
 
 
 # ============================================

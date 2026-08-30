@@ -70,24 +70,28 @@ def _llm_usage_for_stats(metadata: object) -> tuple[int, list[tuple[str, int]]]:
                     continue
                 usage = attempt.get("usage")
                 tokens = (
-                    usage.get("total_tokens", 0)
-                    if isinstance(usage, Mapping)
-                    else 0
+                    usage.get("total_tokens", 0) if isinstance(usage, Mapping) else 0
                 )
-                if not isinstance(tokens, int) or isinstance(tokens, bool) or not tokens:
+                if (
+                    not isinstance(tokens, int)
+                    or isinstance(tokens, bool)
+                    or not tokens
+                ):
                     continue
                 reported = attempt.get("reported_model")
                 requested = attempt.get("requested_model")
-                model = reported if isinstance(reported, str) and reported.strip() else requested
+                model = (
+                    reported
+                    if isinstance(reported, str) and reported.strip()
+                    else requested
+                )
                 if isinstance(model, str) and model:
                     model_entries.append((model, tokens))
         return total_tokens, model_entries
 
     legacy_usage = metadata.get("llm_usage")
     legacy_tokens = (
-        legacy_usage.get("total_tokens", 0)
-        if isinstance(legacy_usage, Mapping)
-        else 0
+        legacy_usage.get("total_tokens", 0) if isinstance(legacy_usage, Mapping) else 0
     )
     if (
         not isinstance(legacy_tokens, int)
@@ -499,9 +503,7 @@ async def get_trace_stats(
         if tokens:
             total_tokens_sum += tokens
         for llm_model, model_tokens_used in llm_model_entries:
-            model_tokens[llm_model] = (
-                model_tokens.get(llm_model, 0) + model_tokens_used
-            )
+            model_tokens[llm_model] = model_tokens.get(llm_model, 0) + model_tokens_used
         # Audio transcription (Whisper) — track separately with audio seconds as unit
         whisper_model = metadata.get("whisper_model")
         if whisper_model and metadata.get("is_audio"):
