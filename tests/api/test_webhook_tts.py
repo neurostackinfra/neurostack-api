@@ -90,3 +90,97 @@ async def test_any_tts_failure_falls_back_to_original_text(
     )
     assert result == {"messageId": "fallback-text"}
     assert used_audio is False
+
+
+@pytest.mark.asyncio
+async def test_force_text_bypasses_tts_when_enabled(monkeypatch) -> None:
+    """Deterministic responses (e.g. scheduling links) must never become audio.
+
+    Even when the clinic has TTS enabled, ``force_text=True`` sends the raw
+    text so the URL stays clickable in WhatsApp.
+    """
+
+    async def unexpected_synthesis(*args, **kwargs):
+        raise AssertionError("TTS must not run when force_text=True")
+
+    async def send_audio(_content: bytes, _mime: str) -> dict:
+        raise AssertionError("audio sender must not run when force_text=True")
+
+    captured: dict = {}
+
+    async def send_text() -> dict:
+        captured["called"] = True
+        return {"messageId": "det-text"}
+
+    monkeypatch.setattr(webhook, "synthesize_speech", unexpected_synthesis)
+    result, used_audio = await webhook._send_reply_with_optional_tts(
+        credentials={"tts_enabled": True},
+        text="Agende: https://example.com/book/abc",
+        language_code="pt-BR",
+        channel="test",
+        phone="5511",
+        send_audio=send_audio,
+        send_text=send_text,
+        force_text=True,
+    )
+    assert captured.get("called") is True
+    assert result == {"messageId": "det-text"}
+    assert used_audio is False
+
+
+@pytest.mark.asyncio
+async def test_force_text_false_preserves_audio_behaviour(monkeypatch) -> None:
+    """Regression guard: non-deterministic replies must still speak when TTS is on."""
+
+    async def synthesize(*args, **kwargs):
+        return SynthesizedAudio(b"mp3")
+
+    async def send_audio(content: bytes, mime: str) -> dict:
+        assert content == b"mp3"
+        assert mime == "audio/mpeg"
+        return {"messageId": "audio-2"}
+
+    async def send_text() -> dict:
+        raise AssertionError("text sender must not run when audio succeeds")
+
+    monkeypatch.setattr(webhook, "synthesize_speech", synthesize)
+    result, used_audio = await webhook._send_reply_with_optional_tts(
+        credentials={"tts_enabled": True},
+        text="Resposta normal",
+        language_code="pt-BR",
+        channel="test",
+        phone="5511",
+        send_audio=send_audio,
+        send_text=send_text,
+        force_text=False,
+    )
+    assert result == {"messageId": "audio-2"}
+    assert used_audio is True
+
+
+@pytest.mark.asyncio
+async def test_force_text_with_tts_disabled_still_sends_text(monkeypatch) -> None:
+    """When TTS is off the branch is the same regardless of force_text."""
+
+    async def unexpected_synthesis(*args, **kwargs):
+        raise AssertionError("TTS must not run while disabled")
+
+    async def send_audio(_content: bytes, _mime: str) -> dict:
+        raise AssertionError("audio sender must not run while disabled")
+
+    async def send_text() -> dict:
+        return {"messageId": "text-off"}
+
+    monkeypatch.setattr(webhook, "synthesize_speech", unexpected_synthesis)
+    result, used_audio = await webhook._send_reply_with_optional_tts(
+        credentials={"tts_enabled": False},
+        text="https://example.com/book/xyz",
+        language_code="pt-BR",
+        channel="test",
+        phone="5511",
+        send_audio=send_audio,
+        send_text=send_text,
+        force_text=True,
+    )
+    assert result == {"messageId": "text-off"}
+    assert used_audio is False
