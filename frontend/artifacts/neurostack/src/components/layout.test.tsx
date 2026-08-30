@@ -64,11 +64,13 @@ function deferredResponse() {
   };
 }
 
-function setRole(role: "builder" | "super_admin" | "clinic_admin") {
+function setRole(role: "builder" | "super_admin" | "clinic_admin" | "investor") {
   mocks.auth.role = role;
   mocks.auth.isBuilder = role === "builder";
   mocks.auth.isSuperAdmin = role === "super_admin";
   mocks.auth.isClinicAdmin = role === "clinic_admin";
+  mocks.auth.isInvestor = role === "investor";
+  mocks.auth.isReadOnly = role === "investor";
 }
 
 function renderLayout() {
@@ -89,6 +91,7 @@ beforeEach(() => {
   localStorage.clear();
   localStorage.setItem("ns_auth", JSON.stringify({ token: "test-token" }));
   localStorage.setItem("ns_locale", "en");
+  window.history.replaceState({}, "", "/");
 
   setRole("builder");
   mocks.auth.email = "builder@example.com";
@@ -421,5 +424,41 @@ describe("<Layout /> clinic selector search", () => {
     expect(optionLabels(select)).toEqual(builderClinics.map((clinic) => clinic.name));
     expect(select).toHaveValue("builder-clinic-2");
     expect(builderRequestCount).toBe(1);
+  });
+});
+
+describe("<Layout /> inactive queue navigation", () => {
+  it("places the user-inactive item between handoff and traces and applies the normal selected style", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    setRole("clinic_admin");
+    mocks.auth.email = "clinic-admin@example.com";
+    mocks.auth.clinicId = "clinic-admin-clinic";
+    mocks.auth.viewingClinicId = "clinic-admin-clinic";
+    window.history.replaceState({}, "", "/inactive-queue");
+
+    renderLayout();
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+
+    const handoff = screen.getByTestId("nav-link-handoff-queue");
+    const inactive = screen.getByTestId("nav-link-inactive-queue");
+    const traces = screen.getByTestId("nav-link-trace-history");
+    expect(handoff.compareDocumentPosition(inactive) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(inactive.compareDocumentPosition(traces) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(inactive).toHaveTextContent("Fila de Inativos");
+    expect(inactive).toHaveClass("bg-sidebar-accent", "text-sidebar-accent-foreground");
+    expect(inactive.querySelector(".lucide-user-x")).toBeInTheDocument();
+  });
+
+  it("does not show the inactive queue navigation item to investors", async () => {
+    setRole("investor");
+    mocks.auth.email = "investor@example.com";
+    mocks.auth.clinicId = "investor-clinic";
+    mocks.auth.viewingClinicId = "investor-clinic";
+
+    renderLayout();
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+
+    expect(screen.queryByTestId("nav-link-inactive-queue")).not.toBeInTheDocument();
+    expect(screen.queryByText("Inactive Queue")).not.toBeInTheDocument();
   });
 });
