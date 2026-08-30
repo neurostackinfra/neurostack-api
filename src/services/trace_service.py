@@ -5,8 +5,9 @@ Minimal query builders for read-only trace views over the events table.
 
 import csv
 import io
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
 from sqlalchemy import func, select, text
@@ -35,6 +36,69 @@ def _is_conversational_trace(event_data: object, event_metadata: object) -> bool
     if "decision" in data or any(marker in data for marker in _CONVERSATIONAL_MARKERS):
         return True
     return any(marker in metadata for marker in _CONVERSATIONAL_MARKERS)
+
+
+def _llm_usage_for_stats(metadata: object) -> tuple[int, list[tuple[str, int]]]:
+    """Return total and model-token entries without double-counting attempts.
+
+    New events persist ``llm_usage_total`` plus one entry per attempt.  Their
+    total is authoritative and their per-model breakdown is derived only from
+    attempts.  Older events have neither key and retain the legacy
+    ``llm_usage``/``llm_model`` representation exactly once.
+    """
+    if not isinstance(metadata, Mapping):
+        return 0, []
+
+    usage_total = metadata.get("llm_usage_total")
+    attempts = metadata.get("llm_attempts")
+    if isinstance(usage_total, Mapping) or isinstance(attempts, list):
+        total = (
+            usage_total.get("total_tokens", 0)
+            if isinstance(usage_total, Mapping)
+            else 0
+        )
+        total_tokens = (
+            total if isinstance(total, int) and not isinstance(total, bool) else 0
+        )
+        model_entries: list[tuple[str, int]] = []
+        if isinstance(attempts, list):
+            for attempt in attempts:
+                if (
+                    not isinstance(attempt, Mapping)
+                    or attempt.get("usage_status") != "reported"
+                ):
+                    continue
+                usage = attempt.get("usage")
+                tokens = (
+                    usage.get("total_tokens", 0)
+                    if isinstance(usage, Mapping)
+                    else 0
+                )
+                if not isinstance(tokens, int) or isinstance(tokens, bool) or not tokens:
+                    continue
+                reported = attempt.get("reported_model")
+                requested = attempt.get("requested_model")
+                model = reported if isinstance(reported, str) and reported.strip() else requested
+                if isinstance(model, str) and model:
+                    model_entries.append((model, tokens))
+        return total_tokens, model_entries
+
+    legacy_usage = metadata.get("llm_usage")
+    legacy_tokens = (
+        legacy_usage.get("total_tokens", 0)
+        if isinstance(legacy_usage, Mapping)
+        else 0
+    )
+    if (
+        not isinstance(legacy_tokens, int)
+        or isinstance(legacy_tokens, bool)
+        or not legacy_tokens
+    ):
+        return 0, []
+    legacy_model = metadata.get("llm_model")
+    if isinstance(legacy_model, str) and legacy_model:
+        return legacy_tokens, [(legacy_model, legacy_tokens)]
+    return legacy_tokens, []
 
 
 def _base_trace_query(tenant_id: UUID):
@@ -431,13 +495,13 @@ async def get_trace_stats(
         intent_dist[intent] = intent_dist.get(intent, 0) + 1
 
         # Token usage (LLM)
-        llm_usage = metadata.get("llm_usage", {})
-        llm_model = metadata.get("llm_model", "")
-        tokens = llm_usage.get("total_tokens", 0)
+        tokens, llm_model_entries = _llm_usage_for_stats(metadata)
         if tokens:
             total_tokens_sum += tokens
-            if llm_model:
-                model_tokens[llm_model] = model_tokens.get(llm_model, 0) + tokens
+        for llm_model, model_tokens_used in llm_model_entries:
+            model_tokens[llm_model] = (
+                model_tokens.get(llm_model, 0) + model_tokens_used
+            )
         # Audio transcription (Whisper) — track separately with audio seconds as unit
         whisper_model = metadata.get("whisper_model")
         if whisper_model and metadata.get("is_audio"):

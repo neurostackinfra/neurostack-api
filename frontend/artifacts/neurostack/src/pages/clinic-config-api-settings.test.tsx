@@ -578,10 +578,10 @@ describe("API capability headers driven by the shared registry", () => {
       },
       {
         id: "multimodal",
-        short: "API STT Fall Back",
+        short: "FallBack LLM Multimodal",
         desc: {
-          pt: "Multimodal (modelo que ouve o áudio direto)",
-          en: "Multimodal (model that listens to the audio directly)",
+          pt: "Fallback multimodal para duas contingências: quando o LLM primário falhar (com prompt e histórico enviados ao provedor multimodal) e quando o STT falhar (o modelo ouve o áudio direto).",
+          en: "Multimodal fallback for two contingencies: when the primary LLM fails (prompt and history are sent to the multimodal provider) and when STT fails (the model listens to the audio directly).",
         },
         required: false,
       },
@@ -613,7 +613,7 @@ describe("API capability headers driven by the shared registry", () => {
     expect(screen.getByText("API WhatsApp")).toBeInTheDocument();
     expect(screen.getByText("API LLM")).toBeInTheDocument();
     expect(screen.getByText("API STT")).toBeInTheDocument();
-    expect(screen.getByText("API STT Fall Back")).toBeInTheDocument();
+    expect(screen.getByText("FallBack LLM Multimodal")).toBeInTheDocument();
     expect(screen.getByText("API TTS")).toBeInTheDocument();
 
     // Final PT paragraphs from the acceptance table.
@@ -621,7 +621,7 @@ describe("API capability headers driven by the shared registry", () => {
     expect(screen.getByText("Large Language Model (gera as respostas em texto)")).toBeInTheDocument();
     expect(screen.getByText("Speech to Text (transcrição de áudio)")).toBeInTheDocument();
     expect(screen.getByText(
-      "Multimodal (modelo que ouve o áudio direto). Usado como alternativa quando o STT falha.",
+      "Fallback multimodal para duas contingências: quando o LLM primário falhar (com prompt e histórico enviados ao provedor multimodal) e quando o STT falhar (o modelo ouve o áudio direto).",
     )).toBeInTheDocument();
     expect(screen.getByText(
       "Text to Speech (gerar áudio). Quando ativado, as respostas do agente são sintetizadas e enviadas como áudio no WhatsApp. Se o provedor falhar, a resposta é enviada em texto.",
@@ -656,8 +656,9 @@ describe("API capability headers driven by the shared registry", () => {
     expect(screen.getByText("Messaging channel (receives and sends on WhatsApp)")).toBeInTheDocument();
     expect(screen.getByText("Large Language Model (generates the text replies)")).toBeInTheDocument();
     expect(screen.getByText("Speech to Text (audio transcription)")).toBeInTheDocument();
+    expect(screen.getByText("FallBack LLM Multimodal")).toBeInTheDocument();
     expect(screen.getByText(
-      "Multimodal (model that listens to the audio directly). Used as a fallback when STT fails.",
+      "Multimodal fallback for two contingencies: when the primary LLM fails (prompt and history are sent to the multimodal provider) and when STT fails (the model listens to the audio directly).",
     )).toBeInTheDocument();
     expect(screen.getByText(
       "Text to Speech (generate audio). When enabled, agent replies are synthesized and sent as WhatsApp audio. If the provider fails, the reply is sent as text.",

@@ -89,6 +89,11 @@ const SAVED_GROQ_STATUS = {
   multimodal_model_name: "whisper-large-v3",
 };
 
+const TEXT_FALLBACK_ENABLED_STATUS = {
+  ...SAVED_OPENROUTER_STATUS,
+  multimodal_text_fallback_enabled: true,
+};
+
 describe("Backend / frontend multimodal provider parity", () => {
   it("MULTIMODAL_PROVIDERS covers every canonical id from the backend allowlist", () => {
     expect(MULTIMODAL_PROVIDERS.map(p => p.id).sort())
@@ -168,6 +173,129 @@ describe("<ApiCredentialsForm /> — multimodal card", () => {
     const section = await screen.findByTestId("multimodal-settings-section");
     expect(within(section).getByTestId("multimodal-recommended-badge"))
       .toHaveTextContent("RECOMMENDED");
+  });
+
+  it("uses the exact title and describes both text and audio contingencies in PT and EN", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    mockCredentials([EMPTY_STATUS]);
+
+    const { unmount } = render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="42" isReadOnly={false} isSuperAdmin={false} />
+      </Wrapper>,
+    );
+
+    const portuguese = await screen.findByTestId("multimodal-settings-section");
+    expect(within(portuguese).getByText("FallBack LLM Multimodal")).toBeInTheDocument();
+    expect(within(portuguese).getByText(
+      "Fallback multimodal para duas contingências: quando o LLM primário falhar (com prompt e histórico enviados ao provedor multimodal) e quando o STT falhar (o modelo ouve o áudio direto).",
+    )).toBeInTheDocument();
+    expect(within(portuguese).getByRole("switch", {
+      name: "Autorizar fallback textual multimodal",
+    })).toBeInTheDocument();
+
+    unmount();
+    localStorage.setItem("ns_locale", "en");
+    mockCredentials([EMPTY_STATUS]);
+    render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="42" isReadOnly={false} isSuperAdmin={false} />
+      </Wrapper>,
+    );
+
+    const english = await screen.findByTestId("multimodal-settings-section");
+    expect(within(english).getByText("FallBack LLM Multimodal")).toBeInTheDocument();
+    expect(within(english).getByText(
+      "Multimodal fallback for two contingencies: when the primary LLM fails (prompt and history are sent to the multimodal provider) and when STT fails (the model listens to the audio directly).",
+    )).toBeInTheDocument();
+    expect(within(english).getByRole("switch", {
+      name: "Authorize multimodal text fallback",
+    })).toBeInTheDocument();
+  });
+
+  it("defaults a legacy status to unchecked and never sends the opt-in while saving other multimodal edits", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    const { patches } = mockCredentials([EMPTY_STATUS]);
+
+    render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="42" isReadOnly={false} isSuperAdmin={false} />
+      </Wrapper>,
+    );
+
+    const section = await screen.findByTestId("multimodal-settings-section");
+    const toggle = within(section).getByRole("switch", { name: /autorizar fallback textual multimodal/i });
+    await waitFor(() => expect(toggle).toBeEnabled());
+    expect(toggle).not.toBeChecked();
+
+    fireEvent.change(within(section).getByPlaceholderText("google/gemini-2.5-flash"), {
+      target: { value: "replacement-model" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /salvar configurações de api/i }));
+
+    await waitFor(() => expect(patches).toHaveLength(1));
+    expect(patches[0]).not.toHaveProperty("multimodal_text_fallback_enabled");
+    expect(toggle).not.toBeChecked();
+  });
+
+  it("exposes an accessible text opt-in that PATCHes only the explicit boolean and reloads persisted state", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    const { patches } = mockCredentials([
+      EMPTY_STATUS,
+      TEXT_FALLBACK_ENABLED_STATUS,
+      TEXT_FALLBACK_ENABLED_STATUS,
+    ]);
+
+    const { unmount } = render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="42" isReadOnly={false} isSuperAdmin={false} />
+      </Wrapper>,
+    );
+
+    const section = await screen.findByTestId("multimodal-settings-section");
+    const toggle = within(section).getByRole("switch", { name: /autorizar fallback textual multimodal/i });
+    await waitFor(() => expect(toggle).toBeEnabled());
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => expect(patches).toEqual([
+      { multimodal_text_fallback_enabled: true },
+    ]));
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
+
+    unmount();
+    render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="42" isReadOnly={false} isSuperAdmin={false} />
+      </Wrapper>,
+    );
+
+    const reloaded = await screen.findByTestId("multimodal-settings-section");
+    expect(within(reloaded).getByRole("switch", {
+      name: /autorizar fallback textual multimodal/i,
+    })).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("shows the persisted opt-in but disables it and credentials for read-only users", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    const { patches } = mockCredentials([TEXT_FALLBACK_ENABLED_STATUS]);
+
+    render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="42" isReadOnly isSuperAdmin={false} />
+      </Wrapper>,
+    );
+
+    const section = await screen.findByTestId("multimodal-settings-section");
+    const toggle = within(section).getByRole("switch", { name: /autorizar fallback textual multimodal/i });
+    expect(toggle).toBeChecked();
+    expect(toggle).toBeDisabled();
+    expect(multimodalKeyInput(section)).toBeDisabled();
+    expect(within(section).getByTestId("multimodal-provider-openrouter")).toBeDisabled();
+
+    fireEvent.click(toggle);
+    expect(patches).toHaveLength(0);
   });
 
   it("offers every allowlisted provider and flags the non-operational ones", async () => {
@@ -307,6 +435,24 @@ describe("<ApiCredentialsForm /> — multimodal card", () => {
 
     await waitFor(() => expect(patches).toHaveLength(1));
     expect(Object.keys(patches[0]).some(key => key.startsWith("multimodal_"))).toBe(false);
+  });
+
+  it("keeps an existing masked key without requiring or resending it on an unrelated save", async () => {
+    const { patches } = mockCredentials([SAVED_OPENROUTER_STATUS]);
+
+    render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="42" isReadOnly={false} isSuperAdmin={false} />
+      </Wrapper>,
+    );
+
+    const section = await screen.findByTestId("multimodal-settings-section");
+    await waitFor(() => expect(multimodalKeyInput(section).value).toBe("••••••••"));
+    fireEvent.click(screen.getByRole("button", { name: /salvar configurações de api/i }));
+
+    await waitFor(() => expect(patches).toHaveLength(1));
+    expect(patches[0]).not.toHaveProperty("multimodal_api_key");
+    expect(patches[0]).not.toHaveProperty("multimodal_text_fallback_enabled");
   });
 
   it("asks for a new key when the provider changes instead of saving a stale one", async () => {

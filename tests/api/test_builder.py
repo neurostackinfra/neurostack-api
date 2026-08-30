@@ -398,6 +398,28 @@ class TestBuilderScopeIsolation:
 class TestBuilderStats:
     """Test GET /v1/builder/stats."""
 
+    def test_stats_share_new_llm_attempt_accounting_contract(self) -> None:
+        """Builder imports the trace helper so new events cannot double-count."""
+        from src.api.routes.builder import _llm_usage_for_stats
+
+        total, breakdown = _llm_usage_for_stats(
+            {
+                "llm_usage_total": {"total_tokens": 8},
+                "llm_usage": {"total_tokens": 80},
+                "llm_attempts": [
+                    {
+                        "usage_status": "reported",
+                        "usage": {"total_tokens": 8},
+                        "reported_model": None,
+                        "requested_model": "requested-model",
+                    }
+                ],
+            }
+        )
+
+        assert total == 8
+        assert breakdown == [("requested-model", 8)]
+
     def test_returns_stats_structure(self, client: TestClient, builder_a_headers):
         response = client.get("/v1/builder/stats", headers=builder_a_headers)
         assert response.status_code == 200
