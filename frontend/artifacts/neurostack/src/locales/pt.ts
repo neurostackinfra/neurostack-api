@@ -27,6 +27,9 @@ export const pt: Record<TranslationKey, string> = {
   nav_partners: "Portal de Parceiros",
   badge_coming_soon: "Em breve",
   label_select_clinic: "Selecionar Clínica",
+  label_search_clinics: "Buscar clínicas",
+  placeholder_search_clinics: "Buscar pelo nome da clínica",
+  clinic_search_no_results: "Nenhuma clínica encontrada",
   label_read_only_mode: "Modo somente leitura",
 
   // Login
