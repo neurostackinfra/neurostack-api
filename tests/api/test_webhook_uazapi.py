@@ -19,8 +19,8 @@ import copy
 import json
 import pathlib
 from datetime import datetime, timedelta, timezone
-from typing import Any
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
@@ -29,7 +29,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.config.settings import settings
-
 
 # Real captured Uazapi webhook payloads (audio + image), redacted only for
 # the per-tenant webhook token. Group 4 acceptance criterion: media tests
@@ -1356,6 +1355,7 @@ def _session_row(client: TestClient, session_id: UUID):
     committed state, not the in-memory object the request handler mutated.
     """
     from sqlalchemy import select
+
     from src.models.session import Session as SessionRow
     from src.repositories.database import get_db_session
 
@@ -1379,6 +1379,7 @@ def _session_metadata(client: TestClient, session_id: UUID) -> dict:
     """Load ``session_metadata`` in a new AsyncSession — used by the aviso
     echo end-to-end test, which needs to plant the aviso id server-side."""
     from sqlalchemy import select
+
     from src.models.session import Session as SessionRow
     from src.repositories.database import get_db_session
 
@@ -1409,6 +1410,7 @@ def _seed_handoff_active(
     test does.
     """
     from sqlalchemy import update
+
     from src.models.clinic_config_table import ClinicConfigTable
     from src.repositories.database import get_db_session
 
@@ -1500,9 +1502,10 @@ class TestUazapiFromMeHumanTakeover:
         chatid, so no session is ever seeded for the clinic's own number.
         """
         from sqlalchemy import select
+
+        from src.api.routes.webhook import _normalise_phone
         from src.models.session import Session as SessionRow
         from src.repositories.database import get_db_session
-        from src.api.routes.webhook import _normalise_phone
 
         self._clear_state()
         instance = f"clinica_{uuid4().hex[:8]}"
@@ -1652,8 +1655,9 @@ class TestUazapiFromMeAiEcho:
 
         # The aviso id was committed to session_metadata by Group 1b —
         # verify from a NEW DB session (not the request's).
-        from src.api.routes.webhook import _normalise_phone
         from sqlalchemy import select
+
+        from src.api.routes.webhook import _normalise_phone
         from src.models.session import Session as SessionRow
         from src.repositories.database import get_db_session
 
@@ -1878,6 +1882,7 @@ class TestUazapiFromMeTriggerReactivation:
 
     def _pause_session(self, client: TestClient, session_id: UUID) -> None:
         from sqlalchemy import update
+
         from src.models.session import Session as SessionRow
         from src.repositories.database import get_db_session
 
@@ -2307,6 +2312,7 @@ class TestUazapiGroup4PatientAudioTranscription:
             return_value=(b"OggS_fake_bytes", "audio/ogg; codecs=opus")
         )
         send_mock = AsyncMock(return_value=_fake_uazapi_send_result())
+        tts_gate = AsyncMock()
 
         with (
             patch("src.api.routes.webhook.download_uazapi_media", download_mock),
@@ -2319,6 +2325,10 @@ class TestUazapiGroup4PatientAudioTranscription:
                 new=AsyncMock(side_effect=RuntimeError("mm 429")),
             ),
             patch("src.api.routes.webhook.send_uazapi_text", send_mock),
+            patch(
+                "src.api.routes.webhook._send_reply_with_optional_tts",
+                tts_gate,
+            ),
         ):
             resp = client.post(WEBHOOK_PATH, json=payload)
 
@@ -2326,6 +2336,7 @@ class TestUazapiGroup4PatientAudioTranscription:
         assert resp.json() == {"ok": True, "replied": True, "action": "stt_fallback"}
         assert send_mock.await_count == 1
         assert send_mock.await_args.args[3] == _STT_TEMPORARY_FAILURE_MSG_PT
+        tts_gate.assert_not_awaited()
 
     def test_patient_audio_download_error_skips_with_labelled_reason(
         self,
@@ -2496,3 +2507,197 @@ class TestUazapiGroup4FromMeAudioUntouched:
         # Half 2: the patient's session got paused
         row = _session_row(client, patient_session_id)
         assert row["is_paused"] is True
+
+
+class TestInactiveQueueReactivationRuntimeRegression:
+    """The queue command and common webhook pause lookup choose the same row."""
+
+    def test_reactivated_effective_duplicate_continues_to_ai_pipeline(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        from sqlalchemy import update
+
+        from src.api.routes import webhook as webhook_module
+        from src.models.session import Session as SessionRow
+        from src.repositories.database import get_db_session
+
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+        phone = "5511988887722"
+        old_session_id = _create_session(client, tenant_id, phone)
+        effective_session_id = UUID(int=old_session_id.int + 1)
+        now = datetime.now(timezone.utc)
+
+        async def _seed_duplicate() -> None:
+            db = get_db_session()
+            try:
+                await db.execute(
+                    update(SessionRow)
+                    .where(SessionRow.id == old_session_id)
+                    .values(
+                        is_paused=True,
+                        paused_until=None,
+                        last_activity_at=now,
+                    )
+                )
+                db.add(
+                    SessionRow(
+                        id=effective_session_id,
+                        tenant_id=tenant_id,
+                        user_id=phone,
+                        channel="whatsapp",
+                        cognitive_state={"funnel_stage": "lead_novo"},
+                        session_metadata={"source": "webhook"},
+                        last_activity_at=now,
+                        is_active=True,
+                        is_paused=True,
+                        paused_until=None,
+                    )
+                )
+                await db.commit()
+            finally:
+                await db.close()
+
+        client._submit(_seed_duplicate())  # type: ignore[attr-defined]
+
+        reactivated = client.post(
+            f"/v1/sessions/{effective_session_id}/reactivate",
+            headers=_admin_headers(tenant_id),
+        )
+        assert reactivated.status_code == 200, reactivated.text
+        assert reactivated.json()["status"] == "reactivated"
+
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone=phone,
+            body="Quero continuar o atendimento",
+            message_id=f"3EB0_reactivated_{uuid4().hex[:8]}",
+        )
+        with (
+            patch("src.api.routes.webhook.get_event_service") as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(return_value=_fake_uazapi_send_result()),
+            ),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Atendimento retomado"),
+            )
+            mock_get_service.return_value = service
+
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "replied": True}
+        assert service.process_event.await_count == 1
+        event = service.process_event.await_args.args[0]
+        assert event.session_id == effective_session_id
+        assert _session_row(client, effective_session_id)["is_paused"] is False
+        assert _session_row(client, old_session_id)["is_paused"] is True
+
+
+class TestUazapiVoiceReplyOrigin:
+    @staticmethod
+    def _clear_state() -> None:
+        from src.api.routes import webhook as webhook_module
+
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+        webhook_module._INMEM_STT_NOTICE.clear()
+
+    def test_text_reply_reaches_gate_as_non_audio(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000390",
+            body="Olá",
+            message_id=f"3EB0_text_{uuid4().hex[:8]}",
+        )
+        reply_gate = AsyncMock(
+            return_value=(_fake_uazapi_send_result("voice_gate_text"), False),
+        )
+
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), False)),
+            ),
+            patch("src.api.routes.webhook.get_event_service") as get_service,
+            patch(
+                "src.api.routes.webhook._send_reply_with_optional_tts",
+                reply_gate,
+            ),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Resposta"),
+            )
+            get_service.return_value = service
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "replied": True}
+        reply_gate.assert_awaited_once()
+        assert reply_gate.await_args.kwargs["input_was_audio"] is False
+
+    def test_transcribed_patient_audio_keeps_audio_origin(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(client, tenant_id, instance, stt=True)
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_voice_{uuid4().hex[:8]}",
+        )
+        reply_gate = AsyncMock(
+            return_value=(_fake_uazapi_send_result("voice_gate_audio"), True),
+        )
+
+        with (
+            patch(
+                "src.api.routes.webhook.download_uazapi_media",
+                new=AsyncMock(return_value=(b"OggS_voice", "audio/ogg")),
+            ),
+            patch(
+                "src.api.routes.webhook._transcribe_audio_chain",
+                new=AsyncMock(return_value=("áudio transcrito", None)),
+            ),
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), False)),
+            ),
+            patch("src.api.routes.webhook.get_event_service") as get_service,
+            patch(
+                "src.api.routes.webhook._send_reply_with_optional_tts",
+                reply_gate,
+            ),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Resposta"),
+            )
+            get_service.return_value = service
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "replied": True}
+        reply_gate.assert_awaited_once()
+        assert reply_gate.await_args.kwargs["input_was_audio"] is True

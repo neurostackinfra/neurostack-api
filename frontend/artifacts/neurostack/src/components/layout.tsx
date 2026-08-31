@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Link, useLocation } from "wouter";
 import {
   MessageSquare,
@@ -27,8 +27,9 @@ import {
   Wrench,
   ChevronDown,
   Users2,
+  UserX,
 } from "lucide-react";
-import logoSrc from "@assets/logo_png_1775411054369.png";
+import logoSrc from "../../../../attached_assets/logo_png_1775411054369.png";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import { useAuth } from "@/context/auth";
@@ -39,12 +40,41 @@ interface LayoutProps {
   children: React.ReactNode;
 }
 
+interface ClinicOption {
+  id: string;
+  name: string;
+}
+
+function normalizeClinicSearch(value: string) {
+  return value
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+function filterClinics(clinics: ClinicOption[], query: string) {
+  const normalizedQuery = normalizeClinicSearch(query);
+  if (!normalizedQuery) return clinics;
+
+  return clinics.filter((clinic) =>
+    normalizeClinicSearch(clinic.name).includes(normalizedQuery),
+  );
+}
+
 export function Layout({ children }: LayoutProps) {
   const [location] = useLocation();
   const { logout, email, clinicId, role, isSuperAdmin, isInvestor, isBuilder, isClinicAdmin, isReadOnly, viewingClinicId } = useAuth();
   const { t, locale, setLocale } = useI18n();
   const { setViewingClinicId } = useAuth();
   const displayClinicId = (isSuperAdmin || isBuilder) ? viewingClinicId : clinicId;
+  const [clinicSearchQuery, setClinicSearchQuery] = useState("");
+  const viewingClinicIdRef = useRef(viewingClinicId);
+  viewingClinicIdRef.current = viewingClinicId;
+
+  useEffect(() => {
+    setClinicSearchQuery("");
+  }, [role, email]);
 
   // useGetClinicConfig ignores clinic_id — fetch directly with ?clinic_id= so
   // builders see the selected clinic's name instead of their own HQ config.
@@ -67,55 +97,69 @@ export function Layout({ children }: LayoutProps) {
   }, [displayClinicId]);
 
   // Builder clinic list for dropdown
-  const [builderClinics, setBuilderClinics] = useState<Array<{ id: string; name: string }>>([]);
+  const [builderClinics, setBuilderClinics] = useState<ClinicOption[]>([]);
   useEffect(() => {
-    if (!isBuilder) return;
+    let active = true;
+    setBuilderClinics([]);
+    if (!isBuilder) return () => { active = false; };
     const raw = localStorage.getItem("ns_auth");
     const token = raw ? (JSON.parse(raw) as { token?: string }).token : null;
-    if (!token) return;
+    if (!token) return () => { active = false; };
     fetch("/v1/builder/clinics", {
       headers: { Authorization: `Bearer ${token}` },
     })
       .then((r) => r.ok ? r.json() : Promise.reject(r))
       .then((data: Array<{ id: string; name: string }> | { clinics?: Array<{ id: string; name: string }> }) => {
+        if (!active) return;
         // API returns a plain array, not { clinics: [...] }
         const clinics = Array.isArray(data) ? data : (data.clinics ?? []);
         setBuilderClinics(clinics);
         // Stale viewingClinicId guard — use c.id (the tenant UUID)
-        if (clinics.length > 0 && !clinics.some((c) => c.id === viewingClinicId)) {
+        if (clinics.length > 0 && !clinics.some((c) => c.id === viewingClinicIdRef.current)) {
           setViewingClinicId(clinics[0].id);
         }
       })
       .catch(() => {});
-  }, [isBuilder, viewingClinicId, setViewingClinicId]);
+    return () => { active = false; };
+  }, [isBuilder, email, setViewingClinicId]);
 
   // Super admin clinic list for dropdown (all active clinics on the platform)
-  const [superAdminClinics, setSuperAdminClinics] = useState<Array<{ id: string; name: string }>>([]);
+  const [superAdminClinics, setSuperAdminClinics] = useState<ClinicOption[]>([]);
   useEffect(() => {
-    if (!isSuperAdmin) return;
+    let active = true;
+    setSuperAdminClinics([]);
+    if (!isSuperAdmin) return () => { active = false; };
     const raw = localStorage.getItem("ns_auth");
     const token = raw ? (JSON.parse(raw) as { token?: string }).token : null;
-    if (!token) return;
+    if (!token) return () => { active = false; };
     fetch("/v1/admin/clinics", {
       headers: { Authorization: `Bearer ${token}` },
     })
       .then((r) => r.ok ? r.json() : Promise.reject(r))
       .then((data: Array<{ clinic_id: string; clinic_name: string; status: string }>) => {
-        const active = data
+        if (!active) return;
+        const activeClinics = data
           .filter((c) => c.status === "active")
           .map((c) => ({ id: c.clinic_id, name: c.clinic_name }));
-        setSuperAdminClinics(active);
+        setSuperAdminClinics(activeClinics);
         // Auto-select first clinic if current viewingClinicId is not in the list
-        if (active.length > 0 && !active.some((c) => c.id === viewingClinicId)) {
-          setViewingClinicId(active[0].id);
+        if (activeClinics.length > 0 && !activeClinics.some((c) => c.id === viewingClinicIdRef.current)) {
+          setViewingClinicId(activeClinics[0].id);
         }
       })
       .catch(() => {});
-  }, [isSuperAdmin, viewingClinicId, setViewingClinicId]);
+    return () => { active = false; };
+  }, [isSuperAdmin, email, setViewingClinicId]);
+
+  const filteredBuilderClinics = filterClinics(builderClinics, clinicSearchQuery);
+  const filteredSuperAdminClinics = filterClinics(superAdminClinics, clinicSearchQuery);
+  const builderSelectionVisible = filteredBuilderClinics.some((clinic) => clinic.id === viewingClinicId);
+  const superAdminSelectionVisible = filteredSuperAdminClinics.some((clinic) => clinic.id === viewingClinicId);
 
   const navItems = [
     { href: "/",         label: t("nav_chat"),      icon: MessageSquare,  id: "chat-simulator", hideFor: [] },
     { href: "/handoff-queue", label: t("nav_handoff_queue"), icon: Users2, id: "handoff-queue", hideFor: [] },
+    { href: "/inactive-queue", label: t("nav_inactive_queue"), icon: UserX, id: "inactive-queue", hideFor: ["investor"] },
     { href: "/traces",   label: t("nav_traces"),    icon: Activity,       id: "trace-history",  hideFor: [] },
     { href: "/dashboard",label: t("nav_dashboard"), icon: LayoutDashboard,id: "dashboard",      hideFor: [] },
     { href: "/config",   label: t("nav_config"),    icon: Sliders,        id: "clinic-config",  hideFor: [] },
@@ -137,7 +181,7 @@ export function Layout({ children }: LayoutProps) {
     { href: "/portal-parceiros",label: t("nav_partners"),      icon: Briefcase,     id: "portal-parceiros",v: "v3", hideFor: ["clinic_admin"] },
   ].filter(item => !item.hideFor.includes(role));
 
-  const SidebarContent = () => (
+  const renderSidebarContent = () => (
     <div className="flex h-full flex-col bg-sidebar text-sidebar-foreground">
       {/* Logo */}
       <div className="flex h-40 items-center border-b border-sidebar-border px-4">
@@ -169,13 +213,31 @@ export function Layout({ children }: LayoutProps) {
               {t("label_select_clinic")}
             </span>
           </div>
+          <input
+            type="search"
+            value={clinicSearchQuery}
+            onChange={(event) => setClinicSearchQuery(event.target.value)}
+            aria-label={t("label_search_clinics")}
+            placeholder={t("placeholder_search_clinics")}
+            className="mb-2 w-full rounded-md border border-sidebar-border bg-sidebar px-2 py-1.5 text-xs text-sidebar-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            data-testid="builder-clinic-search"
+          />
           <select
-            value={viewingClinicId}
-            onChange={(e) => setViewingClinicId(e.target.value)}
+            value={builderSelectionVisible ? viewingClinicId : ""}
+            onChange={(e) => {
+              if (e.target.value) setViewingClinicId(e.target.value);
+            }}
             className="w-full rounded-md border border-sidebar-border bg-sidebar px-2 py-1.5 text-xs text-sidebar-foreground focus:outline-none focus:ring-1 focus:ring-indigo-500"
             data-testid="builder-clinic-dropdown"
           >
-            {builderClinics.map((c) => (
+            {!builderSelectionVisible && (
+              <option value="" disabled>
+                {filteredBuilderClinics.length === 0
+                  ? t("clinic_search_no_results")
+                  : t("label_select_clinic")}
+              </option>
+            )}
+            {filteredBuilderClinics.map((c) => (
               <option key={c.id} value={c.id}>
                 {c.name}
               </option>
@@ -193,13 +255,31 @@ export function Layout({ children }: LayoutProps) {
               {t("label_select_clinic")}
             </span>
           </div>
+          <input
+            type="search"
+            value={clinicSearchQuery}
+            onChange={(event) => setClinicSearchQuery(event.target.value)}
+            aria-label={t("label_search_clinics")}
+            placeholder={t("placeholder_search_clinics")}
+            className="mb-2 w-full rounded-md border border-sidebar-border bg-sidebar px-2 py-1.5 text-xs text-sidebar-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-violet-500"
+            data-testid="super-admin-clinic-search"
+          />
           <select
-            value={viewingClinicId ?? ""}
-            onChange={(e) => setViewingClinicId(e.target.value)}
+            value={superAdminSelectionVisible ? viewingClinicId : ""}
+            onChange={(e) => {
+              if (e.target.value) setViewingClinicId(e.target.value);
+            }}
             className="w-full rounded-md border border-sidebar-border bg-sidebar px-2 py-1.5 text-xs text-sidebar-foreground focus:outline-none focus:ring-1 focus:ring-violet-500"
             data-testid="super-admin-clinic-dropdown"
           >
-            {superAdminClinics.map((c) => (
+            {!superAdminSelectionVisible && (
+              <option value="" disabled>
+                {filteredSuperAdminClinics.length === 0
+                  ? t("clinic_search_no_results")
+                  : t("label_select_clinic")}
+              </option>
+            )}
+            {filteredSuperAdminClinics.map((c) => (
               <option key={c.id} value={c.id}>
                 {c.name}
               </option>
@@ -369,7 +449,7 @@ export function Layout({ children }: LayoutProps) {
     <div className="flex min-h-screen w-full flex-col bg-background">
       {/* Desktop Sidebar */}
       <div className="hidden border-r border-border md:block md:w-64 lg:w-72 fixed inset-y-0 left-0 z-50">
-        <SidebarContent />
+        {renderSidebarContent()}
       </div>
 
       <div className="flex flex-col md:pl-64 lg:pl-72 flex-1">
@@ -388,7 +468,7 @@ export function Layout({ children }: LayoutProps) {
               </Button>
             </SheetTrigger>
             <SheetContent side="left" className="w-64 p-0 border-r-0">
-              <SidebarContent />
+              {renderSidebarContent()}
             </SheetContent>
           </Sheet>
           <div className="flex items-center">

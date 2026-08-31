@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.config.settings import settings
+from src.services.api_credentials import PROVIDER_AVAILABILITY
 
 
 def _headers() -> dict[str, str]:
@@ -30,8 +31,11 @@ def _headers() -> dict[str, str]:
 
 
 def test_generic_get_omits_credential_bucket_fields_and_secrets(
-    client: TestClient,
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # This test isolates the generic-read boundary; provider availability has
+    # its own route coverage.
+    monkeypatch.setitem(PROVIDER_AVAILABILITY["llm"], "openai", "active")
     headers = _headers()
     secret = "generic-boundary-secret"
     saved = client.patch(
@@ -67,10 +71,14 @@ def test_generic_get_omits_credential_bucket_fields_and_secrets(
         "llm_api_key",
         "llm_base_url",
         "multimodal_api_key",
+        # The fallback opt-in gate is a credential-bucket field even though
+        # it is non-secret: generic config must refuse it too.
+        "multimodal_text_fallback_enabled",
         "stt_api_key",
         "whisper_api_key",
         "whisper_model",
         "tts_api_key",
+        "tts_reply_policy",
         "tts_future_alias",
     ],
 )
@@ -120,8 +128,11 @@ def test_generic_patch_allows_handoff_service_time_target(
 
 
 def test_sequential_http_saves_preserve_previous_capabilities(
-    client: TestClient,
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Exercise merge/persistence after availability validation succeeds.
+    monkeypatch.setitem(PROVIDER_AVAILABILITY["llm"], "dropout", "active")
+    monkeypatch.setitem(PROVIDER_AVAILABILITY["stt"], "outros", "active")
     headers = _headers()
     first = client.patch(
         "/v1/config/api-credentials",

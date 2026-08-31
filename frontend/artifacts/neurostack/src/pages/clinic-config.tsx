@@ -42,7 +42,11 @@ import {
   Cpu, MessageSquare, Lock, ChevronDown, ExternalLink, FileText, Mic2, Volume2,
   AudioLines,
 } from "lucide-react";
-import { ProviderCredentialCard } from "@/components/api-settings/provider-credential-card";
+import {
+  ProviderCredentialCard,
+  type ProviderCardState,
+} from "@/components/api-settings/provider-credential-card";
+import { VoiceResponseControls } from "@/components/api-settings/voice-response-controls";
 
 // ── API Credentials (Tab 6) ───────────────────────────────────────────────────
 
@@ -497,22 +501,239 @@ function providersForCapability(capability: ApiCapabilityId): readonly ProviderD
   }
 }
 
-export function ApiCredentialsForm(_: {
+type CredentialField = {
+  name: string;
+  label: { pt: string; en: string };
+  secret?: boolean;
+  numeric?: boolean;
+};
+
+// WhatsApp is the one capability whose credential shape depends on the
+// provider; the rest share a single bundle shape per capability.
+const WHATSAPP_PROVIDER_FIELDS: Record<string, readonly CredentialField[]> = {
+  zapi: [
+    { name: "zapi_instance_id", label: { pt: "ID da instância", en: "Instance ID" } },
+    { name: "zapi_token", label: { pt: "Token", en: "Token" }, secret: true },
+    { name: "zapi_client_token", label: { pt: "Client token", en: "Client token" }, secret: true },
+  ],
+  evolution: [
+    { name: "evolution_api_url", label: { pt: "URL da API", en: "API URL" } },
+    { name: "evolution_instance_name", label: { pt: "Nome da instância", en: "Instance name" } },
+    { name: "evolution_api_key", label: { pt: "Chave da API", en: "API key" }, secret: true },
+  ],
+  meta_cloud: [
+    { name: "meta_phone_number_id", label: { pt: "Phone number ID", en: "Phone number ID" } },
+    { name: "meta_waba_id", label: { pt: "WABA ID", en: "WABA ID" } },
+    { name: "meta_permanent_token", label: { pt: "Token permanente", en: "Permanent token" }, secret: true },
+    { name: "meta_app_secret", label: { pt: "App secret", en: "App secret" }, secret: true },
+  ],
+  uazapi: [
+    { name: "uazapi_api_url", label: { pt: "URL da API", en: "API URL" } },
+    { name: "uazapi_instance_name", label: { pt: "Nome da instância", en: "Instance name" } },
+    { name: "uazapi_token", label: { pt: "Token", en: "Token" }, secret: true },
+  ],
+  dialog360: [],
+  twilio: [],
+};
+
+// Voice triggers (`tts_enabled`, `tts_reply_policy`) belong to
+// VoiceResponseControls and are deliberately absent here.
+const CAPABILITY_FIELDS: Record<string, readonly CredentialField[]> = {
+  llm: [
+    { name: "llm_api_url", label: { pt: "URL da API", en: "API URL" } },
+    { name: "llm_api_key", label: { pt: "Chave da API", en: "API key" }, secret: true },
+    { name: "llm_model_name", label: { pt: "Modelo", en: "Model" } },
+  ],
+  stt: [
+    { name: "stt_api_url", label: { pt: "URL da API", en: "API URL" } },
+    { name: "stt_api_key", label: { pt: "Chave da API", en: "API key" }, secret: true },
+    { name: "stt_model_name", label: { pt: "Modelo", en: "Model" } },
+    { name: "audio_max_seconds", label: { pt: "Duração máxima (s)", en: "Max duration (s)" }, numeric: true },
+  ],
+  multimodal: [
+    { name: "multimodal_api_url", label: { pt: "URL da API", en: "API URL" } },
+    { name: "multimodal_api_key", label: { pt: "Chave da API", en: "API key" }, secret: true },
+    { name: "multimodal_model_name", label: { pt: "Modelo", en: "Model" } },
+  ],
+  tts: [
+    { name: "tts_api_url", label: { pt: "URL da API", en: "API URL" } },
+    { name: "tts_api_key", label: { pt: "Chave da API", en: "API key" }, secret: true },
+    { name: "tts_model_name", label: { pt: "Modelo", en: "Model" } },
+    { name: "tts_voice_id", label: { pt: "ID da voz", en: "Voice ID" } },
+  ],
+};
+
+const CAPABILITY_PROVIDER_FIELD: Record<ApiCapabilityId, string> = {
+  whatsapp: "whatsapp_provider",
+  llm: "llm_provider",
+  stt: "stt_provider",
+  multimodal: "multimodal_provider",
+  tts: "tts_provider",
+};
+
+const CAPABILITY_READINESS_FIELD: Record<ApiCapabilityId, string> = {
+  whatsapp: "whatsapp_readiness",
+  llm: "llm_readiness",
+  stt: "stt_readiness",
+  multimodal: "multimodal_readiness",
+  tts: "tts_readiness",
+};
+
+type CredentialStatus = Record<string, unknown>;
+
+export function credentialFields(
+  capability: ApiCapabilityId,
+  provider: string,
+): readonly CredentialField[] {
+  return capability === "whatsapp"
+    ? WHATSAPP_PROVIDER_FIELDS[provider] ?? []
+    : CAPABILITY_FIELDS[capability];
+}
+
+function statusText(status: CredentialStatus | null, field: string): string {
+  const value = status?.[field];
+  return value === null || value === undefined ? "" : String(value);
+}
+
+// Allowlist rather than denylist: `signature_pending` means a Meta bundle is
+// missing its app secret, so it must read as partial. Only these two readiness
+// values stand for a whole bundle.
+const COMPLETE_READINESS = new Set(["active", "configuration_only"]);
+
+/**
+ * A provider is `configured` once the tenant holds it with a whole bundle,
+ * `incomplete` when it is held but the bundle is partial, and `coming_soon`
+ * otherwise. Only the first two are editable — that is exactly the set the
+ * backend availability gate lets a tenant keep maintaining.
+ */
+export function providerCardState(
+  capability: ApiCapabilityId,
+  providerId: string,
+  status: CredentialStatus | null,
+): ProviderCardState {
+  const persisted = statusText(status, CAPABILITY_PROVIDER_FIELD[capability]);
+  if (!persisted || persisted !== providerId) return "coming_soon";
+  return COMPLETE_READINESS.has(statusText(status, CAPABILITY_READINESS_FIELD[capability]))
+    ? "configured"
+    : "incomplete";
+}
+
+export function ApiCredentialsForm({ clinicId, isReadOnly }: {
   clinicId: string; isReadOnly: boolean; isSuperAdmin: boolean;
 }) {
   const { locale } = useI18n();
-  const comingSoonLabel = locale === "en" ? "COMING SOON" : "EM BREVE";
+  const { toast } = useToast();
+  const txt = (pt: string, en: string) => (locale === "en" ? en : pt);
+  const [status, setStatus] = useState<CredentialStatus | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [baseline, setBaseline] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState(false);
 
-  // This surface intentionally has no credential fetch or PATCH workflow.
-  // A legacy saved provider is never normalized to a new default, so viewing
-  // this tab cannot turn a read into an accidental state transition.
+  const badgeLabel: Record<ProviderCardState, string> = {
+    configured: txt("CONFIGURADO", "CONFIGURED"),
+    incomplete: txt("INCOMPLETO", "INCOMPLETE"),
+    coming_soon: txt("EM BREVE", "COMING SOON"),
+  };
+
+  const credentialsUrl = `/v1/config/api-credentials?tenant_id=${encodeURIComponent(clinicId)}`;
+
+  const loadStatus = useCallback(async () => {
+    if (!clinicId) { setLoadFailed(true); return; }
+    try {
+      const token = getToken();
+      const res = await fetch(credentialsUrl, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) throw new Error(`Credential status fetch failed: ${res.status}`);
+      setStatus(await res.json() as CredentialStatus);
+      setLoadFailed(false);
+    } catch {
+      setStatus(null);
+      setLoadFailed(true);
+    }
+  }, [clinicId, credentialsUrl]);
+
+  useEffect(() => { void loadStatus(); }, [loadStatus]);
+
+  function toggleProvider(capability: ApiCapabilityId, providerId: string) {
+    const key = `${capability}:${providerId}`;
+    if (expanded === key) { setExpanded(null); return; }
+    // Secrets never pre-fill: an empty input means "keep the stored value",
+    // which is also how the backend reads an omitted secret field.
+    const hydrated: Record<string, string> = {};
+    for (const field of credentialFields(capability, providerId)) {
+      hydrated[field.name] = field.secret ? "" : statusText(status, field.name);
+    }
+    setBaseline(hydrated);
+    setDraft(hydrated);
+    setExpanded(key);
+  }
+
+  async function saveProvider(capability: ApiCapabilityId, providerId: string) {
+    const body: Record<string, string | number> = {};
+    for (const field of credentialFields(capability, providerId)) {
+      const value = draft[field.name] ?? "";
+      if (field.secret) {
+        if (value) body[field.name] = value;
+      } else if (value !== baseline[field.name]) {
+        body[field.name] = field.numeric ? Number(value) : value;
+      }
+    }
+    if (Object.keys(body).length === 0) { setExpanded(null); return; }
+
+    setSaving(true);
+    try {
+      const token = getToken();
+      const res = await fetch(credentialsUrl, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null) as { detail?: { error?: string } } | null;
+        throw new Error(detail?.detail?.error ?? "save_failed");
+      }
+      setStatus(await res.json() as CredentialStatus);
+      setExpanded(null);
+      toast({ title: txt("Credenciais salvas", "Credentials saved") });
+    } catch (err) {
+      const code = err instanceof Error ? err.message : "save_failed";
+      toast({
+        variant: "destructive",
+        title: txt("Não foi possível salvar", "Could not save"),
+        description: code === "provider_not_available"
+          ? txt(
+              "Este provedor ainda não está liberado para nova configuração.",
+              "This provider is not available for new configuration yet.",
+            )
+          : txt("Tente novamente.", "Please try again."),
+      });
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <section className="space-y-5" data-testid="api-settings-section">
       <p className="text-sm text-muted-foreground" data-testid="api-settings-legacy-state-note">
-        {locale === "en"
-          ? "Existing API settings are preserved. New provider configuration is coming soon."
-          : "As configurações de API existentes são preservadas. A configuração de novos provedores estará disponível em breve."}
+        {txt(
+          "Você pode manter os provedores que já usa. A adoção de novos provedores estará disponível em breve.",
+          "You can keep maintaining the providers you already use. Adopting new providers is coming soon.",
+        )}
       </p>
+      {loadFailed && (
+        <p className="text-xs text-destructive" data-testid="api-settings-load-error">
+          {txt(
+            "Não foi possível carregar o estado das credenciais. Recarregue a página.",
+            "Credential status could not be loaded. Try reloading the page.",
+          )}
+        </p>
+      )}
 
       {API_CAPABILITIES.map((capability) => {
         const providers = providersForCapability(capability.id);
@@ -532,9 +753,7 @@ export function ApiCredentialsForm(_: {
                 data-testid={`capability-requirement-${capability.id}`}
                 className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/80"
               >
-                {capability.required
-                  ? locale === "en" ? "Required" : "obrigatório"
-                  : locale === "en" ? "Optional" : "opcional"}
+                {capability.required ? txt("obrigatório", "Required") : txt("opcional", "Optional")}
               </span>
             </div>
             <p className="text-[11px] text-muted-foreground">
@@ -545,20 +764,86 @@ export function ApiCredentialsForm(_: {
               data-testid={`${capability.id}-provider-list`}
             >
               {providers.map((provider) => {
-                if (availability[provider.id as keyof typeof availability] !== "coming_soon") {
-                  return null;
-                }
+                if (!(provider.id in availability)) return null;
+                const state = providerCardState(capability.id, provider.id, status);
+                const key = `${capability.id}:${provider.id}`;
                 return (
                   <ProviderCredentialCard
                     key={provider.id}
                     id={`${capability.id}-${provider.id}`}
                     label={provider.label}
                     sub={provider.sub}
-                    comingSoonLabel={comingSoonLabel}
+                    state={state}
+                    badgeLabel={badgeLabel[state]}
+                    isExpanded={expanded === key}
+                    onToggle={state === "coming_soon" || isReadOnly
+                      ? undefined
+                      : () => toggleProvider(capability.id, provider.id)}
                   />
                 );
               })}
             </div>
+
+            {providers.map((provider) => {
+              if (expanded !== `${capability.id}:${provider.id}`) return null;
+              const fields = credentialFields(capability.id, provider.id);
+              return (
+                <div
+                  key={`${provider.id}-editor`}
+                  className="space-y-3 rounded-md border border-border bg-background p-3"
+                  data-testid={`provider-editor-${capability.id}-${provider.id}`}
+                >
+                  {fields.length === 0 ? (
+                    <p className="text-[11px] text-muted-foreground">
+                      {txt(
+                        "Este provedor não tem campos editáveis nesta versão.",
+                        "This provider has no editable fields in this release.",
+                      )}
+                    </p>
+                  ) : (
+                    <>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        {fields.map((field) => (
+                          <div key={field.name} className="space-y-1">
+                            <Label
+                              htmlFor={`field-${field.name}`}
+                              className="text-xs font-medium text-muted-foreground"
+                            >
+                              {locale === "en" ? field.label.en : field.label.pt}
+                            </Label>
+                            <Input
+                              id={`field-${field.name}`}
+                              data-testid={`field-${field.name}`}
+                              type={field.secret ? "password" : field.numeric ? "number" : "text"}
+                              value={draft[field.name] ?? ""}
+                              placeholder={field.secret && status?.[`${field.name}_set`] === true
+                                ? txt("•••••••• (manter atual)", "•••••••• (keep current)")
+                                : undefined}
+                              onChange={(e) => setDraft(
+                                (prev) => ({ ...prev, [field.name]: e.target.value }),
+                              )}
+                              className="text-xs"
+                            />
+                          </div>
+                        ))}
+                      </div>
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={saving}
+                        data-testid={`save-${capability.id}-${provider.id}`}
+                        onClick={() => void saveProvider(capability.id, provider.id)}
+                      >
+                        {saving
+                          ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          : <Save className="h-3.5 w-3.5" />}
+                        <span className="ml-1.5">{txt("Salvar", "Save")}</span>
+                      </Button>
+                    </>
+                  )}
+                </div>
+              );
+            })}
           </div>
         );
       })}
@@ -2308,7 +2593,12 @@ export default function ClinicConfig() {
               </div>
               <CardDescription className="text-xs">{t("config_integrations_desc")}</CardDescription>
             </CardHeader>
-            <CardContent className="pt-5">
+            <CardContent className="space-y-5 pt-5">
+              <VoiceResponseControls
+                clinicId={(isBuilder || isSuperAdmin) && viewingClinicId ? viewingClinicId : clinicId}
+                isReadOnly={isReadOnly}
+                role={role}
+              />
               <ApiCredentialsForm
                 clinicId={(isBuilder || isSuperAdmin) && viewingClinicId ? viewingClinicId : clinicId}
                 isReadOnly={isReadOnly}

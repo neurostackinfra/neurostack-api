@@ -25,6 +25,9 @@ export const en = {
   nav_partners: "Partners Portal",
   badge_coming_soon: "Coming soon",
   label_select_clinic: "Select Clinic",
+  label_search_clinics: "Search clinics",
+  placeholder_search_clinics: "Search by clinic name",
+  clinic_search_no_results: "No clinics found",
   label_read_only_mode: "Read-only mode",
 
   // Login
@@ -372,9 +375,11 @@ export const en = {
   admin_alerts_empty: "No alerts, all systems operational",
 
   // ── Context Sources (Trace Viewer) ──
-  ctx_panel_title: "Context Used",
-  ctx_origin_config: "Configuration",
-  ctx_origin_rag: "Knowledge Base",
+  ctx_panel_title: "Selected Context",
+  ctx_origin_config: "Clinic Config",
+  ctx_origin_rag: "RAG",
+  ctx_origin_unknown: "Unknown Source",
+  ctx_title_fallback: "Context",
   ctx_empty: "No context used.",
   ctx_field_identity_clinic_name: "Clinic Name",
   ctx_field_persona_agent_name: "Agent Name",
@@ -441,6 +446,32 @@ export const en = {
   handoff_no_clinic: "Select a clinic to view the queue.",
   handoff_meta_minutos_label: "SLA target (minutes) after handoff",
   handoff_meta_minutos_hint: "Target time for first human response.",
+
+  // ── Inactive Session Queue ──
+  nav_inactive_queue: "Inactive Queue",
+  inactive_queue_title: "Inactive Queue",
+  inactive_queue_subtitle: "Inactive conversations available to return to AI control.",
+  inactive_contact: "Contact",
+  inactive_session_code: "Session code",
+  inactive_channel: "Channel",
+  inactive_last_intent: "Last intent",
+  inactive_funnel_stage: "Funnel stage",
+  inactive_last_activity: "Last activity",
+  inactive_action: "AI control",
+  inactive_reactivate: "Return service to AI",
+  inactive_ai_in_control: "AI in control",
+  inactive_loading: "Loading inactive conversations…",
+  inactive_empty: "No inactive conversations at the moment.",
+  inactive_error: "Could not load the inactive queue.",
+  inactive_retry: "Try again",
+  inactive_no_clinic: "Select a clinic to view the inactive queue.",
+  inactive_previous: "Previous",
+  inactive_next: "Next",
+  inactive_page: "Page",
+  inactive_of: "of",
+  inactive_total: "inactive conversations",
+  inactive_reactivate_error_title: "Could not return service to AI",
+  inactive_reactivate_error_description: "The conversation remains inactive. Please try again.",
 } as const;
 
 export type TranslationKey = keyof typeof en;

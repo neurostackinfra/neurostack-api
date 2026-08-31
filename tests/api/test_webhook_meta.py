@@ -236,11 +236,7 @@ def _clear_webhook_process_state():
     of exactly that kind — without this fixture the first test to trigger the
     fallback chain sends, and every later one asserts zero sends.
     """
-    from src.api.routes.webhook import (
-        _INMEM_INCOMING,
-        _INMEM_SENT,
-        _INMEM_STT_NOTICE,
-    )
+    from src.api.routes.webhook import _INMEM_INCOMING, _INMEM_SENT, _INMEM_STT_NOTICE
 
     _INMEM_INCOMING.clear()
     _INMEM_SENT.clear()
@@ -2036,6 +2032,7 @@ class TestMetaSttFallbackChain:
         send_mock = AsyncMock(return_value=_fake_meta_send_result())
         handoff_mock = AsyncMock()
         mm_mock = AsyncMock()
+        tts_gate = AsyncMock()
 
         with (
             patch(
@@ -2055,6 +2052,10 @@ class TestMetaSttFallbackChain:
             ),
             patch("src.api.routes.webhook.send_meta_cloud_text", send_mock),
             patch("src.api.routes.webhook._meta_initiate_file_handoff", handoff_mock),
+            patch(
+                "src.api.routes.webhook._send_reply_with_optional_tts",
+                tts_gate,
+            ),
         ):
             resp = _post_meta(client, payload)
 
@@ -2065,6 +2066,7 @@ class TestMetaSttFallbackChain:
         # The patient is being asked to type, not escalated
         handoff_mock.assert_not_called()
         mm_mock.assert_not_called()
+        tts_gate.assert_not_awaited()
 
     def test_no_capability_reroutes_with_never_configured_copy(
         self,
@@ -2463,3 +2465,99 @@ class TestMetaSttFallbackChain:
         assert resp.json() == {"ok": True, "skipped": "no_credentials"}
         resolve_mock.assert_not_called()
         send_mock.assert_not_called()
+
+
+class TestMetaVoiceReplyOrigin:
+    def test_text_reply_reaches_gate_as_non_audio(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+        payload = _meta_text_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900000490",
+            text_body="Olá",
+            message_id=f"wamid.text_{uuid4().hex[:8]}",
+        )
+        reply_gate = AsyncMock(
+            return_value=(_fake_meta_send_result("wamid.voice_gate_text"), False),
+        )
+
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), False)),
+            ),
+            patch("src.api.routes.webhook.get_event_service") as get_service,
+            patch(
+                "src.api.routes.webhook._send_reply_with_optional_tts",
+                reply_gate,
+            ),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Resposta"),
+            )
+            get_service.return_value = service
+            response = _post_meta(client, payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "replied": True}
+        reply_gate.assert_awaited_once()
+        assert reply_gate.await_args.kwargs["input_was_audio"] is False
+
+    def test_transcribed_patient_audio_keeps_audio_origin(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_audio_tenant(client, tenant_id, phone_id, stt=True)
+        payload = _meta_audio_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900000491",
+            media_id=f"media_{uuid4().hex[:8]}",
+            message_id=f"wamid.audio_{uuid4().hex[:8]}",
+        )
+        reply_gate = AsyncMock(
+            return_value=(_fake_meta_send_result("wamid.voice_gate_audio"), True),
+        )
+
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(return_value=dict(_META_MEDIA_INFO)),
+            ),
+            patch(
+                "src.api.routes.webhook.download_meta_media_audio",
+                new=AsyncMock(return_value=_META_AUDIO_BYTES),
+            ),
+            patch(
+                "src.api.routes.webhook._transcribe_audio_chain",
+                new=AsyncMock(return_value=("áudio transcrito", None)),
+            ),
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), False)),
+            ),
+            patch("src.api.routes.webhook.get_event_service") as get_service,
+            patch(
+                "src.api.routes.webhook._send_reply_with_optional_tts",
+                reply_gate,
+            ),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Resposta"),
+            )
+            get_service.return_value = service
+            response = _post_meta(client, payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "replied": True}
+        reply_gate.assert_awaited_once()
+        assert reply_gate.await_args.kwargs["input_was_audio"] is True

@@ -4,14 +4,21 @@
 
 ## Simmering
 
+- [Reparo do baseline da suíte backend](wishes/backend-test-baseline-repair/WISH.md) - IN_PROGRESS; plano ampliado e revisado inclui scheduling gate herdado com contrato de cinco valores.
+
 ## Ready
 
-- [Gatilhos de resposta por voz](brainstorms/voice-response-triggers/DESIGN.md) - WRS 100/100; duas políticas exclusivas, com `audio_input` como default seguro.
+- [FallBack LLM Multimodal](brainstorms/fallback-llm-multimodal/DESIGN.md) - WRS 100/100; uma única contingência `multimodal_*` cobre falha do LLM de texto e falha do transcritor de áudio.
 - [Templates Meta para follow-up](brainstorms/meta-templates-followup/DESIGN.md) - Infra de templates da Meta Cloud API para futuros agentes ativos de follow-up.
-- [Disponibilidade honesta de provedores](brainstorms/api-provider-availability/DESIGN.md) - Só o testado aceita credencial; o resto fica visível, bloqueado e marcado `(em breve)` em vermelho.
 
 ## Poured
 
+- [Contrato visual da lista de traces](wishes/trace-list-presentation-contract/WISH.md) - IN_PROGRESS; implementação completa, aguardando gate agregado após correção da falha preexistente de locale em API settings.
+- [Fila de Inativos](wishes/fila-inativos/WISH.md) - APPROVED; fila tenant-safe da sessão efetiva em handoff permanente, com retomada manual da IA e estados visuais referenciados.
+
+- [Cards de contexto do trace](wishes/trace-context-cards/WISH.md) - APPROVED; cards responsivos por fonte, `config` canônico com alias legado e fallback neutro localizado.
+- [Gatilhos de resposta por voz](wishes/voice-response-triggers/WISH.md) - BLOCKED; os 16 caminhos estão em SHIP, mas o `pytest` completo obrigatório reproduz failures/hang preexistentes na base e exige decisão sobre correção upstream ou waiver.
+- [Disponibilidade honesta de provedores](wishes/api-provider-availability/WISH.md) - APPROVED; 19 opções visíveis, com seis homologadas e 13 bloqueadas pelo selo pequeno laranja `EM BREVE` / `COMING SOON`.
 - [Relatório de auditoria de notas](wishes/rating-audit-report/WISH.md) - APPROVED; seis grupos, do corte do fluxo de sugestão ao relatório do painel master com facetas e acervo de opiniões.
 - [Núcleo de origem confiável](wishes/interaction-origin-training-safety/WISH.md) - APPROVED; seis grupos, com Group 1 bloqueado até `billing-usage-metering` incorporar a migração 016.
 - [Fallback texto](wishes/fallback-texto/WISH.md) - APPROVED; corrige credenciais de áudio Z-API mortas em produção, depois cadeia STT → multimodal → recondução por texto
