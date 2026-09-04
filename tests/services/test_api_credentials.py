@@ -190,7 +190,9 @@ def test_sequential_saves_preserve_capabilities_and_clean_stt_aliases() -> None:
     ],
 )
 def test_tts_configuration_is_operational_but_never_projected_to_cache(
-    provider: str, api_url: str, voice_id: str | None,
+    provider: str,
+    api_url: str,
+    voice_id: str | None,
 ) -> None:
     credentials = merge_credentials(
         {},

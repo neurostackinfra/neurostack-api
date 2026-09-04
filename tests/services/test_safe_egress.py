@@ -238,9 +238,7 @@ class TestEnforceHostAllowlist:
                 enforce_host_allowlist(self._parsed(host), allowlist)
 
     def test_tts_pinning(self) -> None:
-        enforce_host_allowlist(
-            self._parsed("api.elevenlabs.io"), TTS_ELEVENLABS_HOSTS
-        )
+        enforce_host_allowlist(self._parsed("api.elevenlabs.io"), TTS_ELEVENLABS_HOSTS)
         enforce_host_allowlist(
             self._parsed("texttospeech.googleapis.com"), TTS_GOOGLE_HOSTS
         )

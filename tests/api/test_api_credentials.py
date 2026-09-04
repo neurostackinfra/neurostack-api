@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from src.api.schemas.config import ApiCredentialsPatch
 from src.config.settings import settings
 from src.repositories import get_db_session_dependency
+from src.services.api_credentials import PROVIDER_AVAILABILITY
 
 PATH = "/v1/config/api-credentials"
 
@@ -423,9 +424,10 @@ def test_multimodal_text_fallback_gate_round_trips_true_and_false(
     )
     assert enabled.status_code == 200, enabled.text
     assert enabled.json()["multimodal_text_fallback_enabled"] is True
-    assert client.get(PATH, headers=headers).json()[
-        "multimodal_text_fallback_enabled"
-    ] is True
+    assert (
+        client.get(PATH, headers=headers).json()["multimodal_text_fallback_enabled"]
+        is True
+    )
 
     disabled = client.patch(
         PATH,
@@ -434,17 +436,18 @@ def test_multimodal_text_fallback_gate_round_trips_true_and_false(
     )
     assert disabled.status_code == 200, disabled.text
     assert disabled.json()["multimodal_text_fallback_enabled"] is False
-    assert client.get(PATH, headers=headers).json()[
-        "multimodal_text_fallback_enabled"
-    ] is False
+    assert (
+        client.get(PATH, headers=headers).json()["multimodal_text_fallback_enabled"]
+        is False
+    )
 
 
 @pytest.mark.parametrize(
     "bad_value",
     [
-        None,   # explicit `null` in the JSON body
+        None,  # explicit `null` in the JSON body
         "true",  # string never silently coerced to bool
-        1,       # number never silently coerced to bool
+        1,  # number never silently coerced to bool
     ],
 )
 def test_multimodal_text_fallback_gate_rejects_null_and_wrong_type_atomically(
@@ -480,15 +483,18 @@ def test_multimodal_text_fallback_gate_rejects_null_and_wrong_type_atomically(
         for entry in detail["fields"]
     )
     # No mutation: the stored value stayed `true`.
-    assert client.get(PATH, headers=headers).json()[
-        "multimodal_text_fallback_enabled"
-    ] is True
+    assert (
+        client.get(PATH, headers=headers).json()["multimodal_text_fallback_enabled"]
+        is True
+    )
 
 
 def test_multimodal_text_fallback_gate_preserved_by_unrelated_patch(
     client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A patch touching an unrelated capability must not flip or clear the gate."""
+    monkeypatch.setitem(PROVIDER_AVAILABILITY["llm"], "openai", "active")
     headers = _jwt_headers("clinic_admin")
     on = client.patch(
         PATH,
