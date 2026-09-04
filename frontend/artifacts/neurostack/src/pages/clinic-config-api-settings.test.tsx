@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 
-import {
+import ClinicConfig, {
   API_CAPABILITIES,
   API_PROVIDER_AVAILABILITY,
   ApiCredentialsForm,
@@ -13,9 +13,35 @@ import {
   WA_PROVIDERS,
 } from "./clinic-config";
 import { I18nProvider } from "@/context/i18n";
+import { AuthProvider } from "@/context/auth";
 
 function Wrapper({ children }: { children: ReactNode }) {
   return <I18nProvider>{children}</I18nProvider>;
+}
+
+function PageWrapper({ children }: { children: ReactNode }) {
+  return (
+    <AuthProvider>
+      <I18nProvider>{children}</I18nProvider>
+    </AuthProvider>
+  );
+}
+
+function mountAsInvestor() {
+  const investorAuth = {
+    token: null,
+    email: null,
+    clinicId: null,
+    tenantId: null,
+    userId: null,
+    builderId: null,
+    role: "investor",
+    viewingClinicId: null,
+    leadSubmitted: false,
+  };
+  localStorage.setItem("ns_auth", JSON.stringify(investorAuth));
+  localStorage.setItem("ns_locale", "pt");
+  window.history.replaceState({}, "", "/config?tab=operacao");
 }
 
 const BACKEND_PROVIDER_AVAILABILITY = {
@@ -41,18 +67,28 @@ describe("describeConfigSaveFailure", () => {
     expect(description).not.toContain("sensitive-value-that-must-not-be-rendered");
   });
 
-  it("lists every invalid business-hours field using friendly labels", () => {
-    const description = describeConfigSaveFailure({
-      detail: [
-        { loc: ["business_hours_open"], input: "99:99" },
-        { loc: ["business_hours_days"], input: ["invalid-day"] },
-      ],
+  it("labels every nested business_hours 422 with the top-level field name", () => {
+    // Pydantic's `loc` for the new weekly-schedule contract has depth 1, 2, or
+    // 3 depending on which validation layer fires (day-key vs. cross-field vs.
+    // per-field). All three must collapse to a single friendly label instead
+    // of leaking the raw sub-token ("open" / "mon") into the banner.
+    const dayKeyFailure = describeConfigSaveFailure({
+      detail: [{ loc: ["business_hours"], input: { xxx: { open: "09:00", close: "18:00" } } }],
+    }, 422, "pt");
+    const crossFieldFailure = describeConfigSaveFailure({
+      detail: [{ loc: ["business_hours", "mon"], input: { open: "18:00", close: "09:00" } }],
+    }, 422, "pt");
+    const fieldLevelFailure = describeConfigSaveFailure({
+      detail: [{ loc: ["business_hours", "mon", "open"], input: "99:99" }],
     }, 422, "pt");
 
-    expect(description).toContain("horário de abertura");
-    expect(description).toContain("dias de atendimento");
-    expect(description).not.toContain("99:99");
-    expect(description).not.toContain("invalid-day");
+    for (const description of [dayKeyFailure, crossFieldFailure, fieldLevelFailure]) {
+      expect(description).toContain("horários de funcionamento");
+      expect(description).not.toContain("99:99");
+      expect(description).not.toContain(": open");
+      expect(description).not.toContain(": mon");
+      expect(description).not.toContain(": xxx");
+    }
   });
 
   it("translates authorization failures from their stable backend code", () => {
@@ -215,5 +251,46 @@ describe("<ApiCredentialsForm /> all-coming-soon boundary", () => {
     render(<Wrapper><ApiCredentialsForm clinicId="legacy-clinic" isReadOnly={false} isSuperAdmin /></Wrapper>);
     expect(screen.getByTestId("api-settings-legacy-state-note")).toHaveTextContent("configurações de API existentes são preservadas");
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("<ClinicConfig /> operations tab — business-hours UI surface", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    localStorage.clear();
+    window.history.replaceState({}, "", "/");
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("no longer renders the free-text 'Horário de Funcionamento' input or the outside-hours-metric toggle", () => {
+    mountAsInvestor();
+    render(<PageWrapper><ClinicConfig /></PageWrapper>);
+
+    // Removed free-text field — its stable testid must be absent from the DOM.
+    expect(screen.queryByTestId("input-working-hours")).toBeNull();
+
+    // Removed opt-in toggle — the SwitchRow's copy is unique to that control.
+    expect(screen.queryByText(/Métrica de atendimentos fora do horário/)).toBeNull();
+    expect(screen.queryByText(/Ativar métrica de atendimentos fora do horário/)).toBeNull();
+
+    // Confirm the operations tab actually rendered by locating the sibling
+    // "Horário do Setor de Agendamento" field that must remain untouched.
+    expect(screen.getByText(/Horário do Setor de Agendamento/)).toBeInTheDocument();
+  });
+
+  it("renders the new weekly business-hours editor with 7 day switches", () => {
+    mountAsInvestor();
+    render(<PageWrapper><ClinicConfig /></PageWrapper>);
+
+    const editor = screen.getByTestId("business-hours-editor");
+    for (const day of ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]) {
+      expect(within(editor).getByTestId(`business-hours-row-${day}`)).toBeInTheDocument();
+      expect(within(editor).getByTestId(`business-hours-switch-${day}`)).toBeInTheDocument();
+    }
+    // Static metric note anchors the "no opt-in" contract on the mounted page.
+    expect(within(editor).getByTestId("business-hours-metric-note")).toBeInTheDocument();
   });
 });
