@@ -9,7 +9,7 @@ from typing import Any, Optional
 from urllib.parse import urlparse
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class PricingDisclosureMode(str, Enum):
@@ -128,12 +128,50 @@ class ClinicIdentity(BaseModel):
     clinic_specialties: Optional[list[str]] = None
 
 
+_VALID_DAY_CODES = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+_BUSINESS_HOUR_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+
+
+class BusinessHoursWindow(BaseModel):
+    """A single same-day open/close window for one weekday.
+
+    ``open`` and ``close`` are ``HH:MM`` strings in the clinic's local time.
+    ``close`` must be strictly after ``open`` (compared as minutes-of-day);
+    overnight windows are not representable and must be modelled as a
+    "closed" day for the wrap-around.
+    """
+
+    open: str
+    close: str
+
+    @field_validator("open", "close")
+    @classmethod
+    def _validate_hhmm(cls, value: str) -> str:
+        if not isinstance(value, str) or _BUSINESS_HOUR_PATTERN.fullmatch(value) is None:
+            raise ValueError("business hours must use HH:MM (00:00-23:59)")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_close_after_open(self) -> "BusinessHoursWindow":
+        open_minutes = _hhmm_to_minutes(self.open)
+        close_minutes = _hhmm_to_minutes(self.close)
+        if close_minutes <= open_minutes:
+            raise ValueError("business hours close must be strictly greater than open")
+        return self
+
+
+def _hhmm_to_minutes(value: str) -> int:
+    hour, minute = value.split(":")
+    return int(hour) * 60 + int(minute)
+
+
 class ClinicOperations(BaseModel):
     """Operations bucket — address, hours, service formats.
 
-    Business hours describe a same-day window.  The model deliberately does
-    not reject ``close <= open``; consumers treat that combination as
-    unconfigured rather than assuming an overnight window.
+    Business hours are a per-weekday map (``mon..sun``) of
+    ``BusinessHoursWindow`` entries.  Days omitted from the map are treated
+    as closed.  ``working_hours`` remains as the free-text fallback used by
+    the prompt pipeline when a structured schedule is not configured.
     """
 
     full_address: Optional[str] = None
@@ -141,38 +179,32 @@ class ClinicOperations(BaseModel):
     working_hours: Optional[str] = None
     scheduling_hours: Optional[str] = None
     timezone: Optional[str] = None
-    business_hours_enabled: bool = False
-    business_hours_open: Optional[str] = None
-    business_hours_close: Optional[str] = None
-    business_hours_days: Optional[list[str]] = None
+    business_hours: Optional[dict[str, BusinessHoursWindow]] = None
     service_format: Optional[str] = None
     online_services_desc: Optional[str] = None
     presential_services_desc: Optional[str] = None
 
-    @field_validator("business_hours_open", "business_hours_close", mode="before")
+    @field_validator("business_hours", mode="before")
     @classmethod
-    def _validate_business_hour(cls, value: Any) -> Optional[str]:
-        if value is None or value == "":
+    def _validate_business_hours(cls, value: Any) -> Any:
+        if value is None:
             return None
-        if (
-            not isinstance(value, str)
-            or re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value) is None
-        ):
-            raise ValueError("business hours must use HH:MM (00:00-23:59)")
-        return value
-
-    @field_validator("business_hours_days")
-    @classmethod
-    def _validate_business_days(cls, value: Optional[list[str]]) -> Optional[list[str]]:
+        if not isinstance(value, dict):
+            raise ValueError("business_hours must be a mapping of day → window")
         if not value:
             return None
-        valid_days = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
-        normalized = [day.lower() for day in value]
-        invalid = [day for day in normalized if day not in valid_days]
-        if invalid:
-            raise ValueError(
-                "business hours days must use mon, tue, wed, thu, fri, sat, or sun"
-            )
+        normalized: dict[str, Any] = {}
+        for day, window in value.items():
+            if not isinstance(day, str):
+                raise ValueError(
+                    "business_hours keys must be mon, tue, wed, thu, fri, sat, or sun"
+                )
+            key = day.lower()
+            if key not in _VALID_DAY_CODES:
+                raise ValueError(
+                    "business_hours keys must be mon, tue, wed, thu, fri, sat, or sun"
+                )
+            normalized[key] = window
         return normalized
 
 
