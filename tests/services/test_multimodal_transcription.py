@@ -34,6 +34,16 @@ PUBLIC_IP = "104.18.2.1"
 AUDIO = b"OggS\x00\x02fake-opus-payload"
 
 
+@pytest.fixture(autouse=True)
+def _restore_session_event_loop(event_loop: asyncio.AbstractEventLoop) -> Any:
+    """asyncio.run() below clears the process-wide current event loop on exit
+    (``asyncio.set_event_loop(None)``), which otherwise poisons every test that
+    runs later in the same session and relies on ``asyncio.get_event_loop()``
+    resolving pytest-asyncio's session-scoped loop."""
+    yield
+    asyncio.set_event_loop(event_loop)
+
+
 def _addrinfo(ip: str, port: int = 443) -> tuple[Any, ...]:
     if ":" in ip:
         return (
