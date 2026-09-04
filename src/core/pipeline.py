@@ -44,6 +44,7 @@ from src.flow.models import FlowContext, FlowDecision, FlowMode as FlowModeModel
 from src.prompt.engine import PromptEngine, get_prompt_engine
 from src.prompt.models import PromptMode, PromptVariables, GeneratedPrompt
 from src.services import HandoffService, get_handoff_service
+from src.services.business_hours import format_business_hours
 from src.handoff.models import (
     HandoffRequest,
     HandoffResponse,
@@ -576,7 +577,11 @@ class CognitivePipeline:
             if isinstance(raw_specs, str):
                 raw_specs = [s.strip() for s in raw_specs.split(",") if s.strip()]
             custom_vars["clinic_specialties"] = raw_specs
-            custom_vars["working_hours"] = operations.get("working_hours", "")
+            _schedule_phrase = format_business_hours(operations)
+            _working_hours_from_schedule = bool(_schedule_phrase)
+            custom_vars["working_hours"] = (
+                _schedule_phrase or operations.get("working_hours", "")
+            )
             custom_vars["timezone"] = operations.get("timezone") or "America/Sao_Paulo"
             custom_vars["full_address"] = operations.get("full_address", "")
             custom_vars["differentials"] = business.get("differentials", "")
@@ -706,7 +711,12 @@ class CognitivePipeline:
                 "clinic_name": ("identity.clinic_name", "Nome da Clínica"),
                 "agent_name": ("persona.agent_name", "Nome do Agente"),
                 "clinic_specialties": ("identity.clinic_specialties", "Especialidades"),
-                "working_hours": ("operations.working_hours", "Horário de Funcionamento"),
+                "working_hours": (
+                    "operations.business_hours"
+                    if _working_hours_from_schedule
+                    else "operations.working_hours",
+                    "Horário de Funcionamento",
+                ),
                 "full_address": ("operations.full_address", "Endereço"),
                 "differentials": ("business_rules.differentials", "Diferenciais"),
                 "payment_methods": ("business_rules.payment_methods", "Formas de Pagamento"),
