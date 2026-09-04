@@ -78,6 +78,26 @@ def _scheduling_link_config():
     }
 
 
+def _business_hours_config(operations: dict) -> dict:
+    """Return a minimal clinic_config exercising only the operations bucket.
+
+    Mirrors the per-bucket shape of ``_scheduling_link_config`` — only the
+    fields the assertion depends on are populated so we can pinpoint
+    ``custom_vars["working_hours"]`` and its provenance without noise from
+    other context sources.
+    """
+    return {
+        "operations": operations,
+    }
+
+
+def _find_working_hours_source(sources: list[dict]) -> dict | None:
+    for source in sources:
+        if source.get("title") == "Horário de Funcionamento":
+            return source
+    return None
+
+
 def _isolated_pipeline():
     handoff_service = HandoffService(
         event_store=None,
@@ -394,6 +414,119 @@ class TestCognitivePipeline:
 
         assert result.handoff_required is True
         assert result.deterministic_response == expected
+
+
+class TestWorkingHoursProvenance:
+    """Wiring tests for ``custom_vars['working_hours']`` and its context card.
+
+    The pipeline generates the "Horário de atendimento" line from the
+    structured ``operations.business_hours`` when configured, and falls back
+    to the legacy free-text ``operations.working_hours`` otherwise. The
+    audit-facing context card must name the source that actually produced
+    the value, never the other one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_business_hours_populates_working_hours_from_schedule(
+        self,
+        tenant_id,
+        session_id,
+    ):
+        # Hand-written expected phrase — the test states what the rendered
+        # string looks like independently of ``format_business_hours``, so a
+        # regression in either the renderer or the wiring surfaces here.
+        expected_phrase = (
+            "Seg–Sex: 09:00–19:00 | Sáb: 09:00–14:00 | Dom: fechado"
+        )
+
+        clinic_config = _business_hours_config(
+            {
+                "business_hours": {
+                    "mon": {"open": "09:00", "close": "19:00"},
+                    "tue": {"open": "09:00", "close": "19:00"},
+                    "wed": {"open": "09:00", "close": "19:00"},
+                    "thu": {"open": "09:00", "close": "19:00"},
+                    "fri": {"open": "09:00", "close": "19:00"},
+                    "sat": {"open": "09:00", "close": "14:00"},
+                },
+                # A legacy value that MUST be ignored when the schedule is
+                # populated — proves the fallback did not fire.
+                "working_hours": "texto legado que nao deveria aparecer",
+            }
+        )
+
+        result = await CognitivePipeline().process(
+            PipelineInput(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                message="Qual o horário de vocês?",
+                channel="whatsapp",
+                clinic_config=clinic_config,
+            )
+        )
+
+        # ``custom_vars['working_hours']`` is inlined into the system prompt
+        # via ``normal.py:927`` as ``**Horário de atendimento:** <phrase>``.
+        assert f"**Horário de atendimento:** {expected_phrase}" in result.system_prompt
+        assert "texto legado que nao deveria aparecer" not in result.system_prompt
+
+        source = _find_working_hours_source(result.context_sources)
+        assert source is not None, "Horário de Funcionamento card missing"
+        assert source["field"] == "operations.business_hours"
+        assert source["content"] == expected_phrase
+
+    @pytest.mark.asyncio
+    async def test_legacy_working_hours_populates_via_fallback(
+        self,
+        tenant_id,
+        session_id,
+    ):
+        legacy_text = "Seg-Sex das 8h às 18h"
+        clinic_config = _business_hours_config({"working_hours": legacy_text})
+
+        result = await CognitivePipeline().process(
+            PipelineInput(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                message="Qual o horário de vocês?",
+                channel="whatsapp",
+                clinic_config=clinic_config,
+            )
+        )
+
+        assert f"**Horário de atendimento:** {legacy_text}" in result.system_prompt
+
+        source = _find_working_hours_source(result.context_sources)
+        assert source is not None, "Horário de Funcionamento card missing"
+        # The card must name the source the value actually came from — the
+        # legacy free-text field, not the (empty) structured schedule.
+        assert source["field"] == "operations.working_hours"
+        assert source["content"] == legacy_text
+
+    @pytest.mark.asyncio
+    async def test_neither_business_hours_nor_working_hours_leaves_value_empty(
+        self,
+        tenant_id,
+        session_id,
+    ):
+        clinic_config = _business_hours_config({"timezone": "America/Sao_Paulo"})
+
+        result = await CognitivePipeline().process(
+            PipelineInput(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                message="Qual o horário de vocês?",
+                channel="whatsapp",
+                clinic_config=clinic_config,
+            )
+        )
+
+        # No structured schedule and no legacy string → the section line
+        # driven by ``normal.py:926 if custom.get("working_hours")`` never
+        # renders, and the context card is suppressed by the empty-value
+        # filter at ``pipeline.py:737``.
+        assert "**Horário de atendimento:**" not in result.system_prompt
+        assert _find_working_hours_source(result.context_sources) is None
 
 
 class TestConvenienceFunctions:
