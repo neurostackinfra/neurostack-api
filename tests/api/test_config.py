@@ -45,9 +45,12 @@ def _headers() -> dict[str, str]:
 @pytest.mark.parametrize(
     "payload",
     [
-        {"business_hours_open": "25:00"},
-        {"business_hours_close": "9h"},
-        {"business_hours_days": ["funday"]},
+        # close <= open
+        {"business_hours": {"mon": {"open": "19:00", "close": "09:00"}}},
+        # bad hour (25:00)
+        {"business_hours": {"mon": {"open": "25:00", "close": "18:00"}}},
+        # bad day key
+        {"business_hours": {"funday": {"open": "09:00", "close": "18:00"}}},
     ],
 )
 def test_patch_rejects_invalid_business_hours(
@@ -62,28 +65,40 @@ def test_patch_rejects_invalid_business_hours(
 def test_valid_business_hours_persist_and_round_trip(client: TestClient) -> None:
     headers = _headers()
     payload = {
-        "business_hours_enabled": True,
-        "business_hours_open": "09:00",
-        "business_hours_close": "18:00",
-        "business_hours_days": ["MON", "tue", "fri"],
+        "business_hours": {
+            "MON": {"open": "09:00", "close": "18:00"},
+            "tue": {"open": "09:00", "close": "18:00"},
+            "wed": {"open": "09:00", "close": "18:00"},
+            "thu": {"open": "09:00", "close": "18:00"},
+            "fri": {"open": "09:00", "close": "18:00"},
+            "sat": {"open": "09:00", "close": "13:00"},
+        }
+    }
+    # Day keys are normalized to lowercase by the ClinicOperations validator.
+    expected = {
+        "mon": {"open": "09:00", "close": "18:00"},
+        "tue": {"open": "09:00", "close": "18:00"},
+        "wed": {"open": "09:00", "close": "18:00"},
+        "thu": {"open": "09:00", "close": "18:00"},
+        "fri": {"open": "09:00", "close": "18:00"},
+        "sat": {"open": "09:00", "close": "13:00"},
     }
 
     patched = client.patch(PATH, headers=headers, json=payload)
     assert patched.status_code == 200, patched.text
-    assert patched.json()["business_hours_days"] == ["mon", "tue", "fri"]
+    assert patched.json()["business_hours"] == expected
 
     loaded = client.get(PATH, headers=headers)
     assert loaded.status_code == 200, loaded.text
-    for field, expected in {
-        **payload,
-        "business_hours_days": ["mon", "tue", "fri"],
-    }.items():
-        assert loaded.json()[field] == expected
+    assert loaded.json()["business_hours"] == expected
 
 
 def test_operations_revalidation_preserves_existing_free_text_hours(
     client: TestClient,
 ) -> None:
+    """Setting ``business_hours`` must leave the sibling operations fields
+    that this wish deliberately does not touch (``working_hours``,
+    ``scheduling_hours``, ``service_format``) exactly where they were."""
     headers = _headers()
     initial = client.patch(
         PATH,
@@ -91,6 +106,7 @@ def test_operations_revalidation_preserves_existing_free_text_hours(
         json={
             "working_hours": "Seg-Sex 08h-18h",
             "scheduling_hours": "Seg-Sex 09h-17h",
+            "service_format": "presencial e online",
         },
     )
     assert initial.status_code == 200, initial.text
@@ -99,26 +115,30 @@ def test_operations_revalidation_preserves_existing_free_text_hours(
         PATH,
         headers=headers,
         json={
-            "business_hours_enabled": True,
-            "business_hours_open": "08:00",
-            "business_hours_close": "18:00",
-            "business_hours_days": ["mon", "tue", "wed", "thu", "fri"],
+            "business_hours": {
+                "mon": {"open": "08:00", "close": "18:00"},
+                "tue": {"open": "08:00", "close": "18:00"},
+                "wed": {"open": "08:00", "close": "18:00"},
+                "thu": {"open": "08:00", "close": "18:00"},
+                "fri": {"open": "08:00", "close": "18:00"},
+            }
         },
     )
 
     assert updated.status_code == 200, updated.text
-    assert updated.json()["working_hours"] == "Seg-Sex 08h-18h"
-    assert updated.json()["scheduling_hours"] == "Seg-Sex 09h-17h"
+    body = updated.json()
+    assert body["working_hours"] == "Seg-Sex 08h-18h"
+    assert body["scheduling_hours"] == "Seg-Sex 09h-17h"
+    assert body["service_format"] == "presencial e online"
 
 
-def test_business_hour_fields_route_to_operations_and_flatten() -> None:
+def test_business_hours_routes_to_operations_and_round_trips_through_flatten() -> None:
     payload = {
-        "business_hours_enabled": True,
-        "business_hours_open": "09:00",
-        "business_hours_close": "17:00",
-        "business_hours_days": ["mon"],
+        "business_hours": {
+            "mon": {"open": "09:00", "close": "17:00"},
+        }
     }
-    assert all(FIELD_TO_BUCKET[field] == "operations" for field in payload)
+    assert FIELD_TO_BUCKET["business_hours"] == "operations"
     assert unflatten_patch(payload) == {"operations": payload}
 
     row = SimpleNamespace(
@@ -134,7 +154,81 @@ def test_business_hour_fields_route_to_operations_and_flatten() -> None:
         },
     )
     flat = flatten_config(row)
-    assert all(flat[field] == value for field, value in payload.items())
+    assert flat["business_hours"] == payload["business_hours"]
+
+
+def test_patch_with_only_legacy_business_hours_keys_is_silent_no_op(
+    client: TestClient,
+) -> None:
+    """Legacy flat keys are no longer in FIELD_TO_BUCKET; they must be
+    silently dropped by ``unflatten_patch`` and never revalidate the bucket."""
+    headers = _headers()
+
+    initial = client.patch(
+        PATH,
+        headers=headers,
+        json={"working_hours": "Seg-Sex 08h-18h"},
+    )
+    assert initial.status_code == 200, initial.text
+
+    legacy_only = client.patch(
+        PATH,
+        headers=headers,
+        json={
+            "business_hours_enabled": True,
+            "business_hours_open": "09:00",
+            "business_hours_close": "17:00",
+            "business_hours_days": ["mon", "tue"],
+        },
+    )
+    assert legacy_only.status_code == 200, legacy_only.text
+    body = legacy_only.json()
+    # None of the legacy keys land in any bucket.
+    for key in (
+        "business_hours_enabled",
+        "business_hours_open",
+        "business_hours_close",
+        "business_hours_days",
+    ):
+        assert key not in body or body.get(key) in (None, False, [], "")
+    # Working hours are untouched.
+    assert body["working_hours"] == "Seg-Sex 08h-18h"
+    # No structured schedule was created either.
+    assert body.get("business_hours") in (None, {}, "")
+
+
+def test_patch_business_hours_replaces_whole_schedule(client: TestClient) -> None:
+    """The bucket merge is a shallow ``{**existing, **new}``; ``business_hours``
+    is a single field, so a subsequent PATCH replaces the entire map instead
+    of per-day merging (config.py:369 semantics)."""
+    headers = _headers()
+
+    first = client.patch(
+        PATH,
+        headers=headers,
+        json={
+            "business_hours": {
+                "mon": {"open": "09:00", "close": "18:00"},
+                "tue": {"open": "09:00", "close": "18:00"},
+            }
+        },
+    )
+    assert first.status_code == 200, first.text
+    assert set(first.json()["business_hours"]) == {"mon", "tue"}
+
+    second = client.patch(
+        PATH,
+        headers=headers,
+        json={
+            "business_hours": {
+                "wed": {"open": "10:00", "close": "16:00"},
+            }
+        },
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["business_hours"] == {
+        "wed": {"open": "10:00", "close": "16:00"},
+    }
 
 
 @pytest.mark.asyncio
@@ -178,7 +272,7 @@ async def test_operations_validation_warns_when_legacy_key_is_dropped(
     with caplog.at_level("WARNING", logger="src.api.routes.config"):
         await patch_config(
             request=SimpleNamespace(query_params={}),
-            body=ConfigPatchRequest(business_hours_open="09:00"),
+            body=ConfigPatchRequest(timezone="America/Sao_Paulo"),
             tenant=TenantContext(
                 tenant_id=tenant_id, role="clinic_admin", user_id=None
             ),

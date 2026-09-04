@@ -19,10 +19,13 @@ from src.repositories import get_db_session
 _CLINIC_TZ = ZoneInfo("America/Sao_Paulo")
 _OPERATIONS = {
     "timezone": "America/Sao_Paulo",
-    "business_hours_enabled": True,
-    "business_hours_open": "09:00",
-    "business_hours_close": "18:00",
-    "business_hours_days": ["mon", "tue", "wed", "thu", "fri"],
+    "business_hours": {
+        "mon": {"open": "09:00", "close": "18:00"},
+        "tue": {"open": "09:00", "close": "18:00"},
+        "wed": {"open": "09:00", "close": "18:00"},
+        "thu": {"open": "09:00", "close": "18:00"},
+        "fri": {"open": "09:00", "close": "18:00"},
+    },
 }
 
 
