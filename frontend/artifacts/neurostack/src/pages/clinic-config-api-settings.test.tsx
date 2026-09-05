@@ -95,12 +95,14 @@ async function renderForm(
 }
 
 const BACKEND_PROVIDER_AVAILABILITY = {
-  whatsapp: { meta_cloud: "coming_soon", zapi: "coming_soon", uazapi: "coming_soon", evolution: "coming_soon", dialog360: "coming_soon", twilio: "coming_soon" },
-  llm: { dropout: "coming_soon", openai: "coming_soon", outros: "coming_soon", slm_cortex: "coming_soon" },
-  multimodal: { openrouter: "coming_soon" },
-  stt: { outros: "coming_soon", openai_whisper: "coming_soon", elevenlabs_scribe: "coming_soon", google_stt: "coming_soon", deepgram_stt: "coming_soon", microsoft_stt: "coming_soon" },
-  tts: { elevenlabs: "coming_soon", google: "coming_soon" },
+  whatsapp: { meta_cloud: "active", zapi: "active", uazapi: "active", evolution: "active", dialog360: "coming_soon", twilio: "coming_soon" },
+  llm: { dropout: "active", openai: "active", outros: "active", slm_cortex: "coming_soon" },
+  multimodal: { openrouter: "active" },
+  stt: { outros: "active", openai_whisper: "active", elevenlabs_scribe: "coming_soon", google_stt: "coming_soon", deepgram_stt: "coming_soon", microsoft_stt: "coming_soon" },
+  tts: { elevenlabs: "active", google: "active" },
 } as const;
+const COMING_SOON_COUNT = 7;
+const ACTIVE_COUNT = 12;
 
 describe("describeConfigSaveFailure", () => {
   it("identifies invalid backend fields without exposing their submitted values", () => {
@@ -234,10 +236,12 @@ describe("describeConfigSaveFailure", () => {
 });
 
 describe("frontend provider availability mirror", () => {
-  it("contains the exact 19 backend pairs, all coming soon", () => {
+  it("contains the exact 19 backend pairs, 12 active and 7 coming soon", () => {
     expect(API_PROVIDER_AVAILABILITY).toEqual(BACKEND_PROVIDER_AVAILABILITY);
-    expect(Object.values(API_PROVIDER_AVAILABILITY).flatMap(Object.values))
-      .toEqual(Array.from({ length: 19 }, () => "coming_soon"));
+    const states = Object.values(API_PROVIDER_AVAILABILITY).flatMap(Object.values);
+    expect(states).toHaveLength(19);
+    expect(states.filter((state) => state === "active")).toHaveLength(ACTIVE_COUNT);
+    expect(states.filter((state) => state === "coming_soon")).toHaveLength(COMING_SOON_COUNT);
   });
 
   it("does not expose a provider outside the availability matrix", () => {
@@ -258,13 +262,25 @@ describe("frontend provider availability mirror", () => {
 });
 
 describe("providerCardState", () => {
-  it("keeps a provider the tenant does not hold coming soon", () => {
-    expect(providerCardState("llm", "openai", emptyStatus())).toBe("coming_soon");
-    expect(providerCardState("llm", "openai", null)).toBe("coming_soon");
+  it("offers an unheld provider the runtime can serve as available", () => {
+    expect(providerCardState("llm", "openai", emptyStatus())).toBe("available");
+    expect(providerCardState("llm", "openai", null)).toBe("available");
     expect(providerCardState(
       "llm",
       "openai",
       emptyStatus({ llm_provider: "outros", llm_readiness: "active" }),
+    )).toBe("available");
+  });
+
+  it("keeps a provider without a runtime path coming soon", () => {
+    // These must stay inert whatever the tenant holds: the backend gate
+    // rejects them, so an interactive card would only lead to a failed PATCH.
+    expect(providerCardState("llm", "slm_cortex", emptyStatus())).toBe("coming_soon");
+    expect(providerCardState("whatsapp", "twilio", emptyStatus())).toBe("coming_soon");
+    expect(providerCardState(
+      "stt",
+      "deepgram_stt",
+      emptyStatus({ stt_provider: "outros", stt_readiness: "active" }),
     )).toBe("coming_soon");
   });
 
@@ -319,22 +335,40 @@ describe("<ApiCredentialsForm /> card states", () => {
     });
   });
 
-  it("renders all 19 Portuguese cards as inert EM BREVE for a tenant holding nothing", async () => {
+  it("offers the 12 runtime-backed cards and leaves the other 7 inert", async () => {
     localStorage.setItem("ns_locale", "pt");
     await renderForm(emptyStatus());
 
     const section = screen.getByTestId("api-settings-section");
     expect(within(section).getAllByTestId(/provider-card-/)).toHaveLength(19);
-    expect(within(section).getAllByText("EM BREVE")).toHaveLength(19);
-    expect(section.querySelectorAll("input, button, select, textarea, [tabindex]")).toHaveLength(0);
-    expect(within(section).queryByRole("button")).not.toBeInTheDocument();
+    expect(within(section).getAllByText("DISPONÍVEL")).toHaveLength(ACTIVE_COUNT);
+    expect(within(section).getAllByText("EM BREVE")).toHaveLength(COMING_SOON_COUNT);
+    expect(within(section).getAllByRole("button")).toHaveLength(ACTIVE_COUNT);
   });
 
-  it("uses the English COMING SOON badge for every unheld card", async () => {
+  it("keeps every card without a runtime path unreachable", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    await renderForm(emptyStatus());
+
+    for (const id of [
+      "whatsapp-dialog360",
+      "whatsapp-twilio",
+      "llm-slm_cortex",
+      "stt-elevenlabs_scribe",
+      "stt-google_stt",
+      "stt-deepgram_stt",
+      "stt-microsoft_stt",
+    ]) {
+      expect(screen.getByTestId(`provider-card-${id}`).tagName).toBe("ARTICLE");
+    }
+  });
+
+  it("uses the English badges for available and unavailable cards", async () => {
     localStorage.setItem("ns_locale", "en");
     await renderForm(emptyStatus());
 
-    expect(screen.getAllByText("COMING SOON")).toHaveLength(19);
+    expect(screen.getAllByText("AVAILABLE")).toHaveLength(ACTIVE_COUNT);
+    expect(screen.getAllByText("COMING SOON")).toHaveLength(COMING_SOON_COUNT);
   });
 
   it("marks only the persisted provider as CONFIGURADO and leaves the rest inert", async () => {
@@ -349,9 +383,11 @@ describe("<ApiCredentialsForm /> card states", () => {
 
     expect(screen.getByTestId("provider-badge-configured-llm-openai"))
       .toHaveTextContent("CONFIGURADO");
-    expect(screen.getAllByText("EM BREVE")).toHaveLength(18);
-    // Exactly one card became interactive: the one the tenant already holds.
-    expect(screen.getAllByRole("button")).toHaveLength(1);
+    // Only the held provider carries the seal; its available siblings stay
+    // offered rather than claiming a configuration they do not have.
+    expect(screen.getAllByText("CONFIGURADO")).toHaveLength(1);
+    expect(screen.getAllByText("DISPONÍVEL")).toHaveLength(ACTIVE_COUNT - 1);
+    expect(screen.getAllByText("EM BREVE")).toHaveLength(COMING_SOON_COUNT);
     expect(screen.getByTestId("provider-card-llm-openai").tagName).toBe("BUTTON");
   });
 
@@ -394,6 +430,26 @@ describe("<ApiCredentialsForm /> card states", () => {
     expect(editor.textContent).not.toContain("sk-…abcd");
   });
 
+  it("opens a sibling provider's editor empty instead of inheriting the held bundle", async () => {
+    await renderForm(emptyStatus({
+      llm_provider: "openai",
+      llm_readiness: "active",
+      llm_api_url: "https://api.openai.com/v1",
+      llm_model_name: "gpt-4o",
+      llm_api_key_set: true,
+    }));
+
+    fireEvent.click(screen.getByTestId("provider-card-llm-outros"));
+    const editor = await screen.findByTestId("provider-editor-llm-outros");
+    // The credential field names are flat and shared across providers, so
+    // hydrating here would offer OpenAI's endpoint and model as if they were
+    // this provider's, and a save with no edits would adopt it on credentials
+    // that belong to someone else.
+    expect(within(editor).getByTestId("field-llm_api_url")).toHaveValue("");
+    expect(within(editor).getByTestId("field-llm_model_name")).toHaveValue("");
+    expect(within(editor).getByTestId("field-llm_api_key")).toHaveValue("");
+  });
+
   it("patches only changed fields and omits an untouched secret", async () => {
     const fetchMock = await renderForm(emptyStatus({
       llm_provider: "openai",
@@ -417,6 +473,79 @@ describe("<ApiCredentialsForm /> card states", () => {
     expect(patch).toBeDefined();
     // An empty secret input means "keep the stored value", so it must not be
     // sent as an empty string that would clear the credential.
+    expect(JSON.parse(String(patch![1].body))).toEqual({ llm_model_name: "gpt-4o-mini" });
+  });
+
+  it("names the adopted provider in the PATCH so the card can reach CONFIGURADO", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response(emptyStatus()))
+      .mockResolvedValueOnce(response(emptyStatus({
+        llm_provider: "openai",
+        llm_readiness: "active",
+        llm_api_url: "https://api.openai.com/v1",
+        llm_model_name: "gpt-4o",
+        llm_api_key_set: true,
+      })));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="clinic-42" isReadOnly={false} isSuperAdmin={false} />
+      </Wrapper>,
+    );
+    await waitFor(() => expect(
+      screen.getByTestId("provider-card-llm-openai").tagName,
+    ).toBe("BUTTON"));
+
+    fireEvent.click(screen.getByTestId("provider-card-llm-openai"));
+    await screen.findByTestId("provider-editor-llm-openai");
+    fireEvent.change(screen.getByTestId("field-llm_api_url"), {
+      target: { value: "https://api.openai.com/v1" },
+    });
+    fireEvent.change(screen.getByTestId("field-llm_model_name"), {
+      target: { value: "gpt-4o" },
+    });
+    fireEvent.change(screen.getByTestId("field-llm_api_key"), {
+      target: { value: "fresh-secret" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("save-llm-openai"));
+    });
+
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    expect(patch).toBeDefined();
+    // Without the provider field the credentials would land under no provider
+    // at all, leaving the card stuck short of CONFIGURADO.
+    expect(JSON.parse(String(patch![1].body))).toEqual({
+      llm_provider: "openai",
+      llm_api_url: "https://api.openai.com/v1",
+      llm_model_name: "gpt-4o",
+      llm_api_key: "fresh-secret",
+    });
+    expect(screen.getByTestId("provider-badge-configured-llm-openai"))
+      .toHaveTextContent("CONFIGURADO");
+  });
+
+  it("omits the provider field when maintaining the provider already held", async () => {
+    const fetchMock = await renderForm(emptyStatus({
+      llm_provider: "openai",
+      llm_readiness: "active",
+      llm_api_url: "https://api.openai.com/v1",
+      llm_model_name: "gpt-4o",
+      llm_api_key_set: true,
+    }));
+
+    fireEvent.click(screen.getByTestId("provider-card-llm-openai"));
+    await screen.findByTestId("provider-editor-llm-openai");
+    fireEvent.change(screen.getByTestId("field-llm_model_name"), {
+      target: { value: "gpt-4o-mini" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("save-llm-openai"));
+    });
+
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
     expect(JSON.parse(String(patch![1].body))).toEqual({ llm_model_name: "gpt-4o-mini" });
   });
 
@@ -495,7 +624,10 @@ describe("<ApiCredentialsForm /> card states", () => {
 
     expect(screen.queryByTestId("provider-editor-llm-openai")).not.toBeInTheDocument();
     expect(screen.queryByDisplayValue("clinic-a-model")).not.toBeInTheDocument();
-    expect(screen.getByTestId("provider-card-llm-openai").tagName).toBe("ARTICLE");
+    // Clinic B holds nothing, so the card falls back to an offer rather than
+    // carrying clinic A's CONFIGURADO seal across the switch.
+    expect(screen.getByTestId("provider-badge-available-llm-openai"))
+      .toBeInTheDocument();
   });
 
   it("keeps every card inert and warns when the status fetch fails", async () => {
