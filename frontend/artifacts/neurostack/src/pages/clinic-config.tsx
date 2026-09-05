@@ -43,6 +43,7 @@ import { ProviderCredentialCard } from "@/components/api-settings/provider-crede
 import {
   BusinessHoursEditor,
   BUSINESS_DAY_ORDER,
+  CompactHoursCard,
   type BusinessDayCode,
   type BusinessHoursMap,
 } from "@/components/business-hours-editor";
@@ -1540,12 +1541,20 @@ export default function ClinicConfig() {
                 />
               </Field>
               <Field label={txt("Horário do Setor de Agendamento", "Scheduling Department Hours")} hint={txt("Quando difere do horário geral de atendimento.", "When it differs from the general working hours.")}>
-                <Input
-                  value={schedulingHours}
-                  onChange={(e) => setSchedulingHours(e.target.value)}
-                  placeholder={txt("Ex: Seg–Sex: 8h–18h (agendamentos apenas por WhatsApp)", "e.g. Mon–Fri: 8am–6pm (scheduling via WhatsApp only)")}
-                  disabled={isReadOnly}
-                />
+                <CompactHoursCard
+                  summary={schedulingHours.trim() || txt("Mesmo horário de funcionamento", "Same as business hours")}
+                  editLabel={txt("Editar", "Edit")}
+                  closeLabel={txt("Concluir", "Done")}
+                  testId="scheduling-hours-editor"
+                >
+                  <Input
+                    value={schedulingHours}
+                    onChange={(e) => setSchedulingHours(e.target.value)}
+                    placeholder={txt("Ex: Seg–Sex: 8h–18h (agendamentos apenas por WhatsApp)", "e.g. Mon–Fri: 8am–6pm (scheduling via WhatsApp only)")}
+                    aria-label={txt("Horário do Setor de Agendamento", "Scheduling Department Hours")}
+                    disabled={isReadOnly}
+                  />
+                </CompactHoursCard>
               </Field>
 
               {/* Scheduling link (stopgap pré-ERP) */}
