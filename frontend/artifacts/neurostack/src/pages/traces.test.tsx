@@ -50,6 +50,7 @@ function traceFixture(
   id: string,
   intent: string,
   userMessage = longMessage,
+  flags: { safety_concern?: boolean; handoff_required?: boolean } = {},
 ): TraceFixture {
   return {
     id,
@@ -61,8 +62,8 @@ function traceFixture(
       funnel_stage: "pos_atendimento",
       action: "respond",
       confidence: 0.98,
-      safety_concern: false,
-      handoff_required: false,
+      safety_concern: flags.safety_concern ?? false,
+      handoff_required: flags.handoff_required ?? false,
     },
     processing_time_ms: 123,
     channel: "whatsapp",
@@ -175,8 +176,9 @@ describe("<TracesList /> presentation contract", () => {
     expect(metadata).toHaveClass("flex-wrap");
 
     const unknownBadge = screen.getByTestId("badge-intent-future_intent");
-    expect(unknownBadge).toHaveTextContent("future_intent");
-    expect(unknownBadge).toHaveClass("bg-slate-500", "text-white");
+    expect(unknownBadge).toHaveTextContent("Outras");
+    expect(unknownBadge.textContent).not.toContain("future_intent");
+    expect(unknownBadge).toHaveClass("bg-neutral-500", "text-white");
 
     expectNoClippingClasses(message, content);
     expectNoClippingClasses(badge, content);
@@ -236,5 +238,39 @@ describe("<TracesList /> presentation contract", () => {
       ).toBe(true);
       expect(anchorClick).toHaveBeenCalledOnce();
     });
+  });
+
+  it("renders the Dúvida Pós-Procedimento bucket badge alongside the ShieldAlert icon when safety_concern is true", async () => {
+    renderTraces([
+      traceFixture(
+        "safety-trace",
+        "pos_atendimento_sintomas_preocupantes",
+        "Estou com sintomas preocupantes",
+        { safety_concern: true },
+      ),
+    ]);
+
+    const row = await screen.findByTestId("trace-row-safety-trace");
+    const badge = screen.getByTestId("badge-intent-pos_atendimento_sintomas_preocupantes");
+    expect(badge).toHaveTextContent("Dúvida Pós-Procedimento");
+    const svgs = row.querySelectorAll("svg.text-destructive");
+    expect(svgs.length).toBeGreaterThan(0);
+  });
+
+  it("renders the Reclamação bucket badge alongside the AlertTriangle icon when handoff_required is true", async () => {
+    renderTraces([
+      traceFixture(
+        "handoff-trace",
+        "reclamacao",
+        "Quero falar com um humano",
+        { handoff_required: true },
+      ),
+    ]);
+
+    const row = await screen.findByTestId("trace-row-handoff-trace");
+    const badge = screen.getByTestId("badge-intent-reclamacao");
+    expect(badge).toHaveTextContent("Reclamação");
+    const svgs = row.querySelectorAll("svg.text-orange-500");
+    expect(svgs.length).toBeGreaterThan(0);
   });
 });

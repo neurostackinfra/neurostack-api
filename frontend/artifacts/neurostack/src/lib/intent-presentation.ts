@@ -69,3 +69,75 @@ export function getIntentLabel(key: string, t: (translationKey: TranslationKey) 
   const translated = t(presentation.translationKey);
   return translated && translated !== presentation.translationKey ? translated : key;
 }
+
+export type IntentBucket =
+  | "pedido_preco"
+  | "agendar"
+  | "interesse_tratamento"
+  | "reclamacao"
+  | "pos_atendimento_duvida"
+  | "outras";
+
+export const INTENT_BUCKET = {
+  // pedido_preco
+  pedido_preco: "pedido_preco",
+  orcamento_existente: "pedido_preco",
+  // agendar
+  agendar: "agendar",
+  reagendar: "agendar",
+  cancelar: "agendar",
+  confirmar_presenca: "agendar",
+  disponibilidade_horarios: "agendar",
+  pre_atendimento: "agendar",
+  fora_do_horario: "agendar",
+  // interesse_tratamento
+  interesse_tratamento: "interesse_tratamento",
+  comparacao_tratamentos: "interesse_tratamento",
+  objecao_vou_pensar: "interesse_tratamento",
+  detalhes_servicos: "interesse_tratamento",
+  informacoes_profissionais: "interesse_tratamento",
+  qualificacao_publico: "interesse_tratamento",
+  cultura_historia: "interesse_tratamento",
+  // reclamacao
+  reclamacao: "reclamacao",
+  conduta_inadequada_ameaca: "reclamacao",
+  // pos_atendimento_duvida
+  pos_atendimento_duvida: "pos_atendimento_duvida",
+  pos_atendimento_sintomas_preocupantes: "pos_atendimento_duvida",
+  pedido_alterar_medicacao: "pos_atendimento_duvida",
+  // outras
+  saudacao: "outras",
+  duvida_generica_sem_contexto: "outras",
+  fora_do_escopo: "outras",
+  pedido_atendente_humano: "outras",
+  documentos_e_comprovantes: "outras",
+  paciente_ativo: "outras",
+  cobranca_renegociacao: "outras",
+  faq: "outras",
+} as const satisfies Record<keyof typeof INTENT_PRESENTATION, IntentBucket>;
+
+export const BUCKET_PRESENTATION = {
+  pedido_preco: intent("intent_pedido_preco", "bg-blue-500", "hover:bg-blue-600", "#3b82f6"),
+  agendar: intent("intent_agendar", "bg-green-500", "hover:bg-green-600", "#22c55e"),
+  interesse_tratamento: intent("intent_interesse_tratamento", "bg-violet-500", "hover:bg-violet-600", "#8b5cf6"),
+  reclamacao: intent("intent_reclamacao", "bg-rose-500", "hover:bg-rose-600", "#f43f5e"),
+  pos_atendimento_duvida: intent("intent_pos_atendimento_duvida", "bg-indigo-500", "hover:bg-indigo-600", "#6366f1"),
+  outras: intent("intent_outras", "bg-neutral-500", "hover:bg-neutral-600", "#737373"),
+} as const satisfies Record<IntentBucket, IntentPresentation>;
+
+export function getIntentBucket(key: string): IntentBucket {
+  if (Object.prototype.hasOwnProperty.call(INTENT_BUCKET, key)) {
+    return INTENT_BUCKET[key as keyof typeof INTENT_BUCKET];
+  }
+  return "outras";
+}
+
+export function getBucketPresentation(bucket: IntentBucket): IntentPresentation {
+  return BUCKET_PRESENTATION[bucket];
+}
+
+export function getBucketLabel(bucket: IntentBucket, t: (translationKey: TranslationKey) => string): string {
+  const presentation = BUCKET_PRESENTATION[bucket];
+  const translated = t(presentation.translationKey);
+  return translated && translated !== presentation.translationKey ? translated : bucket;
+}

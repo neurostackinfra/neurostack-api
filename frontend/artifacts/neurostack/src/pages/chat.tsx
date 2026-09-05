@@ -12,7 +12,7 @@ import { Button } from "@/components/ui/button";
 import {
   Send, User, Bot, Loader2, Activity, RotateCcw,
 } from "lucide-react";
-import { TraceViewer } from "@/components/trace-viewer";
+import { IntentBadge, TraceViewer } from "@/components/trace-viewer";
 import { RatingBlock } from "@/components/rating-block";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useToast } from "@/hooks/use-toast";
@@ -45,7 +45,7 @@ const MOCK_CONVERSATIONS: { id: string; label: string; messages: MockMessage[] }
         id: "m2", role: "assistant",
         content: "Olá! Que ótima escolha. As facetas de porcelana são o padrão ouro para transformação de sorriso, com resultados naturais e duradouros. Para te oferecer um orçamento preciso, o ideal é uma avaliação personalizada com nosso especialista. Posso agendar para você?",
         trace: {
-          intent: "Price Inquiry",
+          intent: "pedido_preco",
           stage: "authority",
           confidence: 96.0,
           processingMs: 287,
@@ -62,7 +62,7 @@ const MOCK_CONVERSATIONS: { id: string; label: string; messages: MockMessage[] }
         id: "m4", role: "assistant",
         content: "O investimento varia conforme o número de facetas e o caso clínico, mas costuma ficar entre 6 consultas ao longo de 4 a 6 semanas. Nossa clínica trabalha com porcelana de altíssima qualidade importada, com garantia de 10 anos. Para valores exatos e um plano personalizado, agende sua consulta inicial aqui mesmo, no momento está sem custos!",
         trace: {
-          intent: "Price Inquiry",
+          intent: "pedido_preco",
           stage: "consideration",
           confidence: 94.0,
           processingMs: 312,
@@ -238,9 +238,7 @@ function InvestorMockChat() {
                   <div className="grid grid-cols-2 gap-4">
                     <div>
                       <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1">Intent</p>
-                      <span className="inline-block bg-blue-600 text-white text-xs font-medium px-3 py-1 rounded-md">
-                        {activeTrace.intent}
-                      </span>
+                      <IntentBadge intent={activeTrace.intent} />
                     </div>
                     <div>
                       <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1">Stage</p>

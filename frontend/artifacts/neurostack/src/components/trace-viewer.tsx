@@ -18,7 +18,7 @@ import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
 import type { TranslationKey } from "@/locales/en";
 import { RatingBlock } from "@/components/rating-block";
-import { getIntentLabel, getIntentPresentation } from "@/lib/intent-presentation";
+import { getBucketLabel, getBucketPresentation, getIntentBucket } from "@/lib/intent-presentation";
 import { cn } from "@/lib/utils";
 
 const STAGE_KEYS = [
@@ -37,13 +37,14 @@ const STAGE_KEYS = [
 
 export function IntentBadge({ intent, className }: { intent: string; className?: string }) {
   const { t } = useI18n();
-  const presentation = getIntentPresentation(intent);
+  const bucket = getIntentBucket(intent);
+  const presentation = getBucketPresentation(bucket);
   return (
     <Badge
       className={cn(presentation.badgeClassName, className)}
       data-testid={`badge-intent-${intent}`}
     >
-      {getIntentLabel(intent, t)}
+      {getBucketLabel(bucket, t)}
     </Badge>
   );
 }
