@@ -68,7 +68,7 @@ interface KpiStats {
 
 // -- Technical KPI cards ---
 
-function KpiCards({ stats, t, locale }: { stats: KpiStats; t: (k: TranslationKey) => string; locale: string }) {
+export function KpiCards({ stats, t, locale }: { stats: KpiStats; t: (k: TranslationKey) => string; locale: string }) {
   const maxModelTokens = stats.modelBreakdown[0]?.tokens ?? 0;
   const txt = (pt: string, en: string) => locale === "en" ? en : pt;
   const outsideHoursHasData = stats.businessHoursConfigured
@@ -123,7 +123,7 @@ function KpiCards({ stats, t, locale }: { stats: KpiStats; t: (k: TranslationKey
 
       <Card data-testid="stat-outside-hours">
         <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-          <CardTitle className="text-sm font-medium">{txt("Fora do horário", "Outside hours")}</CardTitle>
+          <CardTitle className="text-sm font-medium">{txt("Atendimentos fora do horário", "Outside hours")}</CardTitle>
           <CalendarRange className="h-4 w-4 text-violet-400" />
         </CardHeader>
         <CardContent>
