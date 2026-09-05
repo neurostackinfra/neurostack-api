@@ -1,4 +1,4 @@
-import { DecisionTrace } from "@workspace/api-client-react";
+import type { DecisionTrace, TraceContextItem } from "@workspace/api-client-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -9,53 +9,17 @@ import {
   Lock,
   FlaskConical,
   ChevronDown,
+  BookOpen,
+  Settings2,
+  CircleHelp,
 } from "lucide-react";
 import { useState } from "react";
 import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
 import type { TranslationKey } from "@/locales/en";
 import { RatingBlock } from "@/components/rating-block";
-
-const INTENT_CLASSNAMES: Record<string, string> = {
-  // Greeting / Farewell
-  saudacao: "bg-sky-500 hover:bg-sky-600 text-white",
-  // Interest & Qualification
-  interesse_tratamento: "bg-violet-500 hover:bg-violet-600 text-white",
-  qualificacao_publico: "bg-purple-500 hover:bg-purple-600 text-white",
-  comparacao_tratamentos: "bg-fuchsia-500 hover:bg-fuchsia-600 text-white",
-  // Price & Objections
-  pedido_preco: "bg-blue-500 hover:bg-blue-600 text-white",
-  objecao_vou_pensar: "bg-amber-500 hover:bg-amber-600 text-white",
-  // Scheduling
-  agendar: "bg-green-500 hover:bg-green-600 text-white",
-  reagendar: "bg-emerald-500 hover:bg-emerald-600 text-white",
-  cancelar: "bg-orange-500 hover:bg-orange-600 text-white",
-  confirmar_presenca: "bg-teal-500 hover:bg-teal-600 text-white",
-  disponibilidade_horarios: "bg-cyan-500 hover:bg-cyan-600 text-white",
-  // Info & FAQ
-  detalhes_servicos: "bg-indigo-400 hover:bg-indigo-500 text-white",
-  informacoes_profissionais: "bg-indigo-500 hover:bg-indigo-600 text-white",
-  faq: "bg-slate-500 hover:bg-slate-600 text-white",
-  cultura_historia: "bg-slate-400 hover:bg-slate-500 text-white",
-  duvida_generica_sem_contexto: "bg-gray-500 hover:bg-gray-600 text-white",
-  pre_atendimento: "bg-lime-500 hover:bg-lime-600 text-white",
-  // Post-care
-  pos_atendimento_duvida: "bg-indigo-500 hover:bg-indigo-600 text-white",
-  pos_atendimento_sintomas_preocupantes: "bg-red-500 hover:bg-red-600 text-white",
-  pedido_alterar_medicacao: "bg-red-600 hover:bg-red-700 text-white",
-  // Admin / Financial
-  documentos_e_comprovantes: "bg-zinc-500 hover:bg-zinc-600 text-white",
-  orcamento_existente: "bg-blue-400 hover:bg-blue-500 text-white",
-  cobranca_renegociacao: "bg-yellow-500 hover:bg-yellow-600 text-white",
-  // Escalation
-  reclamacao: "bg-rose-500 hover:bg-rose-600 text-white",
-  conduta_inadequada_ameaca: "bg-red-700 hover:bg-red-800 text-white",
-  pedido_atendente_humano: "bg-rose-600 hover:bg-rose-700 text-white",
-  // Patient & Out-of-scope
-  paciente_ativo: "bg-teal-600 hover:bg-teal-700 text-white",
-  fora_do_escopo: "bg-stone-500 hover:bg-stone-600 text-white",
-  fora_do_horario: "bg-stone-600 hover:bg-stone-700 text-white",
-};
+import { getIntentLabel, getIntentPresentation } from "@/lib/intent-presentation";
+import { cn } from "@/lib/utils";
 
 const STAGE_KEYS = [
   "initial",
@@ -71,18 +35,15 @@ const STAGE_KEYS = [
   "escalation",
 ] as const;
 
-export function IntentBadge({ intent }: { intent: string }) {
+export function IntentBadge({ intent, className }: { intent: string; className?: string }) {
   const { t } = useI18n();
-  const className = INTENT_CLASSNAMES[intent];
-  const labelKey = `intent_${intent}` as TranslationKey;
-  const translated = t(labelKey);
-  const label = translated && translated !== labelKey ? translated : intent;
+  const presentation = getIntentPresentation(intent);
   return (
     <Badge
-      className={className ?? "bg-slate-500 text-white"}
+      className={cn(presentation.badgeClassName, className)}
       data-testid={`badge-intent-${intent}`}
     >
-      {label}
+      {getIntentLabel(intent, t)}
     </Badge>
   );
 }
@@ -131,10 +92,34 @@ function PayloadSection({ title, data }: { title: string; data: any }) {
   );
 }
 
-function ctxFieldTitle(field: string, count: string | undefined, t: (k: TranslationKey) => string): string {
-  const key = `ctx_field_${field.replace(/\./g, "_")}` as TranslationKey;
-  const base = t(key) || field;
-  return count ? `${base} (${count})` : base;
+export type ContextSourceKind = "rag" | "config" | "unknown";
+
+export function normalizeContextSource(source: string | null | undefined): ContextSourceKind {
+  switch (source?.trim().toLowerCase()) {
+    case "rag":
+      return "rag";
+    case "config":
+    case "clinic_config":
+      return "config";
+    default:
+      return "unknown";
+  }
+}
+
+function getContextTitle(
+  context: TraceContextItem,
+  t: (key: TranslationKey) => string,
+): string {
+  const title = context.title?.trim();
+  if (title) return title;
+
+  const fieldKey = context.field?.trim() || context.key?.trim();
+  if (fieldKey) {
+    const translationKey = `ctx_field_${fieldKey.replace(/\./g, "_")}` as TranslationKey;
+    return t(translationKey) || fieldKey;
+  }
+
+  return t("ctx_title_fallback");
 }
 
 export function TraceViewer({ trace }: { trace: DecisionTrace }) {
@@ -263,38 +248,63 @@ export function TraceViewer({ trace }: { trace: DecisionTrace }) {
         </CardHeader>
         <CardContent className="pt-4">
           {trace.selectedContext && trace.selectedContext.length > 0 ? (
-            <div className="space-y-3">
+            <div
+              className="grid grid-cols-1 gap-3 md:grid-cols-2"
+              data-testid="context-grid"
+            >
               {trace.selectedContext.map((ctx, idx) => {
-                const countMatch = ctx.title?.match(/\((\d+)\)$/);
-                const count = countMatch ? countMatch[1] : undefined;
-                const fieldKey = ctx.field || ctx.key;
-                const label = ctxFieldTitle(fieldKey, count, t);
+                const source = normalizeContextSource(ctx.source);
+                const title = getContextTitle(ctx, t);
+                const sourceMeta = {
+                  rag: {
+                    label: t("ctx_origin_rag"),
+                    icon: BookOpen,
+                    className:
+                      "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300",
+                  },
+                  config: {
+                    label: t("ctx_origin_config"),
+                    icon: Settings2,
+                    className:
+                      "bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300",
+                  },
+                  unknown: {
+                    label: t("ctx_origin_unknown"),
+                    icon: CircleHelp,
+                    className:
+                      "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300",
+                  },
+                }[source];
+                const SourceIcon = sourceMeta.icon;
+
                 return (
                   <div
                     key={idx}
-                    className="text-sm bg-muted rounded-md p-3 border border-border"
+                    className="min-w-0 rounded-md border border-border bg-muted p-4 text-sm"
                     data-testid={`context-item-${idx}`}
+                    data-source-kind={source}
                   >
-                    <div className="flex justify-between items-start mb-1">
-                      <div className="flex flex-col gap-0.5">
-                        <span className="text-xs font-bold text-foreground">
-                          {label}
-                        </span>
-                        {fieldKey && (
-                          <span className="font-mono text-[10px] text-muted-foreground">
-                            {fieldKey}
-                          </span>
-                        )}
-                      </div>
-                      <span className={`text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded font-medium ${
-                        ctx.source === "rag"
-                          ? "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300"
-                          : "bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300"
-                      }`}>
-                        {ctx.source === "rag" ? t("ctx_origin_rag") : t("ctx_origin_config")}
+                    <div className="mb-3">
+                      <span
+                        className={`inline-flex items-center gap-1.5 rounded px-2 py-1 text-[10px] font-medium uppercase tracking-wider ${sourceMeta.className}`}
+                        data-testid={`context-source-${idx}`}
+                      >
+                        <SourceIcon className="h-3.5 w-3.5" aria-hidden="true" />
+                        {sourceMeta.label}
                       </span>
                     </div>
-                    <div className="text-foreground mt-1">{ctx.value}</div>
+                    <div
+                      className="break-words text-sm font-semibold text-foreground [overflow-wrap:anywhere]"
+                      data-testid={`context-title-${idx}`}
+                    >
+                      {title}
+                    </div>
+                    <div
+                      className="mt-2 whitespace-pre-wrap break-words text-foreground [overflow-wrap:anywhere]"
+                      data-testid={`context-value-${idx}`}
+                    >
+                      {ctx.value}
+                    </div>
                   </div>
                 );
               })}
