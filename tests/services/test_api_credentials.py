@@ -1067,6 +1067,97 @@ def test_whatsapp_relabel_the_credentials_cannot_back_is_rejected(
     assert existing == snapshot
 
 
+# The non-secret outbound field of each bundle: the one a credential form can
+# actually blank out, since `merge_credentials` reads an emptied secret as
+# "keep the stored value" rather than as a clear.
+_WHATSAPP_DECOMMISSION_LEVER = {
+    "zapi": "zapi_instance_id",
+    "meta_cloud": "meta_phone_number_id",
+    "evolution": "evolution_api_url",
+    "uazapi": "uazapi_api_url",
+}
+_WHOLE_UAZAPI_BUNDLE = {
+    "whatsapp_provider": "uazapi",
+    "uazapi_api_url": "https://uazapi.example",
+    "uazapi_instance_name": "clinic-1",
+    "uazapi_token": "uaz-token",
+}
+
+
+@pytest.mark.parametrize(
+    ("incoming", "cleared"),
+    [
+        pytest.param(_WHOLE_META_BUNDLE, "zapi", id="to_meta_cloud"),
+        pytest.param(_WHOLE_UAZAPI_BUNDLE, "zapi", id="to_uazapi"),
+    ],
+)
+def test_whatsapp_switch_leaves_a_way_to_stop_the_old_provider(
+    incoming: dict[str, object], cleared: str
+) -> None:
+    """A switch that cannot be finished is a trap, not a policy.
+
+    The old bundle survives the switch and keeps resolving its own inbound
+    webhooks, so it goes on replying under the new provider's name. Emptying a
+    group is therefore decommissioning rather than adoption, and has to stay
+    reachable — otherwise the tenant holds two live outbound paths for good.
+    """
+
+    switched = merge_credentials(_STORED_ZAPI, incoming)
+    validate_provider_availability(_STORED_ZAPI, switched)
+    assert switched["zapi_instance_id"] == "i1"
+
+    lever = _WHATSAPP_DECOMMISSION_LEVER[cleared]
+    retired = merge_credentials(switched, {lever: ""})
+    validate_provider_availability(switched, retired)
+    assert not retired[lever]
+
+
+def test_whatsapp_switch_may_clear_the_outgoing_bundle_in_the_same_request() -> None:
+    """Retiring the old provider as you adopt the new one is the clean path."""
+
+    candidate = merge_credentials(
+        _STORED_ZAPI, {**_WHOLE_META_BUNDLE, "zapi_instance_id": ""}
+    )
+    validate_provider_availability(_STORED_ZAPI, candidate)
+    assert not candidate["zapi_instance_id"]
+    assert candidate["meta_phone_number_id"] == "999888777"
+
+
+def test_whatsapp_unlabelled_row_may_not_relabel_over_a_live_bundle() -> None:
+    """A row can carry a sending bundle under no label at all.
+
+    Keying the switch on the stored label alone would wave those rows through,
+    because there is no label to differ from — while the credentials underneath
+    keep sending for a provider the new label does not name.
+    """
+
+    existing = {
+        "zapi_instance_id": "i1",
+        "zapi_token": "t1",
+        "zapi_inbound_token_digest": "d" * 64,
+    }
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(
+            existing, merge_credentials(existing, {"whatsapp_provider": "meta_cloud"})
+        )
+    assert caught.value.detail["error"] == "provider_not_available"
+
+
+def test_whatsapp_unlabelled_row_may_name_the_provider_it_actually_runs() -> None:
+    """Adopting the label its own credentials already back stays open."""
+
+    existing = {
+        "zapi_instance_id": "i1",
+        "zapi_token": "t1",
+        "zapi_inbound_token_digest": "d" * 64,
+    }
+
+    candidate = merge_credentials(existing, {"whatsapp_provider": "zapi"})
+    validate_provider_availability(existing, candidate)
+    assert candidate["whatsapp_provider"] == "zapi"
+
+
 def test_whatsapp_switch_may_not_also_write_the_outgoing_bundle() -> None:
     """Two populated bundles leave no answer to which one sends."""
 

@@ -625,6 +625,16 @@ const WHATSAPP_PROVIDER_FIELDS: Record<string, readonly CredentialField[]> = {
   twilio: [],
 };
 
+// The non-secret field each outbound path needs, mirroring the backend's
+// WHATSAPP_OUTBOUND_FIELDS. Emptying it is the only way to retire a bundle,
+// because a blanked secret reads as "keep the stored value" on both sides.
+const WHATSAPP_DECOMMISSION_LEVER: Record<string, string> = {
+  zapi: "zapi_instance_id",
+  evolution: "evolution_api_url",
+  meta_cloud: "meta_phone_number_id",
+  uazapi: "uazapi_api_url",
+};
+
 // Voice triggers (`tts_enabled`, `tts_reply_policy`) belong to
 // VoiceResponseControls and are deliberately absent here.
 const CAPABILITY_FIELDS: Record<string, readonly CredentialField[]> = {
@@ -787,8 +797,17 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
     // bundle; omitting it would persist credentials under the previous
     // provider's label and leave the card unable to reach CONFIGURADO.
     const providerField = CAPABILITY_PROVIDER_FIELD[capability];
-    if (statusText(status, providerField) !== providerId) {
+    const held = statusText(status, providerField);
+    if (held !== providerId) {
       body[providerField] = providerId;
+      // The retired bundle stays populated and goes on resolving its own
+      // inbound webhooks, so it would keep replying under the new provider's
+      // name. Emptying its identity field here retires it while the switch is
+      // still expressible; afterwards its card reads empty and there is
+      // nothing left to blank.
+      const lever =
+        capability === "whatsapp" ? WHATSAPP_DECOMMISSION_LEVER[held] : undefined;
+      if (lever) body[lever] = "";
     }
     for (const field of credentialFields(capability, providerId)) {
       const value = draft[field.name] ?? "";

@@ -6,7 +6,7 @@ It is the single credential contract used by public routes and runtime callers.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, Literal
 
 MASKED_SECRET = "••••••••"
@@ -327,6 +327,12 @@ def _tts_bundle_complete(credentials: Mapping[str, Any]) -> bool:
     return all(bool(credentials.get(field)) for field in _tts_required_fields(provider))
 
 
+def _populates(fields: Iterable[str], credentials: Mapping[str, Any]) -> bool:
+    """True when any of `fields` still carries a value after the write."""
+
+    return any(credentials.get(field) for field in fields)
+
+
 def persisted_provider(capability: str, credentials: Mapping[str, Any]) -> str | None:
     """Return the allowlisted provider a tenant already stores for a capability."""
 
@@ -408,10 +414,14 @@ def validate_provider_availability(
                         provider=provider,
                     )
         if capability == "whatsapp":
+            # Emptying a group is decommissioning, not adoption, and has to stay
+            # reachable: the outbound path is chosen from whichever bundle is
+            # populated, so a tenant who switched providers needs some way to
+            # stop the old one, which still resolves its own inbound webhooks.
             adopted = {
                 group_provider
                 for group_provider, group in WHATSAPP_PROVIDER_FIELD_GROUPS.items()
-                if changed_fields & group
+                if _populates(changed_fields & group, candidate)
             } - {stored}
             # This runs before the `active` escape below, so it has to consult
             # availability itself; otherwise writing an available provider's
@@ -434,13 +444,30 @@ def validate_provider_availability(
             # new one's name. Writing the outgoing bundle in the same request is
             # refused for the mirror reason: it would leave two populated
             # bundles and no answer to which of them sends.
-            if isinstance(provider, str) and stored is not None and provider != stored:
-                outgoing = WHATSAPP_PROVIDER_FIELD_GROUPS.get(stored, frozenset())
+            # A legacy row can carry a live bundle under no label at all, so
+            # incumbency is read from the credentials there: otherwise the first
+            # relabel of such a row is unchecked, because `stored` is None and
+            # the switch below never fires while the old bundle keeps sending.
+            if stored is None:
+                departing = {
+                    p
+                    for p, outbound in WHATSAPP_OUTBOUND_FIELDS.items()
+                    if p != provider and all(existing.get(field) for field in outbound)
+                }
+            else:
+                departing = {stored} - {provider}
+            if isinstance(provider, str) and departing:
+                outgoing = frozenset().union(
+                    *(
+                        WHATSAPP_PROVIDER_FIELD_GROUPS.get(p, frozenset())
+                        for p in departing
+                    )
+                )
                 required = WHATSAPP_OUTBOUND_FIELDS.get(provider)
                 if (
                     required is None
                     or not all(candidate.get(field) for field in required)
-                    or changed_fields & outgoing
+                    or _populates(changed_fields & outgoing, candidate)
                 ):
                     raise CredentialPolicyError(
                         "provider_not_available",
