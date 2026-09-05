@@ -170,11 +170,7 @@ def _session_is_paused(client: TestClient, session_id: UUID) -> bool:
 @pytest.fixture(autouse=True)
 def _clear_state():
     from src.api.middleware.rate_limit import rate_limit_store
-    from src.api.routes.webhook import (
-        _INMEM_INCOMING,
-        _INMEM_SENT,
-        _INMEM_STT_NOTICE,
-    )
+    from src.api.routes.webhook import _INMEM_INCOMING, _INMEM_SENT, _INMEM_STT_NOTICE
 
     _INMEM_INCOMING.clear()
     _INMEM_SENT.clear()

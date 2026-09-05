@@ -40,6 +40,7 @@ import {
   AudioLines,
 } from "lucide-react";
 import { ProviderCredentialCard } from "@/components/api-settings/provider-credential-card";
+import { VoiceResponseControls } from "@/components/api-settings/voice-response-controls";
 import {
   BusinessHoursEditor,
   BUSINESS_DAY_ORDER,
@@ -2290,7 +2291,12 @@ export default function ClinicConfig() {
               </div>
               <CardDescription className="text-xs">{t("config_integrations_desc")}</CardDescription>
             </CardHeader>
-            <CardContent className="pt-5">
+            <CardContent className="space-y-5 pt-5">
+              <VoiceResponseControls
+                clinicId={(isBuilder || isSuperAdmin) && viewingClinicId ? viewingClinicId : clinicId}
+                isReadOnly={isReadOnly}
+                role={role}
+              />
               <ApiCredentialsForm
                 clinicId={(isBuilder || isSuperAdmin) && viewingClinicId ? viewingClinicId : clinicId}
                 isReadOnly={isReadOnly}
