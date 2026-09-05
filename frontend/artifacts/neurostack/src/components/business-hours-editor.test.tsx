@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 
 import {
   BusinessHoursEditor,
+  formatBusinessHoursSummary,
   type BusinessHoursMap,
 } from "./business-hours-editor";
 
@@ -11,7 +12,11 @@ afterEach(() => {
 });
 
 describe("<BusinessHoursEditor />", () => {
-  it("renders 7 rows with open/closed switches and disabled times on closed days", () => {
+  const expandEditor = () => {
+    fireEvent.click(screen.getByTestId("business-hours-editor-toggle"));
+  };
+
+  it("starts compact and reveals 7 single-line day controls on demand", () => {
     const value: BusinessHoursMap = {
       mon: { open: "09:00", close: "18:00" },
     };
@@ -24,23 +29,42 @@ describe("<BusinessHoursEditor />", () => {
       />,
     );
 
+    expect(screen.getByTestId("business-hours-editor-summary")).toHaveTextContent(
+      "Seg: 09:00–18:00 | Ter–Dom: fechado",
+    );
+    expect(screen.queryByTestId("business-hours-row-mon")).toBeNull();
+
+    expandEditor();
+
     for (const day of ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]) {
       expect(screen.getByTestId(`business-hours-row-${day}`)).toBeInTheDocument();
       expect(screen.getByTestId(`business-hours-switch-${day}`)).toBeInTheDocument();
-      expect(screen.getByTestId(`business-hours-open-${day}`)).toBeInTheDocument();
-      expect(screen.getByTestId(`business-hours-close-${day}`)).toBeInTheDocument();
     }
 
-    // Monday is open — inputs enabled and prefilled
     expect(screen.getByTestId("business-hours-open-mon")).toHaveValue("09:00");
     expect(screen.getByTestId("business-hours-open-mon")).not.toBeDisabled();
     expect(screen.getByTestId("business-hours-close-mon")).toHaveValue("18:00");
     expect(screen.getByTestId("business-hours-close-mon")).not.toBeDisabled();
 
-    // Tuesday is closed — inputs disabled and empty
-    expect(screen.getByTestId("business-hours-open-tue")).toBeDisabled();
-    expect(screen.getByTestId("business-hours-open-tue")).toHaveValue("");
-    expect(screen.getByTestId("business-hours-close-tue")).toBeDisabled();
+    expect(screen.queryByTestId("business-hours-open-tue")).toBeNull();
+    expect(screen.queryByTestId("business-hours-close-tue")).toBeNull();
+    expect(screen.getByTestId("business-hours-row-tue")).toHaveTextContent("Fechado");
+  });
+
+  it("groups consecutive days with equal hours in the compact summary", () => {
+    const value: BusinessHoursMap = {
+      mon: { open: "09:00", close: "18:00" },
+      tue: { open: "09:00", close: "18:00" },
+      wed: { open: "09:00", close: "18:00" },
+      thu: { open: "09:00", close: "18:00" },
+      fri: { open: "09:00", close: "18:00" },
+      sat: { open: "09:00", close: "13:00" },
+    };
+
+    expect(formatBusinessHoursSummary(value)).toBe(
+      "Seg–Sex: 09:00–18:00 | Sáb: 09:00–13:00 | Dom: fechado",
+    );
+    expect(formatBusinessHoursSummary(null)).toBe("Nenhum horário configurado");
   });
 
   it("closing a day removes its window from the emitted value", () => {
@@ -58,6 +82,7 @@ describe("<BusinessHoursEditor />", () => {
       />,
     );
 
+    expandEditor();
     fireEvent.click(screen.getByTestId("business-hours-switch-tue"));
 
     expect(onChange).toHaveBeenCalledTimes(1);
@@ -80,6 +105,7 @@ describe("<BusinessHoursEditor />", () => {
       />,
     );
 
+    expandEditor();
     fireEvent.click(screen.getByTestId("business-hours-switch-mon"));
 
     expect(onChange).toHaveBeenCalledWith(null);
@@ -98,6 +124,7 @@ describe("<BusinessHoursEditor />", () => {
       />,
     );
 
+    // Validation errors force the editor open so the invalid fields are visible.
     const row = screen.getByTestId("business-hours-row-mon");
     const errorNode = within(row).getByTestId("business-hours-error-mon");
     expect(errorNode).toHaveAttribute("role", "alert");
@@ -127,6 +154,7 @@ describe("<BusinessHoursEditor />", () => {
       />,
     );
 
+    expandEditor();
     const monOpen = screen.getByTestId("business-hours-open-mon");
     fireEvent.change(monOpen, { target: { value: "10:30" } });
 
@@ -148,6 +176,8 @@ describe("<BusinessHoursEditor />", () => {
         disabled={false}
       />,
     );
+    expect(screen.queryByTestId("business-hours-metric-note")).toBeNull();
+    expandEditor();
     expect(screen.getByTestId("business-hours-metric-note")).toBeInTheDocument();
   });
 });

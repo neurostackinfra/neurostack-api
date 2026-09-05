@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 
 import ClinicConfig, {
@@ -281,16 +281,30 @@ describe("<ClinicConfig /> operations tab — business-hours UI surface", () => 
     expect(screen.getByText(/Horário do Setor de Agendamento/)).toBeInTheDocument();
   });
 
-  it("renders the new weekly business-hours editor with 7 day switches", () => {
+  it("renders both hours fields as compact summaries with on-demand editors", () => {
     mountAsInvestor();
     render(<PageWrapper><ClinicConfig /></PageWrapper>);
 
     const editor = screen.getByTestId("business-hours-editor");
+    expect(within(editor).getByTestId("business-hours-editor-summary")).toHaveTextContent(
+      "Seg–Sex: 09:00–19:00 | Sáb: 09:00–14:00 | Dom: fechado",
+    );
+    expect(within(editor).queryByTestId("business-hours-row-mon")).toBeNull();
+
+    fireEvent.click(within(editor).getByTestId("business-hours-editor-toggle"));
     for (const day of ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]) {
       expect(within(editor).getByTestId(`business-hours-row-${day}`)).toBeInTheDocument();
       expect(within(editor).getByTestId(`business-hours-switch-${day}`)).toBeInTheDocument();
     }
-    // Static metric note anchors the "no opt-in" contract on the mounted page.
     expect(within(editor).getByTestId("business-hours-metric-note")).toBeInTheDocument();
+
+    const schedulingEditor = screen.getByTestId("scheduling-hours-editor");
+    expect(within(schedulingEditor).getByTestId("scheduling-hours-editor-summary"))
+      .toHaveTextContent("Seg–Sex: 8h–18h");
+    expect(within(schedulingEditor).queryByRole("textbox")).toBeNull();
+
+    fireEvent.click(within(schedulingEditor).getByTestId("scheduling-hours-editor-toggle"));
+    expect(within(schedulingEditor).getByRole("textbox", { name: /Horário do Setor de Agendamento/ }))
+      .toHaveValue("Seg–Sex: 8h–18h");
   });
 });

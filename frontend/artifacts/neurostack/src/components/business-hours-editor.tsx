@@ -1,6 +1,14 @@
+import { useEffect, useState, type ReactNode } from "react";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { Button } from "@/components/ui/button";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import { ChevronDown, ChevronUp, Pencil } from "lucide-react";
 
 /**
  * Weekly business-hours schedule shared with the backend contract at
@@ -61,6 +69,102 @@ const DAY_FULL: Record<BusinessDayCode, DayLabel> = {
   sun: { pt: "Domingo", en: "Sunday" },
 };
 
+interface CompactHoursCardProps {
+  summary: string;
+  children: ReactNode;
+  editLabel: string;
+  closeLabel: string;
+  testId: string;
+  forceOpen?: boolean;
+}
+
+export function CompactHoursCard({
+  summary,
+  children,
+  editLabel,
+  closeLabel,
+  testId,
+  forceOpen = false,
+}: CompactHoursCardProps) {
+  const [open, setOpen] = useState(forceOpen);
+
+  useEffect(() => {
+    if (forceOpen) setOpen(true);
+  }, [forceOpen]);
+
+  return (
+    <Collapsible open={open} onOpenChange={setOpen}>
+      <div className="overflow-hidden rounded-md border border-border bg-muted/10" data-testid={testId}>
+        <div className="flex min-h-11 items-center gap-3 px-3 py-2">
+          <p
+            className="min-w-0 flex-1 truncate text-sm text-foreground"
+            title={summary}
+            data-testid={`${testId}-summary`}
+          >
+            {summary}
+          </p>
+          <CollapsibleTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-8 shrink-0 gap-1.5 px-2 text-xs"
+              aria-label={open ? closeLabel : editLabel}
+              data-testid={`${testId}-toggle`}
+            >
+              {open ? <ChevronUp className="h-3.5 w-3.5" /> : <Pencil className="h-3.5 w-3.5" />}
+              {open ? closeLabel : editLabel}
+              {!open && <ChevronDown className="h-3.5 w-3.5" />}
+            </Button>
+          </CollapsibleTrigger>
+        </div>
+        <CollapsibleContent className="border-t border-border p-3">
+          {children}
+        </CollapsibleContent>
+      </div>
+    </Collapsible>
+  );
+}
+
+export function formatBusinessHoursSummary(
+  value: BusinessHoursMap | null,
+  locale: "pt" | "en" = "pt",
+): string {
+  const current = value ?? {};
+  if (Object.keys(current).length === 0) {
+    return locale === "en" ? "No hours configured" : "Nenhum horário configurado";
+  }
+
+  const groups: Array<{
+    days: BusinessDayCode[];
+    window: BusinessHoursWindow | null;
+  }> = [];
+
+  for (const day of BUSINESS_DAY_ORDER) {
+    const window = current[day] ?? null;
+    const previous = groups.at(-1);
+    const sameWindow = previous
+      && previous.window?.open === window?.open
+      && previous.window?.close === window?.close;
+
+    if (sameWindow) {
+      previous.days.push(day);
+    } else {
+      groups.push({ days: [day], window });
+    }
+  }
+
+  return groups.map(({ days, window }) => {
+    const first = DAY_LABELS[days[0]][locale];
+    const last = DAY_LABELS[days[days.length - 1]][locale];
+    const label = days.length === 1 ? first : `${first}–${last}`;
+    const hours = window
+      ? `${window.open}–${window.close}`
+      : locale === "en" ? "closed" : "fechado";
+    return `${label}: ${hours}`;
+  }).join(" | ");
+}
+
 function emitOrNull(next: BusinessHoursMap): BusinessHoursMap | null {
   return Object.keys(next).length === 0 ? null : next;
 }
@@ -74,6 +178,7 @@ export function BusinessHoursEditor({
 }: BusinessHoursEditorProps) {
   const current: BusinessHoursMap = value ?? {};
   const txt = (pt: string, en: string) => (locale === "en" ? en : pt);
+  const hasErrors = Object.keys(errors).length > 0;
 
   const setDay = (day: BusinessDayCode, window: BusinessHoursWindow) => {
     const next: BusinessHoursMap = { ...current, [day]: window };
@@ -95,11 +200,14 @@ export function BusinessHoursEditor({
   };
 
   return (
-    <div
-      className="space-y-3 rounded-md border border-border bg-muted/10 p-3"
-      data-testid="business-hours-editor"
+    <CompactHoursCard
+      summary={formatBusinessHoursSummary(value, locale)}
+      editLabel={txt("Editar", "Edit")}
+      closeLabel={txt("Concluir", "Done")}
+      testId="business-hours-editor"
+      forceOpen={hasErrors}
     >
-      <div className="space-y-2">
+      <div className="divide-y divide-border/70">
         {BUSINESS_DAY_ORDER.map((day) => {
           const window = current[day];
           const isOpen = Boolean(window);
@@ -115,10 +223,10 @@ export function BusinessHoursEditor({
           return (
             <div
               key={day}
-              className="flex flex-col gap-2 rounded-md border border-border bg-background p-3 sm:flex-row sm:items-center"
+              className="flex min-h-11 flex-wrap items-center gap-x-3 gap-y-2 py-2 first:pt-0 last:pb-0"
               data-testid={`business-hours-row-${day}`}
             >
-              <div className="flex items-center gap-3 sm:w-40">
+              <div className="flex w-28 shrink-0 items-center gap-2.5">
                 <Switch
                   aria-label={txt(
                     `Abrir ${dayFull}`,
@@ -129,19 +237,10 @@ export function BusinessHoursEditor({
                   disabled={disabled}
                   data-testid={`business-hours-switch-${day}`}
                 />
-                <Label className="text-sm font-medium">{dayLabel}</Label>
-                <span className="text-xs text-muted-foreground">
-                  {isOpen ? txt("Aberto", "Open") : txt("Fechado", "Closed")}
-                </span>
+                <Label className="w-8 text-sm font-medium">{dayLabel}</Label>
               </div>
-              <div className="grid flex-1 grid-cols-2 gap-2">
-                <div>
-                  <Label
-                    className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground"
-                    htmlFor={`business-hours-${day}-open`}
-                  >
-                    {txt("Abertura", "Opens")}
-                  </Label>
+              {isOpen ? (
+                <div className="flex min-w-0 flex-1 items-center gap-2">
                   <Input
                     id={`business-hours-${day}-open`}
                     type="time"
@@ -160,17 +259,10 @@ export function BusinessHoursEditor({
                       })
                     }
                     disabled={disabled || !isOpen}
-                    className={rowInvalid ? "border-red-500" : ""}
+                    className={`h-8 min-w-0 max-w-32 ${rowInvalid ? "border-red-500" : ""}`}
                     data-testid={`business-hours-open-${day}`}
                   />
-                </div>
-                <div>
-                  <Label
-                    className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground"
-                    htmlFor={`business-hours-${day}-close`}
-                  >
-                    {txt("Fechamento", "Closes")}
-                  </Label>
+                  <span className="text-xs text-muted-foreground" aria-hidden="true">–</span>
                   <Input
                     id={`business-hours-${day}-close`}
                     type="time"
@@ -189,11 +281,15 @@ export function BusinessHoursEditor({
                       })
                     }
                     disabled={disabled || !isOpen}
-                    className={rowInvalid ? "border-red-500" : ""}
+                    className={`h-8 min-w-0 max-w-32 ${rowInvalid ? "border-red-500" : ""}`}
                     data-testid={`business-hours-close-${day}`}
                   />
                 </div>
-              </div>
+              ) : (
+                <span className="flex-1 text-sm text-muted-foreground">
+                  {txt("Fechado", "Closed")}
+                </span>
+              )}
               {rowInvalid && (
                 <p
                   id={errorId}
@@ -208,12 +304,12 @@ export function BusinessHoursEditor({
           );
         })}
       </div>
-      <p className="text-xs text-muted-foreground" data-testid="business-hours-metric-note">
+      <p className="mt-3 text-xs text-muted-foreground" data-testid="business-hours-metric-note">
         {txt(
-          "A métrica de atendimentos fora do horário é derivada automaticamente deste calendário e do fuso horário da clínica — sem opção de desligar.",
-          "The outside-hours metric is derived automatically from this schedule and the clinic's timezone — there is no opt-in.",
+          "A métrica de atendimentos fora do horário é derivada automaticamente deste calendário e do fuso horário da clínica.",
+          "The outside-hours metric is derived automatically from this schedule and the clinic's timezone.",
         )}
       </p>
-    </div>
+    </CompactHoursCard>
   );
 }
