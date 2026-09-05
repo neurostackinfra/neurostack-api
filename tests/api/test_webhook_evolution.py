@@ -12,7 +12,6 @@ Evolution handler remains out of scope (declared in the wish under OUT).
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
@@ -22,7 +21,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.config.settings import settings
-
 
 API_CRED_PATH = "/v1/config/api-credentials"
 WEBHOOK_PATH = "/v1/webhook/evolution"
@@ -150,11 +148,7 @@ def tenant_id() -> UUID:
 def _clear_process_state():
     """Reset per-worker replay + rate limit state between tests."""
     from src.api.middleware.rate_limit import rate_limit_store
-    from src.api.routes.webhook import (
-        _INMEM_INCOMING,
-        _INMEM_SENT,
-        _INMEM_STT_NOTICE,
-    )
+    from src.api.routes.webhook import _INMEM_INCOMING, _INMEM_SENT, _INMEM_STT_NOTICE
 
     _INMEM_INCOMING.clear()
     _INMEM_SENT.clear()
@@ -392,3 +386,72 @@ class TestEvolutionReplyIdNormalisation:
         tracked_arg = mock_track.call_args.args[0]
         assert tracked_arg == {"messageid": "REPLY_TAIL"}
         assert ":" not in tracked_arg["messageid"]
+
+
+class TestEvolutionVoiceReplyOrigin:
+    def test_text_reply_reaches_gate_as_non_audio(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        instance = f"evo_{uuid4().hex[:8]}"
+        _seed_evolution_credentials(client, tenant_id, instance)
+        payload = _evolution_text_payload(
+            instance_name=instance,
+            from_phone="5511900000290",
+            text_body="Olá",
+            message_id=f"evo_msg_{uuid4().hex[:8]}",
+        )
+        reply_gate = AsyncMock(
+            return_value=(_fake_evolution_send_result("evo_voice_gate"), False),
+        )
+
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), False)),
+            ),
+            patch("src.api.routes.webhook.get_event_service") as get_service,
+            patch(
+                "src.api.routes.webhook._send_reply_with_optional_tts",
+                reply_gate,
+            ),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Resposta"),
+            )
+            get_service.return_value = service
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "replied": True}
+        reply_gate.assert_awaited_once()
+        assert reply_gate.await_args.kwargs["input_was_audio"] is False
+
+    def test_audio_remains_non_text_without_reaching_tts_gate(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        payload = _evolution_text_payload(
+            instance_name=f"evo_{uuid4().hex[:8]}",
+            from_phone="5511900000291",
+            text_body="",
+            message_id=f"evo_audio_{uuid4().hex[:8]}",
+        )
+        payload["data"]["message"] = {
+            "audioMessage": {"url": "https://example.com/audio.ogg"}
+        }
+        reply_gate = AsyncMock()
+
+        with patch(
+            "src.api.routes.webhook._send_reply_with_optional_tts",
+            reply_gate,
+        ):
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "skipped": "non-text"}
+        reply_gate.assert_not_awaited()
