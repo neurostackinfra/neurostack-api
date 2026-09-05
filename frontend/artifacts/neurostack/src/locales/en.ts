@@ -100,6 +100,7 @@ export const en = {
   intent_paciente_ativo: "Active Patient",
   intent_fora_do_escopo: "Out of Scope",
   intent_fora_do_horario: "Out of Hours",
+  intent_outras: "Other",
 
   // Stage labels (trace viewer)
   stage_initial: "Initial",

@@ -29,20 +29,29 @@ function contextItem(
   };
 }
 
-function decisionTrace(selectedContext: TraceContextItem[]): DecisionTrace {
+interface DecisionOverrides {
+  intent?: string;
+  safety_concern?: boolean;
+  handoff_required?: boolean;
+}
+
+function decisionTrace(
+  selectedContext: TraceContextItem[],
+  overrides: DecisionOverrides = {},
+): DecisionTrace {
   return {
     id: "trace-1",
     timestamp: "2026-08-30T12:00:00Z",
     userMessage: "User message",
     srmDecision: {
-      intent: "faq",
+      intent: overrides.intent ?? "faq",
       stage: "initial",
       action: "respond",
       confidence: 0.9,
       constraints: [],
       gate_authority_before_price: false,
-      safety_concern: false,
-      handoff_required: false,
+      safety_concern: overrides.safety_concern ?? false,
+      handoff_required: overrides.handoff_required ?? false,
     },
     selectedContext,
     promptBuilt: "",
@@ -54,11 +63,12 @@ function decisionTrace(selectedContext: TraceContextItem[]): DecisionTrace {
 function renderViewer(
   selectedContext: TraceContextItem[],
   locale: Locale = "en",
+  overrides: DecisionOverrides = {},
 ) {
   localStorage.setItem("ns_locale", locale);
   return render(
     <I18nProvider>
-      <TraceViewer trace={decisionTrace(selectedContext)} />
+      <TraceViewer trace={decisionTrace(selectedContext, overrides)} />
     </I18nProvider>,
   );
 }
@@ -76,21 +86,52 @@ describe("<IntentBadge />", () => {
     expect(screen.getByTestId("badge-intent-pedido_preco")).toHaveClass("bg-blue-500", "rounded-none", "text-white");
   });
 
-  it("renders an unknown intent with the neutral fallback", () => {
+  it("renders an unknown intent as the Outras bucket fallback", () => {
     render(<I18nProvider><IntentBadge intent="future_intent" /></I18nProvider>);
-    expect(screen.getByTestId("badge-intent-future_intent")).toHaveTextContent("future_intent");
-    expect(screen.getByTestId("badge-intent-future_intent")).toHaveClass("bg-slate-500", "text-white");
+    const badge = screen.getByTestId("badge-intent-future_intent");
+    expect(badge).toHaveTextContent("Other");
+    expect(badge).not.toHaveTextContent("future_intent");
+    expect(badge).toHaveClass("bg-neutral-500", "text-white");
   });
 
   it.each(["constructor", "__proto__", "toString"])(
-    "renders inherited object property %s as a raw unknown intent",
+    "routes inherited object property %s through the Outras bucket without leaking the raw key",
     (intentName) => {
       render(<I18nProvider><IntentBadge intent={intentName} /></I18nProvider>);
       const badge = screen.getByTestId(`badge-intent-${intentName}`);
-      expect(badge).toHaveTextContent(intentName);
-      expect(badge).toHaveClass("bg-slate-500", "text-white");
+      expect(badge).toHaveTextContent("Other");
+      expect(badge.textContent).not.toContain(intentName);
+      expect(badge).toHaveClass("bg-neutral-500", "text-white");
     },
   );
+});
+
+describe("<TraceViewer /> risk markers coexist with bucket badge", () => {
+  it("renders the Dúvida Pós-Procedimento bucket badge alongside the ShieldAlert icon when safety_concern is true", () => {
+    renderViewer(
+      [],
+      "pt",
+      { intent: "pos_atendimento_sintomas_preocupantes", safety_concern: true },
+    );
+    const badge = screen.getByTestId("badge-intent-pos_atendimento_sintomas_preocupantes");
+    expect(badge).toHaveTextContent("Dúvida Pós-Procedimento");
+    const safetyFlag = screen.getByTestId("flag-safety-concern");
+    expect(safetyFlag).toBeInTheDocument();
+    expect(safetyFlag.querySelector("svg")).not.toBeNull();
+  });
+
+  it("renders the Reclamação bucket badge alongside the AlertTriangle icon when handoff_required is true", () => {
+    renderViewer(
+      [],
+      "pt",
+      { intent: "reclamacao", handoff_required: true },
+    );
+    const badge = screen.getByTestId("badge-intent-reclamacao");
+    expect(badge).toHaveTextContent("Reclamação");
+    const handoffFlag = screen.getByTestId("flag-handoff");
+    expect(handoffFlag).toBeInTheDocument();
+    expect(handoffFlag.querySelector("svg")).not.toBeNull();
+  });
 });
 
 describe("normalizeContextSource", () => {
