@@ -54,4 +54,12 @@ describe("<IntentBreakdown />", () => {
     expect(screen.getByTestId("stat-intent-reclamacao")).toHaveTextContent("12\u00b7 5,1%");
     expect(screen.getByTestId("stat-intent-reclamacao")).not.toHaveTextContent("100%");
   });
+
+  it("uses the shared palette for dots and bars", () => {
+    render(
+      <IntentBreakdown byIntent={byIntent} t={t} locale="pt" intentFilter="" onIntentFilterChange={vi.fn()} />,
+    );
+    const price = screen.getByTestId("stat-intent-pedido_preco");
+    expect(price.querySelectorAll(".bg-blue-500")).toHaveLength(2);
+  });
 });

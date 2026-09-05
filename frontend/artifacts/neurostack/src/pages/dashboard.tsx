@@ -9,6 +9,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { DateRangePicker } from "@/components/date-range-picker";
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from "recharts";
 import { format } from "date-fns";
+import { getIntentLabel, getIntentPresentation, INTENT_PRESENTATION } from "@/lib/intent-presentation";
 
 // -- Default date range: last 7 days ---
 
@@ -26,49 +27,6 @@ function getToken(): string | null {
   } catch {
     return null;
   }
-}
-
-// -- Intent metadata ---
-
-const INTENT_META: Record<string, { bar: string; dot: string; hex: string }> = {
-  // Greeting
-  saudacao:                              { bar: "bg-sky-500",     dot: "bg-sky-500",     hex: "#0ea5e9" },
-  // Interest & Qualification
-  interesse_tratamento:                  { bar: "bg-violet-500",  dot: "bg-violet-500",  hex: "#8b5cf6" },
-  qualificacao_publico:                  { bar: "bg-purple-500",  dot: "bg-purple-500",  hex: "#a855f7" },
-  comparacao_tratamentos:                { bar: "bg-fuchsia-500", dot: "bg-fuchsia-500", hex: "#d946ef" },
-  // Price & Objections
-  pedido_preco:                          { bar: "bg-blue-500",    dot: "bg-blue-500",    hex: "#3b82f6" },
-  objecao_vou_pensar:                    { bar: "bg-amber-500",   dot: "bg-amber-500",   hex: "#f59e0b" },
-  // Scheduling
-  agendar:                               { bar: "bg-green-500",   dot: "bg-green-500",   hex: "#22c55e" },
-  reagendar:                             { bar: "bg-emerald-500", dot: "bg-emerald-500", hex: "#10b981" },
-  cancelar:                              { bar: "bg-orange-500",  dot: "bg-orange-500",  hex: "#f97316" },
-  confirmar_presenca:                    { bar: "bg-teal-500",    dot: "bg-teal-500",    hex: "#14b8a6" },
-  disponibilidade_horarios:              { bar: "bg-cyan-500",    dot: "bg-cyan-500",    hex: "#06b6d4" },
-  // Info & FAQ
-  detalhes_servicos:                     { bar: "bg-indigo-400",  dot: "bg-indigo-400",  hex: "#818cf8" },
-  informacoes_profissionais:             { bar: "bg-indigo-500",  dot: "bg-indigo-500",  hex: "#6366f1" },
-  faq:                                   { bar: "bg-slate-500",   dot: "bg-slate-500",   hex: "#64748b" },
-  cultura_historia:                      { bar: "bg-slate-400",   dot: "bg-slate-400",   hex: "#94a3b8" },
-  duvida_generica_sem_contexto:          { bar: "bg-gray-500",    dot: "bg-gray-500",    hex: "#6b7280" },
-  pre_atendimento:                       { bar: "bg-lime-500",    dot: "bg-lime-500",    hex: "#84cc16" },
-  // Post-care
-  pos_atendimento_duvida:                { bar: "bg-indigo-500",  dot: "bg-indigo-500",  hex: "#6366f1" },
-  pos_atendimento_sintomas_preocupantes: { bar: "bg-red-500",     dot: "bg-red-500",     hex: "#ef4444" },
-  pedido_alterar_medicacao:              { bar: "bg-red-600",     dot: "bg-red-600",     hex: "#dc2626" },
-  // Admin / Financial
-  documentos_e_comprovantes:             { bar: "bg-zinc-500",    dot: "bg-zinc-500",    hex: "#71717a" },
-  orcamento_existente:                   { bar: "bg-blue-400",    dot: "bg-blue-400",    hex: "#60a5fa" },
-  cobranca_renegociacao:                 { bar: "bg-yellow-500",  dot: "bg-yellow-500",  hex: "#eab308" },
-  // Escalation
-  reclamacao:                            { bar: "bg-rose-500",    dot: "bg-rose-500",    hex: "#f43f5e" },
-  conduta_inadequada_ameaca:             { bar: "bg-red-700",     dot: "bg-red-700",     hex: "#b91c1c" },
-};
-
-function getIntentLabel(key: string, t: (k: TranslationKey) => string): string {
-  const tk = `intent_${key}` as TranslationKey;
-  return t(tk) || key;
 }
 
 // -- Custom tooltip ---
@@ -250,7 +208,7 @@ export function IntentBreakdown({
       key: intent,
       name: getIntentLabel(intent, t),
       value: count,
-      hex: INTENT_META[intent]?.hex ?? "#64748b",
+      hex: getIntentPresentation(intent).hex,
       pct: periodIntentTotal > 0 ? (count / periodIntentTotal) * 100 : 0,
     }));
   const emptyChart = chartData.length === 0;
@@ -277,12 +235,12 @@ export function IntentBreakdown({
           <div className="space-y-3.5">
             {Object.entries(visibleIntent).map(([intent, count]) => {
               const pct = periodIntentTotal > 0 ? (count / periodIntentTotal) * 100 : 0;
-              const m = INTENT_META[intent] ?? { bar: "bg-accent", dot: "bg-accent" };
+              const m = getIntentPresentation(intent);
               return (
                 <div key={intent} className="space-y-1" data-testid={`stat-intent-${intent}`}>
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-1.5 min-w-0">
-                      <span className={`h-2 w-2 rounded-full shrink-0 ${m.dot}`} />
+                      <span className={`h-2 w-2 rounded-full shrink-0 ${m.baseClassName}`} />
                       <span className="text-xs font-medium text-foreground truncate">{getIntentLabel(intent, t)}</span>
                     </div>
                     <span className="text-xs font-bold text-foreground shrink-0 tabular-nums">
@@ -293,7 +251,7 @@ export function IntentBreakdown({
                     </span>
                   </div>
                   <div className="h-1.5 w-full rounded-full bg-muted overflow-hidden">
-                    <div className={`h-full ${m.bar} rounded-full transition-all duration-500`} style={{ width: `${pct}%` }} />
+                    <div className={`h-full ${m.baseClassName} rounded-full transition-all duration-500`} style={{ width: `${pct}%` }} />
                   </div>
                 </div>
               );
@@ -335,7 +293,7 @@ export function IntentBreakdown({
               </div>
             </div>
             <div className="flex flex-wrap justify-center gap-x-3 gap-y-1.5">
-              {Object.entries(INTENT_META)
+              {Object.entries(INTENT_PRESENTATION)
                 .filter(([key]) => VISIBLE_INTENTS.includes(key) && (!intentFilter || key === intentFilter))
                 .map(([key, m]) => (
                   <div key={key} className="flex items-center gap-1">
