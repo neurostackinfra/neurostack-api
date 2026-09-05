@@ -102,6 +102,7 @@ export const pt: Record<TranslationKey, string> = {
   intent_paciente_ativo: "Paciente Ativo",
   intent_fora_do_escopo: "Fora do Escopo",
   intent_fora_do_horario: "Fora do Horário",
+  intent_outras: "Outras",
 
   // Stage labels (trace viewer)
   stage_initial: "Inicial",
