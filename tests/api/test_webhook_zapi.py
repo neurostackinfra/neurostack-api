@@ -29,7 +29,6 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
-from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import jwt
@@ -162,11 +161,7 @@ def tenant_id() -> UUID:
 def _clear_process_state():
     """Reset per-worker replay + rate limit state between tests."""
     from src.api.middleware.rate_limit import rate_limit_store
-    from src.api.routes.webhook import (
-        _INMEM_INCOMING,
-        _INMEM_SENT,
-        _INMEM_STT_NOTICE,
-    )
+    from src.api.routes.webhook import _INMEM_INCOMING, _INMEM_SENT, _INMEM_STT_NOTICE
 
     _INMEM_INCOMING.clear()
     _INMEM_SENT.clear()
@@ -803,6 +798,7 @@ class TestZapiSttFallbackChain:
         send_mock = AsyncMock(return_value=_fake_send_result())
         unread_mock = AsyncMock(return_value={})
         mm_mock = AsyncMock()
+        tts_gate = AsyncMock()
 
         with (
             patch("src.api.routes.webhook.safe_download_audio", self._download_ok()),
@@ -815,6 +811,10 @@ class TestZapiSttFallbackChain:
             ),
             patch("src.api.routes.webhook.send_text_message", send_mock),
             patch("src.api.routes.webhook.mark_conversation_unread", unread_mock),
+            patch(
+                "src.api.routes.webhook._send_reply_with_optional_tts",
+                tts_gate,
+            ),
         ):
             resp = client.post(
                 f"/v1/webhook/zapi/{raw_token}",
@@ -831,6 +831,7 @@ class TestZapiSttFallbackChain:
         assert unread_mock.await_count == 1
         # No multimodal configured — the second rung was never attempted
         mm_mock.assert_not_called()
+        tts_gate.assert_not_awaited()
 
     def test_stt_failure_with_multimodal_success_never_reroutes(
         self,
@@ -1202,10 +1203,7 @@ class TestZapiSttFallbackChain:
         actually runs, and it is the one whose expiry can be simulated
         without waiting six hours.
         """
-        from src.api.routes.webhook import (
-            _INMEM_STT_NOTICE,
-            _stt_fallback_notice_key,
-        )
+        from src.api.routes.webhook import _INMEM_STT_NOTICE, _stt_fallback_notice_key
 
         instance_id = f"3E{uuid4().hex[:10]}"
         raw_token = _new_canonical_token()
@@ -1425,3 +1423,158 @@ class TestZapiSttFallbackChain:
         download_mock.assert_not_called()
         send_mock.assert_not_called()
         unread_mock.assert_not_called()
+
+
+class TestZapiVoiceReplyOrigin:
+    @pytest.mark.parametrize("mixed_payload", [False, True])
+    def test_text_and_mixed_payloads_reach_reply_gate_as_non_audio(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        mixed_payload: bool,
+    ) -> None:
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_tenant(client, tenant_id, instance_id, raw_token)
+        body = _zapi_body(
+            instance_id=instance_id,
+            message_id=f"mid_{uuid4().hex[:10]}",
+        )
+        if mixed_payload:
+            body["audio"] = {
+                "url": "https://cdn.example.com/mixed.ogg",
+                "mimeType": "audio/ogg",
+            }
+
+        reply_gate = AsyncMock(return_value=(_fake_send_result(), False))
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), False)),
+            ),
+            patch("src.api.routes.webhook.get_event_service") as get_service,
+            patch(
+                "src.api.routes.webhook._send_reply_with_optional_tts",
+                reply_gate,
+            ),
+            patch("src.api.routes.webhook.mark_message_read", new=AsyncMock()),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Resposta"),
+            )
+            get_service.return_value = service
+
+            response = client.post(f"/v1/webhook/zapi/{raw_token}", json=body)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "replied": True}
+        reply_gate.assert_awaited_once()
+        assert reply_gate.await_args.kwargs["input_was_audio"] is False
+
+    def test_transcribed_patient_audio_keeps_audio_origin(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        from src.services.safe_egress import SafeDownload
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_audio_tenant(
+            client,
+            tenant_id,
+            instance_id,
+            raw_token,
+            stt=True,
+        )
+        reply_gate = AsyncMock(return_value=(_fake_send_result(), True))
+
+        with (
+            patch(
+                "src.api.routes.webhook.safe_download_audio",
+                new=AsyncMock(
+                    return_value=SafeDownload(
+                        content=b"OggS_voice",
+                        mime_type="audio/ogg",
+                    )
+                ),
+            ),
+            patch(
+                "src.api.routes.webhook._transcribe_audio_chain",
+                new=AsyncMock(return_value=("áudio transcrito", None)),
+            ),
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), False)),
+            ),
+            patch("src.api.routes.webhook.get_event_service") as get_service,
+            patch(
+                "src.api.routes.webhook._send_reply_with_optional_tts",
+                reply_gate,
+            ),
+            patch("src.api.routes.webhook.mark_message_read", new=AsyncMock()),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(
+                return_value={"business_rules": {}},
+            )
+            service.process_event = AsyncMock(
+                return_value=_fake_event_response("Resposta"),
+            )
+            get_service.return_value = service
+
+            response = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_audio_body(
+                    instance_id=instance_id,
+                    message_id=f"mid_{uuid4().hex[:10]}",
+                ),
+            )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "replied": True}
+        reply_gate.assert_awaited_once()
+        assert reply_gate.await_args.kwargs["input_was_audio"] is True
+
+    @pytest.mark.parametrize(
+        ("audio", "expected_skip"),
+        [
+            ({}, "non-text"),
+            ({"mimeType": "audio/ogg"}, "empty"),
+        ],
+    )
+    def test_malformed_or_non_transcribed_audio_never_reaches_reply_gate(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        audio: dict,
+        expected_skip: str,
+    ) -> None:
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_tenant(client, tenant_id, instance_id, raw_token)
+        body = _zapi_body(
+            instance_id=instance_id,
+            message_id=f"mid_{uuid4().hex[:10]}",
+        )
+        body.pop("text")
+        body["audio"] = audio
+        reply_gate = AsyncMock()
+
+        with (
+            patch("src.api.routes.webhook.get_event_service") as get_service,
+            patch(
+                "src.api.routes.webhook._send_reply_with_optional_tts",
+                reply_gate,
+            ),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            get_service.return_value = service
+            response = client.post(f"/v1/webhook/zapi/{raw_token}", json=body)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "skipped": expected_skip}
+        reply_gate.assert_not_awaited()

@@ -1,13 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 
+import { VoiceResponseControls } from "@/components/api-settings/voice-response-controls";
 import ClinicConfig, {
   API_CAPABILITIES,
   API_PROVIDER_AVAILABILITY,
   ApiCredentialsForm,
   describeConfigSaveFailure,
   PROVIDERS,
+  providerCardState,
   STT_PROVIDERS,
   TTS_PROVIDERS,
   WA_PROVIDERS,
@@ -44,13 +46,63 @@ function mountAsInvestor() {
   window.history.replaceState({}, "", "/config?tab=operacao");
 }
 
+function response(body: unknown, ok = true, status = ok ? 200 : 422): Response {
+  return {
+    ok,
+    status,
+    json: vi.fn().mockResolvedValue(body),
+  } as unknown as Response;
+}
+
+/** A tenant that holds no provider at all — every card must stay coming soon. */
+function emptyStatus(overrides: Record<string, unknown> = {}) {
+  return {
+    whatsapp_provider: null,
+    llm_provider: null,
+    stt_provider: null,
+    multimodal_provider: null,
+    tts_provider: null,
+    whatsapp_readiness: "incomplete",
+    llm_readiness: "incomplete",
+    stt_readiness: "incomplete",
+    multimodal_readiness: "incomplete",
+    tts_readiness: "incomplete",
+    ...overrides,
+  };
+}
+
+async function renderForm(
+  status: Record<string, unknown>,
+  props: Partial<React.ComponentProps<typeof ApiCredentialsForm>> = {},
+) {
+  const fetchMock = vi.fn().mockResolvedValue(response(status));
+  globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+  render(
+    <Wrapper>
+      <ApiCredentialsForm
+        clinicId="clinic-42"
+        isReadOnly={false}
+        isSuperAdmin={false}
+        {...props}
+      />
+    </Wrapper>,
+  );
+
+  await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+  await act(async () => { await Promise.resolve(); });
+  return fetchMock;
+}
+
 const BACKEND_PROVIDER_AVAILABILITY = {
-  whatsapp: { meta_cloud: "coming_soon", zapi: "coming_soon", uazapi: "coming_soon", evolution: "coming_soon", dialog360: "coming_soon", twilio: "coming_soon" },
-  llm: { dropout: "coming_soon", openai: "coming_soon", outros: "coming_soon", slm_cortex: "coming_soon" },
-  multimodal: { openrouter: "coming_soon" },
-  stt: { outros: "coming_soon", openai_whisper: "coming_soon", elevenlabs_scribe: "coming_soon", google_stt: "coming_soon", deepgram_stt: "coming_soon", microsoft_stt: "coming_soon" },
-  tts: { elevenlabs: "coming_soon", google: "coming_soon" },
+  whatsapp: { meta_cloud: "active", zapi: "active", uazapi: "active", evolution: "active", dialog360: "coming_soon", twilio: "coming_soon" },
+  llm: { dropout: "active", openai: "active", outros: "active", slm_cortex: "coming_soon" },
+  multimodal: { openrouter: "active" },
+  stt: { outros: "active", openai_whisper: "active", elevenlabs_scribe: "coming_soon", google_stt: "coming_soon", deepgram_stt: "coming_soon", microsoft_stt: "coming_soon" },
+  tts: { elevenlabs: "active", google: "active" },
 } as const;
+const COMING_SOON_COUNT = 7;
+const ACTIVE_COUNT = 12;
 
 describe("describeConfigSaveFailure", () => {
   it("identifies invalid backend fields without exposing their submitted values", () => {
@@ -184,10 +236,12 @@ describe("describeConfigSaveFailure", () => {
 });
 
 describe("frontend provider availability mirror", () => {
-  it("contains the exact 19 backend pairs, all coming soon", () => {
+  it("contains the exact 19 backend pairs, 12 active and 7 coming soon", () => {
     expect(API_PROVIDER_AVAILABILITY).toEqual(BACKEND_PROVIDER_AVAILABILITY);
-    expect(Object.values(API_PROVIDER_AVAILABILITY).flatMap(Object.values))
-      .toEqual(Array.from({ length: 19 }, () => "coming_soon"));
+    const states = Object.values(API_PROVIDER_AVAILABILITY).flatMap(Object.values);
+    expect(states).toHaveLength(19);
+    expect(states.filter((state) => state === "active")).toHaveLength(ACTIVE_COUNT);
+    expect(states.filter((state) => state === "coming_soon")).toHaveLength(COMING_SOON_COUNT);
   });
 
   it("does not expose a provider outside the availability matrix", () => {
@@ -207,17 +261,71 @@ describe("frontend provider availability mirror", () => {
   });
 });
 
-describe("<ApiCredentialsForm /> all-coming-soon boundary", () => {
+describe("providerCardState", () => {
+  it("offers an unheld provider the runtime can serve as available", () => {
+    expect(providerCardState("llm", "openai", emptyStatus())).toBe("available");
+    expect(providerCardState("llm", "openai", null)).toBe("available");
+    expect(providerCardState(
+      "llm",
+      "openai",
+      emptyStatus({ llm_provider: "outros", llm_readiness: "active" }),
+    )).toBe("available");
+  });
+
+  it("keeps a provider without a runtime path coming soon", () => {
+    // These must stay inert whatever the tenant holds: the backend gate
+    // rejects them, so an interactive card would only lead to a failed PATCH.
+    expect(providerCardState("llm", "slm_cortex", emptyStatus())).toBe("coming_soon");
+    expect(providerCardState("whatsapp", "twilio", emptyStatus())).toBe("coming_soon");
+    expect(providerCardState(
+      "stt",
+      "deepgram_stt",
+      emptyStatus({ stt_provider: "outros", stt_readiness: "active" }),
+    )).toBe("coming_soon");
+  });
+
+  it.each(["active", "configuration_only"])(
+    "reads a held provider with %s readiness as configured",
+    (readiness) => {
+      expect(providerCardState(
+        "stt",
+        "openai_whisper",
+        emptyStatus({ stt_provider: "openai_whisper", stt_readiness: readiness }),
+      )).toBe("configured");
+    },
+  );
+
+  it("reads a held provider with a partial bundle as incomplete", () => {
+    expect(providerCardState(
+      "llm",
+      "openai",
+      emptyStatus({ llm_provider: "openai", llm_readiness: "incomplete" }),
+    )).toBe("incomplete");
+  });
+
+  it("does not claim a signature_pending Meta bundle is configured", () => {
+    // `signature_pending` means the app secret is missing, so the bundle is
+    // partial and must not carry the CONFIGURADO seal.
+    expect(providerCardState(
+      "whatsapp",
+      "meta_cloud",
+      emptyStatus({ whatsapp_provider: "meta_cloud", whatsapp_readiness: "signature_pending" }),
+    )).toBe("incomplete");
+  });
+});
+
+describe("<ApiCredentialsForm /> card states", () => {
   const originalFetch = globalThis.fetch;
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
     localStorage.clear();
+    window.history.replaceState({}, "", "/");
     cleanup();
     vi.restoreAllMocks();
   });
 
-  it("keeps the multimodal fallback copy while making the provider inert", () => {
+  it("keeps the multimodal fallback capability copy", () => {
     expect(API_CAPABILITIES.find(({ id }) => id === "multimodal")).toMatchObject({
       short: "FallBack LLM Multimodal",
       desc: {
@@ -227,30 +335,416 @@ describe("<ApiCredentialsForm /> all-coming-soon boundary", () => {
     });
   });
 
-  it("renders all 19 Portuguese cards as inert EM BREVE cards", () => {
+  it("offers the 12 runtime-backed cards and leaves the other 7 inert", async () => {
     localStorage.setItem("ns_locale", "pt");
-    render(<Wrapper><ApiCredentialsForm clinicId="42" isReadOnly={false} isSuperAdmin={false} /></Wrapper>);
+    await renderForm(emptyStatus());
 
     const section = screen.getByTestId("api-settings-section");
     expect(within(section).getAllByTestId(/provider-card-/)).toHaveLength(19);
+    expect(within(section).getAllByText("DISPONÍVEL")).toHaveLength(ACTIVE_COUNT);
+    expect(within(section).getAllByText("EM BREVE")).toHaveLength(COMING_SOON_COUNT);
+    expect(within(section).getAllByRole("button")).toHaveLength(ACTIVE_COUNT);
+  });
+
+  it("keeps every card without a runtime path unreachable", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    await renderForm(emptyStatus());
+
+    for (const id of [
+      "whatsapp-dialog360",
+      "whatsapp-twilio",
+      "llm-slm_cortex",
+      "stt-elevenlabs_scribe",
+      "stt-google_stt",
+      "stt-deepgram_stt",
+      "stt-microsoft_stt",
+    ]) {
+      expect(screen.getByTestId(`provider-card-${id}`).tagName).toBe("ARTICLE");
+    }
+  });
+
+  it("uses the English badges for available and unavailable cards", async () => {
+    localStorage.setItem("ns_locale", "en");
+    await renderForm(emptyStatus());
+
+    expect(screen.getAllByText("AVAILABLE")).toHaveLength(ACTIVE_COUNT);
+    expect(screen.getAllByText("COMING SOON")).toHaveLength(COMING_SOON_COUNT);
+  });
+
+  it("marks only the persisted provider as CONFIGURADO and leaves the rest inert", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    await renderForm(emptyStatus({
+      llm_provider: "openai",
+      llm_readiness: "active",
+      llm_api_url: "https://api.openai.com/v1",
+      llm_model_name: "gpt-4o",
+      llm_api_key_set: true,
+    }));
+
+    expect(screen.getByTestId("provider-badge-configured-llm-openai"))
+      .toHaveTextContent("CONFIGURADO");
+    // Only the held provider carries the seal; its available siblings stay
+    // offered rather than claiming a configuration they do not have.
+    expect(screen.getAllByText("CONFIGURADO")).toHaveLength(1);
+    expect(screen.getAllByText("DISPONÍVEL")).toHaveLength(ACTIVE_COUNT - 1);
+    expect(screen.getAllByText("EM BREVE")).toHaveLength(COMING_SOON_COUNT);
+    expect(screen.getByTestId("provider-card-llm-openai").tagName).toBe("BUTTON");
+  });
+
+  it("marks a persisted but partial bundle INCOMPLETO and still lets it be repaired", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    await renderForm(emptyStatus({
+      whatsapp_provider: "meta_cloud",
+      whatsapp_readiness: "signature_pending",
+      meta_phone_number_id: "1234567890",
+      meta_permanent_token_set: true,
+    }));
+
+    expect(screen.getByTestId("provider-badge-incomplete-whatsapp-meta_cloud"))
+      .toHaveTextContent("INCOMPLETO");
+
+    fireEvent.click(screen.getByTestId("provider-card-whatsapp-meta_cloud"));
+    const editor = await screen.findByTestId("provider-editor-whatsapp-meta_cloud");
+    // The missing field is reachable, which is the whole point of keeping an
+    // incomplete bundle editable.
+    expect(within(editor).getByTestId("field-meta_app_secret")).toBeInTheDocument();
+    expect(within(editor).getByTestId("field-meta_phone_number_id"))
+      .toHaveValue("1234567890");
+  });
+
+  it("hydrates non-secret values but never pre-fills a secret", async () => {
+    await renderForm(emptyStatus({
+      llm_provider: "openai",
+      llm_readiness: "active",
+      llm_api_url: "https://api.openai.com/v1",
+      llm_model_name: "gpt-4o",
+      llm_api_key_set: true,
+      llm_api_key_masked: "sk-…abcd",
+    }));
+
+    fireEvent.click(screen.getByTestId("provider-card-llm-openai"));
+    const editor = await screen.findByTestId("provider-editor-llm-openai");
+    expect(within(editor).getByTestId("field-llm_api_url"))
+      .toHaveValue("https://api.openai.com/v1");
+    expect(within(editor).getByTestId("field-llm_api_key")).toHaveValue("");
+    expect(editor.textContent).not.toContain("sk-…abcd");
+  });
+
+  it("opens a sibling provider's editor empty instead of inheriting the held bundle", async () => {
+    await renderForm(emptyStatus({
+      llm_provider: "openai",
+      llm_readiness: "active",
+      llm_api_url: "https://api.openai.com/v1",
+      llm_model_name: "gpt-4o",
+      llm_api_key_set: true,
+    }));
+
+    fireEvent.click(screen.getByTestId("provider-card-llm-outros"));
+    const editor = await screen.findByTestId("provider-editor-llm-outros");
+    // The credential field names are flat and shared across providers, so
+    // hydrating here would offer OpenAI's endpoint and model as if they were
+    // this provider's, and a save with no edits would adopt it on credentials
+    // that belong to someone else.
+    expect(within(editor).getByTestId("field-llm_api_url")).toHaveValue("");
+    expect(within(editor).getByTestId("field-llm_model_name")).toHaveValue("");
+    expect(within(editor).getByTestId("field-llm_api_key")).toHaveValue("");
+  });
+
+  it("patches only changed fields and omits an untouched secret", async () => {
+    const fetchMock = await renderForm(emptyStatus({
+      llm_provider: "openai",
+      llm_readiness: "active",
+      llm_api_url: "https://api.openai.com/v1",
+      llm_model_name: "gpt-4o",
+      llm_api_key_set: true,
+    }));
+
+    fireEvent.click(screen.getByTestId("provider-card-llm-openai"));
+    await screen.findByTestId("provider-editor-llm-openai");
+    fireEvent.change(screen.getByTestId("field-llm_model_name"), {
+      target: { value: "gpt-4o-mini" },
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("save-llm-openai"));
+    });
+
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    expect(patch).toBeDefined();
+    // An empty secret input means "keep the stored value", so it must not be
+    // sent as an empty string that would clear the credential.
+    expect(JSON.parse(String(patch![1].body))).toEqual({ llm_model_name: "gpt-4o-mini" });
+  });
+
+  it("retires the outgoing WhatsApp bundle in the same PATCH that switches provider", async () => {
+    const fetchMock = await renderForm(emptyStatus({
+      whatsapp_provider: "zapi",
+      whatsapp_readiness: "active",
+      zapi_instance_id: "i1",
+      zapi_token_set: true,
+    }));
+
+    fireEvent.click(screen.getByTestId("provider-card-whatsapp-meta_cloud"));
+    await screen.findByTestId("provider-editor-whatsapp-meta_cloud");
+    fireEvent.change(screen.getByTestId("field-meta_phone_number_id"), {
+      target: { value: "999888777" },
+    });
+    fireEvent.change(screen.getByTestId("field-meta_permanent_token"), {
+      target: { value: "EAAG-x" },
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("save-whatsapp-meta_cloud"));
+    });
+
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    expect(patch).toBeDefined();
+    // Z-API keeps resolving its own inbound webhooks off the surviving bundle,
+    // so without this the clinic would go on replying over Z-API under Meta's
+    // name — and the Z-API card, no longer the held provider, opens empty with
+    // nothing left to blank.
+    expect(JSON.parse(String(patch![1].body))).toEqual({
+      whatsapp_provider: "meta_cloud",
+      zapi_instance_id: "",
+      meta_phone_number_id: "999888777",
+      meta_permanent_token: "EAAG-x",
+    });
+  });
+
+  it("names the adopted provider in the PATCH so the card can reach CONFIGURADO", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response(emptyStatus()))
+      .mockResolvedValueOnce(response(emptyStatus({
+        llm_provider: "openai",
+        llm_readiness: "active",
+        llm_api_url: "https://api.openai.com/v1",
+        llm_model_name: "gpt-4o",
+        llm_api_key_set: true,
+      })));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="clinic-42" isReadOnly={false} isSuperAdmin={false} />
+      </Wrapper>,
+    );
+    await waitFor(() => expect(
+      screen.getByTestId("provider-card-llm-openai").tagName,
+    ).toBe("BUTTON"));
+
+    fireEvent.click(screen.getByTestId("provider-card-llm-openai"));
+    await screen.findByTestId("provider-editor-llm-openai");
+    fireEvent.change(screen.getByTestId("field-llm_api_url"), {
+      target: { value: "https://api.openai.com/v1" },
+    });
+    fireEvent.change(screen.getByTestId("field-llm_model_name"), {
+      target: { value: "gpt-4o" },
+    });
+    fireEvent.change(screen.getByTestId("field-llm_api_key"), {
+      target: { value: "fresh-secret" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("save-llm-openai"));
+    });
+
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    expect(patch).toBeDefined();
+    // Without the provider field the credentials would land under no provider
+    // at all, leaving the card stuck short of CONFIGURADO.
+    expect(JSON.parse(String(patch![1].body))).toEqual({
+      llm_provider: "openai",
+      llm_api_url: "https://api.openai.com/v1",
+      llm_model_name: "gpt-4o",
+      llm_api_key: "fresh-secret",
+    });
+    expect(screen.getByTestId("provider-badge-configured-llm-openai"))
+      .toHaveTextContent("CONFIGURADO");
+  });
+
+  it("omits the provider field when maintaining the provider already held", async () => {
+    const fetchMock = await renderForm(emptyStatus({
+      llm_provider: "openai",
+      llm_readiness: "active",
+      llm_api_url: "https://api.openai.com/v1",
+      llm_model_name: "gpt-4o",
+      llm_api_key_set: true,
+    }));
+
+    fireEvent.click(screen.getByTestId("provider-card-llm-openai"));
+    await screen.findByTestId("provider-editor-llm-openai");
+    fireEvent.change(screen.getByTestId("field-llm_model_name"), {
+      target: { value: "gpt-4o-mini" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("save-llm-openai"));
+    });
+
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    expect(JSON.parse(String(patch![1].body))).toEqual({ llm_model_name: "gpt-4o-mini" });
+  });
+
+  it("surfaces a provider_not_available rejection without closing the editor", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response(emptyStatus({
+        llm_provider: "openai",
+        llm_readiness: "active",
+        llm_model_name: "gpt-4o",
+      })))
+      .mockResolvedValueOnce(response({ detail: { error: "provider_not_available" } }, false));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(
+      <Wrapper>
+        <ApiCredentialsForm clinicId="clinic-42" isReadOnly={false} isSuperAdmin={false} />
+      </Wrapper>,
+    );
+    // The card only becomes interactive once the loaded status lands in state,
+    // so waiting on the fetch call alone would click an inert <article>.
+    await waitFor(() => expect(
+      screen.getByTestId("provider-card-llm-openai").tagName,
+    ).toBe("BUTTON"));
+
+    fireEvent.click(screen.getByTestId("provider-card-llm-openai"));
+    await screen.findByTestId("provider-editor-llm-openai");
+    fireEvent.change(screen.getByTestId("field-llm_model_name"), {
+      target: { value: "rejected" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("save-llm-openai"));
+    });
+
+    expect(screen.getByTestId("provider-editor-llm-openai")).toBeInTheDocument();
+  });
+
+  it("opens no editor for a read-only viewer even when a provider is held", async () => {
+    await renderForm(
+      emptyStatus({ llm_provider: "openai", llm_readiness: "active" }),
+      { isReadOnly: true },
+    );
+
+    const section = screen.getByTestId("api-settings-section");
+    expect(section.querySelectorAll("input, textarea, select")).toHaveLength(0);
+    fireEvent.click(screen.getByTestId("provider-card-llm-openai"));
+    expect(within(section).queryByTestId(/provider-editor-/)).not.toBeInTheDocument();
+  });
+
+  it("drops the previous tenant's open editor when the viewed clinic changes", async () => {
+    const held = emptyStatus({
+      llm_provider: "openai",
+      llm_readiness: "active",
+      llm_model_name: "clinic-a-model",
+    });
+    const fetchMock = vi.fn().mockResolvedValue(response(held));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const { rerender } = render(
+      <Wrapper><ApiCredentialsForm clinicId="clinic-a" isReadOnly={false} isSuperAdmin /></Wrapper>,
+    );
+    await waitFor(() => expect(
+      screen.getByTestId("provider-card-llm-openai").tagName,
+    ).toBe("BUTTON"));
+    fireEvent.click(screen.getByTestId("provider-card-llm-openai"));
+    await screen.findByTestId("provider-editor-llm-openai");
+
+    // The builder switches clinics; the prop changes without a remount, so the
+    // component itself has to drop clinic A's editor and draft.
+    fetchMock.mockResolvedValue(response(emptyStatus()));
+    await act(async () => {
+      rerender(
+        <Wrapper><ApiCredentialsForm clinicId="clinic-b" isReadOnly={false} isSuperAdmin /></Wrapper>,
+      );
+    });
+
+    expect(screen.queryByTestId("provider-editor-llm-openai")).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue("clinic-a-model")).not.toBeInTheDocument();
+    // Clinic B holds nothing, so the card falls back to an offer rather than
+    // carrying clinic A's CONFIGURADO seal across the switch.
+    expect(screen.getByTestId("provider-badge-available-llm-openai"))
+      .toBeInTheDocument();
+  });
+
+  it("keeps every card inert and warns when the status fetch fails", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    const fetchMock = vi.fn().mockResolvedValue(response({}, false, 500));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(
+      <Wrapper><ApiCredentialsForm clinicId="clinic-42" isReadOnly={false} isSuperAdmin={false} /></Wrapper>,
+    );
+    await screen.findByTestId("api-settings-load-error");
+
+    // Fail closed: an unknown tenant state must never make a card editable.
+    const section = screen.getByTestId("api-settings-section");
     expect(within(section).getAllByText("EM BREVE")).toHaveLength(19);
-    expect(section.querySelectorAll("input, button, select, textarea, [tabindex]")).toHaveLength(0);
     expect(within(section).queryByRole("button")).not.toBeInTheDocument();
   });
 
-  it("uses the English COMING SOON badge for every card", () => {
-    localStorage.setItem("ns_locale", "en");
-    render(<Wrapper><ApiCredentialsForm clinicId="42" isReadOnly={false} isSuperAdmin={false} /></Wrapper>);
-    expect(screen.getAllByText("COMING SOON")).toHaveLength(19);
+  it("keeps voice controls as a sibling of the provider grid", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response(emptyStatus()));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(
+      <Wrapper>
+        <div data-testid="integrations-content">
+          <VoiceResponseControls clinicId="preview" isReadOnly role="investor" />
+          <ApiCredentialsForm clinicId="preview" isReadOnly isSuperAdmin={false} />
+        </div>
+      </Wrapper>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const voiceSection = screen.getByTestId("voice-response-controls");
+    const apiSection = screen.getByTestId("api-settings-section");
+    expect(apiSection.contains(voiceSection)).toBe(false);
+    expect(within(apiSection).getAllByTestId(/provider-card-/)).toHaveLength(19);
   });
 
-  it("does not read, normalize, or submit legacy credentials", () => {
-    const fetchMock = vi.fn();
+  it("does not expose the Integrations tab or voice section to clinic admins", async () => {
+    const payload = btoa(JSON.stringify({
+      sub: "clinic-admin",
+      clinic_id: "clinic-admin",
+      role: "clinic_admin",
+      exp: 9999999999,
+    }));
+    const token = `eyJhbGciOiJub25lIn0.${payload}.synthetic`;
+    localStorage.setItem("ns_locale", "en");
+    localStorage.setItem("ns_auth", JSON.stringify({
+      token,
+      email: "admin@example.test",
+      clinicId: "clinic-admin",
+      tenantId: "clinic-admin",
+      userId: "clinic-admin",
+      builderId: null,
+      role: "clinic_admin",
+      viewingClinicId: "clinic-admin",
+      leadSubmitted: true,
+    }));
+    window.history.replaceState({}, "", "/config?tab=integracoes");
+    let resolveConfig!: (value: Response) => void;
+    const fetchMock = vi.fn().mockImplementation(() => new Promise<Response>((resolve) => {
+      resolveConfig = resolve;
+    }));
     globalThis.fetch = fetchMock as unknown as typeof fetch;
-    localStorage.setItem("ns_locale", "pt");
-    render(<Wrapper><ApiCredentialsForm clinicId="legacy-clinic" isReadOnly={false} isSuperAdmin /></Wrapper>);
-    expect(screen.getByTestId("api-settings-legacy-state-note")).toHaveTextContent("configurações de API existentes são preservadas");
-    expect(fetchMock).not.toHaveBeenCalled();
+
+    render(
+      <AuthProvider>
+        <Wrapper>
+          <ClinicConfig />
+        </Wrapper>
+      </AuthProvider>,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    await act(async () => {
+      resolveConfig(response({ clinic_name: "Clinic" }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await screen.findByRole("tab", { name: "Identity" });
+    expect(screen.queryByRole("tab", { name: "Integrations" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("voice-response-controls")).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("api-credentials"))).toBe(false);
   });
 });
 
@@ -281,16 +775,30 @@ describe("<ClinicConfig /> operations tab — business-hours UI surface", () => 
     expect(screen.getByText(/Horário do Setor de Agendamento/)).toBeInTheDocument();
   });
 
-  it("renders the new weekly business-hours editor with 7 day switches", () => {
+  it("renders both hours fields as compact summaries with on-demand editors", () => {
     mountAsInvestor();
     render(<PageWrapper><ClinicConfig /></PageWrapper>);
 
     const editor = screen.getByTestId("business-hours-editor");
+    expect(within(editor).getByTestId("business-hours-editor-summary")).toHaveTextContent(
+      "Seg–Sex: 09:00–19:00 | Sáb: 09:00–14:00 | Dom: fechado",
+    );
+    expect(within(editor).queryByTestId("business-hours-row-mon")).toBeNull();
+
+    fireEvent.click(within(editor).getByTestId("business-hours-editor-toggle"));
     for (const day of ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]) {
       expect(within(editor).getByTestId(`business-hours-row-${day}`)).toBeInTheDocument();
       expect(within(editor).getByTestId(`business-hours-switch-${day}`)).toBeInTheDocument();
     }
-    // Static metric note anchors the "no opt-in" contract on the mounted page.
     expect(within(editor).getByTestId("business-hours-metric-note")).toBeInTheDocument();
+
+    const schedulingEditor = screen.getByTestId("scheduling-hours-editor");
+    expect(within(schedulingEditor).getByTestId("scheduling-hours-editor-summary"))
+      .toHaveTextContent("Seg–Sex: 8h–18h");
+    expect(within(schedulingEditor).queryByRole("textbox")).toBeNull();
+
+    fireEvent.click(within(schedulingEditor).getByTestId("scheduling-hours-editor-toggle"));
+    expect(within(schedulingEditor).getByRole("textbox", { name: /Horário do Setor de Agendamento/ }))
+      .toHaveValue("Seg–Sex: 8h–18h");
   });
 });

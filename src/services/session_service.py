@@ -21,6 +21,8 @@ from src.api.schemas.sessions import (
     SessionResponse,
     SessionUpdateRequest,
 )
+from src.core.interaction_context import InteractionOrigin
+from src.models.event import Event, EventType
 from src.models.session import CognitiveStateData, Session
 from src.repositories import EventRepository, SessionRepository, TenantRepository
 
@@ -162,7 +164,11 @@ class SessionService:
         raise SessionReactivationError(result)
 
     async def create_session(
-        self, request: SessionCreateRequest, db: AsyncSession
+        self,
+        request: SessionCreateRequest,
+        db: AsyncSession,
+        *,
+        tenant_id: UUID,
     ) -> SessionResponse:
         """
         Create a new conversation session.
@@ -180,13 +186,13 @@ class SessionService:
         tenant_repo = TenantRepository(db)
 
         # Validate tenant exists
-        tenant = await tenant_repo.get_by_id(request.tenant_id)
+        tenant = await tenant_repo.get_by_id(tenant_id)
 
         if not tenant:
-            raise ValueError(f"Tenant {request.tenant_id} not found")
+            raise ValueError(f"Tenant {tenant_id} not found")
 
         if not tenant.is_active:
-            raise ValueError(f"Tenant {request.tenant_id} is not active")
+            raise ValueError(f"Tenant {tenant_id} is not active")
 
         session_repo = SessionRepository(db)
 
@@ -202,7 +208,7 @@ class SessionService:
 
         # Create session
         new_session = await session_repo.create(
-            tenant_id=request.tenant_id,
+            tenant_id=tenant_id,
             user_id=request.user_id,
             channel=request.channel,
             cognitive_state=initial_state.to_dict(),
@@ -211,7 +217,12 @@ class SessionService:
 
         return self._session_to_response(new_session)
 
-    async def get_session(self, session_id: UUID, db: AsyncSession) -> SessionResponse:
+    async def get_session(
+        self,
+        session_id: UUID,
+        tenant_id: UUID,
+        db: AsyncSession,
+    ) -> SessionResponse:
         """
         Retrieve session details by ID.
 
@@ -227,7 +238,7 @@ class SessionService:
         """
         session_repo = SessionRepository(db)
 
-        db_session = await session_repo.get_by_id(session_id)
+        db_session = await session_repo.get_by_tenant(session_id, tenant_id)
 
         if not db_session:
             raise ValueError(f"Session {session_id} not found")
@@ -295,6 +306,7 @@ class SessionService:
     async def update_session(
         self,
         session_id: UUID,
+        tenant_id: UUID,
         request: SessionUpdateRequest,
         db: AsyncSession,
     ) -> SessionResponse:
@@ -320,14 +332,23 @@ class SessionService:
         if request.is_active is not None:
             update_data["is_active"] = request.is_active
 
-        updated_session = await session_repo.update(session_id, **update_data)
+        updated_session = await session_repo.update_for_tenant(
+            session_id,
+            tenant_id,
+            **update_data,
+        )
 
         if not updated_session:
             raise ValueError(f"Session {session_id} not found")
 
         return self._session_to_response(updated_session)
 
-    async def end_session(self, session_id: UUID, db: AsyncSession) -> None:
+    async def end_session(
+        self,
+        session_id: UUID,
+        tenant_id: UUID,
+        db: AsyncSession,
+    ) -> None:
         """
         End a session (mark as inactive).
 
@@ -340,7 +361,7 @@ class SessionService:
         """
         session_repo = SessionRepository(db)
 
-        success = await session_repo.end_session(session_id)
+        success = await session_repo.end_for_tenant(session_id, tenant_id)
 
         if not success:
             raise ValueError(f"Session {session_id} not found")
@@ -366,6 +387,10 @@ class SessionService:
         Returns:
             Session events response
         """
+        session_repo = SessionRepository(db)
+        if await session_repo.get_by_tenant(session_id, tenant_id) is None:
+            raise ValueError(f"Session {session_id} not found")
+
         event_repo = EventRepository(db)
 
         events_list = await event_repo.find_by_session(
@@ -376,16 +401,7 @@ class SessionService:
         )
         total = await event_repo.count_by_session(tenant_id, session_id)
 
-        event_responses = [
-            SessionEventResponse(
-                event_id=event.id,
-                event_type=event.event_type,
-                payload=event.event_data,
-                decision=event.event_data.get("decision"),
-                created_at=event.created_at.isoformat(),
-            )
-            for event in events_list
-        ]
+        event_responses = [self._event_to_response(event) for event in events_list]
 
         return SessionEventsResponse(
             session_id=session_id,
@@ -395,8 +411,28 @@ class SessionService:
             offset=offset,
         )
 
+    @staticmethod
+    def _event_to_response(event: Event) -> SessionEventResponse:
+        origin = event.interaction_origin or InteractionOrigin.UNKNOWN.value
+        return SessionEventResponse(
+            event_id=event.id,
+            tenant_id=event.tenant_id,
+            session_id=event.session_id,
+            event_type=event.event_type,
+            interaction_origin=InteractionOrigin(origin),
+            interaction_event_id=(
+                event.id if event.event_type == EventType.MESSAGE_IN.value else None
+            ),
+            payload=event.event_data,
+            decision=event.event_data.get("decision"),
+            created_at=event.created_at.isoformat(),
+        )
+
     async def get_session_state(
-        self, session_id: UUID, db: AsyncSession
+        self,
+        session_id: UUID,
+        tenant_id: UUID,
+        db: AsyncSession,
     ) -> CognitiveState:
         """
         Get the cognitive state of a session.
@@ -413,7 +449,7 @@ class SessionService:
         """
         session_repo = SessionRepository(db)
 
-        db_session = await session_repo.get_by_id(session_id)
+        db_session = await session_repo.get_by_tenant(session_id, tenant_id)
 
         if not db_session:
             raise ValueError(f"Session {session_id} not found")

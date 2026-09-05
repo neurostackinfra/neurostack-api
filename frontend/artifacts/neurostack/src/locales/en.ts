@@ -375,9 +375,11 @@ export const en = {
   admin_alerts_empty: "No alerts, all systems operational",
 
   // ── Context Sources (Trace Viewer) ──
-  ctx_panel_title: "Context Used",
-  ctx_origin_config: "Configuration",
-  ctx_origin_rag: "Knowledge Base",
+  ctx_panel_title: "Selected Context",
+  ctx_origin_config: "Clinic Config",
+  ctx_origin_rag: "RAG",
+  ctx_origin_unknown: "Unknown Source",
+  ctx_title_fallback: "Context",
   ctx_empty: "No context used.",
   ctx_field_identity_clinic_name: "Clinic Name",
   ctx_field_persona_agent_name: "Agent Name",

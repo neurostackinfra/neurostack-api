@@ -6,12 +6,14 @@ import pytest
 
 from src.services.api_credentials import (
     API_CREDENTIAL_FIELDS,
+    CAPABILITY_PROVIDER_FIELDS,
     CONFIG_CACHE_SCHEMA_VERSION,
     CONFIG_CACHE_VERSION_FIELD,
-    PROVIDER_AVAILABILITY,
     PROVIDER_ALLOWLISTS,
+    PROVIDER_AVAILABILITY,
     READINESS_IDS,
     SECRET_FIELDS,
+    TTS_FIELDS,
     WIRE_ERROR_CODES,
     CredentialPolicyError,
     build_cache_payload,
@@ -27,39 +29,57 @@ from src.services.api_credentials import (
 )
 
 
-def test_provider_availability_is_the_exact_all_coming_soon_contract() -> None:
+def test_provider_availability_is_active_exactly_where_a_runtime_path_exists() -> None:
+    """The 19 displayable pairs split into 12 adoptable and 7 still blocked.
+
+    A provider is `active` only where a runtime send/transcribe/synthesize
+    path dispatches on it. The 7 below have no such path, so marking them
+    available would hand a tenant a green badge over a capability that fails
+    at message time.
+    """
+
     assert PROVIDER_AVAILABILITY == {
         "whatsapp": {
-            "meta_cloud": "coming_soon",
-            "zapi": "coming_soon",
-            "uazapi": "coming_soon",
-            "evolution": "coming_soon",
+            "meta_cloud": "active",
+            "zapi": "active",
+            "uazapi": "active",
+            "evolution": "active",
             "dialog360": "coming_soon",
             "twilio": "coming_soon",
         },
         "llm": {
-            "dropout": "coming_soon",
-            "openai": "coming_soon",
-            "outros": "coming_soon",
+            "dropout": "active",
+            "openai": "active",
+            "outros": "active",
             "slm_cortex": "coming_soon",
         },
-        "multimodal": {"openrouter": "coming_soon"},
+        "multimodal": {"openrouter": "active"},
         "stt": {
-            "outros": "coming_soon",
-            "openai_whisper": "coming_soon",
+            "outros": "active",
+            "openai_whisper": "active",
             "elevenlabs_scribe": "coming_soon",
             "google_stt": "coming_soon",
             "deepgram_stt": "coming_soon",
             "microsoft_stt": "coming_soon",
         },
-        "tts": {"elevenlabs": "coming_soon", "google": "coming_soon"},
+        "tts": {"elevenlabs": "active", "google": "active"},
     }
     assert sum(len(providers) for providers in PROVIDER_AVAILABILITY.values()) == 19
-    assert all(
-        availability == "coming_soon"
-        for providers in PROVIDER_AVAILABILITY.values()
-        for availability in providers.values()
-    )
+    unavailable = {
+        f"{capability}:{provider}"
+        for capability, providers in PROVIDER_AVAILABILITY.items()
+        for provider, availability in providers.items()
+        if availability != "active"
+    }
+    assert unavailable == {
+        "whatsapp:dialog360",
+        "whatsapp:twilio",
+        "llm:slm_cortex",
+        "stt:elevenlabs_scribe",
+        "stt:google_stt",
+        "stt:deepgram_stt",
+        "stt:microsoft_stt",
+    }
     assert PROVIDER_ALLOWLISTS == {
         capability: frozenset(providers)
         for capability, providers in PROVIDER_AVAILABILITY.items()
@@ -110,38 +130,6 @@ def test_merge_errors_are_exact_and_atomic(
         merge_credentials(existing, patch)
     assert caught.value.detail == {"error": error, **context}
     assert existing == snapshot
-
-
-def test_post_merge_availability_rejects_effective_changes_and_allows_masked_echo() -> None:
-    existing = {
-        "llm_provider": "openai",
-        "llm_api_url": "https://api.openai.com/v1",
-        "llm_api_key": "secret-one",
-        "llm_model_name": "old-model",
-    }
-    changed = merge_credentials(
-        existing,
-        {"llm_model_name": "new-model", "llm_api_key": "••••••••"},
-    )
-    with pytest.raises(CredentialPolicyError) as caught:
-        validate_provider_availability(existing, changed)
-    assert caught.value.detail == {
-        "error": "provider_not_available",
-        "capability": "llm",
-        "provider": "openai",
-    }
-
-    echoed = merge_credentials(
-        existing,
-        {
-            "llm_provider": "openai",
-            "llm_api_url": "https://api.openai.com/v1",
-            "llm_api_key": "••••••••",
-            "llm_model_name": "old-model",
-        },
-    )
-    assert echoed == existing
-    validate_provider_availability(existing, echoed)
 
 
 def test_sequential_saves_preserve_capabilities_and_clean_stt_aliases() -> None:
@@ -203,6 +191,7 @@ def test_tts_configuration_is_operational_but_never_projected_to_cache(
             "tts_model_name": "pt-br-voice",
             "tts_voice_id": voice_id,
             "tts_enabled": True,
+            "tts_reply_policy": "all_inputs",
         },
     )
 
@@ -212,11 +201,78 @@ def test_tts_configuration_is_operational_but_never_projected_to_cache(
     assert status["tts_api_key_masked"] == "••••••••"
     assert status["tts_enabled"] is True
     assert status["tts_voice_id"] == voice_id
+    assert status["tts_reply_policy"] == "all_inputs"
     assert status["tts_readiness"] == "active"
     assert not any(
         field.startswith("tts_") for field in runtime_projection(credentials)
     )
     assert "tts-secret" not in repr(status)
+
+
+@pytest.mark.parametrize(
+    ("patch", "expected_controls"),
+    [
+        (
+            {"tts_reply_policy": "all_inputs"},
+            {"tts_enabled": False, "tts_reply_policy": "all_inputs"},
+        ),
+        (
+            {"tts_enabled": True},
+            {"tts_enabled": True, "tts_reply_policy": "audio_input"},
+        ),
+        (
+            {
+                "tts_enabled": True,
+                "tts_reply_policy": "all_inputs",
+                "tts_api_key": "••••••••",
+            },
+            {"tts_enabled": True, "tts_reply_policy": "all_inputs"},
+        ),
+    ],
+)
+def test_tts_control_merge_preserves_complete_saved_bundle_and_readiness(
+    patch: dict[str, object], expected_controls: dict[str, object]
+) -> None:
+    existing = {
+        "tts_provider": "google",
+        "tts_api_url": "https://texttospeech.googleapis.com/v1",
+        "tts_api_key": "saved-tts-secret",
+        "tts_model_name": "pt-br-voice",
+        "tts_voice_id": "saved-voice",
+        "tts_enabled": False,
+        "llm_model_name": "unrelated-model",
+    }
+
+    merged = merge_credentials(existing, patch)
+
+    assert "tts_reply_policy" in TTS_FIELDS
+    validate_provider_availability(existing, merged)
+    status = credential_status(merged)
+    assert status["tts_enabled"] is expected_controls["tts_enabled"]
+    assert status["tts_reply_policy"] == expected_controls["tts_reply_policy"]
+    assert status["tts_readiness"] == "active"
+    for field in (
+        "tts_provider",
+        "tts_api_url",
+        "tts_api_key",
+        "tts_model_name",
+        "tts_voice_id",
+        "llm_model_name",
+    ):
+        assert merged[field] == existing[field]
+    assert "saved-tts-secret" not in repr(status)
+    assert not any(field.startswith("tts_") for field in runtime_projection(merged))
+
+
+def test_tts_reply_policy_status_defaults_only_for_legacy_storage() -> None:
+    assert credential_status({})["tts_reply_policy"] == "audio_input"
+    assert credential_status({"tts_provider": "google"})["tts_reply_policy"] == (
+        "audio_input"
+    )
+    assert (
+        credential_status({"tts_reply_policy": "all_inputs"})["tts_reply_policy"]
+        == "all_inputs"
+    )
 
 
 @pytest.mark.parametrize(
@@ -689,3 +745,802 @@ def test_generic_boundary_covers_exact_fields_aliases_and_future_prefixes() -> N
     assert "llm_base_url" in blocked
     assert "tts_future_secret" in blocked
     assert set(API_CREDENTIAL_FIELDS).issubset(blocked)
+
+
+def test_post_merge_availability_allows_maintaining_the_persisted_provider() -> None:
+    existing = {
+        "llm_provider": "openai",
+        "llm_api_url": "https://api.openai.com/v1",
+        "llm_api_key": "secret-one",
+        "llm_model_name": "old-model",
+    }
+    changed = merge_credentials(
+        existing,
+        {"llm_model_name": "new-model", "llm_api_key": "••••••••"},
+    )
+    validate_provider_availability(existing, changed)
+    assert changed["llm_model_name"] == "new-model"
+    assert changed["llm_api_key"] == "secret-one"
+
+    echoed = merge_credentials(
+        existing,
+        {
+            "llm_provider": "openai",
+            "llm_api_url": "https://api.openai.com/v1",
+            "llm_api_key": "••••••••",
+            "llm_model_name": "old-model",
+        },
+    )
+    assert echoed == existing
+    validate_provider_availability(existing, echoed)
+
+
+@pytest.mark.parametrize(
+    ("existing", "patch", "rejected_provider"),
+    [
+        pytest.param(
+            {
+                "llm_provider": "openai",
+                "llm_api_url": "https://api.openai.com/v1",
+                "llm_api_key": "secret-one",
+                "llm_model_name": "old-model",
+            },
+            {"llm_provider": "slm_cortex"},
+            "slm_cortex",
+            id="provider_switch",
+        ),
+        pytest.param(
+            {
+                "llm_provider": "openai",
+                "llm_api_url": "https://api.openai.com/v1",
+                "llm_api_key": "secret-one",
+                "llm_model_name": "old-model",
+            },
+            {"llm_provider": None},
+            None,
+            id="provider_clear",
+        ),
+        pytest.param(
+            {},
+            {
+                "llm_provider": "slm_cortex",
+                "llm_api_url": "https://api.slm-cortex.example/v1",
+                "llm_api_key": "fresh-secret",
+                "llm_model_name": "fresh-model",
+            },
+            "slm_cortex",
+            id="bootstrap_from_nothing",
+        ),
+    ],
+)
+def test_post_merge_availability_rejects_adopting_a_provider_not_held(
+    existing: dict[str, object],
+    patch: dict[str, object],
+    rejected_provider: str | None,
+) -> None:
+    snapshot = dict(existing)
+    candidate = merge_credentials(existing, patch)
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(existing, candidate)
+    assert caught.value.detail == {
+        "error": "provider_not_available",
+        "capability": "llm",
+        "provider": rejected_provider,
+    }
+    assert existing == snapshot
+
+
+@pytest.mark.parametrize(
+    ("capability", "provider", "patch"),
+    [
+        (
+            "whatsapp",
+            "meta_cloud",
+            {
+                "whatsapp_provider": "meta_cloud",
+                "meta_phone_number_id": "1234567890",
+                "meta_permanent_token": "EAAG-fresh",
+                "meta_app_secret": "fresh-secret",
+            },
+        ),
+        (
+            "whatsapp",
+            "zapi",
+            {
+                "whatsapp_provider": "zapi",
+                "zapi_instance_id": "i-fresh",
+                "zapi_token": "t-fresh",
+                "zapi_client_token": "c-fresh",
+            },
+        ),
+        (
+            "llm",
+            "openai",
+            {
+                "llm_provider": "openai",
+                "llm_api_url": "https://api.openai.com/v1",
+                "llm_api_key": "fresh-secret",
+                "llm_model_name": "gpt-4o",
+            },
+        ),
+        (
+            "multimodal",
+            "openrouter",
+            {
+                "multimodal_provider": "openrouter",
+                "multimodal_api_url": "https://openrouter.ai/api/v1",
+                "multimodal_api_key": "fresh-secret",
+                "multimodal_model_name": "fresh-model",
+            },
+        ),
+        (
+            "stt",
+            "openai_whisper",
+            {
+                "stt_provider": "openai_whisper",
+                "stt_api_url": "https://api.openai.com/v1",
+                "stt_api_key": "fresh-secret",
+                "stt_model_name": "whisper-1",
+            },
+        ),
+        (
+            "tts",
+            "elevenlabs",
+            {
+                "tts_provider": "elevenlabs",
+                "tts_api_url": "https://api.elevenlabs.io/v1",
+                "tts_api_key": "fresh-secret",
+                "tts_model_name": "eleven_multilingual_v2",
+                "tts_voice_id": "voice-1",
+            },
+        ),
+    ],
+)
+def test_a_tenant_holding_nothing_can_adopt_an_active_provider(
+    capability: str, provider: str, patch: dict[str, object]
+) -> None:
+    """Bootstrapping is allowed exactly where the runtime can serve it."""
+
+    candidate = merge_credentials({}, patch)
+    validate_provider_availability({}, candidate)
+    assert candidate[CAPABILITY_PROVIDER_FIELDS[capability]] == provider
+
+
+@pytest.mark.parametrize(
+    ("provider", "missing_field"),
+    [
+        ("google", "tts_api_url"),
+        ("google", "tts_api_key"),
+        ("google", "tts_model_name"),
+        ("elevenlabs", "tts_voice_id"),
+    ],
+)
+def test_incomplete_stored_bundle_can_be_completed_by_its_own_provider(
+    provider: str, missing_field: str
+) -> None:
+    complete = {
+        "tts_provider": provider,
+        "tts_api_url": "https://texttospeech.googleapis.com/v1",
+        "tts_api_key": "saved-tts-secret",
+        "tts_model_name": "pt-br-voice",
+        "tts_voice_id": "saved-voice",
+    }
+    existing = {k: v for k, v in complete.items() if k != missing_field}
+    assert credential_status(existing)["tts_readiness"] == "incomplete"
+
+    repaired = merge_credentials(existing, {missing_field: complete[missing_field]})
+    validate_provider_availability(existing, repaired)
+    assert credential_status(repaired)["tts_readiness"] == "active"
+
+
+def test_meta_signature_pending_bundle_can_be_completed() -> None:
+    existing = {
+        "whatsapp_provider": "meta_cloud",
+        "meta_phone_number_id": "phone-1",
+        "meta_permanent_token": "token-1",
+    }
+    assert credential_status(existing)["whatsapp_readiness"] == "signature_pending"
+
+    candidate = merge_credentials(existing, {"meta_app_secret": "app-secret"})
+    validate_provider_availability(existing, candidate)
+    assert credential_status(candidate)["whatsapp_readiness"] == "active"
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(
+            existing, merge_credentials(existing, {"whatsapp_provider": "dialog360"})
+        )
+    assert caught.value.detail == {
+        "error": "provider_not_available",
+        "capability": "whatsapp",
+        "provider": "dialog360",
+    }
+
+
+@pytest.mark.parametrize(
+    ("label", "existing", "patch", "adopted"),
+    [
+        (
+            "zapi_tenant_writes_meta_bundle",
+            {
+                "whatsapp_provider": "zapi",
+                "zapi_instance_id": "i1",
+                "zapi_token": "t1",
+                "zapi_client_token": "c1",
+            },
+            {
+                "meta_phone_number_id": "999888777",
+                "meta_permanent_token": "EAAG-x",
+                "meta_app_secret": "s",
+            },
+            "meta_cloud",
+        ),
+        (
+            "meta_tenant_writes_zapi_bundle",
+            {"whatsapp_provider": "meta_cloud", "meta_phone_number_id": "111"},
+            {"zapi_instance_id": "i9", "zapi_token": "t9"},
+            "zapi",
+        ),
+        (
+            "empty_tenant_writes_meta_bundle",
+            {},
+            {"meta_phone_number_id": "999", "meta_permanent_token": "E"},
+            "meta_cloud",
+        ),
+        (
+            "zapi_tenant_writes_uazapi_bundle",
+            {"whatsapp_provider": "zapi", "zapi_token": "t1"},
+            {"uazapi_api_url": "https://u", "uazapi_token": "ut"},
+            "uazapi",
+        ),
+    ],
+)
+def test_whatsapp_bundle_cannot_adopt_a_provider_without_naming_it(
+    label: str,
+    existing: dict[str, object],
+    patch: dict[str, object],
+    adopted: str,
+) -> None:
+    """WhatsApp runtime dispatches on credential material, not on the label.
+
+    The webhook resolves a tenant from ``meta_phone_number_id`` and picks its
+    outbound path from whichever token is set, so leaving ``whatsapp_provider``
+    untouched while writing another provider's bundle would silently adopt that
+    provider. The gate must reject the bundle regardless of the label.
+    """
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(existing, merge_credentials(existing, patch))
+    assert caught.value.detail == {
+        "error": "provider_not_available",
+        "capability": "whatsapp",
+        "provider": adopted,
+    }
+
+
+_STORED_ZAPI = {
+    "whatsapp_provider": "zapi",
+    "zapi_instance_id": "i1",
+    "zapi_token": "t1",
+    "zapi_client_token": "c1",
+    "zapi_inbound_token_digest": "d" * 64,
+}
+_WHOLE_META_BUNDLE = {
+    "whatsapp_provider": "meta_cloud",
+    "meta_phone_number_id": "999888777",
+    "meta_waba_id": "waba-1",
+    "meta_permanent_token": "EAAG-x",
+    "meta_app_secret": "app-secret",
+    "meta_verify_token": "verify",
+}
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        pytest.param({"whatsapp_provider": "meta_cloud"}, id="bare_relabel"),
+        pytest.param({"whatsapp_provider": "uazapi"}, id="bare_relabel_other_provider"),
+        pytest.param(
+            {"whatsapp_provider": "meta_cloud", "meta_phone_number_id": "999888777"},
+            id="partial_bundle",
+        ),
+    ],
+)
+def test_whatsapp_relabel_the_credentials_cannot_back_is_rejected(
+    patch: dict[str, object],
+) -> None:
+    """The label has no runtime effect, so it may not outrun the bundle.
+
+    The outbound path is chosen from whichever bundle is populated, so a tenant
+    that relabels to a provider it holds no working credentials for would keep
+    sending over the old provider while the stored label, and every consumer
+    reading it, names the new one.
+    """
+
+    existing = dict(_STORED_ZAPI)
+    snapshot = dict(existing)
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(existing, merge_credentials(existing, patch))
+    assert caught.value.detail["error"] == "provider_not_available"
+    assert caught.value.detail["capability"] == "whatsapp"
+    assert existing == snapshot
+
+
+# The non-secret outbound field of each bundle: the one a credential form can
+# actually blank out, since `merge_credentials` reads an emptied secret as
+# "keep the stored value" rather than as a clear.
+_WHATSAPP_DECOMMISSION_LEVER = {
+    "zapi": "zapi_instance_id",
+    "meta_cloud": "meta_phone_number_id",
+    "evolution": "evolution_api_url",
+    "uazapi": "uazapi_api_url",
+}
+_WHOLE_UAZAPI_BUNDLE = {
+    "whatsapp_provider": "uazapi",
+    "uazapi_api_url": "https://uazapi.example",
+    "uazapi_instance_name": "clinic-1",
+    "uazapi_token": "uaz-token",
+}
+
+
+@pytest.mark.parametrize(
+    ("incoming", "cleared"),
+    [
+        pytest.param(_WHOLE_META_BUNDLE, "zapi", id="to_meta_cloud"),
+        pytest.param(_WHOLE_UAZAPI_BUNDLE, "zapi", id="to_uazapi"),
+    ],
+)
+def test_whatsapp_switch_leaves_a_way_to_stop_the_old_provider(
+    incoming: dict[str, object], cleared: str
+) -> None:
+    """A switch that cannot be finished is a trap, not a policy.
+
+    The old bundle survives the switch and keeps resolving its own inbound
+    webhooks, so it goes on replying under the new provider's name. Emptying a
+    group is therefore decommissioning rather than adoption, and has to stay
+    reachable — otherwise the tenant holds two live outbound paths for good.
+    """
+
+    switched = merge_credentials(_STORED_ZAPI, incoming)
+    validate_provider_availability(_STORED_ZAPI, switched)
+    assert switched["zapi_instance_id"] == "i1"
+
+    lever = _WHATSAPP_DECOMMISSION_LEVER[cleared]
+    retired = merge_credentials(switched, {lever: ""})
+    validate_provider_availability(switched, retired)
+    assert not retired[lever]
+
+
+def test_whatsapp_switch_may_clear_the_outgoing_bundle_in_the_same_request() -> None:
+    """Retiring the old provider as you adopt the new one is the clean path."""
+
+    candidate = merge_credentials(
+        _STORED_ZAPI, {**_WHOLE_META_BUNDLE, "zapi_instance_id": ""}
+    )
+    validate_provider_availability(_STORED_ZAPI, candidate)
+    assert not candidate["zapi_instance_id"]
+    assert candidate["meta_phone_number_id"] == "999888777"
+
+
+def test_whatsapp_unlabelled_row_may_not_relabel_over_a_live_bundle() -> None:
+    """A row can carry a sending bundle under no label at all.
+
+    Keying the switch on the stored label alone would wave those rows through,
+    because there is no label to differ from — while the credentials underneath
+    keep sending for a provider the new label does not name.
+    """
+
+    existing = {
+        "zapi_instance_id": "i1",
+        "zapi_token": "t1",
+        "zapi_inbound_token_digest": "d" * 64,
+    }
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(
+            existing, merge_credentials(existing, {"whatsapp_provider": "meta_cloud"})
+        )
+    assert caught.value.detail["error"] == "provider_not_available"
+
+
+def test_whatsapp_unlabelled_row_may_name_the_provider_it_actually_runs() -> None:
+    """Adopting the label its own credentials already back stays open."""
+
+    existing = {
+        "zapi_instance_id": "i1",
+        "zapi_token": "t1",
+        "zapi_inbound_token_digest": "d" * 64,
+    }
+
+    candidate = merge_credentials(existing, {"whatsapp_provider": "zapi"})
+    validate_provider_availability(existing, candidate)
+    assert candidate["whatsapp_provider"] == "zapi"
+
+
+def test_whatsapp_switch_may_not_also_write_the_outgoing_bundle() -> None:
+    """Two populated bundles leave no answer to which one sends."""
+
+    existing = dict(_STORED_ZAPI)
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(
+            existing,
+            merge_credentials(
+                existing, {**_WHOLE_META_BUNDLE, "zapi_token": "rotated-on-the-way-out"}
+            ),
+        )
+    assert caught.value.detail["error"] == "provider_not_available"
+    assert existing["zapi_token"] == "t1"
+
+
+@pytest.mark.parametrize(
+    ("patch", "readiness"),
+    [
+        pytest.param(_WHOLE_META_BUNDLE, "active", id="whole_bundle"),
+        pytest.param(
+            {
+                "whatsapp_provider": "meta_cloud",
+                "meta_phone_number_id": "999888777",
+                "meta_permanent_token": "EAAG-x",
+            },
+            "signature_pending",
+            id="inbound_hardening_is_repairable_not_a_blocker",
+        ),
+    ],
+)
+def test_whatsapp_switch_carrying_a_sending_bundle_is_accepted(
+    patch: dict[str, object], readiness: str
+) -> None:
+    """The gate asks whether the new provider can send, not whether it is hardened."""
+
+    existing = dict(_STORED_ZAPI)
+    candidate = merge_credentials(existing, patch)
+
+    validate_provider_availability(existing, candidate)
+    assert candidate["whatsapp_provider"] == "meta_cloud"
+    assert credential_status(candidate)["whatsapp_readiness"] == readiness
+
+
+def test_whatsapp_switch_to_zapi_needs_only_the_fields_a_form_can_collect() -> None:
+    """Z-API readiness also wants an inbound digest no credential form collects.
+
+    Gating the switch on readiness would therefore strand Z-API: a tenant on
+    another provider could never adopt it through the public surface. The
+    outbound pair is what makes the label true, so that is what is required.
+    """
+
+    existing = {
+        "whatsapp_provider": "meta_cloud",
+        "meta_phone_number_id": "111",
+        "meta_permanent_token": "EAAG-x",
+    }
+    candidate = merge_credentials(
+        existing,
+        {
+            "whatsapp_provider": "zapi",
+            "zapi_instance_id": "i9",
+            "zapi_token": "t9",
+            "zapi_client_token": "c9",
+        },
+    )
+
+    validate_provider_availability(existing, candidate)
+    assert candidate["whatsapp_provider"] == "zapi"
+    assert "zapi_inbound_token_digest" not in candidate
+
+
+def test_whatsapp_tenant_still_maintains_its_own_bundle() -> None:
+    existing = {
+        "whatsapp_provider": "zapi",
+        "zapi_instance_id": "i1",
+        "zapi_token": "t1",
+        "zapi_client_token": "c1",
+    }
+    candidate = merge_credentials(existing, {"zapi_token": "rotated"})
+    validate_provider_availability(existing, candidate)
+    assert candidate["zapi_token"] == "rotated"
+
+
+def test_legacy_stt_tenant_maintains_the_provider_implied_by_its_aliases() -> None:
+    # A whisper-era tenant never stored `stt_provider`; resolution implies
+    # `outros`. Reading that as adopting a new provider would lock these
+    # tenants out of their own configuration.
+    existing = {"whisper_api_key": "legacy-secret", "whisper_model": "legacy-model"}
+    assert resolve_stt_credentials(existing)["stt_provider"] == "outros"
+
+    candidate = merge_credentials(existing, {"audio_max_seconds": 45})
+    validate_provider_availability(existing, candidate)
+    assert candidate["audio_max_seconds"] == 45
+
+    canonical = merge_credentials(
+        existing,
+        {"stt_api_key": "canonical-secret", "stt_model_name": "canonical-model"},
+    )
+    validate_provider_availability(existing, canonical)
+
+
+def test_stt_bootstrap_and_switch_are_rejected_for_unconfigured_tenants() -> None:
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(
+            {}, merge_credentials({}, {"stt_api_key": "fresh-secret"})
+        )
+    assert caught.value.detail["capability"] == "stt"
+
+    existing = {"whisper_api_key": "legacy-secret"}
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(
+            existing, merge_credentials(existing, {"stt_provider": "deepgram_stt"})
+        )
+    assert caught.value.detail == {
+        "error": "provider_not_available",
+        "capability": "stt",
+        "provider": "deepgram_stt",
+    }
+
+
+def test_voice_replies_cannot_be_enabled_by_bundling_a_credential_field() -> None:
+    """The completeness guard must not be escapable by widening the patch.
+
+    Restricting the check to control-only patches let a caller flip
+    ``tts_enabled`` over an incomplete bundle simply by attaching any one
+    credential field to the same request.
+    """
+
+    existing = {"tts_provider": "elevenlabs"}
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(
+            existing,
+            merge_credentials(
+                existing, {"tts_enabled": True, "tts_api_url": "https://x"}
+            ),
+        )
+    assert caught.value.detail["error"] == "provider_not_available"
+
+
+@pytest.mark.parametrize(
+    ("provider", "missing_field"),
+    [
+        ("google", "tts_api_url"),
+        ("google", "tts_api_key"),
+        ("google", "tts_model_name"),
+        ("elevenlabs", "tts_voice_id"),
+    ],
+)
+def test_voice_replies_cannot_be_switched_on_over_an_incomplete_bundle(
+    provider: str, missing_field: str
+) -> None:
+    # The bundle may be repaired, but the feature stays off until it is whole.
+    existing = {
+        "tts_provider": provider,
+        "tts_api_url": "https://texttospeech.googleapis.com/v1",
+        "tts_api_key": "saved-tts-secret",
+        "tts_model_name": "pt-br-voice",
+        "tts_voice_id": "saved-voice",
+    }
+    existing.pop(missing_field)
+    candidate = merge_credentials(existing, {"tts_enabled": True})
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(existing, candidate)
+    assert caught.value.detail == {
+        "error": "provider_not_available",
+        "capability": "tts",
+        "provider": provider,
+    }
+    assert credential_status(existing)["tts_readiness"] == "incomplete"
+
+
+def test_voice_replies_enable_over_a_complete_bundle() -> None:
+    existing = {
+        "tts_provider": "elevenlabs",
+        "tts_api_url": "https://u",
+        "tts_api_key": "k",
+        "tts_model_name": "m",
+        "tts_voice_id": "v",
+    }
+    candidate = merge_credentials(existing, {"tts_enabled": True})
+    validate_provider_availability(existing, candidate)
+    assert candidate["tts_enabled"] is True
+
+
+@pytest.mark.parametrize(
+    "config_patch",
+    [
+        {"tts_api_url": "https://texttospeech.example/v2"},
+        {"tts_api_key": "replacement-secret"},
+        {"tts_model_name": "replacement-model"},
+        {"tts_voice_id": "replacement-voice"},
+    ],
+)
+@pytest.mark.parametrize("mixed_with_controls", [False, True])
+def test_tts_config_edits_allowed_for_the_stored_provider(
+    config_patch: dict[str, object], mixed_with_controls: bool
+) -> None:
+    existing = {
+        "tts_provider": "google",
+        "tts_api_url": "https://texttospeech.googleapis.com/v1",
+        "tts_api_key": "saved-tts-secret",
+        "tts_model_name": "pt-br-voice",
+        "tts_voice_id": "saved-voice",
+        "tts_enabled": False,
+    }
+    patch = dict(config_patch)
+    if mixed_with_controls:
+        patch.update({"tts_enabled": True, "tts_reply_policy": "all_inputs"})
+    candidate = merge_credentials(existing, patch)
+
+    validate_provider_availability(existing, candidate)
+    assert candidate["tts_provider"] == "google"
+    for field, value in config_patch.items():
+        assert candidate[field] == value
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        {},
+        {
+            "tts_provider": "unknown",
+            "tts_api_url": "https://tts.example/v1",
+            "tts_api_key": "saved-tts-secret",
+            "tts_model_name": "legacy-model",
+            "tts_voice_id": "legacy-voice",
+        },
+    ],
+    ids=["provider_missing", "provider_unknown"],
+)
+@pytest.mark.parametrize(
+    "config_patch",
+    [
+        {"tts_api_url": "https://tts.example/v2"},
+        {"tts_api_key": "replacement-secret"},
+        {"tts_model_name": "replacement-model"},
+        {"tts_voice_id": "replacement-voice"},
+    ],
+)
+@pytest.mark.parametrize("mixed_with_controls", [False, True])
+def test_tts_config_mutations_fail_closed_without_known_provider(
+    existing: dict[str, object],
+    config_patch: dict[str, object],
+    mixed_with_controls: bool,
+) -> None:
+    snapshot = dict(existing)
+    patch = dict(config_patch)
+    if mixed_with_controls:
+        patch.update({"tts_enabled": True, "tts_reply_policy": "all_inputs"})
+    candidate = merge_credentials(existing, patch)
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(existing, candidate)
+    assert caught.value.detail == {
+        "error": "provider_not_available",
+        "capability": "tts",
+        "provider": existing.get("tts_provider"),
+    }
+    assert existing == snapshot
+
+
+def test_tts_controls_reject_complete_bundle_with_unknown_provider() -> None:
+    existing = {
+        "tts_provider": "unknown",
+        "tts_api_url": "https://tts.example/v1",
+        "tts_api_key": "saved-tts-secret",
+        "tts_model_name": "legacy-model",
+        "tts_voice_id": "legacy-voice",
+    }
+    candidate = merge_credentials(existing, {"tts_enabled": True})
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(existing, candidate)
+    assert caught.value.detail == {
+        "error": "provider_not_available",
+        "capability": "tts",
+        "provider": "unknown",
+    }
+    assert credential_status(existing)["tts_readiness"] == "incomplete"
+
+
+def test_tts_writes_rejected_when_no_provider_is_stored() -> None:
+    existing = {
+        "tts_api_url": "https://texttospeech.googleapis.com/v1",
+        "tts_api_key": "saved-tts-secret",
+        "tts_model_name": "pt-br-voice",
+    }
+    candidate = merge_credentials(existing, {"tts_enabled": True})
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(existing, candidate)
+    assert caught.value.detail == {
+        "error": "provider_not_available",
+        "capability": "tts",
+        "provider": None,
+    }
+
+
+def _stored_google_tts() -> dict[str, object]:
+    return {
+        "tts_provider": "google",
+        "tts_api_url": "https://texttospeech.googleapis.com/v1",
+        "tts_api_key": "saved-tts-secret",
+        "tts_model_name": "pt-br-voice",
+        "tts_voice_id": "saved-voice",
+        "tts_enabled": False,
+    }
+
+
+@pytest.mark.parametrize("mixed_with_controls", [False, True])
+def test_tts_provider_clear_remains_atomic(mixed_with_controls: bool) -> None:
+    """Clearing the provider strands the stored bundle, so it stays rejected."""
+
+    existing = _stored_google_tts()
+    snapshot = dict(existing)
+    patch: dict[str, object] = {"tts_provider": None}
+    if mixed_with_controls:
+        patch.update({"tts_enabled": True, "tts_reply_policy": "all_inputs"})
+    candidate = merge_credentials(existing, patch)
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(existing, candidate)
+    assert caught.value.detail["error"] == "provider_not_available"
+    assert caught.value.detail["capability"] == "tts"
+    assert existing == snapshot
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        pytest.param({"tts_provider": "elevenlabs"}, id="bare_label"),
+        pytest.param(
+            {"tts_provider": "elevenlabs", "tts_enabled": True},
+            id="bare_label_with_controls",
+        ),
+        pytest.param(
+            {
+                "tts_provider": "elevenlabs",
+                "tts_api_url": "https://api.elevenlabs.io/v1",
+            },
+            id="partial_bundle",
+        ),
+    ],
+)
+def test_tts_switch_without_its_own_bundle_is_rejected(
+    patch: dict[str, object],
+) -> None:
+    """A switch that does not carry a whole bundle inherits the old one.
+
+    The credential fields are flat and shared between providers, so the stored
+    Google endpoint, key and model survive a bare relabel. That leaves a bundle
+    that reads complete — sealing the card as configured — while synthesis is
+    dispatched to ElevenLabs using Google's credentials and every reply fails.
+    """
+
+    existing = _stored_google_tts()
+    snapshot = dict(existing)
+    candidate = merge_credentials(existing, patch)
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(existing, candidate)
+    assert caught.value.detail["error"] == "provider_not_available"
+    assert caught.value.detail["capability"] == "tts"
+    assert existing == snapshot
+
+
+def test_tts_switch_carrying_a_whole_bundle_is_accepted() -> None:
+    existing = _stored_google_tts()
+    snapshot = dict(existing)
+    candidate = merge_credentials(
+        existing,
+        {
+            "tts_provider": "elevenlabs",
+            "tts_api_url": "https://api.elevenlabs.io/v1",
+            "tts_api_key": "fresh-eleven-secret",
+            "tts_model_name": "eleven_multilingual_v2",
+            "tts_voice_id": "fresh-voice",
+        },
+    )
+
+    validate_provider_availability(existing, candidate)
+    assert candidate["tts_provider"] == "elevenlabs"
+    assert candidate["tts_api_url"] == "https://api.elevenlabs.io/v1"
+    assert existing == snapshot

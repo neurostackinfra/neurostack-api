@@ -39,10 +39,15 @@ import {
   Cpu, MessageSquare, Lock, ChevronDown, ExternalLink, FileText, Mic2, Volume2,
   AudioLines,
 } from "lucide-react";
-import { ProviderCredentialCard } from "@/components/api-settings/provider-credential-card";
+import {
+  ProviderCredentialCard,
+  type ProviderCardState,
+} from "@/components/api-settings/provider-credential-card";
+import { VoiceResponseControls } from "@/components/api-settings/voice-response-controls";
 import {
   BusinessHoursEditor,
   BUSINESS_DAY_ORDER,
+  CompactHoursCard,
   type BusinessDayCode,
   type BusinessHoursMap,
 } from "@/components/business-hours-editor";
@@ -280,6 +285,9 @@ export function describeConfigSaveFailure(
 }
 
 interface CredentialStatus {
+  // The backend projects capability readiness and provider labels alongside the
+  // documented fields below; `providerCardState` reads those by name.
+  [key: string]: unknown;
   // Z-API
   zapi_instance_id:         string | null;
   zapi_token_set:           boolean;
@@ -385,46 +393,46 @@ export const MULTIMODAL_PROVIDERS: {
 // the product spec never promised.
 export type ApiCapabilityId = "whatsapp" | "llm" | "stt" | "multimodal" | "tts";
 
-export type ProviderAvailability = "coming_soon";
+export type ProviderAvailability = "active" | "coming_soon";
 
 /**
  * Frontend mirror of `PROVIDER_AVAILABILITY` in
  * `src/services/api_credentials.py`.
  *
- * This literal is deliberately a closed 0/19 matrix: every displayed pair is
- * unavailable for new configuration, and a future promotion must change both
- * contracts together. Keeping it capability-keyed prevents a provider id
- * being accidentally rendered under a different credential shape.
+ * Marking a pair available here without the backend agreeing only produces a
+ * card that opens and then fails its PATCH, so the two contracts must move
+ * together. Keeping it capability-keyed prevents a provider id being
+ * accidentally rendered under a different credential shape.
  */
 export const API_PROVIDER_AVAILABILITY = {
   whatsapp: {
-    meta_cloud: "coming_soon",
-    zapi: "coming_soon",
-    uazapi: "coming_soon",
-    evolution: "coming_soon",
+    meta_cloud: "active",
+    zapi: "active",
+    uazapi: "active",
+    evolution: "active",
     dialog360: "coming_soon",
     twilio: "coming_soon",
   },
   llm: {
-    dropout: "coming_soon",
-    openai: "coming_soon",
-    outros: "coming_soon",
+    dropout: "active",
+    openai: "active",
+    outros: "active",
     slm_cortex: "coming_soon",
   },
   multimodal: {
-    openrouter: "coming_soon",
+    openrouter: "active",
   },
   stt: {
-    outros: "coming_soon",
-    openai_whisper: "coming_soon",
+    outros: "active",
+    openai_whisper: "active",
     elevenlabs_scribe: "coming_soon",
     google_stt: "coming_soon",
     deepgram_stt: "coming_soon",
     microsoft_stt: "coming_soon",
   },
   tts: {
-    elevenlabs: "coming_soon",
-    google: "coming_soon",
+    elevenlabs: "active",
+    google: "active",
   },
 } as const satisfies Record<ApiCapabilityId, Readonly<Record<string, ProviderAvailability>>>;
 
@@ -582,22 +590,286 @@ function providersForCapability(capability: ApiCapabilityId): readonly ProviderD
   }
 }
 
-export function ApiCredentialsForm(_: {
+type CredentialField = {
+  name: string;
+  label: { pt: string; en: string };
+  secret?: boolean;
+  numeric?: boolean;
+};
+
+// WhatsApp is the one capability whose credential shape depends on the
+// provider; the rest share a single bundle shape per capability.
+const WHATSAPP_PROVIDER_FIELDS: Record<string, readonly CredentialField[]> = {
+  zapi: [
+    { name: "zapi_instance_id", label: { pt: "ID da instância", en: "Instance ID" } },
+    { name: "zapi_token", label: { pt: "Token", en: "Token" }, secret: true },
+    { name: "zapi_client_token", label: { pt: "Client token", en: "Client token" }, secret: true },
+  ],
+  evolution: [
+    { name: "evolution_api_url", label: { pt: "URL da API", en: "API URL" } },
+    { name: "evolution_instance_name", label: { pt: "Nome da instância", en: "Instance name" } },
+    { name: "evolution_api_key", label: { pt: "Chave da API", en: "API key" }, secret: true },
+  ],
+  meta_cloud: [
+    { name: "meta_phone_number_id", label: { pt: "Phone number ID", en: "Phone number ID" } },
+    { name: "meta_waba_id", label: { pt: "WABA ID", en: "WABA ID" } },
+    { name: "meta_permanent_token", label: { pt: "Token permanente", en: "Permanent token" }, secret: true },
+    { name: "meta_app_secret", label: { pt: "App secret", en: "App secret" }, secret: true },
+  ],
+  uazapi: [
+    { name: "uazapi_api_url", label: { pt: "URL da API", en: "API URL" } },
+    { name: "uazapi_instance_name", label: { pt: "Nome da instância", en: "Instance name" } },
+    { name: "uazapi_token", label: { pt: "Token", en: "Token" }, secret: true },
+  ],
+  dialog360: [],
+  twilio: [],
+};
+
+// The non-secret field each outbound path needs, mirroring the backend's
+// WHATSAPP_OUTBOUND_FIELDS. Emptying it is the only way to retire a bundle,
+// because a blanked secret reads as "keep the stored value" on both sides.
+const WHATSAPP_DECOMMISSION_LEVER: Record<string, string> = {
+  zapi: "zapi_instance_id",
+  evolution: "evolution_api_url",
+  meta_cloud: "meta_phone_number_id",
+  uazapi: "uazapi_api_url",
+};
+
+// Voice triggers (`tts_enabled`, `tts_reply_policy`) belong to
+// VoiceResponseControls and are deliberately absent here.
+const CAPABILITY_FIELDS: Record<string, readonly CredentialField[]> = {
+  llm: [
+    { name: "llm_api_url", label: { pt: "URL da API", en: "API URL" } },
+    { name: "llm_api_key", label: { pt: "Chave da API", en: "API key" }, secret: true },
+    { name: "llm_model_name", label: { pt: "Modelo", en: "Model" } },
+  ],
+  stt: [
+    { name: "stt_api_url", label: { pt: "URL da API", en: "API URL" } },
+    { name: "stt_api_key", label: { pt: "Chave da API", en: "API key" }, secret: true },
+    { name: "stt_model_name", label: { pt: "Modelo", en: "Model" } },
+    { name: "audio_max_seconds", label: { pt: "Duração máxima (s)", en: "Max duration (s)" }, numeric: true },
+  ],
+  multimodal: [
+    { name: "multimodal_api_url", label: { pt: "URL da API", en: "API URL" } },
+    { name: "multimodal_api_key", label: { pt: "Chave da API", en: "API key" }, secret: true },
+    { name: "multimodal_model_name", label: { pt: "Modelo", en: "Model" } },
+  ],
+  tts: [
+    { name: "tts_api_url", label: { pt: "URL da API", en: "API URL" } },
+    { name: "tts_api_key", label: { pt: "Chave da API", en: "API key" }, secret: true },
+    { name: "tts_model_name", label: { pt: "Modelo", en: "Model" } },
+    { name: "tts_voice_id", label: { pt: "ID da voz", en: "Voice ID" } },
+  ],
+};
+
+const CAPABILITY_PROVIDER_FIELD: Record<ApiCapabilityId, string> = {
+  whatsapp: "whatsapp_provider",
+  llm: "llm_provider",
+  stt: "stt_provider",
+  multimodal: "multimodal_provider",
+  tts: "tts_provider",
+};
+
+const CAPABILITY_READINESS_FIELD: Record<ApiCapabilityId, string> = {
+  whatsapp: "whatsapp_readiness",
+  llm: "llm_readiness",
+  stt: "stt_readiness",
+  multimodal: "multimodal_readiness",
+  tts: "tts_readiness",
+};
+
+export function credentialFields(
+  capability: ApiCapabilityId,
+  provider: string,
+): readonly CredentialField[] {
+  return capability === "whatsapp"
+    ? WHATSAPP_PROVIDER_FIELDS[provider] ?? []
+    : CAPABILITY_FIELDS[capability];
+}
+
+// Keyed reads only, so the looser shape keeps `CredentialStatus` documented
+// while still accepting a partial projection from the backend.
+type CredentialStatusFields = Readonly<Record<string, unknown>>;
+
+function statusText(status: CredentialStatusFields | null, field: string): string {
+  const value = status?.[field];
+  return value === null || value === undefined ? "" : String(value);
+}
+
+// Allowlist rather than denylist: `signature_pending` means a Meta bundle is
+// missing its app secret, so it must read as partial. Only these two readiness
+// values stand for a whole bundle.
+const COMPLETE_READINESS = new Set(["active", "configuration_only"]);
+
+/**
+ * The provider the tenant holds reads `configured` with a whole bundle and
+ * `incomplete` with a partial one. Any other provider reads `available` when
+ * the runtime can serve it and `coming_soon` when it cannot — which is exactly
+ * the set the backend availability gate refuses to adopt, so an inert card and
+ * a rejected PATCH always agree.
+ */
+export function providerCardState(
+  capability: ApiCapabilityId,
+  providerId: string,
+  status: CredentialStatusFields | null,
+): ProviderCardState {
+  const persisted = statusText(status, CAPABILITY_PROVIDER_FIELD[capability]);
+  if (persisted && persisted === providerId) {
+    return COMPLETE_READINESS.has(statusText(status, CAPABILITY_READINESS_FIELD[capability]))
+      ? "configured"
+      : "incomplete";
+  }
+  const availability: Readonly<Record<string, ProviderAvailability>> =
+    API_PROVIDER_AVAILABILITY[capability];
+  return availability[providerId] === "active" ? "available" : "coming_soon";
+}
+
+export function ApiCredentialsForm({ clinicId, isReadOnly }: {
   clinicId: string; isReadOnly: boolean; isSuperAdmin: boolean;
 }) {
   const { locale } = useI18n();
-  const comingSoonLabel = locale === "en" ? "COMING SOON" : "EM BREVE";
+  const { toast } = useToast();
+  const txt = (pt: string, en: string) => (locale === "en" ? en : pt);
+  const [status, setStatus] = useState<CredentialStatus | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [baseline, setBaseline] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState(false);
 
-  // This surface intentionally has no credential fetch or PATCH workflow.
-  // A legacy saved provider is never normalized to a new default, so viewing
-  // this tab cannot turn a read into an accidental state transition.
+  const badgeLabel: Record<ProviderCardState, string> = {
+    configured: txt("CONFIGURADO", "CONFIGURED"),
+    incomplete: txt("INCOMPLETO", "INCOMPLETE"),
+    available: txt("DISPONÍVEL", "AVAILABLE"),
+    coming_soon: txt("EM BREVE", "COMING SOON"),
+  };
+
+  const credentialsUrl = `/v1/config/api-credentials?tenant_id=${encodeURIComponent(clinicId)}`;
+
+  const loadStatus = useCallback(async () => {
+    // A builder switching clinics changes `clinicId` without remounting, so the
+    // previous tenant's open editor and draft must be dropped here. Clearing
+    // status too keeps every card inert while the new tenant's state loads.
+    setExpanded(null);
+    setDraft({});
+    setBaseline({});
+    setStatus(null);
+    if (!clinicId) { setLoadFailed(true); return; }
+    try {
+      const token = getToken();
+      const res = await fetch(credentialsUrl, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) throw new Error(`Credential status fetch failed: ${res.status}`);
+      setStatus(await res.json() as CredentialStatus);
+      setLoadFailed(false);
+    } catch {
+      setStatus(null);
+      setLoadFailed(true);
+    }
+  }, [clinicId, credentialsUrl]);
+
+  useEffect(() => { void loadStatus(); }, [loadStatus]);
+
+  function toggleProvider(capability: ApiCapabilityId, providerId: string) {
+    const key = `${capability}:${providerId}`;
+    if (expanded === key) { setExpanded(null); return; }
+    // Secrets never pre-fill: an empty input means "keep the stored value",
+    // which is also how the backend reads an omitted secret field. Non-secrets
+    // only pre-fill for the provider actually held, because the field names are
+    // flat and shared — hydrating another provider's card would present one
+    // provider's endpoint and model as if they belonged to the other.
+    const held =
+      statusText(status, CAPABILITY_PROVIDER_FIELD[capability]) === providerId;
+    const hydrated: Record<string, string> = {};
+    for (const field of credentialFields(capability, providerId)) {
+      hydrated[field.name] =
+        field.secret || !held ? "" : statusText(status, field.name);
+    }
+    setBaseline(hydrated);
+    setDraft(hydrated);
+    setExpanded(key);
+  }
+
+  async function saveProvider(capability: ApiCapabilityId, providerId: string) {
+    const body: Record<string, string | number> = {};
+    // Adoption only takes effect if the provider field travels with the
+    // bundle; omitting it would persist credentials under the previous
+    // provider's label and leave the card unable to reach CONFIGURADO.
+    const providerField = CAPABILITY_PROVIDER_FIELD[capability];
+    const held = statusText(status, providerField);
+    if (held !== providerId) {
+      body[providerField] = providerId;
+      // The retired bundle stays populated and goes on resolving its own
+      // inbound webhooks, so it would keep replying under the new provider's
+      // name. Emptying its identity field here retires it while the switch is
+      // still expressible; afterwards its card reads empty and there is
+      // nothing left to blank.
+      const lever =
+        capability === "whatsapp" ? WHATSAPP_DECOMMISSION_LEVER[held] : undefined;
+      if (lever) body[lever] = "";
+    }
+    for (const field of credentialFields(capability, providerId)) {
+      const value = draft[field.name] ?? "";
+      if (field.secret) {
+        if (value) body[field.name] = value;
+      } else if (value !== baseline[field.name]) {
+        body[field.name] = field.numeric ? Number(value) : value;
+      }
+    }
+    if (Object.keys(body).length === 0) { setExpanded(null); return; }
+
+    setSaving(true);
+    try {
+      const token = getToken();
+      const res = await fetch(credentialsUrl, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null) as { detail?: { error?: string } } | null;
+        throw new Error(detail?.detail?.error ?? "save_failed");
+      }
+      setStatus(await res.json() as CredentialStatus);
+      setExpanded(null);
+      toast({ title: txt("Credenciais salvas", "Credentials saved") });
+    } catch (err) {
+      const code = err instanceof Error ? err.message : "save_failed";
+      toast({
+        variant: "destructive",
+        title: txt("Não foi possível salvar", "Could not save"),
+        description: code === "provider_not_available"
+          ? txt(
+              "Este provedor ainda não está liberado para nova configuração.",
+              "This provider is not available for new configuration yet.",
+            )
+          : txt("Tente novamente.", "Please try again."),
+      });
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <section className="space-y-5" data-testid="api-settings-section">
       <p className="text-sm text-muted-foreground" data-testid="api-settings-legacy-state-note">
-        {locale === "en"
-          ? "Existing API settings are preserved. New provider configuration is coming soon."
-          : "As configurações de API existentes são preservadas. A configuração de novos provedores estará disponível em breve."}
+        {txt(
+          "Escolha um provedor disponível para configurar. Os marcados como EM BREVE ainda não têm suporte no runtime.",
+          "Pick an available provider to configure. The ones marked COMING SOON have no runtime support yet.",
+        )}
       </p>
+      {loadFailed && (
+        <p className="text-xs text-destructive" data-testid="api-settings-load-error">
+          {txt(
+            "Não foi possível carregar o estado das credenciais. Recarregue a página.",
+            "Credential status could not be loaded. Try reloading the page.",
+          )}
+        </p>
+      )}
 
       {API_CAPABILITIES.map((capability) => {
         const providers = providersForCapability(capability.id);
@@ -617,25 +889,102 @@ export function ApiCredentialsForm(_: {
                 data-testid={`capability-requirement-${capability.id}`}
                 className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/80"
               >
-                {capability.required
-                  ? locale === "en" ? "Required" : "obrigatório"
-                  : locale === "en" ? "Optional" : "opcional"}
+                {capability.required ? txt("obrigatório", "Required") : txt("opcional", "Optional")}
               </span>
             </div>
             <p className="text-[11px] text-muted-foreground">
               {locale === "en" ? capability.desc.en : capability.desc.pt}
             </p>
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3" data-testid={`${capability.id}-provider-list`}>
-              {providers.map((provider) => availability[provider.id as keyof typeof availability] === "coming_soon" && (
-                <ProviderCredentialCard
-                  key={provider.id}
-                  id={`${capability.id}-${provider.id}`}
-                  label={provider.label}
-                  sub={provider.sub}
-                  comingSoonLabel={comingSoonLabel}
-                />
-              ))}
+            <div
+              className="grid grid-cols-2 gap-2 sm:grid-cols-3"
+              data-testid={`${capability.id}-provider-list`}
+            >
+              {providers.map((provider) => {
+                if (!(provider.id in availability)) return null;
+                // Until the tenant's status lands, which provider is held is
+                // unknown, so every card stays inert rather than offering an
+                // adoption that could silently displace a stored provider.
+                const state = status === null
+                  ? "coming_soon"
+                  : providerCardState(capability.id, provider.id, status);
+                const key = `${capability.id}:${provider.id}`;
+                return (
+                  <ProviderCredentialCard
+                    key={provider.id}
+                    id={`${capability.id}-${provider.id}`}
+                    label={provider.label}
+                    sub={provider.sub}
+                    state={state}
+                    badgeLabel={badgeLabel[state]}
+                    isExpanded={expanded === key}
+                    onToggle={state === "coming_soon" || isReadOnly
+                      ? undefined
+                      : () => toggleProvider(capability.id, provider.id)}
+                  />
+                );
+              })}
             </div>
+
+            {providers.map((provider) => {
+              if (expanded !== `${capability.id}:${provider.id}`) return null;
+              const fields = credentialFields(capability.id, provider.id);
+              return (
+                <div
+                  key={`${provider.id}-editor`}
+                  className="space-y-3 rounded-md border border-border bg-background p-3"
+                  data-testid={`provider-editor-${capability.id}-${provider.id}`}
+                >
+                  {fields.length === 0 ? (
+                    <p className="text-[11px] text-muted-foreground">
+                      {txt(
+                        "Este provedor não tem campos editáveis nesta versão.",
+                        "This provider has no editable fields in this release.",
+                      )}
+                    </p>
+                  ) : (
+                    <>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        {fields.map((field) => (
+                          <div key={field.name} className="space-y-1">
+                            <Label
+                              htmlFor={`field-${field.name}`}
+                              className="text-xs font-medium text-muted-foreground"
+                            >
+                              {locale === "en" ? field.label.en : field.label.pt}
+                            </Label>
+                            <Input
+                              id={`field-${field.name}`}
+                              data-testid={`field-${field.name}`}
+                              type={field.secret ? "password" : field.numeric ? "number" : "text"}
+                              value={draft[field.name] ?? ""}
+                              placeholder={field.secret && status?.[`${field.name}_set`] === true
+                                ? txt("•••••••• (manter atual)", "•••••••• (keep current)")
+                                : undefined}
+                              onChange={(e) => setDraft(
+                                (prev) => ({ ...prev, [field.name]: e.target.value }),
+                              )}
+                              className="text-xs"
+                            />
+                          </div>
+                        ))}
+                      </div>
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={saving}
+                        data-testid={`save-${capability.id}-${provider.id}`}
+                        onClick={() => void saveProvider(capability.id, provider.id)}
+                      >
+                        {saving
+                          ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          : <Save className="h-3.5 w-3.5" />}
+                        <span className="ml-1.5">{txt("Salvar", "Save")}</span>
+                      </Button>
+                    </>
+                  )}
+                </div>
+              );
+            })}
           </div>
         );
       })}
@@ -1540,12 +1889,20 @@ export default function ClinicConfig() {
                 />
               </Field>
               <Field label={txt("Horário do Setor de Agendamento", "Scheduling Department Hours")} hint={txt("Quando difere do horário geral de atendimento.", "When it differs from the general working hours.")}>
-                <Input
-                  value={schedulingHours}
-                  onChange={(e) => setSchedulingHours(e.target.value)}
-                  placeholder={txt("Ex: Seg–Sex: 8h–18h (agendamentos apenas por WhatsApp)", "e.g. Mon–Fri: 8am–6pm (scheduling via WhatsApp only)")}
-                  disabled={isReadOnly}
-                />
+                <CompactHoursCard
+                  summary={schedulingHours.trim() || txt("Mesmo horário de funcionamento", "Same as business hours")}
+                  editLabel={txt("Editar", "Edit")}
+                  closeLabel={txt("Concluir", "Done")}
+                  testId="scheduling-hours-editor"
+                >
+                  <Input
+                    value={schedulingHours}
+                    onChange={(e) => setSchedulingHours(e.target.value)}
+                    placeholder={txt("Ex: Seg–Sex: 8h–18h (agendamentos apenas por WhatsApp)", "e.g. Mon–Fri: 8am–6pm (scheduling via WhatsApp only)")}
+                    aria-label={txt("Horário do Setor de Agendamento", "Scheduling Department Hours")}
+                    disabled={isReadOnly}
+                  />
+                </CompactHoursCard>
               </Field>
 
               {/* Scheduling link (stopgap pré-ERP) */}
@@ -2290,7 +2647,12 @@ export default function ClinicConfig() {
               </div>
               <CardDescription className="text-xs">{t("config_integrations_desc")}</CardDescription>
             </CardHeader>
-            <CardContent className="pt-5">
+            <CardContent className="space-y-5 pt-5">
+              <VoiceResponseControls
+                clinicId={(isBuilder || isSuperAdmin) && viewingClinicId ? viewingClinicId : clinicId}
+                isReadOnly={isReadOnly}
+                role={role}
+              />
               <ApiCredentialsForm
                 clinicId={(isBuilder || isSuperAdmin) && viewingClinicId ? viewingClinicId : clinicId}
                 isReadOnly={isReadOnly}

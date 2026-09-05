@@ -377,9 +377,11 @@ export const pt: Record<TranslationKey, string> = {
   admin_alerts_empty: "Sem alertas, todos os sistemas operacionais",
 
   // ── Context Sources (Trace Viewer) ──
-  ctx_panel_title: "Contexto Utilizado",
-  ctx_origin_config: "Configuração",
-  ctx_origin_rag: "Base de Conhecimento",
+  ctx_panel_title: "Contexto Selecionado",
+  ctx_origin_config: "Configuração da Clínica",
+  ctx_origin_rag: "RAG",
+  ctx_origin_unknown: "Origem Desconhecida",
+  ctx_title_fallback: "Contexto",
   ctx_empty: "Nenhum contexto utilizado.",
   ctx_field_identity_clinic_name: "Nome da Clínica",
   ctx_field_persona_agent_name: "Nome do Agente",

@@ -7,8 +7,9 @@ through the cognitive pipeline, and sends the LLM response back.
 import hashlib
 import hmac
 import logging
-import os
 import re
+import time as _time
+from collections import OrderedDict as _OrderedDict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 from uuid import UUID
@@ -50,8 +51,8 @@ from src.services.zapi_service import (
     mark_message_read,
     send_evolution_audio,
     send_evolution_text,
-    send_zapi_audio,
     send_text_message,
+    send_zapi_audio,
 )
 
 # ── Constants for webhook authenticity ──
@@ -128,8 +129,6 @@ _INCOMING_ID_TTL = 900  # 15 minutes — providers may retry duplicate webhooks
 
 # In-memory fallback: bounded set of (message_id, expiry_epoch) tuples.
 # Used when Redis is down so bot echoes don't trigger false human-takeover.
-import time as _time
-from collections import OrderedDict as _OrderedDict
 
 _INMEM_SENT: "_OrderedDict[str, float]" = _OrderedDict()
 _INMEM_INCOMING: "_OrderedDict[str, float]" = _OrderedDict()
@@ -171,6 +170,7 @@ async def _send_reply_with_optional_tts(
     language_code: str,
     channel: str,
     phone: str,
+    input_was_audio: bool,
     send_audio: Callable[[bytes, str], Awaitable[dict]],
     send_text: Callable[[], Awaitable[dict]],
     force_text: bool = False,
@@ -187,7 +187,15 @@ async def _send_reply_with_optional_tts(
     links) whose text form must stay clickable for the patient.
     """
 
-    if force_text or not _is_enabled(credentials.get("tts_enabled")):
+    reply_policy = credentials.get("tts_reply_policy") or "audio_input"
+    policy_allows_audio = reply_policy == "all_inputs" or (
+        reply_policy == "audio_input" and input_was_audio
+    )
+    if (
+        force_text
+        or not _is_enabled(credentials.get("tts_enabled"))
+        or not policy_allows_audio
+    ):
         return await send_text(), False
 
     try:
@@ -897,9 +905,7 @@ async def _send_privacy_notice(
     if not _is_enabled(lgpd_cfg.get("lgpd_enabled")):
         return
     try:
-        clinic_name = (
-            (clinic_config or {}).get("identity", {}).get("clinic_name", "")
-        )
+        clinic_name = (clinic_config or {}).get("identity", {}).get("clinic_name", "")
         privacy_msg = _build_lgpd_message(
             lgpd_cfg,
             clinic_id=str(tenant_id),
@@ -913,11 +919,16 @@ async def _send_privacy_notice(
             await _store_ai_msg_id_to_db(session_id, mid, db)
             await db.commit()
         logger.info(
-            "%s LGPD privacy message sent to %s", channel_label, to_phone,
+            "%s LGPD privacy message sent to %s",
+            channel_label,
+            to_phone,
         )
     except Exception as exc:
         logger.warning(
-            "%s LGPD send failed for %s — %s", channel_label, to_phone, exc,
+            "%s LGPD send failed for %s — %s",
+            channel_label,
+            to_phone,
+            exc,
         )
 
 
@@ -1685,6 +1696,10 @@ async def _process_zapi_authenticated_body(
         message_text = (text_obj.get("message") or "").strip()
 
     is_from_me = bool(body.get("fromMe", False))
+    original_message_text = message_text
+    patient_audio_input = (
+        bool(audio_obj) and not original_message_text and not is_from_me
+    )
 
     # A clinic staff voice note. It must never be downloaded, transcribed
     # (real STT cost on the clinic's own audio) or answered, but it still has
@@ -1900,6 +1915,7 @@ async def _process_zapi_authenticated_body(
         z_tok = creds_lgpd.get("zapi_token", "").strip()
         z_ct = creds_lgpd.get("zapi_client_token", "").strip()
         if z_inst and z_tok:
+
             async def _send_zapi_privacy(msg: str) -> dict[str, Any]:
                 return await send_text_message(
                     z_inst,
@@ -1984,6 +2000,7 @@ async def _process_zapi_authenticated_body(
             language_code=_get_agent_language(clinic_config),
             channel="Z-API",
             phone=phone,
+            input_was_audio=patient_audio_input,
             send_audio=lambda audio, mime: send_zapi_audio(
                 zapi_inst,
                 zapi_token,
@@ -1999,7 +2016,9 @@ async def _process_zapi_authenticated_body(
                 suggested,
                 client_token=zapi_client_token,
             ),
-            force_text=bool(response.prompt and getattr(response.prompt, "deterministic", False)),
+            force_text=bool(
+                response.prompt and getattr(response.prompt, "deterministic", False)
+            ),
         )
         _track_sent_message(send_result)
         # DB-backed dedup: store reply message ID so its fromMe echo is recognised
@@ -2162,6 +2181,7 @@ async def evolution_webhook(
         e_name = creds_lgpd.get("evolution_instance_name", "")
         e_key = creds_lgpd.get("evolution_api_key", "")
         if e_url and e_name and e_key:
+
             async def _send_evolution_privacy(msg: str) -> dict[str, Any]:
                 return await send_evolution_text(
                     e_url,
@@ -2231,13 +2251,16 @@ async def evolution_webhook(
             language_code=_get_agent_language(clinic_config),
             channel="Evolution",
             phone=phone,
+            input_was_audio=False,
             send_audio=lambda audio, _mime: send_evolution_audio(
                 evol_url, evol_name, evol_key, phone, audio
             ),
             send_text=lambda: send_evolution_text(
                 evol_url, evol_name, evol_key, phone, suggested
             ),
-            force_text=bool(response.prompt and getattr(response.prompt, "deterministic", False)),
+            force_text=bool(
+                response.prompt and getattr(response.prompt, "deterministic", False)
+            ),
         )
         # Normalise the outbound id (Decisions 4 + 11): both dedup layers
         # receive the same value, and Evolution's ``id`` — the only key it
@@ -2409,7 +2432,11 @@ async def uazapi_webhook(
     # ``non-text`` — Z-API reference, not Meta's file-ack path (out of scope
     # for this wish).
     audio_is_transcribable = is_audio_media and not is_from_me
-    if is_media_message and not (is_from_me and is_audio_media) and not audio_is_transcribable:
+    if (
+        is_media_message
+        and not (is_from_me and is_audio_media)
+        and not audio_is_transcribable
+    ):
         logger.info(
             "Uazapi webhook: skipping non-text msg_type=%s mediaType=%s",
             msg_type,
@@ -2625,6 +2652,7 @@ async def uazapi_webhook(
     if is_new:
         lgpd_cfg = (clinic_config or {}).get("lgpd") or {}
         if u_url and u_token:
+
             async def _send_uazapi_privacy(msg: str) -> dict[str, Any]:
                 return await send_uazapi_text(u_url, u_token, from_phone, msg)
 
@@ -2682,6 +2710,7 @@ async def uazapi_webhook(
             language_code=_get_agent_language(clinic_config),
             channel="Uazapi",
             phone=from_phone,
+            input_was_audio=audio_is_transcribable,
             send_audio=lambda audio, mime: send_uazapi_audio(
                 u_url,
                 u_token,
@@ -2689,10 +2718,10 @@ async def uazapi_webhook(
                 audio,
                 mime_type=mime,
             ),
-            send_text=lambda: send_uazapi_text(
-                u_url, u_token, from_phone, suggested
+            send_text=lambda: send_uazapi_text(u_url, u_token, from_phone, suggested),
+            force_text=bool(
+                response.prompt and getattr(response.prompt, "deterministic", False)
             ),
-            force_text=bool(response.prompt and getattr(response.prompt, "deterministic", False)),
         )
         # Normalise the outbound id (Decisions 4 + 11): Uazapi's ``id``
         # arrives as ``owner:MSGID`` and never matches the echo, which only
@@ -3219,6 +3248,7 @@ async def meta_webhook(
             msg = messages[0] if isinstance(messages[0], dict) else {}
             message_id = str(msg.get("id") or "")
             msg_type = str(msg.get("type") or "")
+            input_was_audio = msg_type in _META_AUDIO_TYPES
             from_phone = _normalise_phone(str(msg.get("from") or ""))
 
             # Log receipt with the Meta message id so a "patient never got a
@@ -3583,6 +3613,7 @@ async def meta_webhook(
                     language_code=_get_agent_language(clinic_config),
                     channel="Meta",
                     phone=from_phone,
+                    input_was_audio=input_was_audio,
                     send_audio=lambda audio, mime: send_meta_cloud_audio(
                         meta_pnid,
                         meta_token,
@@ -3596,7 +3627,10 @@ async def meta_webhook(
                         from_phone,
                         suggested,
                     ),
-                    force_text=bool(response.prompt and getattr(response.prompt, "deterministic", False)),
+                    force_text=bool(
+                        response.prompt
+                        and getattr(response.prompt, "deterministic", False)
+                    ),
                 )
                 _track_meta_sent_message(send_result)
                 _reply_mid = extract_meta_message_id(send_result)
