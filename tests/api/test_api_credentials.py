@@ -152,78 +152,6 @@ def test_invalid_payload_and_unsafe_url_return_stable_secret_free_422(
     assert sentinel not in unsafe.text
 
 
-def test_normalized_legacy_echo_is_allowed_but_a_change_is_atomic(
-    client: TestClient,
-    test_app: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    existing = {
-        "llm_provider": "openai",
-        "llm_api_url": "https://api.openai.com/v1",
-        "llm_api_key": "legacy-secret",
-        "llm_model_name": "legacy-model",
-    }
-    row = SimpleNamespace(api_credentials=dict(existing))
-    calls: list[str] = []
-
-    class SessionSpy:
-        async def flush(self) -> None:
-            calls.append("flush")
-
-        async def commit(self) -> None:
-            calls.append("commit")
-
-    async def override_session() -> Any:
-        yield SessionSpy()
-
-    async def load_existing(*args: Any, **kwargs: Any) -> SimpleNamespace:
-        return row
-
-    async def no_cache_invalidation(*args: Any, **kwargs: Any) -> None:
-        return None
-
-    monkeypatch.setattr("src.api.routes.config._load_config", load_existing)
-    monkeypatch.setattr(
-        "src.services.event_service.invalidate_clinic_config_cache",
-        no_cache_invalidation,
-    )
-    test_app.dependency_overrides[get_db_session_dependency] = override_session
-    headers = _jwt_headers("clinic_admin")
-    try:
-        echo = client.patch(
-            PATH,
-            headers=headers,
-            json={
-                "llm_provider": "openai",
-                "llm_api_url": "HTTPS://API.OPENAI.COM:443/v1/",
-                "llm_api_key": "••••••••",
-                "llm_model_name": "legacy-model",
-            },
-        )
-        assert echo.status_code == 200, echo.text
-        assert echo.json()["llm_api_url"] == "https://api.openai.com/v1"
-        assert calls == ["flush", "commit"]
-        assert row.api_credentials == existing
-
-        calls.clear()
-        changed = client.patch(
-            PATH,
-            headers=headers,
-            json={"llm_model_name": "new-model"},
-        )
-    finally:
-        test_app.dependency_overrides.pop(get_db_session_dependency, None)
-
-    assert changed.status_code == 422, changed.text
-    assert changed.json()["detail"] == {
-        "error": "provider_not_available",
-        "capability": "llm",
-        "provider": "openai",
-    }
-    assert calls == []
-    assert row.api_credentials == existing
-
-
 def test_openapi_uses_typed_credential_patch_and_validation_never_echoes_input(
     client: TestClient,
     caplog: pytest.LogCaptureFixture,
@@ -656,3 +584,240 @@ def test_multimodal_text_fallback_gate_preserved_by_unrelated_patch(
 
     reread = client.get(PATH, headers=headers).json()
     assert reread["multimodal_text_fallback_enabled"] is True
+
+
+def test_legacy_echo_and_maintenance_persist_while_a_switch_stays_atomic(
+    client: TestClient,
+    test_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existing = {
+        "llm_provider": "openai",
+        "llm_api_url": "https://api.openai.com/v1",
+        "llm_api_key": "legacy-secret",
+        "llm_model_name": "legacy-model",
+    }
+    row = SimpleNamespace(api_credentials=dict(existing))
+    calls: list[str] = []
+
+    class SessionSpy:
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+
+    async def override_session() -> Any:
+        yield SessionSpy()
+
+    async def load_existing(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        return row
+
+    async def no_cache_invalidation(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr("src.api.routes.config._load_config", load_existing)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache",
+        no_cache_invalidation,
+    )
+    test_app.dependency_overrides[get_db_session_dependency] = override_session
+    headers = _jwt_headers("clinic_admin")
+    try:
+        echo = client.patch(
+            PATH,
+            headers=headers,
+            json={
+                "llm_provider": "openai",
+                "llm_api_url": "HTTPS://API.OPENAI.COM:443/v1/",
+                "llm_api_key": "••••••••",
+                "llm_model_name": "legacy-model",
+            },
+        )
+        assert echo.status_code == 200, echo.text
+        assert echo.json()["llm_api_url"] == "https://api.openai.com/v1"
+        assert calls == ["flush", "commit"]
+        assert row.api_credentials == existing
+
+        calls.clear()
+        maintained = client.patch(
+            PATH,
+            headers=headers,
+            json={"llm_model_name": "new-model"},
+        )
+        assert maintained.status_code == 200, maintained.text
+        assert calls == ["flush", "commit"]
+        assert row.api_credentials["llm_model_name"] == "new-model"
+        assert row.api_credentials["llm_api_key"] == "legacy-secret"
+
+        row.api_credentials = dict(existing)
+        calls.clear()
+        switched = client.patch(
+            PATH,
+            headers=headers,
+            json={"llm_provider": "dropout"},
+        )
+    finally:
+        test_app.dependency_overrides.pop(get_db_session_dependency, None)
+
+    assert switched.status_code == 422, switched.text
+    assert switched.json()["detail"] == {
+        "error": "provider_not_available",
+        "capability": "llm",
+        "provider": "dropout",
+    }
+    assert calls == []
+    assert row.api_credentials == existing
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        {},
+        {
+            "tts_provider": "unknown",
+            "tts_api_url": "https://tts.example/v1",
+            "tts_api_key": "saved-secret-that-must-not-leak",
+            "tts_model_name": "legacy-model",
+            "tts_voice_id": "legacy-voice",
+        },
+    ],
+    ids=["provider_missing", "provider_unknown"],
+)
+@pytest.mark.parametrize(
+    "config_patch",
+    [
+        {"tts_api_url": "https://tts.example/v2"},
+        {"tts_api_key": "replacement-secret-that-must-not-leak"},
+        {"tts_model_name": "replacement-model"},
+        {"tts_voice_id": "replacement-voice"},
+    ],
+)
+@pytest.mark.parametrize("mixed_with_controls", [False, True])
+def test_tts_config_mutations_without_known_provider_are_atomic(
+    client: TestClient,
+    test_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    existing: dict[str, object],
+    config_patch: dict[str, object],
+    mixed_with_controls: bool,
+) -> None:
+    row = SimpleNamespace(api_credentials=dict(existing))
+    calls: list[str] = []
+
+    class SessionSpy:
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+
+    async def override_session() -> Any:
+        yield SessionSpy()
+
+    async def load_existing(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        return row
+
+    monkeypatch.setattr("src.api.routes.config._load_config", load_existing)
+    test_app.dependency_overrides[get_db_session_dependency] = override_session
+    payload = dict(config_patch)
+    if mixed_with_controls:
+        payload.update({"tts_enabled": True, "tts_reply_policy": "all_inputs"})
+    try:
+        response = client.patch(
+            PATH,
+            headers=_jwt_headers("clinic_admin"),
+            json=payload,
+        )
+    finally:
+        test_app.dependency_overrides.pop(get_db_session_dependency, None)
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == {
+        "error": "provider_not_available",
+        "capability": "tts",
+        "provider": existing.get("tts_provider"),
+    }
+    assert "replacement-secret-that-must-not-leak" not in response.text
+    assert "saved-secret-that-must-not-leak" not in response.text
+    assert calls == []
+    assert row.api_credentials == existing
+
+
+def test_tts_provider_switch_and_clear_are_atomic(
+    client: TestClient,
+    test_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existing = {
+        "tts_provider": "google",
+        "tts_api_url": "https://texttospeech.googleapis.com/v1",
+        "tts_api_key": "saved-secret-that-must-not-leak",
+        "tts_model_name": "pt-br-voice",
+        "tts_voice_id": "saved-voice",
+        "tts_enabled": False,
+    }
+    row = SimpleNamespace(api_credentials=dict(existing))
+    calls: list[str] = []
+
+    class SessionSpy:
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+
+    async def override_session() -> Any:
+        yield SessionSpy()
+
+    async def load_existing(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        return row
+
+    monkeypatch.setattr("src.api.routes.config._load_config", load_existing)
+    test_app.dependency_overrides[get_db_session_dependency] = override_session
+    rejected_mutations = (
+        {"tts_provider": None},
+        {"tts_provider": "elevenlabs"},
+    )
+    maintenance_mutations = (
+        {"tts_api_url": "https://texttospeech.example/v2"},
+        {"tts_api_key": "replacement-secret-that-must-not-leak"},
+        {"tts_model_name": "replacement-model"},
+        {"tts_voice_id": "replacement-voice"},
+    )
+    try:
+        for config_patch in rejected_mutations:
+            for mixed_with_controls in (False, True):
+                row.api_credentials = dict(existing)
+                calls.clear()
+                payload = dict(config_patch)
+                if mixed_with_controls:
+                    payload.update(
+                        {"tts_enabled": True, "tts_reply_policy": "all_inputs"}
+                    )
+                response = client.patch(
+                    PATH,
+                    headers=_jwt_headers("clinic_admin"),
+                    json=payload,
+                )
+                assert response.status_code == 422, response.text
+                assert response.json()["detail"]["error"] == ("provider_not_available")
+                assert calls == []
+                assert row.api_credentials == existing
+
+        for config_patch in maintenance_mutations:
+            row.api_credentials = dict(existing)
+            calls.clear()
+            response = client.patch(
+                PATH,
+                headers=_jwt_headers("clinic_admin"),
+                json=dict(config_patch),
+            )
+            assert response.status_code == 200, response.text
+            assert "replacement-secret-that-must-not-leak" not in response.text
+            assert calls == ["flush", "commit"]
+            assert row.api_credentials["tts_provider"] == "google"
+            for field, value in config_patch.items():
+                assert row.api_credentials[field] == value
+    finally:
+        test_app.dependency_overrides.pop(get_db_session_dependency, None)

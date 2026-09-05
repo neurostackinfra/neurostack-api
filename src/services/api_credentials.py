@@ -130,8 +130,6 @@ TTS_FIELDS = frozenset(
         "tts_reply_policy",
     }
 )
-TTS_CONTROL_FIELDS = frozenset({"tts_enabled", "tts_reply_policy"})
-
 API_CREDENTIAL_FIELDS = frozenset(
     WHATSAPP_FIELDS | LLM_FIELDS | MULTIMODAL_FIELDS | STT_FIELDS | TTS_FIELDS
 )
@@ -141,6 +139,48 @@ CAPABILITY_CREDENTIAL_FIELDS: dict[str, frozenset[str]] = {
     "multimodal": MULTIMODAL_FIELDS,
     "stt": STT_FIELDS,
     "tts": TTS_FIELDS,
+}
+TTS_CONTROL_FIELDS = frozenset({"tts_enabled", "tts_reply_policy"})
+# Behavior knobs that carry no credential material, so writing them adopts no
+# provider and stays available to a tenant that has none configured.
+PROVIDER_INDEPENDENT_CONTROLS: dict[str, frozenset[str]] = {
+    "multimodal": frozenset({"multimodal_text_fallback_enabled"}),
+    "stt": frozenset({"audio_max_seconds"}),
+}
+CAPABILITY_PROVIDER_FIELDS: dict[str, str] = {
+    "whatsapp": "whatsapp_provider",
+    "llm": "llm_provider",
+    "multimodal": "multimodal_provider",
+    "stt": "stt_provider",
+    "tts": "tts_provider",
+}
+# WhatsApp is the one capability whose runtime ignores the provider field: the
+# webhook resolves a tenant from `meta_phone_number_id` and picks its outbound
+# path from whichever token is set, so `whatsapp_provider` is only a label.
+# Writing another provider's bundle therefore adopts that provider even when the
+# label is left untouched, and the gate has to key on the bundle instead.
+WHATSAPP_PROVIDER_FIELD_GROUPS: dict[str, frozenset[str]] = {
+    "meta_cloud": frozenset(
+        {
+            "meta_phone_number_id",
+            "meta_waba_id",
+            "meta_permanent_token",
+            "meta_app_secret",
+            "meta_verify_token",
+        }
+    ),
+    "zapi": frozenset(
+        {
+            "zapi_instance_id",
+            "zapi_token",
+            "zapi_client_token",
+            "zapi_inbound_token_digest",
+        }
+    ),
+    "evolution": frozenset(
+        {"evolution_api_url", "evolution_instance_name", "evolution_api_key"}
+    ),
+    "uazapi": frozenset({"uazapi_api_url", "uazapi_instance_name", "uazapi_token"}),
 }
 LEGACY_CREDENTIAL_ALIASES = frozenset(
     {"llm_base_url", "whisper_api_key", "whisper_model"}
@@ -243,12 +283,7 @@ def merge_credentials(
             "invalid_credentials_payload",
             fields=[{"field": field, "code": "extra_forbidden"} for field in unknown],
         )
-    for capability in PROVIDER_ALLOWLISTS:
-        provider_field = (
-            "whatsapp_provider"
-            if capability == "whatsapp"
-            else f"{capability}_provider"
-        )
+    for capability, provider_field in CAPABILITY_PROVIDER_FIELDS.items():
         if provider_field in patch:
             validate_provider(capability, patch[provider_field])
 
@@ -280,50 +315,92 @@ def _tts_bundle_complete(credentials: Mapping[str, Any]) -> bool:
     return all(bool(credentials.get(field)) for field in required_fields)
 
 
+def persisted_provider(capability: str, credentials: Mapping[str, Any]) -> str | None:
+    """Return the allowlisted provider a tenant already stores for a capability."""
+
+    source = (
+        resolve_stt_credentials(credentials) if capability == "stt" else credentials
+    )
+    provider = source.get(CAPABILITY_PROVIDER_FIELDS[capability])
+    if not isinstance(provider, str):
+        return None
+    return provider if provider in PROVIDER_ALLOWLISTS[capability] else None
+
+
 def validate_provider_availability(
     existing: Mapping[str, Any], candidate: Mapping[str, Any]
 ) -> None:
-    """Reject an effective write to a provider that is not available yet.
+    """Reject an effective write that adopts a provider the tenant does not hold.
 
     This runs strictly after :func:`merge_credentials`.  Comparing the merged
     candidate with the stored values makes a masked, normalized legacy echo a
     no-op, while any resulting provider capability mutation stays atomic at
     the HTTP boundary.
+
+    A tenant may keep maintaining the provider it already has persisted, even
+    while that provider is `coming_soon` and even while its stored bundle is
+    incomplete — otherwise a half-configured capability would have no way to
+    be completed.  Everything else fails closed: adopting a second provider,
+    bootstrapping a capability from nothing, and clearing a stored provider
+    all stay rejected, so no tenant reaches an unvalidated provider it was not
+    already using.
     """
 
     for capability, providers in PROVIDER_AVAILABILITY.items():
-        provider_field = (
-            "whatsapp_provider"
-            if capability == "whatsapp"
-            else f"{capability}_provider"
-        )
-        provider = candidate.get(provider_field)
+        provider_field = CAPABILITY_PROVIDER_FIELDS[capability]
         changed_fields = {
             field
             for field in CAPABILITY_CREDENTIAL_FIELDS[capability]
             if candidate.get(field) != existing.get(field)
         }
-        if (
-            capability == "tts"
-            and changed_fields
-            and changed_fields <= TTS_CONTROL_FIELDS
-        ):
-            if not _tts_bundle_complete(existing):
+        if not changed_fields:
+            continue
+        provider = candidate.get(provider_field)
+        # Both sides go through the same resolution so a legacy STT tenant,
+        # whose provider id is only implied by its `whisper_*` aliases, is not
+        # read as adopting a provider it has stored all along.
+        stored = persisted_provider(capability, existing)
+        if changed_fields <= PROVIDER_INDEPENDENT_CONTROLS.get(capability, frozenset()):
+            continue
+        if capability == "tts":
+            # Enabling voice replies requires an already-operational bundle
+            # whatever else the same request carries; completeness is
+            # deliberately evaluated against `existing`, never a partial
+            # candidate assembled by this very request.
+            turning_on = bool(candidate.get("tts_enabled")) and not bool(
+                existing.get("tts_enabled")
+            )
+            if (
+                turning_on or changed_fields <= TTS_CONTROL_FIELDS
+            ) and not _tts_bundle_complete(existing):
                 raise CredentialPolicyError(
                     "provider_not_available",
                     capability=capability,
                     provider=provider,
                 )
+            if changed_fields <= TTS_CONTROL_FIELDS:
+                continue
+        if capability == "whatsapp":
+            adopted = {
+                group_provider
+                for group_provider, group in WHATSAPP_PROVIDER_FIELD_GROUPS.items()
+                if changed_fields & group
+            } - {stored}
+            if adopted:
+                raise CredentialPolicyError(
+                    "provider_not_available",
+                    capability=capability,
+                    provider=sorted(adopted)[0],
+                )
+        if isinstance(provider, str) and providers.get(provider) == "active":
             continue
-        if providers.get(provider) == "coming_soon" and any(
-            candidate.get(field) != existing.get(field)
-            for field in CAPABILITY_CREDENTIAL_FIELDS[capability]
-        ):
-            raise CredentialPolicyError(
-                "provider_not_available",
-                capability=capability,
-                provider=provider,
-            )
+        if stored is not None and stored == persisted_provider(capability, candidate):
+            continue
+        raise CredentialPolicyError(
+            "provider_not_available",
+            capability=capability,
+            provider=provider,
+        )
 
 
 def resolve_stt_credentials(credentials: Mapping[str, Any]) -> dict[str, Any]:
@@ -469,6 +546,9 @@ def credential_status(credentials: Mapping[str, Any]) -> dict[str, Any]:
             value = False
         result[field] = value
     if "tts_reply_policy" not in credentials:
+        # Legacy rows predate the explicit trigger policy. Their behavior was
+        # audio-in/audio-out, so expose that compatibility default without
+        # mutating persisted JSON.
         result["tts_reply_policy"] = "audio_input"
     for field in sorted(SECRET_FIELDS):
         public_name = (
