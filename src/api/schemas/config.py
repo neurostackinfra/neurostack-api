@@ -149,6 +149,7 @@ class TtsCredentialsPatch(BaseModel):
     tts_model_name: Identifier | None = None
     tts_voice_id: Identifier | None = None
     tts_enabled: bool | None = None
+    tts_reply_policy: Literal["audio_input", "all_inputs"] = "audio_input"
 
 
 class ApiCredentialsPatch(

@@ -127,8 +127,10 @@ TTS_FIELDS = frozenset(
         "tts_model_name",
         "tts_voice_id",
         "tts_enabled",
+        "tts_reply_policy",
     }
 )
+TTS_CONTROL_FIELDS = frozenset({"tts_enabled", "tts_reply_policy"})
 
 API_CREDENTIAL_FIELDS = frozenset(
     WHATSAPP_FIELDS | LLM_FIELDS | MULTIMODAL_FIELDS | STT_FIELDS | TTS_FIELDS
@@ -264,6 +266,20 @@ def merge_credentials(
     return merged
 
 
+def _tts_bundle_complete(credentials: Mapping[str, Any]) -> bool:
+    if credentials.get("tts_provider") not in PROVIDER_ALLOWLISTS["tts"]:
+        return False
+    required_fields = [
+        "tts_provider",
+        "tts_api_url",
+        "tts_api_key",
+        "tts_model_name",
+    ]
+    if credentials.get("tts_provider") == "elevenlabs":
+        required_fields.append("tts_voice_id")
+    return all(bool(credentials.get(field)) for field in required_fields)
+
+
 def validate_provider_availability(
     existing: Mapping[str, Any], candidate: Mapping[str, Any]
 ) -> None:
@@ -282,12 +298,26 @@ def validate_provider_availability(
             else f"{capability}_provider"
         )
         provider = candidate.get(provider_field)
+        changed_fields = {
+            field
+            for field in CAPABILITY_CREDENTIAL_FIELDS[capability]
+            if candidate.get(field) != existing.get(field)
+        }
         if (
-            providers.get(provider) == "coming_soon"
-            and any(
-                candidate.get(field) != existing.get(field)
-                for field in CAPABILITY_CREDENTIAL_FIELDS[capability]
-            )
+            capability == "tts"
+            and changed_fields
+            and changed_fields <= TTS_CONTROL_FIELDS
+        ):
+            if not _tts_bundle_complete(existing):
+                raise CredentialPolicyError(
+                    "provider_not_available",
+                    capability=capability,
+                    provider=provider,
+                )
+            continue
+        if providers.get(provider) == "coming_soon" and any(
+            candidate.get(field) != existing.get(field)
+            for field in CAPABILITY_CREDENTIAL_FIELDS[capability]
         ):
             raise CredentialPolicyError(
                 "provider_not_available",
@@ -438,6 +468,8 @@ def credential_status(credentials: Mapping[str, Any]) -> dict[str, Any]:
         if field == "multimodal_text_fallback_enabled" and value is None:
             value = False
         result[field] = value
+    if "tts_reply_policy" not in credentials:
+        result["tts_reply_policy"] = "audio_input"
     for field in sorted(SECRET_FIELDS):
         public_name = (
             "zapi_inbound_token" if field == "zapi_inbound_token_digest" else field
@@ -468,16 +500,7 @@ def credential_status(credentials: Mapping[str, Any]) -> dict[str, Any]:
     )
     stt_provider = resolved.get("stt_provider", "outros")
     stt_complete = _complete(resolved, ("stt_api_url", "stt_api_key", "stt_model_name"))
-    tts_provider = credentials.get("tts_provider")
-    tts_required_fields = [
-        "tts_provider",
-        "tts_api_url",
-        "tts_api_key",
-        "tts_model_name",
-    ]
-    if tts_provider == "elevenlabs":
-        tts_required_fields.append("tts_voice_id")
-    tts_complete = _complete(credentials, tuple(tts_required_fields))
+    tts_complete = _tts_bundle_complete(credentials)
     whatsapp_readiness = _whatsapp_readiness(credentials)
     result.update(
         {

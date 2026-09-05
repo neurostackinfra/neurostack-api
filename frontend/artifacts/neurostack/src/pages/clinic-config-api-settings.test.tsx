@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 
+import { VoiceResponseControls } from "@/components/api-settings/voice-response-controls";
 import ClinicConfig, {
   API_CAPABILITIES,
   API_PROVIDER_AVAILABILITY,
@@ -251,6 +252,22 @@ describe("<ApiCredentialsForm /> all-coming-soon boundary", () => {
     render(<Wrapper><ApiCredentialsForm clinicId="legacy-clinic" isReadOnly={false} isSuperAdmin /></Wrapper>);
     expect(screen.getByTestId("api-settings-legacy-state-note")).toHaveTextContent("configurações de API existentes são preservadas");
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps voice controls as a sibling of the provider grid", () => {
+    render(
+      <Wrapper>
+        <div data-testid="integrations-content">
+          <VoiceResponseControls clinicId="preview" isReadOnly role="investor" />
+          <ApiCredentialsForm clinicId="preview" isReadOnly isSuperAdmin={false} />
+        </div>
+      </Wrapper>,
+    );
+
+    const voiceSection = screen.getByTestId("voice-response-controls");
+    const apiSection = screen.getByTestId("api-settings-section");
+    expect(apiSection.contains(voiceSection)).toBe(false);
+    expect(within(apiSection).getAllByTestId(/provider-card-/)).toHaveLength(19);
   });
 });
 

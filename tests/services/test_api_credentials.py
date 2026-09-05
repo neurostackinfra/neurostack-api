@@ -8,10 +8,11 @@ from src.services.api_credentials import (
     API_CREDENTIAL_FIELDS,
     CONFIG_CACHE_SCHEMA_VERSION,
     CONFIG_CACHE_VERSION_FIELD,
-    PROVIDER_AVAILABILITY,
     PROVIDER_ALLOWLISTS,
+    PROVIDER_AVAILABILITY,
     READINESS_IDS,
     SECRET_FIELDS,
+    TTS_FIELDS,
     WIRE_ERROR_CODES,
     CredentialPolicyError,
     build_cache_payload,
@@ -112,7 +113,9 @@ def test_merge_errors_are_exact_and_atomic(
     assert existing == snapshot
 
 
-def test_post_merge_availability_rejects_effective_changes_and_allows_masked_echo() -> None:
+def test_post_merge_availability_rejects_effective_changes_and_allows_masked_echo() -> (
+    None
+):
     existing = {
         "llm_provider": "openai",
         "llm_api_url": "https://api.openai.com/v1",
@@ -203,6 +206,7 @@ def test_tts_configuration_is_operational_but_never_projected_to_cache(
             "tts_model_name": "pt-br-voice",
             "tts_voice_id": voice_id,
             "tts_enabled": True,
+            "tts_reply_policy": "all_inputs",
         },
     )
 
@@ -212,11 +216,78 @@ def test_tts_configuration_is_operational_but_never_projected_to_cache(
     assert status["tts_api_key_masked"] == "••••••••"
     assert status["tts_enabled"] is True
     assert status["tts_voice_id"] == voice_id
+    assert status["tts_reply_policy"] == "all_inputs"
     assert status["tts_readiness"] == "active"
     assert not any(
         field.startswith("tts_") for field in runtime_projection(credentials)
     )
     assert "tts-secret" not in repr(status)
+
+
+@pytest.mark.parametrize(
+    ("patch", "expected_controls"),
+    [
+        (
+            {"tts_reply_policy": "all_inputs"},
+            {"tts_enabled": False, "tts_reply_policy": "all_inputs"},
+        ),
+        (
+            {"tts_enabled": True},
+            {"tts_enabled": True, "tts_reply_policy": "audio_input"},
+        ),
+        (
+            {
+                "tts_enabled": True,
+                "tts_reply_policy": "all_inputs",
+                "tts_api_key": "••••••••",
+            },
+            {"tts_enabled": True, "tts_reply_policy": "all_inputs"},
+        ),
+    ],
+)
+def test_tts_control_merge_preserves_complete_saved_bundle_and_readiness(
+    patch: dict[str, object], expected_controls: dict[str, object]
+) -> None:
+    existing = {
+        "tts_provider": "google",
+        "tts_api_url": "https://texttospeech.googleapis.com/v1",
+        "tts_api_key": "saved-tts-secret",
+        "tts_model_name": "pt-br-voice",
+        "tts_voice_id": "saved-voice",
+        "tts_enabled": False,
+        "llm_model_name": "unrelated-model",
+    }
+
+    merged = merge_credentials(existing, patch)
+
+    assert "tts_reply_policy" in TTS_FIELDS
+    validate_provider_availability(existing, merged)
+    status = credential_status(merged)
+    assert status["tts_enabled"] is expected_controls["tts_enabled"]
+    assert status["tts_reply_policy"] == expected_controls["tts_reply_policy"]
+    assert status["tts_readiness"] == "active"
+    for field in (
+        "tts_provider",
+        "tts_api_url",
+        "tts_api_key",
+        "tts_model_name",
+        "tts_voice_id",
+        "llm_model_name",
+    ):
+        assert merged[field] == existing[field]
+    assert "saved-tts-secret" not in repr(status)
+    assert not any(field.startswith("tts_") for field in runtime_projection(merged))
+
+
+def test_tts_reply_policy_status_defaults_only_for_legacy_storage() -> None:
+    assert credential_status({})["tts_reply_policy"] == "audio_input"
+    assert credential_status({"tts_provider": "google"})["tts_reply_policy"] == (
+        "audio_input"
+    )
+    assert (
+        credential_status({"tts_reply_policy": "all_inputs"})["tts_reply_policy"]
+        == "all_inputs"
+    )
 
 
 @pytest.mark.parametrize(

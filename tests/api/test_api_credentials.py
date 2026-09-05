@@ -275,12 +275,145 @@ def test_pydantic_credential_types_and_bounds_are_strict() -> None:
         {"multimodal_provider": "groq"},
         {"multimodal_provider": "openai"},
         {"tts_provider": "microsoft"},
+        {"tts_reply_policy": None},
+        {"tts_reply_policy": "audio_output"},
         {"zapi_inbound_token_digest": "A" * 64},
         {"zapi_inbound_token_digest": "a" * 63},
     )
     for payload in invalid_payloads:
         with pytest.raises(ValidationError):
             ApiCredentialsPatch.model_validate(payload)
+
+
+def test_tts_reply_policy_default_is_not_an_implicit_patch() -> None:
+    omitted = ApiCredentialsPatch.model_validate({})
+    assert omitted.tts_reply_policy == "audio_input"
+    assert "tts_reply_policy" not in omitted.model_fields_set
+    assert omitted.model_dump(exclude_unset=True) == {}
+
+    explicit = ApiCredentialsPatch.model_validate({"tts_reply_policy": "audio_input"})
+    assert explicit.model_fields_set == {"tts_reply_policy"}
+    assert explicit.model_dump(exclude_unset=True) == {
+        "tts_reply_policy": "audio_input"
+    }
+
+
+def test_tts_control_patch_requires_bundle_and_invalid_policy_is_atomic(
+    client: TestClient,
+) -> None:
+    headers = _jwt_headers("clinic_admin")
+    initial = client.get(PATH, headers=headers)
+    assert initial.status_code == 200
+    assert initial.json()["tts_reply_policy"] == "audio_input"
+
+    for control_patch in (
+        {"tts_reply_policy": "all_inputs"},
+        {"tts_enabled": True},
+        {"tts_enabled": True, "tts_reply_policy": "all_inputs"},
+    ):
+        refused = client.patch(PATH, headers=headers, json=control_patch)
+        assert refused.status_code == 422, refused.text
+        assert refused.json()["detail"] == {
+            "error": "provider_not_available",
+            "capability": "tts",
+            "provider": None,
+        }
+
+    for invalid_policy in (None, "audio_output"):
+        invalid = client.patch(
+            PATH,
+            headers=headers,
+            json={"tts_reply_policy": invalid_policy},
+        )
+        assert invalid.status_code == 422
+        assert invalid.json()["detail"]["error"] == "invalid_credentials_payload"
+
+    unchanged = client.get(PATH, headers=headers)
+    assert unchanged.status_code == 200
+    assert unchanged.json()["tts_reply_policy"] == "audio_input"
+    assert unchanged.json()["tts_enabled"] is None
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_controls"),
+    [
+        (
+            {"tts_reply_policy": "all_inputs"},
+            {"tts_enabled": False, "tts_reply_policy": "all_inputs"},
+        ),
+        (
+            {"tts_enabled": True},
+            {"tts_enabled": True, "tts_reply_policy": "audio_input"},
+        ),
+        (
+            {"tts_enabled": True, "tts_reply_policy": "all_inputs"},
+            {"tts_enabled": True, "tts_reply_policy": "all_inputs"},
+        ),
+    ],
+)
+def test_control_only_patch_preserves_complete_saved_tts_bundle(
+    client: TestClient,
+    test_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, object],
+    expected_controls: dict[str, object],
+) -> None:
+    existing = {
+        "tts_provider": "google",
+        "tts_api_url": "https://texttospeech.googleapis.com/v1",
+        "tts_api_key": "saved-secret-that-must-not-leak",
+        "tts_model_name": "pt-br-voice",
+        "tts_voice_id": "saved-voice",
+        "tts_enabled": False,
+    }
+    row = SimpleNamespace(api_credentials=dict(existing))
+    calls: list[str] = []
+
+    class SessionSpy:
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+
+    async def override_session() -> Any:
+        yield SessionSpy()
+
+    async def load_existing(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        return row
+
+    async def no_cache_invalidation(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr("src.api.routes.config._load_config", load_existing)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache",
+        no_cache_invalidation,
+    )
+    test_app.dependency_overrides[get_db_session_dependency] = override_session
+    try:
+        response = client.patch(
+            PATH,
+            headers=_jwt_headers("clinic_admin"),
+            json=payload,
+        )
+    finally:
+        test_app.dependency_overrides.pop(get_db_session_dependency, None)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["tts_enabled"] is expected_controls["tts_enabled"]
+    assert response.json()["tts_reply_policy"] == expected_controls["tts_reply_policy"]
+    assert response.json()["tts_readiness"] == "active"
+    assert "saved-secret-that-must-not-leak" not in response.text
+    assert calls == ["flush", "commit"]
+    assert row.api_credentials["tts_api_key"] == existing["tts_api_key"]
+    for field in (
+        "tts_provider",
+        "tts_api_url",
+        "tts_model_name",
+        "tts_voice_id",
+    ):
+        assert row.api_credentials[field] == existing[field]
 
 
 def test_invalid_merge_does_not_create_or_flush_missing_config(
