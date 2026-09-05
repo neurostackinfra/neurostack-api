@@ -12,18 +12,24 @@ The Event Store provides:
 import time
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Optional, Sequence
+from types import TracebackType
+from typing import Any, Optional, cast
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram
-from sqlalchemy import and_, desc, func, select, text
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from pydantic import BaseModel, Field
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from src.config.logging import get_logger
-from src.core.exceptions import EventStoreError, EventStoreConnectionError
-
+from src.core.exceptions import EventStoreConnectionError, EventStoreError
+from src.core.interaction_context import InteractionOrigin
 
 logger = get_logger(__name__)
 
@@ -120,6 +126,7 @@ class EventData(BaseModel):
     tenant_id: UUID
     session_id: Optional[UUID] = None
     event_type: str
+    interaction_origin: InteractionOrigin = InteractionOrigin.UNKNOWN
     event_data: dict[str, Any] = Field(default_factory=dict)
     event_metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -131,6 +138,7 @@ class EventData(BaseModel):
             "tenant_id": self.tenant_id,
             "session_id": self.session_id,
             "event_type": self.event_type,
+            "interaction_origin": self.interaction_origin.value,
             "event_data": self.event_data,
             "metadata": self.event_metadata,
             "created_at": self.created_at,
@@ -202,12 +210,6 @@ class EventAggregation(BaseModel):
     last_event: Optional[datetime] = None
 
 
-from src.core.exceptions import (
-    EventStoreConnectionError,
-    EventStoreError,
-)
-
-
 # ============================================
 # Event Store Implementation
 # ============================================
@@ -239,7 +241,7 @@ class EventStore:
         database_url: Optional[str] = None,
         pool_size: Optional[int] = None,
         max_overflow: Optional[int] = None,
-    ):
+    ) -> None:
         """
         Initialize Event Store.
 
@@ -250,36 +252,39 @@ class EventStore:
         """
         # Import settings here to avoid circular import
         from src.config.settings import settings
-        
+
         self._database_url = database_url or settings.database_url
         self._pool_size = pool_size or settings.database_pool_size
         self._max_overflow = max_overflow or settings.database_max_overflow
-        self._engine = None
-        self._session_factory = None
+        self._engine: Optional[AsyncEngine] = None
+        self._session_factory: Optional[async_sessionmaker[AsyncSession]] = None
 
     async def connect(self) -> None:
         """Establish connection to PostgreSQL."""
         # Import settings here to avoid circular import
         from src.config.settings import settings
-        
+
         try:
-            self._engine = create_async_engine(
+            engine = create_async_engine(
                 self._database_url,
                 pool_size=self._pool_size,
                 max_overflow=self._max_overflow,
                 echo=settings.debug,
             )
+            self._engine = engine
             self._session_factory = async_sessionmaker(
-                self._engine,
+                engine,
                 class_=AsyncSession,
                 expire_on_commit=False,
             )
             # Test connection
-            async with self._engine.begin() as conn:
+            async with engine.begin() as conn:
                 await conn.execute(text("SELECT 1"))
         except SQLAlchemyError as e:
             EVENT_STORE_OPERATIONS.labels(operation="connect", status="error").inc()
-            raise EventStoreConnectionError(f"Failed to connect to PostgreSQL: {e}") from e
+            raise EventStoreConnectionError(
+                f"Failed to connect to PostgreSQL: {e}"
+            ) from e
         except Exception as e:
             EVENT_STORE_OPERATIONS.labels(operation="connect", status="error").inc()
             logger.error(
@@ -288,7 +293,9 @@ class EventStore:
                 error_type=type(e).__name__,
                 exc_info=True,
             )
-            raise EventStoreConnectionError(f"Failed to connect to PostgreSQL: {e}") from e
+            raise EventStoreConnectionError(
+                f"Failed to connect to PostgreSQL: {e}"
+            ) from e
 
     async def disconnect(self) -> None:
         """Close PostgreSQL connection."""
@@ -302,7 +309,12 @@ class EventStore:
         await self.connect()
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+    async def __aexit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> None:
         """Async context manager exit."""
         await self.disconnect()
 
@@ -311,6 +323,20 @@ class EventStore:
         if not self._session_factory:
             raise EventStoreConnectionError("Not connected to PostgreSQL")
         return self._session_factory()
+
+    @staticmethod
+    def _row_to_event_data(row: Any) -> EventData:
+        """Reconstruct an event without silently discarding provenance."""
+        return EventData(
+            id=row.id,
+            tenant_id=row.tenant_id,
+            session_id=row.session_id,
+            event_type=row.event_type,
+            interaction_origin=row.interaction_origin,
+            event_data=row.event_data,
+            event_metadata=row.metadata,
+            created_at=row.created_at,
+        )
 
     # ============================================
     # Append Operations
@@ -333,16 +359,16 @@ class EventStore:
         try:
             async with self._get_session() as session:
                 import json
-                from sqlalchemy.dialects.postgresql import JSONB
-                from sqlalchemy import bindparam
-                
+
                 # Use bindparam to properly handle JSONB casting
-                query = text("""
-                    INSERT INTO events (id, tenant_id, session_id, event_type, event_data, metadata, created_at)
-                    VALUES (:id, :tenant_id, :session_id, :event_type, CAST(:event_data AS jsonb), CAST(:metadata AS jsonb), :created_at)
+                query = text(
+                    """
+                    INSERT INTO events (id, tenant_id, session_id, event_type, interaction_origin, event_data, metadata, created_at)
+                    VALUES (:id, :tenant_id, :session_id, :event_type, :interaction_origin, CAST(:event_data AS jsonb), CAST(:metadata AS jsonb), :created_at)
                     RETURNING id, created_at
-                """)
-                
+                """
+                )
+
                 result = await session.execute(
                     query,
                     {
@@ -350,6 +376,7 @@ class EventStore:
                         "tenant_id": event.tenant_id,
                         "session_id": event.session_id,
                         "event_type": event.event_type,
+                        "interaction_origin": event.interaction_origin.value,
                         "event_data": json.dumps(event.event_data),
                         "metadata": json.dumps(event.event_metadata),
                         "created_at": event.created_at,
@@ -357,6 +384,8 @@ class EventStore:
                 )
                 await session.commit()
                 row = result.fetchone()
+                if row is None:
+                    raise EventStoreError("Append returned no event row")
                 event.created_at = row.created_at
 
             latency = time.perf_counter() - start_time
@@ -418,12 +447,15 @@ class EventStore:
         start_time = time.perf_counter()
         try:
             import json
+
             async with self._get_session() as session:
                 for event in events:
-                    query = text("""
-                        INSERT INTO events (id, tenant_id, session_id, event_type, event_data, metadata, created_at)
-                        VALUES (:id, :tenant_id, :session_id, :event_type, CAST(:event_data AS jsonb), CAST(:metadata AS jsonb), :created_at)
-                    """)
+                    query = text(
+                        """
+                        INSERT INTO events (id, tenant_id, session_id, event_type, interaction_origin, event_data, metadata, created_at)
+                        VALUES (:id, :tenant_id, :session_id, :event_type, :interaction_origin, CAST(:event_data AS jsonb), CAST(:metadata AS jsonb), :created_at)
+                    """
+                    )
                     await session.execute(
                         query,
                         {
@@ -431,6 +463,7 @@ class EventStore:
                             "tenant_id": event.tenant_id,
                             "session_id": event.session_id,
                             "event_type": event.event_type,
+                            "interaction_origin": event.interaction_origin.value,
                             "event_data": json.dumps(event.event_data),
                             "metadata": json.dumps(event.event_metadata),
                             "created_at": event.created_at,
@@ -440,14 +473,18 @@ class EventStore:
 
             latency = time.perf_counter() - start_time
             EVENT_STORE_LATENCY.labels(operation="append_batch").observe(latency)
-            EVENT_STORE_OPERATIONS.labels(operation="append_batch", status="success").inc()
-            
+            EVENT_STORE_OPERATIONS.labels(
+                operation="append_batch", status="success"
+            ).inc()
+
             for event in events:
                 EVENTS_APPENDED.labels(event_type=event.event_type).inc()
 
             return events
         except SQLAlchemyError as e:
-            EVENT_STORE_OPERATIONS.labels(operation="append_batch", status="error").inc()
+            EVENT_STORE_OPERATIONS.labels(
+                operation="append_batch", status="error"
+            ).inc()
             logger.error(
                 "Database error appending batch to Event Store",
                 batch_size=len(events),
@@ -457,7 +494,9 @@ class EventStore:
             )
             raise EventStoreError(f"Failed to append batch: {e}") from e
         except Exception as e:
-            EVENT_STORE_OPERATIONS.labels(operation="append_batch", status="error").inc()
+            EVENT_STORE_OPERATIONS.labels(
+                operation="append_batch", status="error"
+            ).inc()
             logger.error(
                 "Unexpected error appending batch to Event Store",
                 batch_size=len(events),
@@ -511,14 +550,16 @@ class EventStore:
                     type_filter = "AND event_type = ANY(:event_types)"
                     params["event_types"] = event_types
 
-                query = text(f"""
-                    SELECT id, tenant_id, session_id, event_type, event_data, metadata, created_at
+                query = text(
+                    f"""
+                    SELECT id, tenant_id, session_id, event_type, interaction_origin, event_data, metadata, created_at
                     FROM events
                     WHERE tenant_id = :tenant_id AND session_id = :session_id
                     {type_filter}
                     ORDER BY created_at {order}
                     LIMIT :limit OFFSET :offset
-                """)
+                """
+                )
 
                 result = await session.execute(query, params)
                 rows = result.fetchall()
@@ -528,35 +569,32 @@ class EventStore:
                 if has_more:
                     rows = rows[:limit]
 
-                events = [
-                    EventData(
-                        id=row.id,
-                        tenant_id=row.tenant_id,
-                        session_id=row.session_id,
-                        event_type=row.event_type,
-                        event_data=row.event_data,
-                        event_metadata=row.metadata,
-                        created_at=row.created_at,
-                    )
-                    for row in rows
-                ]
+                events = [self._row_to_event_data(row) for row in rows]
 
                 # Get total count
-                count_query = text(f"""
+                count_query = text(
+                    f"""
                     SELECT COUNT(*) as total
                     FROM events
                     WHERE tenant_id = :tenant_id AND session_id = :session_id
                     {type_filter}
-                """)
+                """
+                )
                 count_result = await session.execute(
-                    count_query, 
-                    {"tenant_id": tenant_id, "session_id": session_id, **({} if not event_types else {"event_types": event_types})}
+                    count_query,
+                    {
+                        "tenant_id": tenant_id,
+                        "session_id": session_id,
+                        **({} if not event_types else {"event_types": event_types}),
+                    },
                 )
                 total_count = count_result.scalar()
 
             latency = time.perf_counter() - start_time
             EVENT_STORE_LATENCY.labels(operation="query_by_session").observe(latency)
-            EVENT_STORE_OPERATIONS.labels(operation="query_by_session", status="success").inc()
+            EVENT_STORE_OPERATIONS.labels(
+                operation="query_by_session", status="success"
+            ).inc()
 
             return EventQueryResult(
                 events=events,
@@ -564,7 +602,9 @@ class EventStore:
                 has_more=has_more,
             )
         except SQLAlchemyError as e:
-            EVENT_STORE_OPERATIONS.labels(operation="query_by_session", status="error").inc()
+            EVENT_STORE_OPERATIONS.labels(
+                operation="query_by_session", status="error"
+            ).inc()
             logger.error(
                 "Database error querying events by session",
                 tenant_id=str(tenant_id),
@@ -575,7 +615,9 @@ class EventStore:
             )
             raise EventStoreError(f"Failed to query events: {e}") from e
         except Exception as e:
-            EVENT_STORE_OPERATIONS.labels(operation="query_by_session", status="error").inc()
+            EVENT_STORE_OPERATIONS.labels(
+                operation="query_by_session", status="error"
+            ).inc()
             logger.error(
                 "Unexpected error querying events by session",
                 tenant_id=str(tenant_id),
@@ -631,13 +673,15 @@ class EventStore:
 
                 where_clause = " AND ".join(filters)
 
-                query = text(f"""
-                    SELECT id, tenant_id, session_id, event_type, event_data, metadata, created_at
+                query = text(
+                    f"""
+                    SELECT id, tenant_id, session_id, event_type, interaction_origin, event_data, metadata, created_at
                     FROM events
                     WHERE {where_clause}
                     ORDER BY created_at DESC
                     LIMIT :limit OFFSET :offset
-                """)
+                """
+                )
 
                 result = await session.execute(query, params)
                 rows = result.fetchall()
@@ -646,32 +690,27 @@ class EventStore:
                 if has_more:
                     rows = rows[:limit]
 
-                events = [
-                    EventData(
-                        id=row.id,
-                        tenant_id=row.tenant_id,
-                        session_id=row.session_id,
-                        event_type=row.event_type,
-                        event_data=row.event_data,
-                        event_metadata=row.metadata,
-                        created_at=row.created_at,
-                    )
-                    for row in rows
-                ]
+                events = [self._row_to_event_data(row) for row in rows]
 
                 # Get total count
-                count_params = {k: v for k, v in params.items() if k not in ("limit", "offset")}
-                count_query = text(f"""
+                count_params = {
+                    k: v for k, v in params.items() if k not in ("limit", "offset")
+                }
+                count_query = text(
+                    f"""
                     SELECT COUNT(*) as total
                     FROM events
                     WHERE {where_clause}
-                """)
+                """
+                )
                 count_result = await session.execute(count_query, count_params)
                 total_count = count_result.scalar()
 
             latency = time.perf_counter() - query_start
             EVENT_STORE_LATENCY.labels(operation="query_by_tenant").observe(latency)
-            EVENT_STORE_OPERATIONS.labels(operation="query_by_tenant", status="success").inc()
+            EVENT_STORE_OPERATIONS.labels(
+                operation="query_by_tenant", status="success"
+            ).inc()
 
             return EventQueryResult(
                 events=events,
@@ -679,7 +718,9 @@ class EventStore:
                 has_more=has_more,
             )
         except SQLAlchemyError as e:
-            EVENT_STORE_OPERATIONS.labels(operation="query_by_tenant", status="error").inc()
+            EVENT_STORE_OPERATIONS.labels(
+                operation="query_by_tenant", status="error"
+            ).inc()
             logger.error(
                 "Database error querying events by tenant",
                 tenant_id=str(tenant_id),
@@ -689,7 +730,9 @@ class EventStore:
             )
             raise EventStoreError(f"Failed to query events: {e}") from e
         except Exception as e:
-            EVENT_STORE_OPERATIONS.labels(operation="query_by_tenant", status="error").inc()
+            EVENT_STORE_OPERATIONS.labels(
+                operation="query_by_tenant", status="error"
+            ).inc()
             logger.error(
                 "Unexpected error querying events by tenant",
                 tenant_id=str(tenant_id),
@@ -712,11 +755,13 @@ class EventStore:
         start_time = time.perf_counter()
         try:
             async with self._get_session() as session:
-                query = text("""
-                    SELECT id, tenant_id, session_id, event_type, event_data, metadata, created_at
+                query = text(
+                    """
+                    SELECT id, tenant_id, session_id, event_type, interaction_origin, event_data, metadata, created_at
                     FROM events
                     WHERE id = :event_id
-                """)
+                """
+                )
                 result = await session.execute(query, {"event_id": event_id})
                 row = result.fetchone()
 
@@ -724,18 +769,14 @@ class EventStore:
             EVENT_STORE_LATENCY.labels(operation="get_event").observe(latency)
 
             if row:
-                EVENT_STORE_OPERATIONS.labels(operation="get_event", status="success").inc()
-                return EventData(
-                    id=row.id,
-                    tenant_id=row.tenant_id,
-                    session_id=row.session_id,
-                    event_type=row.event_type,
-                    event_data=row.event_data,
-                    event_metadata=row.metadata,
-                    created_at=row.created_at,
-                )
+                EVENT_STORE_OPERATIONS.labels(
+                    operation="get_event", status="success"
+                ).inc()
+                return self._row_to_event_data(row)
             else:
-                EVENT_STORE_OPERATIONS.labels(operation="get_event", status="not_found").inc()
+                EVENT_STORE_OPERATIONS.labels(
+                    operation="get_event", status="not_found"
+                ).inc()
                 return None
         except SQLAlchemyError as e:
             EVENT_STORE_OPERATIONS.labels(operation="get_event", status="error").inc()
@@ -826,8 +867,9 @@ class EventStore:
 
                 where_clause = " AND ".join(filters)
 
-                query = text(f"""
-                    SELECT 
+                query = text(
+                    f"""
+                    SELECT
                         event_type,
                         COUNT(*) as count,
                         MIN(created_at) as first_event,
@@ -836,26 +878,31 @@ class EventStore:
                     WHERE {where_clause}
                     GROUP BY event_type
                     ORDER BY count DESC
-                """)
+                """
+                )
 
                 result = await session.execute(query, params)
                 rows = result.fetchall()
 
             latency = time.perf_counter() - query_start
             EVENT_STORE_LATENCY.labels(operation="count_by_type").observe(latency)
-            EVENT_STORE_OPERATIONS.labels(operation="count_by_type", status="success").inc()
+            EVENT_STORE_OPERATIONS.labels(
+                operation="count_by_type", status="success"
+            ).inc()
 
             return [
                 EventAggregation(
-                    event_type=row.event_type,
-                    count=row.count,
-                    first_event=row.first_event,
-                    last_event=row.last_event,
+                    event_type=cast(str, row.event_type),
+                    count=cast(int, row.count),
+                    first_event=cast(Optional[datetime], row.first_event),
+                    last_event=cast(Optional[datetime], row.last_event),
                 )
                 for row in rows
             ]
         except SQLAlchemyError as e:
-            EVENT_STORE_OPERATIONS.labels(operation="count_by_type", status="error").inc()
+            EVENT_STORE_OPERATIONS.labels(
+                operation="count_by_type", status="error"
+            ).inc()
             logger.error(
                 "Database error counting events by type",
                 tenant_id=str(tenant_id),
@@ -865,7 +912,9 @@ class EventStore:
             )
             raise EventStoreError(f"Failed to count events: {e}") from e
         except Exception as e:
-            EVENT_STORE_OPERATIONS.labels(operation="count_by_type", status="error").inc()
+            EVENT_STORE_OPERATIONS.labels(
+                operation="count_by_type", status="error"
+            ).inc()
             logger.error(
                 "Unexpected error counting events by type",
                 tenant_id=str(tenant_id),
@@ -912,22 +961,28 @@ class EventStore:
 
                 where_clause = " AND ".join(filters)
 
-                query = text(f"""
+                query = text(
+                    f"""
                     SELECT COUNT(DISTINCT session_id) as count
                     FROM events
                     WHERE {where_clause}
-                """)
+                """
+                )
 
                 result = await session.execute(query, params)
                 count = result.scalar()
 
             latency = time.perf_counter() - query_start
             EVENT_STORE_LATENCY.labels(operation="count_sessions").observe(latency)
-            EVENT_STORE_OPERATIONS.labels(operation="count_sessions", status="success").inc()
+            EVENT_STORE_OPERATIONS.labels(
+                operation="count_sessions", status="success"
+            ).inc()
 
             return count or 0
         except SQLAlchemyError as e:
-            EVENT_STORE_OPERATIONS.labels(operation="count_sessions", status="error").inc()
+            EVENT_STORE_OPERATIONS.labels(
+                operation="count_sessions", status="error"
+            ).inc()
             logger.error(
                 "Database error counting sessions with events",
                 tenant_id=str(tenant_id),
@@ -937,7 +992,9 @@ class EventStore:
             )
             raise EventStoreError(f"Failed to count sessions: {e}") from e
         except Exception as e:
-            EVENT_STORE_OPERATIONS.labels(operation="count_sessions", status="error").inc()
+            EVENT_STORE_OPERATIONS.labels(
+                operation="count_sessions", status="error"
+            ).inc()
             logger.error(
                 "Unexpected error counting sessions with events",
                 tenant_id=str(tenant_id),
@@ -1157,4 +1214,3 @@ async def close_event_store() -> None:
     if _event_store is not None:
         await _event_store.disconnect()
         _event_store = None
-

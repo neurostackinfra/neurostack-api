@@ -7,9 +7,10 @@ a running PostgreSQL instance.
 """
 
 import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
@@ -18,7 +19,7 @@ sys.path.insert(0, "/home/jairomendes/neurostack/neurostack-api")
 
 # We need to check if src.models.session is already loaded
 # If not, we mock it to avoid SQLAlchemy issues
-if 'src.models.session' not in sys.modules:
+if "src.models.session" not in sys.modules:
     # Create a mock CognitiveStateData class for testing
     class MockCognitiveStateData:
         """Mock CognitiveStateData for testing purposes."""
@@ -67,7 +68,7 @@ if 'src.models.session' not in sys.modules:
                 last_intent=data.get("last_intent"),
                 confidence_avg=data.get("confidence_avg"),
             )
-        
+
         def add_intent(self, intent: str) -> None:
             self.intent_history.append(intent)
             self.last_intent = intent
@@ -93,25 +94,22 @@ if 'src.models.session' not in sys.modules:
     # Patch the module before importing event_store
     mock_session_module = MagicMock()
     mock_session_module.CognitiveStateData = MockCognitiveStateData
-    sys.modules['src.models.session'] = mock_session_module
+    sys.modules["src.models.session"] = mock_session_module
 
-from src.core.exceptions import (
-    EventStoreConnectionError,
-    EventStoreError,
-)
-from src.memory.event_store import (
+from src.core.exceptions import EventStoreConnectionError, EventStoreError  # noqa: E402
+from src.core.interaction_context import InteractionOrigin  # noqa: E402
+from src.memory.event_store import (  # noqa: E402
+    EventAggregation,
     EventData,
     EventQueryResult,
     EventStore,
     EventType,
-    EventAggregation,
-    MessageEventData,
-    SRMDecisionEventData,
-    SafetyEventData,
-    HandoffEventData,
     FunnelTransitionEventData,
+    HandoffEventData,
+    MessageEventData,
+    SafetyEventData,
+    SRMDecisionEventData,
 )
-
 
 # ============================================
 # Fixtures
@@ -204,14 +202,14 @@ def mock_engine():
     """Mock database engine."""
     engine = AsyncMock()
     engine.dispose = AsyncMock()
-    
+
     # Mock begin context manager
     conn_mock = AsyncMock()
     conn_mock.execute = AsyncMock()
     conn_mock.__aenter__ = AsyncMock(return_value=conn_mock)
     conn_mock.__aexit__ = AsyncMock(return_value=None)
     engine.begin = MagicMock(return_value=conn_mock)
-    
+
     return engine
 
 
@@ -268,6 +266,7 @@ class TestEventDataModel:
         assert event.event_data == {"content": "Hello"}
         assert event.id is not None
         assert event.created_at is not None
+        assert event.interaction_origin is InteractionOrigin.UNKNOWN
 
     def test_event_data_without_session(self, sample_tenant_id: UUID):
         """Test EventData creation without session (system event)."""
@@ -289,6 +288,7 @@ class TestEventDataModel:
         assert "tenant_id" in insert_dict
         assert "session_id" in insert_dict
         assert "event_type" in insert_dict
+        assert insert_dict["interaction_origin"] == "unknown"
         assert "event_data" in insert_dict
         assert "metadata" in insert_dict
         assert "created_at" in insert_dict
@@ -541,6 +541,9 @@ class TestCRUDOperations:
         mock_session.execute.assert_called_once()
         mock_session.commit.assert_called_once()
 
+        parameters = mock_session.execute.call_args.args[1]
+        assert parameters["interaction_origin"] == "unknown"
+
     @pytest.mark.asyncio
     async def test_append_batch(
         self,
@@ -608,6 +611,7 @@ class TestCRUDOperations:
             tenant_id=sample_message_event.tenant_id,
             session_id=sample_message_event.session_id,
             event_type=sample_message_event.event_type,
+            interaction_origin=sample_message_event.interaction_origin.value,
             event_data=sample_message_event.event_data,
             metadata=sample_message_event.event_metadata,
             created_at=sample_message_event.created_at,
@@ -670,6 +674,7 @@ class TestQueryOperations:
             tenant_id=sample_message_event.tenant_id,
             session_id=sample_message_event.session_id,
             event_type=sample_message_event.event_type,
+            interaction_origin=sample_message_event.interaction_origin.value,
             event_data=sample_message_event.event_data,
             metadata=sample_message_event.event_metadata,
             created_at=sample_message_event.created_at,
@@ -716,6 +721,94 @@ class TestQueryOperations:
 
         assert isinstance(result, EventQueryResult)
         assert result.events == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("origin", list(InteractionOrigin))
+    async def test_all_read_paths_preserve_interaction_origin(
+        self,
+        origin: InteractionOrigin,
+        sample_tenant_id: UUID,
+        sample_session_id: UUID,
+        mock_session: AsyncMock,
+        mock_session_factory: MagicMock,
+        mock_engine: AsyncMock,
+    ) -> None:
+        event_id = uuid4()
+        row = SimpleNamespace(
+            id=event_id,
+            tenant_id=sample_tenant_id,
+            session_id=sample_session_id,
+            event_type=EventType.MESSAGE_IN.value,
+            interaction_origin=origin.value,
+            event_data={"content": "origin round-trip"},
+            metadata={},
+            created_at=datetime.now(timezone.utc),
+        )
+        rows_result = MagicMock()
+        rows_result.fetchall.return_value = [row]
+        rows_result.fetchone.return_value = row
+        count_result = MagicMock()
+        count_result.scalar.return_value = 1
+
+        store = EventStore()
+        store._engine = mock_engine
+        store._session_factory = mock_session_factory
+
+        mock_session.execute.side_effect = [rows_result, count_result]
+        by_session = await store.query_by_session(
+            tenant_id=sample_tenant_id,
+            session_id=sample_session_id,
+        )
+        assert by_session.events[0].interaction_origin is origin
+
+        mock_session.execute.side_effect = [rows_result, count_result]
+        by_tenant = await store.query_by_tenant(tenant_id=sample_tenant_id)
+        assert by_tenant.events[0].interaction_origin is origin
+
+        mock_session.execute.side_effect = None
+        mock_session.execute.return_value = rows_result
+        fetched = await store.get_event(event_id)
+        assert fetched is not None
+        assert fetched.interaction_origin is origin
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("origin", list(InteractionOrigin))
+    async def test_all_append_paths_persist_interaction_origin(
+        self,
+        origin: InteractionOrigin,
+        sample_tenant_id: UUID,
+        sample_session_id: UUID,
+        mock_session: AsyncMock,
+        mock_session_factory: MagicMock,
+        mock_engine: AsyncMock,
+    ) -> None:
+        event = EventData(
+            tenant_id=sample_tenant_id,
+            session_id=sample_session_id,
+            event_type=EventType.MESSAGE_IN.value,
+            interaction_origin=origin,
+        )
+        append_result = MagicMock()
+        append_result.fetchone.return_value = SimpleNamespace(
+            id=event.id,
+            created_at=event.created_at,
+        )
+        mock_session.execute.return_value = append_result
+
+        store = EventStore()
+        store._engine = mock_engine
+        store._session_factory = mock_session_factory
+
+        await store.append(event)
+        assert (
+            mock_session.execute.call_args.args[1]["interaction_origin"] == origin.value
+        )
+
+        mock_session.reset_mock()
+        await store.append_batch([event])
+        assert (
+            mock_session.execute.call_args.args[1]["interaction_origin"] == origin.value
+        )
 
 
 # ============================================
@@ -1007,4 +1100,3 @@ class TestEventAggregation:
         assert agg.count == 0
         assert agg.first_event is None
         assert agg.last_event is None
-
