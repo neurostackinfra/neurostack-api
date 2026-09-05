@@ -34,6 +34,7 @@ import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
+import { PasswordChangeDialog } from "@/components/password-change-dialog";
 // useGetClinicConfig removed — it ignores clinic_id; layout now fetches directly
 
 interface LayoutProps {
@@ -69,6 +70,7 @@ export function Layout({ children }: LayoutProps) {
   const { setViewingClinicId } = useAuth();
   const displayClinicId = (isSuperAdmin || isBuilder) ? viewingClinicId : clinicId;
   const [clinicSearchQuery, setClinicSearchQuery] = useState("");
+  const [passwordDialogOpen, setPasswordDialogOpen] = useState(false);
   const viewingClinicIdRef = useRef(viewingClinicId);
   viewingClinicIdRef.current = viewingClinicId;
 
@@ -155,6 +157,20 @@ export function Layout({ children }: LayoutProps) {
   const filteredSuperAdminClinics = filterClinics(superAdminClinics, clinicSearchQuery);
   const builderSelectionVisible = filteredBuilderClinics.some((clinic) => clinic.id === viewingClinicId);
   const superAdminSelectionVisible = filteredSuperAdminClinics.some((clinic) => clinic.id === viewingClinicId);
+  const canChangeOwnPassword = isBuilder || isClinicAdmin;
+
+  async function changeOwnPassword(payload: { new_password: string; confirm_password: string }) {
+    const raw = localStorage.getItem("ns_auth");
+    const token = raw ? (JSON.parse(raw) as { token?: string }).token : null;
+    if (!token) return false;
+    const response = await fetch("/v1/auth/me/password", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload),
+    });
+    if (response.ok) logout();
+    return response.ok;
+  }
 
   const navItems = [
     { href: "/",         label: t("nav_chat"),      icon: MessageSquare,  id: "chat-simulator", hideFor: [] },
@@ -413,7 +429,17 @@ export function Layout({ children }: LayoutProps) {
       {/* Footer: locale toggle + email + sign out */}
       <div className="border-t border-sidebar-border px-3 py-3 space-y-2">
         <div className="flex items-center justify-between px-1">
-          <p className="text-[10px] text-muted-foreground truncate max-w-[150px]">{email}</p>
+          {canChangeOwnPassword ? (
+            <button
+              type="button"
+              onClick={() => setPasswordDialogOpen(true)}
+              className="text-left text-[10px] text-muted-foreground truncate max-w-[150px] hover:text-foreground focus:outline-none focus:ring-1 focus:ring-ring rounded"
+              aria-label={t("password_change_own_trigger")}
+              data-testid="btn-change-own-password"
+            >
+              {email}
+            </button>
+          ) : <p className="text-[10px] text-muted-foreground truncate max-w-[150px]">{email}</p>}
           <button
             onClick={() => setLocale(locale === "en" ? "pt" : "en")}
             className="flex items-center gap-1 text-[10px] font-medium text-muted-foreground hover:text-foreground transition-colors shrink-0 ml-2"
@@ -446,6 +472,7 @@ export function Layout({ children }: LayoutProps) {
   );
 
   return (
+    <>
     <div className="flex min-h-screen w-full flex-col bg-background">
       {/* Desktop Sidebar */}
       <div className="hidden border-r border-border md:block md:w-64 lg:w-72 fixed inset-y-0 left-0 z-50">
@@ -481,5 +508,20 @@ export function Layout({ children }: LayoutProps) {
         <main className="flex-1 p-4 sm:p-6 lg:p-8">{children}</main>
       </div>
     </div>
+    <PasswordChangeDialog
+      open={passwordDialogOpen}
+      onOpenChange={setPasswordDialogOpen}
+      title={t("password_change_own_title")}
+      description={t("password_change_own_description")}
+      newPasswordLabel={t("password_change_new_label")}
+      confirmPasswordLabel={t("password_change_confirm_label")}
+      submitLabel={t("password_change_submit")}
+      cancelLabel={t("password_change_cancel")}
+      mismatchMessage={t("password_change_mismatch")}
+      errorMessage={t("password_change_error")}
+      loadingLabel={t("password_change_loading")}
+      onSubmit={changeOwnPassword}
+    />
+    </>
   );
 }
