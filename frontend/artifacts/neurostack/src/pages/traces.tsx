@@ -223,7 +223,7 @@ export default function TracesList() {
   }
 
   return (
-    <div className="space-y-6 max-w-5xl mx-auto">
+    <div className="space-y-6 max-w-7xl mx-auto" data-testid="traces-content">
 
       {/* -- Header -- */}
       <div className="flex items-start justify-between gap-4 flex-wrap">
@@ -400,21 +400,33 @@ export default function TracesList() {
           recentTraces.map((trace) => (
             <Link key={trace.id} href={`/traces/${trace.id}`}>
               <Card
-                className="group p-4 flex flex-col sm:flex-row gap-4 sm:items-center hover:border-accent transition-colors cursor-pointer"
+                className="group p-4 flex flex-col gap-4 md:min-h-24 md:flex-row md:items-center hover:border-accent transition-colors cursor-pointer"
                 data-testid={`trace-row-${trace.id}`}
               >
-                <div className="w-32 shrink-0 flex flex-col gap-2">
-                  <IntentBadge intent={trace.srmDecision.intent} />
+                <div
+                  className="w-full md:w-56 shrink-0 flex flex-col gap-2"
+                  data-testid={`trace-intent-${trace.id}`}
+                >
+                  <IntentBadge
+                    intent={trace.srmDecision.intent}
+                    className="w-full justify-center"
+                  />
                   <div className="text-[10px] text-muted-foreground font-mono">
                     {format(new Date(trace.timestamp), "MMM d, HH:mm:ss")}
                   </div>
                 </div>
 
                 <div className="flex-1 min-w-0">
-                  <div className="text-sm text-foreground truncate font-medium mb-1" title={trace.userMessage}>
+                  <div
+                    className="text-sm text-foreground font-medium mb-1 whitespace-normal break-words [overflow-wrap:anywhere]"
+                    data-testid={`trace-message-${trace.id}`}
+                  >
                     "{trace.userMessage}"
                   </div>
-                  <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                  <div
+                    className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground"
+                    data-testid={`trace-metadata-${trace.id}`}
+                  >
                     <span className="capitalize text-foreground font-medium">
                       {trace.srmDecision.stage}
                     </span>

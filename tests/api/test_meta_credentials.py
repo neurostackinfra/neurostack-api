@@ -137,14 +137,15 @@ class TestMetaProviderAvailability:
             },
         )
 
-        # Update WABA id is rejected without modifying the legacy token.
+        # Maintaining the stored provider is allowed and neither echoes nor
+        # disturbs the untouched legacy verify token.
         second = client.patch(
             API_CRED_PATH,
             json={"meta_waba_id": "777888999"},
             headers=headers,
         )
-        assert second.status_code == 422
-        assert second.json()["detail"]["error"] == "provider_not_available"
+        assert second.status_code == 200, second.text
+        assert second.json()["meta_waba_id"] == "777888999"
         assert verify_token not in second.text
 
         handshake = client.get(

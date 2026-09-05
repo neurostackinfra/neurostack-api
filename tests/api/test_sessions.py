@@ -9,9 +9,15 @@ from uuid import UUID, uuid4
 import jwt
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy import select
 
+from src.api.schemas.sessions import SessionEventResponse
 from src.config.settings import settings
+from src.core.interaction_context import InteractionOrigin
+from src.models.event import Event, EventType
+from src.services import get_session_service
+from src.services.session_service import SessionService
 
 
 def _jwt_headers(
@@ -72,6 +78,7 @@ def _seed(
     sessions: list[Any] | None = None,
     builder_ids: list[UUID] | None = None,
     handoffs: list[Any] | None = None,
+    events: list[Any] | None = None,
 ) -> None:
     from src.models.builder import Builder
     from src.models.tenant import Tenant
@@ -95,6 +102,7 @@ def _seed(
                 )
             db.add_all(sessions or [])
             db.add_all(handoffs or [])
+            db.add_all(events or [])
             await db.commit()
         finally:
             await db.close()
@@ -315,8 +323,10 @@ class TestInactiveSessionTenantAuthorization:
         assert [item["session_id"] for item in own_response.json()["items"]] == [
             str(own.id)
         ]
-        assert override_response.status_code == 400
+        assert override_response.status_code == 403
+        assert override_response.json()["detail"]["code"] == "tenant_override_forbidden"
         assert cross_reactivate.status_code == 404
+        assert cross_reactivate.json()["detail"]["code"] == "session_not_found"
         assert _session_pause_state(client, other.id) == (True, None)
 
     def test_linked_builder_override_and_unlinked_rejection(
@@ -591,3 +601,230 @@ class TestExistingSessionsContract:
         assert listed.json()["total"] == 1
         assert listed.json()["page"] == 1
         assert listed.json()["page_size"] == 10
+
+    def test_cross_tenant_session_detail_is_not_enumerable(
+        self, client: TestClient
+    ) -> None:
+        own_tenant = uuid4()
+        other_tenant = uuid4()
+        foreign_session = _session(
+            other_tenant,
+            user_id="foreign",
+            activity=datetime.now(timezone.utc),
+        )
+        _seed(
+            client,
+            tenants=[(own_tenant, None), (other_tenant, None)],
+            sessions=[foreign_session],
+        )
+
+        response = client.get(
+            f"/v1/sessions/{foreign_session.id}",
+            headers=_jwt_headers("clinic_admin", own_tenant),
+        )
+
+        assert response.status_code == 404
+        assert response.json()["detail"]["code"] == "session_not_found"
+
+    def test_cross_tenant_session_mutations_are_not_enumerable(
+        self, client: TestClient
+    ) -> None:
+        own_tenant = uuid4()
+        other_tenant = uuid4()
+        foreign_session = _session(
+            other_tenant,
+            user_id="foreign-mutation",
+            activity=datetime.now(timezone.utc),
+        )
+        _seed(
+            client,
+            tenants=[(own_tenant, None), (other_tenant, None)],
+            sessions=[foreign_session],
+        )
+        own_headers = _jwt_headers("clinic_admin", own_tenant)
+
+        patched = client.patch(
+            f"/v1/sessions/{foreign_session.id}",
+            json={"metadata": {"forged": True}, "is_active": False},
+            headers=own_headers,
+        )
+        deleted = client.delete(
+            f"/v1/sessions/{foreign_session.id}",
+            headers=own_headers,
+        )
+        unchanged = client.get(
+            f"/v1/sessions/{foreign_session.id}",
+            headers=_jwt_headers("clinic_admin", other_tenant),
+        )
+
+        for response in (patched, deleted):
+            assert response.status_code == 404
+            assert response.json()["detail"]["code"] == "session_not_found"
+        assert unchanged.status_code == 200
+        assert unchanged.json()["is_active"] is True
+        assert unchanged.json()["metadata"] == {}
+
+    def test_cross_tenant_session_state_and_events_are_not_enumerable(
+        self, client: TestClient
+    ) -> None:
+        own_tenant = uuid4()
+        other_tenant = uuid4()
+        foreign_session = _session(
+            other_tenant,
+            user_id="foreign-read",
+            activity=datetime.now(timezone.utc),
+        )
+        _seed(
+            client,
+            tenants=[(own_tenant, None), (other_tenant, None)],
+            sessions=[foreign_session],
+        )
+        headers = _jwt_headers("clinic_admin", own_tenant)
+
+        state = client.get(
+            f"/v1/sessions/{foreign_session.id}/state",
+            headers=headers,
+        )
+        events = client.get(
+            f"/v1/sessions/{foreign_session.id}/events",
+            params={"tenant_id": str(own_tenant)},
+            headers=headers,
+        )
+
+        for response in (state, events):
+            assert response.status_code == 404
+            assert response.json()["detail"]["code"] == "session_not_found"
+
+    def test_session_events_expose_server_managed_origin_and_root_id(
+        self, client: TestClient
+    ) -> None:
+        tenant_id = uuid4()
+        session = _session(
+            tenant_id,
+            user_id="event-reader",
+            activity=datetime.now(timezone.utc),
+        )
+        message = Event(
+            tenant_id=tenant_id,
+            session_id=session.id,
+            event_type=EventType.MESSAGE_IN.value,
+            interaction_origin=InteractionOrigin.PRODUCTION.value,
+            event_data={"content": "hello"},
+            event_metadata={},
+        )
+        legacy = Event(
+            tenant_id=tenant_id,
+            session_id=session.id,
+            event_type=EventType.SESSION_START.value,
+            interaction_origin=InteractionOrigin.UNKNOWN.value,
+            event_data={},
+            event_metadata={},
+        )
+        _seed(
+            client,
+            tenants=[(tenant_id, None)],
+            sessions=[session],
+            events=[message, legacy],
+        )
+
+        response = client.get(
+            f"/v1/sessions/{session.id}/events",
+            params={"tenant_id": str(tenant_id)},
+            headers=_jwt_headers("clinic_admin", tenant_id),
+        )
+
+        assert response.status_code == 200
+        by_type = {event["event_type"]: event for event in response.json()["events"]}
+        assert by_type[EventType.MESSAGE_IN.value]["event_id"] == str(message.id)
+        assert by_type[EventType.MESSAGE_IN.value]["interaction_event_id"] == str(
+            message.id
+        )
+        assert (
+            by_type[EventType.MESSAGE_IN.value]["interaction_origin"]
+            == InteractionOrigin.PRODUCTION.value
+        )
+        assert by_type[EventType.SESSION_START.value]["interaction_event_id"] is None
+        assert (
+            by_type[EventType.SESSION_START.value]["interaction_origin"]
+            == InteractionOrigin.UNKNOWN.value
+        )
+
+    @pytest.mark.parametrize("role", ["investor", "unrecognized"])
+    def test_forbidden_role_cannot_create_session(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        role: str,
+    ) -> None:
+        tenant_id = uuid4()
+        _seed(client, tenants=[(tenant_id, None)])
+        service = get_session_service()
+        create_spy = AsyncMock(wraps=service.create_session)
+        monkeypatch.setattr(service, "create_session", create_spy)
+
+        response = client.post(
+            "/v1/sessions",
+            json={"tenant_id": str(tenant_id)},
+            headers=_jwt_headers(role, tenant_id),
+        )
+        listed = client.get(
+            "/v1/sessions",
+            params={"tenant_id": str(tenant_id)},
+            headers=_jwt_headers("clinic_admin", tenant_id),
+        )
+
+        assert response.status_code == 403
+        assert response.json()["detail"]["code"] == "caller_role_forbidden"
+        create_spy.assert_not_awaited()
+        assert listed.json()["total"] == 0
+
+
+@pytest.mark.parametrize(
+    ("event_type", "origin", "has_interaction_id"),
+    [
+        (EventType.MESSAGE_IN.value, InteractionOrigin.PRODUCTION, True),
+        (EventType.MESSAGE_OUT.value, InteractionOrigin.SIMULATOR, False),
+        (EventType.SESSION_START.value, InteractionOrigin.UNKNOWN, False),
+    ],
+)
+def test_session_event_response_preserves_provenance_and_ids(
+    event_type: str,
+    origin: InteractionOrigin,
+    has_interaction_id: bool,
+) -> None:
+    event = Event(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        session_id=uuid4(),
+        event_type=event_type,
+        interaction_origin=origin.value,
+        event_data={"decision": {"intent": "test"}},
+        event_metadata={},
+        created_at=datetime.now(timezone.utc),
+    )
+
+    response = SessionService._event_to_response(event)
+
+    assert response.event_id == event.id
+    assert response.tenant_id == event.tenant_id
+    assert response.session_id == event.session_id
+    assert response.event_type == event_type
+    assert response.interaction_origin is origin
+    assert response.interaction_event_id == (event.id if has_interaction_id else None)
+
+
+def test_session_event_response_rejects_unknown_origin() -> None:
+    with pytest.raises(ValidationError):
+        SessionEventResponse.model_validate(
+            {
+                "event_id": uuid4(),
+                "tenant_id": uuid4(),
+                "session_id": uuid4(),
+                "event_type": EventType.MESSAGE_IN.value,
+                "interaction_origin": "forged",
+                "interaction_event_id": uuid4(),
+                "payload": {},
+                "decision": None,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )

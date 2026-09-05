@@ -56,9 +56,13 @@ CREATE TABLE IF NOT EXISTS events (
     tenant_id UUID NOT NULL REFERENCES tenants(id),
     session_id UUID REFERENCES sessions(id),
     event_type VARCHAR(100) NOT NULL,
+    interaction_origin VARCHAR(20) NOT NULL DEFAULT 'unknown',
     event_data JSONB NOT NULL,
     metadata JSONB DEFAULT '{}',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT ck_events_interaction_origin CHECK (
+        interaction_origin IN ('production', 'simulator', 'unknown')
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_tenant_id ON events(tenant_id);
@@ -68,6 +72,27 @@ CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
 
 -- Composite index for common queries
 CREATE INDEX IF NOT EXISTS idx_events_tenant_session ON events(tenant_id, session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_tenant_origin_type_created
+    ON events(tenant_id, interaction_origin, event_type, created_at DESC);
+
+CREATE OR REPLACE FUNCTION prevent_events_interaction_origin_change()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+    IF NEW.interaction_origin IS DISTINCT FROM OLD.interaction_origin THEN
+        RAISE EXCEPTION 'events.interaction_origin is immutable'
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    RETURN NEW;
+END;
+$function$;
+
+DROP TRIGGER IF EXISTS trg_events_interaction_origin_immutable ON events;
+CREATE TRIGGER trg_events_interaction_origin_immutable
+BEFORE UPDATE OF interaction_origin ON events
+FOR EACH ROW
+EXECUTE FUNCTION prevent_events_interaction_origin_change();
 
 -- ============================================
 -- Policies Table
@@ -198,4 +223,3 @@ COMMENT ON TABLE handoff_records IS 'Human handoff records';
 
 -- Done!
 SELECT 'Database initialized successfully!' as status;
-
