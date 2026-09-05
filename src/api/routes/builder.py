@@ -9,9 +9,9 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from passlib.context import CryptContext
-from sqlalchemy import case, cast, func, select, text
+from sqlalchemy import and_, case, cast, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 from sqlalchemy.types import String
 
 from src.api.helpers.health import (
@@ -21,7 +21,9 @@ from src.api.helpers.health import (
     _compute_health_status,
     _get_time_series,
 )
-from src.api.middleware.auth import require_builder
+from src.api.helpers.password_validation import PasswordValidationRoute
+from src.api.middleware.auth import TenantContext, get_tenant_context, require_builder
+from src.api.schemas.auth import PasswordChangeRequest
 from src.api.schemas.builder import (
     BuilderAlertResponse,
     BuilderClinicResponse,
@@ -42,6 +44,7 @@ from src.services.business_hours import summarize_outside_hours
 from src.services.trace_service import _is_conversational_trace, _llm_usage_for_stats
 
 router = APIRouter()
+password_router = APIRouter(route_class=PasswordValidationRoute)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
 
 
@@ -352,6 +355,132 @@ async def toggle_clinic_status(
     await session.flush()
 
     return {"ok": True, "is_active": tenant.is_active}
+
+
+def _password_change_forbidden() -> HTTPException:
+    """Return the stable response for a stale or non-builder caller."""
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={"error": "password_change_forbidden"},
+    )
+
+
+@password_router.patch(
+    "/clinics/{clinic_id}/password",
+    status_code=status.HTTP_200_OK,
+    summary="Reset Linked Clinic Password",
+    description="Reset the one clinic administrator password for a currently linked clinic.",
+    responses={
+        200: {"description": "Password changed"},
+        401: {"description": "Missing, invalid, or expired Bearer JWT"},
+        403: {"description": "Password change is not authorized"},
+        404: {"description": "Clinic is not available to this builder"},
+        409: {"description": "Clinic does not have exactly one administrator"},
+        422: {"description": "Invalid password payload without echoed input values"},
+    },
+)
+async def reset_linked_clinic_password(
+    clinic_id: str,
+    body: PasswordChangeRequest,
+    tenant: TenantContext = Depends(get_tenant_context),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> dict[str, bool]:
+    """Reset a linked clinic password using one authorization snapshot query."""
+    if tenant.api_key or tenant.user_id is None:
+        raise _password_change_forbidden()
+
+    try:
+        requested_clinic_id = UUID(clinic_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "clinic_not_available"},
+        ) from None
+
+    builder_user = aliased(User)
+    clinic_admin = aliased(User)
+    authorization_snapshot = (
+        select(
+            builder_user.tenant_id.label("builder_tenant_id"),
+            builder_user.role.label("builder_role"),
+            builder_user.is_active.label("builder_user_active"),
+            builder_user.builder_id.label("current_builder_id"),
+            Builder.id.label("active_builder_id"),
+            Tenant.id.label("clinic_tenant_id"),
+            func.count(clinic_admin.id).label("clinic_admin_count"),
+            func.min(cast(clinic_admin.id, String)).label("clinic_admin_id"),
+        )
+        .select_from(builder_user)
+        .outerjoin(
+            Builder,
+            and_(
+                Builder.id == builder_user.builder_id,
+                Builder.is_active.is_(True),
+            ),
+        )
+        .outerjoin(
+            Tenant,
+            and_(
+                Tenant.id == requested_clinic_id,
+                Tenant.builder_id == builder_user.builder_id,
+            ),
+        )
+        .outerjoin(
+            clinic_admin,
+            and_(
+                clinic_admin.tenant_id == Tenant.id,
+                clinic_admin.role == UserRole.clinic_admin,
+            ),
+        )
+        .where(builder_user.id == tenant.user_id)
+        .group_by(
+            builder_user.tenant_id,
+            builder_user.role,
+            builder_user.is_active,
+            builder_user.builder_id,
+            Builder.id,
+            Tenant.id,
+        )
+    )
+    snapshot_result = await session.execute(authorization_snapshot)
+    snapshot = snapshot_result.mappings().one_or_none()
+
+    if (
+        snapshot is None
+        or not snapshot["builder_user_active"]
+        or snapshot["builder_role"] != UserRole.builder
+        or tenant.role != UserRole.builder.value
+        or snapshot["builder_tenant_id"] != tenant.tenant_id
+        or snapshot["current_builder_id"] is None
+        or snapshot["current_builder_id"] != tenant.builder_id
+        or snapshot["active_builder_id"] is None
+    ):
+        raise _password_change_forbidden()
+
+    if snapshot["clinic_tenant_id"] is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "clinic_not_available"},
+        )
+
+    if snapshot["clinic_admin_count"] != 1 or snapshot["clinic_admin_id"] is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"error": "clinic_admin_unavailable"},
+        )
+
+    await session.execute(
+        update(User)
+        .where(User.id == UUID(str(snapshot["clinic_admin_id"])))
+        .values(password_hash=pwd_context.hash(body.new_password))
+    )
+    await session.commit()
+    return {"ok": True}
+
+
+# The parent builder router retains all existing endpoints; the narrow subrouter
+# gives password payload validation its own redaction behavior.
+router.include_router(password_router)
 
 
 # ============================================
