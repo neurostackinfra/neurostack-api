@@ -10,6 +10,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.core.interaction_context import InteractionOrigin
+
 
 class FunnelStage(str, Enum):
     """
@@ -387,7 +389,20 @@ class SessionEventResponse(BaseModel):
     )
 
     event_id: UUID = Field(..., description="Event identifier")
+    tenant_id: UUID = Field(..., description="Tenant that owns the event")
+    session_id: Optional[UUID] = Field(
+        default=None,
+        description="Session associated with the event",
+    )
     event_type: str = Field(..., description="Type of event")
+    interaction_origin: InteractionOrigin = Field(
+        default=InteractionOrigin.UNKNOWN,
+        description="Server-managed interaction provenance",
+    )
+    interaction_event_id: Optional[UUID] = Field(
+        default=None,
+        description="Root message.in event identifier when this is that event",
+    )
     payload: dict[str, Any] = Field(..., description="Event payload")
     decision: Optional[dict[str, Any]] = Field(default=None, description="SRM decision")
     created_at: str = Field(..., description="Event timestamp")

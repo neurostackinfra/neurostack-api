@@ -6,7 +6,8 @@ and session creation endpoints.
 """
 
 import time
-from typing import Any, Optional
+from typing import Optional
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import jwt
@@ -14,7 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.config.settings import settings
-
+from src.services import get_session_service
 
 # ============================================
 # Helpers
@@ -117,7 +118,8 @@ class TestNonBuilderTenantIdRejection:
         # _resolve_tenant guard for non-builders because tenant_id is the
         # required query param). This is the "general security gap" noted
         # as out of scope for this wish.
-        assert response.status_code in (200, 400)
+        assert response.status_code == 403
+        assert response.json()["detail"]["code"] == "tenant_override_forbidden"
 
 
 # ============================================
@@ -164,6 +166,7 @@ class TestBuilderTenantOverride:
             headers=_auth_headers(token),
         )
         assert response.status_code == 403
+        assert response.json()["detail"]["code"] == "tenant_override_forbidden"
 
     def test_builder_sessions_list_unowned_clinic_returns_403(
         self, client: TestClient
@@ -175,6 +178,7 @@ class TestBuilderTenantOverride:
             headers=_auth_headers(token),
         )
         assert response.status_code == 403
+        assert response.json()["detail"]["code"] == "tenant_override_forbidden"
 
 
 # ============================================
@@ -185,9 +189,7 @@ class TestBuilderTenantOverride:
 class TestBuilderOwnTenant:
     """Builder using their own tenant_id should work normally (no override triggered)."""
 
-    def test_builder_traces_own_tenant_no_override(
-        self, client: TestClient
-    ) -> None:
+    def test_builder_traces_own_tenant_no_override(self, client: TestClient) -> None:
         token = _make_builder_jwt(BUILDER_TENANT_ID, BUILDER_ID)
         response = client.get(
             "/v1/traces",
@@ -196,9 +198,7 @@ class TestBuilderOwnTenant:
         # No tenant_id override → uses JWT tenant_id → 200 (empty list is fine)
         assert response.status_code == 200
 
-    def test_builder_sessions_own_tenant_no_override(
-        self, client: TestClient
-    ) -> None:
+    def test_builder_sessions_own_tenant_no_override(self, client: TestClient) -> None:
         token = _make_builder_jwt(BUILDER_TENANT_ID, BUILDER_ID)
         response = client.get(
             "/v1/sessions",
@@ -217,8 +217,11 @@ class TestBuilderSessionCreation:
     """Builder creating sessions for clinics they don't manage gets 403."""
 
     def test_builder_create_session_unowned_clinic_returns_403(
-        self, client: TestClient
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        service = get_session_service()
+        create_spy = AsyncMock(wraps=service.create_session)
+        monkeypatch.setattr(service, "create_session", create_spy)
         token = _make_builder_jwt(BUILDER_TENANT_ID, BUILDER_ID)
         payload = {
             "tenant_id": str(CLINIC_TENANT_ID),
@@ -230,6 +233,8 @@ class TestBuilderSessionCreation:
             headers=_auth_headers(token),
         )
         assert response.status_code == 403
+        assert response.json()["detail"]["code"] == "tenant_override_forbidden"
+        create_spy.assert_not_awaited()
 
     def test_builder_create_session_own_tenant_succeeds(
         self, client: TestClient
@@ -276,7 +281,8 @@ class TestAuditLogging:
             )
         # Check that audit log was emitted
         audit_messages = [
-            r for r in caplog.records
+            r
+            for r in caplog.records
             if "builder_clinic_override" in str(r.getMessage())
         ]
         assert len(audit_messages) >= 1

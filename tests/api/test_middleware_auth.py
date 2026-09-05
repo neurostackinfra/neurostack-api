@@ -8,6 +8,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
@@ -16,12 +17,25 @@ from fastapi.testclient import TestClient
 from httpx import AsyncClient
 from starlette.responses import RedirectResponse
 
-from src.api.middleware.auth import TenantContext, require_credentials_jwt
+from src.api.middleware.auth import (
+    TenantContext,
+    require_credentials_jwt,
+    resolve_effective_tenant,
+)
 from tests.conftest import LifespanTestClient
 
 
 def _request_with_tenant(tenant: TenantContext) -> Request:
-    request = Request({"type": "http", "method": "GET", "path": "/"})
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [],
+            "scheme": "http",
+            "server": ("testserver", 80),
+        }
+    )
     request.state.tenant = tenant
     return request
 
@@ -46,6 +60,95 @@ def test_credentials_dependency_rejects_api_key_and_forbidden_role() -> None:
     with pytest.raises(HTTPException) as role_error:
         require_credentials_jwt(_request_with_tenant(investor))
     assert cast(Any, role_error.value.detail) == {"error": "credentials_role_forbidden"}
+
+
+@pytest.mark.parametrize("role", ["investor", "unknown", None])
+def test_tenant_resolver_denies_unlisted_jwt_roles_before_db(
+    role: str | None,
+) -> None:
+    tenant = TenantContext(tenant_id=uuid4(), user_id=uuid4(), role=role)
+    db = AsyncMock()
+
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(
+            resolve_effective_tenant(
+                _request_with_tenant(tenant),
+                tenant,
+                tenant.tenant_id,
+                db,
+            )
+        )
+
+    assert error.value.status_code == 403
+    assert cast(Any, error.value.detail) == {"code": "caller_role_forbidden"}
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize("role", [None, "clinic_admin"])
+def test_tenant_resolver_prevents_tenant_scoped_override(
+    role: str | None,
+) -> None:
+    own_tenant = uuid4()
+    tenant = TenantContext(
+        tenant_id=own_tenant,
+        api_key="key" if role is None else "",
+        user_id=uuid4() if role else None,
+        role=role,
+    )
+    db = AsyncMock()
+
+    assert (
+        asyncio.run(
+            resolve_effective_tenant(
+                _request_with_tenant(tenant), tenant, own_tenant, db
+            )
+        )
+        == own_tenant
+    )
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(
+            resolve_effective_tenant(_request_with_tenant(tenant), tenant, uuid4(), db)
+        )
+    assert error.value.status_code == 403
+    assert cast(Any, error.value.detail) == {"code": "tenant_override_forbidden"}
+    db.execute.assert_not_awaited()
+
+
+def test_tenant_resolver_allows_super_admin_selection() -> None:
+    tenant = TenantContext(tenant_id=uuid4(), user_id=uuid4(), role="super_admin")
+    selected = uuid4()
+    db = AsyncMock()
+    assert (
+        asyncio.run(
+            resolve_effective_tenant(_request_with_tenant(tenant), tenant, selected, db)
+        )
+        == selected
+    )
+    db.execute.assert_not_awaited()
+
+
+def test_tenant_resolver_requires_builder_ownership() -> None:
+    own_tenant = uuid4()
+    selected = uuid4()
+    builder_id = uuid4()
+    tenant = TenantContext(
+        tenant_id=own_tenant,
+        user_id=uuid4(),
+        role="builder",
+        builder_id=builder_id,
+    )
+    db = AsyncMock()
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = selected
+    db.execute.return_value = result
+
+    assert (
+        asyncio.run(
+            resolve_effective_tenant(_request_with_tenant(tenant), tenant, selected, db)
+        )
+        == selected
+    )
+    db.execute.assert_awaited_once()
 
 
 def test_sync_client_runs_application_lifespan(client: Any) -> None:

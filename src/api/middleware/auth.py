@@ -51,6 +51,7 @@ class TenantContext:
         is_active: bool = True,
         user_id: Optional[UUID] = None,
         role: Optional[str] = None,
+        builder_id: Optional[UUID] = None,
     ) -> None:
         self.tenant_id = tenant_id
         self.api_key = api_key
@@ -58,6 +59,7 @@ class TenantContext:
         self.is_active = is_active
         self.user_id = user_id
         self.role = role
+        self.builder_id = builder_id
 
 
 # ============================================
@@ -301,6 +303,11 @@ class AuthMiddleware:
                     tenant_id=UUID(payload["tenant_id"]),
                     user_id=UUID(payload["sub"]),
                     role=payload.get("role"),
+                    builder_id=(
+                        UUID(payload["builder_id"])
+                        if payload.get("builder_id") is not None
+                        else None
+                    ),
                     is_active=True,
                 )
             except jwt.ExpiredSignatureError:
@@ -550,6 +557,68 @@ async def require_builder_clinic_access(
             detail="Builder does not manage this clinic",
         )
     return tenant_id
+
+
+_OPERATIONAL_JWT_ROLES = {"clinic_admin", "builder", "super_admin"}
+
+
+def _tenant_resolution_error(code: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={"code": code},
+    )
+
+
+async def resolve_effective_tenant(
+    request: Request,
+    tenant: TenantContext,
+    requested_tenant_id: Optional[UUID],
+    db: AsyncSession,
+) -> UUID:
+    """Resolve one authorized tenant before any tenant-scoped operation.
+
+    API keys are tenant-scoped. JWT callers are deny-by-default; clinic
+    administrators remain scoped to their token, builders must prove ownership
+    for clinic overrides, and super administrators may select a clinic.
+    """
+    if tenant.api_key:
+        if requested_tenant_id is None or requested_tenant_id == tenant.tenant_id:
+            return tenant.tenant_id
+        raise _tenant_resolution_error("tenant_override_forbidden")
+
+    if tenant.role not in _OPERATIONAL_JWT_ROLES:
+        raise _tenant_resolution_error("caller_role_forbidden")
+
+    if requested_tenant_id is None or requested_tenant_id == tenant.tenant_id:
+        return tenant.tenant_id
+
+    if tenant.role == "clinic_admin":
+        raise _tenant_resolution_error("tenant_override_forbidden")
+
+    if tenant.role == "super_admin":
+        return requested_tenant_id
+
+    if tenant.builder_id is None:
+        raise _tenant_resolution_error("tenant_override_forbidden")
+
+    logger.info(
+        "builder_clinic_override",
+        extra={
+            "builder_id": str(tenant.builder_id),
+            "tenant_id": str(requested_tenant_id),
+            "endpoint": request.url.path,
+        },
+    )
+    try:
+        return await require_builder_clinic_access(
+            requested_tenant_id,
+            tenant.builder_id,
+            db,
+        )
+    except HTTPException as error:
+        if error.status_code == status.HTTP_403_FORBIDDEN:
+            raise _tenant_resolution_error("tenant_override_forbidden") from error
+        raise
 
 
 async def resolve_builder_tenant_override(
