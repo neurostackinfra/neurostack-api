@@ -393,46 +393,46 @@ export const MULTIMODAL_PROVIDERS: {
 // the product spec never promised.
 export type ApiCapabilityId = "whatsapp" | "llm" | "stt" | "multimodal" | "tts";
 
-export type ProviderAvailability = "coming_soon";
+export type ProviderAvailability = "active" | "coming_soon";
 
 /**
  * Frontend mirror of `PROVIDER_AVAILABILITY` in
  * `src/services/api_credentials.py`.
  *
- * This literal is deliberately a closed 0/19 matrix: every displayed pair is
- * unavailable for new configuration, and a future promotion must change both
- * contracts together. Keeping it capability-keyed prevents a provider id
- * being accidentally rendered under a different credential shape.
+ * Marking a pair available here without the backend agreeing only produces a
+ * card that opens and then fails its PATCH, so the two contracts must move
+ * together. Keeping it capability-keyed prevents a provider id being
+ * accidentally rendered under a different credential shape.
  */
 export const API_PROVIDER_AVAILABILITY = {
   whatsapp: {
-    meta_cloud: "coming_soon",
-    zapi: "coming_soon",
-    uazapi: "coming_soon",
-    evolution: "coming_soon",
+    meta_cloud: "active",
+    zapi: "active",
+    uazapi: "active",
+    evolution: "active",
     dialog360: "coming_soon",
     twilio: "coming_soon",
   },
   llm: {
-    dropout: "coming_soon",
-    openai: "coming_soon",
-    outros: "coming_soon",
+    dropout: "active",
+    openai: "active",
+    outros: "active",
     slm_cortex: "coming_soon",
   },
   multimodal: {
-    openrouter: "coming_soon",
+    openrouter: "active",
   },
   stt: {
-    outros: "coming_soon",
-    openai_whisper: "coming_soon",
+    outros: "active",
+    openai_whisper: "active",
     elevenlabs_scribe: "coming_soon",
     google_stt: "coming_soon",
     deepgram_stt: "coming_soon",
     microsoft_stt: "coming_soon",
   },
   tts: {
-    elevenlabs: "coming_soon",
-    google: "coming_soon",
+    elevenlabs: "active",
+    google: "active",
   },
 } as const satisfies Record<ApiCapabilityId, Readonly<Record<string, ProviderAvailability>>>;
 
@@ -692,10 +692,11 @@ function statusText(status: CredentialStatusFields | null, field: string): strin
 const COMPLETE_READINESS = new Set(["active", "configuration_only"]);
 
 /**
- * A provider is `configured` once the tenant holds it with a whole bundle,
- * `incomplete` when it is held but the bundle is partial, and `coming_soon`
- * otherwise. Only the first two are editable — that is exactly the set the
- * backend availability gate lets a tenant keep maintaining.
+ * The provider the tenant holds reads `configured` with a whole bundle and
+ * `incomplete` with a partial one. Any other provider reads `available` when
+ * the runtime can serve it and `coming_soon` when it cannot — which is exactly
+ * the set the backend availability gate refuses to adopt, so an inert card and
+ * a rejected PATCH always agree.
  */
 export function providerCardState(
   capability: ApiCapabilityId,
@@ -703,10 +704,14 @@ export function providerCardState(
   status: CredentialStatusFields | null,
 ): ProviderCardState {
   const persisted = statusText(status, CAPABILITY_PROVIDER_FIELD[capability]);
-  if (!persisted || persisted !== providerId) return "coming_soon";
-  return COMPLETE_READINESS.has(statusText(status, CAPABILITY_READINESS_FIELD[capability]))
-    ? "configured"
-    : "incomplete";
+  if (persisted && persisted === providerId) {
+    return COMPLETE_READINESS.has(statusText(status, CAPABILITY_READINESS_FIELD[capability]))
+      ? "configured"
+      : "incomplete";
+  }
+  const availability: Readonly<Record<string, ProviderAvailability>> =
+    API_PROVIDER_AVAILABILITY[capability];
+  return availability[providerId] === "active" ? "available" : "coming_soon";
 }
 
 export function ApiCredentialsForm({ clinicId, isReadOnly }: {
@@ -725,6 +730,7 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
   const badgeLabel: Record<ProviderCardState, string> = {
     configured: txt("CONFIGURADO", "CONFIGURED"),
     incomplete: txt("INCOMPLETO", "INCOMPLETE"),
+    available: txt("DISPONÍVEL", "AVAILABLE"),
     coming_soon: txt("EM BREVE", "COMING SOON"),
   };
 
@@ -759,10 +765,16 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
     const key = `${capability}:${providerId}`;
     if (expanded === key) { setExpanded(null); return; }
     // Secrets never pre-fill: an empty input means "keep the stored value",
-    // which is also how the backend reads an omitted secret field.
+    // which is also how the backend reads an omitted secret field. Non-secrets
+    // only pre-fill for the provider actually held, because the field names are
+    // flat and shared — hydrating another provider's card would present one
+    // provider's endpoint and model as if they belonged to the other.
+    const held =
+      statusText(status, CAPABILITY_PROVIDER_FIELD[capability]) === providerId;
     const hydrated: Record<string, string> = {};
     for (const field of credentialFields(capability, providerId)) {
-      hydrated[field.name] = field.secret ? "" : statusText(status, field.name);
+      hydrated[field.name] =
+        field.secret || !held ? "" : statusText(status, field.name);
     }
     setBaseline(hydrated);
     setDraft(hydrated);
@@ -771,6 +783,13 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
 
   async function saveProvider(capability: ApiCapabilityId, providerId: string) {
     const body: Record<string, string | number> = {};
+    // Adoption only takes effect if the provider field travels with the
+    // bundle; omitting it would persist credentials under the previous
+    // provider's label and leave the card unable to reach CONFIGURADO.
+    const providerField = CAPABILITY_PROVIDER_FIELD[capability];
+    if (statusText(status, providerField) !== providerId) {
+      body[providerField] = providerId;
+    }
     for (const field of credentialFields(capability, providerId)) {
       const value = draft[field.name] ?? "";
       if (field.secret) {
@@ -820,8 +839,8 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
     <section className="space-y-5" data-testid="api-settings-section">
       <p className="text-sm text-muted-foreground" data-testid="api-settings-legacy-state-note">
         {txt(
-          "Você pode manter os provedores que já usa. A adoção de novos provedores estará disponível em breve.",
-          "You can keep maintaining the providers you already use. Adopting new providers is coming soon.",
+          "Escolha um provedor disponível para configurar. Os marcados como EM BREVE ainda não têm suporte no runtime.",
+          "Pick an available provider to configure. The ones marked COMING SOON have no runtime support yet.",
         )}
       </p>
       {loadFailed && (
@@ -863,7 +882,12 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
             >
               {providers.map((provider) => {
                 if (!(provider.id in availability)) return null;
-                const state = providerCardState(capability.id, provider.id, status);
+                // Until the tenant's status lands, which provider is held is
+                // unknown, so every card stays inert rather than offering an
+                // adoption that could silently displace a stored provider.
+                const state = status === null
+                  ? "coming_soon"
+                  : providerCardState(capability.id, provider.id, status);
                 const key = `${capability.id}:${provider.id}`;
                 return (
                   <ProviderCredentialCard

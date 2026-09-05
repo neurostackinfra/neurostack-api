@@ -1,4 +1,8 @@
-export type ProviderCardState = "configured" | "incomplete" | "coming_soon";
+export type ProviderCardState =
+  | "configured"
+  | "incomplete"
+  | "available"
+  | "coming_soon";
 
 export interface ProviderCredentialCardProps {
   id: string;
@@ -13,6 +17,7 @@ export interface ProviderCredentialCardProps {
 const BADGE_CLASSES: Record<ProviderCardState, string> = {
   configured: "border-emerald-500/30 bg-emerald-500/10 text-emerald-400",
   incomplete: "border-amber-500/30 bg-amber-500/10 text-amber-400",
+  available: "border-sky-500/30 bg-sky-500/10 text-sky-400",
   coming_soon: "border-orange-500/30 bg-orange-500/10 text-orange-400",
 };
 
@@ -21,9 +26,8 @@ const BADGE_CLASSES: Record<ProviderCardState, string> = {
  *
  * A `coming_soon` card is inert by construction: it renders no interactive
  * role, so it cannot acquire focus, be selected, or contribute credentials to
- * a PATCH body. Only the provider a tenant already has persisted becomes a
- * button, which is what keeps an unvalidated provider from being adopted
- * through this surface.
+ * a PATCH body. That is what keeps a provider with no runtime path from being
+ * adopted through this surface; every other state opens an editor.
  */
 export function ProviderCredentialCard({
   id,

@@ -6,6 +6,7 @@ import pytest
 
 from src.services.api_credentials import (
     API_CREDENTIAL_FIELDS,
+    CAPABILITY_PROVIDER_FIELDS,
     CONFIG_CACHE_SCHEMA_VERSION,
     CONFIG_CACHE_VERSION_FIELD,
     PROVIDER_ALLOWLISTS,
@@ -28,39 +29,57 @@ from src.services.api_credentials import (
 )
 
 
-def test_provider_availability_is_the_exact_all_coming_soon_contract() -> None:
+def test_provider_availability_is_active_exactly_where_a_runtime_path_exists() -> None:
+    """The 19 displayable pairs split into 12 adoptable and 7 still blocked.
+
+    A provider is `active` only where a runtime send/transcribe/synthesize
+    path dispatches on it. The 7 below have no such path, so marking them
+    available would hand a tenant a green badge over a capability that fails
+    at message time.
+    """
+
     assert PROVIDER_AVAILABILITY == {
         "whatsapp": {
-            "meta_cloud": "coming_soon",
-            "zapi": "coming_soon",
-            "uazapi": "coming_soon",
-            "evolution": "coming_soon",
+            "meta_cloud": "active",
+            "zapi": "active",
+            "uazapi": "active",
+            "evolution": "active",
             "dialog360": "coming_soon",
             "twilio": "coming_soon",
         },
         "llm": {
-            "dropout": "coming_soon",
-            "openai": "coming_soon",
-            "outros": "coming_soon",
+            "dropout": "active",
+            "openai": "active",
+            "outros": "active",
             "slm_cortex": "coming_soon",
         },
-        "multimodal": {"openrouter": "coming_soon"},
+        "multimodal": {"openrouter": "active"},
         "stt": {
-            "outros": "coming_soon",
-            "openai_whisper": "coming_soon",
+            "outros": "active",
+            "openai_whisper": "active",
             "elevenlabs_scribe": "coming_soon",
             "google_stt": "coming_soon",
             "deepgram_stt": "coming_soon",
             "microsoft_stt": "coming_soon",
         },
-        "tts": {"elevenlabs": "coming_soon", "google": "coming_soon"},
+        "tts": {"elevenlabs": "active", "google": "active"},
     }
     assert sum(len(providers) for providers in PROVIDER_AVAILABILITY.values()) == 19
-    assert all(
-        availability == "coming_soon"
-        for providers in PROVIDER_AVAILABILITY.values()
-        for availability in providers.values()
-    )
+    unavailable = {
+        f"{capability}:{provider}"
+        for capability, providers in PROVIDER_AVAILABILITY.items()
+        for provider, availability in providers.items()
+        if availability != "active"
+    }
+    assert unavailable == {
+        "whatsapp:dialog360",
+        "whatsapp:twilio",
+        "llm:slm_cortex",
+        "stt:elevenlabs_scribe",
+        "stt:google_stt",
+        "stt:deepgram_stt",
+        "stt:microsoft_stt",
+    }
     assert PROVIDER_ALLOWLISTS == {
         capability: frozenset(providers)
         for capability, providers in PROVIDER_AVAILABILITY.items()
@@ -766,8 +785,8 @@ def test_post_merge_availability_allows_maintaining_the_persisted_provider() -> 
                 "llm_api_key": "secret-one",
                 "llm_model_name": "old-model",
             },
-            {"llm_provider": "dropout"},
-            "dropout",
+            {"llm_provider": "slm_cortex"},
+            "slm_cortex",
             id="provider_switch",
         ),
         pytest.param(
@@ -784,12 +803,12 @@ def test_post_merge_availability_allows_maintaining_the_persisted_provider() -> 
         pytest.param(
             {},
             {
-                "llm_provider": "openai",
-                "llm_api_url": "https://api.openai.com/v1",
+                "llm_provider": "slm_cortex",
+                "llm_api_url": "https://api.slm-cortex.example/v1",
                 "llm_api_key": "fresh-secret",
                 "llm_model_name": "fresh-model",
             },
-            "openai",
+            "slm_cortex",
             id="bootstrap_from_nothing",
         ),
     ],
@@ -810,6 +829,82 @@ def test_post_merge_availability_rejects_adopting_a_provider_not_held(
         "provider": rejected_provider,
     }
     assert existing == snapshot
+
+
+@pytest.mark.parametrize(
+    ("capability", "provider", "patch"),
+    [
+        (
+            "whatsapp",
+            "meta_cloud",
+            {
+                "whatsapp_provider": "meta_cloud",
+                "meta_phone_number_id": "1234567890",
+                "meta_permanent_token": "EAAG-fresh",
+                "meta_app_secret": "fresh-secret",
+            },
+        ),
+        (
+            "whatsapp",
+            "zapi",
+            {
+                "whatsapp_provider": "zapi",
+                "zapi_instance_id": "i-fresh",
+                "zapi_token": "t-fresh",
+                "zapi_client_token": "c-fresh",
+            },
+        ),
+        (
+            "llm",
+            "openai",
+            {
+                "llm_provider": "openai",
+                "llm_api_url": "https://api.openai.com/v1",
+                "llm_api_key": "fresh-secret",
+                "llm_model_name": "gpt-4o",
+            },
+        ),
+        (
+            "multimodal",
+            "openrouter",
+            {
+                "multimodal_provider": "openrouter",
+                "multimodal_api_url": "https://openrouter.ai/api/v1",
+                "multimodal_api_key": "fresh-secret",
+                "multimodal_model_name": "fresh-model",
+            },
+        ),
+        (
+            "stt",
+            "openai_whisper",
+            {
+                "stt_provider": "openai_whisper",
+                "stt_api_url": "https://api.openai.com/v1",
+                "stt_api_key": "fresh-secret",
+                "stt_model_name": "whisper-1",
+            },
+        ),
+        (
+            "tts",
+            "elevenlabs",
+            {
+                "tts_provider": "elevenlabs",
+                "tts_api_url": "https://api.elevenlabs.io/v1",
+                "tts_api_key": "fresh-secret",
+                "tts_model_name": "eleven_multilingual_v2",
+                "tts_voice_id": "voice-1",
+            },
+        ),
+    ],
+)
+def test_a_tenant_holding_nothing_can_adopt_an_active_provider(
+    capability: str, provider: str, patch: dict[str, object]
+) -> None:
+    """Bootstrapping is allowed exactly where the runtime can serve it."""
+
+    candidate = merge_credentials({}, patch)
+    validate_provider_availability({}, candidate)
+    assert candidate[CAPABILITY_PROVIDER_FIELDS[capability]] == provider
 
 
 @pytest.mark.parametrize(
@@ -853,12 +948,12 @@ def test_meta_signature_pending_bundle_can_be_completed() -> None:
 
     with pytest.raises(CredentialPolicyError) as caught:
         validate_provider_availability(
-            existing, merge_credentials(existing, {"whatsapp_provider": "zapi"})
+            existing, merge_credentials(existing, {"whatsapp_provider": "dialog360"})
         )
     assert caught.value.detail == {
         "error": "provider_not_available",
         "capability": "whatsapp",
-        "provider": "zapi",
+        "provider": "dialog360",
     }
 
 
@@ -921,6 +1016,127 @@ def test_whatsapp_bundle_cannot_adopt_a_provider_without_naming_it(
         "capability": "whatsapp",
         "provider": adopted,
     }
+
+
+_STORED_ZAPI = {
+    "whatsapp_provider": "zapi",
+    "zapi_instance_id": "i1",
+    "zapi_token": "t1",
+    "zapi_client_token": "c1",
+    "zapi_inbound_token_digest": "d" * 64,
+}
+_WHOLE_META_BUNDLE = {
+    "whatsapp_provider": "meta_cloud",
+    "meta_phone_number_id": "999888777",
+    "meta_waba_id": "waba-1",
+    "meta_permanent_token": "EAAG-x",
+    "meta_app_secret": "app-secret",
+    "meta_verify_token": "verify",
+}
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        pytest.param({"whatsapp_provider": "meta_cloud"}, id="bare_relabel"),
+        pytest.param({"whatsapp_provider": "uazapi"}, id="bare_relabel_other_provider"),
+        pytest.param(
+            {"whatsapp_provider": "meta_cloud", "meta_phone_number_id": "999888777"},
+            id="partial_bundle",
+        ),
+    ],
+)
+def test_whatsapp_relabel_the_credentials_cannot_back_is_rejected(
+    patch: dict[str, object],
+) -> None:
+    """The label has no runtime effect, so it may not outrun the bundle.
+
+    The outbound path is chosen from whichever bundle is populated, so a tenant
+    that relabels to a provider it holds no working credentials for would keep
+    sending over the old provider while the stored label, and every consumer
+    reading it, names the new one.
+    """
+
+    existing = dict(_STORED_ZAPI)
+    snapshot = dict(existing)
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(existing, merge_credentials(existing, patch))
+    assert caught.value.detail["error"] == "provider_not_available"
+    assert caught.value.detail["capability"] == "whatsapp"
+    assert existing == snapshot
+
+
+def test_whatsapp_switch_may_not_also_write_the_outgoing_bundle() -> None:
+    """Two populated bundles leave no answer to which one sends."""
+
+    existing = dict(_STORED_ZAPI)
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(
+            existing,
+            merge_credentials(
+                existing, {**_WHOLE_META_BUNDLE, "zapi_token": "rotated-on-the-way-out"}
+            ),
+        )
+    assert caught.value.detail["error"] == "provider_not_available"
+    assert existing["zapi_token"] == "t1"
+
+
+@pytest.mark.parametrize(
+    ("patch", "readiness"),
+    [
+        pytest.param(_WHOLE_META_BUNDLE, "active", id="whole_bundle"),
+        pytest.param(
+            {
+                "whatsapp_provider": "meta_cloud",
+                "meta_phone_number_id": "999888777",
+                "meta_permanent_token": "EAAG-x",
+            },
+            "signature_pending",
+            id="inbound_hardening_is_repairable_not_a_blocker",
+        ),
+    ],
+)
+def test_whatsapp_switch_carrying_a_sending_bundle_is_accepted(
+    patch: dict[str, object], readiness: str
+) -> None:
+    """The gate asks whether the new provider can send, not whether it is hardened."""
+
+    existing = dict(_STORED_ZAPI)
+    candidate = merge_credentials(existing, patch)
+
+    validate_provider_availability(existing, candidate)
+    assert candidate["whatsapp_provider"] == "meta_cloud"
+    assert credential_status(candidate)["whatsapp_readiness"] == readiness
+
+
+def test_whatsapp_switch_to_zapi_needs_only_the_fields_a_form_can_collect() -> None:
+    """Z-API readiness also wants an inbound digest no credential form collects.
+
+    Gating the switch on readiness would therefore strand Z-API: a tenant on
+    another provider could never adopt it through the public surface. The
+    outbound pair is what makes the label true, so that is what is required.
+    """
+
+    existing = {
+        "whatsapp_provider": "meta_cloud",
+        "meta_phone_number_id": "111",
+        "meta_permanent_token": "EAAG-x",
+    }
+    candidate = merge_credentials(
+        existing,
+        {
+            "whatsapp_provider": "zapi",
+            "zapi_instance_id": "i9",
+            "zapi_token": "t9",
+            "zapi_client_token": "c9",
+        },
+    )
+
+    validate_provider_availability(existing, candidate)
+    assert candidate["whatsapp_provider"] == "zapi"
+    assert "zapi_inbound_token_digest" not in candidate
 
 
 def test_whatsapp_tenant_still_maintains_its_own_bundle() -> None:
@@ -1151,18 +1367,8 @@ def test_tts_writes_rejected_when_no_provider_is_stored() -> None:
     }
 
 
-@pytest.mark.parametrize(
-    "config_patch",
-    [
-        {"tts_provider": None},
-        {"tts_provider": "elevenlabs"},
-    ],
-)
-@pytest.mark.parametrize("mixed_with_controls", [False, True])
-def test_tts_provider_switch_and_clear_remain_atomic(
-    config_patch: dict[str, object], mixed_with_controls: bool
-) -> None:
-    existing = {
+def _stored_google_tts() -> dict[str, object]:
+    return {
         "tts_provider": "google",
         "tts_api_url": "https://texttospeech.googleapis.com/v1",
         "tts_api_key": "saved-tts-secret",
@@ -1170,8 +1376,15 @@ def test_tts_provider_switch_and_clear_remain_atomic(
         "tts_voice_id": "saved-voice",
         "tts_enabled": False,
     }
+
+
+@pytest.mark.parametrize("mixed_with_controls", [False, True])
+def test_tts_provider_clear_remains_atomic(mixed_with_controls: bool) -> None:
+    """Clearing the provider strands the stored bundle, so it stays rejected."""
+
+    existing = _stored_google_tts()
     snapshot = dict(existing)
-    patch = dict(config_patch)
+    patch: dict[str, object] = {"tts_provider": None}
     if mixed_with_controls:
         patch.update({"tts_enabled": True, "tts_reply_policy": "all_inputs"})
     candidate = merge_credentials(existing, patch)
@@ -1180,4 +1393,63 @@ def test_tts_provider_switch_and_clear_remain_atomic(
         validate_provider_availability(existing, candidate)
     assert caught.value.detail["error"] == "provider_not_available"
     assert caught.value.detail["capability"] == "tts"
+    assert existing == snapshot
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        pytest.param({"tts_provider": "elevenlabs"}, id="bare_label"),
+        pytest.param(
+            {"tts_provider": "elevenlabs", "tts_enabled": True},
+            id="bare_label_with_controls",
+        ),
+        pytest.param(
+            {
+                "tts_provider": "elevenlabs",
+                "tts_api_url": "https://api.elevenlabs.io/v1",
+            },
+            id="partial_bundle",
+        ),
+    ],
+)
+def test_tts_switch_without_its_own_bundle_is_rejected(
+    patch: dict[str, object],
+) -> None:
+    """A switch that does not carry a whole bundle inherits the old one.
+
+    The credential fields are flat and shared between providers, so the stored
+    Google endpoint, key and model survive a bare relabel. That leaves a bundle
+    that reads complete — sealing the card as configured — while synthesis is
+    dispatched to ElevenLabs using Google's credentials and every reply fails.
+    """
+
+    existing = _stored_google_tts()
+    snapshot = dict(existing)
+    candidate = merge_credentials(existing, patch)
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(existing, candidate)
+    assert caught.value.detail["error"] == "provider_not_available"
+    assert caught.value.detail["capability"] == "tts"
+    assert existing == snapshot
+
+
+def test_tts_switch_carrying_a_whole_bundle_is_accepted() -> None:
+    existing = _stored_google_tts()
+    snapshot = dict(existing)
+    candidate = merge_credentials(
+        existing,
+        {
+            "tts_provider": "elevenlabs",
+            "tts_api_url": "https://api.elevenlabs.io/v1",
+            "tts_api_key": "fresh-eleven-secret",
+            "tts_model_name": "eleven_multilingual_v2",
+            "tts_voice_id": "fresh-voice",
+        },
+    )
+
+    validate_provider_availability(existing, candidate)
+    assert candidate["tts_provider"] == "elevenlabs"
+    assert candidate["tts_api_url"] == "https://api.elevenlabs.io/v1"
     assert existing == snapshot

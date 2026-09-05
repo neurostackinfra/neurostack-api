@@ -6,8 +6,8 @@ Covers save/status flow for Uazapi (wuzapi self-hosted) credentials:
   uazapi_instance_name)
 - The secret field (uazapi_token) is masked in status responses
 - ``apis_configured`` becomes true when the three Uazapi fields are set
-- Legacy Uazapi credentials remain readable, while public provider writes
-  fail closed until availability is enabled.
+- Uazapi is an available provider, so public writes adopt it; providers
+  without a runtime path stay fail closed.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -78,7 +78,7 @@ def headers(tenant_id: UUID) -> dict[str, str]:
 
 
 class TestUazapiProviderAvailability:
-    """PATCH /v1/config/api-credentials fails closed for Uazapi."""
+    """PATCH /v1/config/api-credentials adopts Uazapi."""
 
     def test_saves_all_three_uazapi_fields(
         self,
@@ -93,18 +93,19 @@ class TestUazapiProviderAvailability:
         }
         response = client.patch(API_CRED_PATH, json=payload, headers=headers)
 
-        assert response.status_code == 422, response.text
-        assert response.json()["detail"] == {
-            "error": "provider_not_available",
-            "capability": "whatsapp",
-            "provider": "uazapi",
-        }
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert data["whatsapp_provider"] == "uazapi"
+        assert data["uazapi_api_url"] == "https://uazapi.example.com"
+        assert data["uazapi_instance_name"] == "clinica-x"
+        assert data["uazapi_token_set"] is True
+        assert "uz_token_abcdefghij1234567890" not in response.text
 
     def test_patch_without_uazapi_does_not_break_other_providers(
         self,
         client: TestClient,
     ) -> None:
-        """Every unavailable WhatsApp provider fails closed at this boundary."""
+        """Adopting a sibling WhatsApp provider leaves the Uazapi fields empty."""
         headers = _headers(uuid4())
         resp = client.patch(
             API_CRED_PATH,
@@ -115,9 +116,12 @@ class TestUazapiProviderAvailability:
             },
             headers=headers,
         )
-        assert resp.status_code == 422, resp.text
-        assert resp.json()["detail"]["error"] == "provider_not_available"
-        assert resp.json()["detail"]["provider"] == "zapi"
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["whatsapp_provider"] == "zapi"
+        assert data["zapi_instance_id"] == "instance-xyz"
+        assert data["uazapi_api_url"] is None
+        assert data["uazapi_token_set"] is False
 
 
 class TestMaskingUazapiCredentials:
@@ -223,7 +227,7 @@ class TestUnavailableProviders:
         "provider",
         ["meta_cloud", "zapi", "evolution", "uazapi"],
     )
-    def test_returns_provider_not_available_for_legacy_providers(
+    def test_adopts_the_providers_the_runtime_can_serve(
         self,
         client: TestClient,
         provider: str,
@@ -234,7 +238,5 @@ class TestUnavailableProviders:
             json={"whatsapp_provider": provider},
             headers=headers,
         )
-        assert resp.status_code == 422, resp.text
-        detail = resp.json()["detail"]
-        assert detail["error"] == "provider_not_available"
-        assert detail["provider"] == provider
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["whatsapp_provider"] == provider
