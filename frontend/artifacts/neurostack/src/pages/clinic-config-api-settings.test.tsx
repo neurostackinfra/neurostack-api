@@ -476,6 +476,41 @@ describe("<ApiCredentialsForm /> card states", () => {
     expect(JSON.parse(String(patch![1].body))).toEqual({ llm_model_name: "gpt-4o-mini" });
   });
 
+  it("retires the outgoing WhatsApp bundle in the same PATCH that switches provider", async () => {
+    const fetchMock = await renderForm(emptyStatus({
+      whatsapp_provider: "zapi",
+      whatsapp_readiness: "active",
+      zapi_instance_id: "i1",
+      zapi_token_set: true,
+    }));
+
+    fireEvent.click(screen.getByTestId("provider-card-whatsapp-meta_cloud"));
+    await screen.findByTestId("provider-editor-whatsapp-meta_cloud");
+    fireEvent.change(screen.getByTestId("field-meta_phone_number_id"), {
+      target: { value: "999888777" },
+    });
+    fireEvent.change(screen.getByTestId("field-meta_permanent_token"), {
+      target: { value: "EAAG-x" },
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("save-whatsapp-meta_cloud"));
+    });
+
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    expect(patch).toBeDefined();
+    // Z-API keeps resolving its own inbound webhooks off the surviving bundle,
+    // so without this the clinic would go on replying over Z-API under Meta's
+    // name — and the Z-API card, no longer the held provider, opens empty with
+    // nothing left to blank.
+    expect(JSON.parse(String(patch![1].body))).toEqual({
+      whatsapp_provider: "meta_cloud",
+      zapi_instance_id: "",
+      meta_phone_number_id: "999888777",
+      meta_permanent_token: "EAAG-x",
+    });
+  });
+
   it("names the adopted provider in the PATCH so the card can reach CONFIGURADO", async () => {
     localStorage.setItem("ns_locale", "pt");
     const fetchMock = vi.fn()
