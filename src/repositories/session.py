@@ -37,6 +37,45 @@ class SessionRepository(BaseRepository[Session]):
     def __init__(self, session: AsyncSession):
         super().__init__(session, Session)
 
+    async def get_by_tenant(
+        self, session_id: UUID, tenant_id: UUID
+    ) -> Optional[Session]:
+        """Get a session only when it belongs to the authorized tenant."""
+        result = await self.session.execute(
+            select(Session).where(
+                Session.id == session_id,
+                Session.tenant_id == tenant_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def update_for_tenant(
+        self,
+        session_id: UUID,
+        tenant_id: UUID,
+        **kwargs: Any,
+    ) -> Optional[Session]:
+        """Update a session after a tenant-scoped lookup."""
+        instance = await self.get_by_tenant(session_id, tenant_id)
+        if instance is None:
+            return None
+        for key, value in kwargs.items():
+            if hasattr(instance, key):
+                setattr(instance, key, value)
+        await self.session.flush()
+        await self.session.refresh(instance)
+        return instance
+
+    async def end_for_tenant(self, session_id: UUID, tenant_id: UUID) -> bool:
+        """End a session after a tenant-scoped lookup."""
+        instance = await self.get_by_tenant(session_id, tenant_id)
+        if instance is None:
+            return False
+        instance.end_session()
+        await self.session.flush()
+        await self.session.refresh(instance)
+        return True
+
     @staticmethod
     def _effective_order() -> tuple[ColumnElement[Any], ColumnElement[Any]]:
         """Ordering shared by every effective-active-session lookup."""

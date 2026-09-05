@@ -65,6 +65,28 @@ class TestAPIIntegration:
         api_headers: dict[str, str],
     ) -> None:
         """Test session creation flow."""
+        from src.models.tenant import Tenant
+        from src.repositories.database import get_db_session
+
+        tenant_id = UUID(sample_session_payload["tenant_id"])
+
+        async def seed_tenant() -> None:
+            db = get_db_session()
+            try:
+                db.add(
+                    Tenant(
+                        id=tenant_id,
+                        name="Integration tenant",
+                        slug=f"integration-{tenant_id}",
+                        api_key_hash=f"integration-{tenant_id}",
+                        config={},
+                    )
+                )
+                await db.commit()
+            finally:
+                await db.close()
+
+        client._submit(seed_tenant())  # type: ignore[attr-defined]
         response = client.post(
             "/v1/sessions",
             json=sample_session_payload,
@@ -351,4 +373,3 @@ class TestAPIIntegrationAsync:
         assert health.status_code == 200
         assert ready.status_code == 200
         assert live.status_code == 200
-
