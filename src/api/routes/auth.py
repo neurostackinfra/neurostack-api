@@ -3,22 +3,26 @@ NeuroStack API - Auth Endpoint
 User login with JWT token generation.
 """
 
-from typing import Optional
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 from uuid import uuid4
 
 import jwt
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from passlib.context import CryptContext
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.schemas.auth import LoginRequest, LoginResponse
+from src.api.helpers.password_validation import PasswordValidationRoute
+from src.api.middleware.auth import TenantContext, get_tenant_context
+from src.api.schemas.auth import LoginRequest, LoginResponse, PasswordChangeRequest
 from src.config.settings import settings
 from src.models.clinic_config_table import ClinicConfigTable
-from src.models.user import User
-from src.repositories import get_db_session
+from src.models.user import User, UserRole
+from src.repositories import get_db_session, get_db_session_dependency
 
 router = APIRouter()
+password_router = APIRouter(route_class=PasswordValidationRoute)
 
 # Bcrypt context with 12 rounds (passlib default for bcrypt)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
@@ -39,17 +43,13 @@ JWT_EXPIRATION_HOURS = 24
         401: {
             "description": "Invalid credentials",
             "content": {
-                "application/json": {
-                    "example": {"detail": "Invalid email or password"}
-                }
+                "application/json": {"example": {"detail": "Invalid email or password"}}
             },
         },
         403: {
             "description": "User account inactive",
             "content": {
-                "application/json": {
-                    "example": {"detail": "User account is inactive"}
-                }
+                "application/json": {"example": {"detail": "User account is inactive"}}
             },
         },
     },
@@ -117,3 +117,66 @@ async def login(body: LoginRequest) -> LoginResponse:
             clinic_id=clinic_id,
             role=user.role.value,
         )
+
+
+def _password_change_forbidden() -> HTTPException:
+    """Keep all password-authority failures on one stable public contract."""
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={"error": "password_change_forbidden"},
+    )
+
+
+@password_router.patch(
+    "/me/password",
+    status_code=status.HTTP_200_OK,
+    summary="Change My Password",
+    description="Change the authenticated builder or clinic administrator password.",
+    responses={
+        200: {"description": "Password changed"},
+        401: {"description": "Missing, invalid, or expired Bearer JWT"},
+        403: {
+            "description": "Password change is not authorized",
+            "content": {
+                "application/json": {
+                    "example": {"detail": {"error": "password_change_forbidden"}}
+                }
+            },
+        },
+        422: {
+            "description": "Invalid password payload without echoed input values",
+        },
+    },
+)
+async def change_my_password(
+    body: PasswordChangeRequest,
+    tenant: TenantContext = Depends(get_tenant_context),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> dict[str, bool]:
+    """Update only the current JWT subject after revalidating current DB authority."""
+    if tenant.api_key or tenant.user_id is None:
+        raise _password_change_forbidden()
+
+    result = await session.execute(select(User).where(User.id == tenant.user_id))
+    user = result.scalar_one_or_none()
+    if (
+        user is None
+        or not user.is_active
+        or user.tenant_id != tenant.tenant_id
+        or user.role.value != tenant.role
+        or user.role not in {UserRole.builder, UserRole.clinic_admin}
+        or (
+            user.role == UserRole.builder
+            and (user.builder_id is None or user.builder_id != tenant.builder_id)
+        )
+    ):
+        raise _password_change_forbidden()
+
+    user.password_hash = pwd_context.hash(body.new_password)
+    await session.commit()
+    return {"ok": True}
+
+
+# Keep password validation local so only the password contract replaces FastAPI's
+# default (which includes the rejected input value in its error details).
+router.include_router(password_router)

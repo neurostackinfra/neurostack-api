@@ -256,6 +256,10 @@ def create_app() -> FastAPI:
 
     def _add_headers_to_paths(schema: dict) -> None:
         """Add authentication headers to all non-public path operations."""
+        password_bearer_operations = {
+            (f"{settings.api_prefix}/auth/me/password", "patch"),
+            (f"{settings.api_prefix}/builder/clinics/{{clinic_id}}/password", "patch"),
+        }
         for path, path_item in schema.get("paths", {}).items():
             if _is_public_path(path):
                 continue
@@ -276,6 +280,24 @@ def create_app() -> FastAPI:
                     continue
 
                 if not isinstance(operation, dict):
+                    continue
+
+                if (path, method) in password_bearer_operations:
+                    # These credential mutations are intentionally JWT-only. Keep
+                    # request correlation documentation, but do not advertise the
+                    # global API key as required or sufficient for either route.
+                    _add_header_parameter(
+                        operation,
+                        header_name="X-Request-ID",
+                        required=False,
+                        description=(
+                            "Optional unique identifier for request correlation and "
+                            "tracing. If omitted, the API will generate one automatically."
+                        ),
+                        schema_type="string",
+                        schema_format="uuid",
+                    )
+                    operation["security"] = [{"BearerAuth": []}]
                     continue
 
                 _add_headers_to_operation(operation)

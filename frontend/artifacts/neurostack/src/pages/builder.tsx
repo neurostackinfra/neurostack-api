@@ -21,6 +21,7 @@ import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useToast } from "@/hooks/use-toast";
 import { useI18n } from "@/context/i18n";
+import { PasswordChangeDialog } from "@/components/password-change-dialog";
 import {
   PlanUsageSummary,
   type BillingUsage,
@@ -238,6 +239,7 @@ export default function BuilderPanel() {
 
   // Expandable clinic state
   const [expandedClinicId, setExpandedClinicId] = useState<string | null>(null);
+  const [passwordClinic, setPasswordClinic] = useState<BuilderClinic | null>(null);
 
   // Fetch all data on mount and when token changes
   useEffect(() => {
@@ -415,6 +417,16 @@ export default function BuilderPanel() {
     setExpandedClinicId(clinicId);
   }
 
+  async function changeClinicPassword(payload: { new_password: string; confirm_password: string }) {
+    if (!passwordClinic) return false;
+    const response = await fetch(`/v1/builder/clinics/${passwordClinic.id}/password`, {
+      method: "PATCH",
+      headers: authHeaders(token),
+      body: JSON.stringify(payload),
+    });
+    return response.ok;
+  }
+
   // Guard: only builders
   if (!isBuilder) {
     return (
@@ -466,6 +478,7 @@ export default function BuilderPanel() {
 
       {/* Tabs */}
       {!loading && !error && (
+        <>
         <Tabs value={activeTab} onValueChange={setActiveTab}>
           <TabsList>
             <TabsTrigger value="overview">{t("builder_tab_overview")}</TabsTrigger>
@@ -883,6 +896,15 @@ export default function BuilderPanel() {
                             >
                               <Sliders className="h-3.5 w-3.5" /> {t("builder_configure")}
                             </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 text-xs gap-1.5 flex-1"
+                              onClick={() => setPasswordClinic(clinic)}
+                              data-testid={`btn-change-clinic-password-${clinic.id}`}
+                            >
+                              <KeyRound className="h-3.5 w-3.5" /> {t("builder_change_clinic_password")}
+                            </Button>
                           </div>
                         </CollapsibleContent>
                       </CardContent>
@@ -892,7 +914,23 @@ export default function BuilderPanel() {
               </div>
             )}
           </TabsContent>
-        </Tabs>
+      </Tabs>
+      <PasswordChangeDialog
+        open={passwordClinic !== null}
+        onOpenChange={(open) => { if (!open) setPasswordClinic(null); }}
+        title={t("password_change_clinic_title")}
+        description={t("password_change_clinic_description")}
+        target={passwordClinic ? `${passwordClinic.name} (${passwordClinic.id})` : undefined}
+        newPasswordLabel={t("password_change_new_label")}
+        confirmPasswordLabel={t("password_change_confirm_label")}
+        submitLabel={t("password_change_submit")}
+        cancelLabel={t("password_change_cancel")}
+        mismatchMessage={t("password_change_mismatch")}
+        errorMessage={t("password_change_error")}
+        loadingLabel={t("password_change_loading")}
+        onSubmit={changeClinicPassword}
+      />
+      </>
       )}
     </div>
   );
