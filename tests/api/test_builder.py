@@ -374,6 +374,26 @@ class TestBuilderToggleClinicStatus:
         )
         assert response.status_code == 400
 
+    async def test_toggle_persists_across_a_fresh_session(self, async_client):
+        """Regression guard: the handler must commit, not just flush."""
+        builder_id = uuid4()
+        tenant = await TestBuilderClinicContactPhone._seed_tenant(builder_id)
+        headers = {
+            "Authorization": f"Bearer {_make_builder_token(builder_id=builder_id)}",
+            "Content-Type": "application/json",
+        }
+
+        response = await async_client.patch(
+            f"/v1/builder/clinics/{tenant.id}/status",
+            headers=headers,
+            json={"is_active": False},
+        )
+        assert response.status_code == 200
+        assert response.json()["is_active"] is False
+
+        row = await TestBuilderClinicContactPhone._fetch_tenant(tenant.id)
+        assert row.is_active is False
+
 
 # ============================================
 # Scope Isolation Tests
