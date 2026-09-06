@@ -144,6 +144,14 @@ afterEach(() => {
 });
 
 describe("<TracesList /> presentation contract", () => {
+  it("keeps the raw funnel stage in trace history", async () => {
+    renderTraces([traceFixture("stage-trace", "faq")]);
+
+    const metadata = await screen.findByTestId("trace-metadata-stage-trace");
+    expect(metadata).toHaveTextContent("pos_atendimento");
+    expect(metadata).not.toHaveTextContent("Pós-Atendimento");
+  });
+
   it("shows complete long intents and messages with responsive geometry and no clipping", async () => {
     const knownTrace = traceFixture("long-trace", "pos_atendimento_duvida");
     const unknownTrace = traceFixture(
