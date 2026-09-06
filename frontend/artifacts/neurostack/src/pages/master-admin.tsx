@@ -1210,10 +1210,12 @@ export default function MasterAdmin() {
   const linkedClinicIds = new Set(builders.flatMap((b) => b.clinics.map((c) => c.clinic_id)));
   const unlinkedClinics = clinics.filter((c) => !linkedClinicIds.has(c.clinic_id));
 
-  const filteredBuilders = builderSearchQuery.trim()
+  const normalizedBuilderSearchQuery = builderSearchQuery.trim().toLowerCase();
+  const filteredBuilders = normalizedBuilderSearchQuery
     ? builders.filter((b) =>
-        b.name.toLowerCase().includes(builderSearchQuery.trim().toLowerCase()) ||
-        (b.admin_email ?? "").toLowerCase().includes(builderSearchQuery.trim().toLowerCase())
+        b.name.toLowerCase().includes(normalizedBuilderSearchQuery) ||
+        (b.admin_email ?? "").toLowerCase().includes(normalizedBuilderSearchQuery) ||
+        b.clinics.some((clinic) => clinic.clinic_name.toLowerCase().includes(normalizedBuilderSearchQuery))
       )
     : builders;
 
@@ -1449,7 +1451,7 @@ export default function MasterAdmin() {
               <Input
                 value={builderSearchQuery}
                 onChange={(e) => setBuilderSearchQuery(e.target.value)}
-                placeholder="Buscar builder por nome ou e-mail..."
+                placeholder="Buscar builder, clínica ou e-mail do builder..."
                 className="h-8 text-xs pl-8"
               />
             </div>
