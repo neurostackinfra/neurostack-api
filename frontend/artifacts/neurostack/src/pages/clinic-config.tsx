@@ -1188,6 +1188,7 @@ export default function ClinicConfig() {
   const [timezone, setTimezone] = useState("America/Sao_Paulo");
   const [businessHours, setBusinessHours] = useState<BusinessHoursMap | null>(null);
   const [businessHoursErrors, setBusinessHoursErrors] = useState<Record<string, string>>({});
+  const [metaMinutosAtendimento, setMetaMinutosAtendimento] = useState("10");
   const [onlineServicesDesc, setOnlineServicesDesc] = useState("");
   const [presentialServicesDesc, setPresentialServicesDesc] = useState("");
 
@@ -1228,7 +1229,6 @@ export default function ClinicConfig() {
   const [handoffInactiveDefaultHours, setHandoffInactiveDefaultHours] = useState("24");
   const [hitlActive, setHitlActive] = useState(false);
   const [hitlCooldown, setHitlCooldown] = useState("15");
-  const [metaMinutosAtendimento, setMetaMinutosAtendimento] = useState("10");
 
   // Tab 5 — Catálogo de Serviços
   const [services, setServices] = useState<ClinicService[]>([]);
@@ -1905,6 +1905,23 @@ export default function ClinicConfig() {
                 </CompactHoursCard>
               </Field>
 
+              <Field
+                label={t("handoff_meta_minutos_label")}
+                hint={t("handoff_meta_minutos_hint")}
+              >
+                <Input
+                  type="number"
+                  min={1}
+                  max={120}
+                  value={metaMinutosAtendimento}
+                  onChange={(e) => setMetaMinutosAtendimento(e.target.value)}
+                  placeholder="10"
+                  className="w-32 text-sm"
+                  disabled={isReadOnly}
+                  data-testid="input-meta-minutos-atendimento"
+                />
+              </Field>
+
               {/* Scheduling link (stopgap pré-ERP) */}
               <SwitchRow
                 label={txt("Link de Agendamento", "Scheduling Link")}
@@ -2506,21 +2523,6 @@ export default function ClinicConfig() {
                     />
                   </Field>
 
-                  <Field
-                    label={t("handoff_meta_minutos_label")}
-                    hint={t("handoff_meta_minutos_hint")}
-                  >
-                    <Input
-                      type="number"
-                      min={1}
-                      max={120}
-                      value={metaMinutosAtendimento}
-                      onChange={(e) => setMetaMinutosAtendimento(e.target.value)}
-                      placeholder="10"
-                      className="w-32 text-sm"
-                      disabled={isReadOnly}
-                    />
-                  </Field>
             </CardContent>
           </Card>
         </TabsContent>
