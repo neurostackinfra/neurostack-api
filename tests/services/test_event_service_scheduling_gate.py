@@ -15,10 +15,8 @@ Focus areas (WISH Group 4):
     the counter still increments.
   * ``SCHEDULING_GATE_MODE`` unset behaves as enforce.
 
-Uses ``asyncio.get_event_loop().run_until_complete`` to drive coroutines
-because the repo's ``conftest.py`` installs a session-scoped
-``event_loop`` fixture that interacts poorly with ``asyncio_mode=auto``
-under full-suite runs (loop closed between modules).
+Uses a short-lived local event loop to drive coroutines without relying on
+or mutating pytest's global event-loop state.
 """
 
 from __future__ import annotations
@@ -38,7 +36,6 @@ from src.observability.scheduling_gate import (
     CATEGORY_PROCESSED_CHANGE,
 )
 from src.services.event_service import EventService
-
 
 # ============================================
 # Fixtures / helpers
@@ -95,17 +92,20 @@ def _run_convert(
     clinic_config: Optional[dict] = None,
     user_message: str = "posso confirmar?",
     language: str = "pt-BR",
-) -> tuple[Any, dict, str]:
+) -> tuple[Any, dict, str, list[dict[str, Any]], dict[str, int]]:
     """Drive _convert_pipeline_result_to_response with a stubbed LLM."""
     stub = _StubLLM(llm_content)
 
-    async def _run() -> tuple[Any, dict, str]:
-        with patch(
-            "src.llm.client.get_tenant_llm_client",
-            return_value=stub,
-        ), patch(
-            "src.services.event_service._load_runtime_llm_credentials",
-            new=AsyncMock(return_value={"llm_model_name": "stub"}),
+    async def _run() -> tuple[Any, dict, str, list[dict[str, Any]], dict[str, int]]:
+        with (
+            patch(
+                "src.llm.client.get_tenant_llm_client",
+                return_value=stub,
+            ),
+            patch(
+                "src.services.event_service._load_runtime_llm_credentials",
+                new=AsyncMock(return_value={"llm_model_name": "stub"}),
+            ),
         ):
             return await service._convert_pipeline_result_to_response(
                 result,
@@ -116,19 +116,11 @@ def _run_convert(
                 language=language,
             )
 
-    # Mirror the pattern used in tests/services/test_event_service_config_cache.py:
-    # rely on the repo's session-scoped ``event_loop`` fixture and drive
-    # coroutines with ``asyncio.get_event_loop().run_until_complete``. If
-    # no loop is current (pre-Python-3.12 idiom), install a fresh one so
-    # the call site never explodes with ``no current event loop``.
+    loop = asyncio.new_event_loop()
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            raise RuntimeError("closed loop")
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    return loop.run_until_complete(_run())
+        return loop.run_until_complete(_run())
+    finally:
+        loop.close()
 
 
 def _violation_count(tenant_id: UUID, category: str) -> float:
@@ -169,7 +161,7 @@ class TestEnforceModeReplacesResponse:
         result = _make_result()
         before = _violation_count(result.tenant_id, CATEGORY_CONFIRMED)
 
-        response, _usage, _model = _run_convert(
+        response, _usage, _model, _attempts, _totals = _run_convert(
             service,
             result,
             llm_content="seu agendamento está confirmado para amanhã às 10h",
@@ -179,19 +171,16 @@ class TestEnforceModeReplacesResponse:
         assert response.prompt is not None
         # Original text must be gone.
         assert (
-            "seu agendamento está confirmado"
-            not in response.prompt.suggested_response
+            "seu agendamento está confirmado" not in response.prompt.suggested_response
         )
         # Counter incremented.
-        assert (
-            _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
-        )
+        assert _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
 
     def test_en_confirmed_is_replaced(self, service: EventService) -> None:
         result = _make_result()
         before = _violation_count(result.tenant_id, CATEGORY_CONFIRMED)
 
-        response, _u, _m = _run_convert(
+        response, _u, _m, _attempts, _totals = _run_convert(
             service,
             result,
             llm_content="Your appointment is confirmed for tomorrow at 10am",
@@ -202,9 +191,7 @@ class TestEnforceModeReplacesResponse:
             "your appointment is confirmed"
             not in response.prompt.suggested_response.lower()
         )
-        assert (
-            _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
-        )
+        assert _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
 
     def test_same_sentence_adversative_confirmation_is_replaced(
         self, service: EventService
@@ -216,7 +203,7 @@ class TestEnforceModeReplacesResponse:
             "Sua consulta foi marcada."
         )
 
-        response, _u, _m = _run_convert(
+        response, _u, _m, _attempts, _totals = _run_convert(
             service,
             result,
             llm_content=llm_content,
@@ -226,23 +213,19 @@ class TestEnforceModeReplacesResponse:
         assert response.prompt is not None
         assert response.prompt.suggested_response != llm_content
         assert (
-            "sua consulta foi marcada"
-            not in response.prompt.suggested_response.lower()
+            "sua consulta foi marcada" not in response.prompt.suggested_response.lower()
         )
         assert _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
 
     def test_pt_availability_is_replaced(self, service: EventService) -> None:
         result = _make_result()
-        response, _u, _m = _run_convert(
+        response, _u, _m, _attempts, _totals = _run_convert(
             service,
             result,
             llm_content="Sim, esse horário está disponível na sexta",
             clinic_config={"business_rules": {"accepts_insurance": "no"}},
         )
-        assert (
-            "esse horário está disponível"
-            not in response.prompt.suggested_response
-        )
+        assert "esse horário está disponível" not in response.prompt.suggested_response
         assert _violation_count(result.tenant_id, CATEGORY_AVAILABILITY) >= 1
 
     @pytest.mark.parametrize(
@@ -258,7 +241,7 @@ class TestEnforceModeReplacesResponse:
         result = _make_result()
         before = _violation_count(result.tenant_id, CATEGORY_AVAILABILITY)
 
-        response, _u, _m = _run_convert(
+        response, _u, _m, _attempts, _totals = _run_convert(
             service,
             result,
             llm_content=llm_content,
@@ -267,21 +250,18 @@ class TestEnforceModeReplacesResponse:
         )
 
         assert response.prompt.suggested_response != llm_content
-        assert (
-            _violation_count(result.tenant_id, CATEGORY_AVAILABILITY) == before + 1
-        )
+        assert _violation_count(result.tenant_id, CATEGORY_AVAILABILITY) == before + 1
 
     def test_pt_processed_change_is_replaced(self, service: EventService) -> None:
         result = _make_result(funnel_stage="agendado")
-        response, _u, _m = _run_convert(
+        response, _u, _m, _attempts, _totals = _run_convert(
             service,
             result,
             llm_content="Pronto, seu cancelamento foi processado.",
             clinic_config={"business_rules": {"accepts_insurance": "no"}},
         )
         assert (
-            "seu cancelamento foi processado"
-            not in response.prompt.suggested_response
+            "seu cancelamento foi processado" not in response.prompt.suggested_response
         )
         assert _violation_count(result.tenant_id, CATEGORY_PROCESSED_CHANGE) >= 1
 
@@ -302,7 +282,7 @@ class TestDeterministicResponseNotScanned:
         result = _make_result(deterministic_response=deterministic_text)
         before = _violation_count(result.tenant_id, CATEGORY_CONFIRMED)
 
-        response, _u, _m = _run_convert(
+        response, _u, _m, _attempts, _totals = _run_convert(
             service,
             result,
             llm_content="",  # LLM never called on deterministic path
@@ -312,9 +292,7 @@ class TestDeterministicResponseNotScanned:
         assert response.prompt.suggested_response == deterministic_text
         assert response.prompt.deterministic is True
         # Counter did not budge.
-        assert (
-            _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before
-        )
+        assert _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before
 
 
 # ============================================
@@ -334,7 +312,7 @@ class TestGateAppliesRegardlessOfInsurance:
 
         # clinic_config with NO business_rules at all — insurance branch
         # would evaluate to False in the price gate.
-        response, _u, _m = _run_convert(
+        response, _u, _m, _attempts, _totals = _run_convert(
             service,
             result,
             llm_content="seu agendamento está confirmado",
@@ -342,12 +320,9 @@ class TestGateAppliesRegardlessOfInsurance:
         )
         # Response was rewritten.
         assert (
-            "seu agendamento está confirmado"
-            not in response.prompt.suggested_response
+            "seu agendamento está confirmado" not in response.prompt.suggested_response
         )
-        assert (
-            _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
-        )
+        assert _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
 
     def test_insurance_explicitly_false_still_triggers(
         self, service: EventService
@@ -355,19 +330,16 @@ class TestGateAppliesRegardlessOfInsurance:
         result = _make_result()
         before = _violation_count(result.tenant_id, CATEGORY_CONFIRMED)
 
-        response, _u, _m = _run_convert(
+        response, _u, _m, _attempts, _totals = _run_convert(
             service,
             result,
             llm_content="seu agendamento está confirmado",
             clinic_config={"business_rules": {"accepts_insurance": False}},
         )
         assert (
-            "seu agendamento está confirmado"
-            not in response.prompt.suggested_response
+            "seu agendamento está confirmado" not in response.prompt.suggested_response
         )
-        assert (
-            _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
-        )
+        assert _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
 
 
 # ============================================
@@ -383,36 +355,30 @@ class TestObserveMode:
         result = _make_result()
         before = _violation_count(result.tenant_id, CATEGORY_CONFIRMED)
 
-        response, _u, _m = _run_convert(
+        response, _u, _m, _attempts, _totals = _run_convert(
             service,
             result,
             llm_content="seu agendamento está confirmado para amanhã",
             clinic_config={"business_rules": {"accepts_insurance": "no"}},
         )
         # Original text preserved verbatim.
-        assert (
-            "seu agendamento está confirmado"
-            in response.prompt.suggested_response
-        )
+        assert "seu agendamento está confirmado" in response.prompt.suggested_response
         # Counter still bumped — observe means "watch, don't block".
-        assert (
-            _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
-        )
+        assert _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
 
     def test_unset_env_behaves_as_enforce(
         self, service: EventService, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("SCHEDULING_GATE_MODE", raising=False)
         result = _make_result()
-        response, _u, _m = _run_convert(
+        response, _u, _m, _attempts, _totals = _run_convert(
             service,
             result,
             llm_content="seu agendamento está confirmado",
             clinic_config={"business_rules": {"accepts_insurance": "no"}},
         )
         assert (
-            "seu agendamento está confirmado"
-            not in response.prompt.suggested_response
+            "seu agendamento está confirmado" not in response.prompt.suggested_response
         )
 
 
@@ -426,7 +392,7 @@ class TestAgendadoFunnelReplacement:
         self, service: EventService
     ) -> None:
         result = _make_result(funnel_stage="agendado")
-        response, _u, _m = _run_convert(
+        response, _u, _m, _attempts, _totals = _run_convert(
             service,
             result,
             llm_content="Sim, sua consulta está agendada para amanhã!",

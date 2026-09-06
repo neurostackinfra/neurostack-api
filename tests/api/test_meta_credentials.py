@@ -8,8 +8,9 @@ Covers save/status flow for Meta Cloud API (WhatsApp Business) credentials:
 - Secret fields are exposed only through set/masked status
 - meta_phone_number_id is validated as unique per tenant (app-level check AND
   handling of a database-level IntegrityError race)
-- Meta Cloud is an available provider, so public writes adopt it; providers
-  without a runtime path stay fail closed.
+- Effective public writes stay fail closed while Meta Cloud is coming soon
+- Directly seeded legacy credentials retain masking, handshake, and uniqueness
+  behavior; exact echoes remain accepted without changing stored material
 """
 
 from datetime import datetime, timedelta, timezone
@@ -82,9 +83,9 @@ def headers(tenant_id: UUID) -> dict[str, str]:
 
 
 class TestMetaProviderAvailability:
-    """PATCH /v1/config/api-credentials adopts Meta Cloud API."""
+    """Meta writes fail closed while exact legacy echoes remain valid."""
 
-    def test_saves_all_four_meta_fields(
+    def test_rejects_effective_meta_bundle_atomically(
         self,
         client: TestClient,
         headers: dict[str, str],
@@ -98,17 +99,25 @@ class TestMetaProviderAvailability:
         }
         response = client.patch(API_CRED_PATH, json=payload, headers=headers)
 
-        assert response.status_code == 200, response.text
-        data = response.json()
-        assert data["whatsapp_provider"] == "meta_cloud"
-        assert data["meta_phone_number_id"] == "1234567890"
-        assert data["meta_waba_id"] == "9876543210"
-        assert data["meta_permanent_token_set"] is True
-        assert data["meta_app_secret_set"] is True
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"] == {
+            "error": "provider_not_available",
+            "capability": "whatsapp",
+            "provider": "meta_cloud",
+        }
         assert "EAAG_permanent_token_value_ABCDEFGHIJ" not in response.text
         assert "app_secret_value_XYZ" not in response.text
 
-    def test_seeded_verify_token_is_write_only_on_first_save(
+        stored = client.get(API_CRED_PATH, headers=headers)
+        assert stored.status_code == 200
+        data = stored.json()
+        assert data["whatsapp_provider"] is None
+        assert data["meta_phone_number_id"] is None
+        assert data["meta_waba_id"] is None
+        assert data["meta_permanent_token_set"] is False
+        assert data["meta_app_secret_set"] is False
+
+    def test_rejected_verify_token_bundle_creates_no_state(
         self,
         client: TestClient,
         headers: dict[str, str],
@@ -122,11 +131,18 @@ class TestMetaProviderAvailability:
         }
         response = client.patch(API_CRED_PATH, json=payload, headers=headers)
 
-        assert response.status_code == 200, response.text
-        assert response.json()["meta_verify_token_set"] is True
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"] == {
+            "error": "provider_not_available",
+            "capability": "whatsapp",
+            "provider": "meta_cloud",
+        }
         assert verify_token not in response.text
+        stored = client.get(API_CRED_PATH, headers=headers)
+        assert stored.status_code == 200
+        assert stored.json()["meta_verify_token_set"] is False
 
-    def test_preserves_verify_token_across_saves(
+    def test_exact_legacy_echo_preserves_verify_token_and_handshake(
         self,
         client: TestClient,
         headers: dict[str, str],
@@ -145,16 +161,22 @@ class TestMetaProviderAvailability:
             },
         )
 
-        # Maintaining the stored provider is allowed and neither echoes nor
-        # disturbs the untouched legacy verify token.
-        second = client.patch(
+        echo = client.patch(
             API_CRED_PATH,
-            json={"meta_waba_id": "777888999"},
+            json={
+                "whatsapp_provider": "meta_cloud",
+                "meta_phone_number_id": "444555666",
+                "meta_permanent_token": "••••••••",
+                "meta_verify_token": "••••••••",
+            },
             headers=headers,
         )
-        assert second.status_code == 200, second.text
-        assert second.json()["meta_waba_id"] == "777888999"
-        assert verify_token not in second.text
+        assert echo.status_code == 200, echo.text
+        assert echo.json()["whatsapp_provider"] == "meta_cloud"
+        assert echo.json()["meta_phone_number_id"] == "444555666"
+        assert echo.json()["meta_permanent_token_set"] is True
+        assert echo.json()["meta_verify_token_set"] is True
+        assert verify_token not in echo.text
 
         handshake = client.get(
             META_WEBHOOK_PATH,
@@ -217,54 +239,53 @@ class TestMetaPhoneNumberIdUniqueness:
         client: TestClient,
     ) -> None:
         shared_phone_id = f"dup_phone_{uuid4().hex[:8]}"
-        resp_a = client.patch(
-            API_CRED_PATH,
-            json={
-                "whatsapp_provider": "meta_cloud",
-                "meta_phone_number_id": shared_phone_id,
-                "meta_permanent_token": "EAAG_tenant_a_token_ABCDEF",
-            },
-            headers=_headers(uuid4()),
-        )
-        assert resp_a.status_code == 200, resp_a.text
+        tenant_a = uuid4()
+        tenant_b = uuid4()
+        for tenant, suffix in ((tenant_a, "a"), (tenant_b, "b")):
+            _seed_legacy_credentials(
+                client,
+                tenant,
+                {
+                    "whatsapp_provider": "meta_cloud",
+                    "meta_phone_number_id": shared_phone_id,
+                    "meta_permanent_token": f"EAAG_tenant_{suffix}_token_ABCDEF",
+                },
+            )
 
         resp_b = client.patch(
             API_CRED_PATH,
-            json={
-                "whatsapp_provider": "meta_cloud",
-                "meta_phone_number_id": shared_phone_id,
-                "meta_permanent_token": "EAAG_tenant_b_token_ABCDEF",
-            },
-            headers=_headers(uuid4()),
+            json={"meta_phone_number_id": shared_phone_id},
+            headers=_headers(tenant_b),
         )
         assert resp_b.status_code == 409, resp_b.text
         detail = resp_b.json().get("detail", resp_b.json())
         assert detail.get("error") == "meta_phone_number_id_conflict"
         assert "already registered" in detail.get("message", "").lower()
 
-    def test_same_tenant_can_update_own_phone_number_id(
+    def test_same_tenant_can_echo_own_phone_number_id(
         self,
         client: TestClient,
     ) -> None:
-        headers_a = _headers(uuid4())
+        tenant_id = uuid4()
         phone_id = f"self_update_{uuid4().hex[:8]}"
-        first = client.patch(
-            API_CRED_PATH,
-            json={
+        _seed_legacy_credentials(
+            client,
+            tenant_id,
+            {
                 "whatsapp_provider": "meta_cloud",
                 "meta_phone_number_id": phone_id,
                 "meta_permanent_token": "EAAG_self_token_ABCDEF",
             },
-            headers=headers_a,
         )
-        assert first.status_code == 200, first.text
 
-        second = client.patch(
+        echo = client.patch(
             API_CRED_PATH,
             json={"meta_phone_number_id": phone_id},
-            headers=headers_a,
+            headers=_headers(tenant_id),
         )
-        assert second.status_code == 200, second.text
+        assert echo.status_code == 200, echo.text
+        assert echo.json()["meta_phone_number_id"] == phone_id
+        assert echo.json()["meta_permanent_token_set"] is True
 
     def test_race_integrity_error_is_translated_to_friendly_409(
         self,
@@ -275,7 +296,18 @@ class TestMetaPhoneNumberIdUniqueness:
         SQLite cannot enforce it, so the driver error is simulated; what matters
         is that the endpoint translates it instead of leaking the raw message.
         """
-        headers = _headers(uuid4())
+        tenant_id = uuid4()
+        phone_id = f"race_{uuid4().hex[:8]}"
+        headers = _headers(tenant_id)
+        _seed_legacy_credentials(
+            client,
+            tenant_id,
+            {
+                "whatsapp_provider": "meta_cloud",
+                "meta_phone_number_id": phone_id,
+                "meta_permanent_token": "EAAG_race_token_ABCDEFG",
+            },
+        )
 
         with patch(
             "src.api.routes.config.AsyncSession.commit",
@@ -292,11 +324,7 @@ class TestMetaPhoneNumberIdUniqueness:
         ):
             resp = client.patch(
                 API_CRED_PATH,
-                json={
-                    "whatsapp_provider": "meta_cloud",
-                    "meta_phone_number_id": f"race_{uuid4().hex[:8]}",
-                    "meta_permanent_token": "EAAG_race_token_ABCDEFG",
-                },
+                json={"meta_phone_number_id": phone_id},
                 headers=headers,
             )
 
@@ -309,8 +337,11 @@ class TestMetaPhoneNumberIdUniqueness:
 class TestUnavailableProviders:
     """Every public WhatsApp provider write reports availability uniformly."""
 
-    @pytest.mark.parametrize("provider", ["dialog360", "twilio"])
-    def test_returns_provider_not_available_for_dialog360_and_twilio(
+    @pytest.mark.parametrize(
+        "provider",
+        ["meta_cloud", "zapi", "uazapi", "evolution", "dialog360", "twilio"],
+    )
+    def test_all_whatsapp_provider_writes_fail_closed(
         self,
         client: TestClient,
         provider: str,
@@ -322,21 +353,12 @@ class TestUnavailableProviders:
             headers=headers,
         )
         assert resp.status_code == 422, resp.text
-        detail = resp.json().get("detail", resp.json())
-        assert detail.get("error") == "provider_not_available"
-        assert detail.get("provider") == provider
-
-    @pytest.mark.parametrize("provider", ["meta_cloud", "zapi", "evolution", "uazapi"])
-    def test_adopts_the_providers_the_runtime_can_serve(
-        self,
-        client: TestClient,
-        provider: str,
-    ) -> None:
-        headers = _headers(uuid4())
-        resp = client.patch(
-            API_CRED_PATH,
-            json={"whatsapp_provider": provider},
-            headers=headers,
+        assert resp.json()["detail"] == {
+            "error": "provider_not_available",
+            "capability": "whatsapp",
+            "provider": provider,
+        }
+        assert (
+            client.get(API_CRED_PATH, headers=headers).json()["whatsapp_provider"]
+            is None
         )
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["whatsapp_provider"] == provider
