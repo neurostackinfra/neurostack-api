@@ -21,7 +21,6 @@ from src.handoff.webhook import WebhookDispatcher
 from src.services.event_service import EventService
 from src.services.handoff_service import HandoffService
 
-
 # ============================================
 # Fixtures
 # ============================================
@@ -122,7 +121,7 @@ class TestPipelineInput:
             session_id=session_id,
             message="Test message",
         )
-        
+
         assert input_data.tenant_id == tenant_id
         assert input_data.session_id == session_id
         assert input_data.message == "Test message"
@@ -147,7 +146,7 @@ class TestPipelineInput:
                 {"role": "assistant", "content": "Olá! Como posso ajudar?"},
             ],
         )
-        
+
         assert input_data.channel == "whatsapp"
         assert input_data.turn_count == 5
         assert len(input_data.intent_history) == 2
@@ -176,7 +175,7 @@ class TestPipelineResult:
             constraints=["Não forneça diagnósticos"],
             mode="normal",
         )
-        
+
         assert result.intent == "scheduling_request"
         assert result.confidence == 0.85
         assert result.mode == "normal"
@@ -195,9 +194,9 @@ class TestCognitivePipeline:
             message="Olá, bom dia!",
             channel="whatsapp",
         )
-        
+
         result = await pipeline.process(input_data)
-        
+
         assert isinstance(result, PipelineResult)
         assert result.tenant_id == tenant_id
         assert result.session_id == session_id
@@ -214,9 +213,9 @@ class TestCognitivePipeline:
             message="Quero agendar uma consulta para amanhã",
             channel="whatsapp",
         )
-        
+
         result = await pipeline.process(input_data)
-        
+
         assert isinstance(result, PipelineResult)
         assert result.intent_category in ["scheduling", "information", "unknown"]
 
@@ -229,9 +228,9 @@ class TestCognitivePipeline:
             message="Qual remédio devo tomar para dor de cabeça?",
             channel="whatsapp",
         )
-        
+
         result = await pipeline.process(input_data)
-        
+
         assert isinstance(result, PipelineResult)
         # Medication questions should be handled appropriately
         assert result.system_prompt is not None
@@ -245,9 +244,9 @@ class TestCognitivePipeline:
             message="Quero falar com um atendente humano",
             channel="whatsapp",
         )
-        
+
         result = await pipeline.process(input_data)
-        
+
         assert isinstance(result, PipelineResult)
         # Explicit handoff requests should be detected
         if result.handoff_required:
@@ -262,26 +261,36 @@ class TestCognitivePipeline:
         session_id,
     ):
         """Link-send turn creates the pending handoff and fixes patient text."""
+
         def _no_db():
             raise RuntimeError("db disabled in unit test")
 
         monkeypatch.setattr("src.services.handoff_service.get_db_session", _no_db)
         pipeline = _isolated_pipeline()
         clinic_config = _scheduling_link_config()
-        clinic_config["scheduling"]["scheduling_link_message"] = "  Finalize seu agendamento pelo link:  "
+        clinic_config["scheduling"][
+            "scheduling_link_message"
+        ] = "  Finalize seu agendamento pelo link:  "
         expected = "  Finalize seu agendamento pelo link:  \n\nhttps://clinica.example.com/agendar"
 
         with structlog.testing.capture_logs() as log_records:
-            result = await pipeline.process(PipelineInput(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                message="sim, pode encaminhar",
-                channel="whatsapp",
-                current_funnel_stage="agendamento_solicitado",
-                turn_count=3,
-                flags={"handoff_confirmation_pending": True},
-                clinic_config=clinic_config,
-            ))
+            monkeypatch.setattr(
+                pipeline_module,
+                "logger",
+                structlog.get_logger("src.core.pipeline"),
+            )
+            result = await pipeline.process(
+                PipelineInput(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    message="sim, pode encaminhar",
+                    channel="whatsapp",
+                    current_funnel_stage="agendamento_solicitado",
+                    turn_count=3,
+                    flags={"handoff_confirmation_pending": True},
+                    clinic_config=clinic_config,
+                )
+            )
 
         assert result.handoff_required is True
         assert result.handoff_reason == "scheduling"
@@ -291,7 +300,9 @@ class TestCognitivePipeline:
         handoff_id = result.state_patch["slots"]["scheduling_link_handoff_id"]
         assert result.handoff_summary["id"] == handoff_id
         assert result.handoff_summary["verification_status"] == "link_sent"
-        assert any(record.get("event") == "scheduling_link_sent" for record in log_records)
+        assert any(
+            record.get("event") == "scheduling_link_sent" for record in log_records
+        )
 
         response, *_ = await EventService()._convert_pipeline_result_to_response(
             result,
@@ -309,6 +320,7 @@ class TestCognitivePipeline:
         session_id,
     ):
         """Outcome turn updates the existing handoff and pauses normally."""
+
         def _no_db():
             raise RuntimeError("db disabled in unit test")
 
@@ -316,29 +328,38 @@ class TestCognitivePipeline:
         pipeline = _isolated_pipeline()
 
         with structlog.testing.capture_logs() as log_records:
-            send_result = await pipeline.process(PipelineInput(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                message="sim, pode encaminhar",
-                channel="whatsapp",
-                current_funnel_stage="agendamento_solicitado",
-                turn_count=3,
-                flags={"handoff_confirmation_pending": True},
-                clinic_config=_scheduling_link_config(),
-            ))
+            monkeypatch.setattr(
+                pipeline_module,
+                "logger",
+                structlog.get_logger("src.core.pipeline"),
+            )
+            send_result = await pipeline.process(
+                PipelineInput(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    message="sim, pode encaminhar",
+                    channel="whatsapp",
+                    current_funnel_stage="agendamento_solicitado",
+                    turn_count=3,
+                    flags={"handoff_confirmation_pending": True},
+                    clinic_config=_scheduling_link_config(),
+                )
+            )
             handoff_id = send_result.state_patch["slots"]["scheduling_link_handoff_id"]
 
-            enrich_result = await pipeline.process(PipelineInput(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                message="consegui agendar pelo link",
-                channel="whatsapp",
-                current_funnel_stage="agendamento_solicitado",
-                turn_count=4,
-                flags={"scheduling_link_sent": True},
-                slots={"scheduling_link_handoff_id": handoff_id},
-                clinic_config=_scheduling_link_config(),
-            ))
+            enrich_result = await pipeline.process(
+                PipelineInput(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    message="consegui agendar pelo link",
+                    channel="whatsapp",
+                    current_funnel_stage="agendamento_solicitado",
+                    turn_count=4,
+                    flags={"scheduling_link_sent": True},
+                    slots={"scheduling_link_handoff_id": handoff_id},
+                    clinic_config=_scheduling_link_config(),
+                )
+            )
         detail = await pipeline._handoff.get_handoff(UUID(handoff_id))
         handoffs = await pipeline._handoff.list_handoffs(tenant_id)
 
@@ -363,9 +384,9 @@ class TestCognitivePipeline:
             message="Teste de timing",
             channel="test",
         )
-        
+
         result = await pipeline.process(input_data)
-        
+
         assert result.stage_timings is not None
         assert len(result.stage_timings) > 0
         # At least some stages should be recorded
@@ -394,23 +415,28 @@ class TestCognitivePipeline:
         This test does NOT monkeypatch ``logger.info`` — reintroducing the ``event=``
         kwarg at the link-send site will fail this test by construction.
         """
+
         def _no_db():
             raise RuntimeError("db disabled in unit test")
 
         monkeypatch.setattr("src.services.handoff_service.get_db_session", _no_db)
         pipeline = _isolated_pipeline()
-        expected = "Finalize seu agendamento pelo link:\n\nhttps://clinica.example.com/agendar"
+        expected = (
+            "Finalize seu agendamento pelo link:\n\nhttps://clinica.example.com/agendar"
+        )
 
-        result = await pipeline.process(PipelineInput(
-            tenant_id=tenant_id,
-            session_id=session_id,
-            message="sim, pode encaminhar",
-            channel="whatsapp",
-            current_funnel_stage="agendamento_solicitado",
-            turn_count=3,
-            flags={"handoff_confirmation_pending": True},
-            clinic_config=_scheduling_link_config(),
-        ))
+        result = await pipeline.process(
+            PipelineInput(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                message="sim, pode encaminhar",
+                channel="whatsapp",
+                current_funnel_stage="agendamento_solicitado",
+                turn_count=3,
+                flags={"handoff_confirmation_pending": True},
+                clinic_config=_scheduling_link_config(),
+            )
+        )
 
         assert result.handoff_required is True
         assert result.deterministic_response == expected
@@ -435,9 +461,7 @@ class TestWorkingHoursProvenance:
         # Hand-written expected phrase — the test states what the rendered
         # string looks like independently of ``format_business_hours``, so a
         # regression in either the renderer or the wiring surfaces here.
-        expected_phrase = (
-            "Seg–Sex: 09:00–19:00 | Sáb: 09:00–14:00 | Dom: fechado"
-        )
+        expected_phrase = "Seg–Sex: 09:00–19:00 | Sáb: 09:00–14:00 | Dom: fechado"
 
         clinic_config = _business_hours_config(
             {
@@ -536,7 +560,7 @@ class TestConvenienceFunctions:
         """Test that get_cognitive_pipeline returns singleton."""
         pipeline1 = get_cognitive_pipeline()
         pipeline2 = get_cognitive_pipeline()
-        
+
         assert pipeline1 is pipeline2
 
     @pytest.mark.asyncio
@@ -548,7 +572,7 @@ class TestConvenienceFunctions:
             message="Olá!",
             channel="whatsapp",
         )
-        
+
         assert isinstance(result, PipelineResult)
         assert result.tenant_id == tenant_id
 
@@ -569,7 +593,7 @@ class TestConvenienceFunctions:
                 {"role": "assistant", "content": "Qual horário prefere?"},
             ],
         )
-        
+
         assert isinstance(result, PipelineResult)
         assert result.turn_count > 0
 
@@ -586,9 +610,9 @@ class TestModeSelection:
             message="Qual é o endereço da clínica?",
             channel="web",
         )
-        
+
         result = await pipeline.process(input_data)
-        
+
         # Simple questions should typically be NORMAL or RAG
         assert result.mode in ["normal", "rag"]
 
@@ -602,9 +626,9 @@ class TestModeSelection:
             message="Preciso de ajuda urgente, quero falar com alguém",
             channel="whatsapp",
         )
-        
+
         result = await pipeline.process(input_data)
-        
+
         # If handoff is required, mode should be handoff
         if result.handoff_required:
             assert result.mode == "handoff"
@@ -622,9 +646,9 @@ class TestStatePatching:
             message="Quero agendar",
             channel="whatsapp",
         )
-        
+
         result = await pipeline.process(input_data)
-        
+
         assert result.state_patch is not None
         assert isinstance(result.state_patch, dict)
 
@@ -637,9 +661,9 @@ class TestStatePatching:
             message="Olá!",
             channel="whatsapp",
         )
-        
+
         result = await pipeline.process(input_data)
-        
+
         # State patch should have last_intent or slots
         assert "last_intent" in result.state_patch or "slots" in result.state_patch
 
@@ -656,9 +680,9 @@ class TestPromptGeneration:
             message="Quero agendar uma consulta",
             channel="whatsapp",
         )
-        
+
         result = await pipeline.process(input_data)
-        
+
         assert result.system_prompt is not None
         assert len(result.system_prompt) > 0
 
@@ -671,9 +695,9 @@ class TestPromptGeneration:
             message="Qual remédio devo tomar?",
             channel="whatsapp",
         )
-        
+
         result = await pipeline.process(input_data)
-        
+
         # Constraints list should exist
         assert result.constraints is not None
         assert isinstance(result.constraints, list)

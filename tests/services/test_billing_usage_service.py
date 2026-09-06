@@ -1,6 +1,8 @@
 """Tests for builder subscription usage aggregation."""
 
+import asyncio
 from collections.abc import AsyncGenerator
+from contextlib import suppress
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
@@ -19,20 +21,28 @@ from src.services.billing_usage_service import (
     PlanUsageLimits,
     get_builder_billing_usage,
 )
+from tests.conftest import _keep_event_loop_responsive
 
 
 @pytest.fixture
 async def usage_db() -> AsyncGenerator[AsyncSession, None]:
     _patch_jsonb_for_sqlite()
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+    heartbeat = asyncio.create_task(_keep_event_loop_responsive())
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
 
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    async with factory() as session:
-        yield session
-
-    await engine.dispose()
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory() as session:
+            yield session
+    finally:
+        try:
+            await engine.dispose()
+        finally:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
 
 
 def _tenant(builder_id: UUID) -> Tenant:

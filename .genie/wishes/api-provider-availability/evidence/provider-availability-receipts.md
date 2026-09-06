@@ -3,7 +3,7 @@
 - wish_slug: api-provider-availability
 - governing_design_sha: 527a35a82cdf4776004942bf1db99fe9e5e246214e60f1e3b86ff892a0d8ca0a
 - status: IN_PROGRESS
-- depends_on: none
+- depends_on: api-provider-settings, api-config-clarity
 - blocks: api-provider-runtime-shutdown
 
 No pair has direct non-mocked validation in this delivery, so every displayable pair remains fail-closed.

@@ -460,8 +460,10 @@ async def get_api_credentials(
     "/api-credentials",
     summary="Update API Credentials",
     description=(
-        "Validate a credential patch. Effective writes to providers that are "
-        "not available yet are rejected; empty secret fields preserve existing values."
+        "Validate a credential patch. All displayable providers are currently "
+        "coming soon, so every effective credential or runtime-control change "
+        "is rejected; only normalized legacy echoes that leave stored values "
+        "unchanged are accepted."
     ),
 )
 async def patch_api_credentials(
