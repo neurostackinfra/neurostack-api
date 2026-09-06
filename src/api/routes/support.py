@@ -144,15 +144,17 @@ async def create_support_ticket(
         if tenant_row is None or tenant_row.builder_id is None:
             routing_reason = "no builder linked"
         else:
-            builder_status = (
+            builder_row = (
                 await db.execute(
-                    select(Builder.status).where(Builder.id == tenant_row.builder_id)
+                    select(Builder.status, Builder.support_email).where(
+                        Builder.id == tenant_row.builder_id
+                    )
                 )
-            ).scalar_one_or_none()
+            ).one_or_none()
 
-            if builder_status is None:
+            if builder_row is None:
                 routing_reason = "builder not found"
-            elif builder_status != "active":
+            elif builder_row.status != "active":
                 routing_reason = "builder inactive"
             else:
                 builder_user = (
@@ -167,10 +169,19 @@ async def create_support_ticket(
                 if builder_user is None:
                     routing_reason = "no builder user found"
                 else:
-                    recipient_email = builder_user.email
+                    builder_support_email = (
+                        builder_row.support_email.strip()
+                        if builder_row.support_email
+                        else ""
+                    )
                     routed_to = "builder"
                     routed_to_builder_id = tenant_row.builder_id
-                    routing_reason = "active builder"
+                    if builder_support_email:
+                        recipient_email = builder_support_email
+                        routing_reason = "active builder support_email"
+                    else:
+                        recipient_email = builder_user.email
+                        routing_reason = "active builder"
 
     if routed_to == "builder":
         logger.info(
