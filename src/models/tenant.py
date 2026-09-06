@@ -171,6 +171,12 @@ class Tenant(Base, TimestampMixin):
         nullable=False,
     )
 
+    # Clinic contact phone (surfaced on support screens; not used for messaging)
+    contact_phone: Mapped[Optional[str]] = mapped_column(
+        String(32),
+        nullable=True,
+    )
+
     # Configuration (JSONB)
     config: Mapped[dict[str, Any]] = mapped_column(
         JSONB,

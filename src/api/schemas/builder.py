@@ -7,7 +7,15 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import (
+    BaseModel,
+    EmailStr,
+    Field,
+    TypeAdapter,
+    field_validator,
+)
+
+_EMAIL_ADAPTER = TypeAdapter(EmailStr)
 
 
 # ============================================
@@ -22,6 +30,32 @@ class BuilderProfileResponse(BaseModel):
     name: str
     status: str
     clinic_count: int = 0
+    support_email: Optional[EmailStr] = None
+
+
+class UpdateBuilderProfileRequest(BaseModel):
+    """Request body for PATCH /v1/builder/profile.
+
+    `support_email` may be `null` or an empty string to clear the field.
+    Non-empty values must be a valid email address (422 otherwise).
+    """
+
+    support_email: Optional[str] = None
+
+    @field_validator("support_email", mode="before")
+    @classmethod
+    def _validate_support_email(cls, value):
+        # Explicit null clears
+        if value is None:
+            return None
+        # Normalize to string, empty means "clear"
+        if not isinstance(value, str):
+            raise ValueError("support_email must be a string or null")
+        stripped = value.strip()
+        if stripped == "":
+            return None
+        # Re-use EmailStr validation for the non-empty case
+        return _EMAIL_ADAPTER.validate_python(stripped)
 
 
 # ============================================
@@ -39,6 +73,7 @@ class BuilderClinicResponse(BaseModel):
     plan_type: str = "pilot"
     is_active: bool = True
     created_at: Optional[datetime] = None
+    contact_phone: Optional[str] = None
     # Health fields (enriched)
     last_trace_at: Optional[datetime] = None
     health_status: str = "critical"
@@ -58,6 +93,20 @@ class CreateBuilderClinicRequest(BaseModel):
     clinic_name: str = Field(..., min_length=1, max_length=255)
     admin_email: EmailStr
     admin_password: str = Field(..., min_length=6)
+    contact_phone: Optional[str] = None
+
+
+class UpdateBuilderClinicRequest(BaseModel):
+    """Request body for PATCH /v1/builder/clinics/{clinic_id}.
+
+    `contact_phone` semantics (enforced by the route, not this schema):
+    - Absent or `null`: don't touch the field.
+    - Empty/whitespace-only string: clear the field (persist `NULL`).
+    - Non-empty string: strip non-digits, must yield 10-15 digits (else 400),
+      persist digits-only.
+    """
+
+    contact_phone: Optional[str] = None
 
 
 class ToggleClinicStatusRequest(BaseModel):
@@ -111,3 +160,38 @@ class BuilderDashboardResponse(BaseModel):
     stats: BuilderStatsResponse
     time_series: list[TraceTimeSeriesPoint] = []
     alerts: list[BuilderAlertResponse] = []
+
+
+# ============================================
+# Support Tickets (builder-scoped)
+# ============================================
+
+
+class BuilderSupportTicketResponse(BaseModel):
+    """A single support ticket routed to the authenticated builder.
+
+    `clinic_name` and `contact_phone` are joined from the ticket's originating
+    tenant (via `SupportTicket.tenant_id`), not from the snapshot columns on
+    the ticket row, so the builder always sees the current display data.
+    """
+
+    id: int
+    clinic_id: Optional[UUID] = None
+    clinic_name: Optional[str] = None
+    contact_phone: Optional[str] = None
+    email: str
+    tipo: str
+    mensagem: str
+    filename: Optional[str] = None
+    file_type: Optional[str] = None
+    status: str
+    created_at: datetime
+
+
+class UpdateTicketStatusRequest(BaseModel):
+    """Request body for PATCH /v1/builder/tickets/{ticket_id}/status.
+
+    `status` must be exactly `open` or `closed`; any other value yields 400.
+    """
+
+    status: str
