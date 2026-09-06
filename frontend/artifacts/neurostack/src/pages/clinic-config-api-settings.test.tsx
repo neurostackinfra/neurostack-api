@@ -751,6 +751,38 @@ describe("<ApiCredentialsForm /> card states", () => {
 describe("<ClinicConfig /> operations tab — business-hours UI surface", () => {
   const originalFetch = globalThis.fetch;
 
+  function mountAsRole(role: "clinic_admin" | "builder", viewingClinicId: string) {
+    const payload = btoa(JSON.stringify({
+      sub: `${role}-user`,
+      clinic_id: viewingClinicId,
+      role,
+      exp: 9999999999,
+    }));
+    localStorage.setItem("ns_locale", "en");
+    localStorage.setItem("ns_auth", JSON.stringify({
+      token: `eyJhbGciOiJub25lIn0.${payload}.synthetic`,
+      email: `${role}@example.test`,
+      clinicId: viewingClinicId,
+      tenantId: viewingClinicId,
+      userId: `${role}-user`,
+      builderId: role === "builder" ? "builder-user" : null,
+      role,
+      viewingClinicId,
+      leadSubmitted: true,
+    }));
+    window.history.replaceState({}, "", "/config?tab=operacao");
+  }
+
+  const editableConfig = {
+    clinic_name: "Clinic",
+    clinic_legal_name: "Clinic Legal Name",
+    clinic_cnpj: "12.345.678/0001-90",
+    dpo_name: "DPO Name",
+    dpo_contact: "dpo@example.test",
+    builder_lgpd_consent: true,
+    meta_minutos_atendimento: 15,
+  };
+
   afterEach(() => {
     globalThis.fetch = originalFetch;
     localStorage.clear();
@@ -800,5 +832,56 @@ describe("<ClinicConfig /> operations tab — business-hours UI surface", () => 
     fireEvent.click(within(schedulingEditor).getByTestId("scheduling-hours-editor-toggle"));
     expect(within(schedulingEditor).getByRole("textbox", { name: /Horário do Setor de Agendamento/ }))
       .toHaveValue("Seg–Sex: 8h–18h");
+  });
+
+  it("lets clinic admins edit the hydrated service goal in its operation-tab position and saves a number", async () => {
+    mountAsRole("clinic_admin", "clinic-admin");
+    const fetchMock = vi.fn().mockImplementation(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PATCH") return response(editableConfig);
+      return response(editableConfig);
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(<PageWrapper><ClinicConfig /></PageWrapper>);
+
+    const input = await screen.findByTestId("input-meta-minutos-atendimento");
+    const schedulingEditor = screen.getByTestId("scheduling-hours-editor");
+    const schedulingLink = screen.getByText("Scheduling Link");
+    expect(input).toBeEnabled();
+    expect(input).toHaveValue(15);
+    expect(input).toHaveAttribute("type", "number");
+    expect(input).toHaveAttribute("min", "1");
+    expect(input).toHaveAttribute("max", "120");
+    expect(schedulingEditor.compareDocumentPosition(input) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(input.compareDocumentPosition(schedulingLink) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.queryByRole("tab", { name: "Handoff" })).not.toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: "20" } });
+    fireEvent.click(screen.getByTestId("btn-save-config"));
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(true);
+    });
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const body = JSON.parse(String(patch?.[1]?.body));
+    expect(body.meta_minutos_atendimento).toBe(20);
+    expect(typeof body.meta_minutos_atendimento).toBe("number");
+  });
+
+  it("renders one service-goal input in Operation and none after an all-tabs role opens Handoff", async () => {
+    mountAsRole("builder", "clinic-builder");
+    globalThis.fetch = vi.fn().mockResolvedValue(response(editableConfig)) as unknown as typeof fetch;
+
+    render(<PageWrapper><ClinicConfig /></PageWrapper>);
+
+    await screen.findByTestId("input-meta-minutos-atendimento");
+    expect(screen.getAllByTestId("input-meta-minutos-atendimento")).toHaveLength(1);
+    cleanup();
+    window.history.replaceState({}, "", "/config?tab=handoff");
+    render(<PageWrapper><ClinicConfig /></PageWrapper>);
+    await waitFor(() => expect(screen.getByRole("tab", { name: "Handoff" }))
+      .toHaveAttribute("aria-selected", "true"));
+    expect(within(screen.getByRole("tabpanel")).queryByTestId("input-meta-minutos-atendimento"))
+      .not.toBeInTheDocument();
   });
 });
