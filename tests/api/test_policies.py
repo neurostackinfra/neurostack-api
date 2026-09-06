@@ -18,7 +18,9 @@ class TestPoliciesEndpoint:
         api_headers: dict[str, str],
     ) -> None:
         """Test that policy creation returns 201 Created."""
-        response = client.post("/v1/policies", json=sample_policy_payload, headers=api_headers)
+        response = client.post(
+            "/v1/policies", json=sample_policy_payload, headers=api_headers
+        )
 
         assert response.status_code == 201
         data = response.json()
@@ -33,7 +35,9 @@ class TestPoliciesEndpoint:
         api_headers: dict[str, str],
     ) -> None:
         """Test policy creation with rules."""
-        response = client.post("/v1/policies", json=sample_policy_payload, headers=api_headers)
+        response = client.post(
+            "/v1/policies", json=sample_policy_payload, headers=api_headers
+        )
 
         data = response.json()
         assert len(data["rules"]) == 1
@@ -53,10 +57,10 @@ class TestPoliciesEndpoint:
 
         response = client.post("/v1/policies", json=payload, headers=api_headers)
 
-        assert response.status_code == 201
-        data = response.json()
-        assert data["tenant_id"] is None
-        assert data["policy_type"] == "global"
+        assert response.status_code == 403
+        assert response.json() == {
+            "detail": "Global policies can only be managed by system administrators"
+        }
 
     def test_list_policies_returns_200(
         self,
@@ -111,7 +115,9 @@ class TestPoliciesEndpoint:
         api_headers: dict[str, str],
     ) -> None:
         """Test getting effective policies for a tenant."""
-        response = client.get(f"/v1/policies/tenant/{sample_tenant_id}/effective", headers=api_headers)
+        response = client.get(
+            f"/v1/policies/tenant/{sample_tenant_id}/effective", headers=api_headers
+        )
 
         assert response.status_code == 200
         data = response.json()
@@ -132,7 +138,9 @@ class TestPoliciesEndpointAsync:
         api_headers: dict[str, str],
     ) -> None:
         """Test policy creation with async client."""
-        response = await async_client.post("/v1/policies", json=sample_policy_payload, headers=api_headers)
+        response = await async_client.post(
+            "/v1/policies", json=sample_policy_payload, headers=api_headers
+        )
 
         assert response.status_code == 201
         data = response.json()

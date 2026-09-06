@@ -9,6 +9,7 @@ config (or a bug elsewhere) might smuggle in.
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 from contextlib import contextmanager
 from typing import Any
@@ -159,9 +160,7 @@ class TestSendMetaCloudAudio:
 
         with egress_env(make_resolver(META_PUBLIC_IP), httpx.MockTransport(handler)):
             data = asyncio.run(
-                meta_service.send_meta_cloud_audio(
-                    "123", "TOKEN", "5511", b"mp3-audio"
-                )
+                meta_service.send_meta_cloud_audio("123", "TOKEN", "5511", b"mp3-audio")
             )
         assert data == {"messages": [{"id": "wamid.audio"}]}
         assert [request.url.path for request in seen] == [
@@ -170,8 +169,9 @@ class TestSendMetaCloudAudio:
         ]
         assert b"mp3-audio" in seen[0].content
         assert seen[0].headers["Authorization"] == "Bearer TOKEN"
-        assert b'"type":"audio"' in seen[1].content
-        assert b'"id":"MEDIA-1"' in seen[1].content
+        payload = json.loads(seen[1].content)
+        assert payload["type"] == "audio"
+        assert payload["audio"]["id"] == "MEDIA-1"
 
 
 class TestResolveMetaMedia:
