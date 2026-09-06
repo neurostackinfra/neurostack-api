@@ -25,6 +25,7 @@ export const pt: Record<TranslationKey, string> = {
   nav_billing: "Assinatura & Pagamento",
   nav_voice: "Inteligência de Voz",
   nav_partners: "Portal de Parceiros",
+  investor_sales_cta: "Falar com comercial",
   badge_coming_soon: "Em breve",
   label_select_clinic: "Selecionar Clínica",
   label_search_clinics: "Buscar clínicas",

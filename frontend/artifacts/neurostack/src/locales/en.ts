@@ -23,6 +23,7 @@ export const en = {
   nav_billing: "Subscription & Billing",
   nav_voice: "Voice Intelligence",
   nav_partners: "Partners Portal",
+  investor_sales_cta: "Talk to sales",
   badge_coming_soon: "Coming soon",
   label_select_clinic: "Select Clinic",
   label_search_clinics: "Search clinics",

@@ -112,6 +112,19 @@ function optionLabels(select: HTMLSelectElement) {
     .map((option) => option.textContent);
 }
 
+function expectInvestorSalesCtaPlacement(cta: HTMLElement) {
+  const sidebarContent = cta.parentElement;
+  expect(sidebarContent).not.toBeNull();
+
+  const logo = within(sidebarContent!).getByAltText("NeuroStack");
+  const activeClinicName = within(sidebarContent!).getByTestId(
+    "active-clinic-name",
+  );
+
+  expect(logo.parentElement?.nextElementSibling).toBe(cta);
+  expect(cta.nextElementSibling).toBe(activeClinicName.parentElement);
+}
+
 beforeEach(() => {
   localStorage.clear();
   localStorage.setItem("ns_auth", JSON.stringify({ token: "test-token" }));
@@ -606,6 +619,82 @@ describe("<Layout /> inactive queue navigation", () => {
     ).not.toBeInTheDocument();
     expect(screen.queryByText("Inactive Queue")).not.toBeInTheDocument();
   });
+});
+
+describe("<Layout /> investor sales CTA", () => {
+  it("renders one secure, styled English CTA in each mounted sidebar at the required position", async () => {
+    setRole("investor");
+    mocks.auth.email = "investor@example.com";
+    mocks.auth.clinicId = "investor-clinic";
+    mocks.auth.viewingClinicId = "investor-clinic";
+
+    renderLayout();
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+
+    const desktopCta = screen.getByRole("link", { name: "Talk to sales" });
+    expect(screen.getAllByTestId("investor-sales-cta")).toHaveLength(1);
+    expect(desktopCta).toHaveAttribute(
+      "href",
+      "https://wa.me/551121105486",
+    );
+    expect(desktopCta).toHaveAttribute("target", "_blank");
+    expect(desktopCta).toHaveAttribute("rel", "noopener noreferrer");
+    expect(desktopCta).toHaveClass(
+      "bg-amber-400",
+      "text-black",
+      "font-bold",
+      "h-12",
+      "mx-2",
+      "rounded-md",
+    );
+    expect(
+      desktopCta.querySelector(".lucide-message-square"),
+    ).toBeInTheDocument();
+    expectInvestorSalesCtaPlacement(desktopCta);
+
+    fireEvent.click(screen.getByTestId("mobile-menu-trigger"));
+    await waitFor(() =>
+      expect(screen.getAllByTestId("investor-sales-cta")).toHaveLength(2),
+    );
+    screen
+      .getAllByTestId("investor-sales-cta")
+      .forEach(expectInvestorSalesCtaPlacement);
+  });
+
+  it("uses the exact Portuguese copy", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    setRole("investor");
+    mocks.auth.email = "investidor@example.com";
+    mocks.auth.clinicId = "investor-clinic";
+    mocks.auth.viewingClinicId = "investor-clinic";
+
+    renderLayout();
+
+    expect(
+      await screen.findByRole("link", { name: "Falar com comercial" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Talk to sales")).not.toBeInTheDocument();
+  });
+
+  it.each(["clinic_admin", "builder", "super_admin"] as const)(
+    "does not render the CTA for %s",
+    async (role) => {
+      setRole(role);
+      mocks.auth.email = `${role}@example.com`;
+      mocks.auth.clinicId = `${role}-clinic`;
+      mocks.auth.viewingClinicId = `${role}-clinic`;
+
+      renderLayout();
+      await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+
+      expect(
+        screen.queryByTestId("investor-sales-cta"),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("link", { name: "Talk to sales" }),
+      ).not.toBeInTheDocument();
+    },
+  );
 });
 
 describe("<Layout /> password self-service", () => {
