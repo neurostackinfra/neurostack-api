@@ -13,8 +13,8 @@ any sink the application controls:
 - The global exception handler (Sentry-shaped ``extra``)
 
 Every test in this file inspects real emitted records: ``caplog`` for
-logging, direct call of the middleware helpers for metrics/tracing, and a
-``TestClient`` round-trip that hits an unmatched capability path.
+logging, direct call of the middleware helpers for metrics/tracing, and an
+async ASGI round-trip that hits an unmatched capability path.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import logging
 
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 
 from src.api.main import _redact_capability_token
 from src.api.middleware.performance import PerformanceMiddleware
@@ -136,12 +136,17 @@ class TestRequestIdMiddlewareAccessLog:
 
         return app
 
-    def test_capability_token_absent_from_access_log(
+    async def test_capability_token_absent_from_access_log(
         self, app: FastAPI, caplog: pytest.LogCaptureFixture
     ) -> None:
-        with TestClient(app) as client:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
             with caplog.at_level(logging.INFO):
-                resp = client.post(f"/v1/webhook/zapi/{CAPABILITY_TOKEN_SENTINEL}")
+                resp = await client.post(
+                    f"/v1/webhook/zapi/{CAPABILITY_TOKEN_SENTINEL}"
+                )
         assert resp.status_code == 200
         # Combine every record's message + args + extras so we're sure the
         # token cannot reach any field.
@@ -156,12 +161,15 @@ class TestRequestIdMiddlewareAccessLog:
         assert CAPABILITY_TOKEN_SENTINEL not in blob
         assert "/v1/webhook/zapi/{capability_token}" in blob
 
-    def test_orphan_path_still_logs_template(
+    async def test_orphan_path_still_logs_template(
         self, app: FastAPI, caplog: pytest.LogCaptureFixture
     ) -> None:
-        with TestClient(app) as client:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
             with caplog.at_level(logging.INFO):
-                resp = client.get("/orphan-path")
+                resp = await client.get("/orphan-path")
         assert resp.status_code == 200
         # The route resolved, so the template ``/orphan-path`` is logged.
         blob = " ".join(
@@ -173,7 +181,7 @@ class TestRequestIdMiddlewareAccessLog:
 class TestPerformanceMiddlewareEndpointLabel:
     """When a real route matches, the label is the template — never the token."""
 
-    def test_matched_route_uses_template(self) -> None:
+    async def test_matched_route_uses_template(self) -> None:
         app = FastAPI()
         app.add_middleware(PerformanceMiddleware)
 
@@ -181,8 +189,11 @@ class TestPerformanceMiddlewareEndpointLabel:
         async def zapi(capability_token: str) -> dict[str, str]:  # noqa: ARG001
             return {"ok": "true"}
 
-        with TestClient(app) as client:
-            resp = client.post(f"/v1/webhook/zapi/{CAPABILITY_TOKEN_SENTINEL}")
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            resp = await client.post(f"/v1/webhook/zapi/{CAPABILITY_TOKEN_SENTINEL}")
         assert resp.status_code == 200
         # Timing header is set but never carries the token.
         assert CAPABILITY_TOKEN_SENTINEL not in resp.headers.get("X-Response-Time", "")
@@ -219,19 +230,21 @@ class TestGlobalExceptionHandlerRedaction:
     caught endpoint label never contains the token.
     """
 
-    def test_no_route_falls_back_to_redaction(
-        self, caplog: pytest.LogCaptureFixture
+    async def test_no_route_falls_back_to_redaction(
+        self, async_client: AsyncClient, caplog: pytest.LogCaptureFixture
     ) -> None:
-        from src.api.main import app
-
-        with TestClient(app, raise_server_exceptions=False) as client:
-            with caplog.at_level(logging.ERROR):
-                # An unmatched capability path returns 404; no exception is
-                # raised, so this test is really about the metric/log path
-                # rather than the exception sink itself. The exception
-                # handler is exercised in a dedicated unit test that calls
-                # ``_redact_capability_token`` directly (above).
-                client.post(f"/v1/webhook/zapi/{CAPABILITY_TOKEN_SENTINEL}")
+        # ``async_client`` owns the real app lifespan and keeps its event loop
+        # responsive while startup/shutdown uses async database resources.
+        with caplog.at_level(logging.ERROR):
+            # An unmatched capability path returns 404; no exception is
+            # raised, so this test is really about the metric/log path rather
+            # than the exception sink itself. The exception handler is
+            # exercised in a dedicated unit test that calls
+            # ``_redact_capability_token`` directly (above).
+            response = await async_client.post(
+                f"/v1/webhook/zapi/{CAPABILITY_TOKEN_SENTINEL}"
+            )
+        assert response.status_code == 401
         blob = " ".join(
             record.getMessage() + str(record.__dict__) for record in caplog.records
         )

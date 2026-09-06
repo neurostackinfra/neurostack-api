@@ -6,99 +6,16 @@ Note: These tests use mocked database connections and do not require
 a running PostgreSQL instance.
 """
 
-import sys
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
 
-sys.path.insert(0, "/home/jairomendes/neurostack/neurostack-api")
-
-# We need to check if src.models.session is already loaded
-# If not, we mock it to avoid SQLAlchemy issues
-if "src.models.session" not in sys.modules:
-    # Create a mock CognitiveStateData class for testing
-    class MockCognitiveStateData:
-        """Mock CognitiveStateData for testing purposes."""
-
-        def __init__(
-            self,
-            funnel_stage: str = "lead_novo",
-            intent_history: Optional[list[str]] = None,
-            slots: Optional[dict[str, Any]] = None,
-            flags: Optional[dict[str, bool]] = None,
-            turn_count: int = 0,
-            safety_triggers: int = 0,
-            last_intent: Optional[str] = None,
-            confidence_avg: Optional[float] = None,
-        ):
-            self.funnel_stage = funnel_stage
-            self.intent_history = intent_history or []
-            self.slots = slots or {}
-            self.flags = flags or {}
-            self.turn_count = turn_count
-            self.safety_triggers = safety_triggers
-            self.last_intent = last_intent
-            self.confidence_avg = confidence_avg
-
-        def to_dict(self) -> dict[str, Any]:
-            return {
-                "funnel_stage": self.funnel_stage,
-                "intent_history": self.intent_history,
-                "slots": self.slots,
-                "flags": self.flags,
-                "turn_count": self.turn_count,
-                "safety_triggers": self.safety_triggers,
-                "last_intent": self.last_intent,
-                "confidence_avg": self.confidence_avg,
-            }
-
-        @classmethod
-        def from_dict(cls, data: dict[str, Any]) -> "MockCognitiveStateData":
-            return cls(
-                funnel_stage=data.get("funnel_stage", "lead_novo"),
-                intent_history=data.get("intent_history", []),
-                slots=data.get("slots", {}),
-                flags=data.get("flags", {}),
-                turn_count=data.get("turn_count", 0),
-                safety_triggers=data.get("safety_triggers", 0),
-                last_intent=data.get("last_intent"),
-                confidence_avg=data.get("confidence_avg"),
-            )
-
-        def add_intent(self, intent: str) -> None:
-            self.intent_history.append(intent)
-            self.last_intent = intent
-            self.turn_count += 1
-
-        def update_slot(self, key: str, value: Any) -> None:
-            self.slots[key] = value
-
-        def set_flag(self, key: str, value: bool) -> None:
-            self.flags[key] = value
-
-        def trigger_safety(self) -> None:
-            self.safety_triggers += 1
-
-        def update_confidence(self, confidence: float) -> None:
-            if self.confidence_avg is None:
-                self.confidence_avg = confidence
-            else:
-                self.confidence_avg = (
-                    self.confidence_avg * (self.turn_count - 1) + confidence
-                ) / self.turn_count
-
-    # Patch the module before importing event_store
-    mock_session_module = MagicMock()
-    mock_session_module.CognitiveStateData = MockCognitiveStateData
-    sys.modules["src.models.session"] = mock_session_module
-
-from src.core.exceptions import EventStoreConnectionError, EventStoreError  # noqa: E402
-from src.core.interaction_context import InteractionOrigin  # noqa: E402
-from src.memory.event_store import (  # noqa: E402
+from src.core.exceptions import EventStoreConnectionError, EventStoreError
+from src.core.interaction_context import InteractionOrigin
+from src.memory.event_store import (
     EventAggregation,
     EventData,
     EventQueryResult,

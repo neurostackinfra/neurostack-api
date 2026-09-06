@@ -4,6 +4,8 @@ Tests for POST /v1/rlhf/rating, GET /v1/rlhf/ratings, and PATCH
 /v1/rlhf/ratings/{id}.
 """
 
+import asyncio
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -18,6 +20,7 @@ from src.config.settings import settings
 from src.models.event import Event
 from src.models.tenant import Tenant
 from src.repositories import get_db_session
+from tests.conftest import _keep_event_loop_responsive
 
 TEST_TENANT_ID = UUID("a0000000-0000-0000-0000-000000000001")
 
@@ -1011,15 +1014,20 @@ class TestRatingAnalysisClinicTenantIdValidation:
             init_database,
         )
 
-        created = False
+        heartbeat = asyncio.create_task(_keep_event_loop_responsive())
         try:
-            get_db_engine()
-        except RuntimeError:
-            await init_database()
-            created = True
-        yield
-        if created:
-            await close_database()
+            try:
+                get_db_engine()
+            except RuntimeError:
+                await init_database()
+            yield
+        finally:
+            try:
+                await close_database()
+            finally:
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
 
     @staticmethod
     def _patches(fake_llm, seen: dict):

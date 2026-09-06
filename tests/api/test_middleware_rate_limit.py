@@ -3,11 +3,13 @@ NeuroStack API - Rate Limiting Middleware Tests
 """
 
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
+import src.api.middleware.rate_limit as rate_limit_module
 from src.api.middleware.rate_limit import rate_limit_store
 
 
@@ -43,6 +45,7 @@ class TestRateLimitMiddleware:
         client: TestClient,
         sample_event_payload: dict[str, Any],
         api_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Test that remaining rate limit decreases with each request."""
         # First request
@@ -53,6 +56,14 @@ class TestRateLimitMiddleware:
         )
         remaining1 = int(response1.headers["X-RateLimit-Remaining"])
 
+        bucket = rate_limit_store._buckets[sample_event_payload["tenant_id"]]
+        frozen_time = bucket.last_refill
+        monkeypatch.setattr(
+            rate_limit_module,
+            "time",
+            SimpleNamespace(time=lambda: frozen_time),
+        )
+
         # Second request
         response2 = client.post(
             "/v1/events",
@@ -61,7 +72,7 @@ class TestRateLimitMiddleware:
         )
         remaining2 = int(response2.headers["X-RateLimit-Remaining"])
 
-        assert remaining2 < remaining1
+        assert remaining2 == remaining1 - 1
 
     def test_health_endpoint_not_rate_limited(
         self,
