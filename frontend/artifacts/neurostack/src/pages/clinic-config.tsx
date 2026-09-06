@@ -406,33 +406,33 @@ export type ProviderAvailability = "active" | "coming_soon";
  */
 export const API_PROVIDER_AVAILABILITY = {
   whatsapp: {
-    meta_cloud: "active",
-    zapi: "active",
-    uazapi: "active",
-    evolution: "active",
+    meta_cloud: "coming_soon",
+    zapi: "coming_soon",
+    uazapi: "coming_soon",
+    evolution: "coming_soon",
     dialog360: "coming_soon",
     twilio: "coming_soon",
   },
   llm: {
-    dropout: "active",
-    openai: "active",
-    outros: "active",
+    dropout: "coming_soon",
+    openai: "coming_soon",
+    outros: "coming_soon",
     slm_cortex: "coming_soon",
   },
   multimodal: {
-    openrouter: "active",
+    openrouter: "coming_soon",
   },
   stt: {
-    outros: "active",
-    openai_whisper: "active",
+    outros: "coming_soon",
+    openai_whisper: "coming_soon",
     elevenlabs_scribe: "coming_soon",
     google_stt: "coming_soon",
     deepgram_stt: "coming_soon",
     microsoft_stt: "coming_soon",
   },
   tts: {
-    elevenlabs: "active",
-    google: "active",
+    elevenlabs: "coming_soon",
+    google: "coming_soon",
   },
 } as const satisfies Record<ApiCapabilityId, Readonly<Record<string, ProviderAvailability>>>;
 
@@ -702,26 +702,27 @@ function statusText(status: CredentialStatusFields | null, field: string): strin
 const COMPLETE_READINESS = new Set(["active", "configuration_only"]);
 
 /**
- * The provider the tenant holds reads `configured` with a whole bundle and
- * `incomplete` with a partial one. Any other provider reads `available` when
- * the runtime can serve it and `coming_soon` when it cannot — which is exactly
- * the set the backend availability gate refuses to adopt, so an inert card and
- * a rejected PATCH always agree.
+ * Availability is authoritative even when a tenant still has legacy
+ * credentials stored for the provider. That prevents an existing bundle from
+ * bypassing a shutdown decision and reopening its editor. For an active pair,
+ * the persisted readiness still distinguishes configured from incomplete.
  */
 export function providerCardState(
   capability: ApiCapabilityId,
   providerId: string,
   status: CredentialStatusFields | null,
 ): ProviderCardState {
+  const availability: Readonly<Record<string, ProviderAvailability>> =
+    API_PROVIDER_AVAILABILITY[capability];
+  if (availability[providerId] !== "active") return "coming_soon";
+
   const persisted = statusText(status, CAPABILITY_PROVIDER_FIELD[capability]);
   if (persisted && persisted === providerId) {
     return COMPLETE_READINESS.has(statusText(status, CAPABILITY_READINESS_FIELD[capability]))
       ? "configured"
       : "incomplete";
   }
-  const availability: Readonly<Record<string, ProviderAvailability>> =
-    API_PROVIDER_AVAILABILITY[capability];
-  return availability[providerId] === "active" ? "available" : "coming_soon";
+  return "available";
 }
 
 export function ApiCredentialsForm({ clinicId, isReadOnly }: {
@@ -858,8 +859,8 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
     <section className="space-y-5" data-testid="api-settings-section">
       <p className="text-sm text-muted-foreground" data-testid="api-settings-legacy-state-note">
         {txt(
-          "Escolha um provedor disponível para configurar. Os marcados como EM BREVE ainda não têm suporte no runtime.",
-          "Pick an available provider to configure. The ones marked COMING SOON have no runtime support yet.",
+          "Todos os provedores estão marcados como EM BREVE e ainda não podem ser configurados.",
+          "All providers are marked COMING SOON and cannot be configured yet.",
         )}
       </p>
       {loadFailed && (
@@ -1188,6 +1189,7 @@ export default function ClinicConfig() {
   const [timezone, setTimezone] = useState("America/Sao_Paulo");
   const [businessHours, setBusinessHours] = useState<BusinessHoursMap | null>(null);
   const [businessHoursErrors, setBusinessHoursErrors] = useState<Record<string, string>>({});
+  const [metaMinutosAtendimento, setMetaMinutosAtendimento] = useState("10");
   const [onlineServicesDesc, setOnlineServicesDesc] = useState("");
   const [presentialServicesDesc, setPresentialServicesDesc] = useState("");
 
@@ -1228,7 +1230,6 @@ export default function ClinicConfig() {
   const [handoffInactiveDefaultHours, setHandoffInactiveDefaultHours] = useState("24");
   const [hitlActive, setHitlActive] = useState(false);
   const [hitlCooldown, setHitlCooldown] = useState("15");
-  const [metaMinutosAtendimento, setMetaMinutosAtendimento] = useState("10");
 
   // Tab 5 — Catálogo de Serviços
   const [services, setServices] = useState<ClinicService[]>([]);
@@ -1905,6 +1906,23 @@ export default function ClinicConfig() {
                 </CompactHoursCard>
               </Field>
 
+              <Field
+                label={t("handoff_meta_minutos_label")}
+                hint={t("handoff_meta_minutos_hint")}
+              >
+                <Input
+                  type="number"
+                  min={1}
+                  max={120}
+                  value={metaMinutosAtendimento}
+                  onChange={(e) => setMetaMinutosAtendimento(e.target.value)}
+                  placeholder="10"
+                  className="w-32 text-sm"
+                  disabled={isReadOnly}
+                  data-testid="input-meta-minutos-atendimento"
+                />
+              </Field>
+
               {/* Scheduling link (stopgap pré-ERP) */}
               <SwitchRow
                 label={txt("Link de Agendamento", "Scheduling Link")}
@@ -2506,21 +2524,6 @@ export default function ClinicConfig() {
                     />
                   </Field>
 
-                  <Field
-                    label={t("handoff_meta_minutos_label")}
-                    hint={t("handoff_meta_minutos_hint")}
-                  >
-                    <Input
-                      type="number"
-                      min={1}
-                      max={120}
-                      value={metaMinutosAtendimento}
-                      onChange={(e) => setMetaMinutosAtendimento(e.target.value)}
-                      placeholder="10"
-                      className="w-32 text-sm"
-                      disabled={isReadOnly}
-                    />
-                  </Field>
             </CardContent>
           </Card>
         </TabsContent>
