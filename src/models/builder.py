@@ -32,6 +32,11 @@ class Builder(Base, TimestampMixin):
         Boolean, default=True, server_default="true", nullable=False,
     )
 
+    # Support contact (surfaced to clinics as escalation channel)
+    support_email: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True,
+    )
+
     # Billing / subscription
     subscription_plan: Mapped[Optional[str]] = mapped_column(
         String(20), nullable=True,
