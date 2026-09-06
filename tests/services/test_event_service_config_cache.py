@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 from uuid import UUID, uuid4
 
 import pytest
@@ -85,6 +86,51 @@ def fake_redis(monkeypatch: pytest.MonkeyPatch) -> _FakeRedis:
 
 
 TENANT = UUID("a0000000-0000-0000-0000-000000000001")
+
+
+@contextmanager
+def _installed_event_loop() -> Iterator[asyncio.AbstractEventLoop]:
+    """Install one local loop and restore the caller's loop on every exit."""
+    try:
+        previous_loop = asyncio.get_event_loop()
+    except RuntimeError:
+        previous_loop = None
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        yield loop
+    finally:
+        try:
+            loop.close()
+        finally:
+            asyncio.set_event_loop(previous_loop)
+
+
+@pytest.fixture(autouse=True)
+def local_event_loop() -> Iterator[asyncio.AbstractEventLoop]:
+    """Give each sync test an explicit loop without changing global fixtures."""
+    with _installed_event_loop() as loop:
+        yield loop
+
+
+@pytest.mark.parametrize("raise_inside", [False, True], ids=["success", "exception"])
+def test_local_event_loop_closes_and_restores(raise_inside: bool) -> None:
+    previous_loop = asyncio.get_event_loop()
+    nested_loop: asyncio.AbstractEventLoop | None = None
+
+    if raise_inside:
+        with pytest.raises(RuntimeError, match="cleanup probe"):
+            with _installed_event_loop() as nested_loop:
+                assert asyncio.get_event_loop() is nested_loop
+                raise RuntimeError("cleanup probe")
+    else:
+        with _installed_event_loop() as nested_loop:
+            assert asyncio.get_event_loop() is nested_loop
+
+    assert nested_loop is not None
+    assert nested_loop.is_closed()
+    assert asyncio.get_event_loop() is previous_loop
 
 
 # ============================================
