@@ -149,6 +149,13 @@ describe("normalizeContextSource", () => {
 });
 
 describe("<TraceViewer /> selected context", () => {
+  it("keeps the hardcoded Stage heading and localized stage value", () => {
+    renderViewer(undefined, "pt");
+
+    expect(screen.getByText("Stage")).toBeInTheDocument();
+    expect(screen.getByTestId("trace-stage")).toHaveTextContent("Inicial");
+  });
+
   it("groups mixed normalized sources into exactly two fixed cards in relative input order", () => {
     renderViewer([
       contextItem({ title: "RAG first", value: "RAG value 1", source: "  RAG  " }),

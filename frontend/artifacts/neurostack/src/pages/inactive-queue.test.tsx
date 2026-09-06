@@ -222,7 +222,8 @@ describe("<InactiveQueuePage />", () => {
     expect(screen.getByText(firstItem.channel)).toBeInTheDocument();
     expect(screen.getByText("Solicitação de Agendamento")).toBeInTheDocument();
     expect(screen.queryByText(firstItem.last_intent!)).not.toBeInTheDocument();
-    expect(screen.getByText(firstItem.funnel_stage!)).toBeInTheDocument();
+    expect(screen.queryByText("Etapa do funil")).not.toBeInTheDocument();
+    expect(screen.queryByText(firstItem.funnel_stage!)).not.toBeInTheDocument();
     expect(screen.getAllByText("Última atividade").length).toBeGreaterThan(0);
     expect(screen.queryByText(/pausa/i)).not.toBeInTheDocument();
 
@@ -638,7 +639,7 @@ describe("<InactiveQueuePage />", () => {
     });
     expect(await screen.findByText("AI in control")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Inactive Queue" })).toBeInTheDocument();
-    expect(screen.getByTestId(`inactive-row-${firstItem.session_id}`)).toHaveClass("grid-cols-1", "md:grid-cols-[1.2fr_.8fr_.65fr_1fr_1fr_1fr_1.25fr]");
+    expect(screen.getByTestId(`inactive-row-${firstItem.session_id}`)).toHaveClass("grid-cols-1", "md:grid-cols-[1.2fr_.8fr_.65fr_1fr_1fr_1.25fr]");
     expect(screen.getByRole("list").parentElement).toHaveClass("overflow-hidden");
     expect(screen.getByRole("list").parentElement).not.toHaveClass("overflow-x-auto");
   });

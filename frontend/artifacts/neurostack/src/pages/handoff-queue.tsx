@@ -475,13 +475,10 @@ export default function HandoffQueuePage() {
                   </div>
                 </div>
 
-                {/* Intent + stage */}
+                {/* Intent */}
                 <div className="min-w-[11rem] text-sm space-y-0.5">
                   {item.intencao_detectada && (
                     <p><span className="text-muted-foreground">{t("handoff_intent")}:</span> {item.intencao_detectada}</p>
-                  )}
-                  {item.estagio_atual && (
-                    <p><span className="text-muted-foreground">{t("handoff_stage")}:</span> {item.estagio_atual}</p>
                   )}
                 </div>
 
