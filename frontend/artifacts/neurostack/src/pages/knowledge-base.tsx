@@ -14,7 +14,7 @@ import {
 import { useI18n } from "@/context/i18n";
 
 const mockDocuments = [
-  { id: 1, name: "Protocolo_Pos_Operatorio_Botox.pdf",      type: "PDF",  size: "1.2 MB", status: "syncing" },
+  { id: 1, name: "Protocolo_Pos_Procedimento_Botox.pdf",    type: "PDF",  size: "1.2 MB", status: "syncing" },
   { id: 2, name: "Regras_Internas_Clinica_Lumina.docx",     type: "DOCX", size: "340 KB", status: "ready"   },
 ];
 
