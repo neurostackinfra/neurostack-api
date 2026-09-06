@@ -6,42 +6,41 @@ It is the single credential contract used by public routes and runtime callers.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from typing import Any, Literal
 
 MASKED_SECRET = "••••••••"
 
 ProviderAvailability = Literal["active", "coming_soon"]
 
-# This is the public credential-write contract.  A provider is `active` only
-# where a runtime send/transcribe/synthesize path actually dispatches on it;
-# anything still `coming_soon` would present a green badge over a capability
-# that fails at message time, so adoption of those stays fail-closed.
+# This is the public credential-write contract.  Runtime support is deliberately
+# not evidence of public availability: every displayable provider remains
+# fail-closed until a direct homologation receipt promotes it in a later wish.
 PROVIDER_AVAILABILITY: dict[str, dict[str, ProviderAvailability]] = {
     "whatsapp": {
-        "meta_cloud": "active",
-        "zapi": "active",
-        "uazapi": "active",
-        "evolution": "active",
+        "meta_cloud": "coming_soon",
+        "zapi": "coming_soon",
+        "uazapi": "coming_soon",
+        "evolution": "coming_soon",
         "dialog360": "coming_soon",
         "twilio": "coming_soon",
     },
     "llm": {
-        "dropout": "active",
-        "openai": "active",
-        "outros": "active",
+        "dropout": "coming_soon",
+        "openai": "coming_soon",
+        "outros": "coming_soon",
         "slm_cortex": "coming_soon",
     },
-    "multimodal": {"openrouter": "active"},
+    "multimodal": {"openrouter": "coming_soon"},
     "stt": {
-        "outros": "active",
-        "openai_whisper": "active",
+        "outros": "coming_soon",
+        "openai_whisper": "coming_soon",
         "elevenlabs_scribe": "coming_soon",
         "google_stt": "coming_soon",
         "deepgram_stt": "coming_soon",
         "microsoft_stt": "coming_soon",
     },
-    "tts": {"elevenlabs": "active", "google": "active"},
+    "tts": {"elevenlabs": "coming_soon", "google": "coming_soon"},
 }
 
 # The allowlist remains the request-universe boundary.  Deriving it from the
@@ -141,59 +140,12 @@ CAPABILITY_CREDENTIAL_FIELDS: dict[str, frozenset[str]] = {
     "stt": STT_FIELDS,
     "tts": TTS_FIELDS,
 }
-TTS_CONTROL_FIELDS = frozenset({"tts_enabled", "tts_reply_policy"})
-# Behavior knobs that carry no credential material, so writing them adopts no
-# provider and stays available to a tenant that has none configured.
-PROVIDER_INDEPENDENT_CONTROLS: dict[str, frozenset[str]] = {
-    "multimodal": frozenset({"multimodal_text_fallback_enabled"}),
-    "stt": frozenset({"audio_max_seconds"}),
-}
 CAPABILITY_PROVIDER_FIELDS: dict[str, str] = {
     "whatsapp": "whatsapp_provider",
     "llm": "llm_provider",
     "multimodal": "multimodal_provider",
     "stt": "stt_provider",
     "tts": "tts_provider",
-}
-# WhatsApp is the one capability whose runtime ignores the provider field: the
-# webhook resolves a tenant from `meta_phone_number_id` and picks its outbound
-# path from whichever token is set, so `whatsapp_provider` is only a label.
-# Writing another provider's bundle therefore adopts that provider even when the
-# label is left untouched, and the gate has to key on the bundle instead.
-WHATSAPP_PROVIDER_FIELD_GROUPS: dict[str, frozenset[str]] = {
-    "meta_cloud": frozenset(
-        {
-            "meta_phone_number_id",
-            "meta_waba_id",
-            "meta_permanent_token",
-            "meta_app_secret",
-            "meta_verify_token",
-        }
-    ),
-    "zapi": frozenset(
-        {
-            "zapi_instance_id",
-            "zapi_token",
-            "zapi_client_token",
-            "zapi_inbound_token_digest",
-        }
-    ),
-    "evolution": frozenset(
-        {"evolution_api_url", "evolution_instance_name", "evolution_api_key"}
-    ),
-    "uazapi": frozenset({"uazapi_api_url", "uazapi_instance_name", "uazapi_token"}),
-}
-# Exactly what each outbound send path reads. A relabel is gated on this rather
-# than on readiness, because readiness also counts inbound hardening — Meta's
-# app secret, Z-API's inbound token digest — which a tenant legitimately adds
-# after it is already sending, and which no credential form collects up front.
-WHATSAPP_OUTBOUND_FIELDS: dict[str, frozenset[str]] = {
-    "meta_cloud": frozenset({"meta_phone_number_id", "meta_permanent_token"}),
-    "zapi": frozenset({"zapi_instance_id", "zapi_token"}),
-    "evolution": frozenset(
-        {"evolution_api_url", "evolution_instance_name", "evolution_api_key"}
-    ),
-    "uazapi": frozenset({"uazapi_api_url", "uazapi_token"}),
 }
 LEGACY_CREDENTIAL_ALIASES = frozenset(
     {"llm_base_url", "whisper_api_key", "whisper_model"}
@@ -327,41 +279,20 @@ def _tts_bundle_complete(credentials: Mapping[str, Any]) -> bool:
     return all(bool(credentials.get(field)) for field in _tts_required_fields(provider))
 
 
-def _populates(fields: Iterable[str], credentials: Mapping[str, Any]) -> bool:
-    """True when any of `fields` still carries a value after the write."""
-
-    return any(credentials.get(field) for field in fields)
-
-
-def persisted_provider(capability: str, credentials: Mapping[str, Any]) -> str | None:
-    """Return the allowlisted provider a tenant already stores for a capability."""
-
-    source = (
-        resolve_stt_credentials(credentials) if capability == "stt" else credentials
-    )
-    provider = source.get(CAPABILITY_PROVIDER_FIELDS[capability])
-    if not isinstance(provider, str):
-        return None
-    return provider if provider in PROVIDER_ALLOWLISTS[capability] else None
-
-
 def validate_provider_availability(
     existing: Mapping[str, Any], candidate: Mapping[str, Any]
 ) -> None:
-    """Reject an effective write that adopts a provider the tenant does not hold.
+    """Reject an effective write whose resulting provider is not available.
 
     This runs strictly after :func:`merge_credentials`.  Comparing the merged
     candidate with the stored values makes a masked, normalized legacy echo a
     no-op, while any resulting provider capability mutation stays atomic at
     the HTTP boundary.
 
-    A tenant may keep maintaining the provider it already has persisted, even
-    while that provider is `coming_soon` and even while its stored bundle is
-    incomplete — otherwise a half-configured capability would have no way to
-    be completed.  Everything else fails closed: adopting a second provider,
-    bootstrapping a capability from nothing, and clearing a stored provider
-    all stay rejected, so no tenant reaches an unvalidated provider it was not
-    already using.
+    Exact legacy echoes produce no changed fields and therefore remain valid.
+    Runtime support and stored incumbency do not bypass the public availability
+    matrix. Runtime controls are capability mutations and pass through the same
+    fail-closed gate as credential fields.
     """
 
     for capability, providers in PROVIDER_AVAILABILITY.items():
@@ -374,109 +305,7 @@ def validate_provider_availability(
         if not changed_fields:
             continue
         provider = candidate.get(provider_field)
-        # Both sides go through the same resolution so a legacy STT tenant,
-        # whose provider id is only implied by its `whisper_*` aliases, is not
-        # read as adopting a provider it has stored all along.
-        stored = persisted_provider(capability, existing)
-        if changed_fields <= PROVIDER_INDEPENDENT_CONTROLS.get(capability, frozenset()):
-            continue
-        if capability == "tts":
-            # Enabling voice replies requires an already-operational bundle
-            # whatever else the same request carries; completeness is
-            # deliberately evaluated against `existing`, never a partial
-            # candidate assembled by this very request.
-            turning_on = bool(candidate.get("tts_enabled")) and not bool(
-                existing.get("tts_enabled")
-            )
-            if (
-                turning_on or changed_fields <= TTS_CONTROL_FIELDS
-            ) and not _tts_bundle_complete(existing):
-                raise CredentialPolicyError(
-                    "provider_not_available",
-                    capability=capability,
-                    provider=provider,
-                )
-            if changed_fields <= TTS_CONTROL_FIELDS:
-                continue
-            # The credential fields are flat and shared between providers, so a
-            # switch carried by the label alone inherits the previous provider's
-            # endpoint, key and model. That bundle reads complete, so the card
-            # would seal as configured while every synthesis call is dispatched
-            # to one provider using another's credentials.
-            if isinstance(provider, str) and stored is not None and provider != stored:
-                supplied = set(_tts_required_fields(provider)) - {"tts_provider"}
-                if not supplied <= changed_fields or not _tts_bundle_complete(
-                    candidate
-                ):
-                    raise CredentialPolicyError(
-                        "provider_not_available",
-                        capability=capability,
-                        provider=provider,
-                    )
-        if capability == "whatsapp":
-            # Emptying a group is decommissioning, not adoption, and has to stay
-            # reachable: the outbound path is chosen from whichever bundle is
-            # populated, so a tenant who switched providers needs some way to
-            # stop the old one, which still resolves its own inbound webhooks.
-            adopted = {
-                group_provider
-                for group_provider, group in WHATSAPP_PROVIDER_FIELD_GROUPS.items()
-                if _populates(changed_fields & group, candidate)
-            } - {stored}
-            # This runs before the `active` escape below, so it has to consult
-            # availability itself; otherwise writing an available provider's
-            # bundle would be rejected as adoption no matter what.
-            blocked = sorted(p for p in adopted if providers.get(p) != "active")
-            # Adopting an available provider still has to be declared: the
-            # runtime dispatches on the bundle, so an undeclared write would
-            # leave the label naming a provider that no longer serves traffic.
-            unnamed = sorted(p for p in adopted if p != provider)
-            for rejected in (blocked, unnamed):
-                if rejected:
-                    raise CredentialPolicyError(
-                        "provider_not_available",
-                        capability=capability,
-                        provider=rejected[0],
-                    )
-            # The label carries no runtime effect — the outbound path is picked
-            # from whichever bundle is populated — so a relabel to a provider
-            # that cannot send would leave the old one serving traffic under the
-            # new one's name. Writing the outgoing bundle in the same request is
-            # refused for the mirror reason: it would leave two populated
-            # bundles and no answer to which of them sends.
-            # A legacy row can carry a live bundle under no label at all, so
-            # incumbency is read from the credentials there: otherwise the first
-            # relabel of such a row is unchecked, because `stored` is None and
-            # the switch below never fires while the old bundle keeps sending.
-            if stored is None:
-                departing = {
-                    p
-                    for p, outbound in WHATSAPP_OUTBOUND_FIELDS.items()
-                    if p != provider and all(existing.get(field) for field in outbound)
-                }
-            else:
-                departing = {stored} - {provider}
-            if isinstance(provider, str) and departing:
-                outgoing = frozenset().union(
-                    *(
-                        WHATSAPP_PROVIDER_FIELD_GROUPS.get(p, frozenset())
-                        for p in departing
-                    )
-                )
-                required = WHATSAPP_OUTBOUND_FIELDS.get(provider)
-                if (
-                    required is None
-                    or not all(candidate.get(field) for field in required)
-                    or _populates(changed_fields & outgoing, candidate)
-                ):
-                    raise CredentialPolicyError(
-                        "provider_not_available",
-                        capability=capability,
-                        provider=provider,
-                    )
         if isinstance(provider, str) and providers.get(provider) == "active":
-            continue
-        if stored is not None and stored == persisted_provider(capability, candidate):
             continue
         raise CredentialPolicyError(
             "provider_not_available",

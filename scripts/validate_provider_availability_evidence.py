@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import argparse
 import re
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
-
 
 ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE_DIR = ROOT / ".genie/wishes/api-provider-availability/evidence"
 DESIGN_SHA = "527a35a82cdf4776004942bf1db99fe9e5e246214e60f1e3b86ff892a0d8ca0a"
 RECEIPTS_PATH = EVIDENCE_DIR / "provider-availability-receipts.md"
+EXPECTED_DEPENDS_ON = "api-provider-settings, api-config-clarity"
 
 EXPECTED_DECISIONS = {
     ("whatsapp", "meta_cloud"): "coming_soon",
@@ -56,7 +55,7 @@ HEADER_VALUES = {
     "wish_slug": "api-provider-availability",
     "governing_design_sha": DESIGN_SHA,
     "status": "IN_PROGRESS",
-    "depends_on": "none",
+    "depends_on": EXPECTED_DEPENDS_ON,
     "blocks": "api-provider-runtime-shutdown",
 }
 
@@ -156,9 +155,14 @@ def _validate_receipts(path: Path) -> list[str]:
 
     if set(seen) != set(EXPECTED_DECISIONS):
         errors.append("receipt pairs do not exactly match the 22-pair inventory")
-    counts = {decision: sum(row["decision"] == decision for row in rows) for decision in ("active", "coming_soon", "removed")}
+    counts = {
+        decision: sum(row["decision"] == decision for row in rows)
+        for decision in ("active", "coming_soon", "removed")
+    }
     if counts != {"active": 0, "coming_soon": 19, "removed": 3}:
-        errors.append("receipt decisions must partition to 0 active, 19 coming_soon, 3 removed")
+        errors.append(
+            "receipt decisions must partition to 0 active, 19 coming_soon, 3 removed"
+        )
     if sum(row["displayable"] == "true" for row in rows) != 19:
         errors.append("exactly 19 receipt rows must be displayable")
 
@@ -180,7 +184,9 @@ def _validate_receipts(path: Path) -> list[str]:
     return errors
 
 
-def validate(receipts_path: Path = RECEIPTS_PATH, phase: str = "inventory") -> list[str]:
+def validate(
+    receipts_path: Path = RECEIPTS_PATH, phase: str = "inventory"
+) -> list[str]:
     if phase not in {"inventory", "ui", "release"}:
         return [f"unknown phase: {phase}"]
     # UI/release are explicit phase hooks. Inventory is intentionally the only
@@ -190,7 +196,9 @@ def validate(receipts_path: Path = RECEIPTS_PATH, phase: str = "inventory") -> l
 
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--phase", choices=("inventory", "ui", "release"), required=True)
+    parser.add_argument(
+        "--phase", choices=("inventory", "ui", "release"), required=True
+    )
     parser.add_argument("--receipts", type=Path, default=RECEIPTS_PATH)
     args = parser.parse_args(argv)
     errors = validate(args.receipts, args.phase)

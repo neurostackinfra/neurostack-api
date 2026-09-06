@@ -6,8 +6,9 @@ Covers save/status flow for Uazapi (wuzapi self-hosted) credentials:
   uazapi_instance_name)
 - The secret field (uazapi_token) is masked in status responses
 - ``apis_configured`` becomes true when the three Uazapi fields are set
-- Uazapi is an available provider, so public writes adopt it; providers
-  without a runtime path stay fail closed.
+- Effective public writes stay fail closed while Uazapi is coming soon
+- Directly seeded legacy credentials retain masking and readiness behavior;
+  exact echoes remain accepted without changing stored material
 """
 
 from datetime import datetime, timedelta, timezone
@@ -18,7 +19,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.config.settings import settings
-
 
 API_CRED_PATH = "/v1/config/api-credentials"
 
@@ -78,9 +78,9 @@ def headers(tenant_id: UUID) -> dict[str, str]:
 
 
 class TestUazapiProviderAvailability:
-    """PATCH /v1/config/api-credentials adopts Uazapi."""
+    """Uazapi writes fail closed while exact legacy echoes remain valid."""
 
-    def test_saves_all_three_uazapi_fields(
+    def test_rejects_effective_uazapi_bundle_atomically(
         self,
         client: TestClient,
         headers: dict[str, str],
@@ -93,15 +93,23 @@ class TestUazapiProviderAvailability:
         }
         response = client.patch(API_CRED_PATH, json=payload, headers=headers)
 
-        assert response.status_code == 200, response.text
-        data = response.json()
-        assert data["whatsapp_provider"] == "uazapi"
-        assert data["uazapi_api_url"] == "https://uazapi.example.com"
-        assert data["uazapi_instance_name"] == "clinica-x"
-        assert data["uazapi_token_set"] is True
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"] == {
+            "error": "provider_not_available",
+            "capability": "whatsapp",
+            "provider": "uazapi",
+        }
         assert "uz_token_abcdefghij1234567890" not in response.text
 
-    def test_patch_without_uazapi_does_not_break_other_providers(
+        stored = client.get(API_CRED_PATH, headers=headers)
+        assert stored.status_code == 200
+        data = stored.json()
+        assert data["whatsapp_provider"] is None
+        assert data["uazapi_api_url"] is None
+        assert data["uazapi_instance_name"] is None
+        assert data["uazapi_token_set"] is False
+
+    def test_rejects_sibling_provider_bundle_atomically(
         self,
         client: TestClient,
     ) -> None:
@@ -116,12 +124,53 @@ class TestUazapiProviderAvailability:
             },
             headers=headers,
         )
-        assert resp.status_code == 200, resp.text
-        data = resp.json()
-        assert data["whatsapp_provider"] == "zapi"
-        assert data["zapi_instance_id"] == "instance-xyz"
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["detail"] == {
+            "error": "provider_not_available",
+            "capability": "whatsapp",
+            "provider": "zapi",
+        }
+        assert "zapi_token_1234567890" not in resp.text
+        data = client.get(API_CRED_PATH, headers=headers).json()
+        assert data["whatsapp_provider"] is None
+        assert data["zapi_instance_id"] is None
         assert data["uazapi_api_url"] is None
         assert data["uazapi_token_set"] is False
+
+    def test_exact_legacy_echo_preserves_uazapi_credentials(
+        self,
+        client: TestClient,
+        headers: dict[str, str],
+        tenant_id: UUID,
+    ) -> None:
+        raw_token = "uz_legacy_token_1234567890"
+        _seed_legacy_credentials(
+            client,
+            tenant_id,
+            {
+                "whatsapp_provider": "uazapi",
+                "uazapi_api_url": "https://uazapi.example.com",
+                "uazapi_token": raw_token,
+                "uazapi_instance_name": "clinica-legacy",
+            },
+        )
+
+        echo = client.patch(
+            API_CRED_PATH,
+            json={
+                "whatsapp_provider": "uazapi",
+                "uazapi_api_url": "https://uazapi.example.com/",
+                "uazapi_token": "••••••••",
+                "uazapi_instance_name": "clinica-legacy",
+            },
+            headers=headers,
+        )
+        assert echo.status_code == 200, echo.text
+        assert echo.json()["whatsapp_provider"] == "uazapi"
+        assert echo.json()["uazapi_api_url"] == "https://uazapi.example.com"
+        assert echo.json()["uazapi_instance_name"] == "clinica-legacy"
+        assert echo.json()["uazapi_token_set"] is True
+        assert raw_token not in echo.text
 
 
 class TestMaskingUazapiCredentials:
@@ -206,8 +255,11 @@ class TestUazapiIsConfigured:
 class TestUnavailableProviders:
     """Public writes report the same availability state for every provider."""
 
-    @pytest.mark.parametrize("provider", ["dialog360", "twilio"])
-    def test_returns_provider_not_available_for_dialog360_and_twilio(
+    @pytest.mark.parametrize(
+        "provider",
+        ["meta_cloud", "zapi", "uazapi", "evolution", "dialog360", "twilio"],
+    )
+    def test_all_whatsapp_provider_writes_fail_closed(
         self,
         client: TestClient,
         provider: str,
@@ -219,24 +271,12 @@ class TestUnavailableProviders:
             headers=headers,
         )
         assert resp.status_code == 422, resp.text
-        detail = resp.json().get("detail", resp.json())
-        assert detail.get("error") == "provider_not_available"
-        assert detail.get("provider") == provider
-
-    @pytest.mark.parametrize(
-        "provider",
-        ["meta_cloud", "zapi", "evolution", "uazapi"],
-    )
-    def test_adopts_the_providers_the_runtime_can_serve(
-        self,
-        client: TestClient,
-        provider: str,
-    ) -> None:
-        headers = _headers(uuid4())
-        resp = client.patch(
-            API_CRED_PATH,
-            json={"whatsapp_provider": provider},
-            headers=headers,
+        assert resp.json()["detail"] == {
+            "error": "provider_not_available",
+            "capability": "whatsapp",
+            "provider": provider,
+        }
+        assert (
+            client.get(API_CRED_PATH, headers=headers).json()["whatsapp_provider"]
+            is None
         )
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["whatsapp_provider"] == provider
