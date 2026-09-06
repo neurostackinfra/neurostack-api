@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from passlib.context import CryptContext
 from sqlalchemy import and_, case, cast, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,13 +30,18 @@ from src.api.schemas.builder import (
     BuilderDashboardResponse,
     BuilderProfileResponse,
     BuilderStatsResponse,
+    BuilderSupportTicketResponse,
     CreateBuilderClinicRequest,
     ToggleClinicStatusRequest,
     TraceTimeSeriesPoint,
+    UpdateBuilderClinicRequest,
+    UpdateBuilderProfileRequest,
+    UpdateTicketStatusRequest,
 )
 from src.models.builder import Builder
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.event import Event
+from src.models.support_ticket import SupportTicket
 from src.models.tenant import Tenant
 from src.models.user import User, UserRole
 from src.repositories import get_db_session_dependency
@@ -46,6 +51,36 @@ from src.services.trace_service import _is_conversational_trace, _llm_usage_for_
 router = APIRouter()
 password_router = APIRouter(route_class=PasswordValidationRoute)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
+
+
+# ============================================
+# Contact phone normalization
+# ============================================
+
+
+_CONTACT_PHONE_MIN_DIGITS = 10
+_CONTACT_PHONE_MAX_DIGITS = 15
+
+
+def _normalize_contact_phone(value: Optional[str]) -> Optional[str]:
+    """Normalize a builder-supplied clinic contact phone.
+
+    - `None` propagates as `None` (caller decides what that means).
+    - Empty or whitespace-only string collapses to `None` (clear the field).
+    - Otherwise, strip all non-digit characters and require 10-15 digits;
+      raise HTTP 400 when the digit count is out of range.
+    """
+    if value is None:
+        return None
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if digits == "":
+        return None
+    if not (_CONTACT_PHONE_MIN_DIGITS <= len(digits) <= _CONTACT_PHONE_MAX_DIGITS):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="contact_phone must contain between 10 and 15 digits",
+        )
+    return digits
 
 
 # ============================================
@@ -86,6 +121,97 @@ async def builder_profile(
         name=builder.name,
         status=builder.status,
         clinic_count=clinic_count,
+        support_email=builder.support_email,
+    )
+
+
+# ============================================
+# GET /profile - Builder profile (with support_email)
+# PATCH /profile - Update builder support_email
+# ============================================
+
+
+@router.get(
+    "/profile",
+    summary="Builder Profile (with support_email)",
+    description=(
+        "Return the authenticated builder's profile. Includes `support_email`, "
+        "the escalation address used to route clinic support tickets."
+    ),
+    response_model=BuilderProfileResponse,
+)
+async def get_builder_profile(
+    builder_id: UUID = Depends(require_builder),
+    session: AsyncSession = Depends(get_db_session_dependency),
+):
+    result = await session.execute(select(Builder).where(Builder.id == builder_id))
+    builder = result.scalar_one_or_none()
+    if not builder:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Builder not found",
+        )
+
+    count_result = await session.execute(
+        select(func.count(Tenant.id)).where(
+            Tenant.builder_id == builder_id,
+            Tenant.is_active.is_(True),
+        )
+    )
+    clinic_count = count_result.scalar() or 0
+
+    return BuilderProfileResponse(
+        id=builder.id,
+        name=builder.name,
+        status=builder.status,
+        clinic_count=clinic_count,
+        support_email=builder.support_email,
+    )
+
+
+@router.patch(
+    "/profile",
+    summary="Update Builder Profile",
+    description=(
+        "Update the authenticated builder's own profile. Currently supports "
+        "`support_email` (null or empty string clears the field). Never accepts "
+        "a builder id from the request body; always writes to the JWT's own builder."
+    ),
+    response_model=BuilderProfileResponse,
+)
+async def update_builder_profile(
+    body: UpdateBuilderProfileRequest,
+    builder_id: UUID = Depends(require_builder),
+    session: AsyncSession = Depends(get_db_session_dependency),
+):
+    result = await session.execute(select(Builder).where(Builder.id == builder_id))
+    builder = result.scalar_one_or_none()
+    if not builder:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Builder not found",
+        )
+
+    # The schema validator has already normalized empty/whitespace to None
+    # and validated non-empty values as EmailStr.
+    builder.support_email = body.support_email
+    await session.flush()
+    await session.commit()
+
+    count_result = await session.execute(
+        select(func.count(Tenant.id)).where(
+            Tenant.builder_id == builder_id,
+            Tenant.is_active.is_(True),
+        )
+    )
+    clinic_count = count_result.scalar() or 0
+
+    return BuilderProfileResponse(
+        id=builder.id,
+        name=builder.name,
+        status=builder.status,
+        clinic_count=clinic_count,
+        support_email=builder.support_email,
     )
 
 
@@ -224,6 +350,7 @@ async def list_clinics(
                 plan_type=t.plan_type,
                 is_active=t.is_active,
                 created_at=t.created_at,
+                contact_phone=t.contact_phone,
                 last_trace_at=last_trace,
                 health_status=health,
                 trace_count_7d=trace_7d_map.get(t.id, 0),
@@ -263,6 +390,9 @@ async def create_clinic(
             detail="Email already in use",
         )
 
+    # Normalize (and validate) the contact phone before we touch the DB.
+    normalized_contact_phone = _normalize_contact_phone(body.contact_phone)
+
     # Create tenant linked to this builder
     tenant_id = uuid4()
     slug = body.clinic_name.lower().replace(" ", "-")[:100]
@@ -274,6 +404,7 @@ async def create_clinic(
         is_active=True,
         plan_type="clinic",
         builder_id=builder_id,
+        contact_phone=normalized_contact_phone,
         config={},
     )
     session.add(new_tenant)
@@ -310,6 +441,8 @@ async def create_clinic(
     session.add(new_config)
 
     await session.flush()
+    # get_db_session_dependency requires an explicit commit for writes to persist.
+    await session.commit()
 
     return {"ok": True, "id": str(tenant_id)}
 
@@ -352,9 +485,70 @@ async def toggle_clinic_status(
         )
 
     tenant.is_active = body.is_active
-    await session.flush()
+    await session.commit()
 
     return {"ok": True, "is_active": tenant.is_active}
+
+
+# ============================================
+# PATCH /clinics/{id} - Update clinic contact phone
+# ============================================
+
+
+@router.patch(
+    "/clinics/{clinic_id}",
+    summary="Update Clinic",
+    description=(
+        "Update editable clinic fields. Currently supports `contact_phone` "
+        "(the WhatsApp contact number surfaced on support screens). "
+        "Absent/`null` `contact_phone` leaves the field untouched; an empty "
+        "string clears it; otherwise the value is normalized to digits-only "
+        "and must be 10-15 digits long. SQL-level scope isolation restricts "
+        "the write to the JWT builder's own clinics."
+    ),
+)
+async def update_clinic(
+    clinic_id: str,
+    body: UpdateBuilderClinicRequest,
+    builder_id: UUID = Depends(require_builder),
+    session: AsyncSession = Depends(get_db_session_dependency),
+):
+    from uuid import UUID as _UUID
+
+    try:
+        cid = _UUID(clinic_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid clinic ID")
+
+    # Validate/normalize BEFORE scoping fetch so a bad payload never masquerades
+    # as a scope miss, but AFTER the UUID parse so we return the same 400 shape
+    # as toggle_clinic_status for malformed IDs.
+    touch_contact_phone = "contact_phone" in body.model_fields_set
+    normalized_contact_phone: Optional[str] = None
+    if touch_contact_phone:
+        normalized_contact_phone = _normalize_contact_phone(body.contact_phone)
+
+    # SQL-level scope isolation: WHERE id = :clinic_id AND builder_id = :jwt_builder_id
+    result = await session.execute(
+        select(Tenant).where(
+            Tenant.id == cid,
+            Tenant.builder_id == builder_id,
+        )
+    )
+    tenant = result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Clinic not found",
+        )
+
+    if touch_contact_phone:
+        tenant.contact_phone = normalized_contact_phone
+
+    await session.flush()
+    await session.commit()
+
+    return {"ok": True, "id": str(tenant.id), "contact_phone": tenant.contact_phone}
 
 
 def _password_change_forbidden() -> HTTPException:
@@ -632,3 +826,119 @@ async def builder_dashboard(
         time_series=time_series,
         alerts=alerts,
     )
+
+
+# ============================================
+# GET /tickets - List builder-scoped support tickets
+# PATCH /tickets/{id}/status - Update ticket status (builder-scoped)
+# ============================================
+
+
+_ALLOWED_TICKET_STATUSES = {"open", "closed"}
+
+
+@router.get(
+    "/tickets",
+    summary="List Builder Support Tickets",
+    description=(
+        "Return support tickets routed to the authenticated builder "
+        "(`routed_to_builder_id == jwt.builder_id`). Includes `clinic_name` "
+        "and `contact_phone` joined from the originating tenant. Ordered by "
+        "`created_at` desc. Optional `?status=open|closed` filter; any other "
+        "value is rejected with 400."
+    ),
+    response_model=list[BuilderSupportTicketResponse],
+)
+async def list_builder_tickets(
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    builder_id: UUID = Depends(require_builder),
+    session: AsyncSession = Depends(get_db_session_dependency),
+):
+    if status_filter is not None and status_filter not in _ALLOWED_TICKET_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="status must be 'open' or 'closed'",
+        )
+
+    # SQL-level scope isolation: only tickets routed_to_builder_id == JWT builder_id.
+    # Nulls (central-routed) and other builders' tickets are excluded by the WHERE.
+    stmt = (
+        select(
+            SupportTicket,
+            Tenant.name.label("tenant_name"),
+            Tenant.contact_phone.label("tenant_contact_phone"),
+        )
+        .select_from(SupportTicket)
+        .outerjoin(Tenant, Tenant.id == SupportTicket.tenant_id)
+        .where(SupportTicket.routed_to_builder_id == builder_id)
+        .order_by(SupportTicket.created_at.desc())
+    )
+    if status_filter is not None:
+        stmt = stmt.where(SupportTicket.status == status_filter)
+
+    result = await session.execute(stmt)
+    rows = result.all()
+
+    return [
+        BuilderSupportTicketResponse(
+            id=ticket.id,
+            clinic_id=ticket.tenant_id,
+            clinic_name=tenant_name if tenant_name is not None else ticket.clinic_name,
+            contact_phone=tenant_contact_phone,
+            email=ticket.email,
+            tipo=ticket.tipo,
+            mensagem=ticket.mensagem,
+            filename=ticket.filename,
+            file_type=ticket.file_type,
+            status=ticket.status,
+            created_at=ticket.created_at,
+        )
+        for ticket, tenant_name, tenant_contact_phone in rows
+    ]
+
+
+@router.patch(
+    "/tickets/{ticket_id}/status",
+    summary="Update Builder Ticket Status",
+    description=(
+        "Update `status` (`open`|`closed`) for a support ticket routed to the "
+        "authenticated builder. SQL-level scope isolation: filter is "
+        "`id = :ticket_id AND routed_to_builder_id = :jwt_builder_id`; a mismatch "
+        "returns 404 without touching the row. Any status value outside "
+        "`open`/`closed` returns 400."
+    ),
+)
+async def update_builder_ticket_status(
+    ticket_id: int,
+    body: UpdateTicketStatusRequest,
+    builder_id: UUID = Depends(require_builder),
+    session: AsyncSession = Depends(get_db_session_dependency),
+):
+    if body.status not in _ALLOWED_TICKET_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="status must be 'open' or 'closed'",
+        )
+
+    # SQL-level scope isolation: WHERE id = :ticket_id AND routed_to_builder_id = :builder_id.
+    # A 404 here means either "no such ticket" or "belongs to another builder";
+    # we don't leak which so cross-builder existence can't be probed.
+    result = await session.execute(
+        select(SupportTicket).where(
+            SupportTicket.id == ticket_id,
+            SupportTicket.routed_to_builder_id == builder_id,
+        )
+    )
+    ticket = result.scalar_one_or_none()
+    if ticket is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ticket not found",
+        )
+
+    ticket.status = body.status
+    # get_db_session_dependency never auto-commits; the write is silently lost
+    # in real Postgres deployments without this explicit commit.
+    await session.commit()
+
+    return {"ok": True, "id": ticket.id, "status": ticket.status}
