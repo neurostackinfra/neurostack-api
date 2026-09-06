@@ -396,7 +396,7 @@ export const pt: Record<TranslationKey, string> = {
   ctx_origin_rag: "RAG",
   ctx_origin_unknown: "Origem Desconhecida",
   ctx_title_fallback: "Contexto",
-  ctx_empty: "Nenhum contexto utilizado.",
+  ctx_empty: "Não utilizado",
   ctx_field_identity_clinic_name: "Nome da Clínica",
   ctx_field_persona_agent_name: "Nome do Agente",
   ctx_field_identity_clinic_specialties: "Especialidades",

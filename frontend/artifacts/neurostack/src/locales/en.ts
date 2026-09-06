@@ -394,7 +394,7 @@ export const en = {
   ctx_origin_rag: "RAG",
   ctx_origin_unknown: "Unknown Source",
   ctx_title_fallback: "Context",
-  ctx_empty: "No context used.",
+  ctx_empty: "Not used",
   ctx_field_identity_clinic_name: "Clinic Name",
   ctx_field_persona_agent_name: "Agent Name",
   ctx_field_identity_clinic_specialties: "Specialties",

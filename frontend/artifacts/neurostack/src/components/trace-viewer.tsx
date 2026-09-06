@@ -12,6 +12,7 @@ import {
   BookOpen,
   Settings2,
   CircleHelp,
+  type LucideIcon,
 } from "lucide-react";
 import { useState } from "react";
 import { useAuth } from "@/context/auth";
@@ -123,6 +124,82 @@ function getContextTitle(
   return t("ctx_title_fallback");
 }
 
+type KnownContextSource = Exclude<ContextSourceKind, "unknown">;
+
+function ContextSourceCard({
+  contexts,
+  icon: SourceIcon,
+  label,
+  source,
+  t,
+}: {
+  contexts: TraceContextItem[];
+  icon: LucideIcon;
+  label: string;
+  source: KnownContextSource;
+  t: (key: TranslationKey) => string;
+}) {
+  return (
+    <section
+      aria-labelledby={`context-heading-${source}`}
+      className="min-w-0 overflow-hidden rounded-md border border-border bg-muted text-sm"
+      data-testid={`context-card-${source}`}
+    >
+      <div
+        className="flex items-center gap-2 px-4 py-3 font-semibold text-foreground"
+        data-testid={`context-header-${source}`}
+      >
+        <SourceIcon
+          className="h-4 w-4 shrink-0"
+          aria-hidden="true"
+          data-testid={`context-origin-icon-${source}`}
+        />
+        <h3 id={`context-heading-${source}`}>{label}</h3>
+      </div>
+      <div
+        className="border-t border-border"
+        aria-hidden="true"
+        data-testid={`context-divider-${source}`}
+      />
+      <div className="p-4" data-testid={`context-body-${source}`}>
+        {contexts.length > 0 ? (
+          <div className="space-y-4" role="list" data-testid={`context-list-${source}`}>
+            {contexts.map((context, index) => (
+              <div
+                key={index}
+                className="min-w-0"
+                data-source-kind={source}
+                data-testid={`context-item-${source}-${index}`}
+                role="listitem"
+              >
+                <div
+                  className="break-words text-sm font-semibold text-foreground [overflow-wrap:anywhere]"
+                  data-testid={`context-title-${source}-${index}`}
+                >
+                  {getContextTitle(context, t)}
+                </div>
+                <div
+                  className="mt-2 whitespace-pre-wrap break-words text-foreground [overflow-wrap:anywhere]"
+                  data-testid={`context-value-${source}-${index}`}
+                >
+                  {context.value}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div
+            className="text-sm italic text-muted-foreground"
+            data-testid={`context-empty-${source}`}
+          >
+            {t("ctx_empty")}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 export function TraceViewer({ trace }: { trace: DecisionTrace }) {
   const { isSuperAdmin, isInvestor, viewingClinicId } = useAuth();
   const { t } = useI18n();
@@ -130,6 +207,15 @@ export function TraceViewer({ trace }: { trace: DecisionTrace }) {
   const hasConstraints = srm.constraints && srm.constraints.length > 0;
   const hasFlags =
     srm.gate_authority_before_price || srm.safety_concern || srm.handoff_required;
+  const contexts = (trace.selectedContext ?? []).reduce<
+    Record<ContextSourceKind, TraceContextItem[]>
+  >(
+    (grouped, context) => {
+      grouped[normalizeContextSource(context.source)].push(context);
+      return grouped;
+    },
+    { rag: [], config: [], unknown: [] },
+  );
 
   return (
     <div className="space-y-4">
@@ -248,71 +334,62 @@ export function TraceViewer({ trace }: { trace: DecisionTrace }) {
           </CardTitle>
         </CardHeader>
         <CardContent className="pt-4">
-          {trace.selectedContext && trace.selectedContext.length > 0 ? (
+          <div
+            className="grid grid-cols-1 gap-3 md:grid-cols-2"
+            data-testid="context-grid"
+          >
+            <ContextSourceCard
+              contexts={contexts.rag}
+              icon={BookOpen}
+              label={t("ctx_origin_rag")}
+              source="rag"
+              t={t}
+            />
+            <ContextSourceCard
+              contexts={contexts.config}
+              icon={Settings2}
+              label={t("ctx_origin_config")}
+              source="config"
+              t={t}
+            />
+          </div>
+          {contexts.unknown.length > 0 && (
             <div
-              className="grid grid-cols-1 gap-3 md:grid-cols-2"
-              data-testid="context-grid"
+              className="mt-3 rounded-md border border-border bg-slate-50 p-3 text-sm text-slate-700 dark:bg-slate-900/40 dark:text-slate-300"
+              data-testid="context-unknown-fallback"
             >
-              {trace.selectedContext.map((ctx, idx) => {
-                const source = normalizeContextSource(ctx.source);
-                const title = getContextTitle(ctx, t);
-                const sourceMeta = {
-                  rag: {
-                    label: t("ctx_origin_rag"),
-                    icon: BookOpen,
-                    className:
-                      "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300",
-                  },
-                  config: {
-                    label: t("ctx_origin_config"),
-                    icon: Settings2,
-                    className:
-                      "bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300",
-                  },
-                  unknown: {
-                    label: t("ctx_origin_unknown"),
-                    icon: CircleHelp,
-                    className:
-                      "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300",
-                  },
-                }[source];
-                const SourceIcon = sourceMeta.icon;
-
-                return (
+              <div className="mb-2 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+                <CircleHelp
+                  className="h-3.5 w-3.5 shrink-0"
+                  aria-hidden="true"
+                  data-testid="context-origin-icon-unknown"
+                />
+                <span>{t("ctx_origin_unknown")}</span>
+              </div>
+              <div className="space-y-3" role="list">
+                {contexts.unknown.map((context, index) => (
                   <div
-                    key={idx}
-                    className="min-w-0 rounded-md border border-border bg-muted p-4 text-sm"
-                    data-testid={`context-item-${idx}`}
-                    data-source-kind={source}
+                    key={index}
+                    className="min-w-0"
+                    data-source-kind="unknown"
+                    data-testid={`context-item-unknown-${index}`}
+                    role="listitem"
                   >
-                    <div className="mb-3">
-                      <span
-                        className={`inline-flex items-center gap-1.5 rounded px-2 py-1 text-[10px] font-medium uppercase tracking-wider ${sourceMeta.className}`}
-                        data-testid={`context-source-${idx}`}
-                      >
-                        <SourceIcon className="h-3.5 w-3.5" aria-hidden="true" />
-                        {sourceMeta.label}
-                      </span>
+                    <div
+                      className="break-words font-semibold [overflow-wrap:anywhere]"
+                      data-testid={`context-title-unknown-${index}`}
+                    >
+                      {getContextTitle(context, t)}
                     </div>
                     <div
-                      className="break-words text-sm font-semibold text-foreground [overflow-wrap:anywhere]"
-                      data-testid={`context-title-${idx}`}
+                      className="mt-1 whitespace-pre-wrap break-words [overflow-wrap:anywhere]"
+                      data-testid={`context-value-unknown-${index}`}
                     >
-                      {title}
-                    </div>
-                    <div
-                      className="mt-2 whitespace-pre-wrap break-words text-foreground [overflow-wrap:anywhere]"
-                      data-testid={`context-value-${idx}`}
-                    >
-                      {ctx.value}
+                      {context.value}
                     </div>
                   </div>
-                );
-              })}
-            </div>
-          ) : (
-            <div className="text-sm text-muted-foreground italic">
-              {t("ctx_empty")}
+                ))}
+              </div>
             </div>
           )}
         </CardContent>
