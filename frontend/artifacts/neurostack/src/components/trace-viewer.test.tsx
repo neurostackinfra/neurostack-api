@@ -36,7 +36,7 @@ interface DecisionOverrides {
 }
 
 function decisionTrace(
-  selectedContext: TraceContextItem[],
+  selectedContext?: TraceContextItem[],
   overrides: DecisionOverrides = {},
 ): DecisionTrace {
   return {
@@ -53,15 +53,15 @@ function decisionTrace(
       safety_concern: overrides.safety_concern ?? false,
       handoff_required: overrides.handoff_required ?? false,
     },
-    selectedContext,
+    ...(selectedContext === undefined ? {} : { selectedContext }),
     promptBuilt: "",
     llmResponse: "Response",
     processingTimeMs: 12,
-  };
+  } as DecisionTrace;
 }
 
 function renderViewer(
-  selectedContext: TraceContextItem[],
+  selectedContext?: TraceContextItem[],
   locale: Locale = "en",
   overrides: DecisionOverrides = {},
 ) {
@@ -149,40 +149,122 @@ describe("normalizeContextSource", () => {
 });
 
 describe("<TraceViewer /> selected context", () => {
-  it("renders normalized source variants with icons and preserves input order", () => {
+  it("groups mixed normalized sources into exactly two fixed cards in relative input order", () => {
     renderViewer([
-      contextItem({ title: "First", value: "Value 1", source: "  RAG  " }),
-      contextItem({ title: "Second", value: "Value 2", source: " CONFIG " }),
-      contextItem({ title: "Third", value: "Value 3", source: " CLINIC_CONFIG " }),
-      contextItem({ title: "Fourth", value: "Value 4", source: "new_source" }),
+      contextItem({ title: "RAG first", value: "RAG value 1", source: "  RAG  " }),
+      contextItem({ title: "Config first", value: "Config value 1", source: " CONFIG " }),
+      contextItem({ title: "RAG second", value: "RAG value 2", source: "rag" }),
+      contextItem({ title: "Config second", value: "Config value 2", source: " CLINIC_CONFIG " }),
     ]);
 
-    const cards = screen.getAllByTestId(/^context-item-/);
-    expect(cards.map((card) => within(card).getByTestId(/^context-title-/).textContent)).toEqual([
-      "First",
-      "Second",
-      "Third",
-      "Fourth",
-    ]);
-    expect(cards.map((card) => card.getAttribute("data-source-kind"))).toEqual([
-      "rag",
-      "config",
-      "config",
-      "unknown",
+    const grid = screen.getByTestId("context-grid");
+    expect(within(grid).getAllByTestId(/^context-card-/)).toHaveLength(2);
+    expect(screen.getByTestId("context-card-rag")).toBeInTheDocument();
+    expect(screen.getByTestId("context-card-config")).toBeInTheDocument();
+    expect(screen.queryByTestId("context-card-unknown")).not.toBeInTheDocument();
+
+    const ragCard = screen.getByTestId("context-card-rag");
+    expect(
+      within(ragCard).getAllByTestId(/^context-title-rag-/).map((title) => title.textContent),
+    ).toEqual(["RAG first", "RAG second"]);
+    expect(within(ragCard).queryByText("Config first")).not.toBeInTheDocument();
+
+    const configCard = screen.getByTestId("context-card-config");
+    expect(
+      within(configCard).getAllByTestId(/^context-title-config-/).map((title) => title.textContent),
+    ).toEqual(["Config first", "Config second"]);
+    expect(within(configCard).queryByText("RAG first")).not.toBeInTheDocument();
+  });
+
+  it("gives each card its own labeled header, Lucide icon, divider, body, titles, and values", () => {
+    renderViewer([
+      contextItem({ title: "RAG title", value: "RAG value", source: "rag" }),
+      contextItem({ title: "Config title", value: "Config value", source: "config" }),
     ]);
 
-    expect(within(cards[0]).getByText("RAG")).toBeInTheDocument();
-    expect(within(cards[1]).getByText("Clinic Config")).toBeInTheDocument();
-    expect(within(cards[2]).getByText("Clinic Config")).toBeInTheDocument();
-    expect(within(cards[3]).getByText("Unknown Source")).toBeInTheDocument();
-    expect(within(cards[3]).queryByText("Clinic Config")).not.toBeInTheDocument();
+    for (const [source, label] of [
+      ["rag", "RAG"],
+      ["config", "Clinic Config"],
+    ] as const) {
+      const card = screen.getByTestId(`context-card-${source}`);
+      expect(screen.getByRole("region", { name: label })).toBe(card);
+      expect(within(card).getByRole("heading", { name: label })).toBeInTheDocument();
+      const header = within(card).getByTestId(`context-header-${source}`);
+      const icon = within(header).getByTestId(`context-origin-icon-${source}`);
+      const divider = within(card).getByTestId(`context-divider-${source}`);
+      const body = within(card).getByTestId(`context-body-${source}`);
+      const title = within(body).getByTestId(`context-title-${source}-0`);
+      const value = within(body).getByTestId(`context-value-${source}-0`);
 
-    for (const source of screen.getAllByTestId(/^context-source-/)) {
-      expect(source.querySelector("svg")).not.toBeNull();
+      expect(header).toHaveTextContent(label);
+      expect(icon.tagName.toLowerCase()).toBe("svg");
+      expect(divider).toHaveClass("border-t");
+      expect(title).not.toBe(value);
+      expect(title).toHaveTextContent(source === "rag" ? "RAG title" : "Config title");
+      expect(value).toHaveTextContent(source === "rag" ? "RAG value" : "Config value");
     }
   });
 
-  it("uses title, localized field, localized key, and terminal fallbacks while retaining values", () => {
+  it("keeps both cards visible and gives each collection its own total empty state", () => {
+    renderViewer([]);
+
+    expect(screen.getAllByTestId(/^context-card-/)).toHaveLength(2);
+    expect(screen.getByTestId("context-empty-rag")).toHaveTextContent("Not used");
+    expect(screen.getByTestId("context-empty-config")).toHaveTextContent("Not used");
+    expect(screen.queryByTestId("context-unknown-fallback")).not.toBeInTheDocument();
+  });
+
+  it("keeps both fixed cards empty when selectedContext is omitted", () => {
+    renderViewer(undefined);
+
+    expect(screen.getAllByTestId(/^context-card-/)).toHaveLength(2);
+    expect(screen.getByTestId("context-empty-rag")).toHaveTextContent("Not used");
+    expect(screen.getByTestId("context-empty-config")).toHaveTextContent("Not used");
+  });
+
+  it.each([
+    ["rag", "config"],
+    ["config", "rag"],
+  ] as const)(
+    "keeps the %s card populated and shows the partial empty state only for %s",
+    (populatedSource, emptySource) => {
+      renderViewer([
+        contextItem({ source: populatedSource, title: "Used title", value: "Used value" }),
+      ]);
+
+      expect(screen.getAllByTestId(/^context-card-/)).toHaveLength(2);
+      expect(screen.getByTestId(`context-item-${populatedSource}-0`)).toHaveTextContent(
+        "Used title",
+      );
+      expect(screen.queryByTestId(`context-empty-${populatedSource}`)).not.toBeInTheDocument();
+      expect(screen.getByTestId(`context-empty-${emptySource}`)).toHaveTextContent("Not used");
+    },
+  );
+
+  it("keeps unknown items visible in a neutral fallback outside the two-card grid", () => {
+    renderViewer([
+      contextItem({ title: "Known", value: "Known value", source: "rag" }),
+      contextItem({ title: "Unknown first", value: "Unknown value 1", source: "future_source" }),
+      contextItem({ title: "Unknown second", value: "Unknown value 2", source: "   " }),
+    ]);
+
+    const grid = screen.getByTestId("context-grid");
+    const fallback = screen.getByTestId("context-unknown-fallback");
+    expect(grid).not.toContainElement(fallback);
+    expect(within(grid).getAllByTestId(/^context-card-/)).toHaveLength(2);
+    expect(screen.queryByTestId("context-card-unknown")).not.toBeInTheDocument();
+    expect(within(fallback).getByText("Unknown Source")).toBeInTheDocument();
+    expect(within(fallback).queryByText("RAG")).not.toBeInTheDocument();
+    expect(within(fallback).queryByText("Clinic Config")).not.toBeInTheDocument();
+    expect(
+      within(fallback).getAllByTestId(/^context-title-unknown-/).map((title) => title.textContent),
+    ).toEqual(["Unknown first", "Unknown second"]);
+    expect(within(fallback).getByTestId("context-value-unknown-0")).toHaveTextContent(
+      "Unknown value 1",
+    );
+  });
+
+  it("uses title, localized field, localized key, and terminal fallbacks while retaining full values", () => {
     const longValue = `First line\n${"unbroken-value-".repeat(30)}`;
     renderViewer([
       contextItem({
@@ -195,14 +277,14 @@ describe("<TraceViewer /> selected context", () => {
       contextItem({ title: "", field: "", key: "", value: "Terminal value" }),
     ]);
 
-    expect(screen.getByTestId("context-title-0")).toHaveTextContent("Friendly title");
-    expect(screen.getByTestId("context-title-1")).toHaveTextContent("Clinic Name");
-    expect(screen.getByTestId("context-title-2")).toHaveTextContent("Agent Name");
-    expect(screen.getByTestId("context-title-3")).toHaveTextContent("Context");
-    expect(screen.getByTestId("context-value-0").textContent).toBe(longValue);
-    expect(screen.getByTestId("context-value-1")).toHaveTextContent("Field value");
-    expect(screen.getByTestId("context-value-2")).toHaveTextContent("Key value");
-    expect(screen.getByTestId("context-value-3")).toHaveTextContent("Terminal value");
+    expect(screen.getByTestId("context-title-rag-0")).toHaveTextContent("Friendly title");
+    expect(screen.getByTestId("context-title-rag-1")).toHaveTextContent("Clinic Name");
+    expect(screen.getByTestId("context-title-rag-2")).toHaveTextContent("Agent Name");
+    expect(screen.getByTestId("context-title-rag-3")).toHaveTextContent("Context");
+    expect(screen.getByTestId("context-value-rag-0").textContent).toBe(longValue);
+    expect(screen.getByTestId("context-value-rag-1")).toHaveTextContent("Field value");
+    expect(screen.getByTestId("context-value-rag-2")).toHaveTextContent("Key value");
+    expect(screen.getByTestId("context-value-rag-3")).toHaveTextContent("Terminal value");
   });
 
   it("declares the responsive grid and wrapping classes without truncation", () => {
@@ -212,22 +294,19 @@ describe("<TraceViewer /> selected context", () => {
       "grid-cols-1",
       "md:grid-cols-2",
     );
-    expect(screen.getByTestId("context-item-0")).toHaveClass("min-w-0");
-    expect(screen.getByTestId("context-title-0")).toHaveClass("break-words");
-    expect(screen.getByTestId("context-value-0")).toHaveClass(
+    expect(screen.getByTestId("context-card-rag")).toHaveClass("min-w-0");
+    expect(screen.getByTestId("context-item-rag-0")).toHaveClass("min-w-0");
+    expect(screen.getByTestId("context-title-rag-0")).toHaveClass("break-words");
+    expect(screen.getByTestId("context-value-rag-0")).toHaveClass(
       "whitespace-pre-wrap",
       "break-words",
     );
-    expect(screen.getByTestId("context-item-0").className).not.toMatch(
-      /truncate|line-clamp/,
-    );
+    expect(screen.getByTestId("context-item-rag-0").className).not.toMatch(/truncate|line-clamp/);
   });
 
-  it("renders the Portuguese panel, source labels, terminal title, and empty state", () => {
+  it("renders Portuguese labels, title fallback, and per-card empty copy", () => {
     renderViewer(
       [
-        contextItem({ source: "RAG" }),
-        contextItem({ source: "CONFIG" }),
         contextItem({ title: "", source: "other" }),
       ],
       "pt",
@@ -237,18 +316,17 @@ describe("<TraceViewer /> selected context", () => {
     expect(screen.getByText("RAG")).toBeInTheDocument();
     expect(screen.getByText("Configuração da Clínica")).toBeInTheDocument();
     expect(screen.getByText("Origem Desconhecida")).toBeInTheDocument();
-    expect(screen.getByTestId("context-title-2")).toHaveTextContent("Contexto");
-
-    cleanup();
-    renderViewer([], "pt");
-    expect(screen.getByText("Contexto Selecionado")).toBeInTheDocument();
-    expect(screen.getByText("Nenhum contexto utilizado.")).toBeInTheDocument();
+    expect(screen.getByTestId("context-title-unknown-0")).toHaveTextContent("Contexto");
+    expect(screen.getByTestId("context-empty-rag")).toHaveTextContent("Não utilizado");
+    expect(screen.getByTestId("context-empty-config")).toHaveTextContent("Não utilizado");
   });
 
-  it("renders the English panel and current empty-state copy", () => {
+  it("renders the English labels and per-card empty copy", () => {
     renderViewer([]);
 
     expect(screen.getByText("Selected Context")).toBeInTheDocument();
-    expect(screen.getByText("No context used.")).toBeInTheDocument();
+    expect(screen.getByText("RAG")).toBeInTheDocument();
+    expect(screen.getByText("Clinic Config")).toBeInTheDocument();
+    expect(screen.getAllByText("Not used")).toHaveLength(2);
   });
 });
