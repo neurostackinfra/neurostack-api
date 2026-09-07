@@ -68,6 +68,7 @@ class HandoffQueueItem(BaseModel):
     id: UUID
     numero_whatsapp: Optional[str] = None
     session_id: UUID
+    safety_flag: bool
     intencao_detectada: Optional[str] = None
     estagio_atual: Optional[str] = None
     primeira_linha_mensagem: Optional[str] = None

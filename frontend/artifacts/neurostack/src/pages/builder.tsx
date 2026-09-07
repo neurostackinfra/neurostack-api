@@ -633,8 +633,8 @@ export default function BuilderPanel() {
           <TabsList>
             <TabsTrigger value="overview">{t("builder_tab_overview")}</TabsTrigger>
             <TabsTrigger value="clinics">{t("builder_tab_clinics")}</TabsTrigger>
-          </TabsList>
             <TabsTrigger value="support">{t("builder_tab_support")}</TabsTrigger>
+          </TabsList>
 
           {/* ══════════════════════════════════════════════════════════════════
               VISAO GLOBAL TAB

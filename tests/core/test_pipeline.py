@@ -3,6 +3,7 @@ NeuroStack - Core Pipeline Unit Tests
 Tests for the CognitivePipeline orchestrator.
 """
 
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
@@ -254,6 +255,43 @@ class TestCognitivePipeline:
             assert result.handoff_reason is not None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("safety_concern", [True, False])
+    async def test_run_handoff_passes_canonical_turn_signals(
+        self,
+        tenant_id,
+        session_id,
+        safety_concern,
+    ):
+        """The handoff request keeps reason, intent, and safety independent."""
+        handoff_service = MagicMock()
+        handoff_service.initiate_handoff = AsyncMock(return_value=None)
+        pipeline = CognitivePipeline(handoff_service=handoff_service)
+        input_data = PipelineInput(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            message="Quero falar com alguém",
+            slots={"topic": "billing"},
+        )
+        decision = pipeline_module.SRMDecisionModel(
+            intent="cobranca_renegociacao",
+            intent_category="information",
+            funnel_stage="em_qualificacao",
+            action="handoff_financeiro",
+            confidence=0.98,
+            safety_concern=safety_concern,
+            handoff_required=True,
+            handoff_reason="user_request",
+        )
+
+        await pipeline._run_handoff(input_data, decision)
+
+        request = handoff_service.initiate_handoff.await_args.args[0]
+        assert request.reason.value == "user_request"
+        assert request.detected_intent == "cobranca_renegociacao"
+        assert request.safety_concern is safety_concern
+        assert request.key_info == {"topic": "billing"}
+
+    @pytest.mark.asyncio
     async def test_scheduling_link_send_turn_dispatches_handoff_and_exact_response(
         self,
         monkeypatch,
@@ -272,7 +310,6 @@ class TestCognitivePipeline:
             "scheduling_link_message"
         ] = "  Finalize seu agendamento pelo link:  "
         expected = "  Finalize seu agendamento pelo link:  \n\nhttps://clinica.example.com/agendar"
-
         with structlog.testing.capture_logs() as log_records:
             monkeypatch.setattr(
                 pipeline_module,
@@ -326,7 +363,6 @@ class TestCognitivePipeline:
 
         monkeypatch.setattr("src.services.handoff_service.get_db_session", _no_db)
         pipeline = _isolated_pipeline()
-
         with structlog.testing.capture_logs() as log_records:
             monkeypatch.setattr(
                 pipeline_module,
