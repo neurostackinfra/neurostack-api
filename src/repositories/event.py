@@ -7,12 +7,12 @@ from datetime import datetime, timedelta
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import select, and_, func, desc
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.config.logging import get_logger
 from src.models.event import Event
 from src.repositories.base import BaseRepository
-from src.config.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -20,16 +20,16 @@ logger = get_logger(__name__)
 class EventRepository(BaseRepository[Event]):
     """
     Repository for Event model operations.
-    
+
     Events are append-only, so this repository focuses on:
     - Creating events (no updates/deletes)
     - Querying events by various criteria
     - Event aggregation and analytics
     """
-    
+
     def __init__(self, session: AsyncSession):
         super().__init__(session, Event)
-    
+
     async def find_by_session(
         self,
         tenant_id: UUID,
@@ -40,31 +40,31 @@ class EventRepository(BaseRepository[Event]):
     ) -> list[Event]:
         """
         Find events for a session.
-        
+
         Args:
             tenant_id: Tenant ID
             session_id: Session ID
             skip: Number of records to skip
             limit: Maximum number of records to return
             event_type: Optional event type filter
-            
+
         Returns:
             List of event instances (ordered by created_at DESC)
         """
-        filters = {
+        filters: dict[str, object] = {
             "tenant_id": tenant_id,
             "session_id": session_id,
         }
         if event_type:
             filters["event_type"] = event_type
-        
+
         return await self.find_many(
             skip=skip,
             limit=limit,
             order_by="-created_at",
             **filters,
         )
-    
+
     async def find_by_tenant(
         self,
         tenant_id: UUID,
@@ -76,7 +76,7 @@ class EventRepository(BaseRepository[Event]):
     ) -> list[Event]:
         """
         Find events for a tenant.
-        
+
         Args:
             tenant_id: Tenant ID
             skip: Number of records to skip
@@ -84,29 +84,29 @@ class EventRepository(BaseRepository[Event]):
             event_type: Optional event type filter
             start_time: Optional start time filter
             end_time: Optional end time filter
-            
+
         Returns:
             List of event instances (ordered by created_at DESC)
         """
         stmt = select(Event).where(Event.tenant_id == tenant_id)
-        
+
         if event_type:
             stmt = stmt.where(Event.event_type == event_type)
         if start_time:
             stmt = stmt.where(Event.created_at >= start_time)
         if end_time:
             stmt = stmt.where(Event.created_at <= end_time)
-        
+
         stmt = stmt.order_by(Event.created_at.desc())
-        
+
         if skip > 0:
             stmt = stmt.offset(skip)
         if limit is not None:
             stmt = stmt.limit(limit)
-        
+
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
-    
+
     async def find_by_type(
         self,
         tenant_id: UUID,
@@ -118,7 +118,7 @@ class EventRepository(BaseRepository[Event]):
     ) -> list[Event]:
         """
         Find events by type.
-        
+
         Args:
             tenant_id: Tenant ID
             event_type: Event type
@@ -126,7 +126,7 @@ class EventRepository(BaseRepository[Event]):
             limit: Maximum number of records to return
             start_time: Optional start time filter
             end_time: Optional end time filter
-            
+
         Returns:
             List of event instances
         """
@@ -138,7 +138,7 @@ class EventRepository(BaseRepository[Event]):
             start_time=start_time,
             end_time=end_time,
         )
-    
+
     async def find_recent(
         self,
         tenant_id: UUID,
@@ -148,13 +148,13 @@ class EventRepository(BaseRepository[Event]):
     ) -> list[Event]:
         """
         Find recent events within the last N hours.
-        
+
         Args:
             tenant_id: Tenant ID
             hours: Number of hours to look back
             event_type: Optional event type filter
             limit: Maximum number of records to return
-            
+
         Returns:
             List of event instances
         """
@@ -165,7 +165,7 @@ class EventRepository(BaseRepository[Event]):
             event_type=event_type,
             start_time=start_time,
         )
-    
+
     async def count_by_session(
         self,
         tenant_id: UUID,
@@ -174,27 +174,31 @@ class EventRepository(BaseRepository[Event]):
     ) -> int:
         """
         Count events for a session.
-        
+
         Args:
             tenant_id: Tenant ID
             session_id: Session ID
             event_type: Optional event type filter
-            
+
         Returns:
             Number of events
         """
-        stmt = select(func.count()).select_from(Event).where(
-            and_(
-                Event.tenant_id == tenant_id,
-                Event.session_id == session_id,
+        stmt = (
+            select(func.count())
+            .select_from(Event)
+            .where(
+                and_(
+                    Event.tenant_id == tenant_id,
+                    Event.session_id == session_id,
+                )
             )
         )
         if event_type:
             stmt = stmt.where(Event.event_type == event_type)
-        
+
         result = await self.session.execute(stmt)
         return result.scalar() or 0
-    
+
     async def count_by_type(
         self,
         tenant_id: UUID,
@@ -204,29 +208,33 @@ class EventRepository(BaseRepository[Event]):
     ) -> int:
         """
         Count events by type.
-        
+
         Args:
             tenant_id: Tenant ID
             event_type: Event type
             start_time: Optional start time filter
             end_time: Optional end time filter
-            
+
         Returns:
             Number of events
         """
-        stmt = select(func.count()).select_from(Event).where(
-            and_(
-                Event.tenant_id == tenant_id,
-                Event.event_type == event_type,
+        stmt = (
+            select(func.count())
+            .select_from(Event)
+            .where(
+                and_(
+                    Event.tenant_id == tenant_id,
+                    Event.event_type == event_type,
+                )
             )
         )
         if start_time:
             stmt = stmt.where(Event.created_at >= start_time)
         if end_time:
             stmt = stmt.where(Event.created_at <= end_time)
-        
+
         result = await self.session.execute(stmt)
         return result.scalar() or 0
-    
+
     # Note: Events are append-only, so we don't implement update/delete methods
     # The base repository's update/delete methods are not applicable here

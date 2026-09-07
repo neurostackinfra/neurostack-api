@@ -23,6 +23,24 @@ logger = logging.getLogger(__name__)
 META_GRAPH_BASE = "https://graph.facebook.com/v18.0"
 
 
+def _response_json_object(response: httpx.Response) -> dict[str, object]:
+    """Decode and validate an upstream JSON object response."""
+    try:
+        payload: object = response.json()
+    except ValueError as exc:
+        raise RuntimeError("invalid_upstream_response") from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("invalid_upstream_response")
+
+    result: dict[str, object] = {}
+    for key, value in payload.items():
+        if not isinstance(key, str):
+            raise RuntimeError("invalid_upstream_response")
+        result[key] = value
+    return result
+
+
 def _sanitize_http_status_error(exc: httpx.HTTPStatusError) -> RuntimeError:
     """Return a URL-free RuntimeError describing an upstream HTTP failure.
 
@@ -41,7 +59,7 @@ async def send_meta_cloud_text(
     access_token: str,
     to_phone: str,
     message: str,
-) -> dict:
+) -> dict[str, object]:
     """Send a text message via Meta Cloud API (WhatsApp Business).
 
     Args:
@@ -77,7 +95,7 @@ async def send_meta_cloud_text(
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise _sanitize_http_status_error(exc) from None
-        data = resp.json()
+        data = _response_json_object(resp)
         logger.info(
             "Meta send_text to %s — status %s",
             to_phone,
@@ -93,7 +111,7 @@ async def send_meta_cloud_audio(
     audio_bytes: bytes,
     *,
     mime_type: str = "audio/mpeg",
-) -> dict:
+) -> dict[str, object]:
     """Upload synthesized audio and send it through Meta Cloud API."""
 
     upload_url = f"{META_GRAPH_BASE}/{phone_number_id}/media"
@@ -114,12 +132,9 @@ async def send_meta_cloud_audio(
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise _sanitize_http_status_error(exc) from None
-        try:
-            upload_payload = response.json()
-        except ValueError as exc:
-            raise RuntimeError("invalid_upstream_response") from exc
+        upload_payload = _response_json_object(response)
 
-    media_id = upload_payload.get("id") if isinstance(upload_payload, dict) else None
+    media_id = upload_payload.get("id")
     if not isinstance(media_id, str) or not media_id:
         raise RuntimeError("missing_uploaded_media_id")
 
@@ -144,12 +159,12 @@ async def send_meta_cloud_audio(
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise _sanitize_http_status_error(exc) from None
-        data = response.json()
+        data = _response_json_object(response)
         logger.info("Meta send_audio to %s - status %s", to_phone, response.status_code)
         return data
 
 
-def extract_meta_message_id(send_result: dict) -> Optional[str]:
+def extract_meta_message_id(send_result: dict[str, object]) -> Optional[str]:
     """Return the outbound `wamid.*` from a Graph API send response.
 
     Meta wraps the id inside ``messages[0].id``. Returns ``None`` when the
@@ -168,7 +183,7 @@ def extract_meta_message_id(send_result: dict) -> Optional[str]:
     return mid if isinstance(mid, str) and mid else None
 
 
-async def resolve_meta_media(media_id: str, access_token: str) -> dict:
+async def resolve_meta_media(media_id: str, access_token: str) -> dict[str, object]:
     """Resolve a Meta ``media_id`` to a signed download URL + metadata.
 
     Meta requires a two-hop dance for inbound media:
@@ -192,7 +207,7 @@ async def resolve_meta_media(media_id: str, access_token: str) -> dict:
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise _sanitize_http_status_error(exc) from None
-        return resp.json()
+        return _response_json_object(resp)
 
 
 async def download_meta_media(url: str, access_token: str) -> bytes:

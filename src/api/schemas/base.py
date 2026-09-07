@@ -5,7 +5,7 @@ Foundation classes for all API schemas.
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Generic, TypeVar, Optional
+from typing import Generic, Optional, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -39,8 +39,12 @@ class BaseResponse(BaseModel):
         }
     )
 
-    success: bool = Field(default=True, description="Whether the operation was successful")
-    message: Optional[str] = Field(default=None, description="Optional message about the operation")
+    success: bool = Field(
+        default=True, description="Whether the operation was successful"
+    )
+    message: Optional[str] = Field(
+        default=None, description="Optional message about the operation"
+    )
 
 
 class ErrorCode(str, Enum):
@@ -87,9 +91,13 @@ class ErrorDetail(BaseModel):
         }
     )
 
-    field: Optional[str] = Field(default=None, description="Field that caused the error")
+    field: Optional[str] = Field(
+        default=None, description="Field that caused the error"
+    )
     message: str = Field(..., description="Human-readable error message")
-    code: Optional[str] = Field(default=None, description="Error code for programmatic handling")
+    code: Optional[str] = Field(
+        default=None, description="Error code for programmatic handling"
+    )
 
 
 class ErrorResponse(BaseModel):
@@ -207,4 +215,3 @@ class PaginatedResponse(BaseModel, Generic[T]):
             has_next=page < total_pages,
             has_previous=page > 1,
         )
-

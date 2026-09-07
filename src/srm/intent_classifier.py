@@ -5,16 +5,32 @@ Uses official intents per documentation MVP v0.5.
 """
 
 import re
-from typing import Optional
+from typing import Optional, TypedDict
 
 from src.srm.models import IntentCategory, IntentResult
+
+
+class IntentDefinition(TypedDict):
+    """Complete definition used by the Portuguese intent classifier."""
+
+    category: IntentCategory
+    patterns: list[str]
+    keywords: list[str]
+    weight: float
+
+
+class EnglishIntentPatterns(TypedDict):
+    """English pattern and keyword overrides for an intent."""
+
+    patterns: list[str]
+    keywords: list[str]
 
 
 # ============================================
 # Intent Definitions — official intents only
 # ============================================
 
-INTENT_DEFINITIONS: dict[str, dict] = {
+INTENT_DEFINITIONS: dict[str, IntentDefinition] = {
     # ── Básico ──
     "saudacao": {
         "category": IntentCategory.GREETING,
@@ -28,7 +44,6 @@ INTENT_DEFINITIONS: dict[str, dict] = {
         "keywords": ["olá", "ola", "oi", "bom dia", "boa tarde", "boa noite"],
         "weight": 0.95,
     },
-
     # ── Vendas e conversão ──
     "interesse_tratamento": {
         "category": IntentCategory.INFORMATION,
@@ -63,11 +78,29 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(dentes?\s*(mais\s*)?(brancos?|claros?)|clareamento|branquear|clarear)\b",
             r"\b(deixar|ficar|tornando?)\b.*\b(dentes?\s*(mais\s*)?(brancos?|claros?))\b",
         ],
-        "keywords": ["tratamento", "procedimento", "avaliação", "botox", "peeling",
-                      "clareamento", "harmonização", "tratar", "quero fazer",
-                      "quero saber", "querendo saber", "me explica", "tenho interesse",
-                      "faceta", "facetas", "lente de contato dental", "implante",
-                      "dentes brancos", "dentes mais brancos", "branquear", "clarear"],
+        "keywords": [
+            "tratamento",
+            "procedimento",
+            "avaliação",
+            "botox",
+            "peeling",
+            "clareamento",
+            "harmonização",
+            "tratar",
+            "quero fazer",
+            "quero saber",
+            "querendo saber",
+            "me explica",
+            "tenho interesse",
+            "faceta",
+            "facetas",
+            "lente de contato dental",
+            "implante",
+            "dentes brancos",
+            "dentes mais brancos",
+            "branquear",
+            "clarear",
+        ],
         "weight": 1.0,
     },
     "pedido_preco": {
@@ -88,8 +121,19 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\bquanto é\b",
             r"\bquanto sai\b",
         ],
-        "keywords": ["quanto", "valor", "preço", "preco", "custo", "custa",
-                      "parcelam", "desconto", "pagamento", "pix", "pacote"],
+        "keywords": [
+            "quanto",
+            "valor",
+            "preço",
+            "preco",
+            "custo",
+            "custa",
+            "parcelam",
+            "desconto",
+            "pagamento",
+            "pix",
+            "pacote",
+        ],
         "weight": 1.0,
     },
     "comparacao_tratamentos": {
@@ -137,9 +181,18 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(muito longe)\b",
             r"\b(tenho medo)\b.*\b(procedimento|fazer|cirurgia)\b",
         ],
-        "keywords": ["vou pensar", "pensar", "achei caro", "medo", "receio",
-                      "pesquisar", "não é o momento", "preciso falar",
-                      "não sei se vale", "sem grana"],
+        "keywords": [
+            "vou pensar",
+            "pensar",
+            "achei caro",
+            "medo",
+            "receio",
+            "pesquisar",
+            "não é o momento",
+            "preciso falar",
+            "não sei se vale",
+            "sem grana",
+        ],
         "weight": 1.0,
     },
     "duvida_generica_sem_contexto": {
@@ -150,7 +203,6 @@ INTENT_DEFINITIONS: dict[str, dict] = {
         "keywords": [],
         "weight": 0.3,
     },
-
     # ── Agendamento e operação ──
     "agendar": {
         "category": IntentCategory.SCHEDULING,
@@ -181,10 +233,22 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\bagendar\b.*\bcom urgência\b",
             r"\bconsigo\b.*\b(horário|horario)\b",
         ],
-        "keywords": ["agendar", "marcar", "reservar", "horário", "horario",
-                      "consulta", "vaga", "encaixe",
-                      "agenda", "disponível", "fim de semana", "sábado",
-                      "sabado", "domingo"],
+        "keywords": [
+            "agendar",
+            "marcar",
+            "reservar",
+            "horário",
+            "horario",
+            "consulta",
+            "vaga",
+            "encaixe",
+            "agenda",
+            "disponível",
+            "fim de semana",
+            "sábado",
+            "sabado",
+            "domingo",
+        ],
         # NOTE: "disponibilidade" removed from keywords — belongs to disponibilidade_horarios.
         # "tem disponibilidade?" is captured by the tem|têm?|há pattern above.
         "weight": 1.0,
@@ -221,7 +285,15 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             # (has trailing content after "confirmar"); "...e pode confirmar" DOES match.
             r"\b(pode|podes|pode sim)\s+confirmar[!?.]?\s*$",
         ],
-        "keywords": ["sim", "ok", "confirmo", "confirmado", "certo", "correto", "perfeito"],
+        "keywords": [
+            "sim",
+            "ok",
+            "confirmo",
+            "confirmado",
+            "certo",
+            "correto",
+            "perfeito",
+        ],
         "weight": 0.9,
     },
     "disponibilidade_horarios": {
@@ -241,8 +313,15 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             # messages that mention "encaminhar" as a precondition, e.g. "antes de me encaminhar")
             r"\b(queria?|quero|gostaria)(\s+de)?\s+saber\b.*\b(horários?|horarios?|disponibilidade|agenda)\b",
         ],
-        "keywords": ["horário", "horario", "funciona", "abre", "fecha",
-                      "funcionamento", "expediente"],
+        "keywords": [
+            "horário",
+            "horario",
+            "funciona",
+            "abre",
+            "fecha",
+            "funcionamento",
+            "expediente",
+        ],
         # NOTE: "disponibilidade" intentionally excluded — it scores as agendar for
         # "têm disponibilidade?" and date-specific asks; only "informe+disponibilidade"
         # belongs here (captured by pattern above, not keyword scoring).
@@ -264,9 +343,19 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\bposso levar\b.*\b(acompanhante)\b",
             r"\b(cirurgia plástica|cirurgia plastica)\b",
         ],
-        "keywords": ["serviços", "procedimentos", "especialidades", "endereço", "endereco",
-                      "onde fica", "convênio", "convenio", "estacionamento",
-                      "acessível", "como chego"],
+        "keywords": [
+            "serviços",
+            "procedimentos",
+            "especialidades",
+            "endereço",
+            "endereco",
+            "onde fica",
+            "convênio",
+            "convenio",
+            "estacionamento",
+            "acessível",
+            "como chego",
+        ],
         "weight": 1.0,
     },
     "pre_atendimento": {
@@ -317,11 +406,18 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(médico|medico)\b.*\b(especialista)\b",
             r"\b(formação|formacao)\b.*\b(dr|dra|doutor|médico|medico)\b",
         ],
-        "keywords": ["médico", "medico", "doutor", "profissionais",
-                      "especialista", "nutricionista", "formação", "formacao"],
+        "keywords": [
+            "médico",
+            "medico",
+            "doutor",
+            "profissionais",
+            "especialista",
+            "nutricionista",
+            "formação",
+            "formacao",
+        ],
         "weight": 1.1,
     },
-
     # ── Pós-atendimento ──
     "pos_atendimento_duvida": {
         "category": IntentCategory.INFORMATION,
@@ -334,8 +430,15 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(voltar a)\b.*\b(comer|exercício|exercicio|trabalhar|normal)\b",
             r"\b(efeito)\b.*\b(botox|preenchimento)\b.*\b(dura|quanto tempo)\b",
         ],
-        "keywords": ["depois do procedimento", "é normal", "posso tomar",
-                      "quanto tempo", "cicatrizar", "curativo", "dormência"],
+        "keywords": [
+            "depois do procedimento",
+            "é normal",
+            "posso tomar",
+            "quanto tempo",
+            "cicatrizar",
+            "curativo",
+            "dormência",
+        ],
         "weight": 1.0,
     },
     "pos_atendimento_sintomas_preocupantes": {
@@ -355,8 +458,18 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(piorando|piora)\b",
             r"\b(socorro|ajuda)\b",
         ],
-        "keywords": ["dor forte", "sangramento", "febre", "piora", "emergência",
-                      "passando mal", "inchou", "pus", "pressão caiu", "socorro"],
+        "keywords": [
+            "dor forte",
+            "sangramento",
+            "febre",
+            "piora",
+            "emergência",
+            "passando mal",
+            "inchou",
+            "pus",
+            "pressão caiu",
+            "socorro",
+        ],
         "weight": 1.0,
     },
     "pedido_alterar_medicacao": {
@@ -371,12 +484,19 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(quero parar)\b.*\b(remédio|remedio|medicamento)\b",
             r"\b(tomar)\b.*\b(menos|mais)\b.*\b(remédio|remedio|medicamento|dose)?\b",
         ],
-        "keywords": ["alterar dose", "diminuir remédio", "medicamento forte",
-                      "trocar medicamento", "parar de tomar", "efeito colateral",
-                      "posso tomar", "dose", "remédio"],
+        "keywords": [
+            "alterar dose",
+            "diminuir remédio",
+            "medicamento forte",
+            "trocar medicamento",
+            "parar de tomar",
+            "efeito colateral",
+            "posso tomar",
+            "dose",
+            "remédio",
+        ],
         "weight": 1.1,
     },
-
     # ── Reclamações e conduta ──
     "reclamacao": {
         "category": IntentCategory.COMPLAINT,
@@ -402,10 +522,26 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(muito insatisfeit[oa])\b",
             r"\b(esperando há|esperando ha)\b",
         ],
-        "keywords": ["reclamar", "reclamação", "reclamacao", "problema", "insatisfeito",
-                      "péssimo", "pessimo", "demora", "esperando", "mal atendida",
-                      "não resolveram", "não gostei", "nao gostei", "dinheiro de volta",
-                      "reembolso", "estorno", "decepcionado", "arrependido"],
+        "keywords": [
+            "reclamar",
+            "reclamação",
+            "reclamacao",
+            "problema",
+            "insatisfeito",
+            "péssimo",
+            "pessimo",
+            "demora",
+            "esperando",
+            "mal atendida",
+            "não resolveram",
+            "não gostei",
+            "nao gostei",
+            "dinheiro de volta",
+            "reembolso",
+            "estorno",
+            "decepcionado",
+            "arrependido",
+        ],
         "weight": 1.0,
     },
     "conduta_inadequada_ameaca": {
@@ -420,11 +556,19 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(vão se arrepender|vao se arrepender)\b",
             r"\b(expor)\b.*\b(redes|internet|instagram)\b",
         ],
-        "keywords": ["processar", "advogado", "procon", "crm", "absurdo",
-                      "ameaça", "ameaca", "merda", "denunciar"],
+        "keywords": [
+            "processar",
+            "advogado",
+            "procon",
+            "crm",
+            "absurdo",
+            "ameaça",
+            "ameaca",
+            "merda",
+            "denunciar",
+        ],
         "weight": 1.0,
     },
-
     # ── Documentos e financeiro ──
     "documentos_e_comprovantes": {
         "category": IntentCategory.INFORMATION,
@@ -435,8 +579,14 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(comprovante)\b.*\b(comparecimento)\b",
             r"\bnota fiscal\b.*\b(procedimento|consulta|atendimento)\b",
         ],
-        "keywords": ["documento", "comprovante", "atestado", "receita",
-                      "laudo", "nota fiscal"],
+        "keywords": [
+            "documento",
+            "comprovante",
+            "atestado",
+            "receita",
+            "laudo",
+            "nota fiscal",
+        ],
         "weight": 1.1,
     },
     "orcamento_existente": {
@@ -458,10 +608,16 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(quero parcelar)\b.*\b(débito|debito)\b",
             r"\b(dívida|divida)\b.*\b(renegociar|parcelar)\b",
         ],
-        "keywords": ["parcelar débito", "renegociar", "cobrança", "cobranca", "dívida", "divida"],
+        "keywords": [
+            "parcelar débito",
+            "renegociar",
+            "cobrança",
+            "cobranca",
+            "dívida",
+            "divida",
+        ],
         "weight": 0.9,
     },
-
     # ── New intents from 200-case dataset ──
     "pedido_atendente_humano": {
         "category": IntentCategory.INFORMATION,
@@ -482,8 +638,14 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             # "encaminha agora", "encaminhar já" — timing word required (NOT "sim" — that's a confirmation)
             r"\bencaminh(ar|a|e)\b.*\b(agora|já|ja|direto|logo|então|entao)\b",
         ],
-        "keywords": ["atendente humano", "humano", "pessoa real", "não robô",
-                      "falar com alguém", "transfere"],
+        "keywords": [
+            "atendente humano",
+            "humano",
+            "pessoa real",
+            "não robô",
+            "falar com alguém",
+            "transfere",
+        ],
         # NOTE: do NOT add bare verbs like "encaminhar"/"encaminhe" here —
         # they are too generic and cause false-positives ("encaminhar exames").
         # The patterns above already require handoff context (equipe/agendamento/etc.)
@@ -497,8 +659,12 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(sou paciente)\b.*\b(dr|dra|doutor|clínica|clinica)\b",
             r"\b(já faço|ja faco)\b.*\b(tratamento)\b.*\b(aqui)\b",
         ],
-        "keywords": ["já sou paciente", "faço acompanhamento", "sou paciente",
-                      "já faço tratamento"],
+        "keywords": [
+            "já sou paciente",
+            "faço acompanhamento",
+            "sou paciente",
+            "já faço tratamento",
+        ],
         "weight": 0.9,
     },
     "fora_do_escopo": {
@@ -513,9 +679,22 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(tratam)\b.*\b(animais)\b",
             r"\b(posso fazer)\b.*\b(ressonância|ressonancia)\b",
         ],
-        "keywords": ["exame de sangue", "exame de vista", "veterinário", "veterinario",
-                      "vendem remédio", "laboratório", "laboratorio", "vacinação", "vacinacao",
-                      "ressonância", "ressonancia", "bariátrica", "bariatrica", "animais"],
+        "keywords": [
+            "exame de sangue",
+            "exame de vista",
+            "veterinário",
+            "veterinario",
+            "vendem remédio",
+            "laboratório",
+            "laboratorio",
+            "vacinação",
+            "vacinacao",
+            "ressonância",
+            "ressonancia",
+            "bariátrica",
+            "bariatrica",
+            "animais",
+        ],
         "weight": 1.1,
     },
     "fora_do_horario": {
@@ -528,7 +707,13 @@ INTENT_DEFINITIONS: dict[str, dict] = {
             r"\b(emergência|emergencia)\b.*\b(fora)\b.*\b(horário|horario)\b",
             r"\b(vocês|voces)\b.*\b(plantão|plantao)\b",
         ],
-        "keywords": ["fora do horário", "fora do horario", "madrugada", "plantão", "plantao"],
+        "keywords": [
+            "fora do horário",
+            "fora do horario",
+            "madrugada",
+            "plantão",
+            "plantao",
+        ],
         "weight": 1.1,
     },
 }
@@ -541,15 +726,22 @@ INTENT_DEFINITIONS: dict[str, dict] = {
 # When language="en", these patterns override the PT ones per intent;
 # any intent missing here falls back to its PT patterns.
 
-EN_INTENT_PATTERNS: dict[str, dict] = {
+EN_INTENT_PATTERNS: dict[str, EnglishIntentPatterns] = {
     "saudacao": {
         "patterns": [
             r"^(hello|hi+|hey+|howdy|yo)\b[!.,?]*\s*$",
             r"^(hello|hi|hey)\b.*$",
             r"\bgood (morning|afternoon|evening|night)\b",
         ],
-        "keywords": ["hello", "hi", "hey", "howdy", "good morning",
-                      "good afternoon", "good evening"],
+        "keywords": [
+            "hello",
+            "hi",
+            "hey",
+            "howdy",
+            "good morning",
+            "good afternoon",
+            "good evening",
+        ],
     },
     "interesse_tratamento": {
         "patterns": [
@@ -560,8 +752,13 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\b(do you|can you)\b.*\b(treat|offer|do|perform)\b",
             r"\bi want to know\b",
         ],
-        "keywords": ["interested in", "tell me about", "looking for treatment",
-                      "i want to know", "information about"],
+        "keywords": [
+            "interested in",
+            "tell me about",
+            "looking for treatment",
+            "i want to know",
+            "information about",
+        ],
     },
     "pedido_preco": {
         "patterns": [
@@ -574,8 +771,18 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\b(discount|promotion|offer)\b",
             r"\bpayment (method|options?)\b",
         ],
-        "keywords": ["how much", "price", "cost", "pricing", "fee", "fees",
-                      "rate", "quote", "value", "payment"],
+        "keywords": [
+            "how much",
+            "price",
+            "cost",
+            "pricing",
+            "fee",
+            "fees",
+            "rate",
+            "quote",
+            "value",
+            "payment",
+        ],
     },
     "comparacao_tratamentos": {
         "patterns": [
@@ -586,8 +793,13 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\bwhich (is|one is) better\b",
             r"\b(which|what) (do you|would you) recommend\b",
         ],
-        "keywords": ["compared to", "versus", "difference between",
-                      "better than", "which is better"],
+        "keywords": [
+            "compared to",
+            "versus",
+            "difference between",
+            "better than",
+            "which is better",
+        ],
     },
     "objecao_vou_pensar": {
         "patterns": [
@@ -602,8 +814,14 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\bside effects?\b",
             r"\bi'?ll get back to you\b",
         ],
-        "keywords": ["think about it", "let me think", "maybe later",
-                      "not sure", "too expensive", "afraid"],
+        "keywords": [
+            "think about it",
+            "let me think",
+            "maybe later",
+            "not sure",
+            "too expensive",
+            "afraid",
+        ],
     },
     "duvida_generica_sem_contexto": {
         "patterns": [
@@ -624,8 +842,14 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\bset up (a |an )?(meeting|appointment)\b",
             r"\bavailable (slots?|times?|appointments?)\b",
         ],
-        "keywords": ["schedule", "book", "appointment", "reserve",
-                      "make an appointment", "set up"],
+        "keywords": [
+            "schedule",
+            "book",
+            "appointment",
+            "reserve",
+            "make an appointment",
+            "set up",
+        ],
     },
     "reagendar": {
         "patterns": [
@@ -662,8 +886,12 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\b(business|opening|operating) hours\b",
             r"\bschedule availability\b",
         ],
-        "keywords": ["available times", "when are you open",
-                      "business hours", "opening hours"],
+        "keywords": [
+            "available times",
+            "when are you open",
+            "business hours",
+            "opening hours",
+        ],
     },
     "detalhes_servicos": {
         "patterns": [
@@ -676,8 +904,15 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\b(do|does) (you|the clinic) accept\b.*\b(insurance|plan)\b",
             r"\bparking\b",
         ],
-        "keywords": ["what services", "what do you offer", "procedures",
-                      "address", "location", "insurance", "parking"],
+        "keywords": [
+            "what services",
+            "what do you offer",
+            "procedures",
+            "address",
+            "location",
+            "insurance",
+            "parking",
+        ],
     },
     "pre_atendimento": {
         "patterns": [
@@ -685,8 +920,12 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\bwhat (should i|do i need to|to) (bring|do|prepare)\b",
             r"\b(preparation|prep|fasting)\b.*\b(appointment|procedure)?\b",
         ],
-        "keywords": ["before the appointment", "what to bring",
-                      "preparation", "fasting"],
+        "keywords": [
+            "before the appointment",
+            "what to bring",
+            "preparation",
+            "fasting",
+        ],
     },
     "faq": {
         "patterns": [
@@ -722,8 +961,14 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\b(your |the )?(staff|team|professionals)\b",
             r"\b(do you have|is there)\b.*\b(specialist|dermatologist|psychologist|nutritionist)\b",
         ],
-        "keywords": ["doctor", "professional", "specialist", "staff", "team",
-                      "who will treat me"],
+        "keywords": [
+            "doctor",
+            "professional",
+            "specialist",
+            "staff",
+            "team",
+            "who will treat me",
+        ],
     },
     "pos_atendimento_duvida": {
         "patterns": [
@@ -734,8 +979,7 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\bcan i (eat|drink|drive|exercise) after\b",
             r"\bhow long (until|before|will it take)\b",
         ],
-        "keywords": ["after the procedure", "post treatment", "follow up",
-                      "aftercare"],
+        "keywords": ["after the procedure", "post treatment", "follow up", "aftercare"],
     },
     "pos_atendimento_sintomas_preocupantes": {
         "patterns": [
@@ -747,8 +991,15 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\b(emergency|urgent)\b",
             r"\bgetting worse\b",
         ],
-        "keywords": ["pain", "swelling", "bleeding", "allergic reaction",
-                      "side effect", "something wrong", "emergency"],
+        "keywords": [
+            "pain",
+            "swelling",
+            "bleeding",
+            "allergic reaction",
+            "side effect",
+            "something wrong",
+            "emergency",
+        ],
     },
     "pedido_alterar_medicacao": {
         "patterns": [
@@ -756,8 +1007,13 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\bcan i (take|stop)\b.*\b(medication|meds|pill)\b",
             r"\b(lower|higher|stronger|weaker)\b.*\b(dose|dosage)\b",
         ],
-        "keywords": ["change medication", "alter prescription",
-                      "adjust meds", "stop taking", "dose"],
+        "keywords": [
+            "change medication",
+            "alter prescription",
+            "adjust meds",
+            "stop taking",
+            "dose",
+        ],
     },
     "reclamacao": {
         "patterns": [
@@ -771,9 +1027,18 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\bbad service\b",
             r"\bspeak to (a |the )?(manager|supervisor)\b",
         ],
-        "keywords": ["complaint", "not satisfied", "unhappy", "terrible",
-                      "awful", "refund", "money back", "disappointed",
-                      "bad service", "hated"],
+        "keywords": [
+            "complaint",
+            "not satisfied",
+            "unhappy",
+            "terrible",
+            "awful",
+            "refund",
+            "money back",
+            "disappointed",
+            "bad service",
+            "hated",
+        ],
     },
     "conduta_inadequada_ameaca": {
         "patterns": [
@@ -785,8 +1050,14 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\b(abusive|abuse)\b",
             r"\bexpose you\b.*\b(online|social media)\b",
         ],
-        "keywords": ["sue", "lawyer", "report you", "unacceptable",
-                      "threat", "abusive"],
+        "keywords": [
+            "sue",
+            "lawyer",
+            "report you",
+            "unacceptable",
+            "threat",
+            "abusive",
+        ],
     },
     "documentos_e_comprovantes": {
         "patterns": [
@@ -795,8 +1066,14 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\b(send|email|provide)\b.*\b(receipt|invoice|document|certificate)\b",
             r"\bmedical (record|report)\b",
         ],
-        "keywords": ["receipt", "invoice", "document", "certificate",
-                      "proof of service", "medical record"],
+        "keywords": [
+            "receipt",
+            "invoice",
+            "document",
+            "certificate",
+            "proof of service",
+            "medical record",
+        ],
     },
     "orcamento_existente": {
         "patterns": [
@@ -814,8 +1091,13 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\bdispute (the |a )?(charge|bill)\b",
             r"\binstallments?\b.*\b(debt|payment|bill)\b",
         ],
-        "keywords": ["billing", "payment issue", "renegotiate",
-                      "dispute charge", "wrong charge"],
+        "keywords": [
+            "billing",
+            "payment issue",
+            "renegotiate",
+            "dispute charge",
+            "wrong charge",
+        ],
     },
     "pedido_atendente_humano": {
         "patterns": [
@@ -825,8 +1107,15 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\btransfer me\b.*\b(human|person|someone|agent)\b",
             r"\bcan i (talk|speak) to (a )?(human|person|someone)\b",
         ],
-        "keywords": ["human", "real person", "speak to someone",
-                      "talk to a person", "agent", "attendant", "not a bot"],
+        "keywords": [
+            "human",
+            "real person",
+            "speak to someone",
+            "talk to a person",
+            "agent",
+            "attendant",
+            "not a bot",
+        ],
     },
     "paciente_ativo": {
         "patterns": [
@@ -836,8 +1125,12 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\bi'?ve been (here |to you )?before\b",
             r"\bi already (have|am) (a )?(patient|treatment)\b",
         ],
-        "keywords": ["i'm a patient", "returning patient",
-                      "already use", "been before"],
+        "keywords": [
+            "i'm a patient",
+            "returning patient",
+            "already use",
+            "been before",
+        ],
     },
     "fora_do_escopo": {
         "patterns": [
@@ -845,8 +1138,7 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\bdo you (sell|do)\b.*\b(veterinary|animals|pets|blood test|x-ray)\b",
             r"\b(unrelated|nothing to do)\b",
         ],
-        "keywords": ["not related", "off topic", "different topic",
-                      "something else"],
+        "keywords": ["not related", "off topic", "different topic", "something else"],
     },
     "fora_do_horario": {
         "patterns": [
@@ -856,8 +1148,13 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
             r"\bwhat time do you (open|close)\b",
             r"\bafter hours\b",
         ],
-        "keywords": ["are you open", "closed", "business hours",
-                      "what time do you open", "after hours"],
+        "keywords": [
+            "are you open",
+            "closed",
+            "business hours",
+            "what time do you open",
+            "after hours",
+        ],
     },
 }
 
@@ -866,19 +1163,28 @@ EN_INTENT_PATTERNS: dict[str, dict] = {
 # Safety Guard Patterns (checked before scoring)
 # ============================================
 
-_SAFETY_GUARD_PATTERNS: list[re.Pattern] = [
-    re.compile(r"\b(dor)\b.*\b(forte|intensa|muita|não passa|nao passa)\b", re.IGNORECASE),
+_SAFETY_GUARD_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"\b(dor)\b.*\b(forte|intensa|muita|não passa|nao passa)\b", re.IGNORECASE
+    ),
     re.compile(r"\bmuita\b.*\bdor\b", re.IGNORECASE),
     re.compile(r"\b(sangramento|sangrando|sangrar)\b", re.IGNORECASE),
     re.compile(r"\bo sangramento não para\b", re.IGNORECASE),
-    re.compile(r"\b(febre)\b.*\b(após|apos|depois|procedimento|cirurgia)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(febre)\b.*\b(após|apos|depois|procedimento|cirurgia)\b", re.IGNORECASE
+    ),
     re.compile(r"\b(inchou)\b.*\b(muito|demais)\b", re.IGNORECASE),
     re.compile(r"\bpiorando\b", re.IGNORECASE),
-    re.compile(r"\b(passando)\b.*\b(mal)\b.*\b(depois|após|apos|procedimento)?\b", re.IGNORECASE),
+    re.compile(
+        r"\b(passando)\b.*\b(mal)\b.*\b(depois|após|apos|procedimento)?\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"\b(pus|purulent)\b", re.IGNORECASE),
     re.compile(r"\bsaiu\b.*\bpus\b", re.IGNORECASE),
     re.compile(r"\b(pressão|pressao)\b.*\b(caiu|baixou)\b", re.IGNORECASE),
-    re.compile(r"\b(não consigo|nao consigo)\b.*\b(abrir|respirar|engolir)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(não consigo|nao consigo)\b.*\b(abrir|respirar|engolir)\b", re.IGNORECASE
+    ),
     re.compile(r"\b(rox[ao]|hematoma)\b.*\b(piorando|aumentando)\b", re.IGNORECASE),
     re.compile(r"\bdor\b.*\bintens[ao]\b", re.IGNORECASE),
 ]
@@ -891,14 +1197,14 @@ class IntentClassifier:
 
     def __init__(
         self,
-        custom_intents: Optional[dict] = None,
+        custom_intents: Optional[dict[str, IntentDefinition]] = None,
     ):
         self.intents = INTENT_DEFINITIONS.copy()
         if custom_intents:
             self.intents.update(custom_intents)
 
         # Compile regex patterns (PT — default)
-        self._compiled_patterns: dict[str, list[re.Pattern]] = {}
+        self._compiled_patterns: dict[str, list[re.Pattern[str]]] = {}
         for intent_name, intent_def in self.intents.items():
             self._compiled_patterns[intent_name] = [
                 re.compile(pattern, re.IGNORECASE | re.UNICODE)
@@ -906,7 +1212,7 @@ class IntentClassifier:
             ]
 
         # Compile English patterns (only those defined in EN_INTENT_PATTERNS)
-        self._compiled_patterns_en: dict[str, list[re.Pattern]] = {}
+        self._compiled_patterns_en: dict[str, list[re.Pattern[str]]] = {}
         self._en_keywords: dict[str, list[str]] = {}
         for intent_name, en_def in EN_INTENT_PATTERNS.items():
             self._compiled_patterns_en[intent_name] = [
@@ -946,7 +1252,9 @@ class IntentClassifier:
         # Regex classification
         return self._classify_with_regex(message_lower, language=language)
 
-    def _classify_with_regex(self, message: str, language: str = "pt-BR") -> IntentResult:
+    def _classify_with_regex(
+        self, message: str, language: str = "pt-BR"
+    ) -> IntentResult:
         """Classify using regex patterns."""
         best_intent = "duvida_generica_sem_contexto"
         best_category = IntentCategory.QUESTION
@@ -955,7 +1263,9 @@ class IntentClassifier:
         matched_patterns: list[str] = []
 
         for intent_name, intent_def in self.intents.items():
-            score, patterns = self._score_intent(message, intent_name, intent_def, language=language)
+            score, patterns = self._score_intent(
+                message, intent_name, intent_def, language=language
+            )
 
             if score > best_score:
                 second_best_score = best_score
@@ -983,7 +1293,7 @@ class IntentClassifier:
         self,
         message: str,
         intent_name: str,
-        intent_def: dict,
+        intent_def: IntentDefinition,
         language: str = "pt-BR",
     ) -> tuple[float, list[str]]:
         """Calculate score for an intent based on pattern and keyword matching."""
@@ -994,7 +1304,10 @@ class IntentClassifier:
         # Select pattern + keyword set by language.
         # EN patterns override PT for any intent defined in EN_INTENT_PATTERNS;
         # intents missing from EN fall back to PT patterns.
-        use_en = language.lower().startswith("en") and intent_name in self._compiled_patterns_en
+        use_en = (
+            language.lower().startswith("en")
+            and intent_name in self._compiled_patterns_en
+        )
         if use_en:
             patterns = self._compiled_patterns_en.get(intent_name, [])
             keywords = self._en_keywords.get(intent_name, [])
@@ -1027,8 +1340,7 @@ class IntentClassifier:
     def get_category_intents(self, category: IntentCategory) -> list[str]:
         """Get all intents for a given category."""
         return [
-            name for name, def_ in self.intents.items()
-            if def_["category"] == category
+            name for name, def_ in self.intents.items() if def_["category"] == category
         ]
 
     def add_custom_intent(

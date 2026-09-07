@@ -16,7 +16,6 @@ from src.handoff.models import (
     KeyInformation,
 )
 
-
 # ============================================
 # Extraction Patterns
 # ============================================
@@ -33,25 +32,57 @@ EMAIL_PATTERN = r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
 
 # Symptom keywords (healthcare)
 SYMPTOM_KEYWORDS = [
-    "dor", "dores", "febre", "tosse", "enjoo", "náusea", "vômito",
-    "tontura", "cansaço", "fadiga", "inchaço", "vermelhidão",
-    "coceira", "ardência", "formigamento", "sangramento", "falta de ar",
-    "dificuldade para respirar", "palpitação", "insônia", "ansiedade",
-    "dor de cabeça", "enxaqueca", "mal estar",
+    "dor",
+    "dores",
+    "febre",
+    "tosse",
+    "enjoo",
+    "náusea",
+    "vômito",
+    "tontura",
+    "cansaço",
+    "fadiga",
+    "inchaço",
+    "vermelhidão",
+    "coceira",
+    "ardência",
+    "formigamento",
+    "sangramento",
+    "falta de ar",
+    "dificuldade para respirar",
+    "palpitação",
+    "insônia",
+    "ansiedade",
+    "dor de cabeça",
+    "enxaqueca",
+    "mal estar",
 ]
 
 # Appointment preferences
 APPOINTMENT_KEYWORDS = [
-    "manhã", "tarde", "noite", "segunda", "terça", "quarta", "quinta",
-    "sexta", "sábado", "semana que vem", "amanhã", "hoje", "urgente",
-    "próxima semana", "qualquer horário", "horário livre",
+    "manhã",
+    "tarde",
+    "noite",
+    "segunda",
+    "terça",
+    "quarta",
+    "quinta",
+    "sexta",
+    "sábado",
+    "semana que vem",
+    "amanhã",
+    "hoje",
+    "urgente",
+    "próxima semana",
+    "qualquer horário",
+    "horário livre",
 ]
 
 
 class ConversationSummarizer:
     """
     Generates structured summaries of conversations for human handoff.
-    
+
     Features:
     - Extracts key information (names, contacts, topics)
     - Identifies symptoms and healthcare-specific info
@@ -66,18 +97,17 @@ class ConversationSummarizer:
     ):
         """
         Initialize the summarizer.
-        
+
         Args:
             max_recent_messages: Maximum recent messages to include
             max_summary_length: Maximum length of summary text
         """
         self.max_recent_messages = max_recent_messages
         self.max_summary_length = max_summary_length
-        
+
         # Compile patterns
         self._name_patterns = [
-            re.compile(p, re.IGNORECASE | re.UNICODE)
-            for p in NAME_PATTERNS
+            re.compile(p, re.IGNORECASE | re.UNICODE) for p in NAME_PATTERNS
         ]
         self._phone_pattern = re.compile(PHONE_PATTERN)
         self._email_pattern = re.compile(EMAIL_PATTERN)
@@ -100,7 +130,7 @@ class ConversationSummarizer:
     ) -> ConversationSummary:
         """
         Generate a structured summary of the conversation.
-        
+
         Args:
             session_id: Session identifier
             tenant_id: Tenant identifier
@@ -112,22 +142,22 @@ class ConversationSummarizer:
             slots: Extracted slot values
             safety_flags: Any safety flags triggered
             session_start: When the session started
-            
+
         Returns:
             ConversationSummary with all extracted information
         """
         # Extract key information
         key_info = self._extract_key_info(messages, slots)
-        
+
         # Convert messages to structured format
         conv_messages = self._convert_messages(messages)
-        
+
         # Calculate duration
         duration = None
         if session_start:
             now = datetime.now(timezone.utc)
             duration = int((now - session_start).total_seconds())
-        
+
         # Generate summary text
         summary_text = self._generate_summary_text(
             messages=conv_messages,
@@ -141,10 +171,10 @@ class ConversationSummarizer:
                 "[LINK DE AGENDAMENTO ENVIADO - verificar se o paciente concluiu]\n"
                 + summary_text
             )
-        
+
         # Get recent messages
-        recent = conv_messages[-self.max_recent_messages:] if conv_messages else []
-        
+        recent = conv_messages[-self.max_recent_messages :] if conv_messages else []
+
         return ConversationSummary(
             session_id=session_id,
             tenant_id=tenant_id,
@@ -171,19 +201,17 @@ class ConversationSummarizer:
     ) -> KeyInformation:
         """Extract key information from messages."""
         slots = slots or {}
-        
+
         # Combine all user messages
-        user_text = " ".join([
-            m.get("content", "") 
-            for m in messages 
-            if m.get("role") == "user"
-        ])
-        
+        user_text = " ".join(
+            [m.get("content", "") for m in messages if m.get("role") == "user"]
+        )
+
         # Extract name
         user_name = slots.get("user_name")
         if not user_name:
             user_name = self._extract_name(user_text)
-        
+
         # Extract contact info
         contact_info = None
         phone = self._phone_pattern.search(user_text)
@@ -192,22 +220,22 @@ class ConversationSummarizer:
             contact_info = phone.group()
         elif email:
             contact_info = email.group()
-        
+
         # Extract symptoms
         symptoms = self._extract_symptoms(user_text)
-        
+
         # Extract appointment preferences
         appointment_prefs = self._extract_appointment_preferences(user_text)
-        
+
         # Identify main topic from first messages
         main_topic = self._identify_main_topic(messages)
-        
+
         # Get specific request from last user message
         specific_request = None
         user_messages = [m for m in messages if m.get("role") == "user"]
         if user_messages:
             specific_request = user_messages[-1].get("content", "")[:200]
-        
+
         return KeyInformation(
             user_name=user_name,
             contact_info=contact_info,
@@ -250,10 +278,10 @@ class ConversationSummarizer:
         user_messages = [m for m in messages if m.get("role") == "user"][:3]
         if not user_messages:
             return None
-        
+
         # Simple topic detection based on keywords
         combined = " ".join([m.get("content", "") for m in user_messages]).lower()
-        
+
         topics = {
             "agendamento": ["agendar", "marcar", "consulta", "horário", "agenda"],
             "informação": ["informação", "saber", "dúvida", "pergunta", "como"],
@@ -262,11 +290,11 @@ class ConversationSummarizer:
             "reclamação": ["reclamar", "problema", "ruim", "péssimo", "insatisfeito"],
             "emergência": ["urgente", "emergência", "socorro", "ajuda"],
         }
-        
+
         for topic, keywords in topics.items():
             if any(kw in combined for kw in keywords):
                 return topic
-        
+
         return "atendimento geral"
 
     def _convert_messages(
@@ -284,13 +312,15 @@ class ConversationSummarizer:
                     timestamp = datetime.now(timezone.utc)
             elif not isinstance(timestamp, datetime):
                 timestamp = datetime.now(timezone.utc)
-            
-            result.append(ConversationMessage(
-                role=msg.get("role", "user"),
-                content=msg.get("content", ""),
-                timestamp=timestamp,
-                intent=msg.get("intent"),
-            ))
+
+            result.append(
+                ConversationMessage(
+                    role=msg.get("role", "user"),
+                    content=msg.get("content", ""),
+                    timestamp=timestamp,
+                    intent=msg.get("intent"),
+                )
+            )
         return result
 
     def _generate_summary_text(
@@ -302,46 +332,48 @@ class ConversationSummarizer:
     ) -> str:
         """Generate human-readable summary text."""
         parts = []
-        
+
         # Opening with user info if available
         if key_info.user_name:
             parts.append(f"Usuário: {key_info.user_name}")
-        
+
         # Main topic
         if key_info.main_topic:
             parts.append(f"Assunto principal: {key_info.main_topic}")
-        
+
         # Handoff reason
         reason_text = self._get_reason_text(reason)
         parts.append(f"Motivo do encaminhamento: {reason_text}")
-        
+
         # Specific request
         if key_info.specific_request:
             truncated = key_info.specific_request[:150]
             if len(key_info.specific_request) > 150:
                 truncated += "..."
-            parts.append(f"Última solicitação: \"{truncated}\"")
-        
+            parts.append(f'Última solicitação: "{truncated}"')
+
         # Symptoms if any
         if key_info.symptoms_mentioned:
-            parts.append(f"Sintomas mencionados: {', '.join(key_info.symptoms_mentioned)}")
-        
+            parts.append(
+                f"Sintomas mencionados: {', '.join(key_info.symptoms_mentioned)}"
+            )
+
         # Contact info
         if key_info.contact_info:
             parts.append(f"Contato: {key_info.contact_info}")
-        
+
         # Appointment preferences
         if key_info.appointment_preferences:
             parts.append(f"Preferência de horário: {key_info.appointment_preferences}")
-        
+
         # Conversation stats
         parts.append(f"Total de mensagens: {len(messages)}")
-        
+
         # Combine and truncate
         summary = "\n".join(parts)
         if len(summary) > self.max_summary_length:
-            summary = summary[:self.max_summary_length - 3] + "..."
-        
+            summary = summary[: self.max_summary_length - 3] + "..."
+
         return summary
 
     def _get_reason_text(self, reason: HandoffReason) -> str:
@@ -365,30 +397,30 @@ class ConversationSummarizer:
     ) -> str:
         """
         Generate a quick one-line summary.
-        
+
         Args:
             messages: List of conversation messages
             reason: Reason for handoff
             max_length: Maximum length of summary
-            
+
         Returns:
             Brief summary string
         """
         if not messages:
             return self._get_reason_text(reason)
-        
+
         # Get last user message
         user_messages = [m for m in messages if m.get("role") == "user"]
         if not user_messages:
             return self._get_reason_text(reason)
-        
+
         last_message = user_messages[-1].get("content", "")[:100]
         reason_text = self._get_reason_text(reason)
-        
-        summary = f"{reason_text}. Última mensagem: \"{last_message}\""
+
+        summary = f'{reason_text}. Última mensagem: "{last_message}"'
         if len(summary) > max_length:
-            summary = summary[:max_length - 3] + "..."
-        
+            summary = summary[: max_length - 3] + "..."
+
         return summary
 
 

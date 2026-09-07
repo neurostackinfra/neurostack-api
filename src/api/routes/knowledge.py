@@ -8,8 +8,8 @@ Provides endpoints for:
 - Knowledge base management
 """
 
-from typing import Optional
 from datetime import datetime
+from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -76,7 +76,7 @@ async def upload_document(
     Upload and index a document.
     """
     repo = KnowledgeDocumentRepository(session)
-    
+
     # Create document
     document = await repo.create(
         tenant_id=request.tenant_id,
@@ -94,10 +94,10 @@ async def upload_document(
         chunk_count=0,
         size_bytes=len(request.content.encode("utf-8")),
     )
-    
+
     # TODO: Trigger indexing job (Task 19.0)
     # For now, mark as pending
-    
+
     return DocumentResponse(
         id=str(document.id),
         tenant_id=document.tenant_id,
@@ -186,7 +186,7 @@ async def list_documents(
     """
     repo = KnowledgeDocumentRepository(session)
     skip = (page - 1) * page_size
-    
+
     if category:
         documents_list = await repo.find_by_category(
             tenant_id=tenant_id,
@@ -200,28 +200,47 @@ async def list_documents(
             skip=skip,
             limit=page_size,
         )
-    
+
     total = await repo.count_by_tenant(tenant_id)
-    
+
     document_responses = [
         DocumentResponse(
             id=str(doc.id),
             tenant_id=doc.tenant_id,
             status="indexed" if doc.is_indexed else "pending",
             metadata=DocumentMetadata(
-                title=doc.document_metadata.get("title") if doc.document_metadata else None,
-                source=doc.document_metadata.get("source") if doc.document_metadata else None,
-                category=doc.document_metadata.get("category") if doc.document_metadata else None,
-                tags=doc.document_metadata.get("tags", []) if doc.document_metadata else [],
-                custom={k: v for k, v in (doc.document_metadata or {}).items() 
-                       if k not in ["title", "source", "category", "tags"]},
+                title=(
+                    doc.document_metadata.get("title")
+                    if doc.document_metadata
+                    else None
+                ),
+                source=(
+                    doc.document_metadata.get("source")
+                    if doc.document_metadata
+                    else None
+                ),
+                category=(
+                    doc.document_metadata.get("category")
+                    if doc.document_metadata
+                    else None
+                ),
+                tags=(
+                    doc.document_metadata.get("tags", [])
+                    if doc.document_metadata
+                    else []
+                ),
+                custom={
+                    k: v
+                    for k, v in (doc.document_metadata or {}).items()
+                    if k not in ["title", "source", "category", "tags"]
+                },
             ),
             chunk_count=doc.chunk_count,
             created_at=doc.created_at.isoformat(),
         )
         for doc in documents_list
     ]
-    
+
     return DocumentListResponse(
         documents=document_responses,
         total=total,
@@ -256,24 +275,43 @@ async def get_document(
     """
     repo = KnowledgeDocumentRepository(session)
     document = await repo.get_by_id(document_id)
-    
+
     if not document:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Document {document_id} not found",
         )
-    
+
     return DocumentResponse(
         id=str(document.id),
         tenant_id=document.tenant_id,
         status="indexed" if document.is_indexed else "pending",
         metadata=DocumentMetadata(
-            title=document.document_metadata.get("title") if document.document_metadata else None,
-            source=document.document_metadata.get("source") if document.document_metadata else None,
-            category=document.document_metadata.get("category") if document.document_metadata else None,
-            tags=document.document_metadata.get("tags", []) if document.document_metadata else [],
-            custom={k: v for k, v in (document.document_metadata or {}).items() 
-                   if k not in ["title", "source", "category", "tags"]},
+            title=(
+                document.document_metadata.get("title")
+                if document.document_metadata
+                else None
+            ),
+            source=(
+                document.document_metadata.get("source")
+                if document.document_metadata
+                else None
+            ),
+            category=(
+                document.document_metadata.get("category")
+                if document.document_metadata
+                else None
+            ),
+            tags=(
+                document.document_metadata.get("tags", [])
+                if document.document_metadata
+                else []
+            ),
+            custom={
+                k: v
+                for k, v in (document.document_metadata or {}).items()
+                if k not in ["title", "source", "category", "tags"]
+            },
         ),
         chunk_count=document.chunk_count,
         created_at=document.created_at.isoformat(),
@@ -310,11 +348,11 @@ async def delete_document(
     """
     repo = KnowledgeDocumentRepository(session)
     deleted = await repo.delete(document_id)
-    
+
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Document {document_id} not found",
         )
-    
+
     # TODO: Delete from vector database (Task 19.0)

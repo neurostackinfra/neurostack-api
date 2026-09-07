@@ -19,6 +19,24 @@ logger = logging.getLogger(__name__)
 ZAPI_BASE = "https://api.z-api.io"
 
 
+def _response_json_object(response: httpx.Response) -> dict[str, object]:
+    """Decode and validate an upstream JSON object response."""
+    try:
+        payload: object = response.json()
+    except ValueError as exc:
+        raise RuntimeError("invalid_upstream_response") from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("invalid_upstream_response")
+
+    result: dict[str, object] = {}
+    for key, value in payload.items():
+        if not isinstance(key, str):
+            raise RuntimeError("invalid_upstream_response")
+        result[key] = value
+    return result
+
+
 def _sanitize_http_status_error(exc: httpx.HTTPStatusError) -> RuntimeError:
     """Return a URL-free RuntimeError describing an upstream HTTP failure.
 
@@ -40,7 +58,7 @@ async def send_text_message(
     phone: str,
     message: str,
     client_token: str = "",
-) -> dict:
+) -> dict[str, object]:
     """Send a text message via Z-API.
 
     Args:
@@ -67,7 +85,7 @@ async def send_text_message(
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise _sanitize_http_status_error(exc) from None
-        data = resp.json()
+        data = _response_json_object(resp)
         logger.info("Z-API send_text to %s — status %s", phone, resp.status_code)
         return data
 
@@ -80,7 +98,7 @@ async def send_zapi_audio(
     *,
     mime_type: str = "audio/mpeg",
     client_token: str = "",
-) -> dict:
+) -> dict[str, object]:
     """Send synthesized audio as a WhatsApp voice message through Z-API."""
 
     url = f"{ZAPI_BASE}/instances/{instance_id}/token/{token}/send-audio"
@@ -101,7 +119,7 @@ async def send_zapi_audio(
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise _sanitize_http_status_error(exc) from None
-        data = resp.json()
+        data = _response_json_object(resp)
         logger.info("Z-API send_audio to %s - status %s", phone, resp.status_code)
         return data
 
@@ -200,7 +218,7 @@ async def send_evolution_text(
     api_key: str,
     phone: str,
     message: str,
-) -> dict:
+) -> dict[str, object]:
     """Send a text message via Evolution API.
 
     Args:
@@ -229,7 +247,7 @@ async def send_evolution_text(
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise _sanitize_http_status_error(exc) from None
-        data = resp.json()
+        data = _response_json_object(resp)
         logger.info("Evolution send_text to %s — status %s", phone, resp.status_code)
         return data
 
@@ -240,7 +258,7 @@ async def send_evolution_audio(
     api_key: str,
     phone: str,
     audio_bytes: bytes,
-) -> dict:
+) -> dict[str, object]:
     """Send synthesized MP3 audio through an Evolution API instance."""
 
     url = f"{api_url.rstrip('/')}/message/sendWhatsAppAudio/{instance_name}"
@@ -262,6 +280,6 @@ async def send_evolution_audio(
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise _sanitize_http_status_error(exc) from None
-        data = resp.json()
+        data = _response_json_object(resp)
         logger.info("Evolution send_audio to %s - status %s", phone, resp.status_code)
         return data

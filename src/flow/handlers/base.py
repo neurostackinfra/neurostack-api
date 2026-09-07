@@ -8,12 +8,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
-from src.flow.models import (
-    FlowMode,
-    FlowContext,
-    ModeHandlerResult,
-    TransitionTrigger,
-)
+from src.flow.models import FlowContext, FlowMode, ModeHandlerResult, TransitionTrigger
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +16,7 @@ logger = logging.getLogger(__name__)
 class BaseModeHandler(ABC):
     """
     Abstract base class for flow mode handlers.
-    
+
     Each mode (NORMAL, RAG, SAFETY, HANDOFF) has a handler that
     processes messages and determines next actions.
     """
@@ -29,7 +24,7 @@ class BaseModeHandler(ABC):
     def __init__(self, mode: FlowMode):
         """
         Initialize the handler.
-        
+
         Args:
             mode: The flow mode this handler manages
         """
@@ -40,23 +35,25 @@ class BaseModeHandler(ABC):
     async def handle(self, context: FlowContext) -> ModeHandlerResult:
         """
         Handle a message in this mode.
-        
+
         Args:
             context: Flow context with current state
-            
+
         Returns:
             ModeHandlerResult with handler decision
         """
         pass
 
     @abstractmethod
-    def should_exit(self, context: FlowContext) -> tuple[bool, Optional[TransitionTrigger]]:
+    def should_exit(
+        self, context: FlowContext
+    ) -> tuple[bool, Optional[TransitionTrigger]]:
         """
         Check if the handler should exit to another mode.
-        
+
         Args:
             context: Flow context
-            
+
         Returns:
             Tuple of (should_exit, trigger)
         """
@@ -82,7 +79,7 @@ class BaseModeHandler(ABC):
     ) -> ModeHandlerResult:
         """
         Create a handler result.
-        
+
         Helper method for creating consistent results.
         """
         processing_time = 0.0
@@ -99,4 +96,3 @@ class BaseModeHandler(ABC):
             events_to_log=events or [],
             processing_time_ms=processing_time,
         )
-

@@ -5,7 +5,7 @@ Structured logging using structlog
 
 import logging
 import sys
-from typing import Any
+from typing import Any, cast
 
 import structlog
 from structlog.types import Processor
@@ -67,7 +67,7 @@ def configure_logging() -> None:
 
 def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
     """Get a structured logger instance."""
-    return structlog.get_logger(name)
+    return cast(structlog.stdlib.BoundLogger, structlog.get_logger(name))
 
 
 class LogContext:
@@ -98,4 +98,3 @@ def unbind_context(*keys: str) -> None:
 def clear_context() -> None:
     """Clear all context variables."""
     structlog.contextvars.clear_contextvars()
-

@@ -3,27 +3,18 @@ NeuroStack API - Tenants Schemas
 Contracts for tenant management endpoints (/v1/tenants).
 """
 
-from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.models.clinic_config import (
-    ClinicConfig,
-    ClinicHandoff,
-    ClinicPersona,
-    ClinicPricing,
-    ClinicScheduling,
-    ClinicPostCare,
-    SectorDefaults,
-)
+from src.models.clinic_config import ClinicConfig
 
 
 class TenantFeatures(BaseModel):
     """
     Feature flags for a tenant.
-    
+
     Controls which features are enabled for the tenant.
     """
 
@@ -59,7 +50,7 @@ class TenantFeatures(BaseModel):
 class TenantBranding(BaseModel):
     """
     Branding configuration for a tenant.
-    
+
     Customizes the AI agent's persona for the tenant.
     """
 
@@ -98,7 +89,7 @@ class TenantBranding(BaseModel):
 class TenantConfig(BaseModel):
     """
     Complete tenant configuration.
-    
+
     Contains all configurable settings for a tenant including
     rate limits, session settings, features, and branding.
     """
@@ -172,7 +163,7 @@ class TenantConfig(BaseModel):
 class TenantResponse(BaseModel):
     """
     Tenant response model.
-    
+
     Complete tenant information returned from API endpoints.
     """
 
@@ -236,7 +227,7 @@ class TenantResponse(BaseModel):
 class TenantCreateRequest(BaseModel):
     """
     Request to create a new tenant.
-    
+
     Tenants are builders or clinics that use NeuroStack.
     """
 
@@ -276,7 +267,7 @@ class TenantCreateRequest(BaseModel):
 class TenantUpdateRequest(BaseModel):
     """
     Request to update an existing tenant.
-    
+
     All fields are optional - only provided fields will be updated.
     """
 
@@ -459,4 +450,3 @@ class APIKeyRotateRequest(BaseModel):
         max_length=500,
         description="Reason for rotation (for audit)",
     )
-

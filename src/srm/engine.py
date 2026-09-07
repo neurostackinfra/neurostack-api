@@ -3,42 +3,46 @@ NeuroStack - SRM (Small Reasoning Module) - Main Engine
 The core deterministic decision engine for cognitive processing.
 """
 
+import re
 import time
 from typing import Any, Optional
 from uuid import UUID
 
 from prometheus_client import Counter, Histogram
 
+from src.srm.funnel_detector import get_funnel_detector
+from src.srm.handoff_decider import get_handoff_decider
+from src.srm.intent_classifier import get_intent_classifier
 from src.srm.models import (
-    SRMInput,
-    SRMDecision,
-    StatePatch,
-    IntentCategory,
-    FunnelStage,
-    SafetyCategory,
-    FlowMode,
     ActionType,
+    FlowMode,
+    FunnelResult,
+    FunnelStage,
     HandoffReason,
+    HandoffResult,
+    IntentCategory,
+    IntentResult,
+    RagResult,
+    SafetyCategory,
+    SafetyResult,
+    SentimentLabel,
+    SRMDecision,
+    SRMInput,
+    StatePatch,
 )
-import re
-
-from src.srm.intent_classifier import IntentClassifier, get_intent_classifier
-from src.srm.funnel_detector import FunnelDetector, get_funnel_detector
-from src.srm.safety_detector import SafetyDetector, get_safety_detector
-from src.srm.handoff_decider import HandoffDecider, get_handoff_decider
-from src.srm.rag_decider import RagDecider, get_rag_decider
-from src.srm.models import SentimentLabel
+from src.srm.rag_decider import get_rag_decider
+from src.srm.safety_detector import get_safety_detector
 
 # Detects a day-of-week or time-of-day reference in a scheduling message.
 # Used to gate handoff_confirmation_pending: we only ask "can I forward you?"
 # once the user has provided a time preference — not just their name.
 _SCHEDULING_HAS_TIME_RE = re.compile(
     r"\b(segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado|domingo|amanh[aã]|hoje)\b"
-    r"|\b\d{1,2}\s*h\b"          # 9h, 10h
-    r"|\b\d{1,2}:\d{2}\b"        # 9:00, 14:30
-    r"|\b([aà]s?)\s+\d{1,2}\b"   # às 9, as 9
+    r"|\b\d{1,2}\s*h\b"  # 9h, 10h
+    r"|\b\d{1,2}:\d{2}\b"  # 9:00, 14:30
+    r"|\b([aà]s?)\s+\d{1,2}\b"  # às 9, as 9
     r"|\b(manh[aã]|tarde|noite|madrugada)\b"
-    r"|\b(dia\s+\d{1,2}|\d{1,2}/\d{1,2})\b"          # dia 12, 12/06
+    r"|\b(dia\s+\d{1,2}|\d{1,2}/\d{1,2})\b"  # dia 12, 12/06
     r"|\b(semana\s+que\s+vem|pr[oó]xima\s+semana)\b",  # semana que vem
     re.IGNORECASE | re.UNICODE,
 )
@@ -135,7 +139,7 @@ CATEGORY_ACTIONS: dict[IntentCategory, ActionType] = {
 class SRMEngine:
     """
     Small Reasoning Module - Main Engine.
-    
+
     The SRM is the core deterministic decision engine that:
     - Classifies user intent
     - Detects funnel stage transitions
@@ -143,7 +147,7 @@ class SRMEngine:
     - Decides on handoff requirements
     - Determines RAG necessity
     - Generates state patches
-    
+
     All decisions are rule-based and deterministic, not ML-based.
     """
 
@@ -155,7 +159,7 @@ class SRMEngine:
     ):
         """
         Initialize the SRM engine.
-        
+
         Args:
             confidence_threshold: Minimum confidence for high-confidence decisions
             safety_threshold: Minimum score to trigger safety concern
@@ -164,7 +168,7 @@ class SRMEngine:
         self.confidence_threshold = confidence_threshold
         self.safety_threshold = safety_threshold
         self.max_turns_for_handoff = max_turns_for_handoff
-        
+
         # Initialize sub-components
         self.intent_classifier = get_intent_classifier()
         self.funnel_detector = get_funnel_detector()
@@ -178,20 +182,20 @@ class SRMEngine:
     def process(self, input_data: SRMInput) -> SRMDecision:
         """
         Process a message through the SRM pipeline.
-        
+
         Args:
             input_data: SRM input with message and context
-            
+
         Returns:
             SRMDecision with complete cognitive analysis
         """
         start_time = time.perf_counter()
-        
+
         # Step 1: Classify intent
         intent_result = self.intent_classifier.classify(
             input_data.message, language=input_data.language
         )
-        
+
         # Step 2: Detect safety concerns
         safety_result = self.safety_detector.detect(input_data.message)
 
@@ -209,9 +213,9 @@ class SRMEngine:
         # Optional scheduling-link handoff is active only when the clinic enabled it AND
         # a URL is configured — an enabled-but-empty link must not change the flow.
         _scheduling_cfg = (input_data.clinic_config or {}).get("scheduling", {})
-        scheduling_link_enabled = bool(_scheduling_cfg.get("scheduling_link_enabled")) and bool(
-            _scheduling_cfg.get("scheduling_link_url")
-        )
+        scheduling_link_enabled = bool(
+            _scheduling_cfg.get("scheduling_link_enabled")
+        ) and bool(_scheduling_cfg.get("scheduling_link_url"))
         handoff_result = self.handoff_decider.decide(
             message=input_data.message,
             intent=intent_result.intent,
@@ -263,11 +267,12 @@ class SRMEngine:
         # are classified as duvida_generica (not "agendar"), e.g. "às 10h", "dia 12",
         # "semana que vem".  _extract_slots() only sets this flag when intent=="agendar",
         # so standalone time replies would otherwise never flip it.
-        existing_scheduling_interest = (
-            input_data.flags.get("scheduling_interest", False)
-            or state_patch.flags.get("scheduling_interest", False)
-        )
-        if existing_scheduling_interest and _SCHEDULING_HAS_TIME_RE.search(input_data.message):
+        existing_scheduling_interest = input_data.flags.get(
+            "scheduling_interest", False
+        ) or state_patch.flags.get("scheduling_interest", False)
+        if existing_scheduling_interest and _SCHEDULING_HAS_TIME_RE.search(
+            input_data.message
+        ):
             state_patch.flags["scheduling_has_time"] = True
 
         # Scheduling confirmation flow: propagate pending/cancelled flags
@@ -276,7 +281,9 @@ class SRMEngine:
             # Remember whether this confirmation was opened by a cancellation so the
             # scheduling-link path can exclude it on the confirm turn (intent is then
             # a bare "sim", no longer "cancelar").
-            state_patch.flags["scheduling_cancel_pending"] = intent_result.intent == "cancelar"
+            state_patch.flags["scheduling_cancel_pending"] = (
+                intent_result.intent == "cancelar"
+            )
         if handoff_result.scheduling_cancelled:
             state_patch.flags["handoff_confirmation_pending"] = False
             state_patch.flags["scheduling_interest"] = False
@@ -304,10 +311,10 @@ class SRMEngine:
             handoff_result=handoff_result,
             rag_result=rag_result,
         )
-        
+
         # Calculate processing time
         processing_time_ms = int((time.perf_counter() - start_time) * 1000)
-        
+
         # Determine final funnel stage
         final_funnel_stage = (
             funnel_result.next_stage
@@ -316,7 +323,11 @@ class SRMEngine:
         )
 
         # Escalation intents force STANDBY (100% human), safety_concern=True, handoff=True
-        _ESCALATION_INTENTS = {"reclamacao", "conduta_inadequada_ameaca", "pedido_atendente_humano"}
+        _ESCALATION_INTENTS = {
+            "reclamacao",
+            "conduta_inadequada_ameaca",
+            "pedido_atendente_humano",
+        }
         is_escalation = intent_result.intent in _ESCALATION_INTENTS
         if is_escalation:
             final_funnel_stage = FunnelStage.STANDBY
@@ -330,7 +341,10 @@ class SRMEngine:
             mode = FlowMode.HANDOFF
 
         # Clinical-safety intents force safety_concern=True, handoff=True
-        _CLINICAL_SAFETY_INTENTS = {"pos_atendimento_sintomas_preocupantes", "pedido_alterar_medicacao"}
+        _CLINICAL_SAFETY_INTENTS = {
+            "pos_atendimento_sintomas_preocupantes",
+            "pedido_alterar_medicacao",
+        }
         is_clinical_safety = intent_result.intent in _CLINICAL_SAFETY_INTENTS
         if is_clinical_safety:
             handoff_result.required = True
@@ -344,13 +358,17 @@ class SRMEngine:
             mode = FlowMode.SAFETY
 
         # Safety concern: safety_detector OR escalation OR clinical-safety intent
-        safety_concern = (not safety_result.is_safe) or is_escalation or is_clinical_safety
+        safety_concern = (
+            (not safety_result.is_safe) or is_escalation or is_clinical_safety
+        )
         safety_category = (
             SafetyCategory.CONDUCT_RISK
             if is_escalation and safety_result.is_safe
-            else SafetyCategory.CLINICAL_RISK
-            if is_clinical_safety and safety_result.is_safe
-            else safety_result.category
+            else (
+                SafetyCategory.CLINICAL_RISK
+                if is_clinical_safety and safety_result.is_safe
+                else safety_result.category
+            )
         )
 
         # Action details: include escalation_notice for escalation intents
@@ -366,7 +384,15 @@ class SRMEngine:
             intent=intent_result.intent,
             intent_category=intent_result.category,
             funnel_stage=final_funnel_stage,
-            funnel_transition="Escalation: handoff to human" if is_escalation else (funnel_result.transition_reason if funnel_result.should_transition else None),
+            funnel_transition=(
+                "Escalation: handoff to human"
+                if is_escalation
+                else (
+                    funnel_result.transition_reason
+                    if funnel_result.should_transition
+                    else None
+                )
+            ),
             action=action,
             action_details=action_details,
             confidence=intent_result.confidence,
@@ -387,18 +413,18 @@ class SRMEngine:
             reasoning=reasoning,
             processing_time_ms=processing_time_ms,
         )
-        
+
         # Record metrics
         self._record_metrics(decision)
-        
+
         return decision
 
     def _determine_action(
         self,
         intent: str,
         intent_category: IntentCategory,
-        safety_result,
-        handoff_result,
+        safety_result: SafetyResult,
+        handoff_result: HandoffResult,
     ) -> ActionType:
         """Determine the action based on intent and context (Action Catalog v0.1)."""
         # Handoff required -> use intent-specific handoff if available, else fallback
@@ -406,7 +432,7 @@ class SRMEngine:
             if intent in INTENT_ACTIONS:
                 return INTENT_ACTIONS[intent]
             return ActionType.HANDOFF_ADMINISTRATIVO
-        
+
         # Safety concerns -> safety + handoff
         if not safety_result.is_safe:
             if safety_result.category == SafetyCategory.CLINICAL_RISK:
@@ -415,36 +441,36 @@ class SRMEngine:
                 return ActionType.ATIVAR_PROTOCOLO_CONDUTA_NADEQUADA
             if safety_result.action == "block":
                 return ActionType.RESPOND
-        
+
         # Intent-specific actions (official 23 intents)
         if intent in INTENT_ACTIONS:
             return INTENT_ACTIONS[intent]
-        
+
         return CATEGORY_ACTIONS.get(intent_category, ActionType.CONTINUAR_FLUXO_SRM)
 
     def _determine_mode(
         self,
-        safety_result,
-        handoff_result,
-        rag_result,
+        safety_result: SafetyResult,
+        handoff_result: HandoffResult,
+        rag_result: RagResult,
     ) -> FlowMode:
         """Determine the flow mode."""
         if handoff_result.required:
             return FlowMode.HANDOFF
-        
+
         if not safety_result.is_safe:
             return FlowMode.SAFETY
-        
+
         if rag_result.needs_rag:
             return FlowMode.RAG
-        
+
         return FlowMode.NORMAL
 
     def _generate_state_patch(
         self,
-        intent_result,
-        funnel_result,
-        safety_result,
+        intent_result: IntentResult,
+        funnel_result: FunnelResult,
+        safety_result: SafetyResult,
         action: ActionType,
         message: str = "",
         input_slots: Optional[dict[str, Any]] = None,
@@ -492,7 +518,11 @@ class SRMEngine:
             patch.flags["confirmation_pending"] = False
         if intent == "objecao_vou_pensar":
             patch.flags["objection_active"] = True
-        if intent in ("documentos_e_comprovantes", "orcamento_existente", "cobranca_renegociacao"):
+        if intent in (
+            "documentos_e_comprovantes",
+            "orcamento_existente",
+            "cobranca_renegociacao",
+        ):
             patch.flags["handoff_requested"] = True
         # Complaints and threats → escalation constraint + handoff flag
         if intent in ("reclamacao", "conduta_inadequada_ameaca"):
@@ -550,10 +580,10 @@ class SRMEngine:
 
     def _generate_reasoning(
         self,
-        intent_result,
-        safety_result,
-        handoff_result,
-        rag_result,
+        intent_result: IntentResult,
+        safety_result: SafetyResult,
+        handoff_result: HandoffResult,
+        rag_result: RagResult,
     ) -> str:
         """Generate a brief reasoning explanation."""
         parts = []
@@ -573,7 +603,10 @@ class SRMEngine:
 
         # Handoff reasoning
         if handoff_result.required:
-            parts.append(f"Handoff required: {handoff_result.reason.value}")
+            if handoff_result.reason is not None:
+                parts.append(f"Handoff required: {handoff_result.reason.value}")
+            else:
+                parts.append("Handoff required")
 
         # RAG reasoning
         if rag_result.needs_rag:
@@ -588,15 +621,13 @@ class SRMEngine:
             funnel_stage=decision.funnel_stage.value,
             mode=decision.mode.value,
         ).inc()
-        
+
         if decision.processing_time_ms:
             SRM_LATENCY.observe(decision.processing_time_ms / 1000)
-        
+
         if decision.safety_concern:
-            SRM_SAFETY_TRIGGERS.labels(
-                category=decision.safety_category.value
-            ).inc()
-        
+            SRM_SAFETY_TRIGGERS.labels(category=decision.safety_category.value).inc()
+
         if decision.handoff_required and decision.handoff_reason:
             SRM_HANDOFFS.labels(reason=decision.handoff_reason.value).inc()
 
@@ -638,10 +669,10 @@ async def process_message(
 ) -> SRMDecision:
     """
     Convenience function to process a message through SRM.
-    
+
     This is the main entry point for using SRM. It creates an SRMInput
     from the provided parameters and processes it through the SRM engine.
-    
+
     Args:
         tenant_id: Tenant identifier
         session_id: Session identifier
@@ -653,12 +684,12 @@ async def process_message(
         intent_history: List of previous intents
         slots: Extracted slot values
         flags: Session flags
-        
+
     Returns:
         SRMDecision with complete cognitive analysis
     """
     engine = get_srm_engine()
-    
+
     input_data = SRMInput(
         tenant_id=tenant_id,
         session_id=session_id,
@@ -671,6 +702,5 @@ async def process_message(
         slots=slots or {},
         flags=flags or {},
     )
-    
-    return engine.process(input_data)
 
+    return engine.process(input_data)

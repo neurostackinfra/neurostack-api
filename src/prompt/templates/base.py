@@ -6,14 +6,8 @@ Base class for prompt templates.
 import logging
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Optional
 
-from src.prompt.models import (
-    PromptMode,
-    PromptMessage,
-    PromptVariables,
-    MessageRole,
-)
+from src.prompt.models import MessageRole, PromptMessage, PromptMode, PromptVariables
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +15,7 @@ logger = logging.getLogger(__name__)
 class BaseTemplate(ABC):
     """
     Abstract base class for prompt templates.
-    
+
     Templates define the structure and content of prompts
     for different flow modes.
     """
@@ -29,7 +23,7 @@ class BaseTemplate(ABC):
     def __init__(self, mode: PromptMode):
         """
         Initialize the template.
-        
+
         Args:
             mode: The flow mode this template handles
         """
@@ -39,10 +33,10 @@ class BaseTemplate(ABC):
     def get_system_prompt(self, variables: PromptVariables) -> str:
         """
         Get the system prompt for this template.
-        
+
         Args:
             variables: Variables for rendering
-            
+
         Returns:
             Rendered system prompt
         """
@@ -52,10 +46,10 @@ class BaseTemplate(ABC):
     def get_context_instructions(self, variables: PromptVariables) -> str:
         """
         Get context-specific instructions.
-        
+
         Args:
             variables: Variables for rendering
-            
+
         Returns:
             Context instructions
         """
@@ -64,33 +58,35 @@ class BaseTemplate(ABC):
     def get_constraints(self, variables: PromptVariables) -> str:
         """
         Get policy constraints as formatted text.
-        
+
         Args:
             variables: Variables with constraints
-            
+
         Returns:
             Formatted constraints
         """
         if not variables.constraints:
             return ""
-        
+
         constraints_text = "\n".join(f"- {c}" for c in variables.constraints)
         return f"\n## Restri\u00e7\u00f5es Importantes\n{constraints_text}\n"
 
     def get_safety_reminders(self, variables: PromptVariables) -> str:
         """
         Get safety reminders as formatted text.
-        
+
         Args:
             variables: Variables with safety reminders
-            
+
         Returns:
             Formatted safety reminders
         """
         if not variables.safety_reminders:
             return ""
-        
-        reminders_text = "\n".join(f"\u26a0\ufe0f {r}" for r in variables.safety_reminders)
+
+        reminders_text = "\n".join(
+            f"\u26a0\ufe0f {r}" for r in variables.safety_reminders
+        )
         return f"\n## Lembretes de Seguran\u00e7a\n{reminders_text}\n"
 
     def _get_response_format_reminder(self) -> str:
@@ -111,10 +107,10 @@ class BaseTemplate(ABC):
     def build_system_message(self, variables: PromptVariables) -> PromptMessage:
         """
         Build the complete system message.
-        
+
         Args:
             variables: Variables for rendering
-            
+
         Returns:
             Complete system PromptMessage
         """
@@ -128,7 +124,7 @@ class BaseTemplate(ABC):
 
         # Filter empty parts and join
         content = "\n".join(p for p in parts if p.strip())
-        
+
         return PromptMessage(
             role=MessageRole.SYSTEM,
             content=content,
@@ -141,25 +137,25 @@ class BaseTemplate(ABC):
     ) -> str:
         """
         Render a template string with variables.
-        
+
         Supports {{variable}} syntax for substitution.
-        
+
         Args:
             template: Template string
             variables: Variables for substitution
-            
+
         Returns:
             Rendered string
         """
         result = template
-        
+
         # Get all variable values as dict
         var_dict = variables.model_dump()
-        
+
         # Find all {{variable}} patterns
-        pattern = r'\{\{(\w+)\}\}'
+        pattern = r"\{\{(\w+)\}\}"
         matches = re.findall(pattern, result)
-        
+
         for var_name in matches:
             if var_name in var_dict:
                 value = var_dict[var_name]
@@ -173,12 +169,12 @@ class BaseTemplate(ABC):
             else:
                 # Leave placeholder if variable not found
                 logger.warning(f"Template variable not found: {var_name}")
-        
+
         return result
 
     def get_used_variables(self, template: str) -> list[str]:
         """Get list of variables used in a template."""
-        pattern = r'\{\{(\w+)\}\}'
+        pattern = r"\{\{(\w+)\}\}"
         return re.findall(pattern, template)
 
 
@@ -204,7 +200,6 @@ class TemplateSection:
         """Build the section as string."""
         if not self.content:
             return ""
-        
+
         lines = [f"## {self.title}", *self.content, ""]
         return "\n".join(lines)
-

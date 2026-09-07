@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useLocation } from "wouter";
 import {
   Wrench, Building2, Activity, Plus, CheckCircle2, XCircle, Zap,
@@ -99,6 +99,18 @@ interface BuilderProfile {
   status: string;
   clinic_count: number;
   support_email: string | null;
+}
+
+interface ClinicClonePreview {
+  suggested_name: string;
+  document_count: number;
+  total_bytes: number;
+}
+
+interface ClinicCloneResult {
+  id: string;
+  name: string;
+  is_active: false;
 }
 
 // ── API helpers ───────────────────────────────────────────────────────────────
@@ -267,17 +279,30 @@ export default function BuilderPanel() {
   const [supportEmailDraft, setSupportEmailDraft] = useState("");
   const [savingSupportEmail, setSavingSupportEmail] = useState(false);
 
+  // Clone clinic state
+  const [cloneSourceId, setCloneSourceId] = useState("");
+  const [clonePreview, setClonePreview] = useState<ClinicClonePreview | null>(null);
+  const [clonePreviewLoading, setClonePreviewLoading] = useState(false);
+  const [clonePreviewError, setClonePreviewError] = useState<string | null>(null);
+  const [cloneConfirmed, setCloneConfirmed] = useState(false);
+  const [cloning, setCloning] = useState(false);
+  const [cloneError, setCloneError] = useState<string | null>(null);
+  const [cloneResult, setCloneResult] = useState<ClinicCloneResult | null>(null);
+  const [cloneRefreshWarning, setCloneRefreshWarning] = useState(false);
+  const clonePreviewRequestRef = useRef(0);
+  const cloneRequestInFlightRef = useRef(false);
+
   // Expandable clinic state
   const [expandedClinicId, setExpandedClinicId] = useState<string | null>(null);
   const [passwordClinic, setPasswordClinic] = useState<BuilderClinic | null>(null);
 
   // Fetch all data on mount and when token changes
   useEffect(() => {
-    if (token) {
+    if (isBuilder && token) {
       void fetchAll();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token]);
+  }, [isBuilder, token]);
 
   async function fetchAll() {
     setLoading(true);
@@ -409,6 +434,126 @@ export default function BuilderPanel() {
       setCreateError(t("admin_create_err_network"));
     } finally {
       setCreating(false);
+    }
+  }
+
+  function cloneErrorMessage(status: number): string {
+    if (status === 403) return t("builder_clone_error_403");
+    if (status === 404) return t("builder_clone_error_404");
+    if (status === 409) return t("builder_clone_error_409");
+    if (status === 500) return t("builder_clone_error_500");
+    return t("builder_clone_error_network");
+  }
+
+  function clonePreviewErrorMessage(status: number): string {
+    if (status === 403) return t("builder_clone_preview_error_403");
+    if (status === 404) return t("builder_clone_preview_error_404");
+    if (status === 409) return t("builder_clone_preview_error_409");
+    if (status === 500) return t("builder_clone_preview_error_500");
+    return t("builder_clone_preview_error_network");
+  }
+
+  async function handleCloneSourceChange(sourceId: string) {
+    const requestId = ++clonePreviewRequestRef.current;
+    setCloneSourceId(sourceId);
+    setClonePreview(null);
+    setClonePreviewError(null);
+    setCloneConfirmed(false);
+    setCloneError(null);
+    setCloneResult(null);
+    setCloneRefreshWarning(false);
+
+    if (!sourceId) {
+      setClonePreviewLoading(false);
+      return;
+    }
+
+    setClonePreviewLoading(true);
+    try {
+      const response = await fetch(`/v1/builder/clinics/${sourceId}/clone-preview`, {
+        method: "GET",
+        headers: authHeaders(token),
+      });
+      if (requestId !== clonePreviewRequestRef.current) return;
+      if (!response.ok) {
+        setClonePreviewError(clonePreviewErrorMessage(response.status));
+        return;
+      }
+      const preview = await response.json() as ClinicClonePreview;
+      if (requestId === clonePreviewRequestRef.current) {
+        setClonePreview(preview);
+      }
+    } catch {
+      if (requestId === clonePreviewRequestRef.current) {
+        setClonePreviewError(t("builder_clone_preview_error_network"));
+      }
+    } finally {
+      if (requestId === clonePreviewRequestRef.current) {
+        setClonePreviewLoading(false);
+      }
+    }
+  }
+
+  async function refreshCloneLists(): Promise<boolean> {
+    const headers = authHeaders(token);
+    const [clinicsResponse, usageResponse] = await Promise.all([
+      fetch("/v1/builder/clinics", { headers }),
+      fetch("/v1/billing/usage", { headers }),
+    ]);
+    if (clinicsResponse.ok) {
+      setClinics(await clinicsResponse.json() as BuilderClinic[]);
+    }
+    if (usageResponse.ok) {
+      setUsage(await usageResponse.json() as BillingUsage);
+    }
+    return clinicsResponse.ok && usageResponse.ok;
+  }
+
+  async function handleRetryCloneRefresh() {
+    try {
+      setCloneRefreshWarning(!(await refreshCloneLists()));
+    } catch (refreshError) {
+      console.warn("[Builder] Clone refresh retry failed:", refreshError);
+      setCloneRefreshWarning(true);
+    }
+  }
+
+  async function handleCloneClinic() {
+    if (
+      cloneRequestInFlightRef.current
+      || !cloneSourceId
+      || !clonePreview
+      || !cloneConfirmed
+    ) return;
+
+    cloneRequestInFlightRef.current = true;
+    setCloning(true);
+    setCloneError(null);
+    setCloneRefreshWarning(false);
+    try {
+      const response = await fetch(`/v1/builder/clinics/${cloneSourceId}/clone`, {
+        method: "POST",
+        headers: authHeaders(token),
+      });
+      if (!response.ok) {
+        setCloneError(cloneErrorMessage(response.status));
+        return;
+      }
+      const result = await response.json() as ClinicCloneResult;
+      setCloneResult(result);
+      setClonePreview(null);
+      setCloneConfirmed(false);
+      try {
+        setCloneRefreshWarning(!(await refreshCloneLists()));
+      } catch (refreshError) {
+        console.warn("[Builder] Clone refresh failed:", refreshError);
+        setCloneRefreshWarning(true);
+      }
+    } catch {
+      setCloneError(t("builder_clone_error_network"));
+    } finally {
+      cloneRequestInFlightRef.current = false;
+      setCloning(false);
     }
   }
 
@@ -633,6 +778,7 @@ export default function BuilderPanel() {
           <TabsList>
             <TabsTrigger value="overview">{t("builder_tab_overview")}</TabsTrigger>
             <TabsTrigger value="clinics">{t("builder_tab_clinics")}</TabsTrigger>
+            <TabsTrigger value="cloning-center">{t("builder_tab_cloning_center")}</TabsTrigger>
             <TabsTrigger value="support">{t("builder_tab_support")}</TabsTrigger>
           </TabsList>
 
@@ -1109,6 +1255,147 @@ export default function BuilderPanel() {
                 ))}
               </div>
             )}
+          </TabsContent>
+
+          {/* ══════════════════════════════════════════════════════════════════
+              CLONING CENTER TAB
+             ══════════════════════════════════════════════════════════════════ */}
+          <TabsContent value="cloning-center" className="space-y-4 mt-4">
+            <Card className="border-border">
+              <CardHeader>
+                <CardTitle className="text-base">{t("builder_clone_title")}</CardTitle>
+                <CardDescription>{t("builder_clone_description")}</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-5">
+                {cloneResult ? (
+                  <div className="space-y-4" role="status" aria-live="polite">
+                    <div className="rounded-lg border border-emerald-500/40 bg-emerald-500/5 p-4">
+                      <div className="flex items-start gap-3">
+                        <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-400" />
+                        <div className="space-y-1">
+                          <h2 className="font-semibold text-foreground">{t("builder_clone_success")}</h2>
+                          <p className="text-sm text-muted-foreground">{t("builder_clone_success_desc")}</p>
+                          <p className="pt-2 font-medium text-foreground">{cloneResult.name}</p>
+                          <p className="break-all text-xs text-muted-foreground">ID: {cloneResult.id}</p>
+                          <p className="text-xs font-medium text-slate-400">{t("builder_clone_inactive")}</p>
+                        </div>
+                      </div>
+                    </div>
+                    {cloneRefreshWarning && (
+                      <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-400" role="alert">
+                        <AlertTriangle className="h-4 w-4 shrink-0" />
+                        <span>{t("builder_clone_refresh_warning")}</span>
+                        <Button size="sm" variant="outline" onClick={() => void handleRetryCloneRefresh()}>
+                          {t("builder_clone_refresh_retry")}
+                        </Button>
+                      </div>
+                    )}
+                    <Button onClick={() => handleConfigureClinic(cloneResult.id)} className="gap-2">
+                      <Sliders className="h-4 w-4" /> {t("builder_clone_configure")}
+                    </Button>
+                  </div>
+                ) : (
+                  <>
+                    <div className="space-y-2">
+                      <Label htmlFor="clone-source">{t("builder_clone_source_label")}</Label>
+                      <select
+                        id="clone-source"
+                        value={cloneSourceId}
+                        onChange={(event) => void handleCloneSourceChange(event.target.value)}
+                        disabled={cloning || clinics.length === 0}
+                        className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        <option value="">{t("builder_clone_source_placeholder")}</option>
+                        {clinics.map((clinic) => (
+                          <option key={clinic.id} value={clinic.id}>{clinic.name}</option>
+                        ))}
+                      </select>
+                      {clinics.length === 0 && (
+                        <p className="text-sm text-muted-foreground">{t("builder_clone_source_empty")}</p>
+                      )}
+                    </div>
+
+                    {clonePreviewLoading && (
+                      <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
+                        <Loader2 className="h-4 w-4 animate-spin" /> {t("builder_clone_preview_loading")}
+                      </div>
+                    )}
+
+                    {clonePreviewError && (
+                      <p className="flex items-center gap-2 text-sm text-destructive" role="alert">
+                        <AlertTriangle className="h-4 w-4 shrink-0" /> {clonePreviewError}
+                      </p>
+                    )}
+
+                    {clonePreview && (
+                      <div className="space-y-5" aria-live="polite">
+                        <div className="rounded-lg border border-border bg-muted/20 p-4 space-y-3">
+                          <h2 className="font-semibold text-foreground">{t("builder_clone_preview_title")}</h2>
+                          <div>
+                            <p className="text-xs text-muted-foreground">{t("builder_clone_suggested_name")}</p>
+                            <p className="font-medium">{clonePreview.suggested_name}</p>
+                            <p className="mt-1 text-xs text-muted-foreground">{t("builder_clone_advisory_note")}</p>
+                          </div>
+                          <dl className="grid grid-cols-2 gap-3 text-sm">
+                            <div>
+                              <dt className="text-xs text-muted-foreground">{t("builder_clone_rag_documents")}</dt>
+                              <dd className="font-semibold">{clonePreview.document_count.toLocaleString(locale === "pt" ? "pt-BR" : "en-US")}</dd>
+                            </div>
+                            <div>
+                              <dt className="text-xs text-muted-foreground">{t("builder_clone_rag_bytes")}</dt>
+                              <dd className="font-semibold">{clonePreview.total_bytes.toLocaleString(locale === "pt" ? "pt-BR" : "en-US")} B</dd>
+                            </div>
+                          </dl>
+                          <p className="text-xs text-amber-400">{t("builder_clone_rag_impact")}</p>
+                        </div>
+
+                        <div className="grid gap-3 md:grid-cols-2">
+                          <section className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4" aria-labelledby="clone-included-title">
+                            <h2 id="clone-included-title" className="font-semibold text-emerald-400">{t("builder_clone_included_title")}</h2>
+                            <p className="mt-2 text-sm text-muted-foreground">{t("builder_clone_included_copy")}</p>
+                          </section>
+                          <section className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-4" aria-labelledby="clone-excluded-title">
+                            <h2 id="clone-excluded-title" className="font-semibold text-amber-400">{t("builder_clone_excluded_title")}</h2>
+                            <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                              <li>{t("builder_clone_excluded_admin")}</li>
+                              <li>{t("builder_clone_excluded_integrations")}</li>
+                              <li>{t("builder_clone_inactive")}</li>
+                            </ul>
+                          </section>
+                        </div>
+
+                        {cloneError && (
+                          <p className="flex items-center gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive" role="alert">
+                            <AlertTriangle className="h-4 w-4 shrink-0" /> {cloneError}
+                          </p>
+                        )}
+
+                        <div className="space-y-3 border-t border-border pt-4">
+                          <label className="flex cursor-pointer items-start gap-3 text-sm">
+                            <input
+                              type="checkbox"
+                              checked={cloneConfirmed}
+                              onChange={(event) => setCloneConfirmed(event.target.checked)}
+                              disabled={cloning}
+                              className="mt-0.5 h-4 w-4 rounded border-input accent-indigo-500"
+                            />
+                            <span>{t("builder_clone_confirm")}</span>
+                          </label>
+                          <Button
+                            onClick={() => void handleCloneClinic()}
+                            disabled={!cloneConfirmed || cloning}
+                            className="gap-2"
+                          >
+                            {cloning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Building2 className="h-4 w-4" />}
+                            {cloning ? t("builder_clone_loading") : t("builder_clone_submit")}
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </CardContent>
+            </Card>
           </TabsContent>
 
           {/* ══════════════════════════════════════════════════════════════════

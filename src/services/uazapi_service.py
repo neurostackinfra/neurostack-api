@@ -32,12 +32,30 @@ class UazapiMediaDownloadError(RuntimeError):
     """
 
 
+def _response_json_object(response: httpx.Response) -> dict[str, object]:
+    """Decode and validate an upstream JSON object response."""
+    try:
+        payload: object = response.json()
+    except ValueError as exc:
+        raise RuntimeError("invalid_upstream_response") from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("invalid_upstream_response")
+
+    result: dict[str, object] = {}
+    for key, value in payload.items():
+        if not isinstance(key, str):
+            raise RuntimeError("invalid_upstream_response")
+        result[key] = value
+    return result
+
+
 async def send_uazapi_text(
     api_url: str,
     token: str,
     phone: str,
     message: str,
-) -> dict:
+) -> dict[str, object]:
     """Send a text message via Uazapi (wuzapi).
 
     Args:
@@ -66,7 +84,7 @@ async def send_uazapi_text(
         }
         resp = await client.post(validated.url, json=payload, headers=headers)
         resp.raise_for_status()
-        data = resp.json()
+        data = _response_json_object(resp)
         logger.info(
             "Uazapi send_text to %s — status %s",
             phone,
@@ -82,7 +100,7 @@ async def send_uazapi_audio(
     audio_bytes: bytes,
     *,
     mime_type: str = "audio/mpeg",
-) -> dict:
+) -> dict[str, object]:
     """Send synthesized audio as a push-to-talk message through Uazapi."""
 
     url = f"{api_url.rstrip('/')}/send/media"
@@ -103,7 +121,7 @@ async def send_uazapi_audio(
         }
         resp = await client.post(validated.url, json=payload, headers=headers)
         resp.raise_for_status()
-        data = resp.json()
+        data = _response_json_object(resp)
         logger.info("Uazapi send_audio to %s - status %s", phone, resp.status_code)
         return data
 

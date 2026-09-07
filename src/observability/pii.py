@@ -24,7 +24,6 @@ from __future__ import annotations
 import re
 from typing import Any
 
-
 # ============================================
 # Constants
 # ============================================
@@ -61,7 +60,16 @@ def mask_carteirinha(text: str | None) -> str | None:
     return _DIGIT_SEQ_RE.sub(MASK_TOKEN, text)
 
 
-def mask_carteirinha_in_mapping(data: Any, keys: tuple[str, ...] = ("content", "user_message", "agent_response", "suggested_response", "trigger_message")) -> Any:
+def mask_carteirinha_in_mapping(
+    data: Any,
+    keys: tuple[str, ...] = (
+        "content",
+        "user_message",
+        "agent_response",
+        "suggested_response",
+        "trigger_message",
+    ),
+) -> Any:
     """Return a shallow copy of *data* with *keys* passed through mask_carteirinha.
 
     - dict: copies only the recognised keys; leaves other fields untouched.

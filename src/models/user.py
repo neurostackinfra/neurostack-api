@@ -7,8 +7,9 @@ from enum import Enum
 from typing import TYPE_CHECKING, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, ForeignKey, String
+from sqlalchemy import Boolean
 from sqlalchemy import Enum as PGEnum
+from sqlalchemy import ForeignKey, String
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 

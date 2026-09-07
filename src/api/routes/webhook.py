@@ -11,10 +11,10 @@ import re
 import time as _time
 from collections import OrderedDict as _OrderedDict
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,7 +23,7 @@ from src.api.middleware.rate_limit import (
     check_webhook_rate_limit,
     webhook_rate_limit_response,
 )
-from src.api.schemas.events import EventPayload, EventRequest
+from src.api.schemas.events import EventPayload, EventRequest, EventType
 from src.config.settings import settings
 from src.core.lgpd_utils import resolve_privacy_link
 from src.models.clinic_config_table import ClinicConfigTable
@@ -155,12 +155,12 @@ def _is_enabled(value: Any) -> bool:
     return False
 
 
-def _get_agent_language(clinic_config: Optional[dict]) -> str:
+def _get_agent_language(clinic_config: Optional[dict[str, Any]]) -> str:
     """Return the configured agent language for the clinic, defaulting to pt-BR."""
     if not clinic_config:
         return "pt-BR"
     business = clinic_config.get("business_rules") or {}
-    return business.get("agent_language") or "pt-BR"
+    return cast(str, business.get("agent_language") or "pt-BR")
 
 
 async def _send_reply_with_optional_tts(
@@ -171,10 +171,10 @@ async def _send_reply_with_optional_tts(
     channel: str,
     phone: str,
     input_was_audio: bool,
-    send_audio: Callable[[bytes, str], Awaitable[dict]],
-    send_text: Callable[[], Awaitable[dict]],
+    send_audio: Callable[[bytes, str], Awaitable[dict[str, Any]]],
+    send_text: Callable[[], Awaitable[dict[str, Any]]],
     force_text: bool = False,
-) -> tuple[dict, bool]:
+) -> tuple[dict[str, Any], bool]:
     """Deliver an agent reply as audio when enabled, otherwise as text.
 
     TTS is deliberately best-effort: an incomplete configuration, provider
@@ -234,12 +234,13 @@ def _get_redis() -> Any:
 
         from src.config.settings import settings
 
-        return redis.from_url(settings.redis_url, decode_responses=True)
+        redis_from_url = cast(Callable[..., Any], redis.from_url)
+        return redis_from_url(settings.redis_url, decode_responses=True)
     except Exception:
         return None
 
 
-def _track_sent_message(zapi_response: dict) -> None:
+def _track_sent_message(zapi_response: dict[str, Any]) -> None:
     """Store the messageId from a Z-API send response (Redis + in-memory fallback).
 
     Always writes to the in-process dict so echoes are recognised even if Redis
@@ -447,7 +448,7 @@ def _zapi_token_digest(raw_token: str) -> str:
 async def _resolve_tenant_by_zapi_digest(
     digest: str,
     session: AsyncSession,
-) -> Optional[tuple[UUID, dict]]:
+) -> Optional[tuple[UUID, dict[str, Any]]]:
     """Return the single tenant + credentials matching the token digest.
 
     Zero or multiple matches yield ``None`` — the caller translates that
@@ -505,7 +506,7 @@ def _extract_meta_message_bearing_phone_ids(body: dict[str, Any]) -> list[str]:
 async def _resolve_tenant_by_meta_phone_number_id(
     phone_number_id: str,
     session: AsyncSession,
-) -> Optional[tuple[UUID, dict]]:
+) -> Optional[tuple[UUID, dict[str, Any]]]:
     """Return the single tenant + credentials that own a Meta phone id."""
 
     stmt = select(
@@ -589,7 +590,7 @@ def _session_has_ai_msg_id(session: Any, message_id: str) -> bool:
     that had an active session.
     """
     meta = dict(getattr(session, "session_metadata", None) or {})
-    entries: list = meta.get("ai_msg_ids", [])
+    entries: list[Any] = meta.get("ai_msg_ids", [])
     if not entries:
         return False
     now = _time.monotonic()
@@ -631,7 +632,7 @@ async def _store_ai_msg_id_to_db(
         if not sess:
             return
         meta = dict(getattr(sess, "session_metadata", None) or {})
-        entries: list = meta.get("ai_msg_ids", [])
+        entries: list[Any] = meta.get("ai_msg_ids", [])
         now = _time.monotonic()
         # Prune expired, cap at 20
         entries = [[m, t] for m, t in entries if now - t < _SENT_ID_TTL]
@@ -811,7 +812,7 @@ _DEFAULT_LGPD_MESSAGE_EN = (
 
 
 def _build_lgpd_message(
-    lgpd: dict,
+    lgpd: dict[str, Any],
     clinic_id: str,
     clinic_name: str = "",
     agent_language: str = "pt-BR",
@@ -935,7 +936,7 @@ async def _send_privacy_notice(
 async def _load_tenant_credentials(
     tenant_id: UUID,
     db: AsyncSession,
-) -> dict:
+) -> dict[str, Any]:
     """Load api_credentials for a tenant."""
     stmt = select(ClinicConfigTable.api_credentials).where(
         ClinicConfigTable.tenant_id == tenant_id,
@@ -947,7 +948,7 @@ async def _load_tenant_credentials(
 async def _load_handoff_config(
     tenant_id: UUID,
     db: AsyncSession,
-) -> dict:
+) -> dict[str, Any]:
     """Load handoff config bucket for a tenant."""
     stmt = select(ClinicConfigTable.handoff).where(
         ClinicConfigTable.tenant_id == tenant_id,
@@ -960,7 +961,7 @@ async def _check_pause_state(
     tenant_id: UUID,
     phone: str,
     db: AsyncSession,
-) -> Optional[dict]:
+) -> Optional[dict[str, Any]]:
     """Check if session is paused. Returns action dict or None to continue.
 
     Implements lazy unpause: if paused_until has expired, unpauses the session.
@@ -1017,7 +1018,7 @@ async def _check_bot_active(
     tenant_id: UUID,
     phone: str,
     db: AsyncSession,
-) -> Optional[dict]:
+) -> Optional[dict[str, Any]]:
     """Return a skip-dict when bot_active=False, or None to continue normally.
 
     When the AI is paused (bot_active=False), all incoming messages are silently
@@ -1044,7 +1045,7 @@ async def _handle_clinic_message(
     message_text: str,
     db: AsyncSession,
     message_id: Optional[str] = None,
-) -> dict:
+) -> dict[str, Any]:
     """Handle fromMe=true messages (clinic/secretary).
 
     Never enters pipeline/SRM. Checks for trigger message or human takeover.
@@ -1559,13 +1560,14 @@ async def zapi_webhook_legacy(request: Request) -> dict[str, Any]:
         "are rejected before any database or Redis lookup."
     ),
     tags=["Webhook"],
+    response_model=None,
     status_code=200,
 )
 async def zapi_webhook(
     capability_token: str,
     request: Request,
     db: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> Response | dict[str, Any]:
     """
     Z-API sends a POST for every incoming message.
 
@@ -1655,7 +1657,7 @@ async def _process_zapi_authenticated_body(
     body: dict[str, Any],
     tenant_id: UUID,
     db: AsyncSession,
-) -> Any:
+) -> Response | dict[str, Any]:
     """Downstream Z-API processing for an already authenticated request.
 
     Callers must have verified: canonical token, digest match, ``instanceId``
@@ -1858,13 +1860,14 @@ async def _process_zapi_authenticated_body(
         # When phone is in @lid format, resolve real phone from session metadata
         effective_phone = phone
         if "@lid" in raw_phone:
-            effective_phone = await _resolve_phone_from_lid(tenant_id, raw_phone, db)
-            if not effective_phone:
+            resolved_phone = await _resolve_phone_from_lid(tenant_id, raw_phone, db)
+            if not resolved_phone:
                 logger.warning(
                     "zapi_lid_unresolved",
                     extra={"lid": raw_phone, "tenant_id": str(tenant_id)},
                 )
                 return {"ok": True, "skipped": "lid_unresolved"}
+            effective_phone = resolved_phone
         # Pass message_id for DB-backed cross-worker dedup inside _handle_clinic_message
         result = await _handle_clinic_message(
             tenant_id, effective_phone, message_text, db, message_id=webhook_msg_id
@@ -1936,7 +1939,7 @@ async def _process_zapi_authenticated_body(
                 db=db,
                 send=_send_zapi_privacy,
             )
-    _event_metadata: dict = {
+    _event_metadata: dict[str, Any] = {
         "phone": phone,
         "senderName": sender_name,
         "messageId": body.get("messageId", ""),
@@ -1958,7 +1961,7 @@ async def _process_zapi_authenticated_body(
     event_request = EventRequest(
         tenant_id=tenant_id,
         session_id=session_id,
-        event_type="message.in",
+        event_type=EventType.MESSAGE_IN,
         payload=EventPayload(
             content=message_text,
             channel="whatsapp",
@@ -2075,12 +2078,13 @@ async def _process_zapi_authenticated_body(
     summary="Evolution API Webhook",
     description="Receives incoming WhatsApp messages from Evolution API and responds automatically.",
     tags=["Webhook"],
+    response_model=None,
     status_code=200,
 )
 async def evolution_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> Response | dict[str, Any]:
     """
     Evolution API sends a POST for every event.
 
@@ -2206,7 +2210,7 @@ async def evolution_webhook(
     event_request = EventRequest(
         tenant_id=tenant_id,
         session_id=session_id,
-        event_type="message.in",
+        event_type=EventType.MESSAGE_IN,
         payload=EventPayload(
             content=message_text,
             channel="whatsapp",
@@ -2298,12 +2302,13 @@ async def evolution_webhook(
         "``uazapi_instance_name`` (the ``instance`` field on the payload)."
     ),
     tags=["Webhook"],
+    response_model=None,
     status_code=200,
 )
 async def uazapi_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> Response | dict[str, Any]:
     """
     Uazapi sends a POST for every incoming message.
 
@@ -2672,7 +2677,7 @@ async def uazapi_webhook(
     event_request = EventRequest(
         tenant_id=tenant_id,
         session_id=session_id,
-        event_type="message.in",
+        event_type=EventType.MESSAGE_IN,
         payload=EventPayload(
             content=message_text,
             channel="whatsapp",
@@ -2769,7 +2774,7 @@ async def _resolve_tenant_by_meta_verify_token(
     return result.scalars().first()
 
 
-def _track_meta_sent_message(send_result: dict) -> None:
+def _track_meta_sent_message(send_result: dict[str, Any]) -> None:
     """Adapter around ``_track_sent_message`` for Meta's payload shape.
 
     Meta returns the outbound id at ``messages[0].id`` rather than the
@@ -3009,7 +3014,7 @@ async def _meta_initiate_file_handoff(
 async def meta_webhook_verify(
     request: Request,
     db: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> PlainTextResponse:
     """Meta Cloud API webhook verification handshake.
 
     Meta sends a GET like:
@@ -3046,12 +3051,13 @@ async def meta_webhook_verify(
         "responds automatically. Tenant is resolved by ``phone_number_id``."
     ),
     tags=["Webhook"],
+    response_model=None,
     status_code=200,
 )
 async def meta_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> Response | dict[str, Any]:
     """
     Meta Cloud API sends a POST for every event (messages + statuses).
 
@@ -3410,8 +3416,16 @@ async def meta_webhook(
                 # webhook, so we lean on the file_size the resolve endpoint
                 # returns and treat > audio_max_seconds*16KB as "too long"
                 # — this triggers a handoff, never a 500.
-                audio_max_seconds = int((creds or {}).get("audio_max_seconds") or 60)
-                file_size = int(media_info.get("file_size") or 0)
+                audio_max_seconds_value = (creds or {}).get("audio_max_seconds")
+                if isinstance(audio_max_seconds_value, (str, int, float)):
+                    audio_max_seconds = int(audio_max_seconds_value or 60)
+                else:
+                    audio_max_seconds = 60
+                file_size_value = media_info.get("file_size")
+                if isinstance(file_size_value, (str, int, float)):
+                    file_size = int(file_size_value or 0)
+                else:
+                    file_size = 0
                 max_bytes = audio_max_seconds * _META_AUDIO_APPROX_BYTES_PER_SECOND
                 if file_size and file_size > max_bytes:
                     handoff_msg = (
@@ -3574,7 +3588,7 @@ async def meta_webhook(
             event_request = EventRequest(
                 tenant_id=tenant_id,
                 session_id=session_id,
-                event_type="message.in",
+                event_type=EventType.MESSAGE_IN,
                 payload=EventPayload(
                     content=message_text,
                     channel="whatsapp",

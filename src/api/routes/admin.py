@@ -4,14 +4,15 @@ Super-admin-only routes for cross-tenant management (clinics + builders).
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Optional
-from uuid import uuid4
+from typing import Any
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from passlib.context import CryptContext
 from sqlalchemy import cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.types import String
 
 from src.api.helpers.health import (
@@ -61,11 +62,11 @@ def _build_clinic_slot(
     users: list[User],
     trace_count: int,
     apis_configured: bool,
-    health_status: str = None,
-    last_trace_at: datetime = None,
+    health_status: str | None = None,
+    last_trace_at: datetime | None = None,
     config_completeness: int = 0,
-) -> dict:
-    identity = {}
+) -> dict[str, Any]:
+    identity: dict[str, Any] = {}
     if tenant.clinic_config_row:
         identity = tenant.clinic_config_row.identity or {}
 
@@ -79,8 +80,7 @@ def _build_clinic_slot(
         trace_count=trace_count,
         apis_configured=apis_configured,
         users=[
-            ClinicUserResponse(id=u.id, email=u.email, role=u.role.value)
-            for u in users
+            ClinicUserResponse(id=u.id, email=u.email, role=u.role.value) for u in users
         ],
         health_status=health_status,
         last_trace_at=last_trace_at,
@@ -102,7 +102,7 @@ _NON_CLINIC_ROLES = (UserRole.builder, UserRole.super_admin, UserRole.investor)
 _ACTIVE_BUILDER_SUBSCRIPTION_STATUSES = ("trial", "pilot", "active")
 
 
-def _real_clinic_tenant_filter():
+def _real_clinic_tenant_filter() -> ColumnElement[bool]:
     """Whereclause selecting tenants that represent an actual clinic.
 
     Excludes tenants whose only users are builder/super_admin/investor
@@ -119,7 +119,7 @@ def _real_clinic_tenant_filter():
     return ~(has_users & ~has_clinic_user)
 
 
-async def _compute_platform_totals(session: AsyncSession) -> dict:
+async def _compute_platform_totals(session: AsyncSession) -> dict[str, int]:
     """Shared clinic/builder totals for the admin stats + dashboard KPI cards."""
     clinic_filter = _real_clinic_tenant_filter()
 
@@ -162,11 +162,12 @@ async def _compute_platform_totals(session: AsyncSession) -> dict:
     "/clinics",
     summary="List All Clinics",
     description="Return all tenants with users, config, and trace counts. Super admin only.",
+    response_model=None,
 )
 async def list_clinics(
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> list[dict[str, Any]]:
     # Load ALL tenants (including deactivated) with related config
     stmt = (
         select(Tenant)
@@ -182,7 +183,7 @@ async def list_clinics(
     users_stmt = select(User).where(User.tenant_id.in_(tenant_ids))
     users_result = await session.execute(users_stmt)
     all_users = users_result.scalars().all()
-    users_by_tenant: dict = {}
+    users_by_tenant: dict[UUID, list[User]] = {}
     for u in all_users:
         users_by_tenant.setdefault(u.tenant_id, []).append(u)
 
@@ -196,7 +197,7 @@ async def list_clinics(
         .group_by(Event.tenant_id)
     )
     trace_result = await session.execute(trace_stmt)
-    trace_counts = {row[0]: row[1] for row in trace_result.all()}
+    trace_counts: dict[UUID, int] = {row[0]: row[1] for row in trace_result.all()}
 
     # Batch query: last_trace_at per tenant
     last_trace_stmt = (
@@ -211,12 +212,14 @@ async def list_clinics(
         .group_by(Event.tenant_id)
     )
     last_trace_result = await session.execute(last_trace_stmt)
-    last_trace_map = {row.tenant_id: row.last_trace_at for row in last_trace_result}
+    last_trace_map: dict[UUID, datetime | None] = {
+        row.tenant_id: row.last_trace_at for row in last_trace_result
+    }
 
     # Roles that indicate non-clinic tenants (builder HQ, super-admin, investor)
     non_clinic_roles = {UserRole.builder, UserRole.super_admin, UserRole.investor}
 
-    clinics = []
+    clinics: list[dict[str, Any]] = []
     for t in tenants:
         tenant_users = users_by_tenant.get(t.id, [])
         # Skip tenants where ALL users have non-clinic roles (e.g. builder HQ tenant)
@@ -227,9 +230,7 @@ async def list_clinics(
         health = _compute_health_status(last_trace, t.is_active)
         completeness = _compute_config_completeness(t.clinic_config_row)
         api_creds = (
-            (t.clinic_config_row.api_credentials or {})
-            if t.clinic_config_row
-            else {}
+            (t.clinic_config_row.api_credentials or {}) if t.clinic_config_row else {}
         )
 
         clinics.append(
@@ -250,17 +251,16 @@ async def list_clinics(
     "/clinics",
     summary="Create Clinic",
     description="Create a new tenant + admin user + empty clinic config. Super admin only.",
+    response_model=None,
     status_code=status.HTTP_201_CREATED,
 )
 async def create_clinic(
     body: CreateClinicRequest,
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> dict[str, Any]:
     # Check email uniqueness
-    existing = await session.execute(
-        select(User).where(User.email == body.admin_email)
-    )
+    existing = await session.execute(select(User).where(User.email == body.admin_email))
     if existing.scalar_one_or_none():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -322,16 +322,15 @@ async def create_clinic(
     "/clinics/{clinic_id}",
     summary="Delete Clinic",
     description="Hard-delete a tenant and all associated data (users, sessions, events). Super admin only.",
+    response_model=None,
 )
 async def delete_clinic(
     clinic_id: str,
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
-    from uuid import UUID as _UUID
-
+) -> dict[str, bool]:
     try:
-        cid = _UUID(clinic_id)
+        cid = UUID(clinic_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid clinic ID")
 
@@ -349,21 +348,22 @@ async def delete_clinic(
     "/clinics/{clinic_id}/status",
     summary="Toggle Clinic Status",
     description="Activate or deactivate a clinic. Super admin only.",
+    response_model=None,
 )
 async def toggle_clinic_status(
     clinic_id: str,
-    body: dict,
+    body: dict[str, Any],
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
-    from uuid import UUID as _UUID
-
+) -> dict[str, bool]:
     new_status = body.get("status")
     if new_status not in ("active", "inactive"):
-        raise HTTPException(status_code=400, detail="status must be 'active' or 'inactive'")
+        raise HTTPException(
+            status_code=400, detail="status must be 'active' or 'inactive'"
+        )
 
     try:
-        cid = _UUID(clinic_id)
+        cid = UUID(clinic_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid clinic ID")
 
@@ -372,7 +372,7 @@ async def toggle_clinic_status(
     if not t:
         raise HTTPException(status_code=404, detail="Clinic not found")
 
-    t.is_active = (new_status == "active")
+    t.is_active = new_status == "active"
     await session.commit()
     return {"ok": True}
 
@@ -381,17 +381,16 @@ async def toggle_clinic_status(
     "/clinics/{clinic_id}",
     summary="Update Clinic",
     description="Update clinic name, admin email, and/or password. Super admin only.",
+    response_model=None,
 )
 async def update_clinic(
     clinic_id: str,
     body: UpdateClinicRequest,
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
-    from uuid import UUID as _UUID
-
+) -> dict[str, bool]:
     try:
-        cid = _UUID(clinic_id)
+        cid = UUID(clinic_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid clinic ID")
 
@@ -415,14 +414,20 @@ async def update_clinic(
 
     if body.email is not None or body.password is not None:
         user_result = await session.execute(
-            select(User).where(User.tenant_id == cid, cast(User.role, String) == "clinic_admin")
+            select(User).where(
+                User.tenant_id == cid, cast(User.role, String) == "clinic_admin"
+            )
         )
         user = user_result.scalar_one_or_none()
         if user:
             if body.email is not None and body.email != user.email:
-                existing = await session.execute(select(User).where(User.email == body.email))
+                existing = await session.execute(
+                    select(User).where(User.email == body.email)
+                )
                 if existing.scalar_one_or_none():
-                    raise HTTPException(status_code=409, detail=f"O email {body.email} já está em uso.")
+                    raise HTTPException(
+                        status_code=409, detail=f"O email {body.email} já está em uso."
+                    )
                 user.email = body.email
             if body.password is not None:
                 user.password_hash = pwd_context.hash(body.password)
@@ -440,7 +445,7 @@ async def update_clinic(
 async def admin_stats(
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> AdminStatsResponse:
     # Total processed inbound messages (one trace per message.in event)
     trace_count_result = await session.execute(
         select(func.count(Event.id)).where(Event.event_type == "message.in")
@@ -495,7 +500,7 @@ async def admin_stats(
 async def admin_dashboard(
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> AdminDashboardResponse:
     now = datetime.now(timezone.utc)
     seven_days_ago = now - timedelta(days=7)
 
@@ -597,10 +602,11 @@ async def admin_dashboard(
     "/circuit-breakers",
     summary="List Circuit Breakers (stub)",
     description="Stub endpoint for circuit breaker monitoring. Returns empty list.",
+    response_model=None,
 )
 async def list_circuit_breakers(
     tenant: TenantContext = Depends(require_super_admin),
-):
+) -> list[dict[str, Any]]:
     return []
 
 
@@ -613,11 +619,12 @@ async def list_circuit_breakers(
     "/builders",
     summary="List Builders",
     description="List all builders with linked clinics. Super admin only.",
+    response_model=None,
 )
 async def list_builders(
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> list[dict[str, Any]]:
     stmt = select(Builder).where(Builder.is_active.is_(True)).order_by(Builder.name)
     result = await session.execute(stmt)
     builders = result.scalars().all()
@@ -635,14 +642,14 @@ async def list_builders(
     )
     tenants_result = await session.execute(tenants_stmt)
     all_tenants = tenants_result.scalars().all()
-    tenants_by_builder: dict = {}
+    tenants_by_builder: dict[UUID | None, list[Tenant]] = {}
     for t in all_tenants:
         tenants_by_builder.setdefault(t.builder_id, []).append(t)
 
     # Trace counts for builder clinics
     tenant_ids = [t.id for t in all_tenants]
-    trace_counts: dict = {}
-    last_trace_map: dict = {}
+    trace_counts: dict[UUID, int] = {}
+    last_trace_map: dict[UUID, datetime | None] = {}
     if tenant_ids:
         trace_stmt = (
             select(Event.tenant_id, func.count(Event.id))
@@ -668,14 +675,9 @@ async def list_builders(
             .group_by(Event.tenant_id)
         )
         last_trace_result = await session.execute(last_trace_stmt)
-        last_trace_map = {
-            row.tenant_id: row.last_trace_at for row in last_trace_result
-        }
+        last_trace_map = {row.tenant_id: row.last_trace_at for row in last_trace_result}
 
     # Load admin emails: builder users + clinic admin users
-    all_relevant_tenant_ids = tenant_ids + [
-        u_tid for u_tid in []  # placeholder
-    ]
     # Builder user emails (keyed by builder_id)
     builder_user_stmt = select(User.builder_id, User.email).where(
         User.builder_id.in_(builder_ids), cast(User.role, String) == "builder"
@@ -693,11 +695,11 @@ async def list_builders(
     else:
         clinic_email_map = {}
 
-    output = []
+    output: list[dict[str, Any]] = []
     for b in builders:
-        clinics = []
+        clinics: list[BuilderClinicResponse] = []
         for t in tenants_by_builder.get(b.id, []):
-            api_creds = {}
+            api_creds: dict[str, Any] = {}
             if t.clinic_config_row:
                 api_creds = t.clinic_config_row.api_credentials or {}
             last_trace = last_trace_map.get(t.id)
@@ -716,7 +718,7 @@ async def list_builders(
                     health_status=health,
                     last_trace_at=last_trace,
                     config_completeness=completeness,
-                ).model_dump(mode="json")
+                )
             )
         output.append(
             BuilderWithClinicsResponse(
@@ -737,17 +739,16 @@ async def list_builders(
     "/builders",
     summary="Create Builder",
     description="Create a new builder record. Super admin only.",
+    response_model=None,
     status_code=status.HTTP_201_CREATED,
 )
 async def create_builder(
     body: CreateBuilderRequest,
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> dict[str, Any]:
     # Check email uniqueness
-    existing = await session.execute(
-        select(User).where(User.email == body.admin_email)
-    )
+    existing = await session.execute(select(User).where(User.email == body.admin_email))
     if existing.scalar_one_or_none():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -796,11 +797,12 @@ async def create_builder(
     "/builders/subscriptions",
     summary="Builder Subscription Overview",
     description="Subscription status for all builders. Super admin only.",
+    response_model=None,
 )
 async def builder_subscriptions(
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> list[dict[str, Any]]:
     stmt = select(Builder).order_by(Builder.name)
     result = await session.execute(stmt)
     builders = result.scalars().all()
@@ -821,11 +823,12 @@ async def builder_subscriptions(
     "/transactions",
     summary="List Payment Transactions",
     description="List all confirmed payment transactions. Super admin only.",
+    response_model=None,
 )
 async def list_transactions(
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> list[dict[str, Any]]:
     stmt = select(Transaction).order_by(Transaction.created_at.desc()).limit(200)
     result = await session.execute(stmt)
     txs = result.scalars().all()
@@ -851,17 +854,16 @@ async def list_transactions(
     "/builders/{builder_id}",
     summary="Update Builder",
     description="Update builder name and/or status. Super admin only.",
+    response_model=None,
 )
 async def update_builder(
     builder_id: str,
     body: UpdateBuilderRequest,
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
-    from uuid import UUID as _UUID
-
+) -> dict[str, bool]:
     try:
-        bid = _UUID(builder_id)
+        bid = UUID(builder_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid builder ID")
 
@@ -878,15 +880,21 @@ async def update_builder(
     # Update builder user email/password
     if body.email is not None or body.password is not None:
         user_result = await session.execute(
-            select(User).where(User.builder_id == bid, cast(User.role, String) == "builder")
+            select(User).where(
+                User.builder_id == bid, cast(User.role, String) == "builder"
+            )
         )
         user = user_result.scalar_one_or_none()
         if user:
             if body.email is not None and body.email != user.email:
                 # Check email uniqueness
-                existing = await session.execute(select(User).where(User.email == body.email))
+                existing = await session.execute(
+                    select(User).where(User.email == body.email)
+                )
                 if existing.scalar_one_or_none():
-                    raise HTTPException(status_code=409, detail=f"O email {body.email} já está em uso.")
+                    raise HTTPException(
+                        status_code=409, detail=f"O email {body.email} já está em uso."
+                    )
                 user.email = body.email
             if body.password is not None:
                 user.password_hash = pwd_context.hash(body.password)
@@ -899,16 +907,15 @@ async def update_builder(
     "/builders/{builder_id}",
     summary="Delete Builder",
     description="Hard-delete builder, its tenant, and associated users. Unlinks managed clinics first. Super admin only.",
+    response_model=None,
 )
 async def delete_builder(
     builder_id: str,
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
-    from uuid import UUID as _UUID
-
+) -> dict[str, bool]:
     try:
-        bid = _UUID(builder_id)
+        bid = UUID(builder_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid builder ID")
 
@@ -924,7 +931,11 @@ async def delete_builder(
         t.builder_id = None
 
     # Delete the builder's own tenant (cascade deletes users, sessions, events)
-    builder_tenant_stmt = select(Tenant).join(User, User.tenant_id == Tenant.id).where(User.builder_id == bid)
+    builder_tenant_stmt = (
+        select(Tenant)
+        .join(User, User.tenant_id == Tenant.id)
+        .where(User.builder_id == bid)
+    )
     builder_tenant_result = await session.execute(builder_tenant_stmt)
     builder_tenant = builder_tenant_result.scalar_one_or_none()
     if builder_tenant:
@@ -940,6 +951,7 @@ async def delete_builder(
     "/builders/{builder_id}/clinics",
     summary="Create Clinic Under Builder",
     description="Create a new clinic (tenant + user + config) linked to a builder. Super admin only.",
+    response_model=None,
     status_code=status.HTTP_201_CREATED,
 )
 async def create_builder_clinic(
@@ -947,11 +959,9 @@ async def create_builder_clinic(
     body: CreateBuilderClinicRequest,
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
-    from uuid import UUID as _UUID
-
+) -> dict[str, Any]:
     try:
-        bid = _UUID(builder_id)
+        bid = UUID(builder_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid builder ID")
 
@@ -961,9 +971,7 @@ async def create_builder_clinic(
         raise HTTPException(status_code=404, detail="Builder not found")
 
     # Check email uniqueness
-    existing = await session.execute(
-        select(User).where(User.email == body.admin_email)
-    )
+    existing = await session.execute(select(User).where(User.email == body.admin_email))
     if existing.scalar_one_or_none():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1025,17 +1033,16 @@ async def create_builder_clinic(
     "/builders/{builder_id}/link-clinic",
     summary="Link Existing Clinic to Builder",
     description="Link an existing unlinked clinic to a builder. Super admin only.",
+    response_model=None,
 )
 async def link_clinic_to_builder(
     builder_id: str,
-    body: dict,
+    body: dict[str, Any],
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
-    from uuid import UUID as _UUID
-
+) -> dict[str, bool]:
     try:
-        bid = _UUID(builder_id)
+        bid = UUID(builder_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid builder ID")
 
@@ -1044,7 +1051,7 @@ async def link_clinic_to_builder(
         raise HTTPException(status_code=400, detail="clinic_id is required")
 
     try:
-        cid = _UUID(clinic_id)
+        cid = UUID(clinic_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid clinic ID")
 
@@ -1058,7 +1065,9 @@ async def link_clinic_to_builder(
         raise HTTPException(status_code=404, detail="Clínica não encontrada")
 
     if clinic.builder_id is not None:
-        raise HTTPException(status_code=409, detail="Esta clínica já está vinculada a um builder")
+        raise HTTPException(
+            status_code=409, detail="Esta clínica já está vinculada a um builder"
+        )
 
     clinic.builder_id = bid
     await session.commit()
@@ -1069,17 +1078,16 @@ async def link_clinic_to_builder(
     "/builders/{builder_id}/unlink-clinic",
     summary="Unlink Clinic from Builder",
     description="Unlink a clinic currently linked to this builder. Super admin only.",
+    response_model=None,
 )
 async def unlink_clinic_from_builder(
     builder_id: str,
-    body: dict,
+    body: dict[str, Any],
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
-    from uuid import UUID as _UUID
-
+) -> dict[str, bool]:
     try:
-        bid = _UUID(builder_id)
+        bid = UUID(builder_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid builder ID")
 
@@ -1088,7 +1096,7 @@ async def unlink_clinic_from_builder(
         raise HTTPException(status_code=400, detail="clinic_id is required")
 
     try:
-        cid = _UUID(clinic_id)
+        cid = UUID(clinic_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid clinic ID")
 
@@ -1120,17 +1128,16 @@ async def unlink_clinic_from_builder(
     "/coupons",
     summary="Create Coupon",
     description="Create a new discount coupon. Super admin only.",
+    response_model=None,
     status_code=status.HTTP_201_CREATED,
 )
 async def create_coupon(
     body: CreateCouponRequest,
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> dict[str, Any]:
     code_upper = body.code.strip().upper()
-    existing = await session.execute(
-        select(Coupon).where(Coupon.code == code_upper)
-    )
+    existing = await session.execute(select(Coupon).where(Coupon.code == code_upper))
     if existing.scalar_one_or_none():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1161,14 +1168,13 @@ async def create_coupon(
     "/coupons",
     summary="List Coupons",
     description="List all coupons. Super admin only.",
+    response_model=None,
 )
 async def list_coupons(
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
-    result = await session.execute(
-        select(Coupon).order_by(Coupon.created_at.desc())
-    )
+) -> list[dict[str, Any]]:
+    result = await session.execute(select(Coupon).order_by(Coupon.created_at.desc()))
     coupons = result.scalars().all()
     return [
         CouponResponse(
@@ -1189,16 +1195,15 @@ async def list_coupons(
     "/coupons/{coupon_id}",
     summary="Deactivate Coupon",
     description="Deactivate an existing coupon. Super admin only.",
+    response_model=None,
 )
 async def deactivate_coupon(
     coupon_id: str,
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
-    from uuid import UUID as _UUID
-
+) -> dict[str, bool]:
     try:
-        cid = _UUID(coupon_id)
+        cid = UUID(coupon_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid coupon ID")
 

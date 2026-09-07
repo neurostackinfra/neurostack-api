@@ -67,12 +67,13 @@ TIPO_LABELS = {
 }
 
 
-def _extract_jwt_info(request: Request) -> dict:
+def _extract_jwt_info(request: Request) -> dict[str, Optional[str]]:
     """Extract sender email, role, and builder_id from JWT token."""
     info = {"email": "unknown", "role": None, "builder_id": None}
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         import jwt as pyjwt
+
         try:
             payload = pyjwt.decode(
                 auth_header[7:],
@@ -94,7 +95,7 @@ async def create_support_ticket(
     request: Request,
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> SupportTicketResponse:
     jwt_info = _extract_jwt_info(request)
     sender_email = jwt_info["email"]
     tipo_label = TIPO_LABELS.get(body.tipo, body.tipo)
@@ -104,6 +105,7 @@ async def create_support_ticket(
     try:
         if jwt_info["builder_id"]:
             from uuid import UUID as PyUUID
+
             builder_stmt = select(Builder.name).where(
                 Builder.id == PyUUID(jwt_info["builder_id"])
             )
@@ -113,6 +115,7 @@ async def create_support_ticket(
                 clinic_name = builder_name
         if not clinic_name:
             from src.models.clinic_config_table import ClinicConfigTable
+
             stmt = select(ClinicConfigTable).where(
                 ClinicConfigTable.tenant_id == str(tenant.tenant_id)
             )
@@ -186,12 +189,14 @@ async def create_support_ticket(
     if routed_to == "builder":
         logger.info(
             "Support ticket routing: builder (%s → %s)",
-            routing_reason, recipient_email,
+            routing_reason,
+            recipient_email,
         )
     else:
         logger.info(
             "Support ticket routing: central (%s → %s)",
-            routing_reason, recipient_email,
+            routing_reason,
+            recipient_email,
         )
 
     # Persist ticket to DB
@@ -256,13 +261,16 @@ async def create_support_ticket(
                 start_tls=True,
             )
             email_sent = True
-            logger.info("Support ticket emailed to %s from %s", recipient_email, sender_email)
+            logger.info(
+                "Support ticket emailed to %s from %s", recipient_email, sender_email
+            )
         except Exception as exc:
             logger.error("Failed to send support email: %s", exc, exc_info=True)
     else:
         logger.warning(
             "SMTP not configured — support ticket #%s from %s not emailed",
-            ticket_id, sender_email,
+            ticket_id,
+            sender_email,
         )
 
     return SupportTicketResponse(email_sent=email_sent, ticket_id=ticket_id)
@@ -272,7 +280,7 @@ async def create_support_ticket(
 async def list_support_tickets(
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> list[SupportTicketOut]:
     """List all support tickets. Restricted to super_admin."""
     if tenant.role not in ("super_admin", "admin"):
         raise HTTPException(
@@ -302,13 +310,13 @@ async def list_support_tickets(
     ]
 
 
-@router.patch("/tickets/{ticket_id}/status")
+@router.patch("/tickets/{ticket_id}/status", response_model=None)
 async def update_ticket_status(
     ticket_id: int,
-    body: dict,
+    body: dict[str, object],
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> dict[str, object]:
     """Update ticket status (open/closed). Restricted to super_admin."""
     if tenant.role not in ("super_admin", "admin"):
         raise HTTPException(
@@ -316,12 +324,16 @@ async def update_ticket_status(
             detail="Admin access required",
         )
 
-    new_status = body.get("status")
-    if new_status not in ("open", "closed"):
+    new_status_value = body.get("status")
+    if not isinstance(new_status_value, str) or new_status_value not in (
+        "open",
+        "closed",
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Status must be 'open' or 'closed'",
         )
+    new_status = new_status_value
 
     stmt = select(SupportTicket).where(SupportTicket.id == ticket_id)
     result = await db.execute(stmt)

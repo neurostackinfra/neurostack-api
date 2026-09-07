@@ -7,13 +7,8 @@ import logging
 import time
 from typing import Optional
 
-from src.flow.models import (
-    FlowMode,
-    FlowContext,
-    ModeHandlerResult,
-    TransitionTrigger,
-)
 from src.flow.handlers.base import BaseModeHandler
+from src.flow.models import FlowContext, FlowMode, ModeHandlerResult, TransitionTrigger
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +62,7 @@ HANDOFF_RESPONSES = {
 class HandoffModeHandler(BaseModeHandler):
     """
     Handler for HANDOFF mode.
-    
+
     Manages the transition from AI to human agent, including:
     - Queue management
     - Agent notification
@@ -75,54 +70,51 @@ class HandoffModeHandler(BaseModeHandler):
     - Session state preservation
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(FlowMode.HANDOFF)
         self.default_wait_time = 5  # minutes
 
     async def handle(self, context: FlowContext) -> ModeHandlerResult:
         """
         Handle a message in HANDOFF mode.
-        
+
         In handoff mode, we:
         1. Acknowledge the handoff request
         2. Notify the queue system (placeholder)
         3. Provide status updates
         """
         start_time = time.perf_counter()
-        
+
         # Get handoff reason
         handoff_reason = context.handoff_reason or "default"
-        
+
         # Get current handoff status from metadata
         handoff_status = context.metadata.get("handoff_status", "pending")
         agent_id = context.metadata.get("handoff_agent_id")
 
         # Determine response based on status
         if handoff_status == "connected" and agent_id:
-            response = HANDOFF_RESPONSES["connected"].format(
-                agent_name=agent_id
-            )
+            response = HANDOFF_RESPONSES["connected"].format(agent_name=agent_id)
         elif handoff_status == "waiting":
             wait_time = context.metadata.get("wait_time", self.default_wait_time)
-            response = HANDOFF_RESPONSES["waiting"].format(
-                wait_time=wait_time
-            )
+            response = HANDOFF_RESPONSES["waiting"].format(wait_time=wait_time)
         else:
             response = HANDOFF_RESPONSES.get(
-                handoff_reason,
-                HANDOFF_RESPONSES["default"]
+                handoff_reason, HANDOFF_RESPONSES["default"]
             )
 
         # Log handoff event
-        events = [{
-            "event_type": "flow.handoff.process",
-            "data": {
-                "reason": handoff_reason,
-                "status": handoff_status,
-                "agent_id": agent_id,
-                "turn_count": context.turn_count,
-            },
-        }]
+        events = [
+            {
+                "event_type": "flow.handoff.process",
+                "data": {
+                    "reason": handoff_reason,
+                    "status": handoff_status,
+                    "agent_id": agent_id,
+                    "turn_count": context.turn_count,
+                },
+            }
+        ]
 
         self.logger.info(
             f"HANDOFF mode: reason={handoff_reason}, status={handoff_status}, "
@@ -131,13 +123,15 @@ class HandoffModeHandler(BaseModeHandler):
 
         # Check for transitions
         should_exit, trigger = self.should_exit(context)
-        
+
         # Safety can override handoff
         if context.safety_concern:
-            events.append({
-                "event_type": "flow.handoff.safety_override",
-                "data": {"category": context.safety_category},
-            })
+            events.append(
+                {
+                    "event_type": "flow.handoff.safety_override",
+                    "data": {"category": context.safety_category},
+                }
+            )
             return self.create_result(
                 success=True,
                 response=response,
@@ -165,10 +159,12 @@ class HandoffModeHandler(BaseModeHandler):
             start_time=start_time,
         )
 
-    def should_exit(self, context: FlowContext) -> tuple[bool, Optional[TransitionTrigger]]:
+    def should_exit(
+        self, context: FlowContext
+    ) -> tuple[bool, Optional[TransitionTrigger]]:
         """
         Check if we should exit HANDOFF mode.
-        
+
         Exit conditions:
         - Safety concern -> SAFETY (priority override)
         - Handoff completed -> NORMAL
@@ -177,36 +173,36 @@ class HandoffModeHandler(BaseModeHandler):
         # Safety has highest priority
         if context.safety_concern:
             return True, TransitionTrigger.SAFETY_CONCERN_DETECTED
-        
+
         # Check handoff status
         handoff_status = context.metadata.get("handoff_status", "pending")
-        
+
         if handoff_status == "completed":
             return True, TransitionTrigger.HANDOFF_COMPLETED
-        
+
         if handoff_status == "cancelled":
             return True, TransitionTrigger.HANDOFF_CANCELLED
-        
+
         # Check if handoff is no longer required
         if not context.handoff_required and handoff_status == "pending":
             return True, TransitionTrigger.HANDOFF_CANCELLED
-        
+
         return False, None
 
     async def initiate_handoff(
         self,
         context: FlowContext,
         priority: str = "normal",
-    ) -> dict:
+    ) -> dict[str, object]:
         """
         Initiate a handoff to human agent.
-        
+
         This is a placeholder for the actual handoff system integration.
-        
+
         Args:
             context: Flow context
             priority: Handoff priority (low, normal, high, urgent)
-            
+
         Returns:
             Handoff initiation result
         """
@@ -231,4 +227,3 @@ class HandoffModeHandler(BaseModeHandler):
     def get_response_modifiers(self) -> list[str]:
         """Get response modifiers for HANDOFF mode."""
         return ["transitional", "supportive", "informative"]
-

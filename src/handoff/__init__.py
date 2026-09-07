@@ -9,7 +9,7 @@ This module provides:
 
 Usage:
     from src.handoff import get_handoff_service, HandoffRequest
-    
+
     service = get_handoff_service()
     response = await service.initiate_handoff(HandoffRequest(
         tenant_id=tenant_id,
@@ -18,6 +18,13 @@ Usage:
     ))
 """
 
+from src.core.exceptions import (
+    HandoffNotFoundError,
+    HandoffServiceError,
+    WebhookConfigError,
+    WebhookDeliveryError,
+    WebhookError,
+)
 from src.handoff.models import (
     ConversationMessage,
     ConversationSummary,
@@ -26,8 +33,8 @@ from src.handoff.models import (
     HandoffReason,
     HandoffRequest,
     HandoffResponse,
-    HandoffServiceConfig,
     HandoffSector,
+    HandoffServiceConfig,
     HandoffSLA,
     HandoffStatus,
     HandoffUpdate,
@@ -41,17 +48,7 @@ from src.handoff.models import (
     WebhookPayload,
     WebhookStatus,
 )
-from src.core.exceptions import (
-    HandoffNotFoundError,
-    HandoffServiceError,
-    WebhookConfigError,
-    WebhookDeliveryError,
-    WebhookError,
-)
-from src.handoff.summarizer import (
-    ConversationSummarizer,
-    get_summarizer,
-)
+from src.handoff.summarizer import ConversationSummarizer, get_summarizer
 from src.handoff.webhook import (
     WebhookDispatcher,
     close_webhook_dispatcher,
@@ -63,16 +60,20 @@ from src.handoff.webhook import (
 # lazily via __getattr__ to break the circular import chain:
 # services -> event_service -> api.schemas -> handoff -> services
 
-def __getattr__(name: str):
+
+def __getattr__(name: str) -> object:
     """Lazy import for HandoffService and related functions to avoid circular imports."""
     if name == "HandoffService":
         from src.services import HandoffService
+
         return HandoffService
     elif name == "close_handoff_service":
         from src.services import close_handoff_service
+
         return close_handoff_service
     elif name == "get_handoff_service":
         from src.services import get_handoff_service
+
         return get_handoff_service
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

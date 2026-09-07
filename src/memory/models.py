@@ -16,6 +16,7 @@ from src.srm.models import FunnelStage
 
 class SalesProfile(str, Enum):
     """Perfil comportamental do paciente (doc MVP v0.5)."""
+
     NOVIDADE = "novidade"
     DECEPCAO = "decepcao"
     CONTINUIDADE = "continuidade"
@@ -23,7 +24,7 @@ class SalesProfile(str, Enum):
 
 class FlowMode(str, Enum):
     """Flow modes for conversation state."""
-    
+
     NORMAL = "normal"
     RAG = "rag"
     SAFETY = "safety"
@@ -32,7 +33,7 @@ class FlowMode(str, Enum):
 
 class HandoffStatus(str, Enum):
     """Handoff status values."""
-    
+
     NONE = "none"
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
@@ -42,6 +43,7 @@ class HandoffStatus(str, Enum):
 
 class LeadInfo(BaseModel):
     """Lead info (UserState/FunnelState doc)."""
+
     lead_name: Optional[str] = None
     city_residence: Optional[str] = None
     already_patient: Optional[bool] = None
@@ -49,6 +51,7 @@ class LeadInfo(BaseModel):
 
 class SalesInfo(BaseModel):
     """Sales/vendas state (UserState doc): perfil e flags de fluxo."""
+
     profile: Optional[SalesProfile] = None
     authority_done: bool = False
     objection_active: bool = False
@@ -56,6 +59,7 @@ class SalesInfo(BaseModel):
 
 class LastDecision(BaseModel):
     """Última decisão (intent, action, policy_refs, constraints)."""
+
     intent: Optional[str] = None
     action: Optional[str] = None
     policy_refs: list[str] = Field(default_factory=list)
@@ -116,7 +120,9 @@ class CognitiveState(BaseModel):
         else:
             # Rolling average
             weight = self.turn_count - 1 if self.turn_count > 1 else 1
-            self.confidence_avg = (self.confidence_avg * weight + confidence) / self.turn_count
+            self.confidence_avg = (
+                self.confidence_avg * weight + confidence
+            ) / self.turn_count
 
     def update_sentiment(
         self,
@@ -217,7 +223,7 @@ class RecentMessage(BaseModel):
 class SessionContext(BaseModel):
     """
     Complete session context for CTX orchestrator.
-    
+
     Combines cognitive state with recent messages and metadata
     for prompt construction.
     """
@@ -239,4 +245,3 @@ class StateStoreStats(BaseModel):
     operations_count: dict[str, int] = Field(default_factory=dict)
     avg_latency_ms: dict[str, float] = Field(default_factory=dict)
     redis_info: dict[str, Any] = Field(default_factory=dict)
-
