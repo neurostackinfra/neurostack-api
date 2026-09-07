@@ -3,21 +3,12 @@ NeuroStack - Knowledge Document Model
 Represents documents in the RAG knowledge base.
 """
 
-from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import (
-    BigInteger,
-    Boolean,
-    DateTime,
-    ForeignKey,
-    String,
-    Text,
-    event,
-    func,
-)
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy import BigInteger, Boolean, ForeignKey, String, Text, event
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Mapped, Mapper, mapped_column, relationship
 
@@ -30,13 +21,13 @@ if TYPE_CHECKING:
 class KnowledgeDocument(Base, TimestampMixin):
     """
     Knowledge document model for RAG retrieval.
-    
+
     Stores documents that can be queried semantically to provide
     context-aware responses. Documents are:
     - Indexed in a vector database (Qdrant)
     - Associated with a specific tenant
     - Searchable by semantic similarity
-    
+
     Attributes:
         id: Unique document identifier (UUID)
         tenant_id: Owning tenant
@@ -49,7 +40,7 @@ class KnowledgeDocument(Base, TimestampMixin):
         chunk_count: Number of chunks document was split into
         created_at: Creation timestamp
         updated_at: Last update timestamp
-    
+
     Relationships:
         tenant: The tenant that owns this document
     """
@@ -137,17 +128,31 @@ class KnowledgeDocument(Base, TimestampMixin):
     @property
     def category(self) -> Optional[str]:
         """Get document category from metadata."""
-        return self.metadata.get("category") if self.metadata else None
+        metadata = self.document_metadata
+        if not isinstance(metadata, dict):
+            return None
+        category = metadata.get("category")
+        return category if isinstance(category, str) else None
 
     @property
     def tags(self) -> list[str]:
         """Get document tags from metadata."""
-        return self.metadata.get("tags", []) if self.metadata else []
+        metadata = self.document_metadata
+        if not isinstance(metadata, dict):
+            return []
+        tags = metadata.get("tags", [])
+        if not isinstance(tags, list):
+            return []
+        return [tag for tag in tags if isinstance(tag, str)]
 
     @property
     def source(self) -> Optional[str]:
         """Get document source from metadata."""
-        return self.metadata.get("source") if self.metadata else None
+        metadata = self.document_metadata
+        if not isinstance(metadata, dict):
+            return None
+        source = metadata.get("source")
+        return source if isinstance(source, str) else None
 
     def mark_indexed(self, vector_id: str, chunk_count: int = 1) -> None:
         """Mark document as successfully indexed."""
@@ -163,26 +168,36 @@ class KnowledgeDocument(Base, TimestampMixin):
 
     def add_tag(self, tag: str) -> None:
         """Add a tag to document metadata."""
-        if self.metadata is None:
-            self.metadata = {}
-        if "tags" not in self.metadata:
-            self.metadata["tags"] = []
-        if tag not in self.metadata["tags"]:
-            self.metadata["tags"].append(tag)
+        current_metadata = self.document_metadata
+        metadata = dict(current_metadata) if isinstance(current_metadata, dict) else {}
+        current_tags = metadata.get("tags")
+        tags = list(current_tags) if isinstance(current_tags, list) else []
+        if tag not in tags:
+            tags.append(tag)
+            metadata["tags"] = tags
+            self.document_metadata = metadata
 
     def remove_tag(self, tag: str) -> bool:
         """Remove a tag from document metadata. Returns True if removed."""
-        if self.metadata and "tags" in self.metadata:
-            if tag in self.metadata["tags"]:
-                self.metadata["tags"].remove(tag)
-                return True
+        current_metadata = self.document_metadata
+        if not isinstance(current_metadata, dict):
+            return False
+        current_tags = current_metadata.get("tags")
+        tags = list(current_tags) if isinstance(current_tags, list) else []
+        if tag in tags:
+            tags.remove(tag)
+            metadata = dict(current_metadata)
+            metadata["tags"] = tags
+            self.document_metadata = metadata
+            return True
         return False
 
     def set_category(self, category: str) -> None:
         """Set document category in metadata."""
-        if self.metadata is None:
-            self.metadata = {}
-        self.metadata["category"] = category
+        current_metadata = self.document_metadata
+        metadata = dict(current_metadata) if isinstance(current_metadata, dict) else {}
+        metadata["category"] = category
+        self.document_metadata = metadata
 
     @property
     def content_preview(self) -> str:

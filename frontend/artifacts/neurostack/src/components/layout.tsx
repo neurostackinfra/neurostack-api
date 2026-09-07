@@ -204,6 +204,19 @@ export function Layout({ children }: LayoutProps) {
         <img src={logoSrc} alt="NeuroStack" className="h-32 w-auto max-w-full object-contain" />
       </div>
 
+      {isInvestor && (
+        <a
+          href="https://wa.me/551121105486"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="mx-2 my-4 flex h-12 shrink-0 items-center justify-center gap-2 rounded-md bg-amber-400 px-4 font-bold text-black transition-colors hover:bg-amber-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-200 focus-visible:ring-offset-2 focus-visible:ring-offset-sidebar"
+          data-testid="investor-sales-cta"
+        >
+          <MessageSquare className="h-5 w-5 shrink-0" />
+          {t("investor_sales_cta")}
+        </a>
+      )}
+
       {/* Active Clinic (read-only — set by login) */}
       <div className="border-b border-sidebar-border px-3 py-3">
         <div className="flex items-center gap-1.5 mb-1 px-1">

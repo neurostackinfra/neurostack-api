@@ -5,23 +5,23 @@ Main orchestrator that assembles the complete context for LLM calls.
 
 import logging
 import time
-from typing import Any, Optional
+from typing import Optional
 from uuid import UUID
 
 from prometheus_client import Counter, Histogram
 
+from src.ctx.compression import HistoryCompressor, get_history_compressor
+from src.ctx.context_builder import ContextBuilder, get_context_builder
 from src.ctx.models import (
-    ContextWindow,
+    CognitiveContext,
     ContextMessage,
     ContextRequest,
     ContextResponse,
-    CognitiveContext,
+    ContextWindow,
     KnowledgeChunk,
     MessageRole,
 )
-from src.ctx.context_builder import ContextBuilder, get_context_builder
 from src.ctx.relevance import RelevanceFilter, get_relevance_filter
-from src.ctx.compression import HistoryCompressor, get_history_compressor
 from src.services import KnowledgeService, get_knowledge_service
 
 logger = logging.getLogger(__name__)
@@ -53,7 +53,7 @@ CTX_TOKEN_COUNT = Histogram(
 class ContextOrchestrator:
     """
     Main Context Orchestrator.
-    
+
     Responsibilities:
     1. Assemble context from multiple sources
     2. Include session state and cognitive context
@@ -62,7 +62,7 @@ class ContextOrchestrator:
     5. Include policy constraints
     6. Compress history if needed
     7. Manage token limits
-    
+
     This is the central component that prepares all context
     needed by the Prompt Engine to generate LLM prompts.
     """
@@ -76,7 +76,7 @@ class ContextOrchestrator:
     ):
         """
         Initialize the orchestrator.
-        
+
         Args:
             builder: ContextBuilder instance
             relevance_filter: RelevanceFilter instance
@@ -97,21 +97,21 @@ class ContextOrchestrator:
     ) -> ContextResponse:
         """
         Build complete context for a request.
-        
+
         This is the main entry point for context orchestration.
-        
+
         Args:
             request: Context request parameters
             message_history: Message history (if available)
             constraints: Policy constraints
             safety_reminders: Safety reminders
-            
+
         Returns:
             ContextResponse with built context
         """
         start_time = time.perf_counter()
         warnings: list[str] = []
-        
+
         # Step 1: Filter messages by relevance
         messages = message_history or []
         if messages and len(messages) > request.max_messages:
@@ -120,7 +120,7 @@ class ContextOrchestrator:
                 request.current_message,
                 request.max_messages,
             )
-        
+
         # Step 2: Compress if needed
         summary = None
         if messages:
@@ -128,7 +128,7 @@ class ContextOrchestrator:
                 messages,
                 target_tokens=request.max_tokens // 2,  # Reserve half for other content
             )
-        
+
         # Step 3: Get knowledge (if RAG is needed)
         knowledge_chunks: list[KnowledgeChunk] = []
         if request.needs_rag and request.include_knowledge:
@@ -139,7 +139,7 @@ class ContextOrchestrator:
             )
             if not knowledge_chunks:
                 warnings.append("No knowledge found for query")
-        
+
         # Step 4: Build context window
         context = self._builder.build(
             request=request,
@@ -148,30 +148,30 @@ class ContextOrchestrator:
             constraints=constraints,
             safety_reminders=safety_reminders,
         )
-        
+
         # Step 5: Add compressed summary if available
         if summary:
             context.compressed_history = summary
-        
+
         # Step 6: Ensure within token limits
         if context.context_tokens and context.context_tokens > request.max_tokens:
             context = self._builder.trim_to_token_limit(context, request.max_tokens)
             warnings.append(f"Context trimmed to {request.max_tokens} tokens")
-        
+
         # Calculate build time
         build_time_ms = int((time.perf_counter() - start_time) * 1000)
         context.build_time_ms = build_time_ms
-        
+
         # Record metrics
         self._record_metrics(request, context)
-        
+
         logger.debug(
             f"Built context for session {request.session_id}: "
             f"{len(context.messages)} messages, "
             f"{len(knowledge_chunks)} knowledge chunks, "
             f"~{context.context_tokens} tokens in {build_time_ms}ms"
         )
-        
+
         return ContextResponse(
             context=context,
             success=True,
@@ -200,10 +200,12 @@ class ContextOrchestrator:
         except Exception as e:
             logger.warning(
                 "Knowledge retrieval failed",
-                tenant_id=str(tenant_id),
-                query=query[:100] if query else None,
-                error=str(e),
-                error_type=type(e).__name__,
+                extra={
+                    "tenant_id": str(tenant_id),
+                    "query": query[:100] if query else None,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
             )
             return []
 
@@ -214,15 +216,15 @@ class ContextOrchestrator:
     ) -> None:
         """Record Prometheus metrics."""
         mode = "rag" if request.needs_rag else "normal"
-        
+
         CTX_BUILD_TOTAL.labels(
             tenant_id=str(request.tenant_id)[:8],
             mode=mode,
         ).inc()
-        
+
         if context.build_time_ms:
             CTX_BUILD_LATENCY.observe(context.build_time_ms / 1000)
-        
+
         if context.context_tokens:
             CTX_TOKEN_COUNT.observe(context.context_tokens)
 
@@ -235,15 +237,15 @@ class ContextOrchestrator:
     ) -> ContextWindow:
         """
         Build a simple context with minimal options.
-        
+
         Convenience method for common use cases.
-        
+
         Args:
             tenant_id: Tenant ID
             session_id: Session ID
             message: Current message
             cognitive_state: Optional cognitive state
-            
+
         Returns:
             ContextWindow
         """
@@ -253,7 +255,7 @@ class ContextOrchestrator:
             current_message=message,
             cognitive_state=cognitive_state,
         )
-        
+
         response = await self.build_context(request)
         return response.context
 
@@ -265,12 +267,12 @@ class ContextOrchestrator:
     ) -> ContextWindow:
         """
         Enrich an existing context with additional information.
-        
+
         Args:
             context: Existing context
             knowledge_query: Query for additional knowledge
             additional_constraints: Additional constraints to add
-            
+
         Returns:
             Enriched context
         """
@@ -281,17 +283,17 @@ class ContextOrchestrator:
                 query=knowledge_query,
             )
             context.knowledge_chunks.extend(chunks)
-        
+
         # Add constraints
         if additional_constraints:
             context.constraints.extend(additional_constraints)
-        
+
         # Recalculate tokens
         context.context_tokens = self._builder._estimate_tokens(
             context.messages,
             context.knowledge_chunks,
         )
-        
+
         return context
 
     def create_message(
@@ -303,7 +305,7 @@ class ContextOrchestrator:
     ) -> ContextMessage:
         """
         Create a context message.
-        
+
         Helper method for creating properly formatted messages.
         """
         return ContextMessage(
@@ -340,7 +342,7 @@ async def build_context(
 ) -> ContextWindow:
     """
     Convenience function for building context.
-    
+
     Args:
         tenant_id: Tenant ID
         session_id: Session ID
@@ -349,12 +351,12 @@ async def build_context(
         cognitive_state: Optional cognitive state
         message_history: Optional message history
         constraints: Optional constraints
-        
+
     Returns:
         Built ContextWindow
     """
     orchestrator = get_context_orchestrator()
-    
+
     request = ContextRequest(
         tenant_id=tenant_id,
         session_id=session_id,
@@ -362,12 +364,11 @@ async def build_context(
         needs_rag=needs_rag,
         cognitive_state=cognitive_state,
     )
-    
+
     response = await orchestrator.build_context(
         request=request,
         message_history=message_history,
         constraints=constraints,
     )
-    
-    return response.context
 
+    return response.context

@@ -6,12 +6,7 @@ Compresses long conversation history to fit within context limits.
 import logging
 from typing import Optional
 
-from src.ctx.models import (
-    ContextMessage,
-    ContextWindow,
-    CompressionResult,
-    MessageRole,
-)
+from src.ctx.models import CompressionResult, ContextMessage, MessageRole
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +33,7 @@ SUMMARY_TEMPLATE = """Resumo da conversa anterior:
 class HistoryCompressor:
     """
     Compresses long conversation history.
-    
+
     Strategies:
     1. Keep N most recent messages uncompressed
     2. Summarize older messages into a single context
@@ -54,7 +49,7 @@ class HistoryCompressor:
     ):
         """
         Initialize the compressor.
-        
+
         Args:
             max_tokens: Maximum tokens for context
             min_recent: Minimum recent messages to keep
@@ -71,47 +66,49 @@ class HistoryCompressor:
     ) -> tuple[list[ContextMessage], Optional[str]]:
         """
         Compress message history.
-        
+
         Args:
             messages: Messages to compress
             target_tokens: Target token count (default: max_tokens)
-            
+
         Returns:
             Tuple of (compressed messages, summary of removed messages)
         """
         target = target_tokens or self.max_tokens
-        
+
         # Estimate current tokens
         current_tokens = self._estimate_tokens(messages)
-        
+
         if current_tokens <= target:
             # No compression needed
             return messages, None
-        
+
         logger.info(
             f"Compressing history: {len(messages)} messages, "
             f"~{current_tokens} tokens -> target {target}"
         )
-        
+
         # Step 1: Truncate long messages
         truncated = self._truncate_messages(messages)
         current_tokens = self._estimate_tokens(truncated)
-        
+
         if current_tokens <= target:
             return truncated, None
-        
+
         # Step 2: Keep recent, summarize old
-        recent = truncated[-self.min_recent:]
-        older = truncated[:-self.min_recent]
-        
+        recent = truncated[-self.min_recent :]
+        older = truncated[: -self.min_recent]
+
         # Generate summary of older messages
         summary = self._generate_summary(older)
-        
+
         # Step 3: Continue removing if still too long
         while current_tokens > target and len(recent) > self.min_recent:
             recent = recent[1:]  # Remove oldest
-            current_tokens = self._estimate_tokens(recent) + len(summary) // CHARS_PER_TOKEN
-        
+            current_tokens = (
+                self._estimate_tokens(recent) + len(summary) // CHARS_PER_TOKEN
+            )
+
         return recent, summary
 
     def _estimate_tokens(self, messages: list[ContextMessage]) -> int:
@@ -125,11 +122,11 @@ class HistoryCompressor:
     ) -> list[ContextMessage]:
         """Truncate individual messages that are too long."""
         truncated = []
-        
+
         for msg in messages:
             if len(msg.content) > self.max_message_length:
                 # Truncate with ellipsis
-                new_content = msg.content[:self.max_message_length - 3] + "..."
+                new_content = msg.content[: self.max_message_length - 3] + "..."
                 new_msg = ContextMessage(
                     role=msg.role,
                     content=new_content,
@@ -141,7 +138,7 @@ class HistoryCompressor:
                 truncated.append(new_msg)
             else:
                 truncated.append(msg)
-        
+
         return truncated
 
     def _generate_summary(
@@ -150,33 +147,33 @@ class HistoryCompressor:
     ) -> str:
         """
         Generate a summary of messages.
-        
+
         In production, this would use an LLM. For now, we create
         a simple structured summary.
         """
         if not messages:
             return ""
-        
+
         # Extract information
         user_messages = [m for m in messages if m.role == MessageRole.USER]
         intents = [m.intent for m in messages if m.intent]
-        
+
         # Determine topic from first user message
         topic = user_messages[0].content[:50] + "..." if user_messages else "N/A"
-        
+
         # Main intent
         main_intent = intents[-1] if intents else "unknown"
-        
+
         # Status
         status = f"{len(messages)} mensagens anteriores resumidas"
-        
+
         summary = SUMMARY_TEMPLATE.format(
             topic=topic,
             intent=main_intent,
             slots="(informações coletadas anteriormente)",
             status=status,
         )
-        
+
         return summary
 
     def get_compression_result(
@@ -188,14 +185,16 @@ class HistoryCompressor:
         """Get compression statistics."""
         original_tokens = self._estimate_tokens(original)
         compressed_tokens = self._estimate_tokens(compressed)
-        
+
         if summary:
             compressed_tokens += len(summary) // CHARS_PER_TOKEN
-        
+
         return CompressionResult(
             original_token_count=original_tokens,
             compressed_token_count=compressed_tokens,
-            compression_ratio=compressed_tokens / original_tokens if original_tokens > 0 else 1.0,
+            compression_ratio=(
+                compressed_tokens / original_tokens if original_tokens > 0 else 1.0
+            ),
             summary=summary,
             removed_messages=len(original) - len(compressed),
         )
@@ -204,14 +203,14 @@ class HistoryCompressor:
 class SlidingWindowCompressor:
     """
     Simple sliding window compressor.
-    
+
     Keeps only the N most recent messages.
     """
 
     def __init__(self, window_size: int = 10):
         """
         Initialize with window size.
-        
+
         Args:
             window_size: Number of recent messages to keep
         """
@@ -223,17 +222,17 @@ class SlidingWindowCompressor:
     ) -> list[ContextMessage]:
         """
         Keep only the most recent messages.
-        
+
         Args:
             messages: Messages to compress
-            
+
         Returns:
             Windowed messages
         """
         if len(messages) <= self.window_size:
             return messages
-        
-        return messages[-self.window_size:]
+
+        return messages[-self.window_size :]
 
 
 # ============================================
@@ -249,4 +248,3 @@ def get_history_compressor() -> HistoryCompressor:
     if _compressor is None:
         _compressor = HistoryCompressor()
     return _compressor
-

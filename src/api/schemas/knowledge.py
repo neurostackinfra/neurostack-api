@@ -119,7 +119,9 @@ class SearchResult(BaseModel):
     chunk_id: str = Field(..., description="Chunk identifier")
     content: str = Field(..., description="Matched content")
     score: float = Field(..., ge=0.0, le=1.0, description="Relevance score")
-    metadata: dict[str, Any] = Field(default_factory=dict, description="Document metadata")
+    metadata: dict[str, Any] = Field(
+        default_factory=dict, description="Document metadata"
+    )
 
 
 class SearchResponse(BaseModel):

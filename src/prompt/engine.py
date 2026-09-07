@@ -6,26 +6,24 @@ Main engine for prompt generation and management.
 import logging
 import time
 from typing import Any, Optional
-from uuid import UUID
 
 from prometheus_client import Counter, Histogram
 
 from src.prompt.models import (
-    PromptMode,
-    PromptMessage,
-    PromptVariables,
-    PromptConfig,
     GeneratedPrompt,
     OutputSchema,
+    PromptConfig,
+    PromptMode,
+    PromptVariables,
     ValidationResult,
-    MessageRole,
 )
 from src.prompt.renderer import PromptRenderer, VariableResolver, get_prompt_renderer
-from src.prompt.validator import OutputValidator, ResponseExtractor, get_output_validator
 from src.prompt.templates.base import BaseTemplate
-from src.prompt.templates.normal import NormalTemplate
-from src.prompt.templates.safety import SafetyTemplate
-from src.prompt.templates.handoff import HandoffTemplate
+from src.prompt.validator import (
+    OutputValidator,
+    ResponseExtractor,
+    get_output_validator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,13 +60,13 @@ OUTPUT_VALIDATIONS_TOTAL = Counter(
 class PromptEngine:
     """
     Main Prompt Engine.
-    
+
     Orchestrates prompt generation by:
     1. Selecting appropriate templates based on mode
     2. Rendering templates with variables
     3. Managing conversation history
     4. Validating LLM outputs
-    
+
     This is the central component for all prompt-related operations.
     """
 
@@ -79,7 +77,7 @@ class PromptEngine:
     ):
         """
         Initialize the Prompt Engine.
-        
+
         Args:
             renderer: Prompt renderer instance
             validator: Output validator instance
@@ -96,13 +94,13 @@ class PromptEngine:
     ) -> GeneratedPrompt:
         """
         Generate a prompt for the given mode and context.
-        
+
         Args:
             mode: Prompt mode (NORMAL, RAG, SAFETY, HANDOFF)
             variables: Variables for template rendering
             history: Optional conversation history
             config: Optional prompt configuration
-            
+
         Returns:
             GeneratedPrompt with messages ready for LLM
         """
@@ -138,12 +136,12 @@ class PromptEngine:
     ) -> GeneratedPrompt:
         """
         Generate a simple prompt with minimal configuration.
-        
+
         Args:
             message: User message
             mode: Prompt mode
             **kwargs: Additional variables
-            
+
         Returns:
             GeneratedPrompt
         """
@@ -158,12 +156,12 @@ class PromptEngine:
     ) -> GeneratedPrompt:
         """
         Generate prompt from a ContextWindow.
-        
+
         Args:
             context_window: ContextWindow from CTX
             mode: Prompt mode
             user_message: Current user message
-            
+
         Returns:
             GeneratedPrompt
         """
@@ -184,17 +182,17 @@ class PromptEngine:
     ) -> ValidationResult:
         """
         Validate LLM output against schema.
-        
+
         Args:
             output: Raw LLM output
             mode: Current mode (for schema selection)
             schema: Optional custom schema
-            
+
         Returns:
             ValidationResult
         """
         result = self._validator.validate(output, mode, schema)
-        
+
         # Record metrics
         OUTPUT_VALIDATIONS_TOTAL.labels(
             mode=mode.value,
@@ -206,10 +204,10 @@ class PromptEngine:
     def extract_response(self, validated_output: ValidationResult) -> str:
         """
         Extract the response text from validated output.
-        
+
         Args:
             validated_output: ValidationResult
-            
+
         Returns:
             Response text
         """
@@ -239,7 +237,7 @@ class PromptEngine:
     ) -> None:
         """Record Prometheus metrics."""
         duration = time.perf_counter() - start_time
-        
+
         PROMPT_GENERATIONS_TOTAL.labels(mode=mode.value).inc()
         PROMPT_GENERATION_DURATION.observe(duration)
         PROMPT_TOKENS_TOTAL.labels(mode=mode.value).inc(prompt.total_tokens_estimate)
@@ -248,7 +246,7 @@ class PromptEngine:
 class PromptBuilder:
     """
     Fluent builder for creating prompts.
-    
+
     Usage:
         prompt = (PromptBuilder()
             .mode(PromptMode.NORMAL)
@@ -258,7 +256,7 @@ class PromptBuilder:
             .build())
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize builder."""
         self._mode = PromptMode.NORMAL
         self._user_message = ""
@@ -371,17 +369,16 @@ async def generate_prompt(
 ) -> GeneratedPrompt:
     """
     Convenience function for generating prompts.
-    
+
     Args:
         message: User message
         mode: Prompt mode
         history: Optional conversation history
         **kwargs: Additional variables
-        
+
     Returns:
         GeneratedPrompt
     """
     engine = get_prompt_engine()
     variables = PromptVariables(user_message=message, **kwargs)
     return await engine.generate(mode, variables, history)
-

@@ -7,11 +7,13 @@ import csv
 import io
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Optional, TypedDict
 from uuid import UUID
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import Select
+from sqlalchemy.sql.elements import ColumnElement
 
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.event import Event
@@ -26,6 +28,20 @@ _CONVERSATIONAL_MARKERS = (
     "action",
     "confidence",
 )
+
+
+class TraceRecord(TypedDict):
+    """Typed shape shared by trace API and CSV serialization."""
+
+    id: UUID
+    timestamp: str
+    user_message: str
+    srm_decision: dict[str, object]
+    context_summary: Optional[str]
+    prompt_built: Optional[str]
+    processing_time_ms: object
+    mode: object
+    channel: object
 
 
 def _is_conversational_trace(event_data: object, event_metadata: object) -> bool:
@@ -105,7 +121,7 @@ def _llm_usage_for_stats(metadata: object) -> tuple[int, list[tuple[str, int]]]:
     return legacy_tokens, []
 
 
-def _base_trace_query(tenant_id: UUID):
+def _base_trace_query(tenant_id: UUID) -> Select[tuple[Event]]:
     """
     Build base query for trace views.
 
@@ -123,7 +139,7 @@ def _base_trace_query(tenant_id: UUID):
     )
 
 
-def _user_identity_expression():
+def _user_identity_expression() -> ColumnElement[str]:
     """Resolve the external phone/username attached to a message event."""
     event_user_id = func.nullif(
         func.trim(Event.event_data["user_id"].as_string()),
@@ -151,13 +167,13 @@ def _to_utc(dt: datetime) -> datetime:
 
 
 def _apply_filters(
-    query,
+    query: Select[tuple[Event]],
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
     safety_flag: Optional[bool] = None,
     handoff_required: Optional[bool] = None,
     channel: Optional[str] = None,
-):
+) -> Select[tuple[Event]]:
     """Apply optional filters to a trace query."""
     if start_date is not None:
         query = query.where(Event.created_at >= _to_utc(start_date))
@@ -181,7 +197,7 @@ def _apply_filters(
     return query
 
 
-def _event_to_trace_dict(event: Event) -> dict:
+def _event_to_trace_dict(event: Event) -> TraceRecord:
     """
     Convert an Event model to a trace dictionary.
 
@@ -193,7 +209,7 @@ def _event_to_trace_dict(event: Event) -> dict:
 
     # Extract SRM decision from event_data or metadata
     # The decision may be stored inline or as a nested object
-    srm_decision = event_data.get("decision", {})
+    srm_decision: dict[str, object] = event_data.get("decision", {})
     if not srm_decision:
         # Build decision from top-level keys in event_data
         srm_decision = {
@@ -308,7 +324,7 @@ async def get_prompt_event_for_trace(
     db: AsyncSession,
     tenant_id: UUID,
     session_id: UUID,
-    trace_created_at,
+    trace_created_at: datetime,
 ) -> Optional[Event]:
     """
     Fetch the prompt.generated event associated with a message.in trace.
@@ -339,7 +355,7 @@ async def get_trace_stats(
     tenant_id: UUID,
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
-) -> dict:
+) -> dict[str, object]:
     """
     Get aggregated trace statistics for a time period.
 

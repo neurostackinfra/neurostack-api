@@ -68,15 +68,21 @@ def clinic_admin_headers() -> dict[str, str]:
 class TestRequireSuperAdmin:
     """Test that admin endpoints enforce super_admin role."""
 
-    def test_clinics_returns_403_for_clinic_admin(self, client: TestClient, clinic_admin_headers):
+    def test_clinics_returns_403_for_clinic_admin(
+        self, client: TestClient, clinic_admin_headers
+    ):
         response = client.get("/v1/admin/clinics", headers=clinic_admin_headers)
         assert response.status_code == 403
 
-    def test_builders_returns_403_for_clinic_admin(self, client: TestClient, clinic_admin_headers):
+    def test_builders_returns_403_for_clinic_admin(
+        self, client: TestClient, clinic_admin_headers
+    ):
         response = client.get("/v1/admin/builders", headers=clinic_admin_headers)
         assert response.status_code == 403
 
-    def test_stats_returns_403_for_clinic_admin(self, client: TestClient, clinic_admin_headers):
+    def test_stats_returns_403_for_clinic_admin(
+        self, client: TestClient, clinic_admin_headers
+    ):
         response = client.get("/v1/admin/stats", headers=clinic_admin_headers)
         assert response.status_code == 403
 
@@ -127,8 +133,12 @@ class TestStubEndpoints:
         assert response.status_code == 200
         assert response.json() == []
 
-    def test_removed_rlhf_pending_route_returns_404(self, client: TestClient, super_admin_headers):
-        response = client.get("/v1/admin/rlhf/" + "pending", headers=super_admin_headers)
+    def test_removed_rlhf_pending_route_returns_404(
+        self, client: TestClient, super_admin_headers
+    ):
+        response = client.get(
+            "/v1/admin/rlhf/" + "pending", headers=super_admin_headers
+        )
         assert response.status_code == 404
 
 

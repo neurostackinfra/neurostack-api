@@ -8,8 +8,8 @@ bot-sent message.
 
 from __future__ import annotations
 
-import logging
 import asyncio
+import logging
 from collections.abc import AsyncGenerator
 from uuid import UUID, uuid4
 
@@ -98,9 +98,9 @@ async def test_store_ai_msg_id_round_trips_via_session_metadata(
         entries = (sess.session_metadata or {}).get("ai_msg_ids", [])
 
     stored_ids = [entry[0] for entry in entries]
-    assert message_id in stored_ids, (
-        f"expected {message_id!r} in session_metadata['ai_msg_ids'], got {entries!r}"
-    )
+    assert (
+        message_id in stored_ids
+    ), f"expected {message_id!r} in session_metadata['ai_msg_ids'], got {entries!r}"
 
 
 @pytest.mark.asyncio
@@ -129,11 +129,13 @@ async def test_store_ai_msg_id_logs_warning_on_failure(
             await _store_ai_msg_id_to_db(session_id, "wamid.HBgN-FAIL", db)
 
     warnings = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if r.levelno == logging.WARNING and "_store_ai_msg_id_to_db" in r.getMessage()
     ]
     debugs = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if r.levelno == logging.DEBUG and "_store_ai_msg_id_to_db" in r.getMessage()
     ]
     assert warnings, (

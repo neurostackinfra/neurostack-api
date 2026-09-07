@@ -3,25 +3,26 @@ NeuroStack API - Handoff Schemas
 Request and response models for handoff endpoints.
 """
 
+from datetime import datetime as _dt
 from typing import Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from src.handoff.models import (
     HandoffDetail,
     HandoffListItem,
     HandoffStatus,
     HandoffUrgency,
-    WebhookConfigResponse,
     WebhookConfigCreate,
+    WebhookConfigResponse,
     WebhookConfigUpdate,
 )
 
 
 class HandoffListResponse(BaseModel):
     """Response for handoff list."""
-    
+
     handoffs: list[HandoffListItem]
     total: int
     limit: int
@@ -30,13 +31,13 @@ class HandoffListResponse(BaseModel):
 
 class WebhookTestRequest(BaseModel):
     """Request to test webhook."""
-    
+
     url: Optional[str] = None
 
 
 class WebhookTestResponse(BaseModel):
     """Response from webhook test."""
-    
+
     success: bool
     message: str
     status_code: Optional[int] = None
@@ -45,7 +46,7 @@ class WebhookTestResponse(BaseModel):
 
 class HandoffUpdateRequest(BaseModel):
     """Request to update handoff status."""
-    
+
     status: HandoffStatus
     assigned_to: Optional[str] = None
     notes: Optional[str] = None
@@ -58,8 +59,6 @@ class MessageResponse(BaseModel):
 
 
 # ── Queue schemas ──────────────────────────────────────────────────────────────
-
-from datetime import datetime as _dt
 
 
 class HandoffQueueItem(BaseModel):

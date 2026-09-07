@@ -49,7 +49,9 @@ def test_elevenlabs_sends_model_voice_and_key_and_returns_mp3() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        return httpx.Response(200, content=AUDIO, headers={"Content-Type": "audio/mpeg"})
+        return httpx.Response(
+            200, content=AUDIO, headers={"Content-Type": "audio/mpeg"}
+        )
 
     credentials = {
         "tts_provider": "elevenlabs",
@@ -113,9 +115,7 @@ def test_google_sends_voice_language_and_decodes_audio() -> None:
     }
     with egress_env(httpx.MockTransport(handler)):
         audio = asyncio.run(
-            tts_service.synthesize_speech(
-                "Bom dia", credentials, language_code="pt-BR"
-            )
+            tts_service.synthesize_speech("Bom dia", credentials, language_code="pt-BR")
         )
 
     assert audio.content == AUDIO

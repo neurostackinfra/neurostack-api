@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 class PolicyType(str, Enum):
     """Types of policies."""
+
     GLOBAL = "global"
     TENANT = "tenant"
     SAFETY = "safety"
@@ -20,6 +21,7 @@ class PolicyType(str, Enum):
 
 class RuleSeverity(str, Enum):
     """Severity levels for policy rules."""
+
     INFO = "info"
     WARNING = "warning"
     ERROR = "error"
@@ -28,6 +30,7 @@ class RuleSeverity(str, Enum):
 
 class RuleAction(str, Enum):
     """Actions to take when a rule is triggered."""
+
     LOG = "log"
     WARN = "warn"
     FLAG = "flag"
@@ -37,6 +40,7 @@ class RuleAction(str, Enum):
 
 class RuleCategory(str, Enum):
     """Categories of policy rules."""
+
     SAFETY_CLINICAL = "safety_clinical"
     SAFETY_LEGAL = "safety_legal"
     SAFETY_ETHICAL = "safety_ethical"
@@ -66,19 +70,19 @@ class PolicyRuleDefinition(BaseModel):
         """Check if text matches rule patterns or keywords."""
         if not self.enabled:
             return False
-        
+
         text_lower = text.lower()
-        
+
         # Check patterns (substring match)
         for pattern in self.patterns:
             if pattern.lower() in text_lower:
                 return True
-        
+
         # Check keywords
         for keyword in self.keywords:
             if keyword.lower() in text_lower:
                 return True
-        
+
         return False
 
 
@@ -137,15 +141,15 @@ class PolicyEvaluationResult(BaseModel):
         """Add a violation and update state."""
         self.violations.append(violation)
         self.passed = False
-        
+
         if violation.action == RuleAction.BLOCK:
             self.should_block = True
         elif violation.action == RuleAction.HANDOFF:
             self.should_handoff = True
-        
+
         if violation.action == RuleAction.WARN:
             self.warnings.append(violation.message)
-        
+
         # Update highest severity
         severity_order = [
             RuleSeverity.INFO,
@@ -155,7 +159,9 @@ class PolicyEvaluationResult(BaseModel):
         ]
         if self.highest_severity is None:
             self.highest_severity = violation.severity
-        elif severity_order.index(violation.severity) > severity_order.index(self.highest_severity):
+        elif severity_order.index(violation.severity) > severity_order.index(
+            self.highest_severity
+        ):
             self.highest_severity = violation.severity
 
 
@@ -199,17 +205,17 @@ class PolicyConstraints(BaseModel):
     def to_prompt_constraints(self) -> list[str]:
         """Convert to list of constraint strings for prompt."""
         constraints = []
-        
+
         for item in self.must_not_say:
             constraints.append(f"NÃO {item}")
-        
+
         for item in self.must_include:
             constraints.append(f"SEMPRE {item}")
-        
+
         constraints.extend(self.safety_reminders)
         constraints.extend(self.tone_guidelines)
         constraints.extend(self.custom_instructions)
-        
+
         return constraints
 
 
@@ -277,4 +283,3 @@ class PolicyListResponse(BaseModel):
     total: int
     page: int
     page_size: int
-

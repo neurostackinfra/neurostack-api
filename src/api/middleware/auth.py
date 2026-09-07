@@ -10,7 +10,6 @@ import jwt
 from fastapi import Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from passlib.context import CryptContext
-from passlib.exc import InvalidHashError
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -141,7 +140,7 @@ class APIKeyStore:
                                 rate_limit=config.rate_limit,
                                 is_active=tenant.is_active,
                             )
-                    except (ValueError, InvalidHashError) as e:
+                    except ValueError as e:
                         # Skip invalid hashes (shouldn't happen in production)
                         logger.debug(
                             "Failed to verify API key hash",

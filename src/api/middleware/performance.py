@@ -14,10 +14,11 @@ These optimizations help achieve the target of:
 import hashlib
 import time
 from collections import OrderedDict
+from collections.abc import AsyncIterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from threading import Lock
-from typing import Callable, Optional
+from typing import Optional, Protocol, cast
 
 from fastapi import Request, Response
 from prometheus_client import Counter, Gauge, Histogram
@@ -26,6 +27,12 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from src.config.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+class _StreamingResponse(Protocol):
+    """Response shape returned by ``BaseHTTPMiddleware.call_next``."""
+
+    body_iterator: AsyncIterable[bytes]
 
 
 # ============================================
@@ -376,7 +383,8 @@ class CachingMiddleware(BaseHTTPMiddleware):
             if ttl > 0:
                 # Read response body
                 body = b""
-                async for chunk in response.body_iterator:
+                streaming_response = cast(_StreamingResponse, response)
+                async for chunk in streaming_response.body_iterator:
                     body += chunk
 
                 # Cache the response
@@ -497,7 +505,7 @@ class PerformanceStats:
             return 0.0
         return (self.errors_total / self.requests_total) * 100
 
-    def reset(self) -> dict:
+    def reset(self) -> dict[str, int | float]:
         """Reset stats and return current values."""
         with self._lock:
             stats = {

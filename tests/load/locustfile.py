@@ -18,7 +18,7 @@ Performance Targets:
 Usage:
     # Basic run
     locust -f tests/load/locustfile.py --host=http://localhost:8000
-    
+
     # Headless mode with specific parameters
     locust -f tests/load/locustfile.py \
         --host=http://localhost:8000 \
@@ -33,11 +33,9 @@ import os
 import random
 import uuid
 from datetime import datetime
-from typing import Any
 
 from locust import HttpUser, TaskSet, between, events, tag, task
 from locust.runners import MasterRunner
-
 
 # ============================================
 # Test Configuration
@@ -99,7 +97,7 @@ def generate_tenant_id() -> str:
 class EventProcessingTasks(TaskSet):
     """
     Event processing load tests - the main cognitive pipeline.
-    
+
     This is the critical path that must maintain < 200ms p95 latency.
     """
 
@@ -115,7 +113,7 @@ class EventProcessingTasks(TaskSet):
     def process_normal_message(self) -> None:
         """Process a normal user message through the cognitive pipeline."""
         self.turn_count += 1
-        
+
         payload = {
             "tenant_id": self.tenant_id,
             "session_id": self.session_id,
@@ -182,7 +180,7 @@ class EventProcessingTasks(TaskSet):
         """Start a new session (simulates new users arriving)."""
         self.session_id = str(uuid.uuid4())
         self.turn_count = 0
-        
+
         payload = {
             "tenant_id": self.tenant_id,
             "session_id": self.session_id,
@@ -210,7 +208,7 @@ class EventProcessingTasks(TaskSet):
 class SessionManagementTasks(TaskSet):
     """
     Session management load tests.
-    
+
     Tests CRUD operations on sessions.
     """
 
@@ -274,7 +272,7 @@ class SessionManagementTasks(TaskSet):
             return
 
         session_id = random.choice(self.created_sessions)
-        
+
         with self.client.get(
             f"{API_PREFIX}/sessions/{session_id}",
             headers=get_headers(),
@@ -291,7 +289,7 @@ class SessionManagementTasks(TaskSet):
 class HealthCheckTasks(TaskSet):
     """
     Health check endpoint tests.
-    
+
     These should be extremely fast (< 10ms).
     """
 
@@ -354,7 +352,7 @@ class HealthCheckTasks(TaskSet):
 class EventProcessingUser(HttpUser):
     """
     User class focused on event processing (main workload).
-    
+
     Simulates an AI agent processing user messages through
     the NeuroStack cognitive pipeline.
     """
@@ -367,7 +365,7 @@ class EventProcessingUser(HttpUser):
 class SessionManagementUser(HttpUser):
     """
     User class for session management operations.
-    
+
     Simulates builders managing sessions.
     """
 
@@ -379,7 +377,7 @@ class SessionManagementUser(HttpUser):
 class HealthCheckUser(HttpUser):
     """
     User class for health check monitoring.
-    
+
     Simulates load balancers and monitoring systems.
     """
 
@@ -391,7 +389,7 @@ class HealthCheckUser(HttpUser):
 class MixedWorkloadUser(HttpUser):
     """
     User class that combines all workloads.
-    
+
     More realistic simulation of actual traffic patterns.
     """
 
@@ -431,7 +429,7 @@ class MixedWorkloadUser(HttpUser):
         """Create new session."""
         # Start new session periodically
         self.session_id = str(uuid.uuid4())
-        
+
         payload = {
             "tenant_id": self.tenant_id,
             "user_id": self.user_id,
@@ -477,7 +475,7 @@ def on_test_start(environment, **kwargs):
 def on_test_stop(environment, **kwargs):
     """Log test completion and summary."""
     print(f"\nLoad test completed at {datetime.now().isoformat()}")
-    
+
     if environment.stats.total.num_requests > 0:
         stats = environment.stats.total
         print("\n" + "=" * 60)
@@ -492,16 +490,15 @@ def on_test_stop(environment, **kwargs):
         print(f"p99 Response Time: {stats.get_response_time_percentile(0.99):.2f}ms")
         print(f"Requests/s: {stats.total_rps:.2f}")
         print("=" * 60)
-        
+
         # Check against targets
         p95 = stats.get_response_time_percentile(0.95)
         if p95 < 200:
             print("✅ p95 latency target MET (< 200ms)")
         else:
             print(f"❌ p95 latency target MISSED ({p95:.2f}ms > 200ms)")
-        
+
         if stats.fail_ratio < 0.001:
             print("✅ Error rate target MET (< 0.1%)")
         else:
             print(f"❌ Error rate target MISSED ({stats.fail_ratio * 100:.2f}% > 0.1%)")
-

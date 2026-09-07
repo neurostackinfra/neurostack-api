@@ -1,10 +1,10 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useLocation } from "wouter";
 import {
   Wrench, Building2, Activity, Plus, CheckCircle2, XCircle, Zap,
   Loader2, AlertTriangle, AlertCircle, Info, KeyRound, ToggleLeft, ToggleRight,
   Sliders, Inbox, ChevronDown, ChevronUp, TrendingUp, TrendingDown, ExternalLink,
-  Clock,
+  Clock, MessageCircle, LifeBuoy, Mail,
 } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { useAuth } from "@/context/auth";
@@ -47,6 +47,21 @@ interface BuilderClinic {
   conversational_trace_count_7d: number;
   business_hours_configured: boolean;
   config_completeness: number;
+  contact_phone: string | null;
+}
+
+interface BuilderTicket {
+  id: number;
+  clinic_id: string | null;
+  clinic_name: string | null;
+  contact_phone: string | null;
+  email: string;
+  tipo: string;
+  mensagem: string;
+  filename: string | null;
+  file_type: string | null;
+  status: string;
+  created_at: string;
 }
 
 interface BuilderStats {
@@ -83,6 +98,19 @@ interface BuilderProfile {
   name: string;
   status: string;
   clinic_count: number;
+  support_email: string | null;
+}
+
+interface ClinicClonePreview {
+  suggested_name: string;
+  document_count: number;
+  total_bytes: number;
+}
+
+interface ClinicCloneResult {
+  id: string;
+  name: string;
+  is_active: false;
 }
 
 // ── API helpers ───────────────────────────────────────────────────────────────
@@ -213,7 +241,7 @@ function relativeTime(dateStr: string | null, locale: string): string {
 
 export default function BuilderPanel() {
   const { t, locale } = useI18n();
-  const { isBuilder, setViewingClinicId } = useAuth();
+  const { isBuilder, setViewingClinicId, email: authEmail } = useAuth();
   const [, navigate] = useLocation();
   const token = useBuilderToken();
   const { toast } = useToast();
@@ -234,8 +262,35 @@ export default function BuilderPanel() {
   const [newName, setNewName] = useState("");
   const [newEmail, setNewEmail] = useState("");
   const [newPassword, setNewPassword] = useState("");
+  const [newPhone, setNewPhone] = useState("");
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+
+  // Per-clinic phone editing state (map of clinicId -> current draft)
+  const [phoneDrafts, setPhoneDrafts] = useState<Record<string, string>>({});
+  const [savingPhoneClinicId, setSavingPhoneClinicId] = useState<string | null>(null);
+
+  // Support tickets state
+  const [tickets, setTickets] = useState<BuilderTicket[]>([]);
+  const [ticketsError, setTicketsError] = useState<string | null>(null);
+  const [ticketStatusFilter, setTicketStatusFilter] = useState<"all" | "open" | "closed">("open");
+
+  // Support notification email state
+  const [supportEmailDraft, setSupportEmailDraft] = useState("");
+  const [savingSupportEmail, setSavingSupportEmail] = useState(false);
+
+  // Clone clinic state
+  const [cloneSourceId, setCloneSourceId] = useState("");
+  const [clonePreview, setClonePreview] = useState<ClinicClonePreview | null>(null);
+  const [clonePreviewLoading, setClonePreviewLoading] = useState(false);
+  const [clonePreviewError, setClonePreviewError] = useState<string | null>(null);
+  const [cloneConfirmed, setCloneConfirmed] = useState(false);
+  const [cloning, setCloning] = useState(false);
+  const [cloneError, setCloneError] = useState<string | null>(null);
+  const [cloneResult, setCloneResult] = useState<ClinicCloneResult | null>(null);
+  const [cloneRefreshWarning, setCloneRefreshWarning] = useState(false);
+  const clonePreviewRequestRef = useRef(0);
+  const cloneRequestInFlightRef = useRef(false);
 
   // Expandable clinic state
   const [expandedClinicId, setExpandedClinicId] = useState<string | null>(null);
@@ -243,11 +298,11 @@ export default function BuilderPanel() {
 
   // Fetch all data on mount and when token changes
   useEffect(() => {
-    if (token) {
+    if (isBuilder && token) {
       void fetchAll();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token]);
+  }, [isBuilder, token]);
 
   async function fetchAll() {
     setLoading(true);
@@ -255,11 +310,13 @@ export default function BuilderPanel() {
     setUsage(null);
     try {
       const headers = authHeaders(token);
-      const [profileRes, dashboardRes, clinicsRes, usageRes] = await Promise.all([
+      const [profileRes, dashboardRes, clinicsRes, usageRes, ticketsRes, supportProfileRes] = await Promise.all([
         fetch("/v1/builder/me", { headers }),
         fetch("/v1/builder/dashboard", { headers }),
         fetch("/v1/builder/clinics", { headers }),
         fetch("/v1/billing/usage", { headers }),
+        fetch("/v1/builder/tickets", { headers }),
+        fetch("/v1/builder/profile", { headers }),
       ]);
 
       const errors: string[] = [];
@@ -288,9 +345,24 @@ export default function BuilderPanel() {
         errors.push(`usage: ${usageRes.status}`);
       }
 
+      if (ticketsRes.ok) {
+        setTickets(await ticketsRes.json() as BuilderTicket[]);
+        setTicketsError(null);
+      } else {
+        errors.push(`tickets: ${ticketsRes.status}`);
+        setTicketsError(`tickets: ${ticketsRes.status}`);
+      }
+
+      if (supportProfileRes.ok) {
+        const data = await supportProfileRes.json() as { support_email: string | null };
+        setSupportEmailDraft(data.support_email ?? "");
+      } else {
+        errors.push(`support-profile: ${supportProfileRes.status}`);
+      }
+
       if (errors.length > 0) {
         console.warn("[Builder] Fetch errors:", errors);
-        if (errors.length === 4) {
+        if (errors.length === 6) {
           setError("Erro ao carregar dados");
         }
       }
@@ -325,6 +397,7 @@ export default function BuilderPanel() {
     setCreating(true);
     setCreateError(null);
     try {
+      const phoneTrimmed = newPhone.trim();
       const res = await fetch("/v1/builder/clinics", {
         method: "POST",
         headers: authHeaders(token),
@@ -332,6 +405,7 @@ export default function BuilderPanel() {
           clinic_name: newName.trim(),
           admin_email: newEmail.trim(),
           admin_password: newPassword,
+          contact_phone: phoneTrimmed ? phoneTrimmed : null,
         }),
       });
       const data = await res.json() as { ok?: boolean; error?: string; detail?: unknown; id?: string };
@@ -354,11 +428,132 @@ export default function BuilderPanel() {
       setNewName("");
       setNewEmail("");
       setNewPassword("");
+      setNewPhone("");
       void fetchAll();
     } catch {
       setCreateError(t("admin_create_err_network"));
     } finally {
       setCreating(false);
+    }
+  }
+
+  function cloneErrorMessage(status: number): string {
+    if (status === 403) return t("builder_clone_error_403");
+    if (status === 404) return t("builder_clone_error_404");
+    if (status === 409) return t("builder_clone_error_409");
+    if (status === 500) return t("builder_clone_error_500");
+    return t("builder_clone_error_network");
+  }
+
+  function clonePreviewErrorMessage(status: number): string {
+    if (status === 403) return t("builder_clone_preview_error_403");
+    if (status === 404) return t("builder_clone_preview_error_404");
+    if (status === 409) return t("builder_clone_preview_error_409");
+    if (status === 500) return t("builder_clone_preview_error_500");
+    return t("builder_clone_preview_error_network");
+  }
+
+  async function handleCloneSourceChange(sourceId: string) {
+    const requestId = ++clonePreviewRequestRef.current;
+    setCloneSourceId(sourceId);
+    setClonePreview(null);
+    setClonePreviewError(null);
+    setCloneConfirmed(false);
+    setCloneError(null);
+    setCloneResult(null);
+    setCloneRefreshWarning(false);
+
+    if (!sourceId) {
+      setClonePreviewLoading(false);
+      return;
+    }
+
+    setClonePreviewLoading(true);
+    try {
+      const response = await fetch(`/v1/builder/clinics/${sourceId}/clone-preview`, {
+        method: "GET",
+        headers: authHeaders(token),
+      });
+      if (requestId !== clonePreviewRequestRef.current) return;
+      if (!response.ok) {
+        setClonePreviewError(clonePreviewErrorMessage(response.status));
+        return;
+      }
+      const preview = await response.json() as ClinicClonePreview;
+      if (requestId === clonePreviewRequestRef.current) {
+        setClonePreview(preview);
+      }
+    } catch {
+      if (requestId === clonePreviewRequestRef.current) {
+        setClonePreviewError(t("builder_clone_preview_error_network"));
+      }
+    } finally {
+      if (requestId === clonePreviewRequestRef.current) {
+        setClonePreviewLoading(false);
+      }
+    }
+  }
+
+  async function refreshCloneLists(): Promise<boolean> {
+    const headers = authHeaders(token);
+    const [clinicsResponse, usageResponse] = await Promise.all([
+      fetch("/v1/builder/clinics", { headers }),
+      fetch("/v1/billing/usage", { headers }),
+    ]);
+    if (clinicsResponse.ok) {
+      setClinics(await clinicsResponse.json() as BuilderClinic[]);
+    }
+    if (usageResponse.ok) {
+      setUsage(await usageResponse.json() as BillingUsage);
+    }
+    return clinicsResponse.ok && usageResponse.ok;
+  }
+
+  async function handleRetryCloneRefresh() {
+    try {
+      setCloneRefreshWarning(!(await refreshCloneLists()));
+    } catch (refreshError) {
+      console.warn("[Builder] Clone refresh retry failed:", refreshError);
+      setCloneRefreshWarning(true);
+    }
+  }
+
+  async function handleCloneClinic() {
+    if (
+      cloneRequestInFlightRef.current
+      || !cloneSourceId
+      || !clonePreview
+      || !cloneConfirmed
+    ) return;
+
+    cloneRequestInFlightRef.current = true;
+    setCloning(true);
+    setCloneError(null);
+    setCloneRefreshWarning(false);
+    try {
+      const response = await fetch(`/v1/builder/clinics/${cloneSourceId}/clone`, {
+        method: "POST",
+        headers: authHeaders(token),
+      });
+      if (!response.ok) {
+        setCloneError(cloneErrorMessage(response.status));
+        return;
+      }
+      const result = await response.json() as ClinicCloneResult;
+      setCloneResult(result);
+      setClonePreview(null);
+      setCloneConfirmed(false);
+      try {
+        setCloneRefreshWarning(!(await refreshCloneLists()));
+      } catch (refreshError) {
+        console.warn("[Builder] Clone refresh failed:", refreshError);
+        setCloneRefreshWarning(true);
+      }
+    } catch {
+      setCloneError(t("builder_clone_error_network"));
+    } finally {
+      cloneRequestInFlightRef.current = false;
+      setCloning(false);
     }
   }
 
@@ -427,6 +622,106 @@ export default function BuilderPanel() {
     return response.ok;
   }
 
+  // Save contact_phone for a clinic (inline edit surface)
+  async function handleSavePhone(clinic: BuilderClinic) {
+    const draft = phoneDrafts[clinic.id] ?? "";
+    const trimmed = draft.trim();
+    const previous = clinic.contact_phone;
+    const newValue = trimmed ? trimmed : null;
+    // Optimistic update
+    setClinics((prev) =>
+      prev.map((c) => (c.id === clinic.id ? { ...c, contact_phone: newValue } : c)),
+    );
+    setSavingPhoneClinicId(clinic.id);
+    try {
+      const res = await fetch(`/v1/builder/clinics/${clinic.id}`, {
+        method: "PATCH",
+        headers: authHeaders(token),
+        body: JSON.stringify({ contact_phone: newValue }),
+      });
+      if (!res.ok) {
+        setClinics((prev) =>
+          prev.map((c) => (c.id === clinic.id ? { ...c, contact_phone: previous } : c)),
+        );
+        toast({ title: t("builder_clinic_phone_error"), variant: "destructive" });
+        return;
+      }
+      const data = await res.json() as { contact_phone: string | null };
+      // Sync with server-normalized value (backend strips non-digits)
+      setClinics((prev) =>
+        prev.map((c) => (c.id === clinic.id ? { ...c, contact_phone: data.contact_phone } : c)),
+      );
+      setPhoneDrafts((prev) => ({ ...prev, [clinic.id]: data.contact_phone ?? "" }));
+      toast({ title: t("builder_clinic_phone_saved") });
+    } catch {
+      setClinics((prev) =>
+        prev.map((c) => (c.id === clinic.id ? { ...c, contact_phone: previous } : c)),
+      );
+      toast({ title: t("builder_clinic_phone_error"), variant: "destructive" });
+    } finally {
+      setSavingPhoneClinicId(null);
+    }
+  }
+
+  // Optimistically flip a ticket's status
+  async function handleToggleTicketStatus(ticketId: number, currentStatus: string) {
+    const nextStatus = currentStatus === "open" ? "closed" : "open";
+    setTickets((prev) =>
+      prev.map((tk) => (tk.id === ticketId ? { ...tk, status: nextStatus } : tk)),
+    );
+    try {
+      const res = await fetch(`/v1/builder/tickets/${ticketId}/status`, {
+        method: "PATCH",
+        headers: authHeaders(token),
+        body: JSON.stringify({ status: nextStatus }),
+      });
+      if (!res.ok) {
+        setTickets((prev) =>
+          prev.map((tk) => (tk.id === ticketId ? { ...tk, status: currentStatus } : tk)),
+        );
+        toast({ title: t("builder_support_resolve_error"), variant: "destructive" });
+        return;
+      }
+      toast({ title: t("builder_support_resolve_ok") });
+    } catch {
+      setTickets((prev) =>
+        prev.map((tk) => (tk.id === ticketId ? { ...tk, status: currentStatus } : tk)),
+      );
+      toast({ title: t("builder_support_resolve_error"), variant: "destructive" });
+    }
+  }
+
+  // Save notification email
+  async function handleSaveSupportEmail() {
+    const trimmed = supportEmailDraft.trim();
+    const value = trimmed ? trimmed : null;
+    setSavingSupportEmail(true);
+    try {
+      const res = await fetch("/v1/builder/profile", {
+        method: "PATCH",
+        headers: authHeaders(token),
+        body: JSON.stringify({ support_email: value }),
+      });
+      if (!res.ok) {
+        toast({ title: t("builder_support_email_error"), variant: "destructive" });
+        return;
+      }
+      const data = await res.json() as { support_email: string | null };
+      setSupportEmailDraft(data.support_email ?? "");
+      setProfile((prev) => (prev ? { ...prev, support_email: data.support_email } : prev));
+      toast({ title: t("builder_support_email_saved") });
+    } catch {
+      toast({ title: t("builder_support_email_error"), variant: "destructive" });
+    } finally {
+      setSavingSupportEmail(false);
+    }
+  }
+
+  const filteredTickets = useMemo(() => {
+    if (ticketStatusFilter === "all") return tickets;
+    return tickets.filter((tk) => tk.status === ticketStatusFilter);
+  }, [tickets, ticketStatusFilter]);
+
   // Guard: only builders
   if (!isBuilder) {
     return (
@@ -483,6 +778,8 @@ export default function BuilderPanel() {
           <TabsList>
             <TabsTrigger value="overview">{t("builder_tab_overview")}</TabsTrigger>
             <TabsTrigger value="clinics">{t("builder_tab_clinics")}</TabsTrigger>
+            <TabsTrigger value="cloning-center">{t("builder_tab_cloning_center")}</TabsTrigger>
+            <TabsTrigger value="support">{t("builder_tab_support")}</TabsTrigger>
           </TabsList>
 
           {/* ══════════════════════════════════════════════════════════════════
@@ -717,7 +1014,7 @@ export default function BuilderPanel() {
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-3">
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div className="space-y-1">
                       <Label className="text-xs">{t("admin_create_name_label")}</Label>
                       <Input
@@ -745,6 +1042,17 @@ export default function BuilderPanel() {
                         onChange={(e) => setNewPassword(e.target.value)}
                         placeholder="••••••••"
                         className="h-8 text-xs"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label className="text-xs">{t("builder_clinic_phone_label")}</Label>
+                      <Input
+                        type="tel"
+                        value={newPhone}
+                        onChange={(e) => setNewPhone(e.target.value)}
+                        placeholder={t("builder_clinic_phone_placeholder")}
+                        className="h-8 text-xs"
+                        data-testid="input-new-clinic-phone"
                       />
                     </div>
                   </div>
@@ -866,6 +1174,40 @@ export default function BuilderPanel() {
                             <Progress value={clinic.config_completeness} className="h-2" />
                           </div>
 
+                          {/* Contact phone editor */}
+                          <div className="space-y-1">
+                            <Label className="text-xs">{t("builder_clinic_phone_label")}</Label>
+                            <div className="flex gap-2">
+                              <Input
+                                type="tel"
+                                value={phoneDrafts[clinic.id] ?? clinic.contact_phone ?? ""}
+                                onChange={(e) =>
+                                  setPhoneDrafts((prev) => ({ ...prev, [clinic.id]: e.target.value }))
+                                }
+                                placeholder={t("builder_clinic_phone_placeholder")}
+                                className="h-8 text-xs"
+                                data-testid={`input-clinic-phone-${clinic.id}`}
+                              />
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-8 text-xs"
+                                onClick={() => void handleSavePhone(clinic)}
+                                disabled={savingPhoneClinicId === clinic.id}
+                                data-testid={`btn-save-clinic-phone-${clinic.id}`}
+                              >
+                                {savingPhoneClinicId === clinic.id ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  t("builder_clinic_phone_save")
+                                )}
+                              </Button>
+                            </div>
+                            <p className="text-[10px] text-muted-foreground">
+                              {t("builder_clinic_phone_hint")}
+                            </p>
+                          </div>
+
                           {/* Actions stay hidden with the clinic details. */}
                           <div className="flex items-center gap-2 pt-1">
                             <Button
@@ -913,6 +1255,324 @@ export default function BuilderPanel() {
                 ))}
               </div>
             )}
+          </TabsContent>
+
+          {/* ══════════════════════════════════════════════════════════════════
+              CLONING CENTER TAB
+             ══════════════════════════════════════════════════════════════════ */}
+          <TabsContent value="cloning-center" className="space-y-4 mt-4">
+            <Card className="border-border">
+              <CardHeader>
+                <CardTitle className="text-base">{t("builder_clone_title")}</CardTitle>
+                <CardDescription>{t("builder_clone_description")}</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-5">
+                {cloneResult ? (
+                  <div className="space-y-4" role="status" aria-live="polite">
+                    <div className="rounded-lg border border-emerald-500/40 bg-emerald-500/5 p-4">
+                      <div className="flex items-start gap-3">
+                        <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-400" />
+                        <div className="space-y-1">
+                          <h2 className="font-semibold text-foreground">{t("builder_clone_success")}</h2>
+                          <p className="text-sm text-muted-foreground">{t("builder_clone_success_desc")}</p>
+                          <p className="pt-2 font-medium text-foreground">{cloneResult.name}</p>
+                          <p className="break-all text-xs text-muted-foreground">ID: {cloneResult.id}</p>
+                          <p className="text-xs font-medium text-slate-400">{t("builder_clone_inactive")}</p>
+                        </div>
+                      </div>
+                    </div>
+                    {cloneRefreshWarning && (
+                      <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-400" role="alert">
+                        <AlertTriangle className="h-4 w-4 shrink-0" />
+                        <span>{t("builder_clone_refresh_warning")}</span>
+                        <Button size="sm" variant="outline" onClick={() => void handleRetryCloneRefresh()}>
+                          {t("builder_clone_refresh_retry")}
+                        </Button>
+                      </div>
+                    )}
+                    <Button onClick={() => handleConfigureClinic(cloneResult.id)} className="gap-2">
+                      <Sliders className="h-4 w-4" /> {t("builder_clone_configure")}
+                    </Button>
+                  </div>
+                ) : (
+                  <>
+                    <div className="space-y-2">
+                      <Label htmlFor="clone-source">{t("builder_clone_source_label")}</Label>
+                      <select
+                        id="clone-source"
+                        value={cloneSourceId}
+                        onChange={(event) => void handleCloneSourceChange(event.target.value)}
+                        disabled={cloning || clinics.length === 0}
+                        className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        <option value="">{t("builder_clone_source_placeholder")}</option>
+                        {clinics.map((clinic) => (
+                          <option key={clinic.id} value={clinic.id}>{clinic.name}</option>
+                        ))}
+                      </select>
+                      {clinics.length === 0 && (
+                        <p className="text-sm text-muted-foreground">{t("builder_clone_source_empty")}</p>
+                      )}
+                    </div>
+
+                    {clonePreviewLoading && (
+                      <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
+                        <Loader2 className="h-4 w-4 animate-spin" /> {t("builder_clone_preview_loading")}
+                      </div>
+                    )}
+
+                    {clonePreviewError && (
+                      <p className="flex items-center gap-2 text-sm text-destructive" role="alert">
+                        <AlertTriangle className="h-4 w-4 shrink-0" /> {clonePreviewError}
+                      </p>
+                    )}
+
+                    {clonePreview && (
+                      <div className="space-y-5" aria-live="polite">
+                        <div className="rounded-lg border border-border bg-muted/20 p-4 space-y-3">
+                          <h2 className="font-semibold text-foreground">{t("builder_clone_preview_title")}</h2>
+                          <div>
+                            <p className="text-xs text-muted-foreground">{t("builder_clone_suggested_name")}</p>
+                            <p className="font-medium">{clonePreview.suggested_name}</p>
+                            <p className="mt-1 text-xs text-muted-foreground">{t("builder_clone_advisory_note")}</p>
+                          </div>
+                          <dl className="grid grid-cols-2 gap-3 text-sm">
+                            <div>
+                              <dt className="text-xs text-muted-foreground">{t("builder_clone_rag_documents")}</dt>
+                              <dd className="font-semibold">{clonePreview.document_count.toLocaleString(locale === "pt" ? "pt-BR" : "en-US")}</dd>
+                            </div>
+                            <div>
+                              <dt className="text-xs text-muted-foreground">{t("builder_clone_rag_bytes")}</dt>
+                              <dd className="font-semibold">{clonePreview.total_bytes.toLocaleString(locale === "pt" ? "pt-BR" : "en-US")} B</dd>
+                            </div>
+                          </dl>
+                          <p className="text-xs text-amber-400">{t("builder_clone_rag_impact")}</p>
+                        </div>
+
+                        <div className="grid gap-3 md:grid-cols-2">
+                          <section className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4" aria-labelledby="clone-included-title">
+                            <h2 id="clone-included-title" className="font-semibold text-emerald-400">{t("builder_clone_included_title")}</h2>
+                            <p className="mt-2 text-sm text-muted-foreground">{t("builder_clone_included_copy")}</p>
+                          </section>
+                          <section className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-4" aria-labelledby="clone-excluded-title">
+                            <h2 id="clone-excluded-title" className="font-semibold text-amber-400">{t("builder_clone_excluded_title")}</h2>
+                            <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                              <li>{t("builder_clone_excluded_admin")}</li>
+                              <li>{t("builder_clone_excluded_integrations")}</li>
+                              <li>{t("builder_clone_inactive")}</li>
+                            </ul>
+                          </section>
+                        </div>
+
+                        {cloneError && (
+                          <p className="flex items-center gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive" role="alert">
+                            <AlertTriangle className="h-4 w-4 shrink-0" /> {cloneError}
+                          </p>
+                        )}
+
+                        <div className="space-y-3 border-t border-border pt-4">
+                          <label className="flex cursor-pointer items-start gap-3 text-sm">
+                            <input
+                              type="checkbox"
+                              checked={cloneConfirmed}
+                              onChange={(event) => setCloneConfirmed(event.target.checked)}
+                              disabled={cloning}
+                              className="mt-0.5 h-4 w-4 rounded border-input accent-indigo-500"
+                            />
+                            <span>{t("builder_clone_confirm")}</span>
+                          </label>
+                          <Button
+                            onClick={() => void handleCloneClinic()}
+                            disabled={!cloneConfirmed || cloning}
+                            className="gap-2"
+                          >
+                            {cloning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Building2 className="h-4 w-4" />}
+                            {cloning ? t("builder_clone_loading") : t("builder_clone_submit")}
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          {/* ══════════════════════════════════════════════════════════════════
+              SUPPORT TAB
+             ══════════════════════════════════════════════════════════════════ */}
+          <TabsContent value="support" className="space-y-4 mt-4">
+            {/* Notification email card */}
+            <Card className="border-border">
+              <CardHeader className="pb-2">
+                <div className="flex items-center gap-2">
+                  <Mail className="h-4 w-4 text-indigo-400" />
+                  <CardTitle className="text-sm">{t("builder_support_email_title")}</CardTitle>
+                </div>
+                <CardDescription className="text-xs">
+                  {t("builder_support_email_description")}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-2">
+                <Label className="text-xs" htmlFor="support-email-input">
+                  {t("builder_support_email_label")}
+                </Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="support-email-input"
+                    type="email"
+                    value={supportEmailDraft}
+                    onChange={(e) => setSupportEmailDraft(e.target.value)}
+                    placeholder={t("builder_support_email_placeholder")}
+                    className="h-8 text-xs"
+                    data-testid="input-support-email"
+                  />
+                  <Button
+                    size="sm"
+                    onClick={() => void handleSaveSupportEmail()}
+                    disabled={savingSupportEmail}
+                    data-testid="btn-save-support-email"
+                  >
+                    {savingSupportEmail ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      t("builder_support_email_save")
+                    )}
+                  </Button>
+                </div>
+                <p className="text-[10px] text-muted-foreground">
+                  {t("builder_support_email_hint")}
+                </p>
+                {(!profile?.support_email || profile.support_email === "") && (
+                  <p className="text-xs text-muted-foreground" data-testid="support-email-fallback">
+                    {t("builder_support_email_fallback").replace("{email}", authEmail ?? "—")}
+                  </p>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Tickets list */}
+            <Card className="border-border">
+              <CardHeader className="pb-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <LifeBuoy className="h-4 w-4 text-indigo-400" />
+                    <CardTitle className="text-sm">{t("builder_support_title")}</CardTitle>
+                    <Badge variant="outline" className="text-[10px]">{tickets.length}</Badge>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    {(["open", "closed", "all"] as const).map((flt) => (
+                      <Button
+                        key={flt}
+                        size="sm"
+                        variant={ticketStatusFilter === flt ? "default" : "outline"}
+                        className="h-7 text-[11px] px-2"
+                        onClick={() => setTicketStatusFilter(flt)}
+                        data-testid={`btn-ticket-filter-${flt}`}
+                      >
+                        {flt === "all"
+                          ? t("builder_support_filter_all")
+                          : flt === "open"
+                            ? t("builder_support_filter_open")
+                            : t("builder_support_filter_closed")}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+                <CardDescription className="text-xs">
+                  {t("builder_support_description")}
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                {ticketsError && (
+                  <p className="text-xs text-destructive flex items-center gap-1.5 mb-2">
+                    <AlertTriangle className="h-3.5 w-3.5" /> {ticketsError}
+                  </p>
+                )}
+                {filteredTickets.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center py-10 text-center text-muted-foreground gap-2">
+                    <Inbox className="h-10 w-10 opacity-25" />
+                    <p className="text-sm font-medium" data-testid="support-empty">{t("builder_support_empty")}</p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {filteredTickets.map((ticket) => {
+                      const digits = (ticket.contact_phone ?? "").replace(/\D/g, "");
+                      const hasPhone = digits.length > 0;
+                      const isOpen = ticket.status === "open";
+                      const dateLabel = new Date(ticket.created_at).toLocaleString(
+                        locale === "pt" ? "pt-BR" : "en-US",
+                      );
+                      return (
+                        <div
+                          key={ticket.id}
+                          className="rounded-lg border border-border p-3 space-y-2"
+                          data-testid={`ticket-row-${ticket.id}`}
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="text-sm font-medium truncate">
+                                {ticket.clinic_name ?? "—"}
+                              </p>
+                              <p className="text-[10px] text-muted-foreground">
+                                {ticket.tipo} · {dateLabel}
+                              </p>
+                            </div>
+                            <Badge
+                              variant="outline"
+                              className={`text-[10px] ${
+                                isOpen
+                                  ? "border-amber-500/40 text-amber-400"
+                                  : "border-emerald-500/40 text-emerald-400"
+                              }`}
+                              data-testid={`ticket-status-${ticket.id}`}
+                            >
+                              {isOpen ? t("builder_support_status_open") : t("builder_support_status_closed")}
+                            </Badge>
+                          </div>
+                          <p className="text-xs text-foreground whitespace-pre-wrap break-words">
+                            {ticket.mensagem}
+                          </p>
+                          <div className="flex flex-wrap items-center gap-2 pt-1">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-7 text-xs gap-1.5"
+                              onClick={() => void handleToggleTicketStatus(ticket.id, ticket.status)}
+                              data-testid={`btn-ticket-toggle-${ticket.id}`}
+                            >
+                              {isOpen ? (
+                                <><CheckCircle2 className="h-3.5 w-3.5" /> {t("builder_support_action_resolve")}</>
+                              ) : (
+                                <><ToggleLeft className="h-3.5 w-3.5" /> {t("builder_support_action_reopen")}</>
+                              )}
+                            </Button>
+                            {hasPhone ? (
+                              <a
+                                href={`https://wa.me/${digits}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex h-7 items-center gap-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/5 px-2 text-xs text-emerald-400 hover:bg-emerald-500/10"
+                                data-testid={`link-ticket-whatsapp-${ticket.id}`}
+                              >
+                                <MessageCircle className="h-3.5 w-3.5" /> {t("builder_support_whatsapp")}
+                              </a>
+                            ) : (
+                              <span
+                                className="text-[10px] text-muted-foreground"
+                                data-testid={`ticket-whatsapp-hint-${ticket.id}`}
+                              >
+                                {t("builder_support_whatsapp_hint")}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
           </TabsContent>
       </Tabs>
       <PasswordChangeDialog
