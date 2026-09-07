@@ -856,6 +856,17 @@ _The read-only reviewer returns evidence; the invoking orchestrator appends a ti
 - **Entregáveis:** `.genie/wishes/rlhf-auditoria-humana/baseline-after.txt` (novo — suíte backend completa pós-wish), atualização deste bloco em `WISH.md`. Nenhum arquivo de aplicação foi tocado por este grupo.
 - **Task:** sem rastreio via `genie task` (mesmo motivo do Grupo 1); grupo rastreado só por este bloco.
 
+### Execution Review (agregado do wish inteiro) — 2026-09-07 — **SHIP**
+
+- **Reviewer (independente de todo engineer do wish):** `genie:reviewer` / opus, executado em snapshot isolado — worktree detached pinada no commit `6ab3aa8` (`/home/lorenzo/.genie/worktrees/neurostack-api-review-6ab3aa8-execgate`, removida ao final), para blindar o veredito contra o agente Codex concorrente que segue commitando na mesma branch compartilhada.
+- **Escopo coberto:** os 8 grupos (0–7) e as ~23 critérios de aceitação do wish, reamostrados por leitura direta de código (não apenas confiança nos blocos já registrados): migração `020` (FKs com `ondelete` explícito em todas, check constraint de `channel`, 3 índices), `src/models/rlhf_rating.py`/`rlhf_audit_review.py`, `src/api/routes/rlhf.py` (cadeia de três degraus de `subject_tenant_id`, `_analyze_rating_async` sem consulta própria por `message_id`, endpoint de parecer append-only com `require_super_admin`, gates de `reviewed`/`reviewed_count`/`review_history` por `is_super`), `tests/api/test_rlhf.py`, `tests/api/test_rlhf_review.py`, `tests/integration/test_rlhf_audit_postgres.py`, `frontend/.../rlhf-audit.tsx`, `trace-detail.tsx`, `trace-viewer.tsx`, `layout.tsx`.
+- **Validação re-executada de forma independente dentro do snapshot:** `poetry run pytest -q` → `2683 passed, 14 skipped, 0 failed` (idêntico ao `baseline-after.txt`); suíte frontend `194 passed`; typecheck limpo. Nota de processo: uma primeira tentativa dentro do worktree mostrou 10 falhas de `uazapi-parity` por um fixture não rastreado de OUTRO wish (`.genie/wishes/uazapi-parity/evidence/media-payload.json`, ausente no worktree porque `.genie/` é gitignored e esse arquivo nunca foi force-added); o reviewer diagnosticou a causa corretamente, restaurou o fixture e reproduziu a diferença vazia, confirmando que a árvore de trabalho principal (onde o Grupo 7 rodou) já continha o fixture e portanto seu resultado de `0 failed` já era correto.
+- **Verificação de escopo:** diff dos commits do wish restrito à lista de "Files to Create/Modify"; nenhuma mudança fora do escopo declarado.
+- **Verificação do Simplicity Case:** nenhum cache, sincronização, configuração nova ou abstração ausente do design aprovado foi introduzida.
+- **Achados não bloqueantes (todos LOW):** `RatingEntry` em `rlhf.py:62` segue como código morto documentado; comentário obsoleto `# PATCH /v1/rlhf/ratings/{event_id}` em `test_rlhf.py:1123` ainda usa o nome de parâmetro antigo; fallback literal `"unknown"` em `revisado_por_email` (`rlhf.py:1032`) é um edge case aceitável e documentado; `_analyze_rating_async` reconsulta a existência do `Tenant` para `clinic_tenant_id` mesmo o endpoint já tendo validado — duplicação inofensiva ligada ao próprio design de três degraus, não uma violação do Simplicity Case.
+- **Veredito: SHIP.** Zero gaps CRITICAL/HIGH/MEDIUM.
+- **Task:** sem rastreio via `genie task` (mesmo motivo do Grupo 1); wish rastreado só pelos blocos deste documento.
+
 ---
 
 ## Files to Create/Modify
