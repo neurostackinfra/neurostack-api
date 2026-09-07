@@ -26,6 +26,7 @@ from src.api.middleware.auth import (
 from src.llm import get_tenant_llm_client
 from src.models.builder import Builder
 from src.models.event import Event
+from src.models.rlhf_audit_review import RlhfAuditReview
 from src.models.rlhf_rating import RlhfRating
 from src.models.tenant import Tenant
 from src.models.user import User
@@ -75,6 +76,19 @@ class RatingEntry(BaseModel):
 
 class RatingActionRequest(BaseModel):
     action: Literal["approve", "ignore"]
+
+
+class RatingReviewRequest(BaseModel):
+    """Human verdict for a rating (append-only history).
+
+    ``revisado`` is the required verdict flag; ``observacao`` is optional
+    because marking a rating as reviewed with no additional comment is
+    itself a legitimate outcome. Every call inserts a new row in
+    ``rlhf_audit_reviews`` — there is no UPDATE or DELETE.
+    """
+
+    revisado: bool
+    observacao: Optional[str] = None
 
 
 # ============================================
@@ -889,3 +903,66 @@ async def update_rating_action(
         tenant.user_id,
     )
     return {"ok": True, "id": str(rating_id), "action": body.action}
+
+
+@router.post("/ratings/{rating_id}/review")
+async def submit_rating_review(
+    rating_id: UUID,
+    body: RatingReviewRequest,
+    tenant: TenantContext = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> dict[str, Any]:
+    """Record a human verdict on a rating (append-only history).
+
+    Super admin only. Every call inserts a new ``rlhf_audit_reviews`` row —
+    the endpoint never UPDATEs or DELETEs existing reviews, so the history
+    is complete. ``revisado_por_email`` is captured at write time from the
+    ``users`` row so authorship survives the associated user being deleted
+    (``revisado_por`` is SET NULL in that case, the email remains).
+    """
+    # 404 shape mirrors the PATCH handler above.
+    result = await session.execute(select(RlhfRating).where(RlhfRating.id == rating_id))
+    rating_row = result.scalar_one_or_none()
+    if rating_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Rating not found",
+        )
+
+    # Resolve reviewer email at write time so the audit trail survives the
+    # ``users`` row being deleted (revisado_por -> NULL, email stays).
+    # ``require_super_admin`` already guarantees an authenticated user, so
+    # the lookup miss is a truly exceptional/stale-token case — fall back
+    # to a literal placeholder rather than 500-ing an audit write.
+    reviewer_email: str = "unknown"
+    if tenant.user_id is not None:
+        email_result = await session.execute(
+            select(User.email).where(User.id == tenant.user_id)
+        )
+        found = email_result.scalar_one_or_none()
+        if found is not None:
+            reviewer_email = found
+
+    review = RlhfAuditReview(
+        rating_id=rating_id,
+        observacao=body.observacao,
+        revisado=body.revisado,
+        revisado_por=tenant.user_id,
+        revisado_por_email=reviewer_email,
+        revisado_em=datetime.now(timezone.utc),
+    )
+    session.add(review)
+    await session.commit()
+
+    logger.info(
+        "RLHF rating review: rating_id=%s revisado=%s by=%s",
+        rating_id,
+        body.revisado,
+        tenant.user_id,
+    )
+    return {
+        "ok": True,
+        "id": str(review.id),
+        "rating_id": str(rating_id),
+        "revisado": body.revisado,
+    }

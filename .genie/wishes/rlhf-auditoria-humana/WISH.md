@@ -805,6 +805,17 @@ _The read-only reviewer returns evidence; the invoking orchestrator appends a ti
 - **Entregáveis:** `frontend/artifacts/neurostack/src/pages/trace-detail.tsx` (resolução de `resolvedTenantId` via `useSearch`), `src/components/trace-viewer.tsx` (prop `clinicTenantId?: string | null`), `src/pages/chat.tsx` (encaminha `effectiveTenantId ?? null`), `src/components/layout.tsx` (`/rlhf-audit` movido de `roadmapItems` para `navItems`), `src/components/trace-viewer.test.tsx`, `src/components/layout.test.tsx`, `src/pages/trace-detail.test.tsx` (novo).
 - **Task:** sem rastreio via `genie task` (mesmo motivo do Grupo 1); grupo rastreado só por este bloco.
 
+### Execução — Group 3 — 2026-09-07 — **SHIP**
+
+- **Engineer:** `genie:engineer-standard` / opus (endpoint `POST /v1/rlhf/ratings/{id}/review`, schema `RatingReviewRequest`, `tests/api/test_rlhf_review.py`). O agente atingiu o limite de sessão antes de reportar de volta (interrompido em plena depuração de um problema de coerção de UUID no SQLite de teste) — sem auto-relato do engineer, então o orquestrador e o revisor verificaram o trabalho de forma independente a partir do diff.
+- **Reviewer (independente do engineer):** `genie:reviewer` / opus — **SHIP**. Confirmou os 6 critérios de aceitação com evidência de linha: `observacao` ausente/nulo grava com sucesso (`rlhf.py:91`, `:948`); segundo parecer com `revisado=false` insere linha nova em vez de UPDATE (só `session.add`+`commit` em `rlhf.py:954-955`, nenhum `update()`/`delete()` contra `RlhfAuditReview` no arquivo inteiro) e ambas as linhas sobrevivem (`test_rlhf_review.py:352,360`); tie-break determinístico por `id DESC` quando `revisado_em` empata, testado com dois `id`s ordenados propositalmente (`test_rlhf_review.py:369-430`); 403 para `builder`, `clinic_admin` **e** `investor` via teste parametrizado (`:204-207`), com prova de que o gate de auth roda antes do lookup 404 (UUID inexistente ainda 403 para papel errado); `revisado_por_email` resolvido por `SELECT User.email` real (`rlhf.py:938-944`, não lido de claim do JWT) e comprovadamente sobrevive a `revisado_por` anulado via UPDATE direto seguido de releitura em sessão nova (`test_rlhf_review.py:438-480`); 404 para `rating_id` inexistente (`rlhf.py:924-930`). Checagem de escopo: diff do arquivo é só 1 import + 1 schema + 1 endpoint nesta rodada — `list_ratings`, `_analyze_rating_async`, `_update_rating_status` e o PATCH seguem bit-a-bit idênticos ao Grupo 2; nenhum endpoint GET/histórico foi criado (reservado ao Grupo 4/6).
+- **Validação do orquestrador (re-executada, independente do relato do engineer):**
+  - `poetry run pytest tests/api/test_rlhf_review.py tests/api/test_rlhf.py -q` → `77 passed, 3 warnings` (0 regressão nos 68 testes pré-existentes do Grupo 2)
+  - `poetry run black --check src/api/routes/rlhf.py tests/api/test_rlhf_review.py` → 1 arquivo precisou de reformatação (`black` aplicado, depois `--check` limpo em ambos)
+  - `poetry run mypy src/api/routes/rlhf.py` → `Success: no issues found in 1 source file`
+- **Entregáveis:** `src/api/routes/rlhf.py` (import `RlhfAuditReview`, schema `RatingReviewRequest`, endpoint `submit_rating_review`), `tests/api/test_rlhf_review.py` (novo — 9 testes cobrindo auth, 404, append-only, tie-break e sobrevivência do e-mail).
+- **Task:** sem rastreio via `genie task` (mesmo motivo do Grupo 1); grupo rastreado só por este bloco.
+
 ---
 
 ## Files to Create/Modify
