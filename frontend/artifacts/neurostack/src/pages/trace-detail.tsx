@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { useParams, Link } from "wouter";
+import { useParams, useSearch, Link } from "wouter";
 import { TraceViewer } from "@/components/trace-viewer";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft, Clock, MessageSquare } from "lucide-react";
@@ -67,8 +67,21 @@ const INVESTOR_MOCK_TRACES: Record<string, any> = {
 export default function TraceDetail() {
   const params = useParams();
   const id = params.id as string;
+  const search = useSearch();
   const { t } = useI18n();
   const { isBuilder, isSuperAdmin, isInvestor, viewingClinicId } = useAuth();
+
+  // Resolve the tenant for this trace view. When the current user is a
+  // builder or super-admin, honor `?tenant_id=X` from the URL so opening a
+  // specific clinic's trace attributes actions (fetching + rating) to that
+  // clinic — even when a *different* clinic is selected in the header. For
+  // any other role the URL param is ignored and we fall back to the header's
+  // viewingClinicId (today's behavior).
+  const urlTenantId = new URLSearchParams(search).get("tenant_id");
+  const canOverrideTenant = isBuilder || isSuperAdmin;
+  const resolvedTenantId = canOverrideTenant && urlTenantId
+    ? urlTenantId
+    : viewingClinicId ?? null;
 
   const [trace, setTrace] = useState<ReturnType<typeof mapTrace> | null>(null);
   const [loading, setLoading] = useState(true);
@@ -90,7 +103,7 @@ export default function TraceDetail() {
       setLoadError(null);
       try {
         const token = getToken();
-        const tenantParam = (isBuilder || isSuperAdmin) && viewingClinicId ? `?tenant_id=${viewingClinicId}` : "";
+        const tenantParam = (isBuilder || isSuperAdmin) && resolvedTenantId ? `?tenant_id=${resolvedTenantId}` : "";
         const res = await fetch(`/v1/traces/${id}${tenantParam}`, {
           headers: token ? { Authorization: `Bearer ${token}` } : {},
         });
@@ -106,7 +119,7 @@ export default function TraceDetail() {
 
     void fetchTrace();
     return () => { cancelled = true; };
-  }, [id, isInvestor]);
+  }, [id, isInvestor, isBuilder, isSuperAdmin, resolvedTenantId]);
 
   if (loading) {
     return (
@@ -165,7 +178,7 @@ export default function TraceDetail() {
         </div>
       </div>
 
-      <TraceViewer trace={trace as any} />
+      <TraceViewer trace={trace as any} clinicTenantId={resolvedTenantId} />
     </div>
   );
 }

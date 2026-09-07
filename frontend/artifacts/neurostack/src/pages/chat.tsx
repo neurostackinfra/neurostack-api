@@ -626,7 +626,7 @@ export default function Chat() {
         <ScrollArea className="flex-1">
           <div className="p-4">
             {activeTrace ? (
-              <TraceViewer trace={activeTrace} />
+              <TraceViewer trace={activeTrace} clinicTenantId={effectiveTenantId ?? null} />
             ) : (
               <div className="h-full flex flex-col items-center justify-center text-muted-foreground pt-24 space-y-4">
                 <div className="w-16 h-16 border-2 border-dashed border-muted-foreground/30 rounded-full flex items-center justify-center">

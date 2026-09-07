@@ -621,6 +621,73 @@ describe("<Layout /> inactive queue navigation", () => {
   });
 });
 
+describe("<Layout /> RLHF audit navigation", () => {
+  it("renders /rlhf-audit as a regular nav item (no version badge) for super_admin", async () => {
+    setRole("super_admin");
+    mocks.auth.email = "admin@example.com";
+    mocks.auth.clinicId = "";
+    mocks.auth.viewingClinicId = "super-clinic-1";
+
+    renderLayout();
+    const link = await screen.findByTestId("nav-link-rlhf-audit");
+
+    // Must appear inside the top-level navItems <nav>, not under the Roadmap header.
+    const nav = link.closest("nav");
+    expect(nav).not.toBeNull();
+    const roadmapHeading = within(nav!).queryByText("Roadmap");
+    if (roadmapHeading) {
+      const roadmapHeader = roadmapHeading.parentElement!;
+      // The link must come *before* the Roadmap section header — i.e. not part of it.
+      expect(
+        link.compareDocumentPosition(roadmapHeader) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    }
+
+    // Nav items do not carry a version badge (v2 / v3 / slm) — roadmap items do.
+    expect(link.textContent).not.toMatch(/\bv2\b|\bv3\b|\bslm\b/i);
+  });
+
+  it("renders /rlhf-audit as a nav item for investor", async () => {
+    setRole("investor");
+    mocks.auth.email = "investor@example.com";
+    mocks.auth.clinicId = "investor-clinic";
+    mocks.auth.viewingClinicId = "investor-clinic";
+
+    renderLayout();
+
+    expect(
+      await screen.findByTestId("nav-link-rlhf-audit"),
+    ).toBeInTheDocument();
+  });
+
+  it("hides /rlhf-audit from clinic_admin and builder roles", async () => {
+    setRole("clinic_admin");
+    mocks.auth.email = "clinic-admin@example.com";
+    mocks.auth.clinicId = "clinic-admin-clinic";
+    mocks.auth.viewingClinicId = "clinic-admin-clinic";
+
+    renderLayout();
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+
+    expect(
+      screen.queryByTestId("nav-link-rlhf-audit"),
+    ).not.toBeInTheDocument();
+
+    cleanup();
+    setRole("builder");
+    mocks.auth.email = "builder@example.com";
+    mocks.auth.clinicId = "builder-hq";
+    mocks.auth.viewingClinicId = "builder-clinic-1";
+    renderLayout();
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+
+    expect(
+      screen.queryByTestId("nav-link-rlhf-audit"),
+    ).not.toBeInTheDocument();
+  });
+});
+
 describe("<Layout /> investor sales CTA", () => {
   it("renders one secure, styled English CTA in each mounted sidebar at the required position", async () => {
     setRole("investor");
