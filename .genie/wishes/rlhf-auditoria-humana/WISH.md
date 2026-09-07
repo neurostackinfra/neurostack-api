@@ -766,6 +766,23 @@ _The read-only reviewer returns evidence; the invoking orchestrator appends a ti
 - **Nenhum arquivo sob `src/` modificado por este grupo** — os diffs em `src/` no branch compartilhado são do agente Codex em paralelo e não tocam o call site de `_analyze_rating_async` do qual o teste novo depende.
 - **Task:** `t_mtqfubv00eec1ec6` → `done`
 
+### Execução — Group 1 — 2026-09-07 — **SHIP** (1 ciclo de correção)
+
+- **Engineer:** `genie:engineer-standard` (tabelas, migração `020`, `tests/integration/test_rlhf_audit_postgres.py`)
+- **Reviewer (1ª rodada) — FIX-FIRST:** achado confirmado em `alembic/versions/20260907_000001_020_rlhf_audit_tables.py`: uso de `sa.dialects.postgresql.UUID(as_uuid=True)` / `sa.dialects.postgresql.JSONB()` via `import sqlalchemy as sa` puro (11 + 1 sítios), que só resolve porque `alembic/env.py` importa `src.models` antes de rodar `upgrade()` — reproduzido o `AttributeError` sem esse efeito colateral. Convenção do repositório é o import explícito (`alembic/versions/20260501_000001_006_add_api_credentials.py:14`).
+- **Fixer:** adicionou `from sqlalchemy.dialects.postgresql import JSONB, UUID` e trocou os 12 sítios para `UUID(...)`/`JSONB()`; nenhuma outra linha tocada (colunas, constraints, índices e `downgrade()` idênticos).
+- **Reviewer (2ª rodada, agente independente do fixer) — SHIP:** confirmou zero ocorrências residuais de `sa.dialects.postgresql`; reproduziu import isolado do módulo de migração sem `src.models` pré-carregado (removendo `sqlalchemy.dialects.postgresql` de `sys.modules` antes de importar) sem `AttributeError`; reexecutou a suíte Postgres (12 passed, 0 skipped); confirmou `src/models/rlhf_rating.py` e `src/models/rlhf_audit_review.py` fora do escopo da correção.
+- **Validação do orquestrador (re-executada de ponta a ponta, banco dev real em `localhost:5434/neurostack`):**
+  - `POSTGRES_SMOKE_DATABASE_URL=...localhost:5434/postgres RLHF_DOWN_REVISION=019 poetry run pytest tests/integration/test_rlhf_audit_postgres.py -v -rs` → `12 passed, 3 warnings`, sem `skipped`
+  - `poetry run alembic upgrade head` → já em `020 (head)`
+  - `poetry run alembic downgrade 019` → `Running downgrade 020 -> 019` (sucesso, revisão explícita, nunca `-1`)
+  - `poetry run alembic upgrade head` → `Running upgrade 019 -> 020` (sucesso); `alembic current` confirma `020 (head)`
+  - `poetry run pytest tests/api/test_rlhf.py -q` → `54 passed, 3 warnings`
+  - `poetry run black --check src/models tests/integration/test_rlhf_audit_postgres.py` → `All done! 19 files would be left unchanged.`
+  - `poetry run mypy src/models` → `Success: no issues found in 18 source files`
+- **Entregáveis:** `src/models/rlhf_rating.py`, `src/models/rlhf_audit_review.py`, `src/models/__init__.py` (registro dos dois novos modelos), `alembic/versions/20260907_000001_020_rlhf_audit_tables.py` (`RLHF_DOWN_REVISION=019`), `tests/integration/test_rlhf_audit_postgres.py`.
+- **Task:** `genie task` indisponível nesta sessão (`.genie/genie.db` malformado, incompatibilidade WSL2/DrvFs suspeitada — reparo tentado e abandonado por ser infraestrutural, não bloqueante conforme a skill `work`); grupo rastreado só por este bloco.
+
 ---
 
 ## Files to Create/Modify

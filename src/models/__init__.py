@@ -7,19 +7,21 @@ This module exports all ORM models for database operations.
 
 from src.models.base import Base, TimestampMixin
 from src.models.builder import Builder
-from src.models.coupon import Coupon
-from src.models.tenant import Tenant, TenantConfig
 from src.models.clinic_config import ClinicConfig
 from src.models.clinic_config_table import ClinicConfigTable
-from src.models.session import Session
-from src.models.event import Event
-from src.models.policy import Policy
-from src.models.knowledge import KnowledgeDocument
-from src.models.handoff import HandoffRecord
-from src.models.user import User, UserRole
+from src.models.coupon import Coupon
 from src.models.demo_lead import DemoLead
+from src.models.event import Event
+from src.models.handoff import HandoffRecord
+from src.models.knowledge import KnowledgeDocument
+from src.models.policy import Policy
+from src.models.rlhf_audit_review import RlhfAuditReview
+from src.models.rlhf_rating import RlhfRating
+from src.models.session import Session
 from src.models.support_ticket import SupportTicket
+from src.models.tenant import Tenant, TenantConfig
 from src.models.transaction import Transaction
+from src.models.user import User, UserRole
 
 __all__ = [
     # Base
@@ -37,10 +39,11 @@ __all__ = [
     "Policy",
     "KnowledgeDocument",
     "HandoffRecord",
+    "RlhfRating",
+    "RlhfAuditReview",
     "User",
     "UserRole",
     "DemoLead",
     "SupportTicket",
     "Transaction",
 ]
-
