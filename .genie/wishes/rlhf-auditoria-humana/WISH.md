@@ -816,6 +816,17 @@ _The read-only reviewer returns evidence; the invoking orchestrator appends a ti
 - **Entregáveis:** `src/api/routes/rlhf.py` (import `RlhfAuditReview`, schema `RatingReviewRequest`, endpoint `submit_rating_review`), `tests/api/test_rlhf_review.py` (novo — 9 testes cobrindo auth, 404, append-only, tie-break e sobrevivência do e-mail).
 - **Task:** sem rastreio via `genie task` (mesmo motivo do Grupo 1); grupo rastreado só por este bloco.
 
+### Execução — Group 4 — 2026-09-07 — **SHIP**
+
+- **Engineer:** `genie:engineer-standard` / opus (filtros `channel`/`reviewed`, `reviewed_count`, serialização de parecer/histórico em `list_ratings`, tudo em `src/api/routes/rlhf.py` + `tests/api/test_rlhf.py`). Auto-relato completo e íntegro desta vez — verificado de forma independente mesmo assim.
+- **Reviewer (independente do engineer):** `genie:reviewer` / opus — **SHIP**. Confirmou as 14 evidências com linha: `channel` estreita `summary` mas preserva `facets` idênticos (facets no passo 3, antes do estreitamento — `rlhf.py:761-790` vs `:807-813`); `channel=unknown` devolve não classificadas; `builder`/`clinic_admin` recebem o recorte de canal mas continuam ignorando `tenant_id`/`builder_id`/`reviewed`; `reviewed=false` usa genuinamente o degrau MAIS RECENTE (teste deliberado com uma nota tendo 2 pareceres — mais antigo `revisado=true`, mais novo `revisado=false` — confirmando que a redução por `ORDER BY rating_id, revisado_em DESC, id DESC` decide corretamente, não um seed raso de 1 parecer só); `reviewed_count` e `accepted_count` compartilham o mesmo portão `_row_has_reason` (`rlhf.py:879-889`), tornando divergência estruturalmente impossível; parecer sem motivo não move `reviewed_count`, saturar leva ao total exibível; `entries[].id` é o mesmo `rlhf_ratings.id` do PATCH/review; ausência real das chaves `review_history`/`reviewed_count` para não-super (testado por `not in`, não por `is None`); consulta de parecer roda em lote (1 query, `<=6` mesmo com 20 notas × 2 pareceres = 40 linhas) e só dispara quando `is_super` (sem trabalho desperdiçado); isolamento por tenant, mascaramento de carteirinha e o PATCH do Grupo 2 seguem intactos; nenhuma `DISTINCT ON` ou função de janela. Achados não bloqueantes: notas de super_admin sem parecer emitem `review_history: []` em vez de omitir a chave (documentar para o Grupo 6 tratar `[]` como "sem parecer"); o teste de contagem de consultas mede em N fixo (20) em vez de comparar dois N — suficiente para pegar regressão real, mas não o padrão mais forte possível.
+- **Validação do orquestrador (re-executada, independente do relato do engineer):**
+  - `poetry run pytest tests/api/test_rlhf.py tests/api/test_rlhf_review.py -q` → `93 passed, 3 warnings` (77 pré-existentes + 16 novos, 0 regressão)
+  - `poetry run black --check src/api/routes/rlhf.py tests/api/test_rlhf.py` → `All done! 2 files would be left unchanged.`
+  - `poetry run mypy src/api/routes/rlhf.py` → `Success: no issues found in 1 source file`
+- **Entregáveis:** `src/api/routes/rlhf.py` (`list_ratings` com `channel`/`reviewed`, passo 4b de resolução em lote de parecer/histórico, `reviewed_count`, `_serialize_rating_event` com `review_history` opcional), `tests/api/test_rlhf.py` (16 testes novos cobrindo cada critério, incluindo o teste de contagem de consultas seguindo o padrão já existente em `:2690-2735`).
+- **Task:** sem rastreio via `genie task` (mesmo motivo do Grupo 1); grupo rastreado só por este bloco.
+
 ---
 
 ## Files to Create/Modify

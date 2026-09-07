@@ -563,6 +563,7 @@ def _serialize_rating_event(
     row: RlhfRating,
     tenant_map: Optional[dict[UUID, tuple[str, Optional[UUID], Optional[str]]]] = None,
     accepted_email_map: Optional[dict[UUID, str]] = None,
+    review_history: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Serialize a ``RlhfRating`` row for the audit-report entries list.
 
@@ -603,7 +604,7 @@ def _serialize_rating_event(
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.isoformat()
 
-    return {
+    payload: dict[str, Any] = {
         "id": str(row.id),
         "ts": _iso_utc(row.created_at) or "",
         "tenant_id": str(row.tenant_id),
@@ -631,6 +632,12 @@ def _serialize_rating_event(
             str(row.trace_tenant_id) if row.trace_tenant_id is not None else None
         ),
     }
+    # Group 4: parecer/history is super_admin-only. Callers pass ``None`` for
+    # non-super callers so the key is entirely absent from the JSON (not
+    # ``null``) — Group 6 derives current review state from the first entry.
+    if review_history is not None:
+        payload["review_history"] = review_history
+    return payload
 
 
 @router.get("/ratings")
@@ -645,6 +652,8 @@ async def list_ratings(
     ),
     only_accepted: bool = Query(False),
     only_with_reason: bool = Query(False),
+    channel: Optional[str] = Query(None),
+    reviewed: Optional[bool] = Query(None),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     tenant: TenantContext = Depends(get_tenant_context),
@@ -669,11 +678,23 @@ async def list_ratings(
        subject tenants seen (2 queries total, never N+1).
     3. Facets are computed BEFORE any builder/clinic narrowing, so selecting
        a builder in the panel does not shrink its own dropdown.
-    4. Builder/clinic narrowing matches `subject_tenant_id` with a fallback to
-       `Event.tenant_id` for rows that predate Group 3.
-    5. Summary is computed over the result of step 4.
-    6. `only_accepted` and `only_with_reason` filter entries only — they do
-       not change the summary or facets.
+    4. `channel` narrows the cut for ALL roles; `builder_id`/`tenant_id`
+       narrowing applies to `super_admin` only, matched against
+       `subject_tenant_id`. Non-super callers silently ignore
+       `tenant_id`/`builder_id`/`reviewed` (their tenant isolation lives in
+       step 1's WHERE clause), and `channel` is the one exception that
+       applies universally.
+    4b. `super_admin` only: batched load of every `rlhf_audit_reviews` row for
+        the ratings in the cut, ordered `rating_id, revisado_em DESC, id DESC`
+        so the head of each per-rating list is the current review state.
+        Exactly ONE query, reduced in Python — no `DISTINCT ON` and no window
+        function so SQLite and Postgres behave identically.
+    5. Summary is computed over the result of step 4. `reviewed_count` is
+       included only for `super_admin` and uses the same denominator as
+       `accepted_count` (rows with a qualifying reason whose current review
+       state is `revisado=True`).
+    6. `only_accepted`, `only_with_reason`, and `reviewed` (super_admin only)
+       filter entries only — they do not change the summary or facets.
     7. `limit`/`offset` slice AFTER step 6 so pagination never returns
        incomplete pages silently.
     """
@@ -682,8 +703,8 @@ async def list_ratings(
     # -- Step 1: SQL filters on real columns only --------------------------
     # Group 2: the row source moved from ``events`` (filtered by
     # ``event_type='rlhf.rating'``) to the dedicated ``rlhf_ratings`` table.
-    # No new panel filters are wired here — ``channel`` and ``reviewed``
-    # narrowing belong to Group 4.
+    # ``channel`` and ``reviewed`` are Python-side narrowing in step 4 / 6
+    # (Group 4) so facets are still computed over the un-narrowed cut.
     stmt = select(RlhfRating)
 
     if not is_super:
@@ -780,10 +801,62 @@ async def list_ratings(
                 return False
         return True
 
+    # ``channel`` is the one narrowing that applies to every role — non-super
+    # callers pick their WhatsApp/simulator/web slice too. ``tenant_id`` and
+    # ``builder_id`` stay super_admin-only (see docstring step 4).
+    def _matches_channel(r: RlhfRating) -> bool:
+        return channel is None or r.channel == channel
+
     if not is_super:
-        cut: list[RlhfRating] = list(ratings_rows)
+        cut: list[RlhfRating] = [r for r in ratings_rows if _matches_channel(r)]
     else:
-        cut = [r for r in ratings_rows if _matches_narrowing(r)]
+        cut = [r for r in ratings_rows if _matches_channel(r) and _matches_narrowing(r)]
+
+    # -- Step 4b: super_admin — batched review history for the cut ---------
+    # ORDER BY rating_id, revisado_em DESC, id DESC — iterating the single
+    # result set and appending via ``setdefault(...).append(...)`` yields each
+    # rating's reviews newest-first, so ``review_history_map[rid][0]`` is the
+    # current state. Deliberately no ``DISTINCT ON`` and no window function
+    # (SQLite/Postgres portability, per wish Group 4 contract).
+    review_history_map: dict[UUID, list[dict[str, Any]]] = {}
+    if is_super:
+        rating_ids = {r.id for r in cut}
+        if rating_ids:
+            reviews_result = await session.execute(
+                select(RlhfAuditReview)
+                .where(RlhfAuditReview.rating_id.in_(rating_ids))
+                .order_by(
+                    RlhfAuditReview.rating_id,
+                    RlhfAuditReview.revisado_em.desc(),
+                    RlhfAuditReview.id.desc(),
+                )
+            )
+
+            def _review_iso_utc(dt: Optional[datetime]) -> Optional[str]:
+                if dt is None:
+                    return None
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.isoformat()
+
+            for review_row in reviews_result.scalars().all():
+                review_history_map.setdefault(review_row.rating_id, []).append(
+                    {
+                        "observacao": review_row.observacao,
+                        "revisado": bool(review_row.revisado),
+                        "revisado_por_email": review_row.revisado_por_email,
+                        "revisado_em": _review_iso_utc(review_row.revisado_em),
+                    }
+                )
+
+    def _current_reviewed_state(r: RlhfRating) -> Optional[bool]:
+        """Return the current ``revisado`` verdict for a rating, or ``None``
+        when no review row exists. Only meaningful under ``is_super`` because
+        ``review_history_map`` is populated only in that branch."""
+        history = review_history_map.get(r.id)
+        if not history:
+            return None
+        return bool(history[0]["revisado"])
 
     # -- Step 5: summary over the cut (before only_* toggles) --------------
     def _row_has_reason(r: RlhfRating) -> bool:
@@ -796,29 +869,48 @@ async def list_ratings(
     total = 0
     rating_sum = 0
     accepted_count = 0
+    reviewed_count = 0
     for r in cut:
         rating_value = int(r.rating)
         if 1 <= rating_value <= 5:
             distribution[str(rating_value)] += 1
             total += 1
             rating_sum += rating_value
-        if _is_accepted(r) and _row_has_reason(r):
-            accepted_count += 1
+        if _row_has_reason(r):
+            if _is_accepted(r):
+                accepted_count += 1
+            # Same denominator as ``accepted_count`` — a rating only counts
+            # toward ``reviewed_count`` when it BOTH has a qualifying reason
+            # AND its current review verdict is ``revisado=True``. Non-super
+            # never reaches this branch (``_current_reviewed_state`` returns
+            # ``None`` when the map is empty), but gate on ``is_super``
+            # explicitly so the intent is unambiguous.
+            if is_super and _current_reviewed_state(r) is True:
+                reviewed_count += 1
 
     average = round(rating_sum / total, 1) if total > 0 else 0.0
-    summary = {
+    summary: dict[str, Any] = {
         "total": total,
         "average": average,
         "accepted_count": accepted_count,
         "distribution": distribution,
     }
+    if is_super:
+        summary["reviewed_count"] = reviewed_count
 
-    # -- Step 6: only_accepted / only_with_reason (entries only) -----------
+    # -- Step 6: only_accepted / only_with_reason / reviewed (entries only) -
     filtered = cut
     if only_accepted:
         filtered = [r for r in filtered if _is_accepted(r)]
     if only_with_reason:
         filtered = [r for r in filtered if _row_has_reason(r)]
+    if reviewed is not None and is_super:
+        if reviewed:
+            # reviewed=true: keep rows whose CURRENT verdict is True.
+            filtered = [r for r in filtered if _current_reviewed_state(r) is True]
+        else:
+            # reviewed=false: keep rows with no history OR current=False.
+            filtered = [r for r in filtered if _current_reviewed_state(r) is not True]
 
     # -- Step 7: paginate AFTER filtering ----------------------------------
     page = filtered[offset : offset + limit]
@@ -836,7 +928,10 @@ async def list_ratings(
 
     entries = [
         _serialize_rating_event(
-            r, tenant_map=tenant_map, accepted_email_map=accepted_email_map
+            r,
+            tenant_map=tenant_map,
+            accepted_email_map=accepted_email_map,
+            review_history=(review_history_map.get(r.id, []) if is_super else None),
         )
         for r in page
     ]

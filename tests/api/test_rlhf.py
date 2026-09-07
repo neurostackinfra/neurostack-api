@@ -18,6 +18,7 @@ from sqlalchemy import select
 
 from src.config.settings import settings
 from src.models.event import Event
+from src.models.rlhf_audit_review import RlhfAuditReview
 from src.models.rlhf_rating import RlhfRating
 from src.models.tenant import Tenant
 from src.repositories import get_db_session
@@ -1986,6 +1987,7 @@ async def _seed_rating_event(
     accepted_by: UUID | None = None,
     accepted_at: str | None = None,
     created_at: datetime | None = None,
+    channel: str = "unknown",
 ) -> None:
     """Insert a ``rlhf_ratings`` row directly, bypassing the endpoint.
 
@@ -2017,7 +2019,7 @@ async def _seed_rating_event(
             message_id=f"seed-{event_id.hex[:8]}",
             trace_event_id=None,
             trace_tenant_id=None,
-            channel="unknown",
+            channel=channel,
             rating=rating,
             reason=reason,
             agent_response="resp",
@@ -2799,3 +2801,642 @@ class TestRlhfLoaderNeverSeesMultimodalBundle:
         serialized = json.dumps(result)
         assert "MULTIMODAL-KEY-MUST-NOT-LEAK" not in serialized
         assert "TTS-KEY-MUST-NOT-LEAK" not in serialized
+
+
+# ============================================
+# Group 4: channel filter, reviewed filter, parecer/history, reviewed_count
+# ============================================
+
+
+async def _seed_review(
+    *,
+    rating_id: UUID,
+    revisado: bool,
+    revisado_por_email: str = "reviewer@test.com",
+    observacao: str | None = None,
+    revisado_em: datetime | None = None,
+    review_id: UUID | None = None,
+) -> UUID:
+    """Insert a single ``rlhf_audit_reviews`` row directly.
+
+    Mirrors the local-helper convention established in Group 3
+    (``tests/api/test_rlhf_review.py``); replicated here rather than imported
+    across test files, per the repo's per-file-local-helper convention.
+    """
+    row_id = review_id if review_id is not None else uuid4()
+    ts = revisado_em if revisado_em is not None else datetime.now(timezone.utc)
+    session = get_db_session()
+    try:
+        session.add(
+            RlhfAuditReview(
+                id=row_id,
+                rating_id=rating_id,
+                observacao=observacao,
+                revisado=revisado,
+                revisado_por=None,
+                revisado_por_email=revisado_por_email,
+                revisado_em=ts,
+            )
+        )
+        await session.commit()
+    finally:
+        await session.close()
+    return row_id
+
+
+class TestListRatingsChannelFilter:
+    """`channel` narrows the cut for every role but never touches facets."""
+
+    def test_channel_filter_narrows_summary_but_leaves_facets_unchanged(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        builder_id = uuid4()
+        subj_wa = uuid4()
+        subj_sim = uuid4()
+        client._submit(_seed_builder(builder_id, "Builder X"))
+        client._submit(_seed_tenant_full(subj_wa, "Clinic WA", builder_id=builder_id))
+        client._submit(_seed_tenant_full(subj_sim, "Clinic Sim", builder_id=builder_id))
+        for _ in range(3):
+            client._submit(
+                _seed_rating_event(
+                    event_id=uuid4(),
+                    tenant_id=TEST_TENANT_ID,
+                    rating=4,
+                    subject_tenant_id=subj_wa,
+                    channel="whatsapp",
+                )
+            )
+        for _ in range(2):
+            client._submit(
+                _seed_rating_event(
+                    event_id=uuid4(),
+                    tenant_id=TEST_TENANT_ID,
+                    rating=5,
+                    subject_tenant_id=subj_sim,
+                    channel="web",
+                )
+            )
+
+        # Baseline: no channel filter.
+        base = client.get(
+            f"/v1/rlhf/ratings?builder_id={builder_id}",
+            headers=super_admin_headers,
+        ).json()
+        base_facets = base["facets"]
+        base_total = base["summary"]["total"]
+        assert base_total >= 5
+
+        # WhatsApp cut: summary narrows to the 3 wa rows for this builder,
+        # facets stay identical (facets are step 3, before narrowing).
+        wa = client.get(
+            f"/v1/rlhf/ratings?builder_id={builder_id}&channel=whatsapp",
+            headers=super_admin_headers,
+        ).json()
+        assert wa["summary"]["total"] == 3
+        assert wa["summary"]["total"] < base_total
+        assert wa["facets"] == base_facets
+
+    def test_channel_unknown_returns_unclassified_ratings(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        subj = uuid4()
+        client._submit(_seed_tenant_full(subj, "Unknown Subject"))
+        # Default channel from _seed_rating_event is "unknown".
+        for _ in range(2):
+            client._submit(
+                _seed_rating_event(
+                    event_id=uuid4(),
+                    tenant_id=TEST_TENANT_ID,
+                    rating=3,
+                    subject_tenant_id=subj,
+                )
+            )
+        # Also a whatsapp row that must be excluded.
+        client._submit(
+            _seed_rating_event(
+                event_id=uuid4(),
+                tenant_id=TEST_TENANT_ID,
+                rating=3,
+                subject_tenant_id=subj,
+                channel="whatsapp",
+            )
+        )
+        response = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subj}&channel=unknown",
+            headers=super_admin_headers,
+        )
+        body = response.json()
+        assert body["summary"]["total"] == 2
+        assert all(e["channel"] == "unknown" for e in body["entries"])
+
+    def test_channel_applies_to_non_super_caller(
+        self, client: TestClient, clinic_admin_headers
+    ) -> None:
+        """A clinic_admin with ratings across multiple channels gets the
+        channel narrowing applied (the one narrowing that is universal)."""
+        for _ in range(4):
+            client._submit(
+                _seed_rating_event(
+                    event_id=uuid4(),
+                    tenant_id=TEST_TENANT_ID,
+                    rating=4,
+                    subject_tenant_id=TEST_TENANT_ID,
+                    channel="whatsapp",
+                )
+            )
+        for _ in range(2):
+            client._submit(
+                _seed_rating_event(
+                    event_id=uuid4(),
+                    tenant_id=TEST_TENANT_ID,
+                    rating=5,
+                    subject_tenant_id=TEST_TENANT_ID,
+                    channel="web",
+                )
+            )
+
+        wa = client.get(
+            "/v1/rlhf/ratings?channel=whatsapp", headers=clinic_admin_headers
+        ).json()
+        assert all(e["channel"] == "whatsapp" for e in wa["entries"])
+        # At least the 4 seeded, possibly more from prior tests but never zero.
+        assert wa["summary"]["total"] >= 4
+        # No web rows leak into a whatsapp-only cut.
+        web_only = client.get(
+            "/v1/rlhf/ratings?channel=web", headers=clinic_admin_headers
+        ).json()
+        assert all(e["channel"] == "web" for e in web_only["entries"])
+
+    def test_non_super_ignores_tenant_builder_reviewed_filters(
+        self, client: TestClient, clinic_admin_headers
+    ) -> None:
+        """A clinic_admin has ``tenant_id``, ``builder_id`` and ``reviewed``
+        silently ignored — only ``channel`` narrows for them."""
+        foreign_subject = uuid4()
+        foreign_builder = uuid4()
+        client._submit(_seed_builder(foreign_builder, "Foreign B"))
+        client._submit(
+            _seed_tenant_full(foreign_subject, "Foreign", builder_id=foreign_builder)
+        )
+        client._submit(
+            _seed_rating_event(
+                event_id=uuid4(),
+                tenant_id=TEST_TENANT_ID,
+                rating=2,
+                reason="motivo forte suficiente",
+                subject_tenant_id=TEST_TENANT_ID,
+            )
+        )
+        # Filter attempts on foreign facets must be ignored (still returns
+        # only rows the caller owns).
+        response = client.get(
+            f"/v1/rlhf/ratings?tenant_id={foreign_subject}"
+            f"&builder_id={foreign_builder}&reviewed=true",
+            headers=clinic_admin_headers,
+        )
+        assert response.status_code == 200
+        entries = response.json()["entries"]
+        # Every returned row belongs to the caller's own tenant.
+        assert all(e["tenant_id"] == str(TEST_TENANT_ID) for e in entries)
+
+
+class TestListRatingsReviewedFilter:
+    """`reviewed` (super_admin only) filters entries only — summary/facets
+    are still computed over the full cut (mirrors only_accepted/only_with_reason)."""
+
+    def test_reviewed_false_returns_norev_and_current_false(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        subj = uuid4()
+        client._submit(_seed_tenant_full(subj, "Reviewed False Subject"))
+        # r1: no review at all.
+        r1 = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=r1,
+                tenant_id=TEST_TENANT_ID,
+                rating=2,
+                reason="motivo suficientemente longo",
+                subject_tenant_id=subj,
+            )
+        )
+        # r2: current review is revisado=False (flipped from True).
+        r2 = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=r2,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="motivo mais um pouco",
+                subject_tenant_id=subj,
+            )
+        )
+        older = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
+        newer = datetime(2026, 1, 2, 10, 0, 0, tzinfo=timezone.utc)
+        client._submit(_seed_review(rating_id=r2, revisado=True, revisado_em=older))
+        client._submit(_seed_review(rating_id=r2, revisado=False, revisado_em=newer))
+        # r3: current review is True — must be excluded from reviewed=false.
+        r3 = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=r3,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="terceiro motivo forte",
+                subject_tenant_id=subj,
+            )
+        )
+        client._submit(_seed_review(rating_id=r3, revisado=True))
+
+        base = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subj}",
+            headers=super_admin_headers,
+        ).json()
+        cut = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subj}&reviewed=false",
+            headers=super_admin_headers,
+        ).json()
+        # Summary and facets untouched by reviewed=false (step-6 semantics).
+        assert cut["summary"] == base["summary"]
+        assert cut["facets"] == base["facets"]
+        entry_ids = {e["id"] for e in cut["entries"]}
+        assert str(r1) in entry_ids
+        assert str(r2) in entry_ids
+        assert str(r3) not in entry_ids
+
+    def test_reviewed_true_returns_only_current_true(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        subj = uuid4()
+        client._submit(_seed_tenant_full(subj, "Reviewed True Subject"))
+        r_yes = uuid4()
+        r_no = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=r_yes,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="motivo forte suficiente",
+                subject_tenant_id=subj,
+            )
+        )
+        client._submit(
+            _seed_rating_event(
+                event_id=r_no,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="outro motivo forte suficiente",
+                subject_tenant_id=subj,
+            )
+        )
+        client._submit(_seed_review(rating_id=r_yes, revisado=True))
+
+        response = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subj}&reviewed=true",
+            headers=super_admin_headers,
+        )
+        entry_ids = {e["id"] for e in response.json()["entries"]}
+        assert str(r_yes) in entry_ids
+        assert str(r_no) not in entry_ids
+
+
+class TestListRatingsReviewedCount:
+    """`reviewed_count` = rows whose current review verdict is True AND
+    which have a qualifying reason (same denominator as `accepted_count`)."""
+
+    def test_reviewed_count_ignores_reasonless_reviewed_rows(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        subj = uuid4()
+        client._submit(_seed_tenant_full(subj, "Count Subject"))
+        # Reasonless rating with a True review — must NOT count.
+        r_no_reason = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=r_no_reason,
+                tenant_id=TEST_TENANT_ID,
+                rating=4,
+                reason=None,
+                subject_tenant_id=subj,
+            )
+        )
+        client._submit(_seed_review(rating_id=r_no_reason, revisado=True))
+        # With-reason rating with a True review — MUST count.
+        r_with_reason = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=r_with_reason,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="motivo bem grande para contar",
+                subject_tenant_id=subj,
+            )
+        )
+        client._submit(_seed_review(rating_id=r_with_reason, revisado=True))
+        # With-reason unreviewed — must not count.
+        r_unreviewed = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=r_unreviewed,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="motivo outro sem review",
+                subject_tenant_id=subj,
+            )
+        )
+
+        body = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subj}",
+            headers=super_admin_headers,
+        ).json()
+        assert body["summary"]["reviewed_count"] == 1
+
+    def test_reviewing_every_qualifying_row_saturates_reviewed_count(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        subj = uuid4()
+        client._submit(_seed_tenant_full(subj, "Saturation Subject"))
+        rating_ids = []
+        for _ in range(3):
+            rid = uuid4()
+            client._submit(
+                _seed_rating_event(
+                    event_id=rid,
+                    tenant_id=TEST_TENANT_ID,
+                    rating=1,
+                    reason="motivo qualificado longo o bastante",
+                    subject_tenant_id=subj,
+                )
+            )
+            rating_ids.append(rid)
+        for rid in rating_ids:
+            client._submit(_seed_review(rating_id=rid, revisado=True))
+
+        body = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subj}",
+            headers=super_admin_headers,
+        ).json()
+        # All 3 qualifying rows reviewed => reviewed_count == 3.
+        assert body["summary"]["reviewed_count"] == 3
+
+    def test_reviewed_count_absent_for_non_super(
+        self, client: TestClient, clinic_admin_headers, api_key_headers
+    ) -> None:
+        body_admin = client.get("/v1/rlhf/ratings", headers=clinic_admin_headers).json()
+        body_apikey = client.get("/v1/rlhf/ratings", headers=api_key_headers).json()
+        assert "reviewed_count" not in body_admin["summary"]
+        assert "reviewed_count" not in body_apikey["summary"]
+
+
+class TestListRatingsReviewHistorySerialization:
+    """`review_history` is emitted only for super_admin and only when the
+    caller passes a non-None list — assert the KEY is absent (not null) for
+    other roles, per the wish contract."""
+
+    def test_super_admin_receives_review_history_ordered_current_first(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        subj = uuid4()
+        client._submit(_seed_tenant_full(subj, "History Subject"))
+        rid = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=rid,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="motivo qualificado suficiente",
+                subject_tenant_id=subj,
+            )
+        )
+        older = datetime(2026, 3, 1, 10, 0, 0, tzinfo=timezone.utc)
+        newer = datetime(2026, 3, 2, 10, 0, 0, tzinfo=timezone.utc)
+        client._submit(
+            _seed_review(
+                rating_id=rid,
+                revisado=True,
+                revisado_em=older,
+                observacao="primeiro",
+            )
+        )
+        client._submit(
+            _seed_review(
+                rating_id=rid,
+                revisado=False,
+                revisado_em=newer,
+                observacao="segundo",
+            )
+        )
+
+        body = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subj}",
+            headers=super_admin_headers,
+        ).json()
+        target = [e for e in body["entries"] if e["id"] == str(rid)]
+        assert len(target) == 1
+        history = target[0]["review_history"]
+        assert isinstance(history, list) and len(history) == 2
+        # Newest-first: current state is at index 0.
+        assert history[0]["revisado"] is False
+        assert history[0]["observacao"] == "segundo"
+        assert history[1]["revisado"] is True
+        assert history[1]["observacao"] == "primeiro"
+        # ISO-UTC round-trip on revisado_em.
+        assert history[0]["revisado_em"] == newer.isoformat()
+        assert history[1]["revisado_em"] == older.isoformat()
+
+    def test_non_super_gets_no_review_history_key_or_reviewed_fields(
+        self, client: TestClient, clinic_admin_headers, api_key_headers
+    ) -> None:
+        rid = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=rid,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="motivo qualificado suficiente",
+                subject_tenant_id=TEST_TENANT_ID,
+            )
+        )
+        client._submit(_seed_review(rating_id=rid, revisado=True))
+
+        for headers in (clinic_admin_headers, api_key_headers):
+            body = client.get("/v1/rlhf/ratings", headers=headers).json()
+            # Absence of the KEY, not null — assert on the raw JSON body.
+            entries = body["entries"]
+            for e in entries:
+                assert "review_history" not in e
+                # Wish contract: no flattened reviewed/is_reviewed field either.
+                assert "reviewed" not in e
+                assert "is_reviewed" not in e
+            # Summary must not leak reviewed_count / observacao / authorship.
+            assert "reviewed_count" not in body["summary"]
+
+    def test_entry_id_equals_rlhf_ratings_id_used_by_patch(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        """`entries[].id` is the same UUID accepted by PATCH — no new id
+        scheme is introduced by Group 4."""
+        rid = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=rid,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="motivo qualificado suficiente",
+                subject_tenant_id=TEST_TENANT_ID,
+            )
+        )
+        body = client.get("/v1/rlhf/ratings", headers=super_admin_headers).json()
+        assert any(e["id"] == str(rid) for e in body["entries"])
+        # PATCH accepts the same UUID string.
+        patch = client.patch(
+            f"/v1/rlhf/ratings/{rid}",
+            headers=super_admin_headers,
+            json={"action": "ignore"},
+        )
+        assert patch.status_code == 200
+
+    def test_reason_and_message_still_have_carteirinha_masked(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        """The Group-2 masking of ``reason``/``agent_response``/``user_message``
+        survives the Group-4 serializer changes."""
+        # We seed a row whose reason contains a fake 15-digit carteirinha
+        # sequence — the existing ``mask_carteirinha`` helper must still fire.
+        subj = uuid4()
+        client._submit(_seed_tenant_full(subj, "Mask Subject"))
+        rid = uuid4()
+        # Use a payload that triggers the mask.
+        client._submit(
+            _seed_rating_event(
+                event_id=rid,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="carteirinha 123456789012345 aqui",
+                subject_tenant_id=subj,
+            )
+        )
+        body = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subj}",
+            headers=super_admin_headers,
+        ).json()
+        target = [e for e in body["entries"] if e["id"] == str(rid)]
+        assert target
+        # The literal 15-digit run must not appear in the serialized payload.
+        assert "123456789012345" not in target[0]["reason"]
+
+
+class TestListRatingsReviewHistoryQueryCount:
+    """A request with N ratings each carrying reviews must still issue a
+    query count independent of N (batched — one review-state query)."""
+
+    def test_review_history_batched_regardless_of_row_count(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        from sqlalchemy import event as sa_event
+
+        subj = uuid4()
+        client._submit(_seed_tenant_full(subj, "QC Subject"))
+        # 20 ratings, each with 2 reviews (40 review rows total).
+        rating_ids = []
+        for i in range(20):
+            rid = uuid4()
+            client._submit(
+                _seed_rating_event(
+                    event_id=rid,
+                    tenant_id=TEST_TENANT_ID,
+                    rating=(i % 5) + 1,
+                    reason="motivo qualificado suficiente",
+                    subject_tenant_id=subj,
+                )
+            )
+            rating_ids.append(rid)
+        for rid in rating_ids:
+            client._submit(_seed_review(rating_id=rid, revisado=True))
+            client._submit(_seed_review(rating_id=rid, revisado=False))
+
+        from src.repositories import get_db_engine
+
+        query_count = {"n": 0}
+
+        def _on_execute(conn, clauseelement, multiparams, params, execution_options):
+            query_count["n"] += 1
+
+        engine = get_db_engine().sync_engine
+        sa_event.listen(engine, "before_execute", _on_execute)
+        try:
+            response = client.get(
+                f"/v1/rlhf/ratings?tenant_id={subj}&limit=500",
+                headers=super_admin_headers,
+            )
+        finally:
+            sa_event.remove(engine, "before_execute", _on_execute)
+
+        assert response.status_code == 200
+        # Main SELECT + batched Tenant lookup + batched Builder lookup
+        # (skipped if no builders) + batched review-history query. Same
+        # generous headroom as the sibling batched-tenant test above.
+        assert (
+            query_count["n"] <= 6
+        ), f"expected batched (main+tenants+builders+reviews), got {query_count['n']}"
+
+
+class TestListRatingsTenantIsolationUnchanged:
+    """Group 4's filters must not weaken step-1 tenant isolation for non-super."""
+
+    def test_non_super_still_sees_only_own_rows_with_channel_filter(
+        self, client: TestClient, clinic_admin_headers
+    ) -> None:
+        foreign_owner = uuid4()
+        client._submit(_seed_tenant_full(foreign_owner, "Foreign QQ"))
+        foreign_id = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=foreign_id,
+                tenant_id=foreign_owner,
+                rating=3,
+                subject_tenant_id=foreign_owner,
+                channel="whatsapp",
+            )
+        )
+        # Caller's own row on the same channel.
+        own_id = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=own_id,
+                tenant_id=TEST_TENANT_ID,
+                rating=3,
+                subject_tenant_id=TEST_TENANT_ID,
+                channel="whatsapp",
+            )
+        )
+        response = client.get(
+            "/v1/rlhf/ratings?channel=whatsapp", headers=clinic_admin_headers
+        )
+        entry_ids = {e["id"] for e in response.json()["entries"]}
+        assert str(own_id) in entry_ids
+        assert str(foreign_id) not in entry_ids
+
+
+class TestListRatingsPatchStillGreen:
+    """Group-2 PATCH endpoint unaffected by Group 4 serializer/handler changes."""
+
+    def test_patch_ignore_after_group4_changes(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        rid = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=rid,
+                tenant_id=TEST_TENANT_ID,
+                rating=2,
+                reason="motivo suficientemente longo",
+                subject_tenant_id=TEST_TENANT_ID,
+            )
+        )
+        response = client.patch(
+            f"/v1/rlhf/ratings/{rid}",
+            headers=super_admin_headers,
+            json={"action": "ignore"},
+        )
+        assert response.status_code == 200
