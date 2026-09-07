@@ -838,6 +838,24 @@ _The read-only reviewer returns evidence; the invoking orchestrator appends a ti
 - **Entregáveis:** `frontend/artifacts/neurostack/src/pages/rlhf-audit.tsx` (tipos `ReviewHistoryRow`, extensão de `RatingEntry`/`RatingSummary`, dropdowns de canal/revisado, `TraceLink`, `ReviewPanel`, `FeedbackEntryCard` extraído, KPI `reviewed_count`, recorte por papel), `frontend/artifacts/neurostack/src/pages/rlhf-audit.test.tsx` (mocks de `@/context/auth` e `wouter`, fixtures estendidas, 9 testes novos + 6 pré-existentes intactos), `src/locales/en.ts` e `src/locales/pt.ts` (26 chaves `rlhf_audit_*` cada, paridade exata).
 - **Task:** sem rastreio via `genie task` (mesmo motivo do Grupo 1); grupo rastreado só por este bloco.
 
+### Execução — Group 7 — 2026-09-07 — **SHIP**
+
+- **Engineer:** nenhum — grupo sem entregável de código; executado diretamente pelo orquestrador via shell, conforme a tabela de papéis do skill `work` ("Quick validation: shell diretamente, sem subagent").
+- **Reviewer:** dispensado pelo mesmo motivo — não há diff de código para revisar; a evidência é a própria saída determinística dos comandos de validação, reproduzida abaixo na íntegra.
+- **Validação do orquestrador (execução direta, saída completa registrada):**
+  - `test -f .genie/wishes/rlhf-auditoria-humana/baseline-before.txt` → presente (169 linhas, colhido pelo Grupo 0).
+  - `poetry run pytest -q 2>&1 | tee .genie/wishes/rlhf-auditoria-humana/baseline-after.txt` → `2683 passed, 14 skipped, 48 warnings in 82.15s (0:01:22)`.
+  - Conjunto de falhas **antes** (baseline do Grupo 0, pré-existente e alheio a este wish):
+    - `FAILED tests/integration/test_knowledge_document_metadata.py::test_metadata_mutators_handle_preflush_default_and_malformed_values`
+    - `FAILED tests/integration/test_knowledge_document_metadata.py::test_metadata_mutators_persist_copy_on_write_after_reload`
+  - Conjunto de falhas **depois:** vazio (nenhuma linha `FAILED`).
+  - `diff <(...antes...) <(...depois...)` → só linhas `<` (as 2 falhas de antes, ausentes depois — corrigidas externamente, fora do escopo deste wish); nenhuma linha `>` (nenhuma falha nova). Diferença "depois menos antes" é vazia, conforme exigido.
+  - `pnpm --dir frontend/artifacts/neurostack run test` → `Test Files 23 passed (23)`, `Tests 194 passed (194)` (inclui os 15 de `rlhf-audit.test.tsx` do Grupo 6 e os 49 de `trace-viewer`/`layout`/`rating-block`/`trace-detail` do Grupo 5, todos já verificados isoladamente antes, agora confirmados juntos sem interferência cruzada).
+  - `pnpm --dir frontend/artifacts/neurostack run typecheck` → limpo, sem erros.
+  - `PORT=3001 BASE_PATH=/ pnpm --dir frontend/artifacts/neurostack run build` → `✓ 2804 modules transformed`, `built in 53.89s` (só avisos pré-existentes de sourcemap em componentes shadcn e de tamanho de chunk, sem relação com este wish; `PORT`/`BASE_PATH` exigidos pelo `vite.config.ts` do repo).
+- **Entregáveis:** `.genie/wishes/rlhf-auditoria-humana/baseline-after.txt` (novo — suíte backend completa pós-wish), atualização deste bloco em `WISH.md`. Nenhum arquivo de aplicação foi tocado por este grupo.
+- **Task:** sem rastreio via `genie task` (mesmo motivo do Grupo 1); grupo rastreado só por este bloco.
+
 ---
 
 ## Files to Create/Modify
