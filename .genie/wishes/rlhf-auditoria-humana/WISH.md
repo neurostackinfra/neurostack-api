@@ -795,6 +795,16 @@ _The read-only reviewer returns evidence; the invoking orchestrator appends a ti
 - **Entregáveis:** `src/api/routes/rlhf.py`, `tests/api/test_rlhf.py` — porte completo dos 4 consumidores de produção e dos 2 helpers de teste (34 pontos de chamada) para `rlhf_ratings`; resolução de canal/trace/`subject_tenant_id` em 3 degraus; `_update_rating_status` e `_analyze_rating_async` repontados; `event_id`→`rating_id` na resposta do POST; `RatingEntry` deixado como código morto documentado.
 - **Task:** sem rastreio via `genie task` (mesmo motivo do Grupo 1); grupo rastreado só por este bloco.
 
+### Execução — Group 5 — 2026-09-07 — **SHIP**
+
+- **Engineer:** `genie:engineer-standard` (prop `clinicTenantId` em `TraceViewer`/`RatingBlock`, resolução via `?tenant_id=` em `trace-detail.tsx`, promoção `/rlhf-audit` de `roadmapItems` para `navItems`).
+- **Reviewer (independente do engineer):** `genie:reviewer` — **SHIP**. Confirmou remoção total da leitura interna de `viewingClinicId` via `useAuth()` em `trace-viewer.tsx` (zero ocorrências residuais por grep), guarda `isBuilder || isSuperAdmin` antes de honrar o parâmetro de URL em `trace-detail.tsx` (clinic_admin sempre cai para `viewingClinicId`, nunca lê `?tenant_id=`), preservação do guard `isInvestor` que oculta `RatingBlock` por completo, e a promoção do item de navegação sem badge de versão restrita a `super_admin`/`investor`. Achado não bloqueante: a alegação do brief de dispatch de que `rating-block.test.tsx` já cobria o encaminhamento de `clinicTenantId` para o corpo da requisição estava incorreta — esse arquivo cobre apenas o limiar de 8 caracteres do motivo, não o efeito da prop na requisição; fora do escopo de arquivos de teste declarado no grupo, não afeta o veredito.
+- **Validação do orquestrador (re-executada, não apenas conferida):**
+  - `pnpm --dir frontend/artifacts/neurostack exec vitest run --config vitest.config.ts src/components/trace-viewer.test.tsx src/components/layout.test.tsx src/components/rating-block.test.tsx src/pages/trace-detail.test.tsx` → `49 passed`
+  - `pnpm --dir frontend/artifacts/neurostack run typecheck` → limpo, sem erros
+- **Entregáveis:** `frontend/artifacts/neurostack/src/pages/trace-detail.tsx` (resolução de `resolvedTenantId` via `useSearch`), `src/components/trace-viewer.tsx` (prop `clinicTenantId?: string | null`), `src/pages/chat.tsx` (encaminha `effectiveTenantId ?? null`), `src/components/layout.tsx` (`/rlhf-audit` movido de `roadmapItems` para `navItems`), `src/components/trace-viewer.test.tsx`, `src/components/layout.test.tsx`, `src/pages/trace-detail.test.tsx` (novo).
+- **Task:** sem rastreio via `genie task` (mesmo motivo do Grupo 1); grupo rastreado só por este bloco.
+
 ---
 
 ## Files to Create/Modify

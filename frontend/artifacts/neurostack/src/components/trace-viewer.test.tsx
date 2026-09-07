@@ -8,12 +8,21 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider, type Locale } from "@/context/i18n";
 import { IntentBadge, normalizeContextSource, TraceViewer } from "./trace-viewer";
 
+const authState = {
+  isSuperAdmin: false,
+  isInvestor: true,
+};
+
 vi.mock("@/context/auth", () => ({
-  useAuth: () => ({
-    isSuperAdmin: false,
-    isInvestor: true,
-    viewingClinicId: null,
-  }),
+  useAuth: () => authState,
+}));
+
+const ratingBlockCalls: Array<Record<string, unknown>> = [];
+vi.mock("@/components/rating-block", () => ({
+  RatingBlock: (props: Record<string, unknown>) => {
+    ratingBlockCalls.push(props);
+    return <div data-testid="rating-block-mock" data-clinic-tenant-id={String(props.clinicTenantId)} />;
+  },
 }));
 
 function contextItem(
@@ -54,11 +63,15 @@ function decisionTrace(selectedContext?: TraceContextItem[]): DecisionTrace {
 function renderViewer(
   selectedContext?: TraceContextItem[],
   locale: Locale = "en",
+  clinicTenantId?: string | null,
 ) {
   localStorage.setItem("ns_locale", locale);
   return render(
     <I18nProvider>
-      <TraceViewer trace={decisionTrace(selectedContext)} />
+      <TraceViewer
+        trace={decisionTrace(selectedContext)}
+        clinicTenantId={clinicTenantId}
+      />
     </I18nProvider>,
   );
 }
@@ -66,6 +79,9 @@ function renderViewer(
 afterEach(() => {
   cleanup();
   localStorage.clear();
+  ratingBlockCalls.length = 0;
+  authState.isSuperAdmin = false;
+  authState.isInvestor = true;
 });
 
 describe("<IntentBadge />", () => {
@@ -294,5 +310,39 @@ describe("<TraceViewer /> selected context", () => {
     expect(screen.getByText("RAG")).toBeInTheDocument();
     expect(screen.getByText("Clinic Config")).toBeInTheDocument();
     expect(screen.getAllByText("Not used")).toHaveLength(2);
+  });
+});
+
+describe("<TraceViewer /> rating tenant wiring", () => {
+  it("forwards the clinicTenantId prop to RatingBlock (not any header/auth value)", () => {
+    authState.isInvestor = false;
+    renderViewer(undefined, "en", "trace-tenant-xyz");
+
+    expect(ratingBlockCalls).toHaveLength(1);
+    expect(ratingBlockCalls[0].clinicTenantId).toBe("trace-tenant-xyz");
+    expect(screen.getByTestId("rating-block-mock")).toHaveAttribute(
+      "data-clinic-tenant-id",
+      "trace-tenant-xyz",
+    );
+  });
+
+  it("defaults clinicTenantId to null when the prop is omitted", () => {
+    authState.isInvestor = false;
+    render(
+      <I18nProvider>
+        <TraceViewer trace={decisionTrace()} />
+      </I18nProvider>,
+    );
+
+    expect(ratingBlockCalls).toHaveLength(1);
+    expect(ratingBlockCalls[0].clinicTenantId).toBeNull();
+  });
+
+  it("does not render the rating block for investors", () => {
+    authState.isInvestor = true;
+    renderViewer(undefined, "en", "trace-tenant-xyz");
+
+    expect(ratingBlockCalls).toHaveLength(0);
+    expect(screen.queryByTestId("rating-block-mock")).not.toBeInTheDocument();
   });
 });
