@@ -3,16 +3,24 @@ NeuroStack - SRM - Funnel Detector
 Detects and manages funnel stage transitions based on the 11-stage canonical funnel (MVP v0.5).
 """
 
-from typing import Any, Optional
+from typing import Optional, TypedDict
 
-from src.srm.models import FunnelStage, FunnelResult, IntentCategory
+from src.srm.models import FunnelResult, FunnelStage, IntentCategory
+
+
+class FunnelStageInfo(TypedDict, total=False):
+    """Metadata and allowed transitions for one funnel stage."""
+
+    description: str
+    next_stages: list[FunnelStage]
+    entry_conditions: list[str]
 
 
 # ============================================
 # Funnel Stage Definitions (11 etapas canônicas)
 # ============================================
 
-FUNNEL_STAGES: dict[FunnelStage, dict[str, Any]] = {
+FUNNEL_STAGES: dict[FunnelStage, FunnelStageInfo] = {
     FunnelStage.LEAD_NOVO: {
         "description": "Primeiro contato; verificar se já é paciente",
         "next_stages": [FunnelStage.EM_QUALIFICACAO, FunnelStage.PACIENTE_ATIVO],
@@ -40,7 +48,10 @@ FUNNEL_STAGES: dict[FunnelStage, dict[str, Any]] = {
     },
     FunnelStage.AGENDADO: {
         "description": "Pessoa confirmou agendamento",
-        "next_stages": [FunnelStage.POS_ATENDIMENTO, FunnelStage.AGENDAMENTO_SOLICITADO],
+        "next_stages": [
+            FunnelStage.POS_ATENDIMENTO,
+            FunnelStage.AGENDAMENTO_SOLICITADO,
+        ],
         "entry_conditions": ["confirmar_presenca", "agendamento_finalizado"],
     },
     FunnelStage.PACIENTE_ATIVO: {
@@ -87,37 +98,58 @@ TRANSITION_TRIGGERS: dict[tuple[FunnelStage, str], FunnelStage] = {
     (FunnelStage.LEAD_NOVO, "orcamento_existente"): FunnelStage.EM_QUALIFICACAO,
     (FunnelStage.LEAD_NOVO, "paciente_ativo"): FunnelStage.PACIENTE_ATIVO,
     (FunnelStage.LEAD_NOVO, "pos_atendimento_duvida"): FunnelStage.POS_ATENDIMENTO,
-    (FunnelStage.LEAD_NOVO, "pos_atendimento_sintomas_preocupantes"): FunnelStage.POS_ATENDIMENTO,
+    (
+        FunnelStage.LEAD_NOVO,
+        "pos_atendimento_sintomas_preocupantes",
+    ): FunnelStage.POS_ATENDIMENTO,
     (FunnelStage.LEAD_NOVO, "pedido_alterar_medicacao"): FunnelStage.POS_ATENDIMENTO,
     # lead_novo stays (info/admin intents — no transition needed, handled by default)
     # lead_novo -> paciente_ativo (já é paciente - por slot/flag ou intent direto)
     # em_qualificacao -> qualificado (quando qualificação completa, via slots/flags)
     (FunnelStage.EM_QUALIFICACAO, "agendar"): FunnelStage.AGENDAMENTO_SOLICITADO,
-    (FunnelStage.EM_QUALIFICACAO, "disponibilidade_horarios"): FunnelStage.EM_QUALIFICACAO,
+    (
+        FunnelStage.EM_QUALIFICACAO,
+        "disponibilidade_horarios",
+    ): FunnelStage.EM_QUALIFICACAO,
     # qualificado -> agendamento_solicitado
     (FunnelStage.QUALIFICADO, "agendar"): FunnelStage.AGENDAMENTO_SOLICITADO,
-    (FunnelStage.QUALIFICADO, "disponibilidade_horarios"): FunnelStage.AGENDAMENTO_SOLICITADO,
+    (
+        FunnelStage.QUALIFICADO,
+        "disponibilidade_horarios",
+    ): FunnelStage.AGENDAMENTO_SOLICITADO,
     (FunnelStage.QUALIFICADO, "objecao_vou_pensar"): FunnelStage.QUALIFICADO,
     # followup -> agendamento_solicitado
     (FunnelStage.FOLLOWUP, "agendar"): FunnelStage.AGENDAMENTO_SOLICITADO,
     (FunnelStage.FOLLOWUP, "interesse_tratamento"): FunnelStage.EM_QUALIFICACAO,
     # agendamento_solicitado -> agendado (confirmar que finalizou)
     (FunnelStage.AGENDAMENTO_SOLICITADO, "confirmar_presenca"): FunnelStage.AGENDADO,
-    (FunnelStage.AGENDAMENTO_SOLICITADO, "reagendar"): FunnelStage.AGENDAMENTO_SOLICITADO,
+    (
+        FunnelStage.AGENDAMENTO_SOLICITADO,
+        "reagendar",
+    ): FunnelStage.AGENDAMENTO_SOLICITADO,
     (FunnelStage.AGENDAMENTO_SOLICITADO, "cancelar"): FunnelStage.QUALIFICADO,
     # agendado -> pos_atendimento (quando "já foi atendido" - via flag/slot)
     (FunnelStage.AGENDADO, "confirmar_presenca"): FunnelStage.AGENDADO,
     (FunnelStage.AGENDADO, "reagendar"): FunnelStage.AGENDAMENTO_SOLICITADO,
     (FunnelStage.AGENDADO, "cancelar"): FunnelStage.QUALIFICADO,
     (FunnelStage.AGENDADO, "pos_atendimento_duvida"): FunnelStage.POS_ATENDIMENTO,
-    (FunnelStage.AGENDADO, "pos_atendimento_sintomas_preocupantes"): FunnelStage.POS_ATENDIMENTO,
+    (
+        FunnelStage.AGENDADO,
+        "pos_atendimento_sintomas_preocupantes",
+    ): FunnelStage.POS_ATENDIMENTO,
     # paciente_ativo
     (FunnelStage.PACIENTE_ATIVO, "interesse_tratamento"): FunnelStage.EM_QUALIFICACAO,
     (FunnelStage.PACIENTE_ATIVO, "pedido_preco"): FunnelStage.EM_QUALIFICACAO,
     (FunnelStage.PACIENTE_ATIVO, "pos_atendimento_duvida"): FunnelStage.POS_ATENDIMENTO,
     # pos_atendimento (mantém ou fidelização por gatilho temporal)
-    (FunnelStage.POS_ATENDIMENTO, "pos_atendimento_duvida"): FunnelStage.POS_ATENDIMENTO,
-    (FunnelStage.POS_ATENDIMENTO, "pos_atendimento_sintomas_preocupantes"): FunnelStage.POS_ATENDIMENTO,
+    (
+        FunnelStage.POS_ATENDIMENTO,
+        "pos_atendimento_duvida",
+    ): FunnelStage.POS_ATENDIMENTO,
+    (
+        FunnelStage.POS_ATENDIMENTO,
+        "pos_atendimento_sintomas_preocupantes",
+    ): FunnelStage.POS_ATENDIMENTO,
     # inativo -> reativação
     (FunnelStage.INATIVO, "saudacao"): FunnelStage.LEAD_NOVO,
     (FunnelStage.INATIVO, "interesse_tratamento"): FunnelStage.EM_QUALIFICACAO,
@@ -144,7 +176,10 @@ class FunnelDetector:
     Detects and manages funnel stage transitions for the 11-stage canonical funnel.
     """
 
-    def __init__(self, custom_transitions: Optional[dict] = None):
+    def __init__(
+        self,
+        custom_transitions: Optional[dict[tuple[FunnelStage, str], FunnelStage]] = None,
+    ):
         self.transitions = dict(TRANSITION_TRIGGERS)
         if custom_transitions:
             self.transitions.update(custom_transitions)
@@ -155,8 +190,8 @@ class FunnelDetector:
         intent: str,
         intent_category: IntentCategory,
         turn_count: int,
-        slots: dict,
-        flags: dict,
+        slots: dict[str, object],
+        flags: dict[str, bool],
     ) -> FunnelResult:
         """
         Detect if a funnel transition should occur based on intent and state.
@@ -183,7 +218,10 @@ class FunnelDetector:
                 )
 
         # Transições baseadas em flags/slots (já é paciente -> paciente_ativo)
-        if current_stage == FunnelStage.LEAD_NOVO and slots.get("already_patient") is True:
+        if (
+            current_stage == FunnelStage.LEAD_NOVO
+            and slots.get("already_patient") is True
+        ):
             return FunnelResult(
                 current_stage=current_stage,
                 should_transition=True,
@@ -238,15 +276,19 @@ class FunnelDetector:
         intent: str,
         intent_category: IntentCategory,
         turn_count: int,
-        flags: dict,
+        flags: dict[str, bool],
     ) -> Optional[FunnelResult]:
         """Fallback transitions using intent category for backward compatibility."""
         # Scheduling intent in lead_novo -> em_qualificacao
-        if (
-            current_stage == FunnelStage.LEAD_NOVO
-            and intent_category in (IntentCategory.SCHEDULING, IntentCategory.QUESTION)
+        if current_stage == FunnelStage.LEAD_NOVO and intent_category in (
+            IntentCategory.SCHEDULING,
+            IntentCategory.QUESTION,
         ):
-            if "agendar" in intent or "scheduling" in intent or "question_price" in intent:
+            if (
+                "agendar" in intent
+                or "scheduling" in intent
+                or "question_price" in intent
+            ):
                 return FunnelResult(
                     current_stage=current_stage,
                     should_transition=True,
@@ -254,7 +296,10 @@ class FunnelDetector:
                     transition_reason="Interest/scheduling intent in lead_novo",
                 )
         # Qualificado: agendar -> agendamento_solicitado
-        if current_stage == FunnelStage.QUALIFICADO and intent_category == IntentCategory.SCHEDULING:
+        if (
+            current_stage == FunnelStage.QUALIFICADO
+            and intent_category == IntentCategory.SCHEDULING
+        ):
             return FunnelResult(
                 current_stage=current_stage,
                 should_transition=True,
@@ -276,7 +321,7 @@ class FunnelDetector:
             )
         return None
 
-    def get_stage_info(self, stage: FunnelStage) -> dict:
+    def get_stage_info(self, stage: FunnelStage) -> FunnelStageInfo:
         """Get information about a funnel stage."""
         return FUNNEL_STAGES.get(stage, {})
 

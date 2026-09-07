@@ -8,10 +8,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import cast, func, select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from sqlalchemy.types import String
 
 from src.api.schemas.builder import BuilderAlertResponse, TraceTimeSeriesPoint
 from src.models.clinic_config_table import ClinicConfigTable
@@ -73,8 +72,8 @@ def _compute_config_completeness(config_row: Optional[ClinicConfigTable]) -> int
 
 
 async def _get_time_series(
-    tenant_ids: list, session: AsyncSession, days: int = 30
-) -> list:
+    tenant_ids: list[UUID], session: AsyncSession, days: int = 30
+) -> list[TraceTimeSeriesPoint]:
     """Get N-day daily trace counts, filling gaps with 0."""
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=days)
@@ -106,11 +105,11 @@ async def _get_time_series(
     rows = result.all()
 
     # Build date -> count map
-    count_map: dict = {}
-    for row in rows:
-        if row.day:
-            day_str = row.day.strftime("%Y-%m-%d")
-            count_map[day_str] = row.count
+    count_map: dict[str, int] = {}
+    for day_value, count_value in rows:
+        if day_value:
+            day_str = day_value.strftime("%Y-%m-%d")
+            count_map[day_str] = count_value
 
     # Fill gaps
     series = []
@@ -122,7 +121,7 @@ async def _get_time_series(
 
 async def _compute_alerts(
     builder_id: Optional[UUID], session: AsyncSession
-) -> list:
+) -> list[BuilderAlertResponse]:
     """Compute 3 alert types from existing data.
 
     When *builder_id* is ``None`` all clinics are considered (admin mode).
@@ -162,7 +161,7 @@ async def _compute_alerts(
     last_event_result = await session.execute(last_event_stmt)
     last_event_map = {row.tenant_id: row.last_event_at for row in last_event_result}
 
-    alerts: list = []
+    alerts: list[BuilderAlertResponse] = []
 
     for t in tenants:
         # Type 1: deactivated (critical)
@@ -204,13 +203,13 @@ async def _compute_alerts(
         stt_readiness = status["stt_readiness"]
         stt_key_set = status["stt_api_key_set"]
 
-        missing_names: list = []
+        missing_names: list[str] = []
         if whatsapp_readiness == "incomplete":
             missing_names.append(_CAPABILITY_LABEL_WHATSAPP)
         if llm_readiness == "incomplete":
             missing_names.append(_CAPABILITY_LABEL_LLM)
 
-        clauses: list = []
+        clauses: list[str] = []
         if missing_names:
             if len(missing_names) == 1:
                 joined = missing_names[0]

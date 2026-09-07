@@ -12,10 +12,9 @@ Todas as métricas são expostas via Prometheus e podem ser
 visualizadas no Grafana.
 """
 
-from enum import Enum
 from typing import Optional
 
-from prometheus_client import Counter, Gauge, Histogram, Summary
+from prometheus_client import Counter, Gauge, Histogram
 
 from src.config.logging import get_logger
 
@@ -530,7 +529,7 @@ class BusinessMetrics:
     pipeline = PipelineMetrics()
 
 
-def get_metrics_summary() -> dict:
+def get_metrics_summary() -> dict[str, dict[str, float]]:
     """
     Retorna um resumo das métricas de negócio atuais.
 
@@ -538,7 +537,7 @@ def get_metrics_summary() -> dict:
     """
     from prometheus_client import REGISTRY
 
-    summary = {
+    summary: dict[str, dict[str, float]] = {
         "srm": {},
         "safety": {},
         "flow": {},

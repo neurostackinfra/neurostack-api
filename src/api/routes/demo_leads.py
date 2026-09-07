@@ -42,7 +42,9 @@ async def create_demo_lead(
     await session.flush()
     await session.commit()
 
-    logger.info("Demo lead created", extra={"lead_id": str(lead.id), "email": lead.email})
+    logger.info(
+        "Demo lead created", extra={"lead_id": str(lead.id), "email": lead.email}
+    )
     return DemoLeadResponse.model_validate(lead)
 
 

@@ -6,7 +6,6 @@ Template for safety-critical conversations.
 from src.prompt.models import PromptMode, PromptVariables
 from src.prompt.templates.base import BaseTemplate, TemplateSection
 
-
 # ============================================
 # Safety System Prompt
 # ============================================
@@ -127,12 +126,12 @@ Comportamento inadequado foi detectado.
 class SafetyTemplate(BaseTemplate):
     """
     Template for SAFETY mode conversations.
-    
+
     Handles safety-critical situations with appropriate
     protocols and resources.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(PromptMode.SAFETY)
 
     def get_system_prompt(self, variables: PromptVariables) -> str:
@@ -142,30 +141,32 @@ class SafetyTemplate(BaseTemplate):
     def get_context_instructions(self, variables: PromptVariables) -> str:
         """Get safety-specific instructions based on category."""
         parts = []
-        
+
         # Category-specific instructions
         category = variables.safety_category or "clinical_risk"
         if category in SAFETY_CATEGORY_INSTRUCTIONS:
             parts.append(SAFETY_CATEGORY_INSTRUCTIONS[category])
-        
+
         # Resources section
         resources_section = TemplateSection("Recursos de Ajuda")
-        resources_section.add_list([
-            "CVV (Centro de Valoriza\u00e7\u00e3o da Vida): 188 - 24 horas",
-            "SAMU: 192",
-            "Bombeiros: 193",
-            "Pol\u00edcia: 190",
-            "Disque 100 (Direitos Humanos)",
-            "Disque 180 (Viol\u00eancia contra Mulher)",
-        ])
+        resources_section.add_list(
+            [
+                "CVV (Centro de Valoriza\u00e7\u00e3o da Vida): 188 - 24 horas",
+                "SAMU: 192",
+                "Bombeiros: 193",
+                "Pol\u00edcia: 190",
+                "Disque 100 (Direitos Humanos)",
+                "Disque 180 (Viol\u00eancia contra Mulher)",
+            ]
+        )
         parts.append(resources_section.build())
-        
+
         # Session context if available
         if variables.history_summary:
             context_section = TemplateSection("Contexto da Conversa")
             context_section.add(variables.history_summary)
             parts.append(context_section.build())
-        
+
         return "\n".join(parts)
 
     def get_constraints(self, variables: PromptVariables) -> str:
@@ -178,10 +179,9 @@ class SafetyTemplate(BaseTemplate):
             "SEMPRE ofere\u00e7a recursos profissionais",
             "SEMPRE mantenha tom emp\u00e1tico e acolhedor",
         ]
-        
+
         # Add user-defined constraints
         all_constraints = safety_constraints + list(variables.constraints)
-        
+
         constraints_text = "\n".join(f"- {c}" for c in all_constraints)
         return f"\n## Restri\u00e7\u00f5es de Seguran\u00e7a (OBRIGAT\u00d3RIAS)\n{constraints_text}\n"
-

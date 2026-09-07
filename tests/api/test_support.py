@@ -27,7 +27,6 @@ from src.models.support_ticket import SupportTicket
 from src.models.tenant import Tenant
 from src.models.user import User, UserRole
 
-
 # ============================================
 # Token Helpers (mirrors tests/api/test_builder.py)
 # ============================================
@@ -50,7 +49,9 @@ def _make_clinic_admin_token(tenant_id: UUID, user_id: UUID | None = None) -> st
     )
 
 
-def _make_builder_token(builder_id: UUID | None = None, tenant_id: UUID | None = None) -> str:
+def _make_builder_token(
+    builder_id: UUID | None = None, tenant_id: UUID | None = None
+) -> str:
     now = datetime.now(timezone.utc)
     return jwt.encode(
         {
@@ -593,7 +594,9 @@ class TestSupportAdminAuthEnforcement:
         assert resp.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_patch_status_returns_403_for_builder(self, async_client: AsyncClient):
+    async def test_patch_status_returns_403_for_builder(
+        self, async_client: AsyncClient
+    ):
         headers = {
             "Authorization": f"Bearer {_make_builder_token()}",
             "Content-Type": "application/json",

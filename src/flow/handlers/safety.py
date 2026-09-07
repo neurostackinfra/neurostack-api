@@ -7,13 +7,8 @@ import logging
 import time
 from typing import Optional
 
-from src.flow.models import (
-    FlowMode,
-    FlowContext,
-    ModeHandlerResult,
-    TransitionTrigger,
-)
 from src.flow.handlers.base import BaseModeHandler
+from src.flow.models import FlowContext, FlowMode, ModeHandlerResult, TransitionTrigger
 
 logger = logging.getLogger(__name__)
 
@@ -47,47 +42,48 @@ SAFETY_RESPONSES = {
 class SafetyModeHandler(BaseModeHandler):
     """
     Handler for SAFETY mode.
-    
+
     Handles safety-critical situations with appropriate responses
     and escalation procedures. Safety mode has the highest priority
     and cannot be overridden by other modes.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(FlowMode.SAFETY)
         self.escalation_threshold = 2  # Triggers before auto-handoff
 
     async def handle(self, context: FlowContext) -> ModeHandlerResult:
         """
         Handle a message in SAFETY mode.
-        
+
         In safety mode, we:
         1. Provide immediate safety response
         2. Log the safety event
         3. Consider escalation to human
         """
         start_time = time.perf_counter()
-        
+
         # Get appropriate safety response
         safety_category = context.safety_category or "default"
         safety_response = SAFETY_RESPONSES.get(
-            safety_category, 
-            SAFETY_RESPONSES["default"]
+            safety_category, SAFETY_RESPONSES["default"]
         )
 
         # Calculate safety level
         safety_level = self._calculate_safety_level(context)
-        
+
         # Log safety event
-        events = [{
-            "event_type": "flow.safety.triggered",
-            "data": {
-                "category": safety_category,
-                "level": safety_level,
-                "message_preview": context.message[:50],
-                "turn_count": context.turn_count,
-            },
-        }]
+        events = [
+            {
+                "event_type": "flow.safety.triggered",
+                "data": {
+                    "category": safety_category,
+                    "level": safety_level,
+                    "message_preview": context.message[:50],
+                    "turn_count": context.turn_count,
+                },
+            }
+        ]
 
         self.logger.warning(
             f"SAFETY mode: category={safety_category}, level={safety_level}, "
@@ -95,20 +91,22 @@ class SafetyModeHandler(BaseModeHandler):
         )
 
         # Check if we should escalate to handoff
-        should_escalate = (
-            safety_level >= 3 or 
-            safety_category in ("clinical_risk", "emergency")
+        should_escalate = safety_level >= 3 or safety_category in (
+            "clinical_risk",
+            "emergency",
         )
 
         if should_escalate:
-            events.append({
-                "event_type": "flow.safety.escalation",
-                "data": {
-                    "reason": "high_safety_level",
-                    "category": safety_category,
-                },
-            })
-            
+            events.append(
+                {
+                    "event_type": "flow.safety.escalation",
+                    "data": {
+                        "reason": "high_safety_level",
+                        "category": safety_category,
+                    },
+                }
+            )
+
             return self.create_result(
                 success=True,
                 response=safety_response,
@@ -140,10 +138,12 @@ class SafetyModeHandler(BaseModeHandler):
             start_time=start_time,
         )
 
-    def should_exit(self, context: FlowContext) -> tuple[bool, Optional[TransitionTrigger]]:
+    def should_exit(
+        self, context: FlowContext
+    ) -> tuple[bool, Optional[TransitionTrigger]]:
         """
         Check if we should exit SAFETY mode.
-        
+
         Exit conditions:
         - Safety concern resolved -> NORMAL
         - Handoff required -> HANDOFF (escalation)
@@ -151,21 +151,21 @@ class SafetyModeHandler(BaseModeHandler):
         # Handoff escalation
         if context.handoff_required:
             return True, TransitionTrigger.HANDOFF_REQUESTED
-        
+
         # Safety resolved
         if not context.safety_concern:
             return True, TransitionTrigger.SAFETY_RESOLVED
-        
+
         return False, None
 
     def _calculate_safety_level(self, context: FlowContext) -> int:
         """
         Calculate safety level (0-3).
-        
+
         0 = none, 1 = low, 2 = medium, 3 = high
         """
         category = context.safety_category
-        
+
         if category in ("emergency", "clinical_risk"):
             return 3
         elif category == "legal_risk":
@@ -188,4 +188,3 @@ class SafetyModeHandler(BaseModeHandler):
     def get_response_modifiers(self) -> list[str]:
         """Get response modifiers for SAFETY mode."""
         return ["safety_first", "empathetic", "professional", "resource_providing"]
-

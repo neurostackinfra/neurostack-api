@@ -6,7 +6,7 @@ Centralized configuration using Pydantic Settings
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.core.exceptions import ConfigurationError
@@ -56,7 +56,9 @@ class Settings(BaseSettings):
     # ============================================
     # Database (PostgreSQL)
     # ============================================
-    database_url: str = "postgresql+asyncpg://neurostack:neurostack@localhost:5434/neurostack"
+    database_url: str = (
+        "postgresql+asyncpg://neurostack:neurostack@localhost:5434/neurostack"
+    )
     database_pool_size: int = Field(default=5, ge=1, le=100)
     database_max_overflow: int = Field(default=10, ge=0, le=100)
     database_pool_timeout: int = Field(default=30, ge=1)
@@ -168,11 +170,15 @@ class Settings(BaseSettings):
 
     @field_validator("secret_key")
     @classmethod
-    def validate_secret_key(cls, v: str, info) -> str:
+    def validate_secret_key(cls, v: str, info: ValidationInfo) -> str:
         """Validate secret key strength."""
         # Get environment from info if available
-        environment = info.data.get("environment", "development") if hasattr(info, "data") else "development"
-        
+        environment = (
+            info.data.get("environment", "development")
+            if hasattr(info, "data")
+            else "development"
+        )
+
         if environment == "production":
             if len(v) < 32:
                 raise ValueError(
@@ -191,27 +197,38 @@ class Settings(BaseSettings):
         """Validate critical settings for production environment."""
         if self.environment == "production":
             errors = []
-            
+
             # Check secret key
-            if self.secret_key == "dev-secret-key-change-in-production-min-32-chars-required":
-                errors.append("SECRET_KEY must be changed from default value in production")
-            
+            if (
+                self.secret_key
+                == "dev-secret-key-change-in-production-min-32-chars-required"
+            ):
+                errors.append(
+                    "SECRET_KEY must be changed from default value in production"
+                )
+
             # Check database URL is not default
             if "localhost" in self.database_url or "127.0.0.1" in self.database_url:
-                errors.append("DATABASE_URL should not point to localhost in production")
-            
+                errors.append(
+                    "DATABASE_URL should not point to localhost in production"
+                )
+
             # Check debug is disabled
             if self.debug:
                 errors.append("DEBUG must be False in production")
-            
+
             # Check allowed origins
             if "*" in self.allowed_origins:
-                errors.append("ALLOWED_ORIGINS should not contain '*' in production for security")
-            
+                errors.append(
+                    "ALLOWED_ORIGINS should not contain '*' in production for security"
+                )
+
             if errors:
-                error_msg = "Production configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
+                error_msg = "Production configuration validation failed:\n" + "\n".join(
+                    f"  - {e}" for e in errors
+                )
                 raise ConfigurationError(error_msg)
-        
+
         return self
 
     @property

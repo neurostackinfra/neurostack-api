@@ -1550,23 +1550,18 @@ class TestListRatingsResponseShape:
         subject_id = uuid4()
         client._submit(_seed_tenant_full(subject_id, "Avg Clinic"))
 
-        with patch(
-            "src.api.routes.rlhf._analyze_rating_async",
-            new=AsyncMock(return_value=None),
-        ):
-            for value in (1, 2, 3, 4, 5):
-                payload = _rating_payload(
-                    value,
-                    reason=None if value >= 4 else "motivo x",
-                )
-                payload["clinic_tenant_id"] = str(subject_id)
-                post = client.post(
-                    "/v1/rlhf/rating",
-                    headers=api_key_headers,
-                    json=payload,
-                )
-                assert post.status_code == 200
-                client.drain()
+        for value in (1, 2, 3, 4, 5):
+            # This test owns only the aggregation contract. Reasons on ratings
+            # 1-3 would also start independent LLM-analysis tasks, introducing
+            # unrelated concurrent writes into the shared in-memory SQLite DB.
+            payload = _rating_payload(value, reason=None)
+            payload["clinic_tenant_id"] = str(subject_id)
+            post = client.post(
+                "/v1/rlhf/rating",
+                headers=api_key_headers,
+                json=payload,
+            )
+            assert post.status_code == 200
 
         response = client.get(
             f"/v1/rlhf/ratings?tenant_id={subject_id}",

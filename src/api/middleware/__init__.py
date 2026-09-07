@@ -9,30 +9,30 @@ This module contains all middleware components for the API:
 """
 
 from src.api.middleware.auth import (
-    AuthMiddleware,
-    AuthenticationError,
-    TenantContext,
     APIKeyStore,
-    get_tenant_context,
+    AuthenticationError,
+    AuthMiddleware,
+    TenantContext,
     get_optional_tenant_context,
+    get_tenant_context,
 )
 from src.api.middleware.rate_limit import (
     RateLimitMiddleware,
     RateLimitStore,
     TokenBucket,
-    rate_limit_store,
     get_rate_limit_info,
+    rate_limit_store,
 )
 from src.api.middleware.tracing import (
     RequestIdMiddleware,
+    add_span_attributes,
     configure_tracing,
+    get_tracer,
     instrument_fastapi,
     instrument_redis,
     instrument_sqlalchemy,
-    get_tracer,
-    trace_function,
-    add_span_attributes,
     record_span_exception,
+    trace_function,
 )
 
 __all__ = [

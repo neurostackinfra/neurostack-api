@@ -9,11 +9,10 @@ and structured prompts for LLM response generation.
 Implements Task 13.0 - End-to-End Integration.
 """
 
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.schemas.base import ErrorResponse
@@ -24,7 +23,7 @@ from src.api.schemas.events import (
     EventType,
 )
 from src.repositories import get_db_session_dependency
-from src.services import EventService, get_event_service
+from src.services import get_event_service
 
 router = APIRouter()
 
@@ -33,7 +32,7 @@ router = APIRouter()
 # API Responses Documentation
 # ============================================
 
-RESPONSES_PROCESS_EVENT = {
+RESPONSES_PROCESS_EVENT: dict[int | str, dict[str, Any]] = {
     200: {
         "description": "Event processed successfully",
         "model": EventResponse,
@@ -200,6 +199,7 @@ async def process_event(
     This is the main entry point for all agent interactions.
     """
     from src.config.logging import get_logger as _get_logger
+
     _logger = _get_logger(__name__)
 
     service = get_event_service()
@@ -250,7 +250,9 @@ async def process_event(
     # ── Phase 2: slow I/O (LLM + event-store) ────────────────────────────────
     # DB session is already committed/released; failures here are independent.
     try:
-        return await service.finish_response(request, result, clinic_config, message_history)
+        return await service.finish_response(
+            request, result, clinic_config, message_history
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -337,9 +339,15 @@ Supports pagination and filtering for efficient querying of the Event Store.
 )
 async def list_events(
     tenant_id: UUID = Query(..., description="Filter by tenant ID"),
-    session_id: Optional[UUID] = Query(default=None, description="Filter by session ID"),
-    event_type: Optional[EventType] = Query(default=None, description="Filter by event type"),
-    limit: int = Query(default=50, ge=1, le=100, description="Maximum events to return"),
+    session_id: Optional[UUID] = Query(
+        default=None, description="Filter by session ID"
+    ),
+    event_type: Optional[EventType] = Query(
+        default=None, description="Filter by event type"
+    ),
+    limit: int = Query(
+        default=50, ge=1, le=100, description="Maximum events to return"
+    ),
     offset: int = Query(default=0, ge=0, description="Offset for pagination"),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> list[EventDetailResponse]:

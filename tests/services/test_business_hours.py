@@ -16,7 +16,6 @@ from src.services.business_hours import (
     summarize_outside_hours,
 )
 
-
 _WEEKDAY_WINDOW = {"open": "09:00", "close": "17:00"}
 _SATURDAY_WINDOW = {"open": "10:00", "close": "13:00"}
 

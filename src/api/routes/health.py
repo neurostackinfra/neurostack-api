@@ -10,12 +10,11 @@ Endpoints:
 - GET /live - Liveness probe (process is alive)
 """
 
-from datetime import datetime
 import time
+from datetime import datetime
 
 from fastapi import APIRouter, status
 
-from src.config.settings import settings
 from src.api.schemas.health import (
     ComponentHealth,
     DependencyStatus,
@@ -24,6 +23,7 @@ from src.api.schemas.health import (
     MetricsResponse,
     ReadinessResponse,
 )
+from src.config.settings import settings
 
 router = APIRouter()
 
@@ -99,7 +99,9 @@ async def health_check() -> HealthResponse:
     ]
 
     # Determine overall status
-    unhealthy_count = sum(1 for c in components if c.status == DependencyStatus.UNHEALTHY)
+    unhealthy_count = sum(
+        1 for c in components if c.status == DependencyStatus.UNHEALTHY
+    )
     degraded_count = sum(1 for c in components if c.status == DependencyStatus.DEGRADED)
 
     if unhealthy_count > 0:

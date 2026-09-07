@@ -6,7 +6,7 @@ to rendered prompt output (Group 1 — clinic-config-fullstack).
 
 import pytest
 
-from src.prompt.models import PromptMode, PromptVariables
+from src.prompt.models import PromptVariables
 from src.prompt.templates.normal import NormalTemplate
 
 

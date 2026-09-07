@@ -10,20 +10,19 @@ from uuid import UUID
 
 from prometheus_client import Counter, Histogram
 
+from src.policy.global_rules import get_global_policy
 from src.policy.models import (
-    PolicyContext,
-    PolicyDefinition,
-    PolicyRuleDefinition,
-    PolicyEvaluationResult,
     PolicyConstraints,
-    RuleViolation,
+    PolicyContext,
+    PolicyEvaluationResult,
+    PolicyRuleDefinition,
     RuleAction,
-    RuleSeverity,
     RuleCategory,
+    RuleSeverity,
+    RuleViolation,
 )
-from src.policy.global_rules import get_global_policy, get_global_constraints
-from src.policy.policy_store import PolicyStore, get_policy_store
 from src.policy.policy_merger import PolicyMerger, get_policy_merger
+from src.policy.policy_store import PolicyStore, get_policy_store
 
 logger = logging.getLogger(__name__)
 
@@ -54,13 +53,13 @@ POLICY_LATENCY = Histogram(
 class PolicyEngine:
     """
     Main Policy & Guardrails Engine.
-    
+
     Responsibilities:
     - Pre-SRM validation of incoming messages
     - Post-SRM validation before response
     - Constraint generation for prompts
     - Policy enforcement and logging
-    
+
     The engine evaluates messages against:
     1. Global safety policies (cannot be overridden)
     2. Tenant-specific policies
@@ -74,7 +73,7 @@ class PolicyEngine:
     ):
         """
         Initialize the Policy Engine.
-        
+
         Args:
             policy_store: Optional PolicyStore instance
             policy_merger: Optional PolicyMerger instance
@@ -88,26 +87,26 @@ class PolicyEngine:
     ) -> PolicyEvaluationResult:
         """
         Evaluate a message against all applicable policies.
-        
+
         This is the main pre-SRM validation method.
-        
+
         Args:
             context: Policy evaluation context
-            
+
         Returns:
             PolicyEvaluationResult with any violations
         """
         start_time = time.perf_counter()
         result = PolicyEvaluationResult()
-        
+
         # Get all applicable rules
         rules = await self._merger.get_merged_rules(context.tenant_id)
-        
+
         # Evaluate message against each rule
         for rule in rules:
             if not rule.enabled:
                 continue
-            
+
             if rule.matches(context.message):
                 # Create violation
                 violation = RuleViolation(
@@ -121,36 +120,36 @@ class PolicyEngine:
                     policy_name="Global/Tenant Policy",
                     matched_text=context.message[:100],
                 )
-                
+
                 result.add_violation(violation)
-                
+
                 # Record metric
                 POLICY_VIOLATIONS.labels(
                     category=rule.category.value,
                     severity=rule.severity.value,
                     action=rule.action.value,
                 ).inc()
-                
+
                 logger.info(
                     f"Policy violation: {rule.rule_id} ({rule.action.value}) "
                     f"for tenant {context.tenant_id}"
                 )
-        
+
         # Calculate evaluation time
         result.evaluation_time_ms = int((time.perf_counter() - start_time) * 1000)
-        
+
         # Generate constraints from non-blocking rules
         constraints = await self.get_constraints(context.tenant_id)
         result.constraints = constraints.to_prompt_constraints()
-        
+
         # Record metric
         POLICY_EVALUATIONS.labels(
             tenant_id=str(context.tenant_id)[:8],
             result="passed" if result.passed else "violated",
         ).inc()
-        
+
         POLICY_LATENCY.observe(result.evaluation_time_ms / 1000)
-        
+
         return result
 
     async def evaluate_pre_srm(
@@ -159,15 +158,15 @@ class PolicyEngine:
         session_id: UUID,
         message: str,
         channel: str = "unknown",
-        metadata: Optional[dict] = None,
-        clinic_config: Optional[dict] = None,
-        user_state: Optional[dict] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        clinic_config: Optional[dict[str, Any]] = None,
+        user_state: Optional[dict[str, Any]] = None,
     ) -> PolicyEvaluationResult:
         """
         Quick pre-SRM evaluation of incoming message.
-        
+
         This is called before SRM processing to catch obvious violations.
-        
+
         Args:
             tenant_id: Tenant ID
             session_id: Session ID
@@ -176,7 +175,7 @@ class PolicyEngine:
             metadata: Optional metadata
             clinic_config: Optional ClinicConfig (doc MVP v0.5)
             user_state: Optional UserState (doc MVP v0.5)
-            
+
         Returns:
             PolicyEvaluationResult
         """
@@ -198,33 +197,33 @@ class PolicyEngine:
     ) -> PolicyEvaluationResult:
         """
         Validate a generated response before sending.
-        
+
         This ensures the LLM response doesn't violate policies.
-        
+
         Args:
             tenant_id: Tenant ID
             response: Generated response text
-            
+
         Returns:
             PolicyEvaluationResult
         """
         # Get all rules
         rules = await self._merger.get_merged_rules(tenant_id)
         result = PolicyEvaluationResult()
-        
+
         # Only check content-related rules for responses
         content_categories = [
             RuleCategory.SAFETY_CLINICAL,
             RuleCategory.SAFETY_LEGAL,
             RuleCategory.CONTENT,
         ]
-        
+
         for rule in rules:
             if not rule.enabled:
                 continue
             if rule.category not in content_categories:
                 continue
-            
+
             if rule.matches(response):
                 violation = RuleViolation(
                     rule_id=rule.rule_id,
@@ -237,7 +236,7 @@ class PolicyEngine:
                     policy_name="Response Validation",
                 )
                 result.add_violation(violation)
-        
+
         return result
 
     async def get_constraints(
@@ -246,10 +245,10 @@ class PolicyEngine:
     ) -> PolicyConstraints:
         """
         Get all constraints for prompt generation.
-        
+
         Args:
             tenant_id: Tenant ID
-            
+
         Returns:
             Merged PolicyConstraints
         """
@@ -261,10 +260,10 @@ class PolicyEngine:
     ) -> list[PolicyRuleDefinition]:
         """
         Get all safety rules for a tenant.
-        
+
         Args:
             tenant_id: Tenant ID
-            
+
         Returns:
             List of safety rules
         """
@@ -276,10 +275,10 @@ class PolicyEngine:
     ) -> bool:
         """
         Determine if the message should be blocked.
-        
+
         Args:
             result: Policy evaluation result
-            
+
         Returns:
             True if should block
         """
@@ -291,10 +290,10 @@ class PolicyEngine:
     ) -> bool:
         """
         Determine if handoff is required.
-        
+
         Args:
             result: Policy evaluation result
-            
+
         Returns:
             True if handoff required
         """
@@ -306,16 +305,16 @@ class PolicyEngine:
     ) -> str:
         """
         Get a user-friendly message for violations.
-        
+
         Args:
             result: Policy evaluation result
-            
+
         Returns:
             User-facing message
         """
         if not result.violations:
             return ""
-        
+
         # Get the highest severity violation
         severity_order = [
             RuleSeverity.INFO,
@@ -323,12 +322,12 @@ class PolicyEngine:
             RuleSeverity.ERROR,
             RuleSeverity.CRITICAL,
         ]
-        
+
         highest_violation = max(
             result.violations,
             key=lambda v: severity_order.index(v.severity),
         )
-        
+
         return highest_violation.message
 
     async def get_policies_summary(
@@ -337,20 +336,22 @@ class PolicyEngine:
     ) -> dict[str, Any]:
         """
         Get a summary of all policies for a tenant.
-        
+
         Args:
             tenant_id: Tenant ID
-            
+
         Returns:
             Summary dictionary
         """
         policies = await self._merger.get_merged_policies(tenant_id)
         rules = await self._merger.get_merged_rules(tenant_id)
-        
+
         return {
             "total_policies": len(policies),
             "total_rules": len(rules),
-            "safety_rules": len([r for r in rules if r.category.value.startswith("safety")]),
+            "safety_rules": len(
+                [r for r in rules if r.category.value.startswith("safety")]
+            ),
             "active_policies": len([p for p in policies if p.is_active]),
             "policy_names": [p.name for p in policies],
         }
@@ -379,13 +380,13 @@ async def evaluate_message(
 ) -> PolicyEvaluationResult:
     """
     Convenience function for policy evaluation.
-    
+
     Args:
         tenant_id: Tenant ID
         session_id: Session ID
         message: Message to evaluate
         channel: Communication channel
-        
+
     Returns:
         PolicyEvaluationResult
     """
@@ -396,4 +397,3 @@ async def evaluate_message(
         message=message,
         channel=channel,
     )
-

@@ -15,7 +15,7 @@ from src.srm.models import IntentCategory, IntentResult
 class IntentNaiveBayes:
     """
     Multinomial Naive Bayes classifier for intent classification.
-    
+
     Similar to SentimentClassifier but adapted for multiple intent classes.
     """
 
@@ -26,7 +26,7 @@ class IntentNaiveBayes:
     ):
         """
         Initialize the Naive Bayes intent classifier.
-        
+
         Args:
             training_data: Dictionary mapping intent names to lists of example messages
             smoothing: Laplace smoothing parameter (default: 1.0)
@@ -47,10 +47,10 @@ class IntentNaiveBayes:
     def classify(self, message: str) -> IntentResult:
         """
         Classify intent for a message.
-        
+
         Args:
             message: User message to classify
-            
+
         Returns:
             IntentResult with intent, category, and confidence
         """
@@ -76,13 +76,13 @@ class IntentNaiveBayes:
             score = self._log_priors.get(intent_name, 0.0)
             token_probs = self._log_likelihoods.get(intent_name, {})
             default_prob = self._default_log_prob.get(intent_name, 0.0)
-            
+
             for token in tokens:
                 score += token_probs.get(token, default_prob)
             log_scores[intent_name] = score
 
         probabilities = self._softmax(log_scores)
-        best_intent = max(probabilities, key=probabilities.get)
+        best_intent = max(probabilities, key=lambda intent: probabilities[intent])
         confidence = probabilities[best_intent]
         category = self._intent_categories.get(best_intent, IntentCategory.UNKNOWN)
 
@@ -96,7 +96,7 @@ class IntentNaiveBayes:
     def _train(self, data: dict[str, list[str]]) -> None:
         """
         Train model parameters from labeled data.
-        
+
         Args:
             data: Dictionary mapping intent names to lists of example messages
         """
@@ -105,16 +105,16 @@ class IntentNaiveBayes:
         for intent_name, texts in data.items():
             if not texts:
                 continue
-                
+
             self._intent_counts[intent_name] = len(texts)
             total_docs += len(texts)
             counter: Counter[str] = Counter()
-            
+
             for text in texts:
                 tokens = self._tokenize(text)
                 counter.update(tokens)
                 self._vocab.update(tokens)
-                
+
             self._token_counts[intent_name] = counter
             self._total_tokens[intent_name] = sum(counter.values())
 
@@ -131,12 +131,12 @@ class IntentNaiveBayes:
             total = self._total_tokens[intent_name]
             denom = total + self._smoothing * vocab_size
             self._default_log_prob[intent_name] = math.log(self._smoothing / denom)
-            
+
             token_probs: dict[str, float] = {}
             for token in self._vocab:
                 token_count = self._token_counts[intent_name].get(token, 0)
                 token_probs[token] = math.log((token_count + self._smoothing) / denom)
-                
+
             self._log_likelihoods[intent_name] = token_probs
 
     def set_intent_categories(self, categories: dict[str, IntentCategory]) -> None:
@@ -159,7 +159,7 @@ class IntentNaiveBayes:
         """Convert log-scores to probabilities."""
         if not log_scores:
             return {}
-            
+
         max_log = max(log_scores.values())
         exp_scores = {k: math.exp(v - max_log) for k, v in log_scores.items()}
         total = sum(exp_scores.values()) or 1.0
@@ -168,7 +168,7 @@ class IntentNaiveBayes:
     def update_training_data(self, intent_name: str, examples: list[str]) -> None:
         """
         Update training data for a specific intent.
-        
+
         This allows incremental learning by adding new examples.
         """
         if intent_name not in self._intent_counts:
@@ -195,10 +195,12 @@ class IntentNaiveBayes:
                 total = self._total_tokens[intent_name]
                 denom = total + self._smoothing * vocab_size
                 self._default_log_prob[intent_name] = math.log(self._smoothing / denom)
-                
+
                 token_probs: dict[str, float] = {}
                 for token in self._vocab:
                     token_count = self._token_counts[intent_name].get(token, 0)
-                    token_probs[token] = math.log((token_count + self._smoothing) / denom)
-                    
+                    token_probs[token] = math.log(
+                        (token_count + self._smoothing) / denom
+                    )
+
                 self._log_likelihoods[intent_name] = token_probs
