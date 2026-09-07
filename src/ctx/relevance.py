@@ -6,13 +6,7 @@ Determines what context items are relevant for the current conversation.
 import logging
 from typing import Optional
 
-from src.ctx.models import (
-    ContextMessage,
-    ContextWindow,
-    KnowledgeChunk,
-    RelevanceLevel,
-    MessageRole,
-)
+from src.ctx.models import ContextMessage, KnowledgeChunk, MessageRole, RelevanceLevel
 
 logger = logging.getLogger(__name__)
 
@@ -39,16 +33,25 @@ ROLE_SCORES = {
 
 # Keywords that increase relevance
 HIGH_RELEVANCE_KEYWORDS = [
-    "confirmar", "agendar", "cancelar", "horário",
-    "urgente", "emergência", "problema", "erro",
-    "sim", "não", "ok", "certo",
+    "confirmar",
+    "agendar",
+    "cancelar",
+    "horário",
+    "urgente",
+    "emergência",
+    "problema",
+    "erro",
+    "sim",
+    "não",
+    "ok",
+    "certo",
 ]
 
 
 class RelevanceScorer:
     """
     Scores the relevance of context items.
-    
+
     Uses multiple signals to determine relevance:
     1. Recency - more recent messages are more relevant
     2. Semantic similarity - messages related to current topic
@@ -64,7 +67,7 @@ class RelevanceScorer:
     ):
         """
         Initialize the relevance scorer.
-        
+
         Args:
             recency_weight: Weight for recency score
             similarity_weight: Weight for similarity score
@@ -83,32 +86,32 @@ class RelevanceScorer:
     ) -> float:
         """
         Score the relevance of a message.
-        
+
         Args:
             message: Message to score
             current_message: Current user message
             position: Position in message list (0 = oldest)
             total_messages: Total number of messages
-            
+
         Returns:
             Relevance score (0-1)
         """
         # Recency score (more recent = higher)
         recency_score = (position + 1) / total_messages if total_messages > 0 else 1.0
-        
+
         # Role score
         role_score = ROLE_SCORES.get(message.role, 0.5)
-        
+
         # Similarity score (keyword-based for now)
         similarity_score = self._compute_similarity(message.content, current_message)
-        
+
         # Weighted combination
         final_score = (
-            self.recency_weight * recency_score +
-            self.similarity_weight * similarity_score +
-            self.role_weight * role_score
+            self.recency_weight * recency_score
+            + self.similarity_weight * similarity_score
+            + self.role_weight * role_score
         )
-        
+
         return min(final_score, 1.0)
 
     def _compute_similarity(
@@ -118,27 +121,27 @@ class RelevanceScorer:
     ) -> float:
         """
         Compute simple similarity between two texts.
-        
+
         Uses keyword overlap. In production, this would use embeddings.
         """
         words1 = set(text1.lower().split())
         words2 = set(text2.lower().split())
-        
+
         if not words1 or not words2:
             return 0.5
-        
+
         # Jaccard similarity
         intersection = len(words1 & words2)
         union = len(words1 | words2)
-        
+
         jaccard = intersection / union if union > 0 else 0.0
-        
+
         # Boost for high-relevance keywords
         keyword_boost = 0.0
         for keyword in HIGH_RELEVANCE_KEYWORDS:
             if keyword in text1.lower() and keyword in text2.lower():
                 keyword_boost += 0.1
-        
+
         return min(jaccard + keyword_boost, 1.0)
 
     def score_knowledge_chunk(
@@ -148,22 +151,22 @@ class RelevanceScorer:
     ) -> float:
         """
         Score the relevance of a knowledge chunk.
-        
+
         Args:
             chunk: Knowledge chunk to score
             current_message: Current user message
-            
+
         Returns:
             Relevance score (0-1)
         """
         # Start with the chunk's existing relevance score
         base_score = chunk.relevance_score
-        
+
         # Add similarity to current message
         similarity = self._compute_similarity(chunk.content, current_message)
-        
+
         # Combine
-        return (base_score * 0.6 + similarity * 0.4)
+        return base_score * 0.6 + similarity * 0.4
 
     def get_relevance_level(self, score: float) -> RelevanceLevel:
         """Convert numeric score to relevance level."""
@@ -191,7 +194,7 @@ class RelevanceFilter:
     ):
         """
         Initialize the filter.
-        
+
         Args:
             scorer: Relevance scorer to use
             min_relevance: Minimum relevance score to include
@@ -207,36 +210,34 @@ class RelevanceFilter:
     ) -> list[ContextMessage]:
         """
         Filter messages by relevance, keeping most relevant.
-        
+
         Args:
             messages: Messages to filter
             current_message: Current user message
             max_messages: Maximum messages to keep
-            
+
         Returns:
             Filtered list of messages
         """
         if len(messages) <= max_messages:
             return messages
-        
+
         # Score all messages
         scored = []
         for i, msg in enumerate(messages):
-            score = self.scorer.score_message(
-                msg, current_message, i, len(messages)
-            )
+            score = self.scorer.score_message(msg, current_message, i, len(messages))
             scored.append((msg, score))
-        
+
         # Sort by score (highest first)
         scored.sort(key=lambda x: x[1], reverse=True)
-        
+
         # Keep top N by score
         top_messages = [msg for msg, _ in scored[:max_messages]]
-        
+
         # Re-sort by original order (chronological)
         message_order = {id(msg): i for i, msg in enumerate(messages)}
         top_messages.sort(key=lambda m: message_order.get(id(m), 0))
-        
+
         return top_messages
 
     def filter_knowledge(
@@ -247,25 +248,25 @@ class RelevanceFilter:
     ) -> list[KnowledgeChunk]:
         """
         Filter knowledge chunks by relevance.
-        
+
         Args:
             chunks: Knowledge chunks to filter
             current_message: Current user message
             max_chunks: Maximum chunks to keep
-            
+
         Returns:
             Filtered list of chunks
         """
         if len(chunks) <= max_chunks:
             return chunks
-        
+
         # Score and sort
         scored = [
             (chunk, self.scorer.score_knowledge_chunk(chunk, current_message))
             for chunk in chunks
         ]
         scored.sort(key=lambda x: x[1], reverse=True)
-        
+
         # Keep top N
         return [chunk for chunk, _ in scored[:max_chunks]]
 
@@ -292,4 +293,3 @@ def get_relevance_filter() -> RelevanceFilter:
     if _filter is None:
         _filter = RelevanceFilter()
     return _filter
-

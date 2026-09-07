@@ -3,13 +3,11 @@ NeuroStack - SRM (Small Reasoning Module) - Models
 Data models for SRM decision engine.
 """
 
-from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field
-
 
 # ============================================
 # Enums
@@ -186,7 +184,7 @@ class SRMInput(BaseModel):
     slots: dict[str, Any] = Field(default_factory=dict)
     flags: dict[str, bool] = Field(default_factory=dict)
     safety_triggers: int = 0
-    
+
     # Configuration
     max_turns_for_handoff: int = 10
     safety_threshold: float = 0.5
@@ -236,11 +234,13 @@ class HandoffResult(BaseModel):
     reason: Optional[HandoffReason] = None
     urgency: str = "normal"
     summary: Optional[str] = None
-    sector: Optional[str] = None  # agendamento, financeiro, gerencia, administrativo, clinico, urgencia, fidelizacao
+    sector: Optional[str] = (
+        None  # agendamento, financeiro, gerencia, administrativo, clinico, urgencia, fidelizacao
+    )
     sla: Optional[str] = None  # imediato, prioritario, rotina
     # Two-step scheduling confirmation flow
-    confirmation_pending: bool = False   # ask user to confirm before triggering handoff
-    scheduling_cancelled: bool = False   # user declined — clear scheduling_interest flag
+    confirmation_pending: bool = False  # ask user to confirm before triggering handoff
+    scheduling_cancelled: bool = False  # user declined — clear scheduling_interest flag
     # Optional scheduling-link handoff: "link_sent" on the send turn, "concluiu"/"nao_concluiu" on the enrich turn
     verification_status: Optional[str] = None
 
@@ -291,7 +291,7 @@ class StatePatch(BaseModel):
 class SRMDecision(BaseModel):
     """
     Complete SRM decision output.
-    
+
     Contains the cognitive analysis of the user's message including
     intent classification, funnel stage, safety assessment, and action recommendations.
     """
@@ -299,18 +299,18 @@ class SRMDecision(BaseModel):
     # Intent
     intent: str
     intent_category: IntentCategory
-    
+
     # Funnel
     funnel_stage: FunnelStage
     funnel_transition: Optional[str] = None
-    
+
     # Action
     action: ActionType
     action_details: Optional[str] = None
-    
+
     # Confidence
     confidence: float = Field(ge=0.0, le=1.0)
-    
+
     # Safety
     safety_concern: bool = False
     safety_category: SafetyCategory = SafetyCategory.NONE
@@ -319,22 +319,24 @@ class SRMDecision(BaseModel):
     sentiment_label: SentimentLabel = SentimentLabel.NEUTRAL
     sentiment_score: float = Field(default=0.0, ge=-1.0, le=1.0)
     sentiment_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    
+
     # Flow
     mode: FlowMode = FlowMode.NORMAL
     needs_rag: bool = False
-    
+
     # Handoff (doc: setor + SLA)
     handoff_required: bool = False
     handoff_reason: Optional[HandoffReason] = None
     handoff_urgency: str = "normal"
     handoff_sector: Optional[str] = None
     handoff_sla: Optional[str] = None
-    handoff_verification_status: Optional[str] = None  # scheduling-link: link_sent / concluiu / nao_concluiu
+    handoff_verification_status: Optional[str] = (
+        None  # scheduling-link: link_sent / concluiu / nao_concluiu
+    )
 
     # State changes
     state_patch: StatePatch = Field(default_factory=StatePatch)
-    
+
     # Reasoning (for debugging/audit)
     reasoning: Optional[str] = None
     processing_time_ms: Optional[int] = None
@@ -354,7 +356,8 @@ class SRMDecision(BaseModel):
             "sentiment_confidence": self.sentiment_confidence,
             "needs_rag": self.needs_rag,
             "handoff_required": self.handoff_required,
-            "handoff_reason": self.handoff_reason.value if self.handoff_reason else None,
+            "handoff_reason": (
+                self.handoff_reason.value if self.handoff_reason else None
+            ),
             "reasoning": self.reasoning,
         }
-

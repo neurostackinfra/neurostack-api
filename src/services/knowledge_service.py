@@ -7,12 +7,10 @@ from the vector database. The actual implementation will be completed
 when the Knowledge Service is implemented.
 """
 
-import logging
 from typing import Optional
 from uuid import UUID
 
 from src.config.logging import get_logger
-from src.core.exceptions import KnowledgeServiceError
 from src.ctx.models import KnowledgeChunk
 
 logger = get_logger(__name__)
@@ -21,13 +19,13 @@ logger = get_logger(__name__)
 class KnowledgeService:
     """
     Placeholder for Knowledge Service integration.
-    
+
     When fully implemented, this will:
     1. Query the Qdrant vector database
     2. Retrieve relevant knowledge chunks
     3. Re-rank by relevance
     4. Return formatted chunks for context
-    
+
     For now, returns empty results or mock data.
     """
 
@@ -36,10 +34,10 @@ class KnowledgeService:
         qdrant_url: Optional[str] = None,
         collection_name: str = "knowledge",
         max_results: int = 5,
-    ):
+    ) -> None:
         """
         Initialize the Knowledge Service.
-        
+
         Args:
             qdrant_url: URL to Qdrant server
             collection_name: Name of the collection
@@ -53,7 +51,7 @@ class KnowledgeService:
     async def connect(self) -> bool:
         """
         Connect to the knowledge service.
-        
+
         Returns:
             True if connected successfully
         """
@@ -71,24 +69,24 @@ class KnowledgeService:
         tenant_id: UUID,
         query: str,
         max_results: Optional[int] = None,
-        filters: Optional[dict] = None,
+        filters: Optional[dict[str, object]] = None,
     ) -> list[KnowledgeChunk]:
         """
         Query the knowledge base for relevant chunks.
-        
+
         Args:
             tenant_id: Tenant ID to filter by
             query: Query string
             max_results: Maximum results to return
             filters: Additional filters
-            
+
         Returns:
             List of relevant KnowledgeChunk objects
         """
         if not self._connected:
             logger.debug("Knowledge Service not connected, returning empty results")
             return []
-        
+
         # Placeholder - would query Qdrant
         # Example of what this would do:
         # 1. Embed the query using the embedding model
@@ -96,7 +94,7 @@ class KnowledgeService:
         # 3. Filter by tenant_id
         # 4. Re-rank if needed
         # 5. Return top results
-        
+
         return []
 
     async def query_by_intent(
@@ -108,15 +106,15 @@ class KnowledgeService:
     ) -> list[KnowledgeChunk]:
         """
         Query knowledge base by intent.
-        
+
         Some intents may have specific knowledge associated.
-        
+
         Args:
             tenant_id: Tenant ID
             intent: Detected intent
             query: Original query
             max_results: Maximum results
-            
+
         Returns:
             List of relevant chunks
         """
@@ -128,9 +126,9 @@ class KnowledgeService:
             "question_services": ["services", "procedures", "treatments"],
             "question_insurance": ["insurance", "plans", "coverage"],
         }
-        
+
         categories = intent_categories.get(intent, [])
-        
+
         # Would filter by categories in actual implementation
         return await self.query(
             tenant_id=tenant_id,
@@ -146,17 +144,17 @@ class KnowledgeService:
     ) -> Optional[KnowledgeChunk]:
         """
         Get a specific knowledge chunk by ID.
-        
+
         Args:
             tenant_id: Tenant ID
             chunk_id: Chunk ID
-            
+
         Returns:
             KnowledgeChunk if found
         """
         if not self._connected:
             return None
-        
+
         # Placeholder
         return None
 
@@ -164,7 +162,7 @@ class KnowledgeService:
         """Check if knowledge service is available."""
         return self._connected
 
-    async def health_check(self) -> dict:
+    async def health_check(self) -> dict[str, object]:
         """Perform health check on the knowledge service."""
         return {
             "connected": self._connected,
@@ -178,14 +176,15 @@ class KnowledgeService:
 # Mock Knowledge Service for Testing
 # ============================================
 
+
 class MockKnowledgeService(KnowledgeService):
     """
     Mock Knowledge Service for testing.
-    
+
     Returns predefined knowledge chunks based on query keywords.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self._connected = True
         self._mock_data = self._create_mock_data()
@@ -232,16 +231,16 @@ class MockKnowledgeService(KnowledgeService):
         tenant_id: UUID,
         query: str,
         max_results: Optional[int] = None,
-        filters: Optional[dict] = None,
+        filters: Optional[dict[str, object]] = None,
     ) -> list[KnowledgeChunk]:
         """Return mock knowledge based on query keywords."""
         query_lower = query.lower()
-        results = []
-        
+        results: list[KnowledgeChunk] = []
+
         for keyword, chunks in self._mock_data.items():
             if keyword in query_lower:
                 results.extend(chunks)
-        
+
         # Limit results
         max_r = max_results or self.max_results
         return results[:max_r]
@@ -257,17 +256,16 @@ _service: Optional[KnowledgeService] = None
 def get_knowledge_service(mock: bool = False) -> KnowledgeService:
     """
     Get or create the global KnowledgeService instance.
-    
+
     Args:
         mock: If True, return a mock service for testing
     """
     global _service
-    
+
     if mock:
         return MockKnowledgeService()
-    
+
     if _service is None:
         _service = KnowledgeService()
-    
-    return _service
 
+    return _service

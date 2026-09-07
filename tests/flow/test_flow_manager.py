@@ -3,32 +3,27 @@ NeuroStack - Flow Manager Unit Tests
 Tests for the Flow Manager and all components.
 """
 
-import sys
 from uuid import uuid4
 
 import pytest
 
-sys.path.insert(0, "/home/jairomendes/neurostack/neurostack-api")
-
-from src.flow.models import (
-    FlowMode,
-    FlowState,
-    FlowContext,
-    FlowTransition,
-    TransitionTrigger,
-    TransitionResult,
-    ModeHandlerResult,
-)
-from src.flow.state_machine import FlowStateMachine, get_state_machine
-from src.flow.transitions import TransitionLogger, TransitionAnalytics
 from src.flow.handlers import (
+    HandoffModeHandler,
     NormalModeHandler,
     RagModeHandler,
     SafetyModeHandler,
-    HandoffModeHandler,
 )
 from src.flow.manager import FlowManager, get_flow_manager, process_flow
-
+from src.flow.models import (
+    FlowContext,
+    FlowMode,
+    FlowState,
+    FlowTransition,
+    TransitionResult,
+    TransitionTrigger,
+)
+from src.flow.state_machine import FlowStateMachine, get_state_machine
+from src.flow.transitions import TransitionLogger
 
 # ============================================
 # Fixtures
@@ -180,7 +175,7 @@ class TestStateMachine:
             trigger=TransitionTrigger.SAFETY_CONCERN_DETECTED,
             reason="Safety test",
         )
-        
+
         assert result == TransitionResult.SUCCESS
         assert new_state.current_mode == FlowMode.SAFETY
         assert new_state.previous_mode == FlowMode.NORMAL
@@ -190,12 +185,12 @@ class TestStateMachine:
     def test_execute_transition_locked(self, state_machine, sample_state):
         """Test transition blocked when locked."""
         sample_state.is_locked = True
-        
+
         result, _ = state_machine.execute_transition(
             state=sample_state,
             trigger=TransitionTrigger.SAFETY_CONCERN_DETECTED,
         )
-        
+
         assert result == TransitionResult.BLOCKED
 
     def test_determine_trigger_safety_priority(self, state_machine):
@@ -252,7 +247,7 @@ class TestNormalHandler:
         """Test normal handling."""
         handler = NormalModeHandler()
         result = await handler.handle(sample_context)
-        
+
         assert result.mode == FlowMode.NORMAL
         assert result.success is True
         assert result.should_transition is False
@@ -262,9 +257,9 @@ class TestNormalHandler:
         """Test exit to safety."""
         handler = NormalModeHandler()
         sample_context.safety_concern = True
-        
+
         should_exit, trigger = handler.should_exit(sample_context)
-        
+
         assert should_exit is True
         assert trigger == TransitionTrigger.SAFETY_CONCERN_DETECTED
 
@@ -273,9 +268,9 @@ class TestNormalHandler:
         """Test exit to handoff."""
         handler = NormalModeHandler()
         sample_context.handoff_required = True
-        
+
         should_exit, trigger = handler.should_exit(sample_context)
-        
+
         assert should_exit is True
         assert trigger == TransitionTrigger.HANDOFF_REQUESTED
 
@@ -284,9 +279,9 @@ class TestNormalHandler:
         """Test exit to rag."""
         handler = NormalModeHandler()
         sample_context.needs_rag = True
-        
+
         should_exit, trigger = handler.should_exit(sample_context)
-        
+
         assert should_exit is True
         assert trigger == TransitionTrigger.RAG_REQUIRED
 
@@ -300,7 +295,7 @@ class TestRagHandler:
         handler = RagModeHandler()
         sample_context.needs_rag = True
         result = await handler.handle(sample_context)
-        
+
         assert result.mode == FlowMode.RAG
         assert result.success is True
 
@@ -309,9 +304,9 @@ class TestRagHandler:
         """Test RAG completion when no longer needed."""
         handler = RagModeHandler()
         sample_context.needs_rag = False
-        
+
         should_exit, trigger = handler.should_exit(sample_context)
-        
+
         assert should_exit is True
         assert trigger == TransitionTrigger.RAG_COMPLETED
 
@@ -325,9 +320,9 @@ class TestSafetyHandler:
         handler = SafetyModeHandler()
         sample_context.safety_concern = True
         sample_context.safety_category = "clinical_risk"
-        
+
         result = await handler.handle(sample_context)
-        
+
         assert result.mode == FlowMode.SAFETY
         assert result.success is True
         assert result.response is not None
@@ -338,9 +333,9 @@ class TestSafetyHandler:
         handler = SafetyModeHandler()
         sample_context.safety_concern = True
         sample_context.safety_category = "clinical_risk"
-        
+
         result = await handler.handle(sample_context)
-        
+
         assert "CVV" in result.response or "192" in result.response
 
     @pytest.mark.asyncio
@@ -349,9 +344,9 @@ class TestSafetyHandler:
         handler = SafetyModeHandler()
         sample_context.safety_concern = True
         sample_context.safety_category = "emergency"
-        
+
         result = await handler.handle(sample_context)
-        
+
         # Emergency should escalate
         assert result.should_transition is True
         assert result.next_trigger == TransitionTrigger.HANDOFF_REQUESTED
@@ -366,9 +361,9 @@ class TestHandoffHandler:
         handler = HandoffModeHandler()
         sample_context.handoff_required = True
         sample_context.handoff_reason = "explicit_request"
-        
+
         result = await handler.handle(sample_context)
-        
+
         assert result.mode == FlowMode.HANDOFF
         assert result.success is True
         assert result.response is not None
@@ -378,9 +373,9 @@ class TestHandoffHandler:
         """Test handoff completion."""
         handler = HandoffModeHandler()
         sample_context.metadata["handoff_status"] = "completed"
-        
+
         should_exit, trigger = handler.should_exit(sample_context)
-        
+
         assert should_exit is True
         assert trigger == TransitionTrigger.HANDOFF_COMPLETED
 
@@ -405,11 +400,11 @@ class TestTransitionLogger:
             session_id=sample_session_id,
             tenant_id=sample_tenant_id,
         )
-        
+
         event = await transition_logger.log_transition(
             transition, TransitionResult.SUCCESS
         )
-        
+
         assert event["event_type"] == "flow.transition"
         assert event["data"]["from_mode"] == "normal"
         assert event["data"]["to_mode"] == "safety"
@@ -425,7 +420,7 @@ class TestTransitionLogger:
             FlowMode.SAFETY,
             reason="test",
         )
-        
+
         assert "flow.mode.safety.entry" in event["event_type"]
 
     @pytest.mark.asyncio
@@ -440,7 +435,7 @@ class TestTransitionLogger:
             duration_seconds=10.5,
             reason="resolved",
         )
-        
+
         assert "flow.mode.safety.exit" in event["event_type"]
         assert event["data"]["duration_seconds"] == 10.5
 
@@ -453,9 +448,9 @@ class TestTransitionLogger:
             to_mode=FlowMode.RAG,
             trigger=TransitionTrigger.RAG_REQUIRED,
         )
-        
+
         await transition_logger.log_transition(transition, TransitionResult.SUCCESS)
-        
+
         events = transition_logger.get_buffered_events()
         assert len(events) >= 1
 
@@ -467,9 +462,9 @@ class TestTransitionLogger:
             to_mode=FlowMode.RAG,
             trigger=TransitionTrigger.RAG_REQUIRED,
         )
-        
+
         await transition_logger.log_transition(transition, TransitionResult.SUCCESS)
-        
+
         count = await transition_logger.flush_events()
         assert count >= 1
         assert len(transition_logger.get_buffered_events()) == 0
@@ -487,46 +482,40 @@ class TestFlowManager:
     async def test_process_normal(self, flow_manager, sample_context):
         """Test processing in normal mode."""
         decision = await flow_manager.process(sample_context)
-        
+
         assert decision.current_mode == FlowMode.NORMAL
         assert decision.next_mode == FlowMode.NORMAL
         assert decision.transition_required is False
 
     @pytest.mark.asyncio
-    async def test_process_transition_to_safety(
-        self, flow_manager, sample_context
-    ):
+    async def test_process_transition_to_safety(self, flow_manager, sample_context):
         """Test transition to safety mode."""
         sample_context.safety_concern = True
         sample_context.safety_category = "conduct_risk"  # Use non-escalating category
-        
+
         decision = await flow_manager.process(sample_context)
-        
+
         assert decision.next_mode == FlowMode.SAFETY
         assert decision.transition_required is True
 
     @pytest.mark.asyncio
-    async def test_process_transition_to_rag(
-        self, flow_manager, sample_context
-    ):
+    async def test_process_transition_to_rag(self, flow_manager, sample_context):
         """Test transition to RAG mode."""
         sample_context.needs_rag = True
-        
+
         decision = await flow_manager.process(sample_context)
-        
+
         assert decision.next_mode == FlowMode.RAG
         assert decision.transition_required is True
 
     @pytest.mark.asyncio
-    async def test_process_transition_to_handoff(
-        self, flow_manager, sample_context
-    ):
+    async def test_process_transition_to_handoff(self, flow_manager, sample_context):
         """Test transition to handoff mode."""
         sample_context.handoff_required = True
         sample_context.handoff_reason = "explicit_request"
-        
+
         decision = await flow_manager.process(sample_context)
-        
+
         assert decision.next_mode == FlowMode.HANDOFF
         assert decision.transition_required is True
 
@@ -534,9 +523,9 @@ class TestFlowManager:
     async def test_get_state(self, flow_manager, sample_context):
         """Test getting session state."""
         await flow_manager.process(sample_context)
-        
+
         state = flow_manager.get_state(sample_context.session_id)
-        
+
         assert state is not None
         assert state.session_id == sample_context.session_id
 
@@ -544,9 +533,9 @@ class TestFlowManager:
     async def test_reset_session(self, flow_manager, sample_context):
         """Test resetting session."""
         await flow_manager.process(sample_context)
-        
+
         result = await flow_manager.reset_session(sample_context.session_id)
-        
+
         assert result is True
         assert flow_manager.get_state(sample_context.session_id) is None
 
@@ -554,7 +543,7 @@ class TestFlowManager:
     async def test_get_prompt_additions(self, flow_manager):
         """Test getting prompt additions."""
         additions = flow_manager.get_prompt_additions(FlowMode.SAFETY)
-        
+
         assert len(additions) > 0
         assert any("SEGURANÇA" in a.upper() for a in additions)
 
@@ -575,14 +564,12 @@ class TestConvenienceFunction:
             tenant_id=sample_tenant_id,
             message="Hello",
         )
-        
+
         assert decision.current_mode == FlowMode.NORMAL
         assert decision.next_mode == FlowMode.NORMAL
 
     @pytest.mark.asyncio
-    async def test_process_flow_with_safety(
-        self, sample_session_id, sample_tenant_id
-    ):
+    async def test_process_flow_with_safety(self, sample_session_id, sample_tenant_id):
         """Test process_flow with safety concern."""
         decision = await process_flow(
             session_id=sample_session_id,
@@ -591,7 +578,7 @@ class TestConvenienceFunction:
             safety_concern=True,
             safety_category="conduct_risk",  # Non-escalating category
         )
-        
+
         assert decision.next_mode == FlowMode.SAFETY
 
 
@@ -628,7 +615,7 @@ class TestIntegration:
     async def test_full_flow_cycle(self, sample_session_id, sample_tenant_id):
         """Test a complete flow cycle: NORMAL -> SAFETY -> NORMAL."""
         manager = FlowManager()
-        
+
         # Start in normal
         context = FlowContext(
             session_id=sample_session_id,
@@ -636,31 +623,29 @@ class TestIntegration:
             current_mode=FlowMode.NORMAL,
             message="Hello",
         )
-        
+
         decision1 = await manager.process(context)
         assert decision1.next_mode == FlowMode.NORMAL
-        
+
         # Trigger safety
         context.safety_concern = True
         context.safety_category = "conduct_risk"
-        
+
         decision2 = await manager.process(context)
         assert decision2.next_mode == FlowMode.SAFETY
-        
+
         # Resolve safety
         context.safety_concern = False
         context.safety_category = None
-        
+
         decision3 = await manager.process(context)
         assert decision3.next_mode == FlowMode.NORMAL
 
     @pytest.mark.asyncio
-    async def test_rag_to_safety_priority(
-        self, sample_session_id, sample_tenant_id
-    ):
+    async def test_rag_to_safety_priority(self, sample_session_id, sample_tenant_id):
         """Test that safety takes priority over RAG."""
         manager = FlowManager()
-        
+
         # Context for testing
         context = FlowContext(
             session_id=sample_session_id,
@@ -670,14 +655,13 @@ class TestIntegration:
             needs_rag=True,
             safety_concern=False,
         )
-        
+
         # First, transition to RAG
         await manager.process(context)
-        
+
         # Now trigger safety with non-escalating category
         context.safety_concern = True
         context.safety_category = "legal_risk"  # Non-escalating category (level 2)
         decision = await manager.process(context)
-        
-        assert decision.next_mode == FlowMode.SAFETY
 
+        assert decision.next_mode == FlowMode.SAFETY

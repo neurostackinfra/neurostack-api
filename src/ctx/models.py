@@ -6,13 +6,14 @@ Data models for context orchestration and assembly.
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
 
 class MessageRole(str, Enum):
     """Role of message sender."""
+
     USER = "user"
     ASSISTANT = "assistant"
     SYSTEM = "system"
@@ -20,11 +21,12 @@ class MessageRole(str, Enum):
 
 class RelevanceLevel(str, Enum):
     """Relevance level for context items."""
+
     CRITICAL = "critical"  # Must always include
-    HIGH = "high"          # Include if space allows
-    MEDIUM = "medium"      # Include for context
-    LOW = "low"            # Include only if needed
-    NONE = "none"          # Do not include
+    HIGH = "high"  # Include if space allows
+    MEDIUM = "medium"  # Include for context
+    LOW = "low"  # Include only if needed
+    NONE = "none"  # Do not include
 
 
 class ContextMessage(BaseModel):
@@ -75,7 +77,9 @@ class SessionInfo(BaseModel):
     funnel_stage: str = "lead_novo"
     is_active: bool = True
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    last_activity_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_activity_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
 
 
 class CognitiveContext(BaseModel):
@@ -96,31 +100,31 @@ class CognitiveContext(BaseModel):
 class ContextWindow(BaseModel):
     """
     Complete context window for LLM prompt generation.
-    
+
     This is the main output of the CTX orchestrator.
     """
 
     # Session info
     session_id: UUID
     tenant_id: UUID
-    
+
     # Cognitive state
     cognitive: CognitiveContext
-    
+
     # Messages (ordered, recent first)
     messages: list[ContextMessage] = Field(default_factory=list)
-    
+
     # Knowledge (RAG results)
     knowledge_chunks: list[KnowledgeChunk] = Field(default_factory=list)
-    
+
     # Policies
     constraints: list[str] = Field(default_factory=list)
     safety_reminders: list[str] = Field(default_factory=list)
-    
+
     # Summaries
     session_summary: Optional[str] = None
     compressed_history: Optional[str] = None
-    
+
     # Metadata
     context_tokens: Optional[int] = None
     build_time_ms: Optional[int] = None
@@ -142,22 +146,22 @@ class ContextRequest(BaseModel):
     session_id: UUID
     current_message: str
     channel: str = "unknown"
-    
+
     # Options
     max_messages: int = 10
     max_tokens: int = 4000
     include_knowledge: bool = True
     include_policies: bool = True
     include_summary: bool = False
-    
+
     # Cognitive state (if available)
     cognitive_state: Optional[CognitiveContext] = None
-    
+
     # SRM decision (if available)
     srm_intent: Optional[str] = None
     srm_confidence: Optional[float] = None
     needs_rag: bool = False
-    
+
     # Doc MVP v0.5: ClinicConfig e UserState para prioridade de contexto
     clinic_config: Optional[dict[str, Any]] = None
     user_state: Optional[dict[str, Any]] = None
@@ -180,4 +184,3 @@ class CompressionResult(BaseModel):
     compression_ratio: float
     summary: Optional[str] = None
     removed_messages: int = 0
-

@@ -9,9 +9,10 @@ never follows a redirect. Provider pinning is derived from the caller's
 validation for the ``outros`` provider.
 """
 
-from typing import Any, Optional
+from typing import Any, Optional, TypedDict
 
 import httpx
+from pydantic import JsonValue, TypeAdapter
 
 from src.config.logging import get_logger
 from src.config.settings import settings
@@ -28,6 +29,17 @@ from src.services.safe_egress import (
 logger = get_logger(__name__)
 
 _client: Optional["LLMClient"] = None
+_JSON_OBJECT_ADAPTER: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(
+    dict[str, JsonValue]
+)
+
+
+class LLMGenerationResult(TypedDict):
+    """Normalized result returned by an LLM completion request."""
+
+    content: str
+    usage: dict[str, JsonValue]
+    model: str
 
 
 def _chat_completions_url(base_url: str) -> str:
@@ -106,7 +118,7 @@ class LLMClient:
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-    ) -> dict:
+    ) -> LLMGenerationResult:
         """
         Call the chat completions endpoint and return a dict with content, usage, and model.
 
@@ -159,15 +171,26 @@ class LLMClient:
                 },
             )
             resp.raise_for_status()
-            data = resp.json()
+            data = _JSON_OBJECT_ADAPTER.validate_python(resp.json())
 
-        choice = data.get("choices", [{}])[0]
-        content = choice.get("message", {}).get("content")
-        finish = choice.get("finish_reason")
-        usage = data.get("usage", {})
-        reasoning_tokens = usage.get("completion_tokens_details", {}).get(
-            "reasoning_tokens", 0
+        choices = data.get("choices")
+        choice = (
+            choices[0]
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict)
+            else {}
         )
+        message = choice.get("message")
+        message_data = message if isinstance(message, dict) else {}
+        raw_content = message_data.get("content")
+        content = raw_content if isinstance(raw_content, str) else ""
+        finish = choice.get("finish_reason")
+        raw_usage = data.get("usage")
+        usage = raw_usage if isinstance(raw_usage, dict) else {}
+        raw_completion_details = usage.get("completion_tokens_details")
+        completion_details = (
+            raw_completion_details if isinstance(raw_completion_details, dict) else {}
+        )
+        reasoning_tokens = completion_details.get("reasoning_tokens", 0)
 
         if not content:
             logger.warning(
@@ -211,24 +234,31 @@ def get_llm_client() -> Optional[LLMClient]:
     return _client
 
 
-def get_tenant_llm_client(tenant_id: Any, api_credentials: dict) -> Optional[LLMClient]:
+def get_tenant_llm_client(
+    tenant_id: object, api_credentials: dict[str, JsonValue]
+) -> Optional[LLMClient]:
     """
     Create an LLM client for a specific tenant using their saved API credentials.
 
     If the tenant has no llm_api_key configured, falls back to the global client.
     Creates a new client on each call (safe-egress transports are per-call).
     """
-    api_key = api_credentials.get("llm_api_key")
-    if not api_key:
+    configured_api_key = api_credentials.get("llm_api_key")
+    if not isinstance(configured_api_key, str) or not configured_api_key:
         return get_llm_client()
 
-    base_url = api_credentials.get("llm_api_url") or settings.llm_base_url
+    configured_base_url = api_credentials.get("llm_api_url")
+    base_url = (
+        configured_base_url
+        if isinstance(configured_base_url, str) and configured_base_url
+        else settings.llm_base_url
+    )
     logger.debug(
         "Creating per-tenant LLM client",
         tenant_id=str(tenant_id),
         base_url=base_url,
     )
-    return LLMClient(base_url=base_url, api_key=api_key)
+    return LLMClient(base_url=base_url, api_key=configured_api_key)
 
 
 # Multimodal-text bundle field names — replicated locally instead of imported

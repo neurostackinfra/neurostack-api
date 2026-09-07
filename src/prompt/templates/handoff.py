@@ -3,9 +3,8 @@ NeuroStack - Prompt Engine - Handoff Template
 Template for human handoff transitions.
 """
 
-from src.prompt.models import PromptMode, PromptVariables
+from src.prompt.models import PromptMessage, PromptMode, PromptVariables
 from src.prompt.templates.base import BaseTemplate, TemplateSection
-
 
 # ============================================
 # Handoff System Prompt
@@ -117,15 +116,15 @@ O usu\u00e1rio expressou insatisfa\u00e7\u00e3o ou pediu supervisor.
 class HandoffTemplate(BaseTemplate):
     """
     Template for HANDOFF mode conversations.
-    
+
     Handles the transition to human agents with
     appropriate context preservation.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(PromptMode.HANDOFF)
 
-    def build_system_message(self, variables: PromptVariables):
+    def build_system_message(self, variables: PromptVariables) -> PromptMessage:
         """Override to append language override as the absolute last instruction."""
         msg = super().build_system_message(variables)
         if variables.language == "en":
@@ -144,66 +143,74 @@ class HandoffTemplate(BaseTemplate):
     def get_context_instructions(self, variables: PromptVariables) -> str:
         """Get handoff-specific instructions based on reason."""
         parts = []
-        
+
         # Reason-specific instructions
         reason = variables.handoff_reason or "explicit_request"
         if reason in HANDOFF_REASON_INSTRUCTIONS:
             parts.append(HANDOFF_REASON_INSTRUCTIONS[reason])
-        
+
         # Information collection section
         collection_section = TemplateSection("Informa\u00e7\u00f5es a Coletar")
-        collection_section.add_list([
-            "Nome do usu\u00e1rio (se n\u00e3o tiver)",
-            "Resumo do problema/solicita\u00e7\u00e3o",
-            "Tentativas anteriores de resolu\u00e7\u00e3o",
-            "Urg\u00eancia da quest\u00e3o",
-            "Prefer\u00eancia de contato (se aplic\u00e1vel)",
-        ])
+        collection_section.add_list(
+            [
+                "Nome do usu\u00e1rio (se n\u00e3o tiver)",
+                "Resumo do problema/solicita\u00e7\u00e3o",
+                "Tentativas anteriores de resolu\u00e7\u00e3o",
+                "Urg\u00eancia da quest\u00e3o",
+                "Prefer\u00eancia de contato (se aplic\u00e1vel)",
+            ]
+        )
         parts.append(collection_section.build())
-        
+
         # Slots j\u00e1 coletados
         if variables.slots:
-            collected_section = TemplateSection("Informa\u00e7\u00f5es J\u00e1 Coletadas")
+            collected_section = TemplateSection(
+                "Informa\u00e7\u00f5es J\u00e1 Coletadas"
+            )
             for key, value in variables.slots.items():
                 collected_section.add(f"**{key}**: {value}")
             parts.append(collected_section.build())
-        
+
         # History summary
         if variables.history_summary:
             history_section = TemplateSection("Resumo da Conversa")
             history_section.add(variables.history_summary)
             parts.append(history_section.build())
-        
+
         # Status instructions
         status = variables.handoff_status
         if status == "waiting":
-            parts.append("""
+            parts.append(
+                """
 ## Usu\u00e1rio em Espera
 - Mantenha-o engajado
 - Forne\u00e7a atualiza\u00e7\u00f5es de tempo
 - Ofere\u00e7a para coletar mais informa\u00e7\u00f5es
-""")
+"""
+            )
         elif status == "connected":
-            parts.append("""
+            parts.append(
+                """
 ## Atendente Conectado
 - Finalize seu papel
 - Fa\u00e7a uma passagem de contexto clara
 - Agrade\u00e7a ao usu\u00e1rio
-""")
-        
+"""
+            )
+
         return "\n".join(parts)
 
     def generate_handoff_summary(self, variables: PromptVariables) -> str:
         """
         Generate a summary for the human agent.
-        
+
         Args:
             variables: Prompt variables with context
-            
+
         Returns:
             Formatted summary for agent
         """
-        nao_especificado = 'N\u00e3o especificado'
+        nao_especificado = "N\u00e3o especificado"
         summary_parts = [
             "## Resumo para Atendente",
             "",
@@ -212,27 +219,30 @@ class HandoffTemplate(BaseTemplate):
             f"**Motivo da Transfer\u00eancia:** {variables.handoff_reason or nao_especificado}",
             "",
         ]
-        
+
         if variables.funnel_stage:
             summary_parts.append(f"**Est\u00e1gio:** {variables.funnel_stage}")
-        
+
         if variables.last_intent:
-            summary_parts.append(f"**\u00daltima Inten\u00e7\u00e3o:** {variables.last_intent}")
-        
+            summary_parts.append(
+                f"**\u00daltima Inten\u00e7\u00e3o:** {variables.last_intent}"
+            )
+
         if variables.slots:
             summary_parts.append("")
             summary_parts.append("### Informa\u00e7\u00f5es Coletadas:")
             for key, value in variables.slots.items():
                 summary_parts.append(f"- {key}: {value}")
-        
+
         if variables.history_summary:
             summary_parts.append("")
             summary_parts.append("### Contexto da Conversa:")
             summary_parts.append(variables.history_summary)
-        
+
         if variables.safety_category:
             summary_parts.append("")
-            summary_parts.append(f"\u26a0\ufe0f **Alerta de Seguran\u00e7a:** {variables.safety_category}")
-        
-        return "\n".join(summary_parts)
+            summary_parts.append(
+                f"\u26a0\ufe0f **Alerta de Seguran\u00e7a:** {variables.safety_category}"
+            )
 
+        return "\n".join(summary_parts)

@@ -27,7 +27,6 @@ from src.models.support_ticket import SupportTicket
 from src.models.tenant import Tenant
 from src.models.user import User, UserRole
 
-
 # ============================================
 # Token Helpers (mirrors tests/api/test_builder.py)
 # ============================================
@@ -50,7 +49,9 @@ def _make_clinic_admin_token(tenant_id: UUID, user_id: UUID | None = None) -> st
     )
 
 
-def _make_builder_token(builder_id: UUID | None = None, tenant_id: UUID | None = None) -> str:
+def _make_builder_token(
+    builder_id: UUID | None = None, tenant_id: UUID | None = None
+) -> str:
     now = datetime.now(timezone.utc)
     return jwt.encode(
         {
@@ -123,7 +124,9 @@ async def _seed_tenant(
         await session.close()
 
 
-async def _seed_builder(*, status_: str = "active") -> Builder:
+async def _seed_builder(
+    *, status_: str = "active", support_email: str | None = None
+) -> Builder:
     session = await _open_session()
     try:
         builder = Builder(
@@ -133,6 +136,7 @@ async def _seed_builder(*, status_: str = "active") -> Builder:
             is_active=(status_ == "active"),
             billing_cycle="monthly",
             subscription_status="trial",
+            support_email=support_email,
         )
         session.add(builder)
         await session.commit()
@@ -331,6 +335,145 @@ class TestSupportTicketRouting:
         assert row.routed_to_builder_id is None
 
     @pytest.mark.asyncio
+    async def test_active_builder_with_support_email_routes_to_support_email(
+        self, async_client: AsyncClient, smtp_capture: _SmtpCapture
+    ):
+        """Group 2: when Builder.support_email is set and a role=builder user exists,
+        the ticket is delivered to support_email rather than the user's login email."""
+        support_email = f"support-{uuid4().hex[:6]}@builder.test"
+        builder = await _seed_builder(status_="active", support_email=support_email)
+        tenant = await _seed_tenant(builder_id=builder.id)
+        # role=builder user still exists — that gate is preserved
+        builder_user_email = f"user-{uuid4().hex[:6]}@builder.test"
+        await _seed_builder_user(
+            builder_id=builder.id, tenant_id=tenant.id, email=builder_user_email
+        )
+
+        headers = {
+            "Authorization": f"Bearer {_make_clinic_admin_token(tenant_id=tenant.id)}",
+            "Content-Type": "application/json",
+        }
+        resp = await async_client.post(
+            "/v1/support/tickets",
+            headers=headers,
+            json={"tipo": "solicitacao", "mensagem": "route via support_email"},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+
+        assert len(smtp_capture.messages) == 1
+        # Delivered to support_email, NOT the login user's email
+        assert smtp_capture.messages[0]["To"] == support_email
+        assert smtp_capture.messages[0]["To"] != builder_user_email
+
+        row = await _fetch_ticket(data["ticket_id"])
+        assert row is not None
+        assert row.routed_to == "builder"
+        assert row.routed_to_builder_id == builder.id
+
+    @pytest.mark.asyncio
+    async def test_builder_without_user_falls_back_to_central_even_with_support_email(
+        self, async_client: AsyncClient, smtp_capture: _SmtpCapture
+    ):
+        """Group 2 guardrail: support_email is IGNORED when no role=builder user exists
+        for the builder. This precondition was deliberately preserved."""
+        support_email = f"orphan-{uuid4().hex[:6]}@builder.test"
+        builder = await _seed_builder(status_="active", support_email=support_email)
+        tenant = await _seed_tenant(builder_id=builder.id)
+        # Deliberately no builder-role user
+
+        headers = {
+            "Authorization": f"Bearer {_make_clinic_admin_token(tenant_id=tenant.id)}",
+            "Content-Type": "application/json",
+        }
+        resp = await async_client.post(
+            "/v1/support/tickets",
+            headers=headers,
+            json={"tipo": "solicitacao", "mensagem": "support_email set but no user"},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+
+        assert len(smtp_capture.messages) == 1
+        assert smtp_capture.messages[0]["To"] == settings.support_email_to
+        assert smtp_capture.messages[0]["To"] != support_email
+
+        row = await _fetch_ticket(data["ticket_id"])
+        assert row is not None
+        assert row.routed_to == "central"
+        assert row.routed_to_builder_id is None
+
+    @pytest.mark.asyncio
+    async def test_suspended_builder_with_support_email_still_central(
+        self, async_client: AsyncClient, smtp_capture: _SmtpCapture
+    ):
+        """Group 2 guardrail: inactive builder → central regardless of support_email."""
+        support_email = f"suspended-support-{uuid4().hex[:6]}@builder.test"
+        builder = await _seed_builder(status_="suspended", support_email=support_email)
+        tenant = await _seed_tenant(builder_id=builder.id)
+        await _seed_builder_user(
+            builder_id=builder.id,
+            tenant_id=tenant.id,
+            email=f"suspended-user-{uuid4().hex[:6]}@builder.test",
+        )
+
+        headers = {
+            "Authorization": f"Bearer {_make_clinic_admin_token(tenant_id=tenant.id)}",
+            "Content-Type": "application/json",
+        }
+        resp = await async_client.post(
+            "/v1/support/tickets",
+            headers=headers,
+            json={"tipo": "solicitacao", "mensagem": "suspended + support_email"},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+
+        assert len(smtp_capture.messages) == 1
+        assert smtp_capture.messages[0]["To"] == settings.support_email_to
+        assert smtp_capture.messages[0]["To"] != support_email
+
+        row = await _fetch_ticket(data["ticket_id"])
+        assert row is not None
+        assert row.routed_to == "central"
+        assert row.routed_to_builder_id is None
+
+    @pytest.mark.asyncio
+    async def test_financeiro_with_support_email_still_central(
+        self, async_client: AsyncClient, smtp_capture: _SmtpCapture
+    ):
+        """Group 2 guardrail: financeiro tickets → central even if support_email set."""
+        support_email = f"fin-support-{uuid4().hex[:6]}@builder.test"
+        builder = await _seed_builder(status_="active", support_email=support_email)
+        tenant = await _seed_tenant(builder_id=builder.id)
+        await _seed_builder_user(
+            builder_id=builder.id,
+            tenant_id=tenant.id,
+            email=f"fin-user-{uuid4().hex[:6]}@builder.test",
+        )
+
+        headers = {
+            "Authorization": f"Bearer {_make_clinic_admin_token(tenant_id=tenant.id)}",
+            "Content-Type": "application/json",
+        }
+        resp = await async_client.post(
+            "/v1/support/tickets",
+            headers=headers,
+            json={"tipo": "financeiro", "mensagem": "invoice + support_email"},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+
+        assert len(smtp_capture.messages) == 1
+        assert smtp_capture.messages[0]["To"] == settings.support_email_to
+        assert smtp_capture.messages[0]["To"] != support_email
+
+        row = await _fetch_ticket(data["ticket_id"])
+        assert row is not None
+        assert row.routed_to == "central"
+        assert row.routed_to_builder_id is None
+
+    @pytest.mark.asyncio
     async def test_financeiro_ticket_always_routes_to_central(
         self, async_client: AsyncClient, smtp_capture: _SmtpCapture
     ):
@@ -451,7 +594,9 @@ class TestSupportAdminAuthEnforcement:
         assert resp.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_patch_status_returns_403_for_builder(self, async_client: AsyncClient):
+    async def test_patch_status_returns_403_for_builder(
+        self, async_client: AsyncClient
+    ):
         headers = {
             "Authorization": f"Bearer {_make_builder_token()}",
             "Content-Type": "application/json",

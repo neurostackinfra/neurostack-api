@@ -3,30 +3,31 @@ NeuroStack - Tenant Model
 Represents a builder or clinic using the NeuroStack platform.
 """
 
-from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy import Boolean, ForeignKey, String
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import Base, TimestampMixin
 
 if TYPE_CHECKING:
     from src.models.builder import Builder
-    from src.models.session import Session
-    from src.models.event import Event
-    from src.models.policy import Policy
-    from src.models.knowledge import KnowledgeDocument
-    from src.models.handoff import HandoffRecord
+    from src.models.clinic_config import ClinicConfig
     from src.models.clinic_config_table import ClinicConfigTable
+    from src.models.event import Event
+    from src.models.handoff import HandoffRecord
+    from src.models.knowledge import KnowledgeDocument
+    from src.models.policy import Policy
+    from src.models.session import Session
 
 
 class TenantConfig:
     """
     Tenant configuration structure.
-    
+
     Defines configurable options per tenant including rate limits,
     session settings, and feature flags.
     """
@@ -86,12 +87,12 @@ class TenantConfig:
 class Tenant(Base, TimestampMixin):
     """
     Tenant model representing a builder or clinic.
-    
+
     Tenants are the top-level entity in NeuroStack. Each tenant has:
     - Unique API key for authentication
     - Configuration settings (rate limits, features, etc.)
     - Associated sessions, events, policies, and knowledge documents
-    
+
     Attributes:
         id: Unique tenant identifier (UUID)
         name: Human-readable tenant name
@@ -101,7 +102,7 @@ class Tenant(Base, TimestampMixin):
         config: JSON configuration object
         created_at: Timestamp of creation
         updated_at: Timestamp of last update
-    
+
     Relationships:
         sessions: All sessions for this tenant
         events: All events for this tenant
@@ -171,6 +172,12 @@ class Tenant(Base, TimestampMixin):
         nullable=False,
     )
 
+    # Clinic contact phone (surfaced on support screens; not used for messaging)
+    contact_phone: Mapped[Optional[str]] = mapped_column(
+        String(32),
+        nullable=True,
+    )
+
     # Configuration (JSONB)
     config: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
@@ -233,6 +240,7 @@ class Tenant(Base, TimestampMixin):
     def get_clinic_config(self) -> Optional["ClinicConfig"]:
         """Get ClinicConfig: primeiro da tabela clinic_configs, depois fallback em config JSON (retrocompat)."""
         from src.models.clinic_config import ClinicConfig
+
         if self.clinic_config_row:
             return self.clinic_config_row.to_pydantic()
         data = (self.config or {}).get("clinic_config")
@@ -256,14 +264,19 @@ class Tenant(Base, TimestampMixin):
     def is_rag_enabled(self) -> bool:
         """Check if RAG is enabled for this tenant."""
         features = self.config.get("features", {}) if self.config else {}
-        return features.get("rag_enabled", True)
+        if not isinstance(features, dict):
+            return True
+        enabled = features.get("rag_enabled", True)
+        return enabled if isinstance(enabled, bool) else True
 
     @property
     def is_handoff_enabled(self) -> bool:
         """Check if handoff is enabled for this tenant."""
         features = self.config.get("features", {}) if self.config else {}
-        return features.get("handoff_enabled", True)
+        if not isinstance(features, dict):
+            return True
+        enabled = features.get("handoff_enabled", True)
+        return enabled if isinstance(enabled, bool) else True
 
     def __repr__(self) -> str:
         return f"<Tenant(id={self.id}, name='{self.name}', active={self.is_active})>"
-

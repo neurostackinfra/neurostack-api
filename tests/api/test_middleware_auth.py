@@ -18,6 +18,7 @@ from httpx import AsyncClient
 from starlette.responses import RedirectResponse
 
 from src.api.middleware.auth import (
+    APIKeyStore,
     TenantContext,
     require_credentials_jwt,
     resolve_effective_tenant,
@@ -149,6 +150,35 @@ def test_tenant_resolver_requires_builder_ownership() -> None:
         == selected
     )
     db.execute.assert_awaited_once()
+
+
+def test_api_key_store_skips_malformed_database_hash_locally() -> None:
+    """Malformed tenant hashes are a per-row miss, not an auth-wide failure."""
+    tenant = MagicMock(
+        id=uuid4(),
+        api_key_hash="not-a-passlib-hash",
+        is_active=True,
+    )
+    repository = MagicMock()
+    repository.find_active = AsyncMock(return_value=[tenant])
+
+    @asynccontextmanager
+    async def session_scope() -> AsyncIterator[AsyncMock]:
+        yield AsyncMock()
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("src.api.middleware.auth.get_db_session", session_scope)
+        monkeypatch.setattr(
+            "src.api.middleware.auth.TenantRepository",
+            lambda _session: repository,
+        )
+        logger = MagicMock()
+        monkeypatch.setattr("src.api.middleware.auth.logger", logger)
+
+        assert asyncio.run(APIKeyStore.validate_api_key("unknown-api-key")) is None
+
+    logger.debug.assert_called_once()
+    logger.error.assert_not_called()
 
 
 def test_sync_client_runs_application_lifespan(client: Any) -> None:

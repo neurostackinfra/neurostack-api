@@ -21,7 +21,6 @@ from prometheus_client import Counter
 
 from src.config.logging import get_logger
 
-
 logger = get_logger(__name__)
 
 
@@ -41,10 +40,10 @@ PRICE_GATE_VIOLATIONS = Counter(
 # integers and the common adjective "real" ("caso real") never trip it —
 # only the currency plural "reais" and the R$ marker count as a price.
 _MONEY_RE = re.compile(
-    r"R\$\s*\d"                      # R$ 100 / R$100 / R$ 1.500,00
-    r"|\bR\$"                        # R$ marker (agent quoting the currency)
-    r"|\breais\b"                    # "cem reais", "50 reais" (currency plural)
-    r"|\bRs\.?\s*\d",                # informal "Rs 200" / "Rs. 200"
+    r"R\$\s*\d"  # R$ 100 / R$100 / R$ 1.500,00
+    r"|\bR\$"  # R$ marker (agent quoting the currency)
+    r"|\breais\b"  # "cem reais", "50 reais" (currency plural)
+    r"|\bRs\.?\s*\d",  # informal "Rs 200" / "Rs. 200"
     flags=re.IGNORECASE,
 )
 

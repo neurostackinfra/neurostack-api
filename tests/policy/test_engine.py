@@ -3,39 +3,33 @@ NeuroStack - Policy Engine Unit Tests
 Tests for the Policy & Guardrails Engine.
 """
 
-import sys
 from uuid import uuid4
 
 import pytest
 
-sys.path.insert(0, "/home/jairomendes/neurostack/neurostack-api")
-
-from src.policy.models import (
-    PolicyType,
-    RuleSeverity,
-    RuleAction,
-    RuleCategory,
-    PolicyRuleDefinition,
-    PolicyDefinition,
-    PolicyEvaluationResult,
-    PolicyConstraints,
-    PolicyContext,
-    RuleViolation,
-    PolicyCreate,
-    PolicyRuleCreate,
-)
+from src.policy.engine import PolicyEngine
 from src.policy.global_rules import (
+    get_clinical_safety_rules,
+    get_global_constraints,
     get_global_policy,
     get_global_rules,
-    get_global_constraints,
-    get_clinical_safety_rules,
     get_legal_safety_rules,
-    GLOBAL_SAFETY_POLICY,
 )
-from src.policy.policy_store import PolicyStore, PolicyStoreError
+from src.policy.models import (
+    PolicyConstraints,
+    PolicyCreate,
+    PolicyDefinition,
+    PolicyEvaluationResult,
+    PolicyRuleCreate,
+    PolicyRuleDefinition,
+    PolicyType,
+    RuleAction,
+    RuleCategory,
+    RuleSeverity,
+    RuleViolation,
+)
 from src.policy.policy_merger import PolicyMerger
-from src.policy.engine import PolicyEngine
-
+from src.policy.policy_store import PolicyStore, PolicyStoreError
 
 # ============================================
 # Fixtures
@@ -122,7 +116,7 @@ class TestGlobalRules:
         """Test clinical safety rules."""
         rules = get_clinical_safety_rules()
         assert len(rules) >= 2
-        
+
         # All should be clinical category
         for rule in rules:
             assert rule.category == RuleCategory.SAFETY_CLINICAL
@@ -131,7 +125,7 @@ class TestGlobalRules:
         """Test legal safety rules."""
         rules = get_legal_safety_rules()
         assert len(rules) >= 1
-        
+
         for rule in rules:
             assert rule.category == RuleCategory.SAFETY_LEGAL
 
@@ -149,7 +143,7 @@ class TestGlobalRules:
             (r for r in rules if r.rule_id == "C_MEDICAL_NO_DIAGNOSIS"),
             None,
         )
-        
+
         assert no_diagnosis is not None
         assert no_diagnosis.matches("Qual é meu diagnóstico?")
         assert no_diagnosis.matches("Me diga o que eu tenho")
@@ -162,7 +156,7 @@ class TestGlobalRules:
             (r for r in rules if r.rule_id == "C_MEDICAL_NO_MED_CHANGE_POSTCARE"),
             None,
         )
-        
+
         assert no_medication is not None
         assert no_medication.matches("Que remédio devo tomar?")
         assert no_medication.matches("Me receita um medicamento")
@@ -224,9 +218,9 @@ class TestPolicyStore:
             ],
             priority=50,
         )
-        
+
         policy = await policy_store.create_policy(sample_tenant_id, policy_data)
-        
+
         assert policy.name == "Test Policy"
         assert policy.tenant_id == sample_tenant_id
         assert len(policy.rules) == 1
@@ -240,10 +234,10 @@ class TestPolicyStore:
             policy_type=PolicyType.TENANT,
             rules=[],
         )
-        
+
         created = await policy_store.create_policy(sample_tenant_id, policy_data)
         retrieved = await policy_store.get_policy(created.id, sample_tenant_id)
-        
+
         assert retrieved.id == created.id
         assert retrieved.name == "Get Test"
 
@@ -261,13 +255,16 @@ class TestPolicyStore:
             policy_type=PolicyType.TENANT,
             rules=[],
         )
-        
+
         created = await policy_store.create_policy(sample_tenant_id, policy_data)
-        
+
         from src.policy.models import PolicyUpdate
+
         updates = PolicyUpdate(name="Updated Name", priority=200)
-        updated = await policy_store.update_policy(created.id, sample_tenant_id, updates)
-        
+        updated = await policy_store.update_policy(
+            created.id, sample_tenant_id, updates
+        )
+
         assert updated.name == "Updated Name"
         assert updated.priority == 200
         assert updated.version == 2
@@ -280,10 +277,10 @@ class TestPolicyStore:
             policy_type=PolicyType.TENANT,
             rules=[],
         )
-        
+
         created = await policy_store.create_policy(sample_tenant_id, policy_data)
         assert policy_store.policy_count == 1
-        
+
         deleted = await policy_store.delete_policy(created.id, sample_tenant_id)
         assert deleted is True
         assert policy_store.policy_count == 0
@@ -300,9 +297,9 @@ class TestPolicyStore:
                 priority=i * 10,
             )
             await policy_store.create_policy(sample_tenant_id, policy_data)
-        
+
         policies = await policy_store.list_policies(sample_tenant_id)
-        
+
         assert len(policies) == 3
         # Should be sorted by priority (highest first)
         assert policies[0].priority >= policies[1].priority
@@ -326,10 +323,10 @@ class TestPolicyStore:
                 ),
             ],
         )
-        
+
         await policy_store.create_policy(sample_tenant_id, policy_data)
         rules = await policy_store.get_active_rules(sample_tenant_id)
-        
+
         assert len(rules) == 2
 
 
@@ -347,11 +344,11 @@ class TestPolicyMerger:
     ):
         """Test that merged rules include global rules."""
         rules = await policy_merger.get_merged_rules(sample_tenant_id)
-        
+
         # Should include global rules
         global_rule_ids = [r.rule_id for r in get_global_rules()]
         merged_rule_ids = [r.rule_id for r in rules]
-        
+
         for gid in global_rule_ids:
             assert gid in merged_rule_ids
 
@@ -373,9 +370,9 @@ class TestPolicyMerger:
             ],
         )
         await policy_store.create_policy(sample_tenant_id, policy_data)
-        
+
         rules = await policy_merger.get_merged_rules(sample_tenant_id)
-        
+
         # Should include both global and tenant rules
         rule_names = [r.rule for r in rules]
         assert "custom_tenant_rule" in rule_names
@@ -384,7 +381,7 @@ class TestPolicyMerger:
     async def test_get_merged_constraints(self, policy_merger, sample_tenant_id):
         """Test getting merged constraints."""
         constraints = await policy_merger.get_merged_constraints(sample_tenant_id)
-        
+
         assert constraints is not None
         assert len(constraints.must_not_say) > 0
 
@@ -392,7 +389,7 @@ class TestPolicyMerger:
     async def test_get_safety_rules(self, policy_merger, sample_tenant_id):
         """Test getting safety rules."""
         safety_rules = await policy_merger.get_safety_rules(sample_tenant_id)
-        
+
         # All should be safety-related
         for rule in safety_rules:
             assert rule.category.value.startswith("safety")
@@ -416,7 +413,7 @@ class TestPolicyEngine:
             session_id=sample_session_id,
             message="Olá, gostaria de agendar uma consulta",
         )
-        
+
         assert result.passed is True
         assert len(result.violations) == 0
         assert result.should_block is False
@@ -431,7 +428,7 @@ class TestPolicyEngine:
             session_id=sample_session_id,
             message="Qual é o meu diagnóstico?",
         )
-        
+
         assert result.passed is False
         assert len(result.violations) > 0
         assert result.should_block is True
@@ -446,7 +443,7 @@ class TestPolicyEngine:
             session_id=sample_session_id,
             message="Me receita um remédio para dor de cabeça",
         )
-        
+
         assert result.passed is False
         assert len(result.violations) > 0
 
@@ -460,47 +457,41 @@ class TestPolicyEngine:
             session_id=sample_session_id,
             message="Estou passando muito mal, é uma emergência",
         )
-        
+
         # Should trigger handoff for emergencies
         if not result.passed:
             assert result.should_handoff is True
 
     @pytest.mark.asyncio
-    async def test_get_constraints(
-        self, policy_engine, sample_tenant_id
-    ):
+    async def test_get_constraints(self, policy_engine, sample_tenant_id):
         """Test getting constraints."""
         constraints = await policy_engine.get_constraints(sample_tenant_id)
-        
+
         assert constraints is not None
         assert len(constraints.must_not_say) > 0
-        
+
         # Convert to prompt constraints
         prompt_constraints = constraints.to_prompt_constraints()
         assert len(prompt_constraints) > 0
 
     @pytest.mark.asyncio
-    async def test_get_policies_summary(
-        self, policy_engine, sample_tenant_id
-    ):
+    async def test_get_policies_summary(self, policy_engine, sample_tenant_id):
         """Test getting policies summary."""
         summary = await policy_engine.get_policies_summary(sample_tenant_id)
-        
+
         assert "total_policies" in summary
         assert "total_rules" in summary
         assert "safety_rules" in summary
         assert summary["total_policies"] >= 1  # At least global policy
 
     @pytest.mark.asyncio
-    async def test_validate_response_safe(
-        self, policy_engine, sample_tenant_id
-    ):
+    async def test_validate_response_safe(self, policy_engine, sample_tenant_id):
         """Test validating a safe response."""
         result = await policy_engine.validate_response(
             tenant_id=sample_tenant_id,
             response="Posso ajudá-lo a agendar uma consulta.",
         )
-        
+
         assert result.passed is True
 
     @pytest.mark.asyncio
@@ -513,7 +504,7 @@ class TestPolicyEngine:
             session_id=sample_session_id,
             message="Qual meu diagnóstico?",
         )
-        
+
         if not result.passed:
             message = await policy_engine.get_violation_message(result)
             assert len(message) > 0
@@ -528,7 +519,7 @@ class TestPolicyEngine:
             session_id=sample_session_id,
             message="Olá",
         )
-        
+
         assert result.evaluation_time_ms is not None
         assert result.evaluation_time_ms >= 0
 
@@ -551,9 +542,9 @@ class TestPolicyConstraints:
             must_not_say=["item2"],
             safety_reminders=["safety1"],
         )
-        
+
         merged = c1.merge(c2)
-        
+
         assert "item1" in merged.must_not_say
         assert "item2" in merged.must_not_say
         assert "include1" in merged.must_include
@@ -566,9 +557,9 @@ class TestPolicyConstraints:
             must_include=["ser educado"],
             safety_reminders=["Ligar SAMU em emergência"],
         )
-        
+
         prompt = constraints.to_prompt_constraints()
-        
+
         assert any("NÃO" in p for p in prompt)
         assert any("SEMPRE" in p for p in prompt)
         assert any("SAMU" in p for p in prompt)
@@ -585,7 +576,7 @@ class TestPolicyEvaluationResult:
     def test_add_violation(self):
         """Test adding violations."""
         result = PolicyEvaluationResult()
-        
+
         violation = RuleViolation(
             rule_id="test",
             rule_name="Test Rule",
@@ -596,9 +587,9 @@ class TestPolicyEvaluationResult:
             policy_id=uuid4(),
             policy_name="Test Policy",
         )
-        
+
         result.add_violation(violation)
-        
+
         assert result.passed is False
         assert result.should_block is True
         assert len(result.violations) == 1
@@ -607,7 +598,7 @@ class TestPolicyEvaluationResult:
     def test_handoff_violation(self):
         """Test handoff violation action."""
         result = PolicyEvaluationResult()
-        
+
         violation = RuleViolation(
             rule_id="test",
             rule_name="Test Rule",
@@ -618,40 +609,43 @@ class TestPolicyEvaluationResult:
             policy_id=uuid4(),
             policy_name="Test Policy",
         )
-        
+
         result.add_violation(violation)
-        
+
         assert result.should_handoff is True
 
     def test_severity_escalation(self):
         """Test that highest severity is tracked."""
         result = PolicyEvaluationResult()
-        
-        # Add warning first
-        result.add_violation(RuleViolation(
-            rule_id="test1",
-            rule_name="Test 1",
-            message="Test",
-            category=RuleCategory.CUSTOM,
-            severity=RuleSeverity.WARNING,
-            action=RuleAction.WARN,
-            policy_id=uuid4(),
-            policy_name="Test",
-        ))
-        
-        assert result.highest_severity == RuleSeverity.WARNING
-        
-        # Add critical
-        result.add_violation(RuleViolation(
-            rule_id="test2",
-            rule_name="Test 2",
-            message="Test",
-            category=RuleCategory.SAFETY_CLINICAL,
-            severity=RuleSeverity.CRITICAL,
-            action=RuleAction.BLOCK,
-            policy_id=uuid4(),
-            policy_name="Test",
-        ))
-        
-        assert result.highest_severity == RuleSeverity.CRITICAL
 
+        # Add warning first
+        result.add_violation(
+            RuleViolation(
+                rule_id="test1",
+                rule_name="Test 1",
+                message="Test",
+                category=RuleCategory.CUSTOM,
+                severity=RuleSeverity.WARNING,
+                action=RuleAction.WARN,
+                policy_id=uuid4(),
+                policy_name="Test",
+            )
+        )
+
+        assert result.highest_severity == RuleSeverity.WARNING
+
+        # Add critical
+        result.add_violation(
+            RuleViolation(
+                rule_id="test2",
+                rule_name="Test 2",
+                message="Test",
+                category=RuleCategory.SAFETY_CLINICAL,
+                severity=RuleSeverity.CRITICAL,
+                action=RuleAction.BLOCK,
+                policy_id=uuid4(),
+                policy_name="Test",
+            )
+        )
+
+        assert result.highest_severity == RuleSeverity.CRITICAL
