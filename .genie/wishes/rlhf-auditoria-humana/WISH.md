@@ -783,6 +783,18 @@ _The read-only reviewer returns evidence; the invoking orchestrator appends a ti
 - **Entregáveis:** `src/models/rlhf_rating.py`, `src/models/rlhf_audit_review.py`, `src/models/__init__.py` (registro dos dois novos modelos), `alembic/versions/20260907_000001_020_rlhf_audit_tables.py` (`RLHF_DOWN_REVISION=019`), `tests/integration/test_rlhf_audit_postgres.py`.
 - **Task:** `genie task` indisponível nesta sessão (`.genie/genie.db` malformado, incompatibilidade WSL2/DrvFs suspeitada — reparo tentado e abandonado por ser infraestrutural, não bloqueante conforme a skill `work`); grupo rastreado só por este bloco.
 
+### Execução — Group 2 — 2026-09-07 — **SHIP**
+
+- **Engineer:** `genie:engineer-complex` / opus (troca de armazenamento nos 6 consumidores fechados: escrita, `list_ratings` passo 1, `_update_rating_status`, PATCH, e os dois helpers de teste `_load_rating`/`_seed_rating_event`). O agente atingiu o limite de sessão antes de reportar de volta — sem auto-relato do engineer, então o orquestrador e o revisor verificaram o trabalho de forma independente, sem confiar em nenhuma alegação do engineer.
+- **Reviewer (independente do engineer):** `genie:reviewer` / opus — **SHIP**. Verificou, lendo o código e os testes linha a linha (não apenas os nomes), todos os 25 critérios de aceitação, incluindo os cinco formatos de par canal/trace, a exclusão do `RatingEntry` morto, a renomeação completa `event_id`→`rating_id`, e isolamento de tenant inalterado. Verificação aprofundada do item de maior risco (degrau do meio): `TestSubmitRatingMiddleRungAttribution::test_message_id_resolution_pins_credential_tenant_end_to_end` (`tests/api/test_rlhf.py:799-916`) confirmado como teste de ponta a ponta via `client.post` real, com os três patches exigidos (`_load_runtime_llm_credentials`, `get_tenant_llm_client`, `_update_rating_status`) mais um quarto para aguardar a `create_task` deterministicamente, e asserção nas duas direções (`seen["resolve_tenant_id"] == original_event_owner` **e** `!= TEST_TENANT_ID`) — mais rigoroso que o mínimo pedido.
+- **Achados não bloqueantes (informativos, não afetam o veredito):** comentário obsoleto `# PATCH /v1/rlhf/ratings/{event_id}` em `tests/api/test_rlhf.py:1123` (parâmetro real é `{rating_id}`); nota explicativa sobre `RatingEntry` morto vive no docstring do serializer (`rlhf.py:556-559`) em vez de na própria classe — ambos cosméticos, correção barata para depois.
+- **Validação do orquestrador (re-executada, independente do relato do engineer):**
+  - `poetry run pytest tests/api/test_rlhf.py -v` → `68 passed, 3 warnings`
+  - `poetry run black --check src/api/routes/rlhf.py tests/api/test_rlhf.py` → `All done! 2 files would be left unchanged.`
+  - `poetry run mypy src/api/routes/rlhf.py` → `Success: no issues found in 1 source file`
+- **Entregáveis:** `src/api/routes/rlhf.py`, `tests/api/test_rlhf.py` — porte completo dos 4 consumidores de produção e dos 2 helpers de teste (34 pontos de chamada) para `rlhf_ratings`; resolução de canal/trace/`subject_tenant_id` em 3 degraus; `_update_rating_status` e `_analyze_rating_async` repontados; `event_id`→`rating_id` na resposta do POST; `RatingEntry` deixado como código morto documentado.
+- **Task:** sem rastreio via `genie task` (mesmo motivo do Grupo 1); grupo rastreado só por este bloco.
+
 ---
 
 ## Files to Create/Modify
