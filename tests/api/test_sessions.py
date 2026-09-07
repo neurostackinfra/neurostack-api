@@ -505,8 +505,10 @@ class TestSessionReactivation:
         assert _handoff_snapshot(client, accepted_handoff.id) == accepted_before
         assert _handoff_snapshot(client, pending_handoff.id) == pending_before
         assert handoff_queue.status_code == 200
-        queue_ids = {item["id"] for item in handoff_queue.json()["items"]}
+        queue_items = handoff_queue.json()["items"]
+        queue_ids = {item["id"] for item in queue_items}
         assert queue_ids >= {str(accepted_handoff.id), str(pending_handoff.id)}
+        assert all(item["safety_flag"] is False for item in queue_items)
 
     def test_superseded_active_session_returns_conflict_without_mutation(
         self, client: TestClient

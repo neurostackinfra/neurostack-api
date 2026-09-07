@@ -5,6 +5,7 @@ NeuroStack API - Pytest Configuration and Fixtures
 import asyncio
 import threading
 from collections.abc import AsyncGenerator, Generator
+from concurrent.futures import Future
 from contextlib import suppress
 from typing import Any
 from uuid import UUID
@@ -27,14 +28,11 @@ class LifespanTestClient:
     def __init__(self, application: Any) -> None:
         self.application = application
         self.lifespan_started = False
-        policy_local = getattr(asyncio.get_event_loop_policy(), "_local", None)
-        self._previous_loop: asyncio.AbstractEventLoop | None = getattr(
-            policy_local, "_loop", None
-        )
-        self._runner = asyncio.Runner()
-        self._loop = self._runner.get_loop()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._started: Future[None] = Future()
+        self._finished: Future[None] = Future()
         self._thread = threading.Thread(
-            target=self._loop.run_forever,
+            target=self._run_application_loop,
             name="lifespan-test-client",
             daemon=True,
         )
@@ -61,73 +59,95 @@ class LifespanTestClient:
         self.lifespan_started = True
 
     async def _stop(self) -> None:
-        if self._client is not None:
-            await self._client.__aexit__(None, None, None)
-        if self._lifespan is not None:
-            await self._lifespan.__aexit__(None, None, None)
-        current = asyncio.current_task()
-        leaked_tasks = [
-            task
-            for task in asyncio.all_tasks()
-            if task not in self._baseline_tasks
-            and task is not current
-            and task is not self._heartbeat
-            and not task.done()
-        ]
-        for task in leaked_tasks:
-            task.cancel()
-        if leaked_tasks:
-            await asyncio.gather(*leaked_tasks, return_exceptions=True)
-        loop = asyncio.get_running_loop()
         try:
-            await loop.shutdown_asyncgens()
-            await loop.shutdown_default_executor()
+            if self._client is not None:
+                await self._client.__aexit__(None, None, None)
+            if self._lifespan is not None:
+                await self._lifespan.__aexit__(None, None, None)
         finally:
-            if self._heartbeat is not None:
-                self._heartbeat.cancel()
-                with suppress(asyncio.CancelledError):
-                    await self._heartbeat
-        self.lifespan_started = False
-        if leaked_tasks:
-            leaked = ", ".join(sorted(task.get_name() for task in leaked_tasks))
-            raise AssertionError(f"application task leak: {leaked}")
+            current = asyncio.current_task()
+            leaked_tasks = [
+                task
+                for task in asyncio.all_tasks()
+                if task not in self._baseline_tasks
+                and task is not current
+                and task is not self._heartbeat
+                and not task.done()
+            ]
+            for task in leaked_tasks:
+                task.cancel()
+            if leaked_tasks:
+                await asyncio.gather(*leaked_tasks, return_exceptions=True)
+            loop = asyncio.get_running_loop()
+            try:
+                await loop.shutdown_asyncgens()
+                await loop.shutdown_default_executor()
+            finally:
+                if self._heartbeat is not None:
+                    self._heartbeat.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await self._heartbeat
+            self.lifespan_started = False
+            if leaked_tasks:
+                leaked = ", ".join(sorted(task.get_name() for task in leaked_tasks))
+                raise AssertionError(f"application task leak: {leaked}")
+
+    def _run_application_loop(self) -> None:
+        try:
+            with asyncio.Runner() as runner:
+                self._loop = runner.get_loop()
+                try:
+                    runner.run(self._start())
+                except BaseException as error:
+                    self._started.set_exception(error)
+                    raise
+                self._started.set_result(None)
+                self._loop.run_forever()
+                runner.run(self._stop())
+        except BaseException as error:
+            if not self._started.done():
+                self._started.set_exception(error)
+            self._finished.set_exception(error)
+        else:
+            self._finished.set_result(None)
 
     def _submit(self, coroutine: Any) -> Any:
+        if self._loop is None:
+            raise RuntimeError("Test client application loop has not started")
         return asyncio.run_coroutine_threadsafe(coroutine, self._loop).result()
 
+    def drain(self) -> None:
+        """Drain owned application tasks on the application's event loop."""
+        from src.api.routes import rlhf
+
+        self._submit(rlhf.wait_idle())
+
     def __enter__(self) -> "LifespanTestClient":
-        try:
-            self._runner.run(self._start())
-        except BaseException:
-            try:
-                self._runner.close()
-            finally:
-                self._restore_current_loop()
-            raise
         self._thread.start()
+        try:
+            self._started.result()
+        except BaseException:
+            self._thread.join()
+            raise
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         cleanup_error: BaseException | None = None
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join()
         try:
-            self._runner.run(self._stop())
+            self.drain()
         except BaseException as error:
             cleanup_error = error
         finally:
-            try:
-                self._runner.close()
-            finally:
-                self._restore_current_loop()
+            if self._loop is not None:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join()
+        try:
+            self._finished.result()
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
         if cleanup_error is not None:
             raise cleanup_error
-
-    def _restore_current_loop(self) -> None:
-        if self._previous_loop is not None and not self._previous_loop.is_closed():
-            asyncio.set_event_loop(self._previous_loop)
-        else:
-            asyncio.set_event_loop(None)
 
     def request(self, method: str, url: str, **kwargs: Any) -> Any:
         if self._client is None:
