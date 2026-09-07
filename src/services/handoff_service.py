@@ -199,6 +199,9 @@ class HandoffService:
                     )
 
                     context = dict(request.key_info or {})
+                    context.pop("safety_concern", None)
+                    if request.safety_concern is not None:
+                        context["safety_concern"] = request.safety_concern
                     if request.verification_status:
                         context["verification_status"] = request.verification_status
 
@@ -212,7 +215,7 @@ class HandoffService:
                         urgency=request.urgency.value,
                         status=HandoffStatus.PENDING.value,
                         numero_whatsapp=whatsapp_num,
-                        intencao_detectada=request.reason.value,
+                        intencao_detectada=request.detected_intent,
                         estagio_atual=(
                             str(request.funnel_stage) if request.funnel_stage else None
                         ),

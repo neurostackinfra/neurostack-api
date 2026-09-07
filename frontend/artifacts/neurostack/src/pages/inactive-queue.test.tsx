@@ -57,7 +57,7 @@ const firstItem = {
   session_id: "12345678-abcd-4abc-8def-1234567890ab",
   contact_identifier: "+55 11 99999-0000",
   channel: "whatsapp",
-  last_intent: "agendar_consulta",
+  last_intent: "agendar",
   funnel_stage: "qualificacao",
   last_activity_at: "2026-08-30T13:45:00Z",
 } satisfies InactiveSessionItem;
@@ -66,7 +66,7 @@ const secondItem = {
   session_id: "87654321-abcd-4abc-8def-1234567890ab",
   contact_identifier: "patient@example.com",
   channel: "webchat",
-  last_intent: "duvida_preco",
+  last_intent: "pedido_preco",
   funnel_stage: "consideracao",
   last_activity_at: "2026-08-29T10:15:00Z",
 } satisfies InactiveSessionItem;
@@ -186,6 +186,21 @@ afterEach(() => {
 });
 
 describe("<InactiveQueuePage />", () => {
+  it("renders the em-dash fallback for a null last_intent without falling into the Outras bucket", async () => {
+    const nullIntentItem = {
+      ...firstItem,
+      session_id: "cccccccc-dddd-4eee-8fff-999999999999",
+      last_intent: null,
+    } satisfies InactiveSessionItem;
+    mocks.fetch.mockImplementation(() => response(queueResponse([nullIntentItem])));
+    renderPage();
+
+    const row = await screen.findByTestId(`inactive-row-${nullIntentItem.session_id}`);
+    expect(row).toHaveTextContent("—");
+    expect(row).not.toHaveTextContent("Outras");
+    expect(row).not.toHaveTextContent("Solicitação de Agendamento");
+  });
+
   it("accepts a null contact identity and renders a safe fallback without hiding valid fields", async () => {
     mocks.fetch.mockImplementation(() => response(queueResponse([nullIdentityItem])));
     renderPage();
@@ -193,7 +208,8 @@ describe("<InactiveQueuePage />", () => {
     const row = await screen.findByTestId(`inactive-row-${nullIdentityItem.session_id}`);
     expect(row).toHaveTextContent("—");
     expect(row).toHaveTextContent(nullIdentityItem.channel);
-    expect(row).toHaveTextContent(nullIdentityItem.last_intent!);
+    expect(row).toHaveTextContent("Solicitação de Agendamento");
+    expect(row.textContent).not.toContain(nullIdentityItem.last_intent!);
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
@@ -204,7 +220,8 @@ describe("<InactiveQueuePage />", () => {
     expect(await screen.findByText(firstItem.contact_identifier)).toBeInTheDocument();
     expect(screen.getByText("#12345678")).toBeInTheDocument();
     expect(screen.getByText(firstItem.channel)).toBeInTheDocument();
-    expect(screen.getByText(firstItem.last_intent!)).toBeInTheDocument();
+    expect(screen.getByText("Solicitação de Agendamento")).toBeInTheDocument();
+    expect(screen.queryByText(firstItem.last_intent!)).not.toBeInTheDocument();
     expect(screen.queryByText("Etapa do funil")).not.toBeInTheDocument();
     expect(screen.queryByText(firstItem.funnel_stage!)).not.toBeInTheDocument();
     expect(screen.getAllByText("Última atividade").length).toBeGreaterThan(0);

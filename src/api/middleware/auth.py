@@ -148,16 +148,6 @@ class APIKeyStore:
                             error=str(e),
                         )
                         continue
-                    except Exception as e:
-                        # Unexpected error during hash verification
-                        logger.warning(
-                            "Unexpected error verifying API key hash",
-                            tenant_id=str(tenant.id),
-                            error=str(e),
-                            error_type=type(e).__name__,
-                        )
-                        continue
-
                 # No commit needed - this is a read-only operation
 
         except SQLAlchemyError as e:

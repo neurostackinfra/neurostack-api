@@ -11,13 +11,14 @@ Covers Groups 2 + 4 of the uazapi-integration wish:
 - A tenant with resolved instance but no ``uazapi_api_url``/``uazapi_token``
   logs a warning and returns ``replied=False`` with ``reason=no_credentials``
 - Group 4: patient audio is transcribed via the STT chain or falls back to
-  the text reroute; media tests load the real captured payload from
-  ``.genie/wishes/uazapi-parity/evidence/media-payload.json``
+  the text reroute; media tests load a tracked, synthetic fixture derived
+  from the shape of the locally captured payload.
 """
 
 import copy
 import json
 import pathlib
+import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -30,30 +31,64 @@ from fastapi.testclient import TestClient
 
 from src.config.settings import settings
 
-# Real captured Uazapi webhook payloads (audio + image), redacted only for
-# the per-tenant webhook token. Group 4 acceptance criterion: media tests
-# MUST use these instead of hand-written fixtures.
+# Synthetic Uazapi webhook payloads (audio + image), derived from capture
+# SHA-256 256b7ffbea39fa09e25041172f2af217424e60470be45c8ef11aabd502fe5f40.
+# The tracked fixture preserves only schema, types, MIME values and media
+# semantics; every identifying or signed scalar is replaced by a sentinel.
 _MEDIA_PAYLOAD_PATH = (
-    pathlib.Path(__file__).resolve().parents[2]
-    / ".genie"
-    / "wishes"
-    / "uazapi-parity"
-    / "evidence"
+    pathlib.Path(__file__).resolve().parents[1]
+    / "fixtures"
+    / "uazapi"
     / "media-payload.json"
 )
 
+_LONG_DIGIT_RUN = re.compile(r"\d{8,}")
+_UUID = re.compile(
+    r"(?<![0-9a-f])[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?![0-9a-f])",
+    re.IGNORECASE,
+)
+_DOMAIN = re.compile(r"(?:[a-z0-9-]+\.)+[a-z]{2,}", re.I)
+_EXAMPLE_URL = re.compile(r"https://example[.]invalid(?:/.*)?")
+_TIMESTAMP_KEY = re.compile(r"timestamp|(?:^|_)at$")
+_SEMANTIC_STRINGS = {
+    ("audio", "EventType"): "messages",
+    ("audio", "chat", "wa_lastMessageType"): "AudioMessage",
+    ("audio", "message", "content", "mimetype"): "audio/ogg; codecs=opus",
+    ("audio", "message", "mediaType"): "ptt",
+    ("audio", "message", "messageType"): "AudioMessage",
+    ("audio", "message", "type"): "media",
+    ("image", "EventType"): "messages",
+    ("image", "chat", "wa_lastMessageType"): "ImageMessage",
+    ("image", "message", "content", "mimetype"): "image/jpeg",
+    ("image", "message", "mediaType"): "image",
+    ("image", "message", "messageType"): "ImageMessage",
+    ("image", "message", "type"): "media",
+}
+
+
+def _iter_fixture_scalars(value: Any, path: tuple[str, ...] = ()):
+    """Yield every scalar with its deterministic object/list path."""
+    if isinstance(value, dict):
+        for key in sorted(value):
+            yield from _iter_fixture_scalars(value[key], (*path, key))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _iter_fixture_scalars(item, (*path, str(index)))
+    else:
+        yield path, value
+
 
 def _load_media_evidence(kind: str) -> dict:
-    """Deep-copy the captured ``audio`` or ``image`` webhook body from disk.
+    """Deep-copy the sanitized ``audio`` or ``image`` fixture from disk.
 
     Deep-copy so per-test mutations (instanceName, fromMe, messageid) never
-    leak into the next test. Raises if the evidence file is missing so a
-    stale copy of the repo fails loudly rather than silently.
+    leak into the next test. The file is tracked under ``tests/fixtures`` so
+    clean checkouts exercise the same schema without depending on local evidence.
     """
     if not _MEDIA_PAYLOAD_PATH.exists():
         raise FileNotFoundError(
-            f"Missing captured evidence at {_MEDIA_PAYLOAD_PATH}. "
-            "Group 4 tests refuse to hand-write media fixtures."
+            f"Missing sanitized fixture at {_MEDIA_PAYLOAD_PATH}. "
+            "Group 4 tests require the tracked media schema."
         )
     doc = json.loads(_MEDIA_PAYLOAD_PATH.read_text(encoding="utf-8"))
     if kind not in doc:
@@ -2100,12 +2135,11 @@ def _build_uazapi_media_body(
     from_me: bool | None = None,
     seconds_override: int | None = None,
 ) -> dict:
-    """Return the real captured Uazapi webhook body with minimal edits.
+    """Return the sanitized Uazapi fixture body with minimal test edits.
 
     Only ``instanceName`` (required to route the test's tenant) and the
     optional ``fromMe`` / ``messageid`` / ``content.seconds`` are touched;
-    everything else is the untouched shape captured against the live
-    Uazapi instance (see ``.genie/wishes/uazapi-parity/evidence/``).
+    everything else retains the captured schema with synthetic scalar values.
     """
     body = _load_media_evidence(kind)
     body["instanceName"] = instance
@@ -2126,11 +2160,43 @@ def _build_uazapi_media_body(
 class TestUazapiGroup4MediaEvidenceShape:
     """Sanity-check the loaded evidence so downstream asserts have a firm base."""
 
+    def test_fixture_scalars_are_recursively_sanitized(self):
+        document = json.loads(_MEDIA_PAYLOAD_PATH.read_text(encoding="utf-8"))
+
+        assert _UUID.search("TEST_abcdefab-cdef-abcd-efab-cdefabcdefab")
+        assert _DOMAIN.findall("TEST_evil.com") == ["evil.com"]
+
+        for path, value in _iter_fixture_scalars(document):
+            key = path[-1]
+            location = ".".join(path)
+            normalized_key = re.sub(r"(?<!^)(?=[A-Z])", "_", key).lower()
+
+            if isinstance(value, str):
+                assert not _LONG_DIGIT_RUN.search(value), location
+                assert not _UUID.search(value), location
+
+                domains = {match.lower() for match in _DOMAIN.findall(value)}
+                assert domains <= {"example.invalid"}, (location, domains)
+                if "://" in value:
+                    assert _EXAMPLE_URL.fullmatch(value), location
+
+                if value:
+                    allowed = (
+                        value.startswith(("TEST_", "REDACTED_"))
+                        or _EXAMPLE_URL.fullmatch(value) is not None
+                        or _SEMANTIC_STRINGS.get(path) == value
+                    )
+                    assert allowed, (location, value)
+
+            if _TIMESTAMP_KEY.search(normalized_key):
+                assert type(value) is int, location
+                assert 0 <= value <= 10, location
+
     def test_evidence_file_shape_matches_group_expectations(self):
         audio = _load_media_evidence("audio")
         image = _load_media_evidence("image")
 
-        # Real captured payload identifiers Group 4 depends on
+        # Captured payload semantics Group 4 depends on
         assert audio["message"]["fromMe"] is False
         assert audio["message"]["mediaType"] == "ptt"
         assert audio["message"]["type"] == "media"
@@ -2146,7 +2212,7 @@ class TestUazapiGroup4MediaEvidenceShape:
 
 class TestUazapiGroup4NonAudioMedia:
     """Non-audio media exits as ``non-text`` (Z-API reference, not Meta's
-    file-ack). Uses the real captured *image* payload."""
+    file-ack). Uses the sanitized captured-shape *image* fixture."""
 
     def _clear_state(self) -> None:
         from src.api.routes import webhook as webhook_module
@@ -2470,7 +2536,7 @@ class TestUazapiGroup4FromMeAudioUntouched:
         patient_number = "5516994420699"
         patient_session_id = _create_session(client, tenant_id, patient_number)
 
-        # Real audio evidence, retargeted to fromMe with the clinic as sender
+        # Captured-shape audio fixture, retargeted to fromMe with the clinic as sender
         # and the patient as counterparty (matches Group 3's fromMe routing).
         payload = _build_uazapi_media_body(
             "audio",

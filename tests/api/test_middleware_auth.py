@@ -41,6 +41,63 @@ def _request_with_tenant(tenant: TenantContext) -> Request:
     return request
 
 
+@asynccontextmanager
+async def _auth_session() -> AsyncIterator[AsyncMock]:
+    yield AsyncMock()
+
+
+def test_invalid_hash_does_not_block_following_valid_tenant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.api.middleware import auth
+
+    invalid_tenant = MagicMock(id=uuid4(), api_key_hash="not-a-hash")
+    valid_tenant = MagicMock(
+        id=uuid4(),
+        api_key_hash="$2b$12$valid",
+        is_active=True,
+    )
+    valid_tenant.get_config.return_value.rate_limit = 42
+    repository = MagicMock()
+    repository.find_active = AsyncMock(return_value=[invalid_tenant, valid_tenant])
+    verify = MagicMock(side_effect=[ValueError("invalid hash"), True])
+    fallback = MagicMock(return_value=None)
+
+    monkeypatch.setattr(auth, "get_db_session", _auth_session)
+    monkeypatch.setattr(auth, "TenantRepository", MagicMock(return_value=repository))
+    monkeypatch.setattr(auth.pwd_context, "verify", verify)
+    monkeypatch.setattr(APIKeyStore, "_fallback_to_dev_keys", fallback)
+
+    result = asyncio.run(APIKeyStore.validate_api_key("real-key"))
+
+    assert result is not None
+    assert result.tenant_id == valid_tenant.id
+    assert result.rate_limit == 42
+    assert verify.call_count == 2
+    fallback.assert_not_called()
+
+
+def test_invalid_hash_only_returns_none_through_normal_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.api.middleware import auth
+
+    tenants = [
+        MagicMock(id=uuid4(), api_key_hash="not-a-hash"),
+        MagicMock(id=uuid4(), api_key_hash="still-not-a-hash"),
+    ]
+    repository = MagicMock()
+    repository.find_active = AsyncMock(return_value=tenants)
+    verify = MagicMock(side_effect=ValueError("invalid hash"))
+
+    monkeypatch.setattr(auth, "get_db_session", _auth_session)
+    monkeypatch.setattr(auth, "TenantRepository", MagicMock(return_value=repository))
+    monkeypatch.setattr(auth.pwd_context, "verify", verify)
+
+    assert asyncio.run(APIKeyStore.validate_api_key("unknown-key")) is None
+    assert verify.call_count == 2
+
+
 @pytest.mark.parametrize("role", ["clinic_admin", "builder", "super_admin"])
 def test_credentials_dependency_accepts_only_allowed_jwt_roles(role: str) -> None:
     tenant = TenantContext(tenant_id=uuid4(), user_id=uuid4(), role=role, api_key="")
@@ -265,8 +322,8 @@ def test_sync_client_restores_registered_current_loop() -> None:
         with facade:
             assert facade.get("/openapi.json").status_code == 200
         assert asyncio.get_event_loop() is previous
-        with pytest.raises(RuntimeError, match="closed"):
-            facade._runner.get_loop()
+        assert facade._loop is not None
+        assert facade._loop.is_closed()
     finally:
         asyncio.set_event_loop(None)
         previous.close()
@@ -298,6 +355,51 @@ def test_sync_client_clears_current_loop_and_joins_default_executor_thread() -> 
             asyncio.get_event_loop()
         assert not executor_threads[0].is_alive()
         assert not facade._thread.is_alive()
+        assert facade._loop.is_closed()
+    finally:
+        asyncio.set_event_loop(original)
+
+
+def test_sync_client_restores_registered_current_loop_after_lifespan_error() -> None:
+    @asynccontextmanager
+    async def failing_lifespan(application: FastAPI) -> AsyncIterator[None]:
+        yield
+        raise RuntimeError("shutdown failed")
+
+    previous = asyncio.new_event_loop()
+    asyncio.set_event_loop(previous)
+    facade = LifespanTestClient(FastAPI(lifespan=failing_lifespan))
+    try:
+        with pytest.raises(RuntimeError, match="shutdown failed"):
+            with facade:
+                pass
+        assert asyncio.get_event_loop() is previous
+        assert facade._loop is not None
+        assert facade._loop.is_closed()
+    finally:
+        asyncio.set_event_loop(None)
+        previous.close()
+
+
+def test_sync_client_preserves_absent_current_loop_after_lifespan_error() -> None:
+    @asynccontextmanager
+    async def failing_lifespan(application: FastAPI) -> AsyncIterator[None]:
+        yield
+        raise RuntimeError("shutdown failed")
+
+    try:
+        original: asyncio.AbstractEventLoop | None = asyncio.get_event_loop()
+    except RuntimeError:
+        original = None
+    asyncio.set_event_loop(None)
+    facade = LifespanTestClient(FastAPI(lifespan=failing_lifespan))
+    try:
+        with pytest.raises(RuntimeError, match="shutdown failed"):
+            with facade:
+                pass
+        with pytest.raises(RuntimeError, match="no current event loop"):
+            asyncio.get_event_loop()
+        assert facade._loop is not None
         assert facade._loop.is_closed()
     finally:
         asyncio.set_event_loop(original)

@@ -620,6 +620,52 @@ class TestHandoffService:
         assert "segurança" in response.user_message.lower()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("safety_concern", "spoofed_safety"),
+        [(None, True), (True, False), (False, True)],
+    )
+    async def test_persisted_handoff_uses_only_typed_canonical_signals(
+        self,
+        monkeypatch,
+        handoff_service,
+        tenant_id,
+        session_id,
+        safety_concern,
+        spoofed_safety,
+    ):
+        """Typed intent and safety win over unrelated reason and key_info."""
+        db = MagicMock()
+        db.__aenter__ = AsyncMock(return_value=db)
+        db.__aexit__ = AsyncMock(return_value=None)
+        db.commit = AsyncMock()
+        monkeypatch.setattr(
+            "src.services.handoff_service.get_db_session",
+            lambda: db,
+        )
+        request = HandoffRequest(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            reason=HandoffReason.USER_REQUEST,
+            detected_intent="pos_atendimento_sintomas_preocupantes",
+            safety_concern=safety_concern,
+            key_info={
+                "topic": "follow_up",
+                "safety_concern": spoofed_safety,
+            },
+        )
+
+        await handoff_service.initiate_handoff(request)
+
+        persisted = db.add.call_args.args[0]
+        assert persisted.reason == "user_request"
+        assert persisted.intencao_detectada == "pos_atendimento_sintomas_preocupantes"
+        assert persisted.context["topic"] == "follow_up"
+        if safety_concern is None:
+            assert "safety_concern" not in persisted.context
+        else:
+            assert persisted.context["safety_concern"] is safety_concern
+
+    @pytest.mark.asyncio
     async def test_scheduling_link_handoff_carries_verification_status(
         self,
         handoff_service,
@@ -1028,6 +1074,8 @@ class TestModels:
         assert request.urgency == HandoffUrgency.NORMAL
         assert request.funnel_stage == "unknown"
         assert request.requested_by == "system"
+        assert request.detected_intent is None
+        assert request.safety_concern is None
 
     def test_webhook_config_defaults(self):
         """Test WebhookConfig default values."""
