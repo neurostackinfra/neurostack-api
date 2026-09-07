@@ -127,7 +127,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Shutting down NeuroStack API")
     from src.repositories import close_database
 
-    await close_database()
+    try:
+        await rlhf.shutdown()
+    finally:
+        await close_database()
     # await close_redis()
 
 

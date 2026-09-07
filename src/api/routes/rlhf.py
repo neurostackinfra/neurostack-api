@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import Coroutine
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 from uuid import UUID, uuid4
@@ -37,6 +38,60 @@ from src.services.trace_service import _to_utc
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+_rating_analysis_tasks: set[asyncio.Task[None]] = set()
+_rating_analysis_errors: list[BaseException] = []
+
+
+def _task_finished(task: asyncio.Task[None]) -> None:
+    """Remove a completed task and retain its terminal error for the drain."""
+    if task not in _rating_analysis_tasks:
+        return
+    _rating_analysis_tasks.remove(task)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        _rating_analysis_errors.append(error)
+
+
+def spawn(coro: Coroutine[Any, Any, None], name: str) -> asyncio.Task[None]:
+    """Create one owned rating-analysis task on the running application loop."""
+    task = asyncio.create_task(coro, name=name)
+    _rating_analysis_tasks.add(task)
+    task.add_done_callback(_task_finished)
+    return task
+
+
+def _raise_rating_analysis_errors() -> None:
+    if not _rating_analysis_errors:
+        return
+    errors = tuple(_rating_analysis_errors)
+    _rating_analysis_errors.clear()
+    if len(errors) == 1:
+        raise errors[0]
+    raise BaseExceptionGroup("RLHF rating analysis tasks failed", list(errors))
+
+
+async def wait_idle() -> None:
+    """Wait until every owned analysis completes, then propagate retained errors."""
+    while _rating_analysis_tasks:
+        done, _ = await asyncio.wait(tuple(_rating_analysis_tasks))
+        for task in done:
+            _task_finished(task)
+    _raise_rating_analysis_errors()
+
+
+async def shutdown() -> None:
+    """Cancel and await every owned analysis before application resources close."""
+    pending = tuple(_rating_analysis_tasks)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in pending:
+            _task_finished(task)
+    await wait_idle()
 
 
 # ============================================
@@ -378,7 +433,7 @@ async def _analyze_rating_async(
             rating_id,
             parsed["status"],
         )
-    except Exception as exc:  # noqa: BLE001 — background task must swallow
+    except (Exception,) as exc:  # noqa: BLE001 — supervisor must receive the error
         logger.error(
             "Rating analysis failed rating_id=%s error=%s",
             rating_id,
@@ -386,6 +441,7 @@ async def _analyze_rating_async(
             exc_info=True,
         )
         await _update_rating_status(rating_id, status_="failed")
+        raise
 
 
 async def _update_rating_status(
@@ -426,6 +482,7 @@ async def _update_rating_status(
             rating_id,
             status_,
         )
+        raise
 
 
 @router.post("/rating", response_model=RatingResponse)
@@ -536,7 +593,7 @@ async def submit_rating(
 
     if triggers_analysis:
         assert reason is not None
-        asyncio.create_task(
+        spawn(
             _analyze_rating_async(
                 rating_id=rating_id,
                 rating=body.rating,
@@ -546,7 +603,8 @@ async def submit_rating(
                 tenant_id=tenant.tenant_id,
                 clinic_tenant_id=body.clinic_tenant_id,
                 resolved_event=resolved_event,
-            )
+            ),
+            name=f"rlhf-rating-analysis:{rating_id}",
         )
 
     logger.info(

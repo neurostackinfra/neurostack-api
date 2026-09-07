@@ -103,6 +103,7 @@ export const pt: Record<TranslationKey, string> = {
   intent_paciente_ativo: "Paciente Ativo",
   intent_fora_do_escopo: "Fora do Escopo",
   intent_fora_do_horario: "Fora do Horário",
+  intent_outras: "Outras",
 
   // Stage labels (trace viewer)
   stage_initial: "Inicial",
@@ -529,6 +530,14 @@ export const pt: Record<TranslationKey, string> = {
   handoff_btn_attended: "Atendido",
   handoff_export_csv: "Exportar CSV",
   handoff_empty: "Nenhum handoff ativo no momento.",
+  handoff_filters_label: "Filtros",
+  handoff_filter_safety: "Somente com sinalização de segurança",
+  handoff_filter_intent: "Grupo de intenção",
+  handoff_filter_all_intents: "Todas",
+  handoff_safety_marker: "Sinalização de segurança",
+  handoff_filters_cards_only: "Os filtros de segurança e intenção se aplicam somente aos cards.",
+  handoff_clear_filters: "Limpar filtros",
+  handoff_filtered_empty: "Nenhum card corresponde aos filtros selecionados.",
   handoff_no_clinic: "Selecione uma clínica para ver a fila.",
   handoff_meta_minutos_label: "Meta em minutos para atendimento após handoff",
   handoff_meta_minutos_hint: "Tempo alvo para o primeiro atendimento humano.",

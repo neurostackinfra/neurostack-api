@@ -9,7 +9,13 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { DateRangePicker } from "@/components/date-range-picker";
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from "recharts";
 import { format } from "date-fns";
-import { getIntentLabel, getIntentPresentation, INTENT_PRESENTATION } from "@/lib/intent-presentation";
+import {
+  BUCKET_PRESENTATION,
+  getBucketLabel,
+  getBucketPresentation,
+  getIntentBucket,
+  type IntentBucket,
+} from "@/lib/intent-presentation";
 
 // -- Default date range: last 7 days ---
 
@@ -183,7 +189,14 @@ export function KpiCards({ stats, t, locale }: { stats: KpiStats; t: (k: Transla
 
 // -- Intent breakdown chart ---
 
-const VISIBLE_INTENTS = ["pedido_preco", "agendar", "interesse_tratamento", "reclamacao", "pos_atendimento_duvida"];
+const BUCKET_ORDER: IntentBucket[] = [
+  "pedido_preco",
+  "agendar",
+  "interesse_tratamento",
+  "reclamacao",
+  "pos_atendimento_duvida",
+  "outras",
+];
 
 export function IntentBreakdown({
   byIntent, t, locale, intentFilter, onIntentFilterChange,
@@ -194,23 +207,30 @@ export function IntentBreakdown({
   intentFilter: string;
   onIntentFilterChange: (v: string) => void;
 }) {
-  const baseIntent = Object.fromEntries(
-    VISIBLE_INTENTS.map(k => [k, byIntent[k] ?? 0])
-  );
+  const baseIntent: Record<IntentBucket, number> = {
+    pedido_preco: 0,
+    agendar: 0,
+    interesse_tratamento: 0,
+    reclamacao: 0,
+    pos_atendimento_duvida: 0,
+    outras: 0,
+  };
+  for (const [rawKey, count] of Object.entries(byIntent)) {
+    const bucket = getIntentBucket(rawKey);
+    baseIntent[bucket] += count;
+  }
   const periodIntentTotal = Object.values(baseIntent).reduce((s, n) => s + n, 0);
-  const visibleIntent = Object.fromEntries(
-    Object.entries(baseIntent).filter(([k]) => !intentFilter || k === intentFilter)
-  );
-  const visibleIntentTotal = Object.values(visibleIntent).reduce((s, n) => s + n, 0);
+  const visibleIntentEntries = (Object.entries(baseIntent) as [IntentBucket, number][])
+    .filter(([k]) => !intentFilter || k === intentFilter);
+  const visibleIntentTotal = visibleIntentEntries.reduce((s, [, n]) => s + n, 0);
   const numberLocale = locale === "en" ? "en-US" : "pt-BR";
-  const chartData = Object.entries(visibleIntent)
-    .map(([intent, count]) => ({
-      key: intent,
-      name: getIntentLabel(intent, t),
-      value: count,
-      hex: getIntentPresentation(intent).hex,
-      pct: periodIntentTotal > 0 ? (count / periodIntentTotal) * 100 : 0,
-    }));
+  const chartData = visibleIntentEntries.map(([bucket, count]) => ({
+    key: bucket,
+    name: getBucketLabel(bucket, t),
+    value: count,
+    hex: getBucketPresentation(bucket).hex,
+    pct: periodIntentTotal > 0 ? (count / periodIntentTotal) * 100 : 0,
+  }));
   const emptyChart = chartData.length === 0;
 
   return (
@@ -224,8 +244,8 @@ export function IntentBreakdown({
             className="rounded-md border border-border bg-background px-3 py-1.5 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent h-8 w-full sm:w-48"
           >
             <option value="">{t("dash_intent_all")}</option>
-            {VISIBLE_INTENTS.map(key => (
-              <option key={key} value={key}>{getIntentLabel(key, t)}</option>
+            {BUCKET_ORDER.map(bucket => (
+              <option key={bucket} value={bucket}>{getBucketLabel(bucket, t)}</option>
             ))}
           </select>
         </div>
@@ -233,15 +253,15 @@ export function IntentBreakdown({
       <CardContent>
         <div className="grid gap-8 sm:grid-cols-2 items-center">
           <div className="space-y-3.5">
-            {Object.entries(visibleIntent).map(([intent, count]) => {
+            {visibleIntentEntries.map(([bucket, count]) => {
               const pct = periodIntentTotal > 0 ? (count / periodIntentTotal) * 100 : 0;
-              const m = getIntentPresentation(intent);
+              const m = getBucketPresentation(bucket);
               return (
-                <div key={intent} className="space-y-1" data-testid={`stat-intent-${intent}`}>
+                <div key={bucket} className="space-y-1" data-testid={`stat-intent-${bucket}`}>
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-1.5 min-w-0">
                       <span className={`h-2 w-2 rounded-full shrink-0 ${m.baseClassName}`} />
-                      <span className="text-xs font-medium text-foreground truncate">{getIntentLabel(intent, t)}</span>
+                      <span className="text-xs font-medium text-foreground truncate">{getBucketLabel(bucket, t)}</span>
                     </div>
                     <span className="text-xs font-bold text-foreground shrink-0 tabular-nums">
                       {count.toLocaleString(numberLocale)}
@@ -288,17 +308,19 @@ export function IntentBreakdown({
               <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
                 <span className="text-2xl font-bold text-foreground tabular-nums leading-none">{visibleIntentTotal}</span>
                 <span className="text-[10px] text-muted-foreground uppercase tracking-wider font-medium mt-1">
-                  {intentFilter ? getIntentLabel(intentFilter, t).split(" ")[0] : t("dash_intent_total")}
+                  {intentFilter
+                    ? getBucketLabel(getIntentBucket(intentFilter), t).split(" ")[0]
+                    : t("dash_intent_total")}
                 </span>
               </div>
             </div>
             <div className="flex flex-wrap justify-center gap-x-3 gap-y-1.5">
-              {Object.entries(INTENT_PRESENTATION)
-                .filter(([key]) => VISIBLE_INTENTS.includes(key) && (!intentFilter || key === intentFilter))
-                .map(([key, m]) => (
-                  <div key={key} className="flex items-center gap-1">
+              {(Object.entries(BUCKET_PRESENTATION) as [IntentBucket, typeof BUCKET_PRESENTATION[IntentBucket]][])
+                .filter(([bucket]) => !intentFilter || bucket === intentFilter)
+                .map(([bucket, m]) => (
+                  <div key={bucket} className="flex items-center gap-1">
                     <span className="h-2 w-2 rounded-full shrink-0" style={{ backgroundColor: m.hex }} />
-                    <span className="text-[10px] text-muted-foreground">{getIntentLabel(key, t).split(" ")[0]}</span>
+                    <span className="text-[10px] text-muted-foreground">{getBucketLabel(bucket, t).split(" ")[0]}</span>
                   </div>
                 ))}
             </div>
@@ -436,7 +458,7 @@ function UserAcquisitionMetrics({ stats, locale }: { stats: KpiStats; locale: st
 // -- Main Dashboard ---
 
 // ── Investor mock stats ──
-const INVESTOR_MOCK_STATS: KpiStats = {
+export const INVESTOR_MOCK_STATS: KpiStats = {
   total: 291,
   avgProcessingTimeMs: 849,
   safetyFlagCount: 3,
@@ -452,6 +474,8 @@ const INVESTOR_MOCK_STATS: KpiStats = {
     interesse_tratamento: 52,
     reclamacao: 12,
     pos_atendimento_duvida: 31,
+    cancelar: 9,
+    saudacao: 45,
   },
   outsideHoursCount: 24,
   outsideHoursPct: 8.2,

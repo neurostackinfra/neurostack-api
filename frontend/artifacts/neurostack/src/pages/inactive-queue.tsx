@@ -6,6 +6,7 @@ import { Switch } from "@/components/ui/switch";
 import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
 import { useToast } from "@/hooks/use-toast";
+import { getBucketLabel, getIntentBucket } from "@/lib/intent-presentation";
 
 const PAGE_SIZE = 20;
 const POLL_INTERVAL_MS = 30_000;
@@ -453,7 +454,10 @@ export default function InactiveQueuePage() {
                   <QueueField label={t("inactive_contact")} value={item.contact_identifier || "—"} prominent />
                   <QueueField label={t("inactive_session_code")} value={shortSessionCode(item.session_id)} mono />
                   <QueueField label={t("inactive_channel")} value={item.channel} />
-                  <QueueField label={t("inactive_last_intent")} value={item.last_intent || "—"} />
+                  <QueueField
+                    label={t("inactive_last_intent")}
+                    value={item.last_intent ? getBucketLabel(getIntentBucket(item.last_intent), t) : "—"}
+                  />
                   <QueueField label={t("inactive_last_activity")} value={formattedActivity.format(new Date(item.last_activity_at))} />
                   <div className="flex min-w-0 items-center justify-between gap-3 md:justify-start">
                     <label

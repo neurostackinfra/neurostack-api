@@ -101,6 +101,7 @@ export const en = {
   intent_paciente_ativo: "Active Patient",
   intent_fora_do_escopo: "Out of Scope",
   intent_fora_do_horario: "Out of Hours",
+  intent_outras: "Other",
 
   // Stage labels (trace viewer)
   stage_initial: "Initial",
@@ -527,6 +528,14 @@ export const en = {
   handoff_btn_attended: "Attended",
   handoff_export_csv: "Export CSV",
   handoff_empty: "No active handoffs at the moment.",
+  handoff_filters_label: "Filters",
+  handoff_filter_safety: "Only safety-flagged",
+  handoff_filter_intent: "Intent group",
+  handoff_filter_all_intents: "All",
+  handoff_safety_marker: "Safety flag",
+  handoff_filters_cards_only: "Safety and intent filters apply only to cards.",
+  handoff_clear_filters: "Clear filters",
+  handoff_filtered_empty: "No cards match the selected filters.",
   handoff_no_clinic: "Select a clinic to view the queue.",
   handoff_meta_minutos_label: "SLA target (minutes) after handoff",
   handoff_meta_minutos_hint: "Target time for first human response.",
