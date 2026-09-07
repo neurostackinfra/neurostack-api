@@ -4,13 +4,11 @@ Maps SRM engine output to the frontend DecisionTrace contract.
 """
 
 from datetime import datetime, timezone
-from typing import Optional
 
 from pydantic import BaseModel, Field
 
 from src.observability.pii import mask_carteirinha
 from src.srm.models import SRMDecision
-
 
 # ============================================
 # Frontend-compatible schemas
@@ -87,8 +85,18 @@ def adapt_srm_decision(decision: SRMDecision) -> FrontendSRMDecision:
     )
 
 
-_ESCALATION_INTENTS = {"reclamacao", "conduta_inadequada_ameaca", "pedido_atendente_humano"}
-_SCHEDULING_INTENTS = {"agendar", "reagendar", "cancelar", "confirmar_presenca", "disponibilidade_horarios"}
+_ESCALATION_INTENTS = {
+    "reclamacao",
+    "conduta_inadequada_ameaca",
+    "pedido_atendente_humano",
+}
+_SCHEDULING_INTENTS = {
+    "agendar",
+    "reagendar",
+    "cancelar",
+    "confirmar_presenca",
+    "disponibilidade_horarios",
+}
 
 _CONSTRAINT_DESCRIPTIONS = {
     "C_ESCALATE_TO_HUMAN": "Encaminhar para atendimento humano imediatamente",
@@ -104,39 +112,50 @@ def generate_selected_context(decision: SRMDecision) -> list[FrontendSelectedCon
     intent = decision.intent
 
     if intent in _ESCALATION_INTENTS:
-        items.append(FrontendSelectedContext(
-            key="escalation_notice",
-            value="O paciente expressou insatisfação. Priorize empatia, acolhimento e encaminhe para atendimento humano imediatamente.",
-            source="srm_engine",
-        ))
+        items.append(
+            FrontendSelectedContext(
+                key="escalation_notice",
+                value="O paciente expressou insatisfação. Priorize empatia, acolhimento e encaminhe para atendimento humano imediatamente.",
+                source="srm_engine",
+            )
+        )
 
     if intent in _SCHEDULING_INTENTS:
-        items.append(FrontendSelectedContext(
-            key="scheduling_context",
-            value=decision.action_details or "Coletar preferências de agendamento",
-            source="srm_engine",
-        ))
+        items.append(
+            FrontendSelectedContext(
+                key="scheduling_context",
+                value=decision.action_details or "Coletar preferências de agendamento",
+                source="srm_engine",
+            )
+        )
 
     if intent == "pedido_preco":
-        items.append(FrontendSelectedContext(
-            key="authority_context",
-            value=decision.action_details or "Gerar autoridade antes de apresentar preço",
-            source="srm_engine",
-        ))
+        items.append(
+            FrontendSelectedContext(
+                key="authority_context",
+                value=decision.action_details
+                or "Gerar autoridade antes de apresentar preço",
+                source="srm_engine",
+            )
+        )
 
     if intent == "pos_atendimento_sintomas_preocupantes":
-        items.append(FrontendSelectedContext(
-            key="safety_alert",
-            value="Paciente relatou sintomas preocupantes. Protocolo de segurança ativado.",
-            source="safety_detector",
-        ))
+        items.append(
+            FrontendSelectedContext(
+                key="safety_alert",
+                value="Paciente relatou sintomas preocupantes. Protocolo de segurança ativado.",
+                source="safety_detector",
+            )
+        )
 
     for constraint in decision.state_patch.constraints:
-        items.append(FrontendSelectedContext(
-            key=constraint,
-            value=_CONSTRAINT_DESCRIPTIONS.get(constraint, constraint),
-            source="policy",
-        ))
+        items.append(
+            FrontendSelectedContext(
+                key=constraint,
+                value=_CONSTRAINT_DESCRIPTIONS.get(constraint, constraint),
+                source="policy",
+            )
+        )
 
     return items
 

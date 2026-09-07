@@ -11,8 +11,7 @@ Targets:
 
 Usage:
     locust -f tests/load/locustfile.py --host=http://localhost:8000
-    
+
 Or use the run script:
     ./tests/load/run_load_tests.sh
 """
-

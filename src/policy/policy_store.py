@@ -7,15 +7,13 @@ import logging
 from typing import Optional
 from uuid import UUID
 
-from pydantic import ValidationError
-
 from src.policy.models import (
+    PolicyCreate,
     PolicyDefinition,
+    PolicyRuleCreate,
     PolicyRuleDefinition,
     PolicyType,
-    PolicyCreate,
     PolicyUpdate,
-    PolicyRuleCreate,
 )
 
 logger = logging.getLogger(__name__)
@@ -23,18 +21,19 @@ logger = logging.getLogger(__name__)
 
 class PolicyStoreError(Exception):
     """Custom exception for PolicyStore operations."""
+
     pass
 
 
 class PolicyStore:
     """
     In-memory store for policies.
-    
+
     In production, this would be backed by PostgreSQL using the Policy model.
     For now, we use an in-memory dict for simplicity and testing.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._policies: dict[UUID, PolicyDefinition] = {}
         self._tenant_policies: dict[UUID, list[UUID]] = {}
 
@@ -45,11 +44,11 @@ class PolicyStore:
     ) -> PolicyDefinition:
         """
         Create a new policy for a tenant.
-        
+
         Args:
             tenant_id: The tenant ID
             policy_data: Policy creation data
-            
+
         Returns:
             The created PolicyDefinition
         """
@@ -68,7 +67,7 @@ class PolicyStore:
             )
             for r in policy_data.rules
         ]
-        
+
         policy = PolicyDefinition(
             tenant_id=tenant_id,
             name=policy_data.name,
@@ -78,13 +77,13 @@ class PolicyStore:
             priority=policy_data.priority,
             is_active=policy_data.is_active,
         )
-        
+
         self._policies[policy.id] = policy
-        
+
         if tenant_id not in self._tenant_policies:
             self._tenant_policies[tenant_id] = []
         self._tenant_policies[tenant_id].append(policy.id)
-        
+
         logger.info(f"Created policy {policy.id} for tenant {tenant_id}")
         return policy
 
@@ -95,25 +94,27 @@ class PolicyStore:
     ) -> PolicyDefinition:
         """
         Get a policy by ID.
-        
+
         Args:
             policy_id: The policy ID
             tenant_id: Optional tenant ID for validation
-            
+
         Returns:
             The PolicyDefinition
-            
+
         Raises:
             PolicyStoreError: If policy not found or tenant mismatch
         """
         policy = self._policies.get(policy_id)
-        
+
         if not policy:
             raise PolicyStoreError(f"Policy {policy_id} not found")
-        
+
         if tenant_id and policy.tenant_id != tenant_id:
-            raise PolicyStoreError(f"Policy {policy_id} does not belong to tenant {tenant_id}")
-        
+            raise PolicyStoreError(
+                f"Policy {policy_id} does not belong to tenant {tenant_id}"
+            )
+
         return policy
 
     async def get_policy_or_none(
@@ -135,17 +136,17 @@ class PolicyStore:
     ) -> PolicyDefinition:
         """
         Update a policy.
-        
+
         Args:
             policy_id: The policy ID
             tenant_id: The tenant ID
             updates: Update data
-            
+
         Returns:
             The updated PolicyDefinition
         """
         policy = await self.get_policy(policy_id, tenant_id)
-        
+
         if updates.name is not None:
             policy.name = updates.name
         if updates.description is not None:
@@ -169,11 +170,12 @@ class PolicyStore:
                 )
                 for r in updates.rules
             ]
-        
+
         policy.version += 1
         from datetime import datetime
+
         policy.updated_at = datetime.now()
-        
+
         self._policies[policy_id] = policy
         logger.info(f"Updated policy {policy_id}")
         return policy
@@ -185,27 +187,26 @@ class PolicyStore:
     ) -> bool:
         """
         Delete a policy.
-        
+
         Args:
             policy_id: The policy ID
             tenant_id: The tenant ID
-            
+
         Returns:
             True if deleted, False if not found
         """
         policy = await self.get_policy_or_none(policy_id, tenant_id)
-        
+
         if not policy:
             return False
-        
+
         del self._policies[policy_id]
-        
+
         if tenant_id in self._tenant_policies:
             self._tenant_policies[tenant_id] = [
-                pid for pid in self._tenant_policies[tenant_id]
-                if pid != policy_id
+                pid for pid in self._tenant_policies[tenant_id] if pid != policy_id
             ]
-        
+
         logger.info(f"Deleted policy {policy_id}")
         return True
 
@@ -217,31 +218,31 @@ class PolicyStore:
     ) -> list[PolicyDefinition]:
         """
         List policies for a tenant.
-        
+
         Args:
             tenant_id: The tenant ID
             active_only: Only return active policies
             policy_type: Filter by policy type
-            
+
         Returns:
             List of PolicyDefinition objects
         """
         policy_ids = self._tenant_policies.get(tenant_id, [])
         policies = []
-        
+
         for pid in policy_ids:
             policy = self._policies.get(pid)
             if not policy:
                 continue
-            
+
             if active_only and not policy.is_active:
                 continue
-            
+
             if policy_type and policy.policy_type != policy_type:
                 continue
-            
+
             policies.append(policy)
-        
+
         # Sort by priority (highest first)
         policies.sort(key=lambda p: p.priority, reverse=True)
         return policies
@@ -252,19 +253,19 @@ class PolicyStore:
     ) -> list[PolicyRuleDefinition]:
         """
         Get all active rules for a tenant.
-        
+
         Args:
             tenant_id: The tenant ID
-            
+
         Returns:
             List of active PolicyRuleDefinition objects
         """
         policies = await self.list_policies(tenant_id, active_only=True)
         rules = []
-        
+
         for policy in policies:
             rules.extend([r for r in policy.rules if r.enabled])
-        
+
         return rules
 
     async def add_rule_to_policy(
@@ -275,7 +276,7 @@ class PolicyStore:
     ) -> PolicyDefinition:
         """Add a rule to an existing policy."""
         policy = await self.get_policy(policy_id, tenant_id)
-        
+
         new_rule = PolicyRuleDefinition(
             rule=rule.rule,
             message=rule.message,
@@ -287,10 +288,10 @@ class PolicyStore:
             keywords=rule.keywords,
             enabled=rule.enabled,
         )
-        
+
         policy.rules.append(new_rule)
         policy.version += 1
-        
+
         self._policies[policy_id] = policy
         return policy
 
@@ -302,13 +303,13 @@ class PolicyStore:
     ) -> PolicyDefinition:
         """Remove a rule from a policy."""
         policy = await self.get_policy(policy_id, tenant_id)
-        
+
         original_count = len(policy.rules)
         policy.rules = [r for r in policy.rules if r.rule_id != rule_id]
-        
+
         if len(policy.rules) == original_count:
             raise PolicyStoreError(f"Rule {rule_id} not found in policy {policy_id}")
-        
+
         policy.version += 1
         self._policies[policy_id] = policy
         return policy
@@ -337,4 +338,3 @@ def get_policy_store() -> PolicyStore:
     if _store is None:
         _store = PolicyStore()
     return _store
-

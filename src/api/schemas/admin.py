@@ -9,7 +9,6 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
 
-
 # ============================================
 # Clinic Schemas (Group 3)
 # ============================================
@@ -83,7 +82,9 @@ class UpdateBuilderRequest(BaseModel):
     """Request body for updating a builder."""
 
     name: Optional[str] = Field(default=None, max_length=255)
-    status: Optional[str] = Field(default=None, pattern=r"^(active|inactive|suspended)$")
+    status: Optional[str] = Field(
+        default=None, pattern=r"^(active|inactive|suspended)$"
+    )
     email: Optional[EmailStr] = None
     password: Optional[str] = Field(default=None, min_length=6)
 

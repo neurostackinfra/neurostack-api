@@ -9,17 +9,34 @@ The State Store provides:
 - Metrics collection for observability
 """
 
-import json
 import time
+from collections.abc import Awaitable
 from datetime import datetime, timezone
-from typing import Any, Optional
+from types import TracebackType
+from typing import Any, Optional, TypeVar
 from uuid import UUID
 
 import redis.asyncio as redis
-from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram
+from pydantic import BaseModel, Field
 
+from src.core.exceptions import (
+    StateNotFoundError,
+    StateStoreConnectionError,
+    StateStoreError,
+)
 from src.models.session import CognitiveStateData
+
+RedisResult = TypeVar("RedisResult")
+
+
+async def _resolve_redis_result(
+    result: Awaitable[RedisResult] | RedisResult,
+) -> RedisResult:
+    """Resolve redis-py's declared sync-or-async command result."""
+    if isinstance(result, Awaitable):
+        return await result
+    return result
 
 
 # ============================================
@@ -48,7 +65,7 @@ REDIS_LATENCY = Histogram(
 class SessionState(BaseModel):
     """
     Session state stored in Redis.
-    
+
     This represents the real-time state of a conversation session,
     optimized for fast read/write access during message processing.
     """
@@ -62,7 +79,9 @@ class SessionState(BaseModel):
     message_count: int = 0
     is_active: bool = True
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    last_activity_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_activity_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
     handoff_status: Optional[str] = None
 
     def get_cognitive_state_obj(self) -> CognitiveStateData:
@@ -83,13 +102,6 @@ class SessionState(BaseModel):
         self.update_activity()
 
 
-from src.core.exceptions import (
-    StateNotFoundError,
-    StateStoreConnectionError,
-    StateStoreError,
-)
-
-
 # ============================================
 # State Store Implementation
 # ============================================
@@ -98,16 +110,16 @@ from src.core.exceptions import (
 class StateStore:
     """
     Redis-based State Store for session state management.
-    
+
     Provides fast OLTP operations for:
     - Session state CRUD
     - CognitiveState serialization/deserialization
     - TTL-based expiration per tenant
     - Metrics collection
-    
+
     Key naming convention:
         neurostack:session:{tenant_id}:{session_id}
-    
+
     Usage:
         async with StateStore() as store:
             await store.create_session(session_state)
@@ -118,10 +130,10 @@ class StateStore:
 
     # Key prefix for session states
     KEY_PREFIX = "neurostack:session"
-    
+
     # Key prefix for tenant TTL configs
     TTL_PREFIX = "neurostack:tenant:ttl"
-    
+
     # Index key for active sessions per tenant
     INDEX_PREFIX = "neurostack:tenant:sessions"
 
@@ -134,7 +146,7 @@ class StateStore:
     ):
         """
         Initialize State Store.
-        
+
         Args:
             redis_url: Redis connection URL (defaults to settings)
             max_connections: Maximum connection pool size
@@ -143,7 +155,7 @@ class StateStore:
         """
         # Import settings here to avoid circular import
         from src.config.settings import settings
-        
+
         self._redis_url = redis_url or settings.redis_url
         self._max_connections = max_connections or settings.redis_max_connections
         self._socket_timeout = socket_timeout or settings.redis_socket_timeout
@@ -181,7 +193,12 @@ class StateStore:
         await self.connect()
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+    async def __aexit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> None:
         """Async context manager exit."""
         await self.disconnect()
 
@@ -212,17 +229,17 @@ class StateStore:
 
         ttl_key = self._get_ttl_key(tenant_id)
         cached_ttl = await self._redis.get(ttl_key)
-        
+
         if cached_ttl:
             return int(cached_ttl)
-        
+
         # Return default TTL if not configured
         return self._default_ttl
 
     async def set_tenant_ttl(self, tenant_id: UUID, ttl_seconds: int) -> None:
         """
         Set custom TTL for a tenant.
-        
+
         Args:
             tenant_id: Tenant identifier
             ttl_seconds: TTL in seconds
@@ -235,7 +252,7 @@ class StateStore:
             ttl_key = self._get_ttl_key(tenant_id)
             # TTL config never expires (or very long TTL)
             await self._redis.set(ttl_key, ttl_seconds, ex=86400 * 365)
-            
+
             latency = time.perf_counter() - start_time
             REDIS_LATENCY.labels(operation="set_tenant_ttl").observe(latency)
             REDIS_OPERATIONS.labels(operation="set_tenant_ttl", status="success").inc()
@@ -254,14 +271,14 @@ class StateStore:
     ) -> SessionState:
         """
         Create a new session state in Redis.
-        
+
         Args:
             state: Session state to create
             ttl_seconds: Optional TTL override
-            
+
         Returns:
             Created session state
-            
+
         Raises:
             StateStoreError: If creation fails
         """
@@ -272,24 +289,24 @@ class StateStore:
         try:
             key = self._get_session_key(state.tenant_id, state.session_id)
             index_key = self._get_index_key(state.tenant_id)
-            
+
             # Get TTL for this tenant
             ttl = ttl_seconds or await self._get_tenant_ttl(state.tenant_id)
-            
+
             # Serialize and store
             data = self._serialize_session(state)
-            
+
             # Use pipeline for atomic operation
             async with self._redis.pipeline(transaction=True) as pipe:
                 pipe.set(key, data, ex=ttl)
                 pipe.sadd(index_key, str(state.session_id))
                 pipe.expire(index_key, ttl)
                 await pipe.execute()
-            
+
             latency = time.perf_counter() - start_time
             REDIS_LATENCY.labels(operation="create_session").observe(latency)
             REDIS_OPERATIONS.labels(operation="create_session", status="success").inc()
-            
+
             return state
         except redis.RedisError as e:
             REDIS_OPERATIONS.labels(operation="create_session", status="error").inc()
@@ -302,14 +319,14 @@ class StateStore:
     ) -> SessionState:
         """
         Get session state from Redis.
-        
+
         Args:
             tenant_id: Tenant identifier
             session_id: Session identifier
-            
+
         Returns:
             Session state
-            
+
         Raises:
             StateNotFoundError: If session not found
             StateStoreError: If read fails
@@ -321,16 +338,18 @@ class StateStore:
         try:
             key = self._get_session_key(tenant_id, session_id)
             data = await self._redis.get(key)
-            
+
             latency = time.perf_counter() - start_time
             REDIS_LATENCY.labels(operation="get_session").observe(latency)
-            
+
             if data is None:
-                REDIS_OPERATIONS.labels(operation="get_session", status="not_found").inc()
+                REDIS_OPERATIONS.labels(
+                    operation="get_session", status="not_found"
+                ).inc()
                 raise StateNotFoundError(
                     f"Session {session_id} not found for tenant {tenant_id}"
                 )
-            
+
             REDIS_OPERATIONS.labels(operation="get_session", status="success").inc()
             return self._deserialize_session(data)
         except StateNotFoundError:
@@ -346,11 +365,11 @@ class StateStore:
     ) -> Optional[SessionState]:
         """
         Get session state from Redis, returning None if not found.
-        
+
         Args:
             tenant_id: Tenant identifier
             session_id: Session identifier
-            
+
         Returns:
             Session state or None
         """
@@ -367,15 +386,15 @@ class StateStore:
     ) -> SessionState:
         """
         Update session state in Redis.
-        
+
         Args:
             state: Session state to update
             ttl_seconds: Optional TTL override
             refresh_ttl: Whether to refresh the TTL
-            
+
         Returns:
             Updated session state
-            
+
         Raises:
             StateStoreError: If update fails
         """
@@ -385,24 +404,24 @@ class StateStore:
         start_time = time.perf_counter()
         try:
             key = self._get_session_key(state.tenant_id, state.session_id)
-            
+
             # Update activity timestamp
             state.update_activity()
-            
+
             # Serialize
             data = self._serialize_session(state)
-            
+
             if refresh_ttl:
                 ttl = ttl_seconds or await self._get_tenant_ttl(state.tenant_id)
                 await self._redis.set(key, data, ex=ttl)
             else:
                 # Keep existing TTL
                 await self._redis.set(key, data, keepttl=True)
-            
+
             latency = time.perf_counter() - start_time
             REDIS_LATENCY.labels(operation="update_session").observe(latency)
             REDIS_OPERATIONS.labels(operation="update_session", status="success").inc()
-            
+
             return state
         except redis.RedisError as e:
             REDIS_OPERATIONS.labels(operation="update_session", status="error").inc()
@@ -415,14 +434,14 @@ class StateStore:
     ) -> bool:
         """
         Delete session state from Redis.
-        
+
         Args:
             tenant_id: Tenant identifier
             session_id: Session identifier
-            
+
         Returns:
             True if deleted, False if not found
-            
+
         Raises:
             StateStoreError: If deletion fails
         """
@@ -433,22 +452,26 @@ class StateStore:
         try:
             key = self._get_session_key(tenant_id, session_id)
             index_key = self._get_index_key(tenant_id)
-            
+
             async with self._redis.pipeline(transaction=True) as pipe:
                 pipe.delete(key)
                 pipe.srem(index_key, str(session_id))
                 results = await pipe.execute()
-            
-            deleted = results[0] > 0
-            
+
+            deleted = int(results[0]) > 0
+
             latency = time.perf_counter() - start_time
             REDIS_LATENCY.labels(operation="delete_session").observe(latency)
-            
+
             if deleted:
-                REDIS_OPERATIONS.labels(operation="delete_session", status="success").inc()
+                REDIS_OPERATIONS.labels(
+                    operation="delete_session", status="success"
+                ).inc()
             else:
-                REDIS_OPERATIONS.labels(operation="delete_session", status="not_found").inc()
-            
+                REDIS_OPERATIONS.labels(
+                    operation="delete_session", status="not_found"
+                ).inc()
+
             return deleted
         except redis.RedisError as e:
             REDIS_OPERATIONS.labels(operation="delete_session", status="error").inc()
@@ -461,11 +484,11 @@ class StateStore:
     ) -> bool:
         """
         Check if session exists in Redis.
-        
+
         Args:
             tenant_id: Tenant identifier
             session_id: Session identifier
-            
+
         Returns:
             True if exists, False otherwise
         """
@@ -476,12 +499,12 @@ class StateStore:
         try:
             key = self._get_session_key(tenant_id, session_id)
             result = await self._redis.exists(key)
-            
+
             latency = time.perf_counter() - start_time
             REDIS_LATENCY.labels(operation="exists").observe(latency)
             REDIS_OPERATIONS.labels(operation="exists", status="success").inc()
-            
-            return result > 0
+
+            return bool(result)
         except redis.RedisError as e:
             REDIS_OPERATIONS.labels(operation="exists", status="error").inc()
             raise StateStoreError(f"Failed to check session existence: {e}") from e
@@ -497,14 +520,14 @@ class StateStore:
     ) -> CognitiveStateData:
         """
         Get cognitive state for a session.
-        
+
         Args:
             tenant_id: Tenant identifier
             session_id: Session identifier
-            
+
         Returns:
             CognitiveStateData object
-            
+
         Raises:
             StateNotFoundError: If session not found
         """
@@ -519,15 +542,15 @@ class StateStore:
     ) -> SessionState:
         """
         Update cognitive state for a session.
-        
+
         Args:
             tenant_id: Tenant identifier
             session_id: Session identifier
             cognitive_state: New cognitive state
-            
+
         Returns:
             Updated session state
-            
+
         Raises:
             StateNotFoundError: If session not found
         """
@@ -543,23 +566,23 @@ class StateStore:
     ) -> SessionState:
         """
         Apply a partial update (patch) to cognitive state.
-        
+
         This is useful for SRM state_patch operations.
-        
+
         Args:
             tenant_id: Tenant identifier
             session_id: Session identifier
             patch: Dictionary with updates to apply
-            
+
         Returns:
             Updated session state
-            
+
         Raises:
             StateNotFoundError: If session not found
         """
         state = await self.get_session(tenant_id, session_id)
         cognitive = state.get_cognitive_state_obj()
-        
+
         # Apply patch fields
         if "funnel_stage" in patch:
             cognitive.funnel_stage = patch["funnel_stage"]
@@ -585,7 +608,7 @@ class StateStore:
                 score=patch.get("sentiment_score"),
                 confidence=patch.get("sentiment_confidence"),
             )
-        
+
         state.set_cognitive_state_obj(cognitive)
         return await self.update_session(state)
 
@@ -600,11 +623,11 @@ class StateStore:
     ) -> list[UUID]:
         """
         List active session IDs for a tenant.
-        
+
         Args:
             tenant_id: Tenant identifier
             limit: Maximum number of sessions to return
-            
+
         Returns:
             List of session UUIDs
         """
@@ -614,14 +637,14 @@ class StateStore:
         start_time = time.perf_counter()
         try:
             index_key = self._get_index_key(tenant_id)
-            members = await self._redis.smembers(index_key)
-            
+            members = await _resolve_redis_result(self._redis.smembers(index_key))
+
             session_ids = [UUID(m) for m in list(members)[:limit]]
-            
+
             latency = time.perf_counter() - start_time
             REDIS_LATENCY.labels(operation="list_sessions").observe(latency)
             REDIS_OPERATIONS.labels(operation="list_sessions", status="success").inc()
-            
+
             return session_ids
         except redis.RedisError as e:
             REDIS_OPERATIONS.labels(operation="list_sessions", status="error").inc()
@@ -630,10 +653,10 @@ class StateStore:
     async def count_sessions(self, tenant_id: UUID) -> int:
         """
         Count active sessions for a tenant.
-        
+
         Args:
             tenant_id: Tenant identifier
-            
+
         Returns:
             Number of active sessions
         """
@@ -643,13 +666,13 @@ class StateStore:
         start_time = time.perf_counter()
         try:
             index_key = self._get_index_key(tenant_id)
-            count = await self._redis.scard(index_key)
-            
+            count = await _resolve_redis_result(self._redis.scard(index_key))
+
             latency = time.perf_counter() - start_time
             REDIS_LATENCY.labels(operation="count_sessions").observe(latency)
             REDIS_OPERATIONS.labels(operation="count_sessions", status="success").inc()
-            
-            return count
+
+            return int(count)
         except redis.RedisError as e:
             REDIS_OPERATIONS.labels(operation="count_sessions", status="error").inc()
             raise StateStoreError(f"Failed to count sessions: {e}") from e
@@ -661,11 +684,11 @@ class StateStore:
     ) -> int:
         """
         Get remaining TTL for a session.
-        
+
         Args:
             tenant_id: Tenant identifier
             session_id: Session identifier
-            
+
         Returns:
             Remaining TTL in seconds (-1 if no expiry, -2 if not found)
         """
@@ -673,7 +696,7 @@ class StateStore:
             raise StateStoreConnectionError("Not connected to Redis")
 
         key = self._get_session_key(tenant_id, session_id)
-        return await self._redis.ttl(key)
+        return int(await self._redis.ttl(key))
 
     async def refresh_session_ttl(
         self,
@@ -683,12 +706,12 @@ class StateStore:
     ) -> bool:
         """
         Refresh TTL for a session without updating data.
-        
+
         Args:
             tenant_id: Tenant identifier
             session_id: Session identifier
             ttl_seconds: Optional TTL override
-            
+
         Returns:
             True if refreshed, False if session not found
         """
@@ -699,14 +722,14 @@ class StateStore:
         try:
             key = self._get_session_key(tenant_id, session_id)
             ttl = ttl_seconds or await self._get_tenant_ttl(tenant_id)
-            
+
             result = await self._redis.expire(key, ttl)
-            
+
             latency = time.perf_counter() - start_time
             REDIS_LATENCY.labels(operation="refresh_ttl").observe(latency)
             REDIS_OPERATIONS.labels(operation="refresh_ttl", status="success").inc()
-            
-            return result
+
+            return bool(result)
         except redis.RedisError as e:
             REDIS_OPERATIONS.labels(operation="refresh_ttl", status="error").inc()
             raise StateStoreError(f"Failed to refresh TTL: {e}") from e
@@ -718,7 +741,7 @@ class StateStore:
     async def health_check(self) -> dict[str, Any]:
         """
         Perform health check on Redis connection.
-        
+
         Returns:
             Health check result with status and latency
         """
@@ -732,9 +755,9 @@ class StateStore:
         try:
             await self._redis.ping()
             latency = time.perf_counter() - start_time
-            
+
             info = await self._redis.info("server")
-            
+
             return {
                 "status": "healthy",
                 "latency_ms": round(latency * 1000, 2),
@@ -758,7 +781,7 @@ _state_store: Optional[StateStore] = None
 async def get_state_store() -> StateStore:
     """
     Get or create the global StateStore instance.
-    
+
     Returns:
         StateStore instance
     """
@@ -775,4 +798,3 @@ async def close_state_store() -> None:
     if _state_store is not None:
         await _state_store.disconnect()
         _state_store = None
-

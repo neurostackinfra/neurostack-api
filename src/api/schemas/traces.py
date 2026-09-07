@@ -230,7 +230,7 @@ class TraceStatsResponse(BaseModel):
         ge=0,
         description="Total LLM tokens consumed in the period",
     )
-    model_breakdown: list[dict] = Field(
+    model_breakdown: list[dict[str, object]] = Field(
         default_factory=list,
         description="Token consumption per model, sorted descending by tokens",
     )

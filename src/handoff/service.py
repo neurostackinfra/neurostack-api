@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 from prometheus_client import Counter, Histogram
 
 from config.logging import get_logger
+from src.core.exceptions import WebhookError
 from src.handoff.models import (
     ConversationSummary,
     HandoffDetail,
@@ -23,22 +24,11 @@ from src.handoff.models import (
     HandoffUpdate,
     HandoffUrgency,
     WebhookConfig,
-    WebhookPayload,
     WebhookStatus,
 )
 from src.handoff.summarizer import ConversationSummarizer, get_summarizer
-from src.handoff.webhook import (
-    WebhookDispatcher,
-    WebhookError,
-    get_webhook_dispatcher,
-)
-from src.memory.event_store import (
-    EventData,
-    EventStore,
-    EventType,
-    HandoffEventData,
-)
-
+from src.handoff.webhook import WebhookDispatcher, get_webhook_dispatcher
+from src.memory.event_store import EventData, EventStore, EventType, HandoffEventData
 
 logger = get_logger(__name__)
 
@@ -74,16 +64,19 @@ HANDOFF_LATENCY = Histogram(
 
 class HandoffServiceError(Exception):
     """Base exception for handoff service errors."""
+
     pass
 
 
 class HandoffNotFoundError(HandoffServiceError):
     """Raised when handoff is not found."""
+
     pass
 
 
 class HandoffConfigError(HandoffServiceError):
     """Raised when configuration is invalid."""
+
     pass
 
 
@@ -95,13 +88,13 @@ class HandoffConfigError(HandoffServiceError):
 class HandoffService:
     """
     Main service for human handoff operations.
-    
+
     Provides:
     - Handoff initiation with summary generation
     - Webhook notifications to external systems
     - Handoff status management
     - Event logging for audit
-    
+
     Usage:
         service = HandoffService(event_store=event_store)
         response = await service.initiate_handoff(request)
@@ -116,7 +109,7 @@ class HandoffService:
     ):
         """
         Initialize the handoff service.
-        
+
         Args:
             event_store: Event store for logging
             summarizer: Conversation summarizer
@@ -127,7 +120,7 @@ class HandoffService:
         self.summarizer = summarizer or get_summarizer()
         self.webhook_dispatcher = webhook_dispatcher or get_webhook_dispatcher()
         self.config = config or HandoffServiceConfig()
-        
+
         # In-memory handoff store (should be replaced with persistent storage)
         self._handoffs: dict[UUID, dict[str, Any]] = {}
 
@@ -141,23 +134,23 @@ class HandoffService:
     ) -> HandoffResponse:
         """
         Initiate a human handoff.
-        
+
         This method:
         1. Generates a conversation summary
         2. Creates a handoff record
         3. Logs the event
         4. Sends webhook notification
         5. Returns user-facing message
-        
+
         Args:
             request: Handoff request with session details
-            
+
         Returns:
             HandoffResponse with status and user message
         """
         start_time = time.perf_counter()
         handoff_id = uuid4()
-        
+
         logger.info(
             "Initiating handoff",
             handoff_id=str(handoff_id),
@@ -166,11 +159,11 @@ class HandoffService:
             reason=request.reason.value,
             urgency=request.urgency.value,
         )
-        
+
         try:
             # Generate summary
             summary = self._generate_summary(request)
-            
+
             # Create handoff record
             handoff_record = {
                 "id": handoff_id,
@@ -192,7 +185,7 @@ class HandoffService:
                 "resolution_notes": None,
             }
             self._handoffs[handoff_id] = handoff_record
-            
+
             # Log event to Event Store
             await self._log_handoff_event(
                 tenant_id=request.tenant_id,
@@ -203,11 +196,11 @@ class HandoffService:
                 urgency=request.urgency,
                 summary=summary.summary_text,
             )
-            
+
             # Send webhook notification
             webhook_sent = False
             webhook_status = None
-            
+
             if self.webhook_dispatcher.is_configured(request.tenant_id):
                 try:
                     delivery = await self._send_webhook(
@@ -227,10 +220,10 @@ class HandoffService:
                         error=str(e),
                     )
                     webhook_status = WebhookStatus.FAILED
-            
+
             # Get user message
             user_message = self._get_handoff_message(request.reason)
-            
+
             # Record metrics
             latency = time.perf_counter() - start_time
             HANDOFF_LATENCY.labels(operation="initiate").observe(latency)
@@ -239,14 +232,14 @@ class HandoffService:
                 reason=request.reason.value,
                 urgency=request.urgency.value,
             ).inc()
-            
+
             logger.info(
                 "Handoff initiated successfully",
                 handoff_id=str(handoff_id),
                 latency_ms=round(latency * 1000, 2),
                 webhook_sent=webhook_sent,
             )
-            
+
             return HandoffResponse(
                 id=handoff_id,
                 tenant_id=request.tenant_id,
@@ -297,14 +290,14 @@ class HandoffService:
         """Log handoff event to Event Store."""
         if not self.event_store:
             return
-        
+
         event_data = HandoffEventData(
             reason=reason.value,
             summary=summary,
             urgency=urgency.value,
             key_info={"handoff_id": str(handoff_id)},
         )
-        
+
         event = EventData(
             tenant_id=tenant_id,
             session_id=session_id,
@@ -312,7 +305,7 @@ class HandoffService:
             event_data=event_data.model_dump(),
             event_metadata={"handoff_id": str(handoff_id)},
         )
-        
+
         await self.event_store.append(event)
 
     async def _send_webhook(
@@ -336,13 +329,12 @@ class HandoffService:
             turn_count=summary.turn_count,
             funnel_stage=summary.funnel_stage,
             recent_messages=[
-                {"role": m.role, "content": m.content}
-                for m in summary.recent_messages
+                {"role": m.role, "content": m.content} for m in summary.recent_messages
             ],
             sector=summary.sector,
             sla=summary.sla,
         )
-        
+
         return await self.webhook_dispatcher.send(request.tenant_id, payload)
 
     def _get_handoff_message(self, reason: HandoffReason) -> str:
@@ -365,7 +357,8 @@ class HandoffService:
             if (
                 candidate
                 and candidate["session_id"] == session_id
-                and candidate["status"] in (
+                and candidate["status"]
+                in (
                     HandoffStatus.PENDING,
                     HandoffStatus.ACCEPTED,
                     HandoffStatus.IN_PROGRESS,
@@ -375,13 +368,10 @@ class HandoffService:
 
         if handoff is None:
             for candidate in self._handoffs.values():
-                if (
-                    candidate["session_id"] == session_id
-                    and candidate["status"] in (
-                        HandoffStatus.PENDING,
-                        HandoffStatus.ACCEPTED,
-                        HandoffStatus.IN_PROGRESS,
-                    )
+                if candidate["session_id"] == session_id and candidate["status"] in (
+                    HandoffStatus.PENDING,
+                    HandoffStatus.ACCEPTED,
+                    HandoffStatus.IN_PROGRESS,
                 ):
                     handoff = candidate
                     break
@@ -423,7 +413,9 @@ class HandoffService:
                     ),
                     verification_status=verification_status,
                     turn_count=summary.turn_count if summary is not None else 0,
-                    funnel_stage=summary.funnel_stage if summary is not None else "unknown",
+                    funnel_stage=(
+                        summary.funnel_stage if summary is not None else "unknown"
+                    ),
                     recent_messages=recent_messages,
                     sector=handoff.get("sector"),
                     sla=handoff.get("sla"),
@@ -437,7 +429,10 @@ class HandoffService:
                     error=str(e),
                 )
 
-        return handoff["id"]
+        resolved_handoff_id = handoff["id"]
+        if not isinstance(resolved_handoff_id, UUID):
+            raise HandoffServiceError("Handoff record has an invalid ID")
+        return resolved_handoff_id
 
     # ============================================
     # Handoff Status Management
@@ -449,27 +444,27 @@ class HandoffService:
     ) -> HandoffDetail:
         """
         Update handoff status.
-        
+
         Args:
             update: Update with new status
-            
+
         Returns:
             Updated handoff detail
-            
+
         Raises:
             HandoffNotFoundError: If handoff not found
         """
         handoff = self._handoffs.get(update.handoff_id)
         if not handoff:
             raise HandoffNotFoundError(f"Handoff {update.handoff_id} not found")
-        
+
         old_status = handoff["status"]
         handoff["status"] = update.status
         handoff["updated_at"] = update.updated_at
-        
+
         if update.assigned_to:
             handoff["assigned_to"] = update.assigned_to
-        
+
         if update.notes:
             handoff["resolution_notes"] = update.notes
 
@@ -478,7 +473,7 @@ class HandoffService:
             summary = handoff.get("summary")
             if summary is not None and hasattr(summary, "verification_status"):
                 summary.verification_status = update.verification_status
-        
+
         # Set resolved_at for terminal states
         if update.status in (
             HandoffStatus.COMPLETED,
@@ -486,14 +481,14 @@ class HandoffService:
             HandoffStatus.TIMEOUT,
         ):
             handoff["resolved_at"] = update.updated_at
-        
+
         # Log status change event
         await self._log_status_change_event(
             handoff=handoff,
             old_status=old_status,
             new_status=update.status,
         )
-        
+
         # Send webhook for status change
         if self.webhook_dispatcher.is_configured(handoff["tenant_id"]):
             try:
@@ -504,19 +499,21 @@ class HandoffService:
                     handoff_id=str(update.handoff_id),
                     error=str(e),
                 )
-        
+
         HANDOFF_OPERATIONS.labels(
             operation="update",
             status=update.status.value,
         ).inc()
-        
+
         logger.info(
             "Handoff updated",
             handoff_id=str(update.handoff_id),
-            old_status=old_status.value if hasattr(old_status, 'value') else str(old_status),
+            old_status=(
+                old_status.value if hasattr(old_status, "value") else str(old_status)
+            ),
             new_status=update.status.value,
         )
-        
+
         return self._to_detail(handoff)
 
     async def accept_handoff(
@@ -525,11 +522,13 @@ class HandoffService:
         agent_id: Optional[str] = None,
     ) -> HandoffDetail:
         """Accept a handoff and assign to an agent."""
-        return await self.update_handoff(HandoffUpdate(
-            handoff_id=handoff_id,
-            status=HandoffStatus.ACCEPTED,
-            assigned_to=agent_id,
-        ))
+        return await self.update_handoff(
+            HandoffUpdate(
+                handoff_id=handoff_id,
+                status=HandoffStatus.ACCEPTED,
+                assigned_to=agent_id,
+            )
+        )
 
     async def complete_handoff(
         self,
@@ -537,11 +536,13 @@ class HandoffService:
         notes: Optional[str] = None,
     ) -> HandoffDetail:
         """Mark a handoff as completed."""
-        return await self.update_handoff(HandoffUpdate(
-            handoff_id=handoff_id,
-            status=HandoffStatus.COMPLETED,
-            notes=notes,
-        ))
+        return await self.update_handoff(
+            HandoffUpdate(
+                handoff_id=handoff_id,
+                status=HandoffStatus.COMPLETED,
+                notes=notes,
+            )
+        )
 
     async def cancel_handoff(
         self,
@@ -549,18 +550,22 @@ class HandoffService:
         notes: Optional[str] = None,
     ) -> HandoffDetail:
         """Cancel a handoff."""
-        return await self.update_handoff(HandoffUpdate(
-            handoff_id=handoff_id,
-            status=HandoffStatus.CANCELLED,
-            notes=notes,
-        ))
+        return await self.update_handoff(
+            HandoffUpdate(
+                handoff_id=handoff_id,
+                status=HandoffStatus.CANCELLED,
+                notes=notes,
+            )
+        )
 
     async def timeout_handoff(self, handoff_id: UUID) -> HandoffDetail:
         """Mark a handoff as timed out."""
-        return await self.update_handoff(HandoffUpdate(
-            handoff_id=handoff_id,
-            status=HandoffStatus.TIMEOUT,
-        ))
+        return await self.update_handoff(
+            HandoffUpdate(
+                handoff_id=handoff_id,
+                status=HandoffStatus.TIMEOUT,
+            )
+        )
 
     async def _log_status_change_event(
         self,
@@ -571,31 +576,35 @@ class HandoffService:
         """Log status change to Event Store."""
         if not self.event_store:
             return
-        
+
         # Map status to event type
         event_type_map = {
             HandoffStatus.ACCEPTED: EventType.HANDOFF_ACCEPT,
             HandoffStatus.COMPLETED: EventType.HANDOFF_COMPLETE,
             HandoffStatus.TIMEOUT: EventType.HANDOFF_TIMEOUT,
         }
-        
+
         event_type = event_type_map.get(new_status)
         if not event_type:
             return
-        
+
         event = EventData(
             tenant_id=handoff["tenant_id"],
             session_id=handoff["session_id"],
             event_type=event_type.value,
             event_data={
                 "handoff_id": str(handoff["id"]),
-                "old_status": old_status.value if hasattr(old_status, 'value') else str(old_status),
+                "old_status": (
+                    old_status.value
+                    if hasattr(old_status, "value")
+                    else str(old_status)
+                ),
                 "new_status": new_status.value,
                 "assigned_to": handoff.get("assigned_to"),
             },
             event_metadata={},
         )
-        
+
         await self.event_store.append(event)
 
     async def _send_status_webhook(
@@ -607,7 +616,7 @@ class HandoffService:
         summary = handoff.get("summary")
         if not summary:
             return
-        
+
         payload = self.webhook_dispatcher.create_payload(
             handoff_id=handoff["id"],
             tenant_id=handoff["tenant_id"],
@@ -615,7 +624,11 @@ class HandoffService:
             status=status,
             urgency=handoff["urgency"],
             reason=handoff["reason"],
-            summary=summary.summary_text if hasattr(summary, 'summary_text') else str(summary),
+            summary=(
+                summary.summary_text
+                if hasattr(summary, "summary_text")
+                else str(summary)
+            ),
             key_info={},
             verification_status=handoff.get("verification_status"),
             turn_count=0,
@@ -623,7 +636,7 @@ class HandoffService:
             sector=handoff.get("sector"),
             sla=handoff.get("sla"),
         )
-        
+
         await self.webhook_dispatcher.send(handoff["tenant_id"], payload)
 
     # ============================================
@@ -633,13 +646,13 @@ class HandoffService:
     async def get_handoff(self, handoff_id: UUID) -> HandoffDetail:
         """
         Get handoff details.
-        
+
         Args:
             handoff_id: Handoff identifier
-            
+
         Returns:
             HandoffDetail
-            
+
         Raises:
             HandoffNotFoundError: If not found
         """
@@ -657,30 +670,27 @@ class HandoffService:
     ) -> list[HandoffListItem]:
         """
         List handoffs for a tenant.
-        
+
         Args:
             tenant_id: Tenant identifier
             status: Optional status filter
             limit: Maximum records
             offset: Skip records
-            
+
         Returns:
             List of handoff items
         """
-        handoffs = [
-            h for h in self._handoffs.values()
-            if h["tenant_id"] == tenant_id
-        ]
-        
+        handoffs = [h for h in self._handoffs.values() if h["tenant_id"] == tenant_id]
+
         if status:
             handoffs = [h for h in handoffs if h["status"] == status]
-        
+
         # Sort by created_at descending
         handoffs.sort(key=lambda x: x["created_at"], reverse=True)
-        
+
         # Apply pagination
-        handoffs = handoffs[offset:offset + limit]
-        
+        handoffs = handoffs[offset : offset + limit]
+
         return [self._to_list_item(h) for h in handoffs]
 
     async def get_pending_handoffs(
@@ -699,13 +709,10 @@ class HandoffService:
     ) -> Optional[HandoffDetail]:
         """Get active handoff for a session if any."""
         for handoff in self._handoffs.values():
-            if (
-                handoff["session_id"] == session_id
-                and handoff["status"] in (
-                    HandoffStatus.PENDING,
-                    HandoffStatus.ACCEPTED,
-                    HandoffStatus.IN_PROGRESS,
-                )
+            if handoff["session_id"] == session_id and handoff["status"] in (
+                HandoffStatus.PENDING,
+                HandoffStatus.ACCEPTED,
+                HandoffStatus.IN_PROGRESS,
             ):
                 return self._to_detail(handoff)
         return None
@@ -723,11 +730,23 @@ class HandoffService:
             sector=handoff.get("sector"),
             sla=handoff.get("sla"),
             verification_status=handoff.get("verification_status"),
-            summary=summary.summary_text if hasattr(summary, 'summary_text') else "",
-            key_info=summary.key_info.model_dump() if summary and hasattr(summary, 'key_info') else {},
+            summary=(
+                summary.summary_text
+                if summary is not None and hasattr(summary, "summary_text")
+                else ""
+            ),
+            key_info=(
+                summary.key_info.model_dump()
+                if summary and hasattr(summary, "key_info")
+                else {}
+            ),
             recent_messages=[
-                m.model_dump() 
-                for m in (summary.recent_messages if summary and hasattr(summary, 'recent_messages') else [])
+                m.model_dump()
+                for m in (
+                    summary.recent_messages
+                    if summary and hasattr(summary, "recent_messages")
+                    else []
+                )
             ],
             assigned_to=handoff.get("assigned_to"),
             webhook_sent=handoff.get("webhook_sent", False),
@@ -743,11 +762,11 @@ class HandoffService:
         summary = handoff.get("summary")
         summary_preview = ""
         if summary:
-            if hasattr(summary, 'summary_text'):
+            if hasattr(summary, "summary_text"):
                 summary_preview = summary.summary_text[:100]
             else:
                 summary_preview = str(summary)[:100]
-        
+
         return HandoffListItem(
             id=handoff["id"],
             session_id=handoff["session_id"],

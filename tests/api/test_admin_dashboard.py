@@ -13,7 +13,6 @@ from fastapi.testclient import TestClient
 
 from src.config.settings import settings
 
-
 # ============================================
 # Token Helpers
 # ============================================
@@ -155,12 +154,13 @@ class TestAdminDashboard:
         self, async_client, super_admin_headers, monkeypatch
     ):
         """KPI endpoints use the clinic-list population and billing-active builders."""
+        from sqlalchemy import func, select
+
         from src.api.routes.admin import _compute_platform_totals
         from src.models.builder import Builder
         from src.models.tenant import Tenant
         from src.models.user import User, UserRole
         from src.repositories import get_db_session
-        from sqlalchemy import func, select
 
         async def _empty_time_series(*args, **kwargs):
             return []
@@ -285,8 +285,12 @@ class TestAdminDashboard:
         finally:
             await session.close()
 
-        stats_response = await async_client.get("/v1/admin/stats", headers=super_admin_headers)
-        dashboard_response = await async_client.get("/v1/admin/dashboard", headers=super_admin_headers)
+        stats_response = await async_client.get(
+            "/v1/admin/stats", headers=super_admin_headers
+        )
+        dashboard_response = await async_client.get(
+            "/v1/admin/dashboard", headers=super_admin_headers
+        )
         assert stats_response.status_code == 200
         assert dashboard_response.status_code == 200
 
@@ -310,13 +314,20 @@ class TestAdminDashboard:
         )
         assert patch_response.status_code == 200
 
-        stats_after = (await async_client.get("/v1/admin/stats", headers=super_admin_headers)).json()
+        stats_after = (
+            await async_client.get("/v1/admin/stats", headers=super_admin_headers)
+        ).json()
         dashboard_after = (
             await async_client.get("/v1/admin/dashboard", headers=super_admin_headers)
         ).json()["stats"]
-        expected_after = {**expected, "active_builders": expected["active_builders"] - 1}
+        expected_after = {
+            **expected,
+            "active_builders": expected["active_builders"] - 1,
+        }
         assert {field: stats_after[field] for field in expected_after} == expected_after
-        assert {field: dashboard_after[field] for field in expected_after} == expected_after
+        assert {
+            field: dashboard_after[field] for field in expected_after
+        } == expected_after
         assert stats_after["active_pilots"] == stats["active_pilots"]
         assert dashboard_after["active_pilots"] == dashboard_stats["active_pilots"]
 
@@ -333,7 +344,9 @@ class TestAdminDashboardAuth:
         response = client.get("/v1/admin/dashboard")
         assert response.status_code == 401
 
-    def test_returns_403_for_clinic_admin(self, client: TestClient, clinic_admin_headers):
+    def test_returns_403_for_clinic_admin(
+        self, client: TestClient, clinic_admin_headers
+    ):
         response = client.get("/v1/admin/dashboard", headers=clinic_admin_headers)
         assert response.status_code == 403
 
@@ -350,7 +363,9 @@ class TestAdminDashboardAuth:
 class TestAdminEnrichedClinics:
     """Test that admin clinic endpoints include health fields."""
 
-    def test_clinics_response_has_health_fields(self, client: TestClient, super_admin_headers):
+    def test_clinics_response_has_health_fields(
+        self, client: TestClient, super_admin_headers
+    ):
         """GET /v1/admin/clinics response objects should include health fields."""
         response = client.get("/v1/admin/clinics", headers=super_admin_headers)
         assert response.status_code == 200
@@ -363,7 +378,9 @@ class TestAdminEnrichedClinics:
             assert "last_trace_at" in clinic
             assert "config_completeness" in clinic
 
-    def test_builders_clinics_have_health_fields(self, client: TestClient, super_admin_headers):
+    def test_builders_clinics_have_health_fields(
+        self, client: TestClient, super_admin_headers
+    ):
         """GET /v1/admin/builders clinic objects should include health fields."""
         response = client.get("/v1/admin/builders", headers=super_admin_headers)
         assert response.status_code == 200
@@ -419,17 +436,27 @@ class TestAdminEnrichedClinics:
         finally:
             await session.close()
 
-        response = await async_client.get("/v1/admin/builders", headers=super_admin_headers)
+        response = await async_client.get(
+            "/v1/admin/builders", headers=super_admin_headers
+        )
         assert response.status_code == 200
-        builder = next(item for item in response.json() if item["id"] == str(builder_id))
-        clinic = next(item for item in builder["clinics"] if item["clinic_id"] == str(clinic_id))
+        builder = next(
+            item for item in response.json() if item["id"] == str(builder_id)
+        )
+        clinic = next(
+            item for item in builder["clinics"] if item["clinic_id"] == str(clinic_id)
+        )
         assert clinic["status"] == "inactive"
         assert clinic["apis_configured"] is True
 
-        clinics_response = await async_client.get("/v1/admin/clinics", headers=super_admin_headers)
+        clinics_response = await async_client.get(
+            "/v1/admin/clinics", headers=super_admin_headers
+        )
         assert clinics_response.status_code == 200
         admin_clinic = next(
-            item for item in clinics_response.json() if item["clinic_id"] == str(clinic_id)
+            item
+            for item in clinics_response.json()
+            if item["clinic_id"] == str(clinic_id)
         )
         assert admin_clinic["apis_configured"] is True
         assert "zapi_instance_id" not in admin_clinic
@@ -509,14 +536,17 @@ class TestHealthHelperImports:
 
     def test_import_compute_health_status_from_builder(self):
         from src.api.routes.builder import _compute_health_status
+
         assert callable(_compute_health_status)
 
     def test_import_compute_config_completeness_from_builder(self):
         from src.api.routes.builder import _compute_config_completeness
+
         assert callable(_compute_config_completeness)
 
     def test_import_config_buckets_from_builder(self):
         from src.api.routes.builder import CONFIG_COMPLETENESS_BUCKETS
+
         assert isinstance(CONFIG_COMPLETENESS_BUCKETS, list)
         assert len(CONFIG_COMPLETENESS_BUCKETS) == 6
 
@@ -569,8 +599,9 @@ def _seed_tenant_and_config(session, *, builder_id, tenant_id, name, api_credent
 
     session.add_all(
         [
-            Builder(id=builder_id, name=f"Builder {name}", status="active",
-                    is_active=True),
+            Builder(
+                id=builder_id, name=f"Builder {name}", status="active", is_active=True
+            ),
             Tenant(
                 id=tenant_id,
                 name=name,
@@ -615,6 +646,7 @@ class TestApiErrorAlertReadiness:
     @pytest.mark.asyncio
     async def test_meta_cloud_complete_no_alert(self, async_client):
         from src.repositories import get_db_session
+
         builder_id = uuid4()
         tenant_id = uuid4()
         session = get_db_session()
@@ -636,6 +668,7 @@ class TestApiErrorAlertReadiness:
     @pytest.mark.asyncio
     async def test_uazapi_complete_no_alert(self, async_client):
         from src.repositories import get_db_session
+
         builder_id = uuid4()
         tenant_id = uuid4()
         session = get_db_session()
@@ -657,6 +690,7 @@ class TestApiErrorAlertReadiness:
     @pytest.mark.asyncio
     async def test_zapi_complete_no_alert(self, async_client):
         from src.repositories import get_db_session
+
         builder_id = uuid4()
         tenant_id = uuid4()
         session = get_db_session()
@@ -678,6 +712,7 @@ class TestApiErrorAlertReadiness:
     @pytest.mark.asyncio
     async def test_missing_llm_only_one_alert_naming_llm(self, async_client):
         from src.repositories import get_db_session
+
         builder_id = uuid4()
         tenant_id = uuid4()
         session = get_db_session()
@@ -703,6 +738,7 @@ class TestApiErrorAlertReadiness:
     @pytest.mark.asyncio
     async def test_missing_whatsapp_and_llm_single_alert_lists_both(self, async_client):
         from src.repositories import get_db_session
+
         builder_id = uuid4()
         tenant_id = uuid4()
         session = get_db_session()
@@ -731,6 +767,7 @@ class TestApiErrorAlertReadiness:
     @pytest.mark.asyncio
     async def test_signature_pending_message_cites_app_secret(self, async_client):
         from src.repositories import get_db_session
+
         builder_id = uuid4()
         tenant_id = uuid4()
         session = get_db_session()
@@ -762,6 +799,7 @@ class TestApiErrorAlertReadiness:
     @pytest.mark.asyncio
     async def test_stt_key_without_model_flags_incomplete(self, async_client):
         from src.repositories import get_db_session
+
         builder_id = uuid4()
         tenant_id = uuid4()
         session = get_db_session()
@@ -792,6 +830,7 @@ class TestApiErrorAlertReadiness:
     @pytest.mark.asyncio
     async def test_stt_configuration_only_provider_flagged(self, async_client):
         from src.repositories import get_db_session
+
         builder_id = uuid4()
         tenant_id = uuid4()
         session = get_db_session()
@@ -822,6 +861,7 @@ class TestApiErrorAlertReadiness:
     @pytest.mark.asyncio
     async def test_stt_no_key_absent_from_message(self, async_client):
         from src.repositories import get_db_session
+
         builder_id = uuid4()
         tenant_id = uuid4()
         session = get_db_session()
@@ -845,6 +885,7 @@ class TestApiErrorAlertReadiness:
     @pytest.mark.asyncio
     async def test_legacy_whisper_alias_without_url_alerts(self, async_client):
         from src.repositories import get_db_session
+
         builder_id = uuid4()
         tenant_id = uuid4()
         session = get_db_session()
@@ -876,6 +917,7 @@ class TestApiErrorAlertReadiness:
         # stt_provider to "outros" (operational) when a URL is also present,
         # so readiness resolves `active` and no alert should be produced.
         from src.repositories import get_db_session
+
         builder_id = uuid4()
         tenant_id = uuid4()
         session = get_db_session()
@@ -901,8 +943,11 @@ class TestApiErrorAlertReadiness:
         assert _api_error_alerts_for(alerts, tenant_id) == []
 
     @pytest.mark.asyncio
-    async def test_no_config_row_yields_single_alert_with_both_names(self, async_client):
+    async def test_no_config_row_yields_single_alert_with_both_names(
+        self, async_client
+    ):
         from src.repositories import get_db_session
+
         builder_id = uuid4()
         tenant_id = uuid4()
         session = get_db_session()

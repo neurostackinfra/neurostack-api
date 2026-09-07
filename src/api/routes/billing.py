@@ -6,7 +6,7 @@ Plan summary, checkout (AbacatePay), webhook handler, and coupon validation.
 from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -89,7 +89,7 @@ async def _get_usage(
     return BillingUsageResponse.model_validate(usage)
 
 
-def _calc_pricing(active_clinics: int) -> dict:
+def _calc_pricing(active_clinics: int) -> dict[str, int]:
     extra = max(0, active_clinics - FREE_TIER)
     extra_price = extra * EXTRA_PER_CLINIC
     total_monthly = BASE_PRICE + extra_price
@@ -114,7 +114,7 @@ def _calc_pricing(active_clinics: int) -> dict:
 async def billing_summary(
     builder_id: UUID = Depends(require_builder),
     db: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> BillingSummaryResponse:
     builder = await _get_builder(builder_id, db)
 
     active_clinics = await _count_active_clinics(builder_id, db)
@@ -138,16 +138,14 @@ async def billing_summary(
 async def billing_usage(
     builder_id: UUID = Depends(require_builder),
     db: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> BillingUsageResponse:
     """Return monthly trace and current storage usage for the builder."""
     builder = await _get_builder(builder_id, db)
     return await _get_usage(builder, db)
 
 
 async def _validate_coupon(code: str, db: AsyncSession) -> Coupon:
-    result = await db.execute(
-        select(Coupon).where(Coupon.code == code.upper())
-    )
+    result = await db.execute(select(Coupon).where(Coupon.code == code.upper()))
     coupon = result.scalar_one_or_none()
     if not coupon:
         raise HTTPException(status_code=404, detail="Cupom não encontrado")
@@ -169,10 +167,8 @@ async def validate_coupon(
     code: str,
     builder_id: UUID = Depends(require_builder),
     db: AsyncSession = Depends(get_db_session_dependency),
-):
-    result = await db.execute(
-        select(Coupon).where(Coupon.code == code.upper())
-    )
+) -> CouponValidationResponse:
+    result = await db.execute(select(Coupon).where(Coupon.code == code.upper()))
     coupon = result.scalar_one_or_none()
     if not coupon or not coupon.is_active:
         return CouponValidationResponse(valid=False, message="Cupom inválido")
@@ -196,7 +192,7 @@ async def create_checkout(
     body: CheckoutRequest,
     builder_id: UUID = Depends(require_builder),
     db: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> CheckoutResponse:
     result = await db.execute(select(Builder).where(Builder.id == builder_id))
     builder = result.scalar_one_or_none()
     if not builder:
@@ -247,7 +243,7 @@ async def create_checkout(
     if body.method == "pix" and body.cycle == "annual":
         result_pay = client.create_pix_charge(
             amount_cents=amount_cents,
-            description=f"NeuroStack Start - Anual (PIX)",
+            description="NeuroStack Start - Anual (PIX)",
             metadata=metadata,
         )
         return CheckoutResponse(
@@ -280,12 +276,13 @@ async def create_checkout(
 @router.post(
     "/webhook",
     summary="AbacatePay Webhook",
+    response_model=None,
     status_code=200,
 )
 async def abacatepay_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> dict[str, bool]:
     body = await request.body()
 
     signature = request.headers.get("X-Webhook-Signature", "")
@@ -297,6 +294,7 @@ async def abacatepay_webhook(
             raise HTTPException(status_code=400, detail="Invalid signature")
 
     import json
+
     try:
         payload = json.loads(body)
     except json.JSONDecodeError:
@@ -315,6 +313,7 @@ async def abacatepay_webhook(
         return {"ok": True, "ignored": True}
 
     from uuid import UUID as _UUID
+
     try:
         bid = _UUID(builder_id_str)
     except ValueError:
@@ -353,11 +352,13 @@ async def abacatepay_webhook(
         cycle=cycle,
         plan=plan,
         coupon_code=coupon_code if coupon_code else None,
-        external_id=data.get("id") or data.get("charge_id") or data.get("subscription_id"),
+        external_id=data.get("id")
+        or data.get("charge_id")
+        or data.get("subscription_id"),
         event_type=event_type,
     )
     db.add(tx)
 
     await db.commit()
-    logger.info("Webhook processed", builder_id=builder_id_str, event=event_type)
+    logger.info("Webhook processed", builder_id=builder_id_str, event_type=event_type)
     return {"ok": True}

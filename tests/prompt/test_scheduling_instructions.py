@@ -38,7 +38,6 @@ from src.prompt.templates.normal import (
     NormalTemplate,
 )
 
-
 # ---------------------------------------------------------------------------
 # Forbidden pattern set (pt-BR + en)
 # Each pattern captures one of the three forbidden behaviors:
@@ -287,15 +286,15 @@ def test_anchor_negative_pt_prohibition_line_survives(template: NormalTemplate):
     to prove the negation-aware rule works on the real output."""
     variables = _make_vars("pt-BR", "agendamento_solicitado", "agendar")
     rendered = template.get_context_instructions(variables)
-    assert "NUNCA confirme o agendamento" in rendered, (
-        "Prohibition line was removed — deliverable 1 broke the guard."
-    )
+    assert (
+        "NUNCA confirme o agendamento" in rendered
+    ), "Prohibition line was removed — deliverable 1 broke the guard."
     violations = _find_violations(rendered)
     # Only assert that the pt prohibition line itself is not flagged.
     for _name, line, _no in violations:
-        assert "NUNCA confirme" not in line, (
-            f"Scan wrongly flagged a prohibition line as a violation: {line!r}"
-        )
+        assert (
+            "NUNCA confirme" not in line
+        ), f"Scan wrongly flagged a prohibition line as a violation: {line!r}"
 
 
 def test_anchor_negative_en_prohibition_line_survives(template: NormalTemplate):
@@ -304,14 +303,14 @@ def test_anchor_negative_en_prohibition_line_survives(template: NormalTemplate):
     MUST NOT be flagged."""
     variables = _make_vars("en", "agendamento_solicitado", "agendar")
     rendered = template.get_context_instructions(variables)
-    assert "NEVER confirm the appointment" in rendered, (
-        "Prohibition line was removed — deliverable 1 broke the guard."
-    )
+    assert (
+        "NEVER confirm the appointment" in rendered
+    ), "Prohibition line was removed — deliverable 1 broke the guard."
     violations = _find_violations(rendered)
     for _name, line, _no in violations:
-        assert "NEVER confirm" not in line, (
-            f"Scan wrongly flagged a prohibition line as a violation: {line!r}"
-        )
+        assert (
+            "NEVER confirm" not in line
+        ), f"Scan wrongly flagged a prohibition line as a violation: {line!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +366,9 @@ def test_pt_global_rule_declares_no_erp(template: NormalTemplate):
 def test_en_global_rule_declares_no_erp(template: NormalTemplate):
     variables = _make_vars("en", "lead_novo", "saudacao")
     system = template.get_system_prompt(variables)
-    assert "ERP" in system or "calendar" in system.lower() or "schedule" in system.lower()
+    assert (
+        "ERP" in system or "calendar" in system.lower() or "schedule" in system.lower()
+    )
     assert any(
         marker in system
         for marker in (

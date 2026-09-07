@@ -5,7 +5,7 @@ Persists support tickets submitted by clinics/builders.
 
 from datetime import datetime
 from typing import Optional
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from sqlalchemy import DateTime, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
@@ -75,4 +75,6 @@ class SupportTicket(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<SupportTicket(id={self.id}, email='{self.email}', tipo='{self.tipo}')>"
+        return (
+            f"<SupportTicket(id={self.id}, email='{self.email}', tipo='{self.tipo}')>"
+        )

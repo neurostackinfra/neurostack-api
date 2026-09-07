@@ -3,7 +3,6 @@ NeuroStack API - Health Check Schemas
 Contracts for health, readiness, and liveness endpoints.
 """
 
-from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
@@ -268,4 +267,3 @@ class MetricsResponse(BaseModel):
         ge=0,
         description="Events processed since midnight UTC",
     )
-

@@ -10,10 +10,9 @@ from uuid import UUID
 
 from src.flow.models import (
     FlowMode,
-    FlowState,
     FlowTransition,
-    TransitionTrigger,
     TransitionResult,
+    TransitionTrigger,
 )
 
 logger = logging.getLogger(__name__)
@@ -22,11 +21,11 @@ logger = logging.getLogger(__name__)
 class TransitionLogger:
     """
     Logs state transitions to the Event Store.
-    
+
     Provides audit trail and analytics for flow transitions.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the transition logger."""
         self._event_buffer: list[dict[str, Any]] = []
         self._buffer_size = 100
@@ -39,12 +38,12 @@ class TransitionLogger:
     ) -> dict[str, Any]:
         """
         Log a state transition.
-        
+
         Args:
             transition: The transition that occurred
             result: Result of the transition
             additional_data: Additional data to log
-            
+
         Returns:
             Event data that was logged
         """
@@ -65,7 +64,7 @@ class TransitionLogger:
 
         # Buffer the event
         self._event_buffer.append(event)
-        
+
         # Flush if buffer is full
         if len(self._event_buffer) >= self._buffer_size:
             await self.flush_events()
@@ -87,14 +86,14 @@ class TransitionLogger:
     ) -> dict[str, Any]:
         """
         Log entry into a mode.
-        
+
         Args:
             session_id: Session ID
             tenant_id: Tenant ID
             mode: Mode being entered
             reason: Reason for entering
             metadata: Additional metadata
-            
+
         Returns:
             Event data
         """
@@ -111,9 +110,9 @@ class TransitionLogger:
         }
 
         self._event_buffer.append(event)
-        
+
         logger.debug(f"Mode entry logged: {mode.value}")
-        
+
         return event
 
     async def log_mode_exit(
@@ -127,7 +126,7 @@ class TransitionLogger:
     ) -> dict[str, Any]:
         """
         Log exit from a mode.
-        
+
         Args:
             session_id: Session ID
             tenant_id: Tenant ID
@@ -135,7 +134,7 @@ class TransitionLogger:
             duration_seconds: Time spent in mode
             reason: Reason for exiting
             metadata: Additional metadata
-            
+
         Returns:
             Event data
         """
@@ -153,9 +152,9 @@ class TransitionLogger:
         }
 
         self._event_buffer.append(event)
-        
+
         logger.debug(f"Mode exit logged: {mode.value} after {duration_seconds:.2f}s")
-        
+
         return event
 
     async def log_handler_result(
@@ -169,7 +168,7 @@ class TransitionLogger:
     ) -> None:
         """
         Log handler result events.
-        
+
         Args:
             session_id: Session ID
             tenant_id: Tenant ID
@@ -204,9 +203,9 @@ class TransitionLogger:
     async def flush_events(self) -> int:
         """
         Flush buffered events to Event Store.
-        
+
         This is a placeholder - would integrate with actual Event Store.
-        
+
         Returns:
             Number of events flushed
         """
@@ -214,12 +213,12 @@ class TransitionLogger:
             return 0
 
         count = len(self._event_buffer)
-        
+
         # Placeholder - would send to Event Store
         # await self._event_store.batch_write(self._event_buffer)
-        
+
         logger.debug(f"Flushed {count} events to Event Store")
-        
+
         self._event_buffer = []
         return count
 
@@ -233,7 +232,7 @@ class TransitionAnalytics:
     Provides analytics on state transitions.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize analytics."""
         self._transition_counts: dict[str, int] = {}
 
@@ -250,14 +249,12 @@ class TransitionAnalytics:
     def get_transition_stats(self) -> dict[str, Any]:
         """Get transition statistics."""
         total = sum(self._transition_counts.values())
-        
+
         return {
             "total_transitions": total,
             "by_transition": self._transition_counts,
             "most_common": max(
-                self._transition_counts.items(),
-                key=lambda x: x[1],
-                default=("none", 0)
+                self._transition_counts.items(), key=lambda x: x[1], default=("none", 0)
             ),
         }
 
@@ -284,4 +281,3 @@ def get_transition_analytics() -> TransitionAnalytics:
     if _transition_analytics is None:
         _transition_analytics = TransitionAnalytics()
     return _transition_analytics
-
