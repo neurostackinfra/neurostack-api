@@ -33,12 +33,6 @@ from src.core.exceptions import (
     StateStoreConnectionError,
     StateStoreError,
 )
-from src.memory.state_store import (
-    SessionState,
-    StateStore,
-    get_state_store,
-    close_state_store,
-)
 from src.memory.event_store import (
     EventAggregation,
     EventData,
@@ -48,28 +42,34 @@ from src.memory.event_store import (
     FunnelTransitionEventData,
     HandoffEventData,
     MessageEventData,
-    SRMDecisionEventData,
     SafetyEventData,
-    get_event_store,
+    SRMDecisionEventData,
     close_event_store,
+    get_event_store,
 )
 from src.memory.models import (
     CognitiveState,
-    FunnelStage,
     FlowMode,
     HandoffStatus,
+    LastDecision,
     LeadInfo,
+    RecentMessage,
     SalesInfo,
     SalesProfile,
-    LastDecision,
+    SessionContext,
     SessionStateCreate,
+    SessionStateResponse,
     SessionStateUpdate,
     StatePatch,
-    SessionStateResponse,
-    RecentMessage,
-    SessionContext,
     StateStoreStats,
 )
+from src.memory.state_store import (
+    SessionState,
+    StateStore,
+    close_state_store,
+    get_state_store,
+)
+from src.srm.models import FunnelStage
 
 __all__ = [
     # State Store

@@ -18,7 +18,9 @@ class TestEventsEndpoint:
         api_headers: dict[str, str],
     ) -> None:
         """Test that event processing returns 200 OK."""
-        response = client.post("/v1/events", json=sample_event_payload, headers=api_headers)
+        response = client.post(
+            "/v1/events", json=sample_event_payload, headers=api_headers
+        )
 
         assert response.status_code == 200
         data = response.json()
@@ -35,7 +37,9 @@ class TestEventsEndpoint:
         api_headers: dict[str, str],
     ) -> None:
         """Test that event processing returns a valid decision."""
-        response = client.post("/v1/events", json=sample_event_payload, headers=api_headers)
+        response = client.post(
+            "/v1/events", json=sample_event_payload, headers=api_headers
+        )
 
         data = response.json()
         decision = data["decision"]
@@ -57,7 +61,9 @@ class TestEventsEndpoint:
         api_headers: dict[str, str],
     ) -> None:
         """Test that event processing returns a valid prompt."""
-        response = client.post("/v1/events", json=sample_event_payload, headers=api_headers)
+        response = client.post(
+            "/v1/events", json=sample_event_payload, headers=api_headers
+        )
 
         data = response.json()
         prompt = data["prompt"]
@@ -74,7 +80,9 @@ class TestEventsEndpoint:
         api_headers: dict[str, str],
     ) -> None:
         """Test that event processing returns context."""
-        response = client.post("/v1/events", json=sample_event_payload, headers=api_headers)
+        response = client.post(
+            "/v1/events", json=sample_event_payload, headers=api_headers
+        )
 
         data = response.json()
         context = data["context"]
@@ -110,7 +118,9 @@ class TestEventsEndpoint:
         """Test that empty content returns validation error."""
         sample_event_payload["payload"]["content"] = ""
 
-        response = client.post("/v1/events", json=sample_event_payload, headers=api_headers)
+        response = client.post(
+            "/v1/events", json=sample_event_payload, headers=api_headers
+        )
         assert response.status_code == 422
 
     def test_process_event_mode_is_normal(
@@ -120,7 +130,9 @@ class TestEventsEndpoint:
         api_headers: dict[str, str],
     ) -> None:
         """Test that default mode is normal."""
-        response = client.post("/v1/events", json=sample_event_payload, headers=api_headers)
+        response = client.post(
+            "/v1/events", json=sample_event_payload, headers=api_headers
+        )
 
         data = response.json()
         assert data["mode"] == "normal"
@@ -137,7 +149,9 @@ class TestEventsEndpointAsync:
         api_headers: dict[str, str],
     ) -> None:
         """Test event processing with async client."""
-        response = await async_client.post("/v1/events", json=sample_event_payload, headers=api_headers)
+        response = await async_client.post(
+            "/v1/events", json=sample_event_payload, headers=api_headers
+        )
 
         assert response.status_code == 200
         data = response.json()

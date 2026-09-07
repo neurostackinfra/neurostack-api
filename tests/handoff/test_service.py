@@ -8,26 +8,20 @@ Tests cover:
 - API endpoints
 """
 
-import asyncio
-import json
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
-import httpx
 import pytest
 
+from src.core.exceptions import HandoffNotFoundError, WebhookConfigError
 from src.handoff.models import (
-    ConversationMessage,
     ConversationSummary,
-    HandoffDetail,
     HandoffListItem,
     HandoffReason,
     HandoffRequest,
     HandoffResponse,
-    HandoffServiceConfig,
     HandoffStatus,
-    HandoffUpdate,
     HandoffUrgency,
     KeyInformation,
     WebhookConfig,
@@ -35,23 +29,9 @@ from src.handoff.models import (
     WebhookPayload,
     WebhookStatus,
 )
-from src.core.exceptions import (
-    HandoffNotFoundError,
-    HandoffServiceError,
-)
-from src.services import (
-    HandoffService,
-    get_handoff_service,
-)
 from src.handoff.summarizer import ConversationSummarizer
-from src.core.exceptions import (
-    WebhookConfigError,
-    WebhookDeliveryError,
-)
-from src.handoff.webhook import (
-    WebhookDispatcher,
-)
-
+from src.handoff.webhook import WebhookDispatcher
+from src.services import HandoffService
 
 # ============================================
 # Fixtures
@@ -199,8 +179,10 @@ class TestConversationSummarizer:
             reason=HandoffReason.USER_REQUEST,
         )
 
-        assert "dor de cabeça" in summary.key_info.symptoms_mentioned or \
-               "dor" in summary.key_info.symptoms_mentioned
+        assert (
+            "dor de cabeça" in summary.key_info.symptoms_mentioned
+            or "dor" in summary.key_info.symptoms_mentioned
+        )
         assert "enjoo" in summary.key_info.symptoms_mentioned
 
     def test_summarize_extracts_appointment_preferences(
@@ -518,7 +500,7 @@ class TestWebhookDispatcher:
         mock_response.status_code = 200
         mock_response.text = '{"success": true}'
 
-        with patch.object(webhook_dispatcher, '_get_client') as mock_get_client:
+        with patch.object(webhook_dispatcher, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.post.return_value = mock_response
             mock_get_client.return_value = mock_client
@@ -558,7 +540,7 @@ class TestWebhookDispatcher:
         mock_response_success.status_code = 200
         mock_response_success.text = "OK"
 
-        with patch.object(webhook_dispatcher, '_get_client') as mock_get_client:
+        with patch.object(webhook_dispatcher, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.post.side_effect = [mock_response_fail, mock_response_success]
             mock_get_client.return_value = mock_client
@@ -1011,7 +993,7 @@ class TestModels:
     def test_conversation_message_to_prompt_format(self):
         """Test ConversationMessage prompt format conversion."""
         from src.handoff.models import ConversationMessage
-        
+
         msg = ConversationMessage(
             role="user",
             content="Hello",
@@ -1128,7 +1110,7 @@ class TestHandoffIntegration:
         mock_response.status_code = 200
         mock_response.text = '{"received": true}'
 
-        with patch.object(dispatcher, '_get_client') as mock_get_client:
+        with patch.object(dispatcher, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.post.return_value = mock_response
             mock_get_client.return_value = mock_client

@@ -19,10 +19,14 @@ class Transaction(Base, TimestampMixin):
     __tablename__ = "transactions"
 
     id: Mapped[UUID] = mapped_column(
-        PG_UUID(as_uuid=True), primary_key=True, default=uuid4,
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
     )
     builder_id: Mapped[UUID] = mapped_column(
-        PG_UUID(as_uuid=True), nullable=False, index=True,
+        PG_UUID(as_uuid=True),
+        nullable=False,
+        index=True,
     )
     builder_name: Mapped[str] = mapped_column(String(255), nullable=False)
     amount_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

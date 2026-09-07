@@ -3,31 +3,26 @@ NeuroStack - SRM Engine Unit Tests
 Tests for the Small Reasoning Module main engine and all components.
 """
 
-import sys
 from uuid import uuid4
 
 import pytest
 
-sys.path.insert(0, "/home/jairomendes/neurostack/neurostack-api")
-
-from src.srm.models import (
-    IntentCategory,
-    FunnelStage,
-    SafetyCategory,
-    FlowMode,
-    ActionType,
-    HandoffReason,
-    SRMInput,
-    SRMDecision,
-    SafetyResult,
-)
-from src.srm.intent_classifier import IntentClassifier, get_intent_classifier
-from src.srm.funnel_detector import FunnelDetector, get_funnel_detector
-from src.srm.safety_detector import SafetyDetector, get_safety_detector
-from src.srm.handoff_decider import HandoffDecider, get_handoff_decider
-from src.srm.rag_decider import RagDecider, get_rag_decider
 from src.srm.engine import SRMEngine, get_srm_engine
-
+from src.srm.funnel_detector import FunnelDetector, get_funnel_detector
+from src.srm.handoff_decider import HandoffDecider, get_handoff_decider
+from src.srm.intent_classifier import IntentClassifier, get_intent_classifier
+from src.srm.models import (
+    ActionType,
+    FlowMode,
+    FunnelStage,
+    HandoffReason,
+    IntentCategory,
+    SafetyCategory,
+    SafetyResult,
+    SRMInput,
+)
+from src.srm.rag_decider import RagDecider, get_rag_decider
+from src.srm.safety_detector import SafetyDetector, get_safety_detector
 
 # ============================================
 # Fixtures
@@ -136,7 +131,9 @@ class TestIntentClassifier:
         for msg in messages:
             result = intent_classifier.classify(msg)
             assert result.category == IntentCategory.QUESTION, f"Failed for: {msg}"
-            assert result.intent == "pedido_preco", f"Expected pedido_preco, got {result.intent}"
+            assert (
+                result.intent == "pedido_preco"
+            ), f"Expected pedido_preco, got {result.intent}"
 
     def test_farewell_detection(self, intent_classifier):
         """Test farewell intent detection — farewell is no longer a separate intent.
@@ -156,8 +153,8 @@ class TestIntentClassifier:
         for msg in messages:
             result = intent_classifier.classify(msg)
             assert result.category in [
-                IntentCategory.COMPLAINT, 
-                IntentCategory.FEEDBACK
+                IntentCategory.COMPLAINT,
+                IntentCategory.FEEDBACK,
             ], f"Failed for: {msg}"
 
     def test_empty_message(self, intent_classifier):
@@ -513,11 +510,14 @@ class TestSRMEngine:
             channel="whatsapp",
         )
         decision = srm_engine.process(input_data)
-        
+
         assert decision.intent_category == IntentCategory.GREETING
         assert decision.mode == FlowMode.NORMAL
         # Greetings now trigger qualification flow or respond
-        assert decision.action in (ActionType.RESPOND, ActionType.PERGUNTA_UNICA_PARA_DESTRAVAR)
+        assert decision.action in (
+            ActionType.RESPOND,
+            ActionType.PERGUNTA_UNICA_PARA_DESTRAVAR,
+        )
         assert not decision.safety_concern
         assert not decision.handoff_required
 
@@ -533,7 +533,7 @@ class TestSRMEngine:
             current_funnel_stage=FunnelStage.LEAD_NOVO,
         )
         decision = srm_engine.process(input_data)
-        
+
         assert decision.intent_category == IntentCategory.SCHEDULING
         # Scheduling requests may trigger collection or qualification depending on stage
         assert decision.action in (
@@ -541,7 +541,10 @@ class TestSRMEngine:
             ActionType.COLETAR_PREFERENCIAS_AGENDAMENTO,
             ActionType.SOLICITAR_DECISAO_AGENDAMENTO,
         )
-        assert decision.funnel_stage in (FunnelStage.EM_QUALIFICACAO, FunnelStage.LEAD_NOVO)
+        assert decision.funnel_stage in (
+            FunnelStage.EM_QUALIFICACAO,
+            FunnelStage.LEAD_NOVO,
+        )
 
     def test_process_safety_concern(
         self, srm_engine, sample_tenant_id, sample_session_id
@@ -554,7 +557,7 @@ class TestSRMEngine:
             channel="whatsapp",
         )
         decision = srm_engine.process(input_data)
-        
+
         assert decision.safety_concern
         assert decision.safety_category == SafetyCategory.CLINICAL_RISK
         assert decision.mode == FlowMode.SAFETY or decision.mode == FlowMode.HANDOFF
@@ -571,7 +574,7 @@ class TestSRMEngine:
             channel="whatsapp",
         )
         decision = srm_engine.process(input_data)
-        
+
         assert decision.handoff_required
         assert decision.mode == FlowMode.HANDOFF
         # Handoff request now maps to pedido_atendente_humano → administrative handoff
@@ -591,9 +594,12 @@ class TestSRMEngine:
             channel="whatsapp",
         )
         decision = srm_engine.process(input_data)
-        
+
         assert decision.needs_rag
-        assert decision.mode == FlowMode.RAG or decision.intent_category == IntentCategory.QUESTION
+        assert (
+            decision.mode == FlowMode.RAG
+            or decision.intent_category == IntentCategory.QUESTION
+        )
 
     def test_state_patch_generation(
         self, srm_engine, sample_tenant_id, sample_session_id
@@ -606,7 +612,7 @@ class TestSRMEngine:
             channel="whatsapp",
         )
         decision = srm_engine.process(input_data)
-        
+
         assert decision.state_patch is not None
         assert decision.state_patch.last_intent is not None
         assert decision.state_patch.confidence is not None
@@ -622,13 +628,11 @@ class TestSRMEngine:
             channel="whatsapp",
         )
         decision = srm_engine.process(input_data)
-        
+
         assert decision.processing_time_ms is not None
         assert decision.processing_time_ms >= 0
 
-    def test_reasoning_generated(
-        self, srm_engine, sample_tenant_id, sample_session_id
-    ):
+    def test_reasoning_generated(self, srm_engine, sample_tenant_id, sample_session_id):
         """Test that reasoning is generated."""
         input_data = SRMInput(
             tenant_id=sample_tenant_id,
@@ -637,7 +641,7 @@ class TestSRMEngine:
             channel="whatsapp",
         )
         decision = srm_engine.process(input_data)
-        
+
         assert decision.reasoning is not None
         assert len(decision.reasoning) > 0
 
@@ -704,7 +708,7 @@ class TestEdgeCases:
             channel="whatsapp",
         )
         decision = srm_engine.process(input_data)
-        
+
         assert decision.intent == "duvida_generica_sem_contexto"
         assert decision.confidence == 0.0
 
@@ -718,7 +722,7 @@ class TestEdgeCases:
             channel="whatsapp",
         )
         decision = srm_engine.process(input_data)
-        
+
         # Should not crash and return some decision
         assert decision is not None
         assert decision.intent is not None
@@ -732,10 +736,14 @@ class TestEdgeCases:
             channel="whatsapp",
         )
         decision = srm_engine.process(input_data)
-        
+
         assert decision is not None
         # Should still detect scheduling intent
-        assert decision.intent_category in [IntentCategory.SCHEDULING, IntentCategory.QUESTION, IntentCategory.UNKNOWN]
+        assert decision.intent_category in [
+            IntentCategory.SCHEDULING,
+            IntentCategory.QUESTION,
+            IntentCategory.UNKNOWN,
+        ]
 
     def test_mixed_case(self, srm_engine, sample_tenant_id, sample_session_id):
         """Test case insensitivity."""
@@ -746,7 +754,7 @@ class TestEdgeCases:
             channel="whatsapp",
         )
         decision = srm_engine.process(input_data)
-        
+
         assert decision.intent_category == IntentCategory.SCHEDULING
 
     def test_max_turns_boundary(self, handoff_decider):
@@ -790,49 +798,57 @@ class TestAtendimentoTipoSlot:
         self, srm_engine, sample_tenant_id, sample_session_id
     ):
         """'vai ser pelo convênio' ⇒ atendimento_tipo=convenio."""
-        decision = srm_engine.process(SRMInput(
-            tenant_id=sample_tenant_id,
-            session_id=sample_session_id,
-            message="vai ser pelo convênio",
-            channel="whatsapp",
-        ))
+        decision = srm_engine.process(
+            SRMInput(
+                tenant_id=sample_tenant_id,
+                session_id=sample_session_id,
+                message="vai ser pelo convênio",
+                channel="whatsapp",
+            )
+        )
         assert decision.state_patch.slots.get("atendimento_tipo") == "convenio"
 
     def test_convenio_no_accent_sets_slot(
         self, srm_engine, sample_tenant_id, sample_session_id
     ):
         """'convenio' without accent ⇒ atendimento_tipo=convenio."""
-        decision = srm_engine.process(SRMInput(
-            tenant_id=sample_tenant_id,
-            session_id=sample_session_id,
-            message="convenio",
-            channel="whatsapp",
-        ))
+        decision = srm_engine.process(
+            SRMInput(
+                tenant_id=sample_tenant_id,
+                session_id=sample_session_id,
+                message="convenio",
+                channel="whatsapp",
+            )
+        )
         assert decision.state_patch.slots.get("atendimento_tipo") == "convenio"
 
     def test_particular_message_sets_slot(
         self, srm_engine, sample_tenant_id, sample_session_id
     ):
         """'é particular' ⇒ atendimento_tipo=particular."""
-        decision = srm_engine.process(SRMInput(
-            tenant_id=sample_tenant_id,
-            session_id=sample_session_id,
-            message="é particular",
-            channel="whatsapp",
-        ))
+        decision = srm_engine.process(
+            SRMInput(
+                tenant_id=sample_tenant_id,
+                session_id=sample_session_id,
+                message="é particular",
+                channel="whatsapp",
+            )
+        )
         assert decision.state_patch.slots.get("atendimento_tipo") == "particular"
 
     def test_no_signal_leaves_slot_unchanged(
         self, srm_engine, sample_tenant_id, sample_session_id
     ):
         """Messages without the modality word do not touch the slot."""
-        decision = srm_engine.process(SRMInput(
-            tenant_id=sample_tenant_id,
-            session_id=sample_session_id,
-            message="quero agendar amanhã de tarde",
-            channel="whatsapp",
-            slots={"atendimento_tipo": "convenio"},
-        ))
+        decision = srm_engine.process(
+            SRMInput(
+                tenant_id=sample_tenant_id,
+                session_id=sample_session_id,
+                message="quero agendar amanhã de tarde",
+                channel="whatsapp",
+                slots={"atendimento_tipo": "convenio"},
+            )
+        )
         # Patch should NOT overwrite when there is no explicit signal.
         assert "atendimento_tipo" not in decision.state_patch.slots
 
@@ -840,26 +856,30 @@ class TestAtendimentoTipoSlot:
         self, srm_engine, sample_tenant_id, sample_session_id
     ):
         """Restating the same modality does not re-emit into the patch."""
-        decision = srm_engine.process(SRMInput(
-            tenant_id=sample_tenant_id,
-            session_id=sample_session_id,
-            message="é particular sim",
-            channel="whatsapp",
-            slots={"atendimento_tipo": "particular"},
-        ))
+        decision = srm_engine.process(
+            SRMInput(
+                tenant_id=sample_tenant_id,
+                session_id=sample_session_id,
+                message="é particular sim",
+                channel="whatsapp",
+                slots={"atendimento_tipo": "particular"},
+            )
+        )
         assert "atendimento_tipo" not in decision.state_patch.slots
 
     def test_explicit_switch_overwrites(
         self, srm_engine, sample_tenant_id, sample_session_id
     ):
         """User changing their mind is honored: convenio → particular."""
-        decision = srm_engine.process(SRMInput(
-            tenant_id=sample_tenant_id,
-            session_id=sample_session_id,
-            message="na verdade vai ser particular",
-            channel="whatsapp",
-            slots={"atendimento_tipo": "convenio"},
-        ))
+        decision = srm_engine.process(
+            SRMInput(
+                tenant_id=sample_tenant_id,
+                session_id=sample_session_id,
+                message="na verdade vai ser particular",
+                channel="whatsapp",
+                slots={"atendimento_tipo": "convenio"},
+            )
+        )
         assert decision.state_patch.slots.get("atendimento_tipo") == "particular"
 
 
@@ -973,7 +993,10 @@ class TestSchedulingLinkHandoff:
             turn_count=3,
             safety_result=SafetyResult(is_safe=True),
             funnel_stage=FunnelStage.AGENDAMENTO_SOLICITADO,
-            flags={"handoff_confirmation_pending": True, "scheduling_cancel_pending": True},
+            flags={
+                "handoff_confirmation_pending": True,
+                "scheduling_cancel_pending": True,
+            },
             scheduling_link_enabled=True,
         )
         assert result.required is True
@@ -1031,47 +1054,64 @@ class TestSchedulingLinkHandoff:
     # --- Engine: full state-machine round trip ---
 
     def _cfg(self, enabled=True, url="https://clinica.example.com/agendar"):
-        return {"scheduling": {"scheduling_link_enabled": enabled, "scheduling_link_url": url}}
+        return {
+            "scheduling": {
+                "scheduling_link_enabled": enabled,
+                "scheduling_link_url": url,
+            }
+        }
 
-    def test_engine_send_turn_arms_link_sent_flag(self, srm_engine, sample_tenant_id, sample_session_id):
-        decision = srm_engine.process(SRMInput(
-            tenant_id=sample_tenant_id,
-            session_id=sample_session_id,
-            message="sim, pode encaminhar",
-            turn_count=3,
-            current_funnel_stage=FunnelStage.AGENDAMENTO_SOLICITADO,
-            flags={"handoff_confirmation_pending": True},
-            clinic_config=self._cfg(),
-        ))
+    def test_engine_send_turn_arms_link_sent_flag(
+        self, srm_engine, sample_tenant_id, sample_session_id
+    ):
+        decision = srm_engine.process(
+            SRMInput(
+                tenant_id=sample_tenant_id,
+                session_id=sample_session_id,
+                message="sim, pode encaminhar",
+                turn_count=3,
+                current_funnel_stage=FunnelStage.AGENDAMENTO_SOLICITADO,
+                flags={"handoff_confirmation_pending": True},
+                clinic_config=self._cfg(),
+            )
+        )
         assert decision.handoff_required is True
         assert decision.handoff_verification_status == "link_sent"
         assert decision.state_patch.flags.get("scheduling_link_sent") is True
 
-    def test_engine_enrich_turn_annotates_and_disarms(self, srm_engine, sample_tenant_id, sample_session_id):
-        decision = srm_engine.process(SRMInput(
-            tenant_id=sample_tenant_id,
-            session_id=sample_session_id,
-            message="consegui agendar pelo link",
-            turn_count=4,
-            current_funnel_stage=FunnelStage.AGENDAMENTO_SOLICITADO,
-            flags={"scheduling_link_sent": True},
-            clinic_config=self._cfg(),
-        ))
+    def test_engine_enrich_turn_annotates_and_disarms(
+        self, srm_engine, sample_tenant_id, sample_session_id
+    ):
+        decision = srm_engine.process(
+            SRMInput(
+                tenant_id=sample_tenant_id,
+                session_id=sample_session_id,
+                message="consegui agendar pelo link",
+                turn_count=4,
+                current_funnel_stage=FunnelStage.AGENDAMENTO_SOLICITADO,
+                flags={"scheduling_link_sent": True},
+                clinic_config=self._cfg(),
+            )
+        )
         assert decision.handoff_required is False
         assert decision.handoff_verification_status == "concluiu"
         assert decision.state_patch.flags.get("scheduling_link_sent") is False
 
-    def test_engine_enabled_but_no_url_is_plain_handoff(self, srm_engine, sample_tenant_id, sample_session_id):
+    def test_engine_enabled_but_no_url_is_plain_handoff(
+        self, srm_engine, sample_tenant_id, sample_session_id
+    ):
         """Enabled with an empty URL must not change the flow (plain handoff)."""
-        decision = srm_engine.process(SRMInput(
-            tenant_id=sample_tenant_id,
-            session_id=sample_session_id,
-            message="sim, pode encaminhar",
-            turn_count=3,
-            current_funnel_stage=FunnelStage.AGENDAMENTO_SOLICITADO,
-            flags={"handoff_confirmation_pending": True},
-            clinic_config=self._cfg(enabled=True, url=None),
-        ))
+        decision = srm_engine.process(
+            SRMInput(
+                tenant_id=sample_tenant_id,
+                session_id=sample_session_id,
+                message="sim, pode encaminhar",
+                turn_count=3,
+                current_funnel_stage=FunnelStage.AGENDAMENTO_SOLICITADO,
+                flags={"handoff_confirmation_pending": True},
+                clinic_config=self._cfg(enabled=True, url=None),
+            )
+        )
         assert decision.handoff_required is True
         assert decision.handoff_verification_status is None
         assert decision.state_patch.flags.get("scheduling_link_sent") is not True

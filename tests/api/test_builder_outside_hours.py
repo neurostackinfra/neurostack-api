@@ -15,7 +15,6 @@ from src.models.event import Event
 from src.models.tenant import Tenant
 from src.repositories import get_db_session
 
-
 _CLINIC_TZ = ZoneInfo("America/Sao_Paulo")
 _OPERATIONS = {
     "timezone": "America/Sao_Paulo",

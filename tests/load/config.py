@@ -10,7 +10,7 @@ from enum import Enum
 
 class LoadTestProfile(Enum):
     """Predefined load test profiles."""
-    
+
     SMOKE = "smoke"  # Quick validation (10 users, 1 min)
     LOAD = "load"  # Standard load test (100 users, 5 min)
     STRESS = "stress"  # Push limits (500 users, 10 min)
@@ -22,27 +22,27 @@ class LoadTestProfile(Enum):
 @dataclass
 class PerformanceThresholds:
     """Performance thresholds and SLOs."""
-    
+
     # Latency thresholds (milliseconds)
     avg_response_time_ms: float = 100.0
     p95_response_time_ms: float = 200.0
     p99_response_time_ms: float = 500.0
-    
+
     # Error thresholds (percentage)
     max_error_rate: float = 0.1  # 0.1%
-    
+
     # Throughput thresholds
     min_requests_per_second: float = 100.0
     target_requests_per_second: float = 1000.0
-    
+
     def check_latency(self, p95_ms: float) -> bool:
         """Check if latency meets threshold."""
         return p95_ms <= self.p95_response_time_ms
-    
+
     def check_error_rate(self, error_percentage: float) -> bool:
         """Check if error rate meets threshold."""
         return error_percentage <= self.max_error_rate
-    
+
     def check_throughput(self, rps: float) -> bool:
         """Check if throughput meets minimum."""
         return rps >= self.min_requests_per_second
@@ -51,28 +51,30 @@ class PerformanceThresholds:
 @dataclass
 class LoadTestConfig:
     """Load test configuration."""
-    
+
     profile: LoadTestProfile = LoadTestProfile.LOAD
-    
+
     # User configuration
     users: int = 100
     spawn_rate: int = 10
-    
+
     # Duration
     run_time_seconds: int = 300  # 5 minutes
-    
+
     # Host configuration
     host: str = "http://localhost:8000"
-    
+
     # Thresholds
     thresholds: PerformanceThresholds = field(default_factory=PerformanceThresholds)
-    
+
     # Output
     html_report: str = "load_test_report.html"
     csv_prefix: str = "load_test"
-    
+
     @classmethod
-    def from_profile(cls, profile: LoadTestProfile, host: str = "http://localhost:8000") -> "LoadTestConfig":
+    def from_profile(
+        cls, profile: LoadTestProfile, host: str = "http://localhost:8000"
+    ) -> "LoadTestConfig":
         """Create config from predefined profile."""
         configs = {
             LoadTestProfile.SMOKE: cls(
@@ -123,7 +125,7 @@ class LoadTestConfig:
             ),
         }
         return configs.get(profile, cls(host=host))
-    
+
     def to_locust_args(self) -> list[str]:
         """Generate Locust command-line arguments."""
         return [
@@ -157,4 +159,3 @@ DEFAULT_THRESHOLDS = PerformanceThresholds(
     min_requests_per_second=100.0,
     target_requests_per_second=1000.0,  # Target from task 14.3
 )
-

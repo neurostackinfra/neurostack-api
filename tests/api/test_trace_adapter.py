@@ -3,8 +3,13 @@ Tests for the trace adapter service.
 Validates SRM decision → FrontendDecisionTrace mapping.
 """
 
-import pytest
-
+from src.services.trace_adapter import (
+    FrontendDecisionTrace,
+    FrontendSRMDecision,
+    adapt_srm_decision,
+    build_decision_trace,
+    generate_selected_context,
+)
 from src.srm.models import (
     ActionType,
     FunnelStage,
@@ -12,14 +17,6 @@ from src.srm.models import (
     SafetyCategory,
     SRMDecision,
     StatePatch,
-)
-from src.services.trace_adapter import (
-    FrontendDecisionTrace,
-    FrontendSelectedContext,
-    FrontendSRMDecision,
-    adapt_srm_decision,
-    build_decision_trace,
-    generate_selected_context,
 )
 
 
@@ -90,7 +87,9 @@ class TestAdaptSRMDecision:
         ]:
             decision = _make_decision(funnel_stage=stage)
             result = adapt_srm_decision(decision)
-            assert result.stage == stage.value, f"Expected {stage.value}, got {result.stage}"
+            assert (
+                result.stage == stage.value
+            ), f"Expected {stage.value}, got {result.stage}"
 
     def test_constraints_from_state_patch(self):
         decision = _make_decision(
@@ -105,9 +104,7 @@ class TestAdaptSRMDecision:
     def test_gate_authority_before_price(self):
         decision = _make_decision(
             intent="pedido_preco",
-            state_patch=StatePatch(
-                constraints=["C_SEQUENCE_AUTHORITY_BEFORE_PRICE"]
-            ),
+            state_patch=StatePatch(constraints=["C_SEQUENCE_AUTHORITY_BEFORE_PRICE"]),
         )
         result = adapt_srm_decision(decision)
         assert result.gate_authority_before_price is True

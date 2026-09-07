@@ -16,13 +16,6 @@ from src.api.schemas.admin import (
     CreateClinicRequest,
     UpdateBuilderRequest,
 )
-from src.api.schemas.builder import (
-    BuilderClinicResponse as BuilderPanelClinicResponse,
-    BuilderProfileResponse,
-    BuilderStatsResponse,
-    CreateBuilderClinicRequest as CreateBuilderPanelClinicRequest,
-    ToggleClinicStatusRequest,
-)
 from src.api.schemas.base import (
     BaseResponse,
     ErrorDetail,
@@ -31,6 +24,12 @@ from src.api.schemas.base import (
     PaginationParams,
     TimestampMixin,
 )
+from src.api.schemas.builder import BuilderClinicResponse as BuilderPanelClinicResponse
+from src.api.schemas.builder import BuilderProfileResponse, BuilderStatsResponse
+from src.api.schemas.builder import (
+    CreateBuilderClinicRequest as CreateBuilderPanelClinicRequest,
+)
+from src.api.schemas.builder import ToggleClinicStatusRequest
 from src.api.schemas.events import (
     ContextOutput,
     EventPayload,
@@ -186,4 +185,3 @@ __all__ = [
     "TenantStatsResponse",
     "TenantUpdateRequest",
 ]
-

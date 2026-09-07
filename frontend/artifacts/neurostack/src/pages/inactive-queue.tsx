@@ -430,12 +430,11 @@ export default function InactiveQueuePage() {
         </div>
       ) : (
         <div className="overflow-hidden rounded-xl border bg-card shadow-sm">
-          <div className="hidden grid-cols-[1.2fr_.8fr_.65fr_1fr_1fr_1fr_1.25fr] gap-4 border-b bg-muted/40 px-5 py-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground md:grid">
+          <div className="hidden grid-cols-[1.2fr_.8fr_.65fr_1fr_1fr_1.25fr] gap-4 border-b bg-muted/40 px-5 py-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground md:grid">
             <span>{t("inactive_contact")}</span>
             <span>{t("inactive_session_code")}</span>
             <span>{t("inactive_channel")}</span>
             <span>{t("inactive_last_intent")}</span>
-            <span>{t("inactive_funnel_stage")}</span>
             <span>{t("inactive_last_activity")}</span>
             <span>{t("inactive_action")}</span>
           </div>
@@ -449,13 +448,12 @@ export default function InactiveQueuePage() {
                   key={item.session_id}
                   role="listitem"
                   data-testid={`inactive-row-${item.session_id}`}
-                  className={`grid grid-cols-1 gap-3 border-b px-5 py-4 transition-all duration-500 last:border-b-0 md:grid-cols-[1.2fr_.8fr_.65fr_1fr_1fr_1fr_1.25fr] md:items-center md:gap-4 ${successful ? "bg-emerald-500/5 opacity-70" : ""}`}
+                  className={`grid grid-cols-1 gap-3 border-b px-5 py-4 transition-all duration-500 last:border-b-0 md:grid-cols-[1.2fr_.8fr_.65fr_1fr_1fr_1.25fr] md:items-center md:gap-4 ${successful ? "bg-emerald-500/5 opacity-70" : ""}`}
                 >
                   <QueueField label={t("inactive_contact")} value={item.contact_identifier || "—"} prominent />
                   <QueueField label={t("inactive_session_code")} value={shortSessionCode(item.session_id)} mono />
                   <QueueField label={t("inactive_channel")} value={item.channel} />
                   <QueueField label={t("inactive_last_intent")} value={item.last_intent || "—"} />
-                  <QueueField label={t("inactive_funnel_stage")} value={item.funnel_stage || "—"} />
                   <QueueField label={t("inactive_last_activity")} value={formattedActivity.format(new Date(item.last_activity_at))} />
                   <div className="flex min-w-0 items-center justify-between gap-3 md:justify-start">
                     <label

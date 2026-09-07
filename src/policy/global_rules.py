@@ -7,15 +7,14 @@ cannot be overridden by tenant-specific policies.
 """
 
 from src.policy.models import (
+    PolicyConstraints,
     PolicyDefinition,
     PolicyRuleDefinition,
     PolicyType,
+    RuleAction,
     RuleCategory,
     RuleSeverity,
-    RuleAction,
-    PolicyConstraints,
 )
-
 
 # ============================================
 # Clinical Safety Rules
@@ -310,6 +309,7 @@ GLOBAL_CONSTRAINTS = PolicyConstraints(
 # Helper Functions
 # ============================================
 
+
 def get_global_policy() -> PolicyDefinition:
     """Get the global safety policy."""
     return GLOBAL_SAFETY_POLICY
@@ -328,7 +328,8 @@ def get_global_constraints() -> PolicyConstraints:
 def get_clinical_safety_rules() -> list[PolicyRuleDefinition]:
     """Get only clinical safety rules."""
     return [
-        r for r in GLOBAL_SAFETY_POLICY.rules
+        r
+        for r in GLOBAL_SAFETY_POLICY.rules
         if r.category == RuleCategory.SAFETY_CLINICAL
     ]
 
@@ -336,7 +337,5 @@ def get_clinical_safety_rules() -> list[PolicyRuleDefinition]:
 def get_legal_safety_rules() -> list[PolicyRuleDefinition]:
     """Get only legal safety rules."""
     return [
-        r for r in GLOBAL_SAFETY_POLICY.rules
-        if r.category == RuleCategory.SAFETY_LEGAL
+        r for r in GLOBAL_SAFETY_POLICY.rules if r.category == RuleCategory.SAFETY_LEGAL
     ]
-

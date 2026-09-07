@@ -3,21 +3,21 @@ NeuroStack API - OpenTelemetry Tracing Middleware
 Distributed tracing for observability.
 """
 
-import sys
 import uuid
-from pathlib import Path
-from typing import Callable, Optional
+from collections.abc import Awaitable
+from typing import TYPE_CHECKING, Callable, Optional, TypeVar, cast
 
-from fastapi import Request
-from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi import FastAPI, Request
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
-
-# Add the project root to sys.path for local module resolution
-project_root = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(project_root))
 
 from src.config.logging import bind_context, clear_context, get_logger
 from src.config.settings import settings
+
+if TYPE_CHECKING:
+    from opentelemetry.trace import Tracer
+
+TracedCallable = TypeVar("TracedCallable", bound=Callable[..., object])
 
 logger = get_logger(__name__)
 
@@ -43,7 +43,6 @@ def configure_tracing() -> None:
 
     try:
         from opentelemetry import trace
-        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.sampling import TraceIdRatioBased
@@ -86,7 +85,7 @@ def configure_tracing() -> None:
         )
 
 
-def instrument_fastapi(app) -> None:
+def instrument_fastapi(app: FastAPI) -> None:
     """
     Instrument FastAPI application with OpenTelemetry.
 
@@ -188,8 +187,8 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
     async def dispatch(
         self,
         request: Request,
-        call_next: Callable,
-    ):
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
         """Add request ID to request and response."""
 
         # Get existing request ID from header or generate new one
@@ -265,7 +264,7 @@ def _redact_raw_path(path: str) -> str:
 # ============================================
 
 
-def get_tracer(name: str = "neurostack"):
+def get_tracer(name: str = "neurostack") -> "Tracer | NoOpTracer":
     """
     Get a tracer instance for creating spans.
 
@@ -289,32 +288,36 @@ def get_tracer(name: str = "neurostack"):
 class NoOpSpan:
     """No-operation span for when tracing is disabled."""
 
-    def __enter__(self):
+    def __enter__(self) -> "NoOpSpan":
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: object) -> None:
         pass
 
-    def set_attribute(self, key: str, value) -> None:
+    def set_attribute(self, key: str, value: object) -> None:
         pass
 
-    def set_status(self, status) -> None:
+    def set_status(self, status: object) -> None:
         pass
 
     def record_exception(self, exception: Exception) -> None:
         pass
 
-    def add_event(self, name: str, attributes: Optional[dict] = None) -> None:
+    def add_event(
+        self,
+        name: str,
+        attributes: Optional[dict[str, object]] = None,
+    ) -> None:
         pass
 
 
 class NoOpTracer:
     """No-operation tracer for when tracing is disabled."""
 
-    def start_as_current_span(self, name: str, **kwargs):
+    def start_as_current_span(self, name: str, **kwargs: object) -> NoOpSpan:
         return NoOpSpan()
 
-    def start_span(self, name: str, **kwargs):
+    def start_span(self, name: str, **kwargs: object) -> NoOpSpan:
         return NoOpSpan()
 
 
@@ -323,7 +326,9 @@ class NoOpTracer:
 # ============================================
 
 
-def trace_function(name: Optional[str] = None):
+def trace_function(
+    name: Optional[str] = None,
+) -> Callable[[TracedCallable], TracedCallable]:
     """
     Decorator to trace a function with OpenTelemetry.
 
@@ -333,7 +338,7 @@ def trace_function(name: Optional[str] = None):
             ...
     """
 
-    def decorator(func):
+    def decorator(func: TracedCallable) -> TracedCallable:
         span_name = name or func.__name__
 
         if settings.tracing_enabled:
@@ -346,18 +351,19 @@ def trace_function(name: Optional[str] = None):
                 tracer = trace.get_tracer("neurostack")
 
                 @wraps(func)
-                async def async_wrapper(*args, **kwargs):
+                async def async_wrapper(*args: object, **kwargs: object) -> object:
                     with tracer.start_as_current_span(span_name):
-                        return await func(*args, **kwargs)
+                        result = func(*args, **kwargs)
+                        return await cast(Awaitable[object], result)
 
                 @wraps(func)
-                def sync_wrapper(*args, **kwargs):
+                def sync_wrapper(*args: object, **kwargs: object) -> object:
                     with tracer.start_as_current_span(span_name):
                         return func(*args, **kwargs)
 
                 if asyncio.iscoroutinefunction(func):
-                    return async_wrapper
-                return sync_wrapper
+                    return cast(TracedCallable, async_wrapper)
+                return cast(TracedCallable, sync_wrapper)
 
             except ImportError:
                 return func
@@ -371,7 +377,7 @@ def trace_function(name: Optional[str] = None):
 # ============================================
 
 
-def add_span_attributes(**attributes) -> None:
+def add_span_attributes(**attributes: object) -> None:
     """
     Add attributes to the current span.
 

@@ -127,6 +127,8 @@ beforeEach(() => {
       });
     if (url === "/v1/builder/clinics") return ok([clinic]);
     if (url === "/v1/billing/usage") return ok(billingUsage);
+    if (url === "/v1/builder/tickets") return ok([]);
+    if (url === "/v1/builder/profile") return ok({ support_email: null });
     if (url === "/v1/builder/clinics/clinic-42/password")
       return ok({ ok: true });
     throw new Error(`Unexpected fetch: ${url}`);

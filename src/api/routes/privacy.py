@@ -69,6 +69,7 @@ def _render_page(
     slm_training: bool = False,
 ) -> str:
     from datetime import date
+
     today = date.today().strftime("%d/%m/%Y")
     shield_header = _shield(20, "#7c3aed")
     shield_footer = _shield(14, "#a78bfa")
@@ -379,12 +380,17 @@ async def get_privacy_page(
 
     # Build the resolved privacy link (same logic as webhook)
     from src.config.settings import settings
+
     custom_link = (lgpd.get("lgpd_custom_link") or "").strip()
     if custom_link:
         privacy_link = custom_link
     else:
         base_url = (settings.public_base_url or "").rstrip("/")
-        privacy_link = f"{base_url}/privacidade/{clinic_id}" if base_url else f"/privacidade/{clinic_id}"
+        privacy_link = (
+            f"{base_url}/privacidade/{clinic_id}"
+            if base_url
+            else f"/privacidade/{clinic_id}"
+        )
 
     # Pick PT or EN message based on agent language
     if agent_language == "en":
@@ -397,7 +403,12 @@ async def get_privacy_page(
     resolved_message = resolved_message.replace("[Nome da Clínica]", legal_name)
 
     slm_training_raw = lgpd.get("builder_slm_training")
-    slm_training_flag = slm_training_raw is True or str(slm_training_raw).lower() in ("true", "yes", "1") if slm_training_raw is not None else False
+    slm_training_flag = (
+        slm_training_raw is True
+        or str(slm_training_raw).lower() in ("true", "yes", "1")
+        if slm_training_raw is not None
+        else False
+    )
 
     html_body = _render_page(
         title=_esc(legal_name),
@@ -420,7 +431,7 @@ async def get_privacy_page(
 async def get_privacy_data(
     clinic_id: str,
     session: AsyncSession = Depends(get_db_session_dependency),
-) -> ClinicPrivData:
+) -> ClinicPrivData | JSONResponse:
     """JSON data for the React privacy page frontend."""
     try:
         clinic_uuid = UUID(clinic_id)
@@ -430,9 +441,7 @@ async def get_privacy_data(
             status_code=status.HTTP_404_NOT_FOUND,
         )
 
-    tenant_row = await session.execute(
-        select(Tenant).where(Tenant.id == clinic_uuid)
-    )
+    tenant_row = await session.execute(select(Tenant).where(Tenant.id == clinic_uuid))
     tenant = tenant_row.scalar_one_or_none()
     if tenant is None:
         return JSONResponse(
@@ -455,7 +464,11 @@ async def get_privacy_data(
         lgpd_enabled_str = None
 
     slm_raw = lgpd.get("builder_slm_training")
-    slm_consent = slm_raw is True or str(slm_raw).lower() in ("true", "yes", "1") if slm_raw is not None else False
+    slm_consent = (
+        slm_raw is True or str(slm_raw).lower() in ("true", "yes", "1")
+        if slm_raw is not None
+        else False
+    )
 
     return ClinicPrivData(
         clinic_id=str(clinic_uuid),

@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID, uuid4
 
 from sqlalchemy import ForeignKey, Integer, UniqueConstraint, text
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import Base, TimestampMixin
@@ -35,7 +36,9 @@ class ClinicConfigTable(Base, TimestampMixin):
     """
 
     __tablename__ = "clinic_configs"
-    __table_args__ = (UniqueConstraint("tenant_id", name="uq_clinic_configs_tenant_id"),)
+    __table_args__ = (
+        UniqueConstraint("tenant_id", name="uq_clinic_configs_tenant_id"),
+    )
 
     id: Mapped[UUID] = mapped_column(
         PG_UUID(as_uuid=True),
@@ -139,7 +142,9 @@ class ClinicConfigTable(Base, TimestampMixin):
             handoff=ClinicHandoff.model_validate(self.handoff or {}),
             identity=ClinicIdentity.model_validate(self.identity or {}),
             operations=ClinicOperations.model_validate(self.operations or {}),
-            business_rules=ClinicBusinessRules.model_validate(self.business_rules or {}),
+            business_rules=ClinicBusinessRules.model_validate(
+                self.business_rules or {}
+            ),
             lgpd=ClinicLGPD.model_validate(self.lgpd or {}),
         )
 

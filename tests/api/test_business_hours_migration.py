@@ -13,7 +13,6 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-
 MIGRATION_PATH = (
     Path(__file__).resolve().parents[2]
     / "alembic"
