@@ -4,7 +4,6 @@ Contracts for authentication endpoints (/v1/auth).
 """
 
 from typing import Optional
-from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 

@@ -250,17 +250,13 @@ async def test_builder_support_columns_postgres_smoke() -> None:
             # Pre-existing rows retain NULL (no server_default backfill).
             assert (
                 await connection.execute(
-                    text(
-                        "SELECT support_email FROM builders WHERE id = :id"
-                    ),
+                    text("SELECT support_email FROM builders WHERE id = :id"),
                     {"id": builder_id},
                 )
             ).scalar_one() is None
             assert (
                 await connection.execute(
-                    text(
-                        "SELECT contact_phone FROM tenants WHERE id = :id"
-                    ),
+                    text("SELECT contact_phone FROM tenants WHERE id = :id"),
                     {"id": tenant_id},
                 )
             ).scalar_one() is None
@@ -268,15 +264,11 @@ async def test_builder_support_columns_postgres_smoke() -> None:
         # Write and read back through raw SQL to prove the column accepts data.
         async with child_engine.begin() as connection:
             await connection.execute(
-                text(
-                    "UPDATE builders SET support_email = :email WHERE id = :id"
-                ),
+                text("UPDATE builders SET support_email = :email WHERE id = :id"),
                 {"email": "support@example.com", "id": builder_id},
             )
             await connection.execute(
-                text(
-                    "UPDATE tenants SET contact_phone = :phone WHERE id = :id"
-                ),
+                text("UPDATE tenants SET contact_phone = :phone WHERE id = :id"),
                 {"phone": "+55 11 91234-5678", "id": tenant_id},
             )
         async with child_engine.connect() as connection:

@@ -14,7 +14,6 @@ from src.observability.pii import (
 )
 from src.observability.price_gate import check_price_gate
 
-
 # ============================================
 # mask_carteirinha
 # ============================================
@@ -113,13 +112,17 @@ class TestCheckPriceGate:
     def test_no_violation_for_particular(self):
         tenant = "t-part-1"
         before = _violation_count(tenant, "particular")
-        assert check_price_gate("A consulta custa R$ 200", "particular", tenant) is False
+        assert (
+            check_price_gate("A consulta custa R$ 200", "particular", tenant) is False
+        )
         # particular is never a violation, so nothing is recorded under it.
         assert _violation_count(tenant, "particular") == before
 
     def test_no_violation_without_price(self):
         tenant = "t-noprice-1"
-        assert check_price_gate("Vamos agendar sua consulta", "convenio", tenant) is False
+        assert (
+            check_price_gate("Vamos agendar sua consulta", "convenio", tenant) is False
+        )
         assert _violation_count(tenant, "convenio") == 0.0
 
     def test_undefined_tipo_with_price_is_violation(self):

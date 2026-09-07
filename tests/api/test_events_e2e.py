@@ -13,7 +13,6 @@ from uuid import uuid4
 import pytest
 from httpx import AsyncClient
 
-
 # ============================================
 # Fixtures
 # ============================================
@@ -129,7 +128,7 @@ class TestNormalFlowEndToEnd:
         # Verify scheduling intent detected
         decision = data["decision"]
         assert decision["intent_category"] in ["scheduling", "information", "unknown"]
-        
+
         # Verify prompt was generated
         prompt = data["prompt"]
         assert "system" in prompt
@@ -161,7 +160,7 @@ class TestNormalFlowEndToEnd:
 
         # Should remain in NORMAL mode for questions
         assert data["mode"] in ["normal", "rag"]
-        
+
         # Verify processing time is reasonable
         assert data["processing_time_ms"] is not None
         assert data["processing_time_ms"] < 5000  # Should complete in under 5 seconds
@@ -200,7 +199,7 @@ class TestSafetyFlowEndToEnd:
 
         # Should trigger SAFETY or HANDOFF mode for emergency content
         decision = data["decision"]
-        
+
         # Emergency keywords should trigger safety concern
         # Note: Exact behavior depends on safety detector configuration
         if decision["safety_concern"]:
@@ -233,7 +232,7 @@ class TestSafetyFlowEndToEnd:
         # Medication questions may trigger safety
         # Verify prompt includes safety constraints
         prompt = data["prompt"]
-        
+
         # System should have instructions to avoid medical advice
         # or constraints list should include relevant warnings
         assert prompt["system"] is not None
@@ -261,9 +260,6 @@ class TestSafetyFlowEndToEnd:
         assert response.status_code == 200
         data = response.json()
 
-        # Should trigger safety concern
-        decision = data["decision"]
-        
         # Self-harm mentions should be detected
         # This may trigger safety mode or handoff
         assert data["mode"] in ["safety", "handoff", "normal"]
@@ -302,7 +298,7 @@ class TestHandoffFlowEndToEnd:
 
         # Explicit handoff request should trigger handoff
         decision = data["decision"]
-        
+
         if decision["handoff_required"]:
             assert data["mode"] == "handoff"
             assert decision["handoff_reason"] is not None
@@ -491,9 +487,7 @@ class TestErrorHandling:
     """Test error handling in the pipeline."""
 
     @pytest.mark.asyncio
-    async def test_missing_required_fields(
-        self, client: AsyncClient, auth_headers
-    ):
+    async def test_missing_required_fields(self, client: AsyncClient, auth_headers):
         """Test validation for missing required fields."""
         response = await client.post(
             "/v1/events",
@@ -507,9 +501,7 @@ class TestErrorHandling:
         assert response.status_code == 422  # Validation error
 
     @pytest.mark.asyncio
-    async def test_invalid_uuid_format(
-        self, client: AsyncClient, auth_headers
-    ):
+    async def test_invalid_uuid_format(self, client: AsyncClient, auth_headers):
         """Test validation for invalid UUID format."""
         response = await client.post(
             "/v1/events",

@@ -5,7 +5,7 @@ Business logic for event processing and management.
 
 from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,6 +38,11 @@ from src.services.api_credentials import (
     config_cache_key,
     is_cache_v2_payload,
 )
+
+if TYPE_CHECKING:
+    import redis.asyncio as aioredis
+
+    from src.core.pipeline import CognitivePipeline, PipelineResult
 
 logger = get_logger(__name__)
 
@@ -85,10 +90,10 @@ _ALWAYS_RELEVANT_FIELDS = {"identity.clinic_name", "persona.agent_name"}
 
 
 def _filter_relevant_sources(
-    sources: list[dict],
+    sources: list[dict[str, Any]],
     user_message: str,
     llm_response: Optional[str],
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """
     Keep only context sources whose content is reflected in the LLM response
     or whose keywords match the user's question. Identity fields always pass.
@@ -176,14 +181,17 @@ def _filter_relevant_sources(
 _CONFIG_CACHE_TTL = 900  # 15 minutes
 
 
-async def _open_redis() -> Optional[Any]:
+async def _open_redis() -> Optional["aioredis.Redis"]:
     """Return a Redis client or None if the module/URL is unavailable."""
     try:
         import redis.asyncio as aioredis  # noqa: WPS433 (local import for testability)
 
         from src.config.settings import get_settings
 
-        client: Any = aioredis.from_url(get_settings().redis_url, decode_responses=True)
+        client: "aioredis.Redis" = aioredis.Redis.from_url(
+            get_settings().redis_url,
+            decode_responses=True,
+        )
         return client
     except Exception:
         return None
@@ -206,7 +214,7 @@ async def _delete_cache_entry(tenant_id: UUID) -> bool:
             pass
 
 
-async def _get_cached_config(tenant_id: UUID) -> Optional[dict]:
+async def _get_cached_config(tenant_id: UUID) -> Optional[dict[str, Any]]:
     """Return the cached config only when the v2 marker matches.
 
     Any other outcome (missing entry, invalid JSON, stale marker) causes a DEL
@@ -246,7 +254,7 @@ async def _get_cached_config(tenant_id: UUID) -> Optional[dict]:
     return None
 
 
-async def _set_cached_config(tenant_id: UUID, config: dict) -> bool:
+async def _set_cached_config(tenant_id: UUID, config: dict[str, Any]) -> bool:
     """Store the v2-projected snapshot. Returns True on confirmed write.
 
     Callers must project via ``build_cache_payload`` (or a helper that already
@@ -288,7 +296,7 @@ async def invalidate_clinic_config_cache(tenant_id: UUID) -> None:
 
 
 async def _resolve_builder_owner_tenant_id(
-    db_session: Any, tenant_id: UUID
+    db_session: AsyncSession, tenant_id: UUID
 ) -> Optional[UUID]:
     """Resolve the single builder-owner tenant for the given clinic tenant.
 
@@ -334,7 +342,7 @@ async def _resolve_builder_owner_tenant_id(
     return resolved
 
 
-async def _load_config_from_db(tenant_id: UUID) -> Optional[dict]:
+async def _load_config_from_db(tenant_id: UUID) -> Optional[dict[str, Any]]:
     """Load a clinic config row with composed LLM overlay applied.
 
     Returns the flat dict WITH raw ``api_credentials`` (secrets present).
@@ -359,8 +367,8 @@ async def _load_config_from_db(tenant_id: UUID) -> Optional[dict]:
             if row is None:
                 return None
 
-            clinic_creds: dict = dict(row.api_credentials or {})
-            builder_creds: Optional[dict] = None
+            clinic_creds: dict[str, Any] = dict(row.api_credentials or {})
+            builder_creds: Optional[dict[str, Any]] = None
 
             owner_tenant_id = await _resolve_builder_owner_tenant_id(
                 db_session, tenant_id
@@ -395,7 +403,7 @@ async def _load_config_from_db(tenant_id: UUID) -> Optional[dict]:
         return None
 
 
-async def _load_runtime_llm_credentials(tenant_id: UUID) -> dict:
+async def _load_runtime_llm_credentials(tenant_id: UUID) -> dict[str, Any]:
     """Return exactly the four LLM fields needed for an outbound LLM call.
 
     JWT-free, DB-only. Raw key stays in the returned dict for the duration of
@@ -641,7 +649,7 @@ class EventService:
         self._pipeline = pipeline
         self._event_repo = event_repo
 
-    async def _load_clinic_config(self, tenant_id: UUID) -> Optional[dict]:
+    async def _load_clinic_config(self, tenant_id: UUID) -> Optional[dict[str, Any]]:
         """Load projected clinic config from cache or DB.
 
         Public callers receive the v2 projected snapshot: ``api_credentials``
@@ -815,7 +823,11 @@ class EventService:
         self,
         request: EventRequest,
         session: Optional[AsyncSession] = None,
-    ) -> tuple["PipelineResult", Optional[dict], list[dict]]:
+    ) -> tuple[
+        "PipelineResult",
+        Optional[dict[str, Any]],
+        list[dict[str, str]],
+    ]:
         """
         Phase 1 — fast, DB-bound work: load state → run pipeline → flush state.
 
@@ -875,8 +887,8 @@ class EventService:
         self,
         request: EventRequest,
         result: "PipelineResult",
-        clinic_config: Optional[dict],
-        message_history: list[dict],
+        clinic_config: Optional[dict[str, Any]],
+        message_history: list[dict[str, str]],
     ) -> EventResponse:
         """
         Phase 2 — slow I/O: LLM call + event-store writes.
@@ -941,11 +953,17 @@ class EventService:
         self,
         result: "PipelineResult",
         user_message: str = "",
-        clinic_config: Optional[dict] = None,
+        clinic_config: Optional[dict[str, Any]] = None,
         tenant_id: Optional[UUID] = None,
         message_history: Optional[list[dict[str, str]]] = None,
         language: str = "pt-BR",
-    ) -> tuple[EventResponse, dict, str, list[dict[str, Any]], dict[str, int]]:
+    ) -> tuple[
+        EventResponse,
+        dict[str, int],
+        str,
+        list[dict[str, Any]],
+        dict[str, int],
+    ]:
         """
         Convert pipeline result to API response.
 
@@ -993,7 +1011,7 @@ class EventService:
         )
 
         suggested_response = None
-        llm_usage: dict = {}
+        llm_usage: dict[str, int] = {}
         llm_model: str = ""
         llm_attempts: list[dict[str, Any]] = []
         language_code = (
@@ -1409,7 +1427,7 @@ class EventService:
         request: EventRequest,
         result: "PipelineResult",
         suggested_response: Optional[str] = None,
-        llm_usage: Optional[dict] = None,
+        llm_usage: Optional[dict[str, int]] = None,
         llm_model: str = "",
         llm_attempts: Optional[list[dict[str, Any]]] = None,
         llm_usage_total: Optional[dict[str, int]] = None,
@@ -1703,6 +1721,8 @@ class EventService:
 
         if not event:
             raise ValueError(f"Event {event_id} not found")
+        if event.session_id is None:
+            raise ValueError(f"Event {event_id} has no session")
 
         return EventDetailResponse(
             event_id=event.id,
@@ -1755,18 +1775,22 @@ class EventService:
                 event_type=event_type.value if event_type else None,
             )
 
-        return [
-            EventDetailResponse(
-                event_id=event.id,
-                tenant_id=event.tenant_id,
-                session_id=event.session_id,
-                event_type=EventType(event.event_type),
-                payload=event.event_data,
-                decision=event.event_data.get("decision"),
-                created_at=event.created_at.isoformat(),
+        responses: list[EventDetailResponse] = []
+        for event in events_list:
+            if event.session_id is None:
+                raise ValueError(f"Event {event.id} has no session")
+            responses.append(
+                EventDetailResponse(
+                    event_id=event.id,
+                    tenant_id=event.tenant_id,
+                    session_id=event.session_id,
+                    event_type=EventType(event.event_type),
+                    payload=event.event_data,
+                    decision=event.event_data.get("decision"),
+                    created_at=event.created_at.isoformat(),
+                )
             )
-            for event in events_list
-        ]
+        return responses
 
 
 # Singleton instance

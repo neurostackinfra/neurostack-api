@@ -31,7 +31,6 @@ from prometheus_client import Counter
 
 from src.config.logging import get_logger
 
-
 logger = get_logger(__name__)
 
 
@@ -250,18 +249,21 @@ def _is_negated_or_prohibited(response_text: str, match: re.Match[str]) -> bool:
     independent assertion separated by punctuation, a comma, or a
     conjunction.
     """
-    sentence_start = max(
-        response_text.rfind(boundary, 0, match.start())
-        for boundary in ("\n", ".", "!", "?", ";")
-    ) + 1
-    prefix = response_text[sentence_start:match.start()]
+    sentence_start = (
+        max(
+            response_text.rfind(boundary, 0, match.start())
+            for boundary in ("\n", ".", "!", "?", ";")
+        )
+        + 1
+    )
+    prefix = response_text[sentence_start : match.start()]
     negations = tuple(_NEGATED_CLAIM_PREFIX_RE.finditer(prefix))
     if not negations:
         return False
 
     # The most recent negation is the only one that can govern this match.
     negation_end = sentence_start + negations[-1].end()
-    between = response_text[negation_end:match.start()]
+    between = response_text[negation_end : match.start()]
     return _NEGATED_CLAIM_LINK_RE.fullmatch(between) is not None
 
 

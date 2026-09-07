@@ -11,10 +11,11 @@ Policies define the rules that govern agent behavior, including:
 
 from datetime import datetime
 from typing import Any, Optional
-from uuid import UUID, uuid4
+from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, status, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from src.api.middleware.auth import TenantContext, get_tenant_context
 from src.api.schemas.base import ErrorResponse
 from src.api.schemas.policies import (
     EffectivePolicyResponse,
@@ -27,21 +28,19 @@ from src.api.schemas.policies import (
     RuleAction,
     RuleSeverity,
 )
-from src.policy import (
-    PolicyEngine,
-    PolicyStore,
-    PolicyMerger,
-    get_policy_engine,
-    get_policy_store,
-    get_policy_merger,
-    get_global_policy,
-    PolicyCreate,
-    PolicyUpdate,
-    PolicyRuleCreate,
-    RuleCategory,
-)
 from src.config.logging import get_logger
-from src.api.middleware.auth import TenantContext, get_tenant_context
+from src.policy import PolicyCreate, PolicyDefinition, PolicyRuleCreate
+from src.policy import PolicyType as DomainPolicyType
+from src.policy import PolicyUpdate
+from src.policy import RuleAction as DomainRuleAction
+from src.policy import RuleCategory
+from src.policy import RuleSeverity as DomainRuleSeverity
+from src.policy import (
+    get_global_policy,
+    get_policy_engine,
+    get_policy_merger,
+    get_policy_store,
+)
 
 logger = get_logger(__name__)
 
@@ -53,7 +52,7 @@ router = APIRouter()
 # ============================================
 
 
-def convert_to_response(policy) -> PolicyResponse:
+def convert_to_response(policy: PolicyDefinition) -> PolicyResponse:
     """Convert PolicyDefinition to PolicyResponse."""
     rules = [
         PolicyRule(
@@ -68,7 +67,7 @@ def convert_to_response(policy) -> PolicyResponse:
         )
         for r in policy.rules
     ]
-    
+
     return PolicyResponse(
         id=policy.id,
         tenant_id=policy.tenant_id,
@@ -79,8 +78,16 @@ def convert_to_response(policy) -> PolicyResponse:
         priority=policy.priority,
         is_active=policy.is_active,
         version=policy.version,
-        created_at=policy.created_at.isoformat() if isinstance(policy.created_at, datetime) else str(policy.created_at),
-        updated_at=policy.updated_at.isoformat() if isinstance(policy.updated_at, datetime) else str(policy.updated_at),
+        created_at=(
+            policy.created_at.isoformat()
+            if isinstance(policy.created_at, datetime)
+            else str(policy.created_at)
+        ),
+        updated_at=(
+            policy.updated_at.isoformat()
+            if isinstance(policy.updated_at, datetime)
+            else str(policy.updated_at)
+        ),
     )
 
 
@@ -161,7 +168,7 @@ async def create_policy(
         )
 
     store = get_policy_store()
-    
+
     # Convert rules
     rules = [
         PolicyRuleCreate(
@@ -169,26 +176,26 @@ async def create_policy(
             message=r.message,
             description=r.description,
             category=RuleCategory.CUSTOM,
-            severity=r.severity,
-            action=r.action,
+            severity=DomainRuleSeverity(r.severity.value),
+            action=DomainRuleAction(r.action.value),
             patterns=r.patterns,
             keywords=[],
             enabled=True,
         )
         for r in request.rules
     ]
-    
+
     policy_create = PolicyCreate(
         name=request.name,
         description=request.description,
-        policy_type=request.policy_type,
+        policy_type=DomainPolicyType(request.policy_type.value),
         rules=rules,
         priority=request.priority,
         is_active=True,
     )
-    
+
     policy = await store.create_policy(effective_tenant_id, policy_create)
-    
+
     return convert_to_response(policy)
 
 
@@ -233,13 +240,13 @@ async def get_policy(policy_id: UUID) -> PolicyResponse:
     # Try to get from store
     store = get_policy_store()
     policy = await store.get_policy_or_none(policy_id)
-    
+
     if not policy:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Policy {policy_id} not found",
         )
-    
+
     return convert_to_response(policy)
 
 
@@ -271,7 +278,9 @@ async def list_policies(
     tenant_id: Optional[UUID] = Query(default=None, description="Filter by tenant ID"),
     include_global: bool = Query(default=True, description="Include global policies"),
     active_only: bool = Query(default=True, description="Only return active policies"),
-    policy_type: Optional[PolicyType] = Query(default=None, description="Filter by policy type"),
+    policy_type: Optional[PolicyType] = Query(
+        default=None, description="Filter by policy type"
+    ),
 ) -> PolicyListResponse:
     """
     List policies.
@@ -281,17 +290,17 @@ async def list_policies(
     - If active_only is True (default), only returns active policies
     """
     policies = []
-    
+
     # Add global policy if requested
     if include_global:
         policies.append(get_global_policy_response())
-    
+
     # Add tenant policies if tenant_id provided
     if tenant_id:
         store = get_policy_store()
         tenant_policies = await store.list_policies(tenant_id, active_only=active_only)
         policies.extend([convert_to_response(p) for p in tenant_policies])
-    
+
     # Filter by policy type if specified
     if policy_type:
         policies = [p for p in policies if p.policy_type == policy_type]
@@ -349,7 +358,7 @@ async def update_policy(
         )
 
     store = get_policy_store()
-    
+
     # Convert rules if provided
     rules = None
     if request.rules is not None:
@@ -359,15 +368,15 @@ async def update_policy(
                 message=r.message,
                 description=r.description,
                 category=RuleCategory.CUSTOM,
-                severity=r.severity,
-                action=r.action,
+                severity=DomainRuleSeverity(r.severity.value),
+                action=DomainRuleAction(r.action.value),
                 patterns=r.patterns,
                 keywords=[],
                 enabled=True,
             )
             for r in request.rules
         ]
-    
+
     policy_update = PolicyUpdate(
         name=request.name,
         description=request.description,
@@ -375,7 +384,7 @@ async def update_policy(
         priority=request.priority,
         is_active=request.is_active,
     )
-    
+
     try:
         policy = await store.update_policy(policy_id, tenant_id, policy_update)
         return convert_to_response(policy)
@@ -444,7 +453,7 @@ async def delete_policy(
 
     store = get_policy_store()
     deleted = await store.delete_policy(policy_id, tenant_id)
-    
+
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -489,33 +498,32 @@ async def get_effective_policies(tenant_id: UUID) -> EffectivePolicyResponse:
     This returns global + tenant policies merged by priority.
     """
     merger = get_policy_merger()
-    
+
     # Get merged policies
     policies = await merger.get_merged_policies(tenant_id)
     rules = await merger.get_merged_rules(tenant_id)
-    
+
     # Convert to effective rules format
     effective_rules = []
     global_policy = get_global_policy()
-    
+
     for rule in rules:
         # Determine source
-        is_global = any(
-            r.rule_id == rule.rule_id 
-            for r in global_policy.rules
+        is_global = any(r.rule_id == rule.rule_id for r in global_policy.rules)
+
+        effective_rules.append(
+            {
+                "rule_id": rule.rule_id,
+                "rule": rule.rule,
+                "message": rule.message,
+                "severity": rule.severity.value,
+                "action": rule.action.value,
+                "patterns": rule.patterns,
+                "source": "global" if is_global else "tenant",
+                "source_policy_id": str(global_policy.id) if is_global else None,
+            }
         )
-        
-        effective_rules.append({
-            "rule_id": rule.rule_id,
-            "rule": rule.rule,
-            "message": rule.message,
-            "severity": rule.severity.value,
-            "action": rule.action.value,
-            "patterns": rule.patterns,
-            "source": "global" if is_global else "tenant",
-            "source_policy_id": str(global_policy.id) if is_global else None,
-        })
-    
+
     source_policies = [
         {
             "id": str(p.id),
@@ -563,7 +571,7 @@ async def evaluate_message(
         session_id=session_id,
         message=message,
     )
-    
+
     return {
         "passed": result.passed,
         "should_block": result.should_block,

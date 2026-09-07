@@ -3,7 +3,6 @@ NeuroStack API - Policies Schemas
 Contracts for policy management endpoints (/v1/policies).
 """
 
-from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 from uuid import UUID
@@ -406,4 +405,3 @@ class EffectivePolicyResponse(BaseModel):
         ...,
         description="When the merge was computed",
     )
-

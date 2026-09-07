@@ -37,21 +37,21 @@ from src.services.event_service import EN_HANDOFF_MESSAGES
 
 def _render_handoff_confirmation_pending(language: str) -> str:
     """Render the actual production block instead of maintaining a snapshot."""
-    content = NormalTemplate().build_system_message(
-        PromptVariables(
-            user_message="",
-            funnel_stage="agendamento_solicitado",
-            last_intent="agendar",
-            language=language,
-            custom={"handoff_confirmation_pending": True},
+    content = (
+        NormalTemplate()
+        .build_system_message(
+            PromptVariables(
+                user_message="",
+                funnel_stage="agendamento_solicitado",
+                last_intent="agendar",
+                language=language,
+                custom={"handoff_confirmation_pending": True},
+            )
         )
-    ).content
-    header = (
-        "## ⚠️ MANDATORY ACTION"
-        if language == "en"
-        else "## ⚠️ AÇÃO OBRIGATÓRIA"
+        .content
     )
-    return content[content.index(header):]
+    header = "## ⚠️ MANDATORY ACTION" if language == "en" else "## ⚠️ AÇÃO OBRIGATÓRIA"
+    return content[content.index(header) :]
 
 
 def _violation_count(tenant_id: str, category: str) -> float:
@@ -242,9 +242,7 @@ class TestCheckSchedulingGate:
     def test_processed_change_en_bumps_counter(self) -> None:
         tenant = "t-sched-proc-en"
         before = _violation_count(tenant, CATEGORY_PROCESSED_CHANGE)
-        got = check_scheduling_gate(
-            "I've cancelled your appointment", tenant
-        )
+        got = check_scheduling_gate("I've cancelled your appointment", tenant)
         assert got == CATEGORY_PROCESSED_CHANGE
         assert _violation_count(tenant, CATEGORY_PROCESSED_CHANGE) == before + 1
 
@@ -271,6 +269,7 @@ class TestCheckSchedulingGate:
 
     def test_log_sink_failure_does_not_break_the_gate(self, monkeypatch) -> None:
         """The guard is an observability backstop, never a new failure mode."""
+
         def _broken_warning(*_args, **_kwargs) -> None:
             raise RuntimeError("log sink unavailable")
 
@@ -279,9 +278,7 @@ class TestCheckSchedulingGate:
             _broken_warning,
         )
         assert (
-            check_scheduling_gate(
-                "seu agendamento está confirmado", "t-log-failure"
-            )
+            check_scheduling_gate("seu agendamento está confirmado", "t-log-failure")
             == CATEGORY_CONFIRMED
         )
 
@@ -289,6 +286,7 @@ class TestCheckSchedulingGate:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Every observability side effect remains best-effort."""
+
         class _BrokenCounter:
             def labels(self, **_kwargs):
                 raise RuntimeError("metrics unavailable")
@@ -323,11 +321,11 @@ class TestCheckSchedulingGate:
         import logging
 
         caplog.set_level(logging.WARNING)
-        check_scheduling_gate(
-            "seu agendamento está confirmado", "t-log-1"
-        )
+        check_scheduling_gate("seu agendamento está confirmado", "t-log-1")
         matching = [
-            rec for rec in caplog.records if "scheduling_gate_violation" in rec.getMessage()
+            rec
+            for rec in caplog.records
+            if "scheduling_gate_violation" in rec.getMessage()
         ]
         assert matching, "expected a scheduling_gate_violation log record"
         # Structured logger renders key=value pairs into the message.
@@ -372,9 +370,9 @@ class TestGetSafeReplacement:
             "our team will follow up",
         ]
         for phrase in forbidden:
-            assert phrase not in low, (
-                f"[{category}/{language}] replacement promises follow-up: {phrase!r}"
-            )
+            assert (
+                phrase not in low
+            ), f"[{category}/{language}] replacement promises follow-up: {phrase!r}"
 
     @pytest.mark.parametrize("language", ["pt-BR", None, "en"])
     @pytest.mark.parametrize(
@@ -394,9 +392,9 @@ class TestGetSafeReplacement:
             "transfer you",
             "transfer to a human",
         ]:
-            assert phrase not in low, (
-                f"[{category}/{language}] replacement uses forbidden phrase: {phrase!r}"
-            )
+            assert (
+                phrase not in low
+            ), f"[{category}/{language}] replacement uses forbidden phrase: {phrase!r}"
 
     @pytest.mark.parametrize("language", ["pt-BR", "en"])
     def test_availability_does_not_ask_for_full_name(self, language: str) -> None:
@@ -408,9 +406,7 @@ class TestGetSafeReplacement:
         assert "full name" not in low
 
     @pytest.mark.parametrize("language", ["pt-BR", "en"])
-    def test_processed_change_does_not_ask_for_full_name(
-        self, language: str
-    ) -> None:
+    def test_processed_change_does_not_ask_for_full_name(self, language: str) -> None:
         text = get_safe_replacement(
             CATEGORY_PROCESSED_CHANGE, language=language, funnel_stage="agendado"
         )
@@ -456,9 +452,9 @@ class TestGetSafeReplacement:
             CATEGORY_CONFIRMED, language="pt-BR", funnel_stage="agendado"
         )
         # No affirmative reaffirmation.
-        assert detect_scheduling_violation(text) is None, (
-            "reply itself must not trip the gate"
-        )
+        assert (
+            detect_scheduling_violation(text) is None
+        ), "reply itself must not trip the gate"
         low = text.lower()
         # No explicit denial framings.
         assert "você não tem agendamento" not in low
@@ -556,15 +552,15 @@ class TestCorpusNoFalsePositive:
     def test_default_handoff_messages_all_reasons(self) -> None:
         cfg = HandoffServiceConfig()
         for reason, text in cfg.default_handoff_messages.items():
-            assert detect_scheduling_violation(text) is None, (
-                f"default_handoff_messages[{reason!r}] false-positived: {text!r}"
-            )
+            assert (
+                detect_scheduling_violation(text) is None
+            ), f"default_handoff_messages[{reason!r}] false-positived: {text!r}"
 
     def test_en_handoff_messages_all_reasons(self) -> None:
         for reason, text in EN_HANDOFF_MESSAGES.items():
-            assert detect_scheduling_violation(text) is None, (
-                f"EN_HANDOFF_MESSAGES[{reason!r}] false-positived: {text!r}"
-            )
+            assert (
+                detect_scheduling_violation(text) is None
+            ), f"EN_HANDOFF_MESSAGES[{reason!r}] false-positived: {text!r}"
 
     def test_en_handoff_scheduling_no_longer_promises_confirm(self) -> None:
         """Deliverable 6 #1 — the EN scheduling literal must not read as
@@ -584,22 +580,24 @@ class TestCorpusNoFalsePositive:
             if "{" in text and "}" in text:
                 # Substitute plausible values so the assertion is meaningful.
                 text = text.format(wait_time="5", agent_name="Ana")
-            assert detect_scheduling_violation(text) is None, (
-                f"HANDOFF_RESPONSES[{key!r}] false-positived: {text!r}"
-            )
+            assert (
+                detect_scheduling_violation(text) is None
+            ), f"HANDOFF_RESPONSES[{key!r}] false-positived: {text!r}"
 
     def test_handoff_confirmation_pending_pt_block(self) -> None:
         # Even though the gate never reads this at runtime (it's part of
         # the system prompt, not suggested_response), the corpus test
         # asserts zero match so any future regex tightening stays safe.
-        assert detect_scheduling_violation(
-            _render_handoff_confirmation_pending("pt-BR")
-        ) is None
+        assert (
+            detect_scheduling_violation(_render_handoff_confirmation_pending("pt-BR"))
+            is None
+        )
 
     def test_handoff_confirmation_pending_en_block(self) -> None:
-        assert detect_scheduling_violation(
-            _render_handoff_confirmation_pending("en")
-        ) is None
+        assert (
+            detect_scheduling_violation(_render_handoff_confirmation_pending("en"))
+            is None
+        )
 
     def test_no_match_on_price_gate_wordings(self) -> None:
         # Sanity: price replies must not trigger scheduling gate.

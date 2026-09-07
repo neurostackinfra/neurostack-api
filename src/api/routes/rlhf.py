@@ -14,7 +14,7 @@ from typing import Any, Literal, Optional
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, JsonValue
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -294,7 +294,7 @@ async def _analyze_rating_async(
 
     # DB-only resolver: returns ONLY the four LLM overlay fields (raw key held
     # in-memory for this call), builder-owner composition already applied.
-    api_credentials: dict = {}
+    api_credentials: dict[str, JsonValue] = {}
     try:
         api_credentials = await _load_runtime_llm_credentials(resolve_tenant_id)
     except Exception:
@@ -303,7 +303,8 @@ async def _analyze_rating_async(
             event_id,
         )
 
-    tenant_model: Optional[str] = api_credentials.get("llm_model_name") or None
+    tenant_model_value = api_credentials.get("llm_model_name")
+    tenant_model = tenant_model_value if isinstance(tenant_model_value, str) else None
     # Structured log MUST NOT contain any secret material or prefix — only the
     # public presence bit and the non-secret model id are safe to emit.
     logger.info(
@@ -406,7 +407,7 @@ async def submit_rating(
     body: RatingRequest,
     tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
-):
+) -> RatingResponse:
     """Persist a rating (1-5) for an agent response.
 
     For ratings 1-3 that ship with a substantive written critique
@@ -477,6 +478,7 @@ async def submit_rating(
     await session.commit()
 
     if triggers_analysis:
+        assert reason is not None
         spawn(
             _analyze_rating_async(
                 event_id=event_id,

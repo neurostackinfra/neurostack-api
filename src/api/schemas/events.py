@@ -3,7 +3,6 @@ NeuroStack API - Events Schemas
 Contracts for event processing endpoints (/v1/events).
 """
 
-from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 from uuid import UUID
@@ -298,12 +297,16 @@ class SRMDecision(BaseModel):
     handoff_reason: Optional[str] = Field(
         default=None,
         description="Reason for handoff if required",
-        json_schema_extra={"example": "User explicitly requested to speak with a human"},
+        json_schema_extra={
+            "example": "User explicitly requested to speak with a human"
+        },
     )
     reasoning: Optional[str] = Field(
         default=None,
         description="Brief explanation of the decision",
-        json_schema_extra={"example": "User explicitly requested to schedule an appointment"},
+        json_schema_extra={
+            "example": "User explicitly requested to schedule an appointment"
+        },
     )
 
 
@@ -454,10 +457,14 @@ class ContextSource(BaseModel):
     )
 
     origin: str = Field(..., description="Source origin: 'config' or 'rag'")
-    field: Optional[str] = Field(default=None, description="Technical field path (e.g. 'identity.clinic_name')")
+    field: Optional[str] = Field(
+        default=None, description="Technical field path (e.g. 'identity.clinic_name')"
+    )
     title: str = Field(..., description="Human-readable title in Portuguese")
     content: str = Field(..., description="Value or content excerpt")
-    document_id: Optional[str] = Field(default=None, description="Document ID for RAG sources")
+    document_id: Optional[str] = Field(
+        default=None, description="Document ID for RAG sources"
+    )
     relevance_score: Optional[float] = Field(
         default=None,
         ge=0.0,
@@ -659,6 +666,7 @@ class EventDetailResponse(BaseModel):
     session_id: UUID = Field(..., description="Session identifier")
     event_type: EventType = Field(..., description="Type of event")
     payload: dict[str, Any] = Field(..., description="Original event payload")
-    decision: Optional[dict[str, Any]] = Field(default=None, description="SRM decision if applicable")
+    decision: Optional[dict[str, Any]] = Field(
+        default=None, description="SRM decision if applicable"
+    )
     created_at: str = Field(..., description="Event creation timestamp")
-

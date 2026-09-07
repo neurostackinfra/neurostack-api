@@ -23,7 +23,6 @@ DATASET: list[tuple[str, str]] = [
     ("Olá, vocês ainda estão atendendo?", "saudacao"),
     ("Oii", "saudacao"),
     ("Boa noite", "saudacao"),
-
     # ── INTERESSE EM TRATAMENTO (8 cases) → interesse_tratamento ──
     ("Quero saber sobre tratamentos estéticos", "interesse_tratamento"),
     ("Vocês fazem botox?", "interesse_tratamento"),
@@ -33,7 +32,6 @@ DATASET: list[tuple[str, str]] = [
     ("Quero tratar minha queda de cabelo", "interesse_tratamento"),
     ("Tenho interesse em fazer harmonização facial", "interesse_tratamento"),
     ("Quero tratar minhas manchas no rosto", "interesse_tratamento"),
-
     # ── QUALIFICAÇÃO (28 cases) → interesse_tratamento (qualify = deeper interest) ──
     ("Nunca fiz botox, quero entender como funciona", "interesse_tratamento"),
     ("Já fiz botox em outro lugar mas não gostei do resultado", "interesse_tratamento"),
@@ -41,15 +39,24 @@ DATASET: list[tuple[str, str]] = [
     ("Quero fazer uma consulta com ortopedista", "interesse_tratamento"),
     ("Me explica como funciona", "interesse_tratamento"),
     ("Quero saber mais", "interesse_tratamento"),
-    ("Tenho 45 anos e quero cuidar mais da pele, por onde começo?", "interesse_tratamento"),
+    (
+        "Tenho 45 anos e quero cuidar mais da pele, por onde começo?",
+        "interesse_tratamento",
+    ),
     ("Quero emagrecer, vocês têm tratamento?", "interesse_tratamento"),
     ("Quero fazer peeling", "interesse_tratamento"),
     ("Tenho acne e quero tratar", "interesse_tratamento"),
     ("Quero melhorar meu sorriso", "interesse_tratamento"),
     ("Tenho bruxismo e quero tratar", "interesse_tratamento"),
     ("Tenho 30 anos e nunca fui ao dentista, tenho vergonha", "interesse_tratamento"),
-    ("Tive uma experiência ruim no dentista antes e tenho medo", "interesse_tratamento"),
-    ("Já fiz harmonização em outro lugar, quero continuar aqui", "interesse_tratamento"),
+    (
+        "Tive uma experiência ruim no dentista antes e tenho medo",
+        "interesse_tratamento",
+    ),
+    (
+        "Já fiz harmonização em outro lugar, quero continuar aqui",
+        "interesse_tratamento",
+    ),
     ("Sofro de ansiedade, isso interfere no tratamento?", "interesse_tratamento"),
     ("Sou diabético, posso fazer o procedimento?", "interesse_tratamento"),
     ("Estou grávida, vocês atendem?", "interesse_tratamento"),
@@ -58,12 +65,17 @@ DATASET: list[tuple[str, str]] = [
     ("Não sei por onde começar", "interesse_tratamento"),
     ("Meu filho quer fazer um procedimento, tem idade mínima?", "interesse_tratamento"),
     ("Tenho endometriose, vocês têm tratamento?", "interesse_tratamento"),
-    ("Quero tratar minha depressão, vocês atendem psiquiatria?", "interesse_tratamento"),
+    (
+        "Quero tratar minha depressão, vocês atendem psiquiatria?",
+        "interesse_tratamento",
+    ),
     ("Tenho 60 anos, posso fazer botox?", "interesse_tratamento"),
     ("Quero tratar cicatriz de acne", "interesse_tratamento"),
-    ("Fiz a mesma coisa na clínica X e fiquei satisfeita, quero fazer aqui", "interesse_tratamento"),
+    (
+        "Fiz a mesma coisa na clínica X e fiquei satisfeita, quero fazer aqui",
+        "interesse_tratamento",
+    ),
     ("Ouvi falar do tratamento X, vocês fazem?", "interesse_tratamento"),
-
     # ── PEDIDO DE PREÇO (14 cases) → pedido_preco ──
     ("Quanto custa o botox?", "pedido_preco"),
     ("Qual o valor da consulta?", "pedido_preco"),
@@ -79,7 +91,6 @@ DATASET: list[tuple[str, str]] = [
     ("Tem como fazer por um preço menor?", "pedido_preco"),
     ("Aceita pix?", "pedido_preco"),
     ("Quais as formas de pagamento?", "pedido_preco"),
-
     # ── AGENDAMENTO (24 cases) → agendar ──
     ("Quero agendar uma consulta", "agendar"),
     ("Tem horário disponível para segunda?", "agendar"),
@@ -105,7 +116,6 @@ DATASET: list[tuple[str, str]] = [
     ("Pode ser na próxima quarta?", "agendar"),
     ("Quero agendar com urgência", "agendar"),
     ("Tem encaixe para hoje?", "agendar"),
-
     # ── INFORMAÇÕES DA CLÍNICA (23 cases) → detalhes_servicos / informacoes_profissionais / disponibilidade_horarios ──
     ("Onde fica a clínica?", "detalhes_servicos"),
     ("Qual o endereço?", "detalhes_servicos"),
@@ -130,7 +140,6 @@ DATASET: list[tuple[str, str]] = [
     ("Posso levar acompanhante?", "detalhes_servicos"),
     ("Vocês atendem crianças?", "detalhes_servicos"),
     ("A clínica tem quantos anos?", "cultura_historia"),
-
     # ── PÓS-ATENDIMENTO DÚVIDAS (9 cases) → pos_atendimento_duvida ──
     ("Posso tomar sorvete depois da extração?", "pos_atendimento_duvida"),
     ("É normal ficar inchado?", "pos_atendimento_duvida"),
@@ -141,28 +150,43 @@ DATASET: list[tuple[str, str]] = [
     ("Posso dirigir depois da anestesia?", "pos_atendimento_duvida"),
     ("É normal sentir dormência?", "pos_atendimento_duvida"),
     ("Quanto tempo o efeito do botox dura?", "pos_atendimento_duvida"),
-
     # ── PÓS-ATENDIMENTO URGENTE (11 cases) → pos_atendimento_sintomas_preocupantes ──
-    ("Tô com muita dor depois do procedimento", "pos_atendimento_sintomas_preocupantes"),
-    ("Meu rosto inchou muito após a aplicação", "pos_atendimento_sintomas_preocupantes"),
+    (
+        "Tô com muita dor depois do procedimento",
+        "pos_atendimento_sintomas_preocupantes",
+    ),
+    (
+        "Meu rosto inchou muito após a aplicação",
+        "pos_atendimento_sintomas_preocupantes",
+    ),
     ("Tive sangramento depois da cirurgia", "pos_atendimento_sintomas_preocupantes"),
     ("Estou com febre após o procedimento", "pos_atendimento_sintomas_preocupantes"),
     ("A região ficou roxa e está piorando", "pos_atendimento_sintomas_preocupantes"),
-    ("Não consigo abrir a boca depois da extração", "pos_atendimento_sintomas_preocupantes"),
+    (
+        "Não consigo abrir a boca depois da extração",
+        "pos_atendimento_sintomas_preocupantes",
+    ),
     ("Saiu pus do local da cirurgia", "pos_atendimento_sintomas_preocupantes"),
-    ("Tô passando muito mal depois do procedimento", "pos_atendimento_sintomas_preocupantes"),
+    (
+        "Tô passando muito mal depois do procedimento",
+        "pos_atendimento_sintomas_preocupantes",
+    ),
     ("Minha pressão caiu depois da anestesia", "pos_atendimento_sintomas_preocupantes"),
-    ("Tenho dor intensa que não passa com remédio", "pos_atendimento_sintomas_preocupantes"),
+    (
+        "Tenho dor intensa que não passa com remédio",
+        "pos_atendimento_sintomas_preocupantes",
+    ),
     ("O sangramento não para", "pos_atendimento_sintomas_preocupantes"),
-
     # ── PEDIDO DE ALTERAÇÃO DE MEDICAÇÃO (6 cases) → pedido_alterar_medicacao ──
     ("Quero diminuir a dose do remédio", "pedido_alterar_medicacao"),
     ("O remédio tá muito forte, posso tomar menos?", "pedido_alterar_medicacao"),
-    ("Posso trocar o medicamento? Tô tendo efeito colateral", "pedido_alterar_medicacao"),
+    (
+        "Posso trocar o medicamento? Tô tendo efeito colateral",
+        "pedido_alterar_medicacao",
+    ),
     ("Quero parar de tomar esse remédio", "pedido_alterar_medicacao"),
     ("Posso tomar junto com outro medicamento?", "pedido_alterar_medicacao"),
     ("A dose tá fraca, posso tomar mais?", "pedido_alterar_medicacao"),
-
     # ── RECLAMAÇÕES (9 cases) → reclamacao ──
     ("O atendimento foi péssimo", "reclamacao"),
     ("Esperando há 40 minutos", "reclamacao"),
@@ -173,7 +197,6 @@ DATASET: list[tuple[str, str]] = [
     ("Já liguei 3 vezes e ninguém atende", "reclamacao"),
     ("O resultado não ficou como prometido", "reclamacao"),
     ("Estou muito insatisfeita com o serviço", "reclamacao"),
-
     # ── CONDUTA INADEQUADA / AMEAÇA (6 cases) → conduta_inadequada_ameaca ──
     ("Vou processar vocês", "conduta_inadequada_ameaca"),
     ("Seu atendimento é uma merda, vou no Procon", "conduta_inadequada_ameaca"),
@@ -181,29 +204,24 @@ DATASET: list[tuple[str, str]] = [
     ("Isso é um absurdo, vou chamar meu advogado", "conduta_inadequada_ameaca"),
     ("Vocês vão se arrepender, vou expor nas redes", "conduta_inadequada_ameaca"),
     ("Que clínica de merda", "conduta_inadequada_ameaca"),
-
     # ── PEDIDO DE ATENDENTE HUMANO (4 cases) → pedido_atendente_humano ──
     ("Quero falar com um atendente humano", "pedido_atendente_humano"),
     ("Não quero falar com robô", "pedido_atendente_humano"),
     ("Me transfere para alguém de verdade", "pedido_atendente_humano"),
     ("Tem como falar com uma pessoa?", "pedido_atendente_humano"),
-
     # ── DOCUMENTOS E COMPROVANTES (5 cases) → documentos_e_comprovantes ──
     ("Preciso do meu atestado", "documentos_e_comprovantes"),
     ("Manda a receita por aqui", "documentos_e_comprovantes"),
     ("Preciso de um comprovante de comparecimento", "documentos_e_comprovantes"),
     ("Pode enviar o laudo do exame?", "documentos_e_comprovantes"),
     ("Quero a nota fiscal do procedimento", "documentos_e_comprovantes"),
-
     # ── ORÇAMENTO EXISTENTE (2 cases) → orcamento_existente ──
     ("Já recebi um orçamento antes", "orcamento_existente"),
     ("Quero ver o orçamento que me passaram", "orcamento_existente"),
-
     # ── FINANCEIRO / COBRANÇA (3 cases) → cobranca_renegociacao ──
     ("Quero parcelar meu débito", "cobranca_renegociacao"),
     ("Preciso renegociar minha dívida", "cobranca_renegociacao"),
     ("Recebi uma cobrança, o que é?", "cobranca_renegociacao"),
-
     # ── OBJEÇÕES (18 cases) → objecao_vou_pensar ──
     ("Vou pensar e te retorno", "objecao_vou_pensar"),
     ("Achei caro, vou pesquisar", "objecao_vou_pensar"),
@@ -223,20 +241,17 @@ DATASET: list[tuple[str, str]] = [
     ("Preciso pesquisar mais", "objecao_vou_pensar"),
     ("Acho que não é o momento", "objecao_vou_pensar"),
     ("Tô sem grana agora", "objecao_vou_pensar"),
-
     # ── COMPARAÇÃO DE TRATAMENTOS (5 cases) → comparacao_tratamentos ──
     ("Qual a diferença entre botox e preenchimento?", "comparacao_tratamentos"),
     ("O que é melhor, laser ou peeling?", "comparacao_tratamentos"),
     ("Clareamento a laser ou moldeira, qual é melhor?", "comparacao_tratamentos"),
     ("Implante ou prótese, qual a diferença?", "comparacao_tratamentos"),
     ("Qual tratamento é mais indicado pro meu caso?", "comparacao_tratamentos"),
-
     # ── PACIENTE ATIVO (4 cases) → paciente_ativo ──
     ("Já sou paciente de vocês", "paciente_ativo"),
     ("Faço acompanhamento há 2 anos", "paciente_ativo"),
     ("Sou paciente do Dr. João", "paciente_ativo"),
     ("Já faço tratamento aqui na clínica", "paciente_ativo"),
-
     # ── FORA DO ESCOPO CLÍNICO (10 cases) → fora_do_escopo ──
     ("Vocês tratam depressão?", "fora_do_escopo"),
     ("Fazem exame de sangue?", "fora_do_escopo"),
@@ -248,7 +263,6 @@ DATASET: list[tuple[str, str]] = [
     ("Vocês fazem vacinação?", "fora_do_escopo"),
     ("Posso fazer ressonância aí?", "fora_do_escopo"),
     ("Vocês tratam animais?", "fora_do_escopo"),
-
     # ── FORA DO HORÁRIO (4 cases) → fora_do_horario ──
     ("Vocês atendem fora do horário?", "fora_do_horario"),
     ("Tô mandando mensagem de madrugada, vocês abrem que horas?", "fora_do_horario"),
@@ -288,7 +302,9 @@ class TestIntentAccuracyByCategory:
         assert acc == 100, f"Saudação {c}/{t} = {acc:.0f}%\n" + "\n".join(f)
 
     def test_interesse_tratamento(self, classifier):
-        acc, c, t, f = self._run_category(classifier, "Interesse/Qualificação", "interesse_tratamento")
+        acc, c, t, f = self._run_category(
+            classifier, "Interesse/Qualificação", "interesse_tratamento"
+        )
         assert acc >= 80, f"Interesse {c}/{t} = {acc:.0f}%\n" + "\n".join(f)
 
     def test_pedido_preco(self, classifier):
@@ -301,11 +317,15 @@ class TestIntentAccuracyByCategory:
 
     def test_pos_urgente(self, classifier):
         """Safety-critical: must be 100%."""
-        acc, c, t, f = self._run_category(classifier, "Pós-Urgente", "pos_atendimento_sintomas_preocupantes")
+        acc, c, t, f = self._run_category(
+            classifier, "Pós-Urgente", "pos_atendimento_sintomas_preocupantes"
+        )
         assert acc == 100, f"SAFETY: Pós-Urgente {c}/{t} = {acc:.0f}%\n" + "\n".join(f)
 
     def test_pos_duvida(self, classifier):
-        acc, c, t, f = self._run_category(classifier, "Pós-Dúvida", "pos_atendimento_duvida")
+        acc, c, t, f = self._run_category(
+            classifier, "Pós-Dúvida", "pos_atendimento_duvida"
+        )
         assert acc >= 70, f"Pós-Dúvida {c}/{t} = {acc:.0f}%\n" + "\n".join(f)
 
     def test_objecoes(self, classifier):
@@ -317,35 +337,51 @@ class TestIntentAccuracyByCategory:
         assert acc >= 80, f"Reclamação {c}/{t} = {acc:.0f}%\n" + "\n".join(f)
 
     def test_conduta_inadequada(self, classifier):
-        acc, c, t, f = self._run_category(classifier, "Conduta", "conduta_inadequada_ameaca")
+        acc, c, t, f = self._run_category(
+            classifier, "Conduta", "conduta_inadequada_ameaca"
+        )
         assert acc >= 80, f"Conduta {c}/{t} = {acc:.0f}%\n" + "\n".join(f)
 
     def test_pedido_atendente_humano(self, classifier):
-        acc, c, t, f = self._run_category(classifier, "Humano", "pedido_atendente_humano")
+        acc, c, t, f = self._run_category(
+            classifier, "Humano", "pedido_atendente_humano"
+        )
         assert acc >= 75, f"Humano {c}/{t} = {acc:.0f}%\n" + "\n".join(f)
 
     def test_documentos(self, classifier):
-        acc, c, t, f = self._run_category(classifier, "Documentos", "documentos_e_comprovantes")
+        acc, c, t, f = self._run_category(
+            classifier, "Documentos", "documentos_e_comprovantes"
+        )
         assert acc >= 75, f"Documentos {c}/{t} = {acc:.0f}%\n" + "\n".join(f)
 
     def test_medicacao(self, classifier):
-        acc, c, t, f = self._run_category(classifier, "Medicação", "pedido_alterar_medicacao")
+        acc, c, t, f = self._run_category(
+            classifier, "Medicação", "pedido_alterar_medicacao"
+        )
         assert acc >= 75, f"Medicação {c}/{t} = {acc:.0f}%\n" + "\n".join(f)
 
     def test_comparacao(self, classifier):
-        acc, c, t, f = self._run_category(classifier, "Comparação", "comparacao_tratamentos")
+        acc, c, t, f = self._run_category(
+            classifier, "Comparação", "comparacao_tratamentos"
+        )
         assert acc >= 70, f"Comparação {c}/{t} = {acc:.0f}%\n" + "\n".join(f)
 
     def test_paciente_ativo(self, classifier):
-        acc, c, t, f = self._run_category(classifier, "Paciente Ativo", "paciente_ativo")
+        acc, c, t, f = self._run_category(
+            classifier, "Paciente Ativo", "paciente_ativo"
+        )
         assert acc >= 75, f"Paciente Ativo {c}/{t} = {acc:.0f}%\n" + "\n".join(f)
 
     def test_fora_do_escopo(self, classifier):
-        acc, c, t, f = self._run_category(classifier, "Fora do Escopo", "fora_do_escopo")
+        acc, c, t, f = self._run_category(
+            classifier, "Fora do Escopo", "fora_do_escopo"
+        )
         assert acc >= 70, f"Fora Escopo {c}/{t} = {acc:.0f}%\n" + "\n".join(f)
 
     def test_fora_do_horario(self, classifier):
-        acc, c, t, f = self._run_category(classifier, "Fora do Horário", "fora_do_horario")
+        acc, c, t, f = self._run_category(
+            classifier, "Fora do Horário", "fora_do_horario"
+        )
         assert acc >= 70, f"Fora Horário {c}/{t} = {acc:.0f}%\n" + "\n".join(f)
 
 
@@ -373,7 +409,9 @@ class TestOverallAccuracy:
                 print(f)
             if len(failures) > 20:
                 print(f"  ... and {len(failures) - 20} more")
-        assert accuracy >= 85, f"Overall accuracy {correct}/{total} = {accuracy:.1f}% < 85%"
+        assert (
+            accuracy >= 85
+        ), f"Overall accuracy {correct}/{total} = {accuracy:.1f}% < 85%"
 
     def test_no_false_generics(self, classifier):
         """No message with a specific expected intent should be classified as duvida_generica."""
@@ -383,8 +421,12 @@ class TestOverallAccuracy:
                 continue
             result = classifier.classify(msg)
             if result.intent == "duvida_generica_sem_contexto":
-                false_generics.append(f"  '{msg}' → duvida_generica (expected '{expected}')")
-        assert not false_generics, f"False generics ({len(false_generics)}):\n" + "\n".join(false_generics[:10])
+                false_generics.append(
+                    f"  '{msg}' → duvida_generica (expected '{expected}')"
+                )
+        assert (
+            not false_generics
+        ), f"False generics ({len(false_generics)}):\n" + "\n".join(false_generics[:10])
 
     def test_all_confidence_above_95(self, classifier):
         """All 199 cases must produce confidence >= 0.95."""
@@ -426,9 +468,10 @@ class TestFunnelStageAccuracy:
     }
 
     def test_all_stages_correct(self):
-        from src.srm.engine import SRMEngine
-        from src.srm.models import SRMInput, FunnelStage
         from uuid import uuid4
+
+        from src.srm.engine import SRMEngine
+        from src.srm.models import SRMInput
 
         engine = SRMEngine()
         wrong = []
@@ -449,14 +492,17 @@ class TestFunnelStageAccuracy:
         assert not wrong, f"Wrong stages ({len(wrong)}):\n" + "\n".join(wrong[:10])
 
     def test_escalation_intents_standby(self):
-        from src.srm.engine import SRMEngine
-        from src.srm.models import SRMInput, FunnelStage
         from uuid import uuid4
+
+        from src.srm.engine import SRMEngine
+        from src.srm.models import SRMInput
 
         engine = SRMEngine()
         escalation_cases = [
-            (msg, exp) for msg, exp in DATASET
-            if exp in ("reclamacao", "conduta_inadequada_ameaca", "pedido_atendente_humano")
+            (msg, exp)
+            for msg, exp in DATASET
+            if exp
+            in ("reclamacao", "conduta_inadequada_ameaca", "pedido_atendente_humano")
         ]
         for msg, expected_intent in escalation_cases:
             inp = SRMInput(
@@ -466,12 +512,12 @@ class TestFunnelStageAccuracy:
                 channel="whatsapp",
             )
             decision = engine.process(inp)
-            assert decision.funnel_stage.value == "standby", (
-                f"'{msg}' → stage={decision.funnel_stage.value}, expected standby"
-            )
-            assert decision.safety_concern is True, (
-                f"'{msg}' → safety_concern=False, expected True"
-            )
-            assert decision.handoff_required is True, (
-                f"'{msg}' → handoff_required=False, expected True"
-            )
+            assert (
+                decision.funnel_stage.value == "standby"
+            ), f"'{msg}' → stage={decision.funnel_stage.value}, expected standby"
+            assert (
+                decision.safety_concern is True
+            ), f"'{msg}' → safety_concern=False, expected True"
+            assert (
+                decision.handoff_required is True
+            ), f"'{msg}' → handoff_required=False, expected True"

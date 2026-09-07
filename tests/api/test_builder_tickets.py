@@ -13,11 +13,7 @@ import jwt
 import pytest
 
 from src.config.settings import settings
-from tests.api.test_builder import (
-    _make_builder_token,
-    _make_clinic_admin_token,
-)
-
+from tests.api.test_builder import _make_builder_token, _make_clinic_admin_token
 
 # ============================================
 # Local helpers
@@ -170,9 +166,7 @@ async def _fetch_ticket(ticket_id: int):
 
 class TestListBuilderTickets:
     @pytest.mark.asyncio
-    async def test_lists_only_own_tickets_with_joined_clinic_fields(
-        self, async_client
-    ):
+    async def test_lists_only_own_tickets_with_joined_clinic_fields(self, async_client):
         """Two tickets routed to A + one to B: A sees exactly its two, with
         clinic_name and contact_phone joined from Tenant."""
         builder_a = await _seed_builder()
@@ -221,9 +215,7 @@ class TestListBuilderTickets:
             assert row["mensagem"] == "Preciso de ajuda"
 
     @pytest.mark.asyncio
-    async def test_builder_with_no_tickets_returns_200_empty_list(
-        self, async_client
-    ):
+    async def test_builder_with_no_tickets_returns_200_empty_list(self, async_client):
         """Builder A with zero routed tickets gets 200 + `[]`, never 403."""
         builder_a = await _seed_builder()
         # Seed a ticket for someone else so the table isn't empty
@@ -491,9 +483,7 @@ class TestBuilderTicketsRoleGuards:
         resp = await async_client.get(
             "/v1/builder/tickets",
             headers={
-                "Authorization": (
-                    f"Bearer {_make_builder_token_without_builder_id()}"
-                ),
+                "Authorization": (f"Bearer {_make_builder_token_without_builder_id()}"),
                 "Content-Type": "application/json",
             },
         )
@@ -506,9 +496,7 @@ class TestBuilderTicketsRoleGuards:
         resp = await async_client.patch(
             "/v1/builder/tickets/1/status",
             headers={
-                "Authorization": (
-                    f"Bearer {_make_builder_token_without_builder_id()}"
-                ),
+                "Authorization": (f"Bearer {_make_builder_token_without_builder_id()}"),
                 "Content-Type": "application/json",
             },
             json={"status": "closed"},

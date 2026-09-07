@@ -12,55 +12,73 @@ from typing import Any, Optional, Union
 from uuid import UUID, uuid4
 
 from prometheus_client import Counter, Histogram
+from pydantic import BaseModel, Field, JsonValue
 
 from src.config.logging import get_logger
+from src.core.exceptions import EventServiceError, PolicyServiceError, ServiceError
 from src.core.lgpd_utils import resolve_privacy_link
-from src.observability.price_gate import check_price_gate
-from src.observability.scheduling_gate import (
-    check_scheduling_gate,
-    get_safe_replacement,
-    resolve_gate_mode,
-    GATE_MODE_OBSERVE,
+from src.ctx.models import (
+    CognitiveContext,
+    ContextMessage,
+    ContextRequest,
+    ContextResponse,
+    MessageRole,
 )
-from src.core.exceptions import (
-    ServiceError,
-    PolicyServiceError,
-    EventServiceError,
-)
-from src.srm.engine import SRMEngine, get_srm_engine
-from src.srm.models import (
-    SRMInput,
-    SRMDecision as SRMDecisionModel,
-    FunnelStage,
-    FlowMode as SRMFlowMode,
-    HandoffReason as SRMHandoffReason,
-)
-from src.policy.engine import PolicyEngine, get_policy_engine
-from src.policy.models import PolicyContext, PolicyEvaluationResult
 from src.ctx.orchestrator import ContextOrchestrator, get_context_orchestrator
-from src.ctx.models import ContextRequest, ContextMessage, MessageRole, CognitiveContext
 from src.flow.manager import FlowManager, get_flow_manager
-from src.flow.models import FlowContext, FlowDecision, FlowMode as FlowModeModel
-from src.prompt.engine import PromptEngine, get_prompt_engine
-from src.prompt.models import PromptMode, PromptVariables, GeneratedPrompt
-from src.services import HandoffService, get_handoff_service
-from src.services.business_hours import format_business_hours
+from src.flow.models import FlowContext, FlowDecision
+from src.flow.models import FlowMode as FlowModeModel
 from src.handoff.models import (
+    HandoffReason,
     HandoffRequest,
     HandoffResponse,
-    HandoffReason,
     HandoffSector,
     HandoffSLA,
     HandoffUrgency,
 )
-
+from src.observability.price_gate import check_price_gate
+from src.observability.scheduling_gate import (
+    GATE_MODE_OBSERVE,
+    check_scheduling_gate,
+    get_safe_replacement,
+    resolve_gate_mode,
+)
+from src.policy.engine import PolicyEngine, get_policy_engine
+from src.policy.models import PolicyEvaluationResult
+from src.prompt.engine import PromptEngine, get_prompt_engine
+from src.prompt.models import GeneratedPrompt, PromptMode, PromptVariables
+from src.services import HandoffService, get_handoff_service
+from src.services.business_hours import format_business_hours
+from src.srm.engine import SRMEngine, get_srm_engine
+from src.srm.models import FunnelStage
+from src.srm.models import HandoffReason as SRMHandoffReason
+from src.srm.models import SRMDecision as SRMDecisionModel
+from src.srm.models import SRMInput
 
 logger = get_logger(__name__)
+
+
+def _json_object(value: JsonValue) -> dict[str, JsonValue]:
+    """Return a JSON object or an empty object for a different JSON shape."""
+    return value if isinstance(value, dict) else {}
+
+
+def _json_string(value: JsonValue, default: str = "") -> str:
+    """Return a JSON string or the supplied default."""
+    return value if isinstance(value, str) else default
+
+
+def _json_int(value: JsonValue) -> int:
+    """Convert a scalar JSON value to an integer using the existing semantics."""
+    if isinstance(value, (str, int, float)):
+        return int(value)
+    raise TypeError("Expected a scalar integer configuration value")
 
 
 # ============================================
 # User Journey (contexto para condução pelo funil)
 # ============================================
+
 
 def build_user_journey(
     current_funnel_stage: str,
@@ -117,18 +135,16 @@ PIPELINE_STAGE_LATENCY = Histogram(
 # Pipeline Models
 # ============================================
 
-from pydantic import BaseModel, Field
-
 
 class PipelineInput(BaseModel):
     """Input for the cognitive pipeline."""
-    
+
     tenant_id: UUID
     session_id: UUID
     message: str
     channel: str = "unknown"
     user_id: Optional[str] = None
-    
+
     # Session context (from StateStore in production)
     current_funnel_stage: str = "lead_novo"
     turn_count: int = 0
@@ -137,20 +153,20 @@ class PipelineInput(BaseModel):
     flags: dict[str, bool] = Field(default_factory=dict)
     message_history: list[dict[str, str]] = Field(default_factory=list)
     # Doc MVP v0.5: ClinicConfig e UserState (quando carregados)
-    clinic_config: Optional[dict] = None
-    user_state: Optional[dict] = None
+    clinic_config: Optional[dict[str, JsonValue]] = None
+    user_state: Optional[dict[str, JsonValue]] = None
     # Response language code (pt-BR default to preserve existing behavior)
     language: str = "pt-BR"
 
 
 class PipelineResult(BaseModel):
     """Complete result from the cognitive pipeline."""
-    
+
     # Identifiers
     event_id: UUID = Field(default_factory=uuid4)
     tenant_id: UUID
     session_id: UUID
-    
+
     # SRM Decision (Decision Trace doc: funnel_stage_before/after)
     intent: str
     intent_category: str
@@ -169,25 +185,25 @@ class PipelineResult(BaseModel):
     sentiment_label: str = "neutral"
     sentiment_score: float = 0.0
     sentiment_confidence: float = 0.0
-    
+
     # State Patch
     state_patch: dict[str, Any] = Field(default_factory=dict)
-    
+
     # Prompt
     system_prompt: str
     instructions: str
     deterministic_response: Optional[str] = None
     constraints: list[str] = Field(default_factory=list)
     context_summary: Optional[str] = None
-    
+
     # Context
     recent_messages: list[dict[str, str]] = Field(default_factory=list)
     context_sources: list[dict[str, Any]] = Field(default_factory=list)
     turn_count: int = 0
-    
+
     # Flow
     mode: str = "normal"
-    
+
     # Handoff
     handoff_summary: Optional[dict[str, Any]] = None
     handoff_user_message: Optional[str] = None
@@ -200,11 +216,13 @@ class PipelineResult(BaseModel):
     # (convenio-particular-triage) — populated by the pipeline so the
     # observability layer can consult it without re-loading session slots.
     atendimento_tipo: Optional[str] = None
-    
+
     # Metadata
-    processed_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    processed_at: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
     processing_time_ms: int = 0
-    
+
     # Stage timings for debugging
     stage_timings: dict[str, float] = Field(default_factory=dict)
 
@@ -213,19 +231,20 @@ class PipelineResult(BaseModel):
 # Cognitive Pipeline
 # ============================================
 
+
 class CognitivePipeline:
     """
     Main Cognitive Pipeline Orchestrator.
-    
+
     Connects all NeuroStack modules in the complete processing flow:
-    
+
     1. **Policy Pre-Check**: Validate incoming message against policies
     2. **SRM Processing**: Classify intent, detect safety, decide handoff
     3. **Flow Management**: Determine conversation mode
     4. **CTX Context Building**: Assemble context for LLM
     5. **Prompt Generation**: Create structured prompt
     6. **Handoff (if needed)**: Initiate human handoff
-    
+
     This is the central orchestrator implementing Task 13.0.
     """
 
@@ -240,7 +259,7 @@ class CognitivePipeline:
     ):
         """
         Initialize the cognitive pipeline.
-        
+
         Args:
             srm_engine: SRM engine for cognitive decisions
             policy_engine: Policy engine for guardrails
@@ -259,87 +278,103 @@ class CognitivePipeline:
     async def process(self, input_data: PipelineInput) -> PipelineResult:
         """
         Process a message through the complete cognitive pipeline.
-        
+
         This is the main entry point for end-to-end processing.
-        
+
         Args:
             input_data: Pipeline input with message and context
-            
+
         Returns:
             PipelineResult with complete cognitive decision
         """
         start_time = time.perf_counter()
         stage_timings: dict[str, float] = {}
-        
+
         logger.info(
             "Processing pipeline",
             tenant_id=str(input_data.tenant_id),
             session_id=str(input_data.session_id),
             channel=input_data.channel,
         )
-        
+
         try:
             # Stage 1: Policy Pre-Check
             stage_start = time.perf_counter()
             policy_result = await self._run_policy_check(input_data)
             stage_timings["policy"] = (time.perf_counter() - stage_start) * 1000
-            
+
             # If message is blocked by policy, return early
             if policy_result.should_block:
-                return self._build_blocked_response(input_data, policy_result, stage_timings)
-            
+                return self._build_blocked_response(
+                    input_data, policy_result, stage_timings
+                )
+
             # Stage 2: SRM Processing
             stage_start = time.perf_counter()
             srm_decision = await self._run_srm(input_data)
             stage_timings["srm"] = (time.perf_counter() - stage_start) * 1000
-            
+
             # Stage 3: Flow Management
             stage_start = time.perf_counter()
             flow_decision = await self._run_flow_manager(input_data, srm_decision)
             stage_timings["flow"] = (time.perf_counter() - stage_start) * 1000
-            
+
             # Determine effective mode from flow decision
             effective_mode = self._get_effective_mode(srm_decision, flow_decision)
-            
+
             # Stage 4: CTX Context Building
             stage_start = time.perf_counter()
-            context_response = await self._run_ctx(input_data, srm_decision, policy_result)
+            context_response = await self._run_ctx(
+                input_data, srm_decision, policy_result
+            )
             stage_timings["ctx"] = (time.perf_counter() - stage_start) * 1000
-            
+
             # Stage 5: Prompt Generation
             stage_start = time.perf_counter()
             generated_prompt, context_sources = await self._run_prompt_engine(
-                input_data, srm_decision, context_response, effective_mode, policy_result
+                input_data,
+                srm_decision,
+                context_response,
+                effective_mode,
+                policy_result,
             )
             stage_timings["prompt"] = (time.perf_counter() - stage_start) * 1000
-            
+
             # Stage 6: Handoff (if required)
             handoff_response = None
             should_pause = False
             paused_until_iso: Optional[str] = None
             deterministic_response: Optional[str] = None
-            verification_status = getattr(srm_decision, "handoff_verification_status", None)
+            verification_status = getattr(
+                srm_decision, "handoff_verification_status", None
+            )
             if srm_decision.handoff_required:
                 stage_start = time.perf_counter()
                 handoff_response = await self._run_handoff(input_data, srm_decision)
 
                 if verification_status == "link_sent":
                     should_pause, paused_until_iso = False, None
-                    deterministic_response = self._build_scheduling_link_response(input_data)
+                    deterministic_response = self._build_scheduling_link_response(
+                        input_data
+                    )
                     if handoff_response is not None:
-                        srm_decision.state_patch.slots["scheduling_link_handoff_id"] = str(
-                            handoff_response.id
+                        srm_decision.state_patch.slots["scheduling_link_handoff_id"] = (
+                            str(handoff_response.id)
                         )
                     logger.info(
                         "scheduling_link_sent",
                         tenant_id=str(input_data.tenant_id),
                         session_id=str(input_data.session_id),
                         intent=srm_decision.intent,
-                        handoff_id=str(handoff_response.id) if handoff_response else None,
+                        handoff_id=(
+                            str(handoff_response.id) if handoff_response else None
+                        ),
                     )
                 else:
                     # Handoff engine: check config and pause session if allowed
-                    should_pause, paused_until_iso = await self._apply_handoff_pause(input_data)
+                    should_pause, paused_until_iso = await self._apply_handoff_pause(
+                        input_data
+                    )
 
                 stage_timings["handoff"] = (time.perf_counter() - stage_start) * 1000
             elif verification_status in ("concluiu", "nao_concluiu"):
@@ -356,25 +391,31 @@ class CognitivePipeline:
                             session_id=str(input_data.session_id),
                             raw_handoff_id=str(raw_handoff_id),
                         )
-                enriched_handoff_id = await self._handoff.enrich_scheduling_verification(
-                    input_data.session_id,
-                    verification_status,
-                    handoff_id=handoff_id,
+                enriched_handoff_id = (
+                    await self._handoff.enrich_scheduling_verification(
+                        input_data.session_id,
+                        verification_status,
+                        handoff_id=handoff_id,
+                    )
                 )
-                should_pause, paused_until_iso = await self._apply_handoff_pause(input_data)
+                should_pause, paused_until_iso = await self._apply_handoff_pause(
+                    input_data
+                )
                 logger.info(
                     "scheduling_link_verified",
                     tenant_id=str(input_data.tenant_id),
                     session_id=str(input_data.session_id),
                     intent=srm_decision.intent,
-                    handoff_id=str(enriched_handoff_id) if enriched_handoff_id else None,
+                    handoff_id=(
+                        str(enriched_handoff_id) if enriched_handoff_id else None
+                    ),
                     verification_status=verification_status,
                 )
                 stage_timings["handoff"] = (time.perf_counter() - stage_start) * 1000
-            
+
             # Build final result
             total_time = int((time.perf_counter() - start_time) * 1000)
-            
+
             result = self._build_result(
                 input_data=input_data,
                 srm_decision=srm_decision,
@@ -389,10 +430,10 @@ class CognitivePipeline:
                 paused_until=paused_until_iso,
                 deterministic_response=deterministic_response,
             )
-            
+
             # Record metrics
             self._record_metrics(result)
-            
+
             logger.info(
                 "Pipeline complete",
                 event_id=str(result.event_id),
@@ -400,9 +441,9 @@ class CognitivePipeline:
                 intent=result.intent,
                 processing_time_ms=total_time,
             )
-            
+
             return result
-            
+
         except (PolicyServiceError, ServiceError) as e:
             logger.error(
                 "Pipeline service error",
@@ -426,7 +467,9 @@ class CognitivePipeline:
             PIPELINE_TOTAL.labels(mode="error", result="error").inc()
             raise EventServiceError("Unexpected error in pipeline processing") from e
 
-    async def _run_policy_check(self, input_data: PipelineInput) -> PolicyEvaluationResult:
+    async def _run_policy_check(
+        self, input_data: PipelineInput
+    ) -> PolicyEvaluationResult:
         """Run policy pre-check on the message."""
         return await self._policy.evaluate_pre_srm(
             tenant_id=input_data.tenant_id,
@@ -473,14 +516,22 @@ class CognitivePipeline:
             detected_intent=srm_decision.intent,
             intent_confidence=srm_decision.confidence,
             safety_concern=srm_decision.safety_concern,
-            safety_category=srm_decision.safety_category.value if srm_decision.safety_concern else None,
+            safety_category=(
+                srm_decision.safety_category.value
+                if srm_decision.safety_concern
+                else None
+            ),
             handoff_required=srm_decision.handoff_required,
-            handoff_reason=srm_decision.handoff_reason.value if srm_decision.handoff_reason else None,
+            handoff_reason=(
+                srm_decision.handoff_reason.value
+                if srm_decision.handoff_reason
+                else None
+            ),
             needs_rag=srm_decision.needs_rag,
             turn_count=input_data.turn_count,
             message=input_data.message,
         )
-        
+
         return await self._flow.process(flow_context)
 
     async def _run_ctx(
@@ -488,7 +539,7 @@ class CognitivePipeline:
         input_data: PipelineInput,
         srm_decision: SRMDecisionModel,
         policy_result: PolicyEvaluationResult,
-    ):
+    ) -> ContextResponse:
         """Run context orchestrator."""
         # Build cognitive context from session state (doc: Clinic Config > UserState)
         cognitive_state = CognitiveContext(
@@ -501,7 +552,7 @@ class CognitivePipeline:
             clinic_config=getattr(input_data, "clinic_config", None),
             user_state=getattr(input_data, "user_state", None),
         )
-        
+
         messages = [
             ContextMessage(
                 role=MessageRole(m.get("role", "user")),
@@ -509,7 +560,7 @@ class CognitivePipeline:
             )
             for m in input_data.message_history
         ]
-        
+
         request = ContextRequest(
             tenant_id=input_data.tenant_id,
             session_id=input_data.session_id,
@@ -520,7 +571,7 @@ class CognitivePipeline:
             clinic_config=getattr(input_data, "clinic_config", None),
             user_state=getattr(input_data, "user_state", None),
         )
-        
+
         return await self._ctx.build_context(
             request=request,
             message_history=messages,
@@ -531,7 +582,7 @@ class CognitivePipeline:
         self,
         input_data: PipelineInput,
         srm_decision: SRMDecisionModel,
-        context_response,
+        context_response: ContextResponse,
         effective_mode: str,
         policy_result: PolicyEvaluationResult,
     ) -> tuple[GeneratedPrompt, list[dict[str, Any]]]:
@@ -544,7 +595,7 @@ class CognitivePipeline:
             "handoff": PromptMode.HANDOFF,
         }
         prompt_mode = prompt_mode_map.get(effective_mode, PromptMode.NORMAL)
-        
+
         # Jornada do usuário no funil (contexto principal: etapas/intenções/dados, não mensagens)
         user_journey = build_user_journey(
             current_funnel_stage=srm_decision.funnel_stage.value,
@@ -558,11 +609,11 @@ class CognitivePipeline:
         custom_vars: dict[str, Any] = {}
         if input_data.clinic_config:
             cfg = input_data.clinic_config
-            identity = cfg.get("identity", {})
-            operations = cfg.get("operations", {})
-            business = cfg.get("business_rules", {})
-            pricing = cfg.get("pricing", {})
-            persona = cfg.get("persona", {})
+            identity = _json_object(cfg.get("identity"))
+            operations = _json_object(cfg.get("operations"))
+            business = _json_object(cfg.get("business_rules"))
+            pricing = _json_object(cfg.get("pricing"))
+            persona = _json_object(cfg.get("persona"))
             custom_vars["agent_name"] = (
                 identity.get("agent_name")
                 or persona.get("agent_display_name")
@@ -579,8 +630,8 @@ class CognitivePipeline:
             custom_vars["clinic_specialties"] = raw_specs
             _schedule_phrase = format_business_hours(operations)
             _working_hours_from_schedule = bool(_schedule_phrase)
-            custom_vars["working_hours"] = (
-                _schedule_phrase or operations.get("working_hours", "")
+            custom_vars["working_hours"] = _schedule_phrase or operations.get(
+                "working_hours", ""
             )
             custom_vars["timezone"] = operations.get("timezone") or "America/Sao_Paulo"
             custom_vars["full_address"] = operations.get("full_address", "")
@@ -600,9 +651,11 @@ class CognitivePipeline:
             custom_vars["accepts_insurance"] = business.get("accepts_insurance", False)
             custom_vars["insurance_list"] = business.get("insurance_list", "")
             custom_vars["provide_prices"] = business.get("provide_prices", False)
-            custom_vars["initial_consultation"] = business.get("initial_consultation", "")
+            custom_vars["initial_consultation"] = business.get(
+                "initial_consultation", ""
+            )
             custom_vars["privacy_link"] = resolve_privacy_link(
-                cfg.get("lgpd", {}), str(input_data.tenant_id)
+                _json_object(cfg.get("lgpd")), str(input_data.tenant_id)
             )
 
             # Format professionals array
@@ -625,23 +678,32 @@ class CognitivePipeline:
             # Format services array (with price and description when available)
             # Check if initial consultation is free (to annotate service lines)
             initial_consult = str(cfg.get("initial_consultation", "")).lower()
-            initial_free = any(w in initial_consult for w in ("gratuita", "cortesia", "grátis", "free", "complimentary"))
+            initial_free = any(
+                w in initial_consult
+                for w in ("gratuita", "cortesia", "grátis", "free", "complimentary")
+            )
 
             services = cfg.get("services", [])
             # Detect consultation service price for prompt rules
             consult_price = ""
-            for s in (services if isinstance(services, list) else []):
-                if isinstance(s, dict) and s.get("name", "").lower().strip() in ("consulta", "consulta inicial", "avaliação"):
-                    consult_price = s.get("price", "")
+            for s in services if isinstance(services, list) else []:
+                if isinstance(s, dict) and _json_string(
+                    s.get("name")
+                ).lower().strip() in (
+                    "consulta",
+                    "consulta inicial",
+                    "avaliação",
+                ):
+                    consult_price = _json_string(s.get("price"))
                     break
             custom_vars["consult_service_price"] = consult_price
 
             if services and isinstance(services, list):
-                svc_names = []
-                svc_lines = []
+                svc_names: list[str] = []
+                svc_lines: list[str] = []
                 for s in services:
                     if isinstance(s, dict):
-                        name = s.get("name", "")
+                        name = _json_string(s.get("name"))
                         if not name:
                             continue
                         svc_names.append(name)
@@ -650,7 +712,11 @@ class CognitivePipeline:
                         if price:
                             line += f" — {price}"
                         # If this looks like a consultation service and initial is free, annotate
-                        if initial_free and name.lower().strip() in ("consulta", "consulta inicial", "avaliação"):
+                        if initial_free and name.lower().strip() in (
+                            "consulta",
+                            "consulta inicial",
+                            "avaliação",
+                        ):
                             line += " (⚠️ PRIMEIRA CONSULTA É CORTESIA da clínica — não cobrar)"
                         desc = s.get("description", "")
                         if desc:
@@ -675,10 +741,14 @@ class CognitivePipeline:
         # - patch=False → engine cleared it this turn (user said "não" or handoff fired)
         #                 → do NOT show confirmation prompt, even if session flag was True
         # - patch absent → no change this turn → fall back to stored session flag
-        _patch_pending = srm_decision.state_patch.flags.get("handoff_confirmation_pending")
+        _patch_pending = srm_decision.state_patch.flags.get(
+            "handoff_confirmation_pending"
+        )
         if _patch_pending is True:
             custom_vars["handoff_confirmation_pending"] = True
-        elif _patch_pending is None and input_data.flags.get("handoff_confirmation_pending"):
+        elif _patch_pending is None and input_data.flags.get(
+            "handoff_confirmation_pending"
+        ):
             custom_vars["handoff_confirmation_pending"] = True
         # patch=False → engine explicitly cleared it → leave custom_vars unset
 
@@ -700,7 +770,9 @@ class CognitivePipeline:
         # Prompt only emits monetary values when this is True.
         custom_vars["can_quote_particular"] = atendimento_tipo == "particular"
 
-        _verification_status = getattr(srm_decision, "handoff_verification_status", None)
+        _verification_status = getattr(
+            srm_decision, "handoff_verification_status", None
+        )
         if _verification_status in ("concluiu", "nao_concluiu"):
             custom_vars["scheduling_link_verification_status"] = _verification_status
 
@@ -712,24 +784,44 @@ class CognitivePipeline:
                 "agent_name": ("persona.agent_name", "Nome do Agente"),
                 "clinic_specialties": ("identity.clinic_specialties", "Especialidades"),
                 "working_hours": (
-                    "operations.business_hours"
-                    if _working_hours_from_schedule
-                    else "operations.working_hours",
+                    (
+                        "operations.business_hours"
+                        if _working_hours_from_schedule
+                        else "operations.working_hours"
+                    ),
                     "Horário de Funcionamento",
                 ),
                 "full_address": ("operations.full_address", "Endereço"),
                 "differentials": ("business_rules.differentials", "Diferenciais"),
-                "payment_methods": ("business_rules.payment_methods", "Formas de Pagamento"),
+                "payment_methods": (
+                    "business_rules.payment_methods",
+                    "Formas de Pagamento",
+                ),
                 "pricing_mode": ("pricing.disclosure_mode", "Modo de Preços"),
-                "agent_presentation": ("persona.agent_presentation", "Apresentação do Agente"),
+                "agent_presentation": (
+                    "persona.agent_presentation",
+                    "Apresentação do Agente",
+                ),
                 "use_emojis": ("persona.use_emojis", "Uso de Emojis"),
                 "language_policy": ("persona.language_policy", "Política de Linguagem"),
                 "clinic_history": ("identity.clinic_history", "História da Clínica"),
                 "parking_info": ("operations.parking_info", "Estacionamento"),
-                "scheduling_hours": ("operations.scheduling_hours", "Horário de Agendamento"),
-                "service_format": ("operations.service_format", "Formato de Atendimento"),
-                "accepts_insurance": ("business_rules.accepts_insurance", "Aceita Convênio"),
-                "insurance_list": ("business_rules.insurance_list", "Lista de Convênios"),
+                "scheduling_hours": (
+                    "operations.scheduling_hours",
+                    "Horário de Agendamento",
+                ),
+                "service_format": (
+                    "operations.service_format",
+                    "Formato de Atendimento",
+                ),
+                "accepts_insurance": (
+                    "business_rules.accepts_insurance",
+                    "Aceita Convênio",
+                ),
+                "insurance_list": (
+                    "business_rules.insurance_list",
+                    "Lista de Convênios",
+                ),
                 "provide_prices": ("business_rules.provide_prices", "Fornecer Preços"),
             }
             for var_key, (field_path, title) in _FIELD_TITLES.items():
@@ -737,38 +829,50 @@ class CognitivePipeline:
                 if val is None or val == "" or val == [] or val is False:
                     continue
                 content = ", ".join(val) if isinstance(val, list) else str(val)
-                if content and content not in ("assistente", "nossa clínica", "CONSULT_ONLY"):
-                    context_sources.append({
-                        "origin": "config",
-                        "field": field_path,
-                        "title": title,
-                        "content": content[:200],
-                    })
+                if content and content not in (
+                    "assistente",
+                    "nossa clínica",
+                    "CONSULT_ONLY",
+                ):
+                    context_sources.append(
+                        {
+                            "origin": "config",
+                            "field": field_path,
+                            "title": title,
+                            "content": content[:200],
+                        }
+                    )
 
             # Grouped: services
             svc_val = custom_vars.get("services", "")
             if svc_val:
                 svc_list = [s.strip() for s in svc_val.split(",") if s.strip()]
                 if svc_list:
-                    context_sources.append({
-                        "origin": "config",
-                        "field": "services",
-                        "title": f"Serviços ({len(svc_list)})",
-                        "content": svc_val[:200],
-                    })
+                    context_sources.append(
+                        {
+                            "origin": "config",
+                            "field": "services",
+                            "title": f"Serviços ({len(svc_list)})",
+                            "content": svc_val[:200],
+                        }
+                    )
 
             # Grouped: professionals
             prof_val = custom_vars.get("professionals", "")
             if prof_val:
-                prof_lines = [l for l in prof_val.split("\n") if l.strip()]
+                prof_lines = [line for line in prof_val.split("\n") if line.strip()]
                 if prof_lines:
-                    prof_names = [l.lstrip("- ").split(",")[0].strip() for l in prof_lines]
-                    context_sources.append({
-                        "origin": "config",
-                        "field": "professionals",
-                        "title": f"Profissionais ({len(prof_lines)})",
-                        "content": ", ".join(prof_names)[:200],
-                    })
+                    prof_names = [
+                        line.lstrip("- ").split(",")[0].strip() for line in prof_lines
+                    ]
+                    context_sources.append(
+                        {
+                            "origin": "config",
+                            "field": "professionals",
+                            "title": f"Profissionais ({len(prof_lines)})",
+                            "content": ", ".join(prof_names)[:200],
+                        }
+                    )
 
         # Build variables
         variables = PromptVariables(
@@ -783,15 +887,15 @@ class CognitivePipeline:
             custom=custom_vars,
             language=input_data.language,
         )
-        
+
         # Add safety context if needed
         if srm_decision.safety_concern:
             variables.safety_category = srm_decision.safety_category.value
             variables.safety_level = 1
-        
+
         # Contexto é a jornada do usuário, não o histórico de mensagens (condução pelo funil)
         history: list[dict[str, str]] = []
-        
+
         generated = await self._prompt.generate(
             mode=prompt_mode,
             variables=variables,
@@ -815,12 +919,13 @@ class CognitivePipeline:
             SRMHandoffReason.ESCALATION: HandoffReason.ESCALATION,
             SRMHandoffReason.SCHEDULING: HandoffReason.SCHEDULING,
         }
-        
-        reason = reason_map.get(
-            srm_decision.handoff_reason,
-            HandoffReason.USER_REQUEST,
+
+        reason = (
+            reason_map.get(srm_decision.handoff_reason, HandoffReason.USER_REQUEST)
+            if srm_decision.handoff_reason is not None
+            else HandoffReason.USER_REQUEST
         )
-        
+
         # Map urgency
         urgency_map = {
             "low": HandoffUrgency.LOW,
@@ -829,7 +934,7 @@ class CognitivePipeline:
             "critical": HandoffUrgency.CRITICAL,
         }
         urgency = urgency_map.get(srm_decision.handoff_urgency, HandoffUrgency.NORMAL)
-        
+
         # Build recent messages for summary
         recent_messages = [
             {
@@ -838,7 +943,7 @@ class CognitivePipeline:
             }
             for m in input_data.message_history[-5:]  # Last 5 messages
         ]
-        
+
         # Setor e SLA (doc MVP v0.5): do SRM quando disponíveis
         sector = None
         sla = None
@@ -872,13 +977,19 @@ class CognitivePipeline:
             funnel_stage=input_data.current_funnel_stage,
             recent_messages=recent_messages,
             key_info=key_info,
-            verification_status=getattr(srm_decision, "handoff_verification_status", None),
+            verification_status=getattr(
+                srm_decision, "handoff_verification_status", None
+            ),
         )
         return await self._handoff.initiate_handoff(request)
 
-    def _build_scheduling_link_response(self, input_data: PipelineInput) -> Optional[str]:
+    def _build_scheduling_link_response(
+        self, input_data: PipelineInput
+    ) -> Optional[str]:
         """Build the exact patient-facing scheduling link response from clinic config."""
-        scheduling_cfg = (input_data.clinic_config or {}).get("scheduling", {})
+        scheduling_cfg = _json_object(
+            (input_data.clinic_config or {}).get("scheduling")
+        )
         url = scheduling_cfg.get("scheduling_link_url")
         if not url:
             return None
@@ -897,7 +1008,7 @@ class CognitivePipeline:
         Called after SRM detects handoff_required=True.
         Returns (should_pause, paused_until_iso).
         """
-        cfg = (input_data.clinic_config or {}).get("handoff", {})
+        cfg = _json_object((input_data.clinic_config or {}).get("handoff"))
         handoff_active = str(cfg.get("handoff_active", "yes")).lower()
         standby_mode = str(cfg.get("standby_mode", "active")).lower()
 
@@ -915,11 +1026,11 @@ class CognitivePipeline:
         paused_until_iso: Optional[str] = None
 
         if standby_mode == "inactive":
-            fallback_hours = int(cfg.get("handoff_inactive_default_hours", 24))
+            fallback_hours = _json_int(cfg.get("handoff_inactive_default_hours", 24))
             paused_until = datetime.now(timezone.utc) + timedelta(hours=fallback_hours)
             paused_until_iso = paused_until.isoformat()
         elif handoff_period == "cycle":
-            cycle_days = int(cfg.get("handoff_cycle_days", 7))
+            cycle_days = _json_int(cfg.get("handoff_cycle_days", 7))
             paused_until = datetime.now(timezone.utc) + timedelta(days=cycle_days)
             paused_until_iso = paused_until.isoformat()
 
@@ -954,11 +1065,11 @@ class CognitivePipeline:
             return "safety"
         if srm_decision.needs_rag:
             return "rag"
-        
+
         # Use flow decision if it determined a transition
         if flow_decision.transition_required:
             return flow_decision.next_mode.value
-        
+
         return "normal"
 
     def _build_blocked_response(
@@ -969,7 +1080,7 @@ class CognitivePipeline:
     ) -> PipelineResult:
         """Build a response for blocked messages."""
         violation = policy_result.violations[0] if policy_result.violations else None
-        
+
         return PipelineResult(
             event_id=uuid4(),
             tenant_id=input_data.tenant_id,
@@ -998,7 +1109,7 @@ class CognitivePipeline:
         input_data: PipelineInput,
         srm_decision: SRMDecisionModel,
         generated_prompt: GeneratedPrompt,
-        context_response,
+        context_response: ContextResponse,
         effective_mode: str,
         handoff_response: Optional[HandoffResponse],
         stage_timings: dict[str, float],
@@ -1017,12 +1128,12 @@ class CognitivePipeline:
                 system_prompt = msg.content
             elif msg.role.value == "assistant" and not instructions:
                 instructions = msg.content
-        
+
         # Get constraints from prompt variables if available
-        constraints = []
-        if hasattr(generated_prompt, 'config') and generated_prompt.config:
-            constraints = getattr(generated_prompt.config, 'constraints', [])
-        
+        constraints: list[str] = []
+        if hasattr(generated_prompt, "config") and generated_prompt.config:
+            constraints = getattr(generated_prompt.config, "constraints", [])
+
         # Build recent messages from context
         recent_messages = []
         if context_response.context and context_response.context.messages:
@@ -1030,11 +1141,11 @@ class CognitivePipeline:
                 {
                     "role": m.role.value,
                     "content": m.content,
-                    "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+                    "timestamp": m.timestamp.isoformat(),
                 }
                 for m in context_response.context.messages
             ]
-        
+
         # Build handoff summary if needed
         handoff_summary = None
         handoff_user_message = None
@@ -1048,13 +1159,23 @@ class CognitivePipeline:
                 "status": handoff_response.status.value,
                 "summary": s.summary_text if s else "",
                 "urgency": u.value if u and hasattr(u, "value") else (u or "normal"),
-                "sector": sec.value if sec and hasattr(sec, "value") else (sec if isinstance(sec, str) else None),
-                "sla": sla_val.value if sla_val and hasattr(sla_val, "value") else (sla_val if isinstance(sla_val, str) else None),
-                "verification_status": getattr(handoff_response, "verification_status", None)
+                "sector": (
+                    sec.value
+                    if sec and hasattr(sec, "value")
+                    else (sec if isinstance(sec, str) else None)
+                ),
+                "sla": (
+                    sla_val.value
+                    if sla_val and hasattr(sla_val, "value")
+                    else (sla_val if isinstance(sla_val, str) else None)
+                ),
+                "verification_status": getattr(
+                    handoff_response, "verification_status", None
+                )
                 or getattr(s, "verification_status", None),
             }
             handoff_user_message = handoff_response.user_message
-        
+
         # Build state patch (Decision Trace: policy_refs, constraints)
         state_patch = {
             "funnel_stage": srm_decision.state_patch.funnel_stage,
@@ -1079,7 +1200,7 @@ class CognitivePipeline:
         # expose the current value to the observability guard.
         _patch_tipo = srm_decision.state_patch.slots.get("atendimento_tipo")
         _effective_tipo = _patch_tipo or input_data.slots.get("atendimento_tipo")
-        
+
         return PipelineResult(
             event_id=uuid4(),
             tenant_id=input_data.tenant_id,
@@ -1087,7 +1208,14 @@ class CognitivePipeline:
             intent=srm_decision.intent,
             intent_category=srm_decision.intent_category.value,
             funnel_stage=srm_decision.funnel_stage.value,
-            funnel_stage_before=input_data.current_funnel_stage if isinstance(input_data.current_funnel_stage, str) else (getattr(input_data.current_funnel_stage, "value", None) or str(input_data.current_funnel_stage)),
+            funnel_stage_before=(
+                input_data.current_funnel_stage
+                if isinstance(input_data.current_funnel_stage, str)
+                else (
+                    getattr(input_data.current_funnel_stage, "value", None)
+                    or str(input_data.current_funnel_stage)
+                )
+            ),
             action=srm_decision.action.value,
             confidence=srm_decision.confidence,
             safety_concern=srm_decision.safety_concern,
@@ -1097,14 +1225,22 @@ class CognitivePipeline:
             sentiment_confidence=srm_decision.sentiment_confidence,
             needs_rag=srm_decision.needs_rag,
             handoff_required=srm_decision.handoff_required,
-            handoff_reason=srm_decision.handoff_reason.value if srm_decision.handoff_reason else None,
+            handoff_reason=(
+                srm_decision.handoff_reason.value
+                if srm_decision.handoff_reason
+                else None
+            ),
             reasoning=srm_decision.reasoning,
             state_patch=state_patch,
             system_prompt=system_prompt,
             instructions=instructions,
             deterministic_response=deterministic_response,
             constraints=constraints,
-            context_summary=context_response.context.compressed_history if context_response.context else None,
+            context_summary=(
+                context_response.context.compressed_history
+                if context_response.context
+                else None
+            ),
             recent_messages=recent_messages,
             context_sources=context_sources or [],
             turn_count=input_data.turn_count + 1,
@@ -1113,7 +1249,9 @@ class CognitivePipeline:
             handoff_user_message=handoff_user_message,
             should_pause=should_pause,
             paused_until=paused_until,
-            atendimento_tipo=_effective_tipo if isinstance(_effective_tipo, str) else None,
+            atendimento_tipo=(
+                _effective_tipo if isinstance(_effective_tipo, str) else None
+            ),
             processing_time_ms=total_time,
             stage_timings=stage_timings,
         )
@@ -1214,13 +1352,13 @@ async def process_event(
     user_id: Optional[str] = None,
     current_funnel_stage: str = "lead_novo",
     turn_count: int = 0,
-    slots: Optional[dict] = None,
-    flags: Optional[dict] = None,
-    message_history: Optional[list[dict]] = None,
+    slots: Optional[dict[str, Union[str, int, float, bool]]] = None,
+    flags: Optional[dict[str, bool]] = None,
+    message_history: Optional[list[dict[str, str]]] = None,
 ) -> PipelineResult:
     """
     Convenience function for processing events through the pipeline.
-    
+
     Args:
         tenant_id: Tenant identifier
         session_id: Session identifier
@@ -1232,12 +1370,12 @@ async def process_event(
         slots: Session slot values
         flags: Session flags
         message_history: Recent message history
-        
+
     Returns:
         PipelineResult with complete cognitive decision
     """
     pipeline = get_cognitive_pipeline()
-    
+
     input_data = PipelineInput(
         tenant_id=tenant_id,
         session_id=session_id,
@@ -1250,5 +1388,5 @@ async def process_event(
         flags=flags or {},
         message_history=message_history or [],
     )
-    
+
     return await pipeline.process(input_data)

@@ -8,15 +8,16 @@ from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID, uuid4
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import Base
 
 if TYPE_CHECKING:
-    from src.models.tenant import Tenant
     from src.models.event import Event
     from src.models.handoff import HandoffRecord
+    from src.models.tenant import Tenant
 
 
 class CognitiveStateData:
@@ -87,7 +88,9 @@ class CognitiveStateData:
             "sales": getattr(self, "sales", {}),
             "last": getattr(self, "last", {}),
             "first_contact_at": getattr(self, "first_contact_at", None),
-            "pos_atendimento_started_at": getattr(self, "pos_atendimento_started_at", None),
+            "pos_atendimento_started_at": getattr(
+                self, "pos_atendimento_started_at", None
+            ),
             "last_message_at": getattr(self, "last_message_at", None),
         }
 
@@ -162,7 +165,7 @@ class CognitiveStateData:
 class Session(Base):
     """
     Session model for conversation tracking.
-    
+
     A session represents a single conversation between a user and the AI agent.
     Sessions track:
     - User identity (optional)
@@ -170,7 +173,7 @@ class Session(Base):
     - Cognitive state (funnel, intents, slots)
     - Activity timestamps
     - Message count
-    
+
     Attributes:
         id: Unique session identifier (UUID)
         tenant_id: Owning tenant
@@ -184,7 +187,7 @@ class Session(Base):
         is_active: Whether session is currently active
         message_count: Total messages in session
         handoff_status: Current handoff status if any
-    
+
     Relationships:
         tenant: The tenant that owns this session
         events: All events for this session
@@ -329,7 +332,11 @@ class Session(Base):
     @property
     def funnel_stage(self) -> str:
         """Get current funnel stage."""
-        return self.cognitive_state.get("funnel_stage", "lead_novo") if self.cognitive_state else "lead_novo"
+        return (
+            self.cognitive_state.get("funnel_stage", "lead_novo")
+            if self.cognitive_state
+            else "lead_novo"
+        )
 
     @property
     def turn_count(self) -> int:
@@ -338,4 +345,3 @@ class Session(Base):
 
     def __repr__(self) -> str:
         return f"<Session(id={self.id}, tenant_id={self.tenant_id}, active={self.is_active})>"
-

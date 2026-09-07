@@ -25,43 +25,39 @@ Usage:
     )
 """
 
-from src.ctx.models import (
-    # Enums
-    MessageRole,
-    RelevanceLevel,
-    # Core Models
-    ContextMessage,
-    ContextWindow,
-    ContextRequest,
-    ContextResponse,
-    CognitiveContext,
-    KnowledgeChunk,
-    PolicyConstraint,
-    SessionInfo,
-    CompressionResult,
-)
-from src.ctx.context_builder import (
-    ContextBuilder,
-    get_context_builder,
-)
-from src.ctx.relevance import (
-    RelevanceScorer,
-    RelevanceFilter,
-    get_relevance_scorer,
-    get_relevance_filter,
-)
+from src.core.exceptions import KnowledgeServiceError
 from src.ctx.compression import (
     HistoryCompressor,
     SlidingWindowCompressor,
     get_history_compressor,
 )
-from src.core.exceptions import KnowledgeServiceError
+from src.ctx.context_builder import ContextBuilder, get_context_builder
+from src.ctx.models import (  # Enums; Core Models
+    CognitiveContext,
+    CompressionResult,
+    ContextMessage,
+    ContextRequest,
+    ContextResponse,
+    ContextWindow,
+    KnowledgeChunk,
+    MessageRole,
+    PolicyConstraint,
+    RelevanceLevel,
+    SessionInfo,
+)
+
 # Note: KnowledgeService is not exported here to avoid circular imports
 # Import it directly from src.services.knowledge_service if needed
 from src.ctx.orchestrator import (
     ContextOrchestrator,
-    get_context_orchestrator,
     build_context,
+    get_context_orchestrator,
+)
+from src.ctx.relevance import (
+    RelevanceFilter,
+    RelevanceScorer,
+    get_relevance_filter,
+    get_relevance_scorer,
 )
 
 __all__ = [

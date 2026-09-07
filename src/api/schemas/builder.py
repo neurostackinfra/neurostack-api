@@ -4,11 +4,12 @@ Pydantic models for builder-scoped endpoints.
 """
 
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 from uuid import UUID
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     EmailStr,
     Field,
     TypeAdapter,
@@ -44,7 +45,7 @@ class UpdateBuilderProfileRequest(BaseModel):
 
     @field_validator("support_email", mode="before")
     @classmethod
-    def _validate_support_email(cls, value):
+    def _validate_support_email(cls, value: object) -> Optional[str]:
         # Explicit null clears
         if value is None:
             return None
@@ -109,6 +110,47 @@ class UpdateBuilderClinicRequest(BaseModel):
     contact_phone: Optional[str] = None
 
 
+class ClinicClonePreviewResponse(BaseModel):
+    """Advisory impact summary for cloning a Builder-owned clinic."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    suggested_name: str
+    document_count: int = Field(ge=0)
+    total_bytes: int = Field(ge=0)
+
+
+class ClinicCloneResponse(BaseModel):
+    """Authoritative identity and inactive state of a persisted clinic clone."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    id: UUID
+    name: str
+    is_active: Literal[False]
+
+
+class ClinicCloneErrorDetail(BaseModel):
+    """Stable, redacted machine-readable clone failure."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    error: Literal[
+        "clinic_clone_forbidden",
+        "clinic_clone_source_not_found",
+        "clinic_clone_invalid",
+        "clinic_clone_persistence_failed",
+    ]
+
+
+class ClinicCloneErrorResponse(BaseModel):
+    """HTTP error envelope emitted by clinic clone operations."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    detail: ClinicCloneErrorDetail
+
+
 class ToggleClinicStatusRequest(BaseModel):
     """Request body for toggling clinic active/inactive status."""
 
@@ -128,7 +170,7 @@ class BuilderStatsResponse(BaseModel):
     inactive_clinics: int = 0
     total_traces: int = 0
     total_tokens: int = 0
-    model_breakdown: list[dict] = []
+    model_breakdown: list[dict[str, object]] = []
 
 
 # ============================================
