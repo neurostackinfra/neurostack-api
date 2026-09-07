@@ -96,8 +96,7 @@ async def _synthesize_elevenlabs(
         else f"{api_base}/text-to-speech"
     )
     target_url = (
-        f"{synthesis_base}/{quote(voice_id, safe='')}"
-        "?output_format=mp3_44100_128"
+        f"{synthesis_base}/{quote(voice_id, safe='')}" "?output_format=mp3_44100_128"
     )
     body = {"text": text, "model_id": model_name}
     async with safe_async_client(
@@ -132,7 +131,9 @@ async def _synthesize_google(
 ) -> SynthesizedAudio:
     api_base = api_url.rstrip("/")
     target_url = (
-        api_base if api_base.endswith("/text:synthesize") else f"{api_base}/text:synthesize"
+        api_base
+        if api_base.endswith("/text:synthesize")
+        else f"{api_base}/text:synthesize"
     )
     body = {
         "input": {"text": text},

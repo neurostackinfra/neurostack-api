@@ -3,16 +3,17 @@ NeuroStack - Database Session Management
 Manages SQLAlchemy async engine and session factory.
 """
 
+from collections.abc import AsyncGenerator
 from typing import Optional
 
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy import JSON, event, text
-from sqlalchemy.exc import SQLAlchemyError
 
 from src.config.logging import get_logger
 from src.core.exceptions import ConfigurationError
@@ -22,12 +23,13 @@ logger = get_logger(__name__)
 
 def _patch_jsonb_for_sqlite() -> None:
     """Register JSONB as JSON on SQLite so create_all works in tests."""
-    from sqlalchemy.dialects.postgresql import JSONB
     from sqlalchemy.dialects import sqlite as sqlite_dialect
 
     # Teach the SQLite compiler to treat JSONB as plain JSON
-    sqlite_dialect.base.SQLiteTypeCompiler.visit_JSONB = (
-        sqlite_dialect.base.SQLiteTypeCompiler.visit_JSON
+    setattr(
+        sqlite_dialect.base.SQLiteTypeCompiler,
+        "visit_JSONB",
+        sqlite_dialect.base.SQLiteTypeCompiler.visit_JSON,
     )
 
 
@@ -39,19 +41,19 @@ _session_factory: Optional[async_sessionmaker[AsyncSession]] = None
 async def init_database() -> None:
     """
     Initialize database connection pool.
-    
+
     Creates the async engine and session factory.
     Should be called during application startup.
     """
     # Import settings here to avoid circular import
     from src.config.settings import settings
-    
+
     global _engine, _session_factory
-    
+
     if _engine is not None:
         logger.warning("Database already initialized")
         return
-    
+
     try:
         # If running tests (pytest present) or environment explicitly set to 'test',
         # prefer an in-memory sqlite database to avoid concurrency issues and external dependencies.
@@ -59,7 +61,12 @@ async def init_database() -> None:
 
         if "pytest" in _sys.modules or getattr(settings, "environment", "") == "test":
             logger.info("Using in-memory sqlite for test environment")
-            _engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False, future=True)
+            _engine = create_async_engine(
+                "sqlite+aiosqlite:///:memory:",
+                echo=False,
+                future=True,
+                hide_parameters=True,
+            )
         else:
             _engine = create_async_engine(
                 settings.database_url,
@@ -68,8 +75,9 @@ async def init_database() -> None:
                 pool_timeout=settings.database_pool_timeout,
                 echo=settings.debug,
                 future=True,
+                hide_parameters=True,
             )
-        
+
         _session_factory = async_sessionmaker(
             _engine,
             class_=AsyncSession,
@@ -77,15 +85,16 @@ async def init_database() -> None:
             autoflush=False,
             autocommit=False,
         )
-        
+
         # Test connection
         async with _engine.begin() as conn:
             await conn.execute(text("SELECT 1"))
-        
+
         # If using an in-memory sqlite database for tests, create the schema
         try:
             # Import models package to ensure all models are registered on Base.metadata
             import src.models  # noqa: F401 - import side-effects (register models)
+
             # Import Base lazily to avoid circular imports
             from src.models.base import Base as _Base
 
@@ -95,11 +104,16 @@ async def init_database() -> None:
                 # synchronously on the sync_engine triggers MissingGreenlet.
                 async with _engine.begin() as conn:
                     await conn.run_sync(_Base.metadata.create_all)
-                logger.info("Created sqlite schema (in-memory or file-backed) for tests")
+                logger.info(
+                    "Created sqlite schema (in-memory or file-backed) for tests"
+                )
         except Exception:
             # Non-fatal: if schema creation fails, we'll surface errors later when queries run
-            logger.debug("Skipping in-memory sqlite schema creation (not applicable or failed)", exc_info=True)
-        
+            logger.debug(
+                "Skipping in-memory sqlite schema creation (not applicable or failed)",
+                exc_info=True,
+            )
+
         logger.info(
             "Database initialized successfully",
             pool_size=settings.database_pool_size,
@@ -117,7 +131,12 @@ async def init_database() -> None:
         if getattr(settings, "environment", "") == "test":
             logger.warning("Falling back to in-memory sqlite for test environment")
             # Create a lightweight in-memory sqlite async engine
-            _engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False, future=True)
+            _engine = create_async_engine(
+                "sqlite+aiosqlite:///:memory:",
+                echo=False,
+                future=True,
+                hide_parameters=True,
+            )
             _session_factory = async_sessionmaker(
                 _engine,
                 class_=AsyncSession,
@@ -131,6 +150,7 @@ async def init_database() -> None:
             try:
                 import src.models  # noqa: F401
                 from src.models.base import Base as _Base
+
                 async with _engine.begin() as conn:
                     await conn.run_sync(_Base.metadata.create_all)
                 logger.info("Created sqlite schema in fallback path")
@@ -152,12 +172,12 @@ async def init_database() -> None:
 async def close_database() -> None:
     """
     Close database connections.
-    
+
     Disposes of the engine and clears session factory.
     Should be called during application shutdown.
     """
     global _engine, _session_factory
-    
+
     if _engine is not None:
         await _engine.dispose()
         _engine = None
@@ -168,10 +188,10 @@ async def close_database() -> None:
 def get_db_engine() -> AsyncEngine:
     """
     Get the database engine.
-    
+
     Returns:
         The async engine instance
-        
+
     Raises:
         RuntimeError: If database is not initialized
     """
@@ -183,10 +203,10 @@ def get_db_engine() -> AsyncEngine:
 def get_db_session() -> AsyncSession:
     """
     Get a new database session.
-    
+
     Returns:
         A new AsyncSession instance
-        
+
     Raises:
         RuntimeError: If database is not initialized
     """
@@ -195,7 +215,7 @@ def get_db_session() -> AsyncSession:
     return _session_factory()
 
 
-async def get_db_session_dependency() -> AsyncSession:
+async def get_db_session_dependency() -> AsyncGenerator[AsyncSession, None]:
     """
     Dependency function for FastAPI dependency injection.
 

@@ -9,45 +9,48 @@ from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID, uuid4
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import Base
 
 if TYPE_CHECKING:
-    from src.models.tenant import Tenant
     from src.models.session import Session
+    from src.models.tenant import Tenant
 
 
 class HandoffStatus(str, Enum):
     """Status of a handoff request."""
-    PENDING = "pending"       # Waiting for human agent
-    ACCEPTED = "accepted"     # Human agent accepted
+
+    PENDING = "pending"  # Waiting for human agent
+    ACCEPTED = "accepted"  # Human agent accepted
     IN_PROGRESS = "in_progress"  # Being handled by human
-    COMPLETED = "completed"   # Successfully completed
-    CANCELLED = "cancelled"   # Cancelled by user or system
-    TIMEOUT = "timeout"       # Timed out waiting for agent
+    COMPLETED = "completed"  # Successfully completed
+    CANCELLED = "cancelled"  # Cancelled by user or system
+    TIMEOUT = "timeout"  # Timed out waiting for agent
 
 
 class HandoffUrgency(str, Enum):
     """Urgency levels for handoff."""
-    LOW = "low"           # Can wait
-    NORMAL = "normal"     # Standard priority
-    HIGH = "high"         # Should be handled soon
-    CRITICAL = "critical" # Immediate attention required
+
+    LOW = "low"  # Can wait
+    NORMAL = "normal"  # Standard priority
+    HIGH = "high"  # Should be handled soon
+    CRITICAL = "critical"  # Immediate attention required
 
 
 class HandoffRecord(Base):
     """
     Handoff record model for tracking human agent handoffs.
-    
+
     When the AI agent determines that human intervention is needed,
     a handoff record is created. This tracks:
     - Why the handoff was requested
     - Summary of the conversation
     - Status of the handoff
     - Webhook notifications sent
-    
+
     Attributes:
         id: Unique handoff identifier (UUID)
         tenant_id: Tenant where handoff occurred
@@ -63,7 +66,7 @@ class HandoffRecord(Base):
         resolved_at: When handoff was resolved
         resolution_notes: Notes from resolution
         created_at: Handoff creation timestamp
-    
+
     Relationships:
         tenant: The tenant that owns this handoff
         session: The session that triggered this handoff
@@ -255,4 +258,3 @@ class HandoffRecord(Base):
 
     def __repr__(self) -> str:
         return f"<HandoffRecord(id={self.id}, session={self.session_id}, status='{self.status}')>"
-

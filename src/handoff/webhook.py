@@ -10,12 +10,13 @@ import json
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import httpx
 from prometheus_client import Counter, Histogram
 
 from src.config.logging import get_logger
+from src.core.exceptions import WebhookConfigError, WebhookDeliveryError, WebhookError
 from src.handoff.models import (
     HandoffReason,
     HandoffSector,
@@ -27,7 +28,6 @@ from src.handoff.models import (
     WebhookPayload,
     WebhookStatus,
 )
-
 
 logger = get_logger(__name__)
 
@@ -57,18 +57,6 @@ WEBHOOK_RETRIES = Counter(
 
 
 # ============================================
-# Exceptions
-# ============================================
-
-
-from src.core.exceptions import (
-    WebhookConfigError,
-    WebhookDeliveryError,
-    WebhookError,
-)
-
-
-# ============================================
 # Webhook Dispatcher
 # ============================================
 
@@ -76,7 +64,7 @@ from src.core.exceptions import (
 class WebhookDispatcher:
     """
     Dispatches webhooks to external systems for handoff events.
-    
+
     Features:
     - Async HTTP delivery with timeout
     - Automatic retries with exponential backoff
@@ -92,7 +80,7 @@ class WebhookDispatcher:
     ):
         """
         Initialize the webhook dispatcher.
-        
+
         Args:
             default_timeout: Default timeout in seconds
             max_retries: Maximum number of retries
@@ -102,10 +90,10 @@ class WebhookDispatcher:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self._client: Optional[httpx.AsyncClient] = None
-        
+
         # In-memory config store (should be replaced with persistent storage)
         self._configs: dict[UUID, WebhookConfig] = {}
-        
+
         # Delivery history (should be replaced with persistent storage)
         self._deliveries: list[WebhookDelivery] = []
 
@@ -131,14 +119,14 @@ class WebhookDispatcher:
     def set_config(self, tenant_id: UUID, config: WebhookConfig) -> None:
         """
         Set webhook configuration for a tenant.
-        
+
         Args:
             tenant_id: Tenant identifier
             config: Webhook configuration
         """
         if not config.url:
             raise WebhookConfigError("Webhook URL is required")
-        
+
         self._configs[tenant_id] = config
         logger.info(
             "Webhook config set",
@@ -150,10 +138,10 @@ class WebhookDispatcher:
     def get_config(self, tenant_id: UUID) -> Optional[WebhookConfig]:
         """
         Get webhook configuration for a tenant.
-        
+
         Args:
             tenant_id: Tenant identifier
-            
+
         Returns:
             WebhookConfig or None if not configured
         """
@@ -162,10 +150,10 @@ class WebhookDispatcher:
     def remove_config(self, tenant_id: UUID) -> bool:
         """
         Remove webhook configuration for a tenant.
-        
+
         Args:
             tenant_id: Tenant identifier
-            
+
         Returns:
             True if config was removed, False if not found
         """
@@ -234,11 +222,11 @@ class WebhookDispatcher:
     ) -> str:
         """
         Generate HMAC signature for payload.
-        
+
         Args:
             payload: Payload dictionary
             secret: Secret key for signing
-            
+
         Returns:
             HMAC-SHA256 signature as hex string
         """
@@ -261,14 +249,14 @@ class WebhookDispatcher:
     ) -> WebhookDelivery:
         """
         Send a webhook notification.
-        
+
         Args:
             tenant_id: Tenant identifier
             payload: Webhook payload to send
-            
+
         Returns:
             WebhookDelivery with result
-            
+
         Raises:
             WebhookConfigError: If webhook not configured
             WebhookDeliveryError: If delivery fails after retries
@@ -276,7 +264,7 @@ class WebhookDispatcher:
         config = self._configs.get(tenant_id)
         if not config:
             raise WebhookConfigError(f"No webhook configured for tenant {tenant_id}")
-        
+
         if not config.enabled:
             logger.info(
                 "Webhook disabled for tenant",
@@ -307,20 +295,20 @@ class WebhookDispatcher:
 
         for attempt in range(1, config.retry_count + 1):
             delivery.attempt = attempt
-            
+
             try:
                 result = await self._send_request(config, payload)
-                
+
                 # Success
                 delivery.status = WebhookStatus.SENT
                 delivery.response_status = result.get("status_code")
                 delivery.response_body = result.get("body")
                 delivery.sent_at = datetime.now(timezone.utc)
-                
+
                 latency = time.perf_counter() - start_time
                 WEBHOOK_LATENCY.labels(operation="send").observe(latency)
                 WEBHOOK_OPERATIONS.labels(operation="send", status="success").inc()
-                
+
                 logger.info(
                     "Webhook sent successfully",
                     tenant_id=str(tenant_id),
@@ -328,7 +316,7 @@ class WebhookDispatcher:
                     attempt=attempt,
                     status_code=result.get("status_code"),
                 )
-                
+
                 self._deliveries.append(delivery)
                 return delivery
 
@@ -351,7 +339,7 @@ class WebhookDispatcher:
                     attempt=attempt,
                     error=str(e),
                 )
-                
+
                 if attempt < config.retry_count:
                     # Exponential backoff
                     delay = config.retry_delay_seconds * (2 ** (attempt - 1))
@@ -362,7 +350,7 @@ class WebhookDispatcher:
         # All retries failed
         delivery.status = WebhookStatus.FAILED
         delivery.error_message = str(last_error) if last_error else "Unknown error"
-        
+
         if isinstance(last_error, WebhookDeliveryError):
             delivery.response_status = last_error.status_code
             delivery.response_body = last_error.response_body
@@ -370,7 +358,7 @@ class WebhookDispatcher:
         latency = time.perf_counter() - start_time
         WEBHOOK_LATENCY.labels(operation="send").observe(latency)
         WEBHOOK_OPERATIONS.labels(operation="send", status="failed").inc()
-        
+
         logger.error(
             "Webhook delivery failed after all retries",
             tenant_id=str(tenant_id),
@@ -378,7 +366,7 @@ class WebhookDispatcher:
             attempts=config.retry_count,
             error=str(last_error),
         )
-        
+
         self._deliveries.append(delivery)
         return delivery
 
@@ -389,19 +377,19 @@ class WebhookDispatcher:
     ) -> dict[str, Any]:
         """
         Send the actual HTTP request.
-        
+
         Args:
             config: Webhook configuration
             payload: Payload to send
-            
+
         Returns:
             Dict with status_code and body
-            
+
         Raises:
             WebhookDeliveryError: If request fails
         """
         client = await self._get_client()
-        
+
         # Prepare headers
         headers = {
             "Content-Type": "application/json",
@@ -410,13 +398,13 @@ class WebhookDispatcher:
             "X-Webhook-Timestamp": payload.timestamp.isoformat(),
             **config.headers,
         }
-        
+
         # Add signature if secret is configured
         payload_dict = payload.to_dict()
         if config.secret:
             signature = self.generate_signature(payload_dict, config.secret)
             headers["X-Webhook-Signature"] = signature
-        
+
         try:
             response = await client.post(
                 config.url,
@@ -424,7 +412,7 @@ class WebhookDispatcher:
                 headers=headers,
                 timeout=config.timeout_seconds,
             )
-            
+
             # Check for success (2xx status codes)
             if 200 <= response.status_code < 300:
                 return {
@@ -456,7 +444,7 @@ class WebhookDispatcher:
     ) -> None:
         """
         Send webhook in background without waiting.
-        
+
         Args:
             tenant_id: Tenant identifier
             payload: Webhook payload to send
@@ -491,22 +479,22 @@ class WebhookDispatcher:
     ) -> list[WebhookDelivery]:
         """
         Get webhook delivery history.
-        
+
         Args:
             tenant_id: Filter by tenant
             handoff_id: Filter by handoff
             limit: Maximum records to return
-            
+
         Returns:
             List of WebhookDelivery records
         """
         result = self._deliveries
-        
+
         if tenant_id:
             result = [d for d in result if d.tenant_id == tenant_id]
         if handoff_id:
             result = [d for d in result if d.handoff_id == handoff_id]
-        
+
         return result[-limit:]
 
     def get_delivery_stats(
@@ -515,15 +503,15 @@ class WebhookDispatcher:
     ) -> dict[str, Any]:
         """
         Get delivery statistics for a tenant.
-        
+
         Args:
             tenant_id: Tenant identifier
-            
+
         Returns:
             Statistics dictionary
         """
         deliveries = [d for d in self._deliveries if d.tenant_id == tenant_id]
-        
+
         if not deliveries:
             return {
                 "total": 0,
@@ -531,10 +519,10 @@ class WebhookDispatcher:
                 "failed": 0,
                 "success_rate": 0.0,
             }
-        
+
         sent = sum(1 for d in deliveries if d.status == WebhookStatus.SENT)
         failed = sum(1 for d in deliveries if d.status == WebhookStatus.FAILED)
-        
+
         return {
             "total": len(deliveries),
             "sent": sent,

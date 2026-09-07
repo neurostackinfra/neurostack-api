@@ -10,25 +10,24 @@ from uuid import UUID
 
 from prometheus_client import Counter, Histogram
 
-from src.flow.models import (
-    FlowMode,
-    FlowState,
-    FlowContext,
-    FlowDecision,
-    FlowTransition,
-    TransitionTrigger,
-    TransitionResult,
-    ModeHandlerResult,
-)
-from src.flow.state_machine import FlowStateMachine, get_state_machine
-from src.flow.transitions import TransitionLogger, get_transition_logger
 from src.flow.handlers import (
     BaseModeHandler,
+    HandoffModeHandler,
     NormalModeHandler,
     RagModeHandler,
     SafetyModeHandler,
-    HandoffModeHandler,
 )
+from src.flow.models import (
+    FlowContext,
+    FlowDecision,
+    FlowMode,
+    FlowState,
+    ModeHandlerResult,
+    TransitionResult,
+    TransitionTrigger,
+)
+from src.flow.state_machine import FlowStateMachine, get_state_machine
+from src.flow.transitions import TransitionLogger, get_transition_logger
 
 logger = logging.getLogger(__name__)
 
@@ -60,13 +59,13 @@ FLOW_DECISIONS_TOTAL = Counter(
 class FlowManager:
     """
     Main Flow Manager.
-    
+
     Orchestrates conversation flow between different modes:
     - NORMAL: Standard conversation
     - RAG: Knowledge-augmented responses
     - SAFETY: Safety-critical situations
     - HANDOFF: Human agent handoff
-    
+
     The Flow Manager uses a state machine to manage transitions
     and mode-specific handlers to process messages.
     """
@@ -78,14 +77,14 @@ class FlowManager:
     ):
         """
         Initialize the Flow Manager.
-        
+
         Args:
             state_machine: State machine for transitions
             transition_logger: Logger for transition events
         """
         self._state_machine = state_machine or get_state_machine()
         self._transition_logger = transition_logger or get_transition_logger()
-        
+
         # Initialize handlers
         self._handlers: dict[FlowMode, BaseModeHandler] = {
             FlowMode.NORMAL: NormalModeHandler(),
@@ -93,7 +92,7 @@ class FlowManager:
             FlowMode.SAFETY: SafetyModeHandler(),
             FlowMode.HANDOFF: HandoffModeHandler(),
         }
-        
+
         # Session states (in production, would be stored in Redis)
         self._states: dict[UUID, FlowState] = {}
 
@@ -103,23 +102,23 @@ class FlowManager:
     ) -> FlowDecision:
         """
         Process a message through the flow manager.
-        
+
         This is the main entry point for flow management.
-        
+
         Args:
             context: Flow context with current state
-            
+
         Returns:
             FlowDecision with processing results
         """
         start_time = time.perf_counter()
-        
+
         # Get or create session state
         state = self._get_or_create_state(
             context.session_id,
             context.tenant_id,
         )
-        
+
         # Update context with current mode
         context.current_mode = state.current_mode
 
@@ -139,7 +138,7 @@ class FlowManager:
                 trigger=trigger,
                 context=context,
             )
-            
+
             # Update stored state
             self._states[context.session_id] = state
 
@@ -151,7 +150,7 @@ class FlowManager:
 
         # Process with handler
         handler_result = await self._run_handler(handler, context)
-        
+
         # Log handler events
         await self._transition_logger.log_handler_result(
             session_id=context.session_id,
@@ -173,7 +172,7 @@ class FlowManager:
 
         # Build decision
         processing_time = (time.perf_counter() - start_time) * 1000
-        
+
         decision = FlowDecision(
             current_mode=state.previous_mode or state.current_mode,
             next_mode=state.current_mode,
@@ -232,7 +231,7 @@ class FlowManager:
                 transition=transition,
                 result=result,
             )
-            
+
             # Log entry to new mode
             await self._transition_logger.log_mode_entry(
                 session_id=context.session_id,
@@ -348,7 +347,7 @@ async def process_flow(
 ) -> FlowDecision:
     """
     Convenience function for processing flow.
-    
+
     Args:
         session_id: Session ID
         tenant_id: Tenant ID
@@ -362,12 +361,12 @@ async def process_flow(
         needs_rag: Whether RAG is needed
         turn_count: Current turn count
         metadata: Additional metadata
-        
+
     Returns:
         FlowDecision
     """
     manager = get_flow_manager()
-    
+
     context = FlowContext(
         session_id=session_id,
         tenant_id=tenant_id,
@@ -383,6 +382,5 @@ async def process_flow(
         message=message,
         metadata=metadata or {},
     )
-    
-    return await manager.process(context)
 
+    return await manager.process(context)

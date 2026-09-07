@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 class PricingDisclosureMode(str, Enum):
     """Modo de divulgação de preços (doc MVP v0.5)."""
+
     CONSULT_ONLY = "consult_only"
     RANGE_ALLOWED = "range_allowed"
     EXACT_ALLOWED = "exact_allowed"
@@ -22,12 +23,14 @@ class PricingDisclosureMode(str, Enum):
 
 class HandoffDefaultMode(str, Enum):
     """Modo padrão de handoff (doc MVP v0.5)."""
+
     WHATSAPP_HUMAN_TAKEOVER = "whatsapp_human_takeover"
     CRM_TASK_CREATE = "crm_task_create"
 
 
 class HandoffSLA(str, Enum):
     """SLA por setor (doc MVP v0.5)."""
+
     IMEDIATO = "imediato"
     PRIORITARIO = "prioritario"
     ROTINA = "rotina"
@@ -35,6 +38,7 @@ class HandoffSLA(str, Enum):
 
 class ClinicPersona(BaseModel):
     """Persona da clínica/agente (doc MVP v0.5)."""
+
     clinic_display_name: Optional[str] = None
     agent_display_name: Optional[str] = None
     use_personal_name: bool = False
@@ -42,6 +46,7 @@ class ClinicPersona(BaseModel):
 
 class ClinicScheduling(BaseModel):
     """Configuração de agendamento (doc MVP v0.5)."""
+
     has_scheduling_agent: bool = False
     hours_rag_key: Optional[str] = None
     # Scheduling-link stopgap (pre-ERP). When enabled, on positive
@@ -85,6 +90,7 @@ class ClinicScheduling(BaseModel):
 
 class ClinicPricing(BaseModel):
     """Configuração de preços (doc MVP v0.5)."""
+
     disclosure_mode: PricingDisclosureMode = PricingDisclosureMode.CONSULT_ONLY
     range_table_available: bool = False
     exact_table_available: bool = False
@@ -94,12 +100,14 @@ class ClinicPricing(BaseModel):
 
 class ClinicPostCare(BaseModel):
     """Configuração pós-atendimento (doc MVP v0.5)."""
+
     standard_instructions_rag_key: Optional[str] = None
     emergency_warning_text_enabled: bool = True
 
 
 class SectorDefaults(BaseModel):
     """SLA por setor (doc MVP v0.5)."""
+
     agendamento: HandoffSLA = HandoffSLA.PRIORITARIO
     financeiro: HandoffSLA = HandoffSLA.ROTINA
     administrativo: HandoffSLA = HandoffSLA.ROTINA
@@ -111,6 +119,7 @@ class SectorDefaults(BaseModel):
 
 class ClinicHandoff(BaseModel):
     """Configuração de handoff (doc MVP v0.5)."""
+
     default_mode: HandoffDefaultMode = HandoffDefaultMode.WHATSAPP_HUMAN_TAKEOVER
     sector_defaults: SectorDefaults = Field(default_factory=SectorDefaults)
     meta_minutos_atendimento: int = 10
@@ -118,6 +127,7 @@ class ClinicHandoff(BaseModel):
 
 class ClinicIdentity(BaseModel):
     """Identity bucket — admin panel fields for clinic/agent branding."""
+
     clinic_name: Optional[str] = None
     main_domain: Optional[str] = None
     agent_name: Optional[str] = None
@@ -147,7 +157,10 @@ class BusinessHoursWindow(BaseModel):
     @field_validator("open", "close")
     @classmethod
     def _validate_hhmm(cls, value: str) -> str:
-        if not isinstance(value, str) or _BUSINESS_HOUR_PATTERN.fullmatch(value) is None:
+        if (
+            not isinstance(value, str)
+            or _BUSINESS_HOUR_PATTERN.fullmatch(value) is None
+        ):
             raise ValueError("business hours must use HH:MM (00:00-23:59)")
         return value
 
@@ -210,6 +223,7 @@ class ClinicOperations(BaseModel):
 
 class ClinicBusinessRules(BaseModel):
     """Business rules bucket — insurance, pricing, language policies."""
+
     accepts_insurance: bool = False
     insurance_list: Optional[list[str]] = None
     initial_consultation: Optional[str] = None
@@ -222,6 +236,7 @@ class ClinicBusinessRules(BaseModel):
 
 class ClinicLGPD(BaseModel):
     """LGPD bucket — data-protection / compliance fields."""
+
     lgpd_enabled: bool = False
     lgpd_message: Optional[str] = None
     lgpd_message_en: Optional[str] = None
@@ -258,4 +273,13 @@ class ClinicConfig(BaseModel):
     def get_sla_for_sector(self, sector: str) -> str:
         """Retorna o SLA para um setor (doc defaults)."""
         sd = self.handoff.sector_defaults
-        return getattr(sd, sector, HandoffSLA.ROTINA).value
+        sla_by_sector = {
+            "agendamento": sd.agendamento,
+            "financeiro": sd.financeiro,
+            "administrativo": sd.administrativo,
+            "gerencia": sd.gerencia,
+            "clinico": sd.clinico,
+            "urgencia": sd.urgencia,
+            "fidelizacao": sd.fidelizacao,
+        }
+        return sla_by_sector.get(sector, HandoffSLA.ROTINA).value

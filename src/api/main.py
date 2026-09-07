@@ -5,38 +5,15 @@ Entry point for the cognitive infrastructure API
 
 # Standard library imports
 import json
-import os
 import re
-import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import AsyncGenerator, Optional
-
-
-def _redact_capability_token(path: str) -> str:
-    """Redact the Z-API webhook capability token from a raw path.
-
-    Used as a fallback for exception logging when no route template
-    resolved (e.g. an unmatched 404). Every other observability sink
-    prefers ``request.scope["route"].path`` directly.
-    """
-
-    return re.sub(
-        r"(/v1/webhook/zapi)/[A-Za-z0-9_-]{20,}",
-        r"\1/{capability_token}",
-        path,
-    )
-
+from typing import Any, AsyncGenerator, Optional
 
 # Third-party imports
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import make_asgi_app
-
-# Add the project root to sys.path for local module resolution
-project_root = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(project_root))
 
 # Local application imports
 from src.api.middleware.auth import AuthMiddleware
@@ -79,6 +56,21 @@ from src.core.exceptions import ConfigurationError
 # Configure logging on module load
 configure_logging()
 logger = get_logger(__name__)
+
+
+def _redact_capability_token(path: str) -> str:
+    """Redact the Z-API webhook capability token from a raw path.
+
+    Used as a fallback for exception logging when no route template
+    resolved (e.g. an unmatched 404). Every other observability sink
+    prefers ``request.scope["route"].path`` directly.
+    """
+
+    return re.sub(
+        r"(/v1/webhook/zapi)/[A-Za-z0-9_-]{20,}",
+        r"\1/{capability_token}",
+        path,
+    )
 
 
 @asynccontextmanager
@@ -176,7 +168,7 @@ def create_app() -> FastAPI:
             path.startswith(p) for p in ["/docs", "/redoc", "/metrics"]
         )
 
-    def _ensure_openapi_structure(schema: dict) -> dict:
+    def _ensure_openapi_structure(schema: dict[str, Any]) -> dict[str, Any]:
         """Ensure OpenAPI schema has required structure."""
         # Use OpenAPI 3.0.3 for better ReDoc compatibility
         if "openapi" not in schema:
@@ -200,7 +192,7 @@ def create_app() -> FastAPI:
         return schema
 
     def _add_header_parameter(
-        operation: dict,
+        operation: dict[str, Any],
         header_name: str,
         required: bool,
         description: str,
@@ -232,7 +224,7 @@ def create_app() -> FastAPI:
                 }
             )
 
-    def _add_headers_to_operation(operation: dict) -> None:
+    def _add_headers_to_operation(operation: dict[str, Any]) -> None:
         """Add X-API-Key and X-Request-ID headers to an operation."""
         _add_header_parameter(
             operation,
@@ -254,11 +246,16 @@ def create_app() -> FastAPI:
             schema_format="uuid",
         )
 
-    def _add_headers_to_paths(schema: dict) -> None:
+    def _add_headers_to_paths(schema: dict[str, Any]) -> None:
         """Add authentication headers to all non-public path operations."""
-        password_bearer_operations = {
+        bearer_only_operations = {
             (f"{settings.api_prefix}/auth/me/password", "patch"),
             (f"{settings.api_prefix}/builder/clinics/{{clinic_id}}/password", "patch"),
+            (
+                f"{settings.api_prefix}/builder/clinics/{{source_id}}/clone-preview",
+                "get",
+            ),
+            (f"{settings.api_prefix}/builder/clinics/{{source_id}}/clone", "post"),
         }
         for path, path_item in schema.get("paths", {}).items():
             if _is_public_path(path):
@@ -282,7 +279,7 @@ def create_app() -> FastAPI:
                 if not isinstance(operation, dict):
                     continue
 
-                if (path, method) in password_bearer_operations:
+                if (path, method) in bearer_only_operations:
                     # These credential mutations are intentionally JWT-only. Keep
                     # request correlation documentation, but do not advertise the
                     # global API key as required or sufficient for either route.
@@ -302,7 +299,7 @@ def create_app() -> FastAPI:
 
                 _add_headers_to_operation(operation)
 
-    def custom_openapi():
+    def custom_openapi() -> dict[str, Any]:
         """
         Custom OpenAPI schema that includes X-API-Key and X-Request-ID headers.
 
@@ -529,11 +526,11 @@ def create_app() -> FastAPI:
 
     # Override OpenAPI schema to include headers (after all routers are registered)
     # This must be done after all routers are registered so routes are available
-    app.openapi = custom_openapi
+    setattr(app, "openapi", custom_openapi)
 
     # Add alternative OpenAPI JSON endpoint for compatibility (root path)
     @app.get("/openapi.json", include_in_schema=False)
-    async def alternative_openapi_json():
+    async def alternative_openapi_json() -> Response:
         """Alternative OpenAPI JSON endpoint for compatibility."""
         schema = app.openapi()
         return Response(

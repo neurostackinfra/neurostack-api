@@ -5,17 +5,18 @@ Foundation classes for SQLAlchemy models.
 
 from datetime import datetime
 from typing import Any
+from uuid import UUID as PythonUUID
 from uuid import uuid4
 
 from sqlalchemy import DateTime, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
     """
     Base class for all SQLAlchemy models.
-    
+
     Provides common functionality like automatic table naming
     and JSON serialization.
     """
@@ -41,7 +42,7 @@ class Base(DeclarativeBase):
 class TimestampMixin:
     """
     Mixin that adds created_at and updated_at columns.
-    
+
     - created_at: Set automatically on insert
     - updated_at: Updated automatically on every update
     """
@@ -64,10 +65,9 @@ class UUIDMixin:
     Mixin that adds a UUID primary key column.
     """
 
-    id: Mapped[UUID] = mapped_column(
-        UUID(as_uuid=True),
+    id: Mapped[PythonUUID] = mapped_column(
+        PG_UUID(as_uuid=True),
         primary_key=True,
         default=uuid4,
         nullable=False,
     )
-

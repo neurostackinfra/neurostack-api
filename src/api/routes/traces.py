@@ -6,23 +6,39 @@ Traces expose a curated view of message.in events that were processed
 through the cognitive pipeline, including SRM decisions, context, and prompts.
 """
 
+from collections.abc import Iterator
 from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 
+import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-
-import jwt as pyjwt
 
 from src.api.middleware.auth import (
     TenantContext,
     get_tenant_context,
     require_builder_clinic_access,
 )
+from src.api.schemas.traces import (
+    TraceDetailResponse,
+    TraceItem,
+    TraceListResponse,
+    TraceStatsResponse,
+)
 from src.config.logging import get_logger
 from src.config.settings import settings
+from src.observability.pii import mask_carteirinha
+from src.repositories import get_db_session_dependency
+from src.services.trace_service import (
+    _event_to_trace_dict,
+    export_traces_csv,
+    get_prompt_event_for_trace,
+    get_trace,
+    get_trace_stats,
+    list_traces,
+)
 
 _logger = get_logger(__name__)
 
@@ -39,14 +55,17 @@ async def _resolve_tenant(
     if override_tenant_id is None:
         # For builders, auto-resolve to first managed clinic
         if tenant.role == "builder":
-            from src.models.tenant import Tenant
             from sqlalchemy import select as sa_select
+
+            from src.models.tenant import Tenant
+
             auth_header = request.headers.get("Authorization", "")
             if auth_header.startswith("Bearer "):
                 token = auth_header[7:]
                 try:
                     payload = pyjwt.decode(
-                        token, settings.secret_key,
+                        token,
+                        settings.secret_key,
                         algorithms=["HS256"],
                         options={"require": ["sub", "tenant_id", "exp"]},
                     )
@@ -82,7 +101,8 @@ async def _resolve_tenant(
         token = auth_header[7:]
         try:
             payload = pyjwt.decode(
-                token, settings.secret_key,
+                token,
+                settings.secret_key,
                 algorithms=["HS256"],
                 options={"require": ["sub", "tenant_id", "exp"]},
             )
@@ -91,27 +111,22 @@ async def _resolve_tenant(
             pass
 
     if not builder_id_str:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Builder ID not found in token")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Builder ID not found in token",
+        )
 
     builder_id = UUID(builder_id_str)
-    _logger.info("builder_clinic_override", extra={"builder_id": str(builder_id), "tenant_id": str(override_tenant_id), "endpoint": request.url.path})
+    _logger.info(
+        "builder_clinic_override",
+        extra={
+            "builder_id": str(builder_id),
+            "tenant_id": str(override_tenant_id),
+            "endpoint": request.url.path,
+        },
+    )
     return await require_builder_clinic_access(override_tenant_id, builder_id, db)
-from src.api.schemas.traces import (
-    TraceDetailResponse,
-    TraceItem,
-    TraceListResponse,
-    TraceStatsResponse,
-)
-from src.repositories import get_db_session_dependency
-from src.observability.pii import mask_carteirinha
-from src.services.trace_service import (
-    _event_to_trace_dict,
-    export_traces_csv,
-    get_prompt_event_for_trace,
-    get_trace,
-    get_trace_stats,
-    list_traces,
-)
+
 
 router = APIRouter()
 
@@ -142,7 +157,8 @@ async def trace_stats(
         default=None, description="End of period (ISO 8601)"
     ),
     override_tenant_id: Optional[UUID] = Query(
-        default=None, alias="tenant_id",
+        default=None,
+        alias="tenant_id",
         description="Builder override: view stats for a managed clinic",
     ),
     tenant: TenantContext = Depends(get_tenant_context),
@@ -156,7 +172,7 @@ async def trace_stats(
         start_date=start_date,
         end_date=end_date,
     )
-    return TraceStatsResponse(**stats)
+    return TraceStatsResponse.model_validate(stats)
 
 
 @router.get(
@@ -188,7 +204,8 @@ async def trace_export(
         default=None, description="Filter by channel (whatsapp, web)"
     ),
     override_tenant_id: Optional[UUID] = Query(
-        default=None, alias="tenant_id",
+        default=None,
+        alias="tenant_id",
         description="Builder override: export traces for a managed clinic",
     ),
     tenant: TenantContext = Depends(get_tenant_context),
@@ -206,7 +223,7 @@ async def trace_export(
         channel=channel,
     )
 
-    def iterate_csv():
+    def iterate_csv() -> Iterator[str]:
         yield csv_content
 
     return StreamingResponse(
@@ -247,7 +264,9 @@ async def trace_detail(
     request: Request,
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
-    override_tenant_id: Optional[UUID] = Query(None, alias="tenant_id", description="Builder clinic override"),
+    override_tenant_id: Optional[UUID] = Query(
+        None, alias="tenant_id", description="Builder clinic override"
+    ),
 ) -> TraceDetailResponse:
     """Get detailed information for a single trace."""
     effective_tenant_id = await _resolve_tenant(request, tenant, override_tenant_id, db)
@@ -292,22 +311,24 @@ async def trace_detail(
             llm_response = mask_carteirinha(prompt_data.get("suggested_response"))
             selected_context = prompt_data.get("context_sources", [])
 
-    return TraceDetailResponse(
-        id=trace["id"],
-        timestamp=trace["timestamp"],
-        user_message=trace["user_message"],
-        srm_decision=trace["srm_decision"],
-        context_summary=trace["context_summary"],
-        prompt_built=prompt_built,
-        processing_time_ms=trace["processing_time_ms"],
-        mode=trace["mode"],
-        full_context=full_context,
-        full_prompt=full_prompt,
-        session_id=event.session_id,
-        event_data=event_data,
-        event_metadata=metadata,
-        llm_response=llm_response,
-        selected_context=selected_context,
+    return TraceDetailResponse.model_validate(
+        {
+            "id": trace["id"],
+            "timestamp": trace["timestamp"],
+            "user_message": trace["user_message"],
+            "srm_decision": trace["srm_decision"],
+            "context_summary": trace["context_summary"],
+            "prompt_built": prompt_built,
+            "processing_time_ms": trace["processing_time_ms"],
+            "mode": trace["mode"],
+            "full_context": full_context,
+            "full_prompt": full_prompt,
+            "session_id": event.session_id,
+            "event_data": event_data,
+            "event_metadata": metadata,
+            "llm_response": llm_response,
+            "selected_context": selected_context,
+        }
     )
 
 
@@ -346,7 +367,9 @@ async def trace_list(
     channel: Optional[str] = Query(
         default=None, description="Filter by channel (whatsapp, web)"
     ),
-    override_tenant_id: Optional[UUID] = Query(None, alias="tenant_id", description="Builder clinic override"),
+    override_tenant_id: Optional[UUID] = Query(
+        None, alias="tenant_id", description="Builder clinic override"
+    ),
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
 ) -> TraceListResponse:
@@ -364,10 +387,7 @@ async def trace_list(
         channel=channel,
     )
 
-    items = [
-        TraceItem(**_event_to_trace_dict(event))
-        for event in events
-    ]
+    items = [TraceItem.model_validate(_event_to_trace_dict(event)) for event in events]
 
     return TraceListResponse(
         items=items,

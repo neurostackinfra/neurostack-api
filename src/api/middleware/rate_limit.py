@@ -3,19 +3,14 @@ NeuroStack API - Rate Limiting Middleware
 Token bucket rate limiting per tenant.
 """
 
-import sys
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 from fastapi import Request, status
 from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-
-# Add the project root to sys.path for local module resolution
-project_root = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(project_root))
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.responses import Response
 
 from src.config.logging import get_logger
 from src.config.settings import settings
@@ -175,8 +170,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(
         self,
         request: Request,
-        call_next: Callable,
-    ) -> JSONResponse:
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
         """Process request through rate limiting."""
 
         # Skip rate limiting if disabled
@@ -351,7 +346,7 @@ def webhook_rate_limit_response(
 # ============================================
 
 
-def get_rate_limit_info(request: Request) -> dict:
+def get_rate_limit_info(request: Request) -> dict[str, int | str]:
     """
     Get rate limit information for the current request.
 

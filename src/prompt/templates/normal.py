@@ -4,10 +4,11 @@ Template for standard conversation flow.
 Aligned with NeuroStack v0.6 methodology (200-case dataset).
 """
 
-from src.prompt.models import PromptMode, PromptVariables
+from datetime import datetime
+
+from src.prompt.models import PromptMessage, PromptMode, PromptVariables
 from src.prompt.templates.base import BaseTemplate, TemplateSection
 from src.prompt.timeutils import clinic_now
-
 
 # ============================================
 # System Prompt — NeuroStack v0.6 Methodology
@@ -595,10 +596,10 @@ class NormalTemplate(BaseTemplate):
     Aligned with NeuroStack v0.6 methodology.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(PromptMode.NORMAL)
 
-    def build_system_message(self, variables: PromptVariables):
+    def build_system_message(self, variables: PromptVariables) -> PromptMessage:
         """Override to append scheduling confirmation, emoji, and language as absolute last instructions."""
         msg = super().build_system_message(variables)
 
@@ -609,47 +610,67 @@ class NormalTemplate(BaseTemplate):
         if variables.custom.get("handoff_confirmation_pending"):
             lang = variables.language or "pt-BR"
             if lang == "en":
-                _q  = "Can I connect you with our scheduling team now?"
+                _q = "Can I connect you with our scheduling team now?"
                 _no_confirm = "Do NOT say the time 'is confirmed' or 'scheduled' — you do NOT have access to the clinic calendar."
-                _no_docs    = "Do NOT ask about documents, additional information, or any other topic."
-                _no_extra   = "Do NOT add any other sentence before or after the question above."
-                _no_ann     = "Do NOT announce the transfer — wait for the patient's response."
-                _sys_yes    = "If they confirm: the system handles the transfer automatically."
-                _sys_no     = "If they decline: continue the conversation normally."
-                _header     = "⚠️ MANDATORY ACTION — OVERRIDES ALL PREVIOUS INSTRUCTIONS"
-                _collected  = "You have already collected the full name and time preference. Before forwarding, you MUST confirm with the patient."
-                _label      = "Your response must contain ONLY this question:"
-                _prohib     = "STRICTLY PROHIBITED in your response:"
+                _no_docs = "Do NOT ask about documents, additional information, or any other topic."
+                _no_extra = (
+                    "Do NOT add any other sentence before or after the question above."
+                )
+                _no_ann = (
+                    "Do NOT announce the transfer — wait for the patient's response."
+                )
+                _sys_yes = (
+                    "If they confirm: the system handles the transfer automatically."
+                )
+                _sys_no = "If they decline: continue the conversation normally."
+                _header = "⚠️ MANDATORY ACTION — OVERRIDES ALL PREVIOUS INSTRUCTIONS"
+                _collected = "You have already collected the full name and time preference. Before forwarding, you MUST confirm with the patient."
+                _label = "Your response must contain ONLY this question:"
+                _prohib = "STRICTLY PROHIBITED in your response:"
             elif lang == "es":
-                _q  = "¿Puedo comunicarte con nuestro equipo de citas ahora?"
+                _q = "¿Puedo comunicarte con nuestro equipo de citas ahora?"
                 _no_confirm = "NO digas que el horario 'está confirmado' o 'agendado' — NO tienes acceso al calendario de la clínica."
-                _no_docs    = "NO preguntes sobre documentos, información adicional ni ningún otro tema."
-                _no_extra   = "NO añadas ninguna otra frase antes o después de la pregunta."
-                _no_ann     = "NO anuncies la transferencia — espera la respuesta del paciente."
-                _sys_yes    = "Si confirma: el sistema gestiona la transferencia automáticamente."
-                _sys_no     = "Si rechaza: continúa la conversación normalmente."
-                _header     = "⚠️ ACCIÓN OBLIGATORIA — ANULA TODAS LAS INSTRUCCIONES ANTERIORES"
-                _collected  = "Ya recopilaste el nombre completo y la preferencia de horario. Antes de derivar, DEBES confirmar con el paciente."
-                _label      = "Tu respuesta debe contener ÚNICAMENTE esta pregunta:"
-                _prohib     = "ESTRICTAMENTE PROHIBIDO en tu respuesta:"
+                _no_docs = "NO preguntes sobre documentos, información adicional ni ningún otro tema."
+                _no_extra = (
+                    "NO añadas ninguna otra frase antes o después de la pregunta."
+                )
+                _no_ann = (
+                    "NO anuncies la transferencia — espera la respuesta del paciente."
+                )
+                _sys_yes = (
+                    "Si confirma: el sistema gestiona la transferencia automáticamente."
+                )
+                _sys_no = "Si rechaza: continúa la conversación normalmente."
+                _header = (
+                    "⚠️ ACCIÓN OBLIGATORIA — ANULA TODAS LAS INSTRUCCIONES ANTERIORES"
+                )
+                _collected = "Ya recopilaste el nombre completo y la preferencia de horario. Antes de derivar, DEBES confirmar con el paciente."
+                _label = "Tu respuesta debe contener ÚNICAMENTE esta pregunta:"
+                _prohib = "ESTRICTAMENTE PROHIBIDO en tu respuesta:"
             else:  # pt-BR default
-                _q  = "Posso te encaminhar para nossa equipe de agendamento agora?"
+                _q = "Posso te encaminhar para nossa equipe de agendamento agora?"
                 _no_confirm = "NÃO diga que o horário 'está confirmado' ou 'agendado' — você NÃO tem acesso à agenda da clínica."
-                _no_docs    = "NÃO pergunte sobre documentos, informações adicionais, preparo ou qualquer outro assunto."
-                _no_extra   = "NÃO adicione nenhuma outra frase antes ou depois da pergunta acima."
-                _no_ann     = "NÃO anuncie a transferência — aguarde a resposta do paciente."
-                _sys_yes    = "Se ele confirmar: o sistema fará o encaminhamento automaticamente."
-                _sys_no     = "Se ele recusar: continue a conversa normalmente."
-                _header     = "⚠️ AÇÃO OBRIGATÓRIA — SOBRESCREVE TODAS AS INSTRUÇÕES ANTERIORES"
-                _collected  = "Você já coletou nome completo e preferência de horário. Antes de encaminhar, DEVE confirmar com o paciente."
-                _label      = "Sua resposta deve conter SOMENTE esta pergunta:"
-                _prohib     = "ESTRITAMENTE PROIBIDO na sua resposta:"
+                _no_docs = "NÃO pergunte sobre documentos, informações adicionais, preparo ou qualquer outro assunto."
+                _no_extra = "NÃO adicione nenhuma outra frase antes ou depois da pergunta acima."
+                _no_ann = (
+                    "NÃO anuncie a transferência — aguarde a resposta do paciente."
+                )
+                _sys_yes = (
+                    "Se ele confirmar: o sistema fará o encaminhamento automaticamente."
+                )
+                _sys_no = "Se ele recusar: continue a conversa normalmente."
+                _header = (
+                    "⚠️ AÇÃO OBRIGATÓRIA — SOBRESCREVE TODAS AS INSTRUÇÕES ANTERIORES"
+                )
+                _collected = "Você já coletou nome completo e preferência de horário. Antes de encaminhar, DEVE confirmar com o paciente."
+                _label = "Sua resposta deve conter SOMENTE esta pergunta:"
+                _prohib = "ESTRITAMENTE PROIBIDO na sua resposta:"
 
             msg.content += (
                 f"\n\n## {_header}\n"
                 f"{_collected}\n\n"
                 f"**{_label}**\n"
-                f"\"{_q}\"\n\n"
+                f'"{_q}"\n\n'
                 f"**{_prohib}**\n"
                 f"- {_no_confirm}\n"
                 f"- {_no_docs}\n"
@@ -677,16 +698,16 @@ class NormalTemplate(BaseTemplate):
                     "**out of pocket (particular)**.\n"
                     "- Weave the question warmly into the discovery flow — never as a cold "
                     "interrogation. Example: acknowledge what they shared first, then ask "
-                    "gently: \"Só para eu te orientar melhor, o atendimento seria pelo "
-                    "seu convênio ou particular?\" (translate naturally to English if that "
+                    'gently: "Só para eu te orientar melhor, o atendimento seria pelo '
+                    'seu convênio ou particular?" (translate naturally to English if that '
                     "is the response language).\n"
                     "- **HOLD ALL PRICES until the patient chooses.** Do NOT state any "
                     "monetary value, range, discount, or comparison while the modality is "
                     "undefined. If they ask for price first: validate their concern, then "
                     "ask the modality question, then continue.\n"
-                    "- Never say \"I can't tell you the price\" — frame the pause as "
-                    "\"para eu te passar a informação certa, preciso saber se é convênio "
-                    "ou particular\"."
+                    '- Never say "I can\'t tell you the price" — frame the pause as '
+                    '"para eu te passar a informação certa, preciso saber se é convênio '
+                    'ou particular".'
                 )
             elif lang == "es":
                 msg.content += (
@@ -694,12 +715,12 @@ class NormalTemplate(BaseTemplate):
                     "Antes de cotizar cualquier precio o pasar al agendamiento, debes "
                     "saber si el paciente usará **convenio** o **particular**.\n"
                     "- Integra la pregunta de forma cálida al descubrimiento — nunca como "
-                    "un interrogatorio. Ejemplo: \"Para orientarte mejor, ¿la atención "
-                    "sería por tu convenio o particular?\".\n"
+                    'un interrogatorio. Ejemplo: "Para orientarte mejor, ¿la atención '
+                    'sería por tu convenio o particular?".\n'
                     "- **RETÉN CUALQUIER VALOR mientras el paciente no elija.** No "
                     "menciones ningún importe, rango ni descuento hasta que la modalidad "
                     "esté definida.\n"
-                    "- Nunca digas \"no puedo informarte el precio\" — enmarca la pausa "
+                    '- Nunca digas "no puedo informarte el precio" — enmarca la pausa '
                     "como necesidad de saber la modalidad para pasar la información "
                     "correcta."
                 )
@@ -711,15 +732,15 @@ class NormalTemplate(BaseTemplate):
                     "**particular**.\n"
                     "- Integre a pergunta de forma acolhedora ao fluxo de descoberta — "
                     "nunca como interrogatório. Exemplo: reconheça o que o paciente "
-                    "compartilhou e então pergunte com leveza: \"Só para eu te orientar "
-                    "melhor, o atendimento seria pelo seu convênio ou particular?\".\n"
+                    'compartilhou e então pergunte com leveza: "Só para eu te orientar '
+                    'melhor, o atendimento seria pelo seu convênio ou particular?".\n'
                     "- **SEGURE QUALQUER VALOR MONETÁRIO até o paciente escolher.** Não "
                     "informe preço, faixa, desconto nem comparação enquanto a modalidade "
                     "não estiver definida. Se ele perguntar preço antes: valide a "
                     "preocupação, faça a pergunta de triagem, e só depois siga.\n"
-                    "- Nunca diga \"não posso informar o preço\" — enquadre a pausa como "
-                    "\"para eu te passar a informação certa, preciso saber se será "
-                    "convênio ou particular\"."
+                    '- Nunca diga "não posso informar o preço" — enquadre a pausa como '
+                    '"para eu te passar a informação certa, preciso saber se será '
+                    'convênio ou particular".'
                 )
 
         if variables.custom.get("scheduling_link_verification_status"):
@@ -746,14 +767,13 @@ class NormalTemplate(BaseTemplate):
                         "Reconheça brevemente que o paciente não conseguiu concluir pelo link e diga que a equipe dará continuidade. "
                         "Não reenvie o link, a menos que o paciente peça explicitamente, e não mencione status interno de handoff."
                     )
-            msg.content += (
-                "\n\n## Scheduling Link Outcome (Mandatory)\n"
-                f"{guidance}"
-            )
+            msg.content += "\n\n## Scheduling Link Outcome (Mandatory)\n" f"{guidance}"
 
         # Emoji directive — suppressed when handoff_confirmation_pending to avoid
         # conflict with "SOMENTE esta pergunta" constraint in the confirmation block.
-        if variables.custom.get("use_emojis") and not variables.custom.get("handoff_confirmation_pending"):
+        if variables.custom.get("use_emojis") and not variables.custom.get(
+            "handoff_confirmation_pending"
+        ):
             msg.content += (
                 "\n\n## EMOJI INSTRUCTION (MANDATORY)\n"
                 "**You MUST include 1-2 relevant emojis in EVERY response.** "
@@ -796,7 +816,9 @@ class NormalTemplate(BaseTemplate):
     def get_context_instructions(self, variables: PromptVariables) -> str:
         """Get context-specific instructions based on funnel stage and user journey."""
         now_local = clinic_now(variables.custom.get("timezone"))
-        parts = [f"**Data e hora atual:** {now_local.strftime('%d/%m/%Y %H:%M')} (horário local da clínica)"]
+        parts = [
+            f"**Data e hora atual:** {now_local.strftime('%d/%m/%Y %H:%M')} (horário local da clínica)"
+        ]
 
         # Inject clinic identity for template placeholders in funnel instructions
         agent_name = variables.custom.get("agent_name", "assistente")
@@ -814,7 +836,11 @@ class NormalTemplate(BaseTemplate):
 
         # Funnel stage instructions — pick EN or PT dict based on language
         funnel_stage = variables.funnel_stage.lower()
-        funnel_dict = EN_FUNNEL_INSTRUCTIONS if variables.language == "en" else FUNNEL_INSTRUCTIONS
+        funnel_dict = (
+            EN_FUNNEL_INSTRUCTIONS
+            if variables.language == "en"
+            else FUNNEL_INSTRUCTIONS
+        )
         if funnel_stage in funnel_dict:
             instruction = funnel_dict[funnel_stage]
             instruction = instruction.replace("{{agent_name}}", agent_name)
@@ -838,7 +864,7 @@ class NormalTemplate(BaseTemplate):
                         "1. **Insurance name (convênio)** — e.g. Bradesco Saúde, Unimed.\n"
                         "2. **Insurance card number (número da carteirinha).**\n\n"
                         "Ask kindly and explicitly: **please type it in writing, do not send a photo** "
-                        "(\"gentileza enviar por escrito, não por foto\").\n"
+                        '("gentileza enviar por escrito, não por foto").\n'
                         "Rules:\n"
                         "- One question at a time — do NOT ask nome + preferência + convênio + carteirinha in a single message.\n"
                         "- The card number is sensitive data — only ask it inside this scheduling step and never repeat it back in full.\n"
@@ -852,7 +878,7 @@ class NormalTemplate(BaseTemplate):
                         "1. **Nome do convênio** (ex.: Bradesco Saúde, Unimed, SulAmérica).\n"
                         "2. **Número da carteirinha.**\n\n"
                         "Peça de forma gentil e explícita: **gentileza enviar por escrito, não por foto** "
-                        "(\"por favor, digite os números da carteirinha aqui na conversa — não envie foto\").\n"
+                        '("por favor, digite os números da carteirinha aqui na conversa — não envie foto").\n'
                         "Regras:\n"
                         "- Uma pergunta por vez — NÃO peça nome + preferência + convênio + carteirinha na mesma mensagem.\n"
                         "- O número da carteirinha é dado sensível — colete somente neste passo do agendamento e nunca o repita por extenso na resposta.\n"
@@ -916,13 +942,14 @@ class NormalTemplate(BaseTemplate):
         if not custom:
             return ""
 
-        parts = []
         section = TemplateSection("Informações da Clínica (Clinic Config)")
 
         if custom.get("clinic_history"):
             section.add(f"**História da Clínica:** {custom['clinic_history']}")
         if custom.get("clinic_specialties"):
-            section.add(f"**Especialidades:** {', '.join(custom['clinic_specialties'])}")
+            section.add(
+                f"**Especialidades:** {', '.join(custom['clinic_specialties'])}"
+            )
         if custom.get("working_hours"):
             section.add(f"**Horário de atendimento:** {custom['working_hours']}")
         if custom.get("full_address"):
@@ -964,8 +991,8 @@ class NormalTemplate(BaseTemplate):
             # exact_allowed / consult_only).  provide_prices=yes always means exact_allowed.
             provide_prices = custom.get("provide_prices")
             pricing_mode = str(custom.get("pricing_mode", "")).lower().strip()
-            is_range_allowed  = pricing_mode == "range_allowed"
-            is_exact_allowed  = (
+            is_range_allowed = pricing_mode == "range_allowed"
+            is_exact_allowed = (
                 provide_prices in (True, "yes", "true", "True")
                 or pricing_mode == "exact_allowed"
             )
@@ -1027,9 +1054,14 @@ class NormalTemplate(BaseTemplate):
                 )
             else:
                 ic_lower = str(ic).lower()
-                is_cortesia = any(w in ic_lower for w in ("gratuita", "cortesia", "grátis", "free", "complimentary"))
+                is_cortesia = any(
+                    w in ic_lower
+                    for w in ("gratuita", "cortesia", "grátis", "free", "complimentary")
+                )
                 consult_price = str(custom.get("consult_service_price", "")).strip()
-                consult_price_num = consult_price.replace("R$", "").replace(",", ".").strip()
+                consult_price_num = (
+                    consult_price.replace("R$", "").replace(",", ".").strip()
+                )
                 # Empty string = "not configured", NOT free — only explicit "0" / "0.00" means explicitly free
                 is_explicitly_zero = consult_price_num in ("0", "0.00", "0,00")
                 has_followup_price = consult_price_num != "" and not is_explicitly_zero
@@ -1076,9 +1108,13 @@ class NormalTemplate(BaseTemplate):
         if custom.get("service_format"):
             section.add(f"**Formato de atendimento:** {custom['service_format']}")
         if custom.get("use_emojis"):
-            section.add("**Estilo:** USE emojis nas respostas para torná-las mais acolhedoras. Inclua 1-2 emojis relevantes por mensagem, variando entre eles.")
+            section.add(
+                "**Estilo:** USE emojis nas respostas para torná-las mais acolhedoras. Inclua 1-2 emojis relevantes por mensagem, variando entre eles."
+            )
         else:
-            section.add("**Estilo:** NÃO use emojis nas respostas. Mantenha o texto limpo, sem emojis.")
+            section.add(
+                "**Estilo:** NÃO use emojis nas respostas. Mantenha o texto limpo, sem emojis."
+            )
         if custom.get("language_policy"):
             section.add(f"**Política de idioma:** {custom['language_policy']}")
         # provide_prices already handled above in pricing policy section
@@ -1105,8 +1141,11 @@ class NormalTemplate(BaseTemplate):
         return content if section.content else ""
 
     def _get_intent_instruction(
-        self, intent: str, agent_name: str = "assistente", clinic_name: str = "clínica",
-        now_local=None,
+        self,
+        intent: str,
+        agent_name: str = "assistente",
+        clinic_name: str = "clínica",
+        now_local: datetime | None = None,
     ) -> str:
         """Get instruction for specific intent — NeuroStack v0.6 methodology."""
         # Compute correct greeting for current clinic-local time

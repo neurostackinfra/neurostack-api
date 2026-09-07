@@ -4,22 +4,21 @@ Renders prompt templates with variables.
 """
 
 import logging
-import re
 import time
 from typing import Any, Optional
 
 from src.prompt.models import (
-    PromptMode,
-    PromptMessage,
-    PromptVariables,
-    PromptConfig,
     GeneratedPrompt,
     MessageRole,
+    PromptConfig,
+    PromptMessage,
+    PromptMode,
+    PromptVariables,
 )
 from src.prompt.templates.base import BaseTemplate
+from src.prompt.templates.handoff import HandoffTemplate
 from src.prompt.templates.normal import NormalTemplate
 from src.prompt.templates.safety import SafetyTemplate
-from src.prompt.templates.handoff import HandoffTemplate
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +30,7 @@ CHARS_PER_TOKEN = 4
 class PromptRenderer:
     """
     Renders prompt templates with variables.
-    
+
     Handles:
     - Variable substitution
     - Message history formatting
@@ -39,7 +38,7 @@ class PromptRenderer:
     - Template selection by mode
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the renderer with templates."""
         self._templates: dict[PromptMode, BaseTemplate] = {
             PromptMode.NORMAL: NormalTemplate(),
@@ -56,12 +55,12 @@ class PromptRenderer:
     ) -> GeneratedPrompt:
         """
         Render a complete prompt.
-        
+
         Args:
             variables: Variables for rendering
             config: Prompt configuration
             history_messages: Optional conversation history
-            
+
         Returns:
             GeneratedPrompt with all messages
         """
@@ -77,7 +76,7 @@ class PromptRenderer:
         if config.include_system:
             system_message = template.build_system_message(variables)
             messages.append(system_message)
-            
+
             # Track used variables
             variables_used.extend(template.get_used_variables(system_message.content))
 
@@ -90,17 +89,21 @@ class PromptRenderer:
 
         # Add current user message
         if variables.user_message:
-            messages.append(PromptMessage(
-                role=MessageRole.USER,
-                content=variables.user_message,
-            ))
+            messages.append(
+                PromptMessage(
+                    role=MessageRole.USER,
+                    content=variables.user_message,
+                )
+            )
 
         # Estimate tokens
         total_tokens = self._estimate_tokens(messages)
 
         # Check token limit
         if total_tokens > config.max_tokens:
-            warnings.append(f"Estimated tokens ({total_tokens}) exceed limit ({config.max_tokens})")
+            warnings.append(
+                f"Estimated tokens ({total_tokens}) exceed limit ({config.max_tokens})"
+            )
             # Trim history if needed
             messages = self._trim_to_fit(messages, config.max_tokens)
             total_tokens = self._estimate_tokens(messages)
@@ -116,7 +119,9 @@ class PromptRenderer:
         if messages and messages[0].role == MessageRole.SYSTEM:
             sys_content = messages[0].content
             if "Saudação" in sys_content or "saudacao" in sys_content.lower():
-                logger.warning(f"[GREETING_DEBUG] System prompt excerpt (last 500 chars): ...{sys_content[-500:]}")
+                logger.warning(
+                    f"[GREETING_DEBUG] System prompt excerpt (last 500 chars): ...{sys_content[-500:]}"
+                )
 
         return GeneratedPrompt(
             messages=messages,
@@ -135,12 +140,12 @@ class PromptRenderer:
     ) -> GeneratedPrompt:
         """
         Render a simple prompt with minimal configuration.
-        
+
         Args:
             user_message: User's message
             mode: Prompt mode
             **kwargs: Additional variables
-            
+
         Returns:
             GeneratedPrompt
         """
@@ -148,17 +153,14 @@ class PromptRenderer:
             user_message=user_message,
             **kwargs,
         )
-        
+
         config = PromptConfig(mode=mode)
-        
+
         return self.render(variables, config)
 
     def _estimate_tokens(self, messages: list[PromptMessage]) -> int:
         """Estimate token count for messages."""
-        total_chars = sum(
-            len(m.content) + len(m.role.value) + 10
-            for m in messages
-        )
+        total_chars = sum(len(m.content) + len(m.role.value) + 10 for m in messages)
         return total_chars // CHARS_PER_TOKEN
 
     def _trim_to_fit(
@@ -168,7 +170,7 @@ class PromptRenderer:
     ) -> list[PromptMessage]:
         """
         Trim messages to fit within token limit.
-        
+
         Preserves system message and most recent messages.
         """
         if not messages:
@@ -183,7 +185,10 @@ class PromptRenderer:
         # Keep removing oldest until within limit
         while (
             len(messages) > 1
-            and self._estimate_tokens([system_msg] + messages if system_msg else messages) > max_tokens
+            and self._estimate_tokens(
+                [system_msg] + messages if system_msg else messages
+            )
+            > max_tokens
         ):
             messages = messages[1:]
 
@@ -211,10 +216,10 @@ class VariableResolver:
     def from_context_window(context: Any) -> PromptVariables:
         """
         Create PromptVariables from a ContextWindow.
-        
+
         Args:
             context: ContextWindow from CTX
-            
+
         Returns:
             PromptVariables
         """
@@ -225,9 +230,14 @@ class VariableResolver:
             f"**Última intenção:** {cog.last_intent or '—'}",
         ]
         if cog.intent_history:
-            journey_parts.append(f"**Intenções já percorridas:** {', '.join(cog.intent_history[-10:])}")
+            journey_parts.append(
+                f"**Intenções já percorridas:** {', '.join(cog.intent_history[-10:])}"
+            )
         if cog.slots:
-            journey_parts.append("**Dados já coletados:** " + ", ".join(f"{k}={v}" for k, v in list(cog.slots.items())[:15]))
+            journey_parts.append(
+                "**Dados já coletados:** "
+                + ", ".join(f"{k}={v}" for k, v in list(cog.slots.items())[:15])
+            )
         user_journey = "\n".join(journey_parts)
 
         return PromptVariables(
@@ -246,10 +256,10 @@ class VariableResolver:
     def from_flow_context(flow_context: Any) -> PromptVariables:
         """
         Create PromptVariables from FlowContext.
-        
+
         Args:
             flow_context: FlowContext from Flow Manager
-            
+
         Returns:
             PromptVariables
         """
@@ -270,30 +280,30 @@ class VariableResolver:
     ) -> PromptVariables:
         """
         Merge two PromptVariables, with override taking precedence.
-        
+
         Args:
             base: Base variables
             override: Override variables
-            
+
         Returns:
             Merged PromptVariables
         """
         base_dict = base.model_dump()
         override_dict = override.model_dump(exclude_unset=True)
-        
+
         # Merge, preferring override values
         merged = {**base_dict, **override_dict}
-        
+
         # Special handling for dicts (merge instead of replace)
         for key in ["slots", "custom"]:
             if key in base_dict and key in override_dict:
                 merged[key] = {**base_dict[key], **override_dict[key]}
-        
+
         # Special handling for lists (extend instead of replace)
         for key in ["constraints", "safety_reminders", "knowledge_sources"]:
             if key in base_dict and key in override_dict:
                 merged[key] = list(set(base_dict[key] + override_dict[key]))
-        
+
         return PromptVariables(**merged)
 
 
@@ -310,4 +320,3 @@ def get_prompt_renderer() -> PromptRenderer:
     if _renderer is None:
         _renderer = PromptRenderer()
     return _renderer
-

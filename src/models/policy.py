@@ -3,13 +3,13 @@ NeuroStack - Policy Model
 Represents policy rules that govern agent behavior.
 """
 
-from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy import Boolean, ForeignKey, Integer, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import Base, TimestampMixin
@@ -20,32 +20,35 @@ if TYPE_CHECKING:
 
 class PolicyType(str, Enum):
     """Types of policies."""
-    GLOBAL = "global"     # Applies to all tenants (system-level)
-    TENANT = "tenant"     # Specific to a single tenant
-    SAFETY = "safety"     # Safety-related rules (higher priority)
+
+    GLOBAL = "global"  # Applies to all tenants (system-level)
+    TENANT = "tenant"  # Specific to a single tenant
+    SAFETY = "safety"  # Safety-related rules (higher priority)
 
 
 class RuleSeverity(str, Enum):
     """Severity levels for policy rules."""
-    INFO = "info"         # Informational, no action required
-    WARNING = "warning"   # Should be flagged but not blocked
-    ERROR = "error"       # Should be blocked with explanation
-    CRITICAL = "critical" # Must be blocked, may require handoff
+
+    INFO = "info"  # Informational, no action required
+    WARNING = "warning"  # Should be flagged but not blocked
+    ERROR = "error"  # Should be blocked with explanation
+    CRITICAL = "critical"  # Must be blocked, may require handoff
 
 
 class RuleAction(str, Enum):
     """Actions to take when a rule is triggered."""
-    LOG = "log"           # Log the occurrence only
-    WARN = "warn"         # Include warning in response
-    FLAG = "flag"         # Flag for review
-    BLOCK = "block"       # Block the action
-    HANDOFF = "handoff"   # Trigger human handoff
+
+    LOG = "log"  # Log the occurrence only
+    WARN = "warn"  # Include warning in response
+    FLAG = "flag"  # Flag for review
+    BLOCK = "block"  # Block the action
+    HANDOFF = "handoff"  # Trigger human handoff
 
 
 class PolicyRule:
     """
     Represents a single rule within a policy.
-    
+
     Rules define specific behaviors that should be enforced or monitored.
     Each rule has:
     - Identifier and message for humans
@@ -80,8 +83,16 @@ class PolicyRule:
             "rule": self.rule,
             "message": self.message,
             "description": self.description,
-            "severity": self.severity.value if isinstance(self.severity, RuleSeverity) else self.severity,
-            "action": self.action.value if isinstance(self.action, RuleAction) else self.action,
+            "severity": (
+                self.severity.value
+                if isinstance(self.severity, RuleSeverity)
+                else self.severity
+            ),
+            "action": (
+                self.action.value
+                if isinstance(self.action, RuleAction)
+                else self.action
+            ),
             "patterns": self.patterns,
             "metadata": self.metadata,
         }
@@ -91,7 +102,7 @@ class PolicyRule:
         """Create from dictionary."""
         severity = data.get("severity", "warning")
         action = data.get("action", "warn")
-        
+
         return cls(
             rule=data.get("rule", ""),
             message=data.get("message", ""),
@@ -115,18 +126,18 @@ class PolicyRule:
 class Policy(Base, TimestampMixin):
     """
     Policy model for defining agent behavior rules.
-    
+
     Policies control how the AI agent behaves, including:
     - What it can and cannot say
     - Safety constraints
     - Tone and style guidelines
     - Compliance requirements
-    
+
     Policies can be:
     - Global: Apply to all tenants (managed by NeuroStack)
     - Tenant: Apply to a specific tenant
     - Safety: High-priority safety rules
-    
+
     Attributes:
         id: Unique policy identifier (UUID)
         tenant_id: Owning tenant (NULL for global policies)
@@ -139,7 +150,7 @@ class Policy(Base, TimestampMixin):
         version: Policy version number
         created_at: Creation timestamp
         updated_at: Last update timestamp
-    
+
     Relationships:
         tenant: The tenant that owns this policy (if tenant-specific)
     """
@@ -251,10 +262,10 @@ class Policy(Base, TimestampMixin):
     def evaluate(self, text: str) -> list[tuple[PolicyRule, bool]]:
         """
         Evaluate text against all rules.
-        
+
         Args:
             text: Text to evaluate
-        
+
         Returns:
             List of tuples (rule, matched) for all rules
         """
@@ -267,10 +278,10 @@ class Policy(Base, TimestampMixin):
     def get_triggered_rules(self, text: str) -> list[PolicyRule]:
         """
         Get all rules triggered by the text.
-        
+
         Args:
             text: Text to evaluate
-        
+
         Returns:
             List of triggered PolicyRule objects
         """
@@ -279,4 +290,3 @@ class Policy(Base, TimestampMixin):
     def __repr__(self) -> str:
         scope = "global" if self.is_global else f"tenant={self.tenant_id}"
         return f"<Policy(id={self.id}, name='{self.name}', {scope}, active={self.is_active})>"
-

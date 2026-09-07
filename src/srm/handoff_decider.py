@@ -7,14 +7,13 @@ import re
 from typing import Optional
 
 from src.srm.models import (
+    FunnelStage,
     HandoffReason,
     HandoffResult,
     IntentCategory,
     SafetyCategory,
     SafetyResult,
-    FunnelStage,
 )
-
 
 # ============================================
 # Handoff Trigger Patterns
@@ -43,7 +42,7 @@ _SCHEDULING_HAS_TIME_RE = re.compile(
     r"|\b\d{1,2}:\d{2}\b"
     r"|\b([a\u00e0]s?)\s+\d{1,2}\b"
     r"|\b(manh[a\u00e3]|tarde|noite|madrugada)\b"
-    r"|\b(dia\s+\d{1,2}|\d{1,2}/\d{1,2})\b"          # dia 12, 12/06
+    r"|\b(dia\s+\d{1,2}|\d{1,2}/\d{1,2})\b"  # dia 12, 12/06
     r"|\b(semana\s+que\s+vem|pr[o\u00f3]xima\s+semana)\b",  # semana que vem
     re.IGNORECASE | re.UNICODE,
 )
@@ -98,7 +97,7 @@ _SCHEDULING_COMPLETED_RE = re.compile(
 class HandoffDecider:
     """
     Decides when to trigger human handoff.
-    
+
     Handoff reasons:
     - USER_REQUEST: User explicitly asked for a human
     - SAFETY_CONCERN: Safety issue detected requiring human intervention
@@ -116,7 +115,7 @@ class HandoffDecider:
     ):
         """
         Initialize the handoff decider.
-        
+
         Args:
             max_turns: Maximum turns before suggesting handoff
             min_confidence: Minimum confidence before suggesting handoff
@@ -125,14 +124,19 @@ class HandoffDecider:
         self.max_turns = max_turns
         self.min_confidence = min_confidence
         self.escalation_keywords = escalation_keywords or [
-            "gerente", "supervisor", "respons\u00e1vel", "reclamar",
-            "ouvidoria", "procon", "processo", "advogado",
+            "gerente",
+            "supervisor",
+            "respons\u00e1vel",
+            "reclamar",
+            "ouvidoria",
+            "procon",
+            "processo",
+            "advogado",
         ]
-        
+
         # Compile explicit handoff patterns
         self._patterns = [
-            re.compile(p, re.IGNORECASE | re.UNICODE)
-            for p in EXPLICIT_HANDOFF_PATTERNS
+            re.compile(p, re.IGNORECASE | re.UNICODE) for p in EXPLICIT_HANDOFF_PATTERNS
         ]
 
     def decide(
@@ -144,7 +148,7 @@ class HandoffDecider:
         turn_count: int,
         safety_result: SafetyResult,
         funnel_stage: FunnelStage,
-        flags: dict,
+        flags: dict[str, bool],
         scheduling_link_enabled: bool = False,
     ) -> HandoffResult:
         """
@@ -213,7 +217,10 @@ class HandoffDecider:
         already_collecting = flags.get("scheduling_interest", False)
         has_time = flags.get("scheduling_has_time", False)
         confirmation_pending = flags.get("handoff_confirmation_pending", False)
-        is_scheduling = intent in ("agendar", "reagendar", "cancelar") or intent_category == IntentCategory.SCHEDULING
+        is_scheduling = (
+            intent in ("agendar", "reagendar", "cancelar")
+            or intent_category == IntentCategory.SCHEDULING
+        )
 
         # Scheduling-link enrich turn: the link was delivered last turn (pending handoff
         # already created). This turn we only read back whether the patient reported
@@ -246,7 +253,9 @@ class HandoffDecider:
                 # Scheduling-link path: deliver the link and create a PENDING handoff this
                 # same turn (verification_status="link_sent"). Excluded for cancellations —
                 # a booking link is meaningless when the patient wants to cancel.
-                if scheduling_link_enabled and not flags.get("scheduling_cancel_pending", False):
+                if scheduling_link_enabled and not flags.get(
+                    "scheduling_cancel_pending", False
+                ):
                     return HandoffResult(
                         required=True,
                         reason=HandoffReason.SCHEDULING,
@@ -270,7 +279,9 @@ class HandoffDecider:
             # Ambiguous answer — keep confirmation pending
             return HandoffResult(required=False, confirmation_pending=True)
 
-        if (already_collecting and has_time) or (is_scheduling and intent in ("reagendar", "cancelar")):
+        if (already_collecting and has_time) or (
+            is_scheduling and intent in ("reagendar", "cancelar")
+        ):
             # Both scheduling interest and a time preference are present → ask for confirmation
             return HandoffResult(required=False, confirmation_pending=True)
 
@@ -291,7 +302,10 @@ class HandoffDecider:
             )
 
         # Priority 6: Low confidence → administrativo, rotina
-        if confidence < self.min_confidence and flags.get("low_confidence_count", 0) >= 2:
+        if (
+            confidence < self.min_confidence
+            and flags.get("low_confidence_count", 0) >= 2
+        ):
             return HandoffResult(
                 required=True,
                 reason=HandoffReason.LOW_CONFIDENCE,
@@ -414,13 +428,10 @@ class HandoffDecider:
     ) -> bool:
         """
         Check if we should suggest handoff option to user.
-        
+
         This is a softer check - doesn't force handoff but suggests it.
         """
-        return (
-            turn_count >= self.max_turns - 2
-            or low_confidence_count >= 2
-        )
+        return turn_count >= self.max_turns - 2 or low_confidence_count >= 2
 
     # NOTE: A ``generate_handoff_message`` method used to live here with a
     # per-reason PT message dict, but it had zero callers anywhere in

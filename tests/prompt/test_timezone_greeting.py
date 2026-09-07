@@ -18,11 +18,8 @@ config), these tests would fail:
 
 from datetime import datetime, timezone
 
-import pytest
-
 from src.prompt.models import PromptVariables
 from src.prompt.templates.normal import NormalTemplate
-
 
 # ============================================
 # Helpers

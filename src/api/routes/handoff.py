@@ -5,17 +5,23 @@ Endpoints for human handoff management and webhook configuration.
 
 import csv
 import io
+import time as time_module
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+import jwt as pyjwt
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func as sa_func, select
+from sqlalchemy import func as sa_func
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from fastapi import Request
-from src.api.middleware.auth import TenantContext, get_tenant_context, require_builder_clinic_access
+from src.api.middleware.auth import (
+    TenantContext,
+    get_tenant_context,
+    require_builder_clinic_access,
+)
 from src.api.schemas.handoff import (
     HandoffCheckoutResponse,
     HandoffDetail,
@@ -31,21 +37,24 @@ from src.api.schemas.handoff import (
     WebhookTestRequest,
     WebhookTestResponse,
 )
-from src.handoff.models import HandoffStatus, WebhookConfig
-from src.models.handoff import HandoffRecord
-from src.repositories import get_db_session_dependency
-from src.services import (
-    HandoffService,
-    get_handoff_service,
-)
+from src.config.logging import get_logger
+from src.config.settings import settings as _settings
 from src.core.exceptions import (
+    HandoffConfigError,
     HandoffNotFoundError,
     HandoffServiceError,
-    HandoffConfigError,
-    WebhookError,
     WebhookDeliveryError,
+    WebhookError,
 )
-from src.config.logging import get_logger
+from src.handoff.models import (
+    HandoffReason,
+    HandoffStatus,
+    HandoffUrgency,
+    WebhookConfig,
+)
+from src.models.handoff import HandoffRecord
+from src.repositories import get_db_session_dependency
+from src.services import HandoffService, get_handoff_service
 
 logger = get_logger(__name__)
 
@@ -66,9 +75,6 @@ def get_service() -> HandoffService:
 # Tenant resolution (builder / super-admin override)
 # ============================================
 
-import jwt as pyjwt
-from src.config.settings import settings as _settings
-
 
 async def _resolve_queue_tenant(
     request: Request,
@@ -87,7 +93,9 @@ async def _resolve_queue_tenant(
     if tenant.role == "super_admin":
         return tenant_id
     if tenant.role != "builder":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="tenant_mismatch")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="tenant_mismatch"
+        )
 
     # Extract builder_id from JWT
     auth_header = request.headers.get("Authorization", "")
@@ -106,7 +114,10 @@ async def _resolve_queue_tenant(
             pass
 
     if not builder_id_str:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="builder_id_not_found_in_token")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="builder_id_not_found_in_token",
+        )
 
     builder_id = UUID(builder_id_str)
     return await require_builder_clinic_access(tenant_id, builder_id, db)
@@ -125,8 +136,12 @@ async def _resolve_queue_tenant(
 async def get_handoff_queue(
     request: Request,
     tenant_id: UUID = Query(..., description="Tenant to fetch queue for"),
-    from_date: Optional[date] = Query(None, description="Stats window start (entry date). Defaults to 30 days ago."),
-    to_date: Optional[date] = Query(None, description="Stats window end (entry date). Defaults to today."),
+    from_date: Optional[date] = Query(
+        None, description="Stats window start (entry date). Defaults to 30 days ago."
+    ),
+    to_date: Optional[date] = Query(
+        None, description="Stats window end (entry date). Defaults to today."
+    ),
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
 ) -> HandoffQueueResponse:
@@ -169,27 +184,30 @@ async def get_handoff_queue(
     # Stats window: follow the requested date range (entry date), default last 30 days.
     now_utc = datetime.now(timezone.utc)
     if from_date or to_date:
-        window_start = datetime.combine(from_date or now_utc.date(), time.min, tzinfo=timezone.utc)
-        window_end = datetime.combine(to_date or now_utc.date(), time.max, tzinfo=timezone.utc)
+        window_start = datetime.combine(
+            from_date or now_utc.date(), time.min, tzinfo=timezone.utc
+        )
+        window_end = datetime.combine(
+            to_date or now_utc.date(), time.max, tzinfo=timezone.utc
+        )
     else:
         window_start = now_utc - timedelta(days=30)
         window_end = now_utc
 
     # Stats: avg wait + pct within SLA over completed handoffs created in the window
-    stats_q = (
-        select(
-            sa_func.avg(
-                sa_func.extract("epoch", HandoffRecord.data_hora_saida - HandoffRecord.created_at)
-            ).label("avg_wait"),
-            sa_func.count().label("total"),
-        )
-        .where(
-            HandoffRecord.tenant_id == effective_tenant_id,
-            HandoffRecord.status == "completed",
-            HandoffRecord.data_hora_saida.isnot(None),
-            HandoffRecord.created_at >= window_start,
-            HandoffRecord.created_at <= window_end,
-        )
+    stats_q = select(
+        sa_func.avg(
+            sa_func.extract(
+                "epoch", HandoffRecord.data_hora_saida - HandoffRecord.created_at
+            )
+        ).label("avg_wait"),
+        sa_func.count().label("total"),
+    ).where(
+        HandoffRecord.tenant_id == effective_tenant_id,
+        HandoffRecord.status == "completed",
+        HandoffRecord.data_hora_saida.isnot(None),
+        HandoffRecord.created_at >= window_start,
+        HandoffRecord.created_at <= window_end,
     )
     stats_result = await db.execute(stats_q)
     row = stats_result.one()
@@ -200,11 +218,18 @@ async def get_handoff_queue(
     meta_minutes = 10
     try:
         from src.models.clinic_config_table import ClinicConfigTable
-        cfg_q = select(ClinicConfigTable).where(ClinicConfigTable.tenant_id == effective_tenant_id)
+
+        cfg_q = select(ClinicConfigTable).where(
+            ClinicConfigTable.tenant_id == effective_tenant_id
+        )
         cfg_result = await db.execute(cfg_q)
         cfg_row = cfg_result.scalar_one_or_none()
         if cfg_row and cfg_row.handoff:
-            meta_minutes = cfg_row.handoff.get("meta_minutos_atendimento", 10) if isinstance(cfg_row.handoff, dict) else 10
+            meta_minutes = (
+                cfg_row.handoff.get("meta_minutos_atendimento", 10)
+                if isinstance(cfg_row.handoff, dict)
+                else 10
+            )
     except Exception:
         pass
 
@@ -221,7 +246,10 @@ async def get_handoff_queue(
                 HandoffRecord.data_hora_saida.isnot(None),
                 HandoffRecord.created_at >= window_start,
                 HandoffRecord.created_at <= window_end,
-                sa_func.extract("epoch", HandoffRecord.data_hora_saida - HandoffRecord.created_at) <= sla_seconds,
+                sa_func.extract(
+                    "epoch", HandoffRecord.data_hora_saida - HandoffRecord.created_at
+                )
+                <= sla_seconds,
             )
         )
         sla_result = await db.execute(sla_q)
@@ -252,13 +280,17 @@ async def checkout_handoff(
     record = result.scalar_one_or_none()
 
     if not record:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="handoff_not_found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="handoff_not_found"
+        )
 
     # Allow builder/super-admin to check out handoffs for clinics they manage
     await _resolve_queue_tenant(request, record.tenant_id, tenant, db)
 
     if record.data_hora_saida is not None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="already_completed")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="already_completed"
+        )
 
     record.checkout()
     await db.commit()
@@ -289,7 +321,9 @@ async def checkout_handoff(
 async def export_handoffs_csv(
     request: Request,
     tenant_id: UUID = Query(..., description="Tenant ID"),
-    from_date: Optional[date] = Query(None, description="Start date (default: 30 days ago)"),
+    from_date: Optional[date] = Query(
+        None, description="Start date (default: 30 days ago)"
+    ),
     to_date: Optional[date] = Query(None, description="End date (default: today)"),
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
@@ -325,18 +359,28 @@ async def export_handoffs_csv(
     output = io.StringIO()
     output.write("﻿")  # UTF-8 BOM
     writer = csv.writer(output)
-    writer.writerow(["numero_whatsapp", "session_id", "created_at", "data_hora_saida", "tempo_espera_segundos"])
+    writer.writerow(
+        [
+            "numero_whatsapp",
+            "session_id",
+            "created_at",
+            "data_hora_saida",
+            "tempo_espera_segundos",
+        ]
+    )
     for r in records:
         wait = ""
         if r.data_hora_saida and r.created_at:
             wait = str(round((r.data_hora_saida - r.created_at).total_seconds(), 1))
-        writer.writerow([
-            r.numero_whatsapp or "",
-            str(r.session_id),
-            r.created_at.isoformat() if r.created_at else "",
-            r.data_hora_saida.isoformat() if r.data_hora_saida else "",
-            wait,
-        ])
+        writer.writerow(
+            [
+                r.numero_whatsapp or "",
+                str(r.session_id),
+                r.created_at.isoformat() if r.created_at else "",
+                r.data_hora_saida.isoformat() if r.data_hora_saida else "",
+                wait,
+            ]
+        )
 
     output.seek(0)
     filename = f"handoffs_{effective_from}_{effective_to}.csv"
@@ -367,17 +411,17 @@ async def configure_webhook(
 ) -> WebhookConfigResponse:
     """
     Configure or update webhook for handoff notifications.
-    
+
     The webhook will be called when:
     - A new handoff is created
     - Handoff status changes (accepted, completed, timeout)
-    
+
     The webhook payload includes:
     - Handoff details (ID, session ID, urgency, reason)
     - Conversation summary
     - Key information extracted
     - Recent messages
-    
+
     Security:
     - If a secret is provided, requests will include X-Webhook-Signature header
     - Signature is HMAC-SHA256 of the payload
@@ -391,11 +435,11 @@ async def configure_webhook(
             retry_count=config.retry_count,
             enabled=config.enabled,
         )
-        
+
         service.configure_webhook(tenant.tenant_id, webhook_config)
-        
+
         from datetime import datetime, timezone
-        
+
         return WebhookConfigResponse(
             tenant_id=tenant.tenant_id,
             url=config.url,
@@ -454,15 +498,15 @@ async def get_webhook_config(
 ) -> WebhookConfigResponse:
     """Get current webhook configuration for the tenant."""
     config = service.get_webhook_config(tenant.tenant_id)
-    
+
     if not config:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Webhook not configured",
         )
-    
+
     from datetime import datetime, timezone
-    
+
     return WebhookConfigResponse(
         tenant_id=tenant.tenant_id,
         url=config.url,
@@ -487,27 +531,35 @@ async def update_webhook_config(
 ) -> WebhookConfigResponse:
     """Update specific fields of webhook configuration."""
     current = service.get_webhook_config(tenant.tenant_id)
-    
+
     if not current:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Webhook not configured",
         )
-    
+
     # Update only provided fields
     new_config = WebhookConfig(
         url=update.url if update.url is not None else current.url,
         secret=update.secret if update.secret is not None else current.secret,
         headers=update.headers if update.headers is not None else current.headers,
-        timeout_seconds=update.timeout_seconds if update.timeout_seconds is not None else current.timeout_seconds,
-        retry_count=update.retry_count if update.retry_count is not None else current.retry_count,
+        timeout_seconds=(
+            update.timeout_seconds
+            if update.timeout_seconds is not None
+            else current.timeout_seconds
+        ),
+        retry_count=(
+            update.retry_count
+            if update.retry_count is not None
+            else current.retry_count
+        ),
         enabled=update.enabled if update.enabled is not None else current.enabled,
     )
-    
+
     service.configure_webhook(tenant.tenant_id, new_config)
-    
+
     from datetime import datetime, timezone
-    
+
     return WebhookConfigResponse(
         tenant_id=tenant.tenant_id,
         url=new_config.url,
@@ -532,13 +584,13 @@ async def remove_webhook_config(
 ) -> MessageResponse:
     """Remove webhook configuration for the tenant."""
     removed = service.remove_webhook_config(tenant.tenant_id)
-    
+
     if not removed:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Webhook not configured",
         )
-    
+
     return MessageResponse(message="Webhook configuration removed")
 
 
@@ -555,22 +607,17 @@ async def test_webhook(
 ) -> WebhookTestResponse:
     """
     Send a test webhook notification.
-    
+
     Uses the configured webhook URL unless a different URL is provided.
     """
-    import time
-    from uuid import uuid4
-    
-    from src.handoff.models import HandoffReason, WebhookPayload
-    
     config = service.get_webhook_config(tenant.tenant_id)
-    
+
     if not config and not request.url:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No webhook configured and no URL provided",
         )
-    
+
     # Create test payload
     test_payload = service.webhook_dispatcher.create_payload(
         handoff_id=uuid4(),
@@ -585,9 +632,9 @@ async def test_webhook(
         funnel_stage="test",
         recent_messages=[{"role": "user", "content": "Test message"}],
     )
-    
+
     # Override URL if provided
-    test_url = request.url or config.url
+    test_url = request.url or (config.url if config is not None else "")
     test_config = WebhookConfig(
         url=test_url,
         secret=config.secret if config else None,
@@ -595,24 +642,28 @@ async def test_webhook(
         retry_count=0,  # No retries for test
         enabled=True,
     )
-    
+
     # Temporarily set test config
     original_config = service.webhook_dispatcher.get_config(tenant.tenant_id)
     service.webhook_dispatcher.set_config(tenant.tenant_id, test_config)
-    
-    start = time.perf_counter()
+
+    start = time_module.perf_counter()
     try:
         delivery = await service.webhook_dispatcher.send(tenant.tenant_id, test_payload)
-        latency = (time.perf_counter() - start) * 1000
-        
+        latency = (time_module.perf_counter() - start) * 1000
+
         return WebhookTestResponse(
             success=delivery.status.value == "sent",
-            message="Webhook test successful" if delivery.status.value == "sent" else f"Webhook test failed: {delivery.error_message}",
+            message=(
+                "Webhook test successful"
+                if delivery.status.value == "sent"
+                else f"Webhook test failed: {delivery.error_message}"
+            ),
             status_code=delivery.response_status,
             latency_ms=round(latency, 2),
         )
     except WebhookDeliveryError as e:
-        latency = (time.perf_counter() - start) * 1000
+        latency = (time_module.perf_counter() - start) * 1000
         logger.warning(
             "Webhook test delivery failed",
             tenant_id=str(tenant.tenant_id),
@@ -626,7 +677,7 @@ async def test_webhook(
             latency_ms=round(latency, 2),
         )
     except WebhookError as e:
-        latency = (time.perf_counter() - start) * 1000
+        latency = (time_module.perf_counter() - start) * 1000
         logger.warning(
             "Webhook test error",
             tenant_id=str(tenant.tenant_id),
@@ -638,7 +689,7 @@ async def test_webhook(
             latency_ms=round(latency, 2),
         )
     except Exception as e:
-        latency = (time.perf_counter() - start) * 1000
+        latency = (time_module.perf_counter() - start) * 1000
         logger.error(
             "Unexpected error during webhook test",
             tenant_id=str(tenant.tenant_id),
@@ -679,7 +730,7 @@ async def list_handoffs(
 ) -> HandoffListResponse:
     """
     List handoffs for the current tenant.
-    
+
     Supports filtering by status and pagination.
     """
     handoffs = await service.list_handoffs(
@@ -688,7 +739,7 @@ async def list_handoffs(
         limit=limit,
         offset=offset,
     )
-    
+
     return HandoffListResponse(
         handoffs=handoffs,
         total=len(handoffs),  # Would be total count from DB
@@ -725,14 +776,14 @@ async def get_handoff(
     """Get detailed handoff information."""
     try:
         handoff = await service.get_handoff(handoff_id)
-        
+
         # Verify tenant ownership
         if handoff.tenant_id != tenant.tenant_id:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Handoff not found",
             )
-        
+
         return handoff
     except HandoffNotFoundError:
         raise HTTPException(
@@ -755,7 +806,7 @@ async def update_handoff(
 ) -> HandoffDetail:
     """
     Update handoff status.
-    
+
     Valid transitions:
     - pending → accepted (agent accepts)
     - accepted → in_progress (agent starts working)
@@ -770,16 +821,18 @@ async def update_handoff(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Handoff not found",
             )
-        
+
         from src.handoff.models import HandoffUpdate as HandoffUpdateModel
-        
-        return await service.update_handoff(HandoffUpdateModel(
-            handoff_id=handoff_id,
-            status=update.status,
-            assigned_to=update.assigned_to,
-            notes=update.notes,
-        ))
-        
+
+        return await service.update_handoff(
+            HandoffUpdateModel(
+                handoff_id=handoff_id,
+                status=update.status,
+                assigned_to=update.assigned_to,
+                notes=update.notes,
+            )
+        )
+
     except HandoffNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -812,9 +865,9 @@ async def accept_handoff(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Handoff not found",
             )
-        
+
         return await service.accept_handoff(handoff_id, agent_id)
-        
+
     except HandoffNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -842,9 +895,9 @@ async def complete_handoff(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Handoff not found",
             )
-        
+
         return await service.complete_handoff(handoff_id, notes)
-        
+
     except HandoffNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -872,9 +925,9 @@ async def cancel_handoff(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Handoff not found",
             )
-        
+
         return await service.cancel_handoff(handoff_id, notes)
-        
+
     except HandoffNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -895,9 +948,8 @@ async def get_session_handoff(
 ) -> Optional[HandoffDetail]:
     """Get active handoff for a session."""
     handoff = await service.get_active_handoff_for_session(session_id)
-    
+
     if handoff and handoff.tenant_id != tenant.tenant_id:
         return None
-    
-    return handoff
 
+    return handoff
