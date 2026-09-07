@@ -8,7 +8,7 @@ import asyncio
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
 import jwt
@@ -84,6 +84,154 @@ def _rating_payload(rating: int, reason: str | None = None) -> dict:
         "agent_response": "Ok.",
         "user_message": "Tenho dúvidas sobre o tratamento",
     }
+
+
+class TestRatingAnalysisSupervisor:
+    @pytest.mark.asyncio
+    async def test_supervisor_registers_blocked_task_and_drains_to_empty(
+        self,
+    ) -> None:
+        from src.api.routes import rlhf
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_analysis() -> None:
+            entered.set()
+            await release.wait()
+
+        task = rlhf.spawn(blocked_analysis(), name="test-blocked-rating-analysis")
+        await entered.wait()
+        assert task in rlhf._rating_analysis_tasks
+
+        release.set()
+        await rlhf.wait_idle()
+
+        assert task.done()
+        assert not rlhf._rating_analysis_tasks
+
+    @pytest.mark.asyncio
+    async def test_supervisor_drain_rethrows_terminal_analysis_error(self) -> None:
+        from unittest.mock import MagicMock
+
+        from src.api.routes import rlhf
+
+        async def runtime_credentials(_tenant_id: UUID) -> dict[str, str]:
+            return {"llm_model_name": "test-model"}
+
+        llm = MagicMock()
+        llm.generate = AsyncMock(side_effect=RuntimeError("analysis failed"))
+        update_status = AsyncMock(return_value=None)
+        with (
+            patch(
+                "src.services.event_service._load_runtime_llm_credentials",
+                new=runtime_credentials,
+            ),
+            patch("src.api.routes.rlhf.get_tenant_llm_client", return_value=llm),
+            patch(
+                "src.api.routes.rlhf._update_rating_status",
+                new=update_status,
+            ),
+        ):
+            rlhf.spawn(
+                rlhf._analyze_rating_async(
+                    event_id=uuid4(),
+                    rating=1,
+                    reason="motivo válido",
+                    agent_response="Ok.",
+                    user_message="Por quê?",
+                    tenant_id=uuid4(),
+                ),
+                name="test-failing-rating-analysis",
+            )
+            with pytest.raises(RuntimeError, match="analysis failed"):
+                await rlhf.wait_idle()
+
+        update_status.assert_awaited_once()
+        assert update_status.await_args.kwargs["status_"] == "failed"
+        assert not rlhf._rating_analysis_tasks
+
+    @pytest.mark.asyncio
+    async def test_supervisor_drain_rethrows_persistence_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.api.routes import rlhf
+
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(side_effect=RuntimeError("persist failed"))
+        context.__aexit__ = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            rlhf,
+            "get_db_session",
+            MagicMock(return_value=context),
+        )
+
+        rlhf.spawn(
+            rlhf._update_rating_status(uuid4(), status_="failed"),
+            name="test-failing-rating-persistence",
+        )
+        with pytest.raises(RuntimeError, match="persist failed"):
+            await rlhf.wait_idle()
+
+        assert not rlhf._rating_analysis_tasks
+
+    @pytest.mark.asyncio
+    async def test_supervisor_shutdown_cancels_and_awaits_pending_task(self) -> None:
+        from src.api.routes import rlhf
+
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def pending_analysis() -> None:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        task = rlhf.spawn(pending_analysis(), name="test-pending-rating-analysis")
+        await entered.wait()
+
+        await rlhf.shutdown()
+
+        assert task.cancelled()
+        assert cancelled.is_set()
+        assert not rlhf._rating_analysis_tasks
+
+    @pytest.mark.asyncio
+    async def test_supervisor_shutdown_precedes_database_close(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src import repositories
+        from src.api import main
+
+        calls: list[str] = []
+
+        async def init_database() -> None:
+            calls.append("database-start")
+
+        async def shutdown() -> None:
+            calls.append("supervisor-stop")
+
+        async def close_database() -> None:
+            calls.append("database-stop")
+
+        monkeypatch.setattr(repositories, "init_database", init_database)
+        monkeypatch.setattr(repositories, "close_database", close_database)
+        monkeypatch.setattr(main.rlhf, "shutdown", shutdown)
+        monkeypatch.setattr(main, "configure_tracing", MagicMock())
+        monkeypatch.setattr(main, "instrument_redis", MagicMock())
+        monkeypatch.setattr(main, "instrument_sqlalchemy", MagicMock())
+
+        async with main.lifespan(main.app):
+            calls.append("running")
+
+        assert calls == [
+            "database-start",
+            "running",
+            "supervisor-stop",
+            "database-stop",
+        ]
 
 
 # ============================================
@@ -1402,10 +1550,23 @@ class TestListRatingsResponseShape:
         subject_id = uuid4()
         client._submit(_seed_tenant_full(subject_id, "Avg Clinic"))
 
-        for value in (1, 2, 3, 4, 5):
-            payload = _rating_payload(value, reason=None if value >= 4 else "motivo x")
-            payload["clinic_tenant_id"] = str(subject_id)
-            client.post("/v1/rlhf/rating", headers=api_key_headers, json=payload)
+        with patch(
+            "src.api.routes.rlhf._analyze_rating_async",
+            new=AsyncMock(return_value=None),
+        ):
+            for value in (1, 2, 3, 4, 5):
+                payload = _rating_payload(
+                    value,
+                    reason=None if value >= 4 else "motivo x",
+                )
+                payload["clinic_tenant_id"] = str(subject_id)
+                post = client.post(
+                    "/v1/rlhf/rating",
+                    headers=api_key_headers,
+                    json=payload,
+                )
+                assert post.status_code == 200
+                client.drain()
 
         response = client.get(
             f"/v1/rlhf/ratings?tenant_id={subject_id}",
@@ -1415,6 +1576,13 @@ class TestListRatingsResponseShape:
         assert body["summary"]["total"] == 5
         # Arithmetic mean of 1..5 is 3.0
         assert body["summary"]["average"] == 3.0
+        assert body["summary"]["distribution"] == {
+            "1": 1,
+            "2": 1,
+            "3": 1,
+            "4": 1,
+            "5": 1,
+        }
 
     def test_summary_average_is_zero_for_empty_cut(
         self, client: TestClient, super_admin_headers

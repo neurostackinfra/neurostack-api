@@ -3,7 +3,9 @@ import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
 import { useToast } from "@/hooks/use-toast";
 import { Button } from "@/components/ui/button";
-import { Repeat, Gauge, Download, CalendarRange, MessageCircle } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { getBucketLabel, getIntentBucket, type IntentBucket } from "@/lib/intent-presentation";
+import { Repeat, Gauge, Download, CalendarRange, MessageCircle, ShieldAlert } from "lucide-react";
 
 interface HandoffQueueItem {
   id: string;
@@ -15,6 +17,7 @@ interface HandoffQueueItem {
   created_at: string;
   data_hora_saida: string | null;
   status: string;
+  safety_flag: boolean;
 }
 
 interface QueueStats {
@@ -24,6 +27,15 @@ interface QueueStats {
 
 // % goal target shown on the gauge (matches the design / clinic SLA target).
 const HANDOFF_GOAL_PCT = 85;
+
+const INTENT_BUCKETS: readonly IntentBucket[] = [
+  "pedido_preco",
+  "agendar",
+  "interesse_tratamento",
+  "reclamacao",
+  "pos_atendimento_duvida",
+  "outras",
+];
 
 function getToken(): string {
   try {
@@ -81,23 +93,25 @@ function buildMockHandoffs(): HandoffQueueItem[] {
       id: "mock-1",
       numero_whatsapp: "553197924877",
       session_id: "f843ae9f1",
-      intencao_detectada: "scheduling",
+      intencao_detectada: "agendar",
       estagio_atual: "agendamento_solicitado",
       primeira_linha_mensagem: null,
       created_at: agoMin(25, 9),
       data_hora_saida: null,
       status: "pending",
+      safety_flag: true,
     },
     {
       id: "mock-2",
       numero_whatsapp: "551197334455",
       session_id: "ff2e3b8eec",
-      intencao_detectada: "scheduling",
+      intencao_detectada: "agendar",
       estagio_atual: "agendamento_solicitado",
       primeira_linha_mensagem: null,
       created_at: agoMin(11, 42),
       data_hora_saida: null,
       status: "pending",
+      safety_flag: false,
     },
     {
       id: "mock-3",
@@ -109,6 +123,7 @@ function buildMockHandoffs(): HandoffQueueItem[] {
       created_at: agoMin(8, 18),
       data_hora_saida: null,
       status: "pending",
+      safety_flag: false,
     },
     {
       id: "mock-4",
@@ -120,6 +135,7 @@ function buildMockHandoffs(): HandoffQueueItem[] {
       created_at: agoMin(11, 3),
       data_hora_saida: null,
       status: "pending",
+      safety_flag: true,
     },
     {
       id: "mock-5",
@@ -131,6 +147,7 @@ function buildMockHandoffs(): HandoffQueueItem[] {
       created_at: agoMin(3, 27),
       data_hora_saida: null,
       status: "pending",
+      safety_flag: false,
     },
     {
       id: "mock-6",
@@ -142,6 +159,7 @@ function buildMockHandoffs(): HandoffQueueItem[] {
       created_at: agoMin(14, 58),
       data_hora_saida: null,
       status: "pending",
+      safety_flag: true,
     },
   ];
 }
@@ -228,6 +246,8 @@ export default function HandoffQueuePage() {
   const today = ymd(new Date());
   const [startDate, setStartDate] = useState<string>(today);
   const [endDate, setEndDate] = useState<string>(today);
+  const [onlySafety, setOnlySafety] = useState(false);
+  const [intentBucket, setIntentBucket] = useState<"all" | IntentBucket>("all");
 
   const fetchQueue = useCallback(async () => {
     if (!effectiveTenantId) return;
@@ -270,13 +290,24 @@ export default function HandoffQueuePage() {
     return () => clearInterval(id);
   }, [fetchQueue, isInvestor, mockHandoffs]);
 
-  // Filter visible list by entry date within [startDate, endDate].
+  // Preserve the API's FIFO order: all card filters run in one pass, without sorting.
   const visibleHandoffs = useMemo(() => {
     return handoffs.filter((h) => {
       const day = ymd(new Date(h.created_at));
-      return day >= startDate && day <= endDate;
+      if (day < startDate || day > endDate) return false;
+      if (onlySafety && !h.safety_flag) return false;
+      if (intentBucket === "all") return true;
+      if (h.intencao_detectada === null) return false;
+      return getIntentBucket(h.intencao_detectada) === intentBucket;
     });
-  }, [handoffs, startDate, endDate]);
+  }, [handoffs, startDate, endDate, onlySafety, intentBucket]);
+
+  const hasOperationalFilters = onlySafety || intentBucket !== "all";
+
+  const clearOperationalFilters = () => {
+    setOnlySafety(false);
+    setIntentBucket("all");
+  };
 
   const handleCheckout = async (id: string) => {
     // Investor demo: remove the card locally, no API call.
@@ -446,9 +477,56 @@ export default function HandoffQueuePage() {
         </span>
       </div>
 
+      {/* Operational filters affect cards only; analytics and CSV keep their date scope. */}
+      <div className="rounded-lg border bg-card px-4 py-3 space-y-2">
+        <div className="flex flex-wrap items-end gap-4">
+          <span className="self-center text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+            {t("handoff_filters_label")}
+          </span>
+
+          <label className="flex items-center gap-2 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={onlySafety}
+              onChange={(event) => setOnlySafety(event.target.checked)}
+              aria-describedby="handoff-filter-scope"
+              className="h-4 w-4 rounded border-border accent-destructive cursor-pointer"
+            />
+            <span className="text-sm font-medium">{t("handoff_filter_safety")}</span>
+          </label>
+
+          <div className="space-y-1">
+            <label htmlFor="handoff-intent-filter" className="block text-xs font-medium text-muted-foreground">
+              {t("handoff_filter_intent")}
+            </label>
+            <select
+              id="handoff-intent-filter"
+              value={intentBucket}
+              onChange={(event) => setIntentBucket(event.target.value as "all" | IntentBucket)}
+              aria-describedby="handoff-filter-scope"
+              className="h-8 rounded-md border border-border bg-background px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring cursor-pointer"
+            >
+              <option value="all">{t("handoff_filter_all_intents")}</option>
+              {INTENT_BUCKETS.map((bucket) => (
+                <option key={bucket} value={bucket}>{getBucketLabel(bucket, t)}</option>
+              ))}
+            </select>
+          </div>
+
+          <Button type="button" variant="outline" size="sm" onClick={clearOperationalFilters}>
+            {t("handoff_clear_filters")}
+          </Button>
+        </div>
+        <p id="handoff-filter-scope" className="text-xs text-muted-foreground">
+          {t("handoff_filters_cards_only")}
+        </p>
+      </div>
+
       {/* Queue list */}
       {visibleHandoffs.length === 0 && !loading && (
-        <p className="text-center text-muted-foreground py-12">{t("handoff_empty")}</p>
+        <p className="text-center text-muted-foreground py-12">
+          {hasOperationalFilters ? t("handoff_filtered_empty") : t("handoff_empty")}
+        </p>
       )}
 
       <div className="space-y-3">
@@ -459,6 +537,8 @@ export default function HandoffQueuePage() {
           return (
             <div
               key={item.id}
+              data-testid="handoff-card"
+              data-handoff-id={item.id}
               className={`rounded-xl border border-l-4 bg-card p-4 shadow-sm transition-all duration-300 ${slaBorder(secondsWaiting)} ${isFading ? "opacity-0" : "opacity-100"}`}
             >
               <div className="flex flex-wrap items-center gap-x-4 gap-y-3">
@@ -477,8 +557,12 @@ export default function HandoffQueuePage() {
 
                 {/* Intent */}
                 <div className="min-w-[11rem] text-sm space-y-0.5">
-                  {item.intencao_detectada && (
-                    <p><span className="text-muted-foreground">{t("handoff_intent")}:</span> {item.intencao_detectada}</p>
+                  <p><span className="text-muted-foreground">{t("handoff_intent")}:</span> {item.intencao_detectada ?? "—"}</p>
+                  {item.safety_flag && (
+                    <Badge variant="destructive" className="gap-1" aria-label={t("handoff_safety_marker")}>
+                      <ShieldAlert className="h-3 w-3" aria-hidden="true" />
+                      {t("handoff_safety_marker")}
+                    </Badge>
                   )}
                 </div>
 

@@ -192,6 +192,8 @@ class HandoffRequest(BaseModel):
     tenant_id: UUID
     session_id: UUID
     reason: HandoffReason
+    detected_intent: Optional[str] = None
+    safety_concern: Optional[bool] = None
     urgency: HandoffUrgency = HandoffUrgency.NORMAL
     sector: Optional[HandoffSector] = None
     sla: Optional[HandoffSLA] = None

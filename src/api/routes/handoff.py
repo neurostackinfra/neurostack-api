@@ -6,7 +6,7 @@ Endpoints for human handoff management and webhook configuration.
 import csv
 import io
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -31,7 +31,7 @@ from src.api.schemas.handoff import (
     WebhookTestRequest,
     WebhookTestResponse,
 )
-from src.handoff.models import HandoffStatus, WebhookConfig
+from src.handoff.models import HandoffReason, HandoffStatus, WebhookConfig
 from src.models.handoff import HandoffRecord
 from src.repositories import get_db_session_dependency
 from src.services import (
@@ -50,6 +50,8 @@ from src.config.logging import get_logger
 logger = get_logger(__name__)
 
 router = APIRouter()
+
+_LEGACY_HANDOFF_INTENTS = frozenset(reason.value for reason in HandoffReason)
 
 
 # ============================================
@@ -117,6 +119,42 @@ async def _resolve_queue_tenant(
 # ============================================
 
 
+def _handoff_queue_fields(
+    record: HandoffRecord,
+    *,
+    expose_first_message: bool,
+) -> dict[str, Any]:
+    """Project the fields shared by queue listing and checkout responses."""
+    context_safety = (
+        record.context.get("safety_concern")
+        if isinstance(record.context, dict)
+        else None
+    )
+    safety_flag = (
+        context_safety
+        if type(context_safety) is bool
+        else record.reason == HandoffReason.SAFETY_CONCERN.value
+    )
+    detected_intent = record.intencao_detectada
+    if detected_intent in _LEGACY_HANDOFF_INTENTS:
+        detected_intent = None
+
+    return {
+        "id": record.id,
+        "numero_whatsapp": record.numero_whatsapp,
+        "session_id": record.session_id,
+        "safety_flag": safety_flag,
+        "intencao_detectada": detected_intent,
+        "estagio_atual": record.estagio_atual,
+        "primeira_linha_mensagem": (
+            record.primeira_linha_mensagem if expose_first_message else None
+        ),
+        "created_at": record.created_at,
+        "data_hora_saida": record.data_hora_saida,
+        "status": record.status,
+    }
+
+
 @router.get(
     "/queue",
     response_model=HandoffQueueResponse,
@@ -150,19 +188,9 @@ async def get_handoff_queue(
     result = await db.execute(q)
     records = result.scalars().all()
 
+    # Privacy: never expose the customer's first WhatsApp line (often their name)
     items = [
-        HandoffQueueItem(
-            id=r.id,
-            numero_whatsapp=r.numero_whatsapp,
-            session_id=r.session_id,
-            intencao_detectada=r.intencao_detectada,
-            estagio_atual=r.estagio_atual,
-            # Privacy: never expose the customer's first WhatsApp line (often their name)
-            primeira_linha_mensagem=None,
-            created_at=r.created_at,
-            data_hora_saida=r.data_hora_saida,
-            status=r.status,
-        )
+        HandoffQueueItem(**_handoff_queue_fields(r, expose_first_message=False))
         for r in records
     ]
 
@@ -269,15 +297,7 @@ async def checkout_handoff(
         wait_seconds = (record.data_hora_saida - record.created_at).total_seconds()
 
     return HandoffCheckoutResponse(
-        id=record.id,
-        numero_whatsapp=record.numero_whatsapp,
-        session_id=record.session_id,
-        intencao_detectada=record.intencao_detectada,
-        estagio_atual=record.estagio_atual,
-        primeira_linha_mensagem=record.primeira_linha_mensagem,
-        created_at=record.created_at,
-        data_hora_saida=record.data_hora_saida,
-        status=record.status,
+        **_handoff_queue_fields(record, expose_first_message=True),
         wait_seconds=wait_seconds,
     )
 

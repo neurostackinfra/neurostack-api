@@ -864,6 +864,8 @@ class CognitivePipeline:
             tenant_id=input_data.tenant_id,
             session_id=input_data.session_id,
             reason=reason,
+            detected_intent=srm_decision.intent,
+            safety_concern=srm_decision.safety_concern,
             urgency=urgency,
             sector=sector,
             sla=sla,
