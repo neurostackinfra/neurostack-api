@@ -257,6 +257,55 @@ class TestPostRating:
         assert response.status_code == 422
 
 
+class TestSubmitRatingAnalysisPassthrough:
+    """Endpoint-level tripwire: submit_rating must hand `_analyze_rating_async`
+    the raw inputs it needs to resolve the correct tenant for LLM credentials.
+
+    Today the credential chain (validated `clinic_tenant_id` > `message_id`
+    Event lookup > rater's own tenant) is implemented *inside*
+    `_analyze_rating_async`. A later refactor (Group 2 of the RLHF audit wish)
+    will move that resolution out — likely into the storage layer — and the
+    endpoint will start passing a pre-resolved tenant instead. If that
+    refactor lands and the endpoint stops forwarding the `message_id` /
+    `clinic_tenant_id` inputs (or the resolved equivalent), the credential
+    chain silently regresses.
+
+    A direct call to `_analyze_rating_async` cannot catch this regression:
+    after the refactor a direct call would only prove the function used
+    whatever the test handed it (vacuous). This test is the only place that
+    asserts the wire between `submit_rating` and the analysis routine.
+    """
+
+    def test_submit_rating_forwards_message_id_kwarg_to_analysis(
+        self, client: TestClient, api_key_headers
+    ):
+        submitted = _rating_payload(1, "Resposta fria demais e sem empatia.")
+        with patch(
+            "src.api.routes.rlhf._analyze_rating_async",
+            new=AsyncMock(return_value=None),
+        ) as mock_analyze:
+            response = client.post(
+                "/v1/rlhf/rating",
+                headers=api_key_headers,
+                json=submitted,
+            )
+        assert response.status_code == 200
+        assert mock_analyze.called, "analysis must be scheduled for rating 1+reason"
+
+        # Inspect the exact kwargs the endpoint used to invoke analysis.
+        # asyncio.create_task wraps the coroutine, so the mock is called
+        # once — grab the kwargs of that single call.
+        _, kwargs = mock_analyze.call_args
+        # Tripwire on the input the credential chain hinges on: today the
+        # analysis routine resolves the CLINIC tenant from this message_id
+        # (see rlhf._analyze_rating_async, priority-2 branch). If the
+        # endpoint stops forwarding it, that branch dies silently.
+        assert kwargs.get("message_id") == submitted["message_id"], (
+            "submit_rating must forward message_id so the analysis credential "
+            "chain can resolve the clinic tenant from the originating Event"
+        )
+
+
 # ============================================
 # subject_tenant_id derivation on POST /v1/rlhf/rating
 # ============================================
@@ -323,6 +372,12 @@ class TestSubjectTenantIdDerivation:
     def test_missing_clinic_tenant_id_falls_back_to_event_tenant(
         self, client: TestClient, api_key_headers
     ) -> None:
+        # NOTE (Group 2 update point, RLHF audit wish): the storage refactor
+        # planned for Group 2 will change where subject_tenant_id is derived
+        # (moving the fallback from the route into a repository helper). When
+        # that lands, this test will need its "record owner == event.tenant_id"
+        # invariant re-anchored against the new derivation point rather than
+        # rewritten. Kept here as a deliberate marker; do not silently drop.
         response = client.post(
             "/v1/rlhf/rating",
             headers=api_key_headers,
