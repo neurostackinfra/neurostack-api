@@ -1003,7 +1003,7 @@ class TestSubmitRatingMiddleRungAttribution:
         # past this test's client teardown and poison later tests.
         captured: list[Any] = []
 
-        def _capture(coro):
+        def _capture(coro, name=None):
             captured.append(coro)
 
             async def _already_done() -> None:
@@ -1122,7 +1122,7 @@ class TestAnalysisWritesToRlhfRatingsRow:
         """
         captured: list[Any] = []
 
-        def _capture(coro):
+        def _capture(coro, name=None):
             captured.append(coro)
 
             async def _already_done() -> None:
