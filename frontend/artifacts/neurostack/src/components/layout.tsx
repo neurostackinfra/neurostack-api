@@ -22,7 +22,6 @@ import {
   FolderOpen,
   CreditCard,
   HelpCircle,
-  Briefcase,
   FlaskConical,
   Wrench,
   ChevronDown,
@@ -194,7 +193,6 @@ export function Layout({ children }: LayoutProps) {
 
     { href: "/consultoria",    label: t("nav_consulting"),     icon: Lightbulb,     id: "consultoria",    v: "v2",  hideFor: [] },
     { href: "/midias",         label: t("nav_media"),          icon: FolderOpen,    id: "midias",         v: "v3",  hideFor: ["clinic_admin"] },
-    { href: "/portal-parceiros",label: t("nav_partners"),      icon: Briefcase,     id: "portal-parceiros",v: "v3", hideFor: ["clinic_admin"] },
   ].filter(item => !item.hideFor.includes(role));
 
   const renderSidebarContent = () => (
