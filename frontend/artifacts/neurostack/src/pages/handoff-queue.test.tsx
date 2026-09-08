@@ -123,6 +123,34 @@ afterEach(() => {
 });
 
 describe("<HandoffQueuePage />", () => {
+  it("loads a fetched payload containing estagio_atual without rendering its label or value", async () => {
+    mocks.fetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        items: [{
+          id: "handoff-1",
+          numero_whatsapp: "5511999999999",
+          session_id: "12345678-abcd-4abc-8def-1234567890ab",
+          intencao_detectada: "pedido_preco",
+          estagio_atual: "stage-payload-marker",
+          primeira_linha_mensagem: null,
+          created_at: new Date().toISOString(),
+          data_hora_saida: null,
+          status: "pending",
+          safety_flag: false,
+        }],
+        avg_wait_seconds: 10,
+        pct_within_sla: 90,
+      }),
+    } as Response);
+
+    renderPage();
+
+    expect(await screen.findByText("pedido_preco")).toBeInTheDocument();
+    expect(screen.queryByText("Estágio")).not.toBeInTheDocument();
+    expect(screen.queryByText("stage-payload-marker")).not.toBeInTheDocument();
+  });
+
   it("preserves received order through safety, bucket, AND, and clear without fetching", async () => {
     await renderLoaded();
     const requestCount = mocks.fetch.mock.calls.length;
