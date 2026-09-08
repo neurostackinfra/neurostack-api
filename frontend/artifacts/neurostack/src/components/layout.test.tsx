@@ -764,6 +764,24 @@ describe("<Layout /> investor sales CTA", () => {
   );
 });
 
+describe("<Layout /> roadmap migration", () => {
+  it.each(["builder", "investor", "super_admin"] as const)(
+    "does not expose the former partners portal item to %s",
+    async (role) => {
+      setRole(role);
+      mocks.auth.email = `${role}@example.com`;
+      mocks.auth.clinicId = `${role}-clinic`;
+      mocks.auth.viewingClinicId = `${role}-clinic`;
+
+      renderLayout();
+      await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+
+      expect(screen.queryByTestId("nav-link-portal-parceiros")).not.toBeInTheDocument();
+      expect(screen.queryByText(/Partners Portal|Portal de Parceiros/)).not.toBeInTheDocument();
+    },
+  );
+});
+
 describe("<Layout /> password self-service", () => {
   it("shows the accessible trigger only to builder and clinic admins, then logs out only after its successful request", async () => {
     mocks.fetch.mockImplementation(
