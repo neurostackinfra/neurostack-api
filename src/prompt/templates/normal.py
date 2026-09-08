@@ -1122,6 +1122,14 @@ class NormalTemplate(BaseTemplate):
         # Services section (with prices if available)
         if custom.get("services_detail"):
             section.add("\n## Serviços Oferecidos")
+            section.add(
+                "**Regra de modalidade:** a modalidade informada em cada serviço "
+                "tem precedência sobre o formato geral de atendimento. Quando ela "
+                "não estiver informada, use o formato geral apenas como fallback "
+                "quando for `online` ou `presential`; não infira modalidade para "
+                "`both`, formatos vazios ou históricos. Não invente canais, "
+                "disponibilidade, agendamento ou autorização."
+            )
             section.add(custom["services_detail"])
 
         # Professionals section

@@ -180,7 +180,13 @@ def _source_config(**overrides):
             "dpo_contact": "dpo@example.com",
         },
         "professionals": [{"name": "Dra. Ana", "tags": ["retina"]}],
-        "services": [{"name": "Consulta", "details": {"duration": 60}}],
+        "services": [
+            {
+                "name": "Consulta",
+                "service_format": "online",
+                "details": {"duration": 60},
+            }
+        ],
         "api_credentials": {"llm_api_key": "never-copy-me"},
     }
     values.update(overrides)
@@ -320,12 +326,14 @@ def test_config_clone_is_deeply_independent_and_does_not_use_to_pydantic(monkeyp
     clone["handoff"]["sector_defaults"]["agendamento"] = "rotina"
     clone["professionals"][0]["tags"].append("córnea")
     clone["services"][0]["details"]["duration"] = 30
+    clone["services"][0]["service_format"] = "presential"
 
     assert source.identity["clinic_specialties"] == ["Retina"]
     assert source.operations["business_hours"]["mon"]["open"] == "09:00"
     assert source.handoff["sector_defaults"]["agendamento"] == "imediato"
     assert source.professionals[0]["tags"] == ["retina"]
     assert source.services[0]["details"]["duration"] == 60
+    assert source.services[0]["service_format"] == "online"
 
 
 def test_missing_config_values_use_current_model_defaults():

@@ -9,11 +9,61 @@ interface ClinicProfessional {
   specialty: string;
 }
 
+type ServiceFormat = "online" | "presential" | "both";
+
 interface ClinicService {
   name: string;
   description: string;
   price?: string;
   authority_notes?: string;
+  service_format?: ServiceFormat | null;
+  /** Internal hydration marker; it is deliberately excluded from PATCH bodies. */
+  __legacyServiceString?: string;
+  [key: string]: unknown;
+}
+
+const SERVICE_FORMATS: readonly ServiceFormat[] = ["online", "presential", "both"];
+
+function isServiceFormat(value: unknown): value is ServiceFormat {
+  return typeof value === "string" && SERVICE_FORMATS.includes(value as ServiceFormat);
+}
+
+/**
+ * Legacy string entries need a card in the new UI, but must remain strings in
+ * the persisted array until the person explicitly confirms a modality.
+ */
+function hydrateClinicService(value: unknown): ClinicService {
+  if (typeof value === "string") {
+    return {
+      name: value,
+      description: "",
+      price: "",
+      authority_notes: "",
+      service_format: null,
+      __legacyServiceString: value,
+    };
+  }
+
+  if (isRecord(value)) {
+    return {
+      ...value,
+      name: typeof value.name === "string" ? value.name : "",
+      description: typeof value.description === "string" ? value.description : "",
+      price: typeof value.price === "string" ? value.price : "",
+      authority_notes: typeof value.authority_notes === "string" ? value.authority_notes : "",
+      service_format: isServiceFormat(value.service_format) ? value.service_format : null,
+    };
+  }
+
+  return { name: "", description: "", price: "", authority_notes: "", service_format: null };
+}
+
+function serializeClinicService(service: ClinicService): ClinicService | string {
+  if (service.__legacyServiceString !== undefined && !isServiceFormat(service.service_format)) {
+    return service.__legacyServiceString;
+  }
+  const { __legacyServiceString: _legacyServiceString, ...serialized } = service;
+  return serialized;
 }
 
 import { useToast } from "@/hooks/use-toast";
@@ -177,6 +227,14 @@ export function describeConfigSaveFailure(
   const detailRecord = isRecord(detail) ? detail : null;
   const errorCode = typeof detailRecord?.error === "string" ? detailRecord.error : null;
   const fieldNames = configSaveErrorFieldNames(detail);
+
+  if (errorCode === "service_format_conflict") {
+    return txtForLocale(
+      locale,
+      "A modalidade de um serviço não é compatível com a modalidade geral da clínica. Revise o catálogo.",
+      "A service delivery mode is incompatible with the clinic's overall delivery mode. Review the catalog.",
+    );
+  }
 
   const knownErrors: Record<string, Record<ConfigSaveErrorLocale, string>> = {
     credential_endpoint_required: {
@@ -1119,10 +1177,10 @@ const INVESTOR_MOCK_CONFIG = {
   standby_mode: "active",
   handoff_period: "permanent",
   services: [
-    { name: "Toxina Botulínica (Botox)", description: "Aplicação para rugas dinâmicas na testa, glabela e região dos olhos", price: "R$ 1.200", authority_notes: "Procedimento realizado por Dra. Ana Lima, dermatologista com mais de 500 aplicações bem-sucedidas" },
-    { name: "Preenchimento Labial", description: "Ácido hialurônico para volume e contorno labial", price: "R$ 2.500", authority_notes: "Técnica avançada com produto Juvederm, referência mundial em preenchimento" },
-    { name: "Limpeza de Pele Profunda", description: "Extração, peeling enzimático, máscara calmante e proteção solar", price: "R$ 350", authority_notes: "Protocolo exclusivo desenvolvido pela equipe de estética da clínica" },
-    { name: "Harmonização Facial", description: "Protocolo completo: mandíbula, mento, bigode chinês, olheiras", price: "R$ 4.800", authority_notes: "Realizado por Dr. Carlos Mendes, membro da SBCP com mais de 300 harmonizações" },
+    { name: "Toxina Botulínica (Botox)", description: "Aplicação para rugas dinâmicas na testa, glabela e região dos olhos", price: "R$ 1.200", authority_notes: "Procedimento realizado por Dra. Ana Lima, dermatologista com mais de 500 aplicações bem-sucedidas", service_format: "presential" },
+    { name: "Preenchimento Labial", description: "Ácido hialurônico para volume e contorno labial", price: "R$ 2.500", authority_notes: "Técnica avançada com produto Juvederm, referência mundial em preenchimento", service_format: "presential" },
+    { name: "Limpeza de Pele Profunda", description: "Extração, peeling enzimático, máscara calmante e proteção solar", price: "R$ 350", authority_notes: "Protocolo exclusivo desenvolvido pela equipe de estética da clínica", service_format: "both" },
+    { name: "Consulta de Avaliação", description: "Avaliação inicial para indicar o cuidado mais adequado", price: "R$ 250", authority_notes: "Orientação personalizada pela equipe clínica", service_format: "online" },
   ],
 };
 
@@ -1233,6 +1291,7 @@ export default function ClinicConfig() {
 
   // Tab 5 — Catálogo de Serviços
   const [services, setServices] = useState<ClinicService[]>([]);
+  const [serviceFormatErrors, setServiceFormatErrors] = useState<Record<number, string>>({});
 
 
   useEffect(() => {
@@ -1289,7 +1348,8 @@ export default function ClinicConfig() {
     setMetaMinutosAtendimento(String(config.meta_minutos_atendimento ?? "10"));
     setOnlineServicesDesc(config.online_services_desc ?? "");
     setPresentialServicesDesc(config.presential_services_desc ?? "");
-    setServices(config.services ?? []);
+    setServices(Array.isArray(config.services) ? config.services.map(hydrateClinicService) : []);
+    setServiceFormatErrors({});
     // bot_active: treat null/undefined as true (default on)
     setBotActive(config.bot_active !== false);
   }, [config]);
@@ -1302,11 +1362,19 @@ export default function ClinicConfig() {
     setProfessionals((prev) => prev.map((p, i) => (i === idx ? { ...p, [field]: value } : p)));
 
   const addService = () => {
-    setServices((prev) => [...prev, { name: "", description: "", price: "", authority_notes: "" }]);
+    setServices((prev) => [...prev, { name: "", description: "", price: "", authority_notes: "", service_format: null }]);
   };
-  const removeService = (idx: number) => setServices((prev) => prev.filter((_, i) => i !== idx));
-  const updateService = (idx: number, field: keyof ClinicService, value: string) =>
+  const removeService = (idx: number) => {
+    setServices((prev) => prev.filter((_, i) => i !== idx));
+    setServiceFormatErrors({});
+  };
+  const updateService = (idx: number, field: keyof ClinicService, value: string | ServiceFormat | null) => {
     setServices((prev) => prev.map((s, i) => (i === idx ? { ...s, [field]: value } : s)));
+    setServiceFormatErrors((prev) => {
+      const { [idx]: _resolved, ...remaining } = prev;
+      return remaining;
+    });
+  };
 
   const handleBotToggle = async (newValue: boolean) => {
     setIsTogglingBot(true);
@@ -1444,12 +1512,41 @@ export default function ClinicConfig() {
     }
     setBusinessHoursErrors({});
 
+    const serviceValidationErrors: Record<number, string> = {};
+    for (const [index, service] of services.entries()) {
+      if (!service.name.trim()) continue;
+      if (!isServiceFormat(service.service_format)) {
+        serviceValidationErrors[index] = txt(
+          "Confirme a modalidade deste serviço antes de salvar.",
+          "Confirm this service's delivery mode before saving.",
+        );
+      } else if (isServiceFormat(serviceFormat) && serviceFormat !== "both" && service.service_format !== serviceFormat) {
+        serviceValidationErrors[index] = txt(
+          "A modalidade deste serviço não é compatível com a modalidade geral da clínica.",
+          "This service's delivery mode is incompatible with the clinic's overall delivery mode.",
+        );
+      }
+    }
+    if (Object.keys(serviceValidationErrors).length > 0) {
+      setServiceFormatErrors(serviceValidationErrors);
+      toast({
+        title: txt("Revise as modalidades dos serviços.", "Review service delivery modes."),
+        description: txt(
+          "Confirme a modalidade de cada serviço e verifique a modalidade geral da clínica.",
+          "Confirm each service's delivery mode and check the clinic's overall delivery mode.",
+        ),
+        variant: "destructive",
+      });
+      return;
+    }
+    setServiceFormatErrors({});
+
     setIsSaving(true);
     const payload: Record<string, any> = {
       clinic_name: clinicName.trim(),
       agent_name: agentName.trim(),
       differentials: differentials.trim(),
-      services: services.filter((s) => s.name.trim()),
+      services: services.filter((s) => s.name.trim()).map(serializeClinicService),
       pricing_mode: "consult_only",
       main_domain: mainDomain || null,
       agent_presentation: agentPresentation || null,
@@ -2606,6 +2703,31 @@ export default function ClinicConfig() {
                       />
                     </Field>
                   </div>
+
+                  <Field label={txt("Modalidade", "Delivery mode")}>
+                    <Select
+                      value={service.service_format ?? ""}
+                      onValueChange={(value) => updateService(idx, "service_format", value as ServiceFormat)}
+                      disabled={isReadOnly}
+                    >
+                      <SelectTrigger
+                        className="h-8 text-sm"
+                        data-testid={`select-service-format-${idx}`}
+                      >
+                        <SelectValue placeholder={txt("Confirme a modalidade", "Confirm delivery mode")} />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="online">{txt("Online", "Online")}</SelectItem>
+                        <SelectItem value="presential">{txt("Presencial", "In person")}</SelectItem>
+                        <SelectItem value="both">{txt("Online e Presencial", "Online and In person")}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    {serviceFormatErrors[idx] && (
+                      <p className="text-xs text-destructive" data-testid={`service-format-error-${idx}`}>
+                        {serviceFormatErrors[idx]}
+                      </p>
+                    )}
+                  </Field>
 
                   <Field label={t("config_desc_label")}>
                     <Textarea
