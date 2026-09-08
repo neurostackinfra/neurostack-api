@@ -21,7 +21,6 @@ export const en = {
   nav_consulting: "Commercial Consulting",
   nav_media: "Media & Assets",
   nav_billing: "Subscription & Billing",
-  nav_voice: "Voice Intelligence",
   investor_sales_cta: "Talk to sales",
   badge_coming_soon: "Coming soon",
   builder_roadmap_certification_title: "NeuroStack certification and co-branding",
