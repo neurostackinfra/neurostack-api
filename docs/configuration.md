@@ -14,7 +14,8 @@ Este documento descreve onde e como as informações de configuração do tenant
 3. [ClinicConfig (configuração da clínica)](#clinicconfig-configuração-da-clínica)
 4. [Valores permitidos (enums)](#valores-permitidos-enums)
 5. [Exemplo completo](#exemplo-completo)
-6. [Uso no pipeline](#uso-no-pipeline)
+6. [Modalidades dos serviços](#modalidades-dos-serviços)
+7. [Uso no pipeline](#uso-no-pipeline)
 
 ---
 
@@ -148,6 +149,83 @@ A chave `clinic_config` contém a configuração usada pelo SRM, Policy, CTX e H
 | `prioritario` | Prioridade alta |
 | `rotina` | Rotina |
 
+## Modalidades dos serviços
+
+O endpoint administrativo `PATCH /v1/config` recebe um corpo **plano**.
+`service_format` é o formato global da clínica e `services` substitui o array
+inteiro. Cada item de serviço pode ser um objeto extensível ou uma string
+legada. Em objetos, `service_format` aceita somente `online`, `presential` ou
+`both`; a ausência e `null` permanecem compatíveis com dados existentes.
+Omitir `services` preserva o catálogo atual; `services: []` o substitui por uma
+lista vazia; e `services: null` persiste `null`. GET e PATCH retornam o último
+caso como `services: []`, pois a resposta plana apresenta o catálogo como
+array. Strings legadas, por exemplo `"Retorno"`, continuam aceitas.
+
+```json
+{
+  "service_format": "both",
+  "services": [
+    {
+      "name": "Consulta por vídeo",
+      "service_format": "online",
+      "frontend_metadata": {"color": "blue"}
+    },
+    "Retorno"
+  ]
+}
+```
+
+O armazenamento usa a representação aninhada `operations.service_format` e a
+coluna JSON `services`; ela não é o formato do request da API. A resposta 200
+também é plana e preserva os campos extras do item:
+
+```json
+{
+  "service_format": "both",
+  "services": [
+    {
+      "name": "Consulta por vídeo",
+      "service_format": "online",
+      "frontend_metadata": {"color": "blue"}
+    },
+    "Retorno"
+  ]
+}
+```
+
+Um serviço incompatível retorna 422 com um detalhe estável, sem ecoar nomes ou
+descrições de serviços:
+
+```json
+{
+  "detail": {
+    "error": "service_format_conflict",
+    "message": "One or more service modalities are incompatible with the clinic service format.",
+    "clinic_service_format": "online",
+    "allowed_service_formats": ["online"],
+    "conflicts": [{"index": 1, "service_format": "presential"}],
+    "action": "Change the listed service modalities or broaden the clinic service format."
+  }
+}
+```
+
+### Compatibilidade e fallback no contexto da IA
+
+| Formato global canônico | Modalidades permitidas nos objetos de serviço | Fallback para serviço sem modalidade |
+|-------|-------|-------|
+| `online` | `online` | `online` |
+| `presential` | `presential` | `presential` |
+| `both` | `online`, `presential`, `both` | nenhum |
+| vazio ou histórico | não impõe validação cruzada | nenhum |
+
+A modalidade explícita do serviço sempre prevalece sobre a global. O contexto
+da IA não infere canal para `both`, formato vazio ou legado e não declara
+disponibilidade, agendamento ou autorização. A validação cruzada só roda em
+PATCH que contenha `services` ou `service_format`; um PATCH sem esses campos
+não reinterpreta dados históricos. `services: []` grava uma lista vazia e
+`services: null` é mantido como nulo na persistência, embora GET/PATCH o
+retornem como `services: []`.
+
 ---
 
 ## Exemplo completo
@@ -209,7 +287,20 @@ Trecho principal:
         "urgencia": "imediato",
         "fidelizacao": "rotina"
       }
-    }
+    },
+    "operations": {
+      "service_format": "both"
+    },
+    "services": [
+      {
+        "name": "Consulta por vídeo",
+        "service_format": "online"
+      },
+      {
+        "name": "Avaliação presencial",
+        "service_format": "presential"
+      }
+    ]
   }
 }
 ```

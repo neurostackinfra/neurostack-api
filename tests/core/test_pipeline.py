@@ -589,6 +589,64 @@ class TestWorkingHoursProvenance:
         assert _find_working_hours_source(result.context_sources) is None
 
 
+class TestServiceModalityPromptContext:
+    @pytest.mark.asyncio
+    async def test_explicit_service_modality_overrides_global_and_legacy_falls_back(
+        self, tenant_id, session_id
+    ):
+        result = await CognitivePipeline().process(
+            PipelineInput(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                message="Quais atendimentos vocês oferecem?",
+                channel="whatsapp",
+                clinic_config={
+                    "operations": {"service_format": "online"},
+                    "services": [
+                        {
+                            "name": "Consulta especializada",
+                            "service_format": "presential",
+                        },
+                        {"name": "Acompanhamento", "service_format": "both"},
+                        {"name": "Retorno"},
+                        "Triagem",
+                    ],
+                },
+            )
+        )
+
+        assert "Consulta especializada [Modalidade: presencial]" in result.system_prompt
+        assert (
+            "Acompanhamento [Modalidade: online e presencial]" in result.system_prompt
+        )
+        assert "Retorno [Modalidade: online]" in result.system_prompt
+        assert "Triagem [Modalidade: online]" in result.system_prompt
+        assert (
+            "modalidade informada em cada serviço tem precedência"
+            in result.system_prompt
+        )
+
+    @pytest.mark.asyncio
+    async def test_both_and_historical_global_formats_do_not_infer_legacy_modality(
+        self, tenant_id, session_id
+    ):
+        for clinic_service_format in ("both", "presencial e online", ""):
+            result = await CognitivePipeline().process(
+                PipelineInput(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    message="Quais atendimentos vocês oferecem?",
+                    channel="whatsapp",
+                    clinic_config={
+                        "operations": {"service_format": clinic_service_format},
+                        "services": ["Triagem"],
+                    },
+                )
+            )
+
+            assert "Triagem [Modalidade:" not in result.system_prompt
+
+
 class TestConvenienceFunctions:
     """Tests for convenience functions."""
 

@@ -48,6 +48,22 @@
         "urgencia": "imediato",
         "fidelizacao": "rotina"
       }
-    }
+    },
+    "operations": {
+      "service_format": "both"
+    },
+    "services": [
+      {
+        "name": "Consulta por vídeo",
+        "service_format": "online",
+        "frontend_metadata": {
+          "color": "blue"
+        }
+      },
+      {
+        "name": "Avaliação presencial",
+        "service_format": "presential"
+      }
+    ]
   }
 }
