@@ -557,9 +557,7 @@ export default function HandoffQueuePage() {
 
                 {/* Intent */}
                 <div className="min-w-[11rem] text-sm space-y-0.5">
-                  {item.intencao_detectada && (
-                    <p><span className="text-muted-foreground">{t("handoff_intent")}:</span> {item.intencao_detectada}</p>
-                  )}
+                  <p><span className="text-muted-foreground">{t("handoff_intent")}:</span> {item.intencao_detectada ?? "—"}</p>
                   {item.safety_flag && (
                     <Badge variant="destructive" className="gap-1" aria-label={t("handoff_safety_marker")}>
                       <ShieldAlert className="h-3 w-3" aria-hidden="true" />
