@@ -21,7 +21,6 @@ export const en = {
   nav_consulting: "Commercial Consulting",
   nav_media: "Media & Assets",
   nav_billing: "Subscription & Billing",
-  nav_voice: "Voice Intelligence",
   nav_partners: "Partners Portal",
   investor_sales_cta: "Talk to sales",
   badge_coming_soon: "Coming soon",
