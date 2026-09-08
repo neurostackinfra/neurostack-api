@@ -18,6 +18,8 @@ from sqlalchemy import select
 
 from src.config.settings import settings
 from src.models.event import Event
+from src.models.rlhf_audit_review import RlhfAuditReview
+from src.models.rlhf_rating import RlhfRating
 from src.models.tenant import Tenant
 from src.repositories import get_db_session
 from tests.conftest import _keep_event_loop_responsive
@@ -135,7 +137,7 @@ class TestRatingAnalysisSupervisor:
         ):
             rlhf.spawn(
                 rlhf._analyze_rating_async(
-                    event_id=uuid4(),
+                    rating_id=uuid4(),
                     rating=1,
                     reason="motivo válido",
                     agent_response="Ok.",
@@ -251,7 +253,7 @@ class TestPostRating:
         assert response.status_code == 200
         data = response.json()
         assert data["ok"] is True
-        assert UUID(data["event_id"])
+        assert UUID(data["rating_id"])
 
     def test_low_rating_with_reason_schedules_analysis(
         self, client: TestClient, api_key_headers
@@ -266,7 +268,7 @@ class TestPostRating:
                 json=_rating_payload(1, "Resposta fria demais"),
             )
         assert response.status_code == 200
-        event_id = response.json()["event_id"]
+        event_id = response.json()["rating_id"]
 
         # The event body was created; verify status was set to pending by
         # re-fetching via the listing endpoint
@@ -292,7 +294,7 @@ class TestPostRating:
                 json=_rating_payload(1, reason=None),
             )
         assert response.status_code == 200
-        event_id = response.json()["event_id"]
+        event_id = response.json()["rating_id"]
 
         list_resp = client.get("/v1/rlhf/ratings", headers=api_key_headers)
         matched = [e for e in list_resp.json()["entries"] if e["id"] == event_id]
@@ -320,7 +322,7 @@ class TestPostRating:
                 json=_rating_payload(3, "Faltou empatia aqui."),
             )
         assert response.status_code == 200
-        event_id = response.json()["event_id"]
+        event_id = response.json()["rating_id"]
 
         list_resp = client.get("/v1/rlhf/ratings", headers=api_key_headers)
         matched = [e for e in list_resp.json()["entries"] if e["id"] == event_id]
@@ -343,7 +345,7 @@ class TestPostRating:
                 json=_rating_payload(3, "abcdefg"),
             )
         assert response.status_code == 200
-        event_id = response.json()["event_id"]
+        event_id = response.json()["rating_id"]
 
         list_resp = client.get("/v1/rlhf/ratings", headers=api_key_headers)
         matched = [e for e in list_resp.json()["entries"] if e["id"] == event_id]
@@ -381,7 +383,7 @@ class TestPostRating:
                 json=_rating_payload(4, "Elogio detalhado e substantivo."),
             )
         assert response.status_code == 200
-        event_id = response.json()["event_id"]
+        event_id = response.json()["rating_id"]
 
         list_resp = client.get("/v1/rlhf/ratings", headers=api_key_headers)
         matched = [e for e in list_resp.json()["entries"] if e["id"] == event_id]
@@ -403,6 +405,89 @@ class TestPostRating:
             json=_rating_payload(6),
         )
         assert response.status_code == 422
+
+
+class TestSubmitRatingAnalysisPassthrough:
+    """Endpoint-level tripwire (updated for Group 2 of the RLHF audit
+    wish): ``submit_rating`` must hand ``_analyze_rating_async`` the
+    ALREADY-RESOLVED ``Event`` row — not a raw ``message_id``.
+
+    After the Group 2 port, the ``message_id -> Event`` resolution moved
+    OUT of ``_analyze_rating_async`` and INTO ``submit_rating``. The
+    analysis routine no longer issues its own DB query; it consumes the
+    resolved event via the ``resolved_event`` kwarg. If the endpoint
+    stops forwarding the resolved event (or, worse, refactors back to
+    forwarding the raw ``message_id`` and reintroduces the query inside
+    analysis), the middle rung of the credential chain silently
+    regresses.
+
+    Rigor: this test asserts on the actual kwarg value, never just
+    ``mock_analyze.called``. The rigor bar is the same as the pre-port
+    tripwire; only the expected kwarg changed.
+
+    The rung-2 END-TO-END guarantee — that a resolvable ``message_id``
+    causes ``_load_runtime_llm_credentials`` to see the resolved event's
+    ``tenant_id`` — is proven separately in
+    ``TestSubmitRatingMiddleRungAttribution``.
+    """
+
+    def test_submit_rating_forwards_resolved_event_kwarg_to_analysis(
+        self, client: TestClient, api_key_headers
+    ):
+        # Seed an Event so message_id resolves to it — the tripwire proves
+        # the endpoint forwards THIS resolved row, not the raw message_id.
+        original_event_id = uuid4()
+        original_tenant_id = uuid4()
+
+        async def _seed_original() -> None:
+            session = get_db_session()
+            try:
+                session.add(
+                    Event(
+                        id=original_event_id,
+                        tenant_id=original_tenant_id,
+                        session_id=None,
+                        event_type="message.in",
+                        event_data={},
+                        event_metadata={},
+                    )
+                )
+                await session.commit()
+            finally:
+                await session.close()
+
+        client._submit(_seed_original())
+
+        submitted = _rating_payload(1, "Resposta fria demais e sem empatia.")
+        submitted["message_id"] = str(original_event_id)
+
+        with patch(
+            "src.api.routes.rlhf._analyze_rating_async",
+            new=AsyncMock(return_value=None),
+        ) as mock_analyze:
+            response = client.post(
+                "/v1/rlhf/rating",
+                headers=api_key_headers,
+                json=submitted,
+            )
+        assert response.status_code == 200
+        assert mock_analyze.called, "analysis must be scheduled for rating 1+reason"
+
+        _, kwargs = mock_analyze.call_args
+        # Tripwire: submit_rating must pass the resolved Event, not the
+        # raw message_id string. This asserts on the actual kwarg value
+        # (Event.id / Event.tenant_id) — never just ``.called``.
+        resolved = kwargs.get("resolved_event")
+        assert resolved is not None, (
+            "submit_rating must forward the already-resolved Event so the "
+            "analysis credential chain's middle rung stays wired end-to-end"
+        )
+        assert resolved.id == original_event_id
+        assert resolved.tenant_id == original_tenant_id
+        # And prove the pre-port kwarg is gone: forwarding message_id would
+        # let analysis re-query (the exact regression this tripwire guards
+        # against per Group 2, deliverable 9).
+        assert "message_id" not in kwargs
 
 
 # ============================================
@@ -427,22 +512,39 @@ async def _seed_tenant(tenant_id: UUID) -> None:
         await session.close()
 
 
-async def _load_event(event_id: UUID) -> Event:
+async def _load_rating(rating_id: UUID) -> RlhfRating:
+    """Read back the RlhfRating row so tests can assert on real columns
+    (tenant_id, subject_tenant_id, channel, trace pair) — the ports in
+    Group 2 replaced the Event/event_data blob with typed columns.
+    """
     session = get_db_session()
     try:
-        result = await session.execute(select(Event).where(Event.id == event_id))
+        result = await session.execute(
+            select(RlhfRating).where(RlhfRating.id == rating_id)
+        )
         return result.scalar_one()
     finally:
         await session.close()
 
 
 class TestSubjectTenantIdDerivation:
-    """Group 3 wish/rating-audit-report: submit_rating must record which
-    clinic the rating is *about* (subject_tenant_id) so the per-clinic
-    filter on the audit report (Group 4) resolves to a real tenant.
+    """Group 2 (RLHF audit wish) updates Group 3's attribution tests to the
+    new three-rung ``subject_tenant_id`` chain implemented on the
+    ``rlhf_ratings`` port:
 
-    Event.tenant_id (record owner = rater's tenant) is NEVER mutated by
-    this feature — only a new key inside event_data is added.
+    1. Validated ``clinic_tenant_id`` (must parse as UUID AND exist in Tenant).
+    2. ``resolved_event.tenant_id`` — the tenant that owns the Event that
+       ``message_id`` resolved to.
+    3. ``tenant_id`` — the submitter's own tenant, final fallback.
+
+    The record-owner column (``RlhfRating.tenant_id``) is NEVER mutated by
+    this feature; only the ``subject_tenant_id`` column is derived.
+
+    ``_rating_payload`` uses non-UUID ``message_id`` values
+    (``msg-<hex>``), so rung 2 never fires in this class — that middle
+    rung is proven end-to-end in
+    ``TestSubmitRatingMiddleRungAttribution`` below. Kept here to cover
+    the top and bottom rungs against the endpoint.
     """
 
     def test_valid_uuid_existing_tenant_is_persisted_as_subject(
@@ -460,29 +562,36 @@ class TestSubjectTenantIdDerivation:
             json=payload,
         )
         assert response.status_code == 200
-        event_id = UUID(response.json()["event_id"])
+        rating_id = UUID(response.json()["rating_id"])
 
-        event = client._submit(_load_event(event_id))
-        # Event.tenant_id stays the rater's tenant (the record owner).
-        assert event.tenant_id == TEST_TENANT_ID
+        row = client._submit(_load_rating(rating_id))
+        # RlhfRating.tenant_id stays the rater's tenant (the record owner).
+        assert row.tenant_id == TEST_TENANT_ID
         # subject_tenant_id captures the clinic the rating describes.
-        assert event.event_data["subject_tenant_id"] == str(subject_id)
+        assert row.subject_tenant_id == subject_id
 
-    def test_missing_clinic_tenant_id_falls_back_to_event_tenant(
+    def test_missing_clinic_tenant_id_falls_back_to_submitter_tenant(
         self, client: TestClient, api_key_headers
     ) -> None:
+        # Deliberately updated for Group 2 (RLHF audit wish, deliverable 8):
+        # the ``event_data`` blob is gone; subject_tenant_id is a typed
+        # column, and the three-rung derivation lives in ``submit_rating``.
+        # With no ``clinic_tenant_id`` and a non-UUID ``message_id`` (the
+        # ``_rating_payload`` default), rungs 1 and 2 both miss and the
+        # attribution correctly falls to rung 3 — the submitter's tenant.
         response = client.post(
             "/v1/rlhf/rating",
             headers=api_key_headers,
             json=_rating_payload(5),
         )
         assert response.status_code == 200
-        event_id = UUID(response.json()["event_id"])
+        rating_id = UUID(response.json()["rating_id"])
 
-        event = client._submit(_load_event(event_id))
-        assert event.tenant_id == TEST_TENANT_ID
-        # No clinic_tenant_id provided → subject equals record owner.
-        assert event.event_data["subject_tenant_id"] == str(event.tenant_id)
+        row = client._submit(_load_rating(rating_id))
+        assert row.tenant_id == TEST_TENANT_ID
+        # No clinic_tenant_id, no resolvable message_id → subject equals
+        # the record owner (rung 3).
+        assert row.subject_tenant_id == row.tenant_id
 
     def test_non_uuid_clinic_tenant_id_falls_back_and_is_not_persisted(
         self, client: TestClient, api_key_headers
@@ -498,14 +607,16 @@ class TestSubjectTenantIdDerivation:
             json=payload,
         )
         assert response.status_code == 200
-        event_id = UUID(response.json()["event_id"])
+        rating_id = UUID(response.json()["rating_id"])
 
-        event = client._submit(_load_event(event_id))
-        assert event.tenant_id == TEST_TENANT_ID
-        # Fallback to rater's tenant …
-        assert event.event_data["subject_tenant_id"] == str(event.tenant_id)
-        # … and the raw slug is not persisted anywhere in the event body.
-        assert "acme-clinic" not in str(event.event_data.values())
+        row = client._submit(_load_rating(rating_id))
+        assert row.tenant_id == TEST_TENANT_ID
+        # Fallback to rater's tenant (rung 3 — non-UUID also fails rung 1
+        # and the default non-UUID message_id fails rung 2).
+        assert row.subject_tenant_id == row.tenant_id
+        # The raw slug is not stored anywhere on the row.
+        assert row.message_id != "acme-clinic"
+        assert row.reason != "acme-clinic"
 
     def test_valid_uuid_non_existing_tenant_falls_back(
         self, client: TestClient, api_key_headers
@@ -522,13 +633,580 @@ class TestSubjectTenantIdDerivation:
             json=payload,
         )
         assert response.status_code == 200
-        event_id = UUID(response.json()["event_id"])
+        rating_id = UUID(response.json()["rating_id"])
 
-        event = client._submit(_load_event(event_id))
-        assert event.tenant_id == TEST_TENANT_ID
-        # Existence check must reject dangling UUIDs and fall back.
-        assert event.event_data["subject_tenant_id"] == str(event.tenant_id)
-        assert event.event_data["subject_tenant_id"] != str(orphan_id)
+        row = client._submit(_load_rating(rating_id))
+        assert row.tenant_id == TEST_TENANT_ID
+        # Existence check must reject dangling UUIDs and fall through
+        # (rung 2 also misses — non-UUID message_id — so rung 3 wins).
+        assert row.subject_tenant_id == row.tenant_id
+        assert row.subject_tenant_id != orphan_id
+
+
+# ============================================
+# Group 2: channel + trace pair resolution on POST /v1/rlhf/rating
+# ============================================
+
+
+async def _seed_event(
+    event_id: UUID, tenant_id: UUID, event_type: str = "message.in"
+) -> None:
+    """Insert a single Event row so message_id can resolve to it during
+    ``submit_rating``'s ``_resolve_message_context`` call.
+    """
+    session = get_db_session()
+    try:
+        session.add(
+            Event(
+                id=event_id,
+                tenant_id=tenant_id,
+                session_id=None,
+                event_type=event_type,
+                event_data={},
+                event_metadata={},
+            )
+        )
+        await session.commit()
+    finally:
+        await session.close()
+
+
+class TestChannelAndTracePairResolution:
+    """Group 2 (RLHF audit wish, deliverables 2, 3, 6): ``submit_rating``
+    resolves ``message_id -> Event`` synchronously and writes ``channel``
+    + ``trace_event_id`` + ``trace_tenant_id`` on the ``rlhf_ratings``
+    row at submission time. The trace pair is filled ONLY when the
+    resolved event is ``message.in`` — never with divergent nullness.
+    """
+
+    def test_message_in_writes_whatsapp_and_populates_trace_pair(
+        self, client: TestClient, api_key_headers
+    ) -> None:
+        trace_owner = uuid4()
+        trace_event_id = uuid4()
+        client._submit(_seed_tenant_full(trace_owner, "WhatsApp Trace Owner"))
+        client._submit(_seed_event(trace_event_id, trace_owner, "message.in"))
+
+        payload = _rating_payload(4)
+        payload["message_id"] = str(trace_event_id)
+        response = client.post("/v1/rlhf/rating", headers=api_key_headers, json=payload)
+        assert response.status_code == 200
+        row = client._submit(_load_rating(UUID(response.json()["rating_id"])))
+        assert row.channel == "whatsapp"
+        assert row.trace_event_id == trace_event_id
+        assert row.trace_tenant_id == trace_owner
+
+    def test_srm_decision_writes_web_with_null_trace_pair(
+        self, client: TestClient, api_key_headers
+    ) -> None:
+        srm_owner = uuid4()
+        srm_event_id = uuid4()
+        client._submit(_seed_tenant_full(srm_owner, "SRM Owner"))
+        client._submit(_seed_event(srm_event_id, srm_owner, "srm.decision"))
+
+        payload = _rating_payload(4)
+        payload["message_id"] = str(srm_event_id)
+        response = client.post("/v1/rlhf/rating", headers=api_key_headers, json=payload)
+        assert response.status_code == 200
+        row = client._submit(_load_rating(UUID(response.json()["rating_id"])))
+        assert row.channel == "web"
+        assert row.trace_event_id is None
+        assert row.trace_tenant_id is None
+
+    def test_non_uuid_message_id_writes_web_with_null_trace_pair(
+        self, client: TestClient, api_key_headers
+    ) -> None:
+        # ``_rating_payload`` already uses a non-UUID ``msg-<hex>`` id, but
+        # be explicit so the assertion documents the case. Rating 4 avoids
+        # scheduling background analysis (which would leak as an unawaited
+        # asyncio.Task during teardown — see conftest's task-leak guard).
+        payload = _rating_payload(4)
+        payload["message_id"] = "msg-simulator-frontend"
+        response = client.post("/v1/rlhf/rating", headers=api_key_headers, json=payload)
+        assert response.status_code == 200
+        row = client._submit(_load_rating(UUID(response.json()["rating_id"])))
+        assert row.channel == "web"
+        assert row.trace_event_id is None
+        assert row.trace_tenant_id is None
+
+    def test_orphan_uuid_message_id_writes_unknown_with_null_trace_pair(
+        self, client: TestClient, api_key_headers
+    ) -> None:
+        payload = _rating_payload(4)
+        # Well-formed UUID, no Event row matches it.
+        payload["message_id"] = str(uuid4())
+        response = client.post("/v1/rlhf/rating", headers=api_key_headers, json=payload)
+        assert response.status_code == 200
+        row = client._submit(_load_rating(UUID(response.json()["rating_id"])))
+        assert row.channel == "unknown"
+        assert row.trace_event_id is None
+        assert row.trace_tenant_id is None
+
+    def test_resolved_event_with_unknown_channel_writes_unknown(
+        self, client: TestClient, api_key_headers
+    ) -> None:
+        """AC: a resolved event with no known channel writes
+        ``channel='unknown'``. Any event type outside ``message.in`` /
+        ``srm.decision`` maps here — silently mapping to ``web`` or
+        ``whatsapp`` would misattribute the audit report.
+        """
+        owner = uuid4()
+        event_id = uuid4()
+        client._submit(_seed_tenant_full(owner, "Handoff Owner"))
+        client._submit(_seed_event(event_id, owner, "handoff.request"))
+
+        payload = _rating_payload(4)
+        payload["message_id"] = str(event_id)
+        response = client.post("/v1/rlhf/rating", headers=api_key_headers, json=payload)
+        assert response.status_code == 200
+        row = client._submit(_load_rating(UUID(response.json()["rating_id"])))
+        assert row.channel == "unknown"
+        assert row.trace_event_id is None
+        assert row.trace_tenant_id is None
+
+    def test_resolution_failure_fails_open_to_unknown(
+        self, client: TestClient, api_key_headers
+    ) -> None:
+        """AC (deliverable 7): if resolution raises, the rating still
+        persists with ``channel='unknown'`` and a null trace pair. We
+        patch ``_resolve_message_context`` to raise; the endpoint must
+        catch and continue.
+        """
+        boom = RuntimeError("resolver blew up")
+        with patch(
+            "src.api.routes.rlhf._resolve_message_context",
+            new=AsyncMock(side_effect=boom),
+        ):
+            payload = _rating_payload(4)
+            response = client.post(
+                "/v1/rlhf/rating", headers=api_key_headers, json=payload
+            )
+        assert response.status_code == 200
+        row = client._submit(_load_rating(UUID(response.json()["rating_id"])))
+        assert row.channel == "unknown"
+        assert row.trace_event_id is None
+        assert row.trace_tenant_id is None
+
+    def test_clinic_tenant_id_takes_precedence_over_message_id_resolution(
+        self, client: TestClient, api_key_headers
+    ) -> None:
+        """AC: a valid ``clinic_tenant_id`` wins over ``message_id``
+        resolution for ``subject_tenant_id``, AND the trace pair still
+        reflects the resolved event (rung-1 precedence is orthogonal to
+        the trace-link deliverable — Group 6 needs both).
+        """
+        clinic_id = uuid4()
+        trace_owner = uuid4()
+        trace_event_id = uuid4()
+        client._submit(_seed_tenant_full(clinic_id, "Clinic Winner"))
+        client._submit(_seed_tenant_full(trace_owner, "Trace Owner"))
+        client._submit(_seed_event(trace_event_id, trace_owner, "message.in"))
+
+        payload = _rating_payload(4)
+        payload["message_id"] = str(trace_event_id)
+        payload["clinic_tenant_id"] = str(clinic_id)
+        response = client.post("/v1/rlhf/rating", headers=api_key_headers, json=payload)
+        assert response.status_code == 200
+        row = client._submit(_load_rating(UUID(response.json()["rating_id"])))
+        # Subject is clinic_tenant_id (rung 1) even though message_id
+        # resolves to a foreign owner.
+        assert row.subject_tenant_id == clinic_id
+        # But the trace pair still points at the resolved event's owner,
+        # so Group 6's "View trace" link stays honest.
+        assert row.channel == "whatsapp"
+        assert row.trace_event_id == trace_event_id
+        assert row.trace_tenant_id == trace_owner
+
+    def test_middle_rung_subject_uses_resolved_event_tenant(
+        self, client: TestClient, api_key_headers
+    ) -> None:
+        """AC: a rating with no ``clinic_tenant_id`` whose ``message_id``
+        resolves writes ``subject_tenant_id = Event.tenant_id`` (rung 2).
+        """
+        trace_owner = uuid4()
+        trace_event_id = uuid4()
+        client._submit(_seed_tenant_full(trace_owner, "Resolved Owner"))
+        client._submit(_seed_event(trace_event_id, trace_owner, "message.in"))
+
+        payload = _rating_payload(4)
+        payload["message_id"] = str(trace_event_id)
+        response = client.post("/v1/rlhf/rating", headers=api_key_headers, json=payload)
+        assert response.status_code == 200
+        row = client._submit(_load_rating(UUID(response.json()["rating_id"])))
+        # Rung 2: no clinic_tenant_id → subject inherits from resolved event.
+        assert row.subject_tenant_id == trace_owner
+
+    def test_simulator_clinic_tenant_id_wins_when_message_id_orphaned(
+        self, client: TestClient, api_key_headers
+    ) -> None:
+        """AC: a rating from the simulator with
+        ``clinic_tenant_id=effectiveTenantId`` writes that value as
+        ``subject_tenant_id`` even when ``message_id`` resolution fails
+        (orphaned UUID). Proves rung 1 fires INDEPENDENTLY of rung 2's
+        outcome — the simulator's frontend id must never leak the
+        attribution to ``unknown``.
+        """
+        effective_id = uuid4()
+        client._submit(_seed_tenant_full(effective_id, "Simulator Tenant"))
+
+        payload = _rating_payload(4)
+        payload["clinic_tenant_id"] = str(effective_id)
+        payload["message_id"] = str(uuid4())  # orphaned UUID
+        response = client.post("/v1/rlhf/rating", headers=api_key_headers, json=payload)
+        assert response.status_code == 200
+        row = client._submit(_load_rating(UUID(response.json()["rating_id"])))
+        assert row.subject_tenant_id == effective_id
+        # Channel reflects the failed resolution — trace pair stays null
+        # because there's no Event to link to.
+        assert row.channel == "unknown"
+        assert row.trace_event_id is None
+        assert row.trace_tenant_id is None
+
+
+class TestNoRlhfRatingEventEverWritten:
+    """AC: no new ``rlhf.rating`` row ever appears in ``events`` after
+    the Group 2 port. This is the tripwire the port hinges on — a
+    lingering write to ``events`` would silently keep the old audit
+    surface alive.
+    """
+
+    def test_submit_rating_never_writes_rlhf_rating_event_row(
+        self, client: TestClient, api_key_headers
+    ) -> None:
+        async def _count_rlhf_events() -> int:
+            session = get_db_session()
+            try:
+                from sqlalchemy import func
+
+                result = await session.execute(
+                    select(func.count(Event.id)).where(
+                        Event.event_type == "rlhf.rating"
+                    )
+                )
+                return int(result.scalar_one())
+            finally:
+                await session.close()
+
+        before = client._submit(_count_rlhf_events())
+        # Submit a rating that would have triggered analysis under the old
+        # write path (rating 1 + reason), plus a plain neutral one.
+        # ``_analyze_rating_async`` is mocked so no unmocked LLM path
+        # leaks a background task past this test's client teardown — the
+        # tripwire below cares only about the events-table write, not the
+        # analysis path.
+        with patch(
+            "src.api.routes.rlhf._analyze_rating_async",
+            new=AsyncMock(return_value=None),
+        ):
+            client.post(
+                "/v1/rlhf/rating",
+                headers=api_key_headers,
+                json=_rating_payload(1, "crítica escrita e longa o suficiente"),
+            )
+            client.post(
+                "/v1/rlhf/rating",
+                headers=api_key_headers,
+                json=_rating_payload(3),
+            )
+        after = client._submit(_count_rlhf_events())
+        assert after == before, (
+            "submit_rating must not write rlhf.rating rows to events after "
+            "the Group 2 port — the row lives on rlhf_ratings now"
+        )
+
+
+class TestSubmitRatingMiddleRungAttribution:
+    """Group 2, deliverable 10 — the highest-risk item in this group.
+
+    Proves the MIDDLE RUNG of the three-rung credential chain
+    end-to-end: a submission with no ``clinic_tenant_id`` and a
+    resolvable ``message_id`` causes ``_load_runtime_llm_credentials``
+    to receive the resolved event's ``tenant_id`` — not the submitter's.
+
+    Why this test is uniquely load-bearing:
+
+    * Once the ``message_id -> Event`` resolution moved OUT of
+      ``_analyze_rating_async`` and INTO ``submit_rating`` (Group 2
+      deliverable 5), a direct unit-style call to the analysis routine
+      can no longer distinguish "the routine resolved correctly on its
+      own" from "the routine received whatever the test handed it".
+      Only an endpoint-level test that lets ``submit_rating`` do the
+      real resolution and forwarding can catch a silent middle-rung
+      regression.
+    * Group 0's existing direct-call tests still cover the top rung
+      (``clinic_tenant_id``) and the bottom rung (submitter fallback);
+      the middle rung MUST live here.
+
+    Test structure mirrors the sole existing precedent in this file
+    (``TestRatingAnalysisRuntimeCredentials.test_analyze_uses_db_only_loader_and_no_secret_logged``):
+    three patches are applied together, and the analysis coroutine is
+    ``await``-ed directly rather than left to
+    ``asyncio.create_task`` scheduling luck — omitting either half makes
+    the test flaky or vacuous.
+    """
+
+    def test_message_id_resolution_pins_credential_tenant_end_to_end(
+        self, client: TestClient, api_key_headers
+    ) -> None:
+        # Seed an Event owned by a DIFFERENT tenant than the submitter so
+        # a naive implementation that ignores the resolved event and stays
+        # on submitter.tenant_id would fail this assertion loudly.
+        original_event_owner = uuid4()
+        original_event_id = uuid4()
+
+        client._submit(_seed_tenant_full(original_event_owner, "Rung-2 Owner"))
+        client._submit(
+            _seed_event(original_event_id, original_event_owner, "message.in")
+        )
+
+        # ---- Three-patch harness (matches the existing precedent) -------
+        # 1. Patch ``_load_runtime_llm_credentials`` to capture the tenant
+        #    it was called with — this is the actual assertion target.
+        # 2. Patch ``get_tenant_llm_client`` so no real LLM call happens.
+        # 3. Patch ``_update_rating_status`` so nothing gets written
+        #    downstream (the middle-rung capture is upstream of it).
+        # ...plus a fourth patch that swaps ``asyncio.create_task`` for a
+        # direct ``await``. Without this, the analysis coroutine may not
+        # complete before the assertions run — the exact "scheduling
+        # luck" the brief warns against. Direct-await also guarantees no
+        # background task can leak past this test's client teardown,
+        # which would poison later tests running on the same
+        # module-level DB fixture.
+        seen: dict[str, Any] = {}
+
+        async def _capture_creds(tenant_id: UUID) -> dict:
+            seen["resolve_tenant_id"] = tenant_id
+            return {
+                "llm_provider": "openai",
+                "llm_api_url": "https://api.openai.com/v1",
+                "llm_api_key": "SECRET",
+                "llm_model_name": "gpt-model",
+            }
+
+        from unittest.mock import MagicMock
+
+        fake_llm = MagicMock()
+        fake_llm.generate = AsyncMock(
+            return_value={
+                "content": '{"status": "agreed", "justification": "ok"}',
+                "usage": {},
+                "model": "gpt-model",
+            }
+        )
+
+        # Capture the coroutine ``submit_rating`` hands to
+        # ``asyncio.create_task`` and return an already-done sentinel
+        # so the endpoint proceeds. We then await the real coroutine on
+        # the app's loop via ``client._submit`` — this is the
+        # "await the coroutine directly" the wish brief calls for. No
+        # task ever schedules the real analysis, so no task can leak
+        # past this test's client teardown and poison later tests.
+        captured: list[Any] = []
+
+        def _capture(coro, name=None):
+            captured.append(coro)
+
+            async def _already_done() -> None:
+                return None
+
+            return asyncio.ensure_future(_already_done())
+
+        with (
+            patch(
+                "src.services.event_service._load_runtime_llm_credentials",
+                new=_capture_creds,
+            ),
+            patch(
+                "src.api.routes.rlhf.get_tenant_llm_client",
+                return_value=fake_llm,
+            ),
+            patch(
+                "src.api.routes.rlhf._update_rating_status",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "src.api.routes.rlhf.asyncio.create_task",
+                side_effect=_capture,
+            ),
+        ):
+            # No clinic_tenant_id — rung 1 misses.
+            # rating 1 + qualifying reason triggers analysis.
+            # message_id resolves to original_event_id — rung 2 must win.
+            payload = _rating_payload(1, "resposta fria demais e sem empatia")
+            payload["message_id"] = str(original_event_id)
+            response = client.post(
+                "/v1/rlhf/rating", headers=api_key_headers, json=payload
+            )
+            assert response.status_code == 200
+            assert captured, "analysis coroutine must have been scheduled"
+
+            # Await the captured coroutine directly on the app's loop —
+            # this is the deterministic step the brief calls out.
+            for coro in captured:
+                client._submit(coro)
+
+        # Rung 2 assertion: the tenant handed to the credential loader
+        # must be the resolved event's owner, not the submitter's tenant.
+        assert "resolve_tenant_id" in seen, (
+            "_load_runtime_llm_credentials must be invoked from analysis; "
+            "if this fires, the endpoint stopped triggering analysis for "
+            "a rating-1-with-reason submission"
+        )
+        assert seen["resolve_tenant_id"] == original_event_owner, (
+            "the middle rung is broken: analysis received "
+            f"{seen['resolve_tenant_id']!r} instead of the resolved event's "
+            f"tenant_id ({original_event_owner!r}). Either submit_rating "
+            "stopped forwarding the resolved event, or _analyze_rating_async "
+            "stopped consulting it — both are silent regressions this test "
+            "is the only end-to-end guard against."
+        )
+        # And crucially, NOT the submitter's tenant — proving the fallback
+        # rung (rung 3) did not win by accident.
+        assert seen["resolve_tenant_id"] != TEST_TENANT_ID
+
+
+class TestListRatingsEmitsChannelAndTracePair:
+    """AC: ``entries[]`` in the GET response includes ``channel``,
+    ``trace_event_id``, and ``trace_tenant_id``. Group 6 will consume the
+    last two to build the "View trace" link — without them, that group
+    is blocked.
+    """
+
+    def test_entry_dict_carries_channel_and_trace_pair(
+        self, client: TestClient, api_key_headers
+    ) -> None:
+        trace_owner = uuid4()
+        trace_event_id = uuid4()
+        client._submit(_seed_tenant_full(trace_owner, "GET Trace Owner"))
+        client._submit(_seed_event(trace_event_id, trace_owner, "message.in"))
+
+        payload = _rating_payload(4)
+        payload["message_id"] = str(trace_event_id)
+        post = client.post("/v1/rlhf/rating", headers=api_key_headers, json=payload)
+        rating_id = post.json()["rating_id"]
+
+        list_resp = client.get("/v1/rlhf/ratings", headers=api_key_headers)
+        assert list_resp.status_code == 200
+        matched = [e for e in list_resp.json()["entries"] if e["id"] == rating_id]
+        assert matched, "created rating must appear in GET"
+        entry = matched[0]
+        # Serializer contract: these three keys are non-negotiable for
+        # Group 6's downstream consumer.
+        assert entry["channel"] == "whatsapp"
+        assert entry["trace_event_id"] == str(trace_event_id)
+        assert entry["trace_tenant_id"] == str(trace_owner)
+
+
+class TestAnalysisWritesToRlhfRatingsRow:
+    """Group 2 acceptance: a low-rating with a qualifying reason ends
+    with ``ai_analysis`` and ``ai_analysis_status='done'`` written **on
+    the ``rlhf_ratings`` row** — verified by reading the row back, NEVER
+    by mocking ``_update_rating_status`` itself (that would obscure the
+    exact regression the port has to prevent).
+
+    Also verifies the failure branch writes ``ai_analysis_status='failed'``
+    on the same row when the LLM returns unparseable content.
+    """
+
+    def _run_analysis(self, client: TestClient, api_key_headers, payload, fake_llm):
+        """Drive submit_rating end-to-end and force the scheduled analysis
+        coroutine to complete on the app's loop before we assert.
+
+        We capture the coroutine ``submit_rating`` hands to
+        ``asyncio.create_task`` (returning a sentinel already-done task
+        so the endpoint proceeds), then explicitly await the real
+        coroutine on the app's loop via ``client._submit``. This is
+        deterministic — the assertions run only after
+        ``_update_rating_status`` has committed. Task leaks are
+        impossible because we never actually schedule the analysis.
+        """
+        captured: list[Any] = []
+
+        def _capture(coro, name=None):
+            captured.append(coro)
+
+            async def _already_done() -> None:
+                return None
+
+            # Return a task that is already done — the endpoint just
+            # wants a Task-like return value; it never awaits it.
+            return asyncio.ensure_future(_already_done())
+
+        async def _fake_creds(_tenant_id: UUID) -> dict:
+            return {
+                "llm_provider": "openai",
+                "llm_api_url": "https://api.openai.com/v1",
+                "llm_api_key": "SECRET",
+                "llm_model_name": "gpt-model",
+            }
+
+        with (
+            patch(
+                "src.services.event_service._load_runtime_llm_credentials",
+                new=_fake_creds,
+            ),
+            patch(
+                "src.api.routes.rlhf.get_tenant_llm_client",
+                return_value=fake_llm,
+            ),
+            patch(
+                "src.api.routes.rlhf.asyncio.create_task",
+                side_effect=_capture,
+            ),
+        ):
+            response = client.post(
+                "/v1/rlhf/rating", headers=api_key_headers, json=payload
+            )
+            assert response.status_code == 200
+            # Drive each captured analysis coroutine to completion on the
+            # app loop — this is the "await the coroutine directly" the
+            # wish brief calls for.
+            for coro in captured:
+                client._submit(coro)
+        return UUID(response.json()["rating_id"])
+
+    def test_analysis_success_persists_status_done_and_payload_on_row(
+        self, client: TestClient, api_key_headers
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        fake_llm = MagicMock()
+        fake_llm.generate = AsyncMock(
+            return_value={
+                "content": '{"status": "agreed", "justification": "sim"}',
+                "usage": {},
+                "model": "gpt-model",
+            }
+        )
+        payload = _rating_payload(2, "reason substantive and qualifying")
+        rating_id = self._run_analysis(client, api_key_headers, payload, fake_llm)
+
+        row = client._submit(_load_rating(rating_id))
+        assert row.ai_analysis_status == "done"
+        assert row.ai_analysis is not None
+        assert row.ai_analysis.get("status") == "agreed"
+        assert row.ai_analysis.get("justification") == "sim"
+
+    def test_analysis_unparseable_content_persists_status_failed_on_row(
+        self, client: TestClient, api_key_headers
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        fake_llm = MagicMock()
+        fake_llm.generate = AsyncMock(
+            return_value={
+                "content": "totally not JSON",
+                "usage": {},
+                "model": "gpt-model",
+            }
+        )
+        payload = _rating_payload(3, "reason substantive and qualifying")
+        rating_id = self._run_analysis(client, api_key_headers, payload, fake_llm)
+
+        row = client._submit(_load_rating(rating_id))
+        assert row.ai_analysis_status == "failed"
+        # No parsed analysis persisted on a failure.
+        assert row.ai_analysis is None
 
 
 # ============================================
@@ -642,7 +1320,7 @@ class TestPatchRating:
             headers=api_key_headers,
             json=_rating_payload(2, "Motivo"),
         )
-        event_id = post.json()["event_id"]
+        event_id = post.json()["rating_id"]
 
         response = client.patch(
             f"/v1/rlhf/ratings/{event_id}",
@@ -1076,7 +1754,7 @@ class TestRatingAnalysisRuntimeCredentials:
         ):
             with caplog.at_level("INFO"):
                 await rlhf._analyze_rating_async(
-                    event_id=uuid4(),
+                    rating_id=uuid4(),
                     rating=1,
                     reason="motivo",
                     agent_response="ok",
@@ -1120,7 +1798,7 @@ class TestRatingAnalysisRuntimeCredentials:
             ),
         ):
             await rlhf._analyze_rating_async(
-                event_id=uuid4(),
+                rating_id=uuid4(),
                 rating=2,
                 reason="motivo",
                 agent_response="ok",
@@ -1230,13 +1908,13 @@ class TestRatingAnalysisClinicTenantIdValidation:
         p1, p2, p3 = self._patches(fake_llm, seen)
         with p1, p2, p3:
             await rlhf._analyze_rating_async(
-                event_id=uuid4(),
+                rating_id=uuid4(),
                 rating=1,
                 reason="motivo",
                 agent_response="ok",
                 user_message="por que?",
                 tenant_id=submitter_id,
-                message_id=None,
+                resolved_event=None,
                 clinic_tenant_id=str(clinic_id),
             )
 
@@ -1265,25 +1943,33 @@ class TestRatingAnalysisClinicTenantIdValidation:
         p1, p2, p3 = self._patches(fake_llm, seen)
         with p1, p2, p3:
             await rlhf._analyze_rating_async(
-                event_id=uuid4(),
+                rating_id=uuid4(),
                 rating=1,
                 reason="motivo",
                 agent_response="ok",
                 user_message="por que?",
                 tenant_id=submitter_id,
-                message_id=None,
+                resolved_event=None,
                 clinic_tenant_id=str(orphan_id),
             )
 
         # Attacker-supplied UUID must NOT be used to load credentials.
         assert seen["resolve_tenant_id"] != orphan_id
-        # No message_id, so we fall all the way back to the submitter's tenant.
+        # No resolved_event, so we fall all the way back to the submitter tenant.
         assert seen["resolve_tenant_id"] == submitter_id
 
     @pytest.mark.asyncio
-    async def test_orphan_clinic_tenant_id_falls_through_to_message_id_lookup(
+    async def test_orphan_clinic_tenant_id_falls_through_to_resolved_event(
         self, db_ready
     ) -> None:
+        """Group 2 update (RLHF audit wish): the middle rung is now
+        threaded via ``resolved_event`` from ``submit_rating``. This
+        direct-call test proves the analysis routine consults the passed
+        event's ``tenant_id`` (rung 2) when ``clinic_tenant_id`` (rung 1)
+        is bogus. The END-TO-END guarantee that ``submit_rating``
+        actually resolves and forwards this event lives in
+        ``TestSubmitRatingMiddleRungAttribution``.
+        """
         from unittest.mock import AsyncMock, MagicMock
 
         from src.api.routes import rlhf
@@ -1293,29 +1979,16 @@ class TestRatingAnalysisClinicTenantIdValidation:
         real_clinic_id = uuid4()
         await _seed_tenant(real_clinic_id)
 
-        # Seed an Event owned by real_clinic_id so the message_id branch
-        # resolves to it — proving we actually FELL THROUGH to that branch
-        # rather than silently staying on the submitter tenant.
-        original_event_id = uuid4()
-
-        async def _seed_original() -> None:
-            session = get_db_session()
-            try:
-                session.add(
-                    Event(
-                        id=original_event_id,
-                        tenant_id=real_clinic_id,
-                        session_id=None,
-                        event_type="chat.response",
-                        event_data={},
-                        event_metadata={},
-                    )
-                )
-                await session.commit()
-            finally:
-                await session.close()
-
-        await _seed_original()
+        # A pre-resolved event owned by real_clinic_id — the endpoint would
+        # produce exactly this shape after ``_resolve_message_context``.
+        pre_resolved = Event(
+            id=uuid4(),
+            tenant_id=real_clinic_id,
+            session_id=None,
+            event_type="message.in",
+            event_data={},
+            event_metadata={},
+        )
 
         fake_llm = MagicMock()
         fake_llm.generate = AsyncMock(
@@ -1329,18 +2002,18 @@ class TestRatingAnalysisClinicTenantIdValidation:
         p1, p2, p3 = self._patches(fake_llm, seen)
         with p1, p2, p3:
             await rlhf._analyze_rating_async(
-                event_id=uuid4(),
+                rating_id=uuid4(),
                 rating=1,
                 reason="motivo",
                 agent_response="ok",
                 user_message="por que?",
                 tenant_id=submitter_id,
-                message_id=str(original_event_id),
+                resolved_event=pre_resolved,
                 clinic_tenant_id=str(orphan_id),
             )
 
-        # Priority order preserved: bogus clinic_tenant_id falls through to
-        # the message_id branch, which resolves the real owning tenant.
+        # Priority order preserved: bogus clinic_tenant_id falls through
+        # to rung 2 (resolved event), which pins the real owning tenant.
         assert seen["resolve_tenant_id"] == real_clinic_id
 
     @pytest.mark.asyncio
@@ -1365,13 +2038,13 @@ class TestRatingAnalysisClinicTenantIdValidation:
         p1, p2, p3 = self._patches(fake_llm, seen)
         with p1, p2, p3:
             await rlhf._analyze_rating_async(
-                event_id=uuid4(),
+                rating_id=uuid4(),
                 rating=1,
                 reason="motivo",
                 agent_response="ok",
                 user_message="por que?",
                 tenant_id=submitter_id,
-                message_id=None,
+                resolved_event=None,
                 clinic_tenant_id="acme-clinic",  # not a UUID
             )
 
@@ -1462,40 +2135,53 @@ async def _seed_rating_event(
     accepted_by: UUID | None = None,
     accepted_at: str | None = None,
     created_at: datetime | None = None,
+    channel: str = "unknown",
 ) -> None:
-    """Insert a rlhf.rating Event row directly, bypassing the endpoint.
+    """Insert a ``rlhf_ratings`` row directly, bypassing the endpoint.
 
-    This lets us plant events with an explicit created_at (for date-window
-    tests) and with or without a subject_tenant_id (for fallback tests) —
-    control the endpoint's submit_rating pipeline can't give us.
+    Ported to ``rlhf_ratings`` in Group 2 (RLHF audit wish). The parameter
+    ``event_id`` remains for call-site stability across the 34 sites in
+    this file — it maps to ``RlhfRating.id``. When ``subject_tenant_id``
+    is None (the pre-Group-3 shape older tests still exercise), it
+    defaults to ``tenant_id`` so the NOT NULL column contract holds.
+
+    ``accepted_at`` is accepted as an ISO-8601 string (matching the
+    pre-port test signature) and parsed into ``datetime`` for the typed
+    column — the serializer round-trips it back to the same ISO string.
     """
+    resolved_subject = subject_tenant_id if subject_tenant_id is not None else tenant_id
+    parsed_accepted_at: datetime | None = None
+    if accepted_at is not None:
+        parsed_accepted_at = datetime.fromisoformat(accepted_at)
+
     session = get_db_session()
     try:
-        event_data: dict[str, Any] = {
-            "rating": rating,
-            "reason": reason,
-            "agent_response": "resp",
-            "user_message": "msg",
-        }
-        if subject_tenant_id is not None:
-            event_data["subject_tenant_id"] = str(subject_tenant_id)
-        if approved_for_training:
-            event_data["approved_for_training"] = True
-        if accepted_by is not None:
-            event_data["accepted_by"] = str(accepted_by)
-        if accepted_at is not None:
-            event_data["accepted_at"] = accepted_at
-        event = Event(
+        row = RlhfRating(
             id=event_id,
             tenant_id=tenant_id,
+            subject_tenant_id=resolved_subject,
             session_id=None,
-            event_type="rlhf.rating",
-            event_data=event_data,
-            event_metadata={},
+            # Seeded rows predate the channel/trace resolution; treat them
+            # as unknown-provenance for tests that don't care and set the
+            # payload columns to their canonical seed placeholders.
+            message_id=f"seed-{event_id.hex[:8]}",
+            trace_event_id=None,
+            trace_tenant_id=None,
+            channel=channel,
+            rating=rating,
+            reason=reason,
+            agent_response="resp",
+            user_message="msg",
+            submitted_by=None,
+            role=None,
+            approved_for_training=approved_for_training,
+            ignored=False,
+            accepted_by=accepted_by,
+            accepted_at=parsed_accepted_at,
         )
         if created_at is not None:
-            event.created_at = created_at
-        session.add(event)
+            row.created_at = created_at
+        session.add(row)
         await session.commit()
     finally:
         await session.close()
@@ -2275,3 +2961,642 @@ class TestRlhfLoaderNeverSeesMultimodalBundle:
         serialized = json.dumps(result)
         assert "MULTIMODAL-KEY-MUST-NOT-LEAK" not in serialized
         assert "TTS-KEY-MUST-NOT-LEAK" not in serialized
+
+
+# ============================================
+# Group 4: channel filter, reviewed filter, parecer/history, reviewed_count
+# ============================================
+
+
+async def _seed_review(
+    *,
+    rating_id: UUID,
+    revisado: bool,
+    revisado_por_email: str = "reviewer@test.com",
+    observacao: str | None = None,
+    revisado_em: datetime | None = None,
+    review_id: UUID | None = None,
+) -> UUID:
+    """Insert a single ``rlhf_audit_reviews`` row directly.
+
+    Mirrors the local-helper convention established in Group 3
+    (``tests/api/test_rlhf_review.py``); replicated here rather than imported
+    across test files, per the repo's per-file-local-helper convention.
+    """
+    row_id = review_id if review_id is not None else uuid4()
+    ts = revisado_em if revisado_em is not None else datetime.now(timezone.utc)
+    session = get_db_session()
+    try:
+        session.add(
+            RlhfAuditReview(
+                id=row_id,
+                rating_id=rating_id,
+                observacao=observacao,
+                revisado=revisado,
+                revisado_por=None,
+                revisado_por_email=revisado_por_email,
+                revisado_em=ts,
+            )
+        )
+        await session.commit()
+    finally:
+        await session.close()
+    return row_id
+
+
+class TestListRatingsChannelFilter:
+    """`channel` narrows the cut for every role but never touches facets."""
+
+    def test_channel_filter_narrows_summary_but_leaves_facets_unchanged(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        builder_id = uuid4()
+        subj_wa = uuid4()
+        subj_sim = uuid4()
+        client._submit(_seed_builder(builder_id, "Builder X"))
+        client._submit(_seed_tenant_full(subj_wa, "Clinic WA", builder_id=builder_id))
+        client._submit(_seed_tenant_full(subj_sim, "Clinic Sim", builder_id=builder_id))
+        for _ in range(3):
+            client._submit(
+                _seed_rating_event(
+                    event_id=uuid4(),
+                    tenant_id=TEST_TENANT_ID,
+                    rating=4,
+                    subject_tenant_id=subj_wa,
+                    channel="whatsapp",
+                )
+            )
+        for _ in range(2):
+            client._submit(
+                _seed_rating_event(
+                    event_id=uuid4(),
+                    tenant_id=TEST_TENANT_ID,
+                    rating=5,
+                    subject_tenant_id=subj_sim,
+                    channel="web",
+                )
+            )
+
+        # Baseline: no channel filter.
+        base = client.get(
+            f"/v1/rlhf/ratings?builder_id={builder_id}",
+            headers=super_admin_headers,
+        ).json()
+        base_facets = base["facets"]
+        base_total = base["summary"]["total"]
+        assert base_total >= 5
+
+        # WhatsApp cut: summary narrows to the 3 wa rows for this builder,
+        # facets stay identical (facets are step 3, before narrowing).
+        wa = client.get(
+            f"/v1/rlhf/ratings?builder_id={builder_id}&channel=whatsapp",
+            headers=super_admin_headers,
+        ).json()
+        assert wa["summary"]["total"] == 3
+        assert wa["summary"]["total"] < base_total
+        assert wa["facets"] == base_facets
+
+    def test_channel_unknown_returns_unclassified_ratings(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        subj = uuid4()
+        client._submit(_seed_tenant_full(subj, "Unknown Subject"))
+        # Default channel from _seed_rating_event is "unknown".
+        for _ in range(2):
+            client._submit(
+                _seed_rating_event(
+                    event_id=uuid4(),
+                    tenant_id=TEST_TENANT_ID,
+                    rating=3,
+                    subject_tenant_id=subj,
+                )
+            )
+        # Also a whatsapp row that must be excluded.
+        client._submit(
+            _seed_rating_event(
+                event_id=uuid4(),
+                tenant_id=TEST_TENANT_ID,
+                rating=3,
+                subject_tenant_id=subj,
+                channel="whatsapp",
+            )
+        )
+        response = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subj}&channel=unknown",
+            headers=super_admin_headers,
+        )
+        body = response.json()
+        assert body["summary"]["total"] == 2
+        assert all(e["channel"] == "unknown" for e in body["entries"])
+
+    def test_channel_applies_to_non_super_caller(
+        self, client: TestClient, clinic_admin_headers
+    ) -> None:
+        """A clinic_admin with ratings across multiple channels gets the
+        channel narrowing applied (the one narrowing that is universal)."""
+        for _ in range(4):
+            client._submit(
+                _seed_rating_event(
+                    event_id=uuid4(),
+                    tenant_id=TEST_TENANT_ID,
+                    rating=4,
+                    subject_tenant_id=TEST_TENANT_ID,
+                    channel="whatsapp",
+                )
+            )
+        for _ in range(2):
+            client._submit(
+                _seed_rating_event(
+                    event_id=uuid4(),
+                    tenant_id=TEST_TENANT_ID,
+                    rating=5,
+                    subject_tenant_id=TEST_TENANT_ID,
+                    channel="web",
+                )
+            )
+
+        wa = client.get(
+            "/v1/rlhf/ratings?channel=whatsapp", headers=clinic_admin_headers
+        ).json()
+        assert all(e["channel"] == "whatsapp" for e in wa["entries"])
+        # At least the 4 seeded, possibly more from prior tests but never zero.
+        assert wa["summary"]["total"] >= 4
+        # No web rows leak into a whatsapp-only cut.
+        web_only = client.get(
+            "/v1/rlhf/ratings?channel=web", headers=clinic_admin_headers
+        ).json()
+        assert all(e["channel"] == "web" for e in web_only["entries"])
+
+    def test_non_super_ignores_tenant_builder_reviewed_filters(
+        self, client: TestClient, clinic_admin_headers
+    ) -> None:
+        """A clinic_admin has ``tenant_id``, ``builder_id`` and ``reviewed``
+        silently ignored — only ``channel`` narrows for them."""
+        foreign_subject = uuid4()
+        foreign_builder = uuid4()
+        client._submit(_seed_builder(foreign_builder, "Foreign B"))
+        client._submit(
+            _seed_tenant_full(foreign_subject, "Foreign", builder_id=foreign_builder)
+        )
+        client._submit(
+            _seed_rating_event(
+                event_id=uuid4(),
+                tenant_id=TEST_TENANT_ID,
+                rating=2,
+                reason="motivo forte suficiente",
+                subject_tenant_id=TEST_TENANT_ID,
+            )
+        )
+        # Filter attempts on foreign facets must be ignored (still returns
+        # only rows the caller owns).
+        response = client.get(
+            f"/v1/rlhf/ratings?tenant_id={foreign_subject}"
+            f"&builder_id={foreign_builder}&reviewed=true",
+            headers=clinic_admin_headers,
+        )
+        assert response.status_code == 200
+        entries = response.json()["entries"]
+        # Every returned row belongs to the caller's own tenant.
+        assert all(e["tenant_id"] == str(TEST_TENANT_ID) for e in entries)
+
+
+class TestListRatingsReviewedFilter:
+    """`reviewed` (super_admin only) filters entries only — summary/facets
+    are still computed over the full cut (mirrors only_accepted/only_with_reason)."""
+
+    def test_reviewed_false_returns_norev_and_current_false(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        subj = uuid4()
+        client._submit(_seed_tenant_full(subj, "Reviewed False Subject"))
+        # r1: no review at all.
+        r1 = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=r1,
+                tenant_id=TEST_TENANT_ID,
+                rating=2,
+                reason="motivo suficientemente longo",
+                subject_tenant_id=subj,
+            )
+        )
+        # r2: current review is revisado=False (flipped from True).
+        r2 = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=r2,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="motivo mais um pouco",
+                subject_tenant_id=subj,
+            )
+        )
+        older = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
+        newer = datetime(2026, 1, 2, 10, 0, 0, tzinfo=timezone.utc)
+        client._submit(_seed_review(rating_id=r2, revisado=True, revisado_em=older))
+        client._submit(_seed_review(rating_id=r2, revisado=False, revisado_em=newer))
+        # r3: current review is True — must be excluded from reviewed=false.
+        r3 = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=r3,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="terceiro motivo forte",
+                subject_tenant_id=subj,
+            )
+        )
+        client._submit(_seed_review(rating_id=r3, revisado=True))
+
+        base = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subj}",
+            headers=super_admin_headers,
+        ).json()
+        cut = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subj}&reviewed=false",
+            headers=super_admin_headers,
+        ).json()
+        # Summary and facets untouched by reviewed=false (step-6 semantics).
+        assert cut["summary"] == base["summary"]
+        assert cut["facets"] == base["facets"]
+        entry_ids = {e["id"] for e in cut["entries"]}
+        assert str(r1) in entry_ids
+        assert str(r2) in entry_ids
+        assert str(r3) not in entry_ids
+
+    def test_reviewed_true_returns_only_current_true(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        subj = uuid4()
+        client._submit(_seed_tenant_full(subj, "Reviewed True Subject"))
+        r_yes = uuid4()
+        r_no = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=r_yes,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="motivo forte suficiente",
+                subject_tenant_id=subj,
+            )
+        )
+        client._submit(
+            _seed_rating_event(
+                event_id=r_no,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="outro motivo forte suficiente",
+                subject_tenant_id=subj,
+            )
+        )
+        client._submit(_seed_review(rating_id=r_yes, revisado=True))
+
+        response = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subj}&reviewed=true",
+            headers=super_admin_headers,
+        )
+        entry_ids = {e["id"] for e in response.json()["entries"]}
+        assert str(r_yes) in entry_ids
+        assert str(r_no) not in entry_ids
+
+
+class TestListRatingsReviewedCount:
+    """`reviewed_count` = rows whose current review verdict is True AND
+    which have a qualifying reason (same denominator as `accepted_count`)."""
+
+    def test_reviewed_count_ignores_reasonless_reviewed_rows(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        subj = uuid4()
+        client._submit(_seed_tenant_full(subj, "Count Subject"))
+        # Reasonless rating with a True review — must NOT count.
+        r_no_reason = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=r_no_reason,
+                tenant_id=TEST_TENANT_ID,
+                rating=4,
+                reason=None,
+                subject_tenant_id=subj,
+            )
+        )
+        client._submit(_seed_review(rating_id=r_no_reason, revisado=True))
+        # With-reason rating with a True review — MUST count.
+        r_with_reason = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=r_with_reason,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="motivo bem grande para contar",
+                subject_tenant_id=subj,
+            )
+        )
+        client._submit(_seed_review(rating_id=r_with_reason, revisado=True))
+        # With-reason unreviewed — must not count.
+        r_unreviewed = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=r_unreviewed,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="motivo outro sem review",
+                subject_tenant_id=subj,
+            )
+        )
+
+        body = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subj}",
+            headers=super_admin_headers,
+        ).json()
+        assert body["summary"]["reviewed_count"] == 1
+
+    def test_reviewing_every_qualifying_row_saturates_reviewed_count(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        subj = uuid4()
+        client._submit(_seed_tenant_full(subj, "Saturation Subject"))
+        rating_ids = []
+        for _ in range(3):
+            rid = uuid4()
+            client._submit(
+                _seed_rating_event(
+                    event_id=rid,
+                    tenant_id=TEST_TENANT_ID,
+                    rating=1,
+                    reason="motivo qualificado longo o bastante",
+                    subject_tenant_id=subj,
+                )
+            )
+            rating_ids.append(rid)
+        for rid in rating_ids:
+            client._submit(_seed_review(rating_id=rid, revisado=True))
+
+        body = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subj}",
+            headers=super_admin_headers,
+        ).json()
+        # All 3 qualifying rows reviewed => reviewed_count == 3.
+        assert body["summary"]["reviewed_count"] == 3
+
+    def test_reviewed_count_absent_for_non_super(
+        self, client: TestClient, clinic_admin_headers, api_key_headers
+    ) -> None:
+        body_admin = client.get("/v1/rlhf/ratings", headers=clinic_admin_headers).json()
+        body_apikey = client.get("/v1/rlhf/ratings", headers=api_key_headers).json()
+        assert "reviewed_count" not in body_admin["summary"]
+        assert "reviewed_count" not in body_apikey["summary"]
+
+
+class TestListRatingsReviewHistorySerialization:
+    """`review_history` is emitted only for super_admin and only when the
+    caller passes a non-None list — assert the KEY is absent (not null) for
+    other roles, per the wish contract."""
+
+    def test_super_admin_receives_review_history_ordered_current_first(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        subj = uuid4()
+        client._submit(_seed_tenant_full(subj, "History Subject"))
+        rid = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=rid,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="motivo qualificado suficiente",
+                subject_tenant_id=subj,
+            )
+        )
+        older = datetime(2026, 3, 1, 10, 0, 0, tzinfo=timezone.utc)
+        newer = datetime(2026, 3, 2, 10, 0, 0, tzinfo=timezone.utc)
+        client._submit(
+            _seed_review(
+                rating_id=rid,
+                revisado=True,
+                revisado_em=older,
+                observacao="primeiro",
+            )
+        )
+        client._submit(
+            _seed_review(
+                rating_id=rid,
+                revisado=False,
+                revisado_em=newer,
+                observacao="segundo",
+            )
+        )
+
+        body = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subj}",
+            headers=super_admin_headers,
+        ).json()
+        target = [e for e in body["entries"] if e["id"] == str(rid)]
+        assert len(target) == 1
+        history = target[0]["review_history"]
+        assert isinstance(history, list) and len(history) == 2
+        # Newest-first: current state is at index 0.
+        assert history[0]["revisado"] is False
+        assert history[0]["observacao"] == "segundo"
+        assert history[1]["revisado"] is True
+        assert history[1]["observacao"] == "primeiro"
+        # ISO-UTC round-trip on revisado_em.
+        assert history[0]["revisado_em"] == newer.isoformat()
+        assert history[1]["revisado_em"] == older.isoformat()
+
+    def test_non_super_gets_no_review_history_key_or_reviewed_fields(
+        self, client: TestClient, clinic_admin_headers, api_key_headers
+    ) -> None:
+        rid = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=rid,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="motivo qualificado suficiente",
+                subject_tenant_id=TEST_TENANT_ID,
+            )
+        )
+        client._submit(_seed_review(rating_id=rid, revisado=True))
+
+        for headers in (clinic_admin_headers, api_key_headers):
+            body = client.get("/v1/rlhf/ratings", headers=headers).json()
+            # Absence of the KEY, not null — assert on the raw JSON body.
+            entries = body["entries"]
+            for e in entries:
+                assert "review_history" not in e
+                # Wish contract: no flattened reviewed/is_reviewed field either.
+                assert "reviewed" not in e
+                assert "is_reviewed" not in e
+            # Summary must not leak reviewed_count / observacao / authorship.
+            assert "reviewed_count" not in body["summary"]
+
+    def test_entry_id_equals_rlhf_ratings_id_used_by_patch(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        """`entries[].id` is the same UUID accepted by PATCH — no new id
+        scheme is introduced by Group 4."""
+        rid = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=rid,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="motivo qualificado suficiente",
+                subject_tenant_id=TEST_TENANT_ID,
+            )
+        )
+        body = client.get("/v1/rlhf/ratings", headers=super_admin_headers).json()
+        assert any(e["id"] == str(rid) for e in body["entries"])
+        # PATCH accepts the same UUID string.
+        patch = client.patch(
+            f"/v1/rlhf/ratings/{rid}",
+            headers=super_admin_headers,
+            json={"action": "ignore"},
+        )
+        assert patch.status_code == 200
+
+    def test_reason_and_message_still_have_carteirinha_masked(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        """The Group-2 masking of ``reason``/``agent_response``/``user_message``
+        survives the Group-4 serializer changes."""
+        # We seed a row whose reason contains a fake 15-digit carteirinha
+        # sequence — the existing ``mask_carteirinha`` helper must still fire.
+        subj = uuid4()
+        client._submit(_seed_tenant_full(subj, "Mask Subject"))
+        rid = uuid4()
+        # Use a payload that triggers the mask.
+        client._submit(
+            _seed_rating_event(
+                event_id=rid,
+                tenant_id=TEST_TENANT_ID,
+                rating=1,
+                reason="carteirinha 123456789012345 aqui",
+                subject_tenant_id=subj,
+            )
+        )
+        body = client.get(
+            f"/v1/rlhf/ratings?tenant_id={subj}",
+            headers=super_admin_headers,
+        ).json()
+        target = [e for e in body["entries"] if e["id"] == str(rid)]
+        assert target
+        # The literal 15-digit run must not appear in the serialized payload.
+        assert "123456789012345" not in target[0]["reason"]
+
+
+class TestListRatingsReviewHistoryQueryCount:
+    """A request with N ratings each carrying reviews must still issue a
+    query count independent of N (batched — one review-state query)."""
+
+    def test_review_history_batched_regardless_of_row_count(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        from sqlalchemy import event as sa_event
+
+        subj = uuid4()
+        client._submit(_seed_tenant_full(subj, "QC Subject"))
+        # 20 ratings, each with 2 reviews (40 review rows total).
+        rating_ids = []
+        for i in range(20):
+            rid = uuid4()
+            client._submit(
+                _seed_rating_event(
+                    event_id=rid,
+                    tenant_id=TEST_TENANT_ID,
+                    rating=(i % 5) + 1,
+                    reason="motivo qualificado suficiente",
+                    subject_tenant_id=subj,
+                )
+            )
+            rating_ids.append(rid)
+        for rid in rating_ids:
+            client._submit(_seed_review(rating_id=rid, revisado=True))
+            client._submit(_seed_review(rating_id=rid, revisado=False))
+
+        from src.repositories import get_db_engine
+
+        query_count = {"n": 0}
+
+        def _on_execute(conn, clauseelement, multiparams, params, execution_options):
+            query_count["n"] += 1
+
+        engine = get_db_engine().sync_engine
+        sa_event.listen(engine, "before_execute", _on_execute)
+        try:
+            response = client.get(
+                f"/v1/rlhf/ratings?tenant_id={subj}&limit=500",
+                headers=super_admin_headers,
+            )
+        finally:
+            sa_event.remove(engine, "before_execute", _on_execute)
+
+        assert response.status_code == 200
+        # Main SELECT + batched Tenant lookup + batched Builder lookup
+        # (skipped if no builders) + batched review-history query. Same
+        # generous headroom as the sibling batched-tenant test above.
+        assert (
+            query_count["n"] <= 6
+        ), f"expected batched (main+tenants+builders+reviews), got {query_count['n']}"
+
+
+class TestListRatingsTenantIsolationUnchanged:
+    """Group 4's filters must not weaken step-1 tenant isolation for non-super."""
+
+    def test_non_super_still_sees_only_own_rows_with_channel_filter(
+        self, client: TestClient, clinic_admin_headers
+    ) -> None:
+        foreign_owner = uuid4()
+        client._submit(_seed_tenant_full(foreign_owner, "Foreign QQ"))
+        foreign_id = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=foreign_id,
+                tenant_id=foreign_owner,
+                rating=3,
+                subject_tenant_id=foreign_owner,
+                channel="whatsapp",
+            )
+        )
+        # Caller's own row on the same channel.
+        own_id = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=own_id,
+                tenant_id=TEST_TENANT_ID,
+                rating=3,
+                subject_tenant_id=TEST_TENANT_ID,
+                channel="whatsapp",
+            )
+        )
+        response = client.get(
+            "/v1/rlhf/ratings?channel=whatsapp", headers=clinic_admin_headers
+        )
+        entry_ids = {e["id"] for e in response.json()["entries"]}
+        assert str(own_id) in entry_ids
+        assert str(foreign_id) not in entry_ids
+
+
+class TestListRatingsPatchStillGreen:
+    """Group-2 PATCH endpoint unaffected by Group 4 serializer/handler changes."""
+
+    def test_patch_ignore_after_group4_changes(
+        self, client: TestClient, super_admin_headers
+    ) -> None:
+        rid = uuid4()
+        client._submit(
+            _seed_rating_event(
+                event_id=rid,
+                tenant_id=TEST_TENANT_ID,
+                rating=2,
+                reason="motivo suficientemente longo",
+                subject_tenant_id=TEST_TENANT_ID,
+            )
+        )
+        response = client.patch(
+            f"/v1/rlhf/ratings/{rid}",
+            headers=super_admin_headers,
+            json={"action": "ignore"},
+        )
+        assert response.status_code == 200

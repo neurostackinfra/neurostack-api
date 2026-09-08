@@ -1,19 +1,29 @@
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "wouter";
 import { customFetch } from "@workspace/api-client-react";
 import { format } from "date-fns";
 import {
-  Brain, ShieldAlert, CheckCircle2, Zap, Loader2, AlertTriangle, Clock, MessageSquare,
+  Brain, ShieldAlert, CheckCircle2, Zap, Loader2, AlertTriangle, Clock, MessageSquare, ExternalLink,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/hooks/use-toast";
+import { useAuth } from "@/context/auth";
+import { useI18n } from "@/context/i18n";
 import { DateRangePicker } from "@/components/date-range-picker";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
 } from "recharts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
+
+export interface ReviewHistoryRow {
+  observacao: string | null;
+  revisado: boolean;
+  revisado_por_email: string | null;
+  revisado_em: string;
+}
 
 export interface RatingEntry {
   id: string;
@@ -34,6 +44,13 @@ export interface RatingEntry {
   accepted_by: string | null;
   accepted_at: string | null;
   accepted_by_email: string | null;
+  // Added in Group 4 (backend). Every entry carries these; may be null.
+  channel?: string;
+  trace_event_id?: string | null;
+  trace_tenant_id?: string | null;
+  // Super-admin-only: JSON key is entirely absent for non-super callers.
+  // Ordered newest-first — review_history[0] is current state.
+  review_history?: ReviewHistoryRow[];
 }
 
 export interface RatingSummary {
@@ -41,6 +58,8 @@ export interface RatingSummary {
   average: number;
   accepted_count: number;
   distribution: Record<"1" | "2" | "3" | "4" | "5", number>;
+  // Super-admin-only: JSON key entirely absent for non-super callers.
+  reviewed_count?: number;
 }
 
 export interface RatingFacetBuilder {
@@ -86,6 +105,8 @@ const RATING_META: Record<number, { label: string; color: string; tailwind: stri
 
 const ALL_BUILDERS = "__all_builders__";
 const ALL_CLINICS  = "__all_clinics__";
+const ALL_CHANNELS = "__all_channels__";
+const ALL_REVIEWED = "__all_reviewed__";
 
 function defaultDates() {
   const today       = format(new Date(), "yyyy-MM-dd");
@@ -161,7 +182,14 @@ function formatNumber(value: number): string {
   return value.toLocaleString("pt-BR");
 }
 
-function KpiCards({ summary }: { summary: RatingSummary }) {
+function KpiCards({
+  summary,
+  showReviewed,
+}: {
+  summary: RatingSummary;
+  showReviewed: boolean;
+}) {
+  const { t } = useI18n();
   const total       = summary.total;
   const satisfied   = (summary.distribution["4"] ?? 0) + (summary.distribution["5"] ?? 0);
   const unsatisfied = (summary.distribution["1"] ?? 0) + (summary.distribution["2"] ?? 0);
@@ -206,8 +234,20 @@ function KpiCards({ summary }: { summary: RatingSummary }) {
     },
   ];
 
+  // Belt-and-suspenders: backend already omits `reviewed_count` for non-super
+  // callers, but we also gate client-side per repo convention.
+  if (showReviewed && summary.reviewed_count !== undefined) {
+    cards.push({
+      label: t("rlhf_audit_kpi_reviewed_label"),
+      value: formatNumber(summary.reviewed_count),
+      sub: t("rlhf_audit_kpi_reviewed_sub"),
+      color: "text-sky-400",
+      testId: "kpi-reviewed",
+    });
+  }
+
   return (
-    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
+    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
       {cards.map((s) => (
         <Card key={s.label} className="border-border bg-card shadow-sm" data-testid={s.testId}>
           <CardContent className="pt-4 pb-4">
@@ -286,17 +326,24 @@ interface FiltersState {
   startDate: string;
   endDate: string;
   onlyAccepted: boolean;
+  channel: string;     // "" (todos) | "web" | "whatsapp" | "unknown"
+  reviewed: string;    // "" (todos) | "true" | "false"
 }
 
 function Filters({
   filters,
   onChange,
   facets,
+  showBuilderClinic,
+  showReviewed,
 }: {
   filters: FiltersState;
   onChange: (next: FiltersState) => void;
   facets: RatingsResponse["facets"];
+  showBuilderClinic: boolean;
+  showReviewed: boolean;
 }) {
+  const { t } = useI18n();
   // Client-side narrowing: only clinics whose builder_id matches the currently
   // selected builder appear. When "Todos" is selected (empty string), clinics
   // with a null builder_id are also included; otherwise they are hidden.
@@ -319,37 +366,84 @@ function Filters({
     onChange({ ...filters, clinicId: raw === ALL_CLINICS ? "" : raw });
   };
 
+  const onChannelChange = (raw: string) => {
+    onChange({ ...filters, channel: raw === ALL_CHANNELS ? "" : raw });
+  };
+
+  const onReviewedChange = (raw: string) => {
+    onChange({ ...filters, reviewed: raw === ALL_REVIEWED ? "" : raw });
+  };
+
   return (
     <div className="flex flex-col gap-3 md:flex-row md:flex-wrap md:items-end">
+      {showBuilderClinic && (
+        <>
+          <div className="space-y-1">
+            <label className="text-[11px] font-medium text-muted-foreground">Builder</label>
+            <select
+              data-testid="filter-builder"
+              value={filters.builderId || ALL_BUILDERS}
+              onChange={(e) => onBuilderChange(e.target.value)}
+              className="h-9 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent w-56"
+            >
+              <option value={ALL_BUILDERS}>Todos os builders</option>
+              {facets.builders.map((b) => (
+                <option key={b.id} value={b.id}>{b.name}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="space-y-1">
+            <label className="text-[11px] font-medium text-muted-foreground">Clínica</label>
+            <select
+              data-testid="filter-clinic"
+              value={filters.clinicId || ALL_CLINICS}
+              onChange={(e) => onClinicChange(e.target.value)}
+              className="h-9 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent w-56"
+            >
+              <option value={ALL_CLINICS}>Todas as clínicas</option>
+              {visibleClinics.map((c) => (
+                <option key={c.id} value={c.id}>{c.name}</option>
+              ))}
+            </select>
+          </div>
+        </>
+      )}
+
       <div className="space-y-1">
-        <label className="text-[11px] font-medium text-muted-foreground">Builder</label>
+        <label className="text-[11px] font-medium text-muted-foreground">
+          {t("rlhf_audit_filter_channel_label")}
+        </label>
         <select
-          data-testid="filter-builder"
-          value={filters.builderId || ALL_BUILDERS}
-          onChange={(e) => onBuilderChange(e.target.value)}
-          className="h-9 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent w-56"
+          data-testid="filter-channel"
+          value={filters.channel || ALL_CHANNELS}
+          onChange={(e) => onChannelChange(e.target.value)}
+          className="h-9 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent w-44"
         >
-          <option value={ALL_BUILDERS}>Todos os builders</option>
-          {facets.builders.map((b) => (
-            <option key={b.id} value={b.id}>{b.name}</option>
-          ))}
+          <option value={ALL_CHANNELS}>{t("rlhf_audit_filter_channel_all")}</option>
+          <option value="web">{t("rlhf_audit_filter_channel_web")}</option>
+          <option value="whatsapp">{t("rlhf_audit_filter_channel_whatsapp")}</option>
+          <option value="unknown">{t("rlhf_audit_filter_channel_unknown")}</option>
         </select>
       </div>
 
-      <div className="space-y-1">
-        <label className="text-[11px] font-medium text-muted-foreground">Clínica</label>
-        <select
-          data-testid="filter-clinic"
-          value={filters.clinicId || ALL_CLINICS}
-          onChange={(e) => onClinicChange(e.target.value)}
-          className="h-9 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent w-56"
-        >
-          <option value={ALL_CLINICS}>Todas as clínicas</option>
-          {visibleClinics.map((c) => (
-            <option key={c.id} value={c.id}>{c.name}</option>
-          ))}
-        </select>
-      </div>
+      {showReviewed && (
+        <div className="space-y-1">
+          <label className="text-[11px] font-medium text-muted-foreground">
+            {t("rlhf_audit_filter_reviewed_label")}
+          </label>
+          <select
+            data-testid="filter-reviewed"
+            value={filters.reviewed || ALL_REVIEWED}
+            onChange={(e) => onReviewedChange(e.target.value)}
+            className="h-9 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent w-44"
+          >
+            <option value={ALL_REVIEWED}>{t("rlhf_audit_filter_reviewed_all")}</option>
+            <option value="true">{t("rlhf_audit_filter_reviewed_yes")}</option>
+            <option value="false">{t("rlhf_audit_filter_reviewed_no")}</option>
+          </select>
+        </div>
+      )}
 
       <DateRangePicker
         startDate={filters.startDate}
@@ -383,14 +477,289 @@ function formatAcceptedAt(iso: string | null): string {
   }
 }
 
+function TraceLink({ entry }: { entry: RatingEntry }) {
+  const { t } = useI18n();
+  const traceId = entry.trace_event_id ?? null;
+  const traceTenant = entry.trace_tenant_id ?? null;
+  if (!traceId || !traceTenant) {
+    return (
+      <span
+        data-testid={`trace-missing-${entry.id}`}
+        className="text-[10px] text-muted-foreground italic"
+      >
+        {t("rlhf_audit_no_trace")}
+      </span>
+    );
+  }
+  const href = `/traces/${traceId}?tenant_id=${encodeURIComponent(traceTenant)}`;
+  return (
+    <Link
+      href={href}
+      data-testid={`trace-link-${entry.id}`}
+      className="inline-flex items-center gap-1 text-[10px] font-medium text-sky-500 hover:text-sky-400"
+    >
+      <ExternalLink className="h-3 w-3" />
+      {t("rlhf_audit_view_trace")}
+    </Link>
+  );
+}
+
+function ReviewPanel({
+  entry,
+  onSubmitted,
+}: {
+  entry: RatingEntry;
+  onSubmitted: () => Promise<void>;
+}) {
+  const { t } = useI18n();
+  const { toast } = useToast();
+  const history = entry.review_history ?? [];
+  const currentlyReviewed = history[0]?.revisado ?? false;
+  const [observation, setObservation] = useState<string>("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const submit = async (nextRevisado: boolean) => {
+    setSubmitting(true);
+    try {
+      const raw = observation.trim();
+      // Marking REVISADO with no written observation is an explicitly
+      // legitimate verdict per the DESIGN — we pass null to the API in that
+      // case rather than an empty string.
+      const body = JSON.stringify({
+        revisado: nextRevisado,
+        observacao: raw.length > 0 ? raw : null,
+      });
+      await customFetch(`/v1/rlhf/ratings/${entry.id}/review`, {
+        method: "POST",
+        body,
+      });
+      setObservation("");
+      toast({ title: t("rlhf_audit_review_ok") });
+      // Reload from the authoritative summary so review_history and
+      // reviewed_count refresh in a single round-trip.
+      await onSubmitted();
+    } catch {
+      toast({ title: t("rlhf_audit_review_err"), variant: "destructive" });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div
+      data-testid={`review-panel-${entry.id}`}
+      className="rounded-md border border-border bg-muted/30 p-3 space-y-2"
+    >
+      <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+        {t("rlhf_audit_parecer_title")}
+      </p>
+      <div className="space-y-1">
+        <label
+          htmlFor={`observation-${entry.id}`}
+          className="text-[10px] font-medium text-muted-foreground"
+        >
+          {t("rlhf_audit_observation_label")}
+        </label>
+        <textarea
+          id={`observation-${entry.id}`}
+          data-testid={`observation-${entry.id}`}
+          value={observation}
+          onChange={(e) => setObservation(e.target.value)}
+          placeholder={t("rlhf_audit_observation_placeholder")}
+          rows={2}
+          className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent"
+        />
+      </div>
+      <div className="flex flex-wrap gap-2">
+        <Button
+          data-testid={`revisado-toggle-${entry.id}`}
+          size="sm"
+          className={`text-[10px] h-7 gap-1 px-2 ${
+            currentlyReviewed
+              ? "bg-slate-500 hover:bg-slate-400 text-white"
+              : "bg-sky-600 hover:bg-sky-500 text-white"
+          }`}
+          onClick={() => void submit(!currentlyReviewed)}
+          disabled={submitting}
+        >
+          {submitting
+            ? t("rlhf_audit_review_submitting")
+            : currentlyReviewed
+              ? t("rlhf_audit_unmark_reviewed")
+              : t("rlhf_audit_mark_reviewed")}
+        </Button>
+      </div>
+
+      <div data-testid={`review-history-${entry.id}`} className="space-y-1">
+        <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground pt-1">
+          {t("rlhf_audit_history_title")}
+        </p>
+        {history.length === 0 ? (
+          <p className="text-[10px] text-muted-foreground italic">
+            {t("rlhf_audit_history_empty")}
+          </p>
+        ) : (
+          <ul className="space-y-1">
+            {history.map((row, idx) => (
+              <li
+                key={`${entry.id}-hist-${idx}`}
+                data-testid={`review-history-row-${entry.id}-${idx}`}
+                className="text-[10px] text-foreground/80 bg-background rounded border border-border px-2 py-1"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold">
+                    {row.revisado
+                      ? t("rlhf_audit_history_marked_reviewed")
+                      : t("rlhf_audit_history_unmarked_reviewed")}
+                  </span>
+                  <span className="text-muted-foreground">
+                    {formatAcceptedAt(row.revisado_em)}
+                  </span>
+                </div>
+                <div className="text-muted-foreground">
+                  {t("rlhf_audit_history_reviewed_by")} {row.revisado_por_email ?? "—"}
+                </div>
+                {row.observacao && row.observacao.trim().length > 0 && (
+                  <div className="italic text-foreground/80 mt-0.5">"{row.observacao}"</div>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function FeedbackEntryCard({
+  entry,
+  onAction,
+  actioningId,
+  showSuperControls,
+  onReviewSubmitted,
+}: {
+  entry: RatingEntry;
+  onAction: (entryId: string, action: "approve" | "ignore") => void;
+  actioningId: string | null;
+  showSuperControls: boolean;
+  onReviewSubmitted: () => Promise<void>;
+}) {
+  const acceptable  = hasQualifyingReason(entry);
+  const isProcessing = actioningId === entry.id;
+  return (
+    <Card
+      data-testid={`written-entry-${entry.id}`}
+      className={`border-border shadow-sm overflow-hidden transition-opacity ${entry.ignored ? "opacity-40" : ""}`}
+    >
+      <div className="flex items-center justify-between px-4 py-2 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
+        <div className="flex items-center gap-2">
+          <RatingBadge rating={entry.rating} />
+          <span className="text-[11px] text-muted-foreground">
+            {RATING_META[entry.rating]?.label}
+          </span>
+        </div>
+        <span className="text-[10px] text-muted-foreground">
+          {entry.ts ? new Date(entry.ts).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" }) : ""}
+        </span>
+      </div>
+
+      <CardContent className="pt-3 pb-3 space-y-3">
+        <div>
+          <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground mb-1">
+            Opinião do cliente
+          </p>
+          <p className="text-xs italic text-foreground/80 bg-muted rounded px-2 py-1.5 border border-border">
+            "{entry.reason}"
+          </p>
+        </div>
+
+        <div>
+          <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground mb-1">
+            Opinião da IA
+          </p>
+          <AiAnalysisCell entry={entry} />
+        </div>
+
+        <div className="grid gap-2 sm:grid-cols-2">
+          <div>
+            <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground mb-0.5">
+              Clínica / Usuário
+            </p>
+            <p className="text-[11px] font-semibold text-foreground">
+              {entry.subject_clinic_name ?? entry.subject_tenant_id.slice(0, 8) + "..."}
+            </p>
+            <p className="text-[10px] text-muted-foreground">
+              {entry.submitted_by ?? "—"}
+              {entry.builder_name ? ` · Builder: ${entry.builder_name}` : ""}
+            </p>
+          </div>
+
+          <div className="flex flex-col items-start sm:items-end gap-1.5">
+            {showSuperControls && <TraceLink entry={entry} />}
+            {showSuperControls && (entry.approved_for_training ? (
+              <>
+                <Badge className="text-[9px] bg-violet-500/15 text-violet-400 border border-violet-500/30 flex items-center gap-1 w-fit py-0">
+                  <Zap className="h-2.5 w-2.5" /> No Dataset
+                </Badge>
+                <p
+                  data-testid={`accepted-meta-${entry.id}`}
+                  className="text-[10px] text-muted-foreground text-right"
+                >
+                  Aceito por {entry.accepted_by_email ?? "—"}
+                  <br />em {formatAcceptedAt(entry.accepted_at)}
+                </p>
+              </>
+            ) : entry.ignored ? (
+              <span className="text-[10px] text-muted-foreground">Ignorado</span>
+            ) : (
+              <>
+                {acceptable && (
+                  <Button
+                    data-testid={`accept-btn-${entry.id}`}
+                    size="sm"
+                    className="text-[10px] h-7 bg-violet-600 hover:bg-violet-500 text-white gap-1 px-2"
+                    onClick={() => onAction(entry.id, "approve")}
+                    disabled={isProcessing}
+                  >
+                    <Zap className="h-2.5 w-2.5" />
+                    Aceitar e gravar opinião
+                  </Button>
+                )}
+                <Button
+                  data-testid={`ignore-btn-${entry.id}`}
+                  size="sm"
+                  variant="outline"
+                  className="text-[10px] h-7 gap-1 px-2 text-muted-foreground"
+                  onClick={() => onAction(entry.id, "ignore")}
+                  disabled={isProcessing}
+                >
+                  Ignorar
+                </Button>
+              </>
+            ))}
+          </div>
+        </div>
+
+        {showSuperControls && (
+          <ReviewPanel entry={entry} onSubmitted={onReviewSubmitted} />
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function WrittenFeedbackList({
   entries,
   onAction,
   actioningId,
+  showSuperControls,
+  onReviewSubmitted,
 }: {
   entries: RatingEntry[];
   onAction: (entryId: string, action: "approve" | "ignore") => void;
   actioningId: string | null;
+  showSuperControls: boolean;
+  onReviewSubmitted: () => Promise<void>;
 }) {
   const written = entries.filter((e) => e.reason && e.reason.trim().length > 0);
 
@@ -416,106 +785,16 @@ function WrittenFeedbackList({
           </div>
         ) : (
           <div className="space-y-3">
-            {written.map((entry) => {
-              const acceptable  = hasQualifyingReason(entry);
-              const isProcessing = actioningId === entry.id;
-              return (
-                <Card
-                  key={entry.id}
-                  data-testid={`written-entry-${entry.id}`}
-                  className={`border-border shadow-sm overflow-hidden transition-opacity ${entry.ignored ? "opacity-40" : ""}`}
-                >
-                  <div className="flex items-center justify-between px-4 py-2 bg-slate-50/50 dark:bg-slate-900/50 border-b border-border">
-                    <div className="flex items-center gap-2">
-                      <RatingBadge rating={entry.rating} />
-                      <span className="text-[11px] text-muted-foreground">
-                        {RATING_META[entry.rating]?.label}
-                      </span>
-                    </div>
-                    <span className="text-[10px] text-muted-foreground">
-                      {entry.ts ? new Date(entry.ts).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" }) : ""}
-                    </span>
-                  </div>
-
-                  <CardContent className="pt-3 pb-3 space-y-3">
-                    <div>
-                      <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground mb-1">
-                        Opinião do cliente
-                      </p>
-                      <p className="text-xs italic text-foreground/80 bg-muted rounded px-2 py-1.5 border border-border">
-                        "{entry.reason}"
-                      </p>
-                    </div>
-
-                    <div>
-                      <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground mb-1">
-                        Opinião da IA
-                      </p>
-                      <AiAnalysisCell entry={entry} />
-                    </div>
-
-                    <div className="grid gap-2 sm:grid-cols-2">
-                      <div>
-                        <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground mb-0.5">
-                          Clínica / Usuário
-                        </p>
-                        <p className="text-[11px] font-semibold text-foreground">
-                          {entry.subject_clinic_name ?? entry.subject_tenant_id.slice(0, 8) + "..."}
-                        </p>
-                        <p className="text-[10px] text-muted-foreground">
-                          {entry.submitted_by ?? "—"}
-                          {entry.builder_name ? ` · Builder: ${entry.builder_name}` : ""}
-                        </p>
-                      </div>
-
-                      <div className="flex flex-col items-start sm:items-end gap-1.5">
-                        {entry.approved_for_training ? (
-                          <>
-                            <Badge className="text-[9px] bg-violet-500/15 text-violet-400 border border-violet-500/30 flex items-center gap-1 w-fit py-0">
-                              <Zap className="h-2.5 w-2.5" /> No Dataset
-                            </Badge>
-                            <p
-                              data-testid={`accepted-meta-${entry.id}`}
-                              className="text-[10px] text-muted-foreground text-right"
-                            >
-                              Aceito por {entry.accepted_by_email ?? "—"}
-                              <br />em {formatAcceptedAt(entry.accepted_at)}
-                            </p>
-                          </>
-                        ) : entry.ignored ? (
-                          <span className="text-[10px] text-muted-foreground">Ignorado</span>
-                        ) : (
-                          <>
-                            {acceptable && (
-                              <Button
-                                data-testid={`accept-btn-${entry.id}`}
-                                size="sm"
-                                className="text-[10px] h-7 bg-violet-600 hover:bg-violet-500 text-white gap-1 px-2"
-                                onClick={() => onAction(entry.id, "approve")}
-                                disabled={isProcessing}
-                              >
-                                <Zap className="h-2.5 w-2.5" />
-                                Aceitar e gravar opinião
-                              </Button>
-                            )}
-                            <Button
-                              data-testid={`ignore-btn-${entry.id}`}
-                              size="sm"
-                              variant="outline"
-                              className="text-[10px] h-7 gap-1 px-2 text-muted-foreground"
-                              onClick={() => onAction(entry.id, "ignore")}
-                              disabled={isProcessing}
-                            >
-                              Ignorar
-                            </Button>
-                          </>
-                        )}
-                      </div>
-                    </div>
-                  </CardContent>
-                </Card>
-              );
-            })}
+            {written.map((entry) => (
+              <FeedbackEntryCard
+                key={entry.id}
+                entry={entry}
+                onAction={onAction}
+                actioningId={actioningId}
+                showSuperControls={showSuperControls}
+                onReviewSubmitted={onReviewSubmitted}
+              />
+            ))}
           </div>
         )}
       </CardContent>
@@ -533,6 +812,7 @@ const EMPTY_RESPONSE: RatingsResponse = {
 
 export function RatingsPanel() {
   const { toast } = useToast();
+  const { isSuperAdmin, isInvestor } = useAuth();
   const initial = defaultDates();
   const [filters, setFilters] = useState<FiltersState>({
     builderId: "",
@@ -540,6 +820,8 @@ export function RatingsPanel() {
     startDate: initial.startDate,
     endDate: initial.endDate,
     onlyAccepted: false,
+    channel: "",
+    reviewed: "",
   });
   const [data, setData] = useState<RatingsResponse>(EMPTY_RESPONSE);
   const [loading, setLoading] = useState(true);
@@ -557,6 +839,10 @@ export function RatingsPanel() {
       if (current.builderId) qs.set("builder_id", current.builderId);
       if (current.clinicId)  qs.set("tenant_id", current.clinicId);
       if (current.onlyAccepted) qs.set("only_accepted", "true");
+      if (current.channel) qs.set("channel", current.channel);
+      // Backend silently ignores `reviewed` for non-super callers, but per the
+      // wish the UI never even offers the dropdown to investors.
+      if (current.reviewed) qs.set("reviewed", current.reviewed);
       const response = await customFetch<RatingsResponse>(`/v1/rlhf/ratings?${qs}`);
       // Defensive: if the backend ever returns a partial payload, keep shape stable.
       setData({
@@ -575,7 +861,15 @@ export function RatingsPanel() {
   useEffect(() => {
     void load(filters);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filters.builderId, filters.clinicId, filters.startDate, filters.endDate, filters.onlyAccepted]);
+  }, [
+    filters.builderId,
+    filters.clinicId,
+    filters.startDate,
+    filters.endDate,
+    filters.onlyAccepted,
+    filters.channel,
+    filters.reviewed,
+  ]);
 
   const takeAction = async (entryId: string, action: "approve" | "ignore") => {
     setActioningId(entryId);
@@ -598,9 +892,15 @@ export function RatingsPanel() {
 
   return (
     <div className="space-y-6">
-      <Filters filters={filters} onChange={setFilters} facets={data.facets} />
+      <Filters
+        filters={filters}
+        onChange={setFilters}
+        facets={data.facets}
+        showBuilderClinic={isSuperAdmin}
+        showReviewed={!isInvestor}
+      />
 
-      <KpiCards summary={data.summary} />
+      <KpiCards summary={data.summary} showReviewed={!isInvestor} />
 
       <DistributionChart summary={data.summary} />
 
@@ -614,6 +914,8 @@ export function RatingsPanel() {
           entries={data.entries}
           onAction={takeAction}
           actioningId={actioningId}
+          showSuperControls={isSuperAdmin}
+          onReviewSubmitted={() => load(filters)}
         />
       )}
     </div>

@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, JsonValue
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.middleware.auth import (
@@ -26,6 +27,8 @@ from src.api.middleware.auth import (
 from src.llm import get_tenant_llm_client
 from src.models.builder import Builder
 from src.models.event import Event
+from src.models.rlhf_audit_review import RlhfAuditReview
+from src.models.rlhf_rating import RlhfRating
 from src.models.tenant import Tenant
 from src.models.user import User
 from src.observability.pii import mask_carteirinha
@@ -108,7 +111,7 @@ class RatingRequest(BaseModel):
 
 class RatingResponse(BaseModel):
     ok: bool = True
-    event_id: str
+    rating_id: str
 
 
 class RatingEntry(BaseModel):
@@ -128,6 +131,19 @@ class RatingEntry(BaseModel):
 
 class RatingActionRequest(BaseModel):
     action: Literal["approve", "ignore"]
+
+
+class RatingReviewRequest(BaseModel):
+    """Human verdict for a rating (append-only history).
+
+    ``revisado`` is the required verdict flag; ``observacao`` is optional
+    because marking a rating as reviewed with no additional comment is
+    itself a legitimate outcome. Every call inserts a new row in
+    ``rlhf_audit_reviews`` — there is no UPDATE or DELETE.
+    """
+
+    revisado: bool
+    observacao: Optional[str] = None
 
 
 # ============================================
@@ -192,42 +208,116 @@ def _parse_analysis_content(content: str) -> Optional[dict[str, str]]:
     return {"status": status_value, "justification": justification}
 
 
+def _channel_for_event_type(event_type: Optional[str]) -> str:
+    """Map a resolved Event.event_type to the rating's channel string.
+
+    Only ``message.in`` maps to WhatsApp (the source of trace-detail-view
+    ratings). ``srm.decision`` and other simulator-produced event types map
+    to ``web``. Anything else — including an event type unknown to this
+    codebase — is stored as ``unknown`` so the audit report can flag rows
+    whose provenance we cannot vouch for.
+    """
+    if event_type == "message.in":
+        return "whatsapp"
+    if event_type == "srm.decision":
+        return "web"
+    return "unknown"
+
+
+async def _resolve_message_context(
+    message_id: Optional[str],
+    session: AsyncSession,
+) -> tuple[str, Optional[UUID], Optional[UUID], Optional[Event]]:
+    """Resolve a rating's ``message_id`` into a channel + trace pair + event.
+
+    Returns a 4-tuple ``(channel, trace_event_id, trace_tenant_id, event)``.
+
+    The four cases the caller must survive:
+
+    * ``message_id`` absent or a non-UUID string (simulator flow — the panel
+      generates a synthetic id like ``msg-abcd1234``): ``("web", None, None,
+      None)``. The rating is a web-simulator artefact with no trace to
+      point at.
+    * ``message_id`` is a syntactically valid UUID but no ``Event`` row
+      matches (orphaned): ``("unknown", None, None, None)``. We cannot vouch
+      for what channel produced the rating.
+    * ``message_id`` resolves to a ``message.in`` event: ``("whatsapp",
+      event.id, event.tenant_id, event)``. This is the only shape that
+      populates the trace pair — Group 6 will consume the pair to render a
+      "View trace" link.
+    * ``message_id`` resolves to any other event type (``srm.decision``,
+      ``chat.response``, etc.): channel is derived from the event type via
+      :func:`_channel_for_event_type` and the trace pair stays ``None``.
+
+    Fail-open contract: if the DB call raises, the resolver returns
+    ``("unknown", None, None, None)`` rather than propagating — a rating
+    must never be dropped because its provenance lookup failed.
+    """
+    if not message_id:
+        return ("web", None, None, None)
+
+    try:
+        msg_uuid = UUID(message_id)
+    except (ValueError, AttributeError):
+        # Non-UUID id — treat as a simulator-generated synthetic id.
+        return ("web", None, None, None)
+
+    try:
+        original = (
+            await session.execute(select(Event).where(Event.id == msg_uuid))
+        ).scalar_one_or_none()
+    except SQLAlchemyError as exc:
+        logger.warning(
+            "Rating message_id resolution failed message_id=%s err=%s",
+            message_id,
+            exc,
+        )
+        return ("unknown", None, None, None)
+
+    if original is None:
+        # Well-formed UUID, no matching Event — orphaned. Cannot vouch
+        # for the channel that produced this rating.
+        return ("unknown", None, None, None)
+
+    channel = _channel_for_event_type(original.event_type)
+    if original.event_type == "message.in":
+        # Deliverable 3: the trace pair is filled ONLY for message.in and
+        # never leaves the write with divergent nullness. Group 6 needs
+        # both id and tenant to link back to the trace.
+        return (channel, original.id, original.tenant_id, original)
+    return (channel, None, None, original)
+
+
 async def _analyze_rating_async(
-    event_id: UUID,
+    rating_id: UUID,
     rating: int,
     reason: str,
     agent_response: str,
     user_message: str,
     tenant_id: UUID,
-    message_id: Optional[str] = None,
     clinic_tenant_id: Optional[str] = None,
+    resolved_event: Optional[Event] = None,
 ) -> None:
-    """Run LLM analysis for a low-rating event and persist the result.
+    """Run LLM analysis for a low-rating record and persist the result.
 
     Uses a dedicated prompt (NOT the SRM policy engine) since we're
     evaluating a user's critique, not an agent response. Opens its own
     DB session because the request-scoped one is closed by the time this
     background task runs.
 
-    When message_id is a valid UUID that matches an Event row (e.g. a trace
-    event from the Histórico de Traces), we use that event's tenant_id to
-    resolve LLM credentials — because the runtime cache only stores the
-    non-secret projection, so raw key resolution runs DB-only against the
-    CLINIC's tenant, not the builder's. Falls back to the rating's own
-    tenant_id (simulator flow, where message_id is a frontend UUID).
+    The credential-tenant resolution keeps the same three rungs the
+    endpoint uses for ``subject_tenant_id``:
+
+    1. Validated ``clinic_tenant_id`` (existence-checked against Tenant).
+    2. ``resolved_event.tenant_id`` — the event ``message_id`` resolved to,
+       resolved by ``submit_rating`` and forwarded here. This function no
+       longer issues its own ``message_id`` query (deliverable 5); the
+       middle rung is proven by an endpoint-level test that lets
+       ``submit_rating`` perform the real resolution.
+    3. ``tenant_id`` — the submitter's own tenant, the final fallback.
     """
     from src.services.event_service import _load_runtime_llm_credentials
 
-    # Resolve which tenant's credentials to use for LLM.
-    # Priority: explicit clinic_tenant_id (from frontend) > message_id event lookup > submitter's tenant.
-    #
-    # clinic_tenant_id must (a) parse as a UUID AND (b) match a real Tenant row
-    # before we trust it — otherwise a caller could point analysis at any
-    # syntactically valid UUID and pick which tenant's LLM credentials are
-    # loaded for this call. Mirrors the validation in submit_rating. When the
-    # UUID is well-formed but no Tenant matches, fall through to the message_id
-    # lookup rather than silently staying on the submitter tenant, preserving
-    # the declared priority order.
     resolve_tenant_id = tenant_id
     clinic_tenant_resolved = False
     if clinic_tenant_id:
@@ -247,50 +337,34 @@ async def _analyze_rating_async(
                     resolve_tenant_id = candidate
                     clinic_tenant_resolved = True
                     logger.info(
-                        "Rating analysis using explicit clinic_tenant_id event_id=%s clinic_tenant=%s",
-                        event_id,
+                        "Rating analysis using explicit clinic_tenant_id rating_id=%s clinic_tenant=%s",
+                        rating_id,
                         resolve_tenant_id,
                     )
                 else:
                     logger.info(
-                        "Rating analysis clinic_tenant_id not found in tenants, falling back event_id=%s clinic_tenant=%s",
-                        event_id,
+                        "Rating analysis clinic_tenant_id not found in tenants, falling back rating_id=%s clinic_tenant=%s",
+                        rating_id,
                         candidate,
                     )
             except Exception as exc:
                 logger.warning(
-                    "Rating analysis clinic_tenant_id lookup failed event_id=%s clinic_tenant=%s err=%s",
-                    event_id,
+                    "Rating analysis clinic_tenant_id lookup failed rating_id=%s clinic_tenant=%s err=%s",
+                    rating_id,
                     candidate,
                     exc,
                 )
-    if not clinic_tenant_resolved and message_id:
-        try:
-            msg_uuid = UUID(message_id)
-            async with get_db_session() as db:
-                original = (
-                    await db.execute(select(Event).where(Event.id == msg_uuid))
-                ).scalar_one_or_none()
-                if original is not None:
-                    resolve_tenant_id = original.tenant_id
-                    logger.info(
-                        "Rating analysis using clinic tenant event_id=%s clinic_tenant=%s",
-                        event_id,
-                        resolve_tenant_id,
-                    )
-                else:
-                    logger.info(
-                        "Rating analysis message_id not found in events, using submitter tenant event_id=%s message_id=%s",
-                        event_id,
-                        message_id,
-                    )
-        except Exception as exc:
-            logger.warning(
-                "Rating analysis message_id lookup failed event_id=%s message_id=%s err=%s",
-                event_id,
-                message_id,
-                exc,
-            )
+    if not clinic_tenant_resolved and resolved_event is not None:
+        # Middle rung — the endpoint already resolved message_id → Event
+        # and threaded the resolved row through. We do NOT re-query here:
+        # doing so would (a) waste a round-trip and (b) let a refactor
+        # silently drop the middle rung without a visible symptom.
+        resolve_tenant_id = resolved_event.tenant_id
+        logger.info(
+            "Rating analysis using clinic tenant from resolved event rating_id=%s clinic_tenant=%s",
+            rating_id,
+            resolve_tenant_id,
+        )
 
     # DB-only resolver: returns ONLY the four LLM overlay fields (raw key held
     # in-memory for this call), builder-owner composition already applied.
@@ -299,8 +373,8 @@ async def _analyze_rating_async(
         api_credentials = await _load_runtime_llm_credentials(resolve_tenant_id)
     except Exception:
         logger.warning(
-            "Could not load tenant LLM credentials for rating analysis event_id=%s",
-            event_id,
+            "Could not load tenant LLM credentials for rating analysis rating_id=%s",
+            rating_id,
         )
 
     tenant_model_value = api_credentials.get("llm_model_name")
@@ -308,8 +382,8 @@ async def _analyze_rating_async(
     # Structured log MUST NOT contain any secret material or prefix — only the
     # public presence bit and the non-secret model id are safe to emit.
     logger.info(
-        "Rating analysis LLM resolution event_id=%s tenant_id=%s model=%s credentials_present=%s",
-        event_id,
+        "Rating analysis LLM resolution rating_id=%s tenant_id=%s model=%s credentials_present=%s",
+        rating_id,
         resolve_tenant_id,
         tenant_model,
         bool(api_credentials),
@@ -317,10 +391,10 @@ async def _analyze_rating_async(
     llm_client = get_tenant_llm_client(resolve_tenant_id, api_credentials)
     if llm_client is None:
         logger.warning(
-            "LLM client unavailable; marking rating analysis as failed event_id=%s",
-            event_id,
+            "LLM client unavailable; marking rating analysis as failed rating_id=%s",
+            rating_id,
         )
-        await _update_rating_status(event_id, status_="failed")
+        await _update_rating_status(rating_id, status_="failed")
         return
 
     prompt = _build_analysis_prompt(rating, reason, agent_response, user_message)
@@ -343,60 +417,69 @@ async def _analyze_rating_async(
 
         if not parsed:
             logger.warning(
-                "Rating analysis returned unparseable content event_id=%s",
-                event_id,
+                "Rating analysis returned unparseable content rating_id=%s",
+                rating_id,
             )
-            await _update_rating_status(event_id, status_="failed")
+            await _update_rating_status(rating_id, status_="failed")
             return
 
         await _update_rating_status(
-            event_id,
+            rating_id,
             status_="done",
             analysis=parsed,
         )
         logger.info(
-            "Rating analysis complete event_id=%s status=%s",
-            event_id,
+            "Rating analysis complete rating_id=%s status=%s",
+            rating_id,
             parsed["status"],
         )
     except (Exception,) as exc:  # noqa: BLE001 — supervisor must receive the error
         logger.error(
-            "Rating analysis failed event_id=%s error=%s",
-            event_id,
+            "Rating analysis failed rating_id=%s error=%s",
+            rating_id,
             str(exc),
             exc_info=True,
         )
-        await _update_rating_status(event_id, status_="failed")
+        await _update_rating_status(rating_id, status_="failed")
         raise
 
 
 async def _update_rating_status(
-    event_id: UUID,
+    rating_id: UUID,
     status_: str,
     analysis: Optional[dict[str, str]] = None,
 ) -> None:
-    """Update the rating event's ai_analysis_status (and optionally ai_analysis)."""
+    """Update the RlhfRating row's ``ai_analysis_status`` and, when the
+    LLM returned a parseable verdict, ``ai_analysis``.
+
+    Repointed from ``events`` to ``rlhf_ratings`` for Group 2. Prior to the
+    port this function did a ``select(Event).where(...)`` and, on a miss,
+    just logged that the row had "vanished" — which after the port would
+    have silently dropped the AI's opinion on every rating, since the row
+    was never an ``Event`` in the first place. Now the query lives on the
+    real storage.
+    """
     try:
         async with get_db_session() as session:
-            result = await session.execute(select(Event).where(Event.id == event_id))
-            event = result.scalar_one_or_none()
-            if event is None:
+            result = await session.execute(
+                select(RlhfRating).where(RlhfRating.id == rating_id)
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
                 logger.warning(
-                    "Rating event vanished before analysis update event_id=%s",
-                    event_id,
+                    "Rating row vanished before analysis update rating_id=%s",
+                    rating_id,
                 )
                 return
 
-            data = dict(event.event_data or {})
-            data["ai_analysis_status"] = status_
+            row.ai_analysis_status = status_
             if analysis is not None:
-                data["ai_analysis"] = analysis
-            event.event_data = data
+                row.ai_analysis = analysis
             await session.commit()
     except Exception:  # noqa: BLE001
         logger.exception(
-            "Failed to persist rating analysis status event_id=%s status=%s",
-            event_id,
+            "Failed to persist rating analysis status rating_id=%s status=%s",
+            rating_id,
             status_,
         )
         raise
@@ -408,29 +491,56 @@ async def submit_rating(
     tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> RatingResponse:
-    """Persist a rating (1-5) for an agent response.
+    """Persist a rating (1-5) for an agent response into ``rlhf_ratings``.
+
+    Resolves channel, trace pair, and subject-tenant attribution at
+    submission time so a later reader never needs to re-derive them —
+    write and read are atomic on the new storage.
 
     For ratings 1-3 that ship with a substantive written critique
     (reason of at least 8 characters after trimming), a background LLM
     analysis is triggered to evaluate whether the critique is justified
-    given the assigned rating. Status is tracked via `ai_analysis_status`
-    (pending/done/failed).
+    given the assigned rating. Status is tracked via
+    ``ai_analysis_status`` (pending/done/failed).
     """
-    event_id = uuid4()
+    rating_id = uuid4()
     reason = (body.reason or "").strip() or None
     # Analysis threshold: rating 1-3 AND a written critique with substance.
     has_reason = _has_reason(reason)
     triggers_analysis = body.rating <= 3 and has_reason
 
-    # subject_tenant_id records WHICH clinic the rating is *about*, so that
-    # per-clinic filtering on the audit report (Group 4) actually resolves to
-    # a real tenant. It is separate from Event.tenant_id (the rater's own
-    # tenant, i.e. the record owner). We only trust body.clinic_tenant_id when
-    # it (a) parses as a UUID AND (b) matches a real Tenant row — clinic_admin
-    # callers can send a business slug from ClinicConfigTable, and a syntactic
-    # UUID that doesn't exist in Tenant would also mislead the report. Any
-    # failure falls back to the rater's own tenant so the field is never null
-    # nor a dangling reference.
+    # -- Resolve channel + trace pair from message_id ---------------------
+    # Fail-open per deliverable 7: the resolver never raises; if the DB
+    # call fails, we still persist the rating with channel='unknown' and
+    # a null trace pair.
+    try:
+        (
+            channel,
+            trace_event_id,
+            trace_tenant_id,
+            resolved_event,
+        ) = await _resolve_message_context(body.message_id, session)
+    except (RuntimeError, SQLAlchemyError) as exc:
+        logger.warning(
+            "Rating message_id context resolution raised message_id=%s err=%s",
+            body.message_id,
+            exc,
+        )
+        channel, trace_event_id, trace_tenant_id, resolved_event = (
+            "unknown",
+            None,
+            None,
+            None,
+        )
+
+    # -- subject_tenant_id: three rungs in precedence order ---------------
+    # 1. Validated ``clinic_tenant_id`` — must parse as a UUID AND match a
+    #    real Tenant row (clinic_admin callers may send a business slug,
+    #    and a bare syntactic UUID would silently mislead the audit report).
+    # 2. ``resolved_event.tenant_id`` — the tenant that owns the trace this
+    #    rating is *about*, when message_id resolved to a real Event.
+    # 3. The rater's own tenant — the record-owner floor, so the field is
+    #    never null and never a dangling reference.
     subject_tenant_id: UUID = tenant.tenant_id
     if body.clinic_tenant_id:
         try:
@@ -443,19 +553,12 @@ async def submit_rating(
             )
             if exists.scalar_one_or_none() is not None:
                 subject_tenant_id = candidate
-
-    event_data: dict[str, Any] = {
-        "message_id": body.message_id,
-        "rating": body.rating,
-        "reason": reason,
-        "agent_response": body.agent_response,
-        "user_message": body.user_message,
-        "submitted_by": str(tenant.user_id) if tenant.user_id else None,
-        "role": tenant.role,
-        "subject_tenant_id": str(subject_tenant_id),
-    }
-    if triggers_analysis:
-        event_data["ai_analysis_status"] = "pending"
+            elif resolved_event is not None:
+                subject_tenant_id = resolved_event.tenant_id
+        elif resolved_event is not None:
+            subject_tenant_id = resolved_event.tenant_id
+    elif resolved_event is not None:
+        subject_tenant_id = resolved_event.tenant_id
 
     session_uuid: Optional[UUID] = None
     if body.session_id:
@@ -464,16 +567,27 @@ async def submit_rating(
         except (ValueError, AttributeError):
             session_uuid = None
 
-    event = Event(
-        id=event_id,
+    row = RlhfRating(
+        id=rating_id,
         tenant_id=tenant.tenant_id,
+        subject_tenant_id=subject_tenant_id,
         session_id=session_uuid,
-        event_type="rlhf.rating",
-        event_data=event_data,
-        event_metadata={"source": "chat_simulator"},
+        message_id=body.message_id,
+        trace_event_id=trace_event_id,
+        trace_tenant_id=trace_tenant_id,
+        channel=channel,
+        rating=body.rating,
+        reason=reason,
+        agent_response=body.agent_response,
+        user_message=body.user_message,
+        submitted_by=tenant.user_id if tenant.user_id else None,
+        role=tenant.role,
+        ai_analysis_status="pending" if triggers_analysis else None,
+        approved_for_training=False,
+        ignored=False,
     )
 
-    session.add(event)
+    session.add(row)
     await session.flush()
     await session.commit()
 
@@ -481,50 +595,47 @@ async def submit_rating(
         assert reason is not None
         spawn(
             _analyze_rating_async(
-                event_id=event_id,
+                rating_id=rating_id,
                 rating=body.rating,
                 reason=reason,
                 agent_response=body.agent_response,
                 user_message=body.user_message,
                 tenant_id=tenant.tenant_id,
-                message_id=body.message_id,
                 clinic_tenant_id=body.clinic_tenant_id,
+                resolved_event=resolved_event,
             ),
-            name=f"rlhf-rating-analysis:{event_id}",
+            name=f"rlhf-rating-analysis:{rating_id}",
         )
 
     logger.info(
-        "RLHF rating saved: event_id=%s rating=%s analysis=%s",
-        event_id,
+        "RLHF rating saved: rating_id=%s channel=%s rating=%s analysis=%s",
+        rating_id,
+        channel,
         body.rating,
         triggers_analysis,
     )
-    return RatingResponse(event_id=str(event_id))
+    return RatingResponse(rating_id=str(rating_id))
 
 
 def _serialize_rating_event(
-    event: Event,
+    row: RlhfRating,
     tenant_map: Optional[dict[UUID, tuple[str, Optional[UUID], Optional[str]]]] = None,
     accepted_email_map: Optional[dict[UUID, str]] = None,
+    review_history: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
-    data = event.event_data or {}
-    # Mask carteirinha PII on the training-lake export surface: rating
-    # rows flagged as approved_for_training feed the SLM fine-tuning
-    # dataset, so the raw number must never leave the event store here.
-    #
-    # subject_tenant_id records the clinic the rating is *about* (see Group 3);
-    # older rows lack it, so fall back to Event.tenant_id (the record owner)
-    # for display and filtering — this is what keeps pre-Group-3 ratings from
-    # silently vanishing from the report.
-    subject_raw = data.get("subject_tenant_id")
-    subject_uuid: Optional[UUID] = None
-    if subject_raw is not None:
-        try:
-            subject_uuid = UUID(str(subject_raw))
-        except (ValueError, AttributeError):
-            subject_uuid = None
-    if subject_uuid is None:
-        subject_uuid = event.tenant_id
+    """Serialize a ``RlhfRating`` row for the audit-report entries list.
+
+    Emits ``channel``, ``trace_event_id``, and ``trace_tenant_id`` — the
+    last two feed Group 6's "View trace" link. Note ``RatingEntry``
+    (defined above at module top) is stale dead code; the endpoint does
+    not declare a ``response_model`` and entries are returned as dicts
+    from this serializer.
+
+    Mask carteirinha PII on the training-lake export surface: rating rows
+    flagged as ``approved_for_training`` feed the SLM fine-tuning dataset,
+    so the raw number must never leave storage here.
+    """
+    subject_uuid = row.subject_tenant_id
 
     subject_clinic_name: Optional[str] = None
     builder_name: Optional[str] = None
@@ -534,41 +645,57 @@ def _serialize_rating_event(
             subject_clinic_name = entry[0]
             builder_name = entry[2]
 
-    # Group 5: accept-audit trail. `accepted_by` / `accepted_at` are stamped
-    # by the PATCH approve action (see `update_rating_action`); legacy rows
-    # approved before this wish carry no stamp and surface as `None`, which
-    # the panel renders as "—" (no migration, per acceptance criterion).
-    accepted_by_raw = data.get("accepted_by")
-    accepted_by_uuid: Optional[UUID] = None
-    if accepted_by_raw is not None:
-        try:
-            accepted_by_uuid = UUID(str(accepted_by_raw))
-        except (ValueError, AttributeError):
-            accepted_by_uuid = None
     accepted_by_email: Optional[str] = None
-    if accepted_by_uuid is not None and accepted_email_map is not None:
-        accepted_by_email = accepted_email_map.get(accepted_by_uuid)
+    if row.accepted_by is not None and accepted_email_map is not None:
+        accepted_by_email = accepted_email_map.get(row.accepted_by)
 
-    return {
-        "id": str(event.id),
-        "ts": event.created_at.isoformat() if event.created_at else "",
-        "tenant_id": str(event.tenant_id),
-        "rating": int(data.get("rating", 0)),
-        "reason": mask_carteirinha(data.get("reason")),
-        "agent_response": mask_carteirinha(data.get("agent_response")),
-        "user_message": mask_carteirinha(data.get("user_message")),
-        "submitted_by": data.get("submitted_by"),
-        "ai_analysis": data.get("ai_analysis"),
-        "ai_analysis_status": data.get("ai_analysis_status"),
-        "approved_for_training": bool(data.get("approved_for_training", False)),
-        "ignored": bool(data.get("ignored", False)),
+    # SQLite's ``DateTime(timezone=True)`` binding strips ``tzinfo`` on
+    # read (aiosqlite returns naive datetimes even for tz-aware columns).
+    # Reattach UTC so the ISO string round-trips exactly against inputs
+    # emitted by ``datetime.now(timezone.utc).isoformat()`` — the shape
+    # every caller in this codebase sends and the ``accepted_at`` audit
+    # trail asserts on.
+    def _iso_utc(dt: Optional[datetime]) -> Optional[str]:
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+
+    payload: dict[str, Any] = {
+        "id": str(row.id),
+        "ts": _iso_utc(row.created_at) or "",
+        "tenant_id": str(row.tenant_id),
+        "rating": int(row.rating),
+        "reason": mask_carteirinha(row.reason),
+        "agent_response": mask_carteirinha(row.agent_response),
+        "user_message": mask_carteirinha(row.user_message),
+        "submitted_by": str(row.submitted_by) if row.submitted_by else None,
+        "ai_analysis": row.ai_analysis,
+        "ai_analysis_status": row.ai_analysis_status,
+        "approved_for_training": bool(row.approved_for_training),
+        "ignored": bool(row.ignored),
         "subject_tenant_id": str(subject_uuid),
         "subject_clinic_name": subject_clinic_name,
         "builder_name": builder_name,
-        "accepted_by": str(accepted_by_uuid) if accepted_by_uuid is not None else None,
-        "accepted_at": data.get("accepted_at"),
+        "accepted_by": str(row.accepted_by) if row.accepted_by is not None else None,
+        "accepted_at": _iso_utc(row.accepted_at),
         "accepted_by_email": accepted_by_email,
+        # Group 2 additions — Group 6 will consume the trace pair.
+        "channel": row.channel,
+        "trace_event_id": (
+            str(row.trace_event_id) if row.trace_event_id is not None else None
+        ),
+        "trace_tenant_id": (
+            str(row.trace_tenant_id) if row.trace_tenant_id is not None else None
+        ),
     }
+    # Group 4: parecer/history is super_admin-only. Callers pass ``None`` for
+    # non-super callers so the key is entirely absent from the JSON (not
+    # ``null``) — Group 6 derives current review state from the first entry.
+    if review_history is not None:
+        payload["review_history"] = review_history
+    return payload
 
 
 @router.get("/ratings")
@@ -583,6 +710,8 @@ async def list_ratings(
     ),
     only_accepted: bool = Query(False),
     only_with_reason: bool = Query(False),
+    channel: Optional[str] = Query(None),
+    reviewed: Optional[bool] = Query(None),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     tenant: TenantContext = Depends(get_tenant_context),
@@ -607,61 +736,61 @@ async def list_ratings(
        subject tenants seen (2 queries total, never N+1).
     3. Facets are computed BEFORE any builder/clinic narrowing, so selecting
        a builder in the panel does not shrink its own dropdown.
-    4. Builder/clinic narrowing matches `subject_tenant_id` with a fallback to
-       `Event.tenant_id` for rows that predate Group 3.
-    5. Summary is computed over the result of step 4.
-    6. `only_accepted` and `only_with_reason` filter entries only — they do
-       not change the summary or facets.
+    4. `channel` narrows the cut for ALL roles; `builder_id`/`tenant_id`
+       narrowing applies to `super_admin` only, matched against
+       `subject_tenant_id`. Non-super callers silently ignore
+       `tenant_id`/`builder_id`/`reviewed` (their tenant isolation lives in
+       step 1's WHERE clause), and `channel` is the one exception that
+       applies universally.
+    4b. `super_admin` only: batched load of every `rlhf_audit_reviews` row for
+        the ratings in the cut, ordered `rating_id, revisado_em DESC, id DESC`
+        so the head of each per-rating list is the current review state.
+        Exactly ONE query, reduced in Python — no `DISTINCT ON` and no window
+        function so SQLite and Postgres behave identically.
+    5. Summary is computed over the result of step 4. `reviewed_count` is
+       included only for `super_admin` and uses the same denominator as
+       `accepted_count` (rows with a qualifying reason whose current review
+       state is `revisado=True`).
+    6. `only_accepted`, `only_with_reason`, and `reviewed` (super_admin only)
+       filter entries only — they do not change the summary or facets.
     7. `limit`/`offset` slice AFTER step 6 so pagination never returns
        incomplete pages silently.
     """
     is_super = tenant.role == "super_admin"
 
     # -- Step 1: SQL filters on real columns only --------------------------
-    stmt = select(Event).where(Event.event_type == "rlhf.rating")
+    # Group 2: the row source moved from ``events`` (filtered by
+    # ``event_type='rlhf.rating'``) to the dedicated ``rlhf_ratings`` table.
+    # ``channel`` and ``reviewed`` are Python-side narrowing in step 4 / 6
+    # (Group 4) so facets are still computed over the un-narrowed cut.
+    stmt = select(RlhfRating)
 
     if not is_super:
         # Tenant isolation: non-super-admins can only see rows THEY own.
         # For super_admin, tenant/builder filtering happens in step 4 against
-        # subject_tenant_id — a SQL clause on Event.tenant_id here would AND
-        # owner-match with subject-match and return zero rows in the main
+        # subject_tenant_id — a SQL clause on RlhfRating.tenant_id here would
+        # AND owner-match with subject-match and return zero rows in the main
         # case (a builder rating a clinic's agent).
-        stmt = stmt.where(Event.tenant_id == tenant.tenant_id)
+        stmt = stmt.where(RlhfRating.tenant_id == tenant.tenant_id)
 
-    # Date window: reuse the exact convention from
-    # `src/services/trace_service.py:_apply_filters` — end_date at midnight
-    # widens to 23:59:59 so the final day isn't dropped (the panel's default
-    # end_date is "today"), and both ends pass through `_to_utc` which treats
-    # naive datetimes as BRT (UTC-3). Event.created_at is DateTime(timezone=
-    # True), so comparing naive against tz-aware passes on SQLite (test) but
-    # shifts 3 hours on Postgres (prod).
+    # Date window: same convention as trace_service._apply_filters — end_date
+    # at midnight widens to 23:59:59 so the final day isn't dropped, and both
+    # ends pass through _to_utc (naive dates read as BRT / UTC-3).
     if start_date is not None:
-        stmt = stmt.where(Event.created_at >= _to_utc(start_date))
+        stmt = stmt.where(RlhfRating.created_at >= _to_utc(start_date))
     if end_date is not None:
         if end_date.hour == 0 and end_date.minute == 0 and end_date.second == 0:
             end_date = end_date.replace(hour=23, minute=59, second=59)
-        stmt = stmt.where(Event.created_at <= _to_utc(end_date))
+        stmt = stmt.where(RlhfRating.created_at <= _to_utc(end_date))
 
-    stmt = stmt.order_by(Event.created_at.desc())
+    stmt = stmt.order_by(RlhfRating.created_at.desc())
     result = await session.execute(stmt)
-    events = list(result.scalars().all())
+    ratings_rows: list[RlhfRating] = list(result.scalars().all())
 
     # -- Step 2: batched resolution of subject tenants ---------------------
-    # subject_tenant_id lives in event_data (see Group 3). Read it in Python
-    # to keep the query dialect-agnostic (JSON operators are Postgres-only).
-    # Fall back to Event.tenant_id for pre-Group-3 rows so they still show up
-    # named in the report instead of vanishing.
-    def _subject_of(event: Event) -> UUID:
-        data = event.event_data or {}
-        raw = data.get("subject_tenant_id")
-        if raw:
-            try:
-                return UUID(str(raw))
-            except (ValueError, AttributeError):
-                pass
-        return event.tenant_id
-
-    subject_ids: set[UUID] = {_subject_of(e) for e in events}
+    # ``subject_tenant_id`` is a NOT NULL column on ``rlhf_ratings`` — no
+    # more JSON blob inspection or Event.tenant_id fallback needed.
+    subject_ids: set[UUID] = {r.subject_tenant_id for r in ratings_rows}
     tenant_map: dict[UUID, tuple[str, Optional[UUID], Optional[str]]] = {}
     builder_name_map: dict[UUID, str] = {}
     if subject_ids:
@@ -670,27 +799,24 @@ async def list_ratings(
                 Tenant.id.in_(subject_ids)
             )
         )
-        rows = tenants_result.all()
+        tenant_rows = tenants_result.all()
         builder_ids: set[UUID] = {
-            row.builder_id for row in rows if row.builder_id is not None
+            tr.builder_id for tr in tenant_rows if tr.builder_id is not None
         }
         if builder_ids:
             builders_result = await session.execute(
                 select(Builder.id, Builder.name).where(Builder.id.in_(builder_ids))
             )
             builder_name_map = {b.id: b.name for b in builders_result.all()}
-        for row in rows:
+        for tr in tenant_rows:
             b_name = (
-                builder_name_map.get(row.builder_id)
-                if row.builder_id is not None
+                builder_name_map.get(tr.builder_id)
+                if tr.builder_id is not None
                 else None
             )
-            tenant_map[row.id] = (row.name, row.builder_id, b_name)
+            tenant_map[tr.id] = (tr.name, tr.builder_id, b_name)
 
     # -- Step 3: facets computed BEFORE builder/clinic narrowing -----------
-    # Distinct builders and clinics seen among the subjects of this cut.
-    # Clinics carry `builder_id` so the panel can narrow the clinic dropdown
-    # client-side without a second HTTP round-trip.
     facet_clinics: dict[UUID, dict[str, Any]] = {}
     facet_builders: dict[UUID, dict[str, Any]] = {}
     for sid in subject_ids:
@@ -698,8 +824,6 @@ async def list_ratings(
         if entry is not None:
             clinic_name, clinic_builder_id, clinic_builder_name = entry
         else:
-            # Subject tenant not found in the Tenant table (e.g. deleted).
-            # Emit a stable placeholder so the row still faces up.
             clinic_name = str(sid)
             clinic_builder_id = None
             clinic_builder_name = None
@@ -724,8 +848,8 @@ async def list_ratings(
     }
 
     # -- Step 4: apply builder/clinic narrowing against subject_tenant_id --
-    def _matches_narrowing(event: Event) -> bool:
-        sid = _subject_of(event)
+    def _matches_narrowing(r: RlhfRating) -> bool:
+        sid = r.subject_tenant_id
         if tenant_id is not None and sid != tenant_id:
             return False
         if builder_id is not None:
@@ -735,95 +859,147 @@ async def list_ratings(
                 return False
         return True
 
+    # ``channel`` is the one narrowing that applies to every role — non-super
+    # callers pick their WhatsApp/simulator/web slice too. ``tenant_id`` and
+    # ``builder_id`` stay super_admin-only (see docstring step 4).
+    def _matches_channel(r: RlhfRating) -> bool:
+        return channel is None or r.channel == channel
+
     if not is_super:
-        # Non-super-admin: `tenant_id` / `builder_id` query params were also
-        # ignored in the pre-Group-4 handler; keep that contract (their
-        # tenant-isolation clause in step 1 already scopes the row set).
-        cut = list(events)
+        cut: list[RlhfRating] = [r for r in ratings_rows if _matches_channel(r)]
     else:
-        cut = [e for e in events if _matches_narrowing(e)]
+        cut = [r for r in ratings_rows if _matches_channel(r) and _matches_narrowing(r)]
+
+    # -- Step 4b: super_admin — batched review history for the cut ---------
+    # ORDER BY rating_id, revisado_em DESC, id DESC — iterating the single
+    # result set and appending via ``setdefault(...).append(...)`` yields each
+    # rating's reviews newest-first, so ``review_history_map[rid][0]`` is the
+    # current state. Deliberately no ``DISTINCT ON`` and no window function
+    # (SQLite/Postgres portability, per wish Group 4 contract).
+    review_history_map: dict[UUID, list[dict[str, Any]]] = {}
+    if is_super:
+        rating_ids = {r.id for r in cut}
+        if rating_ids:
+            reviews_result = await session.execute(
+                select(RlhfAuditReview)
+                .where(RlhfAuditReview.rating_id.in_(rating_ids))
+                .order_by(
+                    RlhfAuditReview.rating_id,
+                    RlhfAuditReview.revisado_em.desc(),
+                    RlhfAuditReview.id.desc(),
+                )
+            )
+
+            def _review_iso_utc(dt: Optional[datetime]) -> Optional[str]:
+                if dt is None:
+                    return None
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.isoformat()
+
+            for review_row in reviews_result.scalars().all():
+                review_history_map.setdefault(review_row.rating_id, []).append(
+                    {
+                        "observacao": review_row.observacao,
+                        "revisado": bool(review_row.revisado),
+                        "revisado_por_email": review_row.revisado_por_email,
+                        "revisado_em": _review_iso_utc(review_row.revisado_em),
+                    }
+                )
+
+    def _current_reviewed_state(r: RlhfRating) -> Optional[bool]:
+        """Return the current ``revisado`` verdict for a rating, or ``None``
+        when no review row exists. Only meaningful under ``is_super`` because
+        ``review_history_map`` is populated only in that branch."""
+        history = review_history_map.get(r.id)
+        if not history:
+            return None
+        return bool(history[0]["revisado"])
 
     # -- Step 5: summary over the cut (before only_* toggles) --------------
-    def _row_has_reason(event: Event) -> bool:
-        data = event.event_data or {}
-        return _has_reason(data.get("reason"))
+    def _row_has_reason(r: RlhfRating) -> bool:
+        return _has_reason(r.reason)
 
-    def _is_accepted(event: Event) -> bool:
-        data = event.event_data or {}
-        return bool(data.get("approved_for_training", False))
+    def _is_accepted(r: RlhfRating) -> bool:
+        return bool(r.approved_for_training)
 
     distribution: dict[str, int] = {str(i): 0 for i in range(1, 6)}
     total = 0
     rating_sum = 0
     accepted_count = 0
-    for event in cut:
-        data = event.event_data or {}
-        try:
-            rating_value = int(data.get("rating", 0))
-        except (TypeError, ValueError):
-            rating_value = 0
+    reviewed_count = 0
+    for r in cut:
+        rating_value = int(r.rating)
         if 1 <= rating_value <= 5:
             distribution[str(rating_value)] += 1
             total += 1
             rating_sum += rating_value
-        # Group 5: `accepted_count` counts only entries that are BOTH
-        # approved AND carry a qualifying reason. This mirrors the ONE archive
-        # the panel actually surfaces (`only_with_reason=true&only_accepted=true`)
-        # and excludes legacy approvals that predate this wish and have no
-        # written critique on file.
-        if _is_accepted(event) and _row_has_reason(event):
-            accepted_count += 1
+        if _row_has_reason(r):
+            if _is_accepted(r):
+                accepted_count += 1
+            # Same denominator as ``accepted_count`` — a rating only counts
+            # toward ``reviewed_count`` when it BOTH has a qualifying reason
+            # AND its current review verdict is ``revisado=True``. Non-super
+            # never reaches this branch (``_current_reviewed_state`` returns
+            # ``None`` when the map is empty), but gate on ``is_super``
+            # explicitly so the intent is unambiguous.
+            if is_super and _current_reviewed_state(r) is True:
+                reviewed_count += 1
 
     average = round(rating_sum / total, 1) if total > 0 else 0.0
-    summary = {
+    summary: dict[str, Any] = {
         "total": total,
         "average": average,
         "accepted_count": accepted_count,
         "distribution": distribution,
     }
+    if is_super:
+        summary["reviewed_count"] = reviewed_count
 
-    # -- Step 6: only_accepted / only_with_reason (entries only) -----------
+    # -- Step 6: only_accepted / only_with_reason / reviewed (entries only) -
     filtered = cut
     if only_accepted:
-        filtered = [e for e in filtered if _is_accepted(e)]
+        filtered = [r for r in filtered if _is_accepted(r)]
     if only_with_reason:
-        filtered = [e for e in filtered if _row_has_reason(e)]
+        filtered = [r for r in filtered if _row_has_reason(r)]
+    if reviewed is not None and is_super:
+        if reviewed:
+            # reviewed=true: keep rows whose CURRENT verdict is True.
+            filtered = [r for r in filtered if _current_reviewed_state(r) is True]
+        else:
+            # reviewed=false: keep rows with no history OR current=False.
+            filtered = [r for r in filtered if _current_reviewed_state(r) is not True]
 
     # -- Step 7: paginate AFTER filtering ----------------------------------
     page = filtered[offset : offset + limit]
 
-    # Batched email resolution for `accepted_by` on the already-paginated page
-    # (never one query per row — see wish Group 5, deliverable 4). Runs over
-    # the page — not the full cut — because the panel only ever displays the
-    # emails it renders.
-    accepted_by_ids: set[UUID] = set()
-    for event in page:
-        raw = (event.event_data or {}).get("accepted_by")
-        if raw:
-            try:
-                accepted_by_ids.add(UUID(str(raw)))
-            except (ValueError, AttributeError):
-                pass
+    # Batched email resolution for ``accepted_by`` on the paginated page.
+    accepted_by_ids: set[UUID] = {
+        r.accepted_by for r in page if r.accepted_by is not None
+    }
     accepted_email_map: dict[UUID, str] = {}
     if accepted_by_ids:
         users_result = await session.execute(
             select(User.id, User.email).where(User.id.in_(accepted_by_ids))
         )
-        accepted_email_map = {row.id: row.email for row in users_result.all()}
+        accepted_email_map = {ur.id: ur.email for ur in users_result.all()}
 
     entries = [
         _serialize_rating_event(
-            e, tenant_map=tenant_map, accepted_email_map=accepted_email_map
+            r,
+            tenant_map=tenant_map,
+            accepted_email_map=accepted_email_map,
+            review_history=(review_history_map.get(r.id, []) if is_super else None),
         )
-        for e in page
+        for r in page
     ]
 
     return {"summary": summary, "facets": facets, "entries": entries}
 
 
-@router.patch("/ratings/{event_id}")
+@router.patch("/ratings/{rating_id}")
 async def update_rating_action(
-    event_id: UUID,
+    rating_id: UUID,
     body: RatingActionRequest,
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
@@ -831,53 +1007,115 @@ async def update_rating_action(
     """Approve or ignore a rating entry for dataset curation.
 
     Super admin only — approvals are training-dataset gatekeepers.
+
+    Ported to ``rlhf_ratings`` in Group 2; preserves the 422 guard,
+    approve/ignore exclusivity, and the ``accepted_by`` /
+    ``accepted_at`` timestamps.
     """
-    result = await session.execute(
-        select(Event).where(
-            Event.id == event_id,
-            Event.event_type == "rlhf.rating",
-        )
-    )
-    event = result.scalar_one_or_none()
-    if event is None:
+    result = await session.execute(select(RlhfRating).where(RlhfRating.id == rating_id))
+    row = result.scalar_one_or_none()
+    if row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Rating not found",
         )
 
-    data = dict(event.event_data or {})
     if body.action == "approve":
         # Group 5 guard: accepting an opinion is an act OVER written feedback.
         # Ratings without a qualifying reason (empty or under 8 chars) cannot
         # be approved — the training-lake export only ever contains rows the
         # operator explicitly endorsed the critique of, so silently accepting
         # a reasonless entry would poison the dataset with meaningless labels.
-        if not _has_reason(data.get("reason")):
+        if not _has_reason(row.reason):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Cannot approve rating without a qualifying reason",
             )
-        data["approved_for_training"] = True
+        row.approved_for_training = True
         # Audit trail: stamp who accepted and when so the panel can render
-        # authorship. `accepted_at` is ISO-8601 UTC to stay dialect-agnostic
-        # (event_data is a JSON blob — no timestamptz coercion happens).
-        data["accepted_by"] = str(tenant.user_id) if tenant.user_id else None
-        data["accepted_at"] = datetime.now(timezone.utc).isoformat()
-        data.pop("ignored", None)
+        # authorship. Stored as tz-aware ``DateTime`` on the dedicated
+        # column now; serialization happens in ``_serialize_rating_event``.
+        row.accepted_by = tenant.user_id if tenant.user_id else None
+        row.accepted_at = datetime.now(timezone.utc)
+        # Approve/ignore exclusivity: clearing ``ignored`` mirrors the
+        # ``data.pop("ignored", None)`` semantic of the pre-port version.
+        row.ignored = False
     else:
-        # `ignore` unchanged (per wish Group 5, deliverable 6): no stamping,
-        # no reason guard — ignoring a low-value rating is orthogonal to the
-        # accept flow's dataset-curation semantics.
-        data["ignored"] = True
-        data.pop("approved_for_training", None)
+        # ``ignore`` action: no stamping, no reason guard — ignoring a
+        # low-value rating is orthogonal to the accept flow's
+        # dataset-curation semantics.
+        row.ignored = True
+        row.approved_for_training = False
 
-    event.event_data = data
     await session.commit()
 
     logger.info(
-        "RLHF rating action: event_id=%s action=%s by=%s",
-        event_id,
+        "RLHF rating action: rating_id=%s action=%s by=%s",
+        rating_id,
         body.action,
         tenant.user_id,
     )
-    return {"ok": True, "id": str(event_id), "action": body.action}
+    return {"ok": True, "id": str(rating_id), "action": body.action}
+
+
+@router.post("/ratings/{rating_id}/review")
+async def submit_rating_review(
+    rating_id: UUID,
+    body: RatingReviewRequest,
+    tenant: TenantContext = Depends(require_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> dict[str, Any]:
+    """Record a human verdict on a rating (append-only history).
+
+    Super admin only. Every call inserts a new ``rlhf_audit_reviews`` row —
+    the endpoint never UPDATEs or DELETEs existing reviews, so the history
+    is complete. ``revisado_por_email`` is captured at write time from the
+    ``users`` row so authorship survives the associated user being deleted
+    (``revisado_por`` is SET NULL in that case, the email remains).
+    """
+    # 404 shape mirrors the PATCH handler above.
+    result = await session.execute(select(RlhfRating).where(RlhfRating.id == rating_id))
+    rating_row = result.scalar_one_or_none()
+    if rating_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Rating not found",
+        )
+
+    # Resolve reviewer email at write time so the audit trail survives the
+    # ``users`` row being deleted (revisado_por -> NULL, email stays).
+    # ``require_super_admin`` already guarantees an authenticated user, so
+    # the lookup miss is a truly exceptional/stale-token case — fall back
+    # to a literal placeholder rather than 500-ing an audit write.
+    reviewer_email: str = "unknown"
+    if tenant.user_id is not None:
+        email_result = await session.execute(
+            select(User.email).where(User.id == tenant.user_id)
+        )
+        found = email_result.scalar_one_or_none()
+        if found is not None:
+            reviewer_email = found
+
+    review = RlhfAuditReview(
+        rating_id=rating_id,
+        observacao=body.observacao,
+        revisado=body.revisado,
+        revisado_por=tenant.user_id,
+        revisado_por_email=reviewer_email,
+        revisado_em=datetime.now(timezone.utc),
+    )
+    session.add(review)
+    await session.commit()
+
+    logger.info(
+        "RLHF rating review: rating_id=%s revisado=%s by=%s",
+        rating_id,
+        body.revisado,
+        tenant.user_id,
+    )
+    return {
+        "ok": True,
+        "id": str(review.id),
+        "rating_id": str(rating_id),
+        "revisado": body.revisado,
+    }

@@ -5,9 +5,10 @@ Endpoints for human handoff management and webhook configuration.
 
 import csv
 import io
+import time as time_module
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -629,9 +630,6 @@ async def test_webhook(
 
     Uses the configured webhook URL unless a different URL is provided.
     """
-    import time
-    from uuid import uuid4
-
     config = service.get_webhook_config(tenant.tenant_id)
 
     if not config and not request.url:
@@ -656,10 +654,7 @@ async def test_webhook(
     )
 
     # Override URL if provided
-    test_url = request.url
-    if not test_url:
-        assert config is not None
-        test_url = config.url
+    test_url = request.url or (config.url if config is not None else "")
     test_config = WebhookConfig(
         url=test_url,
         secret=config.secret if config else None,
@@ -672,10 +667,10 @@ async def test_webhook(
     original_config = service.webhook_dispatcher.get_config(tenant.tenant_id)
     service.webhook_dispatcher.set_config(tenant.tenant_id, test_config)
 
-    start = time.perf_counter()
+    start = time_module.perf_counter()
     try:
         delivery = await service.webhook_dispatcher.send(tenant.tenant_id, test_payload)
-        latency = (time.perf_counter() - start) * 1000
+        latency = (time_module.perf_counter() - start) * 1000
 
         return WebhookTestResponse(
             success=delivery.status.value == "sent",
@@ -688,7 +683,7 @@ async def test_webhook(
             latency_ms=round(latency, 2),
         )
     except WebhookDeliveryError as e:
-        latency = (time.perf_counter() - start) * 1000
+        latency = (time_module.perf_counter() - start) * 1000
         logger.warning(
             "Webhook test delivery failed",
             tenant_id=str(tenant.tenant_id),
@@ -702,7 +697,7 @@ async def test_webhook(
             latency_ms=round(latency, 2),
         )
     except WebhookError as e:
-        latency = (time.perf_counter() - start) * 1000
+        latency = (time_module.perf_counter() - start) * 1000
         logger.warning(
             "Webhook test error",
             tenant_id=str(tenant.tenant_id),
@@ -714,7 +709,7 @@ async def test_webhook(
             latency_ms=round(latency, 2),
         )
     except Exception as e:
-        latency = (time.perf_counter() - start) * 1000
+        latency = (time_module.perf_counter() - start) * 1000
         logger.error(
             "Unexpected error during webhook test",
             tenant_id=str(tenant.tenant_id),

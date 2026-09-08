@@ -1,0 +1,158 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-7.4.4, pluggy-1.6.0
+rootdir: /mnt/c/Users/dell0/Documents/neurostack/neurostack-api
+configfile: pyproject.toml
+testpaths: tests
+plugins: Faker-22.7.0, cov-4.1.0, anyio-4.13.0, mock-3.15.1, asyncio-0.23.8
+asyncio: mode=Mode.AUTO
+collected 2697 items
+
+tests/api/test_admin.py ..................                               [  0%]
+tests/api/test_admin_dashboard.py ..................................     [  1%]
+tests/api/test_api_credentials.py ...................................... [  3%]
+.........................                                                [  4%]
+tests/api/test_billing_usage.py ..                                       [  4%]
+tests/api/test_builder.py .............................................. [  6%]
+........                                                                 [  6%]
+tests/api/test_builder_clinic_access.py ............                     [  6%]
+tests/api/test_builder_cloning.py ............................           [  7%]
+tests/api/test_builder_outside_hours.py .                                [  7%]
+tests/api/test_builder_tickets.py ..............                         [  8%]
+tests/api/test_business_hours_migration.py .............                 [  8%]
+tests/api/test_config.py .........                                       [  9%]
+tests/api/test_config_credentials_boundary.py ....................       [  9%]
+tests/api/test_events.py ........                                        [ 10%]
+tests/api/test_events_e2e.py ................                            [ 10%]
+tests/api/test_health.py .........                                       [ 11%]
+tests/api/test_integration.py ...............                            [ 11%]
+tests/api/test_meta_credentials.py .............                         [ 12%]
+tests/api/test_middleware_auth.py ...........................            [ 13%]
+tests/api/test_middleware_rate_limit.py .............                    [ 13%]
+tests/api/test_observability_redaction.py ...................            [ 14%]
+tests/api/test_password_management.py ............                       [ 14%]
+tests/api/test_policies.py ........                                      [ 15%]
+tests/api/test_rlhf.py ................................................. [ 16%]
+...................................                                      [ 18%]
+tests/api/test_rlhf_review.py .........                                  [ 18%]
+tests/api/test_sessions.py .......................                       [ 19%]
+tests/api/test_support.py ................                               [ 20%]
+tests/api/test_trace_adapter.py ......................                   [ 20%]
+tests/api/test_trace_user_acquisition.py ...                             [ 20%]
+tests/api/test_traces_outside_hours.py ..                                [ 21%]
+tests/api/test_uazapi_credentials.py ............                        [ 21%]
+tests/api/test_webhook_ai_msg_dedup.py ..                                [ 21%]
+tests/api/test_webhook_egress.py ..........................              [ 22%]
+tests/api/test_webhook_evolution.py ......                               [ 22%]
+tests/api/test_webhook_meta.py ......................................... [ 24%]
+.........                                                                [ 24%]
+tests/api/test_webhook_tts.py ...............                            [ 25%]
+tests/api/test_webhook_uazapi.py ....................................... [ 26%]
+.....                                                                    [ 26%]
+tests/api/test_webhook_zapi.py ......................................... [ 28%]
+.                                                                        [ 28%]
+tests/core/test_config_service.py ....................                   [ 29%]
+tests/core/test_interaction_context.py ...                               [ 29%]
+tests/core/test_pipeline.py .......................                      [ 30%]
+tests/ctx/test_orchestrator.py ................................          [ 31%]
+tests/flow/test_flow_manager.py ........................................ [ 32%]
+....                                                                     [ 32%]
+tests/handoff/test_service.py .......................................... [ 34%]
+.......                                                                  [ 34%]
+tests/integration/test_builder_cloning_postgres.py ....ssssssssssss      [ 35%]
+tests/integration/test_builder_support_columns_postgres.py ...s          [ 35%]
+tests/integration/test_interaction_origin_postgres.py .............s     [ 35%]
+tests/integration/test_knowledge_document_metadata.py ..                 [ 36%]
+tests/integration/test_rlhf_audit_postgres.py ............               [ 36%]
+tests/llm/test_client.py ...............................                 [ 37%]
+tests/memory/test_event_store.py ....................................... [ 39%]
+.......                                                                  [ 39%]
+tests/memory/test_state_store.py ....................................... [ 40%]
+                                                                         [ 40%]
+tests/observability/test_llm_generation_metrics.py .                     [ 40%]
+tests/observability/test_pii_and_price_gate.py ......................    [ 41%]
+tests/observability/test_scheduling_gate.py ............................ [ 42%]
+........................................................................ [ 45%]
+.................................                                        [ 46%]
+tests/policy/test_engine.py ....................................         [ 47%]
+tests/prompt/test_prompt_engine.py ..................................... [ 49%]
+.....................                                                    [ 50%]
+tests/prompt/test_scheduling_instructions.py ........................... [ 51%]
+........................................................................ [ 53%]
+........................................................................ [ 56%]
+........................................................................ [ 59%]
+........................................................................ [ 61%]
+........................................................................ [ 64%]
+........................................................................ [ 67%]
+........................................................................ [ 69%]
+........................................................................ [ 72%]
+........................................................................ [ 75%]
+........................................................................ [ 77%]
+..............                                                           [ 78%]
+tests/prompt/test_timezone_greeting.py ....                              [ 78%]
+tests/scripts/test_api_provider_preflight.py ........................... [ 79%]
+................................................                         [ 81%]
+tests/scripts/test_validate_provider_availability_evidence.py .......... [ 81%]
+..........                                                               [ 81%]
+tests/services/test_api_credentials.py ................................. [ 83%]
+......................                                                   [ 83%]
+tests/services/test_billing_usage_service.py ..                          [ 84%]
+tests/services/test_business_hours.py .................................. [ 85%]
+..............                                                           [ 85%]
+tests/services/test_clinic_clone_service.py .............                [ 86%]
+tests/services/test_event_service_config_cache.py ...................... [ 87%]
+..                                                                       [ 87%]
+tests/services/test_event_service_emission.py ...                        [ 87%]
+tests/services/test_event_service_llm_fallback.py ...................... [ 88%]
+.....................                                                    [ 88%]
+tests/services/test_event_service_scheduling_gate.py .............       [ 89%]
+tests/services/test_meta_service_egress.py ............                  [ 89%]
+tests/services/test_multimodal_transcription.py ........................ [ 90%]
+.......................                                                  [ 91%]
+tests/services/test_safe_egress.py ..................................... [ 92%]
+..............................................                           [ 94%]
+tests/services/test_trace_service.py ..........                          [ 94%]
+tests/services/test_tts_service.py ......                                [ 95%]
+tests/services/test_uazapi_service_egress.py ............                [ 95%]
+tests/services/test_zapi_service_egress.py ..............                [ 96%]
+tests/srm/test_engine.py ............................................... [ 97%]
+.......................                                                  [ 98%]
+tests/srm/test_intent_accuracy.py .....................                  [ 99%]
+tests/srm/test_prompt_injection.py ............                          [100%]
+
+=============================== warnings summary ===============================
+../../../../../../../home/lorenzo/.cache/pypoetry/virtualenvs/neurostack-api-L9nFPJwB-py3.12/lib/python3.12/site-packages/passlib/utils/__init__.py:854
+  /home/lorenzo/.cache/pypoetry/virtualenvs/neurostack-api-L9nFPJwB-py3.12/lib/python3.12/site-packages/passlib/utils/__init__.py:854: DeprecationWarning: 'crypt' is deprecated and slated for removal in Python 3.13
+    from crypt import crypt as _crypt
+
+<string>:9
+  <string>:9: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+
+src/api/routes/support.py:46
+  /mnt/c/Users/dell0/Documents/neurostack/neurostack-api/src/api/routes/support.py:46: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    class SupportTicketOut(BaseModel):
+
+tests/api/test_events.py: 6 warnings
+tests/api/test_events_e2e.py: 17 warnings
+tests/api/test_integration.py: 6 warnings
+tests/api/test_middleware_auth.py: 6 warnings
+tests/api/test_middleware_rate_limit.py: 4 warnings
+tests/core/test_pipeline.py: 1 warning
+  /mnt/c/Users/dell0/Documents/neurostack/neurostack-api/src/services/event_service.py:1371: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    timestamp=m.get("timestamp", datetime.utcnow().isoformat()),
+
+tests/api/test_health.py::TestHealthEndpoints::test_health_check_returns_200
+  /mnt/c/Users/dell0/Documents/neurostack/neurostack-api/src/api/routes/health.py:118: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    timestamp=datetime.utcnow().isoformat(),
+
+tests/api/test_health.py::TestHealthEndpoints::test_liveness_check_returns_200
+tests/api/test_integration.py::TestAPIIntegrationAsync::test_async_health_checks
+tests/api/test_middleware_auth.py::TestAuthMiddleware::test_live_endpoint_no_auth_required
+  /mnt/c/Users/dell0/Documents/neurostack/neurostack-api/src/api/routes/health.py:211: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    timestamp=datetime.utcnow().isoformat(),
+
+tests/api/test_policies.py::TestPoliciesEndpoint::test_get_effective_policies
+  /mnt/c/Users/dell0/Documents/neurostack/neurostack-api/src/api/routes/policies.py:541: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    computed_at=datetime.utcnow().isoformat(),
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========== 2683 passed, 14 skipped, 48 warnings in 82.15s (0:01:22) ===========
