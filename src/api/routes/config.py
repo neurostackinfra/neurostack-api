@@ -101,6 +101,69 @@ class _CredentialValidationRoute(APIRoute):
 credentials_router = APIRouter(route_class=_CredentialValidationRoute)
 
 
+_CANONICAL_SERVICE_FORMATS = frozenset({"online", "presential", "both"})
+
+
+def _validate_service_format_compatibility(
+    patch_data: dict[str, Any], row: ClinicConfigTable | None
+) -> None:
+    """Reject service modalities incompatible with the effective clinic format.
+
+    This is deliberately a PATCH-level check.  Unrelated updates must not
+    reinterpret historical modality values, while a service/global modality
+    update is checked against the counterpart that will remain persisted.
+    """
+
+    if "services" not in patch_data and "service_format" not in patch_data:
+        return
+
+    if "service_format" in patch_data:
+        clinic_service_format = patch_data["service_format"]
+    else:
+        clinic_service_format = (
+            (row.operations or {}).get("service_format") if row else None
+        )
+
+    # Historical/free-text global values stay untouched and impose no
+    # compatibility rule until the caller chooses one of the canonical forms.
+    if clinic_service_format not in _CANONICAL_SERVICE_FORMATS:
+        return
+
+    effective_services = (
+        patch_data["services"]
+        if "services" in patch_data
+        else (row.services if row else [])
+    ) or []
+    allowed = (
+        ["online"]
+        if clinic_service_format == "online"
+        else (
+            ["presential"]
+            if clinic_service_format == "presential"
+            else ["online", "presential", "both"]
+        )
+    )
+    conflicts = [
+        {"index": index, "service_format": service_format}
+        for index, service in enumerate(effective_services)
+        if isinstance(service, dict)
+        and (service_format := service.get("service_format")) is not None
+        and service_format not in allowed
+    ]
+    if conflicts:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "service_format_conflict",
+                "message": "One or more service modalities are incompatible with the clinic service format.",
+                "clinic_service_format": clinic_service_format,
+                "allowed_service_formats": allowed,
+                "conflicts": conflicts,
+                "action": "Change the listed service modalities or broaden the clinic service format.",
+            },
+        )
+
+
 def _extract_builder_id(request: Request) -> UUID:
     """Extract builder_id from the JWT Authorization header."""
     auth_header = request.headers.get("Authorization", "")
@@ -346,7 +409,14 @@ async def patch_config(
             },
         )
     tenant = await _resolve_config_tenant(request, tenant, session)
-    row = await _get_or_create_config(session, tenant)
+    # Do not create a row until modality validation has accepted the effective
+    # patch.  A rejected first write must not flush, commit, or invalidate a
+    # config cache entry.
+    row = await _load_config(session, tenant)
+    _validate_service_format_compatibility(patch_data, row)
+    if row is None:
+        row = _new_config(tenant)
+        session.add(row)
 
     # Group incoming fields by bucket
     grouped = unflatten_patch(patch_data)

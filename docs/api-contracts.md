@@ -530,6 +530,77 @@ Retorna estatísticas do tenant.
 
 ## Schemas
 
+### Configuração da clínica — `PATCH /v1/config`
+
+O endpoint recebe e devolve configuração em formato **plano**. Para atualizar
+modalidades, envie somente os campos necessários; o campo `services` sempre
+substitui o array inteiro, não faz merge por item.
+
+Omitir `services` preserva o catálogo já gravado em um PATCH; `services: []`
+substitui o catálogo por uma lista vazia; e `services: null` grava `null` (o
+campo é nullable), embora a resposta plana de GET/PATCH o normalize para
+`services: []`. Itens string legados, como `"Retorno"`, continuam aceitos.
+
+Request:
+
+```json
+{
+  "service_format": "online",
+  "services": [
+    {"name": "Teleconsulta", "service_format": "online"},
+    "Retorno"
+  ]
+}
+```
+
+Resposta 200 (também plana):
+
+```json
+{
+  "clinic_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "version": 1,
+  "service_format": "online",
+  "services": [
+    {"name": "Teleconsulta", "service_format": "online"},
+    "Retorno"
+  ]
+}
+```
+
+Cada objeto de `services` aceita propriedades extras. Quando presente, o seu
+`service_format` deve ser exatamente `online`, `presential` ou `both`; Strings
+legadas, campo ausente e `null` continuam aceitos. Um valor inválido usa o
+422 padrão de validação Pydantic (`detail` é uma lista). `services: null`
+permanece nullable no armazenamento, mas as respostas GET/PATCH o achatam para
+`services: []`.
+
+Quando o formato global canônico é incompatível com um serviço, a resposta é
+422 com este contrato (índices seguem a ordem do array):
+
+```json
+{
+  "detail": {
+    "error": "service_format_conflict",
+    "message": "One or more service modalities are incompatible with the clinic service format.",
+    "clinic_service_format": "online",
+    "allowed_service_formats": ["online"],
+    "conflicts": [{"index": 1, "service_format": "presential"}],
+    "action": "Change the listed service modalities or broaden the clinic service format."
+  }
+}
+```
+
+| Formato global | Serviços permitidos | Fallback no contexto da IA para serviço sem modalidade |
+|-------|-------|-------|
+| `online` | `online` | `online` |
+| `presential` | `presential` | `presential` |
+| `both` | `online`, `presential`, `both` | nenhum |
+| vazio ou histórico | sem rejeição/reescrita | nenhum |
+
+A validação cruzada roda somente quando o PATCH inclui `services` ou
+`service_format`; PATCHes sem esses campos preservam dados legados. A
+modalidade explícita do serviço tem precedência no contexto da IA.
+
 ### Tenant
 
 Representa um builder ou clínica.
@@ -834,4 +905,3 @@ Os limites são configuráveis por tenant no momento da criação da API Key.
 ---
 
 *Documentação gerada automaticamente. Última atualização: Fevereiro 2026*
-

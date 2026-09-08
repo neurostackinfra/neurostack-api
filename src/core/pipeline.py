@@ -684,6 +684,48 @@ class CognitivePipeline:
             )
 
             services = cfg.get("services", [])
+            clinic_service_format = custom_vars["service_format"]
+            legacy_service_format = (
+                clinic_service_format
+                if isinstance(clinic_service_format, str)
+                and clinic_service_format in {"online", "presential"}
+                else None
+            )
+
+            def _service_modality_label(service: dict[str, Any] | str) -> str | None:
+                """Return the patient-facing modality label when it is known.
+
+                Only the two singleton global formats can describe a legacy
+                service with no explicit modality.  ``both`` and historical
+                values do not describe a particular service, so omit a label.
+                """
+
+                explicit_value = (
+                    service.get("service_format") if isinstance(service, dict) else None
+                )
+                explicit = explicit_value if isinstance(explicit_value, str) else None
+                canonical_format = (
+                    explicit
+                    if explicit
+                    in {
+                        "online",
+                        "presential",
+                        "both",
+                    }
+                    else legacy_service_format
+                )
+                if canonical_format is None:
+                    return None
+                return {
+                    "online": "online",
+                    "presential": "presencial",
+                    "both": "online e presencial",
+                }.get(canonical_format)
+
+            def _with_service_modality(line: str, service: dict[str, Any] | str) -> str:
+                label = _service_modality_label(service)
+                return f"{line} [Modalidade: {label}]" if label else line
+
             # Detect consultation service price for prompt rules
             consult_price = ""
             for s in services if isinstance(services, list) else []:
@@ -724,10 +766,10 @@ class CognitivePipeline:
                         authority = s.get("authority_notes", "")
                         if authority:
                             line += f" ({authority})"
-                        svc_lines.append(line)
+                        svc_lines.append(_with_service_modality(line, s))
                     elif isinstance(s, str) and s:
                         svc_names.append(s)
-                        svc_lines.append(f"- {s}")
+                        svc_lines.append(_with_service_modality(f"- {s}", s))
                 custom_vars["services"] = ", ".join(svc_names)
                 custom_vars["services_detail"] = "\n".join(svc_lines)
             else:
