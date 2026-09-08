@@ -178,6 +178,19 @@ class ConfigResponse(BaseModel):
     version: int = 1
 
 
+class ServicePatchItem(BaseModel):
+    """A service entry accepted by the flat clinic configuration PATCH.
+
+    Service objects intentionally remain extensible: the generic configuration
+    endpoint must round-trip frontend-owned fields it does not model itself.
+    Only a supplied modality is part of this endpoint's stable contract.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    service_format: Literal["online", "presential", "both"] | None = None
+
+
 class ConfigPatchRequest(BaseModel):
     """
     Partial update request.
@@ -187,3 +200,5 @@ class ConfigPatchRequest(BaseModel):
     """
 
     model_config = ConfigDict(extra="allow")
+
+    services: list[ServicePatchItem | str] | None = None
