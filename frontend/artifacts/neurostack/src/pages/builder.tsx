@@ -788,6 +788,15 @@ export default function BuilderPanel() {
           <TabsContent value="overview" className="space-y-6 mt-4">
             {usage && <PlanUsageSummary usage={usage} locale={locale} />}
 
+            <Card className="border-border" data-testid="builder-roadmap-certification-card">
+              <CardContent className="flex items-center justify-between gap-3 py-4">
+                <p className="text-sm font-semibold text-foreground">
+                  {t("builder_roadmap_certification_title")}
+                </p>
+                <Badge variant="outline">{t("builder_roadmap_coming_soon")}</Badge>
+              </CardContent>
+            </Card>
+
             {/* KPI row — 4 cards with trend */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
               <Card className="border-border">
