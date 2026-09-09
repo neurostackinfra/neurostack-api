@@ -17,6 +17,12 @@ import ClinicConfig, {
 import { I18nProvider } from "@/context/i18n";
 import { AuthProvider } from "@/context/auth";
 
+const mocks = vi.hoisted(() => ({ toast: vi.fn() }));
+
+vi.mock("@/hooks/use-toast", () => ({
+  useToast: () => ({ toast: mocks.toast }),
+}));
+
 function Wrapper({ children }: { children: ReactNode }) {
   return <I18nProvider>{children}</I18nProvider>;
 }
@@ -54,7 +60,15 @@ function response(body: unknown, ok = true, status = ok ? 200 : 422): Response {
   } as unknown as Response;
 }
 
-/** A tenant that holds no provider at all — every card must stay coming soon. */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+/** A tenant that holds no provider at all. */
 function emptyStatus(overrides: Record<string, unknown> = {}) {
   return {
     whatsapp_provider: null,
@@ -96,12 +110,30 @@ async function renderForm(
 
 const BACKEND_PROVIDER_AVAILABILITY = {
   whatsapp: { meta_cloud: "coming_soon", zapi: "coming_soon", uazapi: "coming_soon", evolution: "coming_soon", dialog360: "coming_soon", twilio: "coming_soon" },
-  llm: { dropout: "coming_soon", openai: "coming_soon", outros: "coming_soon", slm_cortex: "coming_soon" },
+  llm: { dropout: "coming_soon", gemini: "active", openai: "coming_soon", outros: "coming_soon", slm_cortex: "coming_soon" },
   multimodal: { openrouter: "coming_soon" },
   stt: { outros: "coming_soon", openai_whisper: "coming_soon", elevenlabs_scribe: "coming_soon", google_stt: "coming_soon", deepgram_stt: "coming_soon", microsoft_stt: "coming_soon" },
   tts: { elevenlabs: "coming_soon", google: "coming_soon" },
 } as const;
-const COMING_SOON_COUNT = 19;
+const COMING_SOON_COUNT = 20;
+
+const ACTIVE_GEMINI_PROVIDER_AVAILABILITY = {
+  ...API_PROVIDER_AVAILABILITY,
+  llm: {
+    ...API_PROVIDER_AVAILABILITY.llm,
+    gemini: "active",
+  },
+} as const;
+
+const ACTIVE_GEMINI_AND_OPENAI_PROVIDER_AVAILABILITY = {
+  ...ACTIVE_GEMINI_PROVIDER_AVAILABILITY,
+  llm: {
+    ...ACTIVE_GEMINI_PROVIDER_AVAILABILITY.llm,
+    openai: "active",
+  },
+} as const;
+
+const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
 
 describe("describeConfigSaveFailure", () => {
   it("identifies invalid backend fields without exposing their submitted values", () => {
@@ -185,6 +217,45 @@ describe("describeConfigSaveFailure", () => {
     expect(phoneConflict).not.toContain("backend-only detail");
   });
 
+  it.each([
+    [
+      "pt",
+      "invalid_provider_endpoint",
+      "API LLM: A URL da API não corresponde ao endpoint oficial deste provedor",
+    ],
+    [
+      "en",
+      "invalid_provider_endpoint",
+      "API LLM: The API URL does not match this provider's official endpoint",
+    ],
+    [
+      "pt",
+      "provider_switch_bundle_required",
+      "API LLM: Para trocar o provedor, informe juntos a URL da API, uma nova API Key e o modelo",
+    ],
+    [
+      "en",
+      "provider_switch_bundle_required",
+      "API LLM: To switch providers, enter the API URL, a new API key, and the model together",
+    ],
+  ])("maps %s %s without echoing backend bundle values", (locale, error, expected) => {
+    const description = describeConfigSaveFailure({
+      detail: {
+        error,
+        capability: "llm",
+        submitted_url: "https://private.example.test/secret-path",
+        api_key: "gemini-secret-key",
+        bundle: { llm_model_name: "tenant-private-model" },
+      },
+    }, 422, locale);
+
+    expect(description).toContain(expected);
+    expect(description).not.toContain(error);
+    expect(description).not.toContain("private.example.test");
+    expect(description).not.toContain("gemini-secret-key");
+    expect(description).not.toContain("tenant-private-model");
+  });
+
   it("keeps a safe human fallback when a capability is absent", () => {
     const phoneConflict = describeConfigSaveFailure({
       detail: { error: "meta_phone_number_id_conflict", message: "backend-only detail" },
@@ -235,12 +306,12 @@ describe("describeConfigSaveFailure", () => {
 });
 
 describe("frontend provider availability mirror", () => {
-  it("contains the exact 19 backend pairs and keeps all of them coming soon", () => {
+  it("contains the exact 20 backend pairs with Gemini as the sole active overlay", () => {
     expect(API_PROVIDER_AVAILABILITY).toEqual(BACKEND_PROVIDER_AVAILABILITY);
     const states = Object.values(API_PROVIDER_AVAILABILITY).flatMap(Object.values);
-    expect(states).toHaveLength(19);
-    expect(states.filter((state) => state === "active")).toHaveLength(0);
-    expect(states.filter((state) => state === "coming_soon")).toHaveLength(COMING_SOON_COUNT);
+    expect(states).toHaveLength(COMING_SOON_COUNT);
+    expect(states.filter((state) => state === "active")).toHaveLength(1);
+    expect(states.filter((state) => state === "coming_soon")).toHaveLength(COMING_SOON_COUNT - 1);
   });
 
   it("does not expose a provider outside the availability matrix", () => {
@@ -276,6 +347,28 @@ describe("providerCardState", () => {
   ])("keeps an all-coming-soon provider inert %s", (_case, status) => {
     expect(providerCardState("llm", "openai", status)).toBe("coming_soon");
   });
+
+  it("promotes Gemini in the real matrix and exercises every state", () => {
+    expect(providerCardState("llm", "gemini", emptyStatus())).toBe("available");
+    expect(providerCardState(
+      "llm",
+      "gemini",
+      emptyStatus(),
+      ACTIVE_GEMINI_PROVIDER_AVAILABILITY,
+    )).toBe("available");
+    expect(providerCardState(
+      "llm",
+      "gemini",
+      emptyStatus({ llm_provider: "gemini", llm_readiness: "incomplete" }),
+      ACTIVE_GEMINI_PROVIDER_AVAILABILITY,
+    )).toBe("incomplete");
+    expect(providerCardState(
+      "llm",
+      "gemini",
+      emptyStatus({ llm_provider: "gemini", llm_readiness: "active" }),
+      ACTIVE_GEMINI_PROVIDER_AVAILABILITY,
+    )).toBe("configured");
+  });
 });
 
 describe("<ApiCredentialsForm /> card states", () => {
@@ -286,6 +379,7 @@ describe("<ApiCredentialsForm /> card states", () => {
     localStorage.clear();
     window.history.replaceState({}, "", "/");
     cleanup();
+    mocks.toast.mockReset();
     vi.restoreAllMocks();
   });
 
@@ -302,7 +396,7 @@ describe("<ApiCredentialsForm /> card states", () => {
   it.each([
     ["pt", "EM BREVE", "DISPONÍVEL", "Configuração apenas"],
     ["en", "COMING SOON", "AVAILABLE", "Configuration only"],
-  ])("renders all 19 cards as inert orange surfaces in %s", async (
+  ])("renders all 20 cards as inert orange surfaces in %s", async (
     locale,
     comingSoonLabel,
     availableLabel,
@@ -315,12 +409,12 @@ describe("<ApiCredentialsForm /> card states", () => {
     const cards = within(section).getAllByTestId(/provider-card-/);
     const badges = within(section).getAllByText(comingSoonLabel);
     expect(cards).toHaveLength(COMING_SOON_COUNT);
-    expect(badges).toHaveLength(COMING_SOON_COUNT);
-    expect(within(section).queryByText(availableLabel)).not.toBeInTheDocument();
+    expect(badges).toHaveLength(COMING_SOON_COUNT - 1);
+    expect(within(section).getByText(availableLabel)).toBeInTheDocument();
     expect(within(section).queryByText(configurationOnlyLabel)).not.toBeInTheDocument();
-    expect(section.querySelectorAll("button, input, select, textarea, [tabindex]")).toHaveLength(0);
+    expect(section.querySelectorAll("button")).toHaveLength(1);
 
-    for (const card of cards) {
+    for (const card of cards.filter(card => card.dataset.cardState === "coming_soon")) {
       expect(card.tagName).toBe("ARTICLE");
       expect(card).toHaveAttribute("data-card-state", "coming_soon");
       expect(card).not.toHaveAttribute("aria-expanded");
@@ -336,9 +430,391 @@ describe("<ApiCredentialsForm /> card states", () => {
     await renderForm(emptyStatus());
 
     const section = screen.getByTestId("api-settings-section");
-    expect(within(section).getAllByText("COMING SOON")).toHaveLength(COMING_SOON_COUNT);
-    expect(within(section).queryByText("AVAILABLE")).not.toBeInTheDocument();
+    expect(within(section).getAllByText("COMING SOON")).toHaveLength(COMING_SOON_COUNT - 1);
+    expect(within(section).getByText("AVAILABLE")).toBeInTheDocument();
   });
+
+  it.each([
+    ["pt", "INCOMPLETO"],
+    ["en", "INCOMPLETE"],
+  ])("renders an incomplete Gemini fixture with the %s badge", async (locale, badge) => {
+    localStorage.setItem("ns_locale", locale);
+    await renderForm(emptyStatus({
+      llm_provider: "gemini",
+      llm_readiness: "incomplete",
+    }), { providerAvailability: ACTIVE_GEMINI_PROVIDER_AVAILABILITY });
+
+    const card = screen.getByTestId("provider-card-llm-gemini");
+    expect(card).toHaveAttribute("data-card-state", "incomplete");
+    expect(within(card).getByText("Gemini")).toBeInTheDocument();
+    expect(within(card).getByText("by Google")).toBeInTheDocument();
+    expect(within(card).getByText(badge)).toBeInTheDocument();
+  });
+
+  it("prefills a new Gemini URL, isolates the other provider, and sends the full shared switch bundle", async () => {
+    localStorage.setItem("ns_locale", "en");
+    const fetchMock = await renderForm(emptyStatus({
+      llm_provider: "openai",
+      llm_readiness: "active",
+      llm_base_url: "https://api.openai.com/v1",
+      llm_model_name: "gpt-private-model",
+      llm_api_key_set: true,
+    }), { providerAvailability: ACTIVE_GEMINI_PROVIDER_AVAILABILITY });
+
+    fireEvent.click(screen.getByTestId("provider-card-llm-gemini"));
+    const editor = screen.getByTestId("provider-editor-llm-gemini");
+    const url = within(editor).getByTestId("field-llm_api_url");
+    const key = within(editor).getByTestId("field-llm_api_key");
+    const model = within(editor).getByTestId("field-llm_model_name");
+
+    expect(url).toHaveValue(GEMINI_BASE_URL);
+    expect(key).toHaveValue("");
+    expect(key).not.toHaveAttribute("placeholder");
+    expect(model).toHaveValue("");
+    expect(editor).not.toHaveTextContent("gpt-private-model");
+
+    fireEvent.change(key, { target: { value: "new-gemini-key" } });
+    fireEvent.change(model, { target: { value: "gemini-2.5-flash" } });
+    fireEvent.click(within(editor).getByTestId("save-llm-gemini"));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH"))
+      .toHaveLength(1));
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    expect(JSON.parse(String(patch?.[1]?.body))).toEqual({
+      llm_provider: "gemini",
+      llm_api_url: GEMINI_BASE_URL,
+      llm_api_key: "new-gemini-key",
+      llm_model_name: "gemini-2.5-flash",
+    });
+  });
+
+  it("resets unsaved shared LLM drafts when switching between active provider cards", async () => {
+    localStorage.setItem("ns_locale", "en");
+    await renderForm(emptyStatus(), {
+      providerAvailability: ACTIVE_GEMINI_AND_OPENAI_PROVIDER_AVAILABILITY,
+    });
+
+    fireEvent.click(screen.getByTestId("provider-card-llm-gemini"));
+    expect(screen.getByTestId("field-llm_api_url")).toHaveValue(GEMINI_BASE_URL);
+    fireEvent.change(screen.getByTestId("field-llm_api_key"), {
+      target: { value: "unsaved-gemini-secret" },
+    });
+    fireEvent.change(screen.getByTestId("field-llm_model_name"), {
+      target: { value: "unsaved-gemini-model" },
+    });
+
+    fireEvent.click(screen.getByTestId("provider-card-llm-openai"));
+    expect(screen.getByTestId("provider-editor-llm-openai")).toBeInTheDocument();
+    expect(screen.getByTestId("field-llm_api_url")).toHaveValue("");
+    expect(screen.getByTestId("field-llm_api_key")).toHaveValue("");
+    expect(screen.getByTestId("field-llm_model_name")).toHaveValue("");
+
+    fireEvent.click(screen.getByTestId("provider-card-llm-gemini"));
+    expect(screen.getByTestId("field-llm_api_url")).toHaveValue(GEMINI_BASE_URL);
+    expect(screen.getByTestId("field-llm_api_key")).toHaveValue("");
+    expect(screen.getByTestId("field-llm_model_name")).toHaveValue("");
+    expect(screen.getByTestId("provider-editor-llm-gemini"))
+      .not.toHaveTextContent("unsaved-gemini-model");
+  });
+
+  it("hydrates only held Gemini non-secrets and keeps a same-provider model edit delta-only", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    const fetchMock = await renderForm(emptyStatus({
+      llm_provider: "gemini",
+      llm_readiness: "active",
+      llm_base_url: GEMINI_BASE_URL,
+      llm_model_name: "gemini-2.0-flash",
+      llm_api_key_set: true,
+    }), { providerAvailability: ACTIVE_GEMINI_PROVIDER_AVAILABILITY });
+
+    const card = screen.getByTestId("provider-card-llm-gemini");
+    expect(card).toHaveAttribute("data-card-state", "configured");
+    expect(within(card).getByText("CONFIGURADO")).toBeInTheDocument();
+    fireEvent.click(card);
+
+    const editor = screen.getByTestId("provider-editor-llm-gemini");
+    expect(within(editor).getByTestId("field-llm_api_url")).toHaveValue(GEMINI_BASE_URL);
+    expect(within(editor).getByTestId("field-llm_api_key")).toHaveValue("");
+    expect(within(editor).getByTestId("field-llm_api_key"))
+      .toHaveAttribute("placeholder", "•••••••• (manter atual)");
+    const model = within(editor).getByTestId("field-llm_model_name");
+    expect(model).toHaveValue("gemini-2.0-flash");
+
+    fireEvent.change(model, { target: { value: "gemini-2.5-pro" } });
+    fireEvent.click(within(editor).getByTestId("save-llm-gemini"));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH"))
+      .toHaveLength(1));
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    expect(JSON.parse(String(patch?.[1]?.body))).toEqual({
+      llm_model_name: "gemini-2.5-pro",
+    });
+  });
+
+  it("drops an open Gemini draft and all prior-clinic hydration when the clinic changes", async () => {
+    localStorage.setItem("ns_locale", "en");
+    const fetchMock = vi.fn().mockImplementation(async (url: RequestInfo | URL) => {
+      if (String(url).includes("clinic-a")) {
+        return response(emptyStatus({
+          llm_provider: "gemini",
+          llm_readiness: "active",
+          llm_base_url: GEMINI_BASE_URL,
+          llm_model_name: "clinic-a-model",
+          llm_api_key_set: true,
+        }));
+      }
+      return response(emptyStatus({
+        llm_provider: "openai",
+        llm_readiness: "active",
+        llm_base_url: "https://api.openai.com/v1",
+        llm_model_name: "clinic-b-openai-model",
+        llm_api_key_set: true,
+      }));
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const { rerender } = render(
+      <Wrapper>
+        <ApiCredentialsForm
+          clinicId="clinic-a"
+          isReadOnly={false}
+          isSuperAdmin={false}
+          providerAvailability={ACTIVE_GEMINI_PROVIDER_AVAILABILITY}
+        />
+      </Wrapper>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByTestId("provider-card-llm-gemini"));
+    fireEvent.change(screen.getByTestId("field-llm_api_key"), {
+      target: { value: "clinic-a-unsaved-secret" },
+    });
+    fireEvent.change(screen.getByTestId("field-llm_model_name"), {
+      target: { value: "clinic-a-unsaved-model" },
+    });
+
+    rerender(
+      <Wrapper>
+        <ApiCredentialsForm
+          clinicId="clinic-b"
+          isReadOnly={false}
+          isSuperAdmin={false}
+          providerAvailability={ACTIVE_GEMINI_PROVIDER_AVAILABILITY}
+        />
+      </Wrapper>,
+    );
+    expect(screen.queryByTestId("provider-editor-llm-gemini")).not.toBeInTheDocument();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByTestId("provider-card-llm-gemini"))
+      .toHaveAttribute("data-card-state", "available"));
+
+    fireEvent.click(screen.getByTestId("provider-card-llm-gemini"));
+    expect(screen.getByTestId("field-llm_api_url")).toHaveValue(GEMINI_BASE_URL);
+    expect(screen.getByTestId("field-llm_api_key")).toHaveValue("");
+    expect(screen.getByTestId("field-llm_api_key")).not.toHaveAttribute("placeholder");
+    expect(screen.getByTestId("field-llm_model_name")).toHaveValue("");
+    expect(screen.getByTestId("provider-editor-llm-gemini"))
+      .not.toHaveTextContent("clinic-a-unsaved-model");
+    expect(screen.getByTestId("provider-editor-llm-gemini"))
+      .not.toHaveTextContent("clinic-b-openai-model");
+  });
+
+  it("discards a stale clinic GET that resolves after the current clinic", async () => {
+    localStorage.setItem("ns_locale", "en");
+    const clinicAGet = deferred<Response>();
+    const clinicBGet = deferred<Response>();
+    const clinicBPatch = deferred<Response>();
+    const fetchMock = vi.fn().mockImplementation((url: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PATCH") return clinicBPatch.promise;
+      return String(url).includes("clinic-a") ? clinicAGet.promise : clinicBGet.promise;
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const { rerender } = render(
+      <Wrapper>
+        <ApiCredentialsForm
+          clinicId="clinic-a"
+          isReadOnly={false}
+          isSuperAdmin={false}
+          providerAvailability={ACTIVE_GEMINI_PROVIDER_AVAILABILITY}
+        />
+      </Wrapper>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    rerender(
+      <Wrapper>
+        <ApiCredentialsForm
+          clinicId="clinic-b"
+          isReadOnly={false}
+          isSuperAdmin={false}
+          providerAvailability={ACTIVE_GEMINI_PROVIDER_AVAILABILITY}
+        />
+      </Wrapper>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      clinicBGet.resolve(response(emptyStatus()));
+      await clinicBGet.promise;
+    });
+    await waitFor(() => expect(screen.getByTestId("provider-card-llm-gemini"))
+      .toHaveAttribute("data-card-state", "available"));
+
+    await act(async () => {
+      clinicAGet.resolve(response(emptyStatus({
+        llm_provider: "gemini",
+        llm_readiness: "active",
+        llm_base_url: "https://clinic-a.example.test/v1",
+        llm_model_name: "clinic-a-model",
+        llm_api_key_set: true,
+      })));
+      await clinicAGet.promise;
+    });
+
+    expect(screen.getByTestId("provider-card-llm-gemini"))
+      .toHaveAttribute("data-card-state", "available");
+    fireEvent.click(screen.getByTestId("provider-card-llm-gemini"));
+    expect(screen.getByTestId("field-llm_api_url")).toHaveValue(GEMINI_BASE_URL);
+    expect(screen.getByTestId("field-llm_api_key")).toHaveValue("");
+    expect(screen.getByTestId("field-llm_api_key")).not.toHaveAttribute("placeholder");
+    expect(screen.getByTestId("field-llm_model_name")).toHaveValue("");
+
+    fireEvent.change(screen.getByTestId("field-llm_api_key"), {
+      target: { value: "clinic-b-key" },
+    });
+    fireEvent.change(screen.getByTestId("field-llm_model_name"), {
+      target: { value: "clinic-b-model" },
+    });
+    fireEvent.click(screen.getByTestId("save-llm-gemini"));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body))).toEqual({
+      llm_provider: "gemini",
+      llm_api_url: GEMINI_BASE_URL,
+      llm_api_key: "clinic-b-key",
+      llm_model_name: "clinic-b-model",
+    });
+
+    await act(async () => {
+      clinicBPatch.resolve(response(emptyStatus({
+        llm_provider: "gemini",
+        llm_readiness: "active",
+        llm_base_url: GEMINI_BASE_URL,
+        llm_model_name: "clinic-b-model",
+        llm_api_key_set: true,
+      })));
+      await clinicBPatch.promise;
+    });
+    await waitFor(() => expect(screen.getByTestId("provider-card-llm-gemini"))
+      .toHaveAttribute("data-card-state", "configured"));
+    expect(mocks.toast).toHaveBeenCalledWith({ title: "Credentials saved" });
+  });
+
+  it.each(["success", "failure"] as const)(
+    "discards a stale clinic PATCH %s after switching clinics",
+    async (outcome) => {
+      localStorage.setItem("ns_locale", "en");
+      const clinicAPatch = deferred<Response>();
+      const clinicBPatch = deferred<Response>();
+      const fetchMock = vi.fn().mockImplementation((url: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "PATCH") {
+          return String(url).includes("clinic-a") ? clinicAPatch.promise : clinicBPatch.promise;
+        }
+        if (String(url).includes("clinic-a")) return Promise.resolve(response(emptyStatus()));
+        return Promise.resolve(response(emptyStatus({
+          llm_provider: "gemini",
+          llm_readiness: "active",
+          llm_base_url: GEMINI_BASE_URL,
+          llm_model_name: "clinic-b-model",
+          llm_api_key_set: true,
+        })));
+      });
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      const { rerender } = render(
+        <Wrapper>
+          <ApiCredentialsForm
+            clinicId="clinic-a"
+            isReadOnly={false}
+            isSuperAdmin={false}
+            providerAvailability={ACTIVE_GEMINI_PROVIDER_AVAILABILITY}
+          />
+        </Wrapper>,
+      );
+      await waitFor(() => expect(screen.getByTestId("provider-card-llm-gemini"))
+        .toHaveAttribute("data-card-state", "available"));
+      fireEvent.click(screen.getByTestId("provider-card-llm-gemini"));
+      fireEvent.change(screen.getByTestId("field-llm_api_key"), {
+        target: { value: "clinic-a-key" },
+      });
+      fireEvent.change(screen.getByTestId("field-llm_model_name"), {
+        target: { value: "clinic-a-model" },
+      });
+      fireEvent.click(screen.getByTestId("save-llm-gemini"));
+      await waitFor(() => expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH"))
+        .toHaveLength(1));
+
+      rerender(
+        <Wrapper>
+          <ApiCredentialsForm
+            clinicId="clinic-b"
+            isReadOnly={false}
+            isSuperAdmin={false}
+            providerAvailability={ACTIVE_GEMINI_PROVIDER_AVAILABILITY}
+          />
+        </Wrapper>,
+      );
+      await waitFor(() => expect(screen.getByTestId("provider-card-llm-gemini"))
+        .toHaveAttribute("data-card-state", "configured"));
+      fireEvent.click(screen.getByTestId("provider-card-llm-gemini"));
+      expect(screen.getByTestId("field-llm_api_url")).toHaveValue(GEMINI_BASE_URL);
+      expect(screen.getByTestId("field-llm_api_key"))
+        .toHaveAttribute("placeholder", "•••••••• (keep current)");
+      expect(screen.getByTestId("field-llm_model_name")).toHaveValue("clinic-b-model");
+
+      await act(async () => {
+        clinicAPatch.resolve(outcome === "success"
+          ? response(emptyStatus({
+            llm_provider: "gemini",
+            llm_readiness: "active",
+            llm_base_url: "https://clinic-a.example.test/v1",
+            llm_model_name: "clinic-a-model",
+            llm_api_key_set: false,
+          }))
+          : response({ detail: { error: "unsafe_api_url", field: "llm_api_url" } }, false));
+        await clinicAPatch.promise;
+      });
+
+      expect(screen.getByTestId("provider-editor-llm-gemini")).toBeInTheDocument();
+      expect(screen.getByTestId("field-llm_api_url")).toHaveValue(GEMINI_BASE_URL);
+      expect(screen.getByTestId("field-llm_api_key"))
+        .toHaveAttribute("placeholder", "•••••••• (keep current)");
+      expect(screen.getByTestId("field-llm_model_name")).toHaveValue("clinic-b-model");
+      expect(mocks.toast).not.toHaveBeenCalled();
+
+      fireEvent.change(screen.getByTestId("field-llm_model_name"), {
+        target: { value: "clinic-b-next-model" },
+      });
+      fireEvent.click(screen.getByTestId("save-llm-gemini"));
+      await waitFor(() => expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH"))
+        .toHaveLength(2));
+      const patchCalls = fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH");
+      expect(String(patchCalls[1]?.[0])).toContain("clinic-b");
+      expect(JSON.parse(String(patchCalls[1]?.[1]?.body))).toEqual({
+        llm_model_name: "clinic-b-next-model",
+      });
+
+      await act(async () => {
+        clinicBPatch.resolve(response(emptyStatus({
+          llm_provider: "gemini",
+          llm_readiness: "active",
+          llm_base_url: GEMINI_BASE_URL,
+          llm_model_name: "clinic-b-next-model",
+          llm_api_key_set: true,
+        })));
+        await clinicBPatch.promise;
+      });
+      await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith({ title: "Credentials saved" }));
+    },
+  );
 
   it("does not reopen a card or emit a payload for persisted legacy credentials", async () => {
     localStorage.setItem("ns_locale", "pt");
@@ -357,7 +833,8 @@ describe("<ApiCredentialsForm /> card states", () => {
     fireEvent.click(screen.getByTestId("provider-card-whatsapp-meta_cloud"));
     fireEvent.click(screen.getByTestId("provider-card-llm-openai"));
 
-    expect(within(section).getAllByText("EM BREVE")).toHaveLength(COMING_SOON_COUNT);
+    expect(within(section).getAllByText("EM BREVE")).toHaveLength(COMING_SOON_COUNT - 1);
+    expect(within(section).getByText("DISPONÍVEL")).toBeInTheDocument();
     expect(within(section).queryByText("CONFIGURADO")).not.toBeInTheDocument();
     expect(within(section).queryByText("INCOMPLETO")).not.toBeInTheDocument();
     expect(within(section).queryByTestId(/provider-editor-/)).not.toBeInTheDocument();
@@ -377,7 +854,7 @@ describe("<ApiCredentialsForm /> card states", () => {
 
     // Fail closed: an unknown tenant state must never make a card editable.
     const section = screen.getByTestId("api-settings-section");
-    expect(within(section).getAllByText("EM BREVE")).toHaveLength(19);
+    expect(within(section).getAllByText("EM BREVE")).toHaveLength(COMING_SOON_COUNT);
     expect(within(section).queryByRole("button")).not.toBeInTheDocument();
   });
 
@@ -398,7 +875,7 @@ describe("<ApiCredentialsForm /> card states", () => {
     const voiceSection = screen.getByTestId("voice-response-controls");
     const apiSection = screen.getByTestId("api-settings-section");
     expect(apiSection.contains(voiceSection)).toBe(false);
-    expect(within(apiSection).getAllByTestId(/provider-card-/)).toHaveLength(19);
+    expect(within(apiSection).getAllByTestId(/provider-card-/)).toHaveLength(COMING_SOON_COUNT);
   });
 
   it("does not expose the Integrations tab or voice section to clinic admins", async () => {

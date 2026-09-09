@@ -632,6 +632,34 @@ Por **tenant**. Todas as API Keys do mesmo tenant compartilham o mesmo limite.
 
 ---
 
+## Recuperação do release Gemini
+
+- **Python ausente/antigo no VPS:** instale Python 3.11+ e execute novamente;
+  nada de Docker ou `.env` ocorre antes desse gate.
+- **Buildx ausente:** corrija o runner protegido. Nunca instale buildx no VPS
+  como bypass e nunca use `docker build` no checkout.
+- **Metadata ausente ou digest inválido:** descarte o run, refaça o build por
+  `git archive` e leia apenas `containerimage.digest`; não resolva a tag.
+- **Smoke/digest divergente:** descarte imagem e artefato. O smoke deve rodar
+  read-only exatamente em `repository@sha256` que será implantado.
+- **Smoke `internal_error`:** houve falha local inesperada, não uma resposta
+  homologada do provider. Consulte somente o diagnóstico privado do runner,
+  corrija runner ou imagem e crie um run novo; não copie segredo ou corpo externo.
+- **Trust/fingerprint/assinatura falha:** importe a chave Operations aprovada e
+  configure `GEMINI_RECEIPT_SIGNER_FINGERPRINT` protegido. Não desabilite
+  `git verify-commit`.
+- **HEAD, pai ou diff divergente; checkout dirty; receipt stale:** não limpe ou
+  emende em produção para contornar o gate. Crie novo candidate limpo, build,
+  smoke live, receipt-only assinado e implante com o receipt como HEAD exato.
+- **Compose recusa segredo/origem:** corrija `.env` manualmente com valores
+  distintos e fortes conforme o runbook. A mensagem identifica regra/campo, mas
+  nunca o valor. O deploy nunca cria, altera ou gera segredos.
+
+O checker usa somente a biblioteca padrão do Python. Falha fechada é o estado
+esperado enquanto o receipt protegido ainda não existe.
+
+---
+
 ## Contato para Suporte
 
 ### Níveis de Suporte
@@ -662,4 +690,3 @@ Ao contatar suporte, inclua:
 ---
 
 *Última atualização: Janeiro 2026*
-

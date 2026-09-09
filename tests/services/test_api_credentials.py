@@ -9,8 +9,11 @@ from src.services.api_credentials import (
     CAPABILITY_PROVIDER_FIELDS,
     CONFIG_CACHE_SCHEMA_VERSION,
     CONFIG_CACHE_VERSION_FIELD,
+    GEMINI_API_BASE_URL,
+    OPERATIONAL_LLM_PROVIDERS,
     PROVIDER_ALLOWLISTS,
     PROVIDER_AVAILABILITY,
+    PUBLICLY_ACTIVE_LLM_PROVIDERS,
     READINESS_IDS,
     SECRET_FIELDS,
     TTS_FIELDS,
@@ -29,7 +32,7 @@ from src.services.api_credentials import (
 )
 
 
-def test_provider_availability_has_exactly_19_coming_soon_pairs() -> None:
+def test_provider_availability_has_sole_gemini_active_overlay() -> None:
 
     assert PROVIDER_AVAILABILITY == {
         "whatsapp": {
@@ -42,6 +45,7 @@ def test_provider_availability_has_exactly_19_coming_soon_pairs() -> None:
         },
         "llm": {
             "dropout": "coming_soon",
+            "gemini": "active",
             "openai": "coming_soon",
             "outros": "coming_soon",
             "slm_cortex": "coming_soon",
@@ -57,12 +61,15 @@ def test_provider_availability_has_exactly_19_coming_soon_pairs() -> None:
         },
         "tts": {"elevenlabs": "coming_soon", "google": "coming_soon"},
     }
-    assert sum(len(providers) for providers in PROVIDER_AVAILABILITY.values()) == 19
-    assert {
+    assert sum(len(providers) for providers in PROVIDER_AVAILABILITY.values()) == 20
+    states = [
         availability
         for providers in PROVIDER_AVAILABILITY.values()
         for availability in providers.values()
-    } == {"coming_soon"}
+    ]
+    assert states.count("active") == 1
+    assert states.count("coming_soon") == 19
+    assert PUBLICLY_ACTIVE_LLM_PROVIDERS == {"gemini"}
     assert PROVIDER_ALLOWLISTS == {
         capability: frozenset(providers)
         for capability, providers in PROVIDER_AVAILABILITY.items()
@@ -90,7 +97,9 @@ def test_wire_ids_readiness_and_errors_match_design() -> None:
         "credentials_jwt_required",
         "credentials_role_forbidden",
         "invalid_credentials_payload",
+        "invalid_provider_endpoint",
         "invalid_provider_for_capability",
+        "provider_switch_bundle_required",
         "provider_not_available",
     }.issubset(WIRE_ERROR_CODES)
 
@@ -464,7 +473,7 @@ def test_clinic_complete_llm_wins_over_builder_and_never_pulls_other_fields() ->
         assert composed[field] == clinic[field]
 
 
-def test_incomplete_clinic_llm_inherits_only_four_llm_fields_from_builder() -> None:
+def test_explicit_incomplete_clinic_llm_is_authoritative_over_builder() -> None:
     clinic = {
         "whatsapp_provider": "zapi",
         "zapi_instance_id": "instance-clinic",
@@ -484,11 +493,10 @@ def test_incomplete_clinic_llm_inherits_only_four_llm_fields_from_builder() -> N
         "llm_model_name": "builder-model",
     }
     composed = compose_llm_credentials(clinic, builder)
-    # Exactly the four llm_* fields from builder overlay the clinic
-    assert composed["llm_provider"] == "dropout"
-    assert composed["llm_api_url"] == "https://api.neuralake.cloud/v1"
-    assert composed["llm_api_key"] == "builder-llm-secret"
-    assert composed["llm_model_name"] == "builder-model"
+    assert composed["llm_provider"] == "openai"
+    assert "llm_api_url" not in composed
+    assert "llm_api_key" not in composed
+    assert "llm_model_name" not in composed
     # WhatsApp / STT / any other clinic field remains unchanged
     assert composed["whatsapp_provider"] == "zapi"
     assert composed["zapi_instance_id"] == "instance-clinic"
@@ -530,8 +538,8 @@ def test_two_builders_cross_clinics_prove_zero_credential_bleed() -> None:
     and never mix — the *resolver* (event_service._resolve_builder_owner_tenant_id)
     is exercised in the DB-only integration tests.
     """
-    clinic_x = {"llm_provider": "openai"}  # incomplete → will inherit
-    clinic_y = {"llm_provider": "openai"}
+    clinic_x: dict[str, str] = {}
+    clinic_y: dict[str, str] = {}
     builder_a = {
         "llm_provider": "dropout",
         "llm_api_url": "https://api.neuralake.cloud/v1",
@@ -551,6 +559,22 @@ def test_two_builders_cross_clinics_prove_zero_credential_bleed() -> None:
     # Zero credential bleed across the two computations
     assert "BUILDER-B-SECRET" not in repr(xa)
     assert "BUILDER-A-SECRET" not in repr(yb)
+
+
+@pytest.mark.parametrize("explicit_provider", [None, "invalid", "gemini"])
+def test_any_explicit_clinic_provider_blocks_builder_inheritance(
+    explicit_provider: object,
+) -> None:
+    clinic = {"llm_provider": explicit_provider}
+    builder = {
+        "llm_provider": "openai",
+        "llm_api_url": "https://api.openai.com/v1",
+        "llm_api_key": "BUILDER-SECRET",
+        "llm_model_name": "gpt",
+    }
+    composed = compose_llm_credentials(clinic, builder)
+    assert composed == clinic
+    assert "BUILDER-SECRET" not in repr(composed)
 
 
 def test_cache_marker_and_projection_wrap_scrubs_secrets() -> None:
@@ -747,15 +771,25 @@ def test_generic_boundary_covers_exact_fields_aliases_and_future_prefixes() -> N
     [
         (capability, provider)
         for capability, providers in PROVIDER_AVAILABILITY.items()
-        for provider in providers
+        for provider, availability in providers.items()
+        if availability == "coming_soon"
     ],
 )
-def test_every_displayable_provider_change_is_rejected(
+def test_every_coming_soon_provider_change_is_rejected(
     capability: str, provider: str
 ) -> None:
     provider_field = CAPABILITY_PROVIDER_FIELDS[capability]
     existing: dict[str, object] = {}
-    candidate = merge_credentials(existing, {provider_field: provider})
+    patch: dict[str, object] = {provider_field: provider}
+    if capability == "llm" and provider == "gemini":
+        patch.update(
+            {
+                "llm_api_url": GEMINI_API_BASE_URL,
+                "llm_api_key": "fresh-gemini-key",
+                "llm_model_name": "gemini-model",
+            }
+        )
+    candidate = merge_credentials(existing, patch)
 
     with pytest.raises(CredentialPolicyError) as caught:
         validate_provider_availability(existing, candidate)
@@ -766,6 +800,114 @@ def test_every_displayable_provider_change_is_rejected(
         "provider": provider,
     }
     assert existing == {}
+
+
+@pytest.mark.parametrize(
+    ("existing_provider", "target_provider", "target_url"),
+    [
+        ("openai", "gemini", GEMINI_API_BASE_URL),
+        ("gemini", "openai", "https://api.openai.com/v1"),
+    ],
+)
+@pytest.mark.parametrize(
+    "omitted_field",
+    ["llm_provider", "llm_api_url", "llm_api_key", "llm_model_name"],
+)
+def test_gemini_provider_switch_requires_fresh_atomic_bundle(
+    existing_provider: str,
+    target_provider: str,
+    target_url: str,
+    omitted_field: str,
+) -> None:
+    existing_url = (
+        GEMINI_API_BASE_URL
+        if existing_provider == "gemini"
+        else "https://api.openai.com/v1"
+    )
+    existing = {
+        "llm_provider": existing_provider,
+        "llm_api_url": existing_url,
+        "llm_api_key": "stored-secret",
+        "llm_model_name": "stored-model",
+    }
+    patch = {
+        "llm_provider": target_provider,
+        "llm_api_url": target_url,
+        "llm_api_key": "fresh-secret",
+        "llm_model_name": "fresh-model",
+    }
+    patch.pop(omitted_field)
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        merge_credentials(existing, patch)
+
+    assert caught.value.detail == {
+        "error": "provider_switch_bundle_required",
+        "capability": "llm",
+    }
+    assert existing["llm_api_key"] == "stored-secret"
+
+
+def test_same_provider_model_only_edit_preserves_url_and_key() -> None:
+    existing = {
+        "llm_provider": "gemini",
+        "llm_api_url": GEMINI_API_BASE_URL,
+        "llm_api_key": "stored-secret",
+        "llm_model_name": "old-model",
+    }
+    candidate = merge_credentials(existing, {"llm_model_name": "new-model"})
+    assert candidate == {**existing, "llm_model_name": "new-model"}
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://generativelanguage.googleapis.com:443/v1beta/openai",
+        "https://generativelanguage.googleapis.com:8443/v1beta/openai",
+        "https://generativelanguage.googleapis.com/v1/openai",
+        "https://generativelanguage.googleapis.com/v1beta/openai?x=1",
+        "https://generativelanguage.googleapis.com/v1beta/openai#fragment",
+        "https://user@generativelanguage.googleapis.com/v1beta/openai",
+        "https://example.com/v1beta/openai",
+    ],
+)
+def test_gemini_endpoint_is_exact_and_error_context_is_input_free(
+    endpoint: str,
+) -> None:
+    with pytest.raises(CredentialPolicyError) as caught:
+        merge_credentials(
+            {},
+            {
+                "llm_provider": "gemini",
+                "llm_api_url": endpoint,
+                "llm_api_key": "SECRET-KEY",
+                "llm_model_name": "gemini-model",
+            },
+        )
+    assert caught.value.detail == {
+        "error": "invalid_provider_endpoint",
+        "capability": "llm",
+        "provider": "gemini",
+        "field": "llm_api_url",
+    }
+    rendered = f"{caught.value!s} {caught.value!r} {caught.value.detail!r}"
+    assert endpoint not in rendered
+    assert "SECRET-KEY" not in rendered
+
+
+def test_gemini_is_operational_and_ready_after_promotion() -> None:
+    assert PROVIDER_AVAILABILITY["llm"]["gemini"] == "active"
+    assert "gemini" in OPERATIONAL_LLM_PROVIDERS
+    status = credential_status(
+        {
+            "llm_provider": "gemini",
+            "llm_api_url": GEMINI_API_BASE_URL,
+            "llm_api_key": "secret",
+            "llm_model_name": "gemini-model",
+        }
+    )
+    assert status["llm_readiness"] == "active"
+    assert status["apis_configured"] is True
 
 
 @pytest.mark.parametrize(

@@ -370,19 +370,24 @@ async def _load_config_from_db(tenant_id: UUID) -> Optional[dict[str, Any]]:
             clinic_creds: dict[str, Any] = dict(row.api_credentials or {})
             builder_creds: Optional[dict[str, Any]] = None
 
-            owner_tenant_id = await _resolve_builder_owner_tenant_id(
-                db_session, tenant_id
-            )
-            if owner_tenant_id is not None and owner_tenant_id != tenant_id:
-                builder_row = (
-                    await db_session.execute(
-                        select(ClinicConfigTable).where(
-                            ClinicConfigTable.tenant_id == owner_tenant_id
+            # An explicit clinic provider is authoritative even when it is
+            # invalid, incomplete, or not yet operational. Do not resolve an
+            # owner tenant — and therefore do not load cross-tenant secrets —
+            # unless the clinic has made no provider choice at all.
+            if "llm_provider" not in clinic_creds:
+                owner_tenant_id = await _resolve_builder_owner_tenant_id(
+                    db_session, tenant_id
+                )
+                if owner_tenant_id is not None and owner_tenant_id != tenant_id:
+                    builder_row = (
+                        await db_session.execute(
+                            select(ClinicConfigTable).where(
+                                ClinicConfigTable.tenant_id == owner_tenant_id
+                            )
                         )
-                    )
-                ).scalar_one_or_none()
-                if builder_row is not None:
-                    builder_creds = dict(builder_row.api_credentials or {})
+                    ).scalar_one_or_none()
+                    if builder_row is not None:
+                        builder_creds = dict(builder_row.api_credentials or {})
 
             composed = compose_llm_credentials(clinic_creds, builder_creds)
 
@@ -414,7 +419,7 @@ async def _load_runtime_llm_credentials(tenant_id: UUID) -> dict[str, Any]:
     if loaded is None:
         return {}
     creds = loaded.get("api_credentials") or {}
-    return {field: creds.get(field) for field in LLM_OVERLAY_FIELDS if creds.get(field)}
+    return {field: creds.get(field) for field in LLM_OVERLAY_FIELDS if field in creds}
 
 
 # Allowlisted bundles the private multimodal-fallback loader is allowed to
@@ -1033,10 +1038,12 @@ class EventService:
                 # Runtime LLM call: cached config only contains the non-secret
                 # projection, so we resolve raw creds DB-only for this call.
                 # Raw key stays in-memory for the outbound request only.
-                api_creds = (
-                    await _load_runtime_llm_credentials(tenant_id) if tenant_id else {}
-                )
-                llm = get_tenant_llm_client(tenant_id, api_creds)
+                if tenant_id:
+                    api_creds = await _load_runtime_llm_credentials(tenant_id)
+                    llm = get_tenant_llm_client(tenant_id, api_creds)
+                else:
+                    api_creds = {}
+                    llm = get_tenant_llm_client(tenant_id)
                 tenant_model = api_creds.get("llm_model_name") or None
                 primary_provider = api_creds.get("llm_provider") or "unknown"
                 if llm and user_message:
