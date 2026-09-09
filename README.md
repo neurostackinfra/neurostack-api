@@ -231,19 +231,19 @@ Key variables:
 
 ## 🚢 Deployment
 
-### Docker
+### Produção
+
+O único fluxo autorizado é o deploy de digest homologado e receipt assinado.
+No checkout de produção, prepare manualmente o `.env` conforme o
+[runbook operacional](./docs/api-provider-settings-rollout.md) e execute:
 
 ```bash
-# Build production image
-docker build --target production -t neurostack-api:latest .
-
-# Run container
-docker run -p 8000:8000 --env-file .env neurostack-api:latest
+scripts/deploy-vps.sh
 ```
 
-### Kubernetes
-
-See `/deploy/kubernetes/` (coming soon)
+O entrypoint valida assinatura, fingerprint, candidate, receipt e digests antes
+de qualquer leitura do `.env` ou chamada ao Docker. O VPS não faz checkout-build,
+não resolve tags e não usa imagens mutáveis.
 
 ---
 
@@ -253,6 +253,7 @@ See `/deploy/kubernetes/` (coming soon)
 - [Documentação Técnica](./docs/README.md) – índice da documentação
 - [Pipeline Cognitivo](./docs/cognitive-pipeline.md) – funil 11 etapas, intenções oficiais, ClinicConfig
 - [Contratos de API](./docs/api-contracts.md) – eventos CRM (`ns.funnel_stage_changed`, `ns.handoff_created`), Decision Trace, handoff por setor/SLA
+- [Rollout operacional de providers](./docs/api-provider-settings-rollout.md) – build imutável, smoke, receipt assinado e deploy por digest
 
 ### Alinhamento MVP v0.5 (Documentação Técnica)
 
@@ -288,4 +289,3 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## 🙋 Support
 
 For questions or issues, please open a GitHub issue.
-

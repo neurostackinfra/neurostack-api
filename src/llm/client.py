@@ -16,10 +16,16 @@ from pydantic import JsonValue, TypeAdapter
 
 from src.config.logging import get_logger
 from src.config.settings import settings
-from src.services.api_credentials import OPERATIONAL_MULTIMODAL_PROVIDERS
+from src.services.api_credentials import (
+    GEMINI_API_BASE_URL,
+    LLM_OVERLAY_FIELDS,
+    OPERATIONAL_LLM_PROVIDERS,
+    OPERATIONAL_MULTIMODAL_PROVIDERS,
+)
 from src.services.multimodal_service import multimodal_kind_for_url
 from src.services.safe_egress import (
     LLM_DROPOUT_HOSTS,
+    LLM_GEMINI_HOSTS,
     LLM_OPENAI_HOSTS,
     UnsafeEgressError,
     parse_public_https_url,
@@ -40,6 +46,17 @@ class LLMGenerationResult(TypedDict):
     content: str
     usage: dict[str, JsonValue]
     model: str
+
+
+class LLMClientError(RuntimeError):
+    """Static, secret-free failure raised at the provider client boundary."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+    def __repr__(self) -> str:
+        return f"LLMClientError({self.code!r})"
 
 
 def _chat_completions_url(base_url: str) -> str:
@@ -68,7 +85,29 @@ def _llm_kind_for_url(base_url: str) -> str:
         return "llm_openai"
     if parsed.hostname in LLM_DROPOUT_HOSTS:
         return "llm_dropout"
+    if parsed.hostname in LLM_GEMINI_HOSTS:
+        return "llm_gemini"
     return "llm_outros"
+
+
+def _tenant_llm_egress_kind(provider: str, base_url: str) -> Optional[str]:
+    """Return an egress kind only for a coherent provider/endpoint pair."""
+
+    try:
+        parsed = parse_public_https_url(base_url)
+    except UnsafeEgressError:
+        return None
+    if provider == "openai" and parsed.hostname in LLM_OPENAI_HOSTS:
+        return "llm_openai"
+    if provider == "dropout" and parsed.hostname in LLM_DROPOUT_HOSTS:
+        return "llm_dropout"
+    if provider == "gemini" and base_url == GEMINI_API_BASE_URL:
+        return "llm_gemini"
+    if provider == "outros" and parsed.hostname not in (
+        LLM_OPENAI_HOSTS | LLM_DROPOUT_HOSTS | LLM_GEMINI_HOSTS
+    ):
+        return "llm_outros"
+    return None
 
 
 class LLMClient:
@@ -156,31 +195,43 @@ class LLMClient:
 
         logger.debug("LLM request", model=effective_model, messages_count=len(messages))
         target_url = _chat_completions_url(self._base_url)
-        async with safe_async_client(
-            target_url,
-            kind=self._kind,
-            timeout=httpx.Timeout(self._timeout, connect=10.0),
-        ) as (client, validated):
-            resp = await client.post(
-                validated.url,
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "Content-Type": "application/json",
-                    "Host": validated.sni_host,
-                },
-            )
-            resp.raise_for_status()
-            data = _JSON_OBJECT_ADAPTER.validate_python(resp.json())
+        try:
+            async with safe_async_client(
+                target_url,
+                kind=self._kind,
+                timeout=httpx.Timeout(self._timeout, connect=10.0),
+            ) as (client, validated):
+                resp = await client.post(
+                    validated.url,
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {self._api_key}",
+                        "Content-Type": "application/json",
+                        "Host": validated.sni_host,
+                    },
+                )
+                resp.raise_for_status()
+                try:
+                    data = _JSON_OBJECT_ADAPTER.validate_python(resp.json())
+                except Exception:
+                    raise LLMClientError("invalid_provider_response") from None
+        except LLMClientError:
+            raise
+        except httpx.HTTPStatusError:
+            raise LLMClientError("provider_http_error") from None
+        except (httpx.TimeoutException, httpx.TransportError, UnsafeEgressError):
+            raise LLMClientError("provider_transport_error") from None
+        except httpx.HTTPError:
+            raise LLMClientError("provider_transport_error") from None
 
         choices = data.get("choices")
-        choice = (
-            choices[0]
-            if isinstance(choices, list) and choices and isinstance(choices[0], dict)
-            else {}
-        )
+        if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
+            raise LLMClientError("invalid_provider_response")
+        choice = choices[0]
         message = choice.get("message")
-        message_data = message if isinstance(message, dict) else {}
+        if not isinstance(message, dict) or "content" not in message:
+            raise LLMClientError("invalid_provider_response")
+        message_data = message
         raw_content = message_data.get("content")
         content = raw_content if isinstance(raw_content, str) else ""
         finish = choice.get("finish_reason")
@@ -235,30 +286,46 @@ def get_llm_client() -> Optional[LLMClient]:
 
 
 def get_tenant_llm_client(
-    tenant_id: object, api_credentials: dict[str, JsonValue]
+    tenant_id: object,
+    api_credentials: Optional[dict[str, JsonValue]] = None,
 ) -> Optional[LLMClient]:
     """
     Create an LLM client for a specific tenant using their saved API credentials.
 
-    If the tenant has no llm_api_key configured, falls back to the global client.
-    Creates a new client on each call (safe-egress transports are per-call).
+    An unscoped caller that omits credentials may use the global client. Any
+    explicitly supplied tenant mapping, including an empty mapping from a
+    failed credential resolution, is authoritative and must be operational and
+    provider/endpoint coherent; otherwise this fails closed.
     """
-    configured_api_key = api_credentials.get("llm_api_key")
-    if not isinstance(configured_api_key, str) or not configured_api_key:
+    if api_credentials is None:
         return get_llm_client()
 
-    configured_base_url = api_credentials.get("llm_api_url")
-    base_url = (
-        configured_base_url
-        if isinstance(configured_base_url, str) and configured_base_url
-        else settings.llm_base_url
-    )
+    provider = api_credentials.get("llm_provider")
+    if not isinstance(provider, str) or provider not in OPERATIONAL_LLM_PROVIDERS:
+        return None
+    if not all(
+        isinstance(api_credentials.get(field), str) and bool(api_credentials[field])
+        for field in LLM_OVERLAY_FIELDS
+    ):
+        return None
+
+    base_url = api_credentials["llm_api_url"]
+    api_key = api_credentials["llm_api_key"]
+    if not isinstance(base_url, str) or not isinstance(api_key, str):
+        return None
+    egress_kind = _tenant_llm_egress_kind(provider, base_url)
+    if egress_kind is None:
+        return None
     logger.debug(
         "Creating per-tenant LLM client",
         tenant_id=str(tenant_id),
         base_url=base_url,
     )
-    return LLMClient(base_url=base_url, api_key=configured_api_key)
+    return LLMClient(
+        base_url=base_url,
+        api_key=api_key,
+        egress_kind=egress_kind,
+    )
 
 
 # Multimodal-text bundle field names — replicated locally instead of imported

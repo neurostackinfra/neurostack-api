@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 MASKED_SECRET = "••••••••"
+GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 
 ProviderAvailability = Literal["active", "coming_soon"]
 
@@ -27,6 +29,7 @@ PROVIDER_AVAILABILITY: dict[str, dict[str, ProviderAvailability]] = {
     },
     "llm": {
         "dropout": "coming_soon",
+        "gemini": "active",
         "openai": "coming_soon",
         "outros": "coming_soon",
         "slm_cortex": "coming_soon",
@@ -50,7 +53,10 @@ PROVIDER_ALLOWLISTS: dict[str, frozenset[str]] = {
     for capability, providers in PROVIDER_AVAILABILITY.items()
 }
 
-OPERATIONAL_LLM_PROVIDERS = frozenset({"openai", "dropout", "outros"})
+# Public product activation is deliberately narrower than legacy runtime
+# compatibility used to read already-stored tenant configurations.
+PUBLICLY_ACTIVE_LLM_PROVIDERS = frozenset({"gemini"})
+OPERATIONAL_LLM_PROVIDERS = frozenset({"openai", "dropout", "gemini", "outros"})
 OPERATIONAL_STT_PROVIDERS = frozenset({"outros", "openai_whisper"})
 # Multimodal providers whose chat-completions endpoint was measured against
 # the live API and proven to transcribe the OGG/Opus that WhatsApp actually
@@ -69,7 +75,9 @@ WIRE_ERROR_CODES = frozenset(
         "credentials_jwt_required",
         "credentials_role_forbidden",
         "invalid_credentials_payload",
+        "invalid_provider_endpoint",
         "invalid_provider_for_capability",
+        "provider_switch_bundle_required",
         "provider_not_available",
         "unsafe_api_url",
     }
@@ -237,6 +245,83 @@ def validate_provider(capability: str, provider: Any) -> None:
         )
 
 
+def validate_gemini_endpoint(value: Any) -> None:
+    """Require the immutable Gemini OpenAI-compatible API base.
+
+    The comparison is deliberately byte-for-byte after a defensive parse.
+    That excludes explicit ports (including ``:443``), userinfo, alternate
+    hosts or paths, queries, and fragments. Errors carry only stable policy
+    identifiers; the submitted value is never attached to the exception.
+    """
+
+    if not isinstance(value, str):
+        raise CredentialPolicyError(
+            "invalid_provider_endpoint",
+            capability="llm",
+            provider="gemini",
+            field="llm_api_url",
+        )
+    try:
+        parsed = urlsplit(value)
+        explicit_port = parsed.port is not None
+    except ValueError:
+        raise CredentialPolicyError(
+            "invalid_provider_endpoint",
+            capability="llm",
+            provider="gemini",
+            field="llm_api_url",
+        ) from None
+    if explicit_port or value != GEMINI_API_BASE_URL:
+        raise CredentialPolicyError(
+            "invalid_provider_endpoint",
+            capability="llm",
+            provider="gemini",
+            field="llm_api_url",
+        )
+
+
+def validate_llm_provider_endpoint(credentials: Mapping[str, Any]) -> None:
+    """Validate provider-specific endpoint invariants on a complete candidate."""
+
+    if credentials.get("llm_provider") == "gemini":
+        validate_gemini_endpoint(credentials.get("llm_api_url"))
+
+
+def _validate_llm_provider_switch(
+    existing: Mapping[str, Any], patch: Mapping[str, Any]
+) -> None:
+    """Require a fresh atomic four-field bundle for every provider switch."""
+
+    existing_provider = existing.get("llm_provider")
+    patched_provider = patch.get("llm_provider")
+    endpoint_switches_into_gemini = (
+        existing_provider != "gemini"
+        and patch.get("llm_api_url") == GEMINI_API_BASE_URL
+    )
+    endpoint_switches_out_of_gemini = (
+        existing_provider == "gemini"
+        and "llm_api_url" in patch
+        and patch.get("llm_api_url") != GEMINI_API_BASE_URL
+    )
+    provider_switches_gemini = (
+        "llm_provider" in patch
+        and patched_provider != existing_provider
+        and "gemini" in {existing_provider, patched_provider}
+    )
+    if not (
+        provider_switches_gemini
+        or endpoint_switches_into_gemini
+        or endpoint_switches_out_of_gemini
+    ):
+        return
+    complete = all(
+        field in patch and isinstance(patch.get(field), str) and bool(patch.get(field))
+        for field in LLM_OVERLAY_FIELDS
+    )
+    if not complete or not is_fresh_secret(patch.get("llm_api_key")):
+        raise CredentialPolicyError("provider_switch_bundle_required", capability="llm")
+
+
 def merge_credentials(
     existing: Mapping[str, Any], patch: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -251,6 +336,7 @@ def merge_credentials(
     for capability, provider_field in CAPABILITY_PROVIDER_FIELDS.items():
         if provider_field in patch:
             validate_provider(capability, patch[provider_field])
+    _validate_llm_provider_switch(existing, patch)
 
     merged = dict(existing)
     for field, value in patch.items():
@@ -263,6 +349,7 @@ def merge_credentials(
         merged.pop("whisper_api_key", None)
     if "stt_model_name" in patch:
         merged.pop("whisper_model", None)
+    validate_llm_provider_endpoint(merged)
     return merged
 
 
@@ -360,10 +447,13 @@ def _llm_bundle_complete(candidate: Mapping[str, Any] | None) -> bool:
 def compose_llm_credentials(
     clinic: Mapping[str, Any], builder: Mapping[str, Any] | None
 ) -> dict[str, Any]:
-    """Overlay exactly the four LLM fields when clinic LLM is incomplete."""
+    """Use explicit clinic ownership, otherwise inherit one complete builder bundle."""
 
     result = dict(clinic)
-    if _llm_bundle_complete(clinic):
+    # Presence is authoritative even for null, invalid, incomplete, or
+    # coming-soon values. A clinic that explicitly chose a provider must
+    # never receive another tenant's secret-bearing bundle as a fallback.
+    if "llm_provider" in clinic:
         return result
     if builder is not None and _llm_bundle_complete(builder):
         for field in LLM_OVERLAY_FIELDS:

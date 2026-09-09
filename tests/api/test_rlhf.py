@@ -484,10 +484,11 @@ class TestSubmitRatingAnalysisPassthrough:
         )
         assert resolved.id == original_event_id
         assert resolved.tenant_id == original_tenant_id
-        # And prove the pre-port kwarg is gone: forwarding message_id would
-        # let analysis re-query (the exact regression this tripwire guards
-        # against per Group 2, deliverable 9).
-        assert "message_id" not in kwargs
+        # The raw id is forwarded only to check consistency with the resolved
+        # row; analysis never performs a second Event lookup.
+        assert kwargs["message_id"] == str(original_event_id)
+        assert kwargs["caller_is_api_key"] is True
+        assert kwargs["caller_role"] is None
 
 
 # ============================================
@@ -1045,24 +1046,10 @@ class TestSubmitRatingMiddleRungAttribution:
             for coro in captured:
                 client._submit(coro)
 
-        # Rung 2 assertion: the tenant handed to the credential loader
-        # must be the resolved event's owner, not the submitter's tenant.
-        assert "resolve_tenant_id" in seen, (
-            "_load_runtime_llm_credentials must be invoked from analysis; "
-            "if this fires, the endpoint stopped triggering analysis for "
-            "a rating-1-with-reason submission"
-        )
-        assert seen["resolve_tenant_id"] == original_event_owner, (
-            "the middle rung is broken: analysis received "
-            f"{seen['resolve_tenant_id']!r} instead of the resolved event's "
-            f"tenant_id ({original_event_owner!r}). Either submit_rating "
-            "stopped forwarding the resolved event, or _analyze_rating_async "
-            "stopped consulting it — both are silent regressions this test "
-            "is the only end-to-end guard against."
-        )
-        # And crucially, NOT the submitter's tenant — proving the fallback
-        # rung (rung 3) did not win by accident.
-        assert seen["resolve_tenant_id"] != TEST_TENANT_ID
+        # Tenant API keys are tenant-scoped: a foreign message selector is
+        # rejected before secret lookup and before any outbound generation.
+        assert seen == {}
+        assert fake_llm.generate.await_count == 0
 
 
 class TestListRatingsEmitsChannelAndTracePair:
@@ -1121,6 +1108,10 @@ class TestAnalysisWritesToRlhfRatingsRow:
         impossible because we never actually schedule the analysis.
         """
         captured: list[Any] = []
+        source_event_id = uuid4()
+        client._submit(_seed_tenant_full(TEST_TENANT_ID, "API Key Tenant"))
+        client._submit(_seed_event(source_event_id, TEST_TENANT_ID, "message.in"))
+        payload["message_id"] = str(source_event_id)
 
         def _capture(coro, name=None):
             captured.append(coro)
@@ -2050,6 +2041,287 @@ class TestRatingAnalysisClinicTenantIdValidation:
 
         # Non-UUID clinic_tenant_id must not affect resolution.
         assert seen["resolve_tenant_id"] == submitter_id
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("message_id", "clinic_tenant_id"),
+        [
+            (None, None),
+            ("not-a-uuid", None),
+            ("event-id-filled-below", "conflicting-clinic-filled-below"),
+        ],
+        ids=["missing_message", "malformed_message", "conflicting_selectors"],
+    )
+    async def test_strict_selector_rejections_precede_secret_load_and_client(
+        self,
+        message_id: str | None,
+        clinic_tenant_id: str | None,
+    ) -> None:
+        from src.api.routes import rlhf
+
+        event = Event(
+            id=uuid4(),
+            tenant_id=uuid4(),
+            session_id=None,
+            event_type="message.in",
+            event_data={},
+            event_metadata={},
+        )
+        if message_id == "event-id-filled-below":
+            message_id = str(event.id)
+            clinic_tenant_id = str(uuid4())
+
+        load = AsyncMock()
+        fake_llm = MagicMock()
+        fake_llm.generate = AsyncMock()
+        get_client = MagicMock(return_value=fake_llm)
+        update = AsyncMock(return_value=None)
+        with (
+            patch(
+                "src.services.event_service._load_runtime_llm_credentials",
+                new=load,
+            ),
+            patch("src.api.routes.rlhf.get_tenant_llm_client", new=get_client),
+            patch("src.api.routes.rlhf._update_rating_status", new=update),
+        ):
+            await rlhf._analyze_rating_async(
+                rating_id=uuid4(),
+                rating=1,
+                reason="qualifying reason",
+                agent_response="agent",
+                user_message="user",
+                tenant_id=event.tenant_id,
+                clinic_tenant_id=clinic_tenant_id,
+                resolved_event=event,
+                message_id=message_id,
+                caller_is_api_key=True,
+            )
+
+        load.assert_not_awaited()
+        get_client.assert_not_called()
+        fake_llm.generate.assert_not_awaited()
+        update.assert_awaited_once()
+        assert update.await_args.kwargs["status_"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_clinic_admin_foreign_event_cannot_load_credentials(
+        self, db_ready
+    ) -> None:
+        from src.api.routes import rlhf
+
+        foreign_tenant = uuid4()
+        await _seed_tenant(foreign_tenant)
+        event = Event(
+            id=uuid4(),
+            tenant_id=foreign_tenant,
+            session_id=None,
+            event_type="message.in",
+            event_data={},
+            event_metadata={},
+        )
+        load = AsyncMock()
+        fake_llm = MagicMock()
+        fake_llm.generate = AsyncMock()
+        get_client = MagicMock(return_value=fake_llm)
+        with (
+            patch(
+                "src.services.event_service._load_runtime_llm_credentials",
+                new=load,
+            ),
+            patch("src.api.routes.rlhf.get_tenant_llm_client", new=get_client),
+            patch(
+                "src.api.routes.rlhf._update_rating_status",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            await rlhf._analyze_rating_async(
+                rating_id=uuid4(),
+                rating=1,
+                reason="qualifying reason",
+                agent_response="agent",
+                user_message="user",
+                tenant_id=uuid4(),
+                resolved_event=event,
+                message_id=str(event.id),
+                caller_role="clinic_admin",
+            )
+        load.assert_not_awaited()
+        get_client.assert_not_called()
+        fake_llm.generate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_clinic_admin_own_event_loads_only_own_credentials(
+        self, db_ready
+    ) -> None:
+        from src.api.routes import rlhf
+
+        clinic_id = uuid4()
+        await _seed_tenant(clinic_id)
+        event = Event(
+            id=uuid4(),
+            tenant_id=clinic_id,
+            session_id=None,
+            event_type="message.in",
+            event_data={},
+            event_metadata={},
+        )
+        load = AsyncMock(
+            return_value={
+                "llm_provider": "openai",
+                "llm_api_url": "https://api.openai.com/v1",
+                "llm_api_key": "SECRET",
+                "llm_model_name": "model",
+            }
+        )
+        fake_llm = MagicMock()
+        fake_llm.generate = AsyncMock(
+            return_value={
+                "content": '{"status":"agreed","justification":"ok"}',
+                "usage": {},
+                "model": "model",
+            }
+        )
+        get_client = MagicMock(return_value=fake_llm)
+        with (
+            patch(
+                "src.services.event_service._load_runtime_llm_credentials",
+                new=load,
+            ),
+            patch("src.api.routes.rlhf.get_tenant_llm_client", new=get_client),
+            patch(
+                "src.api.routes.rlhf._update_rating_status",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            await rlhf._analyze_rating_async(
+                rating_id=uuid4(),
+                rating=1,
+                reason="qualifying reason",
+                agent_response="agent",
+                user_message="user",
+                tenant_id=clinic_id,
+                resolved_event=event,
+                message_id=str(event.id),
+                caller_role="clinic_admin",
+            )
+
+        load.assert_awaited_once_with(clinic_id)
+        get_client.assert_called_once_with(clinic_id, load.return_value)
+        fake_llm.generate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_builder_cannot_load_foreign_builders_clinic_credentials(
+        self, db_ready
+    ) -> None:
+        from src.api.routes import rlhf
+
+        builder_a = uuid4()
+        builder_b = uuid4()
+        clinic_b = uuid4()
+        await _seed_builder(builder_a, "Builder A")
+        await _seed_builder(builder_b, "Builder B")
+        await _seed_tenant_full(clinic_b, "Clinic B", builder_id=builder_b)
+        event = Event(
+            id=uuid4(),
+            tenant_id=clinic_b,
+            session_id=None,
+            event_type="message.in",
+            event_data={},
+            event_metadata={},
+        )
+        load = AsyncMock()
+        fake_llm = MagicMock()
+        fake_llm.generate = AsyncMock()
+        get_client = MagicMock(return_value=fake_llm)
+        update = AsyncMock(return_value=None)
+        with (
+            patch(
+                "src.services.event_service._load_runtime_llm_credentials",
+                new=load,
+            ),
+            patch("src.api.routes.rlhf.get_tenant_llm_client", new=get_client),
+            patch("src.api.routes.rlhf._update_rating_status", new=update),
+        ):
+            await rlhf._analyze_rating_async(
+                rating_id=uuid4(),
+                rating=1,
+                reason="qualifying reason",
+                agent_response="agent",
+                user_message="user",
+                tenant_id=uuid4(),
+                clinic_tenant_id=str(clinic_b),
+                resolved_event=event,
+                message_id=str(event.id),
+                caller_role="builder",
+                caller_builder_id=builder_a,
+            )
+
+        load.assert_not_awaited()
+        get_client.assert_not_called()
+        fake_llm.generate.assert_not_awaited()
+        update.assert_awaited_once()
+        assert update.await_args.kwargs["status_"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_builder_may_load_only_managed_clinic_credentials(
+        self, db_ready
+    ) -> None:
+        from src.api.routes import rlhf
+
+        builder_id = uuid4()
+        clinic_id = uuid4()
+        await _seed_builder(builder_id, "Authorized Builder")
+        await _seed_tenant_full(clinic_id, "Managed Clinic", builder_id=builder_id)
+        event = Event(
+            id=uuid4(),
+            tenant_id=clinic_id,
+            session_id=None,
+            event_type="message.in",
+            event_data={},
+            event_metadata={},
+        )
+        load = AsyncMock(
+            return_value={
+                "llm_provider": "openai",
+                "llm_api_url": "https://api.openai.com/v1",
+                "llm_api_key": "SECRET",
+                "llm_model_name": "model",
+            }
+        )
+        fake_llm = MagicMock()
+        fake_llm.generate = AsyncMock(
+            return_value={
+                "content": '{"status":"agreed","justification":"ok"}',
+                "usage": {},
+                "model": "model",
+            }
+        )
+        with (
+            patch(
+                "src.services.event_service._load_runtime_llm_credentials",
+                new=load,
+            ),
+            patch("src.api.routes.rlhf.get_tenant_llm_client", return_value=fake_llm),
+            patch(
+                "src.api.routes.rlhf._update_rating_status",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            await rlhf._analyze_rating_async(
+                rating_id=uuid4(),
+                rating=1,
+                reason="qualifying reason",
+                agent_response="agent",
+                user_message="user",
+                tenant_id=uuid4(),
+                clinic_tenant_id=str(clinic_id),
+                resolved_event=event,
+                message_id=str(event.id),
+                caller_role="builder",
+                caller_builder_id=builder_id,
+            )
+        load.assert_awaited_once_with(clinic_id)
+        fake_llm.generate.assert_awaited_once()
 
 
 class TestRemovedSuggestionFeedbackRoutes:

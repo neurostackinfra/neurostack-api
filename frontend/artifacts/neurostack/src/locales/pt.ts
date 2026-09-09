@@ -176,6 +176,7 @@ export const pt: Record<TranslationKey, string> = {
   config_provider: "Provedor",
   config_llm_none: "- Nenhum (usar mock) -",
   config_llm_openai: "OpenAI",
+  config_llm_gemini: "Gemini",
   config_llm_dropout: "Dropout (compatível com OpenAI)",
   config_llm_cortex: "SLM Cortex - Fallback para Dropout (Em Breve)",
   config_cortex_note: "SLM Vertical Proprietário. Roteando via Dropout para testes de MVP.",

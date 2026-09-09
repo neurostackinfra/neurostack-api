@@ -21,7 +21,9 @@ from src.services.safe_egress import (
     AUDIO_MIME_ALLOWLIST,
     CUSTOM_PUBLIC_PROVIDERS,
     DEFAULT_MAX_AUDIO_BYTES,
+    GEMINI_API_BASE_URL,
     LLM_DROPOUT_HOSTS,
+    LLM_GEMINI_HOSTS,
     LLM_OPENAI_HOSTS,
     META_ALLOWED_HOSTS,
     MULTIMODAL_GROQ_HOSTS,
@@ -370,8 +372,41 @@ class TestProviderPolicies:
         assert PROVIDER_POLICIES["zapi"].allowed_hosts == ZAPI_ALLOWED_HOSTS
         assert PROVIDER_POLICIES["llm_openai"].allowed_hosts == LLM_OPENAI_HOSTS
         assert PROVIDER_POLICIES["llm_dropout"].allowed_hosts == LLM_DROPOUT_HOSTS
+        assert PROVIDER_POLICIES["llm_gemini"].allowed_hosts == LLM_GEMINI_HOSTS
         assert PROVIDER_POLICIES["stt_openai"].allowed_hosts == STT_OPENAI_HOSTS
         assert PROVIDER_POLICIES["stt_groq"].allowed_hosts == STT_GROQ_HOSTS
+
+    def test_gemini_policy_pins_dns_host_and_sni(self) -> None:
+        seen: list[tuple[str, int]] = []
+
+        def resolver(hostname: str, port: int) -> list[tuple[Any, ...]]:
+            seen.append((hostname, port))
+            return [_addrinfo("8.8.8.8", port)]
+
+        validated = validate_url(
+            f"{GEMINI_API_BASE_URL}/chat/completions",
+            kind="llm_gemini",
+            resolver=resolver,
+        )
+        assert seen == [("generativelanguage.googleapis.com", 443)]
+        assert validated.pinned_ips == ("8.8.8.8",)
+        assert validated.sni_host == "generativelanguage.googleapis.com"
+
+    def test_gemini_policy_rejects_noncanonical_host_before_dns(self) -> None:
+        called = False
+
+        def resolver(_hostname: str, _port: int) -> list[tuple[Any, ...]]:
+            nonlocal called
+            called = True
+            return [_addrinfo("8.8.8.8")]
+
+        with pytest.raises(UnsafeEgressError):
+            validate_url(
+                "https://evil.example/v1beta/openai/chat/completions",
+                kind="llm_gemini",
+                resolver=resolver,
+            )
+        assert called is False
 
     def test_every_multimodal_kind_resolves_with_a_pinned_host(self) -> None:
         # The multimodal credential allowlist has no `outros` entry, so all

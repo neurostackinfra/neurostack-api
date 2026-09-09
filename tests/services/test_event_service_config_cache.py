@@ -25,6 +25,7 @@ import json
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, Iterator, Optional
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
@@ -380,6 +381,43 @@ class TestLoaderProjectsAndOverlaysLLM:
         )
         assert result == {}
 
+    @pytest.mark.parametrize("provider_marker", [None, "", False, 0])
+    def test_runtime_loader_preserves_falsey_provider_and_factory_fails_closed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        provider_marker: Any,
+    ) -> None:
+        from src.llm import client as client_module
+
+        async def _explicit_marker(_tenant_id: UUID) -> dict[str, Any]:
+            return {
+                "api_credentials": {
+                    "llm_provider": provider_marker,
+                }
+            }
+
+        monkeypatch.setattr(event_service, "_load_config_from_db", _explicit_marker)
+        global_client = MagicMock(
+            side_effect=AssertionError("explicit provider marker used global client")
+        )
+        outbound_client = MagicMock(
+            side_effect=AssertionError(
+                "explicit provider marker created outbound client"
+            )
+        )
+        monkeypatch.setattr(client_module, "get_llm_client", global_client)
+        monkeypatch.setattr(client_module, "LLMClient", outbound_client)
+
+        credentials = asyncio.get_event_loop().run_until_complete(
+            event_service._load_runtime_llm_credentials(TENANT)
+        )
+
+        assert "llm_provider" in credentials
+        assert credentials["llm_provider"] is provider_marker
+        assert client_module.get_tenant_llm_client(TENANT, credentials) is None
+        global_client.assert_not_called()
+        outbound_client.assert_not_called()
+
 
 # ============================================
 # Builder owner resolution
@@ -445,26 +483,25 @@ class TestBuilderOwnerResolution:
         assert result == owner_tenant
 
     def test_zero_matching_users_is_ambiguous_and_returns_none(
-        self, caplog: pytest.LogCaptureFixture
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         session = _FakeSession()
         builder_id = uuid4()
         tenant_row = SimpleNamespace(id=TENANT, builder_id=builder_id)
         session.queue([tenant_row])
         session.queue([])  # no users for this builder
-        with caplog.at_level("WARNING"):
-            result = asyncio.get_event_loop().run_until_complete(
-                event_service._resolve_builder_owner_tenant_id(session, TENANT)
-            )
+        logger = MagicMock()
+        monkeypatch.setattr(event_service, "logger", logger)
+        result = asyncio.get_event_loop().run_until_complete(
+            event_service._resolve_builder_owner_tenant_id(session, TENANT)
+        )
         assert result is None
-        assert (
-            any(
-                "builder_llm_owner_ambiguous" in rec.getMessage()
-                or "builder_llm_owner_ambiguous" in str(getattr(rec, "event", ""))
-                for rec in caplog.records
-            )
-            or True
-        )  # structlog may route the warning elsewhere; primary is result None
+        logger.warning.assert_called_once_with(
+            "builder_llm_owner_ambiguous",
+            tenant_id=str(TENANT),
+            builder_id=str(builder_id),
+            candidate_count=0,
+        )
 
     def test_multiple_distinct_tenants_is_ambiguous_and_returns_none(self) -> None:
         session = _FakeSession()
@@ -546,6 +583,7 @@ class TestBuilderComposeInDBLoader:
         class _SessionMultiplexer:
             def __init__(self) -> None:
                 self._tenant_queue: list[UUID] = []
+                self.execute_count = 0
 
             def enqueue(self, tenant: UUID) -> None:
                 self._tenant_queue.append(tenant)
@@ -557,6 +595,7 @@ class TestBuilderComposeInDBLoader:
                 return None
 
             async def execute(self_inner, stmt):
+                self_inner.execute_count += 1
                 # Pop the next expected tenant to look up.
                 if not self_inner._tenant_queue:
                     return _FakeExecResult([])
@@ -605,8 +644,7 @@ class TestBuilderComposeInDBLoader:
                     "stt_api_url": "https://speech.clinic",
                     "stt_api_key": "CLINIC-STT",
                     "stt_model_name": "clinic-whisper",
-                    # incomplete LLM triggers builder inheritance
-                    "llm_provider": "openai",
+                    # No provider choice: unique builder-owner may supply LLM.
                 },
             },
             builder_tenant: {
@@ -648,6 +686,151 @@ class TestBuilderComposeInDBLoader:
         assert creds["stt_model_name"] == "clinic-whisper"
         # Zero credential bleed of builder non-LLM secrets
         assert "BUILDER-STT-SECRET" not in json.dumps(creds)
+
+        # The composed bundle survives the runtime projection and remains an
+        # operational tenant client without consulting process-global config.
+        from src.llm import client as client_module
+
+        multiplexer.enqueue(clinic_tenant)
+        multiplexer.enqueue(builder_tenant)
+        runtime_creds = asyncio.get_event_loop().run_until_complete(
+            event_service._load_runtime_llm_credentials(clinic_tenant)
+        )
+        global_client = MagicMock(
+            side_effect=AssertionError("unique owner inheritance used global client")
+        )
+        inherited_client = object()
+        provider_client = MagicMock(return_value=inherited_client)
+        monkeypatch.setattr(client_module, "get_llm_client", global_client)
+        monkeypatch.setattr(client_module, "LLMClient", provider_client)
+
+        assert (
+            client_module.get_tenant_llm_client(clinic_tenant, runtime_creds)
+            is inherited_client
+        )
+        global_client.assert_not_called()
+        provider_client.assert_called_once_with(
+            base_url="https://api.neuralake.cloud/v1",
+            api_key="BUILDER-LLM-SECRET",
+            egress_kind="llm_dropout",
+        )
+
+    @pytest.mark.parametrize(
+        "owner_tenant_ids",
+        [[], [uuid4(), uuid4()]],
+        ids=["zero_owners", "ambiguous_owners"],
+    )
+    def test_failed_builder_resolution_fails_closed_through_factory(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        owner_tenant_ids: list[UUID],
+    ) -> None:
+        from src.llm import client as client_module
+
+        builder_id = uuid4()
+        clinic_row = SimpleNamespace(
+            identity={},
+            persona={},
+            operations={},
+            business_rules={},
+            services={},
+            pricing={},
+            handoff={},
+            professionals=[],
+            lgpd={},
+            api_credentials={"whatsapp_provider": "zapi"},
+        )
+        tenant_row = SimpleNamespace(id=TENANT, builder_id=builder_id)
+
+        class Session:
+            def __init__(self) -> None:
+                self.responses = [
+                    _FakeExecResult([clinic_row]),
+                    _FakeExecResult([tenant_row]),
+                    _FakeExecResult(owner_tenant_ids),
+                ]
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def execute(self, _stmt):
+                return self.responses.pop(0)
+
+        session = Session()
+        monkeypatch.setattr(
+            "src.repositories.get_db_session", lambda: session, raising=False
+        )
+        global_client = MagicMock(
+            side_effect=AssertionError("failed owner resolution used global client")
+        )
+        fake_llm = MagicMock()
+        fake_llm.generate = AsyncMock()
+        provider_client = MagicMock(return_value=fake_llm)
+        monkeypatch.setattr(client_module, "get_llm_client", global_client)
+        monkeypatch.setattr(client_module, "LLMClient", provider_client)
+
+        runtime_creds = asyncio.get_event_loop().run_until_complete(
+            event_service._load_runtime_llm_credentials(TENANT)
+        )
+        result = client_module.get_tenant_llm_client(TENANT, runtime_creds)
+
+        assert runtime_creds == {}
+        assert result is None
+        global_client.assert_not_called()
+        provider_client.assert_not_called()
+        fake_llm.generate.assert_not_awaited()
+
+    def test_explicit_gemini_provider_skips_owner_and_builder_secret_load(
+        self,
+        fake_redis: _FakeRedis,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        clinic_tenant = TENANT
+        builder_tenant = UUID("b0000000-0000-0000-0000-000000000003")
+        rows = {
+            clinic_tenant: {
+                "api_credentials": {
+                    # Explicit and intentionally incomplete/coming-soon.
+                    "llm_provider": "gemini",
+                    "whatsapp_provider": "zapi",
+                }
+            },
+            builder_tenant: {
+                "api_credentials": {
+                    "llm_provider": "openai",
+                    "llm_api_url": "https://api.openai.com/v1",
+                    "llm_api_key": "BUILDER-SECRET-MUST-NOT-LOAD",
+                    "llm_model_name": "gpt",
+                }
+            },
+        }
+        multiplexer = self._install_fake_db(
+            monkeypatch, rows, owner_tenant=builder_tenant
+        )
+        multiplexer.enqueue(clinic_tenant)
+        owner_resolution = AsyncMock(
+            side_effect=AssertionError("explicit provider resolved builder owner")
+        )
+        monkeypatch.setattr(
+            event_service, "_resolve_builder_owner_tenant_id", owner_resolution
+        )
+
+        raw = asyncio.get_event_loop().run_until_complete(
+            event_service._load_config_from_db(clinic_tenant)
+        )
+
+        assert raw is not None
+        owner_resolution.assert_not_awaited()
+        assert multiplexer.execute_count == 1
+        creds = raw["api_credentials"]
+        assert creds["llm_provider"] == "gemini"
+        assert "llm_api_url" not in creds
+        assert "llm_api_key" not in creds
+        assert "llm_model_name" not in creds
+        assert "BUILDER-SECRET-MUST-NOT-LOAD" not in json.dumps(creds)
 
     def test_ambiguous_builder_owner_leaves_clinic_llm_untouched(
         self,

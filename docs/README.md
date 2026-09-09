@@ -27,6 +27,7 @@
 | [Templates de Prompt e Funil](./prompt-templates-and-funnel.md) | Relação entre templates (Normal, Safety, Handoff) e as 11 etapas do funil | Engenheiros / Prompt |
 | [Schema do banco e índices](./database-schema.md) | Tabelas, relacionamentos, índices compostos e triggers | Engenheiros / DBA |
 | [Observabilidade](./observability.md) | Métricas, logs, alertas e dashboards | DevOps/SRE |
+| [Rollout operacional de providers](./api-provider-settings-rollout.md) | Build imutável, smoke, receipt assinado e deploy por digest | Produção / DevOps/SRE |
 
 ---
 
@@ -258,4 +259,3 @@ Veja [Testes de Carga](./load-testing.md) para detalhes.
 ---
 
 *Documentação mantida pela equipe NeuroStack*
-
