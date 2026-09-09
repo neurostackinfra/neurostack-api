@@ -1,17 +1,23 @@
 """Tests for OpenAI-compatible LLM endpoint handling."""
 
+import logging
+import traceback
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import uuid4
 
+import httpx
 import pytest
 
 import src.llm.client as client_module
 from src.llm.client import (
     LLMClient,
+    LLMClientError,
     _chat_completions_url,
     get_multimodal_text_llm_client,
+    get_tenant_llm_client,
 )
+from src.services.api_credentials import GEMINI_API_BASE_URL
 
 
 def test_chat_completions_url_appends_path_to_base_url() -> None:
@@ -26,6 +32,283 @@ def test_chat_completions_url_preserves_complete_endpoint() -> None:
         _chat_completions_url("https://api.neuralake.cloud/v1/chat/completions/")
         == "https://api.neuralake.cloud/v1/chat/completions"
     )
+
+
+def _tenant_llm_bundle(**overrides: Any) -> dict[str, Any]:
+    bundle = {
+        "llm_provider": "openai",
+        "llm_api_url": "https://api.openai.com/v1",
+        "llm_api_key": "tenant-secret",
+        "llm_model_name": "gpt-model",
+    }
+    bundle.update(overrides)
+    return bundle
+
+
+def test_unscoped_none_credentials_may_use_global_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = object()
+    monkeypatch.setattr(client_module, "get_llm_client", lambda: sentinel)
+    assert get_tenant_llm_client(uuid4(), None) is sentinel
+
+
+def test_explicit_empty_tenant_bundle_fails_closed_without_global_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        client_module,
+        "get_llm_client",
+        lambda: pytest.fail("explicit empty tenant bundle used global fallback"),
+    )
+    monkeypatch.setattr(
+        client_module,
+        "LLMClient",
+        lambda **_kwargs: pytest.fail("explicit empty tenant bundle built a client"),
+    )
+    assert get_tenant_llm_client(uuid4(), {}) is None
+
+
+@pytest.mark.parametrize(
+    "bundle",
+    [
+        {"llm_api_key": "partial"},
+        _tenant_llm_bundle(llm_model_name=""),
+        _tenant_llm_bundle(llm_provider="slm_cortex"),
+        _tenant_llm_bundle(llm_api_url="https://api.neuralake.cloud/v1"),
+        _tenant_llm_bundle(
+            llm_provider="dropout", llm_api_url="https://api.openai.com/v1"
+        ),
+        _tenant_llm_bundle(
+            llm_provider="outros", llm_api_url="https://api.openai.com/v1"
+        ),
+    ],
+)
+def test_explicit_bad_tenant_bundle_fails_closed_without_global_fallback(
+    monkeypatch: pytest.MonkeyPatch, bundle: dict[str, Any]
+) -> None:
+    monkeypatch.setattr(
+        client_module,
+        "get_llm_client",
+        lambda: pytest.fail("explicit tenant bundle used global fallback"),
+    )
+    assert get_tenant_llm_client(uuid4(), bundle) is None
+
+
+def test_valid_tenant_bundle_pins_provider_egress() -> None:
+    client = get_tenant_llm_client(uuid4(), _tenant_llm_bundle())
+    assert client is not None
+    assert client._kind == "llm_openai"
+
+
+def test_valid_gemini_tenant_bundle_pins_gemini_egress() -> None:
+    client = get_tenant_llm_client(
+        uuid4(),
+        _tenant_llm_bundle(
+            llm_provider="gemini",
+            llm_api_url=GEMINI_API_BASE_URL,
+            llm_model_name="gemini-2.5-flash",
+        ),
+    )
+    assert client is not None
+    assert client._kind == "llm_gemini"
+
+
+@pytest.mark.asyncio
+async def test_gemini_openai_compatible_transport_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {
+                "choices": [{"message": {"content": "GEMINI_SMOKE_OK"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+                "model": "ignored-provider-model",
+            }
+
+    class FakeClient:
+        async def post(self, url: str, **kwargs: Any) -> FakeResponse:
+            captured["url"] = url
+            captured.update(kwargs)
+            return FakeResponse()
+
+    @asynccontextmanager
+    async def fake_safe_async_client(url: str, **kwargs: Any):
+        captured["requested_url"] = url
+        captured["kind"] = kwargs["kind"]
+        validated = type(
+            "Validated",
+            (),
+            {
+                "url": f"{GEMINI_API_BASE_URL}/chat/completions",
+                "sni_host": "generativelanguage.googleapis.com",
+            },
+        )()
+        yield FakeClient(), validated
+
+    monkeypatch.setattr(client_module, "safe_async_client", fake_safe_async_client)
+    result = await LLMClient(GEMINI_API_BASE_URL, "gemini-secret").generate(
+        [{"role": "user", "content": "fixed"}],
+        model="gemini-2.5-flash",
+        temperature=0.0,
+        max_tokens=16,
+    )
+
+    assert captured["requested_url"] == f"{GEMINI_API_BASE_URL}/chat/completions"
+    assert captured["url"] == f"{GEMINI_API_BASE_URL}/chat/completions"
+    assert captured["kind"] == "llm_gemini"
+    assert captured["headers"] == {
+        "Authorization": "Bearer gemini-secret",
+        "Content-Type": "application/json",
+        "Host": "generativelanguage.googleapis.com",
+    }
+    assert captured["json"]["model"] == "gemini-2.5-flash"
+    assert result == {
+        "content": "GEMINI_SMOKE_OK",
+        "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+        "model": "gemini-2.5-flash",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_payload",
+    [
+        {},
+        {"choices": []},
+        {"choices": [{}]},
+        {"choices": [{"message": {}}]},
+    ],
+)
+async def test_missing_openai_response_shape_is_invalid_provider_response(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_payload: dict[str, Any],
+) -> None:
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return provider_payload
+
+    class FakeClient:
+        async def post(self, *_args: Any, **_kwargs: Any) -> FakeResponse:
+            return FakeResponse()
+
+    @asynccontextmanager
+    async def fake_safe_async_client(url: str, **_kwargs: Any):
+        validated = type(
+            "Validated",
+            (),
+            {"url": url, "sni_host": "generativelanguage.googleapis.com"},
+        )()
+        yield FakeClient(), validated
+
+    monkeypatch.setattr(client_module, "safe_async_client", fake_safe_async_client)
+    with pytest.raises(LLMClientError) as caught:
+        await LLMClient(GEMINI_API_BASE_URL, "secret").generate(
+            [{"role": "user", "content": "fixed"}], model="gemini-model"
+        )
+    assert caught.value.code == "invalid_provider_response"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["", None, []])
+async def test_structurally_valid_unusable_content_remains_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    content: Any,
+) -> None:
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"choices": [{"message": {"content": content}}]}
+
+    class FakeClient:
+        async def post(self, *_args: Any, **_kwargs: Any) -> FakeResponse:
+            return FakeResponse()
+
+    @asynccontextmanager
+    async def fake_safe_async_client(url: str, **_kwargs: Any):
+        validated = type(
+            "Validated",
+            (),
+            {"url": url, "sni_host": "generativelanguage.googleapis.com"},
+        )()
+        yield FakeClient(), validated
+
+    monkeypatch.setattr(client_module, "safe_async_client", fake_safe_async_client)
+    result = await LLMClient(GEMINI_API_BASE_URL, "secret").generate(
+        [{"role": "user", "content": "fixed"}], model="gemini-model"
+    )
+    assert result["content"] == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["http", "transport"])
+async def test_client_failures_are_static_and_redact_every_surface(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_kind: str,
+) -> None:
+    secret = "SUPER-SECRET-GEMINI-KEY"
+    submitted_url = f"{GEMINI_API_BASE_URL}/chat/completions?secret-url"
+    payload_secret = "PRIVATE-PROMPT-PAYLOAD"
+    response_secret = "PRIVATE-RESPONSE-BODY"
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            request = httpx.Request("POST", submitted_url)
+            response = httpx.Response(500, request=request, text=response_secret)
+            raise httpx.HTTPStatusError(
+                f"{secret} {payload_secret} {response_secret}",
+                request=request,
+                response=response,
+            )
+
+    class FakeClient:
+        async def post(self, *_args: Any, **_kwargs: Any) -> FakeResponse:
+            if failure_kind == "transport":
+                raise httpx.ConnectError(
+                    f"{secret} {submitted_url} {payload_secret} {response_secret}"
+                )
+            return FakeResponse()
+
+    @asynccontextmanager
+    async def fake_safe_async_client(*_args: Any, **_kwargs: Any):
+        validated = type(
+            "Validated",
+            (),
+            {"url": submitted_url, "sni_host": "generativelanguage.googleapis.com"},
+        )()
+        yield FakeClient(), validated
+
+    monkeypatch.setattr(client_module, "safe_async_client", fake_safe_async_client)
+    with caplog.at_level(logging.DEBUG), pytest.raises(LLMClientError) as caught:
+        await LLMClient(GEMINI_API_BASE_URL, secret).generate(
+            [{"role": "user", "content": payload_secret}],
+            model="gemini-model",
+        )
+
+    rendered = " ".join(
+        (
+            str(caught.value),
+            repr(caught.value),
+            "".join(traceback.format_exception(caught.value)),
+            caplog.text,
+        )
+    )
+    assert caught.value.code == (
+        "provider_http_error" if failure_kind == "http" else "provider_transport_error"
+    )
+    for forbidden in (secret, submitted_url, payload_secret, response_secret):
+        assert forbidden not in rendered
 
 
 @pytest.mark.asyncio

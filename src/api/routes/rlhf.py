@@ -297,6 +297,10 @@ async def _analyze_rating_async(
     tenant_id: UUID,
     clinic_tenant_id: Optional[str] = None,
     resolved_event: Optional[Event] = None,
+    message_id: Optional[str] = None,
+    caller_role: Optional[str] = None,
+    caller_builder_id: Optional[UUID] = None,
+    caller_is_api_key: bool = False,
 ) -> None:
     """Run LLM analysis for a low-rating record and persist the result.
 
@@ -305,66 +309,114 @@ async def _analyze_rating_async(
     DB session because the request-scoped one is closed by the time this
     background task runs.
 
-    The credential-tenant resolution keeps the same three rungs the
-    endpoint uses for ``subject_tenant_id``:
-
-    1. Validated ``clinic_tenant_id`` (existence-checked against Tenant).
-    2. ``resolved_event.tenant_id`` — the event ``message_id`` resolved to,
-       resolved by ``submit_rating`` and forwarded here. This function no
-       longer issues its own ``message_id`` query (deliverable 5); the
-       middle rung is proven by an endpoint-level test that lets
-       ``submit_rating`` perform the real resolution.
-    3. ``tenant_id`` — the submitter's own tenant, the final fallback.
+    Credential selection is stricter than public rating attribution. A real
+    message event and any explicit clinic selector must agree, and the caller
+    must own that tenant (or, for builders, manage it). Invalid, missing,
+    conflicting, or foreign selectors fail before any secret lookup.
     """
     from src.services.event_service import _load_runtime_llm_credentials
 
-    resolve_tenant_id = tenant_id
-    clinic_tenant_resolved = False
-    if clinic_tenant_id:
-        try:
-            candidate = UUID(clinic_tenant_id)
-        except ValueError:
-            candidate = None
-        if candidate is not None:
-            try:
-                async with get_db_session() as db:
-                    exists = (
-                        await db.execute(
-                            select(Tenant.id).where(Tenant.id == candidate)
-                        )
-                    ).scalar_one_or_none()
-                if exists is not None:
-                    resolve_tenant_id = candidate
-                    clinic_tenant_resolved = True
-                    logger.info(
-                        "Rating analysis using explicit clinic_tenant_id rating_id=%s clinic_tenant=%s",
-                        rating_id,
-                        resolve_tenant_id,
-                    )
-                else:
-                    logger.info(
-                        "Rating analysis clinic_tenant_id not found in tenants, falling back rating_id=%s clinic_tenant=%s",
-                        rating_id,
-                        candidate,
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "Rating analysis clinic_tenant_id lookup failed rating_id=%s clinic_tenant=%s err=%s",
-                    rating_id,
-                    candidate,
-                    exc,
-                )
-    if not clinic_tenant_resolved and resolved_event is not None:
-        # Middle rung — the endpoint already resolved message_id → Event
-        # and threaded the resolved row through. We do NOT re-query here:
-        # doing so would (a) waste a round-trip and (b) let a refactor
-        # silently drop the middle rung without a visible symptom.
-        resolve_tenant_id = resolved_event.tenant_id
-        logger.info(
-            "Rating analysis using clinic tenant from resolved event rating_id=%s clinic_tenant=%s",
-            rating_id,
-            resolve_tenant_id,
+    strict_selectors = any(
+        (
+            message_id is not None,
+            caller_role is not None,
+            caller_builder_id is not None,
+            caller_is_api_key,
         )
+    )
+    selector_error: Optional[str] = None
+    clinic_id: Optional[UUID] = None
+    if strict_selectors:
+        try:
+            parsed_message_id = UUID(message_id) if message_id else None
+        except (ValueError, AttributeError):
+            parsed_message_id = None
+        if (
+            parsed_message_id is None
+            or resolved_event is None
+            or parsed_message_id != resolved_event.id
+        ):
+            selector_error = "invalid_message_id"
+
+        if selector_error is None and clinic_tenant_id is not None:
+            try:
+                clinic_id = UUID(clinic_tenant_id)
+            except (ValueError, AttributeError):
+                selector_error = "invalid_clinic_tenant_id"
+            if (
+                selector_error is None
+                and clinic_id is not None
+                and resolved_event is not None
+                and clinic_id != resolved_event.tenant_id
+            ):
+                selector_error = "tenant_selector_conflict"
+
+        resolve_tenant_id = clinic_id or (
+            resolved_event.tenant_id if resolved_event is not None else tenant_id
+        )
+    else:
+        # Compatibility for internal callers that already pass resolved model
+        # objects and do not carry an HTTP authentication context. Public
+        # submissions always take the strict path above.
+        resolve_tenant_id = tenant_id
+        if clinic_tenant_id:
+            try:
+                clinic_id = UUID(clinic_tenant_id)
+            except (ValueError, AttributeError):
+                clinic_id = None
+            if clinic_id is not None:
+                try:
+                    async with get_db_session() as db:
+                        exists = (
+                            await db.execute(
+                                select(Tenant.id).where(Tenant.id == clinic_id)
+                            )
+                        ).scalar_one_or_none()
+                    if exists is not None:
+                        resolve_tenant_id = clinic_id
+                        clinic_id = exists
+                    else:
+                        clinic_id = None
+                except Exception:
+                    clinic_id = None
+        if clinic_id is None and resolved_event is not None:
+            resolve_tenant_id = resolved_event.tenant_id
+
+    if strict_selectors and selector_error is None:
+        try:
+            async with get_db_session() as db:
+                target = (
+                    await db.execute(
+                        select(Tenant.id, Tenant.builder_id).where(
+                            Tenant.id == resolve_tenant_id
+                        )
+                    )
+                ).one_or_none()
+            if target is None:
+                selector_error = "tenant_selector_not_found"
+            elif resolve_tenant_id == tenant_id or caller_role == "super_admin":
+                pass
+            elif (
+                caller_role == "builder"
+                and caller_builder_id is not None
+                and target.builder_id == caller_builder_id
+            ):
+                pass
+            elif caller_is_api_key or caller_role in {None, "clinic_admin"}:
+                selector_error = "tenant_selector_forbidden"
+            else:
+                selector_error = "tenant_selector_forbidden"
+        except Exception:
+            selector_error = "tenant_selector_unavailable"
+
+    if selector_error is not None:
+        logger.warning(
+            "Rating analysis selector rejected rating_id=%s code=%s",
+            rating_id,
+            selector_error,
+        )
+        await _update_rating_status(rating_id, status_="failed")
+        return
 
     # DB-only resolver: returns ONLY the four LLM overlay fields (raw key held
     # in-memory for this call), builder-owner composition already applied.
@@ -603,6 +655,10 @@ async def submit_rating(
                 tenant_id=tenant.tenant_id,
                 clinic_tenant_id=body.clinic_tenant_id,
                 resolved_event=resolved_event,
+                message_id=body.message_id,
+                caller_role=tenant.role,
+                caller_builder_id=tenant.builder_id,
+                caller_is_api_key=bool(tenant.api_key),
             ),
             name=f"rlhf-rating-analysis:{rating_id}",
         )

@@ -4,6 +4,7 @@ Pydantic schemas for clinic configuration CRUD endpoints.
 """
 
 import ipaddress
+from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
@@ -14,6 +15,13 @@ from pydantic import (
     Field,
     StringConstraints,
     field_validator,
+    model_validator,
+)
+
+from src.services.api_credentials import (
+    GEMINI_API_BASE_URL,
+    CredentialPolicyError,
+    validate_gemini_endpoint,
 )
 
 
@@ -88,10 +96,39 @@ class WhatsAppCredentialsPatch(BaseModel):
 class LlmCredentialsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    llm_provider: Literal["openai", "dropout", "outros", "slm_cortex"] | None = None
+    llm_provider: (
+        Literal["openai", "dropout", "gemini", "outros", "slm_cortex"] | None
+    ) = None
     llm_api_url: ApiUrl | None = None
     llm_api_key: Secret | None = None
     llm_model_name: Identifier | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw_gemini_endpoint(cls, value: Any) -> Any:
+        """Apply Gemini's exact endpoint contract to the unnormalized payload."""
+
+        if not isinstance(value, Mapping) or "llm_api_url" not in value:
+            return value
+        raw_url = value.get("llm_api_url")
+        canonical_host = urlsplit(GEMINI_API_BASE_URL).hostname
+        try:
+            parsed = urlsplit(raw_url) if isinstance(raw_url, str) else None
+            explicit_gemini_port = bool(
+                parsed is not None
+                and parsed.hostname == canonical_host
+                and parsed.port is not None
+            )
+        except ValueError:
+            explicit_gemini_port = value.get("llm_provider") == "gemini"
+        if explicit_gemini_port:
+            raise ValueError("invalid_provider_endpoint")
+        if value.get("llm_provider") == "gemini":
+            try:
+                validate_gemini_endpoint(raw_url)
+            except CredentialPolicyError:
+                raise ValueError("invalid_provider_endpoint") from None
+        return value
 
 
 class MultimodalCredentialsPatch(BaseModel):

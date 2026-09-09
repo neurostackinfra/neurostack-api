@@ -80,8 +80,20 @@ class _CredentialValidationRoute(APIRoute):
                     "unsafe_api_url" in str(error.get("ctx", {}).get("error", ""))
                     for error in errors
                 )
+                invalid_provider_endpoint = any(
+                    "invalid_provider_endpoint"
+                    in str(error.get("ctx", {}).get("error", ""))
+                    for error in errors
+                )
                 detail: dict[str, Any]
-                if unsafe_url:
+                if invalid_provider_endpoint:
+                    detail = {
+                        "error": "invalid_provider_endpoint",
+                        "capability": "llm",
+                        "provider": "gemini",
+                        "field": "llm_api_url",
+                    }
+                elif unsafe_url:
                     detail = {"error": "unsafe_api_url", "field": unsafe_field}
                 else:
                     detail = {
@@ -460,10 +472,10 @@ async def get_api_credentials(
     "/api-credentials",
     summary="Update API Credentials",
     description=(
-        "Validate a credential patch. All displayable providers are currently "
-        "coming soon, so every effective credential or runtime-control change "
-        "is rejected; only normalized legacy echoes that leave stored values "
-        "unchanged are accepted."
+        "Validate a credential patch. Gemini is the sole active provider and "
+        "accepts complete, policy-valid LLM credential changes. Every other "
+        "displayable provider remains coming soon and rejects effective "
+        "credential or runtime-control changes."
     ),
 )
 async def patch_api_credentials(

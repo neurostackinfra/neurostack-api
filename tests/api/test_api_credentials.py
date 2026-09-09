@@ -15,7 +15,7 @@ from pydantic import ValidationError
 from src.api.schemas.config import ApiCredentialsPatch
 from src.config.settings import settings
 from src.repositories import get_db_session_dependency
-from src.services.api_credentials import PROVIDER_AVAILABILITY
+from src.services.api_credentials import GEMINI_API_BASE_URL, PROVIDER_AVAILABILITY
 
 PATH = "/v1/config/api-credentials"
 
@@ -95,7 +95,16 @@ def test_every_displayable_provider_change_is_exact_and_atomic(
 ) -> None:
     headers = _jwt_headers("clinic_admin")
     provider_field = _provider_field(capability)
-    response = client.patch(PATH, headers=headers, json={provider_field: provider})
+    payload: dict[str, object] = {provider_field: provider}
+    if capability == "llm" and provider == "gemini":
+        payload.update(
+            {
+                "llm_api_url": GEMINI_API_BASE_URL,
+                "llm_api_key": "fresh-gemini-key",
+                "llm_model_name": "gemini-model",
+            }
+        )
+    response = client.patch(PATH, headers=headers, json=payload)
     assert response.status_code == 422, response.text
     assert response.json()["detail"] == {
         "error": "provider_not_available",
@@ -103,6 +112,141 @@ def test_every_displayable_provider_change_is_exact_and_atomic(
         "provider": provider,
     }
     assert client.get(PATH, headers=headers).json()[provider_field] is None
+
+
+def test_new_tenant_can_save_and_read_configured_gemini(client: TestClient) -> None:
+    tenant_id = uuid4()
+    headers = _jwt_headers("clinic_admin", tenant_id)
+    secret = "fresh-gemini-secret"
+    response = client.patch(
+        PATH,
+        headers=headers,
+        json={
+            "llm_provider": "gemini",
+            "llm_api_url": GEMINI_API_BASE_URL,
+            "llm_api_key": secret,
+            "llm_model_name": "gemini-2.5-flash",
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["llm_provider"] == "gemini"
+    assert body["llm_readiness"] == "active"
+    assert body["llm_api_key_set"] is True
+    assert body["llm_api_key_masked"] == "••••••••"
+    assert secret not in response.text
+    loaded = client.get(PATH, headers=headers)
+    assert loaded.status_code == 200
+    assert loaded.json()["llm_provider"] == "gemini"
+    assert secret not in loaded.text
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://generativelanguage.googleapis.com:443/v1beta/openai",
+        "https://generativelanguage.googleapis.com:8443/v1beta/openai",
+        "https://generativelanguage.googleapis.com/v1/openai",
+        "https://generativelanguage.googleapis.com/v1beta/openai?query=1",
+        "https://generativelanguage.googleapis.com/v1beta/openai#fragment",
+        "https://user@generativelanguage.googleapis.com/v1beta/openai",
+        "https://example.com/v1beta/openai",
+    ],
+)
+def test_gemini_endpoint_rejection_is_stable_secret_and_input_free(
+    client: TestClient, endpoint: str
+) -> None:
+    secret = "GEMINI-SECRET-THAT-MUST-NOT-LEAK"
+    response = client.patch(
+        PATH,
+        headers=_jwt_headers("clinic_admin"),
+        json={
+            "llm_provider": "gemini",
+            "llm_api_url": endpoint,
+            "llm_api_key": secret,
+            "llm_model_name": "gemini-model",
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "error": "invalid_provider_endpoint",
+        "capability": "llm",
+        "provider": "gemini",
+        "field": "llm_api_url",
+    }
+    assert endpoint not in response.text
+    assert secret not in response.text
+
+
+@pytest.mark.parametrize(
+    ("existing_provider", "target_provider", "target_url"),
+    [
+        ("openai", "gemini", GEMINI_API_BASE_URL),
+        ("gemini", "openai", "https://api.openai.com/v1"),
+    ],
+)
+@pytest.mark.parametrize(
+    "omitted_field",
+    ["llm_provider", "llm_api_url", "llm_api_key", "llm_model_name"],
+)
+def test_gemini_switch_is_atomic_when_any_fresh_field_is_missing(
+    client: TestClient,
+    test_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    existing_provider: str,
+    target_provider: str,
+    target_url: str,
+    omitted_field: str,
+) -> None:
+    existing = {
+        "llm_provider": existing_provider,
+        "llm_api_url": (
+            GEMINI_API_BASE_URL
+            if existing_provider == "gemini"
+            else "https://api.openai.com/v1"
+        ),
+        "llm_api_key": "stored-secret",
+        "llm_model_name": "stored-model",
+    }
+    row = SimpleNamespace(api_credentials=dict(existing))
+    calls: list[str] = []
+
+    class SessionSpy:
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+
+    async def override_session() -> Any:
+        yield SessionSpy()
+
+    async def load_existing(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        return row
+
+    monkeypatch.setattr("src.api.routes.config._load_config", load_existing)
+    test_app.dependency_overrides[get_db_session_dependency] = override_session
+    payload = {
+        "llm_provider": target_provider,
+        "llm_api_url": target_url,
+        "llm_api_key": "fresh-secret",
+        "llm_model_name": "fresh-model",
+    }
+    payload.pop(omitted_field)
+    try:
+        response = client.patch(
+            PATH, headers=_jwt_headers("clinic_admin"), json=payload
+        )
+    finally:
+        test_app.dependency_overrides.pop(get_db_session_dependency, None)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "error": "provider_switch_bundle_required",
+        "capability": "llm",
+    }
+    assert row.api_credentials == existing
+    assert calls == []
 
 
 def test_invalid_payload_and_unsafe_url_return_stable_secret_free_422(
@@ -149,6 +293,9 @@ def test_openapi_uses_typed_credential_patch_and_validation_never_echoes_input(
         "application/json"
     ]["schema"]
     assert request_schema["$ref"].endswith("/ApiCredentialsPatch")
+    description = schema["paths"][PATH]["patch"]["description"]
+    assert "Gemini is the sole active provider" in description
+    assert "All displayable providers are currently coming soon" not in description
 
     headers = _jwt_headers("clinic_admin")
     sentinel = "submitted-secret-sentinel"

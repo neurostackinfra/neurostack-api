@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { useSearch, useLocation } from "wouter";
 import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
@@ -195,6 +195,18 @@ export function describeConfigSaveFailure(
       pt: "O provedor selecionado não é válido para esta capacidade de API.",
       en: "The selected provider is not valid for this API capability.",
     },
+    invalid_provider_endpoint: {
+      pt: "A URL da API não corresponde ao endpoint oficial deste provedor. Use o endpoint oficial indicado no campo URL da API.",
+      en: "The API URL does not match this provider's official endpoint. Use the official endpoint shown in the API URL field.",
+    },
+    provider_switch_bundle_required: {
+      pt: "Para trocar o provedor, informe juntos a URL da API, uma nova API Key e o modelo.",
+      en: "To switch providers, enter the API URL, a new API key, and the model together.",
+    },
+    provider_not_available: {
+      pt: "Este provedor ainda não está liberado para nova configuração.",
+      en: "This provider is not available for new configuration yet.",
+    },
     meta_phone_number_id_conflict: {
       pt: "Este Phone Number ID da Meta já está vinculado a outra clínica. Use um número diferente.",
       en: "This Meta Phone Number ID is already linked to another clinic. Use a different number.",
@@ -249,7 +261,12 @@ export function describeConfigSaveFailure(
     return `${capabilityPrefix}${base}`;
   }
 
-  if (errorCode === "invalid_provider_for_capability" || errorCode === "meta_phone_number_id_conflict") {
+  if (
+    errorCode === "invalid_provider_for_capability"
+    || errorCode === "invalid_provider_endpoint"
+    || errorCode === "provider_switch_bundle_required"
+    || errorCode === "meta_phone_number_id_conflict"
+  ) {
     return `${capabilityPrefix}${knownErrors[errorCode][locale]}`;
   }
 
@@ -318,6 +335,7 @@ interface CredentialStatus {
   // LLM
   llm_api_key_set:          boolean;
   llm_api_key_masked:       string | null;
+  llm_api_url?:             string | null;
   llm_base_url:             string | null;
   llm_model_name:           string | null;
   // Whisper (audio transcription)
@@ -360,7 +378,7 @@ function StatusDot({ configured }: { configured: boolean }) {
     : <XCircle      className="h-3.5 w-3.5 text-slate-500 shrink-0" />;
 }
 
-type LlmProvider = "openai" | "dropout" | "slm_cortex" | "outros";
+type LlmProvider = "openai" | "gemini" | "dropout" | "slm_cortex" | "outros";
 type WhatsappProvider =
   | "meta_cloud"
   | "dialog360"
@@ -395,6 +413,10 @@ export type ApiCapabilityId = "whatsapp" | "llm" | "stt" | "multimodal" | "tts";
 
 export type ProviderAvailability = "active" | "coming_soon";
 
+export type ProviderAvailabilityMatrix = {
+  readonly [Capability in ApiCapabilityId]: Readonly<Record<string, ProviderAvailability>>;
+};
+
 /**
  * Frontend mirror of `PROVIDER_AVAILABILITY` in
  * `src/services/api_credentials.py`.
@@ -415,6 +437,7 @@ export const API_PROVIDER_AVAILABILITY = {
   },
   llm: {
     dropout: "coming_soon",
+    gemini: "active",
     openai: "coming_soon",
     outros: "coming_soon",
     slm_cortex: "coming_soon",
@@ -434,7 +457,7 @@ export const API_PROVIDER_AVAILABILITY = {
     elevenlabs: "coming_soon",
     google: "coming_soon",
   },
-} as const satisfies Record<ApiCapabilityId, Readonly<Record<string, ProviderAvailability>>>;
+} as const satisfies ProviderAvailabilityMatrix;
 
 export const API_CAPABILITIES: readonly {
   id: ApiCapabilityId;
@@ -566,7 +589,7 @@ export const TTS_PROVIDERS: { id: TtsProvider; label: string; sub: string }[] = 
 ];
 
 // The display catalog is intentionally availability-agnostic: the canonical
-// all-coming-soon state lives in API_PROVIDER_AVAILABILITY above.
+// Gemini-active/provider-coming-soon state lives above.
 export const PROVIDERS: {
   id: LlmProvider;
   label: string;
@@ -575,6 +598,7 @@ export const PROVIDERS: {
   { id: "slm_cortex", label: "SLM Cortex", sub: "by NeuroStack" },
   { id: "dropout",    label: "Dropout",    sub: "by Neuralake" },
   { id: "openai",     label: "GPT",        sub: "by OpenAI" },
+  { id: "gemini",     label: "Gemini",     sub: "by Google" },
   { id: "outros",     label: "Outros",     sub: "Custom / OSS" },
 ];
 
@@ -662,6 +686,19 @@ const CAPABILITY_FIELDS: Record<string, readonly CredentialField[]> = {
   ],
 };
 
+const GEMINI_OPENAI_COMPATIBLE_BASE_URL =
+  "https://generativelanguage.googleapis.com/v1beta/openai";
+
+function newProviderFieldDefault(
+  capability: ApiCapabilityId,
+  providerId: string,
+  fieldName: string,
+): string {
+  return capability === "llm" && providerId === "gemini" && fieldName === "llm_api_url"
+    ? GEMINI_OPENAI_COMPATIBLE_BASE_URL
+    : "";
+}
+
 const CAPABILITY_PROVIDER_FIELD: Record<ApiCapabilityId, string> = {
   whatsapp: "whatsapp_provider",
   llm: "llm_provider",
@@ -696,6 +733,14 @@ function statusText(status: CredentialStatusFields | null, field: string): strin
   return value === null || value === undefined ? "" : String(value);
 }
 
+function statusCredentialText(status: CredentialStatusFields | null, field: string): string {
+  if (field !== "llm_api_url") return statusText(status, field);
+  const direct = status?.llm_api_url;
+  return direct === null || direct === undefined
+    ? statusText(status, "llm_base_url")
+    : String(direct);
+}
+
 // Allowlist rather than denylist: `signature_pending` means a Meta bundle is
 // missing its app secret, so it must read as partial. Only these two readiness
 // values stand for a whole bundle.
@@ -711,9 +756,10 @@ export function providerCardState(
   capability: ApiCapabilityId,
   providerId: string,
   status: CredentialStatusFields | null,
+  providerAvailability: ProviderAvailabilityMatrix = API_PROVIDER_AVAILABILITY,
 ): ProviderCardState {
   const availability: Readonly<Record<string, ProviderAvailability>> =
-    API_PROVIDER_AVAILABILITY[capability];
+    providerAvailability[capability];
   if (availability[providerId] !== "active") return "coming_soon";
 
   const persisted = statusText(status, CAPABILITY_PROVIDER_FIELD[capability]);
@@ -725,8 +771,15 @@ export function providerCardState(
   return "available";
 }
 
-export function ApiCredentialsForm({ clinicId, isReadOnly }: {
-  clinicId: string; isReadOnly: boolean; isSuperAdmin: boolean;
+export function ApiCredentialsForm({
+  clinicId,
+  isReadOnly,
+  providerAvailability = API_PROVIDER_AVAILABILITY,
+}: {
+  clinicId: string;
+  isReadOnly: boolean;
+  isSuperAdmin: boolean;
+  providerAvailability?: ProviderAvailabilityMatrix;
 }) {
   const { locale } = useI18n();
   const { toast } = useToast();
@@ -737,6 +790,13 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [baseline, setBaseline] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
+  const clinicGenerationRef = useRef({ clinicId, generation: 0 });
+  if (clinicGenerationRef.current.clinicId !== clinicId) {
+    clinicGenerationRef.current = {
+      clinicId,
+      generation: clinicGenerationRef.current.generation + 1,
+    };
+  }
 
   const badgeLabel: Record<ProviderCardState, string> = {
     configured: txt("CONFIGURADO", "CONFIGURED"),
@@ -748,6 +808,8 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
   const credentialsUrl = `/v1/config/api-credentials?tenant_id=${encodeURIComponent(clinicId)}`;
 
   const loadStatus = useCallback(async () => {
+    const requestGeneration = clinicGenerationRef.current.generation;
+    const isCurrentClinic = () => clinicGenerationRef.current.generation === requestGeneration;
     // A builder switching clinics changes `clinicId` without remounting, so the
     // previous tenant's open editor and draft must be dropped here. Clearing
     // status too keeps every card inert while the new tenant's state loads.
@@ -755,16 +817,21 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
     setDraft({});
     setBaseline({});
     setStatus(null);
+    setSaving(false);
     if (!clinicId) { setLoadFailed(true); return; }
     try {
       const token = getToken();
       const res = await fetch(credentialsUrl, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
+      if (!isCurrentClinic()) return;
       if (!res.ok) throw new Error(`Credential status fetch failed: ${res.status}`);
-      setStatus(await res.json() as CredentialStatus);
+      const nextStatus = await res.json() as CredentialStatus;
+      if (!isCurrentClinic()) return;
+      setStatus(nextStatus);
       setLoadFailed(false);
     } catch {
+      if (!isCurrentClinic()) return;
       setStatus(null);
       setLoadFailed(true);
     }
@@ -785,7 +852,11 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
     const hydrated: Record<string, string> = {};
     for (const field of credentialFields(capability, providerId)) {
       hydrated[field.name] =
-        field.secret || !held ? "" : statusText(status, field.name);
+        field.secret
+          ? ""
+          : held
+            ? statusCredentialText(status, field.name)
+            : newProviderFieldDefault(capability, providerId, field.name);
     }
     setBaseline(hydrated);
     setDraft(hydrated);
@@ -793,6 +864,8 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
   }
 
   async function saveProvider(capability: ApiCapabilityId, providerId: string) {
+    const requestGeneration = clinicGenerationRef.current.generation;
+    const isCurrentClinic = () => clinicGenerationRef.current.generation === requestGeneration;
     const body: Record<string, string | number> = {};
     // Adoption only takes effect if the provider field travels with the
     // bundle; omitting it would persist credentials under the previous
@@ -814,7 +887,7 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
       const value = draft[field.name] ?? "";
       if (field.secret) {
         if (value) body[field.name] = value;
-      } else if (value !== baseline[field.name]) {
+      } else if (held !== providerId || value !== baseline[field.name]) {
         body[field.name] = field.numeric ? Number(value) : value;
       }
     }
@@ -831,27 +904,31 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
         },
         body: JSON.stringify(body),
       });
+      if (!isCurrentClinic()) return;
       if (!res.ok) {
-        const detail = await res.json().catch(() => null) as { detail?: { error?: string } } | null;
-        throw new Error(detail?.detail?.error ?? "save_failed");
+        const payload: unknown = await res.json().catch(() => null);
+        if (!isCurrentClinic()) return;
+        toast({
+          variant: "destructive",
+          title: txt("Não foi possível salvar", "Could not save"),
+          description: describeConfigSaveFailure(payload, res.status, locale),
+        });
+        return;
       }
-      setStatus(await res.json() as CredentialStatus);
+      const nextStatus = await res.json() as CredentialStatus;
+      if (!isCurrentClinic()) return;
+      setStatus(nextStatus);
       setExpanded(null);
       toast({ title: txt("Credenciais salvas", "Credentials saved") });
-    } catch (err) {
-      const code = err instanceof Error ? err.message : "save_failed";
+    } catch {
+      if (!isCurrentClinic()) return;
       toast({
         variant: "destructive",
         title: txt("Não foi possível salvar", "Could not save"),
-        description: code === "provider_not_available"
-          ? txt(
-              "Este provedor ainda não está liberado para nova configuração.",
-              "This provider is not available for new configuration yet.",
-            )
-          : txt("Tente novamente.", "Please try again."),
+        description: txt("Tente novamente.", "Please try again."),
       });
     } finally {
-      setSaving(false);
+      if (isCurrentClinic()) setSaving(false);
     }
   }
 
@@ -859,8 +936,8 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
     <section className="space-y-5" data-testid="api-settings-section">
       <p className="text-sm text-muted-foreground" data-testid="api-settings-legacy-state-note">
         {txt(
-          "Todos os provedores estão marcados como EM BREVE e ainda não podem ser configurados.",
-          "All providers are marked COMING SOON and cannot be configured yet.",
+          "Gemini está disponível; os demais provedores permanecem EM BREVE.",
+          "Gemini is available; the other providers remain COMING SOON.",
         )}
       </p>
       {loadFailed && (
@@ -874,7 +951,7 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
 
       {API_CAPABILITIES.map((capability) => {
         const providers = providersForCapability(capability.id);
-        const availability = API_PROVIDER_AVAILABILITY[capability.id];
+        const availability = providerAvailability[capability.id];
 
         return (
           <div
@@ -907,7 +984,12 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
                 // adoption that could silently displace a stored provider.
                 const state = status === null
                   ? "coming_soon"
-                  : providerCardState(capability.id, provider.id, status);
+                  : providerCardState(
+                      capability.id,
+                      provider.id,
+                      status,
+                      providerAvailability,
+                    );
                 const key = `${capability.id}:${provider.id}`;
                 return (
                   <ProviderCredentialCard
@@ -958,7 +1040,9 @@ export function ApiCredentialsForm({ clinicId, isReadOnly }: {
                               data-testid={`field-${field.name}`}
                               type={field.secret ? "password" : field.numeric ? "number" : "text"}
                               value={draft[field.name] ?? ""}
-                              placeholder={field.secret && status?.[`${field.name}_set`] === true
+                              placeholder={field.secret
+                                && statusText(status, CAPABILITY_PROVIDER_FIELD[capability.id]) === provider.id
+                                && status?.[`${field.name}_set`] === true
                                 ? txt("•••••••• (manter atual)", "•••••••• (keep current)")
                                 : undefined}
                               onChange={(e) => setDraft(

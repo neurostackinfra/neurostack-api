@@ -43,6 +43,8 @@ from httpcore._backends.base import (
     AsyncNetworkStream,
 )
 
+from src.services.api_credentials import GEMINI_API_BASE_URL
+
 # ---------------------------------------------------------------------------
 # Public constants
 # ---------------------------------------------------------------------------
@@ -53,6 +55,7 @@ META_ALLOWED_HOSTS: frozenset[str] = frozenset({"graph.facebook.com"})
 ZAPI_ALLOWED_HOSTS: frozenset[str] = frozenset({"api.z-api.io"})
 LLM_OPENAI_HOSTS: frozenset[str] = frozenset({"api.openai.com"})
 LLM_DROPOUT_HOSTS: frozenset[str] = frozenset({"api.neuralake.cloud"})
+LLM_GEMINI_HOSTS: frozenset[str] = frozenset({"generativelanguage.googleapis.com"})
 STT_GROQ_HOSTS: frozenset[str] = frozenset({"api.groq.com"})
 STT_OPENAI_HOSTS: frozenset[str] = frozenset({"api.openai.com"})
 
@@ -343,6 +346,7 @@ PROVIDER_POLICIES: Mapping[str, ProviderPolicy] = {
     "zapi": ProviderPolicy(kind="zapi", allowed_hosts=ZAPI_ALLOWED_HOSTS),
     "llm_openai": ProviderPolicy(kind="llm_openai", allowed_hosts=LLM_OPENAI_HOSTS),
     "llm_dropout": ProviderPolicy(kind="llm_dropout", allowed_hosts=LLM_DROPOUT_HOSTS),
+    "llm_gemini": ProviderPolicy(kind="llm_gemini", allowed_hosts=LLM_GEMINI_HOSTS),
     "llm_outros": ProviderPolicy(kind="llm_outros", allowed_hosts=None),
     "stt_openai": ProviderPolicy(kind="stt_openai", allowed_hosts=STT_OPENAI_HOSTS),
     "stt_groq": ProviderPolicy(kind="stt_groq", allowed_hosts=STT_GROQ_HOSTS),
@@ -656,7 +660,9 @@ __all__ = [
     "AUDIO_MIME_ALLOWLIST",
     "CUSTOM_PUBLIC_PROVIDERS",
     "DEFAULT_MAX_AUDIO_BYTES",
+    "GEMINI_API_BASE_URL",
     "LLM_DROPOUT_HOSTS",
+    "LLM_GEMINI_HOSTS",
     "LLM_OPENAI_HOSTS",
     "META_ALLOWED_HOSTS",
     "MULTIMODAL_GROQ_HOSTS",
