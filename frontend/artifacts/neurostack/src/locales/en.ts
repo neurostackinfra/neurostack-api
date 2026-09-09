@@ -173,6 +173,7 @@ export const en = {
   config_provider: "Provider",
   config_llm_none: "- None (use mock) -",
   config_llm_openai: "OpenAI",
+  config_llm_gemini: "Gemini",
   config_llm_dropout: "Dropout (OpenAI-compatible)",
   config_llm_cortex: "SLM Cortex - Fallback to Dropout (Coming Soon)",
   config_cortex_note: "Proprietary Vertical SLM. Routing via Dropout for MVP testing.",

@@ -289,3 +289,122 @@ route, exercises the tracing/performance middleware and the exception
 handler, then scans every captured log record and Prometheus label for the
 sentinel. Any hit fails the run — this is the redaction gate for Wave 2 and
 must stay green through Group 8.
+
+## Gemini: build imutável, smoke e receipt assinado
+
+Execute esta sequência, sem pular etapas, em um runner protegido. A identidade
+Git deve ser exatamente `Production Operations Owner`. `GEMINI_IMAGE_REPOSITORY`
+é o repositório OCI aprovado, sem tag ou digest; não contém segredo.
+
+```bash
+set -euo pipefail
+tested_commit="$(git rev-parse --verify HEAD^{commit})"
+run_id="gemini-${tested_commit}-$(date -u +%Y%m%dT%H%M%SZ)"
+GEMINI_IMAGE_REPOSITORY="${GEMINI_IMAGE_REPOSITORY:?set the approved OCI repository}"
+export tested_commit run_id GEMINI_IMAGE_REPOSITORY
+
+test -z "$(git status --porcelain=v1 --untracked-files=all)"
+test "$(git rev-parse HEAD)" = "$tested_commit"
+test -z "$(git ls-files -s | awk '$1 == 120000 || $1 == 160000 {print}')"
+test "$(git config user.name)" = "Production Operations Owner"
+
+tmpdir="$(mktemp -d)"
+export tmpdir
+chmod 700 "$tmpdir"
+git archive --format=tar "$tested_commit" | docker buildx build \
+  --file Dockerfile --target production --provenance=true --sbom=true --push \
+  --tag "$GEMINI_IMAGE_REPOSITORY:$tested_commit" \
+  --metadata-file "$tmpdir/build-metadata.json" -
+```
+
+O contexto de build acima são exatamente os bytes de `git archive` do candidate;
+nenhum arquivo dirty entra na imagem. Extraia somente o digest retornado por
+Buildx, nunca consultando a tag, e execute o smoke live na mesma imagem. As duas
+entradas privadas são injetadas pelo secret store do runner e não aparecem em
+argv, stdout ou receipt.
+
+```bash
+digest="$(python3 -c 'import json,re,sys; d=json.load(open(sys.argv[1], encoding="utf-8"))["containerimage.digest"]; assert re.fullmatch(r"sha256:[0-9a-f]{64}", d); print(d)' "$tmpdir/build-metadata.json")" || exit 1
+image_digest="$GEMINI_IMAGE_REPOSITORY@$digest"
+export image_digest
+
+docker run --rm --read-only --tmpfs /tmp \
+  --env GEMINI_API_KEY --env GEMINI_MODEL "$image_digest" \
+  python -m src.llm.gemini_smoke --json \
+  --tested-commit "$tested_commit" --image-digest "$image_digest" \
+  --run-id "$run_id" >"$tmpdir/smoke.json"
+chmod 600 "$tmpdir/smoke.json"
+```
+
+Metadata ausente/inválido ou smoke não-zero encerra o run. A saída deve ser uma
+única linha JSON canônica terminada por LF. Construa os bytes exatos do receipt
+com Python stdlib; o SHA é calculado sobre a linha JSON incluindo seu LF.
+
+```bash
+receipt_path=.genie/wishes/gemini-credentials/evidence/gemini-llm-receipt.md
+export receipt_path
+mkdir -p "${receipt_path%/*}"
+python3 <<'PY'
+import hashlib, json, os, pathlib
+smoke = pathlib.Path(os.environ["tmpdir"] + "/smoke.json").read_bytes()
+artifact = json.loads(smoke)
+canonical = json.dumps(artifact, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+assert smoke == canonical
+sha = hashlib.sha256(smoke).hexdigest().encode()
+receipt = b"# Gemini LLM release receipt\n\n- smoke_artifact_sha256: " + sha + b"\n\n```json\n" + smoke + b"```\n"
+pathlib.Path(os.environ["receipt_path"]).write_bytes(receipt)
+PY
+
+if git cat-file -e "$tested_commit:$receipt_path" 2>/dev/null; then
+  echo "receipt already exists in candidate" >&2
+  exit 1
+fi
+git add -f -- "$receipt_path"
+test "$(git diff --cached --name-status)" = "A$(printf '\t')$receipt_path"
+git commit -S -m "chore(release): attest Gemini smoke"
+```
+
+O commit precisa ser assinado por GPG ou SSH. Para SSH, configure
+`gpg.format=ssh` e `gpg.ssh.allowedSignersFile` com a principal Operations
+aprovada. Para ambos, injete como variável protegida o fingerprint exato exibido
+por `%GF`: 40/64 hex maiúsculos para GPG ou `SHA256:<base64>` para SSH.
+
+Depois da assinatura, valide novamente o sucessor e só então entregue ao VPS:
+
+```bash
+receipt_head="$(git rev-parse HEAD)"
+test "$(git rev-list --parents -n 1 "$receipt_head" | wc -w)" -eq 2
+test "$(git rev-parse "$receipt_head^")" = "$tested_commit"
+test "$(git diff-tree --no-commit-id --name-status -r "$tested_commit" "$receipt_head")" = "A$(printf '\t')$receipt_path"
+test -z "$(git status --porcelain=v1 --untracked-files=all)"
+git verify-commit --raw "$receipt_head"
+test "$(git show -s --format=%GF "$receipt_head")" = "$GEMINI_RECEIPT_SIGNER_FINGERPRINT"
+test "$(git rev-parse HEAD)" = "$receipt_head"
+python3 scripts/validate_provider_availability_evidence.py --phase release
+```
+
+No VPS, faça checkout exato desse `receipt_head`, configure a mesma trust store e
+fingerprint protegido e use somente `scripts/deploy-vps.sh`.
+
+### `.env` de produção
+
+O arquivo é dado, nunca shell. Cada linha não vazia deve ser exatamente
+`KEY=value`, sem espaços, comentários, aspas de shell, `$`, crase, `;`, pipe,
+redirecionamento, barra invertida, função ou controle. As únicas chaves são
+`ENVIRONMENT`, `DEBUG`, `SECRET_KEY`, `POSTGRES_USER`, `POSTGRES_PASSWORD`,
+`POSTGRES_DB`, `REDIS_PASSWORD`, `QDRANT_API_KEY`, `ALLOWED_ORIGINS`,
+`ALLOWED_HOSTS`, `API_BIND_ADDRESS` e `API_PORT`.
+`PATH`, `DOCKER_HOST`, chaves desconhecidas e duplicatas são recusadas. Valores
+sensíveis têm mínimos explícitos (32 para `SECRET_KEY`/Qdrant, 24 para senhas),
+ao menos 3 classes e 10 caracteres distintos; defaults e valores repetidos são
+recusados sem imprimir o conteúdo. O arquivo continua sendo passado ao Compose
+por `--env-file`, mas nunca é executado pelo Bash.
+
+O VPS requer Python 3.11+, Git, trust GPG/SSH, Docker e Docker Compose. A única
+entrada é `scripts/deploy-vps.sh`; sua primeira operação chama diretamente o
+checker stdlib. Não instale PyYAML ou qualquer outra dependência Python para o
+gate.
+
+Qualquer mudança posterior no candidate, módulo de smoke, receipt, imagem da API
+ou digest de Postgres/Redis/Qdrant exige re-homologação completa a partir de um
+novo `tested_commit`: novo archive-build, smoke live, receipt e sucessor assinado.

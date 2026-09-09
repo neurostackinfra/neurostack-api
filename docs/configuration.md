@@ -319,6 +319,100 @@ Use esse JSON como corpo do objeto `config` ao criar ou atualizar um tenant. O b
 - **Criar/atualizar ClinicConfig:** use `TenantRepository.upsert_clinic_config(tenant_id, clinic_config: ClinicConfig)` para gravar na tabela `clinic_configs`.
 - **Migração Alembic:** revisão `002` cria a tabela `clinic_configs`. Execute `alembic upgrade head` para aplicar.
 
+## Credenciais LLM e Gemini
+
+As credenciais de provedores pertencem à fronteira dedicada
+`/v1/config/api-credentials`. A rota genérica de configuração não aceita
+campos `llm_*`. Leitura e escrita exigem JWT de `clinic_admin`, `builder` ou
+`super_admin`; chaves de API de tenant não podem administrar credenciais. Um
+builder só pode selecionar uma clínica que pertence ao seu próprio
+`builder_id`. Segredos nunca são retornados: a resposta expõe apenas o estado
+`*_set` e a máscara de tamanho constante.
+
+O contrato compartilhado de LLM usa exatamente quatro campos:
+
+| Campo | Regra |
+|-------|-------|
+| `llm_provider` | Identificador wire; Gemini usa `gemini` |
+| `llm_api_url` | Base HTTPS do provedor |
+| `llm_api_key` | Segredo write-only |
+| `llm_model_name` | Modelo habilitado pelo provedor |
+
+Para Gemini, a única base aceita é
+`https://generativelanguage.googleapis.com/v1beta/openai`. Host, caminho e
+ausência de porta explícita são fixos: até `:443` é recusado. Query, fragmento,
+userinfo, outro host ou outro caminho também são recusados. Não existe override
+por variável de ambiente ou tenant para a base, o prompt do smoke ou a política
+de saída. O transporte resolve DNS na fronteira, valida todos os endereços como
+públicos, fixa o IP da conexão e preserva
+`generativelanguage.googleapis.com` em Host/SNI. Redirects são proibidos.
+
+Qualquer troca **para ou de** `gemini` exige que os quatro campos sejam enviados
+juntos com chave nova. Um patch parcial falha atomicamente com
+`provider_switch_bundle_required`; nenhum campo é gravado. Quando o provider
+não muda, um patch apenas de modelo preserva a URL e a chave existentes. Valores
+vazios, `null` e máscaras (`••••…` ou `****…`) nunca apagam nem substituem um
+segredo salvo; numa troca de provider eles não contam como chave nova.
+
+Um `llm_provider` presente na clínica é autoritativo mesmo se estiver incompleto
+ou inválido. A herança do builder só ocorre quando a clínica não
+tem o campo `llm_provider` e existe exatamente um tenant proprietário autorizado
+do builder com bundle operacional completo. A resolução não carrega segredos de
+outro tenant quando a clínica já declarou provider. No RLHF, `clinic_tenant_id`
+e o tenant do `message_id` precisam existir, concordar e ser autorizados para o
+clinic admin, builder ou tenant API key antes de qualquer leitura de segredo ou
+chamada externa.
+
+Erros públicos são estáveis e não incluem entrada ou segredo:
+
+- `invalid_provider_endpoint` (`field=llm_api_url`): a base Gemini não é
+  exatamente a base canônica;
+- `provider_switch_bundle_required`: troca Gemini parcial ou sem chave nova;
+- `provider_not_available`: provider reconhecido, mas indisponível;
+- `invalid_provider_for_capability`: wire id desconhecido para LLM;
+- `invalid_credentials_payload` / `unsafe_api_url`: payload ou URL recusado na
+  fronteira genérica.
+
+### Limitação beta e smoke sanitizado
+
+O endpoint compatível com OpenAI está em `v1beta`. Gemini é o único overlay
+`active` sobre o inventário imutável anterior: um bundle completo fica ativo em
+readiness, overlay e runtime. Todos os outros pares conservam suas decisões.
+Essa promoção de produto não autoriza por si só um deploy: apenas o sucessor
+receipt-only assinado do candidate homologado passa o gate de produção.
+
+O smoke independente usa somente duas entradas de ambiente privadas:
+
+```bash
+docker run --rm --read-only --tmpfs /tmp \
+  --env GEMINI_API_KEY --env GEMINI_MODEL "$image_digest" \
+  python -m src.llm.gemini_smoke --json \
+  --tested-commit "$tested_commit" --image-digest "$image_digest" --run-id "$run_id"
+```
+
+A base e o prompt são fixos. A saída é uma única linha JSON canônica contendo
+somente `schema`, `result`, `result_code`, `validation_kind`,
+`validation_authority`, `timestamp`, `run_id`, `tested_commit`, `image_digest`,
+`smoke_module_sha256` e `exit_code`. Ela nunca
+imprime chave, prompt, resposta do provedor ou corpo de exceção. Classes de falha
+incluem `missing_api_key`, `missing_model`, `provider_http_error`,
+`provider_transport_error`, `invalid_provider_response`, `unexpected_response`
+e `internal_error`.
+Uma resposta sem a estrutura OpenAI esperada (`choices[].message.content`) é
+`invalid_provider_response`; uma resposta estruturalmente válida cujo conteúdo
+está vazio ou não pode ser usado é `unexpected_response`.
+
+Para troubleshooting do gate de release:
+
+1. `missing_api_key`/`missing_model`: corrija apenas o secret store privado;
+2. `provider_http_error`: confirme acesso da chave ao modelo, sem copiar a
+   resposta do provedor para logs ou tickets;
+3. `provider_transport_error`: confirme DNS e HTTPS de saída para o host fixo;
+4. `invalid_provider_response`/`unexpected_response`: confirme a compatibilidade
+   beta do modelo;
+5. smoke verde não libera sozinho: Operations precisa embutir os bytes e SHA no
+   receipt, criar o sucessor assinado receipt-only e manter esse commit como HEAD.
+
 ---
 
 *Documentação mantida pela equipe NeuroStack*

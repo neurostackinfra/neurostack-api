@@ -1,212 +1,151 @@
 #!/bin/bash
 
-# ============================================
-# NeuroStack API - Script de Deploy para VPS
-# ============================================
-# Este script automatiza parte do processo de deploy
-# Use com cuidado e revise antes de executar
+set -euo pipefail
 
-set -e  # Parar em caso de erro
+# Resolve the checked-out repository independently of the caller's directory and
+# PATH. The supported VPS target is Linux, where coreutils installs readlink here.
+readonly SCRIPT_PATH="$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")"
+readonly SCRIPT_DIR="${SCRIPT_PATH%/*}"
+readonly REPO_ROOT="${SCRIPT_DIR%/*}"
+readonly CHECKER="${SCRIPT_DIR}/validate_provider_availability_evidence.py"
+readonly COMPOSE_FILE="${REPO_ROOT}/docker-compose.production.yml"
+readonly ENV_FILE="${REPO_ROOT}/.env"
 
-# Cores para output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
-
-# Função para imprimir mensagens
-info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+fail() {
+    printf 'deploy blocked: %s\n' "$1" >&2
+    return 1
 }
 
-warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+reject_weak_identifier() {
+    local name="$1"
+    local value="${!name:-}"
+    local minimum="$2"
+    local normalized="${value,,}"
+    if [ "${#value}" -lt "$minimum" ]; then
+        fail "$name is missing or shorter than $minimum characters"
+        return 1
+    fi
+    case "$normalized" in
+        postgres|neurostack|admin|root|database|db|prod|production|*dev*|*test*|*default*|*changeme*|*change-me*|*example*)
+            fail "$name is a repository default or development/example value"
+            return 1
+            ;;
+    esac
 }
 
-error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-# Verificar se está rodando como root ou com sudo
-check_permissions() {
-    if [ "$EUID" -ne 0 ] && ! sudo -n true 2>/dev/null; then
-        error "Este script precisa ser executado como root ou com sudo"
-        exit 1
+reject_weak_secret() {
+    local name="$1"
+    local value="${!name:-}"
+    local minimum="$2"
+    local normalized="${value,,}"
+    local classes=0 unique
+    if [ "${#value}" -lt "$minimum" ]; then
+        fail "$name is missing or shorter than $minimum characters"
+        return 1
+    fi
+    case "$normalized" in
+        postgres|neurostack|password|secret|admin|root|*dev*|*test*|*default*|*changeme*|*change-me*|*example*|*password*)
+            fail "$name is a repository default or development/example value"
+            return 1
+            ;;
+    esac
+    [[ "$value" =~ [a-z] ]] && classes=$((classes + 1))
+    [[ "$value" =~ [A-Z] ]] && classes=$((classes + 1))
+    [[ "$value" =~ [0-9] ]] && classes=$((classes + 1))
+    [[ "$value" =~ [^a-zA-Z0-9] ]] && classes=$((classes + 1))
+    unique="$(printf %s "$value" | /usr/bin/fold -w1 | /usr/bin/sort -u | /usr/bin/wc -l)"
+    if [ "$classes" -lt 3 ] || [ "$unique" -lt 10 ]; then
+        fail "$name must use at least 3 character classes and 10 distinct characters"
+        return 1
     fi
 }
 
-# Verificar se Docker está instalado
-check_docker() {
-    if ! command -v docker &> /dev/null; then
-        error "Docker não está instalado. Por favor, instale o Docker primeiro."
-        exit 1
+load_runtime_environment() {
+    [ -f "$ENV_FILE" ] || fail "$ENV_FILE must already exist and is never created by deploy"
+    unset ENVIRONMENT DEBUG SECRET_KEY POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB
+    unset REDIS_PASSWORD QDRANT_API_KEY ALLOWED_ORIGINS ALLOWED_HOSTS
+    unset API_BIND_ADDRESS API_PORT
+    local line key value line_number=0
+    local -A seen=()
+    while IFS= read -r line || [ -n "$line" ]; do
+        line_number=$((line_number + 1))
+        [ -n "$line" ] || continue
+        [[ "$line" != *$'\r'* ]] || {
+            fail ".env line $line_number contains a carriage return"
+            return 1
+        }
+        [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=([^[:space:]\$\`\;\|\&\<\>\\]*)$ ]] || {
+            fail ".env line $line_number must use data-only KEY=value syntax"
+            return 1
+        }
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        case "$key" in
+            ENVIRONMENT|DEBUG|SECRET_KEY|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|REDIS_PASSWORD|QDRANT_API_KEY|ALLOWED_ORIGINS|ALLOWED_HOSTS|API_BIND_ADDRESS|API_PORT) ;;
+            *)
+                fail ".env line $line_number uses an unknown key"
+                return 1
+                ;;
+        esac
+        [ -z "${seen[$key]:-}" ] || {
+            fail ".env line $line_number duplicates $key"
+            return 1
+        }
+        seen[$key]=1
+        printf -v "$key" '%s' "$value"
+        export "$key"
+    done < "$ENV_FILE"
+}
+
+validate_runtime_environment() {
+    load_runtime_environment
+    [ "$GEMINI_IMAGE_DIGEST" = "$CHECKER_APPROVED_IMAGE_DIGEST" ] || fail "checker-approved image digest changed unexpectedly"
+    [ "${ENVIRONMENT:-production}" = "production" ] || fail "ENVIRONMENT must be production"
+    case "${DEBUG:-false}" in false|False|FALSE|0) ;; *) fail "DEBUG must be false" ;; esac
+    reject_weak_secret SECRET_KEY 32
+    reject_weak_secret POSTGRES_PASSWORD 24
+    reject_weak_secret REDIS_PASSWORD 24
+    reject_weak_secret QDRANT_API_KEY 32
+    reject_weak_identifier POSTGRES_USER 8
+    reject_weak_identifier POSTGRES_DB 8
+    if [ "$SECRET_KEY" = "$POSTGRES_PASSWORD" ] ||
+       [ "$SECRET_KEY" = "$REDIS_PASSWORD" ] ||
+       [ "$SECRET_KEY" = "$QDRANT_API_KEY" ] ||
+       [ "$POSTGRES_PASSWORD" = "$REDIS_PASSWORD" ] ||
+       [ "$POSTGRES_PASSWORD" = "$QDRANT_API_KEY" ] ||
+       [ "$REDIS_PASSWORD" = "$QDRANT_API_KEY" ]; then
+        fail "production secrets must be distinct"
+        return 1
     fi
-    info "Docker encontrado: $(docker --version)"
+    [ -n "${ALLOWED_ORIGINS:-}" ] || fail "ALLOWED_ORIGINS is required"
+    case "${ALLOWED_ORIGINS,,}" in *'*'*|*localhost*|*127.0.0.1*|*dev*|*test*)
+        fail "ALLOWED_ORIGINS must name explicit production origins"
+        ;;
+    esac
+    [ -n "${ALLOWED_HOSTS:-}" ] || fail "ALLOWED_HOSTS is required"
+    case "${ALLOWED_HOSTS,,}" in *'*'*|*localhost*|*127.0.0.1*|*dev*|*test*)
+        fail "ALLOWED_HOSTS must name explicit production hosts"
+        ;;
+    esac
 }
 
-# Verificar se Docker Compose está instalado
-check_docker_compose() {
-    if ! command -v docker compose &> /dev/null; then
-        error "Docker Compose não está instalado. Por favor, instale o Docker Compose primeiro."
-        exit 1
-    fi
-    info "Docker Compose encontrado: $(docker compose version)"
-}
-
-# Verificar se arquivo .env existe
-check_env_file() {
-    if [ ! -f .env ]; then
-        warn "Arquivo .env não encontrado. Criando a partir de env.example..."
-        if [ -f env.example ]; then
-            cp env.example .env
-            warn "Por favor, edite o arquivo .env antes de continuar!"
-            exit 1
-        else
-            error "Arquivo env.example não encontrado!"
-            exit 1
-        fi
-    fi
-    info "Arquivo .env encontrado"
-}
-
-# Gerar SECRET_KEY se não estiver definida
-generate_secret_key() {
-    if grep -q "SECRET_KEY=dev-secret-key-change-in-production" .env; then
-        warn "SECRET_KEY padrão detectada. Gerando nova chave..."
-        SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))" 2>/dev/null || openssl rand -hex 32)
-        if [ -n "$SECRET_KEY" ]; then
-            # Atualizar .env (Linux/Mac)
-            if [[ "$OSTYPE" == "darwin"* ]]; then
-                sed -i '' "s/SECRET_KEY=.*/SECRET_KEY=$SECRET_KEY/" .env
-            else
-                sed -i "s/SECRET_KEY=.*/SECRET_KEY=$SECRET_KEY/" .env
-            fi
-            info "Nova SECRET_KEY gerada e configurada"
-        else
-            warn "Não foi possível gerar SECRET_KEY automaticamente. Configure manualmente no .env"
-        fi
-    fi
-}
-
-# Parar containers existentes
-stop_containers() {
-    info "Parando containers existentes..."
-    docker compose down 2>/dev/null || true
-}
-
-# Construir imagens
-build_images() {
-    info "Construindo imagens Docker..."
-    docker compose build --no-cache
-}
-
-# Iniciar containers
-start_containers() {
-    info "Iniciando containers..."
-    docker compose up -d
-    
-    info "Aguardando serviços iniciarem..."
-    sleep 10
-}
-
-# Verificar saúde dos serviços
-check_health() {
-    info "Verificando saúde dos serviços..."
-    
-    # Verificar PostgreSQL
-    if docker compose exec -T postgres pg_isready -U neurostack > /dev/null 2>&1; then
-        info "✓ PostgreSQL está saudável"
-    else
-        warn "✗ PostgreSQL não está respondendo"
-    fi
-    
-    # Verificar Redis
-    if docker compose exec -T redis redis-cli ping > /dev/null 2>&1; then
-        info "✓ Redis está saudável"
-    else
-        warn "✗ Redis não está respondendo"
-    fi
-    
-    # Verificar API
-    sleep 5
-    if curl -f http://localhost:8000/health > /dev/null 2>&1; then
-        info "✓ API está respondendo"
-    else
-        warn "✗ API não está respondendo. Verifique os logs com: docker compose logs api"
-    fi
-}
-
-# Executar migrações
-run_migrations() {
-    info "Executando migrações do banco de dados..."
-    if docker compose exec -T api alembic upgrade head 2>/dev/null; then
-        info "✓ Migrações executadas com sucesso"
-    else
-        warn "✗ Erro ao executar migrações. Execute manualmente: docker compose exec api alembic upgrade head"
-    fi
-}
-
-# Mostrar status
-show_status() {
-    info "Status dos containers:"
-    docker compose ps
-    
-    echo ""
-    info "Endpoints disponíveis:"
-    echo "  - API: http://localhost:8000"
-    echo "  - Docs: http://localhost:8000/docs"
-    echo "  - Health: http://localhost:8000/health"
-    
-    echo ""
-    info "Para ver logs:"
-    echo "  docker compose logs -f"
-    echo "  docker compose logs -f api"
-}
-
-# Função principal
 main() {
-    echo "============================================"
-    echo "  NeuroStack API - Deploy para VPS"
-    echo "============================================"
-    echo ""
-    
-    # Verificações
-    check_permissions
-    check_docker
-    check_docker_compose
-    check_env_file
-    generate_secret_key
-    
-    echo ""
-    read -p "Deseja continuar com o deploy? (s/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Ss]$ ]]; then
-        info "Deploy cancelado pelo usuário"
-        exit 0
-    fi
-    
-    echo ""
-    
-    # Deploy
-    stop_containers
-    build_images
-    start_containers
-    check_health
-    run_migrations
-    
-    echo ""
-    show_status
-    
-    echo ""
-    info "Deploy concluído!"
-    warn "Lembre-se de:"
-    warn "  1. Verificar e ajustar o arquivo .env com valores de produção"
-    warn "  2. Configurar Nginx como reverse proxy (opcional)"
-    warn "  3. Configurar SSL com Let's Encrypt (opcional)"
-    warn "  4. Configurar backups regulares"
-    warn "  5. Configurar monitoramento"
+    GEMINI_IMAGE_DIGEST="$(/usr/bin/python3 "$CHECKER" --phase release)" || return 1
+    export GEMINI_IMAGE_DIGEST
+    readonly CHECKER_APPROVED_IMAGE_DIGEST="$GEMINI_IMAGE_DIGEST"
+
+    # Caller and .env values cannot select a binary or remote Docker daemon.
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    unset DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+    printf 'NeuroStack production deploy: signed release gate passed\n'
+    validate_runtime_environment
+    [ -x /usr/bin/docker ] || fail "Docker is required at /usr/bin/docker"
+    /usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" version >/dev/null 2>&1 || fail "Docker Compose is required"
+
+    /usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" pull api
+    /usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d
+    /usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" exec -T api alembic upgrade head
+    /usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" ps
 }
 
-# Executar função principal
-main
-
+main "$@"
