@@ -119,19 +119,19 @@ load-analyze:
 # ============================================
 
 lint:
-	poetry run flake8 src tests
-	poetry run mypy src --ignore-missing-imports
+	poetry run flake8 src packages/neurostack-core/neurostack_core tests
+	poetry run mypy src packages/neurostack-core/neurostack_core --ignore-missing-imports
 
 format:
-	poetry run black src tests
-	poetry run isort src tests
+	poetry run black src packages/neurostack-core/neurostack_core tests
+	poetry run isort src packages/neurostack-core/neurostack_core tests
 
 format-check:
-	poetry run black --check src tests
-	poetry run isort --check-only src tests
+	poetry run black --check src packages/neurostack-core/neurostack_core tests
+	poetry run isort --check-only src packages/neurostack-core/neurostack_core tests
 
 typecheck:
-	poetry run mypy src --ignore-missing-imports
+	poetry run mypy src packages/neurostack-core/neurostack_core --ignore-missing-imports
 
 quality: format-check lint typecheck test
 
@@ -212,4 +212,3 @@ deps-update:
 
 deps-show:
 	poetry show --tree
-

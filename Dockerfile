@@ -36,14 +36,15 @@ WORKDIR /app
 # Install Poetry
 RUN pip install poetry==1.8.2
 
-# Copy dependency files
+# Copy dependency files and the editable path dependency before installation.
 COPY pyproject.toml poetry.lock* ./
+COPY packages/neurostack-core ./packages/neurostack-core
 
 # Configure Poetry to not create virtual environment
 RUN poetry config virtualenvs.create false
 
 # Install dependencies (production only)
-RUN poetry install --no-interaction --no-ansi --only main
+RUN poetry install --no-interaction --no-ansi --only main --no-root
 
 # ============================================
 # Stage 3: Development image
@@ -51,7 +52,7 @@ RUN poetry install --no-interaction --no-ansi --only main
 FROM deps AS development
 
 # Install dev dependencies
-RUN poetry install --no-interaction --no-ansi
+RUN poetry install --no-interaction --no-ansi --no-root
 
 # Copy application code
 COPY --chown=neurostack:neurostack . .
@@ -79,6 +80,7 @@ WORKDIR /app
 # Copy installed packages from deps stage
 COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=deps /usr/local/bin /usr/local/bin
+COPY --from=deps --chown=neurostack:neurostack /app/packages/neurostack-core /app/packages/neurostack-core
 
 # Copy application code
 COPY --chown=neurostack:neurostack src ./src
@@ -102,4 +104,3 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 # access log via RequestIdMiddleware that uses the route template instead
 # of the raw path so the Z-API capability token cannot leak.
 CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--no-access-log"]
-

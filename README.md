@@ -69,6 +69,9 @@ NeuroStack is a pluggable cognitive infrastructure that transforms generic AI ag
    pip install -r requirements-dev.txt
    ```
 
+   Both commands install the local `packages/neurostack-core` project in
+   editable mode. Keep that directory beside this API checkout.
+
 5. **Run the API**
    ```bash
    # Using Poetry
@@ -192,6 +195,8 @@ neurostack-api/
 │   ├── memory/              # Memory Architecture 2.0
 │   ├── knowledge/           # Knowledge Service (RAG)
 │   └── handoff/             # Human Handoff Service
+├── packages/
+│   └── neurostack-core/     # Framework-independent cognitive core package
 ├── tests/                   # Test suite
 ├── config/                  # Configuration
 ├── scripts/                 # Utility scripts

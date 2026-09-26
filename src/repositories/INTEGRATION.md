@@ -68,7 +68,7 @@ async def endpoint(
 ## 📝 Próximos Passos Recomendados
 
 ### 1. **Migrar PolicyStore para PolicyRepository**
-- Atualizar `src/policy/policy_store.py` para usar `PolicyRepository`
+- Atualizar `packages/neurostack-core/neurostack_core/policy/policy_store.py` para usar `PolicyRepository`
 - Manter compatibilidade com a interface atual do `PolicyStore`
 
 ### 2. **Migrar HandoffService para HandoffRecordRepository**

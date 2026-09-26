@@ -6,7 +6,7 @@ Locks the behavior that the assistant greeting ("Bom dia" / "Boa tarde" /
 are computed from the clinic's configured IANA timezone rather than a fixed
 UTC offset or the server clock.
 
-If `src/prompt/templates/normal.py` were reverted to a hardcoded
+If `packages/neurostack-core/neurostack_core/prompt/templates/normal.py` were reverted to a hardcoded
 `timezone(timedelta(hours=-3))` (or any offset that ignores the clinic
 config), these tests would fail:
   * `test_config_drives_result_not_server_clock` asserts that two clinics
@@ -18,8 +18,8 @@ config), these tests would fail:
 
 from datetime import datetime, timezone
 
-from src.prompt.models import PromptVariables
-from src.prompt.templates.normal import NormalTemplate
+from neurostack_core.prompt.models import PromptVariables
+from neurostack_core.prompt.templates.normal import NormalTemplate
 
 # ============================================
 # Helpers
@@ -28,10 +28,10 @@ from src.prompt.templates.normal import NormalTemplate
 
 def _fixed_datetime_class(fixed_utc: datetime):
     """Return a stand-in for the `datetime` class used inside
-    `src.prompt.timeutils`. Its `.now(tz)` returns the fixed instant
+    `neurostack_core.prompt.timeutils`. Its `.now(tz)` returns the fixed instant
     projected into `tz` (or the raw fixed instant when `tz` is None).
 
-    Monkeypatching `src.prompt.timeutils.datetime` with this class means
+    Monkeypatching `neurostack_core.prompt.timeutils.datetime` with this class means
     `clinic_now(tz_str)` still exercises the real `resolve_clinic_tz`
     branch (real ZoneInfo lookup + fallback) — only the wall-clock is
     frozen. That way the tests validate that the tz actually flows
@@ -70,7 +70,7 @@ class TestTimezoneGreeting:
         # 12:00 UTC on a non-DST day -> 09:00 in America/Sao_Paulo (UTC-3).
         fixed = datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc)
         monkeypatch.setattr(
-            "src.prompt.timeutils.datetime", _fixed_datetime_class(fixed)
+            "neurostack_core.prompt.timeutils.datetime", _fixed_datetime_class(fixed)
         )
 
         out = NormalTemplate().get_context_instructions(
@@ -90,7 +90,7 @@ class TestTimezoneGreeting:
         # (EST, UTC-5 in January) -> Boa noite (hour >= 18).
         fixed = datetime(2026, 1, 16, 1, 0, tzinfo=timezone.utc)
         monkeypatch.setattr(
-            "src.prompt.timeutils.datetime", _fixed_datetime_class(fixed)
+            "neurostack_core.prompt.timeutils.datetime", _fixed_datetime_class(fixed)
         )
 
         out = NormalTemplate().get_context_instructions(
@@ -111,7 +111,7 @@ class TestTimezoneGreeting:
         #   Asia/Tokyo       (JST, UTC+9): 10:00 on 2026-01-16 -> Bom dia
         fixed = datetime(2026, 1, 16, 1, 0, tzinfo=timezone.utc)
         monkeypatch.setattr(
-            "src.prompt.timeutils.datetime", _fixed_datetime_class(fixed)
+            "neurostack_core.prompt.timeutils.datetime", _fixed_datetime_class(fixed)
         )
         template = NormalTemplate()
 
@@ -130,7 +130,7 @@ class TestTimezoneGreeting:
         # 12:00 UTC -> 09:00 in São Paulo (fallback) -> Bom dia.
         fixed = datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc)
         monkeypatch.setattr(
-            "src.prompt.timeutils.datetime", _fixed_datetime_class(fixed)
+            "neurostack_core.prompt.timeutils.datetime", _fixed_datetime_class(fixed)
         )
 
         # Must not raise.

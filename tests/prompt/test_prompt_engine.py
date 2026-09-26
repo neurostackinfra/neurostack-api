@@ -8,8 +8,8 @@ from uuid import uuid4
 
 import pytest
 
-from src.prompt.engine import PromptBuilder, PromptEngine, get_prompt_engine
-from src.prompt.models import (
+from neurostack_core.prompt.engine import PromptBuilder, PromptEngine, get_prompt_engine
+from neurostack_core.prompt.models import (
     RESPONSE_SCHEMA,
     GeneratedPrompt,
     MessageRole,
@@ -20,12 +20,16 @@ from src.prompt.models import (
     PromptVariables,
     ValidationResult,
 )
-from src.prompt.renderer import PromptRenderer, VariableResolver, get_prompt_renderer
-from src.prompt.templates.base import TemplateSection
-from src.prompt.templates.handoff import HandoffTemplate
-from src.prompt.templates.normal import NormalTemplate
-from src.prompt.templates.safety import SafetyTemplate
-from src.prompt.validator import (
+from neurostack_core.prompt.renderer import (
+    PromptRenderer,
+    VariableResolver,
+    get_prompt_renderer,
+)
+from neurostack_core.prompt.templates.base import TemplateSection
+from neurostack_core.prompt.templates.handoff import HandoffTemplate
+from neurostack_core.prompt.templates.normal import NormalTemplate
+from neurostack_core.prompt.templates.safety import SafetyTemplate
+from neurostack_core.prompt.validator import (
     OutputValidator,
     ResponseExtractor,
     get_output_validator,
