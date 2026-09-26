@@ -7,15 +7,15 @@ from uuid import uuid4
 
 import pytest
 
-from src.policy.engine import PolicyEngine
-from src.policy.global_rules import (
+from neurostack_core.policy.engine import PolicyEngine
+from neurostack_core.policy.global_rules import (
     get_clinical_safety_rules,
     get_global_constraints,
     get_global_policy,
     get_global_rules,
     get_legal_safety_rules,
 )
-from src.policy.models import (
+from neurostack_core.policy.models import (
     PolicyConstraints,
     PolicyCreate,
     PolicyDefinition,
@@ -28,8 +28,8 @@ from src.policy.models import (
     RuleSeverity,
     RuleViolation,
 )
-from src.policy.policy_merger import PolicyMerger
-from src.policy.policy_store import PolicyStore, PolicyStoreError
+from neurostack_core.policy.policy_merger import PolicyMerger
+from neurostack_core.policy.policy_store import PolicyStore, PolicyStoreError
 
 # ============================================
 # Fixtures
@@ -258,7 +258,7 @@ class TestPolicyStore:
 
         created = await policy_store.create_policy(sample_tenant_id, policy_data)
 
-        from src.policy.models import PolicyUpdate
+        from neurostack_core.policy.models import PolicyUpdate
 
         updates = PolicyUpdate(name="Updated Name", priority=200)
         updated = await policy_store.update_policy(

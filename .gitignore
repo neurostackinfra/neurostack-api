@@ -190,7 +190,17 @@ alembic/versions/*.pyc
 .github/
 # Genie CLI
 .genie/
-
+!.genie/
+.genie/*
+!.genie/INDEX.md
+!.genie/wishes/
+.genie/wishes/*
+!.genie/wishes/neurostack-core-extraction/
+.genie/wishes/neurostack-core-extraction/*
+!.genie/wishes/neurostack-core-extraction/WISH.md
+!.genie/wishes/neurostack-core-dedomainification/
+.genie/wishes/neurostack-core-dedomainification/*
+!.genie/wishes/neurostack-core-dedomainification/WISH.md
 # Replit artifacts
 .replit-artifact/
 .genie/genie.db

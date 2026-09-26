@@ -53,6 +53,7 @@ site/
 docker-compose*.yml
 Dockerfile*
 .docker/
+**/node_modules/
 
 # Local development
 .env
@@ -67,6 +68,6 @@ Thumbs.db
 # Misc
 *.md
 !README.md
+!packages/neurostack-core/README.md
 LICENSE
 Makefile
-

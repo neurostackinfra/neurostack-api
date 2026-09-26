@@ -13,6 +13,7 @@ set -uo pipefail
 
 # ---- Caminhos / config -----------------------------------------------------
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CORE_PACKAGE_DIR="$PROJECT_DIR/packages/neurostack-core"
 FRONTEND_DIR="$PROJECT_DIR/frontend/artifacts/neurostack"
 VENV="$HOME/neurostack-venv"
 NGROK_DOMAIN="moaning-storeroom-skipper.ngrok-free.dev"
@@ -32,6 +33,7 @@ die() { echo "ERRO: $*" >&2; exit 1; }
 
 # ---- Checagens -------------------------------------------------------------
 [ -x "$VENV/bin/python" ] || die "venv ausente em $VENV (crie: python3 -m venv $VENV && $VENV/bin/pip install -r requirements.txt)"
+[ -f "$CORE_PACKAGE_DIR/pyproject.toml" ] || die "pacote local ausente em $CORE_PACKAGE_DIR"
 command -v node  >/dev/null || die "node nao encontrado no PATH"
 command -v ngrok >/dev/null || echo "AVISO: ngrok nao encontrado no PATH - o tunel publico nao vai subir"
 

@@ -100,6 +100,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+O requirements instala `packages/neurostack-core` em modo editavel. O caminho
+local deve permanecer no checkout; nao copie apenas `src/` para outro diretorio.
+
 ---
 
 ## 5. Rodar migrations do banco

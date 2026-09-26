@@ -54,7 +54,7 @@ O Intent Classifier do SRM agora utiliza uma abordagem **híbrida** que combina:
 
 ### Uso Padrão (Híbrido Ativado)
 ```python
-from src.srm.intent_classifier import get_intent_classifier
+from neurostack_core.srm.intent_classifier import get_intent_classifier
 
 classifier = get_intent_classifier()
 
@@ -67,7 +67,7 @@ result = classifier.classify("preciso de um horário")
 
 ### Desabilitar Naive Bayes (Apenas Regex)
 ```python
-from src.srm.intent_classifier import IntentClassifier
+from neurostack_core.srm.intent_classifier import IntentClassifier
 
 # Criar com Naive Bayes desabilitado
 classifier = IntentClassifier(use_naive_bayes=False)
@@ -95,7 +95,7 @@ Os dados de treinamento são gerados automaticamente a partir das definições d
 
 ### Adicionar Exemplos Manualmente
 ```python
-from src.srm.intent_classifier import get_intent_classifier
+from neurostack_core.srm.intent_classifier import get_intent_classifier
 
 classifier = get_intent_classifier()
 
@@ -172,7 +172,7 @@ if classifier._naive_bayes:
 ### Configuração Programática
 ```python
 # No engine.py ou onde o SRM é inicializado
-from src.srm.intent_classifier import IntentClassifier
+from neurostack_core.srm.intent_classifier import IntentClassifier
 
 # Criar classificador customizado
 intent_classifier = IntentClassifier(
@@ -181,7 +181,7 @@ intent_classifier = IntentClassifier(
 )
 
 # Passar para o SRM engine
-from src.srm.engine import SRMEngine
+from neurostack_core.srm.engine import SRMEngine
 engine = SRMEngine(...)
 engine.intent_classifier = intent_classifier
 ```

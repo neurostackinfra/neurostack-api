@@ -55,7 +55,7 @@ Ou seja: apenas dois “tipos” de prompt (Normal e Safety/Handoff). O funil im
 
 ## Template Normal e as 11 etapas do funil
 
-O **NormalTemplate** (`src/prompt/templates/normal.py`) usa o dicionário **FUNNEL_INSTRUCTIONS**, que associa cada etapa do funil a um bloco de instruções incluído no prompt do sistema.
+O **NormalTemplate** (`neurostack_core/prompt/templates/normal.py`) usa o dicionário **FUNNEL_INSTRUCTIONS**, que associa cada etapa do funil a um bloco de instruções incluído no prompt do sistema.
 
 ### Mapeamento: etapa do funil → instruções no prompt
 
@@ -164,8 +164,8 @@ Para Safety e Handoff, as variáveis relevantes são `safety_category` / `safety
 
 - **Funil canônico:** Documentação Técnica NeuroStack (MVP v0.5) – 11 etapas (lead_novo a standby).
 - **Pipeline cognitivo:** [cognitive-pipeline.md](./cognitive-pipeline.md) – ordem Policy → SRM → Flow → CTX → Prompt → Handoff.
-- **Código dos templates:** `src/prompt/templates/` – `base.py`, `normal.py`, `safety.py`, `handoff.py`.
-- **Renderer:** `src/prompt/renderer.py` – mapeamento `PromptMode` → template.
+- **Código dos templates:** `neurostack_core/prompt/templates/` – `base.py`, `normal.py`, `safety.py`, `handoff.py`.
+- **Renderer:** `neurostack_core/prompt/renderer.py` – mapeamento `PromptMode` → template.
 
 ---
 

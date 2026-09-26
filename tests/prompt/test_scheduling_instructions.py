@@ -31,8 +31,8 @@ from typing import Iterable
 
 import pytest
 
-from src.prompt.models import PromptVariables
-from src.prompt.templates.normal import (
+from neurostack_core.prompt.models import PromptVariables
+from neurostack_core.prompt.templates.normal import (
     EN_FUNNEL_INSTRUCTIONS,
     FUNNEL_INSTRUCTIONS,
     NormalTemplate,
