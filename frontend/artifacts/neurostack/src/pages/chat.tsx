@@ -153,7 +153,7 @@ function InvestorMockChat() {
                 <Bot className="h-4 w-4 text-accent" />
                 SIMULADOR DE CHAT
               </h2>
-              <p className="text-xs text-muted-foreground mt-1">Teste o agente de IA clínico. As respostas geram traces em tempo real.</p>
+              <p className="text-xs text-muted-foreground mt-1">Teste o seu agente de IA e envie feedbacks</p>
             </div>
           </div>
         </div>
@@ -219,7 +219,7 @@ function InvestorMockChat() {
             <h2 className="font-semibold text-foreground uppercase tracking-wider text-sm">
               TRACE DE DECISÃO AO VIVO
             </h2>
-            <p className="text-xs text-muted-foreground mt-1">Visão diagnóstica do último ciclo de raciocínio.</p>
+            <p className="text-xs text-muted-foreground mt-1">Acompanhe as métricas do último ciclo de interação</p>
           </div>
           <div className="text-xs font-mono text-muted-foreground bg-muted px-2 py-1 rounded">
             ID: demo-001...

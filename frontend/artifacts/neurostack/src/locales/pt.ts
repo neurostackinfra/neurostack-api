@@ -125,11 +125,11 @@ export const pt: Record<TranslationKey, string> = {
   traces_fail: "Falha ao carregar traces. Tente novamente.",
 
   // Chat
-  chat_title: "Simulador de Chat",
-  chat_subtitle: "Teste o agente de IA clínico. As respostas geram traces em tempo real.",
+  chat_title: "SIMULADOR DE CHAT",
+  chat_subtitle: "Teste o seu agente de IA e envie feedbacks",
   chat_start: "Inicie uma conversa para gerar traces de decisão.",
-  chat_trace_title: "Trace de Decisão ao Vivo",
-  chat_trace_subtitle: "Visão diagnóstica do último ciclo de raciocínio.",
+  chat_trace_title: "TRACE DE DECISÃO AO VIVO",
+  chat_trace_subtitle: "Acompanhe as métricas do último ciclo de interação",
   chat_waiting: "Aguardando atividade. Envie uma mensagem para gerar um trace.",
   chat_placeholder: "Mensagem para o agente...",
   chat_no_clinic_selected_title: "Nenhuma clínica selecionada",
