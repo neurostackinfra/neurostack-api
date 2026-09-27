@@ -15,6 +15,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import make_asgi_app
 
+from neurostack_core import enable_metrics
+
 # Local application imports
 from src.api.middleware.auth import AuthMiddleware
 from src.api.middleware.performance import (
@@ -106,6 +108,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             exc_info=True,
         )
         raise ConfigurationError(f"Startup validation failed: {e}") from e
+
+    if settings.metrics_enabled:
+        enable_metrics()
 
     # Configure OpenTelemetry tracing
     configure_tracing()

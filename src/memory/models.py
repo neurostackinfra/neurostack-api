@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, Field
 
 # Funil canônico compartilhado (11 etapas) - ver srm.models
-from src.srm.models import FunnelStage
+from neurostack_core.srm import FunnelStage
 
 
 class SalesProfile(str, Enum):

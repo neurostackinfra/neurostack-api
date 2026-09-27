@@ -26,6 +26,7 @@ Usage:
     event_store = await get_event_store()
 """
 
+from neurostack_core.srm import FunnelStage
 from src.core.exceptions import (
     EventStoreConnectionError,
     EventStoreError,
@@ -69,7 +70,6 @@ from src.memory.state_store import (
     close_state_store,
     get_state_store,
 )
-from src.srm.models import FunnelStage
 
 __all__ = [
     # State Store

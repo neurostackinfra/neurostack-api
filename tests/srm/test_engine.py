@@ -7,11 +7,14 @@ from uuid import uuid4
 
 import pytest
 
-from src.srm.engine import SRMEngine, get_srm_engine
-from src.srm.funnel_detector import FunnelDetector, get_funnel_detector
-from src.srm.handoff_decider import HandoffDecider, get_handoff_decider
-from src.srm.intent_classifier import IntentClassifier, get_intent_classifier
-from src.srm.models import (
+from neurostack_core.srm.engine import SRMEngine, get_srm_engine
+from neurostack_core.srm.funnel_detector import FunnelDetector, get_funnel_detector
+from neurostack_core.srm.handoff_decider import HandoffDecider, get_handoff_decider
+from neurostack_core.srm.intent_classifier import (
+    IntentClassifier,
+    get_intent_classifier,
+)
+from neurostack_core.srm.models import (
     ActionType,
     FlowMode,
     FunnelStage,
@@ -21,8 +24,8 @@ from src.srm.models import (
     SafetyResult,
     SRMInput,
 )
-from src.srm.rag_decider import RagDecider, get_rag_decider
-from src.srm.safety_detector import SafetyDetector, get_safety_detector
+from neurostack_core.srm.rag_decider import RagDecider, get_rag_decider
+from neurostack_core.srm.safety_detector import SafetyDetector, get_safety_detector
 
 # ============================================
 # Fixtures

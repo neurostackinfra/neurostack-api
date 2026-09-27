@@ -20,8 +20,8 @@ import re
 from datetime import datetime, timezone, tzinfo
 from typing import Any
 
+from neurostack_core.prompt import resolve_clinic_tz
 from src.models.clinic_config import BusinessHoursWindow
-from src.prompt.timeutils import resolve_clinic_tz
 
 _DAY_CODES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _DAY_LABELS_PT = {

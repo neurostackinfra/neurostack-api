@@ -14,6 +14,25 @@ from uuid import UUID, uuid4
 from prometheus_client import Counter, Histogram
 from pydantic import BaseModel, Field, JsonValue
 
+from neurostack_core.flow import FlowContext, FlowDecision, FlowManager
+from neurostack_core.flow import FlowMode as FlowModeModel
+from neurostack_core.flow import get_flow_manager
+from neurostack_core.policy import (
+    PolicyEngine,
+    PolicyEvaluationResult,
+    get_policy_engine,
+)
+from neurostack_core.prompt import (
+    GeneratedPrompt,
+    PromptEngine,
+    PromptMode,
+    PromptVariables,
+    get_prompt_engine,
+)
+from neurostack_core.srm import FunnelStage
+from neurostack_core.srm import HandoffReason as SRMHandoffReason
+from neurostack_core.srm import SRMDecision as SRMDecisionModel
+from neurostack_core.srm import SRMEngine, SRMInput, get_srm_engine
 from src.config.logging import get_logger
 from src.core.exceptions import EventServiceError, PolicyServiceError, ServiceError
 from src.core.lgpd_utils import resolve_privacy_link
@@ -25,9 +44,6 @@ from src.ctx.models import (
     MessageRole,
 )
 from src.ctx.orchestrator import ContextOrchestrator, get_context_orchestrator
-from src.flow.manager import FlowManager, get_flow_manager
-from src.flow.models import FlowContext, FlowDecision
-from src.flow.models import FlowMode as FlowModeModel
 from src.handoff.models import (
     HandoffReason,
     HandoffRequest,
@@ -43,17 +59,8 @@ from src.observability.scheduling_gate import (
     get_safe_replacement,
     resolve_gate_mode,
 )
-from src.policy.engine import PolicyEngine, get_policy_engine
-from src.policy.models import PolicyEvaluationResult
-from src.prompt.engine import PromptEngine, get_prompt_engine
-from src.prompt.models import GeneratedPrompt, PromptMode, PromptVariables
 from src.services import HandoffService, get_handoff_service
 from src.services.business_hours import format_business_hours
-from src.srm.engine import SRMEngine, get_srm_engine
-from src.srm.models import FunnelStage
-from src.srm.models import HandoffReason as SRMHandoffReason
-from src.srm.models import SRMDecision as SRMDecisionModel
-from src.srm.models import SRMInput
 
 logger = get_logger(__name__)
 

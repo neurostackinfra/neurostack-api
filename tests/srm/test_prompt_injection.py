@@ -6,8 +6,8 @@ to rendered prompt output (Group 1 — clinic-config-fullstack).
 
 import pytest
 
-from src.prompt.models import PromptVariables
-from src.prompt.templates.normal import NormalTemplate
+from neurostack_core.prompt.models import PromptVariables
+from neurostack_core.prompt.templates.normal import NormalTemplate
 
 
 @pytest.fixture
