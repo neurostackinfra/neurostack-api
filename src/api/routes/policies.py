@@ -15,6 +15,18 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from neurostack_core.policy import PolicyCreate, PolicyDefinition, PolicyRuleCreate
+from neurostack_core.policy import PolicyType as DomainPolicyType
+from neurostack_core.policy import PolicyUpdate
+from neurostack_core.policy import RuleAction as DomainRuleAction
+from neurostack_core.policy import RuleCategory
+from neurostack_core.policy import RuleSeverity as DomainRuleSeverity
+from neurostack_core.policy import (
+    get_global_policy,
+    get_policy_engine,
+    get_policy_merger,
+    get_policy_store,
+)
 from src.api.middleware.auth import TenantContext, get_tenant_context
 from src.api.schemas.base import ErrorResponse
 from src.api.schemas.policies import (
@@ -29,18 +41,6 @@ from src.api.schemas.policies import (
     RuleSeverity,
 )
 from src.config.logging import get_logger
-from src.policy import PolicyCreate, PolicyDefinition, PolicyRuleCreate
-from src.policy import PolicyType as DomainPolicyType
-from src.policy import PolicyUpdate
-from src.policy import RuleAction as DomainRuleAction
-from src.policy import RuleCategory
-from src.policy import RuleSeverity as DomainRuleSeverity
-from src.policy import (
-    get_global_policy,
-    get_policy_engine,
-    get_policy_merger,
-    get_policy_store,
-)
 
 logger = get_logger(__name__)
 

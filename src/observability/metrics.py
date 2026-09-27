@@ -27,7 +27,7 @@ logger = get_logger(__name__)
 
 # Total de decisões do SRM
 SRM_DECISIONS_TOTAL = Counter(
-    # ``src.srm.engine`` owns ``neurostack_srm_decisions_total`` for the
+    # ``neurostack_core.srm.engine`` owns ``neurostack_srm_decisions_total`` for the
     # runtime decision metric.  This legacy business view has different
     # labels, so it needs a distinct Prometheus identity to remain importable.
     "neurostack_business_srm_decisions_total",
@@ -98,7 +98,7 @@ SAFETY_SEVERITY = Counter(
 
 # Transições de flow
 FLOW_TRANSITIONS_TOTAL = Counter(
-    # ``src.flow.manager`` owns the runtime transition metric with a
+    # ``neurostack_core.flow.manager`` owns the runtime transition metric with a
     # different label contract; keep this legacy business view distinct.
     "neurostack_business_flow_transitions_total",
     "Total de transições de flow de negócio",
@@ -197,7 +197,7 @@ POLICIES_APPLIED_TOTAL = Counter(
 
 # Violações de política
 POLICY_VIOLATIONS_TOTAL = Counter(
-    # ``src.policy.engine`` owns the runtime violation metric with a
+    # ``neurostack_core.policy.engine`` owns the runtime violation metric with a
     # different label contract; keep this legacy business view distinct.
     "neurostack_business_policy_violations_total",
     "Total de violações de política de negócio detectadas",

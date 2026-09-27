@@ -34,6 +34,7 @@ prometheus-client = "^0.19.0"
 qdrant-client = "^1.7.0"
 aiosmtplib = "^3.0.0"
 tzdata = ">=2024.1"
+neurostack-core = {path = "packages/neurostack-core", develop = true}
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"
@@ -50,6 +51,7 @@ faker = "^22.0.0"
 factory-boy = "^3.3.0"
 locust = "^2.22.0"
 aiosqlite = "^0.22.1"
+build = "^1.2.2"
 
 [tool.poetry.group.docs.dependencies]
 mkdocs = "^1.5.3"
@@ -82,7 +84,7 @@ exclude = '''
 profile = "black"
 line_length = 88
 skip = [".git", ".venv", "migrations"]
-known_first_party = ["src"]
+known_first_party = ["src", "neurostack_core"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -109,7 +111,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["src"]
+source = ["src", "packages/neurostack-core/neurostack_core"]
 branch = true
 omit = ["*/tests/*", "*/__init__.py"]
 
@@ -120,4 +122,3 @@ exclude_lines = [
     "raise NotImplementedError",
     "if TYPE_CHECKING:",
 ]
-

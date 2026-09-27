@@ -10,9 +10,11 @@
 
 ## Poured
 
+- [Extração do núcleo NeuroStack](wishes/neurostack-core-extraction/WISH.md) - IN_PROGRESS; execução e gate final SHIP concluídos, aguardando commit/PR/CI e merge autorizado; `neurostack-api` depende de `neurostack-core`, e o pacote de núcleo nunca importa a árvore `src` da API.
+- [Desdomainificação do núcleo NeuroStack](wishes/neurostack-core-dedomainification/WISH.md) - BLOCKED; depende da conclusão de `neurostack-core-extraction`.
 - [Auditoria humana sobre RLHF](wishes/rlhf-auditoria-humana/WISH.md) - APPROVED; oito grupos, nota sai de `events` numa troca atômica, canal herdado do trace, parecer humano append-only e saída do Roadmap.
-- [Disponibilidade honesta de provedores](wishes/api-provider-availability/WISH.md) - IN_PROGRESS; execução SHIP com 19 pares `coming_soon`, selo laranja PT/EN e PATCH fail-closed, aguardando PR/merge/QA.
-- [Reparo do baseline backend](wishes/backend-test-baseline-repair/WISH.md) - IN_PROGRESS; seis grupos e gate agregado SHIP, aguardando PR/merge/QA.
+- [Disponibilidade honesta de provedores](wishes/api-provider-availability/WISH.md) - SHIPPED; PR #22 mergeada e QA pós-merge verde com 19 pares `coming_soon`, selo laranja PT/EN e PATCH fail-closed.
+- [Reparo do baseline backend](wishes/backend-test-baseline-repair/WISH.md) - SHIPPED; PR #22 mergeada, QA pós-merge e gate backend agregado verdes.
 - [Filtros de safety flag e intenção na fila de handoff](wishes/filtros-safety-intencao-handoff/WISH.md) - IN_PROGRESS; Grupo 0B aprovado corrige lifecycle de auth/RLHF antes dos filtros funcionais.
 - [Central de clonagem de clínicas](wishes/central-clonagem-clinicas/WISH.md) - APPROVED; cinco grupos para réplicas inativas com configuração/conhecimento, sem APIs, link ativo ou administradores.
 - [Cinco intenções comerciais no painel](wishes/cinco-intencoes-painel/WISH.md) - APPROVED; colapso só na camada de painel, 29 intenções cruas em 6 buckets, backend intocado e trava de drift preservada.

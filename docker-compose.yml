@@ -6,7 +6,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: neurostack-api
     ports:
       - "8000:8000"
     environment:
@@ -20,6 +19,7 @@ services:
       - TRACING_ENABLED=true
     volumes:
       - ./src:/app/src
+      - ./packages/neurostack-core:/app/packages/neurostack-core
       - ./tests:/app/tests
       - ./config:/app/config
       - ./alembic:/app/alembic

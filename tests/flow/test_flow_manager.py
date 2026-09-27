@@ -7,14 +7,14 @@ from uuid import uuid4
 
 import pytest
 
-from src.flow.handlers import (
+from neurostack_core.flow.handlers import (
     HandoffModeHandler,
     NormalModeHandler,
     RagModeHandler,
     SafetyModeHandler,
 )
-from src.flow.manager import FlowManager, get_flow_manager, process_flow
-from src.flow.models import (
+from neurostack_core.flow.manager import FlowManager, get_flow_manager, process_flow
+from neurostack_core.flow.models import (
     FlowContext,
     FlowMode,
     FlowState,
@@ -22,8 +22,8 @@ from src.flow.models import (
     TransitionResult,
     TransitionTrigger,
 )
-from src.flow.state_machine import FlowStateMachine, get_state_machine
-from src.flow.transitions import TransitionLogger
+from neurostack_core.flow.state_machine import FlowStateMachine, get_state_machine
+from neurostack_core.flow.transitions import TransitionLogger
 
 # ============================================
 # Fixtures

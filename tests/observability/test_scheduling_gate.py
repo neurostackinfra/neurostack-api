@@ -17,7 +17,9 @@ from typing import Optional
 import pytest
 from prometheus_client import REGISTRY
 
-from src.flow.handlers.handoff import HANDOFF_RESPONSES
+from neurostack_core.flow.handlers.handoff import HANDOFF_RESPONSES
+from neurostack_core.prompt.models import PromptVariables
+from neurostack_core.prompt.templates.normal import NormalTemplate
 from src.handoff.models import HandoffServiceConfig
 from src.observability.scheduling_gate import (
     CATEGORY_AVAILABILITY,
@@ -30,8 +32,6 @@ from src.observability.scheduling_gate import (
     get_safe_replacement,
     resolve_gate_mode,
 )
-from src.prompt.models import PromptVariables
-from src.prompt.templates.normal import NormalTemplate
 from src.services.event_service import EN_HANDOFF_MESSAGES
 
 

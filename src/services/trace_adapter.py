@@ -7,8 +7,8 @@ from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
 
+from neurostack_core.srm import SRMDecision
 from src.observability.pii import mask_carteirinha
-from src.srm.models import SRMDecision
 
 # ============================================
 # Frontend-compatible schemas

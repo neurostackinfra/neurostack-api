@@ -3,20 +3,20 @@ Tests for the trace adapter service.
 Validates SRM decision → FrontendDecisionTrace mapping.
 """
 
-from src.services.trace_adapter import (
-    FrontendDecisionTrace,
-    FrontendSRMDecision,
-    adapt_srm_decision,
-    build_decision_trace,
-    generate_selected_context,
-)
-from src.srm.models import (
+from neurostack_core.srm.models import (
     ActionType,
     FunnelStage,
     IntentCategory,
     SafetyCategory,
     SRMDecision,
     StatePatch,
+)
+from src.services.trace_adapter import (
+    FrontendDecisionTrace,
+    FrontendSRMDecision,
+    adapt_srm_decision,
+    build_decision_trace,
+    generate_selected_context,
 )
 
 

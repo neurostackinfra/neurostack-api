@@ -8,7 +8,7 @@ Run: pytest tests/srm/test_intent_accuracy.py -v
 
 import pytest
 
-from src.srm.intent_classifier import IntentClassifier
+from neurostack_core.srm.intent_classifier import IntentClassifier
 
 # ============================================
 # Dataset: message → expected_intent
@@ -470,8 +470,8 @@ class TestFunnelStageAccuracy:
     def test_all_stages_correct(self):
         from uuid import uuid4
 
-        from src.srm.engine import SRMEngine
-        from src.srm.models import SRMInput
+        from neurostack_core.srm.engine import SRMEngine
+        from neurostack_core.srm.models import SRMInput
 
         engine = SRMEngine()
         wrong = []
@@ -494,8 +494,8 @@ class TestFunnelStageAccuracy:
     def test_escalation_intents_standby(self):
         from uuid import uuid4
 
-        from src.srm.engine import SRMEngine
-        from src.srm.models import SRMInput
+        from neurostack_core.srm.engine import SRMEngine
+        from neurostack_core.srm.models import SRMInput
 
         engine = SRMEngine()
         escalation_cases = [
