@@ -9,6 +9,7 @@ import time as time_module
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Optional
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -337,6 +338,29 @@ async def checkout_handoff(
 @router.get(
     "/queue/export",
     summary="Export Handoffs CSV",
+    description=(
+        "Export handoffs whose created_at is within the requested local-date window "
+        "and whose current status is pending, accepted, or completed with a checkout "
+        "timestamp. The UTF-8 CSV columns, in order, are numero_whatsapp, session_id, "
+        "created_at, data_hora_saida, tempo_espera_segundos, status, and exported_at. "
+        "For pending and accepted rows, data_hora_saida is empty and "
+        "tempo_espera_segundos runs from created_at to exported_at. For completed "
+        "rows, tempo_espera_segundos runs from created_at to data_hora_saida. "
+        "Timestamps are emitted in UTC and exports over 10,000 rows are rejected."
+    ),
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "description": "UTF-8 CSV attachment containing the seven documented columns.",
+            "content": {"text/csv": {"schema": {"type": "string"}}},
+        },
+        400: {
+            "description": (
+                "Invalid request: max_window_90_days, invalid_timezone, "
+                "invalid_date_range, or export_limit_10000_exceeded."
+            )
+        },
+    },
 )
 async def export_handoffs_csv(
     request: Request,
@@ -345,10 +369,22 @@ async def export_handoffs_csv(
         None, description="Start date (default: 30 days ago)"
     ),
     to_date: Optional[date] = Query(None, description="End date (default: today)"),
+    timezone_name: Optional[str] = Query(
+        None,
+        alias="timezone",
+        description="IANA timezone for the inclusive local-date window (default: UTC)",
+    ),
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
 ) -> StreamingResponse:
-    """Export completed handoffs as CSV with UTF-8 BOM."""
+    """Export the handoff entry cohort, including open and completed waits.
+
+    The requested inclusive dates filter created_at after conversion from the
+    supplied IANA timezone to a semi-open UTC window. Current pending and accepted
+    states are open and use one export instant for their wait; completed rows use
+    their recorded checkout timestamp. Invalid requests return max_window_90_days,
+    invalid_timezone, invalid_date_range, or export_limit_10000_exceeded.
+    """
     effective_tenant_id = await _resolve_queue_tenant(request, tenant_id, tenant, db)
 
     today = date.today()
@@ -361,20 +397,68 @@ async def export_handoffs_csv(
             detail="max_window_90_days",
         )
 
+    export_timezone: timezone | ZoneInfo
+    if timezone_name is None:
+        export_timezone = timezone.utc
+    else:
+        try:
+            export_timezone = ZoneInfo(timezone_name)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="invalid_timezone",
+            )
+
+    try:
+        window_start_utc = datetime.combine(
+            effective_from, time.min, tzinfo=export_timezone
+        ).astimezone(timezone.utc)
+        window_end_utc = datetime.combine(
+            effective_to + timedelta(days=1), time.min, tzinfo=export_timezone
+        ).astimezone(timezone.utc)
+    except OverflowError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid_date_range",
+        )
+
     q = (
-        select(HandoffRecord)
+        select(
+            HandoffRecord.numero_whatsapp,
+            HandoffRecord.session_id,
+            HandoffRecord.created_at,
+            HandoffRecord.data_hora_saida,
+            HandoffRecord.status,
+        )
         .where(
             HandoffRecord.tenant_id == effective_tenant_id,
-            HandoffRecord.status == "completed",
-            HandoffRecord.data_hora_saida.isnot(None),
-            sa_func.date(HandoffRecord.data_hora_saida) >= effective_from,
-            sa_func.date(HandoffRecord.data_hora_saida) <= effective_to,
+            HandoffRecord.created_at >= window_start_utc,
+            HandoffRecord.created_at < window_end_utc,
+            HandoffRecord.status.in_(["pending", "accepted"])
+            | (
+                (HandoffRecord.status == "completed")
+                & HandoffRecord.data_hora_saida.isnot(None)
+            ),
         )
-        .order_by(HandoffRecord.data_hora_saida.desc())
-        .limit(10000)
+        .order_by(HandoffRecord.created_at.desc())
+        .limit(10001)
     )
     result = await db.execute(q)
-    records = result.scalars().all()
+    records: list[tuple[Optional[str], UUID, datetime, Optional[datetime], str]] = list(
+        result.tuples().all()
+    )
+    if len(records) == 10001:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="export_limit_10000_exceeded",
+        )
+
+    exported_at = datetime.now(timezone.utc)
+
+    def as_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
     output = io.StringIO()
     output.write("﻿")  # UTF-8 BOM
@@ -386,19 +470,52 @@ async def export_handoffs_csv(
             "created_at",
             "data_hora_saida",
             "tempo_espera_segundos",
+            "status",
+            "exported_at",
         ]
     )
-    for r in records:
-        wait = ""
-        if r.data_hora_saida and r.created_at:
-            wait = str(round((r.data_hora_saida - r.created_at).total_seconds(), 1))
+    for (
+        phone,
+        session_id,
+        created_at_value,
+        checked_out_at_value,
+        handoff_status,
+    ) in records:
+        created_at = as_utc(created_at_value)
+        is_open = handoff_status in {"pending", "accepted"}
+        checked_out_at = None
+        if not is_open and checked_out_at_value is not None:
+            checked_out_at = as_utc(checked_out_at_value)
+        if is_open:
+            wait = str(round((exported_at - created_at).total_seconds(), 1))
+        elif checked_out_at is not None:
+            wait = str(round((checked_out_at - created_at).total_seconds(), 1))
+        else:
+            wait = ""
+        safe_phone = phone or ""
+        if safe_phone[:1] in {
+            "=",
+            "+",
+            "-",
+            "@",
+            "\t",
+            "\r",
+            "\n",
+            "＝",
+            "＋",
+            "－",
+            "＠",
+        }:
+            safe_phone = f"'{safe_phone}"
         writer.writerow(
             [
-                r.numero_whatsapp or "",
-                str(r.session_id),
-                r.created_at.isoformat() if r.created_at else "",
-                r.data_hora_saida.isoformat() if r.data_hora_saida else "",
+                safe_phone,
+                str(session_id),
+                created_at.isoformat(),
+                checked_out_at.isoformat() if checked_out_at else "",
                 wait,
+                handoff_status,
+                exported_at.isoformat(),
             ]
         )
 
