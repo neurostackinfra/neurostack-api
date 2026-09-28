@@ -528,6 +528,8 @@ export const en = {
   handoff_first_message: "Message",
   handoff_btn_attended: "Attended",
   handoff_export_csv: "Export CSV",
+  handoff_export_limit_error: "The export exceeds the 10,000-record limit. Shorten the date range.",
+  handoff_export_timezone_error: "The browser timezone could not be used. Check your date and timezone settings, then try again.",
   handoff_empty: "No active handoffs at the moment.",
   handoff_filters_label: "Filters",
   handoff_filter_safety: "Only safety-flagged",

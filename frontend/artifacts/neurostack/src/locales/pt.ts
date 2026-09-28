@@ -530,6 +530,8 @@ export const pt: Record<TranslationKey, string> = {
   handoff_first_message: "Mensagem",
   handoff_btn_attended: "Atendido",
   handoff_export_csv: "Exportar CSV",
+  handoff_export_limit_error: "A exportação excede o limite de 10.000 registros. Reduza o período.",
+  handoff_export_timezone_error: "Não foi possível usar o fuso horário do navegador. Verifique as configurações de data e fuso horário e tente novamente.",
   handoff_empty: "Nenhum handoff ativo no momento.",
   handoff_filters_label: "Filtros",
   handoff_filter_safety: "Somente com sinalização de segurança",
