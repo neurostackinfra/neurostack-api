@@ -31,7 +31,7 @@ from src.api.schemas.config import (
 )
 from src.config.logging import get_logger as get_structured_logger
 from src.config.settings import settings
-from src.models.clinic_config import ClinicOperations, ClinicScheduling
+from src.models.clinic_config import ClinicHandoff, ClinicOperations, ClinicScheduling
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.tenant import Tenant
 from src.repositories import get_db_session_dependency
@@ -420,6 +420,16 @@ async def patch_config(
                 "fields": blocked_fields,
             },
         )
+    if "meta_minutos_atendimento" in patch_data:
+        try:
+            ClinicHandoff(
+                meta_minutos_atendimento=patch_data["meta_minutos_atendimento"]
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=jsonable_encoder(exc.errors()),
+            )
     tenant = await _resolve_config_tenant(request, tenant, session)
     # Do not create a row until modality validation has accepted the effective
     # patch.  A rejected first write must not flush, commit, or invalidate a

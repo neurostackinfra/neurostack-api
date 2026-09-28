@@ -94,6 +94,119 @@ def test_valid_business_hours_persist_and_round_trip(client: TestClient) -> None
     assert loaded.json()["business_hours"] == expected
 
 
+@pytest.mark.parametrize(
+    "value",
+    [0, 121, True, 1.0, "10", None],
+    ids=["zero", "too-high", "boolean", "float", "string", "null"],
+)
+def test_patch_rejects_invalid_handoff_service_time_without_writing(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    value: object,
+) -> None:
+    calls: list[str] = []
+
+    async def unexpected_load(*args: Any, **kwargs: Any) -> Any:
+        calls.append("load")
+        raise AssertionError("invalid SLA target must fail before loading config")
+
+    async def unexpected_cache(*args: Any, **kwargs: Any) -> None:
+        calls.append("cache")
+
+    monkeypatch.setattr("src.api.routes.config._load_config", unexpected_load)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache",
+        unexpected_cache,
+    )
+
+    response = client.patch(
+        PATH,
+        headers=_headers(),
+        json={"meta_minutos_atendimento": value},
+    )
+
+    assert response.status_code == 422
+    assert isinstance(response.json()["detail"], list)
+    assert calls == []
+
+
+@pytest.mark.parametrize("value", [1, 47, 120])
+def test_patch_persists_valid_handoff_service_time(
+    client: TestClient,
+    value: int,
+) -> None:
+    headers = _headers()
+
+    patched = client.patch(
+        PATH,
+        headers=headers,
+        json={"meta_minutos_atendimento": value},
+    )
+    loaded = client.get(PATH, headers=headers)
+
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["meta_minutos_atendimento"] == value
+    assert loaded.status_code == 200, loaded.text
+    assert loaded.json()["meta_minutos_atendimento"] == value
+
+
+@pytest.mark.asyncio
+async def test_patch_omitting_service_time_preserves_legacy_handoff_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = uuid4()
+    legacy_handoff = {
+        "meta_minutos_atendimento": "legacy-invalid",
+        "legacy_handoff_key": {"nested": True},
+    }
+    row = SimpleNamespace(
+        clinic_id=None,
+        version=1,
+        handoff=legacy_handoff,
+        **{
+            bucket: ([] if bucket in ARRAY_BUCKETS else {})
+            for bucket in ALL_BUCKETS
+            if bucket != "handoff"
+        },
+    )
+
+    class Session:
+        async def flush(self) -> None:
+            pass
+
+        async def commit(self) -> None:
+            pass
+
+    async def get_row(*args: Any, **kwargs: Any) -> Any:
+        return row
+
+    async def keep_tenant(*args: Any, **kwargs: Any) -> TenantContext:
+        return TenantContext(tenant_id=tenant_id, role="clinic_admin", user_id=None)
+
+    async def no_cache(*args: Any, **kwargs: Any) -> None:
+        pass
+
+    monkeypatch.setattr("src.api.routes.config._load_config", get_row)
+    monkeypatch.setattr("src.api.routes.config._resolve_config_tenant", keep_tenant)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache",
+        no_cache,
+    )
+
+    await patch_config(
+        request=SimpleNamespace(query_params={}),
+        body=ConfigPatchRequest(clinic_name="Nova clínica"),
+        tenant=TenantContext(tenant_id=tenant_id, role="clinic_admin", user_id=None),
+        session=Session(),  # type: ignore[arg-type]
+    )
+
+    assert row.handoff is legacy_handoff
+    assert row.handoff == {
+        "meta_minutos_atendimento": "legacy-invalid",
+        "legacy_handoff_key": {"nested": True},
+    }
+
+
 def test_operations_revalidation_preserves_existing_free_text_hours(
     client: TestClient,
 ) -> None:

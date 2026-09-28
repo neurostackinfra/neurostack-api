@@ -5,7 +5,7 @@ Estrutura de configuração da clínica para SRM, handoff e políticas de preço
 
 import re
 from enum import Enum
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 from urllib.parse import urlparse
 from uuid import UUID
 
@@ -122,7 +122,10 @@ class ClinicHandoff(BaseModel):
 
     default_mode: HandoffDefaultMode = HandoffDefaultMode.WHATSAPP_HUMAN_TAKEOVER
     sector_defaults: SectorDefaults = Field(default_factory=SectorDefaults)
-    meta_minutos_atendimento: int = 10
+    meta_minutos_atendimento: Annotated[
+        int,
+        Field(strict=True, ge=1, le=120),
+    ] = 10
 
 
 class ClinicIdentity(BaseModel):
