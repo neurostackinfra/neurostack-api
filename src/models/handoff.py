@@ -8,7 +8,17 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, func
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -73,6 +83,16 @@ class HandoffRecord(Base):
     """
 
     __tablename__ = "handoff_records"
+    __table_args__ = (
+        CheckConstraint(
+            "sla_target_seconds IS NULL OR " "sla_target_seconds BETWEEN 60 AND 7200",
+            name="ck_handoff_records_sla_target_seconds_range",
+        ),
+        CheckConstraint(
+            "lifecycle_version >= 0",
+            name="ck_handoff_records_lifecycle_version_nonnegative",
+        ),
+    )
 
     # Primary Key
     id: Mapped[UUID] = mapped_column(
@@ -172,6 +192,22 @@ class HandoffRecord(Base):
     data_hora_saida: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
+    )
+
+    # SLA snapshot and optimistic lifecycle coordination
+    sla_target_seconds: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    lifecycle_version: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default=text("0"),
+        nullable=False,
     )
 
     # Timestamp
