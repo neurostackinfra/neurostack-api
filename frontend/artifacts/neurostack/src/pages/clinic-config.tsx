@@ -2108,8 +2108,8 @@ export default function ClinicConfig() {
               <SwitchRow
                 label={txt("Link de Agendamento", "Scheduling Link")}
                 hint={txt(
-                  "Quando ativo, a IA envia o link (definido abaixo) ao paciente na confirmação do agendamento e cria um handoff pendente de verificação.",
-                  "When enabled, the AI sends the link (defined below) to the patient on scheduling confirmation and creates a pending-verification handoff.",
+                  "Quando ativo, a IA envia o link (definido abaixo) ao paciente após ele confirmar a solicitação de agendamento e cria um handoff pendente de verificação.",
+                  "When enabled, the AI sends the link (defined below) after the patient confirms the scheduling request and creates a pending-verification handoff.",
                 )}
                 checked={schedulingLinkEnabled}
                 onCheckedChange={(v) => {
