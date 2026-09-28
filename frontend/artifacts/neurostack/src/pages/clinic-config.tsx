@@ -1268,6 +1268,35 @@ const INVESTOR_MOCK_CONFIG = {
   ],
 };
 
+export function HitlComingSoonControl() {
+  const { locale } = useI18n();
+  const modeTitle = locale === "en"
+    ? "Co-pilot mode - COMING SOON"
+    : "Modo co-piloto - EM BREVE";
+
+  return (
+    <div
+      className="flex items-center justify-between gap-3 rounded-lg border border-border/60 bg-muted/20 px-4 py-4"
+      data-testid="hitl-coming-soon"
+    >
+      <div className="space-y-1">
+        <p className="text-sm font-semibold text-foreground">
+          Human-in-the-loop (HITL)
+        </p>
+        <p className="text-xs text-muted-foreground">
+          {modeTitle}
+        </p>
+      </div>
+      <Switch
+        aria-label={modeTitle}
+        checked={false}
+        disabled
+        className="shrink-0"
+      />
+    </div>
+  );
+}
+
 export default function ClinicConfig() {
   const { clinicId, isReadOnly, isClinicAdmin, role, isBuilder, isSuperAdmin, isInvestor, viewingClinicId } = useAuth();
   const { t, locale } = useI18n();
@@ -1370,8 +1399,6 @@ export default function ClinicConfig() {
   const [handoffPeriod, setHandoffPeriod] = useState("permanent");
   const [handoffCycleDays, setHandoffCycleDays] = useState("");
   const [handoffInactiveDefaultHours, setHandoffInactiveDefaultHours] = useState("24");
-  const [hitlActive, setHitlActive] = useState(false);
-  const [hitlCooldown, setHitlCooldown] = useState("15");
 
   // Tab 5 — Catálogo de Serviços
   const [services, setServices] = useState<ClinicService[]>([]);
@@ -2595,58 +2622,7 @@ export default function ClinicConfig() {
               </div>
 
               {/* ── HITL Block ─────────────────────────────────────── */}
-                  <div className="rounded-lg border border-border/60 bg-muted/20 px-4 py-4 space-y-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="space-y-1 flex-1">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-sm font-semibold text-foreground">
-                            {txt("Ativar Human-in-the-Loop (Modo Co-Piloto)", "Enable Human-in-the-Loop (Co-Pilot Mode)")}
-                          </span>
-                          <span className="inline-flex items-center rounded-full border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[10px] font-bold tracking-wider text-indigo-500">
-                            {txt("Recomendado · HITL", "Recommended · HITL")}
-                          </span>
-                          <span className="inline-flex items-center rounded-full border border-purple-500/40 bg-purple-500/10 px-2 py-0.5 text-[10px] font-bold tracking-wider text-purple-400">
-                            ROADMAP · V2
-                          </span>
-                        </div>
-                        <p className="text-xs text-muted-foreground leading-relaxed">
-                          {txt("Em vez de desligar a IA permanentemente, ela pausará e lerá as mensagens da sua equipe no WhatsApp Web, mantendo o contexto para continuar a venda depois.", "Instead of permanently disabling AI, it will pause and read your team's messages on WhatsApp Web, keeping context to continue the conversation later.")}
-                        </p>
-                      </div>
-                      <Switch
-                        checked={hitlActive}
-                        disabled={isReadOnly}
-                        onCheckedChange={() => {
-                          toast({
-                            title: txt("Funcionalidade em desenvolvimento", "Feature in development"),
-                            description: txt("O Modo Co-Piloto estará disponível na V2.", "Co-Pilot Mode will be available in V2."),
-                          });
-                        }}
-                        className="mt-0.5 shrink-0"
-                      />
-                    </div>
-
-                    {hitlActive && (
-                      <div className="pt-1 border-t border-border/40 space-y-1.5">
-                        <label className="text-xs font-semibold text-foreground/80">
-                          {txt("Tempo de Pausa Ativa (Cooldown)", "Active Pause Time (Cooldown)")}
-                        </label>
-                        <Select value={hitlCooldown} onValueChange={setHitlCooldown} disabled={isReadOnly}>
-                          <SelectTrigger className="h-9 text-sm">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="5">5 {txt("Minutos", "Minutes")}</SelectItem>
-                            <SelectItem value="15">15 {txt("Minutos", "Minutes")}</SelectItem>
-                            <SelectItem value="30">30 {txt("Minutos", "Minutes")}</SelectItem>
-                          </SelectContent>
-                        </Select>
-                        <p className="text-[11px] text-muted-foreground">
-                          {txt("A IA ficará em silêncio por este período após cada mensagem enviada por um humano.", "AI will stay silent for this period after each message sent by a human.")}
-                        </p>
-                      </div>
-                    )}
-                  </div>
+                  <HitlComingSoonControl />
 
                   <SwitchRow
                     label={txt("Modo Stand-by pós-Handoff", "Post-Handoff Stand-by Mode")}
