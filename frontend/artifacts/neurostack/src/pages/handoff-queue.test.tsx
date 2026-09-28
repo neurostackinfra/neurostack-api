@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
     viewingClinicId: "",
   },
   fetch: vi.fn(),
+  toast: vi.fn(),
 }));
 
 vi.mock("@/context/auth", () => ({
@@ -20,7 +21,7 @@ vi.mock("@/context/auth", () => ({
 }));
 
 vi.mock("@/hooks/use-toast", () => ({
-  useToast: () => ({ toast: vi.fn() }),
+  useToast: () => ({ toast: mocks.toast }),
 }));
 
 interface QueueItemFixture {
@@ -111,7 +112,14 @@ beforeEach(() => {
     viewingClinicId: "",
   });
   mocks.fetch.mockReset();
+  mocks.toast.mockReset();
   vi.stubGlobal("fetch", mocks.fetch);
+  vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue({
+    locale: "pt-BR",
+    calendar: "gregory",
+    numberingSystem: "latn",
+    timeZone: "America/Sao_Paulo",
+  });
 });
 
 afterEach(() => {
@@ -270,13 +278,15 @@ describe("<HandoffQueuePage />", () => {
   });
 
   it("keeps KPI and date-only CSV semantics when card filters change", async () => {
+    const exportedBlob = new Blob(["csv"]);
+    const blob = vi.fn(async () => exportedBlob);
     const createObjectURL = vi.fn(() => "blob:handoffs");
     const revokeObjectURL = vi.fn();
     vi.stubGlobal("URL", Object.assign(URL, { createObjectURL, revokeObjectURL }));
-    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
     mocks.fetch.mockImplementation(async (input: RequestInfo | URL) => {
       if (String(input).includes("/export?")) {
-        return { ok: true, blob: async () => new Blob(["csv"]) } as Response;
+        return { ok: true, blob } as unknown as Response;
       }
       return queueResponse();
     });
@@ -292,15 +302,86 @@ describe("<HandoffQueuePage />", () => {
     expect(screen.getByText("00:02:18")).toBeInTheDocument();
     expect(mocks.fetch).toHaveBeenCalledTimes(1);
 
+    const createElement = vi.spyOn(document, "createElement");
+    const appendChild = vi.spyOn(document.body, "appendChild");
+    const removeChild = vi.spyOn(document.body, "removeChild");
+
     fireEvent.click(screen.getByRole("button", { name: "Exportar CSV" }));
     await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(2));
 
     const exportUrl = String(mocks.fetch.mock.calls[1][0]);
     expect(initialUrl).toMatch(/^\/v1\/handoffs\/queue\?tenant_id=clinic-id&from_date=\d{4}-\d{2}-\d{2}&to_date=\d{4}-\d{2}-\d{2}$/);
-    expect(exportUrl).toMatch(/^\/v1\/handoffs\/queue\/export\?tenant_id=clinic-id&from_date=\d{4}-\d{2}-\d{2}&to_date=\d{4}-\d{2}-\d{2}$/);
+    expect(exportUrl).toMatch(/^\/v1\/handoffs\/queue\/export\?tenant_id=clinic-id&from_date=\d{4}-\d{2}-\d{2}&to_date=\d{4}-\d{2}-\d{2}&timezone=America%2FSao_Paulo$/);
     expect(exportUrl).not.toContain("safety");
     expect(exportUrl).not.toContain("intent");
-    expect(createObjectURL).toHaveBeenCalledTimes(1);
+    expect(mocks.fetch.mock.calls[1][1]).toEqual({
+      headers: { Authorization: "Bearer test-token" },
+    });
+    expect(blob).toHaveBeenCalledTimes(1);
+    expect(createObjectURL).toHaveBeenCalledWith(exportedBlob);
+    const anchor = createElement.mock.results.find(
+      (result) => result.value instanceof HTMLAnchorElement,
+    )?.value as HTMLAnchorElement;
+    expect(anchor).toBeInstanceOf(HTMLAnchorElement);
+    expect(anchor.download).toBe("handoffs.csv");
+    expect(anchor.href).toBe("blob:handoffs");
+    expect(appendChild).toHaveBeenCalledWith(anchor);
+    expect(anchorClick).toHaveBeenCalledTimes(1);
+    expect(removeChild).toHaveBeenCalledWith(anchor);
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:handoffs");
+  });
+
+  it.each([
+    {
+      locale: "pt" as const,
+      detail: "export_limit_10000_exceeded",
+      message: "A exportação excede o limite de 10.000 registros. Reduza o período.",
+      button: "Exportar CSV",
+    },
+    {
+      locale: "en" as const,
+      detail: "export_limit_10000_exceeded",
+      message: "The export exceeds the 10,000-record limit. Shorten the date range.",
+      button: "Export CSV",
+    },
+    {
+      locale: "pt" as const,
+      detail: "invalid_timezone",
+      message: "Não foi possível usar o fuso horário do navegador. Verifique as configurações de data e fuso horário e tente novamente.",
+      button: "Exportar CSV",
+    },
+    {
+      locale: "en" as const,
+      detail: "invalid_timezone",
+      message: "The browser timezone could not be used. Check your date and timezone settings, then try again.",
+      button: "Export CSV",
+    },
+  ])("shows the localized $detail export error in $locale without downloading", async ({ locale, detail, message, button }) => {
+    const createObjectURL = vi.fn();
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    vi.stubGlobal("URL", Object.assign(URL, { createObjectURL }));
+    mocks.fetch.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input).includes("/export?")) {
+        return {
+          ok: false,
+          status: 400,
+          json: async () => ({ detail }),
+        } as Response;
+      }
+      return queueResponse();
+    });
+
+    renderPage(locale);
+    await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
+    fireEvent.click(screen.getByRole("button", { name: button }));
+
+    await waitFor(() => {
+      expect(mocks.toast).toHaveBeenCalledWith({ title: message, variant: "destructive" });
+    });
+    const exportUrl = String(mocks.fetch.mock.calls[1][0]);
+    expect(exportUrl).toContain("timezone=America%2FSao_Paulo");
+    expect(createObjectURL).not.toHaveBeenCalled();
+    expect(anchorClick).not.toHaveBeenCalled();
   });
 
   it("keeps checkout and attend-and-redirect actions operational", async () => {
