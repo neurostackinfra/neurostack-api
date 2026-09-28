@@ -87,7 +87,12 @@ function jsonResponse(data: unknown): Response {
   } as Response;
 }
 
-function renderTraces(items: TraceFixture[], total = items.length) {
+function renderTraces(
+  items: TraceFixture[],
+  total = items.length,
+  locale: "pt" | "en" = "pt",
+) {
+  localStorage.setItem("ns_locale", locale);
   mocks.fetch.mockImplementation(async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url.startsWith("/v1/traces/export?")) {
@@ -144,6 +149,16 @@ afterEach(() => {
 });
 
 describe("<TracesList /> presentation contract", () => {
+  it.each([
+    { locale: "pt" as const, visible: "Relatórios e Exportação", hidden: "Reports & Export" },
+    { locale: "en" as const, visible: "Reports & Export", hidden: "Relatórios e Exportação" },
+  ])("shows a single report heading in $locale", async ({ locale, visible, hidden }) => {
+    renderTraces([], 0, locale);
+
+    expect(await screen.findByText(visible)).toBeInTheDocument();
+    expect(screen.queryByText(hidden)).not.toBeInTheDocument();
+  });
+
   it("keeps the raw funnel stage in trace history", async () => {
     renderTraces([traceFixture("stage-trace", "faq")]);
 

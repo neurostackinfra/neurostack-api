@@ -447,32 +447,30 @@ export default function HandoffQueuePage() {
         {/* Average handoff time */}
         <div className="relative rounded-xl border bg-card p-5 shadow-sm text-center">
           <Repeat className="absolute left-5 top-5 h-5 w-5 text-primary" />
-          <p className="text-base font-bold">Tempo médio de handoff</p>
-          <p className="text-xs text-muted-foreground">Average Handoff Time</p>
+          <p className="text-base font-bold">{t("handoff_avg_title")}</p>
           <div className="mx-auto mt-4 w-fit rounded-xl bg-muted/60 px-8 py-3">
             <span className="font-mono text-5xl font-bold tracking-wider tabular-nums">
               {formatHMS(stats.avg_wait_seconds)}
             </span>
           </div>
           <p className="text-xs text-muted-foreground mt-3">
-            Tempo médio que o humano demora para atender
+            {t("handoff_avg_description")}
           </p>
         </div>
 
         {/* Goal achievement gauge */}
         <div className="relative rounded-xl border bg-card p-5 shadow-sm text-center">
           <Gauge className="absolute left-5 top-5 h-5 w-5 text-primary" />
-          <p className="text-base font-bold">Meta de atendimento no handoff</p>
-          <p className="text-xs text-muted-foreground">Handoff Goal Achievement</p>
+          <p className="text-base font-bold">{t("handoff_goal_title")}</p>
           <div className="flex justify-center mt-1">
             <SemiGauge value={stats.pct_within_sla} />
           </div>
-          <p className="text-sm font-semibold -mt-2">Meta: ≥ {HANDOFF_GOAL_PCT}%</p>
+          <p className="text-sm font-semibold -mt-2">{t("handoff_goal_label")} ≥ {HANDOFF_GOAL_PCT}%</p>
           <p className="text-xs text-muted-foreground mt-1">
             {t("handoff_goal_current")} {formatHMS(stats.avg_wait_seconds)}
           </p>
           <p className="text-xs text-muted-foreground mt-1">
-            Porcentagem da meta do tempo de atendimento alcançado
+            {t("handoff_goal_description")}
           </p>
         </div>
       </div>

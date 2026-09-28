@@ -159,6 +159,46 @@ describe("<HandoffQueuePage />", () => {
     expect(screen.queryByText("stage-payload-marker")).not.toBeInTheDocument();
   });
 
+  it.each([
+    {
+      locale: "pt" as const,
+      averageTitle: "Tempo médio de handoff",
+      averageDescription: "Tempo médio que o humano demora para atender",
+      goalTitle: "Meta de atendimento no handoff",
+      goalLabel: "Meta: ≥ 85%",
+      goalDescription: "Porcentagem da meta do tempo de atendimento alcançado",
+      hidden: ["Average Handoff Time", "Handoff Goal Achievement"],
+    },
+    {
+      locale: "en" as const,
+      averageTitle: "Average Handoff Time",
+      averageDescription: "Average time before a human starts the service",
+      goalTitle: "Handoff Goal Achievement",
+      goalLabel: "Goal: ≥ 85%",
+      goalDescription: "Percentage of the service-time goal achieved",
+      hidden: ["Tempo médio de handoff", "Meta de atendimento no handoff"],
+    },
+  ])("shows handoff analytics only in $locale", async ({
+    locale,
+    averageTitle,
+    averageDescription,
+    goalTitle,
+    goalLabel,
+    goalDescription,
+    hidden,
+  }) => {
+    await renderLoaded(locale);
+
+    expect(screen.getByText(averageTitle)).toBeInTheDocument();
+    expect(screen.getByText(averageDescription)).toBeInTheDocument();
+    expect(screen.getByText(goalTitle)).toBeInTheDocument();
+    expect(screen.getByText((_, element) => (
+      element?.tagName === "P" && element.textContent === goalLabel
+    ))).toBeInTheDocument();
+    expect(screen.getByText(goalDescription)).toBeInTheDocument();
+    hidden.forEach((text) => expect(screen.queryByText(text)).not.toBeInTheDocument());
+  });
+
   it("preserves received order through safety, bucket, AND, and clear without fetching", async () => {
     await renderLoaded();
     const requestCount = mocks.fetch.mock.calls.length;
