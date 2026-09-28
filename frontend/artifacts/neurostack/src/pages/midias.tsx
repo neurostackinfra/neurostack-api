@@ -87,7 +87,6 @@ export default function Midias() {
             <div>
               <h1 className="text-2xl font-bold tracking-tight text-foreground">
                 {txt("Central de Mídias e Ativos", "Media & Assets Hub")}
-                <span className="text-foreground/60 font-normal text-lg ml-2">(Contextual Assets)</span>
               </h1>
               <p className="text-sm font-medium text-foreground/70 mt-0.5">
                 {txt(

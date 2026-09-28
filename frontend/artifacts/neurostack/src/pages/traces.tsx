@@ -252,7 +252,6 @@ export default function TracesList() {
           </div>
           <div>
             <p className="text-sm font-semibold text-foreground">{t("traces_report_title")}</p>
-            {locale === "pt" && <p className="text-xs text-muted-foreground">Reports & Export</p>}
           </div>
         </div>
 
