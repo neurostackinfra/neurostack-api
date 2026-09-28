@@ -358,10 +358,26 @@ export default function HandoffQueuePage() {
       const params = new URLSearchParams({ tenant_id: effectiveTenantId });
       if (startDate) params.set("from_date", startDate);
       if (endDate) params.set("to_date", endDate);
+      const timezoneName = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (timezoneName) params.set("timezone", timezoneName);
       const res = await fetch(`/v1/handoffs/queue/export?${params.toString()}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      if (!res.ok) return;
+      if (!res.ok) {
+        let detail: unknown;
+        try {
+          const error = await res.json();
+          detail = error?.detail;
+        } catch {
+          detail = undefined;
+        }
+        if (detail === "export_limit_10000_exceeded") {
+          toast({ title: t("handoff_export_limit_error"), variant: "destructive" });
+        } else if (detail === "invalid_timezone") {
+          toast({ title: t("handoff_export_timezone_error"), variant: "destructive" });
+        }
+        return;
+      }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
