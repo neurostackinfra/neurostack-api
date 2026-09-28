@@ -170,7 +170,7 @@ export const pt: Record<TranslationKey, string> = {
 
   // Clinic Config — Integrations
   config_integrations: "Integrações (BYOK)",
-  config_integrations_desc: "Traga suas próprias chaves. Configure LLM e WhatsApp externos. Deixe em branco para usar o mock.",
+  config_integrations_desc: "Traga suas próprias chaves. Configure LLM, WhatsApp, TTS, STT.",
   config_llm_section: "Provedor de LLM",
   config_provider: "Provedor",
   config_llm_none: "- Nenhum (usar mock) -",
