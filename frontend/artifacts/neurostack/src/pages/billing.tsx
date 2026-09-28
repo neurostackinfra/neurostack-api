@@ -232,7 +232,6 @@ export default function Billing() {
             <div>
               <h1 className="text-2xl font-bold tracking-tight text-foreground">
                 {txt("Faturamento e Gestão de Assinatura", "Billing & Subscription Management")}
-                <span className="text-foreground/60 font-normal text-lg ml-2">(Billing)</span>
               </h1>
               <p className="text-sm font-medium text-foreground/70 mt-0.5">
                 {txt(
