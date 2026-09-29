@@ -26,6 +26,7 @@ from src.api.middleware.rate_limit import (
 from src.api.schemas.events import EventPayload, EventRequest, EventType
 from src.config.settings import settings
 from src.core.lgpd_utils import resolve_privacy_link
+from src.handoff.pause_policy import resolve_handoff_pause
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.tenant import Tenant as TenantModel
 from src.repositories import SessionRepository, get_db_session_dependency
@@ -946,19 +947,22 @@ async def _load_tenant_credentials(
 async def _load_handoff_config(
     tenant_id: UUID,
     db: AsyncSession,
-) -> dict[str, Any]:
+) -> Any:
     """Load handoff config bucket for a tenant."""
     stmt = select(ClinicConfigTable.handoff).where(
         ClinicConfigTable.tenant_id == tenant_id,
     )
     result = await db.execute(stmt)
-    return result.scalar_one_or_none() or {}
+    loaded = result.scalar_one_or_none()
+    return loaded if loaded is not None else {}
 
 
 async def _check_pause_state(
     tenant_id: UUID,
     phone: str,
     db: AsyncSession,
+    *,
+    now: datetime | None = None,
 ) -> Optional[dict[str, Any]]:
     """Check if session is paused. Returns action dict or None to continue.
 
@@ -978,10 +982,19 @@ async def _check_pause_state(
     if not session.is_paused:
         return None
 
-    now = datetime.now(timezone.utc)
+    current_time = now or datetime.now(timezone.utc)
 
-    # Lazy unpause: paused_until expired
-    if session.paused_until and session.paused_until <= now:
+    # Lazy unpause: paused_until expired. SQLite test/dev storage may return a
+    # naive UTC datetime even though PostgreSQL preserves timezone metadata.
+    deadline = session.paused_until
+    comparable_deadline = deadline
+    if (
+        comparable_deadline is not None
+        and comparable_deadline.tzinfo is None
+        and current_time.tzinfo is not None
+    ):
+        comparable_deadline = comparable_deadline.replace(tzinfo=current_time.tzinfo)
+    if comparable_deadline and comparable_deadline <= current_time:
         session.is_paused = False
         session.paused_until = None
         await db.flush()
@@ -1043,6 +1056,8 @@ async def _handle_clinic_message(
     message_text: str,
     db: AsyncSession,
     message_id: Optional[str] = None,
+    *,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Handle fromMe=true messages (clinic/secretary).
 
@@ -1080,9 +1095,9 @@ async def _handle_clinic_message(
         await db.flush()
         return {"ok": True, "skipped": "ai_echo_db"}
 
-    handoff_cfg = await _load_handoff_config(tenant_id, db)
-
-    handoff_active = str(handoff_cfg.get("handoff_active", "yes")).lower()
+    handoff_bucket = await _load_handoff_config(tenant_id, db)
+    handoff_cfg = handoff_bucket if isinstance(handoff_bucket, dict) else {}
+    current_time = now or datetime.now(timezone.utc)
     import re as _re
 
     def _normalize_for_match(s: str) -> str:
@@ -1099,16 +1114,44 @@ async def _handle_clinic_message(
             )
         )
     )
-    reactivation_hours = int(handoff_cfg.get("reactivation_delay_hours", 1))
-
     normalized_text = _normalize_for_match(message_text)
 
     # Check if message contains the trigger phrase (flexible match, punctuation-tolerant)
     if trigger_msg in normalized_text:
         if session.is_paused:
-            session.paused_until = datetime.now(timezone.utc) + timedelta(
-                hours=reactivation_hours
-            )
+            raw_reactivation_hours = handoff_cfg.get("reactivation_delay_hours", 1)
+            fallback_reason: str | None = None
+            if isinstance(raw_reactivation_hours, bool) or not isinstance(
+                raw_reactivation_hours, (int, str)
+            ):
+                reactivation_hours = 1
+                fallback_reason = "invalid_duration"
+            else:
+                try:
+                    reactivation_hours = int(raw_reactivation_hours)
+                    if reactivation_hours <= 0:
+                        reactivation_hours = 1
+                        fallback_reason = "invalid_duration"
+                except ValueError:
+                    reactivation_hours = 1
+                    fallback_reason = "invalid_duration"
+            try:
+                reactivates_at = current_time + timedelta(hours=reactivation_hours)
+            except OverflowError:
+                reactivation_hours = 1
+                reactivates_at = current_time + timedelta(hours=reactivation_hours)
+                fallback_reason = "unrepresentable_duration"
+            if fallback_reason is not None:
+                logger.warning(
+                    "handoff_reactivation_config_tolerated",
+                    extra={
+                        "tenant_id": str(tenant_id),
+                        "session_id": str(session.id),
+                        "field": "reactivation_delay_hours",
+                        "reason": fallback_reason,
+                    },
+                )
+            session.paused_until = reactivates_at
             await db.flush()
             logger.info(
                 "trigger_reactivation",
@@ -1123,8 +1166,19 @@ async def _handle_clinic_message(
             return {"ok": True, "action": "trigger_reactivation"}
         return {"ok": True, "action": "already_active"}
 
-    # Not trigger message — check for human takeover
-    if handoff_active != "yes":
+    # Not trigger message — resolve the shared human-takeover pause policy.
+    decision = resolve_handoff_pause(handoff_bucket, current_time)
+    for notice in decision.notices:
+        logger.warning(
+            "handoff_pause_policy_tolerated",
+            extra={
+                "tenant_id": str(tenant_id),
+                "session_id": str(session.id),
+                "field": notice.field,
+                "reason": notice.reason,
+            },
+        )
+    if not decision.should_pause:
         return {"ok": True, "skipped": "handoff_inactive"}
 
     if session.is_paused:
@@ -1132,19 +1186,7 @@ async def _handle_clinic_message(
 
     # Human takeover: pause session (no mark-unread — secretary is in conversation)
     session.is_paused = True
-
-    standby_mode = str(handoff_cfg.get("standby_mode", "active")).lower()
-    handoff_period = str(handoff_cfg.get("handoff_period", "permanent")).lower()
-    if standby_mode == "inactive":
-        fallback_hours = int(handoff_cfg.get("handoff_inactive_default_hours", 24))
-        session.paused_until = datetime.now(timezone.utc) + timedelta(
-            hours=fallback_hours
-        )
-    elif handoff_period == "cycle":
-        cycle_days = int(handoff_cfg.get("handoff_cycle_days", 7))
-        session.paused_until = datetime.now(timezone.utc) + timedelta(days=cycle_days)
-    else:
-        session.paused_until = None  # permanent — espera frase mestra
+    session.paused_until = decision.paused_until
 
     await db.flush()
     logger.info(
@@ -2987,12 +3029,11 @@ async def _meta_initiate_file_handoff(
     session_id: UUID,
     from_phone: str,
     note: str,
-) -> None:
+) -> Any:
     """Initiate a human handoff signalling that a file/audio is pending review.
 
-    Failures are logged at exception level (matching the "send failed"
-    parity requirement) but never re-raised — the webhook should still
-    return 200 so Meta does not retry.
+    PostgreSQL insertion is mandatory. Failures propagate to the route so it
+    cannot clear state or acknowledge a handoff that does not exist.
     """
     from src.handoff.models import HandoffReason, HandoffRequest, HandoffUrgency
     from src.services.handoff_service import get_handoff_service
@@ -3010,20 +3051,21 @@ async def _meta_initiate_file_handoff(
         },
     )
     try:
-        await handoff_service.initiate_handoff(request)
-        logger.info(
-            "Meta file handoff initiated for %s (session=%s, note=%s)",
-            from_phone,
-            session_id,
-            note,
-        )
-    except Exception as exc:
+        response = await handoff_service.initiate_handoff(request)
+    except Exception:
         logger.exception(
-            "Meta file handoff init failed for %s (session=%s) — %s",
-            from_phone,
+            "Meta file handoff creation failed tenant=%s session=%s",
+            tenant_id,
             session_id,
-            exc,
         )
+        raise
+    logger.info(
+        "Meta file handoff initiated for %s (session=%s, note=%s)",
+        from_phone,
+        session_id,
+        note,
+    )
+    return response
 
 
 @router.get(
@@ -3462,6 +3504,12 @@ async def meta_webhook(
                         if agent_lang == "en"
                         else _AUDIO_TOO_LONG_MSG_PT
                     )
+                    await _meta_initiate_file_handoff(
+                        tenant_id,
+                        session_id,
+                        from_phone,
+                        "audio_too_long",
+                    )
                     if meta_pnid and meta_token:
                         try:
                             await send_meta_cloud_text(
@@ -3476,12 +3524,6 @@ async def meta_webhook(
                                 from_phone,
                                 exc,
                             )
-                    await _meta_initiate_file_handoff(
-                        tenant_id,
-                        session_id,
-                        from_phone,
-                        "audio_too_long",
-                    )
                     logger.info(
                         "Meta audio too long (%d bytes > ~%ds*%dB) for %s — handoff",
                         file_size,

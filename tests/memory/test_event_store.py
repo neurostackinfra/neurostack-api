@@ -159,7 +159,7 @@ class TestEventStoreInit:
         assert store._max_overflow == 15
 
     @pytest.mark.asyncio
-    async def test_connect_publishes_only_after_probe_and_retries_after_failure(
+    async def test_connect_publishes_only_after_probe_and_disposes_failed_engine(
         self,
         monkeypatch: pytest.MonkeyPatch,
         mock_engine: AsyncMock,
@@ -221,6 +221,7 @@ class TestEventStoreInit:
         connecting = asyncio.create_task(store.connect())
         await probe_started.wait()
         connecting.cancel()
+
         with pytest.raises(asyncio.CancelledError):
             await connecting
 
@@ -804,6 +805,8 @@ class TestQueryOperations:
         assert len(result.events) == 1
         assert result.total_count == 1
         assert result.has_more is False
+        assert mock_session.execute.await_count == 2
+        assert "COUNT(*)" in str(mock_session.execute.await_args_list[1].args[0])
 
     @pytest.mark.asyncio
     async def test_recent_messages_uses_one_limited_select_without_count(

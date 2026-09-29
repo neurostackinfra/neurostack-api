@@ -1,4 +1,4 @@
-"""add handoff SLA snapshot and lifecycle version
+"""add handoff SLA snapshot and lifecycle metadata
 
 Revision ID: 021
 Revises: 020
@@ -50,15 +50,26 @@ def upgrade() -> None:
         "lifecycle_version >= 0",
         postgresql_not_valid=True,
     )
-    op.execute(sa.text(f"ALTER TABLE handoff_records VALIDATE CONSTRAINT {_SLA_CHECK}"))
-    op.execute(
-        sa.text(f"ALTER TABLE handoff_records VALIDATE CONSTRAINT {_VERSION_CHECK}")
-    )
+    with op.get_context().autocommit_block():
+        op.execute(
+            sa.text(f"ALTER TABLE handoff_records VALIDATE CONSTRAINT {_SLA_CHECK}")
+        )
+        op.execute(
+            sa.text(f"ALTER TABLE handoff_records VALIDATE CONSTRAINT {_VERSION_CHECK}")
+        )
 
 
 def downgrade() -> None:
-    op.drop_constraint(_VERSION_CHECK, "handoff_records", type_="check")
-    op.drop_constraint(_SLA_CHECK, "handoff_records", type_="check")
+    op.drop_constraint(
+        _VERSION_CHECK,
+        "handoff_records",
+        type_="check",
+    )
+    op.drop_constraint(
+        _SLA_CHECK,
+        "handoff_records",
+        type_="check",
+    )
     op.drop_column("handoff_records", "lifecycle_version")
     op.drop_column("handoff_records", "updated_at")
     op.drop_column("handoff_records", "sla_target_seconds")

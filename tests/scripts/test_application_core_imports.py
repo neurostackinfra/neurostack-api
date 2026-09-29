@@ -9,11 +9,9 @@ ROOT = Path(__file__).resolve().parents[2]
 CONSUMERS = (
     Path("src/api/routes/policies.py"),
     Path("src/core/pipeline.py"),
-    Path("src/handoff/sla.py"),
     Path("src/memory/__init__.py"),
     Path("src/memory/models.py"),
     Path("src/services/business_hours.py"),
-    Path("src/services/handoff_service.py"),
     Path("src/services/trace_adapter.py"),
 )
 FACADES = {

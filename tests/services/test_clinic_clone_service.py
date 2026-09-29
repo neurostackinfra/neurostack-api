@@ -41,6 +41,11 @@ _EXPECTED_BUCKET_KEYS = {
         "default_mode",
         "sector_defaults",
         "meta_minutos_atendimento",
+        "handoff_active",
+        "standby_mode",
+        "handoff_period",
+        "handoff_cycle_hours",
+        "handoff_cycle_days",
     },
     "identity": {
         "clinic_name",
@@ -135,6 +140,11 @@ def _source_config(**overrides):
             "default_mode": "crm_task_create",
             "sector_defaults": {"agendamento": "imediato", "clinico": "rotina"},
             "meta_minutos_atendimento": 23,
+            "handoff_active": "yes",
+            "standby_mode": "active",
+            "handoff_period": "cycle",
+            "handoff_cycle_hours": 6,
+            "handoff_cycle_days": None,
         },
         "identity": {
             "clinic_name": "Source",
@@ -264,6 +274,11 @@ def test_config_clone_copies_every_allowlisted_field_and_applies_resets():
     assert clone["post_care"] == source.post_care
     assert clone["handoff"]["default_mode"] == "crm_task_create"
     assert clone["handoff"]["meta_minutos_atendimento"] == 23
+    assert clone["handoff"]["handoff_active"] == "yes"
+    assert clone["handoff"]["standby_mode"] == "active"
+    assert clone["handoff"]["handoff_period"] == "cycle"
+    assert clone["handoff"]["handoff_cycle_hours"] == 6
+    assert clone["handoff"]["handoff_cycle_days"] is None
     assert clone["handoff"]["sector_defaults"] == {
         "agendamento": "imediato",
         "financeiro": "rotina",

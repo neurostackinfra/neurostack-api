@@ -36,8 +36,7 @@ export const pt: Record<TranslationKey, string> = {
   password_change_own_title: "Alterar minha senha",
   password_change_own_description: "Escolha uma nova senha para sua conta.",
   password_change_clinic_title: "Alterar senha da clínica",
-  password_change_clinic_description:
-    "Escolha uma nova senha para o administrador desta clínica.",
+  password_change_clinic_description: "Escolha uma nova senha para o administrador desta clínica.",
   password_change_new_label: "Nova senha",
   password_change_confirm_label: "Confirmar nova senha",
   password_change_submit: "Alterar senha",
@@ -121,10 +120,8 @@ export const pt: Record<TranslationKey, string> = {
 
   // Trace History
   traces_title: "Histórico de Traces",
-  traces_subtitle:
-    "Registro de auditoria de todas as decisões cognitivas do agente.",
-  traces_empty:
-    "Nenhum trace registrado. Use o simulador para gerar atividade.",
+  traces_subtitle: "Registro de auditoria de todas as decisões cognitivas do agente.",
+  traces_empty: "Nenhum trace registrado. Use o simulador para gerar atividade.",
   traces_fail: "Falha ao carregar traces. Tente novamente.",
 
   // Chat
@@ -136,13 +133,11 @@ export const pt: Record<TranslationKey, string> = {
   chat_waiting: "Aguardando atividade. Envie uma mensagem para gerar um trace.",
   chat_placeholder: "Mensagem para o agente...",
   chat_no_clinic_selected_title: "Nenhuma clínica selecionada",
-  chat_no_clinic_selected_desc:
-    "Selecione uma clínica no menu lateral antes de usar o simulador.",
+  chat_no_clinic_selected_desc: "Selecione uma clínica no menu lateral antes de usar o simulador.",
 
   // Clinic Config — Identity
   config_title: "Config. da Clínica",
-  config_subtitle:
-    "Dados dinâmicos injetados no pipeline de raciocínio em tempo real.",
+  config_subtitle: "Dados dinâmicos injetados no pipeline de raciocínio em tempo real.",
   config_pricing_badge: "pricing_mode: consult_only",
   config_identity: "Identidade",
   config_identity_desc: "Usado em comunicações do agente e prompts do sistema.",
@@ -153,15 +148,12 @@ export const pt: Record<TranslationKey, string> = {
 
   // Clinic Config — Differentials
   config_differentials: "Diferenciais da Clínica",
-  config_differentials_hint:
-    "Escreva 2 a 4 frases. O pipeline separará em itens de contexto individuais.",
+  config_differentials_hint: "Escreva 2 a 4 frases. O pipeline separará em itens de contexto individuais.",
 
   // Clinic Config — Services
   config_services: "Serviços Oferecidos",
-  config_services_desc:
-    "Usado para qualificação de intenções e respostas de interesse em tratamento.",
-  config_services_empty:
-    'Nenhum serviço configurado. Clique em "Adicionar" para incluir.',
+  config_services_desc: "Usado para qualificação de intenções e respostas de interesse em tratamento.",
+  config_services_empty: "Nenhum serviço configurado. Clique em \"Adicionar\" para incluir.",
   config_add: "Adicionar",
   config_service_label: "Serviço",
   config_name_label: "Nome",
@@ -178,8 +170,7 @@ export const pt: Record<TranslationKey, string> = {
 
   // Clinic Config — Integrations
   config_integrations: "Integrações (BYOK)",
-  config_integrations_desc:
-    "Traga suas próprias chaves. Configure LLM, WhatsApp, TTS, STT.",
+  config_integrations_desc: "Traga suas próprias chaves. Configure LLM, WhatsApp, TTS, STT.",
   config_llm_section: "Provedor de LLM",
   config_provider: "Provedor",
   config_llm_none: "- Nenhum (usar mock) -",
@@ -187,8 +178,7 @@ export const pt: Record<TranslationKey, string> = {
   config_llm_gemini: "Gemini",
   config_llm_dropout: "Dropout (compatível com OpenAI)",
   config_llm_cortex: "SLM Cortex - Fallback para Dropout (Em Breve)",
-  config_cortex_note:
-    "SLM Vertical Proprietário. Roteando via Dropout para testes de MVP.",
+  config_cortex_note: "SLM Vertical Proprietário. Roteando via Dropout para testes de MVP.",
   config_roadmap: "Roadmap",
   config_llm_key: "Chave API",
   config_llm_key_ph: "sk-...",
@@ -197,8 +187,7 @@ export const pt: Record<TranslationKey, string> = {
   config_llm_base_url_ph: "https://api.dropout.ai",
   config_whatsapp_section: "WhatsApp (Z-API)",
   config_whatsapp_url: "URL da Instância API",
-  config_whatsapp_url_ph:
-    "https://api.z-api.io/instances/{instanceId}/token/{token}",
+  config_whatsapp_url_ph: "https://api.z-api.io/instances/{instanceId}/token/{token}",
   config_whatsapp_token: "Token de Segurança da Instância",
 
   // ── Suporte / Help Desk ───────────────────────────────────────────────────
@@ -206,8 +195,7 @@ export const pt: Record<TranslationKey, string> = {
   support_subtitle: "Central de atendimento e suporte da NeuroStack",
   support_ticket_heading: "Abrir Chamado / Ticket",
   support_active_badge: "ATIVO",
-  support_response_hint:
-    "O chamado será direcionado à equipe responsável, que responderá em até 24h úteis.",
+  support_response_hint: "O chamado será direcionado à equipe responsável, que responderá em até 24h úteis.",
   support_tipo_label: "Tipo",
   support_tipo_ph: "Selecione o tipo…",
   support_tipo_request: "Solicitação",
@@ -222,8 +210,7 @@ export const pt: Record<TranslationKey, string> = {
   support_send_btn: "Enviar Mensagem",
   support_sending_btn: "Enviando…",
   support_toast_ok_title: "Mensagem enviada com sucesso!",
-  support_toast_ok_desc:
-    "Seu ticket foi registrado. Nossa equipe responderá em breve.",
+  support_toast_ok_desc: "Seu ticket foi registrado. Nossa equipe responderá em breve.",
   support_toast_ok_file: "Seu ticket foi registrado com o anexo",
   support_toast_fields_title: "Campos obrigatórios",
   support_toast_fields_desc: "Selecione o tipo e escreva sua mensagem.",
@@ -239,8 +226,7 @@ export const pt: Record<TranslationKey, string> = {
   support_stat_enterprise_note: "resposta em até 4h",
   support_chat_heading: "Chat Interno & Concierge",
   support_chat_badge: "ROADMAP: Em Breve (WebSockets)",
-  support_chat_desc:
-    "Canal de atendimento em tempo real com sua equipe de conta dedicada.",
+  support_chat_desc: "Canal de atendimento em tempo real com sua equipe de conta dedicada.",
   support_online_status: "Equipe Online",
   support_online_time: "Tempo de resposta: < 2 min",
   support_agent_role: "Gerente de Conta",
@@ -281,8 +267,7 @@ export const pt: Record<TranslationKey, string> = {
   admin_tickets_heading: "Tickets de Suporte",
   admin_tickets_open_badge: "abertos",
   admin_tickets_refresh: "Atualizar",
-  admin_tickets_desc:
-    "Solicitações e feedbacks enviados pelas clínicas via página Suporte.",
+  admin_tickets_desc: "Solicitações e feedbacks enviados pelas clínicas via página Suporte.",
   admin_tickets_empty: "Nenhum ticket recebido ainda.",
   admin_ticket_open: "Aberto",
   admin_ticket_closed: "Encerrado",
@@ -293,8 +278,7 @@ export const pt: Record<TranslationKey, string> = {
   admin_ticket_tipo_feedback: "Feedback",
   admin_ticket_tipo_financial: "Financeiro",
   admin_create_title: "Nova Clínica",
-  admin_create_desc:
-    "Cria uma nova clínica e o primeiro usuário administrador.",
+  admin_create_desc: "Cria uma nova clínica e o primeiro usuário administrador.",
   admin_create_name_label: "Nome da Clínica",
   admin_create_name_ph: "Ex: Clínica Vita",
   admin_create_email_label: "Email do Admin",
@@ -330,13 +314,10 @@ export const pt: Record<TranslationKey, string> = {
   traces_filter_handoff: "Apenas com Handoff 🔄",
   traces_filter_active_badge: "ativo",
   traces_filter_csv_note: "Os filtros ativos serão aplicados ao CSV.",
-  traces_report_hint:
-    "Exporte o histórico completo do período selecionado para auditoria e relatórios de performance.",
-  traces_no_filter_match:
-    "Nenhum trace encontrado com os filtros selecionados no período.",
+  traces_report_hint: "Exporte o histórico completo do período selecionado para auditoria e relatórios de performance.",
+  traces_no_filter_match: "Nenhum trace encontrado com os filtros selecionados no período.",
   traces_export_err_title: "Erro ao exportar",
-  traces_export_err_desc:
-    "Não foi possível gerar o relatório. Tente novamente.",
+  traces_export_err_desc: "Não foi possível gerar o relatório. Tente novamente.",
   traces_view_mode_title: "Modo Visualização",
   traces_view_mode_desc: "Alterações não permitidas nesta conta de teste.",
   traces_day_section_title: "Histórico diário de traces",
@@ -354,27 +335,20 @@ export const pt: Record<TranslationKey, string> = {
   traces_source_simulator: "Simulador",
   traces_loading_day: "Carregando traces de",
   traces_empty_day: "Nenhum trace encontrado em",
-  traces_no_filter_match_day:
-    "Nenhum trace corresponde aos filtros selecionados em",
+  traces_no_filter_match_day: "Nenhum trace corresponde aos filtros selecionados em",
   traces_error_no_token: "Faça login para carregar os traces.",
   traces_error_unauthorized: "Sua sessão expirou. Faça login novamente.",
-  traces_error_timezone_required:
-    "O fuso horário é obrigatório para consultar esse dia. Atualize a página e tente novamente.",
-  traces_error_day_required:
-    "Escolha um dia para usar o fuso horário informado.",
-  traces_error_invalid_timezone:
-    "O fuso horário do navegador não foi reconhecido. Atualize as configurações e tente novamente.",
-  traces_error_day_range_conflict:
-    "Use um dia para a lista ou um intervalo para o CSV, não ambos na mesma consulta.",
-  traces_error_unknown:
-    "Não foi possível carregar os traces. Tente novamente; se persistir, contate o suporte.",
+  traces_error_timezone_required: "O fuso horário é obrigatório para consultar esse dia. Atualize a página e tente novamente.",
+  traces_error_day_required: "Escolha um dia para usar o fuso horário informado.",
+  traces_error_invalid_timezone: "O fuso horário do navegador não foi reconhecido. Atualize as configurações e tente novamente.",
+  traces_error_day_range_conflict: "Use um dia para a lista ou um intervalo para o CSV, não ambos na mesma consulta.",
+  traces_error_unknown: "Não foi possível carregar os traces. Tente novamente; se persistir, contate o suporte.",
 
   // ── Detalhe do Trace ──────────────────────────────────────────────────────
   trace_detail_title: "Detalhes do Trace",
   trace_detail_user_message: "Mensagem do Usuário",
   trace_detail_not_found: "Trace Não Encontrado",
-  trace_detail_not_found_desc:
-    "O trace solicitado não pôde ser carregado ou não existe.",
+  trace_detail_not_found_desc: "O trace solicitado não pôde ser carregado ou não existe.",
   trace_detail_back: "Voltar para Traces",
 
   // ── Config. da Clínica — Abas ─────────────────────────────────────────────
@@ -385,22 +359,17 @@ export const pt: Record<TranslationKey, string> = {
   config_tab_servicos: "Serviços",
   config_tab_apis: "APIs",
   config_tab_identidade_header: "Identidade & Persona",
-  config_tab_identidade_desc:
-    "Define como o agente se apresenta e como responde perguntas sobre sua natureza.",
+  config_tab_identidade_desc: "Define como o agente se apresenta e como responde perguntas sobre sua natureza.",
   config_tab_operacao_header: "Operação & Logística",
-  config_tab_operacao_desc:
-    "Dados injetados como string literal no contexto, sem reinterpretação.",
+  config_tab_operacao_desc: "Dados injetados como string literal no contexto, sem reinterpretação.",
   config_tab_negocio_header: "Regras de Negócio & IA",
-  config_tab_negocio_desc:
-    "Diretivas que controlam o comportamento do SRM Core, o núcleo de raciocínio do agente.",
+  config_tab_negocio_desc: "Diretivas que controlam o comportamento do SRM Core, o núcleo de raciocínio do agente.",
   config_tab_handoff_header: "Gestão de Handoff",
-  config_tab_handoff_desc:
-    "Controla quando e como o agente transfere a conversa para um atendente humano.",
+  config_tab_handoff_desc: "Controla quando e como o agente transfere a conversa para um atendente humano.",
   config_readonly_note: "Modo somente leitura, alterações desabilitadas",
   config_service_price: "Preço",
   config_service_authority: "Diferenciais de Autoridade",
-  config_service_authority_hint:
-    "Injetados junto com a descrição para reforçar confiança. Ex: 'Única clínica com tecnologia X na cidade.'",
+  config_service_authority_hint: "Injetados junto com a descrição para reforçar confiança. Ex: 'Única clínica com tecnologia X na cidade.'",
 
   // ── Painel Builder ────────────────────────────────────────────────────────
   builder_panel_title: "Painel Builder",
@@ -424,8 +393,7 @@ export const pt: Record<TranslationKey, string> = {
   builder_clinic_phone_saved: "Telefone atualizado",
   builder_clinic_phone_error: "Não foi possível salvar o telefone",
   builder_support_title: "Chamados de suporte",
-  builder_support_description:
-    "Mensagens enviadas pelas clínicas para o time do Builder.",
+  builder_support_description: "Mensagens enviadas pelas clínicas para o time do Builder.",
   builder_support_empty: "Nenhum chamado no momento.",
   builder_support_filter_all: "Todos",
   builder_support_filter_open: "Abertos",
@@ -437,83 +405,60 @@ export const pt: Record<TranslationKey, string> = {
   builder_support_resolve_ok: "Chamado atualizado",
   builder_support_resolve_error: "Não foi possível atualizar o chamado",
   builder_support_whatsapp: "Abrir WhatsApp",
-  builder_support_whatsapp_hint:
-    "Sem telefone cadastrado. Cadastre em Sub-Contas para habilitar o WhatsApp.",
+  builder_support_whatsapp_hint: "Sem telefone cadastrado. Cadastre em Sub-Contas para habilitar o WhatsApp.",
   builder_support_ticket_clinic: "Clínica",
   builder_support_ticket_type: "Tipo",
   builder_support_ticket_message: "Mensagem",
   builder_support_ticket_date: "Data",
   builder_support_email_title: "Email de notificação",
-  builder_support_email_description:
-    "Endereço que receberá os chamados enviados pelas clínicas.",
+  builder_support_email_description: "Endereço que receberá os chamados enviados pelas clínicas.",
   builder_support_email_label: "Email de notificação",
   builder_support_email_placeholder: "voce@exemplo.com",
   builder_support_email_save: "Salvar email",
   builder_support_email_saved: "Email de notificação atualizado",
   builder_support_email_error: "Não foi possível salvar o email",
-  builder_support_email_fallback:
-    "Sem email personalizado — as notificações vão para {email}.",
+  builder_support_email_fallback: "Sem email personalizado — as notificações vão para {email}.",
   builder_support_email_hint: "Deixe em branco para voltar ao email de login.",
   builder_clone_title: "Clonar uma clínica",
-  builder_clone_description:
-    "Crie uma nova clínica a partir de uma clínica existente na sua conta Builder.",
+  builder_clone_description: "Crie uma nova clínica a partir de uma clínica existente na sua conta Builder.",
   builder_clone_source_label: "Clínica de origem",
   builder_clone_source_placeholder: "Selecione uma clínica de origem",
-  builder_clone_source_empty:
-    "Crie uma clínica antes de usar a Central de Clonagem.",
+  builder_clone_source_empty: "Crie uma clínica antes de usar a Central de Clonagem.",
   builder_clone_preview_loading: "Carregando prévia da clonagem…",
   builder_clone_preview_title: "Prévia da clonagem",
   builder_clone_suggested_name: "Nome sugerido",
-  builder_clone_advisory_note:
-    "Este nome é apenas uma sugestão e pode mudar quando a clonagem for criada.",
+  builder_clone_advisory_note: "Este nome é apenas uma sugestão e pode mudar quando a clonagem for criada.",
   builder_clone_rag_documents: "Documentos de conhecimento",
   builder_clone_rag_bytes: "Armazenamento RAG adicionado",
-  builder_clone_rag_impact:
-    "Os documentos de conhecimento são duplicados e seus bytes contam novamente no armazenamento RAG.",
+  builder_clone_rag_impact: "Os documentos de conhecimento são duplicados e seus bytes contam novamente no armazenamento RAG.",
   builder_clone_included_title: "Incluído na clonagem",
-  builder_clone_included_copy:
-    "Configuração, serviços, profissionais, persona, regras de negócio e conhecimento são copiados.",
+  builder_clone_included_copy: "Configuração, serviços, profissionais, persona, regras de negócio e conhecimento são copiados.",
   builder_clone_excluded_title: "Não incluído ou zerado",
   builder_clone_excluded_admin: "Nenhum usuário administrador é criado.",
-  builder_clone_excluded_integrations:
-    "Credenciais de API e integrações são zeradas; o link de agendamento fica desabilitado e sua URL fica nula.",
+  builder_clone_excluded_integrations: "Credenciais de API e integrações são zeradas; o link de agendamento fica desabilitado e sua URL fica nula.",
   builder_clone_inactive: "A clonagem começa inativa.",
-  builder_clone_confirm:
-    "Entendo o que será copiado e zerado e quero criar esta clonagem.",
+  builder_clone_confirm: "Entendo o que será copiado e zerado e quero criar esta clonagem.",
   builder_clone_submit: "Criar clonagem",
   builder_clone_loading: "Criando clonagem…",
   builder_clone_success: "Clínica clonada com sucesso",
-  builder_clone_success_desc:
-    "Esta é a clínica oficial retornada pelo servidor.",
+  builder_clone_success_desc: "Esta é a clínica oficial retornada pelo servidor.",
   builder_clone_configure: "Configurar clínica clonada",
-  builder_clone_refresh_warning:
-    "A clonagem foi criada, mas não foi possível atualizar clínicas ou cobrança.",
+  builder_clone_refresh_warning: "A clonagem foi criada, mas não foi possível atualizar clínicas ou cobrança.",
   builder_clone_refresh_retry: "Tentar atualizar novamente",
-  builder_clone_preview_error_403:
-    "Você não tem mais permissão para visualizar a prévia desta clínica. A origem continua selecionada.",
-  builder_clone_preview_error_404:
-    "A clínica de origem não foi encontrada para a prévia. A origem continua selecionada.",
-  builder_clone_preview_error_409:
-    "A prévia não está disponível para a configuração atual da clínica. A origem continua selecionada.",
-  builder_clone_preview_error_500:
-    "Não foi possível carregar a prévia da clonagem. A origem continua selecionada.",
-  builder_clone_preview_error_network:
-    "Não foi possível acessar o serviço de prévia da clonagem. A origem continua selecionada.",
-  builder_clone_error_403:
-    "Você não tem mais permissão para clonar esta clínica. Sua seleção e prévia foram mantidas.",
-  builder_clone_error_404:
-    "A clínica de origem não foi encontrada. Sua seleção e prévia foram mantidas.",
-  builder_clone_error_409:
-    "A clínica não pode ser clonada com a configuração atual. Sua seleção e prévia foram mantidas.",
-  builder_clone_error_500:
-    "Não foi possível salvar a clonagem. Nenhuma clínica foi criada; sua seleção e prévia foram mantidas.",
-  builder_clone_error_network:
-    "Não foi possível acessar o serviço de clonagem. Sua seleção e prévia foram mantidas.",
+  builder_clone_preview_error_403: "Você não tem mais permissão para visualizar a prévia desta clínica. A origem continua selecionada.",
+  builder_clone_preview_error_404: "A clínica de origem não foi encontrada para a prévia. A origem continua selecionada.",
+  builder_clone_preview_error_409: "A prévia não está disponível para a configuração atual da clínica. A origem continua selecionada.",
+  builder_clone_preview_error_500: "Não foi possível carregar a prévia da clonagem. A origem continua selecionada.",
+  builder_clone_preview_error_network: "Não foi possível acessar o serviço de prévia da clonagem. A origem continua selecionada.",
+  builder_clone_error_403: "Você não tem mais permissão para clonar esta clínica. Sua seleção e prévia foram mantidas.",
+  builder_clone_error_404: "A clínica de origem não foi encontrada. Sua seleção e prévia foram mantidas.",
+  builder_clone_error_409: "A clínica não pode ser clonada com a configuração atual. Sua seleção e prévia foram mantidas.",
+  builder_clone_error_500: "Não foi possível salvar a clonagem. Nenhuma clínica foi criada; sua seleção e prévia foram mantidas.",
+  builder_clone_error_network: "Não foi possível acessar o serviço de clonagem. Sua seleção e prévia foram mantidas.",
   builder_alerts_title: "Alertas",
   builder_alerts_empty: "Nenhum alerta, tudo funcionando",
   builder_health_grid_title: "Saude das Clinicas",
-  builder_health_legend:
-    "Verde = ativo, Amarelo = sem traces 3-7 dias, Vermelho = sem traces 7+ dias",
+  builder_health_legend: "Verde = ativo, Amarelo = sem traces 3-7 dias, Vermelho = sem traces 7+ dias",
   builder_last_trace: "Ultimo trace",
   builder_days_ago: "dias atras",
   builder_never: "nunca",
@@ -649,8 +594,7 @@ export const pt: Record<TranslationKey, string> = {
   // ── Fila de Sessões Inativas ──
   nav_inactive_queue: "Fila de Inativos",
   inactive_queue_title: "Fila de Inativos",
-  inactive_queue_subtitle:
-    "Conversas inativas disponíveis para retornar ao controle da IA.",
+  inactive_queue_subtitle: "Conversas inativas disponíveis para retornar ao controle da IA.",
   inactive_contact: "Contato",
   inactive_session_code: "Código da sessão",
   inactive_channel: "Canal",
@@ -669,10 +613,8 @@ export const pt: Record<TranslationKey, string> = {
   inactive_page: "Página",
   inactive_of: "de",
   inactive_total: "conversas inativas",
-  inactive_reactivate_error_title:
-    "Não foi possível devolver o atendimento para a IA",
-  inactive_reactivate_error_description:
-    "A conversa continua inativa. Tente novamente.",
+  inactive_reactivate_error_title: "Não foi possível devolver o atendimento para a IA",
+  inactive_reactivate_error_description: "A conversa continua inativa. Tente novamente.",
 
   // ── RLHF Audit ──
   rlhf_audit_filter_channel_label: "Canal",

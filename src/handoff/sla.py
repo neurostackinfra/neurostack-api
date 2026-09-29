@@ -1,22 +1,26 @@
-"""Pure SLA snapshot, classification, aggregation, and period helpers."""
+"""Pure SLA classification and clinic-local period helpers for handoffs."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
-from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from neurostack_core.prompt import resolve_clinic_tz
-
-SLA_FALLBACK_SECONDS = 600
-_PERCENT_QUANTUM = Decimal("0.1")
+DEFAULT_SLA_TARGET_SECONDS = 600
+DEFAULT_CLINIC_TIMEZONE = "America/Sao_Paulo"
+# Public queue/export windows use elapsed civil-date days. A difference of 90
+# therefore remains valid (91 inclusive dates); a difference of 91 is rejected.
+MAX_SLA_RANGE_ELAPSED_DAYS = 90
+_NON_IANA_ZONE_KEYS = frozenset({"localtime", "posixrules"})
+_NORMATIVE_HANDOFF_STATUSES = frozenset(
+    {"pending", "accepted", "in_progress", "completed", "cancelled", "timeout"}
+)
 
 
 class SlaCategory(str, Enum):
-    """The exhaustive and disjoint SLA states for one handoff."""
+    """One disjoint SLA category for a handoff in the selected cohort."""
 
     WITHIN_SLA = "within_sla"
     CONFIRMED_LATE = "confirmed_late"
@@ -26,232 +30,203 @@ class SlaCategory(str, Enum):
     UNMEASURED_LEGACY = "unmeasured_legacy"
 
 
-FallbackReason = Literal["missing", "invalid"]
-HandoffStatus = Literal[
-    "pending",
-    "accepted",
-    "in_progress",
-    "completed",
-    "cancelled",
-    "timeout",
-]
-_HANDOFF_STATUSES = frozenset(
-    {"pending", "accepted", "in_progress", "completed", "cancelled", "timeout"}
-)
+@dataclass(frozen=True)
+class CivilPeriod:
+    """A clinic-local civil day represented as a semi-open UTC interval."""
+
+    local_day: date
+    timezone_name: str
+    start_utc: datetime
+    end_exclusive_utc: datetime
 
 
 @dataclass(frozen=True)
-class SlaTargetResolution:
-    """A snapshot value plus a bounded, safe-to-log fallback reason."""
+class CivilDateRange:
+    """Inclusive clinic-local dates represented by semi-open UTC bounds."""
 
-    seconds: int
-    fallback_reason: FallbackReason | None = None
-
-    @property
-    def used_fallback(self) -> bool:
-        return self.fallback_reason is not None
-
-
-@dataclass(frozen=True)
-class SlaOccurrence:
-    """Inputs required to classify an occurrence without persistence access."""
-
-    created_at: datetime
-    confirmed_at: datetime | None
-    sla_target_seconds: int | None
-    status: HandoffStatus
-
-    def __post_init__(self) -> None:
-        if self.status not in _HANDOFF_STATUSES:
-            raise ValueError("status must be a valid handoff status")
-
-
-@dataclass(frozen=True)
-class SlaClassification:
-    """Classification result retaining the facts needed for aggregation."""
-
-    category: SlaCategory
-    confirmed: bool
-    elapsed_seconds: float | None
-    deadline: datetime | None
-
-
-@dataclass(frozen=True)
-class SlaMetrics:
-    """SLA aggregate over a classified cohort."""
-
-    confirmed_count: int
-    sla_eligible_count: int
-    average_confirmed_seconds: float | None
-    pct_within_sla: Decimal | None
-
-
-@dataclass(frozen=True)
-class SlaPeriod:
-    """UTC half-open bounds and the clock used to classify open handoffs."""
-
+    start_date: date
+    end_date: date
+    timezone_name: str
     start_utc: datetime
     end_exclusive_utc: datetime
     as_of: datetime
 
 
-def resolve_sla_target(handoff_config: Mapping[str, Any] | None) -> SlaTargetResolution:
-    """Resolve a new occurrence's immutable target without rewriting config.
+def resolve_sla_target_seconds(configured_minutes: object) -> int:
+    """Resolve a raw legacy SLA setting to a safe snapshot in seconds.
 
-    Only a real integer number of minutes in the current 1..120 contract is
-    accepted. Missing and malformed legacy values both fall back to ten
-    minutes. The result intentionally exposes only a bounded reason label, not
-    the raw configuration value, so a future caller can log it safely.
+    New configuration writes are validated by ``ClinicHandoff``. This helper
+    deliberately accepts raw legacy JSON and falls back without mutating it.
+    The lifecycle caller is responsible for logging the fallback without
+    including patient data.
     """
 
-    if handoff_config is None or "meta_minutos_atendimento" not in handoff_config:
-        return SlaTargetResolution(SLA_FALLBACK_SECONDS, "missing")
-
-    minutes = handoff_config["meta_minutos_atendimento"]
-    if type(minutes) is not int or not 1 <= minutes <= 120:
-        return SlaTargetResolution(SLA_FALLBACK_SECONDS, "invalid")
-    return SlaTargetResolution(minutes * 60)
-
-
-def _require_aware(value: datetime, field: str) -> None:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError(f"{field} must be timezone-aware")
-
-
-def classify_sla(
-    occurrence: SlaOccurrence,
-    *,
-    as_of: datetime,
-) -> SlaClassification:
-    """Classify one handoff according to its persisted SLA snapshot.
-
-    Missing snapshots always remain legacy/unmeasured. For measured rows a
-    confirmation wins over status (including cancellation), while an
-    unconfirmed cancellation wins over the temporal open-state categories.
-    """
-
-    _require_aware(as_of, "as_of")
-    _require_aware(occurrence.created_at, "created_at")
-    if occurrence.confirmed_at is not None:
-        _require_aware(occurrence.confirmed_at, "confirmed_at")
-
-    created_at = occurrence.created_at.astimezone(timezone.utc)
-    as_of_utc = as_of.astimezone(timezone.utc)
-    confirmed_at = (
-        occurrence.confirmed_at.astimezone(timezone.utc)
-        if occurrence.confirmed_at is not None
-        else None
-    )
-    confirmed = confirmed_at is not None
-    if occurrence.sla_target_seconds is None:
-        return SlaClassification(
-            category=SlaCategory.UNMEASURED_LEGACY,
-            confirmed=confirmed,
-            elapsed_seconds=None,
-            deadline=None,
-        )
     if (
-        type(occurrence.sla_target_seconds) is not int
-        or not 60 <= occurrence.sla_target_seconds <= 7200
+        isinstance(configured_minutes, int)
+        and not isinstance(configured_minutes, bool)
+        and 1 <= configured_minutes <= 120
     ):
-        raise ValueError("sla_target_seconds must be an integer from 60 to 7200")
-
-    deadline = created_at + timedelta(seconds=occurrence.sla_target_seconds)
-    if confirmed_at is not None:
-        elapsed_seconds = (confirmed_at - created_at).total_seconds()
-        if elapsed_seconds < 0:
-            raise ValueError("confirmed_at must not precede created_at")
-        category = (
-            SlaCategory.WITHIN_SLA
-            if confirmed_at <= deadline
-            else SlaCategory.CONFIRMED_LATE
-        )
-        return SlaClassification(
-            category=category,
-            confirmed=True,
-            elapsed_seconds=elapsed_seconds,
-            deadline=deadline,
-        )
-
-    if occurrence.status == "cancelled":
-        category = SlaCategory.CANCELLED_UNCONFIRMED
-    elif as_of_utc >= deadline:
-        category = SlaCategory.UNANSWERED_OVERDUE
-    else:
-        category = SlaCategory.MATURING
-    return SlaClassification(
-        category=category,
-        confirmed=False,
-        elapsed_seconds=None,
-        deadline=deadline,
-    )
+        return configured_minutes * 60
+    return DEFAULT_SLA_TARGET_SECONDS
 
 
-def aggregate_sla(classifications: Iterable[SlaClassification]) -> SlaMetrics:
-    """Aggregate classifications with decimal half-up percentage rounding."""
-
-    cohort = tuple(classifications)
-    eligible_categories = {
-        SlaCategory.WITHIN_SLA,
-        SlaCategory.CONFIRMED_LATE,
-        SlaCategory.UNANSWERED_OVERDUE,
-    }
-    eligible = [item for item in cohort if item.category in eligible_categories]
-    confirmed_count = sum(
-        item.category in {SlaCategory.WITHIN_SLA, SlaCategory.CONFIRMED_LATE}
-        for item in cohort
-    )
-    measurable_confirmed = [
-        item.elapsed_seconds
-        for item in cohort
-        if item.confirmed and item.elapsed_seconds is not None
-    ]
-    average = (
-        sum(measurable_confirmed) / len(measurable_confirmed)
-        if measurable_confirmed
-        else None
-    )
-    if eligible:
-        within_count = sum(item.category is SlaCategory.WITHIN_SLA for item in eligible)
-        percentage = (
-            Decimal(within_count) * Decimal(100) / Decimal(len(eligible))
-        ).quantize(_PERCENT_QUANTUM, rounding=ROUND_HALF_UP)
-    else:
-        percentage = None
-    return SlaMetrics(
-        confirmed_count=confirmed_count,
-        sla_eligible_count=len(eligible),
-        average_confirmed_seconds=average,
-        pct_within_sla=percentage,
-    )
-
-
-def resolve_sla_period(
-    start_date: date,
-    end_date: date,
-    clinic_timezone: str | None,
+def classify_handoff_sla(
     *,
+    created_at: datetime,
+    confirmed_at: datetime | None,
+    target_seconds: int | None,
+    status: str,
     as_of: datetime,
-) -> SlaPeriod:
-    """Resolve inclusive clinic-local UI dates into UTC half-open bounds."""
+) -> SlaCategory:
+    """Classify one handoff into exactly one normative SLA category."""
 
-    if isinstance(start_date, datetime) or isinstance(end_date, datetime):
-        raise TypeError("start_date and end_date must be civil dates")
-    if end_date < start_date:
+    _require_aware("created_at", created_at)
+    _require_aware("as_of", as_of)
+    if confirmed_at is not None:
+        _require_aware("confirmed_at", confirmed_at)
+
+    if target_seconds is not None and (
+        not isinstance(target_seconds, int)
+        or isinstance(target_seconds, bool)
+        or not 60 <= target_seconds <= 7200
+    ):
+        raise ValueError(
+            "target_seconds must be an integer between 60 and 7200 or None"
+        )
+    if status not in _NORMATIVE_HANDOFF_STATUSES:
+        raise ValueError("status must be a normative handoff status")
+
+    created_utc = created_at.astimezone(timezone.utc)
+    confirmed_utc = (
+        confirmed_at.astimezone(timezone.utc) if confirmed_at is not None else None
+    )
+    as_of_utc = as_of.astimezone(timezone.utc)
+    if confirmed_utc is not None and confirmed_utc < created_utc:
+        raise ValueError("confirmed_at must not precede created_at")
+    if target_seconds is None:
+        return SlaCategory.UNMEASURED_LEGACY
+
+    if confirmed_utc is not None:
+        elapsed = (confirmed_utc - created_utc).total_seconds()
+        if elapsed <= target_seconds:
+            return SlaCategory.WITHIN_SLA
+        return SlaCategory.CONFIRMED_LATE
+
+    if status == "cancelled":
+        return SlaCategory.CANCELLED_UNCONFIRMED
+
+    deadline = created_utc + timedelta(seconds=target_seconds)
+    if as_of_utc >= deadline:
+        return SlaCategory.UNANSWERED_OVERDUE
+    return SlaCategory.MATURING
+
+
+def round_half_up_percentage(numerator: int, denominator: int) -> Decimal | None:
+    """Return a percentage rounded half-up to one decimal, or no sample."""
+
+    if (
+        isinstance(numerator, bool)
+        or isinstance(denominator, bool)
+        or not isinstance(numerator, int)
+        or not isinstance(denominator, int)
+    ):
+        raise TypeError("percentage counts must be integers")
+    if numerator < 0 or denominator < 0 or numerator > denominator:
+        raise ValueError("percentage counts must satisfy 0 <= numerator <= denominator")
+    if denominator == 0:
+        return None
+
+    percentage = Decimal(numerator) * Decimal(100) / Decimal(denominator)
+    return percentage.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+
+
+def resolve_clinic_civil_period(
+    *,
+    clinic_timezone: object,
+    as_of: datetime,
+    local_day: date | None = None,
+) -> CivilPeriod:
+    """Resolve one clinic-local civil day to a semi-open UTC interval.
+
+    ``as_of`` is required so callers capture the clock once. When no day is
+    selected, that same instant determines the clinic's current civil date.
+    Invalid or missing configuration uses the product fallback timezone.
+    """
+
+    _require_aware("as_of", as_of)
+    zone_name, zone = _resolve_clinic_zone(clinic_timezone)
+    resolved_day = local_day or as_of.astimezone(zone).date()
+    if resolved_day == date.max:
+        raise ValueError("local_day must be earlier than date.max")
+    next_day = resolved_day + timedelta(days=1)
+    start_local = datetime.combine(resolved_day, time.min, tzinfo=zone)
+    end_local = datetime.combine(next_day, time.min, tzinfo=zone)
+    return CivilPeriod(
+        local_day=resolved_day,
+        timezone_name=zone_name,
+        start_utc=start_local.astimezone(timezone.utc),
+        end_exclusive_utc=end_local.astimezone(timezone.utc),
+    )
+
+
+def resolve_clinic_civil_date_range(
+    *,
+    clinic_timezone: object,
+    as_of: datetime,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> CivilDateRange:
+    """Resolve inclusive clinic dates, defaulting to the last 31 civil dates.
+
+    Partial ranges retain the missing side's default: thirty clinic dates before
+    today for ``start_date`` and the clinic's current date for ``end_date``.
+    The caller may translate representational boundary failures into its public
+    error contract before issuing a cohort query.
+    """
+
+    _require_aware("as_of", as_of)
+    if start_date is not None and type(start_date) is not date:
+        raise TypeError("start_date must be a civil date")
+    if end_date is not None and type(end_date) is not date:
+        raise TypeError("end_date must be a civil date")
+
+    zone_name, zone = _resolve_clinic_zone(clinic_timezone)
+    resolved_as_of = as_of.astimezone(timezone.utc)
+    local_today = resolved_as_of.astimezone(zone).date()
+    resolved_start = start_date or local_today - timedelta(days=30)
+    resolved_end = end_date or local_today
+    if resolved_end < resolved_start:
         raise ValueError("end_date must not precede start_date")
-    if end_date == date.max:
+    if resolved_end == date.max:
         raise ValueError("end_date must be earlier than date.max")
-    _require_aware(as_of, "as_of")
 
-    clinic_tz = resolve_clinic_tz(clinic_timezone)
-    local_start = datetime.combine(start_date, time.min, tzinfo=clinic_tz)
-    local_end = datetime.combine(
-        end_date + timedelta(days=1),
+    start_local = datetime.combine(resolved_start, time.min, tzinfo=zone)
+    end_local = datetime.combine(
+        resolved_end + timedelta(days=1),
         time.min,
-        tzinfo=clinic_tz,
+        tzinfo=zone,
     )
-    return SlaPeriod(
-        start_utc=local_start.astimezone(timezone.utc),
-        end_exclusive_utc=local_end.astimezone(timezone.utc),
-        as_of=as_of.astimezone(timezone.utc),
+    return CivilDateRange(
+        start_date=resolved_start,
+        end_date=resolved_end,
+        timezone_name=zone_name,
+        start_utc=start_local.astimezone(timezone.utc),
+        end_exclusive_utc=end_local.astimezone(timezone.utc),
+        as_of=resolved_as_of,
     )
+
+
+def _resolve_clinic_zone(configured_timezone: object) -> tuple[str, ZoneInfo]:
+    if isinstance(configured_timezone, str):
+        candidate = configured_timezone.strip()
+        if candidate and candidate not in _NON_IANA_ZONE_KEYS:
+            try:
+                return candidate, ZoneInfo(candidate)
+            except (ZoneInfoNotFoundError, ValueError):
+                pass
+    return DEFAULT_CLINIC_TIMEZONE, ZoneInfo(DEFAULT_CLINIC_TIMEZONE)
+
+
+def _require_aware(name: str, value: datetime) -> None:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{name} must be timezone-aware")

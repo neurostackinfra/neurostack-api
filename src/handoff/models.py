@@ -8,7 +8,7 @@ from enum import Enum
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, PrivateAttr
+from pydantic import BaseModel, Field
 
 # ============================================
 # Enums
@@ -439,12 +439,11 @@ class HandoffDetail(BaseModel):
     # Timestamps
     created_at: datetime
     updated_at: Optional[datetime] = None
-    resolved_at: Optional[datetime] = None
     data_hora_saida: Optional[datetime] = None
+    resolved_at: Optional[datetime] = None
+
+    # Immutable first-response SLA snapshot. ``None`` identifies legacy rows.
+    sla_target_seconds: Optional[int] = Field(default=None, ge=60, le=7200)
 
     # Resolution
     resolution_notes: Optional[str] = None
-
-    # Internal snapshot used only by the deprecated queue checkout adapter.
-    # PrivateAttr keeps the canonical detail response and OpenAPI contract unchanged.
-    _checkout_compatibility: Optional[dict[str, Any]] = PrivateAttr(default=None)
