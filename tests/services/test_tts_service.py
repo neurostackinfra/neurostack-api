@@ -130,12 +130,57 @@ def test_google_sends_voice_language_and_decodes_audio() -> None:
     }
 
 
+def test_openai_sends_model_input_voice_and_bearer_key_and_returns_mp3() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200, content=AUDIO, headers={"Content-Type": "audio/mpeg"}
+        )
+
+    credentials = {
+        "tts_provider": "openai",
+        "tts_api_url": "https://api.openai.com/v1",
+        "tts_api_key": "secret-openai-key",
+        "tts_model_name": "gpt-4o-mini-tts",
+        "tts_voice_id": "alloy",
+    }
+    with egress_env(httpx.MockTransport(handler)):
+        audio = asyncio.run(tts_service.synthesize_speech("Olá", credentials))
+
+    assert audio.content == AUDIO
+    assert audio.mime_type == "audio/mpeg"
+    request = seen[0]
+    assert request.method == "POST"
+    assert str(request.url) == "https://api.openai.com/v1/audio/speech"
+    assert request.headers["Authorization"] == "Bearer secret-openai-key"
+    assert request.headers["Host"] == "api.openai.com"
+    assert json.loads(request.content) == {
+        "model": "gpt-4o-mini-tts",
+        "input": "Olá",
+        "voice": "alloy",
+    }
+
+
 def test_elevenlabs_requires_voice_id_before_network() -> None:
     credentials = {
         "tts_provider": "elevenlabs",
         "tts_api_url": "https://api.elevenlabs.io/v1",
         "tts_api_key": "secret",
         "tts_model_name": "model",
+    }
+    with pytest.raises(TtsSynthesisError) as exc:
+        asyncio.run(tts_service.synthesize_speech("Olá", credentials))
+    assert exc.value.code == "tts_configuration_incomplete"
+
+
+def test_openai_requires_voice_id_before_network() -> None:
+    credentials = {
+        "tts_provider": "openai",
+        "tts_api_url": "https://api.openai.com/v1",
+        "tts_api_key": "secret",
+        "tts_model_name": "gpt-4o-mini-tts",
     }
     with pytest.raises(TtsSynthesisError) as exc:
         asyncio.run(tts_service.synthesize_speech("Olá", credentials))
@@ -156,6 +201,32 @@ def test_provider_host_is_pinned() -> None:
             asyncio.run(tts_service.synthesize_speech("Olá", credentials))
 
 
+def test_openai_provider_rejects_hostile_host_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kinds: list[str] = []
+    original_validate = safe_egress.validate_url
+
+    def validate_url(url: str, *, kind: str, resolver: Any = None):
+        kinds.append(kind)
+        return original_validate(url, kind=kind, resolver=resolver)
+
+    monkeypatch.setattr(safe_egress, "validate_url", validate_url)
+    credentials = {
+        "tts_provider": "openai",
+        "tts_api_url": "https://attacker.example/v1",
+        "tts_api_key": "secret",
+        "tts_model_name": "gpt-4o-mini-tts",
+        "tts_voice_id": "alloy",
+    }
+    with egress_env(
+        httpx.MockTransport(lambda request: pytest.fail("network must not be reached"))
+    ):
+        with pytest.raises(UnsafeEgressError):
+            asyncio.run(tts_service.synthesize_speech("Olá", credentials))
+    assert kinds == ["tts_openai"]
+
+
 def test_upstream_error_is_secret_free() -> None:
     secret = "very-secret-eleven-key"
     credentials = {
@@ -170,3 +241,24 @@ def test_upstream_error_is_secret_free() -> None:
             asyncio.run(tts_service.synthesize_speech("Olá", credentials))
     assert exc.value.code == "tts_upstream_http_error_401"
     assert secret not in repr(exc.value)
+
+
+def test_openai_upstream_4xx_is_bucketed_and_secret_free() -> None:
+    secret = "very-secret-openai-key"
+    upstream_body = "upstream-body-that-must-not-leak"
+    credentials = {
+        "tts_provider": "openai",
+        "tts_api_url": "https://api.openai.com/v1/audio/speech",
+        "tts_api_key": secret,
+        "tts_model_name": "gpt-4o-mini-tts",
+        "tts_voice_id": "alloy",
+    }
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(429, text=upstream_body)
+    )
+    with egress_env(transport):
+        with pytest.raises(TtsSynthesisError) as exc:
+            asyncio.run(tts_service.synthesize_speech("Olá", credentials))
+    assert exc.value.code == "tts_upstream_http_error_4xx"
+    assert secret not in repr(exc.value)
+    assert upstream_body not in repr(exc.value)

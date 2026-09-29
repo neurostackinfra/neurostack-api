@@ -113,9 +113,10 @@ const BACKEND_PROVIDER_AVAILABILITY = {
   llm: { dropout: "coming_soon", gemini: "active", openai: "coming_soon", outros: "coming_soon", slm_cortex: "coming_soon" },
   multimodal: { openrouter: "coming_soon" },
   stt: { outros: "coming_soon", openai_whisper: "coming_soon", elevenlabs_scribe: "coming_soon", google_stt: "coming_soon", deepgram_stt: "coming_soon", microsoft_stt: "coming_soon" },
-  tts: { elevenlabs: "coming_soon", google: "coming_soon" },
+  tts: { elevenlabs: "coming_soon", google: "coming_soon", openai: "coming_soon" },
 } as const;
-const COMING_SOON_COUNT = 20;
+const TOTAL_PROVIDER_CARD_COUNT = 21;
+const COMING_SOON_PROVIDER_COUNT = 20;
 
 const ACTIVE_GEMINI_PROVIDER_AVAILABILITY = {
   ...API_PROVIDER_AVAILABILITY,
@@ -133,7 +134,16 @@ const ACTIVE_GEMINI_AND_OPENAI_PROVIDER_AVAILABILITY = {
   },
 } as const;
 
+const ACTIVE_OPENAI_TTS_PROVIDER_AVAILABILITY = {
+  ...API_PROVIDER_AVAILABILITY,
+  tts: {
+    ...API_PROVIDER_AVAILABILITY.tts,
+    openai: "active",
+  },
+} as const;
+
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
+const OPENAI_BASE_URL = "https://api.openai.com/v1";
 
 describe("describeConfigSaveFailure", () => {
   it("identifies invalid backend fields without exposing their submitted values", () => {
@@ -306,12 +316,12 @@ describe("describeConfigSaveFailure", () => {
 });
 
 describe("frontend provider availability mirror", () => {
-  it("contains the exact 20 backend pairs with Gemini as the sole active overlay", () => {
+  it("contains the exact 21 backend pairs with Gemini as the sole active overlay", () => {
     expect(API_PROVIDER_AVAILABILITY).toEqual(BACKEND_PROVIDER_AVAILABILITY);
     const states = Object.values(API_PROVIDER_AVAILABILITY).flatMap(Object.values);
-    expect(states).toHaveLength(COMING_SOON_COUNT);
+    expect(states).toHaveLength(TOTAL_PROVIDER_CARD_COUNT);
     expect(states.filter((state) => state === "active")).toHaveLength(1);
-    expect(states.filter((state) => state === "coming_soon")).toHaveLength(COMING_SOON_COUNT - 1);
+    expect(states.filter((state) => state === "coming_soon")).toHaveLength(COMING_SOON_PROVIDER_COUNT);
   });
 
   it("does not expose a provider outside the availability matrix", () => {
@@ -346,6 +356,10 @@ describe("providerCardState", () => {
     ["with configuration-only legacy credentials", emptyStatus({ llm_provider: "openai", llm_readiness: "configuration_only" })],
   ])("keeps an all-coming-soon provider inert %s", (_case, status) => {
     expect(providerCardState("llm", "openai", status)).toBe("coming_soon");
+  });
+
+  it("keeps OpenAI TTS coming soon without tenant status", () => {
+    expect(providerCardState("tts", "openai", null)).toBe("coming_soon");
   });
 
   it("promotes Gemini in the real matrix and exercises every state", () => {
@@ -396,7 +410,7 @@ describe("<ApiCredentialsForm /> card states", () => {
   it.each([
     ["pt", "EM BREVE", "DISPONÍVEL", "Configuração apenas"],
     ["en", "COMING SOON", "AVAILABLE", "Configuration only"],
-  ])("renders all 20 cards as inert orange surfaces in %s", async (
+  ])("renders 20 coming-soon cards and one active Gemini card in %s", async (
     locale,
     comingSoonLabel,
     availableLabel,
@@ -408,8 +422,8 @@ describe("<ApiCredentialsForm /> card states", () => {
     const section = screen.getByTestId("api-settings-section");
     const cards = within(section).getAllByTestId(/provider-card-/);
     const badges = within(section).getAllByText(comingSoonLabel);
-    expect(cards).toHaveLength(COMING_SOON_COUNT);
-    expect(badges).toHaveLength(COMING_SOON_COUNT - 1);
+    expect(cards).toHaveLength(TOTAL_PROVIDER_CARD_COUNT);
+    expect(badges).toHaveLength(COMING_SOON_PROVIDER_COUNT);
     expect(within(section).getByText(availableLabel)).toBeInTheDocument();
     expect(within(section).queryByText(configurationOnlyLabel)).not.toBeInTheDocument();
     expect(section.querySelectorAll("button")).toHaveLength(1);
@@ -425,12 +439,50 @@ describe("<ApiCredentialsForm /> card states", () => {
     expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH")).toHaveLength(0);
   });
 
-  it("uses the English COMING SOON badge on every card", async () => {
+  it("shows OpenAI TTS copy and prefills only its URL in the credentials editor", async () => {
+    localStorage.setItem("ns_locale", "en");
+    const fetchMock = await renderForm(emptyStatus(), {
+      providerAvailability: ACTIVE_OPENAI_TTS_PROVIDER_AVAILABILITY,
+    });
+
+    const card = screen.getByTestId("provider-card-tts-openai");
+    expect(within(card).getByText("OpenAI TTS")).toBeInTheDocument();
+    expect(within(card).getByText("gpt-4o-audio / tts-1")).toBeInTheDocument();
+    fireEvent.click(card);
+
+    const editor = screen.getByTestId("provider-editor-tts-openai");
+    const url = within(editor).getByTestId("field-tts_api_url");
+    const key = within(editor).getByTestId("field-tts_api_key");
+    const model = within(editor).getByTestId("field-tts_model_name");
+    const voice = within(editor).getByTestId("field-tts_voice_id");
+    expect(url).toHaveValue(OPENAI_BASE_URL);
+    expect(key).toHaveValue("");
+    expect(model).toHaveValue("");
+    expect(voice).toHaveValue("");
+
+    fireEvent.change(key, { target: { value: "new-openai-key" } });
+    fireEvent.change(model, { target: { value: "gpt-4o-mini-tts" } });
+    fireEvent.change(voice, { target: { value: "alloy" } });
+    fireEvent.click(within(editor).getByTestId("save-tts-openai"));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH"))
+      .toHaveLength(1));
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    expect(JSON.parse(String(patch?.[1]?.body))).toEqual({
+      tts_provider: "openai",
+      tts_api_url: OPENAI_BASE_URL,
+      tts_api_key: "new-openai-key",
+      tts_model_name: "gpt-4o-mini-tts",
+      tts_voice_id: "alloy",
+    });
+  });
+
+  it("uses the English COMING SOON badge on 20 cards and AVAILABLE on active Gemini", async () => {
     localStorage.setItem("ns_locale", "en");
     await renderForm(emptyStatus());
 
     const section = screen.getByTestId("api-settings-section");
-    expect(within(section).getAllByText("COMING SOON")).toHaveLength(COMING_SOON_COUNT - 1);
+    expect(within(section).getAllByText("COMING SOON")).toHaveLength(COMING_SOON_PROVIDER_COUNT);
     expect(within(section).getByText("AVAILABLE")).toBeInTheDocument();
   });
 
@@ -833,7 +885,7 @@ describe("<ApiCredentialsForm /> card states", () => {
     fireEvent.click(screen.getByTestId("provider-card-whatsapp-meta_cloud"));
     fireEvent.click(screen.getByTestId("provider-card-llm-openai"));
 
-    expect(within(section).getAllByText("EM BREVE")).toHaveLength(COMING_SOON_COUNT - 1);
+    expect(within(section).getAllByText("EM BREVE")).toHaveLength(COMING_SOON_PROVIDER_COUNT);
     expect(within(section).getByText("DISPONÍVEL")).toBeInTheDocument();
     expect(within(section).queryByText("CONFIGURADO")).not.toBeInTheDocument();
     expect(within(section).queryByText("INCOMPLETO")).not.toBeInTheDocument();
@@ -842,7 +894,7 @@ describe("<ApiCredentialsForm /> card states", () => {
     expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH")).toHaveLength(0);
   });
 
-  it("keeps every card inert and warns when the status fetch fails", async () => {
+  it("fails closed all 21 provider cards and warns when the status fetch fails", async () => {
     localStorage.setItem("ns_locale", "pt");
     const fetchMock = vi.fn().mockResolvedValue(response({}, false, 500));
     globalThis.fetch = fetchMock as unknown as typeof fetch;
@@ -854,7 +906,7 @@ describe("<ApiCredentialsForm /> card states", () => {
 
     // Fail closed: an unknown tenant state must never make a card editable.
     const section = screen.getByTestId("api-settings-section");
-    expect(within(section).getAllByText("EM BREVE")).toHaveLength(COMING_SOON_COUNT);
+    expect(within(section).getAllByText("EM BREVE")).toHaveLength(TOTAL_PROVIDER_CARD_COUNT);
     expect(within(section).queryByRole("button")).not.toBeInTheDocument();
   });
 
@@ -875,7 +927,7 @@ describe("<ApiCredentialsForm /> card states", () => {
     const voiceSection = screen.getByTestId("voice-response-controls");
     const apiSection = screen.getByTestId("api-settings-section");
     expect(apiSection.contains(voiceSection)).toBe(false);
-    expect(within(apiSection).getAllByTestId(/provider-card-/)).toHaveLength(COMING_SOON_COUNT);
+    expect(within(apiSection).getAllByTestId(/provider-card-/)).toHaveLength(TOTAL_PROVIDER_CARD_COUNT);
   });
 
   it("does not expose the Integrations tab or voice section to clinic admins", async () => {

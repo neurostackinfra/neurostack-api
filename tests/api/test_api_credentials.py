@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from src.api.schemas.config import ApiCredentialsPatch
+from src.api.schemas.config import ApiCredentialsPatch, TtsCredentialsPatch
 from src.config.settings import settings
 from src.repositories import get_db_session_dependency
 from src.services.api_credentials import GEMINI_API_BASE_URL, PROVIDER_AVAILABILITY
@@ -359,6 +359,12 @@ def test_tts_reply_policy_default_is_not_an_implicit_patch() -> None:
     assert explicit.model_dump(exclude_unset=True) == {
         "tts_reply_policy": "audio_input"
     }
+
+
+def test_openai_tts_provider_validates_at_the_schema_boundary() -> None:
+    patch = TtsCredentialsPatch.model_validate({"tts_provider": "openai"})
+    assert patch.tts_provider == "openai"
+    assert patch.model_dump(exclude_unset=True) == {"tts_provider": "openai"}
 
 
 def test_tts_control_patch_requires_bundle_and_invalid_policy_is_atomic(
