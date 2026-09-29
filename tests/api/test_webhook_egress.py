@@ -7,9 +7,10 @@ and every ``UnsafeEgressError`` variant produces the exact skip envelope
 BEFORE any STT request, reply, handoff or session mutation.
 
 Also covers:
-- Unsupported STT providers (elevenlabs_scribe, google_stt, deepgram_stt,
-  microsoft_stt) return the skip envelope *before* any download.
-- Supported providers (outros, openai_whisper) proceed to the download step.
+- Unsupported STT providers (google_stt, deepgram_stt, microsoft_stt) return
+  the skip envelope *before* any download.
+- Supported providers (outros, openai_whisper, Scribe and OpenRouter) proceed
+  to the download step.
 """
 
 import base64
@@ -26,10 +27,125 @@ import jwt
 import pytest
 from fastapi.testclient import TestClient
 
+from src.api.routes.webhook import _stt_transcribe_audio
 from src.config.settings import settings
 from src.services.safe_egress import SafeDownload, UnsafeEgressError
+from src.services.stt_service import SttTranscriptionError
 
 API_CRED_PATH = "/v1/config/api-credentials"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "api_url"),
+    [
+        ("elevenlabs_scribe", "https://api.elevenlabs.io/v1"),
+        ("openrouter", "https://openrouter.ai/api/v1"),
+    ],
+)
+async def test_new_stt_providers_dispatch_with_raw_mime_and_no_legacy_call(
+    provider: str, api_url: str
+) -> None:
+    fixed = AsyncMock(return_value="transcript")
+    legacy = AsyncMock()
+    audio = b"raw-ogg-opus-bytes"
+    with (
+        patch("src.services.stt_service.transcribe_audio", fixed),
+        patch("src.services.groq_service.transcribe_audio", legacy),
+    ):
+        result = await _stt_transcribe_audio(
+            audio,
+            "audio/ogg; codecs=opus",
+            {
+                "stt_provider": provider,
+                "stt_api_url": api_url,
+                "stt_api_key": "fixed-provider-key",
+                "stt_model_name": "configured-model",
+            },
+            "pt-BR",
+        )
+
+    assert result == "transcript"
+    fixed.assert_awaited_once_with(
+        provider=provider,
+        api_url=api_url,
+        api_key="fixed-provider-key",
+        audio_bytes=audio,
+        mimetype="audio/ogg; codecs=opus",
+        model_name="configured-model",
+        language="pt",
+    )
+    legacy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["outros", "openai_whisper"])
+async def test_legacy_stt_providers_keep_groq_dispatch(provider: str) -> None:
+    fixed = AsyncMock()
+    legacy = AsyncMock(return_value="legacy transcript")
+    with (
+        patch("src.services.stt_service.transcribe_audio", fixed),
+        patch("src.services.groq_service.transcribe_audio", legacy),
+    ):
+        result = await _stt_transcribe_audio(
+            b"legacy-audio",
+            "audio/ogg",
+            {
+                "stt_provider": provider,
+                "stt_api_key": "legacy-key",
+                "stt_model_name": "legacy-model",
+            },
+            "en",
+        )
+
+    assert result == "legacy transcript"
+    legacy.assert_awaited_once()
+    fixed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "credentials",
+    [
+        {
+            "stt_provider": "openrouter",
+            "stt_api_key": "key",
+            "stt_model_name": "model",
+        },
+        {
+            "stt_provider": "openrouter",
+            "stt_api_url": "https://openrouter.ai/api/v1",
+            "stt_model_name": "model",
+        },
+        {
+            "stt_provider": "openrouter",
+            "stt_api_url": "https://openrouter.ai/api/v1",
+            "stt_api_key": "key",
+        },
+        {
+            "stt_provider": "openrouter",
+            "stt_api_url": "https://openrouter.ai/api/v1",
+            "stt_api_key": "",
+            "stt_model_name": "model",
+        },
+    ],
+)
+async def test_corrupt_explicit_stt_bundle_fails_with_closed_token_pre_network(
+    credentials: dict[str, str],
+) -> None:
+    fixed = AsyncMock()
+    with patch("src.services.stt_service.transcribe_audio", fixed):
+        with pytest.raises(SttTranscriptionError) as caught:
+            await _stt_transcribe_audio(
+                b"audio",
+                "audio/ogg",
+                credentials,
+                "pt-BR",
+            )
+    assert caught.value.code == "stt_configuration_invalid"
+    assert str(caught.value) == "stt_configuration_invalid"
+    fixed.assert_not_awaited()
+
 
 # ---- helpers ----------------------------------------------------------------
 
@@ -591,13 +707,13 @@ class TestZapiAudioEventMetadataModel:
 
 
 class TestUnsupportedSttSkipBeforeDownload:
-    """elevenlabs_scribe, google_stt, deepgram_stt, microsoft_stt must return
+    """google_stt, deepgram_stt and microsoft_stt must return
     the skip envelope BEFORE any audio download, STT call, reply, handoff or
     session mutation."""
 
     @pytest.mark.parametrize(
         "provider",
-        ["elevenlabs_scribe", "google_stt", "deepgram_stt", "microsoft_stt"],
+        ["google_stt", "deepgram_stt", "microsoft_stt"],
     )
     def test_unsupported_stt_returns_skip_without_download(
         self,
@@ -641,14 +757,14 @@ class TestUnsupportedSttSkipBeforeDownload:
 
     @pytest.mark.parametrize(
         "provider",
-        ["outros", "openai_whisper"],
+        ["outros", "openai_whisper", "elevenlabs_scribe", "openrouter"],
     )
     def test_supported_stt_proceeds_to_download(
         self,
         client: TestClient,
         provider: str,
     ) -> None:
-        """Supported providers (outros, openai_whisper) reach the download step."""
+        """Every operational provider reaches the download step."""
         tenant_id = uuid4()
         instance_id = f"inst-{uuid4().hex[:8]}"
         raw_token = _new_zapi_token()
@@ -791,7 +907,7 @@ class TestMetaAudioEgressRejection:
 class TestMetaUnsupportedSttSkipBeforeResolve:
     """Meta webhook: unsupported STT providers skip before any external call.
 
-    WISH.md criterion: "quatro STT unsupported nao produzem efeitos" — resolve,
+    WISH.md criterion: unsupported STT providers produce no effects — resolve,
     download, transcription, reply, handoff and session mutation must all be
     unreachable when stt_provider is in the unsupported set.
     """
@@ -858,7 +974,7 @@ class TestMetaUnsupportedSttSkipBeforeResolve:
 
     @pytest.mark.parametrize(
         "provider",
-        ["elevenlabs_scribe", "google_stt", "deepgram_stt", "microsoft_stt"],
+        ["google_stt", "deepgram_stt", "microsoft_stt"],
     )
     def test_meta_unsupported_stt_skips_before_resolve(
         self, client: TestClient, provider: str

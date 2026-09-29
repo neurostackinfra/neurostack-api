@@ -235,6 +235,53 @@ describe("<HandoffQueuePage />", () => {
     ).not.toBeInTheDocument();
   });
 
+  it.each([
+    {
+      locale: "pt" as const,
+      averageTitle: "Tempo Médio na Fila",
+      averageDescription:
+        "Tempo médio até a confirmação do atendimento humano.",
+      slaTitle: "Dentro da Meta",
+      slaDescription:
+        "Percentual calculado sobre os atendimentos elegíveis no período.",
+      hidden: ["Avg. Queue Wait", "Within SLA"],
+    },
+    {
+      locale: "en" as const,
+      averageTitle: "Avg. Queue Wait",
+      averageDescription: "Average time until human service is confirmed.",
+      slaTitle: "Within SLA",
+      slaDescription:
+        "Percentage calculated from eligible handoffs in the period.",
+      hidden: ["Tempo Médio na Fila", "Dentro da Meta"],
+    },
+  ])(
+    "shows SLA analytics only in $locale",
+    async ({
+      locale,
+      averageTitle,
+      averageDescription,
+      slaTitle,
+      slaDescription,
+      hidden,
+    }) => {
+      await renderLoaded(locale);
+
+      expect(screen.getByText(averageTitle)).toBeInTheDocument();
+      expect(screen.getByText(averageDescription)).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          (_, element) =>
+            element?.tagName === "P" && element.textContent === slaTitle,
+        ),
+      ).toBeInTheDocument();
+      expect(screen.getByText(slaDescription)).toBeInTheDocument();
+      hidden.forEach((text) =>
+        expect(screen.queryByText(text)).not.toBeInTheDocument(),
+      );
+    },
+  );
+
   it("preserves received order through operational filters without refetching", async () => {
     await renderLoaded();
     const requestCount = mocks.fetch.mock.calls.length;

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import jwt
@@ -12,10 +13,15 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from src.api.schemas.config import ApiCredentialsPatch
+from src.api.schemas.config import ApiCredentialsPatch, TtsCredentialsPatch
 from src.config.settings import settings
 from src.repositories import get_db_session_dependency
-from src.services.api_credentials import GEMINI_API_BASE_URL, PROVIDER_AVAILABILITY
+from src.services.api_credentials import (
+    GEMINI_API_BASE_URL,
+    PROVIDER_AVAILABILITY,
+    STT_FIXED_API_BASES,
+    resolve_stt_credentials,
+)
 
 PATH = "/v1/config/api-credentials"
 
@@ -293,8 +299,12 @@ def test_openapi_uses_typed_credential_patch_and_validation_never_echoes_input(
         "application/json"
     ]["schema"]
     assert request_schema["$ref"].endswith("/ApiCredentialsPatch")
+    stt_provider_schema = schema["components"]["schemas"]["ApiCredentialsPatch"][
+        "properties"
+    ]["stt_provider"]
+    assert "openrouter" in stt_provider_schema["anyOf"][0]["enum"]
     description = schema["paths"][PATH]["patch"]["description"]
-    assert "Gemini is the sole active provider" in description
+    assert "Public provider availability is unchanged" in description
     assert "All displayable providers are currently coming soon" not in description
 
     headers = _jwt_headers("clinic_admin")
@@ -359,6 +369,12 @@ def test_tts_reply_policy_default_is_not_an_implicit_patch() -> None:
     assert explicit.model_dump(exclude_unset=True) == {
         "tts_reply_policy": "audio_input"
     }
+
+
+def test_openai_tts_provider_validates_at_the_schema_boundary() -> None:
+    patch = TtsCredentialsPatch.model_validate({"tts_provider": "openai"})
+    assert patch.tts_provider == "openai"
+    assert patch.model_dump(exclude_unset=True) == {"tts_provider": "openai"}
 
 
 def test_tts_control_patch_requires_bundle_and_invalid_policy_is_atomic(
@@ -767,7 +783,7 @@ def test_runtime_control_legacy_echo_is_accepted_without_mutation(
     assert response.status_code == 200, response.text
     assert response.json()["multimodal_text_fallback_enabled"] is True
     assert response.json()["audio_max_seconds"] == 45
-    assert calls == ["flush", "commit"]
+    assert calls == []
     assert row.api_credentials == existing
 
 
@@ -821,7 +837,7 @@ def test_legacy_echo_passes_while_maintenance_and_switch_stay_atomic(
         )
         assert echo.status_code == 200, echo.text
         assert echo.json()["llm_api_url"] == "https://api.openai.com/v1"
-        assert calls == ["flush", "commit"]
+        assert calls == []
         assert row.api_credentials == existing
 
         calls.clear()
@@ -929,3 +945,527 @@ def test_tts_config_mutations_without_known_provider_are_atomic(
     assert "saved-secret-that-must-not-leak" not in response.text
     assert calls == []
     assert row.api_credentials == existing
+
+
+STT_INCUMBENT_FIXTURES = [
+    pytest.param(
+        {
+            "whisper_api_key": "legacy-stt-secret",
+            "whisper_model": "legacy-whisper-model",
+        },
+        id="alias_only",
+    ),
+    pytest.param(
+        {
+            "stt_api_key": "canonical-stt-secret",
+            "stt_model_name": "canonical-model",
+            "stt_api_url": "https://speech.example/v1",
+        },
+        id="canonical_only",
+    ),
+    pytest.param(
+        {
+            "stt_api_key": "canonical-stt-secret",
+            "whisper_model": "legacy-model",
+            "stt_api_url": "https://speech.example/v1",
+        },
+        id="mixed",
+    ),
+    pytest.param(
+        {
+            "stt_provider": "outros",
+            "stt_api_key": "explicit-secret",
+            "stt_model_name": "explicit-model",
+            "stt_api_url": "https://speech.example/v1",
+        },
+        id="explicit_outros",
+    ),
+    pytest.param({"stt_api_url": "https://speech.example/v1"}, id="url_only"),
+    pytest.param({"stt_api_key": "key-only"}, id="key_only"),
+    pytest.param({"stt_model_name": "model-only"}, id="model_only"),
+    pytest.param({"whisper_api_key": "alias-key-only"}, id="alias_key_only"),
+    pytest.param({"whisper_model": "alias-model-only"}, id="alias_model_only"),
+]
+
+
+def _canonical_stt_echo(existing: dict[str, object]) -> dict[str, object]:
+    resolved = resolve_stt_credentials(existing)
+    return {
+        "stt_provider": "outros",
+        "stt_api_url": resolved.get("stt_api_url"),
+        "stt_api_key": "••••••••" if resolved.get("stt_api_key") else None,
+        "stt_model_name": resolved.get("stt_model_name"),
+        "audio_max_seconds": resolved.get("audio_max_seconds"),
+    }
+
+
+@pytest.mark.parametrize("existing", STT_INCUMBENT_FIXTURES)
+def test_stt_incumbent_canonical_echo_is_zero_effect_and_preserves_raw_json(
+    client: TestClient,
+    test_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    existing: dict[str, object],
+) -> None:
+    row = SimpleNamespace(api_credentials=dict(existing))
+    snapshot = dict(existing)
+    calls: list[str] = []
+
+    class SessionSpy:
+        def add(self, value: Any) -> None:
+            calls.append("add")
+
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+
+        async def rollback(self) -> None:
+            calls.append("rollback")
+
+    async def override_session() -> Any:
+        yield SessionSpy()
+
+    async def load_existing(*args: Any, **kwargs: Any) -> Any:
+        return row
+
+    async def invalidate(*args: Any, **kwargs: Any) -> None:
+        calls.append("cache")
+
+    def emit(**kwargs: Any) -> None:
+        calls.append("emit")
+
+    network = AsyncMock()
+    monkeypatch.setattr("src.api.routes.config._load_config", load_existing)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache", invalidate
+    )
+    monkeypatch.setattr("src.api.routes.config._emit_api_credentials_changed", emit)
+    monkeypatch.setattr("src.services.stt_service.transcribe_audio", network)
+    test_app.dependency_overrides[get_db_session_dependency] = override_session
+    try:
+        response = client.patch(
+            PATH,
+            headers=_jwt_headers("clinic_admin"),
+            json=_canonical_stt_echo(existing),
+        )
+    finally:
+        test_app.dependency_overrides.pop(get_db_session_dependency, None)
+
+    assert response.status_code == 200, response.text
+    assert calls == []
+    assert network.await_count == 0
+    assert row.api_credentials == snapshot
+
+
+@pytest.mark.parametrize("provider", ["elevenlabs_scribe", "openrouter"])
+def test_stt_incumbent_switch_orders_commit_cache_emit_and_redacts_payload(
+    client: TestClient,
+    test_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+) -> None:
+    existing = {
+        "whisper_api_key": "legacy-key-sentinel",
+        "whisper_model": "legacy-model-sentinel",
+    }
+    row = SimpleNamespace(api_credentials=dict(existing))
+    calls: list[str] = []
+    emitted: dict[str, Any] = {}
+
+    class SessionSpy:
+        def add(self, value: Any) -> None:
+            calls.append("add")
+
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+
+        async def rollback(self) -> None:
+            calls.append("rollback")
+
+    async def override_session() -> Any:
+        yield SessionSpy()
+
+    async def load_existing(*args: Any, **kwargs: Any) -> Any:
+        return row
+
+    async def invalidate(*args: Any, **kwargs: Any) -> None:
+        calls.append("cache")
+
+    def emit(event: str, **kwargs: Any) -> None:
+        calls.append("emit")
+        emitted["event"] = event
+        emitted.update(kwargs)
+
+    monkeypatch.setattr("src.api.routes.config._load_config", load_existing)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache", invalidate
+    )
+    monkeypatch.setattr("src.api.routes.config._audit_logger.info", emit)
+    test_app.dependency_overrides[get_db_session_dependency] = override_session
+    payload = {
+        "stt_provider": provider,
+        "stt_api_url": STT_FIXED_API_BASES[provider],
+        "stt_api_key": "fresh-key-sentinel",
+        "stt_model_name": "fresh-model-sentinel",
+    }
+    try:
+        response = client.patch(
+            PATH, headers=_jwt_headers("clinic_admin"), json=payload
+        )
+    finally:
+        test_app.dependency_overrides.pop(get_db_session_dependency, None)
+
+    assert response.status_code == 200, response.text
+    assert calls == ["flush", "commit", "cache", "emit"]
+    assert row.api_credentials == payload
+    assert emitted["event"] == "api_credentials_changed"
+    assert emitted["capability"] == "stt"
+    assert emitted["previous_provider"] == "outros"
+    assert emitted["new_provider"] == provider
+    assert emitted["endpoint_class"] == "fixed"
+    assert emitted["fields"] == (
+        "stt_provider",
+        "stt_api_url",
+        "stt_api_key",
+        "stt_model_name",
+    )
+    rendered = repr(emitted)
+    for secret_value in (
+        "legacy-key-sentinel",
+        "legacy-model-sentinel",
+        "fresh-key-sentinel",
+        "fresh-model-sentinel",
+        STT_FIXED_API_BASES[provider],
+    ):
+        assert secret_value not in rendered
+
+
+@pytest.mark.parametrize(
+    ("existing", "payload", "error"),
+    [
+        (
+            {},
+            {
+                "stt_provider": "openrouter",
+                "stt_api_url": STT_FIXED_API_BASES["openrouter"],
+                "stt_api_key": "fresh-key",
+                "stt_model_name": "fresh-model",
+            },
+            "provider_not_available",
+        ),
+        (
+            {"stt_provider": "openai_whisper", "stt_api_key": "saved"},
+            {
+                "stt_provider": "openrouter",
+                "stt_api_url": STT_FIXED_API_BASES["openrouter"],
+                "stt_api_key": "fresh-key",
+                "stt_model_name": "fresh-model",
+            },
+            "provider_not_available",
+        ),
+        (
+            {"whisper_api_key": "legacy"},
+            {
+                "stt_provider": "openrouter",
+                "stt_api_url": "",
+                "stt_api_key": "fresh-key",
+                "stt_model_name": "fresh-model",
+            },
+            "provider_switch_bundle_required",
+        ),
+        (
+            {"whisper_api_key": "legacy"},
+            {
+                "stt_provider": "openrouter",
+                "stt_api_url": "   ",
+                "stt_api_key": "fresh-key",
+                "stt_model_name": "fresh-model",
+            },
+            "provider_switch_bundle_required",
+        ),
+        (
+            {"whisper_api_key": "legacy"},
+            {
+                "stt_provider": "openrouter",
+                "stt_api_url": None,
+                "stt_api_key": "fresh-key",
+                "stt_model_name": "fresh-model",
+            },
+            "provider_switch_bundle_required",
+        ),
+        (
+            {"whisper_api_key": "legacy"},
+            {
+                "stt_provider": "openrouter",
+                "stt_api_url": STT_FIXED_API_BASES["openrouter"],
+                "stt_api_key": "••••••••",
+                "stt_model_name": "fresh-model",
+            },
+            "provider_switch_bundle_required",
+        ),
+        (
+            {"whisper_api_key": "legacy"},
+            {
+                "stt_provider": "openrouter",
+                "stt_api_url": STT_FIXED_API_BASES["openrouter"],
+                "stt_api_key": "",
+                "stt_model_name": "fresh-model",
+            },
+            "provider_switch_bundle_required",
+        ),
+        (
+            {"whisper_api_key": "legacy"},
+            {
+                "stt_provider": "openrouter",
+                "stt_api_url": STT_FIXED_API_BASES["openrouter"],
+                "stt_api_key": "   ",
+                "stt_model_name": "fresh-model",
+            },
+            "provider_switch_bundle_required",
+        ),
+        (
+            {"stt_provider": "outros", "stt_api_key": "legacy"},
+            {"audio_max_seconds": 45},
+            "provider_not_available",
+        ),
+        (
+            {
+                "stt_provider": "openrouter",
+                "stt_api_url": STT_FIXED_API_BASES["openrouter"],
+                "stt_api_key": "saved",
+                "stt_model_name": "saved-model",
+            },
+            {"stt_model_name": "replacement"},
+            "provider_not_available",
+        ),
+        ({}, {"stt_provider": "outros"}, "provider_not_available"),
+    ],
+)
+def test_stt_rejected_transitions_have_zero_effects(
+    client: TestClient,
+    test_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    existing: dict[str, object],
+    payload: dict[str, object],
+    error: str,
+) -> None:
+    row = SimpleNamespace(api_credentials=dict(existing))
+    snapshot = dict(existing)
+    calls: list[str] = []
+
+    class SessionSpy:
+        def add(self, value: Any) -> None:
+            calls.append("add")
+
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+
+        async def rollback(self) -> None:
+            calls.append("rollback")
+
+    async def override_session() -> Any:
+        yield SessionSpy()
+
+    async def load_existing(*args: Any, **kwargs: Any) -> Any:
+        return row
+
+    async def invalidate(*args: Any, **kwargs: Any) -> None:
+        calls.append("cache")
+
+    def emit(**kwargs: Any) -> None:
+        calls.append("emit")
+
+    network = AsyncMock()
+    monkeypatch.setattr("src.api.routes.config._load_config", load_existing)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache", invalidate
+    )
+    monkeypatch.setattr("src.api.routes.config._emit_api_credentials_changed", emit)
+    monkeypatch.setattr("src.services.stt_service.transcribe_audio", network)
+    test_app.dependency_overrides[get_db_session_dependency] = override_session
+    try:
+        response = client.patch(
+            PATH, headers=_jwt_headers("clinic_admin"), json=payload
+        )
+    finally:
+        test_app.dependency_overrides.pop(get_db_session_dependency, None)
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["error"] == error
+    assert calls == []
+    assert network.await_count == 0
+    assert row.api_credentials == snapshot
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://openrouter.ai:443/api/v1",
+        "https://openrouter.ai:8443/api/v1",
+        "https://openrouter.ai/api/v1/audio/transcriptions",
+        "https://openrouter.ai/api/v1?query=sentinel",
+        "https://openrouter.ai/api/v1#fragment",
+        "https://user@openrouter.ai/api/v1",
+        "https://evil.example/api/v1",
+    ],
+)
+def test_stt_fixed_endpoint_rejection_uses_general_secret_free_translation(
+    client: TestClient, endpoint: str
+) -> None:
+    response = client.patch(
+        PATH,
+        headers=_jwt_headers("clinic_admin"),
+        json={
+            "stt_provider": "openrouter",
+            "stt_api_url": endpoint,
+            "stt_api_key": "secret-sentinel",
+            "stt_model_name": "model-sentinel",
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "error": "invalid_provider_endpoint",
+        "capability": "stt",
+        "provider": "openrouter",
+        "field": "stt_api_url",
+    }
+    assert endpoint not in response.text
+    assert "secret-sentinel" not in response.text
+    assert "model-sentinel" not in response.text
+
+
+def test_stt_switch_emitter_failure_is_counted_once_without_rollback(
+    client: TestClient,
+    test_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    row = SimpleNamespace(api_credentials={"whisper_api_key": "legacy"})
+    calls: list[str] = []
+
+    class SessionSpy:
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+
+        async def rollback(self) -> None:
+            calls.append("rollback")
+
+    class CounterSpy:
+        def inc(self) -> None:
+            calls.append("counter")
+
+    async def override_session() -> Any:
+        yield SessionSpy()
+
+    async def load_existing(*args: Any, **kwargs: Any) -> Any:
+        return row
+
+    async def invalidate(*args: Any, **kwargs: Any) -> None:
+        calls.append("cache")
+
+    def fail_emit(**kwargs: Any) -> None:
+        calls.append("emit")
+        raise RuntimeError("emitter-secret-sentinel")
+
+    monkeypatch.setattr("src.api.routes.config._load_config", load_existing)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache", invalidate
+    )
+    monkeypatch.setattr(
+        "src.api.routes.config._emit_api_credentials_changed", fail_emit
+    )
+    monkeypatch.setattr(
+        "src.api.routes.config.API_CREDENTIALS_CHANGE_EMIT_FAILURES_TOTAL",
+        CounterSpy(),
+    )
+    test_app.dependency_overrides[get_db_session_dependency] = override_session
+    try:
+        response = client.patch(
+            PATH,
+            headers=_jwt_headers("clinic_admin"),
+            json={
+                "stt_provider": "openrouter",
+                "stt_api_url": STT_FIXED_API_BASES["openrouter"],
+                "stt_api_key": "fresh-key",
+                "stt_model_name": "fresh-model",
+            },
+        )
+    finally:
+        test_app.dependency_overrides.pop(get_db_session_dependency, None)
+
+    assert response.status_code == 200, response.text
+    assert calls == ["flush", "commit", "cache", "emit", "counter"]
+    assert "emitter-secret-sentinel" not in caplog.text
+
+
+def test_stt_switch_commit_failure_rolls_back_without_cache_emit_or_counter(
+    client: TestClient,
+    test_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = SimpleNamespace(api_credentials={"whisper_api_key": "legacy"})
+    calls: list[str] = []
+
+    class SessionSpy:
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+            raise RuntimeError("commit failed")
+
+        async def rollback(self) -> None:
+            calls.append("rollback")
+
+    class CounterSpy:
+        def inc(self) -> None:
+            calls.append("counter")
+
+    async def override_session() -> Any:
+        yield SessionSpy()
+
+    async def load_existing(*args: Any, **kwargs: Any) -> Any:
+        return row
+
+    async def invalidate(*args: Any, **kwargs: Any) -> None:
+        calls.append("cache")
+
+    def emit(**kwargs: Any) -> None:
+        calls.append("emit")
+
+    monkeypatch.setattr("src.api.routes.config._load_config", load_existing)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache", invalidate
+    )
+    monkeypatch.setattr("src.api.routes.config._emit_api_credentials_changed", emit)
+    monkeypatch.setattr(
+        "src.api.routes.config.API_CREDENTIALS_CHANGE_EMIT_FAILURES_TOTAL",
+        CounterSpy(),
+    )
+    test_app.dependency_overrides[get_db_session_dependency] = override_session
+    try:
+        with pytest.raises(RuntimeError, match="commit failed"):
+            client.patch(
+                PATH,
+                headers=_jwt_headers("clinic_admin"),
+                json={
+                    "stt_provider": "openrouter",
+                    "stt_api_url": STT_FIXED_API_BASES["openrouter"],
+                    "stt_api_key": "fresh-key",
+                    "stt_model_name": "fresh-model",
+                },
+            )
+    finally:
+        test_app.dependency_overrides.pop(get_db_session_dependency, None)
+
+    assert calls == ["flush", "commit", "rollback"]

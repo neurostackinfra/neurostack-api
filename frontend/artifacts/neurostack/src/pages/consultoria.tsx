@@ -53,7 +53,6 @@ export default function Consultoria() {
             <div>
               <h1 className="text-2xl font-bold tracking-tight text-foreground">
                 {txt("Consultoria Comercial & Insights", "Commercial Consulting & Insights")}
-                <span className="text-foreground/60 font-normal text-lg ml-2">(AI Business Partner)</span>
               </h1>
               <p className="text-sm font-medium text-foreground/70 mt-0.5">
                 {txt(

@@ -451,7 +451,7 @@ type SttProvider =
   | "deepgram_stt"
   | "microsoft_stt"
   | "outros";
-type TtsProvider = "elevenlabs" | "google";
+type TtsProvider = "elevenlabs" | "google" | "openai";
 type MultimodalProvider = "openrouter";
 
 // Every canonical multimodal provider id declared in the backend allowlist
@@ -514,6 +514,7 @@ export const API_PROVIDER_AVAILABILITY = {
   tts: {
     elevenlabs: "coming_soon",
     google: "coming_soon",
+    openai: "coming_soon",
   },
 } as const satisfies ProviderAvailabilityMatrix;
 
@@ -644,6 +645,7 @@ export const STT_PROVIDERS: { id: SttProvider; label: string; sub: string }[] = 
 export const TTS_PROVIDERS: { id: TtsProvider; label: string; sub: string }[] = [
   { id: "elevenlabs", label: "ElevenLabs",      sub: "Voz natural e humana" },
   { id: "google",     label: "Google Cloud TTS", sub: "Escala e bom custo"       },
+  { id: "openai",     label: "OpenAI TTS",       sub: "gpt-4o-audio / tts-1" },
 ];
 
 // The display catalog is intentionally availability-agnostic: the canonical
@@ -746,15 +748,20 @@ const CAPABILITY_FIELDS: Record<string, readonly CredentialField[]> = {
 
 const GEMINI_OPENAI_COMPATIBLE_BASE_URL =
   "https://generativelanguage.googleapis.com/v1beta/openai";
+const OPENAI_BASE_URL = "https://api.openai.com/v1";
 
 function newProviderFieldDefault(
   capability: ApiCapabilityId,
   providerId: string,
   fieldName: string,
 ): string {
-  return capability === "llm" && providerId === "gemini" && fieldName === "llm_api_url"
-    ? GEMINI_OPENAI_COMPATIBLE_BASE_URL
-    : "";
+  if (capability === "llm" && providerId === "gemini" && fieldName === "llm_api_url") {
+    return GEMINI_OPENAI_COMPATIBLE_BASE_URL;
+  }
+  if (capability === "tts" && providerId === "openai" && fieldName === "tts_api_url") {
+    return OPENAI_BASE_URL;
+  }
+  return "";
 }
 
 const CAPABILITY_PROVIDER_FIELD: Record<ApiCapabilityId, string> = {
@@ -1247,8 +1254,6 @@ const INVESTOR_MOCK_CONFIG = {
     sat: { open: "09:00", close: "14:00" },
   },
   service_format: "both",
-  online_services_desc: "Consulta de avaliação, acompanhamento pós-procedimento, orientações nutricionais",
-  presential_services_desc: "Aplicação de toxina botulínica, preenchimento labial, limpeza de pele profunda, harmonização facial",
   differentials: "Especialistas com mais de 10 anos de experiência, atendimento humanizado e foco em resultados naturais. Equipamentos de última geração importados da Alemanha.",
   accepts_insurance: "yes",
   insurance_list: "Unimed, Bradesco Saúde, SulAmérica, Amil",
@@ -1267,6 +1272,35 @@ const INVESTOR_MOCK_CONFIG = {
     { name: "Consulta de Avaliação", description: "Avaliação inicial para indicar o cuidado mais adequado", price: "R$ 250", authority_notes: "Orientação personalizada pela equipe clínica", service_format: "online" },
   ],
 };
+
+export function HitlComingSoonControl() {
+  const { locale } = useI18n();
+  const modeTitle = locale === "en"
+    ? "Co-pilot mode - COMING SOON"
+    : "Modo co-piloto - EM BREVE";
+
+  return (
+    <div
+      className="flex items-center justify-between gap-3 rounded-lg border border-border/60 bg-muted/20 px-4 py-4"
+      data-testid="hitl-coming-soon"
+    >
+      <div className="space-y-1">
+        <p className="text-sm font-semibold text-foreground">
+          Human-in-the-loop (HITL)
+        </p>
+        <p className="text-xs text-muted-foreground">
+          {modeTitle}
+        </p>
+      </div>
+      <Switch
+        aria-label={modeTitle}
+        checked={false}
+        disabled
+        className="shrink-0"
+      />
+    </div>
+  );
+}
 
 export default function ClinicConfig() {
   const { clinicId, isReadOnly, isClinicAdmin, role, isBuilder, isSuperAdmin, isInvestor, viewingClinicId } = useAuth();
@@ -1332,8 +1366,6 @@ export default function ClinicConfig() {
   const [businessHours, setBusinessHours] = useState<BusinessHoursMap | null>(null);
   const [businessHoursErrors, setBusinessHoursErrors] = useState<Record<string, string>>({});
   const [metaMinutosAtendimento, setMetaMinutosAtendimento] = useState("10");
-  const [onlineServicesDesc, setOnlineServicesDesc] = useState("");
-  const [presentialServicesDesc, setPresentialServicesDesc] = useState("");
 
   // Tab 3 — Regras de Negócio
   const [differentials, setDifferentials] = useState("");
@@ -1370,8 +1402,6 @@ export default function ClinicConfig() {
   const [handoffPeriod, setHandoffPeriod] = useState("permanent");
   const [handoffCycleDays, setHandoffCycleDays] = useState("");
   const [handoffInactiveDefaultHours, setHandoffInactiveDefaultHours] = useState("24");
-  const [hitlActive, setHitlActive] = useState(false);
-  const [hitlCooldown, setHitlCooldown] = useState("15");
 
   // Tab 5 — Catálogo de Serviços
   const [services, setServices] = useState<ClinicService[]>([]);
@@ -1430,8 +1460,6 @@ export default function ClinicConfig() {
     setHandoffCycleDays(config.handoff_cycle_days ?? "");
     setHandoffInactiveDefaultHours(config.handoff_inactive_default_hours ?? "24");
     setMetaMinutosAtendimento(String(config.meta_minutos_atendimento ?? "10"));
-    setOnlineServicesDesc(config.online_services_desc ?? "");
-    setPresentialServicesDesc(config.presential_services_desc ?? "");
     setServices(Array.isArray(config.services) ? config.services.map(hydrateClinicService) : []);
     setServiceFormatErrors({});
     // bot_active: treat null/undefined as true (default on)
@@ -1674,8 +1702,6 @@ export default function ClinicConfig() {
       handoff_cycle_days: handoffCycleDays.trim() || null,
       handoff_inactive_default_hours: parseInt(handoffInactiveDefaultHours, 10) || 24,
       meta_minutos_atendimento: parseInt(metaMinutosAtendimento, 10) || 10,
-      online_services_desc: onlineServicesDesc.trim() || null,
-      presential_services_desc: presentialServicesDesc.trim() || null,
     };
     try {
       const token = getToken();
@@ -2108,8 +2134,8 @@ export default function ClinicConfig() {
               <SwitchRow
                 label={txt("Link de Agendamento", "Scheduling Link")}
                 hint={txt(
-                  "Quando ativo, a IA envia o link (definido abaixo) ao paciente na confirmação do agendamento e cria um handoff pendente de verificação.",
-                  "When enabled, the AI sends the link (defined below) to the patient on scheduling confirmation and creates a pending-verification handoff.",
+                  "Quando ativo, a IA envia o link (definido abaixo) ao paciente após ele confirmar a solicitação de agendamento e cria um handoff pendente de verificação.",
+                  "When enabled, the AI sends the link (defined below) after the patient confirms the scheduling request and creates a pending-verification handoff.",
                 )}
                 checked={schedulingLinkEnabled}
                 onCheckedChange={(v) => {
@@ -2212,40 +2238,6 @@ export default function ClinicConfig() {
                   </SelectContent>
                 </Select>
               </Field>
-
-              {(serviceFormat === "online" || serviceFormat === "both") && (
-                <Field
-                  label={txt("Serviços realizados Online", "Online Services")}
-                  hint={txt("Quais procedimentos ou consultas são oferecidos de forma remota.", "Which procedures or consultations are offered remotely.")}
-                >
-                  <Textarea
-                    value={onlineServicesDesc}
-                    onChange={(e) => setOnlineServicesDesc(e.target.value)}
-                    placeholder={txt("Ex: Consulta de avaliação, acompanhamento pós-procedimento, orientações nutricionais", "e.g. Assessment consultation, post-procedure follow-up, nutritional guidance")}
-                    rows={3}
-                    className="resize-none text-sm"
-                    disabled={isReadOnly}
-                    data-testid="textarea-online-services"
-                  />
-                </Field>
-              )}
-
-              {(serviceFormat === "presential" || serviceFormat === "both") && (
-                <Field
-                  label={txt("Serviços realizados Presencialmente", "In-Person Services")}
-                  hint={txt("Quais procedimentos exigem presença física na clínica.", "Which procedures require physical presence at the clinic.")}
-                >
-                  <Textarea
-                    value={presentialServicesDesc}
-                    onChange={(e) => setPresentialServicesDesc(e.target.value)}
-                    placeholder={txt("Ex: Aplicação de toxina botulínica, preenchimento labial, limpeza de pele profunda", "e.g. Botulinum toxin application, lip filler, deep skin cleansing")}
-                    rows={3}
-                    className="resize-none text-sm"
-                    disabled={isReadOnly}
-                    data-testid="textarea-presential-services"
-                  />
-                </Field>
-              )}
             </CardContent>
           </Card>
         </TabsContent>
@@ -2595,58 +2587,7 @@ export default function ClinicConfig() {
               </div>
 
               {/* ── HITL Block ─────────────────────────────────────── */}
-                  <div className="rounded-lg border border-border/60 bg-muted/20 px-4 py-4 space-y-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="space-y-1 flex-1">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-sm font-semibold text-foreground">
-                            {txt("Ativar Human-in-the-Loop (Modo Co-Piloto)", "Enable Human-in-the-Loop (Co-Pilot Mode)")}
-                          </span>
-                          <span className="inline-flex items-center rounded-full border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[10px] font-bold tracking-wider text-indigo-500">
-                            {txt("Recomendado · HITL", "Recommended · HITL")}
-                          </span>
-                          <span className="inline-flex items-center rounded-full border border-purple-500/40 bg-purple-500/10 px-2 py-0.5 text-[10px] font-bold tracking-wider text-purple-400">
-                            ROADMAP · V2
-                          </span>
-                        </div>
-                        <p className="text-xs text-muted-foreground leading-relaxed">
-                          {txt("Em vez de desligar a IA permanentemente, ela pausará e lerá as mensagens da sua equipe no WhatsApp Web, mantendo o contexto para continuar a venda depois.", "Instead of permanently disabling AI, it will pause and read your team's messages on WhatsApp Web, keeping context to continue the conversation later.")}
-                        </p>
-                      </div>
-                      <Switch
-                        checked={hitlActive}
-                        disabled={isReadOnly}
-                        onCheckedChange={() => {
-                          toast({
-                            title: txt("Funcionalidade em desenvolvimento", "Feature in development"),
-                            description: txt("O Modo Co-Piloto estará disponível na V2.", "Co-Pilot Mode will be available in V2."),
-                          });
-                        }}
-                        className="mt-0.5 shrink-0"
-                      />
-                    </div>
-
-                    {hitlActive && (
-                      <div className="pt-1 border-t border-border/40 space-y-1.5">
-                        <label className="text-xs font-semibold text-foreground/80">
-                          {txt("Tempo de Pausa Ativa (Cooldown)", "Active Pause Time (Cooldown)")}
-                        </label>
-                        <Select value={hitlCooldown} onValueChange={setHitlCooldown} disabled={isReadOnly}>
-                          <SelectTrigger className="h-9 text-sm">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="5">5 {txt("Minutos", "Minutes")}</SelectItem>
-                            <SelectItem value="15">15 {txt("Minutos", "Minutes")}</SelectItem>
-                            <SelectItem value="30">30 {txt("Minutos", "Minutes")}</SelectItem>
-                          </SelectContent>
-                        </Select>
-                        <p className="text-[11px] text-muted-foreground">
-                          {txt("A IA ficará em silêncio por este período após cada mensagem enviada por um humano.", "AI will stay silent for this period after each message sent by a human.")}
-                        </p>
-                      </div>
-                    )}
-                  </div>
+                  <HitlComingSoonControl />
 
                   <SwitchRow
                     label={txt("Modo Stand-by pós-Handoff", "Post-Handoff Stand-by Mode")}

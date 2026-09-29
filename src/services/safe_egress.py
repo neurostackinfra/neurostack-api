@@ -58,6 +58,8 @@ LLM_DROPOUT_HOSTS: frozenset[str] = frozenset({"api.neuralake.cloud"})
 LLM_GEMINI_HOSTS: frozenset[str] = frozenset({"generativelanguage.googleapis.com"})
 STT_GROQ_HOSTS: frozenset[str] = frozenset({"api.groq.com"})
 STT_OPENAI_HOSTS: frozenset[str] = frozenset({"api.openai.com"})
+STT_ELEVENLABS_HOSTS: frozenset[str] = frozenset({"api.elevenlabs.io"})
+STT_OPENROUTER_HOSTS: frozenset[str] = frozenset({"openrouter.ai"})
 
 # Multimodal transcription (chat-completions carrying ``input_audio`` blocks).
 # Unlike STT there is no ``outros`` escape hatch here: the credential
@@ -68,10 +70,11 @@ MULTIMODAL_OPENAI_HOSTS: frozenset[str] = frozenset({"api.openai.com"})
 MULTIMODAL_GROQ_HOSTS: frozenset[str] = frozenset({"api.groq.com"})
 MULTIMODAL_OPENROUTER_HOSTS: frozenset[str] = frozenset({"openrouter.ai"})
 
-# Text-to-speech providers. TTS carries clinic-owned API keys, so both
+# Text-to-speech providers. TTS carries clinic-owned API keys, so all
 # operational endpoints are pinned exactly and never use custom-public egress.
 TTS_ELEVENLABS_HOSTS: frozenset[str] = frozenset({"api.elevenlabs.io"})
 TTS_GOOGLE_HOSTS: frozenset[str] = frozenset({"texttospeech.googleapis.com"})
+TTS_OPENAI_HOSTS: frozenset[str] = frozenset({"api.openai.com"})
 
 # Providers that fall back to the "custom public" policy: any public
 # HTTPS destination is accepted, but the DNS/IP filter still runs.
@@ -350,6 +353,12 @@ PROVIDER_POLICIES: Mapping[str, ProviderPolicy] = {
     "llm_outros": ProviderPolicy(kind="llm_outros", allowed_hosts=None),
     "stt_openai": ProviderPolicy(kind="stt_openai", allowed_hosts=STT_OPENAI_HOSTS),
     "stt_groq": ProviderPolicy(kind="stt_groq", allowed_hosts=STT_GROQ_HOSTS),
+    "stt_elevenlabs": ProviderPolicy(
+        kind="stt_elevenlabs", allowed_hosts=STT_ELEVENLABS_HOSTS
+    ),
+    "stt_openrouter": ProviderPolicy(
+        kind="stt_openrouter", allowed_hosts=STT_OPENROUTER_HOSTS
+    ),
     "stt_outros": ProviderPolicy(kind="stt_outros", allowed_hosts=None),
     "multimodal_openai": ProviderPolicy(
         kind="multimodal_openai", allowed_hosts=MULTIMODAL_OPENAI_HOSTS
@@ -364,6 +373,7 @@ PROVIDER_POLICIES: Mapping[str, ProviderPolicy] = {
         kind="tts_elevenlabs", allowed_hosts=TTS_ELEVENLABS_HOSTS
     ),
     "tts_google": ProviderPolicy(kind="tts_google", allowed_hosts=TTS_GOOGLE_HOSTS),
+    "tts_openai": ProviderPolicy(kind="tts_openai", allowed_hosts=TTS_OPENAI_HOSTS),
     "evolution": ProviderPolicy(kind="evolution", allowed_hosts=None),
     "uazapi": ProviderPolicy(kind="uazapi", allowed_hosts=None),
     "audio_url": ProviderPolicy(kind="audio_url", allowed_hosts=None),
@@ -669,10 +679,13 @@ __all__ = [
     "MULTIMODAL_OPENAI_HOSTS",
     "MULTIMODAL_OPENROUTER_HOSTS",
     "PROVIDER_POLICIES",
+    "STT_ELEVENLABS_HOSTS",
     "STT_GROQ_HOSTS",
     "STT_OPENAI_HOSTS",
+    "STT_OPENROUTER_HOSTS",
     "TTS_ELEVENLABS_HOSTS",
     "TTS_GOOGLE_HOSTS",
+    "TTS_OPENAI_HOSTS",
     "ZAPI_ALLOWED_HOSTS",
     "ParsedUrl",
     "PinnedAsyncNetworkBackend",
