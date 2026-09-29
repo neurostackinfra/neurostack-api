@@ -1358,6 +1358,55 @@ class TestHandoffService:
         clock.assert_awaited_once_with()
 
     @pytest.mark.asyncio
+    async def test_confirmation_detail_carries_checkout_compatibility_from_winner(
+        self,
+        handoff_service,
+        handoff_session_factory,
+        monkeypatch,
+        tenant_id,
+        session_id,
+    ):
+        response = await handoff_service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.SAFETY_CONCERN,
+            )
+        )
+        created_at = datetime(2030, 1, 2, 3, 0, tzinfo=timezone.utc)
+        confirmed_at = created_at + timedelta(seconds=65)
+        async with handoff_session_factory() as database:
+            record = await database.get(HandoffRecord, response.id)
+            assert record is not None
+            record.created_at = created_at
+            record.numero_whatsapp = "5511987654321"
+            record.intencao_detectada = HandoffReason.USER_REQUEST.value
+            record.estagio_atual = "em_qualificacao"
+            record.primeira_linha_mensagem = "Preciso de ajuda"
+            record.sla_target_seconds = 600
+            record.context = {"safety_concern": "false"}
+            await database.commit()
+        clock = AsyncMock(return_value=confirmed_at)
+        monkeypatch.setattr(HandoffRecordRepository, "current_timestamp", clock)
+
+        confirmed = await handoff_service.confirm_handoff(
+            response.id,
+            tenant_id=tenant_id,
+        )
+
+        assert confirmed._checkout_compatibility == {
+            "numero_whatsapp": "5511987654321",
+            "safety_flag": True,
+            "intencao_detectada": None,
+            "estagio_atual": "em_qualificacao",
+            "primeira_linha_mensagem": "Preciso de ajuda",
+            "sla_target_seconds": 600,
+        }
+        assert confirmed.created_at == created_at
+        assert confirmed.data_hora_saida == confirmed_at
+        assert "_checkout_compatibility" not in confirmed.model_dump()
+
+    @pytest.mark.asyncio
     async def test_generic_update_cannot_bypass_attendance_confirmation(
         self,
         handoff_service,

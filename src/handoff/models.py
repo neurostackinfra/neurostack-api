@@ -8,7 +8,7 @@ from enum import Enum
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 # ============================================
 # Enums
@@ -444,3 +444,7 @@ class HandoffDetail(BaseModel):
 
     # Resolution
     resolution_notes: Optional[str] = None
+
+    # Internal snapshot used only by the deprecated queue checkout adapter.
+    # PrivateAttr keeps the canonical detail response and OpenAPI contract unchanged.
+    _checkout_compatibility: Optional[dict[str, Any]] = PrivateAttr(default=None)

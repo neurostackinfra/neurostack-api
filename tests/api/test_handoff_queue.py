@@ -156,7 +156,7 @@ def _handoff_state(client: TestClient, handoff_id: UUID) -> tuple[str, Any]:
     return client._submit(_run())  # type: ignore[attr-defined,no-any-return]
 
 
-def test_queue_projection_and_confirmation_use_canonical_service_detail(
+def test_queue_projection_and_confirmation_preserve_distinct_response_contracts(
     client: TestClient,
 ) -> None:
     tenant_id = uuid4()
@@ -256,13 +256,25 @@ def test_queue_projection_and_confirmation_use_canonical_service_detail(
             headers=headers,
         )
         assert checked_out.status_code == 200, checked_out.text
-        checkout_body = checked_out.json()
-        assert checkout_body["id"] == item["id"]
-        assert checkout_body["tenant_id"] == str(tenant_id)
-        assert checkout_body["status"] == "in_progress"
-        assert checkout_body["data_hora_saida"] is not None
-        assert "wait_seconds" not in checkout_body
-        assert "primeira_linha_mensagem" not in checkout_body
+        response_body = checked_out.json()
+        assert response_body["id"] == item["id"]
+        assert response_body["status"] == "in_progress"
+        assert response_body["data_hora_saida"] is not None
+        if index == 0:
+            assert response_body["tenant_id"] == str(tenant_id)
+            assert response_body["summary"] == "queue contract"
+            assert "wait_seconds" not in response_body
+            assert "primeira_linha_mensagem" not in response_body
+        else:
+            assert response_body["safety_flag"] is safety_flag
+            assert response_body["intencao_detectada"] == intent
+            assert response_body["numero_whatsapp"] == "5511999999999"
+            assert response_body["estagio_atual"] == "em_qualificacao"
+            assert response_body["primeira_linha_mensagem"] == expected[item["id"]][2]
+            assert response_body["sla_target_seconds"] == 600
+            assert response_body["wait_seconds"] is not None
+            assert "tenant_id" not in response_body
+            assert "summary" not in response_body
 
     duplicate = client.post(
         f"/v1/handoffs/queue/{records[0].id}/checkout",
@@ -445,6 +457,82 @@ def test_confirmation_returns_service_detail_without_repository_requery(
 
     assert response.status_code == 200, response.text
     assert response.json()["summary"] == "committed service detail"
+    service.confirm_handoff.assert_awaited_once_with(
+        handoff_id,
+        tenant_id=tenant_id,
+    )
+    database.execute.assert_not_awaited()
+
+
+def test_checkout_returns_legacy_projection_without_repository_requery(
+    client: TestClient,
+) -> None:
+    from src.api.routes.handoff import get_service
+    from src.handoff.models import HandoffDetail, HandoffStatus, HandoffUrgency
+    from src.repositories import get_db_session_dependency
+
+    tenant_id = uuid4()
+    handoff_id = uuid4()
+    created_at = datetime(2030, 1, 2, 3, 4, 10, tzinfo=timezone.utc)
+    confirmed_at = created_at - timedelta(seconds=5)
+    detail = HandoffDetail(
+        id=handoff_id,
+        tenant_id=tenant_id,
+        session_id=uuid4(),
+        status=HandoffStatus.IN_PROGRESS,
+        urgency=HandoffUrgency.NORMAL,
+        reason=HandoffReason.SAFETY_CONCERN,
+        summary="canonical detail is not the legacy response",
+        created_at=created_at,
+        updated_at=confirmed_at,
+        data_hora_saida=confirmed_at,
+    )
+    detail._checkout_compatibility = {
+        "numero_whatsapp": "5511987654321",
+        "safety_flag": True,
+        "intencao_detectada": "agendamento",
+        "estagio_atual": "em_qualificacao",
+        "primeira_linha_mensagem": "Preciso de ajuda",
+        "sla_target_seconds": 600,
+    }
+    service = MagicMock()
+    service.confirm_handoff = AsyncMock(return_value=detail)
+    database = MagicMock()
+    database.execute = AsyncMock(
+        side_effect=AssertionError("checkout route must not requery")
+    )
+
+    async def override_database() -> Any:
+        yield database
+
+    client.application.dependency_overrides[get_service] = lambda: service
+    client.application.dependency_overrides[get_db_session_dependency] = (
+        override_database
+    )
+    try:
+        response = client.post(
+            f"/v1/handoffs/queue/{handoff_id}/checkout",
+            headers=_jwt_headers("clinic_admin", tenant_id),
+        )
+    finally:
+        client.application.dependency_overrides.pop(get_service, None)
+        client.application.dependency_overrides.pop(get_db_session_dependency, None)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "id": str(handoff_id),
+        "numero_whatsapp": "5511987654321",
+        "session_id": str(detail.session_id),
+        "safety_flag": True,
+        "intencao_detectada": "agendamento",
+        "estagio_atual": "em_qualificacao",
+        "primeira_linha_mensagem": "Preciso de ajuda",
+        "created_at": created_at.isoformat().replace("+00:00", "Z"),
+        "data_hora_saida": confirmed_at.isoformat().replace("+00:00", "Z"),
+        "sla_target_seconds": 600,
+        "status": "in_progress",
+        "wait_seconds": -5.0,
+    }
     service.confirm_handoff.assert_awaited_once_with(
         handoff_id,
         tenant_id=tenant_id,
@@ -896,10 +984,13 @@ def test_openapi_exposes_required_nullable_sla_contract(client: TestClient) -> N
         "409": "HandoffConflictResponse",
         "503": "HandoffUnavailableResponse",
     }
+    assert confirm["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/HandoffDetail"
+    }
+    assert checkout["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/HandoffCheckoutResponse"
+    }
     for operation in (confirm, checkout):
-        assert operation["responses"]["200"]["content"]["application/json"][
-            "schema"
-        ] == {"$ref": "#/components/schemas/HandoffDetail"}
         for response_status, model_name in expected_error_models.items():
             assert operation["responses"][response_status]["content"][
                 "application/json"

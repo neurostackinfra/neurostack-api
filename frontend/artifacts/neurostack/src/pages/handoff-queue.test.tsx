@@ -828,6 +828,129 @@ describe("<HandoffQueuePage />", () => {
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:handoffs");
   });
 
+  it.each(["response", "blob"] as const)(
+    "discards an export when the period changes before the %s resolves",
+    async (pendingStage) => {
+      const exportResponse = deferred<Response>();
+      const exportedBlob = deferred<Blob>();
+      const blob = vi.fn(() => exportedBlob.promise);
+      const createObjectURL = vi.fn(() => "blob:stale-handoffs");
+      const revokeObjectURL = vi.fn();
+      vi.stubGlobal(
+        "URL",
+        Object.assign(URL, { createObjectURL, revokeObjectURL }),
+      );
+      const anchorClick = vi
+        .spyOn(HTMLAnchorElement.prototype, "click")
+        .mockImplementation(() => undefined);
+      mocks.fetch.mockImplementation((input: RequestInfo | URL) => {
+        if (String(input).includes("/export?")) {
+          if (pendingStage === "response") return exportResponse.promise;
+          return Promise.resolve({ ok: true, blob } as unknown as Response);
+        }
+        return Promise.resolve(queueResponse());
+      });
+      renderPage();
+      await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
+      const appendChild = vi.spyOn(document.body, "appendChild");
+
+      fireEvent.click(screen.getByRole("button", { name: "Exportar CSV" }));
+      await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(2));
+      if (pendingStage === "blob") {
+        await waitFor(() => expect(blob).toHaveBeenCalledTimes(1));
+      }
+      fireEvent.change(dateInputs()[0], {
+        target: { value: "2026-09-02" },
+      });
+      await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(3));
+
+      await act(async () => {
+        if (pendingStage === "response") {
+          exportResponse.resolve({ ok: true, blob } as unknown as Response);
+          await exportResponse.promise;
+        }
+        exportedBlob.resolve(new Blob(["stale csv"]));
+        await exportedBlob.promise;
+        await Promise.resolve();
+      });
+
+      expect(createObjectURL).not.toHaveBeenCalled();
+      expect(
+        appendChild.mock.calls.filter(
+          ([node]) => node instanceof HTMLAnchorElement,
+        ),
+      ).toHaveLength(0);
+      expect(anchorClick).not.toHaveBeenCalled();
+      expect(revokeObjectURL).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { isBuilder: true, isSuperAdmin: false },
+    { isBuilder: false, isSuperAdmin: true },
+  ])(
+    "discards an export when the selected privileged clinic changes",
+    async ({ isBuilder, isSuperAdmin }) => {
+      Object.assign(mocks.auth, {
+        tenantId: "privileged-user",
+        isBuilder,
+        isSuperAdmin,
+        viewingClinicId: "clinic-one",
+      });
+      const exportResponse = deferred<Response>();
+      const blob = vi.fn(async () => new Blob(["stale csv"]));
+      const createObjectURL = vi.fn(() => "blob:stale-handoffs");
+      const revokeObjectURL = vi.fn();
+      vi.stubGlobal(
+        "URL",
+        Object.assign(URL, { createObjectURL, revokeObjectURL }),
+      );
+      const anchorClick = vi
+        .spyOn(HTMLAnchorElement.prototype, "click")
+        .mockImplementation(() => undefined);
+      mocks.fetch.mockImplementation((input: RequestInfo | URL) => {
+        if (String(input).includes("/export?")) return exportResponse.promise;
+        return Promise.resolve(queueResponse());
+      });
+      const view = renderPage();
+      await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
+      const appendChild = vi.spyOn(document.body, "appendChild");
+
+      fireEvent.click(screen.getByRole("button", { name: "Exportar CSV" }));
+      await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(2));
+      mocks.auth.viewingClinicId = "clinic-two";
+      view.rerender(
+        <I18nProvider>
+          <HandoffQueuePage />
+        </I18nProvider>,
+      );
+      await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(3));
+      mocks.auth.viewingClinicId = "clinic-one";
+      view.rerender(
+        <I18nProvider>
+          <HandoffQueuePage />
+        </I18nProvider>,
+      );
+      await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(4));
+
+      await act(async () => {
+        exportResponse.resolve({ ok: true, blob } as unknown as Response);
+        await exportResponse.promise;
+        await Promise.resolve();
+      });
+
+      expect(blob).not.toHaveBeenCalled();
+      expect(createObjectURL).not.toHaveBeenCalled();
+      expect(
+        appendChild.mock.calls.filter(
+          ([node]) => node instanceof HTMLAnchorElement,
+        ),
+      ).toHaveLength(0);
+      expect(anchorClick).not.toHaveBeenCalled();
+      expect(revokeObjectURL).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([
     {
       locale: "pt" as const,

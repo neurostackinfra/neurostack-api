@@ -219,7 +219,7 @@ def handoff_record_to_detail(
 
     context = _record_context(record)
     webhook_status = _optional_enum(WebhookStatus, context.get("webhook_status"))
-    return HandoffDetail(
+    detail = HandoffDetail(
         id=record.id,
         tenant_id=record.tenant_id,
         session_id=record.session_id,
@@ -258,6 +258,24 @@ def handoff_record_to_detail(
         data_hora_saida=_aware(record.data_hora_saida),
         resolution_notes=record.resolution_notes,
     )
+    context_safety = context.get("safety_concern")
+    safety_flag = (
+        context_safety
+        if type(context_safety) is bool
+        else record.reason == HandoffReason.SAFETY_CONCERN.value
+    )
+    detected_intent = record.intencao_detectada
+    if detected_intent in {reason.value for reason in HandoffReason}:
+        detected_intent = None
+    detail._checkout_compatibility = {
+        "numero_whatsapp": record.numero_whatsapp,
+        "safety_flag": safety_flag,
+        "intencao_detectada": detected_intent,
+        "estagio_atual": record.estagio_atual,
+        "primeira_linha_mensagem": record.primeira_linha_mensagem,
+        "sla_target_seconds": record.sla_target_seconds,
+    }
+    return detail
 
 
 def handoff_record_to_list_item(record: HandoffRecord) -> HandoffListItem:

@@ -21,6 +21,7 @@ from src.api.middleware.auth import (
     resolve_effective_tenant,
 )
 from src.api.schemas.handoff import (
+    HandoffCheckoutResponse,
     HandoffConflictResponse,
     HandoffDetail,
     HandoffListItem,
@@ -200,6 +201,29 @@ async def _confirm_queue_handoff(
         ) from exc
 
 
+def _legacy_checkout_response(detail: HandoffDetail) -> HandoffCheckoutResponse:
+    """Adapt the committed service result without another persistence read."""
+
+    compatibility = detail._checkout_compatibility
+    if compatibility is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="handoff_service_unavailable",
+        )
+    wait_seconds = None
+    if detail.data_hora_saida is not None:
+        wait_seconds = (detail.data_hora_saida - detail.created_at).total_seconds()
+    return HandoffCheckoutResponse(
+        id=detail.id,
+        session_id=detail.session_id,
+        created_at=detail.created_at,
+        data_hora_saida=detail.data_hora_saida,
+        status=detail.status,
+        wait_seconds=wait_seconds,
+        **compatibility,
+    )
+
+
 @router.post(
     "/queue/{handoff_id}/confirm",
     response_model=HandoffDetail,
@@ -235,7 +259,7 @@ async def confirm_queue_handoff(
 
 @router.post(
     "/queue/{handoff_id}/checkout",
-    response_model=HandoffDetail,
+    response_model=HandoffCheckoutResponse,
     summary="Checkout Handoff",
     deprecated=True,
     responses={
@@ -254,16 +278,18 @@ async def checkout_handoff(
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
     service: HandoffService = Depends(get_service),
-) -> HandoffDetail:
+) -> HandoffCheckoutResponse:
     """Deprecated HTTP alias for attendance confirmation."""
 
-    return await _confirm_queue_handoff(
-        request=request,
-        handoff_id=handoff_id,
-        tenant_id=tenant_id,
-        tenant=tenant,
-        db=db,
-        service=service,
+    return _legacy_checkout_response(
+        await _confirm_queue_handoff(
+            request=request,
+            handoff_id=handoff_id,
+            tenant_id=tenant_id,
+            tenant=tenant,
+            db=db,
+            service=service,
+        )
     )
 
 
