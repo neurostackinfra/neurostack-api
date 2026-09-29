@@ -3,6 +3,7 @@
 | Field | Value |
 |-------|-------|
 | **Status** | APPROVED |
+| **Execution** | BLOCKED — aguardando census WhatsApp e contrato de áudio NeuraLake |
 | **Slug** | `api-provider-catalog-presentation` |
 | **Date** | 2026-09-28 |
 | **Author** | Lorenzo |
@@ -107,8 +108,9 @@ assurance de credenciais e gates de rollout.
 
 Os quatro slugs existem e possuem contratos explícitos. `tts-openai-provider` está `SHIPPED`: o PR
 #40 foi mergeado em `be0a6547c6c7462c1cbeeeb39030a7d10ee781b8`, e execution review, delta review
-e final review retornaram `SHIP`. `stt-openrouter-scribe-activation` está `APPROVED` após final plan
-gate `SHIP` e pode ser executado separadamente porque preserva `Δ public = ∅`.
+e final review retornaram `SHIP`. `stt-openrouter-scribe-activation` está `SHIPPED`: o PR #43 foi
+mergeado em `acf7586c91dd2101129da202d4e9b4c2b4c3ca5b`, execution review e hardening re-review
+retornaram `SHIP`, e o smoke pós-merge passou 569 testes mantendo `Δ public = ∅`.
 `dropout-multimodal-fallback` permanece `DRAFT/BLOCKED` até existir contrato autoritativo e
 versionado da NeuraLake para áudio OGG/Opus bruto; `whatsapp-inbound-provider-activation` permanece
 `DRAFT/BLOCKED` até receipt externo agregado e verificável provar counts zero de incumbents
@@ -747,6 +749,19 @@ cd frontend && pnpm --filter @workspace/neurostack run typecheck && pnpm --filte
   O estado agregado é `BLOCKED` somente pelas duas evidências externas, sem impedir a execução da
   dependência STT. A redação histórica “três dependências ausentes” acima é superseded por esta
   fotografia e pela seção Dependencies atual.
+
+### Post-STT Dependency Snapshot — 2026-09-29 — BLOCKED externally
+
+- **STT:** `stt-openrouter-scribe-activation` está `SHIPPED`; PR #43 mergeado em
+  `acf7586c91dd2101129da202d4e9b4c2b4c3ca5b`, reviews independentes `SHIP` e smoke pós-merge com
+  569 testes verdes. A matriz pública permaneceu inalterada.
+- **Satisfied dependencies:** `tts-openai-provider` e `stt-openrouter-scribe-activation`.
+- **Remaining hard gates:** `whatsapp-inbound-provider-activation` ainda exige receipt externo
+  agregado, verificável e recente com counts `{evolution: 0, uazapi: 0}`; `dropout-multimodal-fallback`
+  ainda exige contrato NeuraLake autoritativo/versionado para áudio OGG/Opus bruto.
+- **Outcome:** nenhum Grupo 1–6 do catálogo pode ser claimed ou iniciado. O próximo avanço legítimo
+  é fornecer e revisar esses dois artefatos externos; mocks, inferência ou alteração local não os
+  substituem.
 
 ## Files to Create/Modify
 
