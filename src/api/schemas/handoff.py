@@ -73,6 +73,7 @@ class HandoffQueueItem(BaseModel):
     primeira_linha_mensagem: Optional[str] = None
     created_at: _dt
     data_hora_saida: Optional[_dt] = None
+    sla_target_seconds: Optional[int]
     status: str
 
 
@@ -80,8 +81,19 @@ class HandoffQueueResponse(BaseModel):
     """Response for GET /queue — items + aggregate stats."""
 
     items: list[HandoffQueueItem]
-    avg_wait_seconds: float
-    pct_within_sla: float
+    avg_wait_seconds: Optional[float]
+    pct_within_sla: Optional[float]
+    within_sla_count: int
+    confirmed_late_count: int
+    unanswered_overdue_count: int
+    maturing_count: int
+    cancelled_unconfirmed_count: int
+    unmeasured_legacy_count: int
+    confirmed_count: int
+    sla_eligible_count: int
+    period_timezone: str
+    period_start: _dt
+    period_end_exclusive: _dt
 
 
 class HandoffCheckoutResponse(HandoffQueueItem):
