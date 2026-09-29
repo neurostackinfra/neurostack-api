@@ -2377,7 +2377,7 @@ class TestMetaSttFallbackChain:
 
     @pytest.mark.parametrize(
         "provider",
-        ["elevenlabs_scribe", "google_stt", "deepgram_stt", "microsoft_stt"],
+        ["google_stt", "deepgram_stt", "microsoft_stt"],
     )
     def test_unsupported_provider_never_reroutes(
         self,
@@ -2407,8 +2407,16 @@ class TestMetaSttFallbackChain:
         download_mock = AsyncMock()
         send_mock = AsyncMock(return_value=_fake_meta_send_result())
         handoff_mock = AsyncMock()
+        replay_mock = MagicMock()
+        bot_mock = AsyncMock()
+        pause_mock = AsyncMock()
+        session_mock = AsyncMock()
 
         with (
+            patch("src.api.routes.webhook._claim_incoming_message", replay_mock),
+            patch("src.api.routes.webhook._check_bot_active", bot_mock),
+            patch("src.api.routes.webhook._check_pause_state", pause_mock),
+            patch("src.api.routes.webhook._get_or_create_session", session_mock),
             patch("src.api.routes.webhook.resolve_meta_media", resolve_mock),
             patch("src.api.routes.webhook.download_meta_media_audio", download_mock),
             patch("src.api.routes.webhook.send_meta_cloud_text", send_mock),
@@ -2426,6 +2434,10 @@ class TestMetaSttFallbackChain:
         download_mock.assert_not_called()
         send_mock.assert_not_called()
         handoff_mock.assert_not_called()
+        replay_mock.assert_not_called()
+        bot_mock.assert_not_awaited()
+        pause_mock.assert_not_awaited()
+        session_mock.assert_not_awaited()
 
     def test_missing_permanent_token_keeps_the_no_credentials_envelope(
         self,

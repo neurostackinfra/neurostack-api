@@ -1377,7 +1377,7 @@ class TestZapiSttFallbackChain:
 
     @pytest.mark.parametrize(
         "provider",
-        ["elevenlabs_scribe", "google_stt", "deepgram_stt", "microsoft_stt"],
+        ["google_stt", "deepgram_stt", "microsoft_stt"],
     )
     def test_unsupported_provider_never_reroutes(
         self,

@@ -239,6 +239,13 @@ LLM_GENERATION_ATTEMPTS_TOTAL = Counter(
     ["tier", "outcome"],
 )
 
+# Deliberately label-free: a telemetry failure must never create tenant,
+# provider, endpoint, model, or secret cardinality in Prometheus.
+API_CREDENTIALS_CHANGE_EMIT_FAILURES_TOTAL = Counter(
+    "api_credentials_change_emit_failures_total",
+    "Failed post-commit api_credentials_changed emission attempts",
+)
+
 
 # ============================================
 # Helper Classes for Metric Collection
