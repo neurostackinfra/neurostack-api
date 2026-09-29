@@ -1010,7 +1010,15 @@ describe("<ClinicConfig /> operations tab — business-hours UI surface", () => 
     dpo_contact: "dpo@example.test",
     builder_lgpd_consent: true,
     meta_minutos_atendimento: 15,
+    online_services_desc: "Legacy remote list",
+    presential_services_desc: "Legacy in-person list",
   };
+
+  async function getGlobalModalitySelect(label = "Modality") {
+    const field = (await screen.findByText(label)).parentElement;
+    expect(field).not.toBeNull();
+    return within(field as HTMLElement).getByRole("combobox");
+  }
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
@@ -1061,6 +1069,53 @@ describe("<ClinicConfig /> operations tab — business-hours UI surface", () => 
     fireEvent.click(within(schedulingEditor).getByTestId("scheduling-hours-editor-toggle"));
     expect(within(schedulingEditor).getByRole("textbox", { name: /Horário do Setor de Agendamento/ }))
       .toHaveValue("Seg–Sex: 8h–18h");
+  });
+
+  it.each([
+    ["online", "Online Only"],
+    ["presential", "In-Person Only"],
+    ["both", "Online and In-Person"],
+    ["", "Select..."],
+  ] as const)("hydrates and saves global modality %s without legacy service lists", async (
+    serviceFormat,
+    expectedLabel,
+  ) => {
+    mountAsRole("clinic_admin", "clinic-admin");
+    const config = { ...editableConfig, service_format: serviceFormat };
+    const fetchMock = vi.fn().mockResolvedValue(response(config));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(<PageWrapper><ClinicConfig /></PageWrapper>);
+
+    const modalitySelect = await getGlobalModalitySelect();
+    await waitFor(() => expect(modalitySelect).toHaveTextContent(expectedLabel));
+    expect(modalitySelect).toBeEnabled();
+    expect(screen.queryByText("Online Services")).not.toBeInTheDocument();
+    expect(screen.queryByText("In-Person Services")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("textarea-online-services")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("textarea-presential-services")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("btn-save-config"));
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(true));
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const body = JSON.parse(String(patch?.[1]?.body));
+    expect(body.service_format).toBe(serviceFormat || null);
+    expect(body).not.toHaveProperty("online_services_desc");
+    expect(body).not.toHaveProperty("presential_services_desc");
+  });
+
+  it("keeps the global modality visible and disabled for read-only viewers", async () => {
+    mountAsInvestor();
+    render(<PageWrapper><ClinicConfig /></PageWrapper>);
+
+    const modalitySelect = await getGlobalModalitySelect("Modalidade");
+    await waitFor(() => expect(modalitySelect).toHaveTextContent("Online e Presencial"));
+    expect(modalitySelect).toBeDisabled();
+    expect(screen.queryByText("Serviços realizados Online")).not.toBeInTheDocument();
+    expect(screen.queryByText("Serviços realizados Presencialmente")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("textarea-online-services")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("textarea-presential-services")).not.toBeInTheDocument();
   });
 
   it("lets clinic admins edit the hydrated service goal in its operation-tab position and saves a number", async () => {
