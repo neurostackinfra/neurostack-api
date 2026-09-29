@@ -2,7 +2,8 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | APPROVED |
+| **Status** | IN_PROGRESS |
+| **Execution** | Final re-review SHIP — aguardando merge e smoke pós-merge |
 | **Slug** | `stt-openrouter-scribe-activation` |
 | **Date** | 2026-09-28 |
 | **Author** | Lorenzo |
@@ -190,45 +191,45 @@ O handoff só destrava o catálogo após este wish estar `SHIPPED`, receber exec
 
 ## Success Criteria
 
-- [ ] `elevenlabs_scribe` e `openrouter` tornam-se IDs STT explícitos, reconhecidos e operacionais no
+- [x] `elevenlabs_scribe` e `openrouter` tornam-se IDs STT explícitos, reconhecidos e operacionais no
   mesmo commit/grupo que conecta o dispatcher; `outros` permanece legado separado.
-- [ ] O diff deste wish não adiciona, remove, reordena nem altera estado em
+- [x] O diff deste wish não adiciona, remove, reordena nem altera estado em
   `PUBLIC_PROVIDER_AVAILABILITY`/matriz pública ou espelho frontend; `Δ public = ∅` independentemente
   da ordem das demais dependencies.
-- [ ] Elegibilidade é calculada por `resolve_stt_credentials(existing)` mais origem raw: somente
+- [x] Elegibilidade é calculada por `resolve_stt_credentials(existing)` mais origem raw: somente
   providerless com qualquer configuração STT efetiva (alias-only, canonical-only ou mista) ou
   `stt_provider="outros"` explícito, todos resolvidos como `outros`, podem trocar para
   Scribe/OpenRouter com quatro campos frescos e base canônica.
-- [ ] Estado realmente vazio (visão resolvida sem provider), outro provider, bundle parcial,
+- [x] Estado realmente vazio (visão resolvida sem provider), outro provider, bundle parcial,
   mask/vazio, manutenção de explícito e entrada/reentrada em `outros` retornam 422.
-- [ ] Echo canônico de fixtures providerless alias-only, canonical-only e mista, além do legado
+- [x] Echo canônico de fixtures providerless alias-only, canonical-only e mista, além do legado
   explícito, retorna 200 sem write/evento e preserva o mapping JSONB raw exatamente, inclusive
   aliases e ausência de defaults persistidos.
-- [ ] Cada 4xx acima prova zero add/flush/commit/cache/network/event e preserva o JSONB byte a byte;
+- [x] Cada 4xx acima prova zero add/flush/commit/cache/network/event e preserva o JSONB byte a byte;
   rollback e no-op/exact echo também não emitem.
-- [ ] A transição aceita commita uma vez, tenta um `api_credentials_changed` depois do commit e antes
+- [x] A transição aceita commita uma vez, tenta um `api_credentials_changed` depois do commit e antes
   da response e usa payload allowlisted/redigido; falha de emissão incrementa o Counter exatamente
   uma vez e não desfaz o commit.
-- [ ] Alerta principal e espelho são byte a byte idênticos, parseáveis e possuem expressão, janela,
+- [x] Alerta principal e espelho são byte a byte idênticos, parseáveis e possuem expressão, janela,
   severity `warning`, owner `platform-sre` e
   `runbook_url=https://docs.neurostack.io/runbooks/api-credentials-change-emission-failures` exatos.
-- [ ] GET/eco/runtime de `stt/outros` incumbente permanecem byte a byte; nunca há rewrite/relabel.
-- [ ] Scribe usa base `https://api.elevenlabs.io/v1`, `/speech-to-text`, `xi-api-key`, multipart
+- [x] GET/eco/runtime de `stt/outros` incumbente permanecem byte a byte; nunca há rewrite/relabel.
+- [x] Scribe usa base `https://api.elevenlabs.io/v1`, `/speech-to-text`, `xi-api-key`, multipart
   `file` + `model_id` e parser JSON `.text`.
-- [ ] OpenRouter usa base `https://openrouter.ai/api/v1`, `/audio/transcriptions`, Bearer, multipart
+- [x] OpenRouter usa base `https://openrouter.ai/api/v1`, `/audio/transcriptions`, Bearer, multipart
   `file` + `model` + `language` opcional e parser JSON `.text`.
-- [ ] ` Audio/OGG ; codecs=opus ` e o valor real Meta `audio/ogg; codecs=opus` normalizam para
+- [x] ` Audio/OGG ; codecs=opus ` e o valor real Meta `audio/ogg; codecs=opus` normalizam para
   `audio/ogg`; multipart envia `audio/ogg` e bytes originais. Parâmetros malformados falham pre-DNS.
-- [ ] Egress kinds distintos pinam host/SNI/IP público; host spoof, query, userinfo, fragmento, porta
+- [x] Egress kinds distintos pinam host/SNI/IP público; host spoof, query, userinfo, fragmento, porta
   ou base/path divergente falham antes de rede.
-- [ ] Todo erro observável pertence à taxonomia fechada; malformed/empty, HTTP e transporte não
+- [x] Todo erro observável pertence à taxonomia fechada; malformed/empty, HTTP e transporte não
   expõem status/body/header/key/URL/áudio nem chained exception.
-- [ ] Todos os handlers alcançáveis selecionam o adapter pelo ID; Google/Deepgram/Microsoft mantêm
+- [x] Todos os handlers alcançáveis selecionam o adapter pelo ID; Google/Deepgram/Microsoft mantêm
   `stt_provider_unsupported` e zero-effect.
-- [ ] `openai_whisper` e `outros` mantêm request/parser/fallback atuais; falhas operacionais válidas
+- [x] `openai_whisper` e `outros` mantêm request/parser/fallback atuais; falhas operacionais válidas
   dos novos providers seguem STT→multimodal→reroute.
-- [ ] `tests/api/test_webhook_egress.py`, gates por canal e `make quality` passam sem rede.
-- [ ] Documentação registra contratos, ownership do catálogo e que mocks não são homologação live.
+- [x] `tests/api/test_webhook_egress.py`, gates por canal e `make quality` passam sem rede.
+- [x] Documentação registra contratos, ownership do catálogo e que mocks não são homologação live.
 
 ## Execution Strategy
 
@@ -284,15 +285,15 @@ operational, persistível ou alcançável por produção.
 
 **Acceptance Criteria:**
 
-- [ ] Nenhum schema, recognized/operational set, readiness, PATCH ou webhook referencia os adapters
+- [x] Nenhum schema, recognized/operational set, readiness, PATCH ou webhook referencia os adapters
   ao final deste grupo; produção mantém comportamento anterior.
-- [ ] Requests observados correspondem exatamente aos dois contratos e não usam JSON/base64.
-- [ ] Bytes da parte `file` são idênticos aos de entrada; filename e Content-Type usam o MIME
+- [x] Requests observados correspondem exatamente aos dois contratos e não usam JSON/base64.
+- [x] Bytes da parte `file` são idênticos aos de entrada; filename e Content-Type usam o MIME
   canônico derivado.
-- [ ] `audio/ogg; codecs=opus` normaliza para `audio/ogg`; segmentos vazios, sem `=`, com nome/valor
+- [x] `audio/ogg; codecs=opus` normaliza para `audio/ogg`; segmentos vazios, sem `=`, com nome/valor
   vazio ou mais de um `=` retornam `unsupported_audio_mime` antes de DNS/HTTP.
-- [ ] Cada kind aceita apenas seu host exato e redirects permanecem desligados.
-- [ ] Response/error tests cobrem todos os tokens adapter da taxonomia e nenhuma sentinela aparece
+- [x] Cada kind aceita apenas seu host exato e redirects permanecem desligados.
+- [x] Response/error tests cobrem todos os tokens adapter da taxonomia e nenhuma sentinela aparece
   em exception/caplog.
 
 **Validation:**
@@ -364,24 +365,24 @@ shippable, mantendo delta público vazio e todos os demais writes fail-closed.
 
 **Acceptance Criteria:**
 
-- [ ] Não existe commit testável onde ID esteja operational/readiness/write sem dispatcher e callers.
-- [ ] O diff público é vazio e testes não dependem de contagem/ordem global.
-- [ ] Incumbency nunca lê somente `existing.get("stt_provider")`: empty real, fixtures providerless
+- [x] Não existe commit testável onde ID esteja operational/readiness/write sem dispatcher e callers.
+- [x] O diff público é vazio e testes não dependem de contagem/ordem global.
+- [x] Incumbency nunca lê somente `existing.get("stt_provider")`: empty real, fixtures providerless
   alias-only, canonical-only e mistas, casos single-field e `outros` explícito exercitam
   `resolve_stt_credentials(existing)` e origem raw.
-- [ ] Echos canônicos de todas as classes providerless e do legado explícito preservam deep equality
+- [x] Echos canônicos de todas as classes providerless e do legado explícito preservam deep equality
   do JSONB raw, inclusive aliases/ausência de defaults, com spies DB/cache/network/emitter zerados.
-- [ ] A matriz de transição acima é exaustiva; cada negativo prova zero
+- [x] A matriz de transição acima é exaustiva; cada negativo prova zero
   add/flush/commit/cache/network/event e JSONB idêntico.
-- [ ] Switch aceito persiste bundle fresco completo, não herda campo e emite uma tentativa pós-commit
+- [x] Switch aceito persiste bundle fresco completo, não herda campo e emite uma tentativa pós-commit
   pre-response com payload allowlisted.
-- [ ] Falha do emitter incrementa Counter uma vez, mantém commit/response e satisfaz alerta; no-op,
+- [x] Falha do emitter incrementa Counter uma vez, mantém commit/response e satisfaz alerta; no-op,
   4xx, rollback e commit failure não incrementam nem emitem.
-- [ ] Nenhuma sentinela de key/URL/path/query/model/value/digest aparece em evento, Counter label,
+- [x] Nenhuma sentinela de key/URL/path/query/model/value/digest aparece em evento, Counter label,
   alerta, GET, cache, erro ou caplog.
-- [ ] Scribe/OpenRouter alcançam somente seu adapter; Google/Deepgram/Microsoft mantêm envelope
+- [x] Scribe/OpenRouter alcançam somente seu adapter; Google/Deepgram/Microsoft mantêm envelope
   `stt_provider_unsupported` antes de qualquer downstream effect.
-- [ ] OpenAI/`outros` e fallbacks mantêm regressões atuais; Meta encaminha MIME parametrizado que o
+- [x] OpenAI/`outros` e fallbacks mantêm regressões atuais; Meta encaminha MIME parametrizado que o
   adapter normaliza sem transcode.
 
 **Validation:**
@@ -422,18 +423,18 @@ promover UI ou alegar homologação.
 
 **Acceptance Criteria:**
 
-- [ ] Docs e código concordam em IDs, transições, bases, paths, auth, multipart/MIME, `.text`,
+- [x] Docs e código concordam em IDs, transições, bases, paths, auth, multipart/MIME, `.text`,
   taxonomia e telemetria.
-- [ ] Documento diferencia operacionalidade, saída incumbent-only, promoção pública e homologação.
-- [ ] Nenhum arquivo de matriz/UI possui mudança deste wish; o teste frontend continua passando.
-- [ ] Suíte integrada, paridade das regras e `make quality` passam sem rede.
-- [ ] Handoff é order-independent e suficiente para o pre-work gate do catálogo reexecutar a prova.
+- [x] Documento diferencia operacionalidade, saída incumbent-only, promoção pública e homologação.
+- [x] Nenhum arquivo de matriz/UI possui mudança deste wish; o teste frontend continua passando.
+- [x] Suíte integrada, paridade das regras e `make quality` passam sem rede.
+- [x] Handoff é order-independent e suficiente para o pre-work gate do catálogo reexecutar a prova.
 
 **Validation:**
 ```bash
 poetry run pytest -q tests/services/test_stt_service.py tests/services/test_safe_egress.py tests/services/test_api_credentials.py tests/api/test_api_credentials.py tests/api/test_config_credentials_boundary.py tests/observability/test_api_credentials_change_alert.py tests/api/test_webhook_egress.py tests/api/test_webhook_zapi.py tests/api/test_webhook_meta.py tests/api/test_webhook_uazapi.py tests/api/test_webhook_evolution.py
 cmp config/prometheus_rules.yml src/config/prometheus_rules.yml
-cd frontend/artifacts/neurostack && pnpm exec vitest run src/pages/clinic-config-api-settings.test.tsx && cd ../../..
+cd frontend/artifacts/neurostack && ./node_modules/.bin/vitest run src/pages/clinic-config-api-settings.test.tsx && cd ../../..
 make quality
 ```
 
@@ -448,22 +449,22 @@ de ownership com o catálogo.
 
 _QA é determinístico e sem credenciais reais; valida contrato e regressão, não homologação live._
 
-- [ ] MockTransport observa Scribe com `xi-api-key`, `file` e `model_id`; OpenRouter com Bearer,
+- [x] MockTransport observa Scribe com `xi-api-key`, `file` e `model_id`; OpenRouter com Bearer,
   `file`, `model` e language, sempre no path/host exato.
-- [ ] Fixture OGG com `audio/ogg; codecs=opus` chega byte a byte à parte multipart como `audio/ogg`
+- [x] Fixture OGG com `audio/ogg; codecs=opus` chega byte a byte à parte multipart como `audio/ogg`
   e transcript `.text` volta ao pipeline.
-- [ ] Cada MIME parametrizado malformado, endpoint hostil e response inválida falha com token fechado,
+- [x] Cada MIME parametrizado malformado, endpoint hostil e response inválida falha com token fechado,
   no limite pre-network aplicável e sem sentinela em erro/log/response/cache/evento.
-- [ ] Fixtures empty real, providerless alias-only, canonical-only, mistas/single-field e `outros`
+- [x] Fixtures empty real, providerless alias-only, canonical-only, mistas/single-field e `outros`
   explícito provam classificação pela visão canônica mais origem raw, nunca pelo campo provider
   ou pelos aliases isoladamente.
-- [ ] Apenas providerless efetivo ou legado explícito resolvido `outros` troca com bundle fresco;
+- [x] Apenas providerless efetivo ou legado explícito resolvido `outros` troca com bundle fresco;
   todas as demais linhas negativas provam zero DB/cache/network/event.
-- [ ] Echo canônico de cada classe providerless e do legado explícito preserva raw JSONB por deep
+- [x] Echo canônico de cada classe providerless e do legado explícito preserva raw JSONB por deep
   equality e não emite; switch aceito emite pós-commit uma vez.
-- [ ] Counter/alerta disparam em falha de emissão sem rollback do commit e sem cardinalidade secreta.
-- [ ] Scribe/OpenRouter continuam sem promoção pública até a release unit do catálogo.
-- [ ] Google, Deepgram e Microsoft permanecem zero-effect no runtime atual.
+- [x] Counter/alerta disparam em falha de emissão sem rollback do commit e sem cardinalidade secreta.
+- [x] Scribe/OpenRouter continuam sem promoção pública até a release unit do catálogo.
+- [x] Google, Deepgram e Microsoft permanecem zero-effect no runtime atual.
 
 ---
 
@@ -542,6 +543,74 @@ Premissas externas verificáveis:
 - **Outcome:** plano promovido de `DRAFT` para `APPROVED`; execution review independente continua
   obrigatória antes de `SHIPPED`.
 
+### Group 1 Execution Review — 2026-09-29 — SHIP
+
+- **Target:** `63302aa85e55da23d00f53c24afb5746a6d3fa13` sobre
+  `e32e5d72f8f205afd2c9fba04d5742061c40a3b1`.
+- **Reviewer:** `/root/stt_group1_review`; zero gaps CRITICAL/HIGH/MEDIUM/LOW.
+- **Evidence:** 132 testes focados e mypy passaram; o diff contém apenas adapters/egress privados e
+  seus testes, sem schema, credenciais, matriz, readiness, webhook ou caller de produção.
+- **Outcome:** Group 1 concluído; Group 2 pode ligar IDs, política, dispatcher e callers como uma
+  única unidade atômica.
+
+### Group 2 Execution Review — 2026-09-29 — FIX-FIRST (loop 1)
+
+- **Target:** `f8c5c39afe2c6df0a1a07bd9dabb1dc23b008ae1`; tree
+  `dbe8c1be3887bf93d61b8621668be95c521dc702`.
+- **Reviewer:** `/root/stt_group2_review`.
+- **Resolved surfaces:** delta público vazio, recognized/operational separados, incumbency e echo,
+  switch atômico, endpoints, telemetria/alerta, rollback, dispatcher e early gate Meta passaram.
+- **HIGH:** faltam provas HTTP por canal dos adapters novos: Uazapi não cobre Scribe/OpenRouter nem
+  G/D/M zero-effect; Z-API e Meta só chegam ao download e o dispatcher é provado separadamente.
+- **Required fix:** adicionar evidência HTTP Scribe/OpenRouter para Z-API, Meta e Uazapi; em Uazapi,
+  provar ainda erro→fallback/reroute e G/D/M antes de todo downstream. Evolution permanece text-only
+  e usa sua regressão `non-text` existente.
+
+### Group 2 Execution Re-review — 2026-09-29 — SHIP
+
+- **Target:** `2d5abd249e39daf0e471ce6ccd67ae20f83e977a`; tree
+  `da713a17516825a19311754a7f020256d40d236d`.
+- **Reviewer:** `/root/stt_group2_review`; zero gaps CRITICAL/HIGH/MEDIUM/LOW.
+- **Evidence:** o fix é somente de testes; Z-API, Meta e Uazapi provam via HTTP Scribe/OpenRouter,
+  bytes/MIME, transcript no pipeline e ausência do adapter legado. Uazapi prova ainda
+  STT→multimodal→reroute e G/D/M antes de download, adapter, chain, reply, sessão ou fallback;
+  Evolution mantém a regressão text-only. Gate focado: 554 testes verdes.
+- **Outcome:** Group 2 concluído; Group 3 pode documentar, executar a regressão integrada e produzir
+  o handoff auditável ao catálogo.
+
+### Group 3 / Final Execution Review — 2026-09-29 — SHIP with hardening
+
+- **Target:** `058751ae64a9f07edef3cd56e7779e9f26e1c3f2`; tree
+  `1ec4628f342cfb5a6b6ebdb02bb557ce35e6cf24`; base
+  `e32e5d72f8f205afd2c9fba04d5742061c40a3b1`.
+- **Reviewer:** `/root/stt_final_execution_review`; zero findings CRITICAL/HIGH. O reviewer confirmou
+  delta público/frontend zero, configuração/runtime por provider e canal, egress, MIME, legado,
+  telemetria, alerta e ausência de alegação de homologação live.
+- **Evidence:** 569 testes backend focados; 52 testes Vitest pelo binário local instalado do lockfile;
+  `make quality` com Black/isort/flake8/mypy verdes e 3.224 testes passando, 16 skipped;
+  `cmp` das regras Prometheus e `git diff --check` verdes.
+- **Regression fix:** o gate completo revelou dois testes Meta regressivos; `058751a` moveu o
+  precheck read-only de unicidade para antes do retorno de echo sem restaurar writes em no-op. Os
+  dois failures de scheduling reproduzidos no baseline eram stubs do helper antigo; `26e1d01`
+  alinhou somente os testes e permitiu que o quality gate passasse integralmente.
+- **Hardening solicitado:** `30900cd` corrigiu a apresentação transitória de `outros`, incluiu
+  `stt_configuration_invalid` na taxonomia documentada e atualizou a docstring do dispatcher. O
+  comando frontend fixo passou a invocar `./node_modules/.bin/vitest`, evitando que `pnpm exec`
+  tente auto-instalar o workspace e falhe no próprio hook `preinstall` antes do teste.
+- **Outcome:** todos os critérios de implementação/QA estão satisfeitos; status permanece
+  `IN_PROGRESS` somente até merge e smoke pós-merge na árvore `main`.
+
+### Final Hardening Re-review — 2026-09-29 — SHIP
+
+- **Target:** `30900cd9d482c6d6967043e1f375d3f2da08e010`; tree
+  `99426425bf95fe441c92050e249cf966658cccb1`.
+- **Reviewer:** `/root/stt_final_execution_review`; zero gaps CRITICAL/HIGH/MEDIUM/LOW.
+- **Evidence:** os quatro findings anteriores foram resolvidos; `058751a..30900cd` contém somente
+  documentação/docstring, frontend e matriz pública permanecem byte a byte, regras Prometheus
+  continuam idênticas e `git diff --check` passou também no delta local de lifecycle.
+- **Outcome:** execução aprovada para PR/merge; promoção pública continua pertencendo exclusivamente
+  a `api-provider-catalog-presentation`.
+
 ---
 
 ## Files to Create/Modify
@@ -551,7 +620,6 @@ src/services/api_credentials.py
 src/api/schemas/config.py
 src/api/routes/config.py
 src/services/safe_egress.py
-src/services/groq_service.py
 src/services/stt_service.py
 src/api/routes/webhook.py
 src/observability/metrics.py
@@ -568,6 +636,7 @@ tests/api/test_webhook_zapi.py
 tests/api/test_webhook_meta.py
 tests/api/test_webhook_uazapi.py
 tests/api/test_webhook_evolution.py
+tests/core/test_config_service.py
 docs/configuration.md
 docs/api-provider-settings-rollout.md
 ```
