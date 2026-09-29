@@ -6,9 +6,10 @@ Minimal query builders for read-only trace views over the events table.
 import csv
 import io
 from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional, TypedDict
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,6 +29,11 @@ _CONVERSATIONAL_MARKERS = (
     "action",
     "confidence",
 )
+
+_IANA_TIMEZONE_KEYS = frozenset(available_timezones()) - {
+    "localtime",
+    "posixrules",
+}
 
 
 class TraceRecord(TypedDict):
@@ -139,6 +145,23 @@ def _base_trace_query(tenant_id: UUID) -> Select[tuple[Event]]:
     )
 
 
+def daily_utc_window(day: date, timezone_name: str) -> tuple[datetime, datetime]:
+    """Return the half-open UTC window for one civil day in an IANA timezone."""
+    if timezone_name not in _IANA_TIMEZONE_KEYS:
+        raise ZoneInfoNotFoundError(timezone_name)
+    local_timezone = ZoneInfo(timezone_name)
+    local_start = datetime.combine(day, time.min, tzinfo=local_timezone)
+    local_next_start = datetime.combine(
+        day + timedelta(days=1),
+        time.min,
+        tzinfo=local_timezone,
+    )
+    return (
+        local_start.astimezone(timezone.utc),
+        local_next_start.astimezone(timezone.utc),
+    )
+
+
 def _user_identity_expression() -> ColumnElement[str]:
     """Resolve the external phone/username attached to a message event."""
     event_user_id = func.nullif(
@@ -173,6 +196,8 @@ def _apply_filters(
     safety_flag: Optional[bool] = None,
     handoff_required: Optional[bool] = None,
     channel: Optional[str] = None,
+    day_start_utc: Optional[datetime] = None,
+    day_end_utc: Optional[datetime] = None,
 ) -> Select[tuple[Event]]:
     """Apply optional filters to a trace query."""
     if start_date is not None:
@@ -194,6 +219,10 @@ def _apply_filters(
         )
     if channel is not None:
         query = query.where(Event.event_data["channel"].as_string() == channel)
+    if day_start_utc is not None:
+        query = query.where(Event.created_at >= day_start_utc)
+    if day_end_utc is not None:
+        query = query.where(Event.created_at < day_end_utc)
     return query
 
 
@@ -259,6 +288,8 @@ async def list_traces(
     safety_flag: Optional[bool] = None,
     handoff_required: Optional[bool] = None,
     channel: Optional[str] = None,
+    day_start_utc: Optional[datetime] = None,
+    day_end_utc: Optional[datetime] = None,
 ) -> tuple[list[Event], int]:
     """
     List traces with pagination and optional filters.
@@ -273,22 +304,31 @@ async def list_traces(
         safety_flag: Optional safety concern filter
         handoff_required: Optional handoff required filter
         channel: Optional channel filter (whatsapp, web)
+        day_start_utc: Inclusive UTC boundary for an exact civil-day query
+        day_end_utc: Exclusive UTC boundary for an exact civil-day query
 
     Returns:
         Tuple of (list of Event objects, total count)
     """
-    base = _base_trace_query(tenant_id)
-    base = _apply_filters(
-        base, start_date, end_date, safety_flag, handoff_required, channel
-    )
+    filtered = _apply_filters(
+        _base_trace_query(tenant_id),
+        start_date,
+        end_date,
+        safety_flag,
+        handoff_required,
+        channel,
+        day_start_utc,
+        day_end_utc,
+    ).order_by(None)
 
     # Count query
-    count_query = select(func.count()).select_from(base.subquery())
+    count_query = select(func.count()).select_from(filtered.subquery())
     count_result = await db.execute(count_query)
     total = count_result.scalar() or 0
 
     # Data query with pagination
-    data_query = base.limit(limit).offset(offset)
+    data_query = filtered.order_by(Event.created_at.desc(), Event.id.desc())
+    data_query = data_query.limit(limit).offset(offset)
     result = await db.execute(data_query)
     events = list(result.scalars().all())
 
