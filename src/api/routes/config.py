@@ -589,6 +589,39 @@ async def get_api_credentials(
     return credential_status(creds)
 
 
+async def _ensure_meta_phone_number_id_available(
+    session: AsyncSession,
+    tenant_id: UUID,
+    phone_number_id: object,
+) -> None:
+    """Reject a Meta phone-number ID already assigned to another tenant."""
+
+    stmt = select(ClinicConfigTable.tenant_id).where(
+        ClinicConfigTable.api_credentials["meta_phone_number_id"].astext
+        == str(phone_number_id),
+        ClinicConfigTable.tenant_id != tenant_id,
+    )
+    conflict = (await session.execute(stmt)).scalar_one_or_none()
+    if conflict is None:
+        return
+
+    logger.warning(
+        "meta_phone_number_id_conflict tenant=%s existing_tenant=%s",
+        tenant_id,
+        conflict,
+    )
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "error": "meta_phone_number_id_conflict",
+            "message": (
+                "This Meta Phone Number ID is already registered by another clinic. "
+                "Each WhatsApp Business number can only be linked to one clinic."
+            ),
+        },
+    )
+
+
 @credentials_router.patch(
     "/api-credentials",
     summary="Update API Credentials",
@@ -609,7 +642,12 @@ async def patch_api_credentials(
     row = await _load_config(session, tenant)
     existing = row.api_credentials or {} if row else {}
     resolved_existing = resolve_stt_credentials(existing)
+    patched_phone_id = patch.get("meta_phone_number_id")
     if is_semantic_credentials_echo(existing, resolved_existing, patch):
+        if patched_phone_id:
+            await _ensure_meta_phone_number_id_available(
+                session, tenant.tenant_id, patched_phone_id
+            )
         return {"ok": True, **credential_status(existing)}
     try:
         creds = merge_credentials(existing, patch)
@@ -649,28 +687,9 @@ async def patch_api_credentials(
     # error message friendly on the common (non-racing) path.
     new_phone_id = creds.get("meta_phone_number_id")
     if new_phone_id:
-        stmt = select(ClinicConfigTable.tenant_id).where(
-            ClinicConfigTable.api_credentials["meta_phone_number_id"].astext
-            == str(new_phone_id),
-            ClinicConfigTable.tenant_id != tenant.tenant_id,
+        await _ensure_meta_phone_number_id_available(
+            session, tenant.tenant_id, new_phone_id
         )
-        conflict = (await session.execute(stmt)).scalar_one_or_none()
-        if conflict is not None:
-            logger.warning(
-                "meta_phone_number_id_conflict tenant=%s existing_tenant=%s",
-                tenant.tenant_id,
-                conflict,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "error": "meta_phone_number_id_conflict",
-                    "message": (
-                        "This Meta Phone Number ID is already registered by another clinic. "
-                        "Each WhatsApp Business number can only be linked to one clinic."
-                    ),
-                },
-            )
 
     row.api_credentials = creds
     try:
