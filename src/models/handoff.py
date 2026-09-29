@@ -227,11 +227,6 @@ class HandoffRecord(Base):
         back_populates="handoff_records",
     )
 
-    def mark_webhook_sent(self, response: Optional[dict[str, Any]] = None) -> None:
-        """Mark webhook as sent with optional response."""
-        self.webhook_sent = True
-        self.webhook_response = response
-
     @property
     def is_pending(self) -> bool:
         """Check if handoff is still pending."""

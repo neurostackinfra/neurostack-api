@@ -398,7 +398,10 @@ async def test_handoff_sla_postgres_smoke(
             await database.execute(
                 sa.text(
                     "EXPLAIN (FORMAT JSON) "
-                    "SELECT id, numero_whatsapp, session_id, context, reason, "
+                    "SELECT id, numero_whatsapp, session_id, "
+                    "CASE WHEN jsonb_typeof(context -> 'safety_concern') = "
+                    "'boolean' THEN (context ->> 'safety_concern')::boolean "
+                    "ELSE NULL END AS safety_concern, reason, "
                     "intencao_detectada, estagio_atual, created_at, "
                     "data_hora_saida, sla_target_seconds, status "
                     "FROM handoff_records "

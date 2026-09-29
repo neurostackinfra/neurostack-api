@@ -8,10 +8,12 @@ Implements Task 13.3-13.5:
 - 13.5: Test HANDOFF flow end-to-end
 """
 
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import delete, select
 
 # ============================================
 # Fixtures
@@ -43,9 +45,100 @@ def auth_headers(valid_api_key):
 
 
 @pytest.fixture
-async def client(async_client: AsyncClient):
-    """Expose the shared lifespan-aware async client under the local name."""
-    yield async_client
+async def client(
+    async_client: AsyncClient,
+    tenant_id,
+    session_id,
+    monkeypatch,
+):
+    """Seed the real tenant/session identity required by canonical handoffs."""
+
+    from src.memory.event_store import EventStore
+    from src.models.session import Session
+    from src.models.tenant import Tenant
+    from src.repositories.database import get_db_session
+    from src.services.event_service import get_event_service
+    from src.services.handoff_service import HandoffService
+
+    event_store = MagicMock(spec=EventStore)
+    event_store.append = AsyncMock()
+    event_store.get_recent_messages = AsyncMock(return_value=[])
+    handoff_service = HandoffService(event_store=event_store)
+    monkeypatch.setattr(
+        get_event_service()._pipeline,
+        "_handoff",
+        handoff_service,
+    )
+
+    database = get_db_session()
+    try:
+        async with database.begin():
+            database.add(
+                Tenant(
+                    id=tenant_id,
+                    name=f"E2E Clinic {tenant_id}",
+                    slug=f"e2e-clinic-{tenant_id}",
+                    api_key_hash=f"e2e-key-{tenant_id}",
+                    config={},
+                )
+            )
+            database.add(
+                Session(
+                    id=session_id,
+                    tenant_id=tenant_id,
+                    channel="test",
+                    cognitive_state={},
+                    session_metadata={},
+                )
+            )
+    finally:
+        await database.close()
+
+    try:
+        yield async_client
+    finally:
+        from src.models.event import Event
+        from src.models.handoff import HandoffRecord
+
+        database = get_db_session()
+        try:
+            async with database.begin():
+                await database.execute(
+                    delete(Event).where(Event.tenant_id == tenant_id)
+                )
+                await database.execute(
+                    delete(HandoffRecord).where(HandoffRecord.tenant_id == tenant_id)
+                )
+                await database.execute(
+                    delete(Session).where(Session.tenant_id == tenant_id)
+                )
+                await database.execute(delete(Tenant).where(Tenant.id == tenant_id))
+        finally:
+            await database.close()
+
+
+async def _assert_persisted_handoff(tenant_id, session_id) -> None:
+    from src.models.handoff import HandoffRecord
+    from src.repositories.database import get_db_session
+
+    database = get_db_session()
+    try:
+        records = list(
+            (
+                await database.scalars(
+                    select(HandoffRecord).where(
+                        HandoffRecord.tenant_id == tenant_id,
+                        HandoffRecord.session_id == session_id,
+                    )
+                )
+            ).all()
+        )
+    finally:
+        await database.close()
+
+    assert len(records) == 1
+    assert records[0].status == "pending"
+    assert records[0].sla_target_seconds == 600
 
 
 # ============================================
@@ -263,6 +356,8 @@ class TestSafetyFlowEndToEnd:
         # Self-harm mentions should be detected
         # This may trigger safety mode or handoff
         assert data["mode"] in ["safety", "handoff", "normal"]
+        if data["decision"]["handoff_required"]:
+            await _assert_persisted_handoff(tenant_id, session_id)
 
 
 # ============================================
@@ -302,6 +397,7 @@ class TestHandoffFlowEndToEnd:
         if decision["handoff_required"]:
             assert data["mode"] == "handoff"
             assert decision["handoff_reason"] is not None
+            await _assert_persisted_handoff(tenant_id, session_id)
             # May include handoff summary
             if data.get("handoff_summary"):
                 assert "reason" in data["handoff_summary"]
@@ -334,6 +430,7 @@ class TestHandoffFlowEndToEnd:
         assert decision["handoff_required"] is True
         assert data["mode"] == "handoff"
         assert decision["handoff_reason"] is not None
+        await _assert_persisted_handoff(tenant_id, session_id)
 
     @pytest.mark.asyncio
     async def test_complaint_escalation(
@@ -361,6 +458,8 @@ class TestHandoffFlowEndToEnd:
         # Complaints may trigger escalation action
         decision = data["decision"]
         assert decision["intent_category"] in ["complaint", "unknown"]
+        if decision["handoff_required"]:
+            await _assert_persisted_handoff(tenant_id, session_id)
 
 
 # ============================================

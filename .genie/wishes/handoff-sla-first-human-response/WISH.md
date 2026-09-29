@@ -676,6 +676,15 @@ _The read-only reviewer returns evidence; the invoking orchestrator appends a ti
 - **Validation:** 133 testes focados PASS; Black, isort, Flake8, mypy, compile e `git diff --check` PASS.
 - **Snapshot:** hashes finais do backend e frontend conferidos novamente no checkout primário, sem drift; a dependência está concluída e liberada para `handoff-standby-reactivation`.
 
+### Post-main PR Reconciliation Review — 2026-09-29T22:12:00Z
+
+- **Context:** PR review do merge de `origin/main` `4cb8ad0b88526c54b365933767d5a4b0f3794746` na branch `wish/handoff-sla-first-human-response`; snapshot pré-stamp revisado em `git diff --cached MERGE_HEAD`, digest `9f1e3b10fac0576409573a6efa853a93459b4aa6f36b05bf47a805ed889df664`.
+- **Initial lenses:** segurança retornou SHIP sem gap CRITICAL/HIGH e confirmou isolamento tenant/session, autorização fail-closed e projeção estreita do radar; performance identificou um HIGH porque `NOT VALID` e `VALIDATE` ainda dividiam a mesma transação Alembic.
+- **Fix loop 1/2:** a migration 021 passou a confirmar os dois constraints `NOT VALID` antes de entrar em `autocommit_block()` para os `VALIDATE`; o teste offline exige `CHECK 1 < CHECK 2 < COMMIT < VALIDATE 1 < VALIDATE 2 < BEGIN`.
+- **Re-review:** as lentes de performance e a revisão global independente retornaram SHIP sem gaps CRITICAL/HIGH/MEDIUM. O manifesto foi ampliado com os cinco arquivos de teste/baseline reconciliados; o único residual LOW é a ausência de benchmark de cardinalidade produtiva, sem regressão observada.
+- **Validation:** gate backend final 3543 PASS / 22 skips com completion validator válido; PostgreSQL real 25/25 e smoke obrigatório 1/1; migration final 21/21; frontend 28 arquivos / 355 testes, TypeScript e build production; Black, isort, Flake8, mypy, Prettier e `git diff --check` PASS.
+- **Verdict:** SHIP. O commit de merge deve registrar o slug `handoff-sla-first-human-response` para fechar a rastreabilidade.
+
 ## Files to Create/Modify
 
 ```text
@@ -693,12 +702,17 @@ src/api/routes/handoff.py
 src/api/routes/webhook.py
 src/api/schemas/handoff.py
 tests/api/test_handoff_sla_migration.py
+tests/api/test_config.py
+tests/api/test_events_e2e.py
+tests/api/test_handoff_lifespan.py
 tests/api/test_handoff_queue.py
 tests/api/test_handoff_queue_export.py
+tests/baselines/neurostack-core-extraction-known-failures.txt
 tests/handoff/test_sla.py
 tests/handoff/test_service.py
 tests/integration/test_handoff_lifecycle_postgres.py
 tests/integration/test_handoff_sla_postgres.py
+tests/memory/test_event_store.py
 tests/scripts/test_check_handoff_sla_postgres.py
 scripts/check-handoff-sla-postgres.sh
 frontend/artifacts/neurostack/src/pages/handoff-queue.tsx

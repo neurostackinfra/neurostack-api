@@ -192,6 +192,43 @@ class TestEventStoreInit:
         assert store._engine is mock_engine
         assert store._session_factory is not None
 
+    @pytest.mark.asyncio
+    async def test_cancelled_connect_disposes_candidate_without_publishing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        probe_started = asyncio.Event()
+        never_release = asyncio.Event()
+        candidate = AsyncMock()
+        candidate.dispose = AsyncMock()
+        connection = AsyncMock()
+
+        async def blocked_probe(*_args: object) -> None:
+            probe_started.set()
+            await never_release.wait()
+
+        connection.execute = AsyncMock(side_effect=blocked_probe)
+        connection.__aenter__ = AsyncMock(return_value=connection)
+        connection.__aexit__ = AsyncMock(return_value=None)
+        candidate.begin = MagicMock(return_value=connection)
+        monkeypatch.setattr(
+            event_store_module,
+            "create_async_engine",
+            MagicMock(return_value=candidate),
+        )
+        store = EventStore()
+
+        connecting = asyncio.create_task(store.connect())
+        await probe_started.wait()
+        connecting.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await connecting
+
+        candidate.dispose.assert_awaited_once()
+        assert store._engine is None
+        assert store._session_factory is None
+
 
 class _LifecycleEventStore:
     def __init__(
@@ -822,7 +859,15 @@ class TestQueryOperations:
         statement, params = mock_session.execute.await_args.args
         assert "LIMIT :limit" in str(statement)
         assert "COUNT(" not in str(statement).upper()
-        assert params["limit"] == 5
+        assert params == {
+            "tenant_id": sample_tenant_id,
+            "session_id": sample_session_id,
+            "event_types": [
+                EventType.MESSAGE_IN.value,
+                EventType.MESSAGE_OUT.value,
+            ],
+            "limit": 5,
+        }
 
     @pytest.mark.asyncio
     async def test_query_by_session_with_type_filter(

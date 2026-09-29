@@ -1131,7 +1131,7 @@ def test_checkout_response_uses_winner_projection_without_requery_or_second_call
         id=handoff_id,
         numero_whatsapp="5511999999999",
         session_id=session_id,
-        context={"safety_concern": "false"},
+        safety_concern=None,
         reason=HandoffReason.SAFETY_CONCERN.value,
         intencao_detectada=HandoffReason.USER_REQUEST.value,
         estagio_atual="em_qualificacao",
@@ -1274,6 +1274,12 @@ def test_openapi_exposes_required_nullable_sla_contract(client: TestClient) -> N
         "as_of",
     } <= set(queue_schema["required"])
     assert "sla_target_seconds" in item_schema["required"]
+    for field in ("period_start", "period_end_exclusive", "as_of"):
+        assert queue_schema["properties"][field]["format"] == "date-time"
+    assert any(
+        branch.get("format") == "date-time"
+        for branch in schemas["HandoffDetail"]["properties"]["updated_at"]["anyOf"]
+    )
     for field in ("avg_wait_seconds", "pct_within_sla"):
         assert {
             branch.get("type") for branch in queue_schema["properties"][field]["anyOf"]
