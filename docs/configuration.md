@@ -413,6 +413,79 @@ Para troubleshooting do gate de release:
 5. smoke verde não libera sozinho: Operations precisa embutir os bytes e SHA no
    receipt, criar o sucessor assinado receipt-only e manter esse commit como HEAD.
 
+## STT: ativação técnica de Scribe e OpenRouter
+
+Os IDs wire explícitos são `elevenlabs_scribe` (ElevenLabs Scribe) e
+`openrouter` (OpenRouter). Eles são reconhecidos, têm readiness operacional e
+podem ser executados pelo runtime, mas continuam fora da promoção pública: a
+matriz/card de produto mantém `elevenlabs_scribe` como `coming_soon` e não inclui
+`openrouter`. Somente a release unit do catálogo pode alterar matriz, UI/card ou
+adoção geral. `outros` continua sendo o adapter legado distinto e, até essa release,
+ainda aparece como card `coming_soon` na matriz/UI existente; não é alias, rótulo
+alternativo nem fallback de OpenRouter. O catálogo será responsável por ocultá-lo
+quando introduzir o ID explícito `openrouter` na apresentação pública.
+
+“Operacional” aqui significa que mocks determinísticos provam o contrato local
+de configuração e transporte. Não significa homologação live de credencial,
+quota, modelo ou formato em produção. Nenhum probe live foi executado ou é
+autorizado por esta documentação.
+
+### Bundle e transições incumbent-only
+
+Uma troca aceita exige, no mesmo PATCH, quatro valores frescos e canônicos:
+`stt_provider`, `stt_api_url`, `stt_api_key` e `stt_model_name`. A chave deve ser
+nova; máscara, vazio e `null` não contam. URL, chave ou modelo anteriores nunca
+são herdados. `audio_max_seconds` não integra o bundle e mantém o default 60
+quando ausente.
+
+| Estado existente (raw / resolvido) | Request efetiva | Resultado |
+|---|---|---|
+| Raw realmente vazio nos seis campos STT / sem provider | Entrada em Scribe ou OpenRouter | `provider_not_available`; não é incumbent |
+| Providerless com valor efetivo em `stt_api_url`, `stt_api_key`, `stt_model_name`, `whisper_api_key` ou `whisper_model` / `outros` | Echo canônico exato, incluindo máscara e default 60 | 200, JSONB raw idêntico, sem write/evento |
+| Mesmo providerless efetivo (alias-only, canonical-only ou misto) / `outros` | Bundle fresco completo de Scribe ou OpenRouter | troca atômica aceita; provider anterior `outros` |
+| Raw `stt_provider="outros"` / `outros` | Echo canônico exato | 200, JSONB raw idêntico, sem write/evento |
+| Raw `stt_provider="outros"` / `outros` | Bundle fresco completo de Scribe ou OpenRouter | troca atômica aceita; provider anterior `outros` |
+| Legado elegível / `outros` | Switch parcial, máscara/vazio, base inválida ou manutenção de `outros` | erro específico; zero efeito |
+| Provider explícito diferente / resolvido diferente de `outros` | Entrada em Scribe/OpenRouter ou entrada/reentrada em `outros` | `provider_not_available`; zero efeito |
+| Qualquer incumbent reconhecido | Echo/no-op exato da própria visão canônica | 200 idêntico; sem write/evento |
+
+Essa é uma saída de compatibilidade **incumbent-only**: não transforma um tenant
+novo em incumbent e não cria um caminho geral de seleção pública.
+
+### Bases, paths e wire contract
+
+| ID | Base persistida exata | Sufixo POST | Autenticação | Campos multipart |
+|---|---|---|---|---|
+| `elevenlabs_scribe` | `https://api.elevenlabs.io/v1` | `/speech-to-text` | `xi-api-key: <secret>` | `file`, `model_id=<stt_model_name>` |
+| `openrouter` | `https://openrouter.ai/api/v1` | `/audio/transcriptions` | `Authorization: Bearer <secret>` | `file`, `model=<stt_model_name>`, `language` quando informado |
+
+As bases são literais: porta explícita (inclusive `:443`), query, fragmento,
+userinfo, host/path alternativo ou URL já contendo o sufixo são recusados. O
+modelo não é hardcoded: `stt_model_name` é obrigatório e é repassado no campo
+próprio de cada provedor.
+
+Ambos enviam os bytes originais em multipart `file`; este contrato escolhe
+multipart e não JSON/base64. O MIME recebido é normalizado para lowercase e sem
+parâmetros válidos antes do envio (por exemplo,
+`audio/ogg; codecs=opus` vira `audio/ogg`), preservando os bytes. Os tipos
+fechados são `audio/wav`, `audio/mpeg`, `audio/flac`, `audio/mp4`, `audio/ogg`,
+`application/ogg`, `audio/webm` e `audio/aac`; tipo ou parâmetro malformado é
+recusado antes da rede. A resposta deve ser JSON objeto e o transcript vem
+exclusivamente de `.text`, após trim; texto ausente/inválido ou vazio falha.
+
+A taxonomia pública/configuração permanece fechada:
+`invalid_provider_endpoint`, `provider_switch_bundle_required`,
+`provider_not_available`, `invalid_provider_for_capability`,
+`invalid_credentials_payload` e `unsafe_api_url`. A fronteira de transporte
+usa somente `stt_provider_unsupported`, `unsupported_audio_mime`,
+`stt_configuration_invalid`,
+`stt_provider_http_error`, `stt_provider_transport_error`,
+`stt_malformed_response` e `stt_empty_transcript`. Corpo, header, URL, modelo e
+segredo externos não são encadeados nesses erros.
+
+Referências oficiais: [OpenRouter — transcription](https://openrouter.ai/blog/tutorials/transcription-on-openrouter/)
+e [ElevenLabs — speech-to-text convert](https://elevenlabs.io/docs/api-reference/speech-to-text/convert).
+
 ---
 
 *Documentação mantida pela equipe NeuroStack*

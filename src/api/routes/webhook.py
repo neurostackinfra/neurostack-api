@@ -66,9 +66,7 @@ META_SIGNATURE_HEADER = "X-Hub-Signature-256"
 
 # STT providers with no runtime adapter: they must skip before any
 # download / request / reply / handoff / session mutation happens.
-UNSUPPORTED_STT_PROVIDERS = frozenset(
-    {"elevenlabs_scribe", "google_stt", "deepgram_stt", "microsoft_stt"}
-)
+UNSUPPORTED_STT_PROVIDERS = frozenset({"google_stt", "deepgram_stt", "microsoft_stt"})
 
 # Replay claim retention: 31 days covers Z-API's documented 30-day media
 # availability plus one extra day of dedup guarantee.
@@ -1226,9 +1224,36 @@ async def _stt_transcribe_audio(
     a legacy ``whisper_api_key`` is only a fallback for rows written before
     ``stt_api_key`` existed.
     """
+    stt_provider = _stt_canonical_provider(creds.get("stt_provider"))
     whisper_key = (creds.get("stt_api_key") or "").strip() or (
         creds.get("whisper_api_key") or ""
     ).strip()
+    lang_hint = "en" if agent_language == "en" else "pt"
+
+    if stt_provider in {"elevenlabs_scribe", "openrouter"}:
+        api_url = creds.get("stt_api_url")
+        api_key = creds.get("stt_api_key")
+        model_name = creds.get("stt_model_name")
+        if not all(
+            isinstance(value, str) and bool(value.strip())
+            for value in (api_url, api_key, model_name)
+        ):
+            from src.services.stt_service import SttTranscriptionError
+
+            raise SttTranscriptionError("stt_configuration_invalid")
+
+        from src.services.stt_service import transcribe_audio as transcribe_fixed_stt
+
+        return await transcribe_fixed_stt(
+            provider=stt_provider,
+            api_url=cast(str, api_url),
+            api_key=cast(str, api_key),
+            audio_bytes=audio_bytes,
+            mimetype=mime_type,
+            model_name=cast(str, model_name),
+            language=lang_hint,
+        )
+
     if not whisper_key:
         return None
 
@@ -1238,9 +1263,7 @@ async def _stt_transcribe_audio(
         transcribe_audio,
     )
 
-    stt_provider = _stt_canonical_provider(creds.get("stt_provider"))
     stt_api_url = (creds.get("stt_api_url") or "").strip()
-    lang_hint = "en" if agent_language == "en" else "pt"
 
     # Resolve STT base URL: use the saved URL (set by the UI for any
     # provider), fall back to known defaults, then Groq as last resort for
@@ -1308,7 +1331,8 @@ async def _transcribe_audio_chain(
     returns ``""`` for silent or unintelligible audio, and letting that
     through would drop the patient into a silent skip with no fallback.
     """
-    has_stt = bool(
+    stt_provider = _stt_canonical_provider(credentials.get("stt_provider"))
+    has_stt = stt_provider in {"elevenlabs_scribe", "openrouter"} or bool(
         (credentials.get("stt_api_key") or "").strip()
         or (credentials.get("whisper_api_key") or "").strip()
     )
@@ -3208,6 +3232,17 @@ async def meta_webhook(
     first_message_id = str(msg.get("id") or "").strip()
     if not first_message_id:
         return {"ok": True, "skipped": "missing_message_id"}
+
+    # Preserve the authenticated Meta boundary, then reject providers without
+    # adapters before replay state, bot/pause checks, session creation, media
+    # resolution/download, reply, or handoff. ``tenant_creds`` is the same raw
+    # row resolved together with the HMAC secret above.
+    first_message_type = str(msg.get("type") or "")
+    if first_message_type in _META_AUDIO_TYPES:
+        early_stt_provider = _stt_canonical_provider(tenant_creds.get("stt_provider"))
+        if early_stt_provider in UNSUPPORTED_STT_PROVIDERS:
+            return _stt_skip_envelope(early_stt_provider)
+
     try:
         first_delivery = _claim_incoming_message("meta", tenant_id, first_message_id)
     except ReplayStoreUnavailable:
@@ -3383,12 +3418,6 @@ async def meta_webhook(
                         tenant_id,
                     )
                     return {"ok": True, "skipped": "no_credentials"}
-
-                # Gate: STT providers without a runtime adapter must not
-                # produce any effect — skip before resolve/download/STT/reply.
-                _meta_stt_provider = _stt_canonical_provider(creds.get("stt_provider"))
-                if _meta_stt_provider in UNSUPPORTED_STT_PROVIDERS:
-                    return _stt_skip_envelope(_meta_stt_provider)
 
                 # 1) Resolve media_id → signed URL (+ file_size / mime)
                 try:

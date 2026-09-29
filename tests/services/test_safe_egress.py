@@ -30,8 +30,10 @@ from src.services.safe_egress import (
     MULTIMODAL_OPENAI_HOSTS,
     MULTIMODAL_OPENROUTER_HOSTS,
     PROVIDER_POLICIES,
+    STT_ELEVENLABS_HOSTS,
     STT_GROQ_HOSTS,
     STT_OPENAI_HOSTS,
+    STT_OPENROUTER_HOSTS,
     TTS_ELEVENLABS_HOSTS,
     TTS_GOOGLE_HOSTS,
     TTS_OPENAI_HOSTS,
@@ -225,6 +227,18 @@ class TestEnforceHostAllowlist:
         with pytest.raises(UnsafeEgressError):
             enforce_host_allowlist(self._parsed("api.groqcloud.com"), STT_GROQ_HOSTS)
 
+    def test_explicit_stt_provider_pinning(self) -> None:
+        enforce_host_allowlist(self._parsed("api.elevenlabs.io"), STT_ELEVENLABS_HOSTS)
+        enforce_host_allowlist(self._parsed("openrouter.ai"), STT_OPENROUTER_HOSTS)
+        for host, allowlist in (
+            ("api.elevenlabs.io.attacker.tld", STT_ELEVENLABS_HOSTS),
+            ("elevenlabs.io", STT_ELEVENLABS_HOSTS),
+            ("openrouter.ai.attacker.tld", STT_OPENROUTER_HOSTS),
+            ("api.openrouter.ai", STT_OPENROUTER_HOSTS),
+        ):
+            with pytest.raises(UnsafeEgressError):
+                enforce_host_allowlist(self._parsed(host), allowlist)
+
     def test_multimodal_pinning(self) -> None:
         enforce_host_allowlist(
             self._parsed("openrouter.ai"), MULTIMODAL_OPENROUTER_HOSTS
@@ -381,6 +395,46 @@ class TestProviderPolicies:
         assert PROVIDER_POLICIES["llm_gemini"].allowed_hosts == LLM_GEMINI_HOSTS
         assert PROVIDER_POLICIES["stt_openai"].allowed_hosts == STT_OPENAI_HOSTS
         assert PROVIDER_POLICIES["stt_groq"].allowed_hosts == STT_GROQ_HOSTS
+        assert PROVIDER_POLICIES["stt_elevenlabs"].allowed_hosts == STT_ELEVENLABS_HOSTS
+        assert PROVIDER_POLICIES["stt_openrouter"].allowed_hosts == STT_OPENROUTER_HOSTS
+
+    def test_explicit_stt_policies_pin_dns_host_and_sni(self) -> None:
+        seen: list[tuple[str, int]] = []
+
+        def resolver(hostname: str, port: int) -> list[tuple[Any, ...]]:
+            seen.append((hostname, port))
+            return [_addrinfo("8.8.8.8", port)]
+
+        for kind, host, path in (
+            ("stt_elevenlabs", "api.elevenlabs.io", "/v1/speech-to-text"),
+            ("stt_openrouter", "openrouter.ai", "/api/v1/audio/transcriptions"),
+        ):
+            validated = validate_url(
+                f"https://{host}{path}", kind=kind, resolver=resolver
+            )
+            assert validated.sni_host == host
+            assert validated.parsed.hostname == host
+        assert seen == [
+            ("api.elevenlabs.io", 443),
+            ("openrouter.ai", 443),
+        ]
+
+    def test_explicit_stt_policies_reject_off_host_before_dns(self) -> None:
+        called = False
+
+        def resolver(_hostname: str, _port: int) -> list[tuple[Any, ...]]:
+            nonlocal called
+            called = True
+            return [_addrinfo("8.8.8.8")]
+
+        for kind in ("stt_elevenlabs", "stt_openrouter"):
+            with pytest.raises(UnsafeEgressError):
+                validate_url(
+                    "https://proxy.attacker.tld/audio/transcriptions",
+                    kind=kind,
+                    resolver=resolver,
+                )
+        assert called is False
 
     def test_gemini_policy_pins_dns_host_and_sni(self) -> None:
         seen: list[tuple[str, int]] = []

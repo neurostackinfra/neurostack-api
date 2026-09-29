@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
 
 from src.config.settings import settings
+from src.services.api_credentials import STT_FIXED_API_BASES
 
 API_CRED_PATH = "/v1/config/api-credentials"
 META_WEBHOOK_PATH = "/v1/webhook/meta"
@@ -306,6 +307,10 @@ class TestMetaPhoneNumberIdUniqueness:
                 "whatsapp_provider": "meta_cloud",
                 "meta_phone_number_id": phone_id,
                 "meta_permanent_token": "EAAG_race_token_ABCDEFG",
+                "stt_provider": "outros",
+                "stt_api_url": "https://legacy-speech.example/v1",
+                "stt_api_key": "legacy-stt-key",
+                "stt_model_name": "legacy-stt-model",
             },
         )
 
@@ -324,7 +329,13 @@ class TestMetaPhoneNumberIdUniqueness:
         ):
             resp = client.patch(
                 API_CRED_PATH,
-                json={"meta_phone_number_id": phone_id},
+                json={
+                    "meta_phone_number_id": phone_id,
+                    "stt_provider": "elevenlabs_scribe",
+                    "stt_api_url": STT_FIXED_API_BASES["elevenlabs_scribe"],
+                    "stt_api_key": "fresh-scribe-key",
+                    "stt_model_name": "scribe_v1",
+                },
                 headers=headers,
             )
 
