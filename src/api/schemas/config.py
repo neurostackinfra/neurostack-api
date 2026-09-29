@@ -180,7 +180,7 @@ class SttCredentialsPatch(BaseModel):
 class TtsCredentialsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    tts_provider: Literal["elevenlabs", "google"] | None = None
+    tts_provider: Literal["elevenlabs", "google", "openai"] | None = None
     tts_api_url: ApiUrl | None = None
     tts_api_key: Secret | None = None
     tts_model_name: Identifier | None = None

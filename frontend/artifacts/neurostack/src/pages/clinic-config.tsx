@@ -451,7 +451,7 @@ type SttProvider =
   | "deepgram_stt"
   | "microsoft_stt"
   | "outros";
-type TtsProvider = "elevenlabs" | "google";
+type TtsProvider = "elevenlabs" | "google" | "openai";
 type MultimodalProvider = "openrouter";
 
 // Every canonical multimodal provider id declared in the backend allowlist
@@ -514,6 +514,7 @@ export const API_PROVIDER_AVAILABILITY = {
   tts: {
     elevenlabs: "coming_soon",
     google: "coming_soon",
+    openai: "coming_soon",
   },
 } as const satisfies ProviderAvailabilityMatrix;
 
@@ -644,6 +645,7 @@ export const STT_PROVIDERS: { id: SttProvider; label: string; sub: string }[] = 
 export const TTS_PROVIDERS: { id: TtsProvider; label: string; sub: string }[] = [
   { id: "elevenlabs", label: "ElevenLabs",      sub: "Voz natural e humana" },
   { id: "google",     label: "Google Cloud TTS", sub: "Escala e bom custo"       },
+  { id: "openai",     label: "OpenAI TTS",       sub: "gpt-4o-audio / tts-1" },
 ];
 
 // The display catalog is intentionally availability-agnostic: the canonical
@@ -746,15 +748,20 @@ const CAPABILITY_FIELDS: Record<string, readonly CredentialField[]> = {
 
 const GEMINI_OPENAI_COMPATIBLE_BASE_URL =
   "https://generativelanguage.googleapis.com/v1beta/openai";
+const OPENAI_BASE_URL = "https://api.openai.com/v1";
 
 function newProviderFieldDefault(
   capability: ApiCapabilityId,
   providerId: string,
   fieldName: string,
 ): string {
-  return capability === "llm" && providerId === "gemini" && fieldName === "llm_api_url"
-    ? GEMINI_OPENAI_COMPATIBLE_BASE_URL
-    : "";
+  if (capability === "llm" && providerId === "gemini" && fieldName === "llm_api_url") {
+    return GEMINI_OPENAI_COMPATIBLE_BASE_URL;
+  }
+  if (capability === "tts" && providerId === "openai" && fieldName === "tts_api_url") {
+    return OPENAI_BASE_URL;
+  }
+  return "";
 }
 
 const CAPABILITY_PROVIDER_FIELD: Record<ApiCapabilityId, string> = {
