@@ -58,6 +58,8 @@ LLM_DROPOUT_HOSTS: frozenset[str] = frozenset({"api.neuralake.cloud"})
 LLM_GEMINI_HOSTS: frozenset[str] = frozenset({"generativelanguage.googleapis.com"})
 STT_GROQ_HOSTS: frozenset[str] = frozenset({"api.groq.com"})
 STT_OPENAI_HOSTS: frozenset[str] = frozenset({"api.openai.com"})
+STT_ELEVENLABS_HOSTS: frozenset[str] = frozenset({"api.elevenlabs.io"})
+STT_OPENROUTER_HOSTS: frozenset[str] = frozenset({"openrouter.ai"})
 
 # Multimodal transcription (chat-completions carrying ``input_audio`` blocks).
 # Unlike STT there is no ``outros`` escape hatch here: the credential
@@ -351,6 +353,12 @@ PROVIDER_POLICIES: Mapping[str, ProviderPolicy] = {
     "llm_outros": ProviderPolicy(kind="llm_outros", allowed_hosts=None),
     "stt_openai": ProviderPolicy(kind="stt_openai", allowed_hosts=STT_OPENAI_HOSTS),
     "stt_groq": ProviderPolicy(kind="stt_groq", allowed_hosts=STT_GROQ_HOSTS),
+    "stt_elevenlabs": ProviderPolicy(
+        kind="stt_elevenlabs", allowed_hosts=STT_ELEVENLABS_HOSTS
+    ),
+    "stt_openrouter": ProviderPolicy(
+        kind="stt_openrouter", allowed_hosts=STT_OPENROUTER_HOSTS
+    ),
     "stt_outros": ProviderPolicy(kind="stt_outros", allowed_hosts=None),
     "multimodal_openai": ProviderPolicy(
         kind="multimodal_openai", allowed_hosts=MULTIMODAL_OPENAI_HOSTS
@@ -671,8 +679,10 @@ __all__ = [
     "MULTIMODAL_OPENAI_HOSTS",
     "MULTIMODAL_OPENROUTER_HOSTS",
     "PROVIDER_POLICIES",
+    "STT_ELEVENLABS_HOSTS",
     "STT_GROQ_HOSTS",
     "STT_OPENAI_HOSTS",
+    "STT_OPENROUTER_HOSTS",
     "TTS_ELEVENLABS_HOSTS",
     "TTS_GOOGLE_HOSTS",
     "TTS_OPENAI_HOSTS",
