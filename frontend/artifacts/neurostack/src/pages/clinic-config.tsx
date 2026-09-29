@@ -127,8 +127,12 @@ const CONFIG_SAVE_FIELD_LABELS: Record<string, Record<ConfigSaveErrorLocale, str
   scheduling_link_message: { pt: "mensagem do link de agendamento", en: "scheduling link message" },
   timezone: { pt: "fuso horário", en: "timezone" },
   business_hours: { pt: "horários de funcionamento", en: "business hours" },
-  handoff_cycle_days: { pt: "dias do ciclo de handoff", en: "handoff cycle days" },
-  handoff_inactive_default_hours: { pt: "horas de inatividade do handoff", en: "handoff inactivity hours" },
+  handoff_policy: { pt: "configuração de stand-by após handoff", en: "post-handoff stand-by settings" },
+  handoff_active: { pt: "ativação do handoff", en: "handoff activation" },
+  standby_mode: { pt: "modo de stand-by", en: "stand-by mode" },
+  handoff_period: { pt: "modo de reativação", en: "reactivation mode" },
+  handoff_cycle_hours: { pt: "horas do prazo de handoff", en: "handoff period hours" },
+  handoff_cycle_days: { pt: "dias do prazo de handoff", en: "handoff period days" },
   meta_minutos_atendimento: { pt: "meta de minutos para atendimento", en: "service-time target in minutes" },
   whatsapp_provider: { pt: "provedor do WhatsApp", en: "WhatsApp provider" },
   zapi_instance_id: { pt: "ID da instância Z-API", en: "Z-API instance ID" },
@@ -184,13 +188,16 @@ function safeConfigFieldLabel(field: unknown, locale: ConfigSaveErrorLocale): st
 }
 
 function configSaveErrorFieldNames(detail: unknown): string[] {
-  const issues = Array.isArray(detail)
-    ? detail
-    : isRecord(detail) && Array.isArray(detail.fields)
-      ? detail.fields
-      : isRecord(detail) && typeof detail.field === "string"
-        ? [detail.field]
-        : [];
+  let issues: unknown[] = [];
+  if (Array.isArray(detail)) {
+    issues = detail;
+  } else if (isRecord(detail) && Array.isArray(detail.violations)) {
+    issues = detail.violations;
+  } else if (isRecord(detail) && Array.isArray(detail.fields)) {
+    issues = detail.fields;
+  } else if (isRecord(detail) && typeof detail.field === "string") {
+    issues = [detail.field];
+  }
   return [...new Set(issues.flatMap((issue) => {
     if (typeof issue === "string") return [issue];
     if (!isRecord(issue)) return [];
@@ -1304,6 +1311,7 @@ export function HitlComingSoonControl() {
 
 export default function ClinicConfig() {
   const { clinicId, isReadOnly, isClinicAdmin, role, isBuilder, isSuperAdmin, isInvestor, viewingClinicId } = useAuth();
+  const canConfigureHandoff = !isClinicAdmin;
   const { t, locale } = useI18n();
   const txt = (p: string, e: string) => locale === "en" ? e : p;
   const { toast } = useToast();
@@ -1397,11 +1405,15 @@ export default function ClinicConfig() {
   const [isTogglingBot, setIsTogglingBot] = useState(false);
 
   // Tab 4 — Handoff
-  const [handoffActive, setHandoffActive] = useState("yes");
   const [standbyMode, setStandbyMode] = useState("active");
   const [handoffPeriod, setHandoffPeriod] = useState("permanent");
-  const [handoffCycleDays, setHandoffCycleDays] = useState("");
-  const [handoffInactiveDefaultHours, setHandoffInactiveDefaultHours] = useState("24");
+  const [handoffCycleValue, setHandoffCycleValue] = useState("");
+  const [handoffCycleUnit, setHandoffCycleUnit] = useState<"hours" | "days">("hours");
+  const [handoffCycleError, setHandoffCycleError] = useState("");
+  const handoffEditGenerationRef = useRef(0);
+  const configTarget = (isBuilder || isSuperAdmin) && viewingClinicId ? viewingClinicId : clinicId;
+  const configTargetRef = useRef(configTarget);
+  configTargetRef.current = configTarget;
 
   // Tab 5 — Catálogo de Serviços
   const [services, setServices] = useState<ClinicService[]>([]);
@@ -1454,11 +1466,21 @@ export default function ClinicConfig() {
     setLanguagePolicy(config.language_policy ?? "neurostack_default");
     setLanguagePolicyCustom(config.language_policy_custom ?? "");
     setAgentLanguage(config.agent_language ?? "pt-BR");
-    setHandoffActive(config.handoff_active ?? "yes");
-    setStandbyMode(config.standby_mode ?? "active");
-    setHandoffPeriod(config.handoff_period ?? "permanent");
-    setHandoffCycleDays(config.handoff_cycle_days ?? "");
-    setHandoffInactiveDefaultHours(config.handoff_inactive_default_hours ?? "24");
+    const hydratedStandbyMode = config.standby_mode === "inactive" ? "inactive" : "active";
+    const hydratedHours = config.handoff_cycle_hours;
+    const hydratedDays = config.handoff_cycle_days;
+    const hasHours = hydratedHours !== null && hydratedHours !== undefined && hydratedHours !== "";
+    const hasDays = hydratedDays !== null && hydratedDays !== undefined && hydratedDays !== "";
+    const hasHydratedDuration = hasHours || hasDays;
+    setStandbyMode(hydratedStandbyMode);
+    setHandoffPeriod(
+      hydratedStandbyMode === "active" && config.handoff_period === "cycle" && hasHydratedDuration
+        ? "cycle"
+        : "permanent",
+    );
+    setHandoffCycleUnit(hasHours ? "hours" : hasDays ? "days" : "hours");
+    setHandoffCycleValue(hasHours ? String(hydratedHours) : hasDays ? String(hydratedDays) : "");
+    setHandoffCycleError("");
     setMetaMinutosAtendimento(String(config.meta_minutos_atendimento ?? "10"));
     setServices(Array.isArray(config.services) ? config.services.map(hydrateClinicService) : []);
     setServiceFormatErrors({});
@@ -1521,6 +1543,22 @@ export default function ClinicConfig() {
     } finally {
       setIsTogglingBot(false);
     }
+  };
+
+  const validateHandoffCycle = (value: string, unit: "hours" | "days") => {
+    const maximum = unit === "hours" ? 720 : 365;
+    if (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > maximum) {
+      return unit === "hours"
+        ? txt(
+            "Informe um número inteiro de 1 a 720 horas.",
+            "Enter a whole number from 1 to 720 hours.",
+          )
+        : txt(
+            "Informe um número inteiro de 1 a 365 dias.",
+            "Enter a whole number from 1 to 365 days.",
+          );
+    }
+    return "";
   };
 
   const handleSave = async () => {
@@ -1653,6 +1691,22 @@ export default function ClinicConfig() {
     }
     setServiceFormatErrors({});
 
+    if (canConfigureHandoff && standbyMode === "active" && handoffPeriod === "cycle") {
+      const cycleError = validateHandoffCycle(handoffCycleValue, handoffCycleUnit);
+      if (cycleError) {
+        setHandoffCycleError(cycleError);
+        return;
+      }
+    }
+    setHandoffCycleError("");
+
+    const customHandoffCycle = canConfigureHandoff
+      && standbyMode === "active"
+      && handoffPeriod === "cycle";
+    const handoffCycleNumber = customHandoffCycle ? Number(handoffCycleValue) : null;
+    const submittedHandoffGeneration = handoffEditGenerationRef.current;
+    const submittedConfigTarget = configTargetRef.current;
+
     setIsSaving(true);
     const payload: Record<string, any> = {
       clinic_name: clinicName.trim(),
@@ -1696,13 +1750,19 @@ export default function ClinicConfig() {
       language_policy: languagePolicy || null,
       language_policy_custom: languagePolicyCustom.trim() || null,
       agent_language: agentLanguage || "pt-BR",
-      handoff_active: "yes",
-      standby_mode: standbyMode || null,
-      handoff_period: handoffPeriod || null,
-      handoff_cycle_days: handoffCycleDays.trim() || null,
-      handoff_inactive_default_hours: parseInt(handoffInactiveDefaultHours, 10) || 24,
       meta_minutos_atendimento: parseInt(metaMinutosAtendimento, 10) || 10,
     };
+    if (canConfigureHandoff) {
+      Object.assign(payload, {
+        handoff_active: "yes",
+        standby_mode: standbyMode,
+        handoff_period: customHandoffCycle ? "cycle" : "permanent",
+        handoff_cycle_hours:
+          customHandoffCycle && handoffCycleUnit === "hours" ? handoffCycleNumber : null,
+        handoff_cycle_days:
+          customHandoffCycle && handoffCycleUnit === "days" ? handoffCycleNumber : null,
+      });
+    }
     try {
       const token = getToken();
       const patchUrl = (isBuilder || isSuperAdmin) && viewingClinicId
@@ -1725,8 +1785,12 @@ export default function ClinicConfig() {
         });
         return;
       }
-      const updated = responseBody;
-      setConfig(updated);
+      if (
+        handoffEditGenerationRef.current === submittedHandoffGeneration
+        && configTargetRef.current === submittedConfigTarget
+      ) {
+        setConfig(responseBody);
+      }
       toast({ title: t("config_saved"), description: t("config_saved_desc") });
     } catch {
       toast({
@@ -2589,62 +2653,175 @@ export default function ClinicConfig() {
               {/* ── HITL Block ─────────────────────────────────────── */}
                   <HitlComingSoonControl />
 
-                  <SwitchRow
-                    label={txt("Modo Stand-by pós-Handoff", "Post-Handoff Stand-by Mode")}
-                    hint={txt("A IA fica inativa após acionar handoff até o ciclo se encerrar", "AI goes inactive after triggering handoff until the cycle ends")}
-                    checked={standbyMode === "active"}
-                    onCheckedChange={(v) => setStandbyMode(v ? "active" : "inactive")}
-                    disabled={isReadOnly}
-                  />
-                  <div className="text-[11px] text-muted-foreground -mt-1 ml-1">
-                    {txt(
-                      `Se inativo, opera em handoff padrão de ${handoffInactiveDefaultHours}h (janela WhatsApp API)`,
-                      `If inactive, operates with default handoff of ${handoffInactiveDefaultHours}h (WhatsApp API window)`
-                    )}
-                  </div>
+                  <section
+                    aria-labelledby="handoff-standby-title"
+                    className="space-y-4 rounded-lg border border-border/60 bg-muted/10 px-4 py-4"
+                    data-testid="handoff-standby-settings"
+                  >
+                    <div className="space-y-1">
+                      <h3 id="handoff-standby-title" className="text-sm font-semibold text-foreground">
+                        {txt("Stand-by após handoff", "Stand-by after handoff")}
+                      </h3>
+                      <p className="text-xs leading-relaxed text-muted-foreground">
+                        {txt(
+                          "Defina por quanto tempo a IA permanece inativa após transferir a conversa para um atendente.",
+                          "Define how long the AI remains inactive after transferring the conversation to an attendant.",
+                        )}
+                      </p>
+                    </div>
 
-                  <Field label={txt("Período de Handoff", "Handoff Period")}>
-                    <Select value={handoffPeriod} onValueChange={setHandoffPeriod} disabled={isReadOnly}>
-                      <SelectTrigger className="h-9 text-sm">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="permanent">{txt("Permanente (até reativação manual)", "Permanent (until manual reactivation)")}</SelectItem>
-                        <SelectItem value="cycle">{txt("Ciclo de X dias", "X-day Cycle")}</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </Field>
-
-                  {handoffPeriod === "cycle" && (
-                    <Field label={txt("Duração do Ciclo (dias)", "Cycle Duration (days)")}>
-                      <Input
-                        type="number"
-                        min="1"
-                        max="365"
-                        value={handoffCycleDays}
-                        onChange={(e) => setHandoffCycleDays(e.target.value)}
-                        placeholder={txt("Ex: 7", "e.g. 7")}
-                        className="w-32 text-sm"
+                    <div className="flex items-center justify-between gap-4">
+                      <Label className="text-sm font-medium text-foreground">
+                        {txt("Ativar stand-by após handoff", "Enable stand-by after handoff")}
+                      </Label>
+                      <Switch
+                        aria-label={txt("Ativar stand-by após handoff", "Enable stand-by after handoff")}
+                        checked={standbyMode === "active"}
+                        onCheckedChange={(enabled) => {
+                          handoffEditGenerationRef.current += 1;
+                          setStandbyMode(enabled ? "active" : "inactive");
+                          setHandoffPeriod("permanent");
+                          setHandoffCycleValue("");
+                          setHandoffCycleUnit("hours");
+                          setHandoffCycleError("");
+                        }}
                         disabled={isReadOnly}
                       />
-                    </Field>
-                  )}
+                    </div>
 
-                  <Field
-                    label={txt("Período padrão (horas) quando Standby está inativo", "Default period (hours) when Standby is inactive")}
-                    hint={txt("Padrão: 24h. Aplicado automaticamente quando o modo Stand-by está desativado.", "Default: 24h. Applied automatically when Stand-by mode is off.")}
-                  >
-                    <Input
-                      type="number"
-                      min="1"
-                      max="720"
-                      value={handoffInactiveDefaultHours}
-                      onChange={(e) => setHandoffInactiveDefaultHours(e.target.value)}
-                      placeholder="24"
-                      className="w-32 text-sm"
-                      disabled={isReadOnly}
-                    />
-                  </Field>
+                    <p className="text-sm font-medium text-foreground" aria-live="polite">
+                      {standbyMode === "active"
+                        ? txt("Stand-by ativado", "Stand-by enabled")
+                        : txt("Stand-by desativado", "Stand-by disabled")}
+                    </p>
+
+                    {standbyMode === "inactive" ? (
+                      <div className="rounded-md border border-sky-200 bg-sky-50 px-3 py-3 text-sm text-sky-800 dark:border-sky-800 dark:bg-sky-950/30 dark:text-sky-200">
+                        {txt(
+                          "A IA volta a responder automaticamente 24 horas após o handoff.",
+                          "The AI automatically starts responding again 24 hours after the handoff.",
+                        )}
+                      </div>
+                    ) : (
+                      <>
+                        <div className="space-y-2 rounded-md border border-sky-200 bg-sky-50 px-3 py-3 text-sm text-sky-800 dark:border-sky-800 dark:bg-sky-950/30 dark:text-sky-200">
+                          <p className="font-medium">
+                            {txt(
+                              "Escolha quando a IA poderá voltar a responder:",
+                              "Choose when the AI may start responding again:",
+                            )}
+                          </p>
+                          <ul className="list-disc space-y-1 pl-5">
+                            <li>
+                              {txt(
+                                "Somente após reativação manual: a IA permanece inativa até ser reativada pela mensagem mestra ou pelo painel de inativos.",
+                                "Only after manual reactivation: the AI remains inactive until it is reactivated by the master message or the inactive conversations panel.",
+                              )}
+                            </li>
+                            <li>
+                              {txt(
+                                "Após um prazo personalizado: a IA volta a responder automaticamente após o número de horas ou dias definido abaixo.",
+                                "After a custom period: the AI starts responding again automatically after the number of hours or days defined below.",
+                              )}
+                            </li>
+                          </ul>
+                        </div>
+
+                        <Field label={txt("Quando reativar a IA?", "When should the AI be reactivated?")}>
+                          <Select
+                            value={handoffPeriod}
+                            onValueChange={(period) => {
+                              handoffEditGenerationRef.current += 1;
+                              setHandoffPeriod(period);
+                              setHandoffCycleValue("");
+                              setHandoffCycleUnit("hours");
+                              setHandoffCycleError("");
+                            }}
+                            disabled={isReadOnly}
+                          >
+                            <SelectTrigger
+                              aria-label={txt("Quando reativar a IA?", "When should the AI be reactivated?")}
+                              className="h-9 text-sm"
+                            >
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="permanent">
+                                {txt("Somente manualmente", "Manually only")}
+                              </SelectItem>
+                              <SelectItem value="cycle">
+                                {txt("Após um prazo personalizado", "After a custom period")}
+                              </SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </Field>
+
+                        {handoffPeriod === "cycle" && (
+                          <div className="space-y-1.5">
+                            <Label
+                              htmlFor="handoff-cycle-value"
+                              className="text-xs font-medium uppercase tracking-wider text-muted-foreground"
+                            >
+                              {txt(
+                                "Prazo para reativação automática",
+                                "Automatic reactivation period",
+                              )}
+                            </Label>
+                            <div className="flex items-start gap-2">
+                              <Input
+                                id="handoff-cycle-value"
+                                type="number"
+                                inputMode="numeric"
+                                min="1"
+                                max={handoffCycleUnit === "hours" ? "720" : "365"}
+                                step="1"
+                                value={handoffCycleValue}
+                                onChange={(event) => {
+                                  const value = event.target.value;
+                                  handoffEditGenerationRef.current += 1;
+                                  setHandoffCycleValue(value);
+                                  if (handoffCycleError) {
+                                    setHandoffCycleError(validateHandoffCycle(value, handoffCycleUnit));
+                                  }
+                                }}
+                                aria-invalid={handoffCycleError ? "true" : "false"}
+                                aria-describedby={handoffCycleError ? "handoff-cycle-error" : undefined}
+                                className="w-32 text-sm"
+                                disabled={isReadOnly}
+                              />
+                              <Select
+                                value={handoffCycleUnit}
+                                onValueChange={(unit: "hours" | "days") => {
+                                  handoffEditGenerationRef.current += 1;
+                                  setHandoffCycleUnit(unit);
+                                  if (handoffCycleError) {
+                                    setHandoffCycleError(validateHandoffCycle(handoffCycleValue, unit));
+                                  }
+                                }}
+                                disabled={isReadOnly}
+                              >
+                                <SelectTrigger
+                                  aria-label={txt("Unidade do prazo", "Period unit")}
+                                  className="h-9 w-32 text-sm"
+                                >
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="hours">{txt("Horas", "Hours")}</SelectItem>
+                                  <SelectItem value="days">{txt("Dias", "Days")}</SelectItem>
+                                </SelectContent>
+                              </Select>
+                            </div>
+                            {handoffCycleError && (
+                              <p id="handoff-cycle-error" role="alert" className="text-xs text-destructive">
+                                {handoffCycleError}
+                              </p>
+                            )}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </section>
 
             </CardContent>
           </Card>

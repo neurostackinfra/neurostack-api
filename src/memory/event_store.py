@@ -9,6 +9,7 @@ The Event Store provides:
 - Training data generation support
 """
 
+import asyncio
 import time
 from datetime import datetime, timezone
 from enum import Enum
@@ -258,51 +259,69 @@ class EventStore:
         self._max_overflow = max_overflow or settings.database_max_overflow
         self._engine: Optional[AsyncEngine] = None
         self._session_factory: Optional[async_sessionmaker[AsyncSession]] = None
+        self._connection_lock = asyncio.Lock()
 
     async def connect(self) -> None:
-        """Establish connection to PostgreSQL."""
+        """Establish a probed connection without publishing partial state."""
         # Import settings here to avoid circular import
         from src.config.settings import settings
 
-        try:
-            engine = create_async_engine(
-                self._database_url,
-                pool_size=self._pool_size,
-                max_overflow=self._max_overflow,
-                echo=settings.debug,
-            )
+        async with self._connection_lock:
+            if self._engine is not None and self._session_factory is not None:
+                return
+
+            engine: AsyncEngine | None = None
+            try:
+                engine = create_async_engine(
+                    self._database_url,
+                    pool_size=self._pool_size,
+                    max_overflow=self._max_overflow,
+                    echo=settings.debug,
+                )
+                session_factory = async_sessionmaker(
+                    engine,
+                    class_=AsyncSession,
+                    expire_on_commit=False,
+                )
+                async with engine.begin() as conn:
+                    await conn.execute(text("SELECT 1"))
+            except BaseException as exc:
+                self._engine = None
+                self._session_factory = None
+                if engine is not None:
+                    try:
+                        await engine.dispose()
+                    except Exception as dispose_exc:
+                        logger.error(
+                            "Failed to dispose rejected Event Store engine",
+                            error_type=type(dispose_exc).__name__,
+                            exc_info=True,
+                        )
+                if not isinstance(exc, Exception):
+                    raise
+                EVENT_STORE_OPERATIONS.labels(operation="connect", status="error").inc()
+                if not isinstance(exc, SQLAlchemyError):
+                    logger.error(
+                        "Unexpected error connecting to Event Store",
+                        error=str(exc),
+                        error_type=type(exc).__name__,
+                        exc_info=True,
+                    )
+                raise EventStoreConnectionError(
+                    f"Failed to connect to PostgreSQL: {exc}"
+                ) from exc
+
             self._engine = engine
-            self._session_factory = async_sessionmaker(
-                engine,
-                class_=AsyncSession,
-                expire_on_commit=False,
-            )
-            # Test connection
-            async with engine.begin() as conn:
-                await conn.execute(text("SELECT 1"))
-        except SQLAlchemyError as e:
-            EVENT_STORE_OPERATIONS.labels(operation="connect", status="error").inc()
-            raise EventStoreConnectionError(
-                f"Failed to connect to PostgreSQL: {e}"
-            ) from e
-        except Exception as e:
-            EVENT_STORE_OPERATIONS.labels(operation="connect", status="error").inc()
-            logger.error(
-                "Unexpected error connecting to Event Store",
-                error=str(e),
-                error_type=type(e).__name__,
-                exc_info=True,
-            )
-            raise EventStoreConnectionError(
-                f"Failed to connect to PostgreSQL: {e}"
-            ) from e
+            self._session_factory = session_factory
 
     async def disconnect(self) -> None:
-        """Close PostgreSQL connection."""
-        if self._engine:
-            await self._engine.dispose()
+        """Close PostgreSQL connection and clear published state first."""
+        async with self._connection_lock:
+            engine = self._engine
             self._engine = None
             self._session_factory = None
+            if engine is not None:
+                await engine.dispose()
 
     async def __aenter__(self) -> "EventStore":
         """Async context manager entry."""
@@ -816,15 +835,52 @@ class EventStore:
         Returns:
             List of message events (oldest first)
         """
-        result = await self.query_by_session(
-            tenant_id=tenant_id,
-            session_id=session_id,
-            event_types=[EventType.MESSAGE_IN.value, EventType.MESSAGE_OUT.value],
-            limit=limit,
-            order_desc=True,
-        )
-        # Reverse to get oldest first
-        return list(reversed(result.events))
+        start_time = time.perf_counter()
+        try:
+            async with self._get_session() as session:
+                query = text(
+                    """
+                    SELECT id, tenant_id, session_id, event_type, interaction_origin,
+                           event_data, metadata, created_at
+                    FROM events
+                    WHERE tenant_id = :tenant_id
+                      AND session_id = :session_id
+                      AND event_type = ANY(:event_types)
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT :limit
+                    """
+                )
+                result = await session.execute(
+                    query,
+                    {
+                        "tenant_id": tenant_id,
+                        "session_id": session_id,
+                        "event_types": [
+                            EventType.MESSAGE_IN.value,
+                            EventType.MESSAGE_OUT.value,
+                        ],
+                        "limit": limit,
+                    },
+                )
+                rows = result.fetchall()
+                events = [self._row_to_event_data(row) for row in rows]
+
+            latency = time.perf_counter() - start_time
+            EVENT_STORE_LATENCY.labels(operation="get_recent_messages").observe(latency)
+            EVENT_STORE_OPERATIONS.labels(
+                operation="get_recent_messages", status="success"
+            ).inc()
+            return list(reversed(events))
+        except SQLAlchemyError as exc:
+            EVENT_STORE_OPERATIONS.labels(
+                operation="get_recent_messages", status="error"
+            ).inc()
+            raise EventStoreError(f"Failed to query recent messages: {exc}") from exc
+        except Exception as exc:
+            EVENT_STORE_OPERATIONS.labels(
+                operation="get_recent_messages", status="error"
+            ).inc()
+            raise EventStoreError(f"Failed to query recent messages: {exc}") from exc
 
     # ============================================
     # Aggregation Operations
@@ -1192,6 +1248,7 @@ class EventStore:
 # ============================================
 
 _event_store: Optional[EventStore] = None
+_event_store_lifecycle_lock = asyncio.Lock()
 
 
 async def get_event_store() -> EventStore:
@@ -1202,15 +1259,31 @@ async def get_event_store() -> EventStore:
         EventStore instance
     """
     global _event_store
-    if _event_store is None:
-        _event_store = EventStore()
-        await _event_store.connect()
-    return _event_store
+    async with _event_store_lifecycle_lock:
+        if _event_store is not None:
+            return _event_store
+
+        candidate = EventStore()
+        try:
+            await candidate.connect()
+        except BaseException:
+            try:
+                await candidate.disconnect()
+            except Exception:
+                logger.error(
+                    "Failed to dispose rejected global Event Store candidate",
+                    exc_info=True,
+                )
+            raise
+        _event_store = candidate
+        return candidate
 
 
 async def close_event_store() -> None:
     """Close the global EventStore instance."""
     global _event_store
-    if _event_store is not None:
-        await _event_store.disconnect()
+    async with _event_store_lifecycle_lock:
+        store = _event_store
         _event_store = None
+        if store is not None:
+            await store.disconnect()

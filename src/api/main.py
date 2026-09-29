@@ -126,16 +126,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # await init_redis()
     # await init_qdrant()
 
-    yield
-
-    # Shutdown
-    logger.info("Shutting down NeuroStack API")
-    from src.repositories import close_database
-
     try:
-        await rlhf.shutdown()
+        yield
     finally:
-        await close_database()
+        # Shutdown shared services before their database dependency. Each
+        # boundary remains eligible for cleanup even when an earlier one fails.
+        logger.info("Shutting down NeuroStack API")
+        from src.memory.event_store import close_event_store
+        from src.repositories import close_database
+        from src.services.handoff_service import close_handoff_service
+
+        try:
+            await rlhf.shutdown()
+        finally:
+            try:
+                await close_handoff_service()
+            finally:
+                try:
+                    await close_event_store()
+                finally:
+                    await close_database()
     # await close_redis()
 
 
