@@ -1,2 +1,0 @@
-FAILED tests/core/test_config_service.py::TestSchedulingLinkPatchBoundary::test_non_https_patch_returns_422_without_persisting
-FAILED tests/core/test_config_service.py::TestSchedulingLinkPatchBoundary::test_url_change_persists_and_emits_structured_audit_event

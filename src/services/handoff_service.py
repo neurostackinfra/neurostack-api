@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Optional, cast
+from typing import Any, Optional, TypeVar, cast, overload
 from uuid import UUID, uuid4
 
 from prometheus_client import Counter, Histogram
@@ -79,6 +79,20 @@ HANDOFF_LATENCY = Histogram(
 SessionFactory = Callable[[], AsyncSession]
 RepositoryFactory = Callable[[AsyncSession], HandoffRecordRepository]
 _DEFAULT_EVENT_STORE = object()
+_EnumT = TypeVar("_EnumT", bound=Enum)
+_INTERNAL_CONTEXT_KEYS = frozenset(
+    {
+        "context_version",
+        "funnel_stage",
+        "safety_concern",
+        "sector",
+        "sla",
+        "summary_snapshot",
+        "turn_count",
+        "verification_status",
+        "webhook_status",
+    }
+)
 
 
 class HandoffPersistenceError(HandoffServiceError):
@@ -141,7 +155,7 @@ class HandoffQueueConfirmation:
     id: UUID
     numero_whatsapp: str | None
     session_id: UUID
-    context: dict[str, Any]
+    safety_concern: bool | None
     reason: str
     intencao_detectada: str | None
     estagio_atual: str | None
@@ -175,6 +189,17 @@ class _Mutation(str, Enum):
     TIMEOUT = "timeout"
 
 
+def _enum_or_default(
+    enum_type: type[_EnumT],
+    value: object,
+    default: _EnumT,
+) -> _EnumT:
+    try:
+        return enum_type(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _optional_enum(enum_type: type[Enum], value: object) -> Any:
     if value is None:
         return None
@@ -186,6 +211,27 @@ def _optional_enum(enum_type: type[Enum], value: object) -> Any:
 
 def _context_dict(record: HandoffRecord) -> dict[str, Any]:
     return dict(record.context) if isinstance(record.context, dict) else {}
+
+
+def _record_safety_concern(record: HandoffRecord) -> bool | None:
+    value = _context_dict(record).get("safety_concern")
+    return value if type(value) is bool else None
+
+
+@overload
+def _aware_utc(value: datetime) -> datetime: ...
+
+
+@overload
+def _aware_utc(value: None) -> None: ...
+
+
+def _aware_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _webhook_status(record: HandoffRecord) -> WebhookStatus | None:
@@ -211,16 +257,11 @@ def map_handoff_record(
     key_info = context.get("key_info")
     if not isinstance(key_info, dict):
         # Pre-canonical rows stored request key_info directly in context.
-        internal_keys = {
-            "context_version",
-            "funnel_stage",
-            "sector",
-            "sla",
-            "summary_snapshot",
-            "turn_count",
-            "verification_status",
+        key_info = {
+            key: value
+            for key, value in context.items()
+            if key not in _INTERNAL_CONTEXT_KEYS
         }
-        key_info = {k: v for k, v in context.items() if k not in internal_keys}
 
     sector = _optional_enum(HandoffSector, context.get("sector"))
     sla = _optional_enum(HandoffSLA, context.get("sla"))
@@ -228,9 +269,17 @@ def map_handoff_record(
         id=record.id,
         tenant_id=record.tenant_id,
         session_id=record.session_id,
-        status=HandoffStatus(record.status),
-        urgency=HandoffUrgency(record.urgency),
-        reason=HandoffReason(record.reason),
+        status=_enum_or_default(HandoffStatus, record.status, HandoffStatus.PENDING),
+        urgency=_enum_or_default(
+            HandoffUrgency,
+            record.urgency,
+            HandoffUrgency.NORMAL,
+        ),
+        reason=_enum_or_default(
+            HandoffReason,
+            record.reason,
+            HandoffReason.USER_REQUEST,
+        ),
         sector=sector,
         sla=sla,
         verification_status=(
@@ -249,10 +298,10 @@ def map_handoff_record(
             if isinstance(record.webhook_response, dict)
             else None
         ),
-        created_at=record.created_at,
-        updated_at=record.updated_at,
-        data_hora_saida=record.data_hora_saida,
-        resolved_at=record.resolved_at,
+        created_at=_aware_utc(record.created_at),
+        updated_at=_aware_utc(record.updated_at),
+        data_hora_saida=_aware_utc(record.data_hora_saida),
+        resolved_at=_aware_utc(record.resolved_at),
         sla_target_seconds=record.sla_target_seconds,
         resolution_notes=record.resolution_notes,
     )
@@ -263,9 +312,17 @@ def _map_list_item(record: HandoffRecord) -> HandoffListItem:
     return HandoffListItem(
         id=record.id,
         session_id=record.session_id,
-        status=HandoffStatus(record.status),
-        urgency=HandoffUrgency(record.urgency),
-        reason=HandoffReason(record.reason),
+        status=_enum_or_default(HandoffStatus, record.status, HandoffStatus.PENDING),
+        urgency=_enum_or_default(
+            HandoffUrgency,
+            record.urgency,
+            HandoffUrgency.NORMAL,
+        ),
+        reason=_enum_or_default(
+            HandoffReason,
+            record.reason,
+            HandoffReason.USER_REQUEST,
+        ),
         sector=_optional_enum(HandoffSector, context.get("sector")),
         sla=_optional_enum(HandoffSLA, context.get("sla")),
         verification_status=(
@@ -274,7 +331,7 @@ def _map_list_item(record: HandoffRecord) -> HandoffListItem:
             else None
         ),
         summary_preview=(record.summary or "")[:100],
-        created_at=record.created_at,
+        created_at=_aware_utc(record.created_at),
         assigned_to=record.assigned_to,
     )
 
@@ -342,6 +399,11 @@ class HandoffService:
         try:
             async with self._open_session() as session:
                 repository = self._repository_factory(session)
+                if not await repository.session_belongs_to_tenant(
+                    request.tenant_id,
+                    request.session_id,
+                ):
+                    raise HandoffServiceError("handoff_session_not_found")
                 sla_configuration = await repository.load_sla_configuration(
                     request.tenant_id
                 )
@@ -401,7 +463,7 @@ class HandoffService:
                 webhook_status=webhook_status,
                 user_message=self._get_handoff_message(request.reason),
                 verification_status=request.verification_status,
-                created_at=record.created_at,
+                created_at=_aware_utc(record.created_at),
             )
         except HandoffServiceError:
             HANDOFF_OPERATIONS.labels(operation="initiate", status="error").inc()
@@ -710,13 +772,13 @@ class HandoffService:
             id=record.id,
             numero_whatsapp=record.numero_whatsapp,
             session_id=record.session_id,
-            context=_context_dict(record),
+            safety_concern=_record_safety_concern(record),
             reason=record.reason,
             intencao_detectada=record.intencao_detectada,
             estagio_atual=record.estagio_atual,
             primeira_linha_mensagem=record.primeira_linha_mensagem,
-            created_at=record.created_at,
-            data_hora_saida=record.data_hora_saida,
+            created_at=_aware_utc(record.created_at),
+            data_hora_saida=_aware_utc(record.data_hora_saida),
             sla_target_seconds=record.sla_target_seconds,
             status=record.status,
         )

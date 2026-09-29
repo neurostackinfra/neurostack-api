@@ -9,11 +9,12 @@ from enum import Enum
 from typing import Any, Optional
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.handoff import HandoffRecord, HandoffStatus
+from src.models.session import Session as SessionRecord
 from src.models.tenant import Tenant
 from src.repositories.base import BaseRepository
 
@@ -63,7 +64,7 @@ class HandoffSlaCohortRow:
     id: UUID
     numero_whatsapp: str | None
     session_id: UUID
-    context: dict[str, Any]
+    safety_concern: bool | None
     reason: str
     intencao_detectada: str | None
     estagio_atual: str | None
@@ -103,6 +104,22 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
         if record is None:
             return HandoffLookupResult(HandoffLookupOutcome.NOT_FOUND)
         return HandoffLookupResult(HandoffLookupOutcome.FOUND, record)
+
+    async def session_belongs_to_tenant(
+        self,
+        tenant_id: UUID,
+        session_id: UUID,
+    ) -> bool:
+        """Return whether the session exists inside the requested tenant."""
+        result = await self.session.execute(
+            select(SessionRecord.id)
+            .where(
+                SessionRecord.id == session_id,
+                SessionRecord.tenant_id == tenant_id,
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def find_by_tenant(
         self,
@@ -244,20 +261,42 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
         result = await self.session.execute(statement)
         return result.scalar() or 0
 
-    @staticmethod
     def _sla_cohort_statement(
+        self,
         *,
         tenant_id: UUID,
         start_utc: datetime,
         end_exclusive_utc: datetime,
     ) -> Any:
         """Build the bounded, tenant-scoped narrow projection statement."""
+        context_safety = HandoffRecord.context["safety_concern"]
+        if self.session.get_bind().dialect.name == "sqlite":
+            safety_concern = case(
+                (
+                    func.json_type(HandoffRecord.context, "$.safety_concern") == "true",
+                    True,
+                ),
+                (
+                    func.json_type(HandoffRecord.context, "$.safety_concern")
+                    == "false",
+                    False,
+                ),
+                else_=None,
+            ).label("safety_concern")
+        else:
+            safety_concern = case(
+                (
+                    func.jsonb_typeof(context_safety) == "boolean",
+                    context_safety.as_boolean(),
+                ),
+                else_=None,
+            ).label("safety_concern")
         return (
             select(
                 HandoffRecord.id,
                 HandoffRecord.numero_whatsapp,
                 HandoffRecord.session_id,
-                HandoffRecord.context,
+                safety_concern,
                 HandoffRecord.reason,
                 HandoffRecord.intencao_detectada,
                 HandoffRecord.estagio_atual,
@@ -353,7 +392,7 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
         value = result.scalar_one()
         if not isinstance(value, datetime):
             raise TypeError("Database current timestamp is not a datetime")
-        if value.tzinfo is None:
+        if value.tzinfo is None or value.utcoffset() is None:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
 

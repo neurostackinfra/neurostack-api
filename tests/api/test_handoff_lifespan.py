@@ -13,31 +13,37 @@ import src.services.handoff_service as handoff_service_module
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("shutdown_fails", [False, True])
-async def test_lifespan_closes_handoff_event_store_and_database_in_order(
+@pytest.mark.parametrize(
+    "failure_stage",
+    [None, "rlhf", "handoff", "event_store", "database"],
+)
+async def test_lifespan_runs_every_cleanup_in_dependency_order(
     monkeypatch: pytest.MonkeyPatch,
-    shutdown_fails: bool,
+    failure_stage: str | None,
 ) -> None:
     order: list[str] = []
 
+    async def step(name: str) -> None:
+        order.append(name)
+        if failure_stage == name:
+            raise RuntimeError(f"{name} shutdown failed")
+
     class Dispatcher:
         async def close(self) -> None:
-            order.append("handoff_dispatcher")
+            await step("handoff")
 
     class Store:
         async def disconnect(self) -> None:
-            order.append("event_store")
+            await step("event_store")
 
     async def init_database() -> None:
         order.append("database_init")
 
     async def close_database() -> None:
-        order.append("database")
+        await step("database")
 
     async def shutdown_rlhf() -> None:
-        order.append("rlhf")
-        if shutdown_fails:
-            raise RuntimeError("rlhf shutdown failed")
+        await step("rlhf")
 
     service = SimpleNamespace(webhook_dispatcher=Dispatcher())
     store = Store()
@@ -61,16 +67,16 @@ async def test_lifespan_closes_handoff_event_store_and_database_in_order(
             assert handoff_service_module._service is service
             assert event_store_module._event_store is store
 
-    if shutdown_fails:
-        with pytest.raises(RuntimeError, match="rlhf shutdown failed"):
-            await run_lifespan()
-    else:
+    if failure_stage is None:
         await run_lifespan()
+    else:
+        with pytest.raises(RuntimeError, match=f"{failure_stage} shutdown failed"):
+            await run_lifespan()
 
     assert order == [
         "database_init",
         "rlhf",
-        "handoff_dispatcher",
+        "handoff",
         "event_store",
         "database",
     ]

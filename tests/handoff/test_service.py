@@ -17,7 +17,12 @@ from uuid import UUID, uuid4
 import pytest
 
 import src.services.handoff_service as handoff_service_module
-from src.core.exceptions import HandoffNotFoundError, WebhookConfigError, WebhookError
+from src.core.exceptions import (
+    HandoffNotFoundError,
+    HandoffServiceError,
+    WebhookConfigError,
+    WebhookError,
+)
 from src.handoff.models import (
     ConversationSummary,
     HandoffListItem,
@@ -136,6 +141,7 @@ class _FakeHandoffStore:
     conflict_next: bool = False
     fail_insert: bool = False
     fail_bookkeeping: bool = False
+    session_is_owned: bool = True
     order: list[str] = field(default_factory=list)
     db_now: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc),
@@ -163,6 +169,9 @@ class _FakeSession:
 class _FakeHandoffRepository:
     def __init__(self, store: _FakeHandoffStore):
         self.store = store
+
+    async def session_belongs_to_tenant(self, _tenant_id, _session_id):
+        return self.store.session_is_owned
 
     async def load_sla_configuration(self, _tenant_id):
         return HandoffSlaConfiguration(self.store.configured_minutes, "fake")
@@ -830,6 +839,7 @@ def test_legacy_service_path_is_canonical_identity_shim_without_lifecycle_bypass
         "complete",
         "cancel",
         "timeout",
+        "mark_webhook_sent",
     ):
         assert not hasattr(HandoffRecord, mutator)
 
@@ -862,6 +872,30 @@ class TestHandoffService:
         assert response.session_id == session_id
         assert response.status == HandoffStatus.PENDING
         assert len(response.user_message) > 0
+
+    @pytest.mark.asyncio
+    async def test_session_must_belong_to_tenant_before_insert(
+        self,
+        handoff_service,
+        handoff_store,
+        tenant_id,
+        session_id,
+    ):
+        handoff_store.session_is_owned = False
+
+        with pytest.raises(HandoffServiceError) as error:
+            await handoff_service.initiate_handoff(
+                HandoffRequest(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    reason=HandoffReason.USER_REQUEST,
+                )
+            )
+
+        assert type(error.value) is HandoffServiceError
+        assert str(error.value) == "handoff_session_not_found"
+        assert handoff_store.records == {}
+        assert "commit" not in handoff_store.order
 
     @pytest.mark.asyncio
     async def test_queue_sla_wraps_corrupt_persisted_timestamps(
@@ -910,7 +944,9 @@ class TestHandoffService:
         self,
         tenant_id,
     ):
-        statement = HandoffRecordRepository._sla_cohort_statement(
+        session = MagicMock()
+        session.get_bind.return_value.dialect.name = "postgresql"
+        statement = HandoffRecordRepository(session)._sla_cohort_statement(
             tenant_id=tenant_id,
             start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
             end_exclusive_utc=datetime(2026, 4, 2, tzinfo=timezone.utc),
@@ -920,7 +956,7 @@ class TestHandoffService:
             "id",
             "numero_whatsapp",
             "session_id",
-            "context",
+            "safety_concern",
             "reason",
             "intencao_detectada",
             "estagio_atual",
@@ -1583,6 +1619,40 @@ class TestHandoffService:
         assert persisted.updated_at == database_now
 
     @pytest.mark.asyncio
+    async def test_queue_confirmation_projects_winner_without_context_json(
+        self,
+        handoff_service,
+        handoff_store,
+        tenant_id,
+        session_id,
+    ):
+        created = await handoff_service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.SAFETY_CONCERN,
+                safety_concern=True,
+                detected_intent="scheduling",
+                funnel_stage="qualification",
+                recent_messages=[{"role": "user", "content": "preciso de ajuda"}],
+            )
+        )
+
+        confirmation = await handoff_service.confirm_queue_handoff(
+            created.id,
+            tenant_id=tenant_id,
+        )
+
+        assert confirmation.status == HandoffStatus.IN_PROGRESS.value
+        assert confirmation.safety_concern is True
+        assert confirmation.intencao_detectada == "scheduling"
+        assert confirmation.estagio_atual == "qualification"
+        assert confirmation.primeira_linha_mensagem == "preciso de ajuda"
+        assert confirmation.data_hora_saida is not None
+        assert not hasattr(confirmation, "context")
+        assert handoff_store.records[created.id].lifecycle_version == 1
+
+    @pytest.mark.asyncio
     async def test_generic_update_cannot_manufacture_in_progress(
         self,
         handoff_service,
@@ -2084,6 +2154,73 @@ class TestHandoffService:
         assert completed.sla_target_seconds == 600
         assert completed.updated_at is not None
         assert "lifecycle_version" not in dumped
+
+    def test_mapper_tolerates_legacy_enums_without_leaking_internal_context(
+        self,
+        tenant_id,
+        session_id,
+    ):
+        created_at = datetime(2026, 9, 29, 12)
+        record = HandoffRecord(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            session_id=session_id,
+            reason="operator_takeover",
+            summary="legacy",
+            context={
+                "legacy_key": "value",
+                "verification_status": "legacy",
+                "safety_concern": True,
+                "webhook_status": "sent",
+                "summary_snapshot": {"private": "internal"},
+            },
+            urgency="unknown",
+            status="pending",
+            webhook_sent=False,
+            created_at=created_at,
+        )
+
+        detail = handoff_service_module.map_handoff_record(
+            record,
+            handoff_service_module.RecentMessageProjection(),
+        )
+        list_item = handoff_service_module._map_list_item(record)
+
+        assert detail.reason is HandoffReason.USER_REQUEST
+        assert detail.urgency is HandoffUrgency.NORMAL
+        assert detail.key_info == {"legacy_key": "value"}
+        assert detail.verification_status == "legacy"
+        assert detail.created_at.tzinfo is timezone.utc
+        assert list_item.reason is HandoffReason.USER_REQUEST
+        assert list_item.urgency is HandoffUrgency.NORMAL
+
+    @pytest.mark.asyncio
+    async def test_sla_snapshot_is_immutable_across_config_changes(
+        self,
+        handoff_service,
+        handoff_store,
+        tenant_id,
+        session_id,
+    ):
+        handoff_store.configured_minutes = 10
+        first = await handoff_service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+        handoff_store.configured_minutes = 5
+        second = await handoff_service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+
+        assert handoff_store.records[first.id].sla_target_seconds == 600
+        assert handoff_store.records[second.id].sla_target_seconds == 300
 
     @pytest.mark.asyncio
     async def test_recent_messages_are_tenant_scoped_bounded_projection_only(

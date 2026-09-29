@@ -122,14 +122,9 @@ def _handoff_queue_fields(
     expose_first_message: bool,
 ) -> dict[str, Any]:
     """Project the fields shared by queue listing and checkout responses."""
-    context_safety = (
-        record.context.get("safety_concern")
-        if isinstance(record.context, dict)
-        else None
-    )
     safety_flag = (
-        context_safety
-        if type(context_safety) is bool
+        record.safety_concern
+        if type(record.safety_concern) is bool
         else record.reason == HandoffReason.SAFETY_CONCERN.value
     )
     detected_intent = record.intencao_detectada
