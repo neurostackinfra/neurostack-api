@@ -8,13 +8,13 @@ Tests cover:
 - API endpoints
 """
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.core.exceptions import (
     HandoffNotFoundError,
@@ -45,13 +45,14 @@ from src.models.handoff import HandoffRecord
 from src.models.session import Session
 from src.models.tenant import Tenant
 from src.repositories.database import _patch_jsonb_for_sqlite
-from src.repositories.handoff import HandoffRecordRepository
+from src.repositories.handoff import HandoffRecordRepository, HandoffSlaCohortRow
 from src.services import HandoffService
 from src.services import handoff_service as handoff_service_module
 from src.services.handoff_service import (
     HANDOFF_OPERATIONS,
     HandoffLifecycleError,
     HandoffPostCommitError,
+    HandoffSlaPeriodError,
     handoff_record_to_detail,
 )
 
@@ -229,6 +230,172 @@ def test_handoff_record_exposes_no_public_mutators_that_bypass_cas() -> None:
     }
 
     assert bypasses.isdisjoint(vars(HandoffRecord))
+
+
+@pytest.mark.asyncio
+async def test_sla_repository_streams_only_narrow_ordered_projection() -> None:
+    tenant_id = uuid4()
+    session_id = uuid4()
+    handoff_id = uuid4()
+    created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    async def projected_rows():
+        yield (
+            handoff_id,
+            "5511999999999",
+            session_id,
+            True,
+            "safety_concern",
+            "scheduling",
+            "qualification",
+            created_at,
+            None,
+            600,
+            "pending",
+        )
+
+    stream_result = MagicMock()
+    stream_result.tuples.return_value = projected_rows()
+    session = MagicMock(spec=AsyncSession)
+    session.stream = AsyncMock(return_value=stream_result)
+    repository = HandoffRecordRepository(session)
+
+    rows = [
+        row
+        async for row in repository.stream_sla_cohort(
+            tenant_id=tenant_id,
+            start_utc=created_at,
+            end_exclusive_utc=created_at + timedelta(days=1),
+        )
+    ]
+
+    assert rows == [
+        HandoffSlaCohortRow(
+            id=handoff_id,
+            numero_whatsapp="5511999999999",
+            session_id=session_id,
+            safety_concern=True,
+            reason="safety_concern",
+            intencao_detectada="scheduling",
+            estagio_atual="qualification",
+            created_at=created_at,
+            data_hora_saida=None,
+            sla_target_seconds=600,
+            status="pending",
+        )
+    ]
+    statement = session.stream.await_args.args[0]
+    selected_keys = [column.key for column in statement.selected_columns]
+    assert selected_keys == [
+        "id",
+        "numero_whatsapp",
+        "session_id",
+        "safety_concern",
+        "reason",
+        "intencao_detectada",
+        "estagio_atual",
+        "created_at",
+        "data_hora_saida",
+        "sla_target_seconds",
+        "status",
+    ]
+    assert {"summary", "context", "primeira_linha_mensagem"}.isdisjoint(selected_keys)
+    assert [str(clause) for clause in statement._order_by_clauses] == [
+        "handoff_records.created_at ASC",
+        "handoff_records.id ASC",
+    ]
+    compiled = str(statement)
+    assert "handoff_records.tenant_id =" in compiled
+    assert "handoff_records.created_at >=" in compiled
+    assert "handoff_records.created_at <" in compiled
+
+
+@pytest.mark.asyncio
+async def test_queue_sla_streams_and_aggregates_once_with_shared_window_limit(
+    handoff_session_factory,
+    tenant_id,
+    monkeypatch,
+) -> None:
+    as_of = datetime(2026, 4, 1, 12, tzinfo=timezone.utc)
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    projected = [
+        HandoffSlaCohortRow(
+            id=uuid4(),
+            numero_whatsapp=None,
+            session_id=uuid4(),
+            safety_concern=None,
+            reason="user_request",
+            intencao_detectada="first",
+            estagio_atual=None,
+            created_at=base,
+            data_hora_saida=base + timedelta(seconds=600),
+            sla_target_seconds=600,
+            status="completed",
+        ),
+        HandoffSlaCohortRow(
+            id=uuid4(),
+            numero_whatsapp=None,
+            session_id=uuid4(),
+            safety_concern=None,
+            reason="user_request",
+            intencao_detectada="second",
+            estagio_atual=None,
+            created_at=base + timedelta(seconds=1),
+            data_hora_saida=None,
+            sla_target_seconds=600,
+            status="pending",
+        ),
+    ]
+
+    class OneShotRows:
+        def __init__(self) -> None:
+            self.iterations = 0
+            self.index = 0
+
+        def __aiter__(self):
+            self.iterations += 1
+            if self.iterations > 1:
+                raise AssertionError("SLA cohort must be consumed once")
+            return self
+
+        async def __anext__(self):
+            if self.index == len(projected):
+                raise StopAsyncIteration
+            row = projected[self.index]
+            self.index += 1
+            return row
+
+    rows = OneShotRows()
+    stream = MagicMock(return_value=rows)
+    monkeypatch.setattr(HandoffRecordRepository, "stream_sla_cohort", stream)
+    service = HandoffService(session_factory=handoff_session_factory)
+
+    result = await service.get_queue_sla(
+        tenant_id,
+        from_date=date(2026, 1, 1),
+        to_date=date(2026, 4, 1),
+        as_of=as_of,
+    )
+
+    assert rows.iterations == 1
+    stream.assert_called_once()
+    assert result.within_sla_count == 1
+    assert result.unanswered_overdue_count == 1
+    assert result.metrics.confirmed_count == 1
+    assert result.metrics.sla_eligible_count == 2
+    assert result.metrics.average_confirmed_seconds == 600.0
+    assert str(result.metrics.pct_within_sla) == "50.0"
+    assert result.items == (projected[1],)
+
+    stream.reset_mock()
+    with pytest.raises(HandoffSlaPeriodError, match="max_window_90_days"):
+        await service.get_queue_sla(
+            tenant_id,
+            from_date=date(2026, 1, 1),
+            to_date=date(2026, 4, 2),
+            as_of=as_of,
+        )
+    stream.assert_not_called()
 
 
 # ============================================

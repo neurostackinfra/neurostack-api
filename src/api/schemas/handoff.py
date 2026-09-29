@@ -4,10 +4,10 @@ Request and response models for handoff endpoints.
 """
 
 from datetime import datetime as _dt
-from typing import Optional
+from typing import Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.handoff.models import (
     HandoffDetail,
@@ -73,24 +73,24 @@ class HandoffQueueItem(BaseModel):
     primeira_linha_mensagem: Optional[str] = None
     created_at: _dt
     data_hora_saida: Optional[_dt] = None
-    sla_target_seconds: Optional[int]
-    status: str
+    sla_target_seconds: Optional[int] = Field(..., ge=60, le=7200)
+    status: HandoffStatus
 
 
 class HandoffQueueResponse(BaseModel):
     """Response for GET /queue — items + aggregate stats."""
 
     items: list[HandoffQueueItem]
-    avg_wait_seconds: Optional[float]
-    pct_within_sla: Optional[float]
-    within_sla_count: int
-    confirmed_late_count: int
-    unanswered_overdue_count: int
-    maturing_count: int
-    cancelled_unconfirmed_count: int
-    unmeasured_legacy_count: int
-    confirmed_count: int
-    sla_eligible_count: int
+    avg_wait_seconds: Optional[float] = Field(..., ge=0)
+    pct_within_sla: Optional[float] = Field(..., ge=0, le=100)
+    within_sla_count: int = Field(ge=0)
+    confirmed_late_count: int = Field(ge=0)
+    unanswered_overdue_count: int = Field(ge=0)
+    maturing_count: int = Field(ge=0)
+    cancelled_unconfirmed_count: int = Field(ge=0)
+    unmeasured_legacy_count: int = Field(ge=0)
+    confirmed_count: int = Field(ge=0)
+    sla_eligible_count: int = Field(ge=0)
     period_timezone: str
     period_start: _dt
     period_end_exclusive: _dt
@@ -102,6 +102,28 @@ class HandoffCheckoutResponse(HandoffQueueItem):
     wait_seconds: Optional[float] = None
 
 
+class HandoffNotFoundResponse(BaseModel):
+    """Stable response returned when a tenant-scoped handoff is absent."""
+
+    detail: Literal["handoff_not_found"]
+
+
+class HandoffConflictResponse(BaseModel):
+    """Stable response returned when attendance cannot transition state."""
+
+    detail: Literal[
+        "attendance_already_confirmed",
+        "invalid_handoff_state",
+        "handoff_conflict",
+    ]
+
+
+class HandoffUnavailableResponse(BaseModel):
+    """Stable response returned when confirmation persistence is unavailable."""
+
+    detail: Literal["handoff_service_unavailable"]
+
+
 __all__ = [
     "HandoffListResponse",
     "WebhookTestRequest",
@@ -111,6 +133,9 @@ __all__ = [
     "HandoffQueueItem",
     "HandoffQueueResponse",
     "HandoffCheckoutResponse",
+    "HandoffNotFoundResponse",
+    "HandoffConflictResponse",
+    "HandoffUnavailableResponse",
     # Re-export for convenience
     "HandoffDetail",
     "HandoffListItem",

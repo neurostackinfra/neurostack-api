@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from collections.abc import AsyncIterator
@@ -344,6 +345,56 @@ async def test_handoff_sla_postgres_smoke(
                     fall_back_excluded,
                 ]
             )
+
+    async with factory() as database:
+        await database.execute(sa.text("ANALYZE handoff_records"))
+        explain_statement = sa.text(
+            """
+            EXPLAIN (FORMAT JSON)
+            SELECT id, numero_whatsapp, session_id,
+                   CASE
+                       WHEN jsonb_typeof(context -> 'safety_concern') = 'boolean'
+                       THEN (context ->> 'safety_concern')::boolean
+                   END AS safety_concern,
+                   reason, intencao_detectada, estagio_atual, created_at,
+                   data_hora_saida, sla_target_seconds, status
+            FROM handoff_records
+            WHERE tenant_id = :tenant_id
+              AND created_at >= :start_utc
+              AND created_at < :end_exclusive_utc
+            ORDER BY created_at ASC, id ASC
+            """
+        ).bindparams(
+            sa.bindparam("tenant_id", type_=sa.Uuid()),
+            sa.bindparam("start_utc", type_=sa.DateTime(timezone=True)),
+            sa.bindparam("end_exclusive_utc", type_=sa.DateTime(timezone=True)),
+        )
+        raw_plan = (
+            await database.execute(
+                explain_statement,
+                {
+                    "tenant_id": normative_tenant,
+                    "start_utc": start,
+                    "end_exclusive_utc": datetime(2026, 9, 2, 3, tzinfo=timezone.utc),
+                },
+            )
+        ).scalar_one()
+        explained = json.loads(raw_plan) if isinstance(raw_plan, str) else raw_plan
+        plan = explained[0]["Plan"]
+
+        plan_nodes = [plan]
+        for node in plan_nodes:
+            plan_nodes.extend(node.get("Plans", []))
+        predicates = " ".join(
+            str(node.get(key, ""))
+            for node in plan_nodes
+            for key in ("Index Cond", "Recheck Cond", "Filter")
+        )
+        assert "tenant_id" in predicates
+        assert "created_at" in predicates
+        assert ">=" in predicates
+        assert "<" in predicates
+        assert 1 <= int(plan["Plan Rows"]) <= len(normative) + 2
 
     radar = await service.get_queue_sla(
         normative_tenant,
