@@ -685,12 +685,29 @@ def _seed_zapi_audio_tenant(
         "zapi_inbound_token_digest": _digest_for(raw_token),
     }
     if stt or stt_provider is not None:
+        provider = stt_provider or "outros"
+        fixed_bundle = {
+            "elevenlabs_scribe": (
+                "https://api.elevenlabs.io/v1",
+                "scribe_v2",
+            ),
+            "openrouter": (
+                "https://openrouter.ai/api/v1",
+                "openai/whisper-large-v3-turbo",
+            ),
+        }.get(provider)
         payload.update(
             {
-                "stt_provider": stt_provider or "outros",
+                "stt_provider": provider,
                 "stt_api_key": f"sk-fake-stt-{uuid4().hex}",
-                "stt_api_url": "https://api.groq.com/openai/v1",
-                "stt_model_name": "whisper-large-v3-turbo",
+                "stt_api_url": (
+                    fixed_bundle[0]
+                    if fixed_bundle
+                    else "https://api.groq.com/openai/v1"
+                ),
+                "stt_model_name": (
+                    fixed_bundle[1] if fixed_bundle else "whisper-large-v3-turbo"
+                ),
             }
         )
     if multimodal:
@@ -715,6 +732,7 @@ def _zapi_audio_body(
     phone: str = "5511900000003",
     seconds: int = 5,
     audio_url: str = "https://cdn.example.com/voice.ogg",
+    mime_type: str = "audio/ogg",
 ) -> dict:
     return {
         "instanceId": instance_id,
@@ -723,7 +741,7 @@ def _zapi_audio_body(
         "fromMe": False,
         "audio": {
             "url": audio_url,
-            "mimeType": "audio/ogg",
+            "mimeType": mime_type,
             "seconds": seconds,
         },
         "momment": 1_711_900_000_000,
@@ -782,6 +800,91 @@ class TestZapiSttFallbackChain:
         return AsyncMock(
             return_value=SafeDownload(content=b"OggS_fake", mime_type="audio/ogg")
         )
+
+    @pytest.mark.parametrize(
+        ("provider", "api_url", "model_name"),
+        [
+            (
+                "elevenlabs_scribe",
+                "https://api.elevenlabs.io/v1",
+                "scribe_v2",
+            ),
+            (
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "openai/whisper-large-v3-turbo",
+            ),
+        ],
+    )
+    def test_fixed_provider_http_dispatch_feeds_transcript_to_pipeline(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        provider: str,
+        api_url: str,
+        model_name: str,
+    ) -> None:
+        """The public Z-API route reaches each fixed adapter, never Groq."""
+        from src.services.event_service import EventService
+        from src.services.safe_egress import SafeDownload
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_audio_tenant(
+            client,
+            tenant_id,
+            instance_id,
+            raw_token,
+            stt_provider=provider,
+        )
+        raw_mime = "audio/ogg; codecs=opus"
+        audio_bytes = b"OggS_zapi_fixed_provider"
+        transcript = f"transcript from {provider}"
+        fixed_adapter = AsyncMock(return_value=transcript)
+        legacy_adapter = AsyncMock()
+        captured: dict[str, str] = {}
+
+        async def _capture(self, event_request, session=None):
+            captured["content"] = event_request.payload.content
+            return _NoReplyResponse()
+
+        with (
+            patch(
+                "src.api.routes.webhook.safe_download_audio",
+                new=AsyncMock(
+                    return_value=SafeDownload(
+                        content=audio_bytes,
+                        mime_type=raw_mime,
+                    )
+                ),
+            ),
+            patch("src.services.stt_service.transcribe_audio", fixed_adapter),
+            patch("src.services.groq_service.transcribe_audio", legacy_adapter),
+            patch("src.api.routes.webhook.mark_message_read", AsyncMock()),
+            patch.object(EventService, "process_event", _capture),
+        ):
+            response = client.post(
+                f"/v1/webhook/zapi/{raw_token}",
+                json=_zapi_audio_body(
+                    instance_id=instance_id,
+                    message_id=f"mid_fixed_{uuid4().hex[:10]}",
+                    mime_type=raw_mime,
+                ),
+            )
+
+        assert response.status_code == 200, response.text
+        assert response.json().get("action") != "stt_fallback"
+        assert captured == {"content": transcript}
+        fixed_adapter.assert_awaited_once()
+        kwargs = fixed_adapter.await_args.kwargs
+        assert kwargs["provider"] == provider
+        assert kwargs["api_url"] == api_url
+        assert kwargs["api_key"].startswith("sk-fake-stt-")
+        assert kwargs["audio_bytes"] == audio_bytes
+        assert kwargs["mimetype"] == raw_mime
+        assert kwargs["model_name"] == model_name
+        assert kwargs["language"] == "pt"
+        legacy_adapter.assert_not_awaited()
 
     def test_stt_failure_without_multimodal_reroutes_to_text(
         self,
