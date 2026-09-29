@@ -2,7 +2,7 @@
 
 import csv
 import io
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.middleware.auth import pwd_context
 from src.config.settings import settings
 from src.models.builder import Builder
+from src.models.clinic_config_table import ClinicConfigTable
 from src.models.handoff import HandoffRecord
 from src.models.session import Session
 from src.models.tenant import Tenant
@@ -38,9 +39,13 @@ def _jwt_headers(
     return {"Authorization": f"Bearer {token}"}
 
 
-def _tenant(*, builder_id: UUID | None = None) -> Tenant:
+def _tenant(
+    *,
+    builder_id: UUID | None = None,
+    timezone_name: str | None = "UTC",
+) -> Tenant:
     tenant_id = uuid4()
-    return Tenant(
+    tenant = Tenant(
         id=tenant_id,
         name=f"Clinic {tenant_id}",
         slug=f"clinic-{tenant_id}",
@@ -48,6 +53,12 @@ def _tenant(*, builder_id: UUID | None = None) -> Tenant:
         builder_id=builder_id,
         config={},
     )
+    if timezone_name is not None:
+        tenant.clinic_config_row = ClinicConfigTable(
+            tenant_id=tenant_id,
+            operations={"timezone": timezone_name},
+        )
+    return tenant
 
 
 def _session(tenant_id: UUID) -> Session:
@@ -144,7 +155,7 @@ def test_export_empty_preserves_bom_headers_defaults_and_window_limit(
 
     response = _export(client, tenant.id)
 
-    today = date.today()
+    today = datetime.now(timezone.utc).date()
     assert response.status_code == 200
     assert response.content.startswith(b"\xef\xbb\xbf")
     assert response.headers["content-type"] == "text/csv; charset=utf-8"
@@ -239,6 +250,23 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
         checked_out_at=datetime(2026, 1, 11, 9, 0, 30, 260000, tzinfo=timezone.utc),
         phone="completed-after-window",
     )
+    confirmed_in_progress = _handoff(
+        tenant.id,
+        session.id,
+        created_at=datetime(2026, 1, 10, 9, 30, tzinfo=timezone.utc),
+        status="in_progress",
+        checked_out_at=datetime(
+            2026,
+            1,
+            10,
+            9,
+            40,
+            0,
+            500000,
+            tzinfo=timezone.utc,
+        ),
+        phone="confirmed-in-progress",
+    )
     excluded = [
         _handoff(
             tenant.id,
@@ -259,6 +287,7 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
             session.id,
             created_at=datetime(2026, 1, 10, 13, tzinfo=timezone.utc),
             status="cancelled",
+            checked_out_at=datetime(2026, 1, 10, 13, 5, tzinfo=timezone.utc),
             phone="cancelled",
         ),
         _handoff(
@@ -266,6 +295,7 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
             session.id,
             created_at=datetime(2026, 1, 10, 13, 30, tzinfo=timezone.utc),
             status="timeout",
+            checked_out_at=datetime(2026, 1, 10, 13, 35, tzinfo=timezone.utc),
             phone="timeout",
         ),
         _handoff(
@@ -298,6 +328,7 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
         pending,
         accepted,
         completed,
+        confirmed_in_progress,
         *excluded,
     )
 
@@ -317,20 +348,24 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
     _, rows = _csv_rows(response)
     assert [row["numero_whatsapp"] for row in rows] == [
         "accepted",
+        "confirmed-in-progress",
         "completed-after-window",
         "pending",
     ]
     assert [row["status"] for row in rows] == [
         "accepted",
+        "in_progress",
         "completed",
         "pending",
     ]
     assert rows[0]["tempo_espera_segundos"] == "180000.0"
-    assert rows[1]["tempo_espera_segundos"] == "86430.3"
-    assert rows[2]["tempo_espera_segundos"] == "187199.6"
+    assert rows[1]["tempo_espera_segundos"] == "600.5"
+    assert rows[2]["tempo_espera_segundos"] == "86430.3"
+    assert rows[3]["tempo_espera_segundos"] == "187199.6"
     assert rows[0]["data_hora_saida"] == ""
-    assert rows[2]["data_hora_saida"] == ""
-    assert rows[1]["data_hora_saida"] == "2026-01-11T09:00:30.260000+00:00"
+    assert rows[3]["data_hora_saida"] == ""
+    assert rows[1]["data_hora_saida"] == "2026-01-10T09:40:00.500000+00:00"
+    assert rows[2]["data_hora_saida"] == "2026-01-11T09:00:30.260000+00:00"
     assert all(row["created_at"].endswith("+00:00") for row in rows)
     assert {row["exported_at"] for row in rows} == {"2026-01-12T12:00:00+00:00"}
     assert now_calls == 1
@@ -343,10 +378,10 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
     ]
 
 
-def test_export_interprets_non_utc_local_midnight_and_rejects_invalid_timezone(
+def test_export_uses_clinic_timezone_fallback_and_ignores_browser_timezone(
     client: TestClient,
 ) -> None:
-    tenant = _tenant()
+    tenant = _tenant(timezone_name=None)
     session = _session(tenant.id)
     records = [
         _handoff(
@@ -381,9 +416,9 @@ def test_export_interprets_non_utc_local_midnight_and_rejects_invalid_timezone(
         tenant.id,
         from_date="2026-01-10",
         to_date="2026-01-10",
-        timezone="America/Sao_Paulo",
+        timezone="Asia/Tokyo",
     )
-    invalid = _export(
+    invalid_browser_timezone = _export(
         client,
         tenant.id,
         from_date="2026-01-10",
@@ -397,8 +432,94 @@ def test_export_interprets_non_utc_local_midnight_and_rejects_invalid_timezone(
         "local-end-minus-one",
         "local-start",
     ]
-    assert invalid.status_code == 400
-    assert invalid.json() == {"detail": "invalid_timezone"}
+    assert invalid_browser_timezone.status_code == 200
+    _, invalid_rows = _csv_rows(invalid_browser_timezone)
+    assert [row["numero_whatsapp"] for row in invalid_rows] == [
+        "local-end-minus-one",
+        "local-start",
+    ]
+
+
+def test_export_queue_and_radar_share_clinic_dst_cohort(
+    client: TestClient,
+) -> None:
+    tenant = _tenant(timezone_name="America/New_York")
+    before_session = _session(tenant.id)
+    start_session = _session(tenant.id)
+    end_minus_session = _session(tenant.id)
+    end_session = _session(tenant.id)
+    records = [
+        _handoff(
+            tenant.id,
+            before_session.id,
+            created_at=datetime(2026, 3, 8, 4, 59, 59, tzinfo=timezone.utc),
+            phone="before-dst-day",
+        ),
+        _handoff(
+            tenant.id,
+            start_session.id,
+            created_at=datetime(2026, 3, 8, 5, tzinfo=timezone.utc),
+            phone="dst-start",
+        ),
+        _handoff(
+            tenant.id,
+            end_minus_session.id,
+            created_at=datetime(2026, 3, 9, 3, 59, 59, tzinfo=timezone.utc),
+            phone="dst-end-minus-one",
+        ),
+        _handoff(
+            tenant.id,
+            end_session.id,
+            created_at=datetime(2026, 3, 9, 4, tzinfo=timezone.utc),
+            phone="dst-end-exclusive",
+        ),
+    ]
+    _seed(
+        client,
+        tenant,
+        before_session,
+        start_session,
+        end_minus_session,
+        end_session,
+        *records,
+    )
+    params = {
+        "tenant_id": str(tenant.id),
+        "from_date": "2026-03-08",
+        "to_date": "2026-03-08",
+        "timezone": "Asia/Tokyo",
+    }
+    headers = _jwt_headers("clinic_admin", tenant.id)
+
+    queue = client.get("/v1/handoffs/queue", params=params, headers=headers)
+    exported = client.get(
+        "/v1/handoffs/queue/export",
+        params=params,
+        headers=headers,
+    )
+
+    assert queue.status_code == 200, queue.text
+    assert exported.status_code == 200, exported.text
+    queue_body = queue.json()
+    assert queue_body["period_timezone"] == "America/New_York"
+    assert queue_body["period_start"] == "2026-03-08T05:00:00Z"
+    assert queue_body["period_end_exclusive"] == "2026-03-09T04:00:00Z"
+    queue_session_ids = {item["session_id"] for item in queue_body["items"]}
+    _, export_rows = _csv_rows(exported)
+    export_session_ids = {row["session_id"] for row in export_rows}
+    assert (
+        queue_session_ids
+        == export_session_ids
+        == {
+            str(start_session.id),
+            str(end_minus_session.id),
+        }
+    )
+
+    export_parameters = client.get("/openapi.json").json()["paths"][
+        "/v1/handoffs/queue/export"
+    ]["get"]["parameters"]
+    assert "timezone" not in {parameter["name"] for parameter in export_parameters}
 
 
 @pytest.mark.parametrize(
@@ -414,14 +535,17 @@ def test_export_rejects_unrepresentable_utc_windows_before_querying_handoffs(
     boundary_date: str,
     timezone_name: str,
 ) -> None:
-    tenant = _tenant()
+    tenant = _tenant(timezone_name=timezone_name)
     _seed(client, tenant)
     query_calls = 0
+    original_execute = AsyncSession.execute
 
     async def unexpected_execute(self: AsyncSession, *args: Any, **kwargs: Any) -> Any:
         nonlocal query_calls
-        query_calls += 1
-        pytest.fail("handoff query must not run for an invalid date range")
+        if "handoff_records" in str(args[0]):
+            query_calls += 1
+            pytest.fail("handoff query must not run for an invalid date range")
+        return await original_execute(self, *args, **kwargs)
 
     monkeypatch.setattr(AsyncSession, "execute", unexpected_execute)
 
@@ -430,7 +554,6 @@ def test_export_rejects_unrepresentable_utc_windows_before_querying_handoffs(
         tenant.id,
         from_date=boundary_date,
         to_date=boundary_date,
-        timezone=timezone_name,
     )
 
     assert response.status_code == 400
@@ -440,7 +563,7 @@ def test_export_rejects_unrepresentable_utc_windows_before_querying_handoffs(
     assert query_calls == 0
 
 
-def test_export_defaults_to_utc_when_timezone_is_absent(client: TestClient) -> None:
+def test_export_uses_configured_utc_clinic_timezone(client: TestClient) -> None:
     tenant = _tenant()
     session = _session(tenant.id)
     at_utc_start = _handoff(
@@ -529,14 +652,15 @@ def test_export_escapes_only_dangerous_whatsapp_csv_prefixes(
 def test_export_preserves_legacy_partial_date_defaults(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.api.routes import handoff as route
+    from src.services import handoff_service
 
-    class FrozenDate(date):
+    class FrozenDatetime(datetime):
         @classmethod
-        def today(cls) -> date:
-            return cls(2026, 5, 31)
+        def now(cls, tz: Any = None) -> datetime:
+            value = cls(2026, 5, 31, 12, tzinfo=timezone.utc)
+            return value if tz is None else value.astimezone(tz)
 
-    monkeypatch.setattr(route, "date", FrozenDate)
+    monkeypatch.setattr(handoff_service, "datetime", FrozenDatetime)
     tenant = _tenant()
     session = _session(tenant.id)
     records = [
