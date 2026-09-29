@@ -195,8 +195,6 @@ async def _synthesize_openai(
             "Host": validated.sni_host,
         }
         response = await client.post(validated.url, headers=headers, json=body)
-        if 400 <= response.status_code < 500:
-            raise TtsSynthesisError("tts_upstream_http_error_4xx")
         _raise_for_status(response)
         try:
             enforce_content_length(
