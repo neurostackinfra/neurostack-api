@@ -3,7 +3,7 @@ NeuroStack - Handoff Record Model
 Tracks human handoff events and their resolution.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID, uuid4
@@ -227,42 +227,6 @@ class HandoffRecord(Base):
         "Session",
         back_populates="handoff_records",
     )
-
-    def checkout(self) -> None:
-        """Mark handoff as attended via queue UI."""
-        self.data_hora_saida = datetime.now(timezone.utc)
-        self.status = HandoffStatus.COMPLETED.value
-
-    def accept(self, agent_id: Optional[str] = None) -> None:
-        """Mark handoff as accepted by human agent."""
-        self.status = HandoffStatus.ACCEPTED.value
-        self.assigned_to = agent_id
-
-    def start_handling(self) -> None:
-        """Mark handoff as being handled."""
-        self.status = HandoffStatus.IN_PROGRESS.value
-
-    def complete(self, notes: Optional[str] = None) -> None:
-        """Mark handoff as completed."""
-        self.status = HandoffStatus.COMPLETED.value
-        self.resolved_at = datetime.utcnow()
-        self.resolution_notes = notes
-
-    def cancel(self, notes: Optional[str] = None) -> None:
-        """Cancel the handoff."""
-        self.status = HandoffStatus.CANCELLED.value
-        self.resolved_at = datetime.utcnow()
-        self.resolution_notes = notes
-
-    def timeout(self) -> None:
-        """Mark handoff as timed out."""
-        self.status = HandoffStatus.TIMEOUT.value
-        self.resolved_at = datetime.utcnow()
-
-    def mark_webhook_sent(self, response: Optional[dict[str, Any]] = None) -> None:
-        """Mark webhook as sent with optional response."""
-        self.webhook_sent = True
-        self.webhook_response = response
 
     @property
     def is_pending(self) -> bool:

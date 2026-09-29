@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import structlog
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.core import pipeline as pipeline_module
 from src.core.pipeline import (
@@ -19,6 +20,10 @@ from src.core.pipeline import (
 )
 from src.handoff.summarizer import ConversationSummarizer
 from src.handoff.webhook import WebhookDispatcher
+from src.models.base import Base
+from src.models.session import Session
+from src.models.tenant import Tenant
+from src.repositories.database import _patch_jsonb_for_sqlite
 from src.services.event_service import EventService
 from src.services.handoff_service import HandoffService
 
@@ -39,10 +44,49 @@ def session_id():
     return uuid4()
 
 
+@pytest.fixture(scope="module")
+async def pipeline_session_factory():
+    _patch_jsonb_for_sqlite()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    yield factory
+    await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def persisted_pipeline_session(
+    pipeline_session_factory,
+    tenant_id,
+    session_id,
+):
+    async with pipeline_session_factory() as database:
+        async with database.begin():
+            database.add(
+                Tenant(
+                    id=tenant_id,
+                    name=f"Pipeline {tenant_id}",
+                    slug=f"pipeline-{tenant_id}",
+                    api_key_hash=f"pipeline-{tenant_id}",
+                    config={},
+                )
+            )
+            database.add(
+                Session(
+                    id=session_id,
+                    tenant_id=tenant_id,
+                    channel="test",
+                    cognitive_state={},
+                    session_metadata={},
+                )
+            )
+
+
 @pytest.fixture
-def pipeline():
+def pipeline(pipeline_session_factory):
     """Create a CognitivePipeline instance."""
-    return CognitivePipeline()
+    return _isolated_pipeline(pipeline_session_factory)
 
 
 @pytest.fixture
@@ -98,11 +142,15 @@ def _find_working_hours_source(sources: list[dict]) -> dict | None:
     return None
 
 
-def _isolated_pipeline():
+def _isolated_pipeline(session_factory):
+    event_store = MagicMock()
+    event_store.append = AsyncMock()
+    event_store.get_recent_messages = AsyncMock(return_value=[])
     handoff_service = HandoffService(
-        event_store=None,
+        event_store=event_store,
         summarizer=ConversationSummarizer(),
         webhook_dispatcher=WebhookDispatcher(),
+        session_factory=session_factory,
     )
     return CognitivePipeline(handoff_service=handoff_service)
 
@@ -297,14 +345,11 @@ class TestCognitivePipeline:
         monkeypatch,
         tenant_id,
         session_id,
+        pipeline_session_factory,
     ):
         """Link-send turn creates the pending handoff and fixes patient text."""
 
-        def _no_db():
-            raise RuntimeError("db disabled in unit test")
-
-        monkeypatch.setattr("src.services.handoff_service.get_db_session", _no_db)
-        pipeline = _isolated_pipeline()
+        pipeline = _isolated_pipeline(pipeline_session_factory)
         clinic_config = _scheduling_link_config()
         clinic_config["scheduling"][
             "scheduling_link_message"
@@ -355,14 +400,11 @@ class TestCognitivePipeline:
         monkeypatch,
         tenant_id,
         session_id,
+        pipeline_session_factory,
     ):
         """Outcome turn updates the existing handoff and pauses normally."""
 
-        def _no_db():
-            raise RuntimeError("db disabled in unit test")
-
-        monkeypatch.setattr("src.services.handoff_service.get_db_session", _no_db)
-        pipeline = _isolated_pipeline()
+        pipeline = _isolated_pipeline(pipeline_session_factory)
         with structlog.testing.capture_logs() as log_records:
             monkeypatch.setattr(
                 pipeline_module,
@@ -396,7 +438,10 @@ class TestCognitivePipeline:
                     clinic_config=_scheduling_link_config(),
                 )
             )
-        detail = await pipeline._handoff.get_handoff(UUID(handoff_id))
+        detail = await pipeline._handoff.get_handoff(
+            UUID(handoff_id),
+            tenant_id=tenant_id,
+        )
         handoffs = await pipeline._handoff.list_handoffs(tenant_id)
 
         assert enrich_result.handoff_required is False
@@ -434,9 +479,9 @@ class TestCognitivePipeline:
     @pytest.mark.asyncio
     async def test_scheduling_link_send_turn_uses_real_logger(
         self,
-        monkeypatch,
         tenant_id,
         session_id,
+        pipeline_session_factory,
     ):
         """Regression: the link-send turn must complete under the real structlog logger.
 
@@ -452,11 +497,7 @@ class TestCognitivePipeline:
         kwarg at the link-send site will fail this test by construction.
         """
 
-        def _no_db():
-            raise RuntimeError("db disabled in unit test")
-
-        monkeypatch.setattr("src.services.handoff_service.get_db_session", _no_db)
-        pipeline = _isolated_pipeline()
+        pipeline = _isolated_pipeline(pipeline_session_factory)
         expected = (
             "Finalize seu agendamento pelo link:\n\nhttps://clinica.example.com/agendar"
         )

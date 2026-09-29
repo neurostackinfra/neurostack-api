@@ -56,6 +56,7 @@ from src.handoff.models import (
 from src.models.handoff import HandoffRecord
 from src.repositories import get_db_session_dependency
 from src.services import HandoffService, get_handoff_service
+from src.services.handoff_service import HandoffLifecycleError
 
 logger = get_logger(__name__)
 
@@ -296,34 +297,67 @@ async def get_handoff_queue(
     "/queue/{handoff_id}/checkout",
     response_model=HandoffCheckoutResponse,
     summary="Checkout Handoff",
+    deprecated=True,
 )
 async def checkout_handoff(
     request: Request,
     handoff_id: UUID,
+    tenant_id: UUID | None = Query(
+        None,
+        description="Tenant that owns the handoff for an authorized override",
+    ),
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
+    service: HandoffService = Depends(get_service),
 ) -> HandoffCheckoutResponse:
-    """Mark a handoff as attended. Returns 409 if already completed."""
-    q = select(HandoffRecord).where(HandoffRecord.id == handoff_id)
-    result = await db.execute(q)
+    """Deprecated alias that confirms attendance without completing it."""
+    requested_tenant_id = tenant_id or tenant.tenant_id
+    try:
+        effective_tenant_id = await _resolve_queue_tenant(
+            request,
+            requested_tenant_id,
+            tenant,
+            db,
+        )
+    except HTTPException as exc:
+        if exc.status_code in {
+            status.HTTP_403_FORBIDDEN,
+            status.HTTP_404_NOT_FOUND,
+        }:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="handoff_not_found",
+            ) from exc
+        raise
+
+    try:
+        await service.checkout_handoff(
+            handoff_id,
+            tenant_id=effective_tenant_id,
+        )
+    except HandoffNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="handoff_not_found",
+        ) from exc
+    except HandoffLifecycleError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=exc.code,
+        ) from exc
+
+    result = await db.execute(
+        select(HandoffRecord).where(
+            HandoffRecord.id == handoff_id,
+            HandoffRecord.tenant_id == effective_tenant_id,
+        )
+    )
     record = result.scalar_one_or_none()
-
-    if not record:
+    if record is None:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="handoff_not_found"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="handoff_not_found",
         )
-
-    # Allow builder/super-admin to check out handoffs for clinics they manage
-    await _resolve_queue_tenant(request, record.tenant_id, tenant, db)
-
-    if record.data_hora_saida is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="already_completed"
-        )
-
-    record.checkout()
-    await db.commit()
-    await db.refresh(record)
 
     wait_seconds = None
     if record.data_hora_saida and record.created_at:
@@ -912,16 +946,10 @@ async def get_handoff(
 ) -> HandoffDetail:
     """Get detailed handoff information."""
     try:
-        handoff = await service.get_handoff(handoff_id)
-
-        # Verify tenant ownership
-        if handoff.tenant_id != tenant.tenant_id:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Handoff not found",
-            )
-
-        return handoff
+        return await service.get_handoff(
+            handoff_id,
+            tenant_id=tenant.tenant_id,
+        )
     except HandoffNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -951,14 +979,6 @@ async def update_handoff(
     - any → cancelled (cancel the handoff)
     """
     try:
-        # First verify ownership
-        handoff = await service.get_handoff(handoff_id)
-        if handoff.tenant_id != tenant.tenant_id:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Handoff not found",
-            )
-
         from src.handoff.models import HandoffUpdate as HandoffUpdateModel
 
         return await service.update_handoff(
@@ -967,13 +987,19 @@ async def update_handoff(
                 status=update.status,
                 assigned_to=update.assigned_to,
                 notes=update.notes,
-            )
+            ),
+            tenant_id=tenant.tenant_id,
         )
 
     except HandoffNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Handoff not found",
+        )
+    except HandoffLifecycleError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=exc.code,
         )
     except HandoffServiceError as e:
         raise HTTPException(
@@ -996,19 +1022,21 @@ async def accept_handoff(
 ) -> HandoffDetail:
     """Accept a handoff and optionally assign to an agent."""
     try:
-        handoff = await service.get_handoff(handoff_id)
-        if handoff.tenant_id != tenant.tenant_id:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Handoff not found",
-            )
-
-        return await service.accept_handoff(handoff_id, agent_id)
+        return await service.accept_handoff(
+            handoff_id,
+            agent_id,
+            tenant_id=tenant.tenant_id,
+        )
 
     except HandoffNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Handoff not found",
+        )
+    except HandoffLifecycleError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=exc.code,
         )
 
 
@@ -1026,19 +1054,21 @@ async def complete_handoff(
 ) -> HandoffDetail:
     """Mark a handoff as completed with optional notes."""
     try:
-        handoff = await service.get_handoff(handoff_id)
-        if handoff.tenant_id != tenant.tenant_id:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Handoff not found",
-            )
-
-        return await service.complete_handoff(handoff_id, notes)
+        return await service.complete_handoff(
+            handoff_id,
+            notes,
+            tenant_id=tenant.tenant_id,
+        )
 
     except HandoffNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Handoff not found",
+        )
+    except HandoffLifecycleError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=exc.code,
         )
 
 
@@ -1056,19 +1086,21 @@ async def cancel_handoff(
 ) -> HandoffDetail:
     """Cancel a handoff with optional notes."""
     try:
-        handoff = await service.get_handoff(handoff_id)
-        if handoff.tenant_id != tenant.tenant_id:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Handoff not found",
-            )
-
-        return await service.cancel_handoff(handoff_id, notes)
+        return await service.cancel_handoff(
+            handoff_id,
+            notes,
+            tenant_id=tenant.tenant_id,
+        )
 
     except HandoffNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Handoff not found",
+        )
+    except HandoffLifecycleError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=exc.code,
         )
 
 
@@ -1084,9 +1116,7 @@ async def get_session_handoff(
     service: HandoffService = Depends(get_service),
 ) -> Optional[HandoffDetail]:
     """Get active handoff for a session."""
-    handoff = await service.get_active_handoff_for_session(session_id)
-
-    if handoff and handoff.tenant_id != tenant.tenant_id:
-        return None
-
-    return handoff
+    return await service.get_active_handoff_for_session(
+        session_id,
+        tenant_id=tenant.tenant_id,
+    )
