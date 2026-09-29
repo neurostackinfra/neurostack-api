@@ -64,6 +64,7 @@ FIELD_TO_BUCKET: dict[str, str] = {
     # handoff
     "handoff_active": "handoff",
     "handoff_period": "handoff",
+    "handoff_cycle_hours": "handoff",
     "handoff_cycle_days": "handoff",
     "standby_mode": "handoff",
     "handoff_sectors": "handoff",

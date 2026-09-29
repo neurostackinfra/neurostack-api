@@ -31,7 +31,11 @@ from src.api.schemas.config import (
 )
 from src.config.logging import get_logger as get_structured_logger
 from src.config.settings import settings
-from src.models.clinic_config import ClinicOperations, ClinicScheduling
+from src.models.clinic_config import (
+    ClinicOperations,
+    ClinicScheduling,
+    HandoffStandbyPolicy,
+)
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.tenant import Tenant
 from src.observability.metrics import API_CREDENTIALS_CHANGE_EMIT_FAILURES_TOTAL
@@ -53,7 +57,62 @@ logger = logging.getLogger(__name__)
 # scheduling-link-handoff wish, Group 1 deliverable 5).
 _audit_logger = get_structured_logger(__name__)
 
-router = APIRouter()
+_HANDOFF_POLICY_FIELDS = (
+    "handoff_active",
+    "standby_mode",
+    "handoff_period",
+    "handoff_cycle_hours",
+    "handoff_cycle_days",
+)
+_HANDOFF_POLICY_FIELD_SET = frozenset(_HANDOFF_POLICY_FIELDS)
+
+
+class _PolicyValidationRoute(APIRoute):
+    """Sanitize request-model errors for the extensible config endpoint."""
+
+    def get_route_handler(
+        self,
+    ) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        original = super().get_route_handler()
+
+        async def policy_route_handler(request: Request) -> Response:
+            try:
+                return await original(request)
+            except RequestValidationError as exc:
+                violations = []
+                for error in exc.errors():
+                    location = tuple(error.get("loc", ()))
+                    field = next(
+                        (
+                            str(item)
+                            for item in reversed(location)
+                            if str(item) in _HANDOFF_POLICY_FIELD_SET
+                        ),
+                        None,
+                    )
+                    if field is not None:
+                        violations.append(
+                            {
+                                "field": field,
+                                "code": str(error.get("type", "invalid")),
+                            }
+                        )
+                if not violations:
+                    raise
+                return JSONResponse(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    content={
+                        "detail": {
+                            "error": "invalid_handoff_policy",
+                            "violations": violations,
+                        }
+                    },
+                )
+
+        return policy_route_handler
+
+
+router = APIRouter(route_class=_PolicyValidationRoute)
 
 
 class _CredentialValidationRoute(APIRoute):
@@ -165,6 +224,88 @@ def _emit_api_credentials_changed(
 
 
 _CANONICAL_SERVICE_FORMATS = frozenset({"online", "presential", "both"})
+_HANDOFF_POLICY_DEFAULTS: dict[str, Any] = {
+    "handoff_active": "yes",
+    "standby_mode": "active",
+    "handoff_period": "permanent",
+    "handoff_cycle_hours": None,
+    "handoff_cycle_days": None,
+}
+
+
+def _validate_handoff_policy_patch(
+    patch_data: dict[str, Any], row: ClinicConfigTable | None
+) -> dict[str, Any] | None:
+    """Return the canonical effective policy when this PATCH touches it.
+
+    Validation is intentionally completed before the caller adds a new row or
+    assigns any JSONB column.  Unrelated PATCHes therefore leave malformed
+    historical policy values byte-for-byte untouched.
+    """
+
+    touched = set(_HANDOFF_POLICY_FIELDS).intersection(patch_data)
+    if not touched:
+        return None
+
+    persisted = row.handoff if row is not None else None
+    if persisted is None:
+        effective = dict(_HANDOFF_POLICY_DEFAULTS)
+    elif isinstance(persisted, dict):
+        effective = {
+            **_HANDOFF_POLICY_DEFAULTS,
+            **{
+                field: persisted[field]
+                for field in _HANDOFF_POLICY_FIELDS
+                if field in persisted
+            },
+        }
+    else:
+        missing = sorted(set(_HANDOFF_POLICY_FIELDS) - touched)
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "invalid_handoff_policy",
+                    "violations": [
+                        {"field": field, "code": "repair_required"} for field in missing
+                    ],
+                },
+            )
+        effective = {}
+
+    effective.update(
+        {
+            field: patch_data[field]
+            for field in _HANDOFF_POLICY_FIELDS
+            if field in patch_data
+        }
+    )
+    try:
+        policy = HandoffStandbyPolicy.model_validate(effective)
+    except ValidationError as exc:
+        violations = []
+        for error in exc.errors():
+            location = error.get("loc", ())
+            field = str(location[-1]) if location else "handoff_policy"
+            code = str(error["type"])
+            context_error = str(error.get("ctx", {}).get("error", ""))
+            for combination_code in (
+                "inactive_requires_permanent_without_duration",
+                "permanent_forbids_duration",
+                "cycle_requires_exactly_one_duration",
+            ):
+                if combination_code in context_error:
+                    code = combination_code
+                    break
+            violations.append({"field": field, "code": code})
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_handoff_policy",
+                "violations": violations,
+            },
+        ) from exc
+    return policy.model_dump()
 
 
 def _validate_service_format_compatibility(
@@ -477,6 +618,7 @@ async def patch_config(
     # config cache entry.
     row = await _load_config(session, tenant)
     _validate_service_format_compatibility(patch_data, row)
+    canonical_handoff_policy = _validate_handoff_policy_patch(patch_data, row)
     if row is None:
         row = _new_config(tenant)
         session.add(row)
@@ -499,7 +641,11 @@ async def patch_config(
         else:
             # Dict buckets: merge with existing
             existing = getattr(row, bucket_name, None) or {}
+            if bucket_name == "handoff" and not isinstance(existing, dict):
+                existing = {}
             merged = {**existing, **cast(dict[str, Any], new_values)}
+            if bucket_name == "handoff" and canonical_handoff_policy is not None:
+                merged.update(canonical_handoff_policy)
             # Revalidate buckets with field-level rules after merging.  The
             # request schema allows extra fields, so this is the enforcement
             # point for scheduling URLs and structured business hours.

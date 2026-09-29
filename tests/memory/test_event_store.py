@@ -6,13 +6,16 @@ Note: These tests use mocked database connections and do not require
 a running PostgreSQL instance.
 """
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
 
+import src.memory.event_store as event_store_module
 from src.core.exceptions import EventStoreConnectionError, EventStoreError
 from src.core.interaction_context import InteractionOrigin
 from src.memory.event_store import (
@@ -154,6 +157,161 @@ class TestEventStoreInit:
         assert store._database_url == "postgresql+asyncpg://custom:5432/test"
         assert store._pool_size == 20
         assert store._max_overflow == 15
+
+    @pytest.mark.asyncio
+    async def test_connect_publishes_only_after_probe_and_disposes_failed_engine(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mock_engine: AsyncMock,
+    ) -> None:
+        failed_engine = AsyncMock()
+        failed_engine.dispose = AsyncMock()
+        failed_connection = AsyncMock()
+        failed_connection.execute = AsyncMock(
+            side_effect=SQLAlchemyError("probe failed")
+        )
+        failed_connection.__aenter__ = AsyncMock(return_value=failed_connection)
+        failed_connection.__aexit__ = AsyncMock(return_value=None)
+        failed_engine.begin = MagicMock(return_value=failed_connection)
+        monkeypatch.setattr(
+            event_store_module,
+            "create_async_engine",
+            MagicMock(side_effect=[failed_engine, mock_engine]),
+        )
+        store = EventStore()
+
+        with pytest.raises(EventStoreConnectionError):
+            await store.connect()
+
+        assert store._engine is None
+        assert store._session_factory is None
+        failed_engine.dispose.assert_awaited_once()
+
+        await store.connect()
+
+        assert store._engine is mock_engine
+        assert store._session_factory is not None
+
+
+class _LifecycleEventStore:
+    def __init__(
+        self,
+        *,
+        release_connect: asyncio.Event | None = None,
+        connect_error: Exception | None = None,
+    ) -> None:
+        self.release_connect = release_connect
+        self.connect_error = connect_error
+        self.connect_started = asyncio.Event()
+        self.connected = False
+        self.disconnect_calls = 0
+
+    async def connect(self) -> None:
+        self.connect_started.set()
+        if self.release_connect is not None:
+            await self.release_connect.wait()
+        if self.connect_error is not None:
+            raise self.connect_error
+        self.connected = True
+
+    async def disconnect(self) -> None:
+        self.disconnect_calls += 1
+        self.connected = False
+
+
+class TestGlobalEventStoreLifecycle:
+    @staticmethod
+    def _reset_globals(monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(event_store_module, "_event_store", None)
+        monkeypatch.setattr(
+            event_store_module,
+            "_event_store_lifecycle_lock",
+            asyncio.Lock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_first_callers_receive_one_connected_singleton(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._reset_globals(monkeypatch)
+        release_connect = asyncio.Event()
+        candidate = _LifecycleEventStore(release_connect=release_connect)
+        factory = MagicMock(return_value=candidate)
+        monkeypatch.setattr(event_store_module, "EventStore", factory)
+
+        first = asyncio.create_task(event_store_module.get_event_store())
+        await candidate.connect_started.wait()
+        second = asyncio.create_task(event_store_module.get_event_store())
+        await asyncio.sleep(0)
+
+        factory.assert_called_once_with()
+        assert event_store_module._event_store is None
+        assert not first.done()
+        assert not second.done()
+
+        release_connect.set()
+        first_result, second_result = await asyncio.gather(first, second)
+
+        assert first_result is candidate
+        assert second_result is candidate
+        assert candidate.connected is True
+        assert event_store_module._event_store is candidate
+
+    @pytest.mark.asyncio
+    async def test_failed_initialization_disposes_and_next_call_retries(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._reset_globals(monkeypatch)
+        rejected = _LifecycleEventStore(
+            connect_error=EventStoreConnectionError("unavailable")
+        )
+        connected = _LifecycleEventStore()
+        factory = MagicMock(side_effect=[rejected, connected])
+        monkeypatch.setattr(event_store_module, "EventStore", factory)
+
+        with pytest.raises(EventStoreConnectionError):
+            await event_store_module.get_event_store()
+
+        assert rejected.disconnect_calls == 1
+        assert event_store_module._event_store is None
+
+        result = await event_store_module.get_event_store()
+
+        assert result is connected
+        assert connected.connected is True
+        assert factory.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_close_waits_for_initialization_then_disconnects_it(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._reset_globals(monkeypatch)
+        release_connect = asyncio.Event()
+        candidate = _LifecycleEventStore(release_connect=release_connect)
+        monkeypatch.setattr(
+            event_store_module,
+            "EventStore",
+            MagicMock(return_value=candidate),
+        )
+
+        initialization = asyncio.create_task(event_store_module.get_event_store())
+        await candidate.connect_started.wait()
+        closing = asyncio.create_task(event_store_module.close_event_store())
+        await asyncio.sleep(0)
+
+        assert not closing.done()
+        assert event_store_module._event_store is None
+
+        release_connect.set()
+        assert await initialization is candidate
+        await closing
+
+        assert candidate.disconnect_calls == 1
+        assert candidate.connected is False
+        assert event_store_module._event_store is None
 
 
 # ============================================
@@ -610,6 +768,61 @@ class TestQueryOperations:
         assert len(result.events) == 1
         assert result.total_count == 1
         assert result.has_more is False
+        assert mock_session.execute.await_count == 2
+        assert "COUNT(*)" in str(mock_session.execute.await_args_list[1].args[0])
+
+    @pytest.mark.asyncio
+    async def test_recent_messages_uses_one_limited_select_without_count(
+        self,
+        sample_tenant_id: UUID,
+        sample_session_id: UUID,
+        mock_session: AsyncMock,
+        mock_session_factory: MagicMock,
+        mock_engine: AsyncMock,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        newest = SimpleNamespace(
+            id=uuid4(),
+            tenant_id=sample_tenant_id,
+            session_id=sample_session_id,
+            event_type=EventType.MESSAGE_OUT.value,
+            interaction_origin=InteractionOrigin.UNKNOWN.value,
+            event_data={"role": "assistant", "content": "newest"},
+            metadata={},
+            created_at=now,
+        )
+        older = SimpleNamespace(
+            id=uuid4(),
+            tenant_id=sample_tenant_id,
+            session_id=sample_session_id,
+            event_type=EventType.MESSAGE_IN.value,
+            interaction_origin=InteractionOrigin.UNKNOWN.value,
+            event_data={"role": "user", "content": "older"},
+            metadata={},
+            created_at=now - timedelta(seconds=1),
+        )
+        query_result = MagicMock()
+        query_result.fetchall.return_value = [newest, older]
+        mock_session.execute.return_value = query_result
+        store = EventStore()
+        store._engine = mock_engine
+        store._session_factory = mock_session_factory
+
+        events = await store.get_recent_messages(
+            sample_tenant_id,
+            sample_session_id,
+            limit=5,
+        )
+
+        assert [event.event_data["content"] for event in events] == [
+            "older",
+            "newest",
+        ]
+        mock_session.execute.assert_awaited_once()
+        statement, params = mock_session.execute.await_args.args
+        assert "LIMIT :limit" in str(statement)
+        assert "COUNT(" not in str(statement).upper()
+        assert params["limit"] == 5
 
     @pytest.mark.asyncio
     async def test_query_by_session_with_type_filter(
