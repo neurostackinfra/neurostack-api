@@ -3,12 +3,21 @@ NeuroStack - Handoff Record Model
 Tracks human handoff events and their resolution.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, func
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -73,6 +82,16 @@ class HandoffRecord(Base):
     """
 
     __tablename__ = "handoff_records"
+    __table_args__ = (
+        CheckConstraint(
+            "sla_target_seconds IS NULL OR " "sla_target_seconds BETWEEN 60 AND 7200",
+            name="ck_handoff_records_sla_target_seconds_range",
+        ),
+        CheckConstraint(
+            "lifecycle_version >= 0",
+            name="ck_handoff_records_lifecycle_version_nonnegative",
+        ),
+    )
 
     # Primary Key
     id: Mapped[UUID] = mapped_column(
@@ -174,6 +193,22 @@ class HandoffRecord(Base):
         nullable=True,
     )
 
+    # SLA snapshot and lifecycle concurrency metadata
+    sla_target_seconds: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    lifecycle_version: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
+
     # Timestamp
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -191,37 +226,6 @@ class HandoffRecord(Base):
         "Session",
         back_populates="handoff_records",
     )
-
-    def checkout(self) -> None:
-        """Mark handoff as attended via queue UI."""
-        self.data_hora_saida = datetime.now(timezone.utc)
-        self.status = HandoffStatus.COMPLETED.value
-
-    def accept(self, agent_id: Optional[str] = None) -> None:
-        """Mark handoff as accepted by human agent."""
-        self.status = HandoffStatus.ACCEPTED.value
-        self.assigned_to = agent_id
-
-    def start_handling(self) -> None:
-        """Mark handoff as being handled."""
-        self.status = HandoffStatus.IN_PROGRESS.value
-
-    def complete(self, notes: Optional[str] = None) -> None:
-        """Mark handoff as completed."""
-        self.status = HandoffStatus.COMPLETED.value
-        self.resolved_at = datetime.utcnow()
-        self.resolution_notes = notes
-
-    def cancel(self, notes: Optional[str] = None) -> None:
-        """Cancel the handoff."""
-        self.status = HandoffStatus.CANCELLED.value
-        self.resolved_at = datetime.utcnow()
-        self.resolution_notes = notes
-
-    def timeout(self) -> None:
-        """Mark handoff as timed out."""
-        self.status = HandoffStatus.TIMEOUT.value
-        self.resolved_at = datetime.utcnow()
 
     def mark_webhook_sent(self, response: Optional[dict[str, Any]] = None) -> None:
         """Mark webhook as sent with optional response."""

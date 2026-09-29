@@ -5,7 +5,7 @@ Pydantic schemas for clinic configuration CRUD endpoints.
 
 import ipaddress
 from collections.abc import Mapping
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import (
@@ -84,6 +84,10 @@ CapabilityDigest = Annotated[
     StringConstraints(
         strict=True, pattern=r"^[0-9a-f]{64}$", min_length=64, max_length=64
     ),
+]
+LegacyCycleDays = Annotated[
+    str,
+    StringConstraints(strict=True, pattern=r"^[0-9]+$", min_length=1),
 ]
 
 
@@ -275,6 +279,41 @@ class ConfigResponse(BaseModel):
 
     clinic_id: Any = None
     version: int = 1
+    handoff_active: Any = Field(
+        default="yes",
+        description="Canonical writes use `yes` or `no`; historical JSON is returned unchanged.",
+        json_schema_extra={"type": "string", "enum": ["yes", "no"]},
+    )
+    standby_mode: Any = Field(
+        default="active",
+        description="Canonical writes use `inactive` or `active`; historical JSON is returned unchanged.",
+        json_schema_extra={"type": "string", "enum": ["inactive", "active"]},
+    )
+    handoff_period: Any = Field(
+        default="permanent",
+        description="Canonical writes use `permanent` or `cycle`; historical JSON is returned unchanged.",
+        json_schema_extra={"type": "string", "enum": ["permanent", "cycle"]},
+    )
+    handoff_cycle_hours: Any = Field(
+        default=None,
+        description="Canonical cycle duration in whole hours, from 1 through 720.",
+        json_schema_extra={
+            "anyOf": [
+                {"type": "integer", "minimum": 1, "maximum": 720},
+                {"type": "null"},
+            ]
+        },
+    )
+    handoff_cycle_days: Any = Field(
+        default=None,
+        description="Canonical cycle duration in whole days, from 1 through 365.",
+        json_schema_extra={
+            "anyOf": [
+                {"type": "integer", "minimum": 1, "maximum": 365},
+                {"type": "null"},
+            ]
+        },
+    )
 
 
 class ServicePatchItem(BaseModel):
@@ -300,4 +339,30 @@ class ConfigPatchRequest(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
+    meta_minutos_atendimento: int = Field(default=10, strict=True, ge=1, le=120)
+    handoff_active: Literal["yes", "no"] = Field(
+        default_factory=lambda: cast(Literal["yes", "no"], None)
+    )
+    standby_mode: Literal["inactive", "active"] = Field(
+        default_factory=lambda: cast(Literal["inactive", "active"], None)
+    )
+    handoff_period: Literal["permanent", "cycle"] = Field(
+        default_factory=lambda: cast(Literal["permanent", "cycle"], None)
+    )
+    handoff_cycle_hours: Annotated[int, Field(strict=True, ge=1, le=720)] | None = None
+    handoff_cycle_days: (
+        Annotated[int, Field(strict=True, ge=1, le=365)] | LegacyCycleDays | None
+    ) = None
     services: list[ServicePatchItem | str] | None = None
+
+    @field_validator(
+        "handoff_active",
+        "standby_mode",
+        "handoff_period",
+        mode="before",
+    )
+    @classmethod
+    def _reject_null_policy_enums(cls, value: Any) -> Any:
+        if value is None:
+            raise PydanticCustomError("null_not_allowed", "null is not allowed")
+        return value

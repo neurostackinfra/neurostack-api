@@ -35,7 +35,16 @@ _BUCKET_FIELDS: dict[str, tuple[str, ...]] = {
         "standard_instructions_rag_key",
         "emergency_warning_text_enabled",
     ),
-    "handoff": ("default_mode", "sector_defaults", "meta_minutos_atendimento"),
+    "handoff": (
+        "default_mode",
+        "sector_defaults",
+        "meta_minutos_atendimento",
+        "handoff_active",
+        "standby_mode",
+        "handoff_period",
+        "handoff_cycle_hours",
+        "handoff_cycle_days",
+    ),
     "identity": (
         "clinic_name",
         "main_domain",
