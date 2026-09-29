@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Router } from "wouter";
 import { memoryLocation } from "wouter/memory-location";
@@ -9,16 +9,17 @@ import TracesList from "./traces";
 const mocks = vi.hoisted(() => ({
   fetch: vi.fn(),
   toast: vi.fn(),
-}));
-
-vi.mock("@/context/auth", () => ({
-  useAuth: () => ({
+  auth: {
     isReadOnly: false,
     isBuilder: false,
     isSuperAdmin: false,
     isInvestor: false,
-    viewingClinicId: "clinic-1",
-  }),
+    viewingClinicId: "clinic-1" as string | null,
+  },
+}));
+
+vi.mock("@/context/auth", () => ({
+  useAuth: () => mocks.auth,
 }));
 
 vi.mock("@/hooks/use-toast", () => ({
@@ -74,7 +75,7 @@ function tracesResponse(items: TraceFixture[], total = items.length) {
   return {
     items,
     total,
-    limit: 20,
+    limit: 50,
     offset: 0,
   };
 }
@@ -87,12 +88,43 @@ function jsonResponse(data: unknown): Response {
   } as Response;
 }
 
+function errorResponse(status: number, detail?: unknown): Response {
+  return {
+    ok: false,
+    status,
+    json: async () => ({ detail }),
+  } as Response;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function mountTraces(locale: "pt" | "en" = "pt") {
+  localStorage.setItem("ns_locale", locale);
+  const location = memoryLocation({ path: "/traces", record: true });
+  const tree = () => (
+    <Router hook={location.hook}>
+      <I18nProvider>
+        <TracesList />
+      </I18nProvider>
+    </Router>
+  );
+  const view = render(tree());
+  return { location, rerender: () => view.rerender(tree()) };
+}
+
 function renderTraces(
   items: TraceFixture[],
   total = items.length,
   locale: "pt" | "en" = "pt",
 ) {
-  localStorage.setItem("ns_locale", locale);
   mocks.fetch.mockImplementation(async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url.startsWith("/v1/traces/export?")) {
@@ -105,15 +137,7 @@ function renderTraces(
     return jsonResponse(tracesResponse(items, total));
   });
 
-  const location = memoryLocation({ path: "/traces", record: true });
-  render(
-    <Router hook={location.hook}>
-      <I18nProvider>
-        <TracesList />
-      </I18nProvider>
-    </Router>,
-  );
-  return location;
+  return mountTraces(locale);
 }
 
 function expectNoClippingClasses(node: HTMLElement, boundary: HTMLElement) {
@@ -129,13 +153,29 @@ function expectNoClippingClasses(node: HTMLElement, boundary: HTMLElement) {
 }
 
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date(2026, 8, 28, 14, 30));
   localStorage.setItem("ns_locale", "pt");
   localStorage.setItem("ns_auth", JSON.stringify({ token: "test-token" }));
+  Object.assign(mocks.auth, {
+    isReadOnly: false,
+    isBuilder: false,
+    isSuperAdmin: false,
+    isInvestor: false,
+    viewingClinicId: "clinic-1",
+  });
   vi.stubGlobal("fetch", mocks.fetch);
-  vi.stubGlobal("URL", {
-    ...URL,
-    createObjectURL: vi.fn(() => "blob:trace-export"),
-    revokeObjectURL: vi.fn(),
+  vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue({
+    locale: "pt-BR",
+    calendar: "gregory",
+    numberingSystem: "latn",
+    timeZone: "America/Sao_Paulo",
+  });
+  Element.prototype.scrollIntoView = vi.fn();
+  const NativeURL = URL;
+  vi.stubGlobal("URL", class extends NativeURL {
+    static createObjectURL = vi.fn(() => "blob:trace-export");
+    static revokeObjectURL = vi.fn();
   });
 });
 
@@ -144,6 +184,7 @@ afterEach(() => {
   localStorage.clear();
   mocks.fetch.mockReset();
   mocks.toast.mockReset();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -157,6 +198,167 @@ describe("<TracesList /> presentation contract", () => {
 
     expect(await screen.findByText(visible)).toBeInTheDocument();
     expect(screen.queryByText(hidden)).not.toBeInTheDocument();
+  });
+
+  it("loads the browser's local day with timezone, 50-item limit, and no export range", async () => {
+    renderTraces([]);
+
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledOnce());
+    const url = new URL(String(mocks.fetch.mock.calls[0][0]), "https://neurostack.test");
+    expect(url.pathname).toBe("/v1/traces");
+    expect(Object.fromEntries(url.searchParams)).toMatchObject({
+      day: "2026-09-28",
+      timezone: "America/Sao_Paulo",
+      limit: "50",
+      offset: "0",
+    });
+    expect(url.searchParams.has("start_date")).toBe(false);
+    expect(url.searchParams.has("end_date")).toBe(false);
+  });
+
+  it.each([
+    {
+      locale: "pt" as const,
+      label: "Dia dos traces",
+      initialButton: "Exibir traces do dia 28 de setembro de 2026",
+      changedButton: "Exibir traces do dia 27 de setembro de 2026",
+      title: "Traces de 27 de setembro de 2026",
+    },
+    {
+      locale: "en" as const,
+      label: "Trace day",
+      initialButton: "Show traces for September 28, 2026",
+      changedButton: "Show traces for September 27, 2026",
+      title: "Traces for September 27, 2026",
+    },
+  ])("applies a drafted day explicitly in $locale", async ({ locale, label, initialButton, changedButton, title }) => {
+    renderTraces([], 0, locale);
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledOnce());
+    expect(screen.getByRole("button", { name: initialButton })).toBeInTheDocument();
+    mocks.fetch.mockClear();
+
+    fireEvent.change(screen.getByLabelText(label), { target: { value: "2026-09-27" } });
+    expect(screen.getByRole("button", { name: changedButton })).toBeInTheDocument();
+    expect(mocks.fetch).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: changedButton }));
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledOnce());
+    const url = new URL(String(mocks.fetch.mock.calls[0][0]), "https://neurostack.test");
+    expect(url.searchParams.get("day")).toBe("2026-09-27");
+    expect(url.searchParams.get("offset")).toBe("0");
+    expect(screen.getByRole("heading", { name: title })).toBeInTheDocument();
+  });
+
+  it("caps cards at 50 and uses compact numeric pagination with the correct offset and scroll", async () => {
+    const items = Array.from({ length: 51 }, (_, index) =>
+      traceFixture(`trace-${index + 1}`, "faq", `Mensagem ${index + 1}`),
+    );
+    renderTraces(items, 251);
+
+    await screen.findByTestId("trace-row-trace-1");
+    expect(screen.getAllByTestId(/^trace-row-/)).toHaveLength(50);
+    expect(screen.getByRole("button", { name: "Página 1" })).toHaveAttribute("aria-current", "page");
+    for (const page of [1, 2, 3, 4, 5, 6]) {
+      expect(screen.getByRole("button", { name: `Página ${page}` })).toBeInTheDocument();
+    }
+    expect(screen.getByText("…")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Anterior" })).toBeDisabled();
+
+    mocks.fetch.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Página 3" }));
+    await waitFor(() => {
+      expect(mocks.fetch).toHaveBeenCalledOnce();
+      expect(new URL(String(mocks.fetch.mock.calls[0][0]), "https://neurostack.test").searchParams.get("offset")).toBe("100");
+    });
+    expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "start" });
+    expect(screen.getByRole("button", { name: "Página 3" })).toHaveAttribute("aria-current", "page");
+
+    fireEvent.click(screen.getByRole("button", { name: "Página 6" }));
+    await waitFor(() => {
+      expect(mocks.fetch).toHaveBeenCalledTimes(2);
+      expect(new URL(String(mocks.fetch.mock.calls.at(-1)?.[0]), "https://neurostack.test").searchParams.get("offset")).toBe("250");
+    });
+    expect(screen.getByRole("button", { name: "Próximo" })).toBeDisabled();
+
+    mocks.fetch.mockClear();
+    fireEvent.change(screen.getByLabelText("Dia dos traces"), { target: { value: "2026-09-27" } });
+    fireEvent.click(screen.getByRole("button", { name: "Exibir traces do dia 27 de setembro de 2026" }));
+    await waitFor(() => {
+      const url = new URL(String(mocks.fetch.mock.calls[0][0]), "https://neurostack.test");
+      expect(url.searchParams.get("day")).toBe("2026-09-27");
+      expect(url.searchParams.get("offset")).toBe("0");
+    });
+  });
+
+  it("resets filters and an effective tenant to page one while retaining tenant-correct detail links", async () => {
+    mocks.auth.isBuilder = true;
+    const { rerender } = renderTraces([traceFixture("tenant-trace", "faq")], 251);
+    const row = await screen.findByTestId("trace-row-tenant-trace");
+    expect(row.closest("a")).toHaveAttribute("href", "/traces/tenant-trace?tenant_id=clinic-1");
+    expect(String(mocks.fetch.mock.calls[0][0])).toContain("tenant_id=clinic-1");
+
+    mocks.fetch.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Página 3" }));
+    await waitFor(() => {
+      expect(mocks.fetch).toHaveBeenCalledOnce();
+      expect(String(mocks.fetch.mock.calls[0][0])).toContain("offset=100");
+    });
+
+    mocks.fetch.mockClear();
+    fireEvent.click(screen.getByLabelText("Apenas com Safety Flag ⚠️"));
+    await waitFor(() => {
+      expect(mocks.fetch).toHaveBeenCalledOnce();
+      const url = String(mocks.fetch.mock.calls[0][0]);
+      expect(url).toContain("offset=0");
+      expect(url).toContain("safety_flag=true");
+    });
+
+    mocks.fetch.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Página 3" }));
+    await waitFor(() => {
+      expect(mocks.fetch).toHaveBeenCalledOnce();
+      expect(String(mocks.fetch.mock.calls[0][0])).toContain("offset=100");
+    });
+    mocks.fetch.mockClear();
+    fireEvent.click(screen.getByLabelText("Apenas com Handoff 🔄"));
+    await waitFor(() => {
+      expect(mocks.fetch).toHaveBeenCalledOnce();
+      const url = String(mocks.fetch.mock.calls[0][0]);
+      expect(url).toContain("offset=0");
+      expect(url).toContain("handoff_required=true");
+    });
+
+    mocks.fetch.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Página 3" }));
+    await waitFor(() => {
+      expect(mocks.fetch).toHaveBeenCalledOnce();
+      expect(String(mocks.fetch.mock.calls[0][0])).toContain("offset=100");
+    });
+    mocks.fetch.mockClear();
+    fireEvent.change(screen.getByRole("combobox", { name: "Origem" }), { target: { value: "web" } });
+    await waitFor(() => {
+      expect(mocks.fetch).toHaveBeenCalledOnce();
+      const url = String(mocks.fetch.mock.calls[0][0]);
+      expect(url).toContain("offset=0");
+      expect(url).toContain("channel=web");
+    });
+
+    mocks.fetch.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Página 3" }));
+    await waitFor(() => {
+      expect(mocks.fetch).toHaveBeenCalledOnce();
+      expect(String(mocks.fetch.mock.calls[0][0])).toContain("offset=100");
+    });
+    mocks.fetch.mockClear();
+    mocks.auth.viewingClinicId = "clinic-2";
+    rerender();
+    await waitFor(() => {
+      expect(mocks.fetch).toHaveBeenCalledOnce();
+      const url = String(mocks.fetch.mock.calls[0][0]);
+      expect(url).toContain("tenant_id=clinic-2");
+      expect(url).toContain("offset=0");
+      expect(url).toContain("safety_flag=true");
+    });
   });
 
   it("keeps the raw funnel stage in trace history", async () => {
@@ -174,7 +376,7 @@ describe("<TracesList /> presentation contract", () => {
       "future_intent",
       "Mensagem de intent ainda desconhecido",
     );
-    const location = renderTraces([knownTrace, unknownTrace]);
+    const { location } = renderTraces([knownTrace, unknownTrace]);
 
     const content = screen.getByTestId("traces-content");
     const row = await screen.findByTestId("trace-row-long-trace");
@@ -215,52 +417,310 @@ describe("<TracesList /> presentation contract", () => {
     });
   });
 
-  it("keeps filters, pagination, and filtered export behavior intact", async () => {
+  it("keeps page data stable while editing the independent filtered export", async () => {
+    mocks.auth.isBuilder = true;
+    let downloadedFilename = "";
     const anchorClick = vi
       .spyOn(HTMLAnchorElement.prototype, "click")
-      .mockImplementation(() => undefined);
-    renderTraces([traceFixture("page-trace", "pedido_preco")], 21);
+      .mockImplementation(function (this: HTMLAnchorElement) {
+        downloadedFilename = this.download;
+      });
+    renderTraces([traceFixture("page-trace", "pedido_preco")], 151);
 
     await screen.findByTestId("trace-row-page-trace");
     mocks.fetch.mockClear();
 
+    fireEvent.click(screen.getByRole("button", { name: "Página 3" }));
+    await waitFor(() => {
+      expect(mocks.fetch).toHaveBeenCalledOnce();
+      expect(String(mocks.fetch.mock.calls[0][0])).toContain("offset=100");
+    });
+    expect(screen.getByRole("button", { name: "Página 3" })).toHaveAttribute("aria-current", "page");
+    mocks.fetch.mockClear();
+
+    fireEvent.change(screen.getByLabelText("Data Inicial"), { target: { value: "2026-09-01T00:00" } });
+    fireEvent.change(screen.getByLabelText("Data Final"), { target: { value: "2026-09-20T23:59" } });
+    expect(mocks.fetch).not.toHaveBeenCalled();
+    expect(screen.getByTestId("trace-row-page-trace")).toBeInTheDocument();
+    expect(screen.getByText(/Página 3 de 4 · 151 traces/)).toBeInTheDocument();
+
     fireEvent.click(screen.getByLabelText("Apenas com Safety Flag ⚠️"));
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledOnce());
+    mocks.fetch.mockClear();
+
+    fireEvent.click(screen.getByLabelText("Apenas com Handoff 🔄"));
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledOnce());
+    mocks.fetch.mockClear();
+
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "web" } });
-
     await waitFor(() => {
-      expect(
-        mocks.fetch.mock.calls.some(([input]) => {
-          const url = String(input);
-          return url.startsWith("/v1/traces?") &&
-            url.includes("safety_flag=true") &&
-            url.includes("channel=web");
-        }),
-      ).toBe(true);
+      expect(mocks.fetch).toHaveBeenCalledOnce();
+      const url = String(mocks.fetch.mock.calls[0][0]);
+      expect(url).toContain("safety_flag=true");
+      expect(url).toContain("handoff_required=true");
+      expect(url).toContain("channel=web");
     });
-
-    fireEvent.click(screen.getByRole("button", { name: "Proximo" }));
-    await waitFor(() => {
-      expect(
-        mocks.fetch.mock.calls.some(([input]) =>
-          String(input).includes("offset=20"),
-        ),
-      ).toBe(true);
-    });
+    mocks.fetch.mockClear();
 
     fireEvent.click(
       screen.getByRole("button", { name: "Exportar para Excel (CSV)" }),
     );
     await waitFor(() => {
-      expect(
-        mocks.fetch.mock.calls.some(([input]) => {
-          const url = String(input);
-          return url.startsWith("/v1/traces/export?") &&
-            url.includes("safety_flag=true") &&
-            url.includes("channel=web");
-        }),
-      ).toBe(true);
+      expect(mocks.fetch).toHaveBeenCalledOnce();
+      const url = String(mocks.fetch.mock.calls[0][0]);
+      expect(url).toContain("/v1/traces/export?");
+      expect(url).toContain("safety_flag=true");
+      expect(url).toContain("handoff_required=true");
+      expect(url).toContain("channel=web");
+      expect(url).toContain("tenant_id=clinic-1");
+      expect(url).toContain("start_date=2026-09-01T00%3A00");
+      expect(url).toContain("end_date=2026-09-20T23%3A59");
+      expect(url).not.toContain("day=");
       expect(anchorClick).toHaveBeenCalledOnce();
+      expect(downloadedFilename).toBe("neurostack_traces_report.csv");
     });
+  });
+
+  it("hides a resolved tenant result immediately while the next tenant is pending", async () => {
+    mocks.auth.isBuilder = true;
+    const clinicTwo = deferred<Response>();
+    mocks.fetch
+      .mockResolvedValueOnce(jsonResponse(tracesResponse([traceFixture("clinic-one", "faq")], 73)))
+      .mockImplementationOnce(() => clinicTwo.promise);
+    const { rerender } = mountTraces();
+
+    const oldRow = await screen.findByTestId("trace-row-clinic-one");
+    expect(oldRow.closest("a")).toHaveAttribute("href", "/traces/clinic-one?tenant_id=clinic-1");
+    expect(screen.getByText(/73 traces/)).toBeInTheDocument();
+
+    mocks.auth.viewingClinicId = "clinic-2";
+    rerender();
+
+    expect(screen.queryByTestId("trace-row-clinic-one")).not.toBeInTheDocument();
+    expect(screen.queryByText(/73 traces/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByText("Carregando traces de 28 de setembro de 2026")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(mocks.fetch).toHaveBeenCalledTimes(2);
+      expect(String(mocks.fetch.mock.calls[1][0])).toContain("tenant_id=clinic-2");
+    });
+
+    await act(async () => {
+      clinicTwo.resolve(jsonResponse(tracesResponse([traceFixture("clinic-two", "faq")], 12)));
+      await clinicTwo.promise;
+    });
+
+    const newRow = await screen.findByTestId("trace-row-clinic-two");
+    expect(newRow.closest("a")).toHaveAttribute("href", "/traces/clinic-two?tenant_id=clinic-2");
+    expect(screen.queryByTestId("trace-row-clinic-one")).not.toBeInTheDocument();
+    expect(screen.getByText(/12 traces/)).toBeInTheDocument();
+  });
+
+  it.each(["isBuilder", "isSuperAdmin"] as const)(
+    "clears self history while %s waits for a clinic, then publishes only that tenant",
+    async accessRole => {
+      mocks.fetch.mockResolvedValueOnce(
+        jsonResponse(tracesResponse([traceFixture("self-trace", "faq")], 41)),
+      );
+      const { rerender } = mountTraces();
+
+      const selfRow = await screen.findByTestId("trace-row-self-trace");
+      expect(selfRow.closest("a")).toHaveAttribute("href", "/traces/self-trace");
+      expect(screen.getByText(/41 traces/)).toBeInTheDocument();
+      expect(String(mocks.fetch.mock.calls[0][0])).not.toContain("tenant_id=");
+      mocks.fetch.mockClear();
+
+      mocks.auth[accessRole] = true;
+      mocks.auth.viewingClinicId = null;
+      rerender();
+
+      expect(screen.queryByTestId("trace-row-self-trace")).not.toBeInTheDocument();
+      expect(screen.queryByText(/41 traces/)).not.toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.getByText("Carregando traces de 28 de setembro de 2026")).toBeInTheDocument();
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(mocks.fetch).not.toHaveBeenCalled();
+
+      const tenantResponse = deferred<Response>();
+      mocks.fetch.mockImplementationOnce(() => tenantResponse.promise);
+      mocks.auth.viewingClinicId = "clinic-2";
+      rerender();
+
+      await waitFor(() => expect(mocks.fetch).toHaveBeenCalledOnce());
+      const tenantUrl = new URL(String(mocks.fetch.mock.calls[0][0]), "https://neurostack.test");
+      expect(tenantUrl.searchParams.get("tenant_id")).toBe("clinic-2");
+      expect(tenantUrl.searchParams.get("offset")).toBe("0");
+
+      await act(async () => {
+        tenantResponse.resolve(
+          jsonResponse(tracesResponse([traceFixture("tenant-trace", "faq")], 9)),
+        );
+        await tenantResponse.promise;
+      });
+
+      const tenantRow = await screen.findByTestId("trace-row-tenant-trace");
+      expect(tenantRow.closest("a")).toHaveAttribute(
+        "href",
+        "/traces/tenant-trace?tenant_id=clinic-2",
+      );
+      expect(screen.getByText(/9 traces/)).toBeInTheDocument();
+      expect(screen.queryByTestId("trace-row-self-trace")).not.toBeInTheDocument();
+      expect(mocks.fetch).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("refetches the last valid page instead of publishing an out-of-range page", async () => {
+    mocks.fetch.mockImplementation(async input => {
+      const offset = new URL(String(input), "https://neurostack.test").searchParams.get("offset");
+      if (offset === "250") return jsonResponse(tracesResponse([], 250));
+      if (offset === "200") return jsonResponse(tracesResponse([traceFixture("last-valid", "faq")], 250));
+      return jsonResponse(tracesResponse([traceFixture("first-page", "faq")], 251));
+    });
+    mountTraces();
+
+    await screen.findByTestId("trace-row-first-page");
+    mocks.fetch.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Página 6" }));
+
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(2));
+    expect(new URL(String(mocks.fetch.mock.calls[0][0]), "https://neurostack.test").searchParams.get("offset")).toBe("250");
+    expect(new URL(String(mocks.fetch.mock.calls[1][0]), "https://neurostack.test").searchParams.get("offset")).toBe("200");
+    expect(screen.queryByText(/Página 6 de 5/)).not.toBeInTheDocument();
+    expect(await screen.findByTestId("trace-row-last-valid")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Página 5" })).toHaveAttribute("aria-current", "page");
+  });
+
+  it("uses bounded pagination windows at the beginning, middle, and end", async () => {
+    renderTraces([traceFixture("window-trace", "faq")], 550);
+    await screen.findByTestId("trace-row-window-trace");
+
+    for (const page of [1, 2, 3, 4, 5, 11]) {
+      expect(screen.getByRole("button", { name: `Página ${page}` })).toBeInTheDocument();
+    }
+    expect(screen.getAllByText("…")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Página 5" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Página 5" })).toHaveAttribute("aria-current", "page"));
+    for (const page of [1, 3, 4, 5, 6, 7, 11]) {
+      expect(screen.getByRole("button", { name: `Página ${page}` })).toBeInTheDocument();
+    }
+    expect(screen.getAllByText("…")).toHaveLength(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "Página 11" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Página 11" })).toHaveAttribute("aria-current", "page"));
+    for (const page of [1, 7, 8, 9, 10, 11]) {
+      expect(screen.getByRole("button", { name: `Página ${page}` })).toBeInTheDocument();
+    }
+    expect(screen.getAllByText("…")).toHaveLength(1);
+  });
+
+  it("uses Investor mock history and detail links without fetching", async () => {
+    mocks.auth.isInvestor = true;
+    mountTraces();
+
+    const row = await screen.findByTestId("trace-row-t1");
+    expect(row.closest("a")).toHaveAttribute("href", "/traces/t1");
+    expect(mocks.fetch).not.toHaveBeenCalled();
+  });
+
+  it.each(["resolve", "reject"] as const)(
+    "ignores an obsolete request when it later %s after the newer day succeeds",
+    async obsoleteOutcome => {
+      const requestA = deferred<Response>();
+      const requestB = deferred<Response>();
+      mocks.fetch
+        .mockImplementationOnce(() => requestA.promise)
+        .mockImplementationOnce(() => requestB.promise);
+      mountTraces();
+      await waitFor(() => expect(mocks.fetch).toHaveBeenCalledOnce());
+
+      fireEvent.change(screen.getByLabelText("Dia dos traces"), { target: { value: "2026-09-27" } });
+      fireEvent.click(screen.getByRole("button", { name: "Exibir traces do dia 27 de setembro de 2026" }));
+      await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(2));
+
+      await act(async () => {
+        requestB.resolve(jsonResponse(tracesResponse([traceFixture("new-day", "faq", "Resposta B")], 7)));
+        await requestB.promise;
+      });
+      expect(await screen.findByTestId("trace-row-new-day")).toBeInTheDocument();
+      expect(screen.getByText(/Página 1 de 1 · 7 traces · 27 de setembro de 2026/)).toBeInTheDocument();
+      expect(screen.queryByText("Carregando traces de 27 de setembro de 2026")).not.toBeInTheDocument();
+
+      await act(async () => {
+        if (obsoleteOutcome === "resolve") {
+          requestA.resolve(jsonResponse(tracesResponse([traceFixture("old-day", "faq", "Resposta A")], 99)));
+          await requestA.promise;
+        } else {
+          requestA.reject(new Error("obsolete raw failure"));
+          await requestA.promise.catch(() => undefined);
+        }
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId("trace-row-new-day")).toBeInTheDocument();
+        expect(screen.queryByTestId("trace-row-old-day")).not.toBeInTheDocument();
+        expect(screen.getByText(/Página 1 de 1 · 7 traces · 27 de setembro de 2026/)).toBeInTheDocument();
+        expect(screen.queryByText("obsolete raw failure")).not.toBeInTheDocument();
+      });
+    },
+  );
+
+  describe.each([
+    {
+      locale: "pt" as const,
+      noToken: "Faça login para carregar os traces.",
+      unauthorized: "Sua sessão expirou. Faça login novamente.",
+      timezoneRequired: "O fuso horário é obrigatório para consultar esse dia. Atualize a página e tente novamente.",
+      dayRequired: "Escolha um dia para usar o fuso horário informado.",
+      invalidTimezone: "O fuso horário do navegador não foi reconhecido. Atualize as configurações e tente novamente.",
+      conflict: "Use um dia para a lista ou um intervalo para o CSV, não ambos na mesma consulta.",
+      unknown: "Não foi possível carregar os traces. Tente novamente; se persistir, contate o suporte.",
+    },
+    {
+      locale: "en" as const,
+      noToken: "Sign in to load traces.",
+      unauthorized: "Your session expired. Sign in again.",
+      timezoneRequired: "A timezone is required for this day. Refresh the page and try again.",
+      dayRequired: "Choose a day to use the supplied timezone.",
+      invalidTimezone: "The browser timezone was not recognized. Update your settings and try again.",
+      conflict: "Use a day for the list or a range for CSV, not both in the same request.",
+      unknown: "Could not load traces. Try again; if the problem persists, contact support.",
+    },
+  ])("localized list errors in $locale", errorText => {
+    it("explains how to authenticate when no token exists", async () => {
+      localStorage.removeItem("ns_auth");
+      mountTraces(errorText.locale);
+
+      expect(await screen.findByText(errorText.noToken)).toBeInTheDocument();
+      expect(screen.getByRole("alert")).toHaveTextContent(errorText.noToken);
+      expect(mocks.fetch).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { status: 401, detail: undefined, message: "unauthorized" as const },
+      { status: 400, detail: "timezone_required_with_day", message: "timezoneRequired" as const },
+      { status: 400, detail: "day_required_with_timezone", message: "dayRequired" as const },
+      { status: 400, detail: "invalid_timezone", message: "invalidTimezone" as const },
+      { status: 400, detail: "day_conflicts_with_date_range", message: "conflict" as const },
+      { status: 500, detail: "sensitive_raw_code", message: "unknown" as const },
+    ])("maps HTTP $status / $detail without exposing raw codes", async ({ status, detail, message }) => {
+      mocks.fetch.mockResolvedValue(errorResponse(status, detail));
+      mountTraces(errorText.locale);
+
+      expect(await screen.findByText(errorText[message])).toBeInTheDocument();
+      expect(screen.getByRole("alert")).toHaveTextContent(errorText[message]);
+      if (detail) expect(screen.queryByText(detail)).not.toBeInTheDocument();
+    });
+  });
+
+  it("announces an empty resolved list as status", async () => {
+    renderTraces([], 0);
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Nenhum trace encontrado em 28 de setembro de 2026.",
+    );
   });
 
   it("renders the Dúvida Pós-Procedimento bucket badge alongside the ShieldAlert icon when safety_concern is true", async () => {
