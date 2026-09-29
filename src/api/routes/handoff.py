@@ -14,7 +14,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func as sa_func
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -56,7 +55,7 @@ from src.handoff.models import (
 from src.models.handoff import HandoffRecord
 from src.repositories import get_db_session_dependency
 from src.services import HandoffService, get_handoff_service
-from src.services.handoff_service import HandoffLifecycleError
+from src.services.handoff_service import HandoffLifecycleError, HandoffSlaPeriodError
 
 logger = get_logger(__name__)
 
@@ -164,6 +163,7 @@ def _handoff_queue_fields(
         ),
         "created_at": record.created_at,
         "data_hora_saida": record.data_hora_saida,
+        "sla_target_seconds": record.sla_target_seconds,
         "status": record.status,
     }
 
@@ -184,133 +184,58 @@ async def get_handoff_queue(
     ),
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
+    service: HandoffService = Depends(get_service),
 ) -> HandoffQueueResponse:
-    """Active handoffs (pending/accepted) with aggregate stats.
-
-    Stats (avg wait + % within SLA) are computed over handoffs whose *entry*
-    (created_at) falls inside the requested window, so the KPIs match the
-    date-filtered list and stale/old handoffs don't skew the average.
-    """
+    """Return the waiting subset and SLA radar for one entry-date cohort."""
     effective_tenant_id = await _resolve_queue_tenant(request, tenant_id, tenant, db)
-
-    # Active items
-    q = (
-        select(HandoffRecord)
-        .where(
-            HandoffRecord.tenant_id == effective_tenant_id,
-            HandoffRecord.status.in_(["pending", "accepted"]),
-        )
-        .order_by(HandoffRecord.created_at.asc())
-    )
-    result = await db.execute(q)
-    records = result.scalars().all()
-
-    # Privacy: never expose the customer's first WhatsApp line (often their name)
-    items = [
-        HandoffQueueItem(**_handoff_queue_fields(r, expose_first_message=False))
-        for r in records
-    ]
-
-    # Stats window: follow the requested date range (entry date), default last 30 days.
-    now_utc = datetime.now(timezone.utc)
-    if from_date or to_date:
-        window_start = datetime.combine(
-            from_date or now_utc.date(), time.min, tzinfo=timezone.utc
-        )
-        window_end = datetime.combine(
-            to_date or now_utc.date(), time.max, tzinfo=timezone.utc
-        )
-    else:
-        window_start = now_utc - timedelta(days=30)
-        window_end = now_utc
-
-    # Stats: avg wait + pct within SLA over completed handoffs created in the window
-    stats_q = select(
-        sa_func.avg(
-            sa_func.extract(
-                "epoch", HandoffRecord.data_hora_saida - HandoffRecord.created_at
-            )
-        ).label("avg_wait"),
-        sa_func.count().label("total"),
-    ).where(
-        HandoffRecord.tenant_id == effective_tenant_id,
-        HandoffRecord.status == "completed",
-        HandoffRecord.data_hora_saida.isnot(None),
-        HandoffRecord.created_at >= window_start,
-        HandoffRecord.created_at <= window_end,
-    )
-    stats_result = await db.execute(stats_q)
-    row = stats_result.one()
-    avg_wait = float(row.avg_wait or 0)
-    total_completed = int(row.total or 0)
-
-    # Get meta_minutos from clinic config
-    meta_minutes = 10
     try:
-        from src.models.clinic_config_table import ClinicConfigTable
-
-        cfg_q = select(ClinicConfigTable).where(
-            ClinicConfigTable.tenant_id == effective_tenant_id
+        queue = await service.get_queue_sla(
+            effective_tenant_id,
+            from_date=from_date,
+            to_date=to_date,
         )
-        cfg_result = await db.execute(cfg_q)
-        cfg_row = cfg_result.scalar_one_or_none()
-        if cfg_row and cfg_row.handoff:
-            meta_minutes = (
-                cfg_row.handoff.get("meta_minutos_atendimento", 10)
-                if isinstance(cfg_row.handoff, dict)
-                else 10
-            )
-    except Exception:
-        pass
+    except HandoffSlaPeriodError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid_date_range",
+        ) from exc
 
-    # pct within SLA
-    pct_within_sla = 0.0
-    if total_completed > 0:
-        sla_seconds = meta_minutes * 60
-        sla_q = (
-            select(sa_func.count())
-            .select_from(HandoffRecord)
-            .where(
-                HandoffRecord.tenant_id == effective_tenant_id,
-                HandoffRecord.status == "completed",
-                HandoffRecord.data_hora_saida.isnot(None),
-                HandoffRecord.created_at >= window_start,
-                HandoffRecord.created_at <= window_end,
-                sa_func.extract(
-                    "epoch", HandoffRecord.data_hora_saida - HandoffRecord.created_at
-                )
-                <= sla_seconds,
-            )
-        )
-        sla_result = await db.execute(sla_q)
-        within_count = sla_result.scalar() or 0
-        pct_within_sla = round((within_count / total_completed) * 100, 1)
-
+    average = queue.metrics.average_confirmed_seconds
+    percentage = queue.metrics.pct_within_sla
     return HandoffQueueResponse(
-        items=items,
-        avg_wait_seconds=round(avg_wait, 1),
-        pct_within_sla=pct_within_sla,
+        items=[
+            HandoffQueueItem(
+                **_handoff_queue_fields(record, expose_first_message=False)
+            )
+            for record in queue.items
+        ],
+        avg_wait_seconds=round(average, 1) if average is not None else None,
+        pct_within_sla=float(percentage) if percentage is not None else None,
+        within_sla_count=queue.within_sla_count,
+        confirmed_late_count=queue.confirmed_late_count,
+        unanswered_overdue_count=queue.unanswered_overdue_count,
+        maturing_count=queue.maturing_count,
+        cancelled_unconfirmed_count=queue.cancelled_unconfirmed_count,
+        unmeasured_legacy_count=queue.unmeasured_legacy_count,
+        confirmed_count=queue.metrics.confirmed_count,
+        sla_eligible_count=queue.metrics.sla_eligible_count,
+        period_timezone=queue.period_timezone,
+        period_start=queue.period.start_utc,
+        period_end_exclusive=queue.period.end_exclusive_utc,
     )
 
 
-@router.post(
-    "/queue/{handoff_id}/checkout",
-    response_model=HandoffCheckoutResponse,
-    summary="Checkout Handoff",
-    deprecated=True,
-)
-async def checkout_handoff(
+async def _confirm_queue_handoff(
+    *,
     request: Request,
     handoff_id: UUID,
-    tenant_id: UUID | None = Query(
-        None,
-        description="Tenant that owns the handoff for an authorized override",
-    ),
-    tenant: TenantContext = Depends(get_tenant_context),
-    db: AsyncSession = Depends(get_db_session_dependency),
-    service: HandoffService = Depends(get_service),
+    tenant_id: UUID | None,
+    tenant: TenantContext,
+    db: AsyncSession,
+    service: HandoffService,
 ) -> HandoffCheckoutResponse:
-    """Deprecated alias that confirms attendance without completing it."""
+    """Authorize, mutate through the lifecycle service, then assemble output."""
+
     requested_tenant_id = tenant_id or tenant.tenant_id
     try:
         effective_tenant_id = await _resolve_queue_tenant(
@@ -331,7 +256,7 @@ async def checkout_handoff(
         raise
 
     try:
-        await service.checkout_handoff(
+        await service.confirm_handoff(
             handoff_id,
             tenant_id=effective_tenant_id,
         )
@@ -347,10 +272,12 @@ async def checkout_handoff(
         ) from exc
 
     result = await db.execute(
-        select(HandoffRecord).where(
+        select(HandoffRecord)
+        .where(
             HandoffRecord.id == handoff_id,
             HandoffRecord.tenant_id == effective_tenant_id,
         )
+        .execution_options(populate_existing=True)
     )
     record = result.scalar_one_or_none()
     if record is None:
@@ -366,6 +293,65 @@ async def checkout_handoff(
     return HandoffCheckoutResponse(
         **_handoff_queue_fields(record, expose_first_message=True),
         wait_seconds=wait_seconds,
+    )
+
+
+@router.post(
+    "/queue/{handoff_id}/confirm",
+    response_model=HandoffCheckoutResponse,
+    summary="Confirm Handoff Attendance",
+    responses={409: {"description": "Typed lifecycle conflict"}},
+)
+async def confirm_queue_handoff(
+    request: Request,
+    handoff_id: UUID,
+    tenant_id: UUID | None = Query(
+        None,
+        description="Tenant that owns the handoff for an authorized override",
+    ),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: AsyncSession = Depends(get_db_session_dependency),
+    service: HandoffService = Depends(get_service),
+) -> HandoffCheckoutResponse:
+    """Persist the first human-response timestamp without completing handoff."""
+
+    return await _confirm_queue_handoff(
+        request=request,
+        handoff_id=handoff_id,
+        tenant_id=tenant_id,
+        tenant=tenant,
+        db=db,
+        service=service,
+    )
+
+
+@router.post(
+    "/queue/{handoff_id}/checkout",
+    response_model=HandoffCheckoutResponse,
+    summary="Checkout Handoff",
+    deprecated=True,
+    responses={409: {"description": "Typed lifecycle conflict"}},
+)
+async def checkout_handoff(
+    request: Request,
+    handoff_id: UUID,
+    tenant_id: UUID | None = Query(
+        None,
+        description="Tenant that owns the handoff for an authorized override",
+    ),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: AsyncSession = Depends(get_db_session_dependency),
+    service: HandoffService = Depends(get_service),
+) -> HandoffCheckoutResponse:
+    """Deprecated HTTP alias for attendance confirmation."""
+
+    return await _confirm_queue_handoff(
+        request=request,
+        handoff_id=handoff_id,
+        tenant_id=tenant_id,
+        tenant=tenant,
+        db=db,
+        service=service,
     )
 
 
@@ -962,6 +948,7 @@ async def get_handoff(
     response_model=HandoffDetail,
     summary="Update Handoff",
     description="Update handoff status",
+    responses={409: {"description": "Typed lifecycle conflict"}},
 )
 async def update_handoff(
     handoff_id: UUID,
@@ -974,8 +961,8 @@ async def update_handoff(
 
     Valid transitions:
     - pending → accepted (agent accepts)
-    - accepted → in_progress (agent starts working)
-    - in_progress → completed (agent finishes)
+    - attendance confirmation uses POST /queue/{handoff_id}/confirm
+    - in_progress → completed (agent finishes after confirmation)
     - any → cancelled (cancel the handoff)
     """
     try:
@@ -1045,6 +1032,7 @@ async def accept_handoff(
     response_model=HandoffDetail,
     summary="Complete Handoff",
     description="Mark a handoff as completed",
+    responses={409: {"description": "Typed lifecycle conflict"}},
 )
 async def complete_handoff(
     handoff_id: UUID,

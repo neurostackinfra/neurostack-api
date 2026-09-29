@@ -2,9 +2,11 @@
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import jwt
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
@@ -51,6 +53,9 @@ def _record(
     intent: str | None,
     context: dict[str, Any],
     first_message: str,
+    status: str = "pending",
+    confirmed_at: datetime | None = None,
+    sla_target_seconds: int | None = 600,
 ) -> Any:
     from src.models.handoff import HandoffRecord
 
@@ -61,12 +66,14 @@ def _record(
         reason=reason,
         summary="queue contract",
         context=context,
-        status="pending",
+        status=status,
         urgency="normal",
         numero_whatsapp="5511999999999",
         intencao_detectada=intent,
         estagio_atual="em_qualificacao",
         primeira_linha_mensagem=first_message,
+        data_hora_saida=confirmed_at,
+        sla_target_seconds=sla_target_seconds,
         created_at=created_at,
     )
 
@@ -77,7 +84,9 @@ def _seed(
     tenants: list[UUID],
     sessions: list[Any],
     handoffs: list[Any],
+    clinic_timezones: dict[UUID, str] | None = None,
 ) -> None:
+    from src.models.clinic_config_table import ClinicConfigTable
     from src.models.tenant import Tenant
     from src.repositories.database import get_db_session
 
@@ -97,6 +106,15 @@ def _seed(
                 ]
             )
             db.add_all(sessions)
+            db.add_all(
+                [
+                    ClinicConfigTable(
+                        tenant_id=tenant_id,
+                        operations={"timezone": timezone_name},
+                    )
+                    for tenant_id, timezone_name in (clinic_timezones or {}).items()
+                ]
+            )
             db.add_all(handoffs)
             await db.commit()
         finally:
@@ -210,14 +228,19 @@ def test_queue_and_checkout_share_canonical_projection_and_fifo(
     assert listed.status_code == 200, listed.text
     items = listed.json()["items"]
     assert [item["id"] for item in items] == [str(record.id) for record in records]
-    for item in items:
+    for index, item in enumerate(items):
         safety_flag, intent, _ = expected[item["id"]]
         assert item["safety_flag"] is safety_flag
         assert item["intencao_detectada"] == intent
         assert item["primeira_linha_mensagem"] is None
+        assert item["sla_target_seconds"] == 600
 
         checked_out = client.post(
-            f"/v1/handoffs/queue/{item['id']}/checkout",
+            (
+                f"/v1/handoffs/queue/{item['id']}/confirm"
+                if index == 0
+                else f"/v1/handoffs/queue/{item['id']}/checkout"
+            ),
             headers=headers,
         )
         assert checked_out.status_code == 200, checked_out.text
@@ -299,3 +322,325 @@ def test_queue_preserves_authentication_and_tenant_boundaries(
     assert cross_tenant_checkout.status_code == 404
     assert cross_tenant_checkout.json()["detail"] == "handoff_not_found"
     assert _handoff_state(client, other.id) == ("pending", None)
+
+
+def test_queue_radar_uses_one_cohort_snapshots_and_nullable_no_data(
+    client: TestClient,
+) -> None:
+    tenant_id = uuid4()
+    empty_tenant_id = uuid4()
+    session = _session(tenant_id, "radar")
+    empty_session = _session(empty_tenant_id, "empty-radar")
+    now = datetime.now(timezone.utc)
+    base = now - timedelta(minutes=20)
+
+    def occurrence(
+        label: str,
+        *,
+        created_at: datetime = base,
+        status: str = "pending",
+        confirmed_after: int | None = None,
+        target: int | None = 600,
+    ) -> Any:
+        return _record(
+            tenant_id,
+            session.id,
+            created_at=created_at,
+            reason=HandoffReason.USER_REQUEST.value,
+            intent=label,
+            context={},
+            first_message=f"private-{label}",
+            status=status,
+            confirmed_at=(
+                created_at + timedelta(seconds=confirmed_after)
+                if confirmed_after is not None
+                else None
+            ),
+            sla_target_seconds=target,
+        )
+
+    records = [
+        occurrence("within-599", status="completed", confirmed_after=599),
+        occurrence("within-600", status="in_progress", confirmed_after=600),
+        occurrence("late-601", status="completed", confirmed_after=601),
+        occurrence("overdue-one"),
+        occurrence("overdue-two"),
+        occurrence("cancelled", status="cancelled"),
+        occurrence("legacy", target=None),
+        occurrence("maturing", created_at=now - timedelta(seconds=30)),
+    ]
+    period_from = min(record.created_at.date() for record in records)
+    period_to = max(record.created_at.date() for record in records)
+    outside = occurrence(
+        "outside-end",
+        created_at=datetime.combine(
+            period_to + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        ),
+    )
+    _seed(
+        client,
+        tenants=[tenant_id, empty_tenant_id],
+        sessions=[session, empty_session],
+        handoffs=[*records, outside],
+        clinic_timezones={tenant_id: "UTC", empty_tenant_id: "UTC"},
+    )
+
+    response = client.get(
+        "/v1/handoffs/queue",
+        params={
+            "tenant_id": str(tenant_id),
+            "from_date": period_from.isoformat(),
+            "to_date": period_to.isoformat(),
+        },
+        headers=_jwt_headers("clinic_admin", tenant_id),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["avg_wait_seconds"] == 600.0
+    assert body["pct_within_sla"] == 40.0
+    assert body["within_sla_count"] == 2
+    assert body["confirmed_late_count"] == 1
+    assert body["unanswered_overdue_count"] == 2
+    assert body["maturing_count"] == 1
+    assert body["cancelled_unconfirmed_count"] == 1
+    assert body["unmeasured_legacy_count"] == 1
+    assert body["confirmed_count"] == 3
+    assert body["sla_eligible_count"] == 5
+    assert sum(
+        body[key]
+        for key in (
+            "within_sla_count",
+            "confirmed_late_count",
+            "unanswered_overdue_count",
+            "maturing_count",
+            "cancelled_unconfirmed_count",
+            "unmeasured_legacy_count",
+        )
+    ) == len(records)
+    assert {item["intencao_detectada"] for item in body["items"]} == {
+        "overdue-one",
+        "overdue-two",
+        "legacy",
+        "maturing",
+    }
+    assert body["period_timezone"] == "UTC"
+    assert body["period_start"].endswith(("Z", "+00:00"))
+    assert body["period_end_exclusive"].endswith(("Z", "+00:00"))
+
+    empty = client.get(
+        "/v1/handoffs/queue",
+        params={"tenant_id": str(empty_tenant_id)},
+        headers=_jwt_headers("clinic_admin", empty_tenant_id),
+    )
+    assert empty.status_code == 200, empty.text
+    assert empty.json()["avg_wait_seconds"] is None
+    assert empty.json()["pct_within_sla"] is None
+    assert empty.json()["confirmed_count"] == 0
+    assert empty.json()["sla_eligible_count"] == 0
+
+
+def test_queue_period_uses_clinic_timezone_default_window_and_dst(
+    client: TestClient,
+) -> None:
+    tenant_id = uuid4()
+    session = _session(tenant_id, "dst-radar")
+    at_start = _record(
+        tenant_id,
+        session.id,
+        created_at=datetime(2026, 3, 8, 5, tzinfo=timezone.utc),
+        reason=HandoffReason.USER_REQUEST.value,
+        intent="at-start",
+        context={},
+        first_message="private-at-start",
+    )
+    at_end = _record(
+        tenant_id,
+        session.id,
+        created_at=datetime(2026, 3, 9, 4, tzinfo=timezone.utc),
+        reason=HandoffReason.USER_REQUEST.value,
+        intent="at-end",
+        context={},
+        first_message="private-at-end",
+    )
+    _seed(
+        client,
+        tenants=[tenant_id],
+        sessions=[session],
+        handoffs=[at_start, at_end],
+        clinic_timezones={tenant_id: "America/New_York"},
+    )
+
+    response = client.get(
+        "/v1/handoffs/queue",
+        params={
+            "tenant_id": str(tenant_id),
+            "from_date": "2026-03-08",
+            "to_date": "2026-03-08",
+            "timezone": "Asia/Tokyo",
+        },
+        headers=_jwt_headers("clinic_admin", tenant_id),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["id"] for item in body["items"]] == [str(at_start.id)]
+    assert body["period_timezone"] == "America/New_York"
+    assert body["period_start"] == "2026-03-08T05:00:00Z"
+    assert body["period_end_exclusive"] == "2026-03-09T04:00:00Z"
+
+    invalid = client.get(
+        "/v1/handoffs/queue",
+        params={
+            "tenant_id": str(tenant_id),
+            "from_date": "2026-03-09",
+            "to_date": "2026-03-08",
+        },
+        headers=_jwt_headers("clinic_admin", tenant_id),
+    )
+    assert invalid.status_code == 400
+    assert invalid.json()["detail"] == "invalid_date_range"
+
+    from src.services.handoff_service import HandoffService
+
+    fixed_as_of = datetime(2026, 9, 28, 12, tzinfo=timezone.utc)
+    default_period = client._submit(  # type: ignore[attr-defined]
+        HandoffService().get_queue_sla(tenant_id, as_of=fixed_as_of)
+    )
+    assert default_period.period.start_utc == datetime(
+        2026, 8, 29, 4, tzinfo=timezone.utc
+    )
+    assert default_period.period.end_exclusive_utc == datetime(
+        2026, 9, 29, 4, tzinfo=timezone.utc
+    )
+
+
+def test_queue_rejects_unrepresentable_local_start_before_cohort_query(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.repositories.handoff import HandoffRecordRepository
+
+    tenant_id = uuid4()
+    session = _session(tenant_id, "date-min-radar")
+    _seed(
+        client,
+        tenants=[tenant_id],
+        sessions=[session],
+        handoffs=[],
+        clinic_timezones={tenant_id: "Asia/Tokyo"},
+    )
+    cohort_query = AsyncMock(
+        side_effect=AssertionError("invalid period must not query the cohort")
+    )
+    monkeypatch.setattr(
+        HandoffRecordRepository,
+        "find_sla_cohort",
+        cohort_query,
+    )
+
+    response = client.get(
+        "/v1/handoffs/queue",
+        params={
+            "tenant_id": str(tenant_id),
+            "from_date": "0001-01-01",
+            "to_date": "0001-01-01",
+        },
+        headers=_jwt_headers("clinic_admin", tenant_id),
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "invalid_date_range"}
+    cohort_query.assert_not_awaited()
+
+
+def test_confirmation_is_required_for_patch_and_completion(
+    client: TestClient,
+) -> None:
+    tenant_id = uuid4()
+    session = _session(tenant_id, "confirmation-required")
+    record = _record(
+        tenant_id,
+        session.id,
+        created_at=datetime.now(timezone.utc),
+        reason=HandoffReason.USER_REQUEST.value,
+        intent="confirmation-required",
+        context={},
+        first_message="private",
+    )
+    _seed(
+        client,
+        tenants=[tenant_id],
+        sessions=[session],
+        handoffs=[record],
+    )
+    headers = _jwt_headers("clinic_admin", tenant_id)
+
+    patched = client.patch(
+        f"/v1/handoffs/{record.id}",
+        json={"status": "in_progress"},
+        headers=headers,
+    )
+    completed = client.post(
+        f"/v1/handoffs/{record.id}/complete",
+        headers=headers,
+    )
+
+    assert patched.status_code == 409
+    assert patched.json()["detail"] == "attendance_confirmation_required"
+    assert completed.status_code == 409
+    assert completed.json()["detail"] == "attendance_not_confirmed"
+    assert _handoff_state(client, record.id) == ("pending", None)
+
+
+def test_openapi_exposes_required_nullable_sla_contract(client: TestClient) -> None:
+    document = client.get("/openapi.json").json()
+    schemas = document["components"]["schemas"]
+    queue_schema = schemas["HandoffQueueResponse"]
+    item_schema = schemas["HandoffQueueItem"]
+
+    assert {
+        "avg_wait_seconds",
+        "pct_within_sla",
+        "within_sla_count",
+        "confirmed_late_count",
+        "unanswered_overdue_count",
+        "maturing_count",
+        "cancelled_unconfirmed_count",
+        "unmeasured_legacy_count",
+        "confirmed_count",
+        "sla_eligible_count",
+        "period_timezone",
+        "period_start",
+        "period_end_exclusive",
+    } <= set(queue_schema["required"])
+    assert "sla_target_seconds" in item_schema["required"]
+    assert {
+        branch.get("type")
+        for branch in queue_schema["properties"]["avg_wait_seconds"]["anyOf"]
+    } == {
+        "number",
+        "null",
+    }
+    assert {
+        branch.get("type")
+        for branch in item_schema["properties"]["sla_target_seconds"]["anyOf"]
+    } == {
+        "integer",
+        "null",
+    }
+    assert "lifecycle_version" not in str(queue_schema)
+    assert "lifecycle_version" not in str(item_schema)
+
+    confirm = document["paths"]["/v1/handoffs/queue/{handoff_id}/confirm"]["post"]
+    checkout = document["paths"]["/v1/handoffs/queue/{handoff_id}/checkout"]["post"]
+    assert confirm.get("deprecated") is not True
+    assert checkout["deprecated"] is True
+    assert "409" in confirm["responses"]
+    assert "409" in document["paths"]["/v1/handoffs/{handoff_id}"]["patch"]["responses"]
+    assert (
+        "409"
+        in document["paths"]["/v1/handoffs/{handoff_id}/complete"]["post"]["responses"]
+    )

@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime, timezone
-from typing import Any, Optional, TypeVar
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Optional, TypeVar, cast
 from uuid import UUID, uuid4
 
 from prometheus_client import Counter, Histogram
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from neurostack_core.prompt import resolve_clinic_tz
 from src.config.logging import get_logger
 from src.core.exceptions import HandoffNotFoundError, HandoffServiceError, WebhookError
 from src.handoff.models import (
@@ -31,7 +33,17 @@ from src.handoff.models import (
     WebhookDelivery,
     WebhookStatus,
 )
-from src.handoff.sla import resolve_sla_target
+from src.handoff.sla import HandoffStatus as SlaHandoffStatus
+from src.handoff.sla import (
+    SlaCategory,
+    SlaMetrics,
+    SlaOccurrence,
+    SlaPeriod,
+    aggregate_sla,
+    classify_sla,
+    resolve_sla_period,
+    resolve_sla_target,
+)
 from src.handoff.summarizer import ConversationSummarizer, get_summarizer
 from src.handoff.webhook import WebhookDispatcher, get_webhook_dispatcher
 from src.memory.event_store import (
@@ -108,6 +120,22 @@ _TRANSITIONS: dict[HandoffStatus, frozenset[HandoffStatus]] = {
 }
 
 
+@dataclass(frozen=True)
+class HandoffQueueSlaResult:
+    """One resolved queue view derived from one persisted SLA cohort."""
+
+    items: tuple[HandoffRecord, ...]
+    metrics: SlaMetrics
+    within_sla_count: int
+    confirmed_late_count: int
+    unanswered_overdue_count: int
+    maturing_count: int
+    cancelled_unconfirmed_count: int
+    unmeasured_legacy_count: int
+    period_timezone: str
+    period: SlaPeriod
+
+
 class HandoffLifecycleError(HandoffServiceError):
     """Stable lifecycle rejection exposed to HTTP adapters as a 409 code."""
 
@@ -115,6 +143,10 @@ class HandoffLifecycleError(HandoffServiceError):
         super().__init__(code)
         self.code = code
         self.current_status = current_status
+
+
+class HandoffSlaPeriodError(HandoffServiceError):
+    """The requested civil-date window cannot form an SLA cohort."""
 
 
 def _default_session_factory() -> AsyncSession:
@@ -985,6 +1017,90 @@ class HandoffService:
                 error=str(exc),
             )
             await self._persist_delivery(record, error=exc)
+
+    async def get_queue_sla(
+        self,
+        tenant_id: UUID,
+        *,
+        from_date: date | None = None,
+        to_date: date | None = None,
+        as_of: datetime | None = None,
+    ) -> HandoffQueueSlaResult:
+        """Return queue items and radar statistics from one tenant cohort.
+
+        The clock is captured once, clinic-local civil dates are resolved once,
+        and the repository executes one tenant/time predicate. The waiting list
+        is then a subset of that in-memory cohort while all six SLA categories
+        remain exhaustive over the full population.
+        """
+
+        resolved_as_of = as_of or datetime.now(timezone.utc)
+        if resolved_as_of.tzinfo is None or resolved_as_of.utcoffset() is None:
+            raise ValueError("as_of must be timezone-aware")
+        resolved_as_of = resolved_as_of.astimezone(timezone.utc)
+
+        async with self._session_factory() as session:
+            raw_operations = await session.scalar(
+                select(ClinicConfigTable.operations).where(
+                    ClinicConfigTable.tenant_id == tenant_id
+                )
+            )
+            configured_timezone = None
+            if isinstance(raw_operations, dict):
+                candidate = raw_operations.get("timezone")
+                if isinstance(candidate, str):
+                    configured_timezone = candidate
+            clinic_timezone = resolve_clinic_tz(configured_timezone)
+            local_today = resolved_as_of.astimezone(clinic_timezone).date()
+            try:
+                period = resolve_sla_period(
+                    from_date or local_today - timedelta(days=30),
+                    to_date or local_today,
+                    clinic_timezone.key,
+                    as_of=resolved_as_of,
+                )
+            except (OverflowError, TypeError, ValueError) as exc:
+                raise HandoffSlaPeriodError("invalid_date_range") from exc
+            cohort = await HandoffRecordRepository(session).find_sla_cohort(
+                tenant_id=tenant_id,
+                start_utc=period.start_utc,
+                end_exclusive_utc=period.end_exclusive_utc,
+            )
+
+        classifications = tuple(
+            classify_sla(
+                SlaOccurrence(
+                    created_at=_aware(record.created_at) or period.as_of,
+                    confirmed_at=_aware(record.data_hora_saida),
+                    sla_target_seconds=record.sla_target_seconds,
+                    status=cast(SlaHandoffStatus, record.status),
+                ),
+                as_of=period.as_of,
+            )
+            for record in cohort
+        )
+        counts = {
+            category: sum(item.category is category for item in classifications)
+            for category in SlaCategory
+        }
+        waiting_statuses = {
+            HandoffStatus.PENDING.value,
+            HandoffStatus.ACCEPTED.value,
+        }
+        return HandoffQueueSlaResult(
+            items=tuple(
+                record for record in cohort if record.status in waiting_statuses
+            ),
+            metrics=aggregate_sla(classifications),
+            within_sla_count=counts[SlaCategory.WITHIN_SLA],
+            confirmed_late_count=counts[SlaCategory.CONFIRMED_LATE],
+            unanswered_overdue_count=counts[SlaCategory.UNANSWERED_OVERDUE],
+            maturing_count=counts[SlaCategory.MATURING],
+            cancelled_unconfirmed_count=counts[SlaCategory.CANCELLED_UNCONFIRMED],
+            unmeasured_legacy_count=counts[SlaCategory.UNMEASURED_LEGACY],
+            period_timezone=clinic_timezone.key,
+            period=period,
+        )
 
     async def get_handoff(
         self,

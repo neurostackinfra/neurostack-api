@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Any, Mapping, Optional, Sequence
 from uuid import UUID
@@ -231,6 +232,32 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
             stmt = stmt.where(HandoffRecord.status == status)
         result = await self.session.execute(stmt)
         return result.scalar() or 0
+
+    async def find_sla_cohort(
+        self,
+        *,
+        tenant_id: UUID,
+        start_utc: datetime,
+        end_exclusive_utc: datetime,
+    ) -> list[HandoffRecord]:
+        """Load the complete tenant SLA cohort through one half-open predicate.
+
+        Consumers must derive both queue items and every aggregate from this
+        returned population. Keeping the time and tenant boundary here avoids
+        subtly different SQL predicates for the list and radar statistics.
+        """
+
+        statement = (
+            select(HandoffRecord)
+            .where(
+                HandoffRecord.tenant_id == tenant_id,
+                HandoffRecord.created_at >= start_utc,
+                HandoffRecord.created_at < end_exclusive_utc,
+            )
+            .order_by(HandoffRecord.created_at.asc(), HandoffRecord.id.asc())
+        )
+        result = await self.session.execute(statement)
+        return list(result.scalars().all())
 
     async def compare_and_set(
         self,
