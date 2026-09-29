@@ -434,11 +434,13 @@ class HandoffDetail(BaseModel):
     # Webhook
     webhook_sent: bool = False
     webhook_status: Optional[WebhookStatus] = None
+    webhook_response: Optional[dict[str, Any]] = None
 
     # Timestamps
     created_at: datetime
     updated_at: Optional[datetime] = None
     resolved_at: Optional[datetime] = None
+    data_hora_saida: Optional[datetime] = None
 
     # Resolution
     resolution_notes: Optional[str] = None

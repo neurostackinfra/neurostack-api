@@ -225,7 +225,7 @@ def test_queue_and_checkout_share_canonical_projection_and_fifo(
         assert checkout_body["safety_flag"] is safety_flag
         assert checkout_body["intencao_detectada"] == intent
         assert checkout_body["primeira_linha_mensagem"] == expected[item["id"]][2]
-        assert checkout_body["status"] == "completed"
+        assert checkout_body["status"] == "in_progress"
         assert checkout_body["data_hora_saida"] is not None
         assert checkout_body["wait_seconds"] is not None
 
@@ -234,7 +234,7 @@ def test_queue_and_checkout_share_canonical_projection_and_fifo(
         headers=headers,
     )
     assert duplicate.status_code == 409
-    assert duplicate.json()["detail"] == "already_completed"
+    assert duplicate.json()["detail"] == "attendance_already_confirmed"
 
 
 def test_queue_preserves_authentication_and_tenant_boundaries(
@@ -287,6 +287,7 @@ def test_queue_preserves_authentication_and_tenant_boundaries(
     )
     cross_tenant_checkout = client.post(
         f"/v1/handoffs/queue/{other.id}/checkout",
+        params={"tenant_id": str(other_tenant)},
         headers=headers,
     )
 
@@ -295,6 +296,6 @@ def test_queue_preserves_authentication_and_tenant_boundaries(
     assert [item["id"] for item in own_queue.json()["items"]] == [str(own.id)]
     assert tenant_override.status_code == 403
     assert tenant_override.json()["detail"] == "tenant_mismatch"
-    assert cross_tenant_checkout.status_code == 403
-    assert cross_tenant_checkout.json()["detail"] == "tenant_mismatch"
+    assert cross_tenant_checkout.status_code == 404
+    assert cross_tenant_checkout.json()["detail"] == "handoff_not_found"
     assert _handoff_state(client, other.id) == ("pending", None)

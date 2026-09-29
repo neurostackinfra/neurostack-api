@@ -1,36 +1,79 @@
-"""
-NeuroStack - Handoff Record Repository
-Data access layer for HandoffRecord model.
-"""
+"""Tenant-scoped persistence and optimistic CAS for handoff records."""
 
-from typing import Optional
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Mapping, Optional, Sequence
 from uuid import UUID
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import ColumnElement, and_, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.config.logging import get_logger
 from src.models.handoff import HandoffRecord, HandoffStatus
 from src.repositories.base import BaseRepository
 
-logger = get_logger(__name__)
+
+class HandoffCasOutcome(str, Enum):
+    """Exhaustive outcomes of a lifecycle compare-and-set."""
+
+    APPLIED = "applied"
+    NOT_FOUND = "not_found"
+    INVALID_STATE = "invalid_state"
+    CONFLICT = "conflict"
+
+
+@dataclass(frozen=True)
+class HandoffCasResult:
+    """Typed repository result; only ``applied`` carries a mutated record."""
+
+    outcome: HandoffCasOutcome
+    record: HandoffRecord | None = None
+    current_status: str | None = None
+
+    @classmethod
+    def applied(cls, record: HandoffRecord) -> "HandoffCasResult":
+        return cls(HandoffCasOutcome.APPLIED, record=record)
+
+    @classmethod
+    def not_found(cls) -> "HandoffCasResult":
+        return cls(HandoffCasOutcome.NOT_FOUND)
+
+    @classmethod
+    def invalid_state(cls, current_status: str) -> "HandoffCasResult":
+        return cls(
+            HandoffCasOutcome.INVALID_STATE,
+            current_status=current_status,
+        )
+
+    @classmethod
+    def conflict(cls, current_status: str | None = None) -> "HandoffCasResult":
+        return cls(HandoffCasOutcome.CONFLICT, current_status=current_status)
 
 
 class HandoffRecordRepository(BaseRepository[HandoffRecord]):
-    """
-    Repository for HandoffRecord model operations.
-
-    Provides methods for:
-    - CRUD operations (inherited from BaseRepository)
-    - Finding handoffs by tenant
-    - Finding handoffs by session
-    - Finding handoffs by status
-    - Finding active handoffs
-    - Finding handoffs by urgency
-    """
+    """Data access for handoffs, including the canonical lifecycle CAS."""
 
     def __init__(self, session: AsyncSession):
         super().__init__(session, HandoffRecord)
+
+    async def get_for_tenant(
+        self,
+        tenant_id: UUID,
+        handoff_id: UUID,
+    ) -> HandoffRecord | None:
+        """Return one handoff only when it belongs to ``tenant_id``."""
+
+        statement = (
+            select(HandoffRecord)
+            .where(
+                HandoffRecord.id == handoff_id,
+                HandoffRecord.tenant_id == tenant_id,
+            )
+            .execution_options(populate_existing=True)
+        )
+        result = await self.session.execute(statement)
+        return result.scalar_one_or_none()
 
     async def find_by_tenant(
         self,
@@ -39,22 +82,9 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
         skip: int = 0,
         limit: Optional[int] = None,
     ) -> list[HandoffRecord]:
-        """
-        Find handoffs for a tenant.
-
-        Args:
-            tenant_id: Tenant ID
-            status: Optional status filter
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-
-        Returns:
-            List of handoff instances (ordered by created_at DESC)
-        """
         filters: dict[str, object] = {"tenant_id": tenant_id}
         if status:
             filters["status"] = status
-
         return await self.find_many(
             skip=skip,
             limit=limit,
@@ -70,26 +100,12 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
         skip: int = 0,
         limit: Optional[int] = None,
     ) -> list[HandoffRecord]:
-        """
-        Find handoffs for a session.
-
-        Args:
-            tenant_id: Tenant ID
-            session_id: Session ID
-            status: Optional status filter
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-
-        Returns:
-            List of handoff instances (ordered by created_at DESC)
-        """
         filters: dict[str, object] = {
             "tenant_id": tenant_id,
             "session_id": session_id,
         }
         if status:
             filters["status"] = status
-
         return await self.find_many(
             skip=skip,
             limit=limit,
@@ -99,47 +115,53 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
 
     async def find_active(
         self,
-        tenant_id: Optional[UUID] = None,
+        tenant_id: UUID,
         skip: int = 0,
         limit: Optional[int] = None,
     ) -> list[HandoffRecord]:
-        """
-        Find active handoffs (pending, accepted, or in_progress).
-
-        Args:
-            tenant_id: Optional tenant ID filter
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-
-        Returns:
-            List of active handoff instances (ordered by urgency and created_at)
-        """
-        stmt = select(HandoffRecord).where(
-            HandoffRecord.status.in_(
-                [
-                    HandoffStatus.PENDING.value,
-                    HandoffStatus.ACCEPTED.value,
-                    HandoffStatus.IN_PROGRESS.value,
-                ]
+        stmt = (
+            select(HandoffRecord)
+            .where(
+                HandoffRecord.tenant_id == tenant_id,
+                HandoffRecord.status.in_(
+                    [
+                        HandoffStatus.PENDING.value,
+                        HandoffStatus.ACCEPTED.value,
+                        HandoffStatus.IN_PROGRESS.value,
+                    ]
+                ),
             )
+            .order_by(HandoffRecord.urgency.desc(), HandoffRecord.created_at.asc())
         )
-
-        if tenant_id:
-            stmt = stmt.where(HandoffRecord.tenant_id == tenant_id)
-
-        # Order by urgency (critical first) then created_at
-        stmt = stmt.order_by(
-            HandoffRecord.urgency.desc(),
-            HandoffRecord.created_at.asc(),
-        )
-
         if skip > 0:
             stmt = stmt.offset(skip)
         if limit is not None:
             stmt = stmt.limit(limit)
-
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
+
+    async def find_active_for_session(
+        self,
+        tenant_id: UUID,
+        session_id: UUID,
+    ) -> HandoffRecord | None:
+        result = await self.session.execute(
+            select(HandoffRecord)
+            .where(
+                HandoffRecord.tenant_id == tenant_id,
+                HandoffRecord.session_id == session_id,
+                HandoffRecord.status.in_(
+                    [
+                        HandoffStatus.PENDING.value,
+                        HandoffStatus.ACCEPTED.value,
+                        HandoffStatus.IN_PROGRESS.value,
+                    ]
+                ),
+            )
+            .order_by(HandoffRecord.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
 
     async def find_by_status(
         self,
@@ -148,18 +170,6 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
         skip: int = 0,
         limit: Optional[int] = None,
     ) -> list[HandoffRecord]:
-        """
-        Find handoffs by status.
-
-        Args:
-            tenant_id: Tenant ID
-            status: Handoff status
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-
-        Returns:
-            List of handoff instances
-        """
         return await self.find_by_tenant(
             tenant_id=tenant_id,
             status=status,
@@ -175,48 +185,31 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
         skip: int = 0,
         limit: Optional[int] = None,
     ) -> list[HandoffRecord]:
-        """
-        Find handoffs by urgency level.
-
-        Args:
-            tenant_id: Tenant ID
-            urgency: Urgency level
-            active_only: Only return active handoffs
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-
-        Returns:
-            List of handoff instances
-        """
-        filters = {
-            "tenant_id": tenant_id,
-            "urgency": urgency,
-        }
+        filters = {"tenant_id": tenant_id, "urgency": urgency}
         if active_only:
-            # Active statuses
-            stmt = select(HandoffRecord).where(
-                and_(
-                    HandoffRecord.tenant_id == tenant_id,
-                    HandoffRecord.urgency == urgency,
-                    HandoffRecord.status.in_(
-                        [
-                            HandoffStatus.PENDING.value,
-                            HandoffStatus.ACCEPTED.value,
-                            HandoffStatus.IN_PROGRESS.value,
-                        ]
-                    ),
+            stmt = (
+                select(HandoffRecord)
+                .where(
+                    and_(
+                        HandoffRecord.tenant_id == tenant_id,
+                        HandoffRecord.urgency == urgency,
+                        HandoffRecord.status.in_(
+                            [
+                                HandoffStatus.PENDING.value,
+                                HandoffStatus.ACCEPTED.value,
+                                HandoffStatus.IN_PROGRESS.value,
+                            ]
+                        ),
+                    )
                 )
+                .order_by(HandoffRecord.created_at.asc())
             )
-            stmt = stmt.order_by(HandoffRecord.created_at.asc())
-
             if skip > 0:
                 stmt = stmt.offset(skip)
             if limit is not None:
                 stmt = stmt.limit(limit)
-
             result = await self.session.execute(stmt)
             return list(result.scalars().all())
-
         return await self.find_many(
             skip=skip,
             limit=limit,
@@ -229,16 +222,6 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
         tenant_id: UUID,
         status: Optional[str] = None,
     ) -> int:
-        """
-        Count handoffs for a tenant.
-
-        Args:
-            tenant_id: Tenant ID
-            status: Optional status filter
-
-        Returns:
-            Number of handoffs
-        """
         stmt = (
             select(func.count())
             .select_from(HandoffRecord)
@@ -246,81 +229,81 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
         )
         if status:
             stmt = stmt.where(HandoffRecord.status == status)
-
         result = await self.session.execute(stmt)
         return result.scalar() or 0
 
-    async def accept_handoff(
+    async def compare_and_set(
         self,
+        *,
+        tenant_id: UUID,
         handoff_id: UUID,
-        agent_id: Optional[str] = None,
-    ) -> bool:
+        observed_status: str,
+        observed_lifecycle_version: int,
+        allowed_statuses: Sequence[str],
+        values: Mapping[str, Any],
+        preconditions: Sequence[ColumnElement[bool]] = (),
+    ) -> HandoffCasResult:
+        """Apply one domain mutation against the exact observed state/version.
+
+        PostgreSQL re-evaluates the frozen predicate after a row-lock wait. A
+        loser therefore returns zero rows and is diagnosed without retrying the
+        operation against state produced by the winner.
         """
-        Accept a handoff.
 
-        Args:
-            handoff_id: Handoff ID
-            agent_id: Optional agent ID
+        if observed_status not in allowed_statuses:
+            return HandoffCasResult.invalid_state(observed_status)
 
-        Returns:
-            True if updated, False if not found
-        """
-        instance = await self.get_by_id(handoff_id)
-        if instance is None:
-            return False
+        lifecycle_values = dict(values)
+        lifecycle_values.update(
+            updated_at=func.now(),
+            lifecycle_version=HandoffRecord.lifecycle_version + 1,
+        )
+        statement = (
+            update(HandoffRecord)
+            .where(
+                HandoffRecord.id == handoff_id,
+                HandoffRecord.tenant_id == tenant_id,
+                HandoffRecord.status == observed_status,
+                HandoffRecord.lifecycle_version == observed_lifecycle_version,
+                *preconditions,
+            )
+            .values(**lifecycle_values)
+            .returning(HandoffRecord)
+            .execution_options(synchronize_session=False)
+        )
+        applied = (await self.session.execute(statement)).scalar_one_or_none()
+        if applied is not None:
+            await self.session.refresh(applied)
+            return HandoffCasResult.applied(applied)
 
-        instance.accept(agent_id)
-        await self.session.flush()
-        await self.session.refresh(instance)
-        logger.debug("Accepted handoff", handoff_id=str(handoff_id))
-        return True
+        current = await self.get_for_tenant(tenant_id, handoff_id)
+        if current is None:
+            return HandoffCasResult.not_found()
+        if (
+            current.lifecycle_version != observed_lifecycle_version
+            or current.status != observed_status
+        ):
+            return HandoffCasResult.conflict(current.status)
+        return HandoffCasResult.invalid_state(current.status)
 
-    async def complete_handoff(
+    async def update_webhook_delivery(
         self,
+        *,
+        tenant_id: UUID,
         handoff_id: UUID,
-        notes: Optional[str] = None,
+        sent: bool,
+        status: str,
+        response: Mapping[str, Any] | None,
     ) -> bool:
-        """
-        Complete a handoff.
+        """Persist delivery bookkeeping without mutating lifecycle metadata."""
 
-        Args:
-            handoff_id: Handoff ID
-            notes: Optional resolution notes
-
-        Returns:
-            True if updated, False if not found
-        """
-        instance = await self.get_by_id(handoff_id)
-        if instance is None:
+        record = await self.get_for_tenant(tenant_id, handoff_id)
+        if record is None:
             return False
-
-        instance.complete(notes)
+        context = dict(record.context or {})
+        context["webhook_status"] = status
+        record.context = context
+        record.webhook_sent = sent
+        record.webhook_response = dict(response) if response is not None else None
         await self.session.flush()
-        await self.session.refresh(instance)
-        logger.debug("Completed handoff", handoff_id=str(handoff_id))
-        return True
-
-    async def cancel_handoff(
-        self,
-        handoff_id: UUID,
-        notes: Optional[str] = None,
-    ) -> bool:
-        """
-        Cancel a handoff.
-
-        Args:
-            handoff_id: Handoff ID
-            notes: Optional cancellation notes
-
-        Returns:
-            True if updated, False if not found
-        """
-        instance = await self.get_by_id(handoff_id)
-        if instance is None:
-            return False
-
-        instance.cancel(notes)
-        await self.session.flush()
-        await self.session.refresh(instance)
-        logger.debug("Cancelled handoff", handoff_id=str(handoff_id))
         return True

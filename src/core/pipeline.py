@@ -403,6 +403,7 @@ class CognitivePipeline:
                         input_data.session_id,
                         verification_status,
                         handoff_id=handoff_id,
+                        tenant_id=input_data.tenant_id,
                     )
                 )
                 should_pause, paused_until_iso = await self._apply_handoff_pause(
