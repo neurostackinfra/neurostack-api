@@ -1254,8 +1254,6 @@ const INVESTOR_MOCK_CONFIG = {
     sat: { open: "09:00", close: "14:00" },
   },
   service_format: "both",
-  online_services_desc: "Consulta de avaliação, acompanhamento pós-procedimento, orientações nutricionais",
-  presential_services_desc: "Aplicação de toxina botulínica, preenchimento labial, limpeza de pele profunda, harmonização facial",
   differentials: "Especialistas com mais de 10 anos de experiência, atendimento humanizado e foco em resultados naturais. Equipamentos de última geração importados da Alemanha.",
   accepts_insurance: "yes",
   insurance_list: "Unimed, Bradesco Saúde, SulAmérica, Amil",
@@ -1368,8 +1366,6 @@ export default function ClinicConfig() {
   const [businessHours, setBusinessHours] = useState<BusinessHoursMap | null>(null);
   const [businessHoursErrors, setBusinessHoursErrors] = useState<Record<string, string>>({});
   const [metaMinutosAtendimento, setMetaMinutosAtendimento] = useState("10");
-  const [onlineServicesDesc, setOnlineServicesDesc] = useState("");
-  const [presentialServicesDesc, setPresentialServicesDesc] = useState("");
 
   // Tab 3 — Regras de Negócio
   const [differentials, setDifferentials] = useState("");
@@ -1464,8 +1460,6 @@ export default function ClinicConfig() {
     setHandoffCycleDays(config.handoff_cycle_days ?? "");
     setHandoffInactiveDefaultHours(config.handoff_inactive_default_hours ?? "24");
     setMetaMinutosAtendimento(String(config.meta_minutos_atendimento ?? "10"));
-    setOnlineServicesDesc(config.online_services_desc ?? "");
-    setPresentialServicesDesc(config.presential_services_desc ?? "");
     setServices(Array.isArray(config.services) ? config.services.map(hydrateClinicService) : []);
     setServiceFormatErrors({});
     // bot_active: treat null/undefined as true (default on)
@@ -1708,8 +1702,6 @@ export default function ClinicConfig() {
       handoff_cycle_days: handoffCycleDays.trim() || null,
       handoff_inactive_default_hours: parseInt(handoffInactiveDefaultHours, 10) || 24,
       meta_minutos_atendimento: parseInt(metaMinutosAtendimento, 10) || 10,
-      online_services_desc: onlineServicesDesc.trim() || null,
-      presential_services_desc: presentialServicesDesc.trim() || null,
     };
     try {
       const token = getToken();
@@ -2246,40 +2238,6 @@ export default function ClinicConfig() {
                   </SelectContent>
                 </Select>
               </Field>
-
-              {(serviceFormat === "online" || serviceFormat === "both") && (
-                <Field
-                  label={txt("Serviços realizados Online", "Online Services")}
-                  hint={txt("Quais procedimentos ou consultas são oferecidos de forma remota.", "Which procedures or consultations are offered remotely.")}
-                >
-                  <Textarea
-                    value={onlineServicesDesc}
-                    onChange={(e) => setOnlineServicesDesc(e.target.value)}
-                    placeholder={txt("Ex: Consulta de avaliação, acompanhamento pós-procedimento, orientações nutricionais", "e.g. Assessment consultation, post-procedure follow-up, nutritional guidance")}
-                    rows={3}
-                    className="resize-none text-sm"
-                    disabled={isReadOnly}
-                    data-testid="textarea-online-services"
-                  />
-                </Field>
-              )}
-
-              {(serviceFormat === "presential" || serviceFormat === "both") && (
-                <Field
-                  label={txt("Serviços realizados Presencialmente", "In-Person Services")}
-                  hint={txt("Quais procedimentos exigem presença física na clínica.", "Which procedures require physical presence at the clinic.")}
-                >
-                  <Textarea
-                    value={presentialServicesDesc}
-                    onChange={(e) => setPresentialServicesDesc(e.target.value)}
-                    placeholder={txt("Ex: Aplicação de toxina botulínica, preenchimento labial, limpeza de pele profunda", "e.g. Botulinum toxin application, lip filler, deep skin cleansing")}
-                    rows={3}
-                    className="resize-none text-sm"
-                    disabled={isReadOnly}
-                    data-testid="textarea-presential-services"
-                  />
-                </Field>
-              )}
             </CardContent>
           </Card>
         </TabsContent>
