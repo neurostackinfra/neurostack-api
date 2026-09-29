@@ -201,6 +201,9 @@ alembic/versions/*.pyc
 !.genie/wishes/neurostack-core-dedomainification/
 .genie/wishes/neurostack-core-dedomainification/*
 !.genie/wishes/neurostack-core-dedomainification/WISH.md
+!.genie/wishes/clinic-modality-source-of-truth/
+.genie/wishes/clinic-modality-source-of-truth/*
+!.genie/wishes/clinic-modality-source-of-truth/WISH.md
 # Replit artifacts
 .replit-artifact/
 .genie/genie.db
