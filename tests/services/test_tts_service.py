@@ -243,7 +243,7 @@ def test_upstream_error_is_secret_free() -> None:
     assert secret not in repr(exc.value)
 
 
-def test_openai_upstream_4xx_is_bucketed_and_secret_free() -> None:
+def test_openai_upstream_error_keeps_status_and_is_secret_free() -> None:
     secret = "very-secret-openai-key"
     upstream_body = "upstream-body-that-must-not-leak"
     credentials = {
@@ -253,12 +253,24 @@ def test_openai_upstream_4xx_is_bucketed_and_secret_free() -> None:
         "tts_model_name": "gpt-4o-mini-tts",
         "tts_voice_id": "alloy",
     }
-    transport = httpx.MockTransport(
+    transport_401 = httpx.MockTransport(
+        lambda request: httpx.Response(401, text=upstream_body)
+    )
+    with egress_env(transport_401):
+        with pytest.raises(TtsSynthesisError) as exc_401:
+            asyncio.run(tts_service.synthesize_speech("Olá", credentials))
+    assert exc_401.value.code == "tts_upstream_http_error_401"
+    assert secret not in repr(exc_401.value)
+    assert upstream_body not in repr(exc_401.value)
+
+    transport_429 = httpx.MockTransport(
         lambda request: httpx.Response(429, text=upstream_body)
     )
-    with egress_env(transport):
-        with pytest.raises(TtsSynthesisError) as exc:
+    with egress_env(transport_429):
+        with pytest.raises(TtsSynthesisError) as exc_429:
             asyncio.run(tts_service.synthesize_speech("Olá", credentials))
-    assert exc.value.code == "tts_upstream_http_error_4xx"
-    assert secret not in repr(exc.value)
-    assert upstream_body not in repr(exc.value)
+    assert exc_429.value.code == "tts_upstream_http_error_429"
+    assert secret not in repr(exc_429.value)
+    assert upstream_body not in repr(exc_429.value)
+
+    assert exc_401.value.code != exc_429.value.code
