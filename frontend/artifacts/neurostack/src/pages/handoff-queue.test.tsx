@@ -283,6 +283,76 @@ describe("<HandoffQueuePage />", () => {
     expect(cardIds()).toEqual(["fresh"]);
   });
 
+  it("clears stale data and blocks export until the edited period loads", async () => {
+    const nextPeriod = deferred<Response>();
+    mocks.fetch
+      .mockResolvedValueOnce(queueResponse())
+      .mockImplementationOnce(() => nextPeriod.promise)
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 500,
+        json: async () => ({}),
+      } as Response);
+    renderPage();
+    await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
+    const exportButton = screen.getByRole("button", { name: "Exportar CSV" });
+
+    fireEvent.change(dateInputs()[0], { target: { value: "2026-09-02" } });
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(2));
+
+    expect(cardIds()).toEqual([]);
+    expect(screen.queryByText("00:02:18")).not.toBeInTheDocument();
+    expect(exportButton).toBeDisabled();
+    fireEvent.click(exportButton);
+    expect(mocks.fetch).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      nextPeriod.resolve(
+        queueResponse([item("new-period")], {
+          avg_wait_seconds: 222,
+          period_start: "2026-09-02T03:00:00Z",
+        }),
+      );
+      await nextPeriod.promise;
+    });
+
+    await waitFor(() => expect(cardIds()).toEqual(["new-period"]));
+    expect(exportButton).toBeEnabled();
+    fireEvent.click(exportButton);
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(3));
+    expect(String(mocks.fetch.mock.calls[2][0])).toContain(
+      "from_date=2026-09-02",
+    );
+  });
+
+  it.each(["http", "network"] as const)(
+    "keeps stale data hidden and export unavailable after a %s period failure",
+    async (failure) => {
+      mocks.fetch
+        .mockResolvedValueOnce(queueResponse())
+        .mockImplementationOnce(() =>
+          failure === "http"
+            ? Promise.resolve({ ok: false, status: 500 } as Response)
+            : Promise.reject(new Error("offline")),
+        );
+      renderPage();
+      await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
+
+      fireEvent.change(dateInputs()[0], { target: { value: "2026-09-02" } });
+      await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(2));
+      await waitFor(() =>
+        expect(
+          screen.getByRole("button", { name: "Exportar CSV" }),
+        ).toBeDisabled(),
+      );
+
+      expect(cardIds()).toEqual([]);
+      expect(screen.queryByText("00:02:18")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Exportar CSV" }));
+      expect(mocks.fetch).toHaveBeenCalledTimes(2);
+    },
+  );
+
   it("resets to backend defaults when the active clinic changes", async () => {
     mocks.fetch
       .mockResolvedValueOnce(
@@ -354,6 +424,20 @@ describe("<HandoffQueuePage />", () => {
     );
     fireEvent.change(dateInputs()[0], { target: { value: "2026-09-02" } });
     await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(3));
+    expect(cardIds()).toEqual([]);
+    await act(async () => {
+      preCommitScope.resolve(
+        queueResponse([item("shared-card")], {
+          avg_wait_seconds: 120,
+          within_sla_count: 4,
+          sla_eligible_count: 5,
+          period_start: "2026-09-02T03:00:00Z",
+          period_end_exclusive: "2026-10-01T03:00:00Z",
+        }),
+      );
+      await preCommitScope.promise;
+    });
+    await waitFor(() => expect(cardIds()).toEqual(["shared-card"]));
     const currentScopeButton = screen.getByRole("button", {
       name: "Confirmando…",
     });
@@ -369,15 +453,6 @@ describe("<HandoffQueuePage />", () => {
     });
     await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(4));
     await act(async () => {
-      preCommitScope.resolve(
-        queueResponse([item("shared-card")], {
-          avg_wait_seconds: 120,
-          within_sla_count: 4,
-          sla_eligible_count: 5,
-          period_start: "2026-09-02T03:00:00Z",
-          period_end_exclusive: "2026-10-01T03:00:00Z",
-        }),
-      );
       authoritativeScope.resolve(
         queueResponse([], {
           avg_wait_seconds: 222,
@@ -387,7 +462,7 @@ describe("<HandoffQueuePage />", () => {
           period_end_exclusive: "2026-10-01T03:00:00Z",
         }),
       );
-      await Promise.all([preCommitScope.promise, authoritativeScope.promise]);
+      await authoritativeScope.promise;
     });
 
     expect(cardIds()).toEqual([]);
@@ -451,6 +526,15 @@ describe("<HandoffQueuePage />", () => {
     expect(open).toHaveBeenCalledWith("https://wa.me/5511999999997", "_blank");
     expect(mocks.fetch).toHaveBeenCalledTimes(1);
     expect(cardIds()).toContain("a");
+  });
+
+  it.each([
+    ["pt" as const, "Confirme somente após iniciar o atendimento humano."],
+    ["en" as const, "Confirm only after human service has started."],
+  ])("shows confirmation timing guidance in %s", async (locale, guidance) => {
+    await renderLoaded(locale);
+
+    expect(screen.getAllByText(guidance)).toHaveLength(FIFO_ITEMS.length);
   });
 
   it.each([

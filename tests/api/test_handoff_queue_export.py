@@ -753,6 +753,62 @@ def test_export_enforces_ten_thousand_limit_without_partial_csv(
     assert not response.content.startswith(b"\xef\xbb\xbf")
 
 
+@pytest.mark.parametrize(
+    ("status", "created_at", "checked_out_at"),
+    [
+        (
+            "pending",
+            datetime(2026, 6, 1, 13, tzinfo=timezone.utc),
+            None,
+        ),
+        (
+            "in_progress",
+            datetime(2026, 6, 1, 11, tzinfo=timezone.utc),
+            datetime(2026, 6, 1, 10, tzinfo=timezone.utc),
+        ),
+    ],
+)
+def test_export_fails_before_csv_for_invalid_temporal_invariants(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    created_at: datetime,
+    checked_out_at: datetime | None,
+) -> None:
+    from src.api.routes import handoff as route
+
+    class ExportDatetime(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            return datetime(2026, 6, 1, 12, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(route, "datetime", ExportDatetime)
+    tenant = _tenant()
+    session = _session(tenant.id)
+    record = _handoff(
+        tenant.id,
+        session.id,
+        created_at=created_at,
+        status=status,
+        checked_out_at=checked_out_at,
+        phone="invalid-temporal-order",
+    )
+    _seed(client, tenant, session, record)
+
+    response = _export(
+        client,
+        tenant.id,
+        from_date="2026-06-01",
+        to_date="2026-06-01",
+    )
+
+    assert response.status_code == 400
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {"detail": "invalid_handoff_timestamps"}
+    assert "content-disposition" not in response.headers
+    assert not response.content.startswith(b"\xef\xbb\xbf")
+
+
 def test_export_requires_credentials_and_honors_api_key_tenant_boundary(
     client: TestClient,
 ) -> None:

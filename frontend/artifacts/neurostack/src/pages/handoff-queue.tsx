@@ -424,6 +424,8 @@ export default function HandoffQueuePage() {
   const confirmingKeysRef = useRef<Set<string>>(new Set());
   const fetchSequenceRef = useRef(0);
   const fetchQueueRef = useRef<() => Promise<void>>(async () => undefined);
+  const loadedScopeRef = useRef<string | null>(null);
+  const [loadedScope, setLoadedScope] = useState<string | null>(null);
 
   // The backend resolves the clinic-local default period; browser dates never
   // participate until the user explicitly changes an input.
@@ -454,6 +456,12 @@ export default function HandoffQueuePage() {
     const requestedScope = `${effectiveTenantId}|${requestedStartDate}|${requestedEndDate}`;
     try {
       setLoading(true);
+      if (loadedScopeRef.current !== requestedScope) {
+        loadedScopeRef.current = null;
+        setLoadedScope(null);
+        setHandoffs([]);
+        setStats(EMPTY_STATS);
+      }
       const params = new URLSearchParams({ tenant_id: effectiveTenantId });
       if (requestedStartDate) params.set("from_date", requestedStartDate);
       if (requestedEndDate) params.set("to_date", requestedEndDate);
@@ -470,6 +478,8 @@ export default function HandoffQueuePage() {
       const { items, ...nextStats } = data;
       setHandoffs(items);
       setStats(nextStats);
+      loadedScopeRef.current = requestedScope;
+      setLoadedScope(requestedScope);
       const resolvedDates = periodDates(nextStats);
       if (resolvedDates) {
         setDateScope((current) => {
@@ -505,6 +515,8 @@ export default function HandoffQueuePage() {
     fetchSequenceRef.current += 1;
     setHandoffs([]);
     setStats(EMPTY_STATS);
+    loadedScopeRef.current = null;
+    setLoadedScope(null);
     setLoading(false);
     setDateScope({
       tenantId: effectiveTenantId,
@@ -644,6 +656,7 @@ export default function HandoffQueuePage() {
 
   const handleExport = async () => {
     if (!effectiveTenantId) return;
+    if (loadedScopeRef.current !== requestScopeRef.current) return;
     const token = getToken();
     if (!token) return;
     try {
@@ -699,6 +712,7 @@ export default function HandoffQueuePage() {
           maximumFractionDigits: 1,
         }).format(stats.pct_within_sla)}%`;
   const displayTimeZone = safeTimeZone(stats.period_timezone);
+  const canExport = loadedScope === requestScope;
 
   if (!effectiveTenantId && !isInvestor) {
     return (
@@ -769,6 +783,7 @@ export default function HandoffQueuePage() {
           <Button
             variant="outline"
             size="sm"
+            disabled={!canExport}
             onClick={handleExport}
             className="gap-1.5 h-[34px]"
           >
@@ -1021,27 +1036,32 @@ export default function HandoffQueuePage() {
                 <div className="flex-1 min-w-[2rem]" />
 
                 {/* Actions */}
-                <div className="flex flex-wrap gap-2 ml-auto shrink-0">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={!item.numero_whatsapp}
-                    onClick={() => handleOpenWhatsApp(item.numero_whatsapp)}
-                  >
-                    <MessageCircle className="h-4 w-4 mr-1" />
-                    {t("handoff_btn_open_whatsapp")}
-                  </Button>
-                  <Button
-                    size="sm"
-                    disabled={isConfirming}
-                    aria-busy={isConfirming}
-                    onClick={() => handleConfirm(item.id)}
-                    className="bg-slate-900 text-white hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white border-transparent"
-                  >
-                    {isConfirming
-                      ? t("handoff_btn_confirming")
-                      : t("handoff_btn_confirm")}
-                  </Button>
+                <div className="ml-auto shrink-0 space-y-1">
+                  <p className="text-right text-[11px] text-muted-foreground">
+                    {t("handoff_confirm_guidance")}
+                  </p>
+                  <div className="flex flex-wrap justify-end gap-2">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={!item.numero_whatsapp}
+                      onClick={() => handleOpenWhatsApp(item.numero_whatsapp)}
+                    >
+                      <MessageCircle className="h-4 w-4 mr-1" />
+                      {t("handoff_btn_open_whatsapp")}
+                    </Button>
+                    <Button
+                      size="sm"
+                      disabled={isConfirming}
+                      aria-busy={isConfirming}
+                      onClick={() => handleConfirm(item.id)}
+                      className="bg-slate-900 text-white hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white border-transparent"
+                    >
+                      {isConfirming
+                        ? t("handoff_btn_confirming")
+                        : t("handoff_btn_confirm")}
+                    </Button>
+                  </div>
                 </div>
               </div>
             </div>

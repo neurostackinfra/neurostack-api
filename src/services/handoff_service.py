@@ -10,7 +10,7 @@ from typing import Any, Optional, TypeVar, cast
 from uuid import UUID, uuid4
 
 from prometheus_client import Counter, Histogram
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from neurostack_core.prompt import resolve_clinic_tz
@@ -153,6 +153,10 @@ class HandoffLifecycleError(HandoffServiceError):
         super().__init__(code)
         self.code = code
         self.current_status = current_status
+
+
+class HandoffPostCommitError(HandoffServiceError):
+    """A required public effect failed after PostgreSQL committed."""
 
 
 class HandoffSlaPeriodError(HandoffServiceError):
@@ -479,22 +483,27 @@ class HandoffService:
         urgency: HandoffUrgency,
         summary: str,
     ) -> None:
-        event_store = await self._resolved_event_store()
-        event_data = HandoffEventData(
-            reason=reason.value,
-            summary=summary,
-            urgency=urgency.value,
-            key_info={"handoff_id": str(handoff_id)},
-        )
-        await event_store.append(
-            EventData(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                event_type=event_type.value,
-                event_data=event_data.model_dump(),
-                event_metadata={"handoff_id": str(handoff_id)},
+        try:
+            event_store = await self._resolved_event_store()
+            event_data = HandoffEventData(
+                reason=reason.value,
+                summary=summary,
+                urgency=urgency.value,
+                key_info={"handoff_id": str(handoff_id)},
             )
-        )
+            await event_store.append(
+                EventData(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    event_type=event_type.value,
+                    event_data=event_data.model_dump(),
+                    event_metadata={"handoff_id": str(handoff_id)},
+                )
+            )
+        except Exception as exc:
+            raise HandoffPostCommitError(
+                "Handoff committed but Event Store append failed"
+            ) from exc
 
     async def _recent_messages(
         self,
@@ -580,9 +589,9 @@ class HandoffService:
             return sent, status
         except WebhookError as exc:
             logger.warning(
-                "Webhook delivery failed",
+                "handoff_creation_webhook_delivery_failed",
                 handoff_id=str(record.id),
-                error=str(exc),
+                error_type=type(exc).__name__,
             )
             await self._persist_delivery(record, error=exc)
             return False, WebhookStatus.FAILED
@@ -597,35 +606,39 @@ class HandoffService:
         status = delivery.status if delivery is not None else WebhookStatus.FAILED
         response: dict[str, Any] = {
             "status": status.value,
-            "attempt": delivery.attempt if delivery is not None else None,
-            "response_status": (
-                delivery.response_status if delivery is not None else None
-            ),
-            "response_body": (
-                (delivery.response_body or "")[:1000] if delivery is not None else None
-            ),
-            "error_message": (
-                (delivery.error_message or "")[:500]
-                if delivery is not None
-                else str(error or "")[:500]
-            ),
+            "attempt": delivery.attempt if delivery is not None else 1,
         }
+        if delivery is not None and delivery.response_status is not None:
+            response["response_status"] = delivery.response_status
+        if status == WebhookStatus.FAILED or error is not None:
+            response["error_type"] = "delivery_failed"
         try:
             async with self._session_factory() as session:
                 async with session.begin():
-                    await HandoffRecordRepository(session).update_webhook_delivery(
+                    persisted = await HandoffRecordRepository(
+                        session
+                    ).update_webhook_delivery(
                         tenant_id=record.tenant_id,
                         handoff_id=record.id,
                         sent=status == WebhookStatus.SENT,
                         status=status.value,
                         response=response,
                     )
+                    if not persisted:
+                        raise HandoffPostCommitError(
+                            "Webhook delivered but its handoff bookkeeping row is missing"
+                        )
+        except HandoffPostCommitError:
+            raise
         except Exception as exc:
-            logger.warning(
-                "handoff_webhook_delivery_bookkeeping_failed",
-                handoff_id=str(record.id),
-                error_type=type(exc).__name__,
-            )
+            raise HandoffPostCommitError(
+                "Webhook delivery bookkeeping could not be persisted"
+            ) from exc
+        context = _record_context(record)
+        context["webhook_status"] = status.value
+        record.context = context
+        record.webhook_sent = status == WebhookStatus.SENT
+        record.webhook_response = response
 
     async def enrich_scheduling_verification(
         self,
@@ -655,20 +668,32 @@ class HandoffService:
                     return None
                 context = _record_context(record)
                 context["verification_status"] = verification_status
+                changed_at = await repository.current_timestamp()
                 result = await repository.compare_and_set(
                     tenant_id=tenant_id,
                     handoff_id=record.id,
                     observed_status=record.status,
                     observed_lifecycle_version=record.lifecycle_version,
                     allowed_statuses=_ACTIVE_STATUSES,
+                    changed_at=changed_at,
                     values={"context": context},
                 )
         updated = self._require_applied(result)
-        await self._deliver_status_webhook(
-            updated,
-            HandoffStatus(updated.status),
-            event_type="handoff.updated",
+        recent_messages = await self._recent_messages(
+            updated.tenant_id,
+            updated.session_id,
         )
+        try:
+            await self._deliver_status_webhook(
+                updated,
+                HandoffStatus(updated.status),
+                recent_messages,
+                event_type="handoff.updated",
+            )
+        except HandoffPostCommitError:
+            HANDOFF_OPERATIONS.labels(operation="update", status="error").inc()
+            raise
+        HANDOFF_OPERATIONS.labels(operation="update", status=updated.status).inc()
         return updated.id
 
     async def update_handoff(
@@ -805,8 +830,10 @@ class HandoffService:
                     confirmation=confirmation,
                     allow_same_status=operation == "update",
                 )
+                changed_at = await repository.current_timestamp()
                 values = self._transition_values(
                     record,
+                    changed_at=changed_at,
                     target_status=target_status,
                     assigned_to=assigned_to,
                     notes=notes,
@@ -824,17 +851,18 @@ class HandoffService:
                     observed_status=record.status,
                     observed_lifecycle_version=record.lifecycle_version,
                     allowed_statuses=(record.status,),
+                    changed_at=changed_at,
                     values=values,
                     preconditions=preconditions,
                 )
         updated = self._require_applied(result)
-        await self._after_transition(
+        recent_messages = await self._after_transition(
             updated,
             old_status=current_status,
             new_status=target_status,
             operation=operation,
         )
-        return await self.get_handoff(handoff_id, tenant_id=tenant_id)
+        return handoff_record_to_detail(updated, recent_messages)
 
     @staticmethod
     def _validate_transition(
@@ -890,6 +918,7 @@ class HandoffService:
     def _transition_values(
         record: HandoffRecord,
         *,
+        changed_at: datetime,
         target_status: HandoffStatus,
         assigned_to: str | None,
         notes: str | None,
@@ -906,13 +935,13 @@ class HandoffService:
             context["verification_status"] = verification_status
             values["context"] = context
         if confirmation:
-            values["data_hora_saida"] = func.now()
+            values["data_hora_saida"] = changed_at
         if target_status in {
             HandoffStatus.COMPLETED,
             HandoffStatus.CANCELLED,
             HandoffStatus.TIMEOUT,
         }:
-            values["resolved_at"] = func.now()
+            values["resolved_at"] = changed_at
         return values
 
     @staticmethod
@@ -932,9 +961,21 @@ class HandoffService:
         old_status: HandoffStatus,
         new_status: HandoffStatus,
         operation: str,
-    ) -> None:
-        await self._log_status_change_event(record, old_status, new_status)
-        await self._deliver_status_webhook(record, new_status)
+    ) -> list[dict[str, str]]:
+        try:
+            await self._log_status_change_event(record, old_status, new_status)
+            recent_messages = await self._recent_messages(
+                record.tenant_id,
+                record.session_id,
+            )
+            await self._deliver_status_webhook(
+                record,
+                new_status,
+                recent_messages,
+            )
+        except HandoffPostCommitError:
+            HANDOFF_OPERATIONS.labels(operation="update", status="error").inc()
+            raise
         HANDOFF_OPERATIONS.labels(operation="update", status=new_status.value).inc()
         logger.info(
             "Handoff updated",
@@ -943,6 +984,7 @@ class HandoffService:
             new_status=new_status.value,
             operation=operation,
         )
+        return recent_messages
 
     async def _log_status_change_event(
         self,
@@ -958,35 +1000,38 @@ class HandoffService:
         event_type = event_type_map.get(new_status)
         if event_type is None:
             return
-        event_store = await self._resolved_event_store()
-        await event_store.append(
-            EventData(
-                tenant_id=record.tenant_id,
-                session_id=record.session_id,
-                event_type=event_type.value,
-                event_data={
-                    "handoff_id": str(record.id),
-                    "old_status": old_status.value,
-                    "new_status": new_status.value,
-                    "assigned_to": record.assigned_to,
-                },
-                event_metadata={},
+        try:
+            event_store = await self._resolved_event_store()
+            await event_store.append(
+                EventData(
+                    tenant_id=record.tenant_id,
+                    session_id=record.session_id,
+                    event_type=event_type.value,
+                    event_data={
+                        "handoff_id": str(record.id),
+                        "old_status": old_status.value,
+                        "new_status": new_status.value,
+                        "assigned_to": record.assigned_to,
+                    },
+                    event_metadata={},
+                )
             )
-        )
+        except Exception as exc:
+            raise HandoffPostCommitError(
+                "Handoff transition committed but Event Store append failed"
+            ) from exc
 
     async def _deliver_status_webhook(
         self,
         record: HandoffRecord,
         status: HandoffStatus,
+        recent_messages: list[dict[str, str]],
         *,
         event_type: str | None = None,
     ) -> None:
         if not self.webhook_dispatcher.is_configured(record.tenant_id):
             return
         context = _record_context(record)
-        recent_messages = await self._recent_messages(
-            record.tenant_id, record.session_id
-        )
         payload = self.webhook_dispatcher.create_payload(
             handoff_id=record.id,
             tenant_id=record.tenant_id,
@@ -1022,9 +1067,9 @@ class HandoffService:
             await self._persist_delivery(record, delivery=delivery)
         except WebhookError as exc:
             logger.warning(
-                "Status webhook failed",
+                "handoff_status_webhook_delivery_failed",
                 handoff_id=str(record.id),
-                error=str(exc),
+                error_type=type(exc).__name__,
             )
             await self._persist_delivery(record, error=exc)
 
@@ -1251,7 +1296,7 @@ def get_handoff_service(event_store: Optional[EventStore] = None) -> HandoffServ
 
 async def close_handoff_service() -> None:
     global _service
-    if _service is not None:
-        if _service.webhook_dispatcher:
-            await _service.webhook_dispatcher.close()
-        _service = None
+    service = _service
+    _service = None
+    if service is not None and service.webhook_dispatcher:
+        await service.webhook_dispatcher.close()

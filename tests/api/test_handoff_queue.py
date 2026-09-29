@@ -626,6 +626,19 @@ def test_openapi_exposes_required_nullable_sla_contract(client: TestClient) -> N
     }
     assert {
         branch.get("type")
+        for branch in queue_schema["properties"]["pct_within_sla"]["anyOf"]
+    } == {
+        "number",
+        "null",
+    }
+    assert queue_schema["properties"]["period_start"]["format"] == "date-time"
+    assert queue_schema["properties"]["period_end_exclusive"]["format"] == "date-time"
+    assert any(
+        branch.get("format") == "date-time"
+        for branch in schemas["HandoffDetail"]["properties"]["updated_at"]["anyOf"]
+    )
+    assert {
+        branch.get("type")
         for branch in item_schema["properties"]["sla_target_seconds"]["anyOf"]
     } == {
         "integer",
