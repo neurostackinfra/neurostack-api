@@ -12,6 +12,10 @@ from urllib.parse import urlsplit
 
 MASKED_SECRET = "••••••••"
 GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+STT_FIXED_API_BASES: dict[str, str] = {
+    "elevenlabs_scribe": "https://api.elevenlabs.io/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+}
 
 ProviderAvailability = Literal["active", "coming_soon"]
 
@@ -56,12 +60,18 @@ PROVIDER_ALLOWLISTS: dict[str, frozenset[str]] = {
     capability: frozenset(providers)
     for capability, providers in PROVIDER_AVAILABILITY.items()
 }
+# Recognition is an internal wire/runtime concern, not public catalog state.
+# OpenRouter deliberately remains absent from ``PROVIDER_AVAILABILITY`` until
+# the catalog wish owns that public promotion.
+PROVIDER_ALLOWLISTS["stt"] = PROVIDER_ALLOWLISTS["stt"] | {"openrouter"}
 
 # Public product activation is deliberately narrower than legacy runtime
 # compatibility used to read already-stored tenant configurations.
 PUBLICLY_ACTIVE_LLM_PROVIDERS = frozenset({"gemini"})
 OPERATIONAL_LLM_PROVIDERS = frozenset({"openai", "dropout", "gemini", "outros"})
-OPERATIONAL_STT_PROVIDERS = frozenset({"outros", "openai_whisper"})
+OPERATIONAL_STT_PROVIDERS = frozenset(
+    {"outros", "openai_whisper", "elevenlabs_scribe", "openrouter"}
+)
 # Multimodal providers whose chat-completions endpoint was measured against
 # the live API and proven to transcribe the OGG/Opus that WhatsApp actually
 # delivers. Evidence:
@@ -291,6 +301,33 @@ def validate_llm_provider_endpoint(credentials: Mapping[str, Any]) -> None:
         validate_gemini_endpoint(credentials.get("llm_api_url"))
 
 
+def validate_stt_provider_endpoint(provider: Any, value: Any) -> None:
+    """Require the immutable base for an explicit Scribe/OpenRouter provider."""
+
+    expected = STT_FIXED_API_BASES.get(provider)
+    if expected is None:
+        return
+    if not isinstance(value, str):
+        raise CredentialPolicyError(
+            "invalid_provider_endpoint",
+            capability="stt",
+            provider=provider,
+            field="stt_api_url",
+        )
+    try:
+        parsed = urlsplit(value)
+        explicit_port = parsed.port is not None
+    except ValueError:
+        explicit_port = True
+    if explicit_port or value != expected:
+        raise CredentialPolicyError(
+            "invalid_provider_endpoint",
+            capability="stt",
+            provider=provider,
+            field="stt_api_url",
+        )
+
+
 def _validate_llm_provider_switch(
     existing: Mapping[str, Any], patch: Mapping[str, Any]
 ) -> None:
@@ -372,7 +409,11 @@ def _tts_bundle_complete(credentials: Mapping[str, Any]) -> bool:
 
 
 def validate_provider_availability(
-    existing: Mapping[str, Any], candidate: Mapping[str, Any]
+    existing: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    *,
+    patch: Mapping[str, Any] | None = None,
+    resolved_existing: Mapping[str, Any] | None = None,
 ) -> None:
     """Reject an effective write whose resulting provider is not available.
 
@@ -397,6 +438,16 @@ def validate_provider_availability(
         if not changed_fields:
             continue
         provider = candidate.get(provider_field)
+        if capability == "stt" and patch is not None:
+            resolved = (
+                resolved_existing
+                if resolved_existing is not None
+                else resolve_stt_credentials(existing)
+            )
+            if _validate_stt_incumbent_transition(existing, resolved, patch):
+                continue
+            if provider is None:
+                provider = resolved.get("stt_provider")
         if isinstance(provider, str) and providers.get(provider) == "active":
             continue
         raise CredentialPolicyError(
@@ -431,6 +482,96 @@ def resolve_stt_credentials(credentials: Mapping[str, Any]) -> dict[str, Any]:
         if resolved.get("audio_max_seconds") is None:
             resolved["audio_max_seconds"] = 60
     return resolved
+
+
+def _raw_has_effective_stt_configuration(existing: Mapping[str, Any]) -> bool:
+    return any(
+        existing.get(field) not in (None, "")
+        for field in (
+            "stt_api_url",
+            "stt_api_key",
+            "stt_model_name",
+            "whisper_api_key",
+            "whisper_model",
+        )
+    )
+
+
+def _eligible_legacy_stt_incumbent(
+    existing: Mapping[str, Any], resolved_existing: Mapping[str, Any]
+) -> bool:
+    """Classify the only legacy state allowed to leave ``outros``."""
+
+    if resolved_existing.get("stt_provider") != "outros":
+        return False
+    raw_provider = existing.get("stt_provider")
+    if raw_provider == "outros":
+        return True
+    return not raw_provider and _raw_has_effective_stt_configuration(existing)
+
+
+def is_semantic_credentials_echo(
+    existing: Mapping[str, Any],
+    resolved_existing: Mapping[str, Any],
+    patch: Mapping[str, Any],
+) -> bool:
+    """Detect an exact incumbent echo without rewriting its raw JSON mapping."""
+
+    if not patch:
+        return True
+
+    touched_capabilities = {
+        capability
+        for capability, fields in CAPABILITY_CREDENTIAL_FIELDS.items()
+        if set(patch) & fields
+    }
+    for capability in touched_capabilities:
+        provider_field = CAPABILITY_PROVIDER_FIELDS[capability]
+        current = (
+            resolved_existing.get(provider_field)
+            if capability == "stt"
+            else existing.get(provider_field)
+        )
+        if current not in PROVIDER_ALLOWLISTS[capability]:
+            return False
+
+    for field, value in patch.items():
+        current = (
+            resolved_existing.get(field) if field in STT_FIELDS else existing.get(field)
+        )
+        if field in SECRET_FIELDS and is_masked_secret(value):
+            if not current:
+                return False
+            continue
+        if value != current:
+            return False
+    return True
+
+
+def _validate_stt_incumbent_transition(
+    existing: Mapping[str, Any],
+    resolved_existing: Mapping[str, Any],
+    patch: Mapping[str, Any],
+) -> bool:
+    """Validate and identify the one compatibility-only STT provider switch."""
+
+    target_provider = patch.get("stt_provider")
+    if target_provider not in STT_FIXED_API_BASES:
+        return False
+    if not _eligible_legacy_stt_incumbent(existing, resolved_existing):
+        return False
+
+    required = ("stt_provider", "stt_api_url", "stt_api_key", "stt_model_name")
+    complete = all(
+        field in patch
+        and isinstance(patch.get(field), str)
+        and bool(str(patch.get(field)).strip())
+        for field in required
+    )
+    if not complete or not is_fresh_secret(patch.get("stt_api_key")):
+        raise CredentialPolicyError("provider_switch_bundle_required", capability="stt")
+    validate_stt_provider_endpoint(target_provider, patch.get("stt_api_url"))
+    return True
 
 
 LLM_OVERLAY_FIELDS: tuple[str, str, str, str] = (
