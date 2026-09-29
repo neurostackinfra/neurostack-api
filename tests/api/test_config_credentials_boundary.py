@@ -129,6 +129,30 @@ def test_generic_patch_allows_handoff_service_time_target(
     assert response.json()["meta_minutos_atendimento"] == 15
 
 
+@pytest.mark.parametrize("invalid_value", [0, 121, True, 10.0, "10", None])
+def test_generic_patch_rejects_invalid_handoff_service_time_target_atomically(
+    client: TestClient, invalid_value: object
+) -> None:
+    headers = _headers()
+    saved = client.patch(
+        "/v1/config",
+        headers=headers,
+        json={"meta_minutos_atendimento": 15},
+    )
+    assert saved.status_code == 200, saved.text
+
+    rejected = client.patch(
+        "/v1/config",
+        headers=headers,
+        json={"meta_minutos_atendimento": invalid_value},
+    )
+    assert rejected.status_code == 422, rejected.text
+
+    loaded = client.get("/v1/config", headers=headers)
+    assert loaded.status_code == 200, loaded.text
+    assert loaded.json()["meta_minutos_atendimento"] == 15
+
+
 def test_sequential_http_saves_preserve_previous_capabilities(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,

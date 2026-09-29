@@ -7,7 +7,7 @@ connecting: SRM → Policy → CTX → Flow → Prompt → Handoff
 """
 
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Optional, Union
 from uuid import UUID, uuid4
 
@@ -52,6 +52,7 @@ from src.handoff.models import (
     HandoffSLA,
     HandoffUrgency,
 )
+from src.handoff.pause_policy import resolve_handoff_pause
 from src.observability.price_gate import check_price_gate
 from src.observability.scheduling_gate import (
     GATE_MODE_OBSERVE,
@@ -403,6 +404,7 @@ class CognitivePipeline:
                         input_data.session_id,
                         verification_status,
                         handoff_id=handoff_id,
+                        tenant_id=input_data.tenant_id,
                     )
                 )
                 should_pause, paused_until_iso = await self._apply_handoff_pause(
@@ -1051,37 +1053,41 @@ class CognitivePipeline:
     async def _apply_handoff_pause(
         self,
         input_data: PipelineInput,
+        *,
+        now: datetime | None = None,
     ) -> tuple[bool, Optional[str]]:
         """Check handoff config and determine if session should be paused.
 
         Called after SRM detects handoff_required=True.
         Returns (should_pause, paused_until_iso).
         """
-        cfg = _json_object((input_data.clinic_config or {}).get("handoff"))
-        handoff_active = str(cfg.get("handoff_active", "yes")).lower()
-        standby_mode = str(cfg.get("standby_mode", "active")).lower()
+        handoff = (input_data.clinic_config or {}).get("handoff")
+        decision = resolve_handoff_pause(
+            handoff,
+            now or datetime.now(timezone.utc),
+        )
+        for notice in decision.notices:
+            logger.warning(
+                "handoff_pause_policy_tolerated",
+                tenant_id=str(input_data.tenant_id),
+                session_id=str(input_data.session_id),
+                field=notice.field,
+                reason=notice.reason,
+            )
 
-        if handoff_active != "yes":
+        if not decision.should_pause:
             logger.info(
                 "handoff_pause_skipped",
                 extra={
                     "session_id": str(input_data.session_id),
-                    "handoff_active": handoff_active,
+                    "tenant_id": str(input_data.tenant_id),
                 },
             )
             return False, None
 
-        handoff_period = str(cfg.get("handoff_period", "permanent")).lower()
-        paused_until_iso: Optional[str] = None
-
-        if standby_mode == "inactive":
-            fallback_hours = _json_int(cfg.get("handoff_inactive_default_hours", 24))
-            paused_until = datetime.now(timezone.utc) + timedelta(hours=fallback_hours)
-            paused_until_iso = paused_until.isoformat()
-        elif handoff_period == "cycle":
-            cycle_days = _json_int(cfg.get("handoff_cycle_days", 7))
-            paused_until = datetime.now(timezone.utc) + timedelta(days=cycle_days)
-            paused_until_iso = paused_until.isoformat()
+        paused_until_iso = (
+            decision.paused_until.isoformat() if decision.paused_until else None
+        )
 
         logger.info(
             "session_paused",
@@ -1090,7 +1096,6 @@ class CognitivePipeline:
                 "reason": "auto_handoff",
                 "session_id": str(input_data.session_id),
                 "tenant_id": str(input_data.tenant_id),
-                "handoff_period": handoff_period,
                 "paused_until": paused_until_iso,
             },
         )
