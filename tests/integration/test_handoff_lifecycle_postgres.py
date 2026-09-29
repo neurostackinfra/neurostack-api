@@ -421,6 +421,11 @@ async def test_two_confirmations_have_one_winner_and_one_effect_set(
         assert record.context["webhook_status"] == WebhookStatus.SENT.value
     assert dispatcher.send.await_count == 1  # type: ignore[attr-defined]
     assert event_store.append.await_count == 0
+    event_store.get_recent_messages.assert_awaited_once_with(
+        tenant_id,
+        session_id,
+        limit=5,
+    )
     assert metric._value.get() - metric_before == 1
 
 
@@ -490,4 +495,9 @@ async def test_confirmation_racing_terminal_has_one_coherent_winner(
             assert event_store.append.await_count == expected_events
         assert record.webhook_sent is True
     assert dispatcher.send.await_count == 1  # type: ignore[attr-defined]
+    event_store.get_recent_messages.assert_awaited_once_with(
+        tenant_id,
+        session_id,
+        limit=5,
+    )
     assert sum(metric._value.get() for metric in metrics) - metrics_before == 1

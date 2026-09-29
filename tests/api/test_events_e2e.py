@@ -53,15 +53,22 @@ async def client(
 ):
     """Seed the real tenant/session identity required by canonical handoffs."""
 
+    from src.memory.event_store import EventStore
     from src.models.session import Session
     from src.models.tenant import Tenant
     from src.repositories.database import get_db_session
-    from src.services.handoff_service import get_handoff_service
+    from src.services.event_service import get_event_service
+    from src.services.handoff_service import HandoffService
 
-    event_store = MagicMock()
+    event_store = MagicMock(spec=EventStore)
     event_store.append = AsyncMock()
     event_store.get_recent_messages = AsyncMock(return_value=[])
-    monkeypatch.setattr(get_handoff_service(), "event_store", event_store)
+    handoff_service = HandoffService(event_store=event_store)
+    monkeypatch.setattr(
+        get_event_service()._pipeline,
+        "_handoff",
+        handoff_service,
+    )
 
     database = get_db_session()
     try:

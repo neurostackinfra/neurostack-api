@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping, Optional, Sequence
 from uuid import UUID
@@ -259,6 +259,17 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
         result = await self.session.execute(statement)
         return list(result.scalars().all())
 
+    async def current_timestamp(self) -> datetime:
+        """Return the current database clock as an aware UTC timestamp."""
+
+        result = await self.session.execute(select(func.now()))
+        value = result.scalar_one()
+        if not isinstance(value, datetime):
+            raise TypeError("Database current timestamp is not a datetime")
+        if value.tzinfo is None or value.utcoffset() is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
     async def compare_and_set(
         self,
         *,
@@ -267,6 +278,7 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
         observed_status: str,
         observed_lifecycle_version: int,
         allowed_statuses: Sequence[str],
+        changed_at: datetime,
         values: Mapping[str, Any],
         preconditions: Sequence[ColumnElement[bool]] = (),
     ) -> HandoffCasResult:
@@ -282,7 +294,7 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
 
         lifecycle_values = dict(values)
         lifecycle_values.update(
-            updated_at=func.now(),
+            updated_at=changed_at,
             lifecycle_version=HandoffRecord.lifecycle_version + 1,
         )
         statement = (

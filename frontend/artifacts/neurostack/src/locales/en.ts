@@ -586,6 +586,7 @@ export const en = {
   handoff_btn_open_whatsapp: "Open WhatsApp",
   handoff_btn_confirm: "Confirm service",
   handoff_btn_confirming: "Confirming…",
+  handoff_confirm_guidance: "Confirm only after human service has started.",
   handoff_confirm_conflict:
     "The confirmation conflicted with a newer state. Wait for the queue to refresh, then try again.",
   handoff_confirm_error: "Could not confirm service. Please try again.",

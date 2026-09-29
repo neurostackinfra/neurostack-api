@@ -594,6 +594,8 @@ export const pt: Record<TranslationKey, string> = {
   handoff_btn_open_whatsapp: "Abrir WhatsApp",
   handoff_btn_confirm: "Confirmar atendimento",
   handoff_btn_confirming: "Confirmando…",
+  handoff_confirm_guidance:
+    "Confirme somente após iniciar o atendimento humano.",
   handoff_confirm_conflict:
     "A confirmação entrou em conflito. Aguarde a atualização da fila e tente novamente.",
   handoff_confirm_error:

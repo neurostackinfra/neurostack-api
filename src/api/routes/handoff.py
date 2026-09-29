@@ -377,7 +377,7 @@ async def checkout_handoff(
         400: {
             "description": (
                 "Invalid request: max_window_90_days, invalid_date_range, "
-                "or export_limit_10000_exceeded."
+                "invalid_handoff_timestamps, or export_limit_10000_exceeded."
             )
         },
     },
@@ -399,7 +399,8 @@ async def export_handoffs_csv(
     clinic's IANA timezone to a semi-open UTC window. Current pending and accepted
     states are open and use one export instant for their wait; confirmed completed
     and in_progress rows use their recorded confirmation timestamp. Invalid requests
-    return max_window_90_days, invalid_date_range, or export_limit_10000_exceeded.
+    return max_window_90_days, invalid_date_range, invalid_handoff_timestamps,
+    or export_limit_10000_exceeded.
     """
     effective_tenant_id = await _resolve_queue_tenant(request, tenant_id, tenant, db)
     try:
@@ -457,6 +458,21 @@ async def export_handoffs_csv(
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
+
+    for _, _, created_at_value, checked_out_at_value, handoff_status in records:
+        created_at = as_utc(created_at_value)
+        if handoff_status in {"pending", "accepted"}:
+            invalid_timestamp_order = created_at > exported_at
+        else:
+            invalid_timestamp_order = (
+                checked_out_at_value is not None
+                and as_utc(checked_out_at_value) < created_at
+            )
+        if invalid_timestamp_order:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="invalid_handoff_timestamps",
+            )
 
     output = io.StringIO()
     output.write("﻿")  # UTF-8 BOM

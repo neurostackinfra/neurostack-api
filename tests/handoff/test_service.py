@@ -51,6 +51,7 @@ from src.services import handoff_service as handoff_service_module
 from src.services.handoff_service import (
     HANDOFF_OPERATIONS,
     HandoffLifecycleError,
+    HandoffPostCommitError,
     handoff_record_to_detail,
 )
 
@@ -1153,6 +1154,43 @@ class TestHandoffService:
         assert record.updated_at is not None
 
     @pytest.mark.asyncio
+    async def test_confirmation_uses_one_database_timestamp_for_all_fields(
+        self,
+        handoff_service,
+        handoff_session_factory,
+        monkeypatch,
+        tenant_id,
+        session_id,
+    ):
+        response = await handoff_service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+        database_now = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        clock = AsyncMock(return_value=database_now)
+        monkeypatch.setattr(HandoffRecordRepository, "current_timestamp", clock)
+
+        confirmed = await handoff_service.confirm_handoff(
+            response.id,
+            tenant_id=tenant_id,
+        )
+
+        async with handoff_session_factory() as database:
+            record = await database.get(HandoffRecord, response.id)
+        assert record is not None
+        persisted_confirmation = record.data_hora_saida
+        persisted_updated = record.updated_at
+        assert persisted_confirmation is not None
+        assert persisted_updated is not None
+        assert persisted_confirmation.replace(tzinfo=timezone.utc) == database_now
+        assert persisted_updated.replace(tzinfo=timezone.utc) == database_now
+        assert confirmed.data_hora_saida == database_now
+        clock.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
     async def test_generic_update_cannot_bypass_attendance_confirmation(
         self,
         handoff_service,
@@ -1259,7 +1297,7 @@ class TestHandoffService:
             session_factory=handoff_session_factory,
         )
 
-        with pytest.raises(HandoffServiceError, match="event unavailable"):
+        with pytest.raises(HandoffPostCommitError):
             await service.initiate_handoff(
                 HandoffRequest(
                     tenant_id=tenant_id,
@@ -1314,8 +1352,10 @@ class TestHandoffService:
         webhook_dispatcher.send = AsyncMock()
         metric = HANDOFF_OPERATIONS.labels(operation="update", status="accepted")
         metric_before = metric._value.get()
+        error_metric = HANDOFF_OPERATIONS.labels(operation="update", status="error")
+        error_before = error_metric._value.get()
 
-        with pytest.raises(RuntimeError, match="event unavailable"):
+        with pytest.raises(HandoffPostCommitError):
             await service.accept_handoff(response.id, tenant_id=tenant_id)
 
         async with handoff_session_factory() as database:
@@ -1324,18 +1364,19 @@ class TestHandoffService:
         assert record.status == HandoffStatus.ACCEPTED.value
         assert record.lifecycle_version == 1
         assert event_store.append.await_count == 1
+        event_store.get_recent_messages.assert_not_awaited()
         webhook_dispatcher.send.assert_not_awaited()
         assert metric._value.get() == metric_before
+        assert error_metric._value.get() == error_before + 1
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "failure_mode",
-        ["failed-delivery", "raised-delivery", "bookkeeping"],
+        ["failed-delivery", "raised-delivery"],
     )
     async def test_transition_webhook_failures_follow_nonfatal_policy(
         self,
         failure_mode,
-        monkeypatch,
         webhook_dispatcher,
         handoff_session_factory,
         tenant_id,
@@ -1369,26 +1410,14 @@ class TestHandoffService:
                     tenant_id=tenant_id,
                     url="https://example.test/handoff",
                     status=WebhookStatus.FAILED,
+                    response_status=503,
+                    response_body="remote private response",
                     error_message="remote rejected",
                 )
             )
         elif failure_mode == "raised-delivery":
             webhook_dispatcher.send = AsyncMock(
                 side_effect=WebhookError("delivery failed")
-            )
-        else:
-            webhook_dispatcher.send = AsyncMock(
-                return_value=WebhookDelivery(
-                    handoff_id=response.id,
-                    tenant_id=tenant_id,
-                    url="https://example.test/handoff",
-                    status=WebhookStatus.SENT,
-                )
-            )
-            monkeypatch.setattr(
-                HandoffRecordRepository,
-                "update_webhook_delivery",
-                AsyncMock(side_effect=RuntimeError("bookkeeping unavailable")),
             )
         metric = HANDOFF_OPERATIONS.labels(operation="update", status="accepted")
         metric_before = metric._value.get()
@@ -1403,14 +1432,25 @@ class TestHandoffService:
         assert record.lifecycle_version == 1
         assert record.webhook_sent is False
         assert event_store.append.await_count == 1
+        event_store.get_recent_messages.assert_awaited_once_with(
+            tenant_id,
+            session_id,
+            limit=5,
+        )
         assert webhook_dispatcher.send.await_count == 1
         assert metric._value.get() - metric_before == 1
-        if failure_mode == "bookkeeping":
-            assert record.context.get("webhook_status") is None
-            assert record.webhook_response is None
-        else:
-            assert record.context["webhook_status"] == WebhookStatus.FAILED.value
-            assert record.webhook_response is not None
+        assert record.context["webhook_status"] == WebhookStatus.FAILED.value
+        expected_response = {
+            "status": "failed",
+            "attempt": 1,
+            "error_type": "delivery_failed",
+        }
+        if failure_mode == "failed-delivery":
+            expected_response["response_status"] = 503
+        assert record.webhook_response == expected_response
+        assert "delivery failed" not in str(record.webhook_response)
+        assert "remote rejected" not in str(record.webhook_response)
+        assert "remote private response" not in str(record.webhook_response)
 
     @pytest.mark.asyncio
     async def test_webhook_failure_is_nonfatal_and_bookkeeping_is_not_lifecycle(
@@ -1446,25 +1486,79 @@ class TestHandoffService:
         assert record is not None
         assert record.context["webhook_status"] == WebhookStatus.FAILED.value
         assert record.webhook_response is not None
-        assert record.webhook_response["error_message"] == "delivery failed"
+        assert record.webhook_response == {
+            "status": "failed",
+            "attempt": 1,
+            "error_type": "delivery_failed",
+        }
+        assert "delivery failed" not in str(record.webhook_response)
         assert record.lifecycle_version == 0
         assert record.updated_at is None
 
     @pytest.mark.asyncio
     async def test_transition_preserves_event_then_webhook_order_and_payload(
         self,
+        monkeypatch,
         handoff_session_factory,
         tenant_id,
         session_id,
     ):
-        order = []
+        order: list[str] = []
+
+        class TrackingTransaction:
+            def __init__(self, transaction):
+                self.transaction = transaction
+
+            async def __aenter__(self):
+                return await self.transaction.__aenter__()
+
+            async def __aexit__(self, exc_type, exc_value, traceback):
+                result = await self.transaction.__aexit__(
+                    exc_type,
+                    exc_value,
+                    traceback,
+                )
+                if exc_type is None:
+                    order.append("commit")
+                return result
+
+        class TrackingSession:
+            def __init__(self, session):
+                self.session = session
+
+            async def __aenter__(self):
+                await self.session.__aenter__()
+                return self
+
+            async def __aexit__(self, exc_type, exc_value, traceback):
+                return await self.session.__aexit__(
+                    exc_type,
+                    exc_value,
+                    traceback,
+                )
+
+            def begin(self):
+                return TrackingTransaction(self.session.begin())
+
+            def __getattr__(self, name):
+                return getattr(self.session, name)
+
         event_store = MagicMock()
 
         async def append_event(event):
-            order.append(("event", event))
+            order.append("event")
 
         event_store.append = AsyncMock(side_effect=append_event)
-        event_store.get_recent_messages = AsyncMock(return_value=[])
+        event_store.get_recent_messages = AsyncMock(
+            return_value=[
+                handoff_service_module.EventData(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    event_type=handoff_service_module.EventType.MESSAGE_IN.value,
+                    event_data={"role": "user", "content": "project once"},
+                )
+            ]
+        )
         dispatcher = WebhookDispatcher()
         dispatcher.set_config(
             tenant_id,
@@ -1472,7 +1566,7 @@ class TestHandoffService:
         )
 
         async def send_webhook(delivery_tenant, payload):
-            order.append(("webhook", payload))
+            order.append("webhook")
             return WebhookDelivery(
                 handoff_id=payload.handoff_id,
                 tenant_id=delivery_tenant,
@@ -1481,11 +1575,22 @@ class TestHandoffService:
             )
 
         dispatcher.send = AsyncMock(side_effect=send_webhook)
+        original_bookkeeping = HandoffRecordRepository.update_webhook_delivery
+
+        async def tracked_bookkeeping(repository, **kwargs):
+            order.append("bookkeeping")
+            return await original_bookkeeping(repository, **kwargs)
+
+        monkeypatch.setattr(
+            HandoffRecordRepository,
+            "update_webhook_delivery",
+            tracked_bookkeeping,
+        )
         service = HandoffService(
             event_store=event_store,
             summarizer=ConversationSummarizer(),
             webhook_dispatcher=dispatcher,
-            session_factory=handoff_session_factory,
+            session_factory=lambda: TrackingSession(handoff_session_factory()),
         )
         response = await service.initiate_handoff(
             HandoffRequest(
@@ -1495,16 +1600,22 @@ class TestHandoffService:
             )
         )
         order.clear()
+        event_store.get_recent_messages.reset_mock()
 
-        await service.accept_handoff(
+        detail = await service.accept_handoff(
             response.id,
             agent_id="agent-order",
             tenant_id=tenant_id,
         )
 
-        assert [kind for kind, _ in order] == ["event", "webhook"]
-        event = order[0][1]
-        payload = order[1][1]
+        assert order == ["commit", "event", "webhook", "bookkeeping", "commit"]
+        event_store.get_recent_messages.assert_awaited_once_with(
+            tenant_id,
+            session_id,
+            limit=5,
+        )
+        event = event_store.append.await_args.args[0]
+        payload = dispatcher.send.await_args.args[1]
         assert event.event_type == "handoff.accept"
         assert event.event_data == {
             "handoff_id": str(response.id),
@@ -1514,6 +1625,74 @@ class TestHandoffService:
         }
         assert payload.event_type == "handoff.accepted"
         assert payload.status == HandoffStatus.ACCEPTED
+        assert payload.recent_messages == detail.recent_messages
+        assert [message["content"] for message in detail.recent_messages] == [
+            "project once"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_bookkeeping_failure_raises_after_exactly_one_send(
+        self,
+        monkeypatch,
+        webhook_dispatcher,
+        handoff_session_factory,
+        tenant_id,
+        session_id,
+    ):
+        event_store = MagicMock()
+        event_store.append = AsyncMock()
+        event_store.get_recent_messages = AsyncMock(return_value=[])
+        service = HandoffService(
+            event_store=event_store,
+            summarizer=ConversationSummarizer(),
+            webhook_dispatcher=webhook_dispatcher,
+            session_factory=handoff_session_factory,
+        )
+        response = await service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+        event_store.append.reset_mock()
+        webhook_dispatcher.set_config(
+            tenant_id,
+            WebhookConfig(url="https://example.test/handoff"),
+        )
+        webhook_dispatcher.send = AsyncMock(
+            return_value=WebhookDelivery(
+                handoff_id=response.id,
+                tenant_id=tenant_id,
+                url="https://example.test/handoff",
+                status=WebhookStatus.SENT,
+            )
+        )
+        monkeypatch.setattr(
+            HandoffRecordRepository,
+            "update_webhook_delivery",
+            AsyncMock(side_effect=RuntimeError("bookkeeping unavailable")),
+        )
+        success_metric = HANDOFF_OPERATIONS.labels(
+            operation="update",
+            status="accepted",
+        )
+        error_metric = HANDOFF_OPERATIONS.labels(operation="update", status="error")
+        success_before = success_metric._value.get()
+        error_before = error_metric._value.get()
+
+        with pytest.raises(HandoffPostCommitError):
+            await service.accept_handoff(response.id, tenant_id=tenant_id)
+
+        async with handoff_session_factory() as database:
+            record = await database.get(HandoffRecord, response.id)
+        assert record is not None
+        assert record.status == HandoffStatus.ACCEPTED.value
+        assert record.lifecycle_version == 1
+        assert record.webhook_response is None
+        webhook_dispatcher.send.assert_awaited_once()
+        assert success_metric._value.get() == success_before
+        assert error_metric._value.get() == error_before + 1
 
     @pytest.mark.asyncio
     async def test_sla_snapshot_is_immutable_across_config_changes(

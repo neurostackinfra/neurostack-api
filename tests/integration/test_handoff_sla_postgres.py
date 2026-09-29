@@ -194,6 +194,8 @@ async def test_handoff_sla_postgres_smoke(
     rounding_session = uuid4()
     dst_tenant = uuid4()
     dst_session = uuid4()
+    fall_back_tenant = uuid4()
+    fall_back_session = uuid4()
 
     start = datetime(2026, 9, 1, 3, tzinfo=timezone.utc)
     as_of = datetime(2026, 9, 1, 6, tzinfo=timezone.utc)
@@ -300,6 +302,25 @@ async def test_handoff_sla_postgres_smoke(
         created_at=datetime(2026, 3, 9, 4, tzinfo=timezone.utc),
     )
 
+    fall_back_start = datetime(2026, 11, 1, 4, tzinfo=timezone.utc)
+    fall_back_included = [
+        _handoff(
+            fall_back_tenant,
+            fall_back_session,
+            created_at=fall_back_start,
+        ),
+        _handoff(
+            fall_back_tenant,
+            fall_back_session,
+            created_at=datetime(2026, 11, 2, 4, 59, 59, 999999, tzinfo=timezone.utc),
+        ),
+    ]
+    fall_back_excluded = _handoff(
+        fall_back_tenant,
+        fall_back_session,
+        created_at=datetime(2026, 11, 2, 5, tzinfo=timezone.utc),
+    )
+
     async with factory() as database:
         async with database.begin():
             for args in (
@@ -308,6 +329,7 @@ async def test_handoff_sla_postgres_smoke(
                 (empty_tenant, empty_session, "UTC"),
                 (rounding_tenant, rounding_session, "UTC"),
                 (dst_tenant, dst_session, "America/New_York"),
+                (fall_back_tenant, fall_back_session, "America/New_York"),
             ):
                 database.add_all(_identity(*args))
             database.add_all(
@@ -318,6 +340,8 @@ async def test_handoff_sla_postgres_smoke(
                     *rounding,
                     dst_included,
                     dst_excluded,
+                    *fall_back_included,
+                    fall_back_excluded,
                 ]
             )
 
@@ -401,3 +425,20 @@ async def test_handoff_sla_postgres_smoke(
         tzinfo=ZoneInfo("Asia/Tokyo"),
     ).astimezone(timezone.utc)
     assert dst.period.start_utc != browser_start
+
+    fall_back = await service.get_queue_sla(
+        fall_back_tenant,
+        from_date=date(2026, 11, 1),
+        to_date=date(2026, 11, 1),
+        as_of=datetime(2026, 11, 3, tzinfo=timezone.utc),
+    )
+    assert [record.id for record in fall_back.items] == [
+        record.id for record in fall_back_included
+    ]
+    assert fall_back.period.start_utc == fall_back_start
+    assert fall_back.period.end_exclusive_utc == datetime(
+        2026, 11, 2, 5, tzinfo=timezone.utc
+    )
+    assert fall_back.period.end_exclusive_utc - fall_back.period.start_utc == timedelta(
+        hours=25
+    )
