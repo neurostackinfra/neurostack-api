@@ -2,7 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import jwt
@@ -14,14 +14,22 @@ from src.config.settings import settings
 from src.handoff.models import HandoffReason
 
 
-def _jwt_headers(role: str, tenant_id: UUID) -> dict[str, str]:
+def _jwt_headers(
+    role: str,
+    tenant_id: UUID,
+    *,
+    builder_id: UUID | None = None,
+) -> dict[str, str]:
+    payload = {
+        "sub": str(uuid4()),
+        "tenant_id": str(tenant_id),
+        "role": role,
+        "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+    }
+    if builder_id is not None:
+        payload["builder_id"] = str(builder_id)
     token = jwt.encode(
-        {
-            "sub": str(uuid4()),
-            "tenant_id": str(tenant_id),
-            "role": role,
-            "exp": datetime.now(timezone.utc) + timedelta(hours=1),
-        },
+        payload,
         settings.secret_key,
         algorithm="HS256",
     )
@@ -85,6 +93,8 @@ def _seed(
     sessions: list[Any],
     handoffs: list[Any],
     clinic_timezones: dict[UUID, str] | None = None,
+    tenant_builders: dict[UUID, UUID] | None = None,
+    builders: list[Any] | None = None,
 ) -> None:
     from src.models.clinic_config_table import ClinicConfigTable
     from src.models.tenant import Tenant
@@ -93,6 +103,7 @@ def _seed(
     async def _run() -> None:
         db = get_db_session()
         try:
+            db.add_all(builders or [])
             db.add_all(
                 [
                     Tenant(
@@ -100,6 +111,7 @@ def _seed(
                         name=f"Clinic {tenant_id}",
                         slug=f"clinic-{tenant_id}",
                         api_key_hash=f"hash-{tenant_id}",
+                        builder_id=(tenant_builders or {}).get(tenant_id),
                         config={},
                     )
                     for tenant_id in tenants
@@ -144,7 +156,7 @@ def _handoff_state(client: TestClient, handoff_id: UUID) -> tuple[str, Any]:
     return client._submit(_run())  # type: ignore[attr-defined,no-any-return]
 
 
-def test_queue_and_checkout_share_canonical_projection_and_fifo(
+def test_queue_projection_and_confirmation_use_canonical_service_detail(
     client: TestClient,
 ) -> None:
     tenant_id = uuid4()
@@ -230,7 +242,7 @@ def test_queue_and_checkout_share_canonical_projection_and_fifo(
     assert [item["id"] for item in items] == [str(record.id) for record in records]
     for index, item in enumerate(items):
         safety_flag, intent, _ = expected[item["id"]]
-        assert item["safety_flag"] is safety_flag
+        assert item["safety_flag"] is safety_flag, item["intencao_detectada"]
         assert item["intencao_detectada"] == intent
         assert item["primeira_linha_mensagem"] is None
         assert item["sla_target_seconds"] == 600
@@ -245,12 +257,12 @@ def test_queue_and_checkout_share_canonical_projection_and_fifo(
         )
         assert checked_out.status_code == 200, checked_out.text
         checkout_body = checked_out.json()
-        assert checkout_body["safety_flag"] is safety_flag
-        assert checkout_body["intencao_detectada"] == intent
-        assert checkout_body["primeira_linha_mensagem"] == expected[item["id"]][2]
+        assert checkout_body["id"] == item["id"]
+        assert checkout_body["tenant_id"] == str(tenant_id)
         assert checkout_body["status"] == "in_progress"
         assert checkout_body["data_hora_saida"] is not None
-        assert checkout_body["wait_seconds"] is not None
+        assert "wait_seconds" not in checkout_body
+        assert "primeira_linha_mensagem" not in checkout_body
 
     duplicate = client.post(
         f"/v1/handoffs/queue/{records[0].id}/checkout",
@@ -318,10 +330,171 @@ def test_queue_preserves_authentication_and_tenant_boundaries(
     assert own_queue.status_code == 200
     assert [item["id"] for item in own_queue.json()["items"]] == [str(own.id)]
     assert tenant_override.status_code == 403
-    assert tenant_override.json()["detail"] == "tenant_mismatch"
-    assert cross_tenant_checkout.status_code == 404
-    assert cross_tenant_checkout.json()["detail"] == "handoff_not_found"
+    assert tenant_override.json() == {"detail": {"code": "tenant_override_forbidden"}}
+    assert cross_tenant_checkout.status_code == 403
+    assert cross_tenant_checkout.json() == {
+        "detail": {"code": "tenant_override_forbidden"}
+    }
     assert _handoff_state(client, other.id) == ("pending", None)
+
+
+def test_queue_allows_builder_and_super_admin_selected_tenants_and_denies_roles(
+    client: TestClient,
+) -> None:
+    from src.models.builder import Builder
+
+    builder_id = uuid4()
+    builder = Builder(id=builder_id, name="Queue Builder")
+    clinic_id = uuid4()
+    session = _session(clinic_id, "selected-clinic")
+    record = _record(
+        clinic_id,
+        session.id,
+        created_at=datetime.now(timezone.utc),
+        reason=HandoffReason.USER_REQUEST.value,
+        intent="selected",
+        context={},
+        first_message="private",
+    )
+    _seed(
+        client,
+        tenants=[clinic_id],
+        sessions=[session],
+        handoffs=[record],
+        tenant_builders={clinic_id: builder_id},
+        builders=[builder],
+    )
+    params = {"tenant_id": str(clinic_id)}
+
+    builder_response = client.get(
+        "/v1/handoffs/queue",
+        params=params,
+        headers=_jwt_headers("builder", uuid4(), builder_id=builder_id),
+    )
+    super_admin_response = client.get(
+        "/v1/handoffs/queue",
+        params=params,
+        headers=_jwt_headers("super_admin", uuid4()),
+    )
+    unknown_role = client.get(
+        "/v1/handoffs/queue",
+        params=params,
+        headers=_jwt_headers("operator", clinic_id),
+    )
+    builder_without_identity = client.get(
+        "/v1/handoffs/queue",
+        params=params,
+        headers=_jwt_headers("builder", uuid4()),
+    )
+
+    for response in (builder_response, super_admin_response):
+        assert response.status_code == 200, response.text
+        assert [item["id"] for item in response.json()["items"]] == [str(record.id)]
+    assert unknown_role.status_code == 403
+    assert unknown_role.json() == {"detail": {"code": "caller_role_forbidden"}}
+    assert builder_without_identity.status_code == 403
+    assert builder_without_identity.json() == {
+        "detail": {"code": "tenant_override_forbidden"}
+    }
+
+
+def test_confirmation_returns_service_detail_without_repository_requery(
+    client: TestClient,
+) -> None:
+    from src.api.routes.handoff import get_service
+    from src.handoff.models import HandoffDetail, HandoffStatus, HandoffUrgency
+    from src.repositories import get_db_session_dependency
+
+    tenant_id = uuid4()
+    handoff_id = uuid4()
+    confirmed_at = datetime.now(timezone.utc)
+    detail = HandoffDetail(
+        id=handoff_id,
+        tenant_id=tenant_id,
+        session_id=uuid4(),
+        status=HandoffStatus.IN_PROGRESS,
+        urgency=HandoffUrgency.NORMAL,
+        reason=HandoffReason.USER_REQUEST,
+        summary="committed service detail",
+        created_at=confirmed_at - timedelta(seconds=5),
+        updated_at=confirmed_at,
+        data_hora_saida=confirmed_at,
+    )
+    service = MagicMock()
+    service.confirm_handoff = AsyncMock(return_value=detail)
+    database = MagicMock()
+    database.execute = AsyncMock(
+        side_effect=AssertionError("confirmation route must not requery")
+    )
+
+    async def override_database() -> Any:
+        yield database
+
+    client.application.dependency_overrides[get_service] = lambda: service
+    client.application.dependency_overrides[get_db_session_dependency] = (
+        override_database
+    )
+    try:
+        response = client.post(
+            f"/v1/handoffs/queue/{handoff_id}/confirm",
+            headers=_jwt_headers("clinic_admin", tenant_id),
+        )
+    finally:
+        client.application.dependency_overrides.pop(get_service, None)
+        client.application.dependency_overrides.pop(get_db_session_dependency, None)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["summary"] == "committed service detail"
+    service.confirm_handoff.assert_awaited_once_with(
+        handoff_id,
+        tenant_id=tenant_id,
+    )
+    database.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("service_error", "expected_status", "expected_detail"),
+    [
+        ("not_found", 404, "handoff_not_found"),
+        ("lifecycle", 409, "handoff_conflict"),
+        ("post_commit", 503, "handoff_service_unavailable"),
+        ("persistence", 503, "handoff_service_unavailable"),
+    ],
+)
+def test_confirmation_maps_typed_service_failures(
+    client: TestClient,
+    service_error: str,
+    expected_status: int,
+    expected_detail: str,
+) -> None:
+    from src.api.routes.handoff import get_service
+    from src.core.exceptions import HandoffNotFoundError, HandoffServiceError
+    from src.services.handoff_service import (
+        HandoffLifecycleError,
+        HandoffPostCommitError,
+    )
+
+    errors = {
+        "not_found": HandoffNotFoundError("missing"),
+        "lifecycle": HandoffLifecycleError("handoff_conflict"),
+        "post_commit": HandoffPostCommitError("event unavailable"),
+        "persistence": HandoffServiceError("database unavailable"),
+    }
+    service = MagicMock()
+    service.confirm_handoff = AsyncMock(side_effect=errors[service_error])
+    tenant_id = uuid4()
+    handoff_id = uuid4()
+    client.application.dependency_overrides[get_service] = lambda: service
+    try:
+        response = client.post(
+            f"/v1/handoffs/queue/{handoff_id}/confirm",
+            headers=_jwt_headers("clinic_admin", tenant_id),
+        )
+    finally:
+        client.application.dependency_overrides.pop(get_service, None)
+
+    assert response.status_code == expected_status
+    assert response.json() == {"detail": expected_detail}
 
 
 def test_queue_radar_uses_one_cohort_snapshots_and_nullable_no_data(
@@ -503,6 +676,28 @@ def test_queue_period_uses_clinic_timezone_default_window_and_dst(
     assert invalid.status_code == 400
     assert invalid.json()["detail"] == "invalid_date_range"
 
+    allowed_window = client.get(
+        "/v1/handoffs/queue",
+        params={
+            "tenant_id": str(tenant_id),
+            "from_date": "2026-01-01",
+            "to_date": "2026-04-01",
+        },
+        headers=_jwt_headers("clinic_admin", tenant_id),
+    )
+    rejected_window = client.get(
+        "/v1/handoffs/queue",
+        params={
+            "tenant_id": str(tenant_id),
+            "from_date": "2026-01-01",
+            "to_date": "2026-04-02",
+        },
+        headers=_jwt_headers("clinic_admin", tenant_id),
+    )
+    assert allowed_window.status_code == 200, allowed_window.text
+    assert rejected_window.status_code == 400
+    assert rejected_window.json() == {"detail": "max_window_90_days"}
+
     from src.services.handoff_service import HandoffService
 
     fixed_as_of = datetime(2026, 9, 28, 12, tzinfo=timezone.utc)
@@ -532,12 +727,12 @@ def test_queue_rejects_unrepresentable_local_start_before_cohort_query(
         handoffs=[],
         clinic_timezones={tenant_id: "Asia/Tokyo"},
     )
-    cohort_query = AsyncMock(
+    cohort_query = MagicMock(
         side_effect=AssertionError("invalid period must not query the cohort")
     )
     monkeypatch.setattr(
         HandoffRecordRepository,
-        "find_sla_cohort",
+        "stream_sla_cohort",
         cohort_query,
     )
 
@@ -553,7 +748,18 @@ def test_queue_rejects_unrepresentable_local_start_before_cohort_query(
 
     assert response.status_code == 400
     assert response.json() == {"detail": "invalid_date_range"}
-    cohort_query.assert_not_awaited()
+    too_wide = client.get(
+        "/v1/handoffs/queue",
+        params={
+            "tenant_id": str(tenant_id),
+            "from_date": "2026-01-01",
+            "to_date": "2026-04-02",
+        },
+        headers=_jwt_headers("clinic_admin", tenant_id),
+    )
+    assert too_wide.status_code == 400
+    assert too_wide.json() == {"detail": "max_window_90_days"}
+    cohort_query.assert_not_called()
 
 
 def test_confirmation_is_required_for_patch_and_completion(
@@ -644,6 +850,40 @@ def test_openapi_exposes_required_nullable_sla_contract(client: TestClient) -> N
         "integer",
         "null",
     }
+    sla_integer = next(
+        branch
+        for branch in item_schema["properties"]["sla_target_seconds"]["anyOf"]
+        if branch.get("type") == "integer"
+    )
+    assert sla_integer["minimum"] == 60
+    assert sla_integer["maximum"] == 7200
+    assert item_schema["properties"]["status"] == {
+        "$ref": "#/components/schemas/HandoffStatus"
+    }
+    avg_number = next(
+        branch
+        for branch in queue_schema["properties"]["avg_wait_seconds"]["anyOf"]
+        if branch.get("type") == "number"
+    )
+    percentage_number = next(
+        branch
+        for branch in queue_schema["properties"]["pct_within_sla"]["anyOf"]
+        if branch.get("type") == "number"
+    )
+    assert avg_number["minimum"] == 0
+    assert percentage_number["minimum"] == 0
+    assert percentage_number["maximum"] == 100
+    for field in (
+        "within_sla_count",
+        "confirmed_late_count",
+        "unanswered_overdue_count",
+        "maturing_count",
+        "cancelled_unconfirmed_count",
+        "unmeasured_legacy_count",
+        "confirmed_count",
+        "sla_eligible_count",
+    ):
+        assert queue_schema["properties"][field]["minimum"] == 0
     assert "lifecycle_version" not in str(queue_schema)
     assert "lifecycle_version" not in str(item_schema)
 
@@ -651,7 +891,32 @@ def test_openapi_exposes_required_nullable_sla_contract(client: TestClient) -> N
     checkout = document["paths"]["/v1/handoffs/queue/{handoff_id}/checkout"]["post"]
     assert confirm.get("deprecated") is not True
     assert checkout["deprecated"] is True
-    assert "409" in confirm["responses"]
+    expected_error_models = {
+        "404": "HandoffNotFoundResponse",
+        "409": "HandoffConflictResponse",
+        "503": "HandoffUnavailableResponse",
+    }
+    for operation in (confirm, checkout):
+        assert operation["responses"]["200"]["content"]["application/json"][
+            "schema"
+        ] == {"$ref": "#/components/schemas/HandoffDetail"}
+        for response_status, model_name in expected_error_models.items():
+            assert operation["responses"][response_status]["content"][
+                "application/json"
+            ]["schema"] == {"$ref": f"#/components/schemas/{model_name}"}
+    assert (
+        schemas["HandoffNotFoundResponse"]["properties"]["detail"]["const"]
+        == "handoff_not_found"
+    )
+    assert (
+        schemas["HandoffUnavailableResponse"]["properties"]["detail"]["const"]
+        == "handoff_service_unavailable"
+    )
+    assert set(schemas["HandoffConflictResponse"]["properties"]["detail"]["enum"]) == {
+        "attendance_already_confirmed",
+        "invalid_handoff_state",
+        "handoff_conflict",
+    }
     assert "409" in document["paths"]["/v1/handoffs/{handoff_id}"]["patch"]["responses"]
     assert (
         "409"

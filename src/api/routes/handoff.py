@@ -10,7 +10,6 @@ from datetime import date, datetime, timezone
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
-import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
@@ -19,15 +18,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.middleware.auth import (
     TenantContext,
     get_tenant_context,
-    require_builder_clinic_access,
+    resolve_effective_tenant,
 )
 from src.api.schemas.handoff import (
-    HandoffCheckoutResponse,
+    HandoffConflictResponse,
     HandoffDetail,
     HandoffListItem,
     HandoffListResponse,
+    HandoffNotFoundResponse,
     HandoffQueueItem,
     HandoffQueueResponse,
+    HandoffUnavailableResponse,
     HandoffUpdateRequest,
     MessageResponse,
     WebhookConfigCreate,
@@ -37,7 +38,6 @@ from src.api.schemas.handoff import (
     WebhookTestResponse,
 )
 from src.config.logging import get_logger
-from src.config.settings import settings as _settings
 from src.core.exceptions import (
     HandoffConfigError,
     HandoffNotFoundError,
@@ -53,8 +53,13 @@ from src.handoff.models import (
 )
 from src.models.handoff import HandoffRecord
 from src.repositories import get_db_session_dependency
+from src.repositories.handoff import HandoffSlaCohortRow
 from src.services import HandoffService, get_handoff_service
-from src.services.handoff_service import HandoffLifecycleError, HandoffSlaPeriodError
+from src.services.handoff_service import (
+    HandoffLifecycleError,
+    HandoffPostCommitError,
+    HandoffSlaPeriodError,
+)
 
 logger = get_logger(__name__)
 
@@ -74,76 +79,17 @@ def get_service() -> HandoffService:
 
 
 # ============================================
-# Tenant resolution (builder / super-admin override)
-# ============================================
-
-
-async def _resolve_queue_tenant(
-    request: Request,
-    tenant_id: UUID,
-    tenant: TenantContext,
-    db: AsyncSession,
-) -> UUID:
-    """Resolve effective tenant_id for queue endpoints.
-
-    - Clinic/API-key callers: tenant_id must match their token.
-    - Super-admins: may pass any tenant_id freely.
-    - Builders: may pass a clinic they own (validated via require_builder_clinic_access).
-    """
-    if tenant_id == tenant.tenant_id:
-        return tenant_id
-    if tenant.role == "super_admin":
-        return tenant_id
-    if tenant.role != "builder":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="tenant_mismatch"
-        )
-
-    # Extract builder_id from JWT
-    auth_header = request.headers.get("Authorization", "")
-    builder_id_str: Optional[str] = None
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:]
-        try:
-            payload = pyjwt.decode(
-                token,
-                _settings.secret_key,
-                algorithms=["HS256"],
-                options={"require": ["sub", "tenant_id", "exp"]},
-            )
-            builder_id_str = payload.get("builder_id")
-        except (pyjwt.InvalidTokenError, KeyError, ValueError):
-            pass
-
-    if not builder_id_str:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="builder_id_not_found_in_token",
-        )
-
-    builder_id = UUID(builder_id_str)
-    return await require_builder_clinic_access(tenant_id, builder_id, db)
-
-
-# ============================================
 # Queue Endpoints (DB-direct, not HandoffService)
 # ============================================
 
 
 def _handoff_queue_fields(
-    record: HandoffRecord,
-    *,
-    expose_first_message: bool,
+    record: HandoffSlaCohortRow,
 ) -> dict[str, Any]:
     """Project the fields shared by queue listing and checkout responses."""
-    context_safety = (
-        record.context.get("safety_concern")
-        if isinstance(record.context, dict)
-        else None
-    )
     safety_flag = (
-        context_safety
-        if type(context_safety) is bool
+        record.safety_concern
+        if type(record.safety_concern) is bool
         else record.reason == HandoffReason.SAFETY_CONCERN.value
     )
     detected_intent = record.intencao_detectada
@@ -157,9 +103,7 @@ def _handoff_queue_fields(
         "safety_flag": safety_flag,
         "intencao_detectada": detected_intent,
         "estagio_atual": record.estagio_atual,
-        "primeira_linha_mensagem": (
-            record.primeira_linha_mensagem if expose_first_message else None
-        ),
+        "primeira_linha_mensagem": None,
         "created_at": record.created_at,
         "data_hora_saida": record.data_hora_saida,
         "sla_target_seconds": record.sla_target_seconds,
@@ -186,7 +130,7 @@ async def get_handoff_queue(
     service: HandoffService = Depends(get_service),
 ) -> HandoffQueueResponse:
     """Return the waiting subset and SLA radar for one entry-date cohort."""
-    effective_tenant_id = await _resolve_queue_tenant(request, tenant_id, tenant, db)
+    effective_tenant_id = await resolve_effective_tenant(request, tenant, tenant_id, db)
     try:
         queue = await service.get_queue_sla(
             effective_tenant_id,
@@ -196,17 +140,14 @@ async def get_handoff_queue(
     except HandoffSlaPeriodError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="invalid_date_range",
+            detail=str(exc),
         ) from exc
 
     average = queue.metrics.average_confirmed_seconds
     percentage = queue.metrics.pct_within_sla
     return HandoffQueueResponse(
         items=[
-            HandoffQueueItem(
-                **_handoff_queue_fields(record, expose_first_message=False)
-            )
-            for record in queue.items
+            HandoffQueueItem(**_handoff_queue_fields(record)) for record in queue.items
         ],
         avg_wait_seconds=round(average, 1) if average is not None else None,
         pct_within_sla=float(percentage) if percentage is not None else None,
@@ -232,30 +173,13 @@ async def _confirm_queue_handoff(
     tenant: TenantContext,
     db: AsyncSession,
     service: HandoffService,
-) -> HandoffCheckoutResponse:
-    """Authorize, mutate through the lifecycle service, then assemble output."""
+) -> HandoffDetail:
+    """Authorize and return the service's committed lifecycle representation."""
 
-    requested_tenant_id = tenant_id or tenant.tenant_id
-    try:
-        effective_tenant_id = await _resolve_queue_tenant(
-            request,
-            requested_tenant_id,
-            tenant,
-            db,
-        )
-    except HTTPException as exc:
-        if exc.status_code in {
-            status.HTTP_403_FORBIDDEN,
-            status.HTTP_404_NOT_FOUND,
-        }:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="handoff_not_found",
-            ) from exc
-        raise
+    effective_tenant_id = await resolve_effective_tenant(request, tenant, tenant_id, db)
 
     try:
-        await service.confirm_handoff(
+        return await service.confirm_handoff(
             handoff_id,
             tenant_id=effective_tenant_id,
         )
@@ -269,37 +193,22 @@ async def _confirm_queue_handoff(
             status_code=status.HTTP_409_CONFLICT,
             detail=exc.code,
         ) from exc
-
-    result = await db.execute(
-        select(HandoffRecord)
-        .where(
-            HandoffRecord.id == handoff_id,
-            HandoffRecord.tenant_id == effective_tenant_id,
-        )
-        .execution_options(populate_existing=True)
-    )
-    record = result.scalar_one_or_none()
-    if record is None:
+    except (HandoffPostCommitError, HandoffServiceError) as exc:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="handoff_not_found",
-        )
-
-    wait_seconds = None
-    if record.data_hora_saida and record.created_at:
-        wait_seconds = (record.data_hora_saida - record.created_at).total_seconds()
-
-    return HandoffCheckoutResponse(
-        **_handoff_queue_fields(record, expose_first_message=True),
-        wait_seconds=wait_seconds,
-    )
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="handoff_service_unavailable",
+        ) from exc
 
 
 @router.post(
     "/queue/{handoff_id}/confirm",
-    response_model=HandoffCheckoutResponse,
+    response_model=HandoffDetail,
     summary="Confirm Handoff Attendance",
-    responses={409: {"description": "Typed lifecycle conflict"}},
+    responses={
+        404: {"model": HandoffNotFoundResponse},
+        409: {"model": HandoffConflictResponse},
+        503: {"model": HandoffUnavailableResponse},
+    },
 )
 async def confirm_queue_handoff(
     request: Request,
@@ -311,7 +220,7 @@ async def confirm_queue_handoff(
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
     service: HandoffService = Depends(get_service),
-) -> HandoffCheckoutResponse:
+) -> HandoffDetail:
     """Persist the first human-response timestamp without completing handoff."""
 
     return await _confirm_queue_handoff(
@@ -326,10 +235,14 @@ async def confirm_queue_handoff(
 
 @router.post(
     "/queue/{handoff_id}/checkout",
-    response_model=HandoffCheckoutResponse,
+    response_model=HandoffDetail,
     summary="Checkout Handoff",
     deprecated=True,
-    responses={409: {"description": "Typed lifecycle conflict"}},
+    responses={
+        404: {"model": HandoffNotFoundResponse},
+        409: {"model": HandoffConflictResponse},
+        503: {"model": HandoffUnavailableResponse},
+    },
 )
 async def checkout_handoff(
     request: Request,
@@ -341,7 +254,7 @@ async def checkout_handoff(
     tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
     service: HandoffService = Depends(get_service),
-) -> HandoffCheckoutResponse:
+) -> HandoffDetail:
     """Deprecated HTTP alias for attendance confirmation."""
 
     return await _confirm_queue_handoff(
@@ -402,7 +315,7 @@ async def export_handoffs_csv(
     return max_window_90_days, invalid_date_range, invalid_handoff_timestamps,
     or export_limit_10000_exceeded.
     """
-    effective_tenant_id = await _resolve_queue_tenant(request, tenant_id, tenant, db)
+    effective_tenant_id = await resolve_effective_tenant(request, tenant, tenant_id, db)
     try:
         resolved_period = await service.resolve_queue_period(
             effective_tenant_id,
@@ -412,14 +325,8 @@ async def export_handoffs_csv(
     except HandoffSlaPeriodError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="invalid_date_range",
+            detail=str(exc),
         ) from exc
-
-    if (resolved_period.to_date - resolved_period.from_date).days > 90:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="max_window_90_days",
-        )
 
     q = (
         select(

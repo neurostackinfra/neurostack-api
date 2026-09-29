@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping, Optional, Sequence
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, and_, func, select, update
+from sqlalchemy import ColumnElement, and_, case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.handoff import HandoffRecord, HandoffStatus
@@ -50,6 +51,23 @@ class HandoffCasResult:
     @classmethod
     def conflict(cls, current_status: str | None = None) -> "HandoffCasResult":
         return cls(HandoffCasOutcome.CONFLICT, current_status=current_status)
+
+
+@dataclass(frozen=True)
+class HandoffSlaCohortRow:
+    """Minimum persisted projection needed by the queue radar and cards."""
+
+    id: UUID
+    numero_whatsapp: str | None
+    session_id: UUID
+    safety_concern: bool | None
+    reason: str
+    intencao_detectada: str | None
+    estagio_atual: str | None
+    created_at: datetime
+    data_hora_saida: datetime | None
+    sla_target_seconds: int | None
+    status: str
 
 
 class HandoffRecordRepository(BaseRepository[HandoffRecord]):
@@ -233,22 +251,57 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
         result = await self.session.execute(stmt)
         return result.scalar() or 0
 
-    async def find_sla_cohort(
+    async def stream_sla_cohort(
         self,
         *,
         tenant_id: UUID,
         start_utc: datetime,
         end_exclusive_utc: datetime,
-    ) -> list[HandoffRecord]:
-        """Load the complete tenant SLA cohort through one half-open predicate.
+    ) -> AsyncIterator[HandoffSlaCohortRow]:
+        """Stream a narrow tenant SLA cohort through one half-open predicate.
 
         Consumers must derive both queue items and every aggregate from this
-        returned population. Keeping the time and tenant boundary here avoids
-        subtly different SQL predicates for the list and radar statistics.
+        population. The projection deliberately excludes summary, context,
+        and first-message payloads so the radar path cannot load private text.
         """
 
+        context_safety = HandoffRecord.context["safety_concern"]
+        if self.session.get_bind().dialect.name == "sqlite":
+            safety_concern = case(
+                (
+                    func.json_type(HandoffRecord.context, "$.safety_concern") == "true",
+                    True,
+                ),
+                (
+                    func.json_type(HandoffRecord.context, "$.safety_concern")
+                    == "false",
+                    False,
+                ),
+                else_=None,
+            ).label("safety_concern")
+        else:
+            safety_concern = case(
+                (
+                    func.jsonb_typeof(context_safety) == "boolean",
+                    context_safety.as_boolean(),
+                ),
+                else_=None,
+            ).label("safety_concern")
+
         statement = (
-            select(HandoffRecord)
+            select(
+                HandoffRecord.id,
+                HandoffRecord.numero_whatsapp,
+                HandoffRecord.session_id,
+                safety_concern,
+                HandoffRecord.reason,
+                HandoffRecord.intencao_detectada,
+                HandoffRecord.estagio_atual,
+                HandoffRecord.created_at,
+                HandoffRecord.data_hora_saida,
+                HandoffRecord.sla_target_seconds,
+                HandoffRecord.status,
+            )
             .where(
                 HandoffRecord.tenant_id == tenant_id,
                 HandoffRecord.created_at >= start_utc,
@@ -256,8 +309,21 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
             )
             .order_by(HandoffRecord.created_at.asc(), HandoffRecord.id.asc())
         )
-        result = await self.session.execute(statement)
-        return list(result.scalars().all())
+        result = await self.session.stream(statement)
+        async for row in result.tuples():
+            yield HandoffSlaCohortRow(
+                id=row[0],
+                numero_whatsapp=row[1],
+                session_id=row[2],
+                safety_concern=row[3],
+                reason=row[4],
+                intencao_detectada=row[5],
+                estagio_atual=row[6],
+                created_at=row[7],
+                data_hora_saida=row[8],
+                sla_target_seconds=row[9],
+                status=row[10],
+            )
 
     async def current_timestamp(self) -> datetime:
         """Return the current database clock as an aware UTC timestamp."""

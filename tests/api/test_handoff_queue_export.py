@@ -847,7 +847,7 @@ def test_export_requires_credentials_and_honors_api_key_tenant_boundary(
     _, rows = _csv_rows(own)
     assert [row["numero_whatsapp"] for row in rows] == ["api-key-authorized"]
     assert cross_tenant.status_code == 403
-    assert cross_tenant.json() == {"detail": "tenant_mismatch"}
+    assert cross_tenant.json() == {"detail": {"code": "tenant_override_forbidden"}}
 
 
 def test_export_preserves_clinic_builder_super_admin_and_tenant_boundaries(
@@ -886,12 +886,30 @@ def test_export_preserves_clinic_builder_super_admin_and_tenant_boundaries(
         headers=_jwt_headers("clinic_admin", outsider.id),
         **params,
     )
+    unknown_role = _export(
+        client,
+        clinic.id,
+        headers=_jwt_headers("operator", clinic.id),
+        **params,
+    )
+    builder_without_identity = _export(
+        client,
+        clinic.id,
+        headers=_jwt_headers("builder", uuid4()),
+        **params,
+    )
 
     assert own.status_code == 200
     assert builder_response.status_code == 200
     assert super_admin.status_code == 200
     assert rejected.status_code == 403
-    assert rejected.json() == {"detail": "tenant_mismatch"}
+    assert rejected.json() == {"detail": {"code": "tenant_override_forbidden"}}
+    assert unknown_role.status_code == 403
+    assert unknown_role.json() == {"detail": {"code": "caller_role_forbidden"}}
+    assert builder_without_identity.status_code == 403
+    assert builder_without_identity.json() == {
+        "detail": {"code": "tenant_override_forbidden"}
+    }
     for response in (own, builder_response, super_admin):
         _, rows = _csv_rows(response)
         assert [row["numero_whatsapp"] for row in rows] == ["authorized"]

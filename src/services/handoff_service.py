@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Optional, TypeVar, cast
 from uuid import UUID, uuid4
 
@@ -39,7 +40,6 @@ from src.handoff.sla import (
     SlaMetrics,
     SlaOccurrence,
     SlaPeriod,
-    aggregate_sla,
     classify_sla,
     resolve_sla_period,
     resolve_sla_target,
@@ -61,6 +61,7 @@ from src.repositories.handoff import (
     HandoffCasOutcome,
     HandoffCasResult,
     HandoffRecordRepository,
+    HandoffSlaCohortRow,
 )
 
 logger = get_logger(__name__)
@@ -124,7 +125,7 @@ _TRANSITIONS: dict[HandoffStatus, frozenset[HandoffStatus]] = {
 class HandoffQueueSlaResult:
     """One resolved queue view derived from one persisted SLA cohort."""
 
-    items: tuple[HandoffRecord, ...]
+    items: tuple[HandoffSlaCohortRow, ...]
     metrics: SlaMetrics
     within_sla_count: int
     confirmed_late_count: int
@@ -1099,38 +1100,61 @@ class HandoffService:
                 to_date=to_date,
                 as_of=resolved_as_of,
             )
-            cohort = await HandoffRecordRepository(session).find_sla_cohort(
+            cohort = HandoffRecordRepository(session).stream_sla_cohort(
                 tenant_id=tenant_id,
                 start_utc=resolved_period.period.start_utc,
                 end_exclusive_utc=resolved_period.period.end_exclusive_utc,
             )
+            period = resolved_period.period
+            counts = {category: 0 for category in SlaCategory}
+            waiting_items: list[HandoffSlaCohortRow] = []
+            confirmed_elapsed_total = 0.0
+            confirmed_count = 0
+            eligible_count = 0
+            async for record in cohort:
+                classification = classify_sla(
+                    SlaOccurrence(
+                        created_at=_aware(record.created_at) or period.as_of,
+                        confirmed_at=_aware(record.data_hora_saida),
+                        sla_target_seconds=record.sla_target_seconds,
+                        status=cast(SlaHandoffStatus, record.status),
+                    ),
+                    as_of=period.as_of,
+                )
+                counts[classification.category] += 1
+                if classification.category in {
+                    SlaCategory.WITHIN_SLA,
+                    SlaCategory.CONFIRMED_LATE,
+                    SlaCategory.UNANSWERED_OVERDUE,
+                }:
+                    eligible_count += 1
+                if classification.elapsed_seconds is not None:
+                    confirmed_elapsed_total += classification.elapsed_seconds
+                    confirmed_count += 1
+                if record.status in {
+                    HandoffStatus.PENDING.value,
+                    HandoffStatus.ACCEPTED.value,
+                }:
+                    waiting_items.append(record)
 
-        period = resolved_period.period
-        classifications = tuple(
-            classify_sla(
-                SlaOccurrence(
-                    created_at=_aware(record.created_at) or period.as_of,
-                    confirmed_at=_aware(record.data_hora_saida),
-                    sla_target_seconds=record.sla_target_seconds,
-                    status=cast(SlaHandoffStatus, record.status),
-                ),
-                as_of=period.as_of,
-            )
-            for record in cohort
+        average = confirmed_elapsed_total / confirmed_count if confirmed_count else None
+        percentage = (
+            (
+                Decimal(counts[SlaCategory.WITHIN_SLA])
+                * Decimal(100)
+                / Decimal(eligible_count)
+            ).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+            if eligible_count
+            else None
         )
-        counts = {
-            category: sum(item.category is category for item in classifications)
-            for category in SlaCategory
-        }
-        waiting_statuses = {
-            HandoffStatus.PENDING.value,
-            HandoffStatus.ACCEPTED.value,
-        }
         return HandoffQueueSlaResult(
-            items=tuple(
-                record for record in cohort if record.status in waiting_statuses
+            items=tuple(waiting_items),
+            metrics=SlaMetrics(
+                confirmed_count=confirmed_count,
+                sla_eligible_count=eligible_count,
+                average_confirmed_seconds=average,
+                pct_within_sla=percentage,
             ),
-            metrics=aggregate_sla(classifications),
             within_sla_count=counts[SlaCategory.WITHIN_SLA],
             confirmed_late_count=counts[SlaCategory.CONFIRMED_LATE],
             unanswered_overdue_count=counts[SlaCategory.UNANSWERED_OVERDUE],
@@ -1191,6 +1215,8 @@ class HandoffService:
         local_today = as_of.astimezone(clinic_timezone).date()
         effective_from = from_date or local_today - timedelta(days=30)
         effective_to = to_date or local_today
+        if (effective_to - effective_from).days > 90:
+            raise HandoffSlaPeriodError("max_window_90_days")
         try:
             period = resolve_sla_period(
                 effective_from,
