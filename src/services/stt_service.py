@@ -1,8 +1,7 @@
-"""Private STT transport primitives for Scribe and OpenRouter.
+"""STT transport primitives and dispatcher for Scribe and OpenRouter.
 
-The public dispatcher in this module intentionally has no production caller yet.
 Provider activation, credential policy, and webhook routing are separate concerns;
-this module only owns the fixed vendor transports and their closed error boundary.
+this module owns the fixed vendor transports and their closed error boundary.
 """
 
 from __future__ import annotations

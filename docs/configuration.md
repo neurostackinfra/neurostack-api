@@ -420,8 +420,10 @@ Os IDs wire explícitos são `elevenlabs_scribe` (ElevenLabs Scribe) e
 podem ser executados pelo runtime, mas continuam fora da promoção pública: a
 matriz/card de produto mantém `elevenlabs_scribe` como `coming_soon` e não inclui
 `openrouter`. Somente a release unit do catálogo pode alterar matriz, UI/card ou
-adoção geral. `outros` continua sendo o adapter legado, oculto e distinto; não é
-alias, rótulo alternativo nem fallback de OpenRouter.
+adoção geral. `outros` continua sendo o adapter legado distinto e, até essa release,
+ainda aparece como card `coming_soon` na matriz/UI existente; não é alias, rótulo
+alternativo nem fallback de OpenRouter. O catálogo será responsável por ocultá-lo
+quando introduzir o ID explícito `openrouter` na apresentação pública.
 
 “Operacional” aqui significa que mocks determinísticos provam o contrato local
 de configuração e transporte. Não significa homologação live de credencial,
@@ -476,6 +478,7 @@ A taxonomia pública/configuração permanece fechada:
 `provider_not_available`, `invalid_provider_for_capability`,
 `invalid_credentials_payload` e `unsafe_api_url`. A fronteira de transporte
 usa somente `stt_provider_unsupported`, `unsupported_audio_mime`,
+`stt_configuration_invalid`,
 `stt_provider_http_error`, `stt_provider_transport_error`,
 `stt_malformed_response` e `stt_empty_transcript`. Corpo, header, URL, modelo e
 segredo externos não são encadeados nesses erros.
