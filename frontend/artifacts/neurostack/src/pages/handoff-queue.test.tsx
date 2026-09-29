@@ -235,6 +235,23 @@ describe("<HandoffQueuePage />", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("URL-encodes the effective managed clinic in queue requests", async () => {
+    Object.assign(mocks.auth, {
+      tenantId: "builder-id",
+      isBuilder: true,
+      viewingClinicId: "managed clinic/id",
+    });
+    mocks.fetch.mockResolvedValue(queueResponse([]));
+
+    renderPage();
+
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(1));
+    expect(mocks.fetch).toHaveBeenCalledWith(
+      "/v1/handoffs/queue?tenant_id=managed+clinic%2Fid",
+      { headers: { Authorization: "Bearer test-token" } },
+    );
+  });
+
   it.each([
     {
       locale: "pt" as const,
@@ -591,9 +608,9 @@ describe("<HandoffQueuePage />", () => {
       auth: {
         tenantId: "builder-id",
         isBuilder: true,
-        viewingClinicId: "viewed-clinic",
+        viewingClinicId: "managed clinic/id",
       },
-      tenant: "viewed-clinic",
+      tenant: "managed+clinic%2Fid",
     },
     {
       role: "super-admin",
@@ -936,7 +953,7 @@ describe("<HandoffQueuePage />", () => {
     { isBuilder: true, isSuperAdmin: false },
     { isBuilder: false, isSuperAdmin: true },
   ])(
-    "discards an export when the selected privileged clinic changes",
+    "discards an export after a privileged clinic changes away and back",
     async ({ isBuilder, isSuperAdmin }) => {
       Object.assign(mocks.auth, {
         tenantId: "privileged-user",
@@ -997,6 +1014,78 @@ describe("<HandoffQueuePage />", () => {
       expect(revokeObjectURL).not.toHaveBeenCalled();
     },
   );
+
+  it("does not toast a stale non-2xx export after its error JSON resolves", async () => {
+    const errorJson = deferred<{ detail: string }>();
+    const json = vi.fn(() => errorJson.promise);
+    mocks.fetch.mockImplementation((input: RequestInfo | URL) => {
+      if (String(input).includes("/export?")) {
+        return Promise.resolve({
+          ok: false,
+          status: 400,
+          json,
+        } as unknown as Response);
+      }
+      return Promise.resolve(queueResponse());
+    });
+    renderPage();
+    await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
+
+    fireEvent.click(screen.getByRole("button", { name: "Exportar CSV" }));
+    await waitFor(() => expect(json).toHaveBeenCalledTimes(1));
+    fireEvent.change(dateInputs()[0], {
+      target: { value: "2026-09-02" },
+    });
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(3));
+
+    await act(async () => {
+      errorJson.resolve({ detail: "export_limit_10000_exceeded" });
+      await errorJson.promise;
+      await Promise.resolve();
+    });
+
+    expect(mocks.toast).not.toHaveBeenCalled();
+  });
+
+  it("revokes a URL without clicking when the export becomes stale after URL creation", async () => {
+    const revokeObjectURL = vi.fn();
+    const createObjectURL = vi.fn(() => {
+      fireEvent.change(dateInputs()[0], {
+        target: { value: "2026-09-02" },
+      });
+      return "blob:stale-handoffs";
+    });
+    vi.stubGlobal(
+      "URL",
+      Object.assign(URL, { createObjectURL, revokeObjectURL }),
+    );
+    const anchorClick = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
+    const appendChild = vi.spyOn(document.body, "appendChild");
+    mocks.fetch.mockImplementation((input: RequestInfo | URL) => {
+      if (String(input).includes("/export?")) {
+        return Promise.resolve({
+          ok: true,
+          blob: async () => new Blob(["stale csv"]),
+        } as Response);
+      }
+      return Promise.resolve(queueResponse());
+    });
+    renderPage();
+    await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
+
+    fireEvent.click(screen.getByRole("button", { name: "Exportar CSV" }));
+
+    await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(1));
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:stale-handoffs");
+    expect(
+      appendChild.mock.calls.filter(
+        ([node]) => node instanceof HTMLAnchorElement,
+      ),
+    ).toHaveLength(0);
+    expect(anchorClick).not.toHaveBeenCalled();
+  });
 
   it.each([
     {

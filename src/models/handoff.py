@@ -17,7 +17,6 @@ from sqlalchemy import (
     String,
     Text,
     func,
-    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
@@ -194,7 +193,7 @@ class HandoffRecord(Base):
         nullable=True,
     )
 
-    # SLA snapshot and optimistic lifecycle coordination
+    # SLA snapshot and lifecycle concurrency metadata
     sla_target_seconds: Mapped[Optional[int]] = mapped_column(
         Integer,
         nullable=True,
@@ -206,7 +205,7 @@ class HandoffRecord(Base):
     lifecycle_version: Mapped[int] = mapped_column(
         Integer,
         default=0,
-        server_default=text("0"),
+        server_default="0",
         nullable=False,
     )
 

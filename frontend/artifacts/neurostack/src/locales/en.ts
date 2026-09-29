@@ -23,8 +23,7 @@ export const en = {
   nav_billing: "Subscription & Billing",
   investor_sales_cta: "Talk to sales",
   badge_coming_soon: "Coming soon",
-  builder_roadmap_certification_title:
-    "NeuroStack certification and co-branding",
+  builder_roadmap_certification_title: "NeuroStack certification and co-branding",
   builder_roadmap_coming_soon: "COMING SOON",
   label_select_clinic: "Select Clinic",
   label_search_clinics: "Search clinics",
@@ -35,8 +34,7 @@ export const en = {
   password_change_own_title: "Change my password",
   password_change_own_description: "Choose a new password for your account.",
   password_change_clinic_title: "Change clinic password",
-  password_change_clinic_description:
-    "Choose a new password for this clinic administrator.",
+  password_change_clinic_description: "Choose a new password for this clinic administrator.",
   password_change_new_label: "New password",
   password_change_confirm_label: "Confirm new password",
   password_change_submit: "Change password",
@@ -121,27 +119,23 @@ export const en = {
   // Trace History
   traces_title: "Trace History",
   traces_subtitle: "Audit log of all cognitive decisions made by the agent.",
-  traces_empty:
-    "No traces recorded yet. Go to the simulator to generate activity.",
+  traces_empty: "No traces recorded yet. Go to the simulator to generate activity.",
   traces_fail: "Failed to load traces. Please try again.",
 
   // Chat
   chat_title: "Chat Simulator",
-  chat_subtitle:
-    "Test the clinical AI agent. Responses will generate real-time traces.",
+  chat_subtitle: "Test the clinical AI agent. Responses will generate real-time traces.",
   chat_start: "Start a conversation to generate decision traces.",
   chat_trace_title: "Live Decision Trace",
   chat_trace_subtitle: "Diagnostic view of the latest reasoning cycle.",
   chat_waiting: "Waiting for activity. Send a message to generate a trace.",
   chat_placeholder: "Message the agent...",
   chat_no_clinic_selected_title: "No clinic selected",
-  chat_no_clinic_selected_desc:
-    "Select a clinic from the sidebar before using the simulator.",
+  chat_no_clinic_selected_desc: "Select a clinic from the sidebar before using the simulator.",
 
   // Clinic Config — Identity
   config_title: "Clinic Config",
-  config_subtitle:
-    "Dynamic data injected into the reasoning pipeline at runtime.",
+  config_subtitle: "Dynamic data injected into the reasoning pipeline at runtime.",
   config_pricing_badge: "pricing_mode: consult_only",
   config_identity: "Identity",
   config_identity_desc: "Used in agent communications and system prompts.",
@@ -152,14 +146,12 @@ export const en = {
 
   // Clinic Config — Differentials
   config_differentials: "Clinic Differentials",
-  config_differentials_hint:
-    "Write 2–4 sentences. The pipeline will split them into separate context items.",
+  config_differentials_hint: "Write 2–4 sentences. The pipeline will split them into separate context items.",
 
   // Clinic Config — Services
   config_services: "Services Offered",
-  config_services_desc:
-    "Used for intent qualification and treatment interest responses.",
-  config_services_empty: 'No services configured. Click "Add" to add one.',
+  config_services_desc: "Used for intent qualification and treatment interest responses.",
+  config_services_empty: "No services configured. Click \"Add\" to add one.",
   config_add: "Add",
   config_service_label: "Service",
   config_name_label: "Name",
@@ -176,8 +168,7 @@ export const en = {
 
   // Clinic Config — Integrations
   config_integrations: "Integrations (BYOK)",
-  config_integrations_desc:
-    "Bring Your Own Keys. Configure external LLM and WhatsApp providers. Leave blank to use the built-in mock.",
+  config_integrations_desc: "Bring Your Own Keys. Configure external LLM and WhatsApp providers. Leave blank to use the built-in mock.",
   config_llm_section: "LLM Provider",
   config_provider: "Provider",
   config_llm_none: "- None (use mock) -",
@@ -185,8 +176,7 @@ export const en = {
   config_llm_gemini: "Gemini",
   config_llm_dropout: "Dropout (OpenAI-compatible)",
   config_llm_cortex: "SLM Cortex - Fallback to Dropout (Coming Soon)",
-  config_cortex_note:
-    "Proprietary Vertical SLM. Routing via Dropout for MVP testing.",
+  config_cortex_note: "Proprietary Vertical SLM. Routing via Dropout for MVP testing.",
   config_roadmap: "Roadmap",
   config_llm_key: "API Key",
   config_llm_key_ph: "sk-...",
@@ -195,8 +185,7 @@ export const en = {
   config_llm_base_url_ph: "https://api.dropout.ai",
   config_whatsapp_section: "WhatsApp (Z-API)",
   config_whatsapp_url: "Instance API URL",
-  config_whatsapp_url_ph:
-    "https://api.z-api.io/instances/{instanceId}/token/{token}",
+  config_whatsapp_url_ph: "https://api.z-api.io/instances/{instanceId}/token/{token}",
   config_whatsapp_token: "Instance Security Token (Client-Token)",
 
   // ── Suporte / Help Desk ───────────────────────────────────────────────────
@@ -204,8 +193,7 @@ export const en = {
   support_subtitle: "NeuroStack support and feedback center",
   support_ticket_heading: "Open Ticket",
   support_active_badge: "ACTIVE",
-  support_response_hint:
-    "Your ticket will be routed to the responsible team, who will respond within 24 business hours.",
+  support_response_hint: "Your ticket will be routed to the responsible team, who will respond within 24 business hours.",
   support_tipo_label: "Type",
   support_tipo_ph: "Select type…",
   support_tipo_request: "Request",
@@ -220,8 +208,7 @@ export const en = {
   support_send_btn: "Send Message",
   support_sending_btn: "Sending…",
   support_toast_ok_title: "Message sent successfully!",
-  support_toast_ok_desc:
-    "Your ticket has been registered. Our team will respond shortly.",
+  support_toast_ok_desc: "Your ticket has been registered. Our team will respond shortly.",
   support_toast_ok_file: "Your ticket was registered with attachment",
   support_toast_fields_title: "Required fields",
   support_toast_fields_desc: "Please select a type and write your message.",
@@ -237,8 +224,7 @@ export const en = {
   support_stat_enterprise_note: "response within 4h",
   support_chat_heading: "Internal Chat & Concierge",
   support_chat_badge: "ROADMAP: Coming Soon (WebSockets)",
-  support_chat_desc:
-    "Real-time support channel with your dedicated account team.",
+  support_chat_desc: "Real-time support channel with your dedicated account team.",
   support_online_status: "Team Online",
   support_online_time: "Response time: < 2 min",
   support_agent_role: "Account Manager",
@@ -279,8 +265,7 @@ export const en = {
   admin_tickets_heading: "Support Tickets",
   admin_tickets_open_badge: "open",
   admin_tickets_refresh: "Refresh",
-  admin_tickets_desc:
-    "Requests and feedback submitted by clinics via the Support page.",
+  admin_tickets_desc: "Requests and feedback submitted by clinics via the Support page.",
   admin_tickets_empty: "No tickets received yet.",
   admin_ticket_open: "Open",
   admin_ticket_closed: "Closed",
@@ -327,10 +312,8 @@ export const en = {
   traces_filter_handoff: "Handoff only 🔄",
   traces_filter_active_badge: "active",
   traces_filter_csv_note: "Active filters will be applied to CSV.",
-  traces_report_hint:
-    "Export the full history of the selected period for audit and performance reports.",
-  traces_no_filter_match:
-    "No traces found with the selected filters in the period.",
+  traces_report_hint: "Export the full history of the selected period for audit and performance reports.",
+  traces_no_filter_match: "No traces found with the selected filters in the period.",
   traces_export_err_title: "Export error",
   traces_export_err_desc: "Could not generate the report. Please try again.",
   traces_view_mode_title: "View Mode",
@@ -353,22 +336,17 @@ export const en = {
   traces_no_filter_match_day: "No traces match the selected filters for",
   traces_error_no_token: "Sign in to load traces.",
   traces_error_unauthorized: "Your session expired. Sign in again.",
-  traces_error_timezone_required:
-    "A timezone is required for this day. Refresh the page and try again.",
+  traces_error_timezone_required: "A timezone is required for this day. Refresh the page and try again.",
   traces_error_day_required: "Choose a day to use the supplied timezone.",
-  traces_error_invalid_timezone:
-    "The browser timezone was not recognized. Update your settings and try again.",
-  traces_error_day_range_conflict:
-    "Use a day for the list or a range for CSV, not both in the same request.",
-  traces_error_unknown:
-    "Could not load traces. Try again; if the problem persists, contact support.",
+  traces_error_invalid_timezone: "The browser timezone was not recognized. Update your settings and try again.",
+  traces_error_day_range_conflict: "Use a day for the list or a range for CSV, not both in the same request.",
+  traces_error_unknown: "Could not load traces. Try again; if the problem persists, contact support.",
 
   // ── Trace Detail ─────────────────────────────────────────────────────────
   trace_detail_title: "Trace Detail",
   trace_detail_user_message: "User Message",
   trace_detail_not_found: "Trace Not Found",
-  trace_detail_not_found_desc:
-    "The requested trace could not be loaded or does not exist.",
+  trace_detail_not_found_desc: "The requested trace could not be loaded or does not exist.",
   trace_detail_back: "Back to Traces",
 
   // ── Clinic Config — Tabs ─────────────────────────────────────────────────
@@ -379,22 +357,17 @@ export const en = {
   config_tab_servicos: "Services",
   config_tab_apis: "APIs",
   config_tab_identidade_header: "Identity & Persona",
-  config_tab_identidade_desc:
-    "Defines how the agent presents itself and answers questions about its nature.",
+  config_tab_identidade_desc: "Defines how the agent presents itself and answers questions about its nature.",
   config_tab_operacao_header: "Operation & Logistics",
-  config_tab_operacao_desc:
-    "Data injected as literal string into context, no reinterpretation.",
+  config_tab_operacao_desc: "Data injected as literal string into context, no reinterpretation.",
   config_tab_negocio_header: "Business Rules & AI",
-  config_tab_negocio_desc:
-    "Directives that control SRM Core behavior, the agent reasoning nucleus.",
+  config_tab_negocio_desc: "Directives that control SRM Core behavior, the agent reasoning nucleus.",
   config_tab_handoff_header: "Handoff Management",
-  config_tab_handoff_desc:
-    "Controls when and how the agent transfers the conversation to a human agent.",
+  config_tab_handoff_desc: "Controls when and how the agent transfers the conversation to a human agent.",
   config_readonly_note: "Read-only mode, changes disabled",
   config_service_price: "Price",
   config_service_authority: "Authority Differentials",
-  config_service_authority_hint:
-    "Injected with the description to reinforce trust. e.g. 'Only clinic with X technology in the city.'",
+  config_service_authority_hint: "Injected with the description to reinforce trust. e.g. 'Only clinic with X technology in the city.'",
 
   // ── Builder Panel ────────────────────────────────────────────────────────
   builder_panel_title: "Builder Panel",
@@ -430,83 +403,60 @@ export const en = {
   builder_support_resolve_ok: "Ticket updated",
   builder_support_resolve_error: "Could not update ticket",
   builder_support_whatsapp: "Open WhatsApp",
-  builder_support_whatsapp_hint:
-    "No phone on file. Add one in Clinics to enable WhatsApp.",
+  builder_support_whatsapp_hint: "No phone on file. Add one in Clinics to enable WhatsApp.",
   builder_support_ticket_clinic: "Clinic",
   builder_support_ticket_type: "Type",
   builder_support_ticket_message: "Message",
   builder_support_ticket_date: "Date",
   builder_support_email_title: "Notification email",
-  builder_support_email_description:
-    "Address that will receive tickets sent by clinics.",
+  builder_support_email_description: "Address that will receive tickets sent by clinics.",
   builder_support_email_label: "Notification email",
   builder_support_email_placeholder: "you@example.com",
   builder_support_email_save: "Save email",
   builder_support_email_saved: "Notification email updated",
   builder_support_email_error: "Could not save email",
-  builder_support_email_fallback:
-    "No custom email — notifications go to {email}.",
+  builder_support_email_fallback: "No custom email — notifications go to {email}.",
   builder_support_email_hint: "Leave blank to fall back to the login email.",
   builder_clone_title: "Clone a clinic",
-  builder_clone_description:
-    "Create a new clinic from an existing clinic in your Builder account.",
+  builder_clone_description: "Create a new clinic from an existing clinic in your Builder account.",
   builder_clone_source_label: "Source clinic",
   builder_clone_source_placeholder: "Select a source clinic",
-  builder_clone_source_empty:
-    "Create a clinic before using the Cloning Center.",
+  builder_clone_source_empty: "Create a clinic before using the Cloning Center.",
   builder_clone_preview_loading: "Loading clone preview…",
   builder_clone_preview_title: "Clone preview",
   builder_clone_suggested_name: "Suggested name",
-  builder_clone_advisory_note:
-    "This name is advisory and may change when the clone is created.",
+  builder_clone_advisory_note: "This name is advisory and may change when the clone is created.",
   builder_clone_rag_documents: "Knowledge documents",
   builder_clone_rag_bytes: "RAG storage added",
-  builder_clone_rag_impact:
-    "Knowledge documents are duplicated and their bytes count again toward RAG storage.",
+  builder_clone_rag_impact: "Knowledge documents are duplicated and their bytes count again toward RAG storage.",
   builder_clone_included_title: "Included in the clone",
-  builder_clone_included_copy:
-    "Configuration, services, professionals, persona, business rules, and knowledge are copied.",
+  builder_clone_included_copy: "Configuration, services, professionals, persona, business rules, and knowledge are copied.",
   builder_clone_excluded_title: "Not included or reset",
   builder_clone_excluded_admin: "No admin user is created.",
-  builder_clone_excluded_integrations:
-    "API credentials and integrations are zeroed; the scheduling link is disabled and its URL is null.",
+  builder_clone_excluded_integrations: "API credentials and integrations are zeroed; the scheduling link is disabled and its URL is null.",
   builder_clone_inactive: "The clone starts inactive.",
-  builder_clone_confirm:
-    "I understand what will be copied and reset, and want to create this clone.",
+  builder_clone_confirm: "I understand what will be copied and reset, and want to create this clone.",
   builder_clone_submit: "Create clone",
   builder_clone_loading: "Creating clone…",
   builder_clone_success: "Clinic cloned successfully",
-  builder_clone_success_desc:
-    "This is the authoritative clinic returned by the server.",
+  builder_clone_success_desc: "This is the authoritative clinic returned by the server.",
   builder_clone_configure: "Configure cloned clinic",
-  builder_clone_refresh_warning:
-    "The clone was created, but clinics or billing could not be refreshed.",
+  builder_clone_refresh_warning: "The clone was created, but clinics or billing could not be refreshed.",
   builder_clone_refresh_retry: "Retry refresh",
-  builder_clone_preview_error_403:
-    "You no longer have permission to preview this clinic. The source remains selected.",
-  builder_clone_preview_error_404:
-    "The source clinic could not be found for preview. The source remains selected.",
-  builder_clone_preview_error_409:
-    "A preview is unavailable for the clinic's current configuration. The source remains selected.",
-  builder_clone_preview_error_500:
-    "The clone preview could not be loaded. The source remains selected.",
-  builder_clone_preview_error_network:
-    "The clone preview service could not be reached. The source remains selected.",
-  builder_clone_error_403:
-    "You no longer have permission to clone this clinic. Your source selection and preview were kept.",
-  builder_clone_error_404:
-    "The source clinic could not be found. Your source selection and preview were kept.",
-  builder_clone_error_409:
-    "The clinic cannot be cloned with its current configuration. Your source selection and preview were kept.",
-  builder_clone_error_500:
-    "The clone could not be saved. No clinic was created; your source selection and preview were kept.",
-  builder_clone_error_network:
-    "The cloning service could not be reached. Your source selection and preview were kept.",
+  builder_clone_preview_error_403: "You no longer have permission to preview this clinic. The source remains selected.",
+  builder_clone_preview_error_404: "The source clinic could not be found for preview. The source remains selected.",
+  builder_clone_preview_error_409: "A preview is unavailable for the clinic's current configuration. The source remains selected.",
+  builder_clone_preview_error_500: "The clone preview could not be loaded. The source remains selected.",
+  builder_clone_preview_error_network: "The clone preview service could not be reached. The source remains selected.",
+  builder_clone_error_403: "You no longer have permission to clone this clinic. Your source selection and preview were kept.",
+  builder_clone_error_404: "The source clinic could not be found. Your source selection and preview were kept.",
+  builder_clone_error_409: "The clinic cannot be cloned with its current configuration. Your source selection and preview were kept.",
+  builder_clone_error_500: "The clone could not be saved. No clinic was created; your source selection and preview were kept.",
+  builder_clone_error_network: "The cloning service could not be reached. Your source selection and preview were kept.",
   builder_alerts_title: "Alerts",
   builder_alerts_empty: "No alerts, everything running smoothly",
   builder_health_grid_title: "Clinic Health",
-  builder_health_legend:
-    "Green = active, Yellow = no traces 3-7 days, Red = no traces 7+ days",
+  builder_health_legend: "Green = active, Yellow = no traces 3-7 days, Red = no traces 7+ days",
   builder_last_trace: "Last trace",
   builder_days_ago: "days ago",
   builder_never: "never",
@@ -636,8 +586,7 @@ export const en = {
   // ── Inactive Session Queue ──
   nav_inactive_queue: "Inactive Queue",
   inactive_queue_title: "Inactive Queue",
-  inactive_queue_subtitle:
-    "Inactive conversations available to return to AI control.",
+  inactive_queue_subtitle: "Inactive conversations available to return to AI control.",
   inactive_contact: "Contact",
   inactive_session_code: "Session code",
   inactive_channel: "Channel",
@@ -657,8 +606,7 @@ export const en = {
   inactive_of: "of",
   inactive_total: "inactive conversations",
   inactive_reactivate_error_title: "Could not return service to AI",
-  inactive_reactivate_error_description:
-    "The conversation remains inactive. Please try again.",
+  inactive_reactivate_error_description: "The conversation remains inactive. Please try again.",
 
   // ── RLHF Audit ──
   rlhf_audit_filter_channel_label: "Channel",

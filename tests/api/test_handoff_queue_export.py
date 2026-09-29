@@ -205,9 +205,10 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
 
     async def tracked_execute(self: AsyncSession, *args: Any, **kwargs: Any) -> Any:
         nonlocal query_completed, selected_columns
-        selected_columns = [column.key for column in args[0].selected_columns]
         result = await original_execute(self, *args, **kwargs)
-        query_completed = True
+        if "handoff_records" in str(args[0]):
+            selected_columns = [column.key for column in args[0].selected_columns]
+            query_completed = True
         return result
 
     class ExportDatetime(datetime):
@@ -253,18 +254,9 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
     confirmed_in_progress = _handoff(
         tenant.id,
         session.id,
-        created_at=datetime(2026, 1, 10, 9, 30, tzinfo=timezone.utc),
+        created_at=datetime(2026, 1, 10, 10, 30, tzinfo=timezone.utc),
         status="in_progress",
-        checked_out_at=datetime(
-            2026,
-            1,
-            10,
-            9,
-            40,
-            0,
-            500000,
-            tzinfo=timezone.utc,
-        ),
+        checked_out_at=datetime(2026, 1, 10, 10, 31, 0, 500000, tzinfo=timezone.utc),
         phone="confirmed-in-progress",
     )
     excluded = [
@@ -280,14 +272,13 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
             session.id,
             created_at=datetime(2026, 1, 10, 12, tzinfo=timezone.utc),
             status="in_progress",
-            phone="in-progress",
+            phone="unconfirmed-in-progress",
         ),
         _handoff(
             tenant.id,
             session.id,
             created_at=datetime(2026, 1, 10, 13, tzinfo=timezone.utc),
             status="cancelled",
-            checked_out_at=datetime(2026, 1, 10, 13, 5, tzinfo=timezone.utc),
             phone="cancelled",
         ),
         _handoff(
@@ -295,7 +286,6 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
             session.id,
             created_at=datetime(2026, 1, 10, 13, 30, tzinfo=timezone.utc),
             status="timeout",
-            checked_out_at=datetime(2026, 1, 10, 13, 35, tzinfo=timezone.utc),
             phone="timeout",
         ),
         _handoff(
@@ -347,24 +337,24 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
     )
     _, rows = _csv_rows(response)
     assert [row["numero_whatsapp"] for row in rows] == [
-        "accepted",
         "confirmed-in-progress",
+        "accepted",
         "completed-after-window",
         "pending",
     ]
     assert [row["status"] for row in rows] == [
-        "accepted",
         "in_progress",
+        "accepted",
         "completed",
         "pending",
     ]
-    assert rows[0]["tempo_espera_segundos"] == "180000.0"
-    assert rows[1]["tempo_espera_segundos"] == "600.5"
+    assert rows[0]["tempo_espera_segundos"] == "60.5"
+    assert rows[1]["tempo_espera_segundos"] == "180000.0"
     assert rows[2]["tempo_espera_segundos"] == "86430.3"
     assert rows[3]["tempo_espera_segundos"] == "187199.6"
-    assert rows[0]["data_hora_saida"] == ""
+    assert rows[0]["data_hora_saida"] == "2026-01-10T10:31:00.500000+00:00"
+    assert rows[1]["data_hora_saida"] == ""
     assert rows[3]["data_hora_saida"] == ""
-    assert rows[1]["data_hora_saida"] == "2026-01-10T09:40:00.500000+00:00"
     assert rows[2]["data_hora_saida"] == "2026-01-11T09:00:30.260000+00:00"
     assert all(row["created_at"].endswith("+00:00") for row in rows)
     assert {row["exported_at"] for row in rows} == {"2026-01-12T12:00:00+00:00"}
@@ -378,10 +368,100 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
     ]
 
 
-def test_export_uses_clinic_timezone_fallback_and_ignores_browser_timezone(
+def test_privileged_checkout_remains_exportable_in_selected_tenant_cohort(
     client: TestClient,
 ) -> None:
-    tenant = _tenant(timezone_name=None)
+    builder_id = uuid4()
+    builder = Builder(id=builder_id, name="Checkout Export Builder")
+    clinic = _tenant(builder_id=builder_id)
+    outsider = _tenant()
+    clinic_session = _session(clinic.id)
+    outsider_session = _session(outsider.id)
+    created_at = datetime.now(timezone.utc) - timedelta(minutes=2)
+    clinic_handoff = _handoff(
+        clinic.id,
+        clinic_session.id,
+        created_at=created_at,
+        phone="confirmed-and-exported",
+    )
+    outsider_handoff = _handoff(
+        outsider.id,
+        outsider_session.id,
+        created_at=created_at,
+        phone="isolated-outsider",
+    )
+    _seed(
+        client,
+        builder,
+        clinic,
+        outsider,
+        clinic_session,
+        outsider_session,
+        clinic_handoff,
+        outsider_handoff,
+    )
+    builder_headers = _jwt_headers(
+        "builder",
+        uuid4(),
+        builder_id=builder_id,
+    )
+    cohort_date = created_at.date().isoformat()
+
+    checkout = client.post(
+        f"/v1/handoffs/queue/{clinic_handoff.id}/checkout",
+        params={"tenant_id": str(clinic.id)},
+        headers=builder_headers,
+    )
+    exported = _export(
+        client,
+        clinic.id,
+        headers=builder_headers,
+        from_date=cohort_date,
+        to_date=cohort_date,
+    )
+    denied_checkout = client.post(
+        f"/v1/handoffs/queue/{outsider_handoff.id}/checkout",
+        params={"tenant_id": str(outsider.id)},
+        headers=builder_headers,
+    )
+    denied_export = _export(
+        client,
+        outsider.id,
+        headers=builder_headers,
+        from_date=cohort_date,
+        to_date=cohort_date,
+    )
+
+    assert checkout.status_code == 200, checkout.text
+    assert checkout.json()["status"] == "in_progress"
+    assert exported.status_code == 200, exported.text
+    _, rows = _csv_rows(exported)
+    assert [row["numero_whatsapp"] for row in rows] == ["confirmed-and-exported"]
+    row = rows[0]
+    assert row["status"] == "in_progress"
+    checked_out_at = datetime.fromisoformat(row["data_hora_saida"])
+    exported_created_at = datetime.fromisoformat(row["created_at"])
+    assert float(row["tempo_espera_segundos"]) == round(
+        (checked_out_at - exported_created_at).total_seconds(),
+        1,
+    )
+    assert denied_checkout.status_code == 403
+    assert denied_export.status_code == 403
+
+
+@pytest.mark.parametrize(
+    ("clinic_timezone", "browser_timezone"),
+    [
+        (None, "Asia/Tokyo"),
+        ("Mars/Olympus_Mons", "Mars/Olympus_Mons"),
+    ],
+)
+def test_export_uses_clinic_timezone_fallback_and_ignores_browser_timezone(
+    client: TestClient,
+    clinic_timezone: str | None,
+    browser_timezone: str,
+) -> None:
+    tenant = _tenant(timezone_name=clinic_timezone)
     session = _session(tenant.id)
     records = [
         _handoff(
@@ -416,9 +496,9 @@ def test_export_uses_clinic_timezone_fallback_and_ignores_browser_timezone(
         tenant.id,
         from_date="2026-01-10",
         to_date="2026-01-10",
-        timezone="Asia/Tokyo",
+        timezone=browser_timezone,
     )
-    invalid_browser_timezone = _export(
+    repeated = _export(
         client,
         tenant.id,
         from_date="2026-01-10",
@@ -432,9 +512,9 @@ def test_export_uses_clinic_timezone_fallback_and_ignores_browser_timezone(
         "local-end-minus-one",
         "local-start",
     ]
-    assert invalid_browser_timezone.status_code == 200
-    _, invalid_rows = _csv_rows(invalid_browser_timezone)
-    assert [row["numero_whatsapp"] for row in invalid_rows] == [
+    assert repeated.status_code == 200
+    _, repeated_rows = _csv_rows(repeated)
+    assert [row["numero_whatsapp"] for row in repeated_rows] == [
         "local-end-minus-one",
         "local-start",
     ]
@@ -520,6 +600,62 @@ def test_export_queue_and_radar_share_clinic_dst_cohort(
         "/v1/handoffs/queue/export"
     ]["get"]["parameters"]
     assert "timezone" not in {parameter["name"] for parameter in export_parameters}
+
+
+@pytest.mark.parametrize(
+    ("status", "created_at", "checked_out_at"),
+    [
+        (
+            "pending",
+            datetime(2026, 6, 1, 13, tzinfo=timezone.utc),
+            None,
+        ),
+        (
+            "in_progress",
+            datetime(2026, 6, 1, 11, tzinfo=timezone.utc),
+            datetime(2026, 6, 1, 10, tzinfo=timezone.utc),
+        ),
+    ],
+)
+def test_export_fails_closed_for_invalid_temporal_invariants(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    created_at: datetime,
+    checked_out_at: datetime | None,
+) -> None:
+    from src.api.routes import handoff as route
+
+    class ExportDatetime(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            return datetime(2026, 6, 1, 12, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(route, "datetime", ExportDatetime)
+    tenant = _tenant()
+    session = _session(tenant.id)
+    record = _handoff(
+        tenant.id,
+        session.id,
+        created_at=created_at,
+        status=status,
+        checked_out_at=checked_out_at,
+        phone="invalid-temporal-order",
+    )
+    _seed(client, tenant, session, record)
+
+    response = _export(
+        client,
+        tenant.id,
+        from_date="2026-06-01",
+        to_date="2026-06-01",
+    )
+
+    assert response.status_code == 400
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {"detail": "invalid_handoff_timestamps"}
+    assert "content-disposition" not in response.headers
+    assert not response.content.startswith(b"\xef\xbb\xbf")
 
 
 @pytest.mark.parametrize(
@@ -750,62 +886,6 @@ def test_export_enforces_ten_thousand_limit_without_partial_csv(
     assert response.status_code == 400
     assert response.headers["content-type"] == "application/json"
     assert response.json() == {"detail": "export_limit_10000_exceeded"}
-    assert not response.content.startswith(b"\xef\xbb\xbf")
-
-
-@pytest.mark.parametrize(
-    ("status", "created_at", "checked_out_at"),
-    [
-        (
-            "pending",
-            datetime(2026, 6, 1, 13, tzinfo=timezone.utc),
-            None,
-        ),
-        (
-            "in_progress",
-            datetime(2026, 6, 1, 11, tzinfo=timezone.utc),
-            datetime(2026, 6, 1, 10, tzinfo=timezone.utc),
-        ),
-    ],
-)
-def test_export_fails_before_csv_for_invalid_temporal_invariants(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-    status: str,
-    created_at: datetime,
-    checked_out_at: datetime | None,
-) -> None:
-    from src.api.routes import handoff as route
-
-    class ExportDatetime(datetime):
-        @classmethod
-        def now(cls, tz: Any = None) -> datetime:
-            return datetime(2026, 6, 1, 12, tzinfo=timezone.utc)
-
-    monkeypatch.setattr(route, "datetime", ExportDatetime)
-    tenant = _tenant()
-    session = _session(tenant.id)
-    record = _handoff(
-        tenant.id,
-        session.id,
-        created_at=created_at,
-        status=status,
-        checked_out_at=checked_out_at,
-        phone="invalid-temporal-order",
-    )
-    _seed(client, tenant, session, record)
-
-    response = _export(
-        client,
-        tenant.id,
-        from_date="2026-06-01",
-        to_date="2026-06-01",
-    )
-
-    assert response.status_code == 400
-    assert response.headers["content-type"] == "application/json"
-    assert response.json() == {"detail": "invalid_handoff_timestamps"}
-    assert "content-disposition" not in response.headers
     assert not response.content.startswith(b"\xef\xbb\xbf")
 
 

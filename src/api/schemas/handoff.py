@@ -73,7 +73,7 @@ class HandoffQueueItem(BaseModel):
     primeira_linha_mensagem: Optional[str] = None
     created_at: _dt
     data_hora_saida: Optional[_dt] = None
-    sla_target_seconds: Optional[int] = Field(..., ge=60, le=7200)
+    sla_target_seconds: Optional[int] = Field(ge=60, le=7200)
     status: HandoffStatus
 
 
@@ -81,8 +81,8 @@ class HandoffQueueResponse(BaseModel):
     """Response for GET /queue — items + aggregate stats."""
 
     items: list[HandoffQueueItem]
-    avg_wait_seconds: Optional[float] = Field(..., ge=0)
-    pct_within_sla: Optional[float] = Field(..., ge=0, le=100)
+    avg_wait_seconds: Optional[float] = Field(ge=0)
+    pct_within_sla: Optional[float] = Field(ge=0, le=100)
     within_sla_count: int = Field(ge=0)
     confirmed_late_count: int = Field(ge=0)
     unanswered_overdue_count: int = Field(ge=0)
@@ -94,6 +94,7 @@ class HandoffQueueResponse(BaseModel):
     period_timezone: str
     period_start: _dt
     period_end_exclusive: _dt
+    as_of: _dt
 
 
 class HandoffCheckoutResponse(HandoffQueueItem):
@@ -103,23 +104,19 @@ class HandoffCheckoutResponse(HandoffQueueItem):
 
 
 class HandoffNotFoundResponse(BaseModel):
-    """Stable response returned when a tenant-scoped handoff is absent."""
+    """Stable lifecycle not-found error."""
 
     detail: Literal["handoff_not_found"]
 
 
 class HandoffConflictResponse(BaseModel):
-    """Stable response returned when attendance cannot transition state."""
+    """Stable lifecycle conflict errors."""
 
-    detail: Literal[
-        "attendance_already_confirmed",
-        "invalid_handoff_state",
-        "handoff_conflict",
-    ]
+    detail: Literal["handoff_conflict", "invalid_handoff_transition"]
 
 
 class HandoffUnavailableResponse(BaseModel):
-    """Stable response returned when confirmation persistence is unavailable."""
+    """Stable lifecycle dependency failure."""
 
     detail: Literal["handoff_service_unavailable"]
 

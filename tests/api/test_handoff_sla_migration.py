@@ -1,15 +1,19 @@
-"""PostgreSQL evidence for the handoff SLA snapshot migration."""
+"""Contract tests for migration 021's handoff SLA columns and constraints."""
 
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import ipaddress
 import os
 import re
+import subprocess
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from types import ModuleType, SimpleNamespace
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -22,17 +26,268 @@ from sqlalchemy.pool import NullPool
 from src.config.settings import settings
 from src.models.handoff import HandoffRecord
 
+MIGRATION_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "alembic"
+    / "versions"
+    / "20260928_000001_021_add_handoff_sla_lifecycle.py"
+)
 _ROOT = Path(__file__).resolve().parents[2]
 _ADMIN_DATABASES = {"postgres"}
 _LOCAL_SOCKET_DIRECTORIES = {"/run/postgresql", "/var/run/postgresql"}
 _CHILD_PATTERN = re.compile(r"^neurostack_handoff_sla_smoke_[0-9a-f]{12}$")
 
 
+class OperationRecorder:
+    def __init__(self) -> None:
+        self.added_columns: list[tuple[str, sa.Column[Any]]] = []
+        self.created_constraints: list[tuple[str, str, str, dict[str, Any]]] = []
+        self.executed_statements: list[str] = []
+        self.executed_in_autocommit: list[bool] = []
+        self.transaction_events: list[str] = []
+        self.constraints_at_autocommit_start: list[int] = []
+        self.dropped_constraints: list[tuple[str, str, str | None]] = []
+        self.dropped_columns: list[tuple[str, str]] = []
+        self._in_autocommit = False
+
+    def add_column(self, table_name: str, column: sa.Column[Any]) -> None:
+        self.added_columns.append((table_name, column))
+
+    def create_check_constraint(
+        self,
+        name: str,
+        table_name: str,
+        condition: str,
+        **dialect_kwargs: Any,
+    ) -> None:
+        self.created_constraints.append((name, table_name, condition, dialect_kwargs))
+
+    def execute(self, statement: Any) -> None:
+        self.executed_statements.append(str(statement))
+        self.executed_in_autocommit.append(self._in_autocommit)
+
+    def get_context(self) -> OperationRecorder:
+        return self
+
+    @contextmanager
+    def autocommit_block(self) -> Iterator[None]:
+        self.constraints_at_autocommit_start.append(len(self.created_constraints))
+        self.transaction_events.append("begin_autocommit")
+        self._in_autocommit = True
+        try:
+            yield
+        finally:
+            self._in_autocommit = False
+            self.transaction_events.append("end_autocommit")
+
+    def drop_constraint(
+        self, name: str, table_name: str, type_: str | None = None
+    ) -> None:
+        self.dropped_constraints.append((name, table_name, type_))
+
+    def drop_column(self, table_name: str, column_name: str) -> None:
+        self.dropped_columns.append((table_name, column_name))
+
+
+def _load_migration() -> ModuleType:
+    import alembic as alembic_package
+
+    if not hasattr(alembic_package, "op"):
+        alembic_package.op = SimpleNamespace()  # type: ignore[attr-defined]
+
+    spec = importlib.util.spec_from_file_location(
+        "handoff_sla_migration_021", MIGRATION_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture()
+def migration() -> ModuleType:
+    return _load_migration()
+
+
+def _upgrade(migration: ModuleType) -> OperationRecorder:
+    recorder = OperationRecorder()
+    setattr(migration, "op", recorder)
+    migration.upgrade()
+    return recorder
+
+
+def _constraint_table(recorder: OperationRecorder) -> tuple[sa.Engine, sa.Table]:
+    metadata = sa.MetaData()
+    added_columns = [column for _, column in recorder.added_columns]
+    constraints = [
+        sa.CheckConstraint(condition, name=name)
+        for name, _, condition, _ in recorder.created_constraints
+    ]
+    table = sa.Table(
+        "handoff_records",
+        metadata,
+        sa.Column("id", sa.Integer(), primary_key=True),
+        *added_columns,
+        *constraints,
+    )
+    engine = sa.create_engine("sqlite://")
+    metadata.create_all(engine)
+    return engine, table
+
+
+def test_revision_extends_the_current_head(migration: ModuleType) -> None:
+    assert migration.revision == "021"
+    assert migration.down_revision == "020"
+
+
+def test_upgrade_adds_nullable_snapshots_and_internal_version(
+    migration: ModuleType,
+) -> None:
+    recorder = _upgrade(migration)
+    columns = {column.name: column for _, column in recorder.added_columns}
+
+    assert {table for table, _ in recorder.added_columns} == {"handoff_records"}
+    assert set(columns) == {"sla_target_seconds", "updated_at", "lifecycle_version"}
+    assert isinstance(columns["sla_target_seconds"].type, sa.Integer)
+    assert columns["sla_target_seconds"].nullable is True
+    assert columns["sla_target_seconds"].server_default is None
+    assert isinstance(columns["updated_at"].type, sa.DateTime)
+    assert columns["updated_at"].type.timezone is True
+    assert columns["updated_at"].nullable is True
+    assert columns["updated_at"].server_default is None
+    assert columns["lifecycle_version"].nullable is False
+    lifecycle_default = columns["lifecycle_version"].server_default
+    assert lifecycle_default is not None
+    assert str(getattr(lifecycle_default, "arg", lifecycle_default)) == "0"
+    assert {name for name, _, _, _ in recorder.created_constraints} == {
+        "ck_handoff_records_sla_target_seconds_range",
+        "ck_handoff_records_lifecycle_version_nonnegative",
+    }
+    assert all(
+        dialect_kwargs == {"postgresql_not_valid": True}
+        for _, _, _, dialect_kwargs in recorder.created_constraints
+    )
+    assert recorder.executed_statements == [
+        "ALTER TABLE handoff_records VALIDATE CONSTRAINT "
+        "ck_handoff_records_sla_target_seconds_range",
+        "ALTER TABLE handoff_records VALIDATE CONSTRAINT "
+        "ck_handoff_records_lifecycle_version_nonnegative",
+    ]
+    assert recorder.executed_in_autocommit == [True, True]
+    assert recorder.constraints_at_autocommit_start == [2]
+    assert recorder.transaction_events == ["begin_autocommit", "end_autocommit"]
+
+
+def test_offline_sql_commits_not_valid_constraints_before_validation() -> None:
+    alembic_executable = Path(sys.executable).with_name("alembic")
+    assert alembic_executable.is_file()
+    environment = os.environ.copy()
+    environment["DATABASE_URL"] = (
+        "postgresql+asyncpg://offline:offline@localhost/offline"
+    )
+    completed = subprocess.run(
+        [str(alembic_executable), "upgrade", "020:021", "--sql"],
+        cwd=_ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    sql = completed.stdout
+
+    sla_not_valid = sql.index(
+        "ADD CONSTRAINT ck_handoff_records_sla_target_seconds_range"
+    )
+    version_not_valid = sql.index(
+        "ADD CONSTRAINT ck_handoff_records_lifecycle_version_nonnegative"
+    )
+    commit = sql.index("COMMIT;", version_not_valid)
+    validate_sla = sql.index(
+        "VALIDATE CONSTRAINT ck_handoff_records_sla_target_seconds_range"
+    )
+    validate_version = sql.index(
+        "VALIDATE CONSTRAINT ck_handoff_records_lifecycle_version_nonnegative"
+    )
+    next_transaction = sql.index("BEGIN;", validate_version)
+
+    assert (
+        sla_not_valid
+        < version_not_valid
+        < commit
+        < validate_sla
+        < validate_version
+        < next_transaction
+    )
+
+
+def test_upgrade_constraints_accept_boundaries_and_preserve_legacy_nulls(
+    migration: ModuleType,
+) -> None:
+    recorder = _upgrade(migration)
+    engine, table = _constraint_table(recorder)
+
+    with engine.begin() as connection:
+        connection.execute(table.insert().values(id=1))
+        connection.execute(table.insert().values(id=2, sla_target_seconds=60))
+        connection.execute(table.insert().values(id=3, sla_target_seconds=7200))
+
+    with engine.connect() as connection:
+        legacy = connection.execute(sa.select(table).where(table.c.id == 1)).one()
+    assert legacy.sla_target_seconds is None
+    assert legacy.updated_at is None
+    assert legacy.lifecycle_version == 0
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"sla_target_seconds": 59},
+        {"sla_target_seconds": 7201},
+        {"lifecycle_version": -1},
+    ],
+)
+def test_upgrade_constraints_reject_out_of_contract_values(
+    migration: ModuleType, values: dict[str, int]
+) -> None:
+    recorder = _upgrade(migration)
+    engine, table = _constraint_table(recorder)
+
+    with pytest.raises(IntegrityError), engine.begin() as connection:
+        connection.execute(table.insert().values(id=1, **values))
+
+
+def test_downgrade_removes_constraints_and_all_three_columns(
+    migration: ModuleType,
+) -> None:
+    recorder = OperationRecorder()
+    setattr(migration, "op", recorder)
+
+    migration.downgrade()
+
+    assert recorder.dropped_constraints == [
+        (
+            "ck_handoff_records_lifecycle_version_nonnegative",
+            "handoff_records",
+            "check",
+        ),
+        (
+            "ck_handoff_records_sla_target_seconds_range",
+            "handoff_records",
+            "check",
+        ),
+    ]
+    assert recorder.dropped_columns == [
+        ("handoff_records", "lifecycle_version"),
+        ("handoff_records", "updated_at"),
+        ("handoff_records", "sla_target_seconds"),
+    ]
+
+
 def _database_identity(url: URL) -> tuple[str, int, str | None]:
     query_host = url.query.get("host")
     query_port = url.query.get("port")
     host = str(query_host or url.host or "").lower()
-    port = int(query_port or url.port or 5432)
+    port = int(str(query_port or url.port or 5432))
     return host, port, url.database
 
 
@@ -181,8 +436,9 @@ def _inspect_handoff(connection: sa.Connection) -> dict[str, Any]:
 
 
 def _inspect_check_validation(connection: sa.Connection) -> dict[str, bool]:
-    return dict(
-        connection.execute(
+    return {
+        str(row[0]): bool(row[1])
+        for row in connection.execute(
             sa.text(
                 "SELECT conname, convalidated FROM pg_constraint "
                 "WHERE conrelid = 'handoff_records'::regclass "
@@ -191,7 +447,7 @@ def _inspect_check_validation(connection: sa.Connection) -> dict[str, bool]:
                 "'ck_handoff_records_lifecycle_version_nonnegative')"
             )
         ).all()
-    )
+    }
 
 
 @pytest.mark.parametrize(
@@ -202,7 +458,10 @@ def _inspect_check_validation(connection: sa.Connection) -> dict[str, bool]:
         ("postgresql://localhost/neurostack", "administrative database"),
         ("postgresql://localhost:6432/postgres", "local PostgreSQL port"),
         ("postgresql:///postgres?host=/tmp", "local socket"),
-        ("postgresql:///postgres?host=/run/postgresql&sslmode=disable", "parameters"),
+        (
+            "postgresql:///postgres?host=/run/postgresql&sslmode=disable",
+            "parameters",
+        ),
         ("postgresql:///postgres?host=/run/postgresql&port=6432", "port"),
     ],
 )
@@ -395,12 +654,14 @@ async def test_real_postgres_upgrade_and_downgrade_preserve_contract(
 
 
 def test_orm_columns_and_constraints_match_the_migration_contract() -> None:
-    table = HandoffRecord.__table__
+    table = cast(sa.Table, HandoffRecord.__table__)
 
     assert table.c.sla_target_seconds.nullable is True
     assert table.c.updated_at.nullable is True
     assert table.c.lifecycle_version.nullable is False
-    assert str(table.c.lifecycle_version.server_default.arg) == "0"
+    lifecycle_default = table.c.lifecycle_version.server_default
+    assert lifecycle_default is not None
+    assert str(getattr(lifecycle_default, "arg", lifecycle_default)) == "0"
     assert {constraint.name for constraint in table.constraints} >= {
         "ck_handoff_records_sla_target_seconds_range",
         "ck_handoff_records_lifecycle_version_nonnegative",

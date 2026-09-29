@@ -8,14 +8,15 @@ Tests cover:
 - API endpoints
 """
 
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+import src.services.handoff_service as handoff_service_module
 from src.core.exceptions import (
     HandoffNotFoundError,
     HandoffServiceError,
@@ -28,6 +29,8 @@ from src.handoff.models import (
     HandoffReason,
     HandoffRequest,
     HandoffResponse,
+    HandoffSector,
+    HandoffSLA,
     HandoffStatus,
     HandoffUpdate,
     HandoffUrgency,
@@ -39,21 +42,24 @@ from src.handoff.models import (
 )
 from src.handoff.summarizer import ConversationSummarizer
 from src.handoff.webhook import WebhookDispatcher
-from src.models.base import Base
-from src.models.clinic_config_table import ClinicConfigTable
+from src.memory.event_store import EventData, EventType
 from src.models.handoff import HandoffRecord
-from src.models.session import Session
-from src.models.tenant import Tenant
-from src.repositories.database import _patch_jsonb_for_sqlite
-from src.repositories.handoff import HandoffRecordRepository, HandoffSlaCohortRow
+from src.repositories.handoff import (
+    HandoffCasOutcome,
+    HandoffCasResult,
+    HandoffLookupOutcome,
+    HandoffLookupResult,
+    HandoffRecordRepository,
+    HandoffSlaConfiguration,
+)
 from src.services import HandoffService
-from src.services import handoff_service as handoff_service_module
 from src.services.handoff_service import (
     HANDOFF_OPERATIONS,
-    HandoffLifecycleError,
+    HandoffConflictError,
+    HandoffPersistenceError,
     HandoffPostCommitError,
-    HandoffSlaPeriodError,
-    handoff_record_to_detail,
+    HandoffSlaDataError,
+    HandoffTransitionError,
 )
 
 # ============================================
@@ -128,274 +134,225 @@ def webhook_dispatcher():
     )
 
 
-@pytest.fixture(scope="module")
-async def handoff_session_factory():
-    _patch_jsonb_for_sqlite()
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    yield factory
-    await engine.dispose()
+@dataclass
+class _FakeHandoffStore:
+    records: dict[UUID, HandoffRecord] = field(default_factory=dict)
+    configured_minutes: object = 10
+    conflict_next: bool = False
+    fail_insert: bool = False
+    fail_bookkeeping: bool = False
+    session_is_owned: bool = True
+    order: list[str] = field(default_factory=list)
+    db_now: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc),
+    )
 
 
-@pytest.fixture(autouse=True)
-async def persisted_handoff_session(
-    handoff_session_factory,
-    tenant_id,
-    session_id,
-):
-    async with handoff_session_factory() as session:
-        async with session.begin():
-            session.add(
-                Tenant(
-                    id=tenant_id,
-                    name=f"Clinic {tenant_id}",
-                    slug=f"clinic-{tenant_id}",
-                    api_key_hash=f"hash-{tenant_id}",
-                    config={},
-                )
-            )
-            session.add(
-                Session(
-                    id=session_id,
-                    tenant_id=tenant_id,
-                    channel="test",
-                    cognitive_state={},
-                    session_metadata={},
-                )
-            )
+class _FakeSession:
+    def __init__(self, store):
+        self.store = store
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def commit(self):
+        self.store.order.append("commit")
+        return None
+
+    async def rollback(self):
+        return None
+
+
+class _FakeHandoffRepository:
+    def __init__(self, store: _FakeHandoffStore):
+        self.store = store
+
+    async def session_belongs_to_tenant(self, _tenant_id, _session_id):
+        return self.store.session_is_owned
+
+    async def load_sla_configuration(self, _tenant_id):
+        return HandoffSlaConfiguration(self.store.configured_minutes, "fake")
+
+    async def create_record(self, record):
+        if self.store.fail_insert:
+            raise RuntimeError("insert failed")
+        record.created_at = datetime.now(timezone.utc)
+        self.store.records[record.id] = record
+        return record
+
+    async def current_timestamp(self):
+        return self.store.db_now
+
+    async def lookup(self, tenant_id, handoff_id):
+        record = self.store.records.get(handoff_id)
+        if record is None or record.tenant_id != tenant_id:
+            return HandoffLookupResult(HandoffLookupOutcome.NOT_FOUND)
+        return HandoffLookupResult(HandoffLookupOutcome.FOUND, record)
+
+    async def find_by_tenant(
+        self,
+        tenant_id,
+        status=None,
+        skip=0,
+        limit=None,
+    ):
+        records = [
+            record
+            for record in self.store.records.values()
+            if record.tenant_id == tenant_id
+            and (status is None or record.status == status)
+        ]
+        records.sort(key=lambda record: record.created_at, reverse=True)
+        return records[skip : None if limit is None else skip + limit]
+
+    async def find_active_for_session(self, tenant_id, session_id):
+        records = [
+            record
+            for record in self.store.records.values()
+            if record.session_id == session_id
+            and record.tenant_id == tenant_id
+            and record.status in {"pending", "accepted", "in_progress"}
+        ]
+        if not records:
+            return HandoffLookupResult(HandoffLookupOutcome.NOT_FOUND)
+        records.sort(key=lambda record: record.created_at, reverse=True)
+        return HandoffLookupResult(HandoffLookupOutcome.FOUND, records[0])
+
+    async def accept_handoff(self, **kwargs):
+        return self._cas(
+            kwargs,
+            status="accepted",
+            assigned_to=kwargs["agent_id"],
+        )
+
+    async def confirm_handoff(self, **kwargs):
+        record = self.store.records[kwargs["handoff_id"]]
+        if record.data_hora_saida is not None:
+            return HandoffCasResult(HandoffCasOutcome.CONFLICT)
+        values = {
+            "status": "in_progress",
+            "data_hora_saida": kwargs["confirmed_at"],
+        }
+        if kwargs["agent_id"] is not None:
+            values["assigned_to"] = kwargs["agent_id"]
+        return self._cas(kwargs, **values)
+
+    async def complete_handoff(self, **kwargs):
+        record = self.store.records[kwargs["handoff_id"]]
+        if record.data_hora_saida is None:
+            return HandoffCasResult(HandoffCasOutcome.CONFLICT)
+        return self._cas(
+            kwargs,
+            status="completed",
+            resolved_at=kwargs["changed_at"],
+            resolution_notes=kwargs["notes"],
+        )
+
+    async def cancel_handoff(self, **kwargs):
+        return self._cas(
+            kwargs,
+            status="cancelled",
+            resolved_at=kwargs["changed_at"],
+            resolution_notes=kwargs["notes"],
+        )
+
+    async def timeout_handoff(self, **kwargs):
+        return self._cas(
+            kwargs,
+            status="timeout",
+            resolved_at=kwargs["changed_at"],
+        )
+
+    async def update_verification(self, **kwargs):
+        return self._cas(kwargs, context=kwargs["context"])
+
+    async def record_webhook_delivery(
+        self,
+        *,
+        tenant_id,
+        handoff_id,
+        sent,
+        response,
+    ):
+        self.store.order.append("bookkeeping")
+        if self.store.fail_bookkeeping:
+            raise RuntimeError("bookkeeping failed")
+        record = self.store.records.get(handoff_id)
+        if record is None or record.tenant_id != tenant_id:
+            return False
+        record.webhook_sent = sent
+        record.webhook_response = response
+        return True
+
+    def _cas(self, kwargs: dict[str, Any], **values: Any):
+        if self.store.conflict_next:
+            self.store.conflict_next = False
+            return HandoffCasResult(HandoffCasOutcome.CONFLICT)
+        record = self.store.records.get(kwargs["handoff_id"])
+        if (
+            record is None
+            or record.tenant_id != kwargs["tenant_id"]
+            or record.status != kwargs["observed_status"]
+            or record.lifecycle_version != kwargs["observed_lifecycle_version"]
+        ):
+            return HandoffCasResult(HandoffCasOutcome.CONFLICT)
+        for key, value in values.items():
+            setattr(record, key, value)
+        changed_at = kwargs.get("changed_at") or kwargs.get("confirmed_at")
+        record.updated_at = changed_at
+        record.lifecycle_version += 1
+        return HandoffCasResult(HandoffCasOutcome.APPLIED, record)
+
+
+class _FakeEventStore:
+    def __init__(self, recent_messages=None, append_error=None, order=None):
+        self.recent_messages = recent_messages or []
+        self.append_error = append_error
+        self.appended = []
+        self.append_calls = 0
+        self.recent_calls = []
+        self.order = order
+
+    async def append(self, event):
+        self.append_calls += 1
+        if self.append_error is not None:
+            raise self.append_error
+        if self.order is not None:
+            self.order.append("event")
+        self.appended.append(event)
+        return event
+
+    async def get_recent_messages(self, tenant_id, session_id, limit):
+        self.recent_calls.append((tenant_id, session_id, limit))
+        return self.recent_messages
+
+
+def _build_test_service(
+    store: _FakeHandoffStore,
+    webhook_dispatcher: WebhookDispatcher,
+    *,
+    event_store=None,
+) -> HandoffService:
+    return HandoffService(
+        event_store=event_store,
+        summarizer=ConversationSummarizer(),
+        webhook_dispatcher=webhook_dispatcher,
+        session_factory=lambda: _FakeSession(store),
+        repository_factory=lambda _session: _FakeHandoffRepository(store),
+    )
 
 
 @pytest.fixture
-def handoff_service(webhook_dispatcher, handoff_session_factory):
-    return HandoffService(
-        event_store=None,  # No event store for unit tests
-        summarizer=ConversationSummarizer(),
-        webhook_dispatcher=webhook_dispatcher,
-        session_factory=handoff_session_factory,
-    )
+def handoff_store():
+    return _FakeHandoffStore()
 
 
-@pytest.fixture(autouse=True)
-def default_event_store(monkeypatch):
-    """Keep unit tests isolated while exercising the runtime lazy resolver."""
-
-    event_store = MagicMock()
-    event_store.append = AsyncMock()
-    event_store.get_recent_messages = AsyncMock(return_value=[])
-    resolver = AsyncMock(return_value=event_store)
-    monkeypatch.setattr(handoff_service_module, "get_event_store", resolver)
-    return resolver, event_store
-
-
-@pytest.mark.asyncio
-async def test_runtime_service_resolves_event_store_lazily(
-    default_event_store,
-    monkeypatch,
-) -> None:
-    resolver, event_store = default_event_store
-    monkeypatch.setattr(handoff_service_module, "_service", None)
-
-    service = handoff_service_module.get_handoff_service()
-
-    assert service.event_store is None
-    resolver.assert_not_awaited()
-
-    messages = await service._recent_messages(uuid4(), uuid4())
-
-    assert messages == []
-    resolver.assert_awaited_once_with()
-    assert service.event_store is event_store
-
-
-def test_legacy_service_module_is_a_canonical_compatibility_shim() -> None:
-    from src.handoff.service import HandoffService as CompatibilityService
-    from src.handoff.service import get_handoff_service as compatibility_factory
-
-    assert CompatibilityService is HandoffService
-    assert compatibility_factory is handoff_service_module.get_handoff_service
-    assert not hasattr(CompatibilityService(event_store=MagicMock()), "_handoffs")
-
-
-def test_handoff_record_exposes_no_public_mutators_that_bypass_cas() -> None:
-    bypasses = {
-        "checkout",
-        "accept",
-        "start_handling",
-        "complete",
-        "cancel",
-        "timeout",
-        "mark_webhook_sent",
-    }
-
-    assert bypasses.isdisjoint(vars(HandoffRecord))
-
-
-@pytest.mark.asyncio
-async def test_sla_repository_streams_only_narrow_ordered_projection() -> None:
-    tenant_id = uuid4()
-    session_id = uuid4()
-    handoff_id = uuid4()
-    created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
-
-    async def projected_rows():
-        yield (
-            handoff_id,
-            "5511999999999",
-            session_id,
-            True,
-            "safety_concern",
-            "scheduling",
-            "qualification",
-            created_at,
-            None,
-            600,
-            "pending",
-        )
-
-    stream_result = MagicMock()
-    stream_result.tuples.return_value = projected_rows()
-    session = MagicMock(spec=AsyncSession)
-    session.stream = AsyncMock(return_value=stream_result)
-    repository = HandoffRecordRepository(session)
-
-    rows = [
-        row
-        async for row in repository.stream_sla_cohort(
-            tenant_id=tenant_id,
-            start_utc=created_at,
-            end_exclusive_utc=created_at + timedelta(days=1),
-        )
-    ]
-
-    assert rows == [
-        HandoffSlaCohortRow(
-            id=handoff_id,
-            numero_whatsapp="5511999999999",
-            session_id=session_id,
-            safety_concern=True,
-            reason="safety_concern",
-            intencao_detectada="scheduling",
-            estagio_atual="qualification",
-            created_at=created_at,
-            data_hora_saida=None,
-            sla_target_seconds=600,
-            status="pending",
-        )
-    ]
-    statement = session.stream.await_args.args[0]
-    selected_keys = [column.key for column in statement.selected_columns]
-    assert selected_keys == [
-        "id",
-        "numero_whatsapp",
-        "session_id",
-        "safety_concern",
-        "reason",
-        "intencao_detectada",
-        "estagio_atual",
-        "created_at",
-        "data_hora_saida",
-        "sla_target_seconds",
-        "status",
-    ]
-    assert {"summary", "context", "primeira_linha_mensagem"}.isdisjoint(selected_keys)
-    assert [str(clause) for clause in statement._order_by_clauses] == [
-        "handoff_records.created_at ASC",
-        "handoff_records.id ASC",
-    ]
-    compiled = str(statement)
-    assert "handoff_records.tenant_id =" in compiled
-    assert "handoff_records.created_at >=" in compiled
-    assert "handoff_records.created_at <" in compiled
-
-
-@pytest.mark.asyncio
-async def test_queue_sla_streams_and_aggregates_once_with_shared_window_limit(
-    handoff_session_factory,
-    tenant_id,
-    monkeypatch,
-) -> None:
-    as_of = datetime(2026, 4, 1, 12, tzinfo=timezone.utc)
-    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    projected = [
-        HandoffSlaCohortRow(
-            id=uuid4(),
-            numero_whatsapp=None,
-            session_id=uuid4(),
-            safety_concern=None,
-            reason="user_request",
-            intencao_detectada="first",
-            estagio_atual=None,
-            created_at=base,
-            data_hora_saida=base + timedelta(seconds=600),
-            sla_target_seconds=600,
-            status="completed",
-        ),
-        HandoffSlaCohortRow(
-            id=uuid4(),
-            numero_whatsapp=None,
-            session_id=uuid4(),
-            safety_concern=None,
-            reason="user_request",
-            intencao_detectada="second",
-            estagio_atual=None,
-            created_at=base + timedelta(seconds=1),
-            data_hora_saida=None,
-            sla_target_seconds=600,
-            status="pending",
-        ),
-    ]
-
-    class OneShotRows:
-        def __init__(self) -> None:
-            self.iterations = 0
-            self.index = 0
-
-        def __aiter__(self):
-            self.iterations += 1
-            if self.iterations > 1:
-                raise AssertionError("SLA cohort must be consumed once")
-            return self
-
-        async def __anext__(self):
-            if self.index == len(projected):
-                raise StopAsyncIteration
-            row = projected[self.index]
-            self.index += 1
-            return row
-
-    rows = OneShotRows()
-    stream = MagicMock(return_value=rows)
-    monkeypatch.setattr(HandoffRecordRepository, "stream_sla_cohort", stream)
-    service = HandoffService(session_factory=handoff_session_factory)
-
-    result = await service.get_queue_sla(
-        tenant_id,
-        from_date=date(2026, 1, 1),
-        to_date=date(2026, 4, 1),
-        as_of=as_of,
-    )
-
-    assert rows.iterations == 1
-    stream.assert_called_once()
-    assert result.within_sla_count == 1
-    assert result.unanswered_overdue_count == 1
-    assert result.metrics.confirmed_count == 1
-    assert result.metrics.sla_eligible_count == 2
-    assert result.metrics.average_confirmed_seconds == 600.0
-    assert str(result.metrics.pct_within_sla) == "50.0"
-    assert result.items == (projected[1],)
-
-    stream.reset_mock()
-    with pytest.raises(HandoffSlaPeriodError, match="max_window_90_days"):
-        await service.get_queue_sla(
-            tenant_id,
-            from_date=date(2026, 1, 1),
-            to_date=date(2026, 4, 2),
-            as_of=as_of,
-        )
-    stream.assert_not_called()
+@pytest.fixture
+def handoff_service(webhook_dispatcher, handoff_store):
+    return _build_test_service(handoff_store, webhook_dispatcher)
 
 
 # ============================================
@@ -853,6 +810,40 @@ class TestWebhookDispatcher:
 # ============================================
 
 
+def test_legacy_service_path_is_canonical_identity_shim_without_lifecycle_bypass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.handoff.service as legacy_service_module
+
+    assert legacy_service_module.HandoffService is handoff_service_module.HandoffService
+    assert (
+        legacy_service_module.get_handoff_service
+        is handoff_service_module.get_handoff_service
+    )
+    assert (
+        legacy_service_module.close_handoff_service
+        is handoff_service_module.close_handoff_service
+    )
+    assert "_service" not in vars(legacy_service_module)
+    assert "_handoffs" not in vars(legacy_service_module)
+
+    monkeypatch.setattr(handoff_service_module, "_service", None)
+    canonical = handoff_service_module.get_handoff_service()
+    assert legacy_service_module.get_handoff_service() is canonical
+    assert not hasattr(canonical, "_handoffs")
+
+    for mutator in (
+        "checkout",
+        "accept",
+        "start_handling",
+        "complete",
+        "cancel",
+        "timeout",
+        "mark_webhook_sent",
+    ):
+        assert not hasattr(HandoffRecord, mutator)
+
+
 class TestHandoffService:
     """Tests for HandoffService."""
 
@@ -883,6 +874,109 @@ class TestHandoffService:
         assert len(response.user_message) > 0
 
     @pytest.mark.asyncio
+    async def test_session_must_belong_to_tenant_before_insert(
+        self,
+        handoff_service,
+        handoff_store,
+        tenant_id,
+        session_id,
+    ):
+        handoff_store.session_is_owned = False
+
+        with pytest.raises(HandoffServiceError) as error:
+            await handoff_service.initiate_handoff(
+                HandoffRequest(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    reason=HandoffReason.USER_REQUEST,
+                )
+            )
+
+        assert type(error.value) is HandoffServiceError
+        assert str(error.value) == "handoff_session_not_found"
+        assert handoff_store.records == {}
+        assert "commit" not in handoff_store.order
+
+    @pytest.mark.asyncio
+    async def test_queue_sla_wraps_corrupt_persisted_timestamps(
+        self,
+        tenant_id,
+        session_id,
+    ):
+        created_at = datetime(2026, 9, 28, 12, tzinfo=timezone.utc)
+        corrupt = HandoffRecord(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            session_id=session_id,
+            reason="user_request",
+            summary="corrupt persisted occurrence",
+            context={},
+            urgency="normal",
+            status="completed",
+            created_at=created_at,
+            data_hora_saida=created_at - timedelta(seconds=1),
+            sla_target_seconds=600,
+        )
+        repository = MagicMock()
+        repository.load_clinic_timezone = AsyncMock(return_value="UTC")
+
+        async def stream_corrupt(**_kwargs: object):
+            yield corrupt
+
+        repository.stream_sla_cohort = stream_corrupt
+        service = HandoffService(
+            session_factory=lambda: _FakeSession(_FakeHandoffStore()),
+            repository_factory=lambda _session: repository,
+        )
+
+        with pytest.raises(HandoffSlaDataError) as error:
+            await service.get_queue_sla(
+                tenant_id,
+                from_date=date(2026, 9, 28),
+                to_date=date(2026, 9, 28),
+                as_of=created_at,
+            )
+
+        assert str(error.value) == "invalid_handoff_timestamps"
+        assert isinstance(error.value.__cause__, ValueError)
+
+    def test_sla_cohort_statement_is_tenant_scoped_narrow_projection(
+        self,
+        tenant_id,
+    ):
+        session = MagicMock()
+        session.get_bind.return_value.dialect.name = "postgresql"
+        statement = HandoffRecordRepository(session)._sla_cohort_statement(
+            tenant_id=tenant_id,
+            start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            end_exclusive_utc=datetime(2026, 4, 2, tzinfo=timezone.utc),
+        )
+
+        assert [item["name"] for item in statement.column_descriptions] == [
+            "id",
+            "numero_whatsapp",
+            "session_id",
+            "safety_concern",
+            "reason",
+            "intencao_detectada",
+            "estagio_atual",
+            "created_at",
+            "data_hora_saida",
+            "sla_target_seconds",
+            "status",
+        ]
+        sql = str(statement)
+        assert "handoff_records.tenant_id" in sql
+        assert sql.count("handoff_records.created_at") >= 3
+        for excluded_column in (
+            "summary",
+            "primeira_linha_mensagem",
+            "webhook_response",
+            "resolution_notes",
+        ):
+            assert excluded_column not in sql
+
+    @pytest.mark.asyncio
     async def test_initiate_handoff_with_safety_concern(
         self,
         handoff_service,
@@ -911,7 +1005,7 @@ class TestHandoffService:
     async def test_persisted_handoff_uses_only_typed_canonical_signals(
         self,
         handoff_service,
-        handoff_session_factory,
+        handoff_store,
         tenant_id,
         session_id,
         safety_concern,
@@ -932,12 +1026,11 @@ class TestHandoffService:
 
         response = await handoff_service.initiate_handoff(request)
 
-        async with handoff_session_factory() as db:
-            persisted = await db.get(HandoffRecord, response.id)
-        assert persisted is not None
+        persisted = handoff_store.records[response.id]
         assert persisted.reason == "user_request"
         assert persisted.intencao_detectada == "pos_atendimento_sintomas_preocupantes"
-        assert persisted.context["key_info"]["topic"] == "follow_up"
+        assert persisted.context["key_info"]["extracted_slots"]["topic"] == "follow_up"
+        assert "recent_messages" not in persisted.context
         if safety_concern is None:
             assert "safety_concern" not in persisted.context
         else:
@@ -965,10 +1058,7 @@ class TestHandoffService:
         )
 
         response = await handoff_service.initiate_handoff(request)
-        detail = await handoff_service.get_handoff(
-            response.id,
-            tenant_id=tenant_id,
-        )
+        detail = await handoff_service.get_handoff(response.id, tenant_id)
 
         assert response.verification_status == "link_sent"
         assert response.summary.verification_status == "link_sent"
@@ -1011,10 +1101,7 @@ class TestHandoffService:
             handoff_id=response.id,
             tenant_id=tenant_id,
         )
-        detail = await handoff_service.get_handoff(
-            response.id,
-            tenant_id=tenant_id,
-        )
+        detail = await handoff_service.get_handoff(response.id, tenant_id)
         handoffs = await handoff_service.list_handoffs(tenant_id)
 
         assert updated_id == response.id
@@ -1044,10 +1131,7 @@ class TestHandoffService:
         response = await handoff_service.initiate_handoff(request)
 
         # Get the handoff
-        handoff = await handoff_service.get_handoff(
-            response.id,
-            tenant_id=tenant_id,
-        )
+        handoff = await handoff_service.get_handoff(response.id, tenant_id)
 
         assert handoff.id == response.id
         assert handoff.tenant_id == tenant_id
@@ -1056,7 +1140,7 @@ class TestHandoffService:
     async def test_get_nonexistent_handoff(self, handoff_service, tenant_id):
         """Test getting a handoff that doesn't exist."""
         with pytest.raises(HandoffNotFoundError):
-            await handoff_service.get_handoff(uuid4(), tenant_id=tenant_id)
+            await handoff_service.get_handoff(uuid4(), tenant_id)
 
     @pytest.mark.asyncio
     async def test_accept_handoff(
@@ -1092,14 +1176,13 @@ class TestHandoffService:
         session_id,
     ):
         """Test completing a handoff."""
-        # Create and accept handoff
+        # Create and confirm handoff
         request = HandoffRequest(
             tenant_id=tenant_id,
             session_id=session_id,
             reason=HandoffReason.USER_REQUEST,
         )
         response = await handoff_service.initiate_handoff(request)
-        await handoff_service.accept_handoff(response.id, tenant_id=tenant_id)
         await handoff_service.confirm_handoff(response.id, tenant_id=tenant_id)
 
         # Complete it
@@ -1277,710 +1360,6 @@ class TestHandoffService:
 
         assert active is None
 
-    @pytest.mark.asyncio
-    async def test_confirmation_is_write_once_and_completion_requires_it(
-        self,
-        handoff_service,
-        handoff_session_factory,
-        tenant_id,
-        session_id,
-    ):
-        response = await handoff_service.initiate_handoff(
-            HandoffRequest(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                reason=HandoffReason.USER_REQUEST,
-            )
-        )
-
-        with pytest.raises(HandoffLifecycleError) as not_confirmed:
-            await handoff_service.complete_handoff(
-                response.id,
-                tenant_id=tenant_id,
-            )
-        assert not_confirmed.value.code == "attendance_not_confirmed"
-
-        first = await handoff_service.confirm_handoff(
-            response.id,
-            tenant_id=tenant_id,
-        )
-        with pytest.raises(HandoffLifecycleError) as repeated:
-            await handoff_service.confirm_handoff(
-                response.id,
-                tenant_id=tenant_id,
-            )
-        assert repeated.value.code == "attendance_already_confirmed"
-
-        async with handoff_session_factory() as database:
-            record = await database.get(HandoffRecord, response.id)
-        assert record is not None
-        assert record.lifecycle_version == 1
-        assert record.data_hora_saida is not None
-        persisted_confirmation = record.data_hora_saida.replace(tzinfo=timezone.utc)
-        assert persisted_confirmation == first.data_hora_saida
-        assert record.updated_at is not None
-
-    @pytest.mark.asyncio
-    async def test_confirmation_uses_one_database_timestamp_for_all_fields(
-        self,
-        handoff_service,
-        handoff_session_factory,
-        monkeypatch,
-        tenant_id,
-        session_id,
-    ):
-        response = await handoff_service.initiate_handoff(
-            HandoffRequest(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                reason=HandoffReason.USER_REQUEST,
-            )
-        )
-        database_now = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
-        clock = AsyncMock(return_value=database_now)
-        monkeypatch.setattr(HandoffRecordRepository, "current_timestamp", clock)
-
-        confirmed = await handoff_service.confirm_handoff(
-            response.id,
-            tenant_id=tenant_id,
-        )
-
-        async with handoff_session_factory() as database:
-            record = await database.get(HandoffRecord, response.id)
-        assert record is not None
-        persisted_confirmation = record.data_hora_saida
-        persisted_updated = record.updated_at
-        assert persisted_confirmation is not None
-        assert persisted_updated is not None
-        assert persisted_confirmation.replace(tzinfo=timezone.utc) == database_now
-        assert persisted_updated.replace(tzinfo=timezone.utc) == database_now
-        assert confirmed.data_hora_saida == database_now
-        clock.assert_awaited_once_with()
-
-    @pytest.mark.asyncio
-    async def test_confirmation_detail_carries_checkout_compatibility_from_winner(
-        self,
-        handoff_service,
-        handoff_session_factory,
-        monkeypatch,
-        tenant_id,
-        session_id,
-    ):
-        response = await handoff_service.initiate_handoff(
-            HandoffRequest(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                reason=HandoffReason.SAFETY_CONCERN,
-            )
-        )
-        created_at = datetime(2030, 1, 2, 3, 0, tzinfo=timezone.utc)
-        confirmed_at = created_at + timedelta(seconds=65)
-        async with handoff_session_factory() as database:
-            record = await database.get(HandoffRecord, response.id)
-            assert record is not None
-            record.created_at = created_at
-            record.numero_whatsapp = "5511987654321"
-            record.intencao_detectada = HandoffReason.USER_REQUEST.value
-            record.estagio_atual = "em_qualificacao"
-            record.primeira_linha_mensagem = "Preciso de ajuda"
-            record.sla_target_seconds = 600
-            record.context = {"safety_concern": "false"}
-            await database.commit()
-        clock = AsyncMock(return_value=confirmed_at)
-        monkeypatch.setattr(HandoffRecordRepository, "current_timestamp", clock)
-
-        confirmed = await handoff_service.confirm_handoff(
-            response.id,
-            tenant_id=tenant_id,
-        )
-
-        assert confirmed._checkout_compatibility == {
-            "numero_whatsapp": "5511987654321",
-            "safety_flag": True,
-            "intencao_detectada": None,
-            "estagio_atual": "em_qualificacao",
-            "primeira_linha_mensagem": "Preciso de ajuda",
-            "sla_target_seconds": 600,
-        }
-        assert confirmed.created_at == created_at
-        assert confirmed.data_hora_saida == confirmed_at
-        assert "_checkout_compatibility" not in confirmed.model_dump()
-
-    @pytest.mark.asyncio
-    async def test_generic_update_cannot_bypass_attendance_confirmation(
-        self,
-        handoff_service,
-        tenant_id,
-        session_id,
-    ):
-        response = await handoff_service.initiate_handoff(
-            HandoffRequest(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                reason=HandoffReason.USER_REQUEST,
-            )
-        )
-
-        with pytest.raises(HandoffLifecycleError) as rejected:
-            await handoff_service.update_handoff(
-                HandoffUpdate(
-                    handoff_id=response.id,
-                    status=HandoffStatus.IN_PROGRESS,
-                ),
-                tenant_id=tenant_id,
-            )
-
-        assert rejected.value.code == "attendance_confirmation_required"
-        detail = await handoff_service.get_handoff(
-            response.id,
-            tenant_id=tenant_id,
-        )
-        assert detail.status == HandoffStatus.PENDING
-        assert detail.updated_at is None
-
-    @pytest.mark.asyncio
-    async def test_cross_tenant_mutation_is_not_found_and_does_not_write(
-        self,
-        handoff_service,
-        handoff_session_factory,
-        tenant_id,
-        session_id,
-    ):
-        response = await handoff_service.initiate_handoff(
-            HandoffRequest(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                reason=HandoffReason.USER_REQUEST,
-            )
-        )
-
-        with pytest.raises(HandoffNotFoundError):
-            await handoff_service.cancel_handoff(
-                response.id,
-                tenant_id=uuid4(),
-            )
-
-        async with handoff_session_factory() as database:
-            record = await database.get(HandoffRecord, response.id)
-        assert record is not None
-        assert record.status == HandoffStatus.PENDING.value
-        assert record.lifecycle_version == 0
-        assert record.updated_at is None
-
-    @pytest.mark.asyncio
-    async def test_session_must_belong_to_tenant_before_insert(
-        self,
-        handoff_service,
-        handoff_session_factory,
-        session_id,
-    ):
-        wrong_tenant = uuid4()
-        with pytest.raises(HandoffServiceError, match="handoff_session_not_found"):
-            await handoff_service.initiate_handoff(
-                HandoffRequest(
-                    tenant_id=wrong_tenant,
-                    session_id=session_id,
-                    reason=HandoffReason.USER_REQUEST,
-                )
-            )
-
-        async with handoff_session_factory() as database:
-            records = list(
-                (
-                    await database.scalars(
-                        select(HandoffRecord).where(
-                            HandoffRecord.tenant_id == wrong_tenant
-                        )
-                    )
-                ).all()
-            )
-        assert records == []
-
-    @pytest.mark.asyncio
-    async def test_event_store_failure_surfaces_after_sql_commit(
-        self,
-        webhook_dispatcher,
-        handoff_session_factory,
-        tenant_id,
-        session_id,
-    ):
-        event_store = MagicMock()
-        event_store.append = AsyncMock(side_effect=RuntimeError("event unavailable"))
-        service = HandoffService(
-            event_store=event_store,
-            summarizer=ConversationSummarizer(),
-            webhook_dispatcher=webhook_dispatcher,
-            session_factory=handoff_session_factory,
-        )
-
-        with pytest.raises(HandoffPostCommitError):
-            await service.initiate_handoff(
-                HandoffRequest(
-                    tenant_id=tenant_id,
-                    session_id=session_id,
-                    reason=HandoffReason.USER_REQUEST,
-                )
-            )
-
-        async with handoff_session_factory() as database:
-            records = list(
-                (
-                    await database.scalars(
-                        select(HandoffRecord).where(
-                            HandoffRecord.tenant_id == tenant_id
-                        )
-                    )
-                ).all()
-            )
-        assert len(records) == 1
-        assert records[0].status == HandoffStatus.PENDING.value
-
-    @pytest.mark.asyncio
-    async def test_transition_event_failure_stops_later_effects_after_commit(
-        self,
-        webhook_dispatcher,
-        handoff_session_factory,
-        tenant_id,
-        session_id,
-    ):
-        event_store = MagicMock()
-        event_store.append = AsyncMock()
-        event_store.get_recent_messages = AsyncMock(return_value=[])
-        service = HandoffService(
-            event_store=event_store,
-            summarizer=ConversationSummarizer(),
-            webhook_dispatcher=webhook_dispatcher,
-            session_factory=handoff_session_factory,
-        )
-        response = await service.initiate_handoff(
-            HandoffRequest(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                reason=HandoffReason.USER_REQUEST,
-            )
-        )
-        event_store.append.reset_mock()
-        event_store.append.side_effect = RuntimeError("event unavailable")
-        webhook_dispatcher.set_config(
-            tenant_id,
-            WebhookConfig(url="https://example.test/handoff"),
-        )
-        webhook_dispatcher.send = AsyncMock()
-        metric = HANDOFF_OPERATIONS.labels(operation="update", status="accepted")
-        metric_before = metric._value.get()
-        error_metric = HANDOFF_OPERATIONS.labels(operation="update", status="error")
-        error_before = error_metric._value.get()
-
-        with pytest.raises(HandoffPostCommitError):
-            await service.accept_handoff(response.id, tenant_id=tenant_id)
-
-        async with handoff_session_factory() as database:
-            record = await database.get(HandoffRecord, response.id)
-        assert record is not None
-        assert record.status == HandoffStatus.ACCEPTED.value
-        assert record.lifecycle_version == 1
-        assert event_store.append.await_count == 1
-        event_store.get_recent_messages.assert_not_awaited()
-        webhook_dispatcher.send.assert_not_awaited()
-        assert metric._value.get() == metric_before
-        assert error_metric._value.get() == error_before + 1
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "failure_mode",
-        ["failed-delivery", "raised-delivery"],
-    )
-    async def test_transition_webhook_failures_follow_nonfatal_policy(
-        self,
-        failure_mode,
-        webhook_dispatcher,
-        handoff_session_factory,
-        tenant_id,
-        session_id,
-    ):
-        event_store = MagicMock()
-        event_store.append = AsyncMock()
-        event_store.get_recent_messages = AsyncMock(return_value=[])
-        service = HandoffService(
-            event_store=event_store,
-            summarizer=ConversationSummarizer(),
-            webhook_dispatcher=webhook_dispatcher,
-            session_factory=handoff_session_factory,
-        )
-        response = await service.initiate_handoff(
-            HandoffRequest(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                reason=HandoffReason.USER_REQUEST,
-            )
-        )
-        event_store.append.reset_mock()
-        webhook_dispatcher.set_config(
-            tenant_id,
-            WebhookConfig(url="https://example.test/handoff"),
-        )
-        if failure_mode == "failed-delivery":
-            webhook_dispatcher.send = AsyncMock(
-                return_value=WebhookDelivery(
-                    handoff_id=response.id,
-                    tenant_id=tenant_id,
-                    url="https://example.test/handoff",
-                    status=WebhookStatus.FAILED,
-                    response_status=503,
-                    response_body="remote private response",
-                    error_message="remote rejected",
-                )
-            )
-        elif failure_mode == "raised-delivery":
-            webhook_dispatcher.send = AsyncMock(
-                side_effect=WebhookError("delivery failed")
-            )
-        metric = HANDOFF_OPERATIONS.labels(operation="update", status="accepted")
-        metric_before = metric._value.get()
-
-        updated = await service.accept_handoff(response.id, tenant_id=tenant_id)
-
-        async with handoff_session_factory() as database:
-            record = await database.get(HandoffRecord, response.id)
-        assert updated.status == HandoffStatus.ACCEPTED
-        assert record is not None
-        assert record.status == HandoffStatus.ACCEPTED.value
-        assert record.lifecycle_version == 1
-        assert record.webhook_sent is False
-        assert event_store.append.await_count == 1
-        event_store.get_recent_messages.assert_awaited_once_with(
-            tenant_id,
-            session_id,
-            limit=5,
-        )
-        assert webhook_dispatcher.send.await_count == 1
-        assert metric._value.get() - metric_before == 1
-        assert record.context["webhook_status"] == WebhookStatus.FAILED.value
-        expected_response = {
-            "status": "failed",
-            "attempt": 1,
-            "error_type": "delivery_failed",
-        }
-        if failure_mode == "failed-delivery":
-            expected_response["response_status"] = 503
-        assert record.webhook_response == expected_response
-        assert "delivery failed" not in str(record.webhook_response)
-        assert "remote rejected" not in str(record.webhook_response)
-        assert "remote private response" not in str(record.webhook_response)
-
-    @pytest.mark.asyncio
-    async def test_webhook_failure_is_nonfatal_and_bookkeeping_is_not_lifecycle(
-        self,
-        webhook_dispatcher,
-        handoff_session_factory,
-        tenant_id,
-        session_id,
-    ):
-        webhook_dispatcher.set_config(
-            tenant_id,
-            WebhookConfig(url="https://example.test/handoff"),
-        )
-        webhook_dispatcher.send = AsyncMock(side_effect=WebhookError("delivery failed"))
-        service = HandoffService(
-            summarizer=ConversationSummarizer(),
-            webhook_dispatcher=webhook_dispatcher,
-            session_factory=handoff_session_factory,
-        )
-
-        response = await service.initiate_handoff(
-            HandoffRequest(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                reason=HandoffReason.USER_REQUEST,
-            )
-        )
-
-        assert response.webhook_sent is False
-        assert response.webhook_status == WebhookStatus.FAILED
-        async with handoff_session_factory() as database:
-            record = await database.get(HandoffRecord, response.id)
-        assert record is not None
-        assert record.context["webhook_status"] == WebhookStatus.FAILED.value
-        assert record.webhook_response is not None
-        assert record.webhook_response == {
-            "status": "failed",
-            "attempt": 1,
-            "error_type": "delivery_failed",
-        }
-        assert "delivery failed" not in str(record.webhook_response)
-        assert record.lifecycle_version == 0
-        assert record.updated_at is None
-
-    @pytest.mark.asyncio
-    async def test_transition_preserves_event_then_webhook_order_and_payload(
-        self,
-        monkeypatch,
-        handoff_session_factory,
-        tenant_id,
-        session_id,
-    ):
-        order: list[str] = []
-
-        class TrackingTransaction:
-            def __init__(self, transaction):
-                self.transaction = transaction
-
-            async def __aenter__(self):
-                return await self.transaction.__aenter__()
-
-            async def __aexit__(self, exc_type, exc_value, traceback):
-                result = await self.transaction.__aexit__(
-                    exc_type,
-                    exc_value,
-                    traceback,
-                )
-                if exc_type is None:
-                    order.append("commit")
-                return result
-
-        class TrackingSession:
-            def __init__(self, session):
-                self.session = session
-
-            async def __aenter__(self):
-                await self.session.__aenter__()
-                return self
-
-            async def __aexit__(self, exc_type, exc_value, traceback):
-                return await self.session.__aexit__(
-                    exc_type,
-                    exc_value,
-                    traceback,
-                )
-
-            def begin(self):
-                return TrackingTransaction(self.session.begin())
-
-            def __getattr__(self, name):
-                return getattr(self.session, name)
-
-        event_store = MagicMock()
-
-        async def append_event(event):
-            order.append("event")
-
-        event_store.append = AsyncMock(side_effect=append_event)
-        event_store.get_recent_messages = AsyncMock(
-            return_value=[
-                handoff_service_module.EventData(
-                    tenant_id=tenant_id,
-                    session_id=session_id,
-                    event_type=handoff_service_module.EventType.MESSAGE_IN.value,
-                    event_data={"role": "user", "content": "project once"},
-                )
-            ]
-        )
-        dispatcher = WebhookDispatcher()
-        dispatcher.set_config(
-            tenant_id,
-            WebhookConfig(url="https://example.test/handoff"),
-        )
-
-        async def send_webhook(delivery_tenant, payload):
-            order.append("webhook")
-            return WebhookDelivery(
-                handoff_id=payload.handoff_id,
-                tenant_id=delivery_tenant,
-                url="https://example.test/handoff",
-                status=WebhookStatus.SENT,
-            )
-
-        dispatcher.send = AsyncMock(side_effect=send_webhook)
-        original_bookkeeping = HandoffRecordRepository.update_webhook_delivery
-
-        async def tracked_bookkeeping(repository, **kwargs):
-            order.append("bookkeeping")
-            return await original_bookkeeping(repository, **kwargs)
-
-        monkeypatch.setattr(
-            HandoffRecordRepository,
-            "update_webhook_delivery",
-            tracked_bookkeeping,
-        )
-        service = HandoffService(
-            event_store=event_store,
-            summarizer=ConversationSummarizer(),
-            webhook_dispatcher=dispatcher,
-            session_factory=lambda: TrackingSession(handoff_session_factory()),
-        )
-        response = await service.initiate_handoff(
-            HandoffRequest(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                reason=HandoffReason.USER_REQUEST,
-            )
-        )
-        order.clear()
-        event_store.get_recent_messages.reset_mock()
-
-        detail = await service.accept_handoff(
-            response.id,
-            agent_id="agent-order",
-            tenant_id=tenant_id,
-        )
-
-        assert order == ["commit", "event", "webhook", "bookkeeping", "commit"]
-        event_store.get_recent_messages.assert_awaited_once_with(
-            tenant_id,
-            session_id,
-            limit=5,
-        )
-        event = event_store.append.await_args.args[0]
-        payload = dispatcher.send.await_args.args[1]
-        assert event.event_type == "handoff.accept"
-        assert event.event_data == {
-            "handoff_id": str(response.id),
-            "old_status": "pending",
-            "new_status": "accepted",
-            "assigned_to": "agent-order",
-        }
-        assert payload.event_type == "handoff.accepted"
-        assert payload.status == HandoffStatus.ACCEPTED
-        assert payload.recent_messages == detail.recent_messages
-        assert [message["content"] for message in detail.recent_messages] == [
-            "project once"
-        ]
-
-    @pytest.mark.asyncio
-    async def test_bookkeeping_failure_raises_after_exactly_one_send(
-        self,
-        monkeypatch,
-        webhook_dispatcher,
-        handoff_session_factory,
-        tenant_id,
-        session_id,
-    ):
-        event_store = MagicMock()
-        event_store.append = AsyncMock()
-        event_store.get_recent_messages = AsyncMock(return_value=[])
-        service = HandoffService(
-            event_store=event_store,
-            summarizer=ConversationSummarizer(),
-            webhook_dispatcher=webhook_dispatcher,
-            session_factory=handoff_session_factory,
-        )
-        response = await service.initiate_handoff(
-            HandoffRequest(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                reason=HandoffReason.USER_REQUEST,
-            )
-        )
-        event_store.append.reset_mock()
-        webhook_dispatcher.set_config(
-            tenant_id,
-            WebhookConfig(url="https://example.test/handoff"),
-        )
-        webhook_dispatcher.send = AsyncMock(
-            return_value=WebhookDelivery(
-                handoff_id=response.id,
-                tenant_id=tenant_id,
-                url="https://example.test/handoff",
-                status=WebhookStatus.SENT,
-            )
-        )
-        monkeypatch.setattr(
-            HandoffRecordRepository,
-            "update_webhook_delivery",
-            AsyncMock(side_effect=RuntimeError("bookkeeping unavailable")),
-        )
-        success_metric = HANDOFF_OPERATIONS.labels(
-            operation="update",
-            status="accepted",
-        )
-        error_metric = HANDOFF_OPERATIONS.labels(operation="update", status="error")
-        success_before = success_metric._value.get()
-        error_before = error_metric._value.get()
-
-        with pytest.raises(HandoffPostCommitError):
-            await service.accept_handoff(response.id, tenant_id=tenant_id)
-
-        async with handoff_session_factory() as database:
-            record = await database.get(HandoffRecord, response.id)
-        assert record is not None
-        assert record.status == HandoffStatus.ACCEPTED.value
-        assert record.lifecycle_version == 1
-        assert record.webhook_response is None
-        webhook_dispatcher.send.assert_awaited_once()
-        assert success_metric._value.get() == success_before
-        assert error_metric._value.get() == error_before + 1
-
-    @pytest.mark.asyncio
-    async def test_sla_snapshot_is_immutable_across_config_changes(
-        self,
-        handoff_service,
-        handoff_session_factory,
-        tenant_id,
-        session_id,
-    ):
-        async with handoff_session_factory() as database:
-            async with database.begin():
-                database.add(
-                    ClinicConfigTable(
-                        tenant_id=tenant_id,
-                        handoff={"meta_minutos_atendimento": 10},
-                    )
-                )
-        first = await handoff_service.initiate_handoff(
-            HandoffRequest(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                reason=HandoffReason.USER_REQUEST,
-            )
-        )
-        async with handoff_session_factory() as database:
-            async with database.begin():
-                config = await database.scalar(
-                    select(ClinicConfigTable).where(
-                        ClinicConfigTable.tenant_id == tenant_id
-                    )
-                )
-                assert config is not None
-                config.handoff = {"meta_minutos_atendimento": 5}
-        second = await handoff_service.initiate_handoff(
-            HandoffRequest(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                reason=HandoffReason.USER_REQUEST,
-            )
-        )
-
-        async with handoff_session_factory() as database:
-            first_record = await database.get(HandoffRecord, first.id)
-            second_record = await database.get(HandoffRecord, second.id)
-        assert first_record is not None
-        assert second_record is not None
-        assert first_record.sla_target_seconds == 600
-        assert second_record.sla_target_seconds == 300
-
-    def test_mapper_tolerates_legacy_context_and_reason(self, tenant_id, session_id):
-        created_at = datetime.now(timezone.utc)
-        record = HandoffRecord(
-            id=uuid4(),
-            tenant_id=tenant_id,
-            session_id=session_id,
-            reason="operator_takeover",
-            summary="legacy",
-            context={"legacy_key": "value", "verification_status": "legacy"},
-            urgency="unknown",
-            status="pending",
-            webhook_sent=False,
-            created_at=created_at,
-        )
-
-        detail = handoff_record_to_detail(record)
-
-        assert detail.reason == HandoffReason.USER_REQUEST
-        assert detail.urgency == HandoffUrgency.NORMAL
-        assert detail.key_info == {"legacy_key": "value"}
-        assert detail.verification_status == "legacy"
-        assert detail.updated_at is None
-
     def test_configure_webhook(
         self,
         handoff_service,
@@ -2011,6 +1390,883 @@ class TestHandoffService:
 
         assert result is True
         assert handoff_service.get_webhook_config(tenant_id) is None
+
+    @pytest.mark.asyncio
+    async def test_restart_instances_share_only_postgres_source_of_truth(
+        self,
+        handoff_store,
+        webhook_dispatcher,
+        tenant_id,
+        session_id,
+    ):
+        service_a = _build_test_service(handoff_store, webhook_dispatcher)
+        service_b = _build_test_service(handoff_store, webhook_dispatcher)
+        service_c = _build_test_service(handoff_store, webhook_dispatcher)
+
+        created = await service_a.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+        confirmed = await service_b.confirm_handoff(
+            created.id,
+            tenant_id=tenant_id,
+        )
+        reread = await service_c.get_handoff(created.id, tenant_id)
+
+        assert confirmed.status is HandoffStatus.IN_PROGRESS
+        assert reread.status is HandoffStatus.IN_PROGRESS
+        assert reread.data_hora_saida == confirmed.data_hora_saida
+        assert not hasattr(service_a, "_handoffs")
+
+    @pytest.mark.asyncio
+    async def test_default_session_provider_is_resolved_per_operation(
+        self,
+        monkeypatch,
+        webhook_dispatcher,
+        tenant_id,
+        session_id,
+    ):
+        captured_during_construction = _FakeHandoffStore()
+        current_provider_store = _FakeHandoffStore()
+        monkeypatch.setattr(
+            handoff_service_module,
+            "get_db_session",
+            lambda: _FakeSession(captured_during_construction),
+        )
+        service = HandoffService(
+            event_store=None,
+            webhook_dispatcher=webhook_dispatcher,
+            repository_factory=lambda session: _FakeHandoffRepository(session.store),
+        )
+        monkeypatch.setattr(
+            handoff_service_module,
+            "get_db_session",
+            lambda: _FakeSession(current_provider_store),
+        )
+
+        created = await service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+
+        assert created.id in current_provider_store.records
+        assert created.id not in captured_during_construction.records
+
+    @pytest.mark.asyncio
+    async def test_default_event_store_provider_appends_and_projects_lazily(
+        self,
+        monkeypatch,
+        handoff_store,
+        webhook_dispatcher,
+        tenant_id,
+        session_id,
+    ):
+        event_store = _FakeEventStore(
+            recent_messages=[
+                EventData(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    event_type=EventType.MESSAGE_IN.value,
+                    event_data={"role": "user", "content": "projected"},
+                )
+            ]
+        )
+        provider = AsyncMock(return_value=event_store)
+        monkeypatch.setattr(
+            handoff_service_module.event_store_module,
+            "get_event_store",
+            provider,
+        )
+
+        def _no_application_engine():
+            raise RuntimeError("application database not initialized")
+
+        monkeypatch.setattr(
+            handoff_service_module,
+            "get_db_engine",
+            _no_application_engine,
+        )
+        service = HandoffService(
+            webhook_dispatcher=webhook_dispatcher,
+            session_factory=lambda: _FakeSession(handoff_store),
+            repository_factory=lambda _session: _FakeHandoffRepository(handoff_store),
+        )
+
+        created = await service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+        detail = await service.get_handoff(created.id, tenant_id)
+
+        assert [event.event_type for event in event_store.appended] == [
+            EventType.HANDOFF_REQUEST.value
+        ]
+        assert [message["content"] for message in detail.recent_messages] == [
+            "projected"
+        ]
+        assert event_store.recent_calls == [(tenant_id, session_id, 5)]
+        assert provider.await_count == 2
+
+    def test_late_event_store_injection_does_not_replace_existing_singleton(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(handoff_service_module, "_service", None)
+        existing = handoff_service_module.get_handoff_service()
+
+        late = handoff_service_module.get_handoff_service(_FakeEventStore())
+
+        assert late is existing
+
+    @pytest.mark.asyncio
+    async def test_completion_requires_write_once_confirmation(
+        self,
+        handoff_service,
+        handoff_store,
+        tenant_id,
+        session_id,
+    ):
+        created = await handoff_service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+
+        with pytest.raises(HandoffTransitionError):
+            await handoff_service.complete_handoff(
+                created.id,
+                tenant_id=tenant_id,
+            )
+
+        first = await handoff_service.confirm_handoff(
+            created.id,
+            tenant_id=tenant_id,
+        )
+        with pytest.raises(HandoffConflictError):
+            await handoff_service.confirm_handoff(
+                created.id,
+                tenant_id=tenant_id,
+            )
+        reread = await handoff_service.get_handoff(created.id, tenant_id)
+        assert reread.data_hora_saida == first.data_hora_saida
+        assert handoff_store.records[created.id].lifecycle_version == 1
+
+    @pytest.mark.asyncio
+    async def test_legacy_in_progress_without_confirmation_can_confirm_once(
+        self,
+        handoff_service,
+        handoff_store,
+        tenant_id,
+        session_id,
+    ):
+        created = await handoff_service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+        legacy = handoff_store.records[created.id]
+        legacy.status = HandoffStatus.IN_PROGRESS.value
+        legacy.data_hora_saida = None
+
+        confirmed = await handoff_service.confirm_handoff(
+            created.id,
+            tenant_id=tenant_id,
+        )
+
+        assert confirmed.status is HandoffStatus.IN_PROGRESS
+        assert confirmed.data_hora_saida is not None
+        assert legacy.lifecycle_version == 1
+
+    @pytest.mark.asyncio
+    async def test_confirmation_uses_one_database_timestamp_for_mutation_fields(
+        self,
+        handoff_service,
+        handoff_store,
+        tenant_id,
+        session_id,
+    ):
+        created = await handoff_service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+        database_now = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        handoff_store.db_now = database_now
+
+        confirmed = await handoff_service.confirm_handoff(
+            created.id,
+            tenant_id=tenant_id,
+        )
+
+        persisted = handoff_store.records[created.id]
+        assert confirmed.data_hora_saida == database_now
+        assert persisted.data_hora_saida == database_now
+        assert persisted.updated_at == database_now
+
+    @pytest.mark.asyncio
+    async def test_queue_confirmation_projects_winner_without_context_json(
+        self,
+        handoff_service,
+        handoff_store,
+        tenant_id,
+        session_id,
+    ):
+        created = await handoff_service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.SAFETY_CONCERN,
+                safety_concern=True,
+                detected_intent="scheduling",
+                funnel_stage="qualification",
+                recent_messages=[{"role": "user", "content": "preciso de ajuda"}],
+            )
+        )
+
+        confirmation = await handoff_service.confirm_queue_handoff(
+            created.id,
+            tenant_id=tenant_id,
+        )
+
+        assert confirmation.status == HandoffStatus.IN_PROGRESS.value
+        assert confirmation.safety_concern is True
+        assert confirmation.intencao_detectada == "scheduling"
+        assert confirmation.estagio_atual == "qualification"
+        assert confirmation.primeira_linha_mensagem == "preciso de ajuda"
+        assert confirmation.data_hora_saida is not None
+        assert not hasattr(confirmation, "context")
+        assert handoff_store.records[created.id].lifecycle_version == 1
+
+    @pytest.mark.asyncio
+    async def test_generic_update_cannot_manufacture_in_progress(
+        self,
+        handoff_service,
+        tenant_id,
+        session_id,
+    ):
+        created = await handoff_service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+
+        with pytest.raises(HandoffTransitionError):
+            await handoff_service.update_handoff(
+                HandoffUpdate(
+                    handoff_id=created.id,
+                    status=HandoffStatus.IN_PROGRESS,
+                ),
+                tenant_id=tenant_id,
+            )
+        assert (await handoff_service.get_handoff(created.id, tenant_id)).status is (
+            HandoffStatus.PENDING
+        )
+
+    @pytest.mark.asyncio
+    async def test_cas_conflict_emits_no_public_effects_and_counts_conflict(
+        self,
+        handoff_store,
+        webhook_dispatcher,
+        tenant_id,
+        session_id,
+    ):
+        event_store = _FakeEventStore()
+        service = _build_test_service(
+            handoff_store,
+            webhook_dispatcher,
+            event_store=event_store,
+        )
+        created = await service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+        service.configure_webhook(
+            tenant_id,
+            WebhookConfig(url="https://example.com/webhook"),
+        )
+        service.webhook_dispatcher.send = AsyncMock()
+        before = {
+            status_name: HANDOFF_OPERATIONS.labels(
+                operation="update",
+                status=status_name,
+            )._value.get()
+            for status_name in ("accepted", "error", "conflict")
+        }
+        handoff_store.conflict_next = True
+
+        with pytest.raises(HandoffConflictError):
+            await service.accept_handoff(created.id, tenant_id=tenant_id)
+
+        after = {
+            status_name: HANDOFF_OPERATIONS.labels(
+                operation="update",
+                status=status_name,
+            )._value.get()
+            for status_name in before
+        }
+        assert len(event_store.appended) == 1
+        service.webhook_dispatcher.send.assert_not_awaited()
+        assert after["conflict"] == before["conflict"] + 1
+        assert after["accepted"] == before["accepted"]
+        assert after["error"] == before["error"]
+
+    @pytest.mark.asyncio
+    async def test_success_effect_order_is_commit_event_webhook_bookkeeping(
+        self,
+        handoff_store,
+        webhook_dispatcher,
+        tenant_id,
+        session_id,
+    ):
+        recent = EventData(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            event_type=EventType.MESSAGE_IN.value,
+            event_data={"role": "user", "content": "project once"},
+        )
+        event_store = _FakeEventStore(
+            recent_messages=[recent],
+            order=handoff_store.order,
+        )
+        service = _build_test_service(
+            handoff_store,
+            webhook_dispatcher,
+            event_store=event_store,
+        )
+        created = await service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+        service.configure_webhook(
+            tenant_id,
+            WebhookConfig(url="https://example.com/webhook"),
+        )
+
+        async def send(_tenant_id, _payload):
+            handoff_store.order.append("webhook")
+            return WebhookDelivery(
+                handoff_id=created.id,
+                tenant_id=tenant_id,
+                url="https://example.com/webhook",
+                status=WebhookStatus.SENT,
+            )
+
+        service.webhook_dispatcher.send = AsyncMock(side_effect=send)
+        handoff_store.order.clear()
+        before = {
+            status_name: HANDOFF_OPERATIONS.labels(
+                operation="update",
+                status=status_name,
+            )._value.get()
+            for status_name in ("accepted", "error", "conflict")
+        }
+
+        detail = await service.accept_handoff(created.id, tenant_id=tenant_id)
+
+        assert handoff_store.order == [
+            "commit",
+            "event",
+            "webhook",
+            "bookkeeping",
+            "commit",
+        ]
+        assert event_store.recent_calls == [(tenant_id, session_id, 5)]
+        assert [message["content"] for message in detail.recent_messages] == [
+            "project once"
+        ]
+        payload = service.webhook_dispatcher.send.await_args.args[1]
+        assert [message["content"] for message in payload.recent_messages] == [
+            "project once"
+        ]
+        after = {
+            status_name: HANDOFF_OPERATIONS.labels(
+                operation="update",
+                status=status_name,
+            )._value.get()
+            for status_name in before
+        }
+        assert after["accepted"] == before["accepted"] + 1
+        assert after["error"] == before["error"]
+        assert after["conflict"] == before["conflict"]
+
+    @pytest.mark.asyncio
+    async def test_transition_event_failure_preserves_cas_and_suppresses_webhook(
+        self,
+        handoff_store,
+        webhook_dispatcher,
+        tenant_id,
+        session_id,
+    ):
+        event_store = _FakeEventStore(order=handoff_store.order)
+        service = _build_test_service(
+            handoff_store,
+            webhook_dispatcher,
+            event_store=event_store,
+        )
+        created = await service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+        service.configure_webhook(
+            tenant_id,
+            WebhookConfig(url="https://example.com/webhook"),
+        )
+        service.webhook_dispatcher.send = AsyncMock()
+        handoff_store.order.clear()
+        event_store.append_error = RuntimeError("event store unavailable")
+        before = {
+            status_name: HANDOFF_OPERATIONS.labels(
+                operation="update",
+                status=status_name,
+            )._value.get()
+            for status_name in ("accepted", "error", "conflict")
+        }
+
+        with pytest.raises(HandoffPostCommitError):
+            await service.accept_handoff(created.id, tenant_id=tenant_id)
+
+        persisted = handoff_store.records[created.id]
+        assert persisted.status == HandoffStatus.ACCEPTED.value
+        assert persisted.lifecycle_version == 1
+        assert handoff_store.order == ["commit"]
+        assert event_store.append_calls == 2
+        assert event_store.recent_calls == []
+        service.webhook_dispatcher.send.assert_not_awaited()
+        after = {
+            status_name: HANDOFF_OPERATIONS.labels(
+                operation="update",
+                status=status_name,
+            )._value.get()
+            for status_name in before
+        }
+        assert after["error"] == before["error"] + 1
+        assert after["accepted"] == before["accepted"]
+        assert after["conflict"] == before["conflict"]
+
+    @pytest.mark.asyncio
+    async def test_failed_delivery_is_sanitized_and_transition_stays_successful(
+        self,
+        handoff_store,
+        webhook_dispatcher,
+        tenant_id,
+        session_id,
+    ):
+        event_store = _FakeEventStore(order=handoff_store.order)
+        service = _build_test_service(
+            handoff_store,
+            webhook_dispatcher,
+            event_store=event_store,
+        )
+        created = await service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+        service.configure_webhook(
+            tenant_id,
+            WebhookConfig(url="https://example.com/webhook"),
+        )
+
+        async def failed_send(_tenant_id, _payload):
+            handoff_store.order.append("webhook")
+            return WebhookDelivery(
+                handoff_id=created.id,
+                tenant_id=tenant_id,
+                url="https://example.com/webhook",
+                status=WebhookStatus.FAILED,
+                error_message="patient secret from remote response",
+            )
+
+        service.webhook_dispatcher.send = AsyncMock(side_effect=failed_send)
+        handoff_store.order.clear()
+
+        detail = await service.accept_handoff(created.id, tenant_id=tenant_id)
+
+        persisted = handoff_store.records[created.id]
+        assert detail.status is HandoffStatus.ACCEPTED
+        assert persisted.lifecycle_version == 1
+        assert persisted.webhook_sent is False
+        assert persisted.webhook_response == {
+            "status": "failed",
+            "attempt": 1,
+            "error_type": "delivery_failed",
+        }
+        assert "patient secret" not in str(persisted.webhook_response)
+        assert handoff_store.order == [
+            "commit",
+            "event",
+            "webhook",
+            "bookkeeping",
+            "commit",
+        ]
+        service.webhook_dispatcher.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_bookkeeping_failure_occurs_after_exactly_one_webhook_send(
+        self,
+        handoff_store,
+        webhook_dispatcher,
+        tenant_id,
+        session_id,
+    ):
+        event_store = _FakeEventStore(order=handoff_store.order)
+        service = _build_test_service(
+            handoff_store,
+            webhook_dispatcher,
+            event_store=event_store,
+        )
+        created = await service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+        service.configure_webhook(
+            tenant_id,
+            WebhookConfig(url="https://example.com/webhook"),
+        )
+
+        async def successful_send(_tenant_id, _payload):
+            handoff_store.order.append("webhook")
+            return WebhookDelivery(
+                handoff_id=created.id,
+                tenant_id=tenant_id,
+                url="https://example.com/webhook",
+                status=WebhookStatus.SENT,
+            )
+
+        service.webhook_dispatcher.send = AsyncMock(side_effect=successful_send)
+        handoff_store.fail_bookkeeping = True
+        handoff_store.order.clear()
+        before_error = HANDOFF_OPERATIONS.labels(
+            operation="update",
+            status="error",
+        )._value.get()
+
+        with pytest.raises(HandoffPostCommitError):
+            await service.accept_handoff(created.id, tenant_id=tenant_id)
+
+        persisted = handoff_store.records[created.id]
+        assert persisted.status == HandoffStatus.ACCEPTED.value
+        assert persisted.lifecycle_version == 1
+        assert persisted.webhook_response is None
+        assert handoff_store.order == [
+            "commit",
+            "event",
+            "webhook",
+            "bookkeeping",
+        ]
+        assert event_store.recent_calls == [(tenant_id, session_id, 5)]
+        service.webhook_dispatcher.send.assert_awaited_once()
+        after_error = HANDOFF_OPERATIONS.labels(
+            operation="update",
+            status="error",
+        )._value.get()
+        assert after_error == before_error + 1
+
+    @pytest.mark.asyncio
+    async def test_wrong_tenant_cannot_mutate_record(
+        self,
+        handoff_service,
+        tenant_id,
+        session_id,
+    ):
+        created = await handoff_service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+
+        with pytest.raises(HandoffNotFoundError):
+            await handoff_service.cancel_handoff(
+                created.id,
+                tenant_id=uuid4(),
+            )
+
+        detail = await handoff_service.get_handoff(created.id, tenant_id)
+        assert detail.status is HandoffStatus.PENDING
+
+    @pytest.mark.asyncio
+    async def test_event_store_failure_is_post_commit_and_stops_webhook(
+        self,
+        handoff_store,
+        webhook_dispatcher,
+        tenant_id,
+        session_id,
+    ):
+        event_store = _FakeEventStore(append_error=RuntimeError("unavailable"))
+        service = _build_test_service(
+            handoff_store,
+            webhook_dispatcher,
+            event_store=event_store,
+        )
+        service.configure_webhook(
+            tenant_id,
+            WebhookConfig(url="https://example.com/webhook"),
+        )
+        service.webhook_dispatcher.send = AsyncMock()
+
+        with pytest.raises(HandoffPostCommitError):
+            await service.initiate_handoff(
+                HandoffRequest(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    reason=HandoffReason.USER_REQUEST,
+                )
+            )
+
+        assert len(handoff_store.records) == 1
+        service.webhook_dispatcher.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_insert_failure_is_typed_and_emits_nothing(
+        self,
+        handoff_store,
+        webhook_dispatcher,
+        tenant_id,
+        session_id,
+    ):
+        handoff_store.fail_insert = True
+        event_store = _FakeEventStore()
+        service = _build_test_service(
+            handoff_store,
+            webhook_dispatcher,
+            event_store=event_store,
+        )
+
+        with pytest.raises(HandoffPersistenceError):
+            await service.initiate_handoff(
+                HandoffRequest(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    reason=HandoffReason.USER_REQUEST,
+                )
+            )
+
+        assert not handoff_store.records
+        assert not event_store.appended
+
+    @pytest.mark.asyncio
+    async def test_failed_webhook_is_nonfatal_and_persists_sanitized_status(
+        self,
+        handoff_store,
+        webhook_dispatcher,
+        tenant_id,
+        session_id,
+    ):
+        service = _build_test_service(handoff_store, webhook_dispatcher)
+        service.configure_webhook(
+            tenant_id,
+            WebhookConfig(url="https://example.com/webhook"),
+        )
+        service.webhook_dispatcher.send = AsyncMock(
+            side_effect=WebhookError("patient secret must not persist")
+        )
+
+        created = await service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+        detail = await service.get_handoff(created.id, tenant_id)
+
+        assert created.webhook_status is WebhookStatus.FAILED
+        assert detail.webhook_status is WebhookStatus.FAILED
+        assert detail.webhook_response == {
+            "status": "failed",
+            "attempt": 1,
+            "error_type": "delivery_failed",
+        }
+        assert "patient secret" not in str(detail.webhook_response)
+
+    @pytest.mark.asyncio
+    async def test_mapper_round_trip_preserves_enriched_fields_without_version(
+        self,
+        handoff_store,
+        webhook_dispatcher,
+        tenant_id,
+        session_id,
+    ):
+        service = _build_test_service(handoff_store, webhook_dispatcher)
+        created = await service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.SCHEDULING,
+                sector=HandoffSector.AGENDAMENTO,
+                sla=HandoffSLA.PRIORITARIO,
+                key_info={"appointment": "morning"},
+                verification_status="link_sent",
+            )
+        )
+        await service.confirm_handoff(
+            created.id,
+            agent_id="agent-7",
+            tenant_id=tenant_id,
+        )
+        completed = await service.complete_handoff(
+            created.id,
+            notes="resolved",
+            tenant_id=tenant_id,
+        )
+        dumped = completed.model_dump()
+
+        assert completed.sector is HandoffSector.AGENDAMENTO
+        assert completed.sla is HandoffSLA.PRIORITARIO
+        assert completed.summary
+        assert completed.key_info["extracted_slots"]["appointment"] == "morning"
+        assert completed.verification_status == "link_sent"
+        assert completed.assigned_to == "agent-7"
+        assert completed.resolution_notes == "resolved"
+        assert completed.sla_target_seconds == 600
+        assert completed.updated_at is not None
+        assert "lifecycle_version" not in dumped
+
+    def test_mapper_tolerates_legacy_enums_without_leaking_internal_context(
+        self,
+        tenant_id,
+        session_id,
+    ):
+        created_at = datetime(2026, 9, 29, 12)
+        record = HandoffRecord(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            session_id=session_id,
+            reason="operator_takeover",
+            summary="legacy",
+            context={
+                "legacy_key": "value",
+                "verification_status": "legacy",
+                "safety_concern": True,
+                "webhook_status": "sent",
+                "summary_snapshot": {"private": "internal"},
+            },
+            urgency="unknown",
+            status="pending",
+            webhook_sent=False,
+            created_at=created_at,
+        )
+
+        detail = handoff_service_module.map_handoff_record(
+            record,
+            handoff_service_module.RecentMessageProjection(),
+        )
+        list_item = handoff_service_module._map_list_item(record)
+
+        assert detail.reason is HandoffReason.USER_REQUEST
+        assert detail.urgency is HandoffUrgency.NORMAL
+        assert detail.key_info == {"legacy_key": "value"}
+        assert detail.verification_status == "legacy"
+        assert detail.created_at.tzinfo is timezone.utc
+        assert list_item.reason is HandoffReason.USER_REQUEST
+        assert list_item.urgency is HandoffUrgency.NORMAL
+
+    @pytest.mark.asyncio
+    async def test_sla_snapshot_is_immutable_across_config_changes(
+        self,
+        handoff_service,
+        handoff_store,
+        tenant_id,
+        session_id,
+    ):
+        handoff_store.configured_minutes = 10
+        first = await handoff_service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+        handoff_store.configured_minutes = 5
+        second = await handoff_service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+            )
+        )
+
+        assert handoff_store.records[first.id].sla_target_seconds == 600
+        assert handoff_store.records[second.id].sla_target_seconds == 300
+
+    @pytest.mark.asyncio
+    async def test_recent_messages_are_tenant_scoped_bounded_projection_only(
+        self,
+        handoff_store,
+        webhook_dispatcher,
+        tenant_id,
+        session_id,
+    ):
+        recent = [
+            EventData(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                event_type=(
+                    EventType.MESSAGE_IN.value
+                    if index % 2 == 0
+                    else EventType.MESSAGE_OUT.value
+                ),
+                event_data={
+                    "role": "user" if index % 2 == 0 else "assistant",
+                    "content": f"message-{index}",
+                },
+            )
+            for index in range(7)
+        ]
+        event_store = _FakeEventStore(recent_messages=recent)
+        service = _build_test_service(
+            handoff_store,
+            webhook_dispatcher,
+            event_store=event_store,
+        )
+        created = await service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+                recent_messages=[{"role": "user", "content": "request-only"}],
+            )
+        )
+        detail = await service.get_handoff(created.id, tenant_id)
+
+        assert [message["content"] for message in detail.recent_messages] == [
+            f"message-{index}" for index in range(5)
+        ]
+        assert event_store.recent_calls == [(tenant_id, session_id, 5)]
+        assert "recent_messages" not in handoff_store.records[created.id].context
 
 
 # ============================================
@@ -2128,8 +2384,14 @@ class TestHandoffIntegration:
         )
         assert updated.status == HandoffStatus.ACCEPTED
 
-        # 3. Agent completes
-        await handoff_service.confirm_handoff(response.id, tenant_id=tenant_id)
+        # 3. Agent confirms first response
+        confirmed = await handoff_service.confirm_handoff(
+            response.id,
+            tenant_id=tenant_id,
+        )
+        assert confirmed.status == HandoffStatus.IN_PROGRESS
+
+        # 4. Agent completes
         final = await handoff_service.complete_handoff(
             response.id,
             notes="Issue resolved",
@@ -2138,7 +2400,7 @@ class TestHandoffIntegration:
         assert final.status == HandoffStatus.COMPLETED
         assert final.resolved_at is not None
 
-        # 4. Verify no active handoff
+        # 5. Verify no active handoff
         active = await handoff_service.get_active_handoff_for_session(
             session_id,
             tenant_id=tenant_id,
@@ -2148,16 +2410,13 @@ class TestHandoffIntegration:
     @pytest.mark.asyncio
     async def test_handoff_with_webhook(
         self,
+        handoff_store,
         tenant_id,
         session_id,
-        handoff_session_factory,
     ):
         """Test handoff with webhook notification."""
         dispatcher = WebhookDispatcher()
-        service = HandoffService(
-            webhook_dispatcher=dispatcher,
-            session_factory=handoff_session_factory,
-        )
+        service = _build_test_service(handoff_store, dispatcher)
 
         # Configure webhook with at least 1 retry to enter the loop
         config = WebhookConfig(

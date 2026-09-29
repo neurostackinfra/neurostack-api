@@ -5,11 +5,13 @@ Estrutura de configuração da clínica para SRM, handoff e políticas de preço
 
 import re
 from enum import Enum
-from typing import Annotated, Any, Optional
+from typing import Any, Literal, Optional
 from urllib.parse import urlparse
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from src.handoff.pause_policy import parse_legacy_cycle_days
 
 
 class PricingDisclosureMode(str, Enum):
@@ -120,12 +122,55 @@ class SectorDefaults(BaseModel):
 class ClinicHandoff(BaseModel):
     """Configuração de handoff (doc MVP v0.5)."""
 
+    model_config = ConfigDict(extra="allow")
+
     default_mode: HandoffDefaultMode = HandoffDefaultMode.WHATSAPP_HUMAN_TAKEOVER
     sector_defaults: SectorDefaults = Field(default_factory=SectorDefaults)
-    meta_minutos_atendimento: Annotated[
-        int,
-        Field(strict=True, ge=1, le=120),
-    ] = 10
+    meta_minutos_atendimento: int = Field(default=10, strict=True, ge=1, le=120)
+    # Persisted reads stay tolerant; strict canonical validation is applied by
+    # HandoffStandbyPolicy only when a PATCH touches one of these fields.
+    handoff_active: Any = "yes"
+    standby_mode: Any = "active"
+    handoff_period: Any = "permanent"
+    handoff_cycle_hours: Any = None
+    handoff_cycle_days: Any = None
+
+
+class HandoffStandbyPolicy(BaseModel):
+    """Canonical policy accepted by new configuration writes.
+
+    Runtime reads remain tolerant through ``resolve_handoff_pause``; this
+    model is only applied after merging a PATCH with persisted state.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    handoff_active: Literal["yes", "no"] = "yes"
+    standby_mode: Literal["inactive", "active"] = "active"
+    handoff_period: Literal["permanent", "cycle"] = "permanent"
+    handoff_cycle_hours: Optional[int] = Field(default=None, strict=True, ge=1, le=720)
+    handoff_cycle_days: Optional[int] = Field(default=None, strict=True, ge=1, le=365)
+
+    @field_validator("handoff_cycle_days", mode="before")
+    @classmethod
+    def _accept_legacy_ascii_days(cls, value: Any) -> Any:
+        parsed = parse_legacy_cycle_days(value)
+        return parsed if parsed is not None else value
+
+    @model_validator(mode="after")
+    def _validate_canonical_combination(self) -> "HandoffStandbyPolicy":
+        durations = (self.handoff_cycle_hours, self.handoff_cycle_days)
+        if self.standby_mode == "inactive":
+            if self.handoff_period != "permanent" or any(
+                duration is not None for duration in durations
+            ):
+                raise ValueError("inactive_requires_permanent_without_duration")
+        elif self.handoff_period == "permanent":
+            if any(duration is not None for duration in durations):
+                raise ValueError("permanent_forbids_duration")
+        elif sum(duration is not None for duration in durations) != 1:
+            raise ValueError("cycle_requires_exactly_one_duration")
+        return self
 
 
 class ClinicIdentity(BaseModel):
