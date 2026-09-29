@@ -2,8 +2,8 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | IN_PROGRESS |
-| **Execution** | Final re-review SHIP — aguardando merge e smoke pós-merge |
+| **Status** | SHIPPED |
+| **Execution** | PR #43 mergeado em `acf7586`; smoke pós-merge verde |
 | **Slug** | `stt-openrouter-scribe-activation` |
 | **Date** | 2026-09-28 |
 | **Author** | Lorenzo |
@@ -610,6 +610,16 @@ Premissas externas verificáveis:
   continuam idênticas e `git diff --check` passou também no delta local de lifecycle.
 - **Outcome:** execução aprovada para PR/merge; promoção pública continua pertencendo exclusivamente
   a `api-provider-catalog-presentation`.
+
+### Post-merge Shipment — 2026-09-29 — SHIPPED
+
+- **PR:** [#43](https://github.com/neurostackinfra-hub/neurostack-api/pull/43).
+- **Source HEAD:** `a39cbf5d6cf0c80a9c149aed7c375cfe5bfe6fa5`; **merge commit:**
+  `acf7586c91dd2101129da202d4e9b4c2b4c3ca5b` em `main`.
+- **Post-merge smoke:** 569 testes focados passaram na árvore limpa do merge; os dois arquivos de
+  regras Prometheus permaneceram byte a byte idênticos.
+- **Outcome:** todos os grupos, critérios de sucesso e QA estão concluídos; a aresta STT do gate de
+  `api-provider-catalog-presentation` está satisfeita. Matriz/card públicos permanecem inalterados.
 
 ---
 
