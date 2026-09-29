@@ -447,6 +447,14 @@ export default function HandoffQueuePage() {
   const requestScope = `${effectiveTenantId ?? ""}|${requestedStartDate}|${requestedEndDate}`;
   const requestScopeRef = useRef(requestScope);
   requestScopeRef.current = requestScope;
+  const exportGenerationRef = useRef(0);
+
+  useEffect(() => {
+    exportGenerationRef.current += 1;
+    return () => {
+      exportGenerationRef.current += 1;
+    };
+  }, [requestScope]);
 
   const fetchQueue = useCallback(async () => {
     if (!effectiveTenantId) return;
@@ -655,12 +663,19 @@ export default function HandoffQueuePage() {
   };
 
   const handleExport = async () => {
-    if (!effectiveTenantId) return;
-    if (loadedScopeRef.current !== requestScopeRef.current) return;
+    const exportTenant = effectiveTenantId;
+    const exportScope = requestScopeRef.current;
+    const exportGeneration = exportGenerationRef.current;
+    const exportIsCurrent = () =>
+      exportGenerationRef.current === exportGeneration &&
+      effectiveTenantRef.current === exportTenant &&
+      requestScopeRef.current === exportScope &&
+      loadedScopeRef.current === exportScope;
+    if (!exportTenant || !exportIsCurrent()) return;
     const token = getToken();
     if (!token) return;
     try {
-      const params = new URLSearchParams({ tenant_id: effectiveTenantId });
+      const params = new URLSearchParams({ tenant_id: exportTenant });
       if (startDate) params.set("from_date", startDate);
       if (endDate) params.set("to_date", endDate);
       const res = await fetch(
@@ -669,6 +684,7 @@ export default function HandoffQueuePage() {
           headers: { Authorization: `Bearer ${token}` },
         },
       );
+      if (!exportIsCurrent()) return;
       if (!res.ok) {
         let detail: unknown;
         try {
@@ -677,6 +693,7 @@ export default function HandoffQueuePage() {
         } catch {
           detail = undefined;
         }
+        if (!exportIsCurrent()) return;
         if (detail === "export_limit_10000_exceeded") {
           toast({
             title: t("handoff_export_limit_error"),
@@ -686,11 +703,25 @@ export default function HandoffQueuePage() {
         return;
       }
       const blob = await res.blob();
+      if (!exportIsCurrent()) return;
       const url = URL.createObjectURL(blob);
+      if (!exportIsCurrent()) {
+        URL.revokeObjectURL(url);
+        return;
+      }
       const a = document.createElement("a");
       a.href = url;
       a.download = "handoffs.csv";
+      if (!exportIsCurrent()) {
+        URL.revokeObjectURL(url);
+        return;
+      }
       document.body.appendChild(a);
+      if (!exportIsCurrent()) {
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        return;
+      }
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
