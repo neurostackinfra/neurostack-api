@@ -34,6 +34,7 @@ from src.services.safe_egress import (
     STT_OPENAI_HOSTS,
     TTS_ELEVENLABS_HOSTS,
     TTS_GOOGLE_HOSTS,
+    TTS_OPENAI_HOSTS,
     ZAPI_ALLOWED_HOSTS,
     ParsedUrl,
     UnsafeEgressError,
@@ -244,10 +245,15 @@ class TestEnforceHostAllowlist:
         enforce_host_allowlist(
             self._parsed("texttospeech.googleapis.com"), TTS_GOOGLE_HOSTS
         )
+        enforce_host_allowlist(self._parsed("api.openai.com"), TTS_OPENAI_HOSTS)
         with pytest.raises(UnsafeEgressError):
             enforce_host_allowlist(
                 self._parsed("api.elevenlabs.io.attacker.tld"),
                 TTS_ELEVENLABS_HOSTS,
+            )
+        with pytest.raises(UnsafeEgressError):
+            enforce_host_allowlist(
+                self._parsed("api.openai.com.attacker.tld"), TTS_OPENAI_HOSTS
             )
 
 
@@ -424,6 +430,7 @@ class TestProviderPolicies:
     def test_every_tts_kind_resolves_with_a_pinned_host(self) -> None:
         assert resolve_policy("tts_elevenlabs").allowed_hosts == TTS_ELEVENLABS_HOSTS
         assert resolve_policy("tts_google").allowed_hosts == TTS_GOOGLE_HOSTS
+        assert resolve_policy("tts_openai").allowed_hosts == TTS_OPENAI_HOSTS
 
     def test_multimodal_kinds_reject_hosts_outside_the_allowlist(self) -> None:
         resolver = make_resolver("104.18.2.1")

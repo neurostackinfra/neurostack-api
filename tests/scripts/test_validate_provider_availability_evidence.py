@@ -97,7 +97,7 @@ def test_dependencies_must_match_the_wish_in_canonical_order(
             lambda text: text.replace(
                 "| whatsapp | meta_cloud |", "| whatsapp | absent |", 1
             ),
-            "22-pair",
+            "23-pair",
         ),
         (
             lambda text: text.replace(
@@ -164,7 +164,7 @@ def test_receipt_only_validation_does_not_require_extra_evidence(
 
 def test_all_displayable_pairs_are_coming_soon() -> None:
     assert (
-        sum(decision == "coming_soon" for decision in EXPECTED_DECISIONS.values()) == 19
+        sum(decision == "coming_soon" for decision in EXPECTED_DECISIONS.values()) == 20
     )
     assert sum(decision == "active" for decision in EXPECTED_DECISIONS.values()) == 0
     assert sum(decision == "removed" for decision in EXPECTED_DECISIONS.values()) == 3

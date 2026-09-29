@@ -68,10 +68,11 @@ MULTIMODAL_OPENAI_HOSTS: frozenset[str] = frozenset({"api.openai.com"})
 MULTIMODAL_GROQ_HOSTS: frozenset[str] = frozenset({"api.groq.com"})
 MULTIMODAL_OPENROUTER_HOSTS: frozenset[str] = frozenset({"openrouter.ai"})
 
-# Text-to-speech providers. TTS carries clinic-owned API keys, so both
+# Text-to-speech providers. TTS carries clinic-owned API keys, so all
 # operational endpoints are pinned exactly and never use custom-public egress.
 TTS_ELEVENLABS_HOSTS: frozenset[str] = frozenset({"api.elevenlabs.io"})
 TTS_GOOGLE_HOSTS: frozenset[str] = frozenset({"texttospeech.googleapis.com"})
+TTS_OPENAI_HOSTS: frozenset[str] = frozenset({"api.openai.com"})
 
 # Providers that fall back to the "custom public" policy: any public
 # HTTPS destination is accepted, but the DNS/IP filter still runs.
@@ -364,6 +365,7 @@ PROVIDER_POLICIES: Mapping[str, ProviderPolicy] = {
         kind="tts_elevenlabs", allowed_hosts=TTS_ELEVENLABS_HOSTS
     ),
     "tts_google": ProviderPolicy(kind="tts_google", allowed_hosts=TTS_GOOGLE_HOSTS),
+    "tts_openai": ProviderPolicy(kind="tts_openai", allowed_hosts=TTS_OPENAI_HOSTS),
     "evolution": ProviderPolicy(kind="evolution", allowed_hosts=None),
     "uazapi": ProviderPolicy(kind="uazapi", allowed_hosts=None),
     "audio_url": ProviderPolicy(kind="audio_url", allowed_hosts=None),
@@ -673,6 +675,7 @@ __all__ = [
     "STT_OPENAI_HOSTS",
     "TTS_ELEVENLABS_HOSTS",
     "TTS_GOOGLE_HOSTS",
+    "TTS_OPENAI_HOSTS",
     "ZAPI_ALLOWED_HOSTS",
     "ParsedUrl",
     "PinnedAsyncNetworkBackend",
