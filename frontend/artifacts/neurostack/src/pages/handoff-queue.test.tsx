@@ -1,4 +1,12 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { I18nProvider } from "@/context/i18n";
@@ -26,32 +34,56 @@ vi.mock("@/hooks/use-toast", () => ({
 
 interface QueueItemFixture {
   id: string;
-  numero_whatsapp: string;
+  numero_whatsapp: string | null;
   session_id: string;
   intencao_detectada: string | null;
   estagio_atual: string;
   primeira_linha_mensagem: null;
   created_at: string;
   data_hora_saida: null;
+  sla_target_seconds: number | null;
   status: string;
   safety_flag: boolean;
 }
 
-function todayAt(hour: number): string {
-  const now = new Date();
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour).toISOString();
+interface QueueStatsFixture {
+  avg_wait_seconds: number | null;
+  pct_within_sla: number | null;
+  within_sla_count: number;
+  confirmed_late_count: number;
+  unanswered_overdue_count: number;
+  maturing_count: number;
+  cancelled_unconfirmed_count: number;
+  unmeasured_legacy_count: number;
+  confirmed_count: number;
+  sla_eligible_count: number;
+  period_timezone: string;
+  period_start: string;
+  period_end_exclusive: string;
 }
 
-function todayYmd(): string {
-  const now = new Date();
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-}
+const DEFAULT_STATS: QueueStatsFixture = {
+  avg_wait_seconds: 138,
+  pct_within_sla: 40,
+  within_sla_count: 2,
+  confirmed_late_count: 3,
+  unanswered_overdue_count: 4,
+  maturing_count: 5,
+  cancelled_unconfirmed_count: 6,
+  unmeasured_legacy_count: 7,
+  confirmed_count: 5,
+  sla_eligible_count: 5,
+  period_timezone: "America/Sao_Paulo",
+  period_start: "2026-09-01T03:00:00Z",
+  period_end_exclusive: "2026-10-01T03:00:00Z",
+};
 
 function item(
   id: string,
-  intent: string | null,
-  safetyFlag: boolean,
-  hour: number,
+  intent: string | null = "pedido_preco",
+  safetyFlag = false,
+  createdAt = "2001-01-01T12:00:00.000Z",
+  slaTargetSeconds: number | null = 600,
 ): QueueItemFixture {
   return {
     id,
@@ -60,8 +92,9 @@ function item(
     intencao_detectada: intent,
     estagio_atual: `hidden-stage-${id}`,
     primeira_linha_mensagem: null,
-    created_at: todayAt(hour),
+    created_at: createdAt,
     data_hora_saida: null,
+    sla_target_seconds: slaTargetSeconds,
     status: "pending",
     safety_flag: safetyFlag,
   };
@@ -69,18 +102,32 @@ function item(
 
 // Deliberately not chronological: the UI must preserve this API/FIFO order.
 const FIFO_ITEMS = [
-  item("a", "pedido_preco", false, 15),
-  item("b", "agendar", true, 9),
-  item("c", "orcamento_existente", true, 14),
-  item("d", null, true, 10),
-  item("e", "future_intent", true, 13),
+  item("a", "pedido_preco"),
+  item("b", "agendar", true),
+  item("c", "orcamento_existente", true),
+  item("d", null, true),
+  item("e", "future_intent", true),
 ];
 
-function queueResponse(items: QueueItemFixture[] = FIFO_ITEMS, avg = 138, pct = 82): Response {
+function queueResponse(
+  items: QueueItemFixture[] = FIFO_ITEMS,
+  stats: Partial<QueueStatsFixture> = {},
+): Response {
   return {
     ok: true,
-    json: async () => ({ items, avg_wait_seconds: avg, pct_within_sla: pct }),
+    status: 200,
+    json: async () => ({ items, ...DEFAULT_STATS, ...stats }),
   } as Response;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 function renderPage(locale: "pt" | "en" = "pt") {
@@ -93,7 +140,13 @@ function renderPage(locale: "pt" | "en" = "pt") {
 }
 
 function cardIds(): string[] {
-  return screen.queryAllByTestId("handoff-card").map((card) => card.getAttribute("data-handoff-id") ?? "");
+  return screen
+    .queryAllByTestId("handoff-card")
+    .map((card) => card.getAttribute("data-handoff-id") ?? "");
+}
+
+function dateInputs(): HTMLInputElement[] {
+  return [...document.querySelectorAll<HTMLInputElement>('input[type="date"]')];
 }
 
 async function renderLoaded(locale: "pt" | "en" = "pt") {
@@ -114,12 +167,6 @@ beforeEach(() => {
   mocks.fetch.mockReset();
   mocks.toast.mockReset();
   vi.stubGlobal("fetch", mocks.fetch);
-  vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue({
-    locale: "pt-BR",
-    calendar: "gregory",
-    numberingSystem: "latn",
-    timeZone: "America/Sao_Paulo",
-  });
 });
 
 afterEach(() => {
@@ -131,295 +178,636 @@ afterEach(() => {
 });
 
 describe("<HandoffQueuePage />", () => {
-  it("loads a fetched payload containing estagio_atual without rendering its label or value", async () => {
-    mocks.fetch.mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        items: [{
-          id: "handoff-1",
-          numero_whatsapp: "5511999999999",
-          session_id: "12345678-abcd-4abc-8def-1234567890ab",
-          intencao_detectada: "pedido_preco",
-          estagio_atual: "stage-payload-marker",
-          primeira_linha_mensagem: null,
-          created_at: new Date().toISOString(),
-          data_hora_saida: null,
-          status: "pending",
-          safety_flag: false,
-        }],
-        avg_wait_seconds: 10,
-        pct_within_sla: 90,
-      }),
-    } as Response);
+  it("lets the clinic resolve the initial period and formats cards in its timezone", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-02T00:30:00.000Z"));
+    vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue({
+      locale: "ja-JP",
+      calendar: "gregory",
+      numberingSystem: "latn",
+      timeZone: "Asia/Tokyo",
+    });
+    mocks.fetch.mockResolvedValue(
+      queueResponse(
+        [
+          item(
+            "clinic-date",
+            "pedido_preco",
+            false,
+            "2026-09-02T01:30:00.000Z",
+          ),
+        ],
+        {
+          period_timezone: "America/Sao_Paulo",
+          period_start: "2026-09-01T03:00:00Z",
+          period_end_exclusive: "2026-09-02T03:00:00Z",
+        },
+      ),
+    );
 
     renderPage();
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
 
-    expect(await screen.findByText("pedido_preco")).toBeInTheDocument();
-    expect(screen.queryByText("Estágio")).not.toBeInTheDocument();
-    expect(screen.queryByText("stage-payload-marker")).not.toBeInTheDocument();
+    expect(cardIds()).toEqual(["clinic-date"]);
+    expect(mocks.fetch).toHaveBeenCalledTimes(1);
+    expect(String(mocks.fetch.mock.calls[0][0])).toBe(
+      "/v1/handoffs/queue?tenant_id=clinic-id",
+    );
+    expect(String(mocks.fetch.mock.calls[0][0])).not.toMatch(
+      /from_date|to_date|timezone/,
+    );
+    expect(dateInputs().map((input) => input.value)).toEqual([
+      "2026-09-01",
+      "2026-09-01",
+    ]);
+    expect(screen.getByTestId("handoff-period")).toHaveTextContent(
+      "America/Sao_Paulo",
+    );
+    expect(
+      within(screen.getByTestId("handoff-card")).getByText(/01\/09\/2026/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("hidden-stage-clinic-date"),
+    ).not.toBeInTheDocument();
   });
 
-  it("preserves received order through safety, bucket, AND, and clear without fetching", async () => {
+  it("preserves received order through operational filters without refetching", async () => {
     await renderLoaded();
     const requestCount = mocks.fetch.mock.calls.length;
-    const dates = screen.getAllByDisplayValue(todayYmd());
+    const dates = dateInputs();
 
-    expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]);
-    expect(screen.getByText("00:02:18")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("checkbox", { name: "Somente com sinalização de segurança" }));
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Somente com sinalização de segurança",
+      }),
+    );
     expect(cardIds()).toEqual(["b", "c", "d", "e"]);
 
-    fireEvent.change(screen.getByRole("combobox", { name: "Grupo de intenção" }), {
-      target: { value: "pedido_preco" },
-    });
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Grupo de intenção" }),
+      {
+        target: { value: "pedido_preco" },
+      },
+    );
     expect(cardIds()).toEqual(["c"]);
-
-    fireEvent.click(screen.getByRole("checkbox", { name: "Somente com sinalização de segurança" }));
-    expect(cardIds()).toEqual(["a", "c"]);
 
     fireEvent.click(screen.getByRole("button", { name: "Limpar filtros" }));
     expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]);
-    expect(screen.getByRole("combobox", { name: "Grupo de intenção" })).toHaveValue("all");
     expect(dates).toHaveLength(2);
-    expect(dates.every((date) => (date as HTMLInputElement).value === todayYmd())).toBe(true);
-    expect(screen.getByText("00:02:18")).toBeInTheDocument();
+    expect(dates.map((input) => input.value)).toEqual([
+      "2026-09-01",
+      "2026-09-30",
+    ]);
     expect(mocks.fetch).toHaveBeenCalledTimes(requestCount);
   });
 
-  it("renders null intent as a dash, excludes it from 'outras', and distinguishes filtered empty", async () => {
-    await renderLoaded();
-
-    expect(within(screen.getAllByTestId("handoff-card")[3]).getByText("—")).toBeInTheDocument();
-
-    fireEvent.change(screen.getByRole("combobox", { name: "Grupo de intenção" }), {
-      target: { value: "outras" },
-    });
-    expect(cardIds()).toEqual(["e"]);
-
-    fireEvent.click(screen.getByRole("checkbox", { name: "Somente com sinalização de segurança" }));
-    expect(cardIds()).toEqual(["e"]);
-
-    fireEvent.change(screen.getByRole("combobox", { name: "Grupo de intenção" }), {
-      target: { value: "reclamacao" },
-    });
-    expect(cardIds()).toEqual([]);
-    expect(screen.getByText("Nenhum card corresponde aos filtros selecionados.")).toBeInTheDocument();
-    expect(screen.queryByText("Nenhum handoff ativo no momento.")).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Limpar filtros" }));
-    expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]);
-  });
-
-  it("preserves the next polled response order and the active filters", async () => {
-    vi.useFakeTimers();
-    const polledItems = [FIFO_ITEMS[4], FIFO_ITEMS[2], FIFO_ITEMS[0], FIFO_ITEMS[1], FIFO_ITEMS[3]];
+  it("ignores a stale queue response after the date scope changes", async () => {
+    const stale = deferred<Response>();
     mocks.fetch
-      .mockResolvedValueOnce(queueResponse())
-      .mockResolvedValueOnce(queueResponse(polledItems));
+      .mockImplementationOnce(() => stale.promise)
+      .mockResolvedValueOnce(queueResponse([item("fresh")]));
 
     renderPage();
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(1));
+    fireEvent.change(dateInputs()[0], { target: { value: "2020-01-01" } });
+
+    await waitFor(() => expect(cardIds()).toEqual(["fresh"]));
     await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
+      stale.resolve(queueResponse([item("stale")]));
+      await stale.promise;
     });
-    expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]);
-
-    fireEvent.click(screen.getByRole("checkbox", { name: "Somente com sinalização de segurança" }));
-    expect(cardIds()).toEqual(["b", "c", "d", "e"]);
-
-    await act(async () => {
-      vi.advanceTimersByTime(30000);
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(mocks.fetch).toHaveBeenCalledTimes(2);
-    expect(cardIds()).toEqual(["e", "c", "b", "d"]);
+    expect(cardIds()).toEqual(["fresh"]);
   });
 
-  it("shows a translated safety marker only on flagged cards", async () => {
+  it("resets to backend defaults when the active clinic changes", async () => {
+    mocks.fetch
+      .mockResolvedValueOnce(
+        queueResponse([item("clinic-one")], {
+          period_timezone: "America/Sao_Paulo",
+          period_start: "2026-09-01T03:00:00Z",
+          period_end_exclusive: "2026-09-02T03:00:00Z",
+        }),
+      )
+      .mockResolvedValueOnce(
+        queueResponse([item("clinic-two")], {
+          period_timezone: "Asia/Tokyo",
+          period_start: "2026-10-01T15:00:00Z",
+          period_end_exclusive: "2026-10-02T15:00:00Z",
+        }),
+      );
+    const view = renderPage();
+    await waitFor(() => expect(cardIds()).toEqual(["clinic-one"]));
+    expect(dateInputs().map((input) => input.value)).toEqual([
+      "2026-09-01",
+      "2026-09-01",
+    ]);
+
+    mocks.auth.tenantId = "clinic-two";
+    view.rerender(
+      <I18nProvider>
+        <HandoffQueuePage />
+      </I18nProvider>,
+    );
+
+    await waitFor(() => expect(cardIds()).toEqual(["clinic-two"]));
+    expect(mocks.fetch).toHaveBeenCalledTimes(2);
+    expect(String(mocks.fetch.mock.calls[1][0])).toBe(
+      "/v1/handoffs/queue?tenant_id=clinic-two",
+    );
+    expect(dateInputs().map((input) => input.value)).toEqual([
+      "2026-10-02",
+      "2026-10-02",
+    ]);
+  });
+
+  it("deduplicates confirmation across date scopes and reconciles the current cohort after commit", async () => {
+    const confirmation = deferred<Response>();
+    const preCommitScope = deferred<Response>();
+    const authoritativeScope = deferred<Response>();
+    let queueRequests = 0;
+    mocks.fetch.mockImplementation(
+      (input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "POST") return confirmation.promise;
+        queueRequests += 1;
+        if (queueRequests === 1) {
+          return Promise.resolve(
+            queueResponse([item("shared-card")], {
+              avg_wait_seconds: 60,
+              period_start: "2026-09-01T03:00:00Z",
+              period_end_exclusive: "2026-10-01T03:00:00Z",
+            }),
+          );
+        }
+        if (queueRequests === 2) return preCommitScope.promise;
+        return authoritativeScope.promise;
+      },
+    );
+    renderPage();
+    await waitFor(() => expect(cardIds()).toEqual(["shared-card"]));
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Confirmar atendimento" }),
+    );
+    fireEvent.change(dateInputs()[0], { target: { value: "2026-09-02" } });
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(3));
+    const currentScopeButton = screen.getByRole("button", {
+      name: "Confirmando…",
+    });
+    expect(currentScopeButton).toBeDisabled();
+    fireEvent.click(currentScopeButton);
+    expect(
+      mocks.fetch.mock.calls.filter(([, init]) => init?.method === "POST"),
+    ).toHaveLength(1);
+
+    await act(async () => {
+      confirmation.resolve({ ok: true, status: 204 } as Response);
+      await confirmation.promise;
+    });
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(4));
+    await act(async () => {
+      preCommitScope.resolve(
+        queueResponse([item("shared-card")], {
+          avg_wait_seconds: 120,
+          within_sla_count: 4,
+          sla_eligible_count: 5,
+          period_start: "2026-09-02T03:00:00Z",
+          period_end_exclusive: "2026-10-01T03:00:00Z",
+        }),
+      );
+      authoritativeScope.resolve(
+        queueResponse([], {
+          avg_wait_seconds: 222,
+          within_sla_count: 9,
+          sla_eligible_count: 10,
+          period_start: "2026-09-02T03:00:00Z",
+          period_end_exclusive: "2026-10-01T03:00:00Z",
+        }),
+      );
+      await Promise.all([preCommitScope.promise, authoritativeScope.promise]);
+    });
+
+    expect(cardIds()).toEqual([]);
+    expect(screen.getByText("00:03:42")).toBeInTheDocument();
+    expect(
+      screen.getByText("9 de 10 atendimentos elegíveis dentro da meta"),
+    ).toBeInTheDocument();
+    expect(
+      mocks.fetch.mock.calls.filter(([, init]) => init?.method === "POST"),
+    ).toHaveLength(1);
+  });
+
+  it("releases a stale failed confirmation for retry without toasting the new scope", async () => {
+    const staleFailure = deferred<Response>();
+    const retry = deferred<Response>();
+    let postRequests = 0;
+    mocks.fetch.mockImplementation(
+      (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          postRequests += 1;
+          return postRequests === 1 ? staleFailure.promise : retry.promise;
+        }
+        return Promise.resolve(queueResponse([item("shared-card")]));
+      },
+    );
+    renderPage();
+    await waitFor(() => expect(cardIds()).toEqual(["shared-card"]));
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Confirmar atendimento" }),
+    );
+    fireEvent.change(dateInputs()[0], { target: { value: "2026-09-02" } });
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(3));
+    expect(screen.getByRole("button", { name: "Confirmando…" })).toBeDisabled();
+
+    await act(async () => {
+      staleFailure.resolve({ ok: false, status: 500 } as Response);
+      await staleFailure.promise;
+    });
+
+    const retryButton = await screen.findByRole("button", {
+      name: "Confirmar atendimento",
+    });
+    expect(mocks.toast).not.toHaveBeenCalled();
+    fireEvent.click(retryButton);
+    expect(
+      mocks.fetch.mock.calls.filter(([, init]) => init?.method === "POST"),
+    ).toHaveLength(2);
+  });
+
+  it("opens WhatsApp without confirming or removing the handoff", async () => {
+    const open = vi.fn();
+    vi.stubGlobal("open", open);
     await renderLoaded();
 
-    expect(screen.getAllByLabelText("Sinalização de segurança")).toHaveLength(4);
-    expect(within(screen.getAllByTestId("handoff-card")[0]).queryByLabelText("Sinalização de segurança")).not.toBeInTheDocument();
-    expect(within(screen.getAllByTestId("handoff-card")[1]).getByLabelText("Sinalização de segurança")).toBeInTheDocument();
+    const firstCard = screen.getAllByTestId("handoff-card")[0];
+    fireEvent.click(
+      within(firstCard).getByRole("button", { name: "Abrir WhatsApp" }),
+    );
+
+    expect(open).toHaveBeenCalledWith("https://wa.me/5511999999997", "_blank");
+    expect(mocks.fetch).toHaveBeenCalledTimes(1);
+    expect(cardIds()).toContain("a");
+  });
+
+  it.each([
+    { role: "clinic", auth: {}, tenant: "clinic-id" },
+    {
+      role: "builder",
+      auth: {
+        tenantId: "builder-id",
+        isBuilder: true,
+        viewingClinicId: "viewed-clinic",
+      },
+      tenant: "viewed-clinic",
+    },
+    {
+      role: "super-admin",
+      auth: {
+        tenantId: "admin-id",
+        isSuperAdmin: true,
+        viewingClinicId: "viewed-clinic",
+      },
+      tenant: "viewed-clinic",
+    },
+  ])(
+    "confirms once through the canonical endpoint for $role and removes only after 2xx",
+    async ({ auth, tenant }) => {
+      Object.assign(mocks.auth, auth);
+      const confirmation = deferred<Response>();
+      mocks.fetch
+        .mockResolvedValueOnce(
+          queueResponse([item("confirm-me"), item("other")]),
+        )
+        .mockImplementationOnce(() => confirmation.promise)
+        .mockResolvedValueOnce(
+          queueResponse([item("other")], {
+            avg_wait_seconds: 321,
+            within_sla_count: 8,
+            sla_eligible_count: 10,
+          }),
+        );
+      renderPage();
+      await waitFor(() => expect(cardIds()).toEqual(["confirm-me", "other"]));
+
+      const [confirmCard, otherCard] = screen.getAllByTestId("handoff-card");
+      const button = within(confirmCard).getByRole("button", {
+        name: "Confirmar atendimento",
+      });
+      fireEvent.click(button);
+      fireEvent.click(button);
+
+      expect(cardIds()).toEqual(["confirm-me", "other"]);
+      expect(
+        screen.getByRole("button", { name: "Confirmando…" }),
+      ).toBeDisabled();
+      expect(
+        within(otherCard).getByRole("button", {
+          name: "Confirmar atendimento",
+        }),
+      ).toBeEnabled();
+      expect(mocks.fetch).toHaveBeenCalledTimes(2);
+      expect(mocks.fetch).toHaveBeenLastCalledWith(
+        `/v1/handoffs/queue/confirm-me/confirm?tenant_id=${tenant}`,
+        { method: "POST", headers: { Authorization: "Bearer test-token" } },
+      );
+      expect(String(mocks.fetch.mock.calls[1][0])).not.toContain("checkout");
+
+      await act(async () => {
+        confirmation.resolve({ ok: true, status: 204 } as Response);
+        await confirmation.promise;
+      });
+      await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(3));
+      await waitFor(() => expect(cardIds()).toEqual(["other"]));
+      expect(screen.getByText("00:05:21")).toBeInTheDocument();
+      expect(
+        screen.getByText("8 de 10 atendimentos elegíveis dentro da meta"),
+      ).toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    {
+      locale: "pt" as const,
+      status: 409,
+      message:
+        "A confirmação entrou em conflito. Aguarde a atualização da fila e tente novamente.",
+      button: "Confirmar atendimento",
+    },
+    {
+      locale: "en" as const,
+      status: 409,
+      message:
+        "The confirmation conflicted with a newer state. Wait for the queue to refresh, then try again.",
+      button: "Confirm service",
+    },
+    {
+      locale: "pt" as const,
+      status: 500,
+      message: "Não foi possível confirmar o atendimento. Tente novamente.",
+      button: "Confirmar atendimento",
+    },
+    {
+      locale: "en" as const,
+      status: 500,
+      message: "Could not confirm service. Please try again.",
+      button: "Confirm service",
+    },
+  ])(
+    "keeps the card and re-enables confirmation after $status in $locale",
+    async ({ locale, status, message, button }) => {
+      mocks.fetch
+        .mockResolvedValueOnce(queueResponse([item("retry-me")]))
+        .mockResolvedValueOnce({ ok: false, status } as Response);
+      renderPage(locale);
+      await waitFor(() => expect(cardIds()).toEqual(["retry-me"]));
+
+      fireEvent.click(screen.getByRole("button", { name: button }));
+
+      await waitFor(() =>
+        expect(mocks.toast).toHaveBeenCalledWith({
+          title: message,
+          variant: "destructive",
+        }),
+      );
+      expect(cardIds()).toEqual(["retry-me"]);
+      expect(screen.getByRole("button", { name: button })).toBeEnabled();
+    },
+  );
+
+  it("distinguishes null KPI data from measured zero", async () => {
+    mocks.fetch.mockResolvedValue(
+      queueResponse([], {
+        avg_wait_seconds: null,
+        pct_within_sla: null,
+        within_sla_count: 0,
+        sla_eligible_count: 0,
+      }),
+    );
+    const view = renderPage();
+
+    expect(await screen.findByText("Sem dados")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Sem dados" })).toHaveTextContent(
+      "—",
+    );
+    expect(screen.queryByText("00:00:00")).not.toBeInTheDocument();
+
+    view.unmount();
+    mocks.fetch.mockReset();
+    mocks.fetch.mockResolvedValue(
+      queueResponse([], {
+        avg_wait_seconds: 0,
+        pct_within_sla: 0,
+        within_sla_count: 0,
+        sla_eligible_count: 0,
+      }),
+    );
+    renderPage();
+
+    expect(await screen.findByText("00:00:00")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "0%" })).toBeInTheDocument();
+    expect(
+      screen.getByText("0 de 0 atendimentos elegíveis dentro da meta"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the backend numerator, denominator, and SLA context counts", async () => {
+    mocks.fetch.mockResolvedValue(queueResponse([], { pct_within_sla: 40 }));
+    renderPage();
+
+    expect(await screen.findByRole("img", { name: "40%" })).toBeInTheDocument();
+    expect(
+      screen.getByText("2 de 5 atendimentos elegíveis dentro da meta"),
+    ).toBeInTheDocument();
+    const expected = [
+      ["Dentro da meta", "2"],
+      ["Confirmados fora", "3"],
+      ["Pendentes vencidos", "4"],
+      ["Em maturação", "5"],
+      ["Cancelados sem confirmação", "6"],
+      ["Legado sem medição", "7"],
+    ];
+    expected.forEach(([label, value]) => {
+      expect(
+        within(screen.getByText(label).parentElement!).getByText(value),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it("keeps decimal precision in the Portuguese accessible label while rounding the visual value", async () => {
+    mocks.fetch.mockResolvedValue(queueResponse([], { pct_within_sla: 66.7 }));
+    renderPage();
+
+    expect(
+      await screen.findByRole("img", { name: "66,7%" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("67%")).toBeInTheDocument();
   });
 
   it.each([
     {
       locale: "pt" as const,
-      safety: "Somente com sinalização de segurança",
-      intent: "Grupo de intenção",
-      scope: "Os filtros de segurança e intenção se aplicam somente aos cards.",
-      clear: "Limpar filtros",
-      empty: "Nenhum card corresponde aos filtros selecionados.",
+      legends: [
+        "Abaixo de 50% do SLA individual",
+        "De 50% a 100% do SLA individual",
+        "Acima de 100% do SLA individual",
+        "Sem meta individual",
+      ],
     },
     {
       locale: "en" as const,
-      safety: "Only safety-flagged",
-      intent: "Intent group",
-      scope: "Safety and intent filters apply only to cards.",
-      clear: "Clear filters",
-      empty: "No cards match the selected filters.",
+      legends: [
+        "Below 50% of individual SLA",
+        "50% to 100% of individual SLA",
+        "Above 100% of individual SLA",
+        "No individual SLA target",
+      ],
     },
-  ])("keeps accessible controls, scope, clear, and filtered empty in $locale", async ({ locale, safety, intent, scope, clear, empty }) => {
-    await renderLoaded(locale);
-    const requestCount = mocks.fetch.mock.calls.length;
+  ])(
+    "maps SLA snapshot color boundaries and legends in $locale",
+    async ({ locale, legends }) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-09-28T12:00:00.000Z"));
+      const createdAt = (secondsAgo: number) =>
+        new Date(Date.now() - secondsAgo * 1000).toISOString();
+      mocks.fetch.mockResolvedValue(
+        queueResponse([
+          item("green", "pedido_preco", false, createdAt(299), 600),
+          item("yellow-half", "pedido_preco", false, createdAt(300), 600),
+          item("yellow-full", "pedido_preco", false, createdAt(600), 600),
+          item("red", "pedido_preco", false, createdAt(601), 600),
+          item("neutral", "pedido_preco", false, createdAt(999), null),
+        ]),
+      );
 
-    expect(screen.getByText(scope)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("checkbox", { name: safety }));
-    fireEvent.change(screen.getByRole("combobox", { name: intent }), { target: { value: "reclamacao" } });
-    expect(screen.getByText(empty)).toBeInTheDocument();
+      renderPage(locale);
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
 
-    fireEvent.click(screen.getByRole("button", { name: clear }));
-    expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]);
-    expect(mocks.fetch).toHaveBeenCalledTimes(requestCount);
-  });
+      const state = (id: string) =>
+        document
+          .querySelector(`[data-handoff-id="${id}"]`)
+          ?.getAttribute("data-sla-state");
+      expect(state("green")).toBe("green");
+      expect(state("yellow-half")).toBe("yellow");
+      expect(state("yellow-full")).toBe("yellow");
+      expect(state("red")).toBe("red");
+      expect(state("neutral")).toBe("neutral");
+      legends.forEach((legend) =>
+        expect(screen.getByText(legend)).toBeInTheDocument(),
+      );
+    },
+  );
 
-  it("keeps KPI and date-only CSV semantics when card filters change", async () => {
+  it("exports the selected backend date scope without a browser timezone", async () => {
     const exportedBlob = new Blob(["csv"]);
     const blob = vi.fn(async () => exportedBlob);
     const createObjectURL = vi.fn(() => "blob:handoffs");
     const revokeObjectURL = vi.fn();
-    vi.stubGlobal("URL", Object.assign(URL, { createObjectURL, revokeObjectURL }));
-    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    vi.stubGlobal(
+      "URL",
+      Object.assign(URL, { createObjectURL, revokeObjectURL }),
+    );
+    const anchorClick = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
     mocks.fetch.mockImplementation(async (input: RequestInfo | URL) => {
-      if (String(input).includes("/export?")) {
+      if (String(input).includes("/export?"))
         return { ok: true, blob } as unknown as Response;
-      }
       return queueResponse();
     });
-
     renderPage();
     await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
-    const initialUrl = String(mocks.fetch.mock.calls[0][0]);
-
-    fireEvent.click(screen.getByRole("checkbox", { name: "Somente com sinalização de segurança" }));
-    fireEvent.change(screen.getByRole("combobox", { name: "Grupo de intenção" }), {
-      target: { value: "pedido_preco" },
-    });
-    expect(screen.getByText("00:02:18")).toBeInTheDocument();
-    expect(mocks.fetch).toHaveBeenCalledTimes(1);
 
     const createElement = vi.spyOn(document, "createElement");
-    const appendChild = vi.spyOn(document.body, "appendChild");
-    const removeChild = vi.spyOn(document.body, "removeChild");
-
     fireEvent.click(screen.getByRole("button", { name: "Exportar CSV" }));
     await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(2));
 
     const exportUrl = String(mocks.fetch.mock.calls[1][0]);
-    expect(initialUrl).toMatch(/^\/v1\/handoffs\/queue\?tenant_id=clinic-id&from_date=\d{4}-\d{2}-\d{2}&to_date=\d{4}-\d{2}-\d{2}$/);
-    expect(exportUrl).toMatch(/^\/v1\/handoffs\/queue\/export\?tenant_id=clinic-id&from_date=\d{4}-\d{2}-\d{2}&to_date=\d{4}-\d{2}-\d{2}&timezone=America%2FSao_Paulo$/);
-    expect(exportUrl).not.toContain("safety");
-    expect(exportUrl).not.toContain("intent");
-    expect(mocks.fetch.mock.calls[1][1]).toEqual({
-      headers: { Authorization: "Bearer test-token" },
-    });
+    expect(exportUrl).toBe(
+      "/v1/handoffs/queue/export?tenant_id=clinic-id&from_date=2026-09-01&to_date=2026-09-30",
+    );
+    expect(exportUrl).not.toContain("timezone=");
     expect(blob).toHaveBeenCalledTimes(1);
     expect(createObjectURL).toHaveBeenCalledWith(exportedBlob);
     const anchor = createElement.mock.results.find(
       (result) => result.value instanceof HTMLAnchorElement,
     )?.value as HTMLAnchorElement;
-    expect(anchor).toBeInstanceOf(HTMLAnchorElement);
     expect(anchor.download).toBe("handoffs.csv");
-    expect(anchor.href).toBe("blob:handoffs");
-    expect(appendChild).toHaveBeenCalledWith(anchor);
     expect(anchorClick).toHaveBeenCalledTimes(1);
-    expect(removeChild).toHaveBeenCalledWith(anchor);
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:handoffs");
   });
 
   it.each([
     {
       locale: "pt" as const,
-      detail: "export_limit_10000_exceeded",
-      message: "A exportação excede o limite de 10.000 registros. Reduza o período.",
       button: "Exportar CSV",
+      message:
+        "A exportação excede o limite de 10.000 registros. Reduza o período.",
     },
     {
       locale: "en" as const,
-      detail: "export_limit_10000_exceeded",
-      message: "The export exceeds the 10,000-record limit. Shorten the date range.",
       button: "Export CSV",
+      message:
+        "The export exceeds the 10,000-record limit. Shorten the date range.",
     },
-    {
-      locale: "pt" as const,
-      detail: "invalid_timezone",
-      message: "Não foi possível usar o fuso horário do navegador. Verifique as configurações de data e fuso horário e tente novamente.",
-      button: "Exportar CSV",
+  ])(
+    "preserves the localized export limit error in $locale",
+    async ({ locale, button, message }) => {
+      mocks.fetch.mockImplementation(async (input: RequestInfo | URL) => {
+        if (String(input).includes("/export?")) {
+          return {
+            ok: false,
+            status: 400,
+            json: async () => ({ detail: "export_limit_10000_exceeded" }),
+          } as Response;
+        }
+        return queueResponse();
+      });
+      renderPage(locale);
+      await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
+
+      fireEvent.click(screen.getByRole("button", { name: button }));
+
+      await waitFor(() =>
+        expect(mocks.toast).toHaveBeenCalledWith({
+          title: message,
+          variant: "destructive",
+        }),
+      );
+      expect(String(mocks.fetch.mock.calls[1][0])).not.toContain("timezone=");
     },
-    {
-      locale: "en" as const,
-      detail: "invalid_timezone",
-      message: "The browser timezone could not be used. Check your date and timezone settings, then try again.",
-      button: "Export CSV",
-    },
-  ])("shows the localized $detail export error in $locale without downloading", async ({ locale, detail, message, button }) => {
-    const createObjectURL = vi.fn();
-    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
-    vi.stubGlobal("URL", Object.assign(URL, { createObjectURL }));
-    mocks.fetch.mockImplementation(async (input: RequestInfo | URL) => {
-      if (String(input).includes("/export?")) {
-        return {
-          ok: false,
-          status: 400,
-          json: async () => ({ detail }),
-        } as Response;
-      }
-      return queueResponse();
-    });
+  );
 
-    renderPage(locale);
-    await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
-    fireEvent.click(screen.getByRole("button", { name: button }));
-
-    await waitFor(() => {
-      expect(mocks.toast).toHaveBeenCalledWith({ title: message, variant: "destructive" });
-    });
-    const exportUrl = String(mocks.fetch.mock.calls[1][0]);
-    expect(exportUrl).toContain("timezone=America%2FSao_Paulo");
-    expect(createObjectURL).not.toHaveBeenCalled();
-    expect(anchorClick).not.toHaveBeenCalled();
-  });
-
-  it("keeps checkout and attend-and-redirect actions operational", async () => {
-    const open = vi.fn();
-    vi.stubGlobal("open", open);
-    mocks.fetch
-      .mockResolvedValueOnce(queueResponse())
-      .mockResolvedValue({ ok: true } as Response);
-
-    renderPage();
-    await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
-    const firstCard = screen.getAllByTestId("handoff-card")[0];
-    fireEvent.click(within(firstCard).getByRole("button", { name: "Atender e direcionar" }));
-
-    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(2));
-    expect(open).toHaveBeenCalledWith("https://wa.me/5511999999997", "_blank");
-    expect(mocks.fetch).toHaveBeenLastCalledWith(
-      "/v1/handoffs/queue/a/checkout",
-      expect.objectContaining({ method: "POST" }),
-    );
-  });
-
-  it("filters investor mocks across buckets and safety without fetching or revealing stage", async () => {
+  it("keeps investor filtering local and does not reveal internal stage values", async () => {
     Object.assign(mocks.auth, { isInvestor: true, tenantId: null });
-
     renderPage();
-    await waitFor(() => expect(screen.getAllByTestId("handoff-card")).toHaveLength(6));
-    expect(screen.getAllByText("agendar")).toHaveLength(2);
 
-    fireEvent.change(screen.getByRole("combobox", { name: "Grupo de intenção" }), {
-      target: { value: "pedido_preco" },
-    });
-    expect(screen.getAllByTestId("handoff-card")).toHaveLength(1);
+    await waitFor(() =>
+      expect(screen.getAllByTestId("handoff-card")).toHaveLength(6),
+    );
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Grupo de intenção" }),
+      {
+        target: { value: "pedido_preco" },
+      },
+    );
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Somente com sinalização de segurança",
+      }),
+    );
 
-    fireEvent.click(screen.getByRole("checkbox", { name: "Somente com sinalização de segurança" }));
     expect(screen.getAllByTestId("handoff-card")).toHaveLength(1);
-    expect(screen.queryByText("Estágio")).not.toBeInTheDocument();
-    expect(screen.queryByText("agendamento_solicitado")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("agendamento_solicitado"),
+    ).not.toBeInTheDocument();
     expect(screen.queryByText("em_qualificacao")).not.toBeInTheDocument();
     expect(mocks.fetch).not.toHaveBeenCalled();
   });
