@@ -2104,12 +2104,29 @@ def _seed_uazapi_audio_tenant(
         "uazapi_instance_name": instance_name,
     }
     if stt or stt_provider is not None:
+        provider = stt_provider or "outros"
+        fixed_bundle = {
+            "elevenlabs_scribe": (
+                "https://api.elevenlabs.io/v1",
+                "scribe_v2",
+            ),
+            "openrouter": (
+                "https://openrouter.ai/api/v1",
+                "openai/whisper-large-v3-turbo",
+            ),
+        }.get(provider)
         payload.update(
             {
-                "stt_provider": stt_provider or "outros",
+                "stt_provider": provider,
                 "stt_api_key": f"sk-fake-stt-{uuid4().hex}",
-                "stt_api_url": "https://api.groq.com/openai/v1",
-                "stt_model_name": "whisper-large-v3-turbo",
+                "stt_api_url": (
+                    fixed_bundle[0]
+                    if fixed_bundle
+                    else "https://api.groq.com/openai/v1"
+                ),
+                "stt_model_name": (
+                    fixed_bundle[1] if fixed_bundle else "whisper-large-v3-turbo"
+                ),
             }
         )
     if multimodal:
@@ -2302,6 +2319,211 @@ class TestUazapiGroup4PatientAudioTranscription:
         webhook_module._INMEM_INCOMING.clear()
         webhook_module._INMEM_SENT.clear()
         webhook_module._INMEM_STT_NOTICE.clear()
+
+    @pytest.mark.parametrize(
+        ("provider", "api_url", "model_name"),
+        [
+            (
+                "elevenlabs_scribe",
+                "https://api.elevenlabs.io/v1",
+                "scribe_v2",
+            ),
+            (
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "openai/whisper-large-v3-turbo",
+            ),
+        ],
+    )
+    def test_fixed_provider_http_dispatch_feeds_pipeline_with_raw_audio(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        provider: str,
+        api_url: str,
+        model_name: str,
+    ) -> None:
+        """Captured-shape Uazapi audio reaches each fixed adapter, never Groq."""
+        from src.services.event_service import EventService
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(
+            client,
+            tenant_id,
+            instance,
+            stt_provider=provider,
+        )
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_fixed_{uuid4().hex[:10]}",
+        )
+        raw_mime = "audio/ogg; codecs=opus"
+        audio_bytes = b"OggS_uazapi_fixed_provider"
+        transcript = f"transcript from {provider}"
+        fixed_adapter = AsyncMock(return_value=transcript)
+        legacy_adapter = AsyncMock()
+        captured: dict[str, str] = {}
+
+        async def _capture(self, event_request, session=None):
+            captured["content"] = event_request.payload.content
+            return SimpleNamespace(
+                prompt=None,
+                handoff_summary=None,
+                decision=SimpleNamespace(handoff_required=False),
+            )
+
+        with (
+            patch(
+                "src.api.routes.webhook.download_uazapi_media",
+                new=AsyncMock(return_value=(audio_bytes, raw_mime)),
+            ),
+            patch("src.services.stt_service.transcribe_audio", fixed_adapter),
+            patch("src.services.groq_service.transcribe_audio", legacy_adapter),
+            patch.object(EventService, "process_event", _capture),
+        ):
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json().get("action") != "stt_fallback"
+        assert captured == {"content": transcript}
+        fixed_adapter.assert_awaited_once()
+        kwargs = fixed_adapter.await_args.kwargs
+        assert kwargs["provider"] == provider
+        assert kwargs["api_url"] == api_url
+        assert kwargs["api_key"].startswith("sk-fake-stt-")
+        assert kwargs["audio_bytes"] == audio_bytes
+        assert kwargs["mimetype"] == raw_mime
+        assert kwargs["model_name"] == model_name
+        assert kwargs["language"] == "pt"
+        legacy_adapter.assert_not_awaited()
+
+    @pytest.mark.parametrize("provider", ["elevenlabs_scribe", "openrouter"])
+    def test_fixed_provider_operational_error_runs_multimodal_then_reroutes(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        provider: str,
+    ) -> None:
+        """A closed fixed-adapter error preserves STT→multimodal→text order."""
+        from src.api.routes.webhook import _STT_TEMPORARY_FAILURE_MSG_PT
+        from src.services.stt_service import SttTranscriptionError
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(
+            client,
+            tenant_id,
+            instance,
+            stt_provider=provider,
+            multimodal=True,
+        )
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_fixed_fail_{uuid4().hex[:10]}",
+        )
+        fixed_adapter = AsyncMock(
+            side_effect=SttTranscriptionError("stt_provider_http_error")
+        )
+        legacy_adapter = AsyncMock()
+        multimodal = AsyncMock(side_effect=RuntimeError("multimodal unavailable"))
+        send = AsyncMock(return_value=_fake_uazapi_send_result())
+
+        with (
+            patch(
+                "src.api.routes.webhook.download_uazapi_media",
+                new=AsyncMock(
+                    return_value=(b"OggS_uazapi_failed", "audio/ogg; codecs=opus")
+                ),
+            ),
+            patch("src.services.stt_service.transcribe_audio", fixed_adapter),
+            patch("src.services.groq_service.transcribe_audio", legacy_adapter),
+            patch(
+                "src.services.multimodal_service.transcribe_audio_multimodal",
+                multimodal,
+            ),
+            patch("src.api.routes.webhook.send_uazapi_text", send),
+        ):
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "ok": True,
+            "replied": True,
+            "action": "stt_fallback",
+        }
+        assert "stt_provider_http_error" not in response.text
+        assert "multimodal unavailable" not in response.text
+        fixed_adapter.assert_awaited_once()
+        assert fixed_adapter.await_args.kwargs["provider"] == provider
+        assert fixed_adapter.await_args.kwargs["mimetype"] == ("audio/ogg; codecs=opus")
+        legacy_adapter.assert_not_awaited()
+        multimodal.assert_awaited_once()
+        send.assert_awaited_once()
+        assert send.await_args.args[3] == _STT_TEMPORARY_FAILURE_MSG_PT
+
+    @pytest.mark.parametrize(
+        "provider",
+        ["google_stt", "deepgram_stt", "microsoft_stt"],
+    )
+    def test_unsupported_provider_is_zero_effect_before_uazapi_downstream(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        provider: str,
+    ) -> None:
+        """Unsupported STT exits before download, adapters, reply or session."""
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(
+            client,
+            tenant_id,
+            instance,
+            stt_provider=provider,
+            multimodal=True,
+        )
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_unsupported_{uuid4().hex[:10]}",
+        )
+        download = AsyncMock()
+        fixed_adapter = AsyncMock()
+        legacy_adapter = AsyncMock()
+        chain = AsyncMock()
+        send = AsyncMock()
+        reply = AsyncMock()
+        session = AsyncMock()
+        fallback = AsyncMock()
+
+        with (
+            patch("src.api.routes.webhook.download_uazapi_media", download),
+            patch("src.services.stt_service.transcribe_audio", fixed_adapter),
+            patch("src.services.groq_service.transcribe_audio", legacy_adapter),
+            patch("src.api.routes.webhook._transcribe_audio_chain", chain),
+            patch("src.api.routes.webhook.send_uazapi_text", send),
+            patch("src.api.routes.webhook._send_reply_with_optional_tts", reply),
+            patch("src.api.routes.webhook._get_or_create_session", session),
+            patch("src.api.routes.webhook._send_uazapi_stt_fallback", fallback),
+        ):
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "ok": True,
+            "skipped": "stt_provider_unsupported",
+            "provider": provider,
+        }
+        download.assert_not_awaited()
+        fixed_adapter.assert_not_awaited()
+        legacy_adapter.assert_not_awaited()
+        chain.assert_not_awaited()
+        send.assert_not_awaited()
+        reply.assert_not_awaited()
+        session.assert_not_awaited()
+        fallback.assert_not_awaited()
 
     def test_patient_audio_transcript_feeds_pipeline(
         self,
