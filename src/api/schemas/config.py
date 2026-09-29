@@ -17,11 +17,14 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from src.services.api_credentials import (
     GEMINI_API_BASE_URL,
+    STT_FIXED_API_BASES,
     CredentialPolicyError,
     validate_gemini_endpoint,
+    validate_stt_provider_endpoint,
 )
 
 
@@ -54,12 +57,27 @@ Identifier = Annotated[
     StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=255),
 ]
 Secret = Annotated[str, StringConstraints(strict=True, min_length=1, max_length=8192)]
+SttIdentifier = Annotated[str, StringConstraints(strict=True, max_length=255)]
+SttSecret = Annotated[str, StringConstraints(strict=True, max_length=8192)]
 ApiUrl = Annotated[
     str,
     StringConstraints(
         strict=True, strip_whitespace=True, min_length=1, max_length=2048
     ),
     AfterValidator(_normalize_https_url),
+]
+
+
+def _normalize_optional_stt_url(value: str) -> str:
+    """Let empty switch fields reach policy; normalize every non-empty URL."""
+
+    return value if not value else _normalize_https_url(value)
+
+
+SttApiUrl = Annotated[
+    str,
+    StringConstraints(strict=True, strip_whitespace=True, max_length=2048),
+    AfterValidator(_normalize_optional_stt_url),
 ]
 CapabilityDigest = Annotated[
     str,
@@ -122,12 +140,28 @@ class LlmCredentialsPatch(BaseModel):
         except ValueError:
             explicit_gemini_port = value.get("llm_provider") == "gemini"
         if explicit_gemini_port:
-            raise ValueError("invalid_provider_endpoint")
+            raise PydanticCustomError(
+                "invalid_provider_endpoint",
+                "invalid_provider_endpoint",
+                {
+                    "capability": "llm",
+                    "provider": "gemini",
+                    "field": "llm_api_url",
+                },
+            )
         if value.get("llm_provider") == "gemini":
             try:
                 validate_gemini_endpoint(raw_url)
             except CredentialPolicyError:
-                raise ValueError("invalid_provider_endpoint") from None
+                raise PydanticCustomError(
+                    "invalid_provider_endpoint",
+                    "invalid_provider_endpoint",
+                    {
+                        "capability": "llm",
+                        "provider": "gemini",
+                        "field": "llm_api_url",
+                    },
+                ) from None
         return value
 
 
@@ -163,24 +197,52 @@ class SttCredentialsPatch(BaseModel):
             "outros",
             "openai_whisper",
             "elevenlabs_scribe",
+            "openrouter",
             "google_stt",
             "deepgram_stt",
             "microsoft_stt",
         ]
         | None
     ) = None
-    stt_api_url: ApiUrl | None = None
-    stt_api_key: Secret | None = None
-    stt_model_name: Identifier | None = None
+    stt_api_url: SttApiUrl | None = None
+    stt_api_key: SttSecret | None = None
+    stt_model_name: SttIdentifier | None = None
     whisper_api_key: Secret | None = None
     whisper_model: Identifier | None = None
     audio_max_seconds: Annotated[int, Field(strict=True, ge=10, le=300)] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw_fixed_stt_endpoint(cls, value: Any) -> Any:
+        """Reject fixed-provider endpoint variants before URL normalization."""
+
+        if not isinstance(value, Mapping):
+            return value
+        provider = value.get("stt_provider")
+        if provider not in STT_FIXED_API_BASES or "stt_api_url" not in value:
+            return value
+        raw_url = value.get("stt_api_url")
+        if raw_url is None or (isinstance(raw_url, str) and not raw_url.strip()):
+            return value
+        try:
+            validate_stt_provider_endpoint(provider, raw_url)
+        except CredentialPolicyError:
+            raise PydanticCustomError(
+                "invalid_provider_endpoint",
+                "invalid_provider_endpoint",
+                {
+                    "capability": "stt",
+                    "provider": provider,
+                    "field": "stt_api_url",
+                },
+            ) from None
+        return value
 
 
 class TtsCredentialsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    tts_provider: Literal["elevenlabs", "google"] | None = None
+    tts_provider: Literal["elevenlabs", "google", "openai"] | None = None
     tts_api_url: ApiUrl | None = None
     tts_api_key: Secret | None = None
     tts_model_name: Identifier | None = None

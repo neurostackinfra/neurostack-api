@@ -335,6 +335,33 @@ export const en = {
   traces_export_err_desc: "Could not generate the report. Please try again.",
   traces_view_mode_title: "View Mode",
   traces_view_mode_desc: "Changes not allowed in this test account.",
+  traces_day_section_title: "Daily trace history",
+  traces_day_label: "Trace day",
+  traces_show_day: "Show traces for",
+  traces_list_title: "Traces for",
+  traces_showing: "Showing",
+  traces_of: "of",
+  traces_on_day: "for",
+  traces_page: "Page",
+  traces_previous: "Previous",
+  traces_next: "Next",
+  traces_source: "Source",
+  traces_source_all: "All",
+  traces_source_simulator: "Simulator",
+  traces_loading_day: "Loading traces for",
+  traces_empty_day: "No traces found for",
+  traces_no_filter_match_day: "No traces match the selected filters for",
+  traces_error_no_token: "Sign in to load traces.",
+  traces_error_unauthorized: "Your session expired. Sign in again.",
+  traces_error_timezone_required:
+    "A timezone is required for this day. Refresh the page and try again.",
+  traces_error_day_required: "Choose a day to use the supplied timezone.",
+  traces_error_invalid_timezone:
+    "The browser timezone was not recognized. Update your settings and try again.",
+  traces_error_day_range_conflict:
+    "Use a day for the list or a range for CSV, not both in the same request.",
+  traces_error_unknown:
+    "Could not load traces. Try again; if the problem persists, contact support.",
 
   // ── Trace Detail ─────────────────────────────────────────────────────────
   trace_detail_title: "Trace Detail",

@@ -339,6 +339,35 @@ export const pt: Record<TranslationKey, string> = {
     "Não foi possível gerar o relatório. Tente novamente.",
   traces_view_mode_title: "Modo Visualização",
   traces_view_mode_desc: "Alterações não permitidas nesta conta de teste.",
+  traces_day_section_title: "Histórico diário de traces",
+  traces_day_label: "Dia dos traces",
+  traces_show_day: "Exibir traces do dia",
+  traces_list_title: "Traces de",
+  traces_showing: "Exibindo",
+  traces_of: "de",
+  traces_on_day: "no dia",
+  traces_page: "Página",
+  traces_previous: "Anterior",
+  traces_next: "Próximo",
+  traces_source: "Origem",
+  traces_source_all: "Todos",
+  traces_source_simulator: "Simulador",
+  traces_loading_day: "Carregando traces de",
+  traces_empty_day: "Nenhum trace encontrado em",
+  traces_no_filter_match_day:
+    "Nenhum trace corresponde aos filtros selecionados em",
+  traces_error_no_token: "Faça login para carregar os traces.",
+  traces_error_unauthorized: "Sua sessão expirou. Faça login novamente.",
+  traces_error_timezone_required:
+    "O fuso horário é obrigatório para consultar esse dia. Atualize a página e tente novamente.",
+  traces_error_day_required:
+    "Escolha um dia para usar o fuso horário informado.",
+  traces_error_invalid_timezone:
+    "O fuso horário do navegador não foi reconhecido. Atualize as configurações e tente novamente.",
+  traces_error_day_range_conflict:
+    "Use um dia para a lista ou um intervalo para o CSV, não ambos na mesma consulta.",
+  traces_error_unknown:
+    "Não foi possível carregar os traces. Tente novamente; se persistir, contate o suporte.",
 
   // ── Detalhe do Trace ──────────────────────────────────────────────────────
   trace_detail_title: "Detalhes do Trace",

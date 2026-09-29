@@ -31,4 +31,5 @@ No pair has direct non-mocked validation in this delivery, so every displayable 
 | stt | microsoft_stt | not_run | not_run | not_run | not_available | not_available | 2026-08-29T00:00:00Z | coming_soon | true |
 | tts | elevenlabs | not_run | not_run | not_run | not_available | not_available | 2026-08-30T00:00:00Z | coming_soon | true |
 | tts | google | not_run | not_run | not_run | not_available | not_available | 2026-08-30T00:00:00Z | coming_soon | true |
+| tts | openai | not_run | not_run | not_run | not_available | not_available | 2026-09-28T00:00:00Z | coming_soon | true |
 | tts | microsoft | not_run | not_run | not_run | not_available | not_available | 2026-08-30T00:00:00Z | removed | false |

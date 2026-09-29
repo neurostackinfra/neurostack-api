@@ -34,12 +34,16 @@ from src.config.settings import settings
 from src.models.clinic_config import ClinicHandoff, ClinicOperations, ClinicScheduling
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.tenant import Tenant
+from src.observability.metrics import API_CREDENTIALS_CHANGE_EMIT_FAILURES_TOTAL
 from src.repositories import get_db_session_dependency
 from src.services.api_credentials import (
+    STT_FIXED_API_BASES,
     CredentialPolicyError,
     credential_boundary_fields,
     credential_status,
+    is_semantic_credentials_echo,
     merge_credentials,
+    resolve_stt_credentials,
     validate_provider_availability,
 )
 from src.services.config_service import ARRAY_BUCKETS, flatten_config, unflatten_patch
@@ -80,18 +84,37 @@ class _CredentialValidationRoute(APIRoute):
                     "unsafe_api_url" in str(error.get("ctx", {}).get("error", ""))
                     for error in errors
                 )
-                invalid_provider_endpoint = any(
-                    "invalid_provider_endpoint"
-                    in str(error.get("ctx", {}).get("error", ""))
-                    for error in errors
+                endpoint_error = next(
+                    (
+                        error
+                        for error in errors
+                        if error.get("type") == "invalid_provider_endpoint"
+                        or "invalid_provider_endpoint"
+                        in str(error.get("ctx", {}).get("error", ""))
+                    ),
+                    None,
                 )
                 detail: dict[str, Any]
-                if invalid_provider_endpoint:
+                if endpoint_error is not None:
+                    context = endpoint_error.get("ctx", {})
+                    capability = context.get("capability")
+                    provider = context.get("provider")
+                    field = context.get("field")
+                    if (capability, provider, field) not in {
+                        ("llm", "gemini", "llm_api_url"),
+                        ("stt", "elevenlabs_scribe", "stt_api_url"),
+                        ("stt", "openrouter", "stt_api_url"),
+                    }:
+                        capability, provider, field = (
+                            "llm",
+                            "gemini",
+                            "llm_api_url",
+                        )
                     detail = {
                         "error": "invalid_provider_endpoint",
-                        "capability": "llm",
-                        "provider": "gemini",
-                        "field": "llm_api_url",
+                        "capability": capability,
+                        "provider": provider,
+                        "field": field,
                     }
                 elif unsafe_url:
                     detail = {"error": "unsafe_api_url", "field": unsafe_field}
@@ -111,6 +134,34 @@ class _CredentialValidationRoute(APIRoute):
 
 
 credentials_router = APIRouter(route_class=_CredentialValidationRoute)
+
+
+def _emit_api_credentials_changed(
+    *,
+    actor_id: UUID | None,
+    actor_role: str | None,
+    tenant_id: UUID,
+    previous_provider: str,
+    new_provider: str,
+) -> None:
+    """Emit the allowlisted, secret-free post-commit credential event."""
+
+    _audit_logger.info(
+        "api_credentials_changed",
+        actor_id=str(actor_id) if actor_id is not None else "unknown",
+        actor_role=actor_role or "unknown",
+        tenant_id=str(tenant_id),
+        capability="stt",
+        fields=(
+            "stt_provider",
+            "stt_api_url",
+            "stt_api_key",
+            "stt_model_name",
+        ),
+        previous_provider=previous_provider,
+        new_provider=new_provider,
+        endpoint_class="fixed",
+    )
 
 
 _CANONICAL_SERVICE_FORMATS = frozenset({"online", "presential", "both"})
@@ -548,14 +599,46 @@ async def get_api_credentials(
     return credential_status(creds)
 
 
+async def _ensure_meta_phone_number_id_available(
+    session: AsyncSession,
+    tenant_id: UUID,
+    phone_number_id: object,
+) -> None:
+    """Reject a Meta phone-number ID already assigned to another tenant."""
+
+    stmt = select(ClinicConfigTable.tenant_id).where(
+        ClinicConfigTable.api_credentials["meta_phone_number_id"].astext
+        == str(phone_number_id),
+        ClinicConfigTable.tenant_id != tenant_id,
+    )
+    conflict = (await session.execute(stmt)).scalar_one_or_none()
+    if conflict is None:
+        return
+
+    logger.warning(
+        "meta_phone_number_id_conflict tenant=%s existing_tenant=%s",
+        tenant_id,
+        conflict,
+    )
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "error": "meta_phone_number_id_conflict",
+            "message": (
+                "This Meta Phone Number ID is already registered by another clinic. "
+                "Each WhatsApp Business number can only be linked to one clinic."
+            ),
+        },
+    )
+
+
 @credentials_router.patch(
     "/api-credentials",
     summary="Update API Credentials",
     description=(
-        "Validate a credential patch. Gemini is the sole active provider and "
-        "accepts complete, policy-valid LLM credential changes. Every other "
-        "displayable provider remains coming soon and rejects effective "
-        "credential or runtime-control changes."
+        "Validate a credential patch. Gemini accepts policy-valid LLM changes; "
+        "legacy STT incumbents may atomically leave outros for a fixed Scribe "
+        "or OpenRouter bundle. Public provider availability is unchanged."
     ),
 )
 async def patch_api_credentials(
@@ -568,14 +651,34 @@ async def patch_api_credentials(
     tenant = await _resolve_config_tenant(request, tenant, session)
     row = await _load_config(session, tenant)
     existing = row.api_credentials or {} if row else {}
+    resolved_existing = resolve_stt_credentials(existing)
+    patched_phone_id = patch.get("meta_phone_number_id")
+    if is_semantic_credentials_echo(existing, resolved_existing, patch):
+        if patched_phone_id:
+            await _ensure_meta_phone_number_id_available(
+                session, tenant.tenant_id, patched_phone_id
+            )
+        return {"ok": True, **credential_status(existing)}
     try:
         creds = merge_credentials(existing, patch)
-        validate_provider_availability(existing, creds)
+        validate_provider_availability(
+            existing,
+            creds,
+            patch=patch,
+            resolved_existing=resolved_existing,
+        )
     except CredentialPolicyError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=exc.detail,
         ) from exc
+
+    stt_switch_provider = patch.get("stt_provider")
+    is_stt_incumbent_switch = (
+        stt_switch_provider in STT_FIXED_API_BASES
+        and resolved_existing.get("stt_provider") == "outros"
+        and creds.get("stt_provider") == stt_switch_provider
+    )
 
     if row is None:
         row = _new_config(tenant)
@@ -594,28 +697,9 @@ async def patch_api_credentials(
     # error message friendly on the common (non-racing) path.
     new_phone_id = creds.get("meta_phone_number_id")
     if new_phone_id:
-        stmt = select(ClinicConfigTable.tenant_id).where(
-            ClinicConfigTable.api_credentials["meta_phone_number_id"].astext
-            == str(new_phone_id),
-            ClinicConfigTable.tenant_id != tenant.tenant_id,
+        await _ensure_meta_phone_number_id_available(
+            session, tenant.tenant_id, new_phone_id
         )
-        conflict = (await session.execute(stmt)).scalar_one_or_none()
-        if conflict is not None:
-            logger.warning(
-                "meta_phone_number_id_conflict tenant=%s existing_tenant=%s",
-                tenant.tenant_id,
-                conflict,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "error": "meta_phone_number_id_conflict",
-                    "message": (
-                        "This Meta Phone Number ID is already registered by another clinic. "
-                        "Each WhatsApp Business number can only be linked to one clinic."
-                    ),
-                },
-            )
 
     row.api_credentials = creds
     try:
@@ -653,11 +737,31 @@ async def patch_api_credentials(
                 "message": "Failed to save credentials due to a data integrity conflict.",
             },
         )
+    except Exception:
+        await session.rollback()
+        logger.error("api_credentials_commit_failed")
+        raise
 
     # Invalidate Redis cache so next pipeline run picks up changes
     from src.services.event_service import invalidate_clinic_config_cache
 
     await invalidate_clinic_config_cache(tenant.tenant_id)
+
+    if is_stt_incumbent_switch:
+        try:
+            _emit_api_credentials_changed(
+                actor_id=tenant.user_id,
+                actor_role=tenant.role,
+                tenant_id=tenant.tenant_id,
+                previous_provider="outros",
+                new_provider=cast(str, stt_switch_provider),
+            )
+        except Exception:  # noqa: BLE001 - telemetry cannot undo the durable write
+            try:
+                API_CREDENTIALS_CHANGE_EMIT_FAILURES_TOTAL.inc()
+            except Exception:  # noqa: BLE001 - metric failure cannot fail the request
+                pass
+            logger.error("api_credentials_change_emit_failed")
 
     return {"ok": True, **credential_status(creds)}
 

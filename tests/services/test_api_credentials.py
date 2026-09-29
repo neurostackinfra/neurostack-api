@@ -11,11 +11,13 @@ from src.services.api_credentials import (
     CONFIG_CACHE_VERSION_FIELD,
     GEMINI_API_BASE_URL,
     OPERATIONAL_LLM_PROVIDERS,
+    OPERATIONAL_STT_PROVIDERS,
     PROVIDER_ALLOWLISTS,
     PROVIDER_AVAILABILITY,
     PUBLICLY_ACTIVE_LLM_PROVIDERS,
     READINESS_IDS,
     SECRET_FIELDS,
+    STT_FIXED_API_BASES,
     TTS_FIELDS,
     WIRE_ERROR_CODES,
     CredentialPolicyError,
@@ -25,6 +27,7 @@ from src.services.api_credentials import (
     credential_boundary_fields,
     credential_status,
     is_cache_v2_payload,
+    is_semantic_credentials_echo,
     merge_credentials,
     resolve_stt_credentials,
     runtime_projection,
@@ -59,21 +62,28 @@ def test_provider_availability_has_sole_gemini_active_overlay() -> None:
             "deepgram_stt": "coming_soon",
             "microsoft_stt": "coming_soon",
         },
-        "tts": {"elevenlabs": "coming_soon", "google": "coming_soon"},
+        "tts": {
+            "elevenlabs": "coming_soon",
+            "google": "coming_soon",
+            "openai": "coming_soon",
+        },
     }
-    assert sum(len(providers) for providers in PROVIDER_AVAILABILITY.values()) == 20
+    assert sum(len(providers) for providers in PROVIDER_AVAILABILITY.values()) == 21
     states = [
         availability
         for providers in PROVIDER_AVAILABILITY.values()
         for availability in providers.values()
     ]
     assert states.count("active") == 1
-    assert states.count("coming_soon") == 19
+    assert states.count("coming_soon") == 20
     assert PUBLICLY_ACTIVE_LLM_PROVIDERS == {"gemini"}
-    assert PROVIDER_ALLOWLISTS == {
+    expected_allowlists = {
         capability: frozenset(providers)
         for capability, providers in PROVIDER_AVAILABILITY.items()
     }
+    expected_allowlists["stt"] = expected_allowlists["stt"] | {"openrouter"}
+    assert PROVIDER_ALLOWLISTS == expected_allowlists
+    assert "openrouter" not in PROVIDER_AVAILABILITY["stt"]
     assert {
         ("multimodal", "groq"),
         ("multimodal", "openai"),
@@ -173,6 +183,7 @@ def test_sequential_saves_preserve_capabilities_and_clean_stt_aliases() -> None:
     [
         ("elevenlabs", "https://api.elevenlabs.io/v1", "voice-123"),
         ("google", "https://texttospeech.googleapis.com/v1", None),
+        ("openai", "https://api.openai.com/v1", "alloy"),
     ],
 )
 def test_tts_configuration_is_operational_but_never_projected_to_cache(
@@ -205,6 +216,18 @@ def test_tts_configuration_is_operational_but_never_projected_to_cache(
         field.startswith("tts_") for field in runtime_projection(credentials)
     )
     assert "tts-secret" not in repr(status)
+
+
+def test_openai_tts_configuration_without_voice_is_incomplete() -> None:
+    status = credential_status(
+        {
+            "tts_provider": "openai",
+            "tts_api_url": "https://api.openai.com/v1",
+            "tts_api_key": "tts-secret",
+            "tts_model_name": "gpt-4o-mini-tts",
+        }
+    )
+    assert status["tts_readiness"] == "incomplete"
 
 
 @pytest.mark.parametrize(
@@ -379,7 +402,7 @@ def test_status_and_runtime_projection_never_expose_secrets_or_digest() -> None:
     assert status["meta_verify_token_set"] is True
     assert status["meta_verify_token_masked"] == "••••••••"
     assert "zapi_inbound_token_digest" not in status
-    assert status["stt_readiness"] == "configuration_only"
+    assert status["stt_readiness"] == "active"
     assert not any(field in projection for field in SECRET_FIELDS)
     assert not any(field.startswith(("multimodal_", "tts_")) for field in projection)
     assert "meta_verify_token" not in projection
@@ -694,10 +717,10 @@ def test_operational_stt_projection_scoped_to_url_and_model_only() -> None:
         "stt_model_name": "scribe",
     }
     projection = runtime_projection(creds)
-    # Non-operational STT: url/model excluded, key never present
+    # Operational STT keeps the non-secret runtime fields, never the key.
     assert projection["stt_provider"] == "elevenlabs_scribe"
-    assert "stt_api_url" not in projection
-    assert "stt_model_name" not in projection
+    assert projection["stt_api_url"] == "https://api.elevenlabs.io/v1"
+    assert projection["stt_model_name"] == "scribe"
     assert "stt_api_key" not in projection
 
 
@@ -990,3 +1013,190 @@ def test_effective_legacy_maintenance_is_rejected_but_identical_echo_passes() ->
     )
     assert echoed == existing
     validate_provider_availability(existing, echoed)
+
+
+LEGACY_STT_INCUMBENTS = [
+    pytest.param(
+        {
+            "whisper_api_key": "legacy-stt-secret",
+            "whisper_model": "legacy-whisper-model",
+        },
+        id="alias_only",
+    ),
+    pytest.param(
+        {
+            "stt_api_key": "canonical-stt-secret",
+            "stt_model_name": "canonical-model",
+            "stt_api_url": "https://speech.example/v1",
+        },
+        id="canonical_only",
+    ),
+    pytest.param(
+        {
+            "stt_api_key": "canonical-stt-secret",
+            "whisper_model": "legacy-model",
+            "stt_api_url": "https://speech.example/v1",
+        },
+        id="mixed",
+    ),
+    pytest.param(
+        {
+            "stt_provider": "outros",
+            "stt_api_key": "explicit-secret",
+            "stt_model_name": "explicit-model",
+            "stt_api_url": "https://speech.example/v1",
+        },
+        id="explicit_outros",
+    ),
+]
+
+
+@pytest.mark.parametrize("existing", LEGACY_STT_INCUMBENTS)
+def test_stt_canonical_echo_preserves_raw_incumbent(existing: dict[str, str]) -> None:
+    snapshot = dict(existing)
+    resolved = resolve_stt_credentials(existing)
+    echo = {
+        "stt_provider": "outros",
+        "stt_api_url": resolved.get("stt_api_url"),
+        "stt_api_key": "••••••••" if resolved.get("stt_api_key") else None,
+        "stt_model_name": resolved.get("stt_model_name"),
+        "audio_max_seconds": resolved.get("audio_max_seconds"),
+    }
+
+    assert is_semantic_credentials_echo(existing, resolved, echo)
+    assert existing == snapshot
+
+
+@pytest.mark.parametrize("existing", LEGACY_STT_INCUMBENTS)
+@pytest.mark.parametrize("provider", ["elevenlabs_scribe", "openrouter"])
+def test_stt_incumbent_can_leave_only_with_fresh_fixed_bundle(
+    existing: dict[str, str], provider: str
+) -> None:
+    patch = {
+        "stt_provider": provider,
+        "stt_api_url": STT_FIXED_API_BASES[provider],
+        "stt_api_key": "fresh-stt-secret",
+        "stt_model_name": "fresh-model",
+    }
+    resolved = resolve_stt_credentials(existing)
+    candidate = merge_credentials(existing, patch)
+
+    validate_provider_availability(
+        existing,
+        candidate,
+        patch=patch,
+        resolved_existing=resolved,
+    )
+    assert candidate["stt_provider"] == provider
+    assert candidate["stt_api_url"] == STT_FIXED_API_BASES[provider]
+    assert candidate["stt_api_key"] == "fresh-stt-secret"
+    assert candidate["stt_model_name"] == "fresh-model"
+    assert "whisper_api_key" not in candidate
+    assert "whisper_model" not in candidate
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        {},
+        {"stt_provider": "openai_whisper", "stt_api_key": "saved"},
+        {"stt_provider": "elevenlabs_scribe", "stt_api_key": "saved"},
+    ],
+    ids=["empty", "other_provider", "explicit_new_provider"],
+)
+def test_stt_non_incumbents_cannot_enter_fixed_provider(
+    existing: dict[str, str]
+) -> None:
+    patch = {
+        "stt_provider": "openrouter",
+        "stt_api_url": STT_FIXED_API_BASES["openrouter"],
+        "stt_api_key": "fresh-stt-secret",
+        "stt_model_name": "fresh-model",
+    }
+    candidate = merge_credentials(existing, patch)
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(
+            existing,
+            candidate,
+            patch=patch,
+            resolved_existing=resolve_stt_credentials(existing),
+        )
+    assert caught.value.detail["error"] == "provider_not_available"
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        {"stt_api_url": "https://speech.example/v1"},
+        {"stt_api_key": "only-key"},
+        {"stt_model_name": "only-model"},
+        {"whisper_api_key": "only-alias-key"},
+        {"whisper_model": "only-alias-model"},
+    ],
+)
+def test_every_single_effective_stt_field_is_an_eligible_incumbent(
+    existing: dict[str, str]
+) -> None:
+    patch = {
+        "stt_provider": "elevenlabs_scribe",
+        "stt_api_url": STT_FIXED_API_BASES["elevenlabs_scribe"],
+        "stt_api_key": "fresh-stt-secret",
+        "stt_model_name": "fresh-model",
+    }
+    candidate = merge_credentials(existing, patch)
+    validate_provider_availability(
+        existing,
+        candidate,
+        patch=patch,
+        resolved_existing=resolve_stt_credentials(existing),
+    )
+
+
+@pytest.mark.parametrize("missing", ["stt_api_url", "stt_api_key", "stt_model_name"])
+def test_stt_switch_requires_every_field_fresh(missing: str) -> None:
+    existing = {"whisper_api_key": "legacy", "whisper_model": "legacy-model"}
+    patch = {
+        "stt_provider": "openrouter",
+        "stt_api_url": STT_FIXED_API_BASES["openrouter"],
+        "stt_api_key": "fresh-stt-secret",
+        "stt_model_name": "fresh-model",
+    }
+    patch.pop(missing)
+    candidate = merge_credentials(existing, patch)
+    with pytest.raises(CredentialPolicyError) as caught:
+        validate_provider_availability(
+            existing,
+            candidate,
+            patch=patch,
+            resolved_existing=resolve_stt_credentials(existing),
+        )
+    assert caught.value.detail == {
+        "error": "provider_switch_bundle_required",
+        "capability": "stt",
+    }
+
+
+def test_new_stt_ids_are_operational_without_public_catalog_promotion() -> None:
+    assert {"elevenlabs_scribe", "openrouter"} <= OPERATIONAL_STT_PROVIDERS
+    assert "openrouter" not in PROVIDER_AVAILABILITY["stt"]
+    for provider, base_url in STT_FIXED_API_BASES.items():
+        status = credential_status(
+            {
+                "stt_provider": provider,
+                "stt_api_url": base_url,
+                "stt_api_key": "secret",
+                "stt_model_name": "model",
+            }
+        )
+        assert status["stt_readiness"] == "active"
+        projection = runtime_projection(
+            {
+                "stt_provider": provider,
+                "stt_api_url": base_url,
+                "stt_api_key": "secret",
+                "stt_model_name": "model",
+            }
+        )
+        assert projection["stt_api_url"] == base_url
+        assert projection["stt_model_name"] == "model"
+        assert "stt_api_key" not in projection

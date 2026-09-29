@@ -228,6 +228,59 @@ poetry run python scripts/api_provider_preflight.py scan-tracked --root .
 The repository-wide `make quality` remains an additional aggregate gate; do not
 weaken or bypass either the focused strict command or the tracked-evidence scan.
 
+## STT Scribe/OpenRouter handoff and emission failure runbook
+
+The Scribe/OpenRouter change is operational readiness, not public promotion or
+live homologation. Deterministic mocks prove the fixed HTTP contract only; they
+do not prove real credentials, account quota, currently enabled models, or
+production audio acceptance. The provider catalog exclusively owns the public
+matrix and cards. Its pre-work gate must keep `elevenlabs_scribe` as
+`coming_soon`, keep `openrouter` absent from the public STT matrix, and verify
+that no UI/matrix diff is introduced before it deliberately promotes either ID.
+
+An accepted incumbent-only transition commits the complete fresh STT bundle,
+invalidates the configuration cache, and then attempts one
+`api_credentials_changed` emission before returning. The payload is allowlisted:
+actor/role, tenant ID, capability `stt`, the four field names, previous provider
+`outros`, new provider, and endpoint class `fixed`; it contains no credential,
+URL, model, value, path, query, or digest.
+
+This signal is **at-most-once**, not a durable audit record. There is no outbox
+or retry. A process crash after the database commit and before the emitter call
+leaves the configuration committed with no event. A crash or lost response
+after emission can make the client uncertain, but an exact retry is a no-op and
+does not emit again. Emission failure also never rolls back the committed
+configuration or turns the successful PATCH into an error.
+
+Each emitter exception increments the label-free Prometheus Counter
+`api_credentials_change_emit_failures_total` exactly once. No-op, validation
+failure, rollback and commit failure neither emit nor increment it. The alert
+`ApiCredentialsChangeEmissionFailures` fires when
+`increase(api_credentials_change_emit_failures_total[15m]) > 0` remains true
+for five minutes, with severity `warning` and owner `platform-sre`. Triage the
+alert using the published runbook:
+https://docs.neurostack.io/runbooks/api-credentials-change-emission-failures.
+Treat the committed database state as authoritative, inspect only aggregate
+Counter/structured-log evidence, never reconstruct secret-bearing payloads,
+and do not replay an event unless a separately approved durable mechanism owns
+deduplication.
+
+Backout must preserve readers and runtime dispatch for persisted
+`elevenlabs_scribe` and `openrouter` bundles. It may halt new incumbent switches
+and must keep the public catalog unpromoted, but must not remove either wire ID
+from schema/recognition/readiness, relabel or rewrite it to `outros`, remove its
+fixed-base validator/adapter/caller, or make stored tenants unreadable. If those
+compatibility guarantees cannot be maintained, use a forward fix rather than a
+code rollback. This makes handoff order-independent: the catalog may land later
+without becoming a prerequisite for existing stored configurations.
+
+For a reproducible handoff, run the Group 3 aggregate pytest command, byte
+parity `cmp config/prometheus_rules.yml src/config/prometheus_rules.yml`, the
+frontend Vitest that protects absence of promotion, and `make quality` against
+the exact source commit. Record the source commit, resulting commit and tree
+digest. These fixed commands—not a manifest—select execution; no manifest may
+choose an executable, arguments, working directory, or shell.
+
 ## Edge (proxy / gateway) redaction contract
 
 The Z-API webhook path template is
