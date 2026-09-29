@@ -136,6 +136,16 @@ class HandoffQueueSlaResult:
     period: SlaPeriod
 
 
+@dataclass(frozen=True)
+class ResolvedHandoffQueuePeriod:
+    """Clinic-authoritative civil dates and their resolved UTC interval."""
+
+    from_date: date
+    to_date: date
+    timezone: str
+    period: SlaPeriod
+
+
 class HandoffLifecycleError(HandoffServiceError):
     """Stable lifecycle rejection exposed to HTTP adapters as a 409 code."""
 
@@ -1034,39 +1044,23 @@ class HandoffService:
         remain exhaustive over the full population.
         """
 
-        resolved_as_of = as_of or datetime.now(timezone.utc)
-        if resolved_as_of.tzinfo is None or resolved_as_of.utcoffset() is None:
-            raise ValueError("as_of must be timezone-aware")
-        resolved_as_of = resolved_as_of.astimezone(timezone.utc)
+        resolved_as_of = self._queue_as_of(as_of)
 
         async with self._session_factory() as session:
-            raw_operations = await session.scalar(
-                select(ClinicConfigTable.operations).where(
-                    ClinicConfigTable.tenant_id == tenant_id
-                )
+            resolved_period = await self._resolve_queue_period(
+                session,
+                tenant_id=tenant_id,
+                from_date=from_date,
+                to_date=to_date,
+                as_of=resolved_as_of,
             )
-            configured_timezone = None
-            if isinstance(raw_operations, dict):
-                candidate = raw_operations.get("timezone")
-                if isinstance(candidate, str):
-                    configured_timezone = candidate
-            clinic_timezone = resolve_clinic_tz(configured_timezone)
-            local_today = resolved_as_of.astimezone(clinic_timezone).date()
-            try:
-                period = resolve_sla_period(
-                    from_date or local_today - timedelta(days=30),
-                    to_date or local_today,
-                    clinic_timezone.key,
-                    as_of=resolved_as_of,
-                )
-            except (OverflowError, TypeError, ValueError) as exc:
-                raise HandoffSlaPeriodError("invalid_date_range") from exc
             cohort = await HandoffRecordRepository(session).find_sla_cohort(
                 tenant_id=tenant_id,
-                start_utc=period.start_utc,
-                end_exclusive_utc=period.end_exclusive_utc,
+                start_utc=resolved_period.period.start_utc,
+                end_exclusive_utc=resolved_period.period.end_exclusive_utc,
             )
 
+        period = resolved_period.period
         classifications = tuple(
             classify_sla(
                 SlaOccurrence(
@@ -1098,7 +1092,73 @@ class HandoffService:
             maturing_count=counts[SlaCategory.MATURING],
             cancelled_unconfirmed_count=counts[SlaCategory.CANCELLED_UNCONFIRMED],
             unmeasured_legacy_count=counts[SlaCategory.UNMEASURED_LEGACY],
-            period_timezone=clinic_timezone.key,
+            period_timezone=resolved_period.timezone,
+            period=period,
+        )
+
+    async def resolve_queue_period(
+        self,
+        tenant_id: UUID,
+        *,
+        from_date: date | None = None,
+        to_date: date | None = None,
+        as_of: datetime | None = None,
+    ) -> ResolvedHandoffQueuePeriod:
+        """Resolve the queue/export entry cohort from clinic-owned timezone data."""
+
+        resolved_as_of = self._queue_as_of(as_of)
+        async with self._session_factory() as session:
+            return await self._resolve_queue_period(
+                session,
+                tenant_id=tenant_id,
+                from_date=from_date,
+                to_date=to_date,
+                as_of=resolved_as_of,
+            )
+
+    @staticmethod
+    def _queue_as_of(as_of: datetime | None) -> datetime:
+        resolved_as_of = as_of or datetime.now(timezone.utc)
+        if resolved_as_of.tzinfo is None or resolved_as_of.utcoffset() is None:
+            raise ValueError("as_of must be timezone-aware")
+        return resolved_as_of.astimezone(timezone.utc)
+
+    @staticmethod
+    async def _resolve_queue_period(
+        session: AsyncSession,
+        *,
+        tenant_id: UUID,
+        from_date: date | None,
+        to_date: date | None,
+        as_of: datetime,
+    ) -> ResolvedHandoffQueuePeriod:
+        raw_operations = await session.scalar(
+            select(ClinicConfigTable.operations).where(
+                ClinicConfigTable.tenant_id == tenant_id
+            )
+        )
+        configured_timezone = None
+        if isinstance(raw_operations, dict):
+            candidate = raw_operations.get("timezone")
+            if isinstance(candidate, str):
+                configured_timezone = candidate
+        clinic_timezone = resolve_clinic_tz(configured_timezone)
+        local_today = as_of.astimezone(clinic_timezone).date()
+        effective_from = from_date or local_today - timedelta(days=30)
+        effective_to = to_date or local_today
+        try:
+            period = resolve_sla_period(
+                effective_from,
+                effective_to,
+                clinic_timezone.key,
+                as_of=as_of,
+            )
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise HandoffSlaPeriodError("invalid_date_range") from exc
+        return ResolvedHandoffQueuePeriod(
+            from_date=effective_from,
+            to_date=effective_to,
+            timezone=clinic_timezone.key,
             period=period,
         )
 
