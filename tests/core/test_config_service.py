@@ -263,7 +263,7 @@ class TestSchedulingLinkPatchBoundary:
             return row
 
         monkeypatch.setattr("src.api.routes.config._resolve_config_tenant", keep_tenant)
-        monkeypatch.setattr("src.api.routes.config._get_or_create_config", get_row)
+        monkeypatch.setattr("src.api.routes.config._load_config", get_row)
 
         with pytest.raises(HTTPException) as exc:
             await patch_config(
@@ -296,7 +296,7 @@ class TestSchedulingLinkPatchBoundary:
             pass
 
         monkeypatch.setattr("src.api.routes.config._resolve_config_tenant", keep_tenant)
-        monkeypatch.setattr("src.api.routes.config._get_or_create_config", get_row)
+        monkeypatch.setattr("src.api.routes.config._load_config", get_row)
         monkeypatch.setattr("src.api.routes.config._audit_logger.info", audit_info)
         monkeypatch.setattr(
             "src.services.event_service.invalidate_clinic_config_cache", no_cache
