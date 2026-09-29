@@ -43,11 +43,15 @@ PROVIDER_AVAILABILITY: dict[str, dict[str, ProviderAvailability]] = {
         "deepgram_stt": "coming_soon",
         "microsoft_stt": "coming_soon",
     },
-    "tts": {"elevenlabs": "coming_soon", "google": "coming_soon"},
+    "tts": {
+        "elevenlabs": "coming_soon",
+        "google": "coming_soon",
+        "openai": "coming_soon",
+    },
 }
 
 # The allowlist remains the request-universe boundary.  Deriving it from the
-# availability matrix makes the 19 displayable pairs impossible to drift.
+# availability matrix makes the displayable provider pairs impossible to drift.
 PROVIDER_ALLOWLISTS: dict[str, frozenset[str]] = {
     capability: frozenset(providers)
     for capability, providers in PROVIDER_AVAILABILITY.items()
@@ -355,8 +359,9 @@ def merge_credentials(
 
 def _tts_required_fields(provider: Any) -> tuple[str, ...]:
     base = ("tts_provider", "tts_api_url", "tts_api_key", "tts_model_name")
-    # ElevenLabs picks a voice at synthesis time, so its bundle is one wider.
-    return base + ("tts_voice_id",) if provider == "elevenlabs" else base
+    # ElevenLabs and OpenAI pick a voice at synthesis time, so their bundles
+    # are one field wider.
+    return base + ("tts_voice_id",) if provider in {"elevenlabs", "openai"} else base
 
 
 def _tts_bundle_complete(credentials: Mapping[str, Any]) -> bool:

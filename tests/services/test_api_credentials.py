@@ -59,16 +59,20 @@ def test_provider_availability_has_sole_gemini_active_overlay() -> None:
             "deepgram_stt": "coming_soon",
             "microsoft_stt": "coming_soon",
         },
-        "tts": {"elevenlabs": "coming_soon", "google": "coming_soon"},
+        "tts": {
+            "elevenlabs": "coming_soon",
+            "google": "coming_soon",
+            "openai": "coming_soon",
+        },
     }
-    assert sum(len(providers) for providers in PROVIDER_AVAILABILITY.values()) == 20
+    assert sum(len(providers) for providers in PROVIDER_AVAILABILITY.values()) == 21
     states = [
         availability
         for providers in PROVIDER_AVAILABILITY.values()
         for availability in providers.values()
     ]
     assert states.count("active") == 1
-    assert states.count("coming_soon") == 19
+    assert states.count("coming_soon") == 20
     assert PUBLICLY_ACTIVE_LLM_PROVIDERS == {"gemini"}
     assert PROVIDER_ALLOWLISTS == {
         capability: frozenset(providers)
@@ -173,6 +177,7 @@ def test_sequential_saves_preserve_capabilities_and_clean_stt_aliases() -> None:
     [
         ("elevenlabs", "https://api.elevenlabs.io/v1", "voice-123"),
         ("google", "https://texttospeech.googleapis.com/v1", None),
+        ("openai", "https://api.openai.com/v1", "alloy"),
     ],
 )
 def test_tts_configuration_is_operational_but_never_projected_to_cache(
@@ -205,6 +210,18 @@ def test_tts_configuration_is_operational_but_never_projected_to_cache(
         field.startswith("tts_") for field in runtime_projection(credentials)
     )
     assert "tts-secret" not in repr(status)
+
+
+def test_openai_tts_configuration_without_voice_is_incomplete() -> None:
+    status = credential_status(
+        {
+            "tts_provider": "openai",
+            "tts_api_url": "https://api.openai.com/v1",
+            "tts_api_key": "tts-secret",
+            "tts_model_name": "gpt-4o-mini-tts",
+        }
+    )
+    assert status["tts_readiness"] == "incomplete"
 
 
 @pytest.mark.parametrize(
