@@ -109,41 +109,20 @@ async function renderForm(
 }
 
 const BACKEND_PROVIDER_AVAILABILITY = {
-  whatsapp: { meta_cloud: "coming_soon", zapi: "coming_soon", uazapi: "coming_soon", evolution: "coming_soon", dialog360: "coming_soon", twilio: "coming_soon" },
-  llm: { dropout: "coming_soon", gemini: "active", openai: "coming_soon", outros: "coming_soon", slm_cortex: "coming_soon" },
+  whatsapp: { meta_cloud: "active", zapi: "active", uazapi: "active", evolution: "active", dialog360: "coming_soon", twilio: "coming_soon" },
+  llm: { dropout: "active", gemini: "active", openai: "active", outros: "active", slm_cortex: "coming_soon" },
   multimodal: { openrouter: "coming_soon" },
-  stt: { outros: "coming_soon", openai_whisper: "coming_soon", elevenlabs_scribe: "coming_soon", google_stt: "coming_soon", deepgram_stt: "coming_soon", microsoft_stt: "coming_soon" },
-  tts: { elevenlabs: "coming_soon", google: "coming_soon", openai: "coming_soon" },
+  stt: { openrouter: "active", openai_whisper: "active", elevenlabs_scribe: "active", google_stt: "coming_soon", deepgram_stt: "coming_soon", microsoft_stt: "coming_soon" },
+  tts: { elevenlabs: "active", google: "active", openai: "active" },
 } as const;
 const TOTAL_PROVIDER_CARD_COUNT = 21;
-const COMING_SOON_PROVIDER_COUNT = 20;
-
-const ACTIVE_GEMINI_PROVIDER_AVAILABILITY = {
-  ...API_PROVIDER_AVAILABILITY,
-  llm: {
-    ...API_PROVIDER_AVAILABILITY.llm,
-    gemini: "active",
-  },
-} as const;
-
-const ACTIVE_GEMINI_AND_OPENAI_PROVIDER_AVAILABILITY = {
-  ...ACTIVE_GEMINI_PROVIDER_AVAILABILITY,
-  llm: {
-    ...ACTIVE_GEMINI_PROVIDER_AVAILABILITY.llm,
-    openai: "active",
-  },
-} as const;
-
-const ACTIVE_OPENAI_TTS_PROVIDER_AVAILABILITY = {
-  ...API_PROVIDER_AVAILABILITY,
-  tts: {
-    ...API_PROVIDER_AVAILABILITY.tts,
-    openai: "active",
-  },
-} as const;
+const ACTIVE_PROVIDER_COUNT = 14;
+const COMING_SOON_PROVIDER_COUNT = 7;
 
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
 const OPENAI_BASE_URL = "https://api.openai.com/v1";
+const ELEVENLABS_BASE_URL = "https://api.elevenlabs.io/v1";
+const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
 describe("describeConfigSaveFailure", () => {
   it("identifies invalid backend fields without exposing their submitted values", () => {
@@ -241,12 +220,12 @@ describe("describeConfigSaveFailure", () => {
     [
       "pt",
       "provider_switch_bundle_required",
-      "API LLM: Para trocar o provedor, informe juntos a URL da API, uma nova API Key e o modelo",
+      "API LLM: Para trocar o provedor ou endpoint, informe todos os campos obrigatórios junto com uma nova chave ou token",
     ],
     [
       "en",
       "provider_switch_bundle_required",
-      "API LLM: To switch providers, enter the API URL, a new API key, and the model together",
+      "API LLM: To switch providers or endpoints, enter all required fields together with a new key or token",
     ],
   ])("maps %s %s without echoing backend bundle values", (locale, error, expected) => {
     const description = describeConfigSaveFailure({
@@ -316,12 +295,47 @@ describe("describeConfigSaveFailure", () => {
 });
 
 describe("frontend provider availability mirror", () => {
-  it("contains the exact 21 backend pairs with Gemini as the sole active overlay", () => {
+  it("contains the exact 21 backend pairs with 14 active providers", () => {
     expect(API_PROVIDER_AVAILABILITY).toEqual(BACKEND_PROVIDER_AVAILABILITY);
     const states = Object.values(API_PROVIDER_AVAILABILITY).flatMap(Object.values);
     expect(states).toHaveLength(TOTAL_PROVIDER_CARD_COUNT);
-    expect(states.filter((state) => state === "active")).toHaveLength(1);
+    expect(states.filter((state) => state === "active")).toHaveLength(ACTIVE_PROVIDER_COUNT);
     expect(states.filter((state) => state === "coming_soon")).toHaveLength(COMING_SOON_PROVIDER_COUNT);
+  });
+
+  it("keeps the exact active and coming-soon pair sets", () => {
+    const pairsByState = (state: "active" | "coming_soon") => Object.entries(
+      API_PROVIDER_AVAILABILITY,
+    ).flatMap(([capability, providers]) => Object.entries(providers)
+      .filter(([, availability]) => availability === state)
+      .map(([provider]) => `${capability}:${provider}`))
+      .sort();
+
+    expect(pairsByState("active")).toEqual([
+      "llm:dropout",
+      "llm:gemini",
+      "llm:openai",
+      "llm:outros",
+      "stt:elevenlabs_scribe",
+      "stt:openai_whisper",
+      "stt:openrouter",
+      "tts:elevenlabs",
+      "tts:google",
+      "tts:openai",
+      "whatsapp:evolution",
+      "whatsapp:meta_cloud",
+      "whatsapp:uazapi",
+      "whatsapp:zapi",
+    ]);
+    expect(pairsByState("coming_soon")).toEqual([
+      "llm:slm_cortex",
+      "multimodal:openrouter",
+      "stt:deepgram_stt",
+      "stt:google_stt",
+      "stt:microsoft_stt",
+      "whatsapp:dialog360",
+      "whatsapp:twilio",
+    ]);
   });
 
   it("does not expose a provider outside the availability matrix", () => {
@@ -343,6 +357,7 @@ describe("frontend provider availability mirror", () => {
   it("keeps the three removed providers outside the display matrix", () => {
     expect("groq" in API_PROVIDER_AVAILABILITY.multimodal).toBe(false);
     expect("openai" in API_PROVIDER_AVAILABILITY.multimodal).toBe(false);
+    expect("outros" in API_PROVIDER_AVAILABILITY.stt).toBe(false);
     expect("microsoft" in API_PROVIDER_AVAILABILITY.tts).toBe(false);
   });
 });
@@ -351,15 +366,15 @@ describe("providerCardState", () => {
   it.each([
     ["without status", null],
     ["without a held provider", emptyStatus()],
-    ["with active legacy credentials", emptyStatus({ llm_provider: "openai", llm_readiness: "active" })],
-    ["with partial legacy credentials", emptyStatus({ llm_provider: "openai", llm_readiness: "incomplete" })],
-    ["with configuration-only legacy credentials", emptyStatus({ llm_provider: "openai", llm_readiness: "configuration_only" })],
+    ["with active legacy credentials", emptyStatus({ llm_provider: "slm_cortex", llm_readiness: "active" })],
+    ["with partial legacy credentials", emptyStatus({ llm_provider: "slm_cortex", llm_readiness: "incomplete" })],
+    ["with configuration-only legacy credentials", emptyStatus({ llm_provider: "slm_cortex", llm_readiness: "configuration_only" })],
   ])("keeps an all-coming-soon provider inert %s", (_case, status) => {
-    expect(providerCardState("llm", "openai", status)).toBe("coming_soon");
+    expect(providerCardState("llm", "slm_cortex", status)).toBe("coming_soon");
   });
 
-  it("keeps OpenAI TTS coming soon without tenant status", () => {
-    expect(providerCardState("tts", "openai", null)).toBe("coming_soon");
+  it("keeps the multimodal fallback coming soon without tenant status", () => {
+    expect(providerCardState("multimodal", "openrouter", null)).toBe("coming_soon");
   });
 
   it("promotes Gemini in the real matrix and exercises every state", () => {
@@ -368,19 +383,19 @@ describe("providerCardState", () => {
       "llm",
       "gemini",
       emptyStatus(),
-      ACTIVE_GEMINI_PROVIDER_AVAILABILITY,
+      API_PROVIDER_AVAILABILITY,
     )).toBe("available");
     expect(providerCardState(
       "llm",
       "gemini",
       emptyStatus({ llm_provider: "gemini", llm_readiness: "incomplete" }),
-      ACTIVE_GEMINI_PROVIDER_AVAILABILITY,
+      API_PROVIDER_AVAILABILITY,
     )).toBe("incomplete");
     expect(providerCardState(
       "llm",
       "gemini",
       emptyStatus({ llm_provider: "gemini", llm_readiness: "active" }),
-      ACTIVE_GEMINI_PROVIDER_AVAILABILITY,
+      API_PROVIDER_AVAILABILITY,
     )).toBe("configured");
   });
 });
@@ -410,7 +425,7 @@ describe("<ApiCredentialsForm /> card states", () => {
   it.each([
     ["pt", "EM BREVE", "DISPONÍVEL", "Configuração apenas"],
     ["en", "COMING SOON", "AVAILABLE", "Configuration only"],
-  ])("renders 20 coming-soon cards and one active Gemini card in %s", async (
+  ])("renders 7 coming-soon cards and 14 active cards in %s", async (
     locale,
     comingSoonLabel,
     availableLabel,
@@ -424,9 +439,9 @@ describe("<ApiCredentialsForm /> card states", () => {
     const badges = within(section).getAllByText(comingSoonLabel);
     expect(cards).toHaveLength(TOTAL_PROVIDER_CARD_COUNT);
     expect(badges).toHaveLength(COMING_SOON_PROVIDER_COUNT);
-    expect(within(section).getByText(availableLabel)).toBeInTheDocument();
+    expect(within(section).getAllByText(availableLabel)).toHaveLength(ACTIVE_PROVIDER_COUNT);
     expect(within(section).queryByText(configurationOnlyLabel)).not.toBeInTheDocument();
-    expect(section.querySelectorAll("button")).toHaveLength(1);
+    expect(section.querySelectorAll("button")).toHaveLength(ACTIVE_PROVIDER_COUNT);
 
     for (const card of cards.filter(card => card.dataset.cardState === "coming_soon")) {
       expect(card.tagName).toBe("ARTICLE");
@@ -441,9 +456,7 @@ describe("<ApiCredentialsForm /> card states", () => {
 
   it("shows OpenAI TTS copy and prefills only its URL in the credentials editor", async () => {
     localStorage.setItem("ns_locale", "en");
-    const fetchMock = await renderForm(emptyStatus(), {
-      providerAvailability: ACTIVE_OPENAI_TTS_PROVIDER_AVAILABILITY,
-    });
+    const fetchMock = await renderForm(emptyStatus());
 
     const card = screen.getByTestId("provider-card-tts-openai");
     expect(within(card).getByText("OpenAI TTS")).toBeInTheDocument();
@@ -477,13 +490,119 @@ describe("<ApiCredentialsForm /> card states", () => {
     });
   });
 
-  it("uses the English COMING SOON badge on 20 cards and AVAILABLE on active Gemini", async () => {
+  it("retires the previous WhatsApp bundle with null when switching active providers", async () => {
+    localStorage.setItem("ns_locale", "en");
+    const fetchMock = await renderForm(emptyStatus({
+      whatsapp_provider: "zapi",
+      whatsapp_readiness: "active",
+      zapi_instance_id: "old-zapi-instance",
+      zapi_token_set: true,
+      zapi_client_token_set: true,
+    }));
+
+    fireEvent.click(screen.getByTestId("provider-card-whatsapp-evolution"));
+    const editor = screen.getByTestId("provider-editor-whatsapp-evolution");
+    fireEvent.change(within(editor).getByTestId("field-evolution_api_url"), {
+      target: { value: "https://evolution.example.test" },
+    });
+    fireEvent.change(within(editor).getByTestId("field-evolution_instance_name"), {
+      target: { value: "new-evolution-instance" },
+    });
+    fireEvent.change(within(editor).getByTestId("field-evolution_api_key"), {
+      target: { value: "new-evolution-key" },
+    });
+    fireEvent.click(within(editor).getByTestId("save-whatsapp-evolution"));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH"))
+      .toHaveLength(1));
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    expect(JSON.parse(String(patch?.[1]?.body))).toEqual({
+      whatsapp_provider: "evolution",
+      zapi_instance_id: null,
+      evolution_api_url: "https://evolution.example.test",
+      evolution_instance_name: "new-evolution-instance",
+      evolution_api_key: "new-evolution-key",
+    });
+  });
+
+  it("sends a fresh Evolution bundle when its endpoint changes", async () => {
+    localStorage.setItem("ns_locale", "en");
+    const fetchMock = await renderForm(emptyStatus({
+      whatsapp_provider: "evolution",
+      whatsapp_readiness: "active",
+      evolution_api_url: "https://old-evolution.example.test",
+      evolution_instance_name: "current-instance",
+      evolution_api_key_set: true,
+    }));
+
+    fireEvent.click(screen.getByTestId("provider-card-whatsapp-evolution"));
+    const editor = screen.getByTestId("provider-editor-whatsapp-evolution");
+    fireEvent.change(within(editor).getByTestId("field-evolution_api_url"), {
+      target: { value: "https://new-evolution.example.test" },
+    });
+    fireEvent.change(within(editor).getByTestId("field-evolution_api_key"), {
+      target: { value: "rotated-evolution-key" },
+    });
+    fireEvent.click(within(editor).getByTestId("save-whatsapp-evolution"));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH"))
+      .toHaveLength(1));
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    expect(JSON.parse(String(patch?.[1]?.body))).toEqual({
+      whatsapp_provider: "evolution",
+      evolution_api_url: "https://new-evolution.example.test",
+      evolution_instance_name: "current-instance",
+      evolution_api_key: "rotated-evolution-key",
+    });
+  });
+
+  it("shows OpenRouter as the STT Outros card, prefills active STT URLs, and sends its wire id", async () => {
+    localStorage.setItem("ns_locale", "en");
+    const fetchMock = await renderForm(emptyStatus());
+
+    const defaults = [
+      ["openai_whisper", OPENAI_BASE_URL],
+      ["elevenlabs_scribe", ELEVENLABS_BASE_URL],
+      ["openrouter", OPENROUTER_BASE_URL],
+    ] as const;
+    for (const [provider, expectedUrl] of defaults) {
+      fireEvent.click(screen.getByTestId(`provider-card-stt-${provider}`));
+      expect(screen.getByTestId("field-stt_api_url")).toHaveValue(expectedUrl);
+    }
+
+    const card = screen.getByTestId("provider-card-stt-openrouter");
+    expect(within(card).getByText("Outros")).toBeInTheDocument();
+    expect(within(card).getByText("by OpenRouter")).toBeInTheDocument();
+    expect(card).toHaveAttribute("data-card-state", "available");
+
+    const editor = screen.getByTestId("provider-editor-stt-openrouter");
+    fireEvent.change(within(editor).getByTestId("field-stt_api_key"), {
+      target: { value: "new-openrouter-key" },
+    });
+    fireEvent.change(within(editor).getByTestId("field-stt_model_name"), {
+      target: { value: "openai/whisper-large-v3" },
+    });
+    expect(within(editor).getByTestId("field-audio_max_seconds")).toHaveValue(null);
+    fireEvent.click(within(editor).getByTestId("save-stt-openrouter"));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH"))
+      .toHaveLength(1));
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    expect(JSON.parse(String(patch?.[1]?.body))).toEqual({
+      stt_provider: "openrouter",
+      stt_api_url: OPENROUTER_BASE_URL,
+      stt_api_key: "new-openrouter-key",
+      stt_model_name: "openai/whisper-large-v3",
+    });
+  });
+
+  it("uses the English badges for the 7 coming-soon and 14 active cards", async () => {
     localStorage.setItem("ns_locale", "en");
     await renderForm(emptyStatus());
 
     const section = screen.getByTestId("api-settings-section");
     expect(within(section).getAllByText("COMING SOON")).toHaveLength(COMING_SOON_PROVIDER_COUNT);
-    expect(within(section).getByText("AVAILABLE")).toBeInTheDocument();
+    expect(within(section).getAllByText("AVAILABLE")).toHaveLength(ACTIVE_PROVIDER_COUNT);
   });
 
   it.each([
@@ -494,7 +613,7 @@ describe("<ApiCredentialsForm /> card states", () => {
     await renderForm(emptyStatus({
       llm_provider: "gemini",
       llm_readiness: "incomplete",
-    }), { providerAvailability: ACTIVE_GEMINI_PROVIDER_AVAILABILITY });
+    }), { providerAvailability: API_PROVIDER_AVAILABILITY });
 
     const card = screen.getByTestId("provider-card-llm-gemini");
     expect(card).toHaveAttribute("data-card-state", "incomplete");
@@ -511,7 +630,7 @@ describe("<ApiCredentialsForm /> card states", () => {
       llm_base_url: "https://api.openai.com/v1",
       llm_model_name: "gpt-private-model",
       llm_api_key_set: true,
-    }), { providerAvailability: ACTIVE_GEMINI_PROVIDER_AVAILABILITY });
+    }), { providerAvailability: API_PROVIDER_AVAILABILITY });
 
     fireEvent.click(screen.getByTestId("provider-card-llm-gemini"));
     const editor = screen.getByTestId("provider-editor-llm-gemini");
@@ -543,7 +662,7 @@ describe("<ApiCredentialsForm /> card states", () => {
   it("resets unsaved shared LLM drafts when switching between active provider cards", async () => {
     localStorage.setItem("ns_locale", "en");
     await renderForm(emptyStatus(), {
-      providerAvailability: ACTIVE_GEMINI_AND_OPENAI_PROVIDER_AVAILABILITY,
+      providerAvailability: API_PROVIDER_AVAILABILITY,
     });
 
     fireEvent.click(screen.getByTestId("provider-card-llm-gemini"));
@@ -577,7 +696,7 @@ describe("<ApiCredentialsForm /> card states", () => {
       llm_base_url: GEMINI_BASE_URL,
       llm_model_name: "gemini-2.0-flash",
       llm_api_key_set: true,
-    }), { providerAvailability: ACTIVE_GEMINI_PROVIDER_AVAILABILITY });
+    }), { providerAvailability: API_PROVIDER_AVAILABILITY });
 
     const card = screen.getByTestId("provider-card-llm-gemini");
     expect(card).toHaveAttribute("data-card-state", "configured");
@@ -600,6 +719,39 @@ describe("<ApiCredentialsForm /> card states", () => {
     const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
     expect(JSON.parse(String(patch?.[1]?.body))).toEqual({
       llm_model_name: "gemini-2.5-pro",
+    });
+  });
+
+  it("sends the complete non-secret bundle and a newly typed key for a same-provider endpoint rotation", async () => {
+    localStorage.setItem("ns_locale", "en");
+    const fetchMock = await renderForm(emptyStatus({
+      llm_provider: "outros",
+      llm_readiness: "active",
+      llm_api_url: "https://old-provider.example.test/v1",
+      llm_model_name: "existing-model",
+      llm_api_key_set: true,
+    }));
+
+    const card = screen.getByTestId("provider-card-llm-outros");
+    expect(within(card).getByText("OpenAI-compatible / OpenRouter")).toBeInTheDocument();
+    fireEvent.click(card);
+    const editor = screen.getByTestId("provider-editor-llm-outros");
+    fireEvent.change(within(editor).getByTestId("field-llm_api_url"), {
+      target: { value: "https://new-provider.example.test/v1" },
+    });
+    fireEvent.change(within(editor).getByTestId("field-llm_api_key"), {
+      target: { value: "new-provider-key" },
+    });
+    fireEvent.click(within(editor).getByTestId("save-llm-outros"));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH"))
+      .toHaveLength(1));
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    expect(JSON.parse(String(patch?.[1]?.body))).toEqual({
+      llm_provider: "outros",
+      llm_api_url: "https://new-provider.example.test/v1",
+      llm_api_key: "new-provider-key",
+      llm_model_name: "existing-model",
     });
   });
 
@@ -631,7 +783,7 @@ describe("<ApiCredentialsForm /> card states", () => {
           clinicId="clinic-a"
           isReadOnly={false}
           isSuperAdmin={false}
-          providerAvailability={ACTIVE_GEMINI_PROVIDER_AVAILABILITY}
+          providerAvailability={API_PROVIDER_AVAILABILITY}
         />
       </Wrapper>,
     );
@@ -650,7 +802,7 @@ describe("<ApiCredentialsForm /> card states", () => {
           clinicId="clinic-b"
           isReadOnly={false}
           isSuperAdmin={false}
-          providerAvailability={ACTIVE_GEMINI_PROVIDER_AVAILABILITY}
+          providerAvailability={API_PROVIDER_AVAILABILITY}
         />
       </Wrapper>,
     );
@@ -687,7 +839,7 @@ describe("<ApiCredentialsForm /> card states", () => {
           clinicId="clinic-a"
           isReadOnly={false}
           isSuperAdmin={false}
-          providerAvailability={ACTIVE_GEMINI_PROVIDER_AVAILABILITY}
+          providerAvailability={API_PROVIDER_AVAILABILITY}
         />
       </Wrapper>,
     );
@@ -699,7 +851,7 @@ describe("<ApiCredentialsForm /> card states", () => {
           clinicId="clinic-b"
           isReadOnly={false}
           isSuperAdmin={false}
-          providerAvailability={ACTIVE_GEMINI_PROVIDER_AVAILABILITY}
+          providerAvailability={API_PROVIDER_AVAILABILITY}
         />
       </Wrapper>,
     );
@@ -787,7 +939,7 @@ describe("<ApiCredentialsForm /> card states", () => {
             clinicId="clinic-a"
             isReadOnly={false}
             isSuperAdmin={false}
-            providerAvailability={ACTIVE_GEMINI_PROVIDER_AVAILABILITY}
+            providerAvailability={API_PROVIDER_AVAILABILITY}
           />
         </Wrapper>,
       );
@@ -810,7 +962,7 @@ describe("<ApiCredentialsForm /> card states", () => {
             clinicId="clinic-b"
             isReadOnly={false}
             isSuperAdmin={false}
-            providerAvailability={ACTIVE_GEMINI_PROVIDER_AVAILABILITY}
+            providerAvailability={API_PROVIDER_AVAILABILITY}
           />
         </Wrapper>,
       );
@@ -871,22 +1023,21 @@ describe("<ApiCredentialsForm /> card states", () => {
   it("does not reopen a card or emit a payload for persisted legacy credentials", async () => {
     localStorage.setItem("ns_locale", "pt");
     const fetchMock = await renderForm(emptyStatus({
-      whatsapp_provider: "meta_cloud",
+      whatsapp_provider: "dialog360",
       whatsapp_readiness: "signature_pending",
-      meta_phone_number_id: "1234567890",
-      llm_provider: "openai",
+      llm_provider: "slm_cortex",
       llm_readiness: "active",
-      llm_api_url: "https://api.openai.com/v1",
-      llm_model_name: "gpt-4o",
+      llm_api_url: "https://legacy-cortex.example.test/v1",
+      llm_model_name: "legacy-cortex",
       llm_api_key_set: true,
     }));
 
     const section = screen.getByTestId("api-settings-section");
-    fireEvent.click(screen.getByTestId("provider-card-whatsapp-meta_cloud"));
-    fireEvent.click(screen.getByTestId("provider-card-llm-openai"));
+    fireEvent.click(screen.getByTestId("provider-card-whatsapp-dialog360"));
+    fireEvent.click(screen.getByTestId("provider-card-llm-slm_cortex"));
 
     expect(within(section).getAllByText("EM BREVE")).toHaveLength(COMING_SOON_PROVIDER_COUNT);
-    expect(within(section).getByText("DISPONÍVEL")).toBeInTheDocument();
+    expect(within(section).getAllByText("DISPONÍVEL")).toHaveLength(ACTIVE_PROVIDER_COUNT);
     expect(within(section).queryByText("CONFIGURADO")).not.toBeInTheDocument();
     expect(within(section).queryByText("INCOMPLETO")).not.toBeInTheDocument();
     expect(within(section).queryByTestId(/provider-editor-/)).not.toBeInTheDocument();
@@ -894,20 +1045,56 @@ describe("<ApiCredentialsForm /> card states", () => {
     expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH")).toHaveLength(0);
   });
 
-  it("fails closed all 21 provider cards and warns when the status fetch fails", async () => {
+  it("shows product availability but keeps every active card disabled while status is loading", async () => {
     localStorage.setItem("ns_locale", "pt");
-    const fetchMock = vi.fn().mockResolvedValue(response({}, false, 500));
+    const pendingGet = deferred<Response>();
+    const fetchMock = vi.fn().mockReturnValue(pendingGet.promise);
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
     render(
       <Wrapper><ApiCredentialsForm clinicId="clinic-42" isReadOnly={false} isSuperAdmin={false} /></Wrapper>,
     );
+
+    const section = screen.getByTestId("api-settings-section");
+    expect(within(section).getAllByText("DISPONÍVEL")).toHaveLength(ACTIVE_PROVIDER_COUNT);
+    expect(within(section).getAllByText("EM BREVE")).toHaveLength(COMING_SOON_PROVIDER_COUNT);
+    const activeButtons = within(section).getAllByRole("button");
+    expect(activeButtons).toHaveLength(ACTIVE_PROVIDER_COUNT);
+    for (const button of activeButtons) expect(button).toBeDisabled();
+    expect(within(section).queryByTestId(/provider-editor-/)).not.toBeInTheDocument();
+
+    await act(async () => {
+      pendingGet.resolve(response(emptyStatus()));
+      await pendingGet.promise;
+    });
+    await waitFor(() => expect(within(section).getAllByRole("button").every(
+      (button) => !button.hasAttribute("disabled"),
+    )).toBe(true));
+  });
+
+  it("keeps active cards visible but fail-closed for a read-only status-fetch failure", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    const fetchMock = vi.fn().mockResolvedValue(response({}, false, 500));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    render(
+      <Wrapper><ApiCredentialsForm clinicId="clinic-42" isReadOnly isSuperAdmin={false} /></Wrapper>,
+    );
     await screen.findByTestId("api-settings-load-error");
 
-    // Fail closed: an unknown tenant state must never make a card editable.
+    // Product availability is not tenant credential state. The former remains
+    // visible, while the unknown latter must never make a card editable.
     const section = screen.getByTestId("api-settings-section");
-    expect(within(section).getAllByText("EM BREVE")).toHaveLength(TOTAL_PROVIDER_CARD_COUNT);
-    expect(within(section).queryByRole("button")).not.toBeInTheDocument();
+    expect(within(section).getAllByText("DISPONÍVEL")).toHaveLength(ACTIVE_PROVIDER_COUNT);
+    expect(within(section).getAllByText("EM BREVE")).toHaveLength(COMING_SOON_PROVIDER_COUNT);
+    const activeButtons = within(section).getAllByRole("button");
+    expect(activeButtons).toHaveLength(ACTIVE_PROVIDER_COUNT);
+    for (const button of activeButtons) {
+      expect(button).toBeDisabled();
+      fireEvent.click(button);
+    }
+    expect(within(section).queryByTestId(/provider-editor-/)).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH")).toHaveLength(0);
   });
 
   it("keeps voice controls as a sibling of the provider grid", async () => {

@@ -102,14 +102,6 @@ def test_every_displayable_provider_change_is_exact_and_atomic(
     headers = _jwt_headers("clinic_admin")
     provider_field = _provider_field(capability)
     payload: dict[str, object] = {provider_field: provider}
-    if capability == "llm" and provider == "gemini":
-        payload.update(
-            {
-                "llm_api_url": GEMINI_API_BASE_URL,
-                "llm_api_key": "fresh-gemini-key",
-                "llm_model_name": "gemini-model",
-            }
-        )
     response = client.patch(PATH, headers=headers, json=payload)
     assert response.status_code == 422, response.text
     assert response.json()["detail"] == {
@@ -255,6 +247,237 @@ def test_gemini_switch_is_atomic_when_any_fresh_field_is_missing(
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    ("existing", "payload", "capability"),
+    [
+        (
+            {
+                "llm_provider": "openai",
+                "llm_api_url": "https://api.openai.com/v1",
+                "llm_api_key": "stored-llm-secret",
+                "llm_model_name": "stored-model",
+            },
+            {"llm_provider": "dropout"},
+            "llm",
+        ),
+        (
+            {
+                "stt_provider": "openai_whisper",
+                "stt_api_url": "https://api.openai.com/v1",
+                "stt_api_key": "stored-stt-secret",
+                "stt_model_name": "stored-model",
+            },
+            {"stt_provider": "openrouter"},
+            "stt",
+        ),
+        (
+            {
+                "tts_provider": "google",
+                "tts_api_url": "https://texttospeech.googleapis.com/v1",
+                "tts_api_key": "stored-tts-secret",
+                "tts_model_name": "stored-model",
+            },
+            {"tts_provider": "openai"},
+            "tts",
+        ),
+        (
+            {
+                "whatsapp_provider": "meta_cloud",
+                "meta_phone_number_id": "stored-meta-phone",
+                "meta_permanent_token": "stored-meta-secret",
+            },
+            {"whatsapp_provider": "evolution"},
+            "whatsapp",
+        ),
+        (
+            {
+                "whatsapp_provider": "meta_cloud",
+                "meta_phone_number_id": "stored-meta-phone",
+                "meta_permanent_token": "stored-meta-secret",
+            },
+            {"whatsapp_provider": "uazapi"},
+            "whatsapp",
+        ),
+    ],
+    ids=["llm", "stt", "tts", "evolution", "uazapi"],
+)
+def test_active_provider_partial_switches_are_atomic(
+    client: TestClient,
+    test_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    existing: dict[str, object],
+    payload: dict[str, object],
+    capability: str,
+) -> None:
+    row = SimpleNamespace(api_credentials=dict(existing))
+    calls: list[str] = []
+
+    class SessionSpy:
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+
+    async def override_session() -> Any:
+        yield SessionSpy()
+
+    async def load_existing(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        return row
+
+    monkeypatch.setattr("src.api.routes.config._load_config", load_existing)
+    test_app.dependency_overrides[get_db_session_dependency] = override_session
+    try:
+        response = client.patch(
+            PATH,
+            headers=_jwt_headers("clinic_admin"),
+            json=payload,
+        )
+    finally:
+        test_app.dependency_overrides.pop(get_db_session_dependency, None)
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == {
+        "error": "provider_switch_bundle_required",
+        "capability": capability,
+    }
+    assert "stored-" not in response.text
+    assert calls == []
+    assert row.api_credentials == existing
+
+
+@pytest.mark.parametrize("dormant", [False, True], ids=["active", "dormant"])
+@pytest.mark.parametrize(
+    (
+        "provider",
+        "endpoint_field",
+        "instance_field",
+        "secret_field",
+        "secret_flag",
+    ),
+    [
+        (
+            "evolution",
+            "evolution_api_url",
+            "evolution_instance_name",
+            "evolution_api_key",
+            "evolution_api_key_set",
+        ),
+        (
+            "uazapi",
+            "uazapi_api_url",
+            "uazapi_instance_name",
+            "uazapi_token",
+            "uazapi_token_set",
+        ),
+    ],
+)
+def test_configurable_whatsapp_endpoint_rotation_is_atomic_and_secret_free(
+    client: TestClient,
+    test_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    dormant: bool,
+    provider: str,
+    endpoint_field: str,
+    instance_field: str,
+    secret_field: str,
+    secret_flag: str,
+) -> None:
+    old_url = f"https://old-{provider}.example.com/v1"
+    new_url = f"https://new-{provider}.example.com/v1"
+    old_secret = f"stored-{provider}-secret"
+    new_secret = f"fresh-{provider}-secret"
+    existing = {
+        "whatsapp_provider": "meta_cloud" if dormant else provider,
+        endpoint_field: old_url,
+        instance_field: "stored-instance",
+        secret_field: old_secret,
+    }
+    row = SimpleNamespace(api_credentials=dict(existing))
+    calls: list[str] = []
+
+    class SessionSpy:
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+
+    async def override_session() -> Any:
+        yield SessionSpy()
+
+    async def load_existing(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        return row
+
+    async def invalidate(*args: Any, **kwargs: Any) -> None:
+        calls.append("cache")
+
+    monkeypatch.setattr("src.api.routes.config._load_config", load_existing)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache", invalidate
+    )
+    test_app.dependency_overrides[get_db_session_dependency] = override_session
+    headers = _jwt_headers("clinic_admin")
+    try:
+        refused = client.patch(
+            PATH,
+            headers=headers,
+            json={endpoint_field: new_url},
+        )
+        assert refused.status_code == 422, refused.text
+        assert refused.json()["detail"] == {
+            "error": "provider_switch_bundle_required",
+            "capability": "whatsapp",
+        }
+        assert old_secret not in refused.text
+        assert calls == []
+        assert row.api_credentials == existing
+
+        accepted = client.patch(
+            PATH,
+            headers=headers,
+            json={
+                "whatsapp_provider": provider,
+                endpoint_field: new_url,
+                instance_field: "fresh-instance",
+                secret_field: new_secret,
+            },
+        )
+        assert accepted.status_code == 200, accepted.text
+        assert accepted.json()["whatsapp_provider"] == provider
+        assert accepted.json()[endpoint_field] == new_url
+        assert accepted.json()[instance_field] == "fresh-instance"
+        assert accepted.json()[secret_flag] is True
+        assert accepted.json()["whatsapp_readiness"] == "active"
+        assert old_secret not in accepted.text
+        assert new_secret not in accepted.text
+        assert calls == ["flush", "commit", "cache"]
+        assert row.api_credentials == {
+            **existing,
+            "whatsapp_provider": provider,
+            endpoint_field: new_url,
+            instance_field: "fresh-instance",
+            secret_field: new_secret,
+        }
+
+        calls.clear()
+        renamed = client.patch(
+            PATH,
+            headers=headers,
+            json={instance_field: "renamed-instance"},
+        )
+    finally:
+        test_app.dependency_overrides.pop(get_db_session_dependency, None)
+
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()[instance_field] == "renamed-instance"
+    assert new_secret not in renamed.text
+    assert calls == ["flush", "commit", "cache"]
+    assert row.api_credentials[endpoint_field] == new_url
+    assert row.api_credentials[instance_field] == "renamed-instance"
+    assert row.api_credentials[secret_field] == new_secret
+
+
 def test_invalid_payload_and_unsafe_url_return_stable_secret_free_422(
     client: TestClient,
 ) -> None:
@@ -304,7 +527,7 @@ def test_openapi_uses_typed_credential_patch_and_validation_never_echoes_input(
     ]["stt_provider"]
     assert "openrouter" in stt_provider_schema["anyOf"][0]["enum"]
     description = schema["paths"][PATH]["patch"]["description"]
-    assert "Public provider availability is unchanged" in description
+    assert "public provider catalog" in description
     assert "All displayable providers are currently coming soon" not in description
 
     headers = _jwt_headers("clinic_admin")
@@ -421,7 +644,7 @@ def test_tts_control_patch_requires_bundle_and_invalid_policy_is_atomic(
         {"tts_enabled": True, "tts_reply_policy": "all_inputs"},
     ],
 )
-def test_control_only_patch_cannot_change_a_coming_soon_tts_bundle(
+def test_control_only_patch_can_change_an_active_tts_bundle(
     client: TestClient,
     test_app: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -469,15 +692,10 @@ def test_control_only_patch_cannot_change_a_coming_soon_tts_bundle(
     finally:
         test_app.dependency_overrides.pop(get_db_session_dependency, None)
 
-    assert response.status_code == 422, response.text
-    assert response.json()["detail"] == {
-        "error": "provider_not_available",
-        "capability": "tts",
-        "provider": "google",
-    }
+    assert response.status_code == 200, response.text
     assert "saved-secret-that-must-not-leak" not in response.text
-    assert calls == []
-    assert row.api_credentials == existing
+    assert calls == ["flush", "commit"]
+    assert row.api_credentials == {**existing, **payload}
 
 
 def test_invalid_merge_does_not_create_or_flush_missing_config(
@@ -787,7 +1005,7 @@ def test_runtime_control_legacy_echo_is_accepted_without_mutation(
     assert row.api_credentials == existing
 
 
-def test_legacy_echo_passes_while_maintenance_and_switch_stay_atomic(
+def test_active_llm_echo_and_maintenance_pass_while_unavailable_switch_is_atomic(
     client: TestClient,
     test_app: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -846,14 +1064,10 @@ def test_legacy_echo_passes_while_maintenance_and_switch_stay_atomic(
             headers=headers,
             json={"llm_model_name": "new-model"},
         )
-        assert maintained.status_code == 422, maintained.text
-        assert maintained.json()["detail"] == {
-            "error": "provider_not_available",
-            "capability": "llm",
-            "provider": "openai",
-        }
-        assert calls == []
-        assert row.api_credentials == existing
+        assert maintained.status_code == 200, maintained.text
+        assert maintained.json()["llm_model_name"] == "new-model"
+        assert calls == ["flush", "commit"]
+        assert row.api_credentials == {**existing, "llm_model_name": "new-model"}
 
         switched = client.patch(
             PATH,
@@ -869,8 +1083,8 @@ def test_legacy_echo_passes_while_maintenance_and_switch_stay_atomic(
         "capability": "llm",
         "provider": "slm_cortex",
     }
-    assert calls == []
-    assert row.api_credentials == existing
+    assert calls == ["flush", "commit"]
+    assert row.api_credentials == {**existing, "llm_model_name": "new-model"}
 
 
 @pytest.mark.parametrize(
@@ -945,6 +1159,48 @@ def test_tts_config_mutations_without_known_provider_are_atomic(
     assert "saved-secret-that-must-not-leak" not in response.text
     assert calls == []
     assert row.api_credentials == existing
+
+
+@pytest.mark.parametrize(
+    ("provider", "api_url", "model"),
+    [
+        ("openai_whisper", "https://api.openai.com/v1", "whisper-1"),
+        (
+            "elevenlabs_scribe",
+            STT_FIXED_API_BASES["elevenlabs_scribe"],
+            "scribe_v1",
+        ),
+        ("openrouter", STT_FIXED_API_BASES["openrouter"], "openai/whisper-large-v3"),
+    ],
+)
+def test_new_tenant_can_configure_each_active_stt_provider(
+    client: TestClient, provider: str, api_url: str, model: str
+) -> None:
+    headers = _jwt_headers("clinic_admin")
+    secret = f"fresh-{provider}-secret"
+    response = client.patch(
+        PATH,
+        headers=headers,
+        json={
+            "stt_provider": provider,
+            "stt_api_url": api_url,
+            "stt_api_key": secret,
+            "stt_model_name": model,
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["stt_provider"] == provider
+    assert body["stt_api_url"] == api_url
+    assert body["stt_model_name"] == model
+    assert body["stt_api_key_set"] is True
+    assert body["stt_readiness"] == "active"
+    assert secret not in response.text
+
+    stored = client.get(PATH, headers=headers)
+    assert stored.status_code == 200
+    assert stored.json()["stt_provider"] == provider
+    assert secret not in stored.text
 
 
 STT_INCUMBENT_FIXTURES = [
@@ -1148,26 +1404,6 @@ def test_stt_incumbent_switch_orders_commit_cache_emit_and_redacts_payload(
     ("existing", "payload", "error"),
     [
         (
-            {},
-            {
-                "stt_provider": "openrouter",
-                "stt_api_url": STT_FIXED_API_BASES["openrouter"],
-                "stt_api_key": "fresh-key",
-                "stt_model_name": "fresh-model",
-            },
-            "provider_not_available",
-        ),
-        (
-            {"stt_provider": "openai_whisper", "stt_api_key": "saved"},
-            {
-                "stt_provider": "openrouter",
-                "stt_api_url": STT_FIXED_API_BASES["openrouter"],
-                "stt_api_key": "fresh-key",
-                "stt_model_name": "fresh-model",
-            },
-            "provider_not_available",
-        ),
-        (
             {"whisper_api_key": "legacy"},
             {
                 "stt_provider": "openrouter",
@@ -1230,16 +1466,6 @@ def test_stt_incumbent_switch_orders_commit_cache_emit_and_redacts_payload(
         (
             {"stt_provider": "outros", "stt_api_key": "legacy"},
             {"audio_max_seconds": 45},
-            "provider_not_available",
-        ),
-        (
-            {
-                "stt_provider": "openrouter",
-                "stt_api_url": STT_FIXED_API_BASES["openrouter"],
-                "stt_api_key": "saved",
-                "stt_model_name": "saved-model",
-            },
-            {"stt_model_name": "replacement"},
             "provider_not_available",
         ),
         ({}, {"stt_provider": "outros"}, "provider_not_available"),
