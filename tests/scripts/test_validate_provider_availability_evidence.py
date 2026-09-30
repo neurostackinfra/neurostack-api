@@ -272,7 +272,7 @@ def test_gemini_receipt_rejects_noncanonical_raw_bytes(
     assert any("non-canonical" in error for error in errors)
 
 
-def test_product_promotion_is_the_sole_active_overlay() -> None:
+def test_product_promotion_matches_the_approved_overlay() -> None:
     assert checker._validate_product_promotion(checker.ROOT) == []
 
 
@@ -281,20 +281,20 @@ def test_product_promotion_is_the_sole_active_overlay() -> None:
     (
         (
             "src/services/api_credentials.py",
-            '"dropout": "coming_soon"',
-            '"renamed": "coming_soon"',
+            '"dropout": "active"',
+            '"renamed": "active"',
             "backend provider matrix",
         ),
         (
             "src/services/api_credentials.py",
-            'PUBLICLY_ACTIVE_LLM_PROVIDERS = frozenset({"gemini"})',
-            'PUBLICLY_ACTIVE_LLM_PROVIDERS = frozenset({"gemini", "openai"})',
+            'PUBLICLY_ACTIVE_LLM_PROVIDERS = frozenset({"openai", "dropout", "gemini", "outros"})',
+            'PUBLICLY_ACTIVE_LLM_PROVIDERS = frozenset({"openai", "dropout", "gemini", "slm_cortex"})',
             "publicly active LLM membership",
         ),
         (
             "frontend/artifacts/neurostack/src/pages/clinic-config.tsx",
-            'dropout: "coming_soon"',
-            'renamed: "coming_soon"',
+            'dropout: "active"',
+            'renamed: "active"',
             "frontend provider matrix",
         ),
     ),

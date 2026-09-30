@@ -47,6 +47,7 @@ describe("<ProviderCredentialCard />", () => {
   it.each([
     ["configured", "CONFIGURADO", "text-emerald-400"],
     ["incomplete", "INCOMPLETO", "text-amber-400"],
+    ["available", "DISPONÍVEL", "text-sky-400"],
   ] as const)(
     "renders a %s provider as a button the tenant can open",
     (state, badgeLabel, badgeClass) => {
@@ -74,6 +75,23 @@ describe("<ProviderCredentialCard />", () => {
     },
   );
 
+  it("renders a visible non-coming provider as a disabled button without a handler", () => {
+    render(
+      <ProviderCredentialCard
+        id="llm-openai"
+        label="GPT"
+        sub="by OpenAI"
+        state="available"
+        badgeLabel="DISPONÍVEL"
+      />,
+    );
+
+    const card = screen.getByTestId("provider-card-llm-openai");
+    expect(card).toBeDisabled();
+    expect(card).toHaveClass("cursor-not-allowed", "opacity-70");
+    expect(card).not.toHaveAttribute("aria-expanded");
+  });
+
   it("reports the expanded state through aria-expanded", () => {
     render(
       <ProviderCredentialCard
@@ -83,6 +101,7 @@ describe("<ProviderCredentialCard />", () => {
         state="configured"
         badgeLabel="CONFIGURADO"
         isExpanded
+        onToggle={() => undefined}
       />,
     );
 

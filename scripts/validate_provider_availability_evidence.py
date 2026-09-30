@@ -85,7 +85,18 @@ EXPECTED_PROMOTED_MATRIX = {
     }
     for capability in ("whatsapp", "llm", "multimodal", "stt", "tts")
 }
-EXPECTED_PROMOTED_MATRIX["llm"]["gemini"] = "active"
+EXPECTED_PROMOTED_MATRIX["stt"]["openrouter"] = EXPECTED_PROMOTED_MATRIX["stt"].pop(
+    "outros"
+)
+for capability, providers in {
+    "whatsapp": {"meta_cloud", "zapi", "uazapi", "evolution"},
+    "llm": {"dropout", "gemini", "openai", "outros"},
+    "stt": {"openrouter", "openai_whisper", "elevenlabs_scribe"},
+    "tts": {"elevenlabs", "google", "openai"},
+}.items():
+    for provider in providers:
+        EXPECTED_PROMOTED_MATRIX[capability][provider] = "active"
+EXPECTED_PUBLICLY_ACTIVE_LLM_PROVIDERS = {"dropout", "gemini", "openai", "outros"}
 EXPECTED_PRODUCTION_IMAGES = {
     "postgres": "postgres@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685",
     "redis": "redis@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf",
@@ -412,7 +423,7 @@ def _parse_frontend_matrix(text: str) -> dict[str, dict[str, str]] | None:
 
 
 def _validate_product_promotion(root: Path) -> list[str]:
-    """Bind the release gate to the sole approved product-matrix overlay."""
+    """Bind the release gate to the approved product-matrix overlay."""
 
     policy_path = root / "src/services/api_credentials.py"
     try:
@@ -443,8 +454,10 @@ def _validate_product_promotion(root: Path) -> list[str]:
         errors.append(
             "backend provider matrix does not exactly match the approved overlay"
         )
-    if operational != {"gemini"}:
-        errors.append("publicly active LLM membership must contain only Gemini")
+    if operational != EXPECTED_PUBLICLY_ACTIVE_LLM_PROVIDERS:
+        errors.append(
+            "publicly active LLM membership does not match the approved overlay"
+        )
     frontend_path = root / "frontend/artifacts/neurostack/src/pages/clinic-config.tsx"
     try:
         frontend = frontend_path.read_text(encoding="utf-8")

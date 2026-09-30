@@ -27,7 +27,9 @@ const BADGE_CLASSES: Record<ProviderCardState, string> = {
  * A `coming_soon` card is inert by construction: it renders no interactive
  * role, so it cannot acquire focus, be selected, or contribute credentials to
  * a PATCH body. That is what keeps a provider with no runtime path from being
- * adopted through this surface; every other state opens an editor.
+ * adopted through this surface. Other states render as buttons, but stay
+ * disabled when the caller cannot safely offer an editor (loading, failed
+ * tenant status, or read-only access).
  */
 export function ProviderCredentialCard({
   id,
@@ -66,16 +68,21 @@ export function ProviderCredentialCard({
     );
   }
 
+  const isDisabled = onToggle === undefined;
+
   return (
     <button
       type="button"
       data-testid={`provider-card-${id}`}
       data-provider-id={id}
       data-card-state={state}
-      aria-expanded={isExpanded}
+      aria-expanded={isDisabled ? undefined : isExpanded}
+      disabled={isDisabled}
       onClick={onToggle}
       className={`rounded-lg border px-3 py-2.5 text-left transition-colors ${
-        isExpanded
+        isDisabled
+          ? "cursor-not-allowed border-border bg-background text-foreground opacity-70"
+          : isExpanded
           ? "border-accent bg-accent/10 text-foreground"
           : "border-border bg-background text-foreground hover:border-muted-foreground/50"
       }`}
