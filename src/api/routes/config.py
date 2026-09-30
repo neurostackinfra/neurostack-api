@@ -772,9 +772,9 @@ async def _ensure_meta_phone_number_id_available(
     "/api-credentials",
     summary="Update API Credentials",
     description=(
-        "Validate a credential patch. Gemini accepts policy-valid LLM changes; "
-        "legacy STT incumbents may atomically leave outros for a fixed Scribe "
-        "or OpenRouter bundle. Public provider availability is unchanged."
+        "Validate a credential patch against the public provider catalog. "
+        "Legacy STT incumbents may atomically leave outros for a fixed Scribe "
+        "or OpenRouter bundle."
     ),
 )
 async def patch_api_credentials(

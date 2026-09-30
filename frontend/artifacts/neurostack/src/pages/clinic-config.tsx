@@ -265,8 +265,8 @@ export function describeConfigSaveFailure(
       en: "The API URL does not match this provider's official endpoint. Use the official endpoint shown in the API URL field.",
     },
     provider_switch_bundle_required: {
-      pt: "Para trocar o provedor, informe juntos a URL da API, uma nova API Key e o modelo.",
-      en: "To switch providers, enter the API URL, a new API key, and the model together.",
+      pt: "Para trocar o provedor ou endpoint, informe todos os campos obrigatórios junto com uma nova chave ou token.",
+      en: "To switch providers or endpoints, enter all required fields together with a new key or token.",
     },
     provider_not_available: {
       pt: "Este provedor ainda não está liberado para nova configuração.",
@@ -457,7 +457,7 @@ type SttProvider =
   | "google_stt"
   | "deepgram_stt"
   | "microsoft_stt"
-  | "outros";
+  | "openrouter";
 type TtsProvider = "elevenlabs" | "google" | "openai";
 type MultimodalProvider = "openrouter";
 
@@ -493,35 +493,35 @@ export type ProviderAvailabilityMatrix = {
  */
 export const API_PROVIDER_AVAILABILITY = {
   whatsapp: {
-    meta_cloud: "coming_soon",
-    zapi: "coming_soon",
-    uazapi: "coming_soon",
-    evolution: "coming_soon",
+    meta_cloud: "active",
+    zapi: "active",
+    uazapi: "active",
+    evolution: "active",
     dialog360: "coming_soon",
     twilio: "coming_soon",
   },
   llm: {
-    dropout: "coming_soon",
+    dropout: "active",
     gemini: "active",
-    openai: "coming_soon",
-    outros: "coming_soon",
+    openai: "active",
+    outros: "active",
     slm_cortex: "coming_soon",
   },
   multimodal: {
     openrouter: "coming_soon",
   },
   stt: {
-    outros: "coming_soon",
-    openai_whisper: "coming_soon",
-    elevenlabs_scribe: "coming_soon",
+    openrouter: "active",
+    openai_whisper: "active",
+    elevenlabs_scribe: "active",
     google_stt: "coming_soon",
     deepgram_stt: "coming_soon",
     microsoft_stt: "coming_soon",
   },
   tts: {
-    elevenlabs: "coming_soon",
-    google: "coming_soon",
-    openai: "coming_soon",
+    elevenlabs: "active",
+    google: "active",
+    openai: "active",
   },
 } as const satisfies ProviderAvailabilityMatrix;
 
@@ -637,16 +637,15 @@ const WA_PROVIDER_LABEL: Record<WhatsappProvider, string> = WA_PROVIDERS.reduce(
   {} as Record<WhatsappProvider, string>,
 );
 
-// Every canonical STT provider id declared in the backend allowlist
-// (`PROVIDER_ALLOWLISTS["stt"]` in `src/services/api_credentials.py`) must be
-// represented here. Missing an id would break credential save/load parity.
+// Public STT catalog. The legacy `outros` wire id remains a backend-only
+// compatibility path; new OpenRouter configurations use its explicit id.
 export const STT_PROVIDERS: { id: SttProvider; label: string; sub: string }[] = [
   { id: "openai_whisper",    label: "Whisper",    sub: "by OpenAI"    },
   { id: "elevenlabs_scribe", label: "Scribe",     sub: "by ElevenLabs" },
   { id: "google_stt",        label: "Cloud STT",  sub: "by Google"          },
   { id: "deepgram_stt",      label: "Deepgram",   sub: "by Deepgram" },
   { id: "microsoft_stt",     label: "Azure STT",  sub: "by Microsoft"       },
-  { id: "outros",            label: "Outros",     sub: "Groq / OpenRouter"    },
+  { id: "openrouter",        label: "Outros",     sub: "by OpenRouter"    },
 ];
 
 export const TTS_PROVIDERS: { id: TtsProvider; label: string; sub: string }[] = [
@@ -656,7 +655,7 @@ export const TTS_PROVIDERS: { id: TtsProvider; label: string; sub: string }[] = 
 ];
 
 // The display catalog is intentionally availability-agnostic: the canonical
-// Gemini-active/provider-coming-soon state lives above.
+// active/coming-soon state lives above.
 export const PROVIDERS: {
   id: LlmProvider;
   label: string;
@@ -666,7 +665,7 @@ export const PROVIDERS: {
   { id: "dropout",    label: "Dropout",    sub: "by Neuralake" },
   { id: "openai",     label: "GPT",        sub: "by OpenAI" },
   { id: "gemini",     label: "Gemini",     sub: "by Google" },
-  { id: "outros",     label: "Outros",     sub: "Custom / OSS" },
+  { id: "outros",     label: "Outros",     sub: "OpenAI-compatible / OpenRouter" },
 ];
 
 type ProviderDisplay = { id: string; label: string; sub: string };
@@ -726,6 +725,11 @@ const WHATSAPP_DECOMMISSION_LEVER: Record<string, string> = {
   uazapi: "uazapi_api_url",
 };
 
+const WHATSAPP_PROVIDER_ENDPOINT_FIELD: Record<string, string> = {
+  evolution: "evolution_api_url",
+  uazapi: "uazapi_api_url",
+};
+
 // Voice triggers (`tts_enabled`, `tts_reply_policy`) belong to
 // VoiceResponseControls and are deliberately absent here.
 const CAPABILITY_FIELDS: Record<string, readonly CredentialField[]> = {
@@ -756,6 +760,8 @@ const CAPABILITY_FIELDS: Record<string, readonly CredentialField[]> = {
 const GEMINI_OPENAI_COMPATIBLE_BASE_URL =
   "https://generativelanguage.googleapis.com/v1beta/openai";
 const OPENAI_BASE_URL = "https://api.openai.com/v1";
+const ELEVENLABS_BASE_URL = "https://api.elevenlabs.io/v1";
+const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
 function newProviderFieldDefault(
   capability: ApiCapabilityId,
@@ -767,6 +773,11 @@ function newProviderFieldDefault(
   }
   if (capability === "tts" && providerId === "openai" && fieldName === "tts_api_url") {
     return OPENAI_BASE_URL;
+  }
+  if (capability === "stt" && fieldName === "stt_api_url") {
+    if (providerId === "openai_whisper") return OPENAI_BASE_URL;
+    if (providerId === "elevenlabs_scribe") return ELEVENLABS_BASE_URL;
+    if (providerId === "openrouter") return OPENROUTER_BASE_URL;
   }
   return "";
 }
@@ -938,28 +949,39 @@ export function ApiCredentialsForm({
   async function saveProvider(capability: ApiCapabilityId, providerId: string) {
     const requestGeneration = clinicGenerationRef.current.generation;
     const isCurrentClinic = () => clinicGenerationRef.current.generation === requestGeneration;
-    const body: Record<string, string | number> = {};
-    // Adoption only takes effect if the provider field travels with the
-    // bundle; omitting it would persist credentials under the previous
-    // provider's label and leave the card unable to reach CONFIGURADO.
+    const body: Record<string, string | number | null> = {};
     const providerField = CAPABILITY_PROVIDER_FIELD[capability];
     const held = statusText(status, providerField);
-    if (held !== providerId) {
+    const endpointField = capability === "whatsapp"
+      ? WHATSAPP_PROVIDER_ENDPOINT_FIELD[providerId]
+      : capability === "multimodal"
+        ? undefined
+        : `${capability}_api_url`;
+    const endpointChanged = endpointField !== undefined
+      && held === providerId
+      && (draft[endpointField] ?? "") !== (baseline[endpointField] ?? "");
+    const requiresFreshBundle = held !== providerId || endpointChanged;
+    // Adoption and endpoint rotation only take effect if the provider and its
+    // complete non-secret bundle travel together. Secrets remain write-only:
+    // an endpoint rotation without a newly typed key is rejected safely by
+    // the backend instead of inheriting the credential stored for the old URL.
+    if (requiresFreshBundle) {
       body[providerField] = providerId;
       // The retired bundle stays populated and goes on resolving its own
       // inbound webhooks, so it would keep replying under the new provider's
-      // name. Emptying its identity field here retires it while the switch is
-      // still expressible; afterwards its card reads empty and there is
-      // nothing left to blank.
+      // name. Nulling its identity field here retires it without violating the
+      // identifier/URL validators that reject empty strings; afterwards its
+      // card reads empty and there is nothing left to clear.
       const lever =
         capability === "whatsapp" ? WHATSAPP_DECOMMISSION_LEVER[held] : undefined;
-      if (lever) body[lever] = "";
+      if (lever) body[lever] = null;
     }
     for (const field of credentialFields(capability, providerId)) {
       const value = draft[field.name] ?? "";
       if (field.secret) {
         if (value) body[field.name] = value;
-      } else if (held !== providerId || value !== baseline[field.name]) {
+      } else if ((requiresFreshBundle && value !== "")
+        || (!requiresFreshBundle && value !== baseline[field.name])) {
         body[field.name] = field.numeric ? Number(value) : value;
       }
     }
@@ -1008,8 +1030,8 @@ export function ApiCredentialsForm({
     <section className="space-y-5" data-testid="api-settings-section">
       <p className="text-sm text-muted-foreground" data-testid="api-settings-legacy-state-note">
         {txt(
-          "Gemini está disponível; os demais provedores permanecem EM BREVE.",
-          "Gemini is available; the other providers remain COMING SOON.",
+          "Selecione um provedor disponível para configurar suas credenciais.",
+          "Select an available provider to configure its credentials.",
         )}
       </p>
       {loadFailed && (
@@ -1051,17 +1073,15 @@ export function ApiCredentialsForm({
             >
               {providers.map((provider) => {
                 if (!(provider.id in availability)) return null;
-                // Until the tenant's status lands, which provider is held is
-                // unknown, so every card stays inert rather than offering an
-                // adoption that could silently displace a stored provider.
-                const state = status === null
-                  ? "coming_soon"
-                  : providerCardState(
-                      capability.id,
-                      provider.id,
-                      status,
-                      providerAvailability,
-                    );
+                // Product availability remains visible while tenant status is
+                // loading or unavailable. Interaction stays fail-closed below
+                // so an unknown held provider can never be displaced.
+                const state = providerCardState(
+                  capability.id,
+                  provider.id,
+                  status,
+                  providerAvailability,
+                );
                 const key = `${capability.id}:${provider.id}`;
                 return (
                   <ProviderCredentialCard
@@ -1072,7 +1092,7 @@ export function ApiCredentialsForm({
                     state={state}
                     badgeLabel={badgeLabel[state]}
                     isExpanded={expanded === key}
-                    onToggle={state === "coming_soon" || isReadOnly
+                    onToggle={status === null || state === "coming_soon" || isReadOnly
                       ? undefined
                       : () => toggleProvider(capability.id, provider.id)}
                   />
