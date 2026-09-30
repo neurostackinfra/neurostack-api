@@ -228,17 +228,19 @@ poetry run python scripts/api_provider_preflight.py scan-tracked --root .
 The repository-wide `make quality` remains an additional aggregate gate; do not
 weaken or bypass either the focused strict command or the tracked-evidence scan.
 
-## STT Scribe/OpenRouter handoff and emission failure runbook
+## STT Scribe/OpenRouter public rollout and emission failure runbook
 
-The Scribe/OpenRouter change is operational readiness, not public promotion or
-live homologation. Deterministic mocks prove the fixed HTTP contract only; they
-do not prove real credentials, account quota, currently enabled models, or
-production audio acceptance. The provider catalog exclusively owns the public
-matrix and cards. Its pre-work gate must keep `elevenlabs_scribe` as
-`coming_soon`, keep `openrouter` absent from the public STT matrix, and verify
-that no UI/matrix diff is introduced before it deliberately promotes either ID.
+The earlier Scribe/OpenRouter work established operational readiness before
+public promotion. The catalog has now promoted `elevenlabs_scribe` and
+`openrouter` to `active`; the public OpenRouter card uses the explicit
+`openrouter` wire ID, while the legacy `outros` ID remains recognized but hidden.
+Whisper is also active. Google, Deepgram, and Azure STT remain `coming_soon`.
+Deterministic mocks prove the fixed HTTP contract only; they do not prove real
+credentials, account quota, currently enabled models, or production audio
+acceptance.
 
-An accepted incumbent-only transition commits the complete fresh STT bundle,
+For the legacy compatibility path specifically, an accepted transition from
+`outros` to Scribe or OpenRouter commits the complete fresh STT bundle,
 invalidates the configuration cache, and then attempts one
 `api_credentials_changed` emission before returning. The payload is allowlisted:
 actor/role, tenant ID, capability `stt`, the four field names, previous provider
@@ -266,17 +268,19 @@ and do not replay an event unless a separately approved durable mechanism owns
 deduplication.
 
 Backout must preserve readers and runtime dispatch for persisted
-`elevenlabs_scribe` and `openrouter` bundles. It may halt new incumbent switches
-and must keep the public catalog unpromoted, but must not remove either wire ID
-from schema/recognition/readiness, relabel or rewrite it to `outros`, remove its
-fixed-base validator/adapter/caller, or make stored tenants unreadable. If those
+`elevenlabs_scribe` and `openrouter` bundles. It may halt the legacy migration
+handler during incident response, but must not silently revert the public cards
+to `coming_soon`. Any product rollback requires a coordinated catalog release.
+The backout must not remove either wire ID from schema/recognition/readiness,
+relabel or rewrite it to `outros`, remove its fixed-base
+validator/adapter/caller, or make stored tenants unreadable. If those
 compatibility guarantees cannot be maintained, use a forward fix rather than a
-code rollback. This makes handoff order-independent: the catalog may land later
-without becoming a prerequisite for existing stored configurations.
+code rollback.
 
 For a reproducible handoff, run the Group 3 aggregate pytest command, byte
 parity `cmp config/prometheus_rules.yml src/config/prometheus_rules.yml`, the
-frontend Vitest that protects absence of promotion, and `make quality` against
+frontend Vitest that protects the published catalog state (including the
+explicit OpenRouter card and hidden legacy `outros`), and `make quality` against
 the exact source commit. Record the source commit, resulting commit and tree
 digest. These fixed commands—not a manifest—select execution; no manifest may
 choose an executable, arguments, working directory, or shell.

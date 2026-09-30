@@ -35,37 +35,36 @@ from src.services.api_credentials import (
 )
 
 
-def test_provider_availability_has_sole_gemini_active_overlay() -> None:
-
+def test_provider_availability_matches_public_catalog() -> None:
     assert PROVIDER_AVAILABILITY == {
         "whatsapp": {
-            "meta_cloud": "coming_soon",
-            "zapi": "coming_soon",
-            "uazapi": "coming_soon",
-            "evolution": "coming_soon",
+            "meta_cloud": "active",
+            "zapi": "active",
+            "uazapi": "active",
+            "evolution": "active",
             "dialog360": "coming_soon",
             "twilio": "coming_soon",
         },
         "llm": {
-            "dropout": "coming_soon",
+            "dropout": "active",
             "gemini": "active",
-            "openai": "coming_soon",
-            "outros": "coming_soon",
+            "openai": "active",
+            "outros": "active",
             "slm_cortex": "coming_soon",
         },
         "multimodal": {"openrouter": "coming_soon"},
         "stt": {
-            "outros": "coming_soon",
-            "openai_whisper": "coming_soon",
-            "elevenlabs_scribe": "coming_soon",
+            "openrouter": "active",
+            "openai_whisper": "active",
+            "elevenlabs_scribe": "active",
             "google_stt": "coming_soon",
             "deepgram_stt": "coming_soon",
             "microsoft_stt": "coming_soon",
         },
         "tts": {
-            "elevenlabs": "coming_soon",
-            "google": "coming_soon",
-            "openai": "coming_soon",
+            "elevenlabs": "active",
+            "google": "active",
+            "openai": "active",
         },
     }
     assert sum(len(providers) for providers in PROVIDER_AVAILABILITY.values()) == 21
@@ -74,16 +73,17 @@ def test_provider_availability_has_sole_gemini_active_overlay() -> None:
         for providers in PROVIDER_AVAILABILITY.values()
         for availability in providers.values()
     ]
-    assert states.count("active") == 1
-    assert states.count("coming_soon") == 20
-    assert PUBLICLY_ACTIVE_LLM_PROVIDERS == {"gemini"}
+    assert states.count("active") == 14
+    assert states.count("coming_soon") == 7
+    assert PUBLICLY_ACTIVE_LLM_PROVIDERS == {"dropout", "gemini", "openai", "outros"}
     expected_allowlists = {
         capability: frozenset(providers)
         for capability, providers in PROVIDER_AVAILABILITY.items()
     }
-    expected_allowlists["stt"] = expected_allowlists["stt"] | {"openrouter"}
+    expected_allowlists["stt"] = expected_allowlists["stt"] | {"outros"}
     assert PROVIDER_ALLOWLISTS == expected_allowlists
-    assert "openrouter" not in PROVIDER_AVAILABILITY["stt"]
+    assert PROVIDER_AVAILABILITY["stt"]["openrouter"] == "active"
+    assert "outros" not in PROVIDER_AVAILABILITY["stt"]
     assert {
         ("multimodal", "groq"),
         ("multimodal", "openai"),
@@ -251,7 +251,7 @@ def test_openai_tts_configuration_without_voice_is_incomplete() -> None:
         ),
     ],
 )
-def test_tts_control_merge_preserves_runtime_state_but_availability_rejects(
+def test_tts_control_merge_preserves_runtime_state_for_active_provider(
     patch: dict[str, object], expected_controls: dict[str, object]
 ) -> None:
     existing = {
@@ -267,13 +267,7 @@ def test_tts_control_merge_preserves_runtime_state_but_availability_rejects(
     merged = merge_credentials(existing, patch)
 
     assert "tts_reply_policy" in TTS_FIELDS
-    with pytest.raises(CredentialPolicyError) as caught:
-        validate_provider_availability(existing, merged)
-    assert caught.value.detail == {
-        "error": "provider_not_available",
-        "capability": "tts",
-        "provider": "google",
-    }
+    validate_provider_availability(existing, merged)
     status = credential_status(merged)
     assert status["tts_enabled"] is expected_controls["tts_enabled"]
     assert status["tts_reply_policy"] == expected_controls["tts_reply_policy"]
@@ -804,14 +798,6 @@ def test_every_coming_soon_provider_change_is_rejected(
     provider_field = CAPABILITY_PROVIDER_FIELDS[capability]
     existing: dict[str, object] = {}
     patch: dict[str, object] = {provider_field: provider}
-    if capability == "llm" and provider == "gemini":
-        patch.update(
-            {
-                "llm_api_url": GEMINI_API_BASE_URL,
-                "llm_api_key": "fresh-gemini-key",
-                "llm_model_name": "gemini-model",
-            }
-        )
     candidate = merge_credentials(existing, patch)
 
     with pytest.raises(CredentialPolicyError) as caught:
@@ -826,17 +812,127 @@ def test_every_coming_soon_provider_change_is_rejected(
 
 
 @pytest.mark.parametrize(
+    ("provider", "endpoint_field", "instance_field", "secret_field"),
+    [
+        (
+            "evolution",
+            "evolution_api_url",
+            "evolution_instance_name",
+            "evolution_api_key",
+        ),
+        ("uazapi", "uazapi_api_url", "uazapi_instance_name", "uazapi_token"),
+    ],
+)
+def test_configurable_whatsapp_egress_changes_require_a_fresh_bundle(
+    provider: str,
+    endpoint_field: str,
+    instance_field: str,
+    secret_field: str,
+) -> None:
+    old_url = f"https://old-{provider}.example/v1"
+    new_url = f"https://new-{provider}.example/v1"
+    active = {
+        "whatsapp_provider": provider,
+        endpoint_field: old_url,
+        instance_field: "stored-instance",
+        secret_field: "stored-secret",
+    }
+    dormant = {
+        **active,
+        "whatsapp_provider": "meta_cloud",
+        "meta_phone_number_id": "stored-meta-phone",
+    }
+
+    for existing, patch in (
+        ({}, {"whatsapp_provider": provider}),
+        (active, {endpoint_field: new_url}),
+        (
+            active,
+            {
+                "whatsapp_provider": provider,
+                endpoint_field: new_url,
+                instance_field: "fresh-instance",
+                secret_field: "••••••••",
+            },
+        ),
+        (dormant, {endpoint_field: new_url}),
+    ):
+        snapshot = dict(existing)
+        with pytest.raises(CredentialPolicyError) as caught:
+            merge_credentials(existing, patch)
+        assert caught.value.detail == {
+            "error": "provider_switch_bundle_required",
+            "capability": "whatsapp",
+        }
+        assert existing == snapshot
+
+
+@pytest.mark.parametrize(
+    ("provider", "endpoint_field", "instance_field", "secret_field"),
+    [
+        (
+            "evolution",
+            "evolution_api_url",
+            "evolution_instance_name",
+            "evolution_api_key",
+        ),
+        ("uazapi", "uazapi_api_url", "uazapi_instance_name", "uazapi_token"),
+    ],
+)
+def test_configurable_whatsapp_full_rotation_and_instance_only_edit_are_valid(
+    provider: str,
+    endpoint_field: str,
+    instance_field: str,
+    secret_field: str,
+) -> None:
+    old_url = f"https://old-{provider}.example/v1"
+    new_url = f"https://new-{provider}.example/v1"
+    existing = {
+        "whatsapp_provider": provider,
+        endpoint_field: old_url,
+        instance_field: "stored-instance",
+        secret_field: "stored-secret",
+    }
+
+    instance_edit = merge_credentials(existing, {instance_field: "renamed-instance"})
+    assert instance_edit == {**existing, instance_field: "renamed-instance"}
+
+    rotated = merge_credentials(
+        existing,
+        {
+            "whatsapp_provider": provider,
+            endpoint_field: new_url,
+            instance_field: "fresh-instance",
+            secret_field: "fresh-secret",
+        },
+    )
+    assert rotated[endpoint_field] == new_url
+    assert rotated[instance_field] == "fresh-instance"
+    assert rotated[secret_field] == "fresh-secret"
+
+    decommissioned = merge_credentials(
+        existing,
+        {"whatsapp_provider": "meta_cloud", endpoint_field: None},
+    )
+    assert decommissioned["whatsapp_provider"] == "meta_cloud"
+    assert decommissioned[endpoint_field] is None
+    assert decommissioned[secret_field] == "stored-secret"
+
+
+@pytest.mark.parametrize(
     ("existing_provider", "target_provider", "target_url"),
     [
         ("openai", "gemini", GEMINI_API_BASE_URL),
         ("gemini", "openai", "https://api.openai.com/v1"),
+        ("openai", "dropout", "https://api.neuralake.cloud/v1"),
+        ("dropout", "outros", "https://custom-llm.example/v1"),
     ],
 )
 @pytest.mark.parametrize(
     "omitted_field",
     ["llm_provider", "llm_api_url", "llm_api_key", "llm_model_name"],
 )
-def test_gemini_provider_switch_requires_fresh_atomic_bundle(
+def test_active_llm_provider_switch_requires_fresh_atomic_bundle(
     existing_provider: str,
     target_provider: str,
     target_url: str,
@@ -880,6 +976,32 @@ def test_same_provider_model_only_edit_preserves_url_and_key() -> None:
     }
     candidate = merge_credentials(existing, {"llm_model_name": "new-model"})
     assert candidate == {**existing, "llm_model_name": "new-model"}
+
+
+def test_active_llm_endpoint_change_requires_a_fresh_atomic_bundle() -> None:
+    existing = {
+        "llm_provider": "outros",
+        "llm_api_url": "https://old-llm.example/v1",
+        "llm_api_key": "stored-secret",
+        "llm_model_name": "stored-model",
+    }
+    with pytest.raises(CredentialPolicyError) as caught:
+        merge_credentials(existing, {"llm_api_url": "https://new-llm.example/v1"})
+    assert caught.value.detail == {
+        "error": "provider_switch_bundle_required",
+        "capability": "llm",
+    }
+
+    candidate = merge_credentials(
+        existing,
+        {
+            "llm_provider": "outros",
+            "llm_api_url": "https://new-llm.example/v1",
+            "llm_api_key": "fresh-secret",
+            "llm_model_name": "fresh-model",
+        },
+    )
+    assert candidate["llm_api_key"] == "fresh-secret"
 
 
 @pytest.mark.parametrize(
@@ -982,7 +1104,7 @@ def test_runtime_controls_cannot_bypass_coming_soon_provider_gate(
     assert existing == snapshot
 
 
-def test_effective_legacy_maintenance_is_rejected_but_identical_echo_passes() -> None:
+def test_active_llm_maintenance_and_identical_echo_pass() -> None:
     existing = {
         "llm_provider": "openai",
         "llm_api_url": "https://api.openai.com/v1",
@@ -992,14 +1114,8 @@ def test_effective_legacy_maintenance_is_rejected_but_identical_echo_passes() ->
     snapshot = dict(existing)
     changed = merge_credentials(existing, {"llm_model_name": "new-model"})
 
-    with pytest.raises(CredentialPolicyError) as caught:
-        validate_provider_availability(existing, changed)
-
-    assert caught.value.detail == {
-        "error": "provider_not_available",
-        "capability": "llm",
-        "provider": "openai",
-    }
+    validate_provider_availability(existing, changed)
+    assert changed["llm_model_name"] == "new-model"
     assert existing == snapshot
 
     echoed = merge_credentials(
@@ -1104,7 +1220,7 @@ def test_stt_incumbent_can_leave_only_with_fresh_fixed_bundle(
     ],
     ids=["empty", "other_provider", "explicit_new_provider"],
 )
-def test_stt_non_incumbents_cannot_enter_fixed_provider(
+def test_stt_non_incumbents_can_enter_active_fixed_provider(
     existing: dict[str, str]
 ) -> None:
     patch = {
@@ -1114,14 +1230,14 @@ def test_stt_non_incumbents_cannot_enter_fixed_provider(
         "stt_model_name": "fresh-model",
     }
     candidate = merge_credentials(existing, patch)
-    with pytest.raises(CredentialPolicyError) as caught:
-        validate_provider_availability(
-            existing,
-            candidate,
-            patch=patch,
-            resolved_existing=resolve_stt_credentials(existing),
-        )
-    assert caught.value.detail["error"] == "provider_not_available"
+    validate_provider_availability(
+        existing,
+        candidate,
+        patch=patch,
+        resolved_existing=resolve_stt_credentials(existing),
+    )
+    assert candidate["stt_provider"] == "openrouter"
+    assert candidate["stt_api_url"] == STT_FIXED_API_BASES["openrouter"]
 
 
 @pytest.mark.parametrize(
@@ -1152,9 +1268,24 @@ def test_every_single_effective_stt_field_is_an_eligible_incumbent(
     )
 
 
+@pytest.mark.parametrize(
+    "existing",
+    [
+        {},
+        {"whisper_api_key": "legacy", "whisper_model": "legacy-model"},
+        {
+            "stt_provider": "openai_whisper",
+            "stt_api_url": "https://api.openai.com/v1",
+            "stt_api_key": "stored-secret",
+            "stt_model_name": "stored-model",
+        },
+    ],
+    ids=["new_tenant", "legacy_incumbent", "active_incumbent"],
+)
 @pytest.mark.parametrize("missing", ["stt_api_url", "stt_api_key", "stt_model_name"])
-def test_stt_switch_requires_every_field_fresh(missing: str) -> None:
-    existing = {"whisper_api_key": "legacy", "whisper_model": "legacy-model"}
+def test_stt_switch_requires_every_field_fresh(
+    existing: dict[str, str], missing: str
+) -> None:
     patch = {
         "stt_provider": "openrouter",
         "stt_api_url": STT_FIXED_API_BASES["openrouter"],
@@ -1162,13 +1293,51 @@ def test_stt_switch_requires_every_field_fresh(missing: str) -> None:
         "stt_model_name": "fresh-model",
     }
     patch.pop(missing)
-    candidate = merge_credentials(existing, patch)
     with pytest.raises(CredentialPolicyError) as caught:
-        validate_provider_availability(
+        merge_credentials(existing, patch)
+    assert caught.value.detail == {
+        "error": "provider_switch_bundle_required",
+        "capability": "stt",
+    }
+
+
+@pytest.mark.parametrize(
+    ("existing", "target_provider", "target_url"),
+    [
+        (
+            {
+                "stt_provider": "openrouter",
+                "stt_api_url": STT_FIXED_API_BASES["openrouter"],
+                "stt_api_key": "stored-secret",
+                "stt_model_name": "stored-model",
+            },
+            "elevenlabs_scribe",
+            STT_FIXED_API_BASES["elevenlabs_scribe"],
+        ),
+        (
+            {
+                "stt_provider": "elevenlabs_scribe",
+                "stt_api_url": STT_FIXED_API_BASES["elevenlabs_scribe"],
+                "stt_api_key": "stored-secret",
+                "stt_model_name": "stored-model",
+            },
+            "openai_whisper",
+            "https://api.openai.com/v1",
+        ),
+    ],
+)
+def test_active_stt_switch_requires_a_fresh_key(
+    existing: dict[str, str], target_provider: str, target_url: str
+) -> None:
+    with pytest.raises(CredentialPolicyError) as caught:
+        merge_credentials(
             existing,
-            candidate,
-            patch=patch,
-            resolved_existing=resolve_stt_credentials(existing),
+            {
+                "stt_provider": target_provider,
+                "stt_api_url": target_url,
+                "stt_api_key": "••••••••",
+                "stt_model_name": "fresh-model",
+            },
         )
     assert caught.value.detail == {
         "error": "provider_switch_bundle_required",
@@ -1176,9 +1345,50 @@ def test_stt_switch_requires_every_field_fresh(missing: str) -> None:
     }
 
 
-def test_new_stt_ids_are_operational_without_public_catalog_promotion() -> None:
+@pytest.mark.parametrize(
+    ("target_provider", "target_url", "target_voice"),
+    [
+        ("google", "https://texttospeech.googleapis.com/v1", None),
+        ("openai", "https://api.openai.com/v1", "alloy"),
+        ("elevenlabs", "https://api.elevenlabs.io/v1", "voice-123"),
+    ],
+)
+def test_active_tts_switch_requires_a_fresh_complete_bundle(
+    target_provider: str, target_url: str, target_voice: str | None
+) -> None:
+    existing_provider = "openai" if target_provider == "google" else "google"
+    existing = {
+        "tts_provider": existing_provider,
+        "tts_api_url": (
+            "https://api.openai.com/v1"
+            if existing_provider == "openai"
+            else "https://texttospeech.googleapis.com/v1"
+        ),
+        "tts_api_key": "stored-secret",
+        "tts_model_name": "stored-model",
+    }
+    if existing_provider == "openai":
+        existing["tts_voice_id"] = "stored-voice"
+    patch: dict[str, object] = {
+        "tts_provider": target_provider,
+        "tts_api_url": target_url,
+        "tts_api_key": "••••••••",
+        "tts_model_name": "fresh-model",
+    }
+    if target_voice is not None:
+        patch["tts_voice_id"] = target_voice
+    with pytest.raises(CredentialPolicyError) as caught:
+        merge_credentials(existing, patch)
+    assert caught.value.detail == {
+        "error": "provider_switch_bundle_required",
+        "capability": "tts",
+    }
+
+
+def test_promoted_stt_ids_are_operational_and_publicly_active() -> None:
     assert {"elevenlabs_scribe", "openrouter"} <= OPERATIONAL_STT_PROVIDERS
-    assert "openrouter" not in PROVIDER_AVAILABILITY["stt"]
+    assert PROVIDER_AVAILABILITY["stt"]["openrouter"] == "active"
+    assert PROVIDER_AVAILABILITY["stt"]["elevenlabs_scribe"] == "active"
     for provider, base_url in STT_FIXED_API_BASES.items():
         status = credential_status(
             {
