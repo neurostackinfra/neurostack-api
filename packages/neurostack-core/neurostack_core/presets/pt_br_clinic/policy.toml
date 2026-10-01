@@ -1,0 +1,270 @@
+# Generated from pre-rewrite source containers by scripts/preset-parity.py.
+"schema_version" = 1
+"constraint_ids" = [
+  '''C_SEQUENCE_AUTHORITY_BEFORE_PRICE''',
+  '''C_OBJECTION_NO_PASSIVE_CLOSE''',
+]
+"flow_policy_ids" = [
+  '''POL_ONB_001_PRESENTATION_OBJECTIVE_NAME_SEQUENCE''',
+  '''POL_QUAL_001_KEY_QUESTION_AND_PROFILE_CLASSIFICATION''',
+  '''POL_OBJ_001_CLARIFY_OBJECTION_BEFORE_CLOSING''',
+  '''POL_PRICE_002_RANGE_FIRST_EXACT_ON_INSISTENCE''',
+  '''POL_HANDOFF_001_USER_REQUESTS_HUMAN_OR_AI_DETECTED''',
+]
+
+["protocol"]
+"rule_ids" = [
+  '''C_COMPLIANCE_NO_PROMISE_OF_RESULTS''',
+  '''C_MEDICAL_NO_DIAGNOSIS''',
+  '''C_MEDICAL_NO_MED_CHANGE_POSTCARE''',
+  '''POL_SAFETY_001_EMERGENCY_POSTCARE_OUT_OF_HOURS''',
+  '''global_no_false_promises''',
+  '''global_no_legal_advice''',
+  '''global_privacy''',
+  '''global_professional_tone''',
+]
+"rule_names" = [
+  '''emergency_redirect''',
+  '''no_false_promises''',
+  '''no_legal_advice''',
+  '''no_medical_diagnosis''',
+  '''no_medication_prescription''',
+  '''no_treatment_guarantee''',
+  '''privacy_compliance''',
+  '''professional_tone''',
+]
+
+["global_policy"]
+"name" = '''NeuroStack Global Safety Policy'''
+"description" = '''Política de segurança global aplicada a todos os tenants'''
+"policy_type" = '''global'''
+"priority" = 1000
+"is_active" = true
+
+["constraints"]
+"must_not_say" = [
+  '''fornecer diagnósticos médicos''',
+  '''prescrever ou recomendar medicamentos''',
+  '''garantir resultados de tratamentos''',
+  '''dar aconselhamento jurídico''',
+  '''fazer promessas sobre resultados específicos''',
+  '''compartilhar informações de outros pacientes''',
+  '''criticar outros profissionais de saúde''',
+  '''sugerir alteração de dosagem ou troca de medicamento''',
+  '''minimizar sintomas pós-atendimento relatados pelo paciente''',
+  '''inventar serviços que a clínica não oferece''',
+]
+"must_include" = []
+"tone_guidelines" = [
+  '''Manter tom profissional e acolhedor''',
+  '''Ser empático mas objetivo''',
+  '''Usar linguagem clara e acessível''',
+  '''Evitar jargões médicos desnecessários''',
+  '''Fazer apenas UMA pergunta por mensagem — nunca duas''',
+  '''Apresentar-se com nome e clínica no primeiro contato''',
+]
+"safety_reminders" = [
+  '''Em caso de emergência, oriente a ligar para SAMU (192)''',
+  '''Para diagnósticos, sempre recomendar consulta presencial''',
+  '''Medicamentos só podem ser prescritos por médicos''',
+  '''Sintomas pós-atendimento preocupantes: escalar IMEDIATAMENTE para equipe médica''',
+  '''Pedidos de alteração de medicação: encaminhar para médico prescritor, NUNCA orientar''',
+]
+"custom_instructions" = [
+  '''C_SEQUENCE_AUTHORITY_BEFORE_PRICE: Preço só após geração de autoridade (authority_done==true).''',
+  '''C_OBJECTION_NO_PASSIVE_CLOSE: Não encerrar passivamente se houver objeção ativa. Fazer pergunta de esclarecimento.''',
+  '''C_ONE_QUESTION_PER_MESSAGE: Fazer apenas UMA pergunta por mensagem. Aguardar resposta antes de prosseguir.''',
+  '''C_QUALIFY_BEFORE_SCHEDULE: Perguntar sobre experiência prévia antes de agendar (Novidade/Decepção/Continuidade).''',
+  '''C_MEDICAL_REDIRECT: Qualquer dúvida sobre condição médica (gravidez, diabetes, alergia, etc.) → 'O profissional avaliará na consulta.'''',
+  '''C_OUT_OF_SCOPE_CHECK: Antes de responder sobre um serviço, verificar se está no Clinic Config. Se não: informar que não oferece.''',
+]
+
+["imperative_literals"]
+"policy.global_rules" = {}
+
+["imperative_literals"."policy.models"]
+"PolicyConstraints.to_prompt_constraints" = [
+  '''NÃO ''',
+]
+
+[["rules"]]
+"rule_id" = '''C_MEDICAL_NO_DIAGNOSIS'''
+"rule" = '''no_medical_diagnosis'''
+"message" = '''Não posso fornecer diagnósticos médicos. Para uma avaliação adequada, por favor consulte um profissional de saúde.'''
+"description" = '''Proíbe o agente de fornecer diagnósticos médicos'''
+"category" = '''safety_clinical'''
+"severity" = '''critical'''
+"action" = '''block'''
+"patterns" = [
+  '''qual meu diagnóstico''',
+  '''qual é meu diagnóstico''',
+  '''qual o meu diagnóstico''',
+  '''me diga o que eu tenho''',
+  '''o que eu tenho''',
+  '''que doença eu tenho''',
+  '''diagnóstico para mim''',
+  '''diagnosticar''',
+]
+"keywords" = [
+  '''diagnóstico''',
+  '''diagnosticar''',
+  '''que doença''',
+  '''o que eu tenho''',
+]
+"enabled" = true
+"metadata" = {}
+
+[["rules"]]
+"rule_id" = '''C_MEDICAL_NO_MED_CHANGE_POSTCARE'''
+"rule" = '''no_medication_prescription'''
+"message" = '''Não posso recomendar ou prescrever medicamentos. Apenas um médico pode fazer prescrições após avaliação adequada.'''
+"description" = '''Proíbe o agente de recomendar ou prescrever medicamentos'''
+"category" = '''safety_clinical'''
+"severity" = '''critical'''
+"action" = '''block'''
+"patterns" = [
+  '''que remédio tomar''',
+  '''que remédio devo''',
+  '''qual remédio devo''',
+  '''qual medicamento tomar''',
+  '''me receita''',
+  '''prescreve para mim''',
+  '''indica um remédio''',
+  '''posso tomar''',
+  '''devo tomar qual''',
+  '''remédio devo tomar''',
+]
+"keywords" = [
+  '''prescrição''',
+  '''prescrever''',
+  '''receitar''',
+  '''medicar''',
+]
+"enabled" = true
+"metadata" = {}
+
+[["rules"]]
+"rule_id" = '''C_COMPLIANCE_NO_PROMISE_OF_RESULTS'''
+"rule" = '''no_treatment_guarantee'''
+"message" = '''Não posso garantir resultados de tratamentos. Os resultados podem variar conforme cada paciente.'''
+"description" = '''Proíbe promessas de resultados de tratamentos'''
+"category" = '''safety_legal'''
+"severity" = '''error'''
+"action" = '''warn'''
+"patterns" = [
+  '''garante que vai curar''',
+  '''certeza que vai funcionar''',
+  '''100% de sucesso''',
+  '''cura garantida''',
+  '''resultado garantido''',
+  '''vai resolver com certeza''',
+]
+"keywords" = [
+  '''garante cura''',
+  '''garantia de resultado''',
+  '''certeza de cura''',
+]
+"enabled" = true
+"metadata" = {}
+
+[["rules"]]
+"rule_id" = '''global_no_legal_advice'''
+"rule" = '''no_legal_advice'''
+"message" = '''Não posso fornecer aconselhamento jurídico. Para questões legais, consulte um advogado.'''
+"description" = '''Proíbe o agente de fornecer aconselhamento jurídico'''
+"category" = '''safety_legal'''
+"severity" = '''error'''
+"action" = '''warn'''
+"patterns" = [
+  '''posso processar''',
+  '''entrar com processo''',
+  '''devo processar''',
+  '''tem direito a indenização''',
+  '''vou processar vocês''',
+]
+"keywords" = [
+  '''processo judicial''',
+  '''advogado''',
+  '''indenização''',
+  '''jurídico''',
+]
+"enabled" = true
+"metadata" = {}
+
+[["rules"]]
+"rule_id" = '''global_no_false_promises'''
+"rule" = '''no_false_promises'''
+"message" = '''Não posso fazer promessas sobre resultados específicos. Cada caso é avaliado individualmente.'''
+"description" = '''Proíbe promessas falsas ou garantias irreais'''
+"category" = '''safety_ethical'''
+"severity" = '''warning'''
+"action" = '''warn'''
+"patterns" = [
+  '''prometo que''',
+  '''garanto que''',
+  '''com certeza vai''',
+  '''100% garantido''',
+]
+"keywords" = []
+"enabled" = true
+"metadata" = {}
+
+[["rules"]]
+"rule_id" = '''global_privacy'''
+"rule" = '''privacy_compliance'''
+"message" = '''Suas informações são tratadas com confidencialidade de acordo com a LGPD e normas de sigilo médico.'''
+"description" = '''Reforça compliance com privacidade e LGPD'''
+"category" = '''compliance'''
+"severity" = '''info'''
+"action" = '''log'''
+"patterns" = [
+  '''dados pessoais''',
+  '''privacidade''',
+  '''sigilo''',
+  '''lgpd''',
+]
+"keywords" = [
+  '''meus dados''',
+  '''informações pessoais''',
+]
+"enabled" = true
+"metadata" = {}
+
+[["rules"]]
+"rule_id" = '''global_professional_tone'''
+"rule" = '''professional_tone'''
+"message" = '''Manter tom profissional e acolhedor em todas as interações'''
+"description" = '''Define o tom de comunicação do agente'''
+"category" = '''tone'''
+"severity" = '''info'''
+"action" = '''log'''
+"patterns" = []
+"keywords" = []
+"enabled" = true
+"metadata" = {}
+
+[["rules"]]
+"rule_id" = '''POL_SAFETY_001_EMERGENCY_POSTCARE_OUT_OF_HOURS'''
+"rule" = '''emergency_redirect'''
+"message" = '''Em caso de emergência médica, ligue imediatamente para o SAMU (192) ou dirija-se ao pronto-socorro mais próximo.'''
+"description" = '''Redireciona emergências para serviços apropriados'''
+"category" = '''safety_clinical'''
+"severity" = '''critical'''
+"action" = '''handoff'''
+"patterns" = [
+  '''emergência''',
+  '''urgência''',
+  '''passando mal''',
+  '''não consigo respirar''',
+  '''dor muito forte''',
+  '''sangramento intenso''',
+  '''perdi a consciência''',
+]
+"keywords" = [
+  '''samu''',
+  '''ambulância''',
+  '''pronto-socorro''',
+  '''emergência médica''',
+]
+"enabled" = true
+"metadata" = {}

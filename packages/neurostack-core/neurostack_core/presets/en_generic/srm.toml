@@ -1,0 +1,1367 @@
+# Compact English proof-only preset for neurostack-core.
+# Content is deliberately generic so no clinic-domain terms leak into the engine.
+"schema_version" = 1
+"safety_guards" = [
+  '''\b(severe|intense)\s+(pain|ache)\b''',
+  '''\bbleeding\b.*\b(won'?t stop|keeps going)\b''',
+  '''\b(fever)\b.*\b(after|post)\b''',
+  '''\b(pus|discharge)\b''',
+  '''\b(can'?t|cannot)\s+(breathe|swallow|open)\b''',
+  '''\b(getting|much)\s+worse\b''',
+]
+
+["protocol"]
+"intent_categories" = [
+  '''scheduling''',
+  '''question''',
+  '''complaint''',
+  '''greeting''',
+  '''farewell''',
+  '''confirmation''',
+  '''cancellation''',
+  '''information''',
+  '''feedback''',
+  '''emergency''',
+  '''unknown''',
+]
+"funnel_stages" = [
+  '''lead_novo''',
+  '''em_qualificacao''',
+  '''qualificado''',
+  '''followup''',
+  '''agendamento_solicitado''',
+  '''agendado''',
+  '''paciente_ativo''',
+  '''pos_atendimento''',
+  '''fidelizacao''',
+  '''inativo''',
+  '''standby''',
+]
+"safety_categories" = [
+  '''clinical_risk''',
+  '''legal_risk''',
+  '''conduct_risk''',
+  '''none''',
+]
+"sentiment_labels" = [
+  '''positive''',
+  '''neutral''',
+  '''negative''',
+]
+"flow_modes" = [
+  '''normal''',
+  '''rag''',
+  '''safety''',
+  '''handoff''',
+]
+"handoff_reasons" = [
+  '''user_request''',
+  '''safety_concern''',
+  '''max_turns_exceeded''',
+  '''low_confidence''',
+  '''complex_query''',
+  '''escalation''',
+  '''scheduling''',
+]
+"official_intents" = [
+  '''agendar''',
+  '''cancelar''',
+  '''cobranca_renegociacao''',
+  '''comparacao_tratamentos''',
+  '''conduta_inadequada_ameaca''',
+  '''confirmar_presenca''',
+  '''cultura_historia''',
+  '''detalhes_servicos''',
+  '''disponibilidade_horarios''',
+  '''documentos_e_comprovantes''',
+  '''duvida_generica_sem_contexto''',
+  '''faq''',
+  '''fora_do_escopo''',
+  '''fora_do_horario''',
+  '''informacoes_profissionais''',
+  '''interesse_tratamento''',
+  '''objecao_vou_pensar''',
+  '''orcamento_existente''',
+  '''paciente_ativo''',
+  '''pedido_alterar_medicacao''',
+  '''pedido_atendente_humano''',
+  '''pedido_preco''',
+  '''pos_atendimento_duvida''',
+  '''pos_atendimento_sintomas_preocupantes''',
+  '''pre_atendimento''',
+  '''qualificacao_publico''',
+  '''reagendar''',
+  '''reclamacao''',
+  '''saudacao''',
+]
+"actions" = [
+  '''ativar_modo_safety_e_handoff''',
+  '''ativar_protocolo_conduta_inadequada''',
+  '''clarify''',
+  '''coletar_preferencias_agendamento''',
+  '''consultar_rag_e_se_faltar_handoff''',
+  '''consultar_rag_responder''',
+  '''continuar_fluxo_srm''',
+  '''definir_funnel_stage''',
+  '''enfileirar_handoff_fora_do_horario''',
+  '''handoff_administrativo''',
+  '''handoff_agendamento''',
+  '''handoff_clinico''',
+  '''handoff_financeiro''',
+  '''handoff_gerencia''',
+  '''handoff_urgencia''',
+  '''iniciar_fluxo_qualificacao_srm''',
+  '''pergunta_unica_para_destravar''',
+  '''perguntar_nome''',
+  '''perguntar_se_ja_e_paciente''',
+  '''processar_cancelamento''',
+  '''processar_confirmacao_presenca''',
+  '''processar_reagendamento''',
+  '''respond''',
+  '''rotear_para_agente_agendamento''',
+  '''solicitar_decisao_agendamento''',
+]
+"engine_regex_keys" = [
+  '''atendimento_tipo''',
+  '''scheduling_has_time''',
+]
+
+["intents"]
+
+["intents"."saudacao"]
+"category" = '''greeting'''
+"patterns" = [
+  '''^\s*(hello|hi+|hey+|howdy)\b''',
+  '''\bgood\s+(morning|afternoon|evening)\b''',
+]
+"keywords" = [
+  '''hello''',
+  '''hi''',
+  '''hey''',
+  '''good morning''',
+  '''good evening''',
+]
+"weight" = 0.95
+
+["intents"."interesse_tratamento"]
+"category" = '''information'''
+"patterns" = [
+  '''\b(i'?m|i am)\s+interested\s+in\b''',
+  '''\btell\s+me\s+about\b''',
+  '''\b(looking\s+for|want\s+to\s+learn)\b''',
+]
+"keywords" = [
+  '''interested in''',
+  '''tell me about''',
+  '''learn more''',
+]
+"weight" = 1.0
+
+["intents"."pedido_preco"]
+"category" = '''question'''
+"patterns" = [
+  '''\bhow\s+much\b''',
+  '''\b(price|cost|fee|pricing|quote)\b''',
+  '''\bpayment\s+options?\b''',
+]
+"keywords" = [
+  '''price''',
+  '''cost''',
+  '''fee''',
+  '''pricing''',
+  '''quote''',
+]
+"weight" = 1.0
+
+["intents"."comparacao_tratamentos"]
+"category" = '''question'''
+"patterns" = [
+  '''\bdifference\s+between\b''',
+  '''\b(versus|vs\.?)\b''',
+  '''\bwhich\s+(is|one)\s+better\b''',
+]
+"keywords" = [
+  '''difference between''',
+  '''versus''',
+  '''which is better''',
+]
+"weight" = 0.9
+
+["intents"."objecao_vou_pensar"]
+"category" = '''confirmation'''
+"patterns" = [
+  '''\bi'?ll\s+think\b''',
+  '''\blet\s+me\s+think\b''',
+  '''\bmaybe\s+later\b''',
+  '''\btoo\s+expensive\b''',
+]
+"keywords" = [
+  '''think about it''',
+  '''maybe later''',
+  '''too expensive''',
+]
+"weight" = 1.0
+
+["intents"."duvida_generica_sem_contexto"]
+"category" = '''question'''
+"patterns" = [
+  '''^\s*(what|how|when|where|why|who)\s*\??\s*$''',
+]
+"keywords" = []
+"weight" = 0.3
+
+["intents"."agendar"]
+"category" = '''scheduling'''
+"patterns" = [
+  '''\b(i\s+want|i'?d\s+like|please)\b.*\b(book|schedule|make|set\s+up)\b''',
+  '''\b(book|schedule|reserve)\b.*\b(appointment|slot|meeting|visit)\b''',
+  '''\bmake\s+an\s+appointment\b''',
+  '''\b(any|a)\s+(slot|opening)\b''',
+]
+"keywords" = [
+  '''schedule''',
+  '''book''',
+  '''appointment''',
+  '''slot''',
+  '''reserve''',
+]
+"weight" = 1.0
+
+["intents"."reagendar"]
+"category" = '''scheduling'''
+"patterns" = [
+  '''\breschedule\b''',
+  '''\b(change|move)\s+(my\s+)?(appointment|slot)\b''',
+]
+"keywords" = [
+  '''reschedule''',
+  '''change appointment''',
+  '''move appointment''',
+]
+"weight" = 0.9
+
+["intents"."cancelar"]
+"category" = '''cancellation'''
+"patterns" = [
+  '''\bcancel\b.*\b(appointment|booking)?\b''',
+  '''\bi\s+(can'?t|cannot)\s+(make\s+it|attend|come)\b''',
+]
+"keywords" = [
+  '''cancel''',
+  '''can't make it''',
+]
+"weight" = 1.0
+
+["intents"."confirmar_presenca"]
+"category" = '''confirmation'''
+"patterns" = [
+  '''^\s*(yes|yeah|yep|ok|okay|sure|confirmed|confirm)\s*[!.]?\s*$''',
+  '''\bi'?ll\s+be\s+there\b''',
+]
+"keywords" = [
+  '''yes''',
+  '''confirm''',
+  '''i'll be there''',
+]
+"weight" = 0.9
+
+["intents"."disponibilidade_horarios"]
+"category" = '''question'''
+"patterns" = [
+  '''\b(business|opening|operating)\s+hours\b''',
+  '''\bwhen\s+are\s+you\s+open\b''',
+  '''\bwhat\s+times?\s+(are\s+)?available\b''',
+]
+"keywords" = [
+  '''business hours''',
+  '''opening hours''',
+  '''when are you open''',
+]
+"weight" = 1.0
+
+["intents"."detalhes_servicos"]
+"category" = '''question'''
+"patterns" = [
+  '''\bwhat\s+services\b''',
+  '''\bwhat\s+do\s+you\s+offer\b''',
+  '''\b(address|location|where\s+are\s+you)\b''',
+  '''\bparking\b''',
+]
+"keywords" = [
+  '''what services''',
+  '''what do you offer''',
+  '''address''',
+  '''location''',
+  '''parking''',
+]
+"weight" = 1.0
+
+["intents"."pre_atendimento"]
+"category" = '''question'''
+"patterns" = [
+  '''\bbefore\s+(the|my)\s+(appointment|visit)\b''',
+  '''\b(preparation|prep|what\s+to\s+bring)\b''',
+]
+"keywords" = [
+  '''before the appointment''',
+  '''preparation''',
+  '''what to bring''',
+]
+"weight" = 0.85
+
+["intents"."faq"]
+"category" = '''question'''
+"patterns" = [
+  '''\bfrequently\s+asked\b''',
+  '''\bcommon\s+questions?\b''',
+]
+"keywords" = [
+  '''frequently asked''',
+  '''common questions''',
+]
+"weight" = 0.8
+
+["intents"."cultura_historia"]
+"category" = '''information'''
+"patterns" = [
+  '''\babout\s+(the\s+)?(clinic|company|team)\b''',
+  '''\bhow\s+long\s+have\s+you\b''',
+]
+"keywords" = [
+  '''about the clinic''',
+  '''about the team''',
+  '''how long have you''',
+]
+"weight" = 0.7
+
+["intents"."qualificacao_publico"]
+"category" = '''question'''
+"patterns" = [
+  '''\bis\s+this\s+for\s+me\b''',
+  '''\bam\s+i\s+a\s+(candidate|good\s+fit)\b''',
+]
+"keywords" = [
+  '''is this for me''',
+  '''good fit''',
+]
+"weight" = 0.7
+
+["intents"."informacoes_profissionais"]
+"category" = '''question'''
+"patterns" = [
+  '''\bwho\s+will\s+(treat|see|help)\s+me\b''',
+  '''\b(your|the)\s+(staff|team|professionals)\b''',
+  '''\b(do\s+you\s+have|is\s+there)\s+a\s+specialist\b''',
+]
+"keywords" = [
+  '''staff''',
+  '''team''',
+  '''professional''',
+  '''specialist''',
+]
+"weight" = 1.1
+
+["intents"."pos_atendimento_duvida"]
+"category" = '''information'''
+"patterns" = [
+  '''\bafter\s+(the|my)\s+(appointment|visit|treatment)\b''',
+  '''\bpost(?:-|\s)?(treatment|visit)\b''',
+  '''\baftercare\b''',
+]
+"keywords" = [
+  '''after the appointment''',
+  '''post treatment''',
+  '''aftercare''',
+]
+"weight" = 1.0
+
+["intents"."pos_atendimento_sintomas_preocupantes"]
+"category" = '''emergency'''
+"patterns" = [
+  '''\b(severe|bad|terrible)\s+pain\b''',
+  '''\b(bleeding|swelling|fever)\b''',
+  '''\ballergic\s+reaction\b''',
+  '''\bemergency\b''',
+  '''\bgetting\s+worse\b''',
+]
+"keywords" = [
+  '''severe pain''',
+  '''bleeding''',
+  '''fever''',
+  '''allergic reaction''',
+  '''emergency''',
+]
+"weight" = 1.0
+
+["intents"."pedido_alterar_medicacao"]
+"category" = '''emergency'''
+"patterns" = [
+  '''\b(change|alter|adjust|stop)\b.*\b(medication|prescription|meds|dose)\b''',
+  '''\b(lower|higher)\s+(dose|dosage)\b''',
+]
+"keywords" = [
+  '''change medication''',
+  '''adjust meds''',
+  '''stop taking''',
+]
+"weight" = 1.1
+
+["intents"."reclamacao"]
+"category" = '''complaint'''
+"patterns" = [
+  '''\bcomplaint\b''',
+  '''\b(not\s+satisfied|unhappy|disappointed)\b''',
+  '''\b(bad|terrible)\s+(service|experience)\b''',
+  '''\b(refund|money\s+back)\b''',
+]
+"keywords" = [
+  '''complaint''',
+  '''not satisfied''',
+  '''disappointed''',
+  '''refund''',
+]
+"weight" = 1.0
+
+["intents"."conduta_inadequada_ameaca"]
+"category" = '''complaint'''
+"patterns" = [
+  '''\b(sue|lawsuit|lawyer|attorney)\b''',
+  '''\bi'?ll\s+(sue|report)\b''',
+  '''\bthis\s+is\s+(unacceptable|outrageous)\b''',
+  '''\b(threat|threaten)\b''',
+]
+"keywords" = [
+  '''sue''',
+  '''lawyer''',
+  '''unacceptable''',
+  '''threat''',
+]
+"weight" = 1.0
+
+["intents"."documentos_e_comprovantes"]
+"category" = '''information'''
+"patterns" = [
+  '''\b(receipt|invoice|document|certificate)\b''',
+  '''\bproof\s+of\s+(visit|payment|attendance)\b''',
+]
+"keywords" = [
+  '''receipt''',
+  '''invoice''',
+  '''certificate''',
+]
+"weight" = 1.1
+
+["intents"."orcamento_existente"]
+"category" = '''question'''
+"patterns" = [
+  '''\bi\s+(have|got)\s+a\s+(quote|estimate|budget)\b''',
+  '''\bprevious\s+(quote|estimate)\b''',
+]
+"keywords" = [
+  '''i have a quote''',
+  '''previous quote''',
+]
+"weight" = 0.9
+
+["intents"."cobranca_renegociacao"]
+"category" = '''question'''
+"patterns" = [
+  '''\b(billing|payment)\s+(issue|problem|question)\b''',
+  '''\brenegotiate\b.*\b(payment|bill)\b''',
+  '''\bdispute\s+(the\s+)?(charge|bill)\b''',
+]
+"keywords" = [
+  '''billing''',
+  '''renegotiate''',
+  '''dispute charge''',
+]
+"weight" = 0.9
+
+["intents"."pedido_atendente_humano"]
+"category" = '''information'''
+"patterns" = [
+  '''\b(talk|speak|chat)\s+(to|with)\s+(a\s+)?(human|person|agent|real\s+person)\b''',
+  '''\btransfer\s+me\b.*\b(human|person|agent)\b''',
+  '''\b(not|don'?t\s+want)\b.*\b(bot|robot|ai)\b''',
+]
+"keywords" = [
+  '''human''',
+  '''real person''',
+  '''agent''',
+  '''not a bot''',
+]
+"weight" = 1.0
+
+["intents"."paciente_ativo"]
+"category" = '''information'''
+"patterns" = [
+  '''\bi'?m\s+(a|an)\s+(patient|client|customer)\b''',
+  '''\bi\s+(already|regularly)\s+(use|visit|come)\b''',
+  '''\breturning\s+(patient|client)\b''',
+]
+"keywords" = [
+  '''i'm a patient''',
+  '''returning patient''',
+  '''already a client''',
+]
+"weight" = 0.9
+
+["intents"."fora_do_escopo"]
+"category" = '''question'''
+"patterns" = [
+  '''\b(unrelated|off\s+topic|different\s+topic)\b''',
+  '''\b(do\s+you|does\s+the\s+clinic)\s+(sell|offer)\s+(veterinary|pet|animal)\b''',
+]
+"keywords" = [
+  '''unrelated''',
+  '''off topic''',
+  '''veterinary''',
+]
+"weight" = 1.1
+
+["intents"."fora_do_horario"]
+"category" = '''question'''
+"patterns" = [
+  '''\bafter\s+hours\b''',
+  '''\bare\s+you\s+closed\b''',
+  '''\bwhat\s+time\s+do\s+you\s+(open|close)\b''',
+]
+"keywords" = [
+  '''after hours''',
+  '''closed''',
+  '''what time do you open''',
+]
+"weight" = 1.1
+
+["intents_en"]
+
+["intents_en"."saudacao"]
+"patterns" = [
+  '''^(hello|hi+|hey+|howdy)\b[!.,?]*\s*$''',
+  '''\bgood\s+(morning|afternoon|evening|night)\b''',
+]
+"keywords" = [
+  '''hello''',
+  '''hi''',
+  '''hey''',
+  '''good morning''',
+  '''good evening''',
+]
+
+["intents_en"."interesse_tratamento"]
+"patterns" = [
+  '''\b(i'?m|i am)\s+interested\s+in\b''',
+  '''\btell me more about\b''',
+]
+"keywords" = [
+  '''interested in''',
+  '''tell me about''',
+]
+
+["intents_en"."pedido_preco"]
+"patterns" = [
+  '''\bhow much\b''',
+  '''\b(price|cost|fee|rate|quote)\b''',
+]
+"keywords" = [
+  '''price''',
+  '''cost''',
+  '''fee''',
+  '''quote''',
+]
+
+["intents_en"."comparacao_tratamentos"]
+"patterns" = [
+  '''\bdifference between\b''',
+  '''\bwhich (is|one is) better\b''',
+]
+"keywords" = [
+  '''difference between''',
+  '''which is better''',
+]
+
+["intents_en"."objecao_vou_pensar"]
+"patterns" = [
+  '''\bi'?ll think\b''',
+  '''\bmaybe later\b''',
+  '''\btoo expensive\b''',
+]
+"keywords" = [
+  '''think about it''',
+  '''maybe later''',
+  '''too expensive''',
+]
+
+["intents_en"."duvida_generica_sem_contexto"]
+"patterns" = [
+  '''^(what|how|when|where|why|who)\s*[?]?\s*$''',
+]
+"keywords" = []
+
+["intents_en"."agendar"]
+"patterns" = [
+  '''\b(book|schedule|reserve)\b.*\b(appointment|slot|visit|meeting|session)\b''',
+  '''\bmake an appointment\b''',
+  '''\bi want to book\b''',
+]
+"keywords" = [
+  '''schedule''',
+  '''book''',
+  '''appointment''',
+]
+
+["intents_en"."reagendar"]
+"patterns" = [
+  '''\breschedule\b''',
+  '''\b(change|move)\b.*\bappointment\b''',
+]
+"keywords" = [
+  '''reschedule''',
+  '''change appointment''',
+]
+
+["intents_en"."cancelar"]
+"patterns" = [
+  '''\bcancel\b.*\b(appointment|booking)?\b''',
+  '''\b(can'?t|cannot)\s+make\s+it\b''',
+]
+"keywords" = [
+  '''cancel''',
+  '''can't make it''',
+]
+
+["intents_en"."confirmar_presenca"]
+"patterns" = [
+  '''^(yes|yeah|yep|ok|okay|sure|confirmed)\b[!.]?\s*$''',
+  '''\bi'?ll be there\b''',
+]
+"keywords" = [
+  '''yes''',
+  '''confirm''',
+]
+
+["intents_en"."disponibilidade_horarios"]
+"patterns" = [
+  '''\bbusiness hours\b''',
+  '''\bwhen are you open\b''',
+]
+"keywords" = [
+  '''business hours''',
+  '''when are you open''',
+]
+
+["intents_en"."detalhes_servicos"]
+"patterns" = [
+  '''\bwhat services\b''',
+  '''\b(address|location)\b''',
+  '''\bparking\b''',
+]
+"keywords" = [
+  '''what services''',
+  '''address''',
+  '''parking''',
+]
+
+["intents_en"."pre_atendimento"]
+"patterns" = [
+  '''\bbefore (the|my) (appointment|visit)\b''',
+  '''\b(preparation|what to bring)\b''',
+]
+"keywords" = [
+  '''preparation''',
+  '''what to bring''',
+]
+
+["intents_en"."faq"]
+"patterns" = [
+  '''\bfrequently asked\b''',
+  '''\bcommon questions?\b''',
+]
+"keywords" = [
+  '''frequently asked''',
+  '''common questions''',
+]
+
+["intents_en"."cultura_historia"]
+"patterns" = [
+  '''\babout the (clinic|company|team)\b''',
+  '''\bhow long have you\b''',
+]
+"keywords" = [
+  '''about the clinic''',
+  '''how long have you''',
+]
+
+["intents_en"."qualificacao_publico"]
+"patterns" = [
+  '''\bis this for me\b''',
+  '''\bam i a (candidate|good fit)\b''',
+]
+"keywords" = [
+  '''is this for me''',
+  '''candidate''',
+]
+
+["intents_en"."informacoes_profissionais"]
+"patterns" = [
+  '''\bwho will (treat|see|help) me\b''',
+  '''\b(staff|team|professionals|specialist)\b''',
+]
+"keywords" = [
+  '''staff''',
+  '''team''',
+  '''specialist''',
+]
+
+["intents_en"."pos_atendimento_duvida"]
+"patterns" = [
+  '''\bafter the (procedure|appointment|visit)\b''',
+  '''\baftercare\b''',
+]
+"keywords" = [
+  '''aftercare''',
+  '''after the appointment''',
+]
+
+["intents_en"."pos_atendimento_sintomas_preocupantes"]
+"patterns" = [
+  '''\b(severe|bad|terrible) pain\b''',
+  '''\b(bleeding|swelling|fever)\b''',
+  '''\bemergency\b''',
+  '''\bgetting worse\b''',
+]
+"keywords" = [
+  '''severe pain''',
+  '''bleeding''',
+  '''emergency''',
+]
+
+["intents_en"."pedido_alterar_medicacao"]
+"patterns" = [
+  '''\b(change|alter|adjust|stop)\b.*\b(medication|prescription|meds|dose)\b''',
+  '''\b(lower|higher) (dose|dosage)\b''',
+]
+"keywords" = [
+  '''change medication''',
+  '''dose''',
+]
+
+["intents_en"."reclamacao"]
+"patterns" = [
+  '''\bcomplaint\b''',
+  '''\b(terrible|awful|bad)\s+(service|experience)\b''',
+  '''\brefund\b''',
+]
+"keywords" = [
+  '''complaint''',
+  '''refund''',
+  '''bad service''',
+]
+
+["intents_en"."conduta_inadequada_ameaca"]
+"patterns" = [
+  '''\b(sue|lawsuit|lawyer)\b''',
+  '''\bi'?ll (sue|report)\b''',
+  '''\bthis is unacceptable\b''',
+]
+"keywords" = [
+  '''sue''',
+  '''lawyer''',
+  '''unacceptable''',
+]
+
+["intents_en"."documentos_e_comprovantes"]
+"patterns" = [
+  '''\b(receipt|invoice|document|certificate)\b''',
+  '''\bproof of\b''',
+]
+"keywords" = [
+  '''receipt''',
+  '''certificate''',
+]
+
+["intents_en"."orcamento_existente"]
+"patterns" = [
+  '''\bi (have|got) a (quote|estimate|budget)\b''',
+  '''\bprevious (quote|estimate)\b''',
+]
+"keywords" = [
+  '''i have a quote''',
+  '''previous quote''',
+]
+
+["intents_en"."cobranca_renegociacao"]
+"patterns" = [
+  '''\b(billing|payment) (issue|problem)\b''',
+  '''\bdispute (the )?(charge|bill)\b''',
+]
+"keywords" = [
+  '''billing''',
+  '''dispute charge''',
+]
+
+["intents_en"."pedido_atendente_humano"]
+"patterns" = [
+  '''\b(talk|speak|chat) (to|with) (a )?(human|person|agent)\b''',
+  '''\btransfer me\b.*\b(human|person|agent)\b''',
+]
+"keywords" = [
+  '''human''',
+  '''real person''',
+  '''agent''',
+]
+
+["intents_en"."paciente_ativo"]
+"patterns" = [
+  '''\bi'?m (a|an) (patient|client|customer)\b''',
+  '''\breturning (patient|client)\b''',
+]
+"keywords" = [
+  '''returning patient''',
+  '''i'm a patient''',
+]
+
+["intents_en"."fora_do_escopo"]
+"patterns" = [
+  '''\b(unrelated|off topic|different topic)\b''',
+]
+"keywords" = [
+  '''unrelated''',
+  '''off topic''',
+]
+
+["intents_en"."fora_do_horario"]
+"patterns" = [
+  '''\bafter hours\b''',
+  '''\bare you (open|closed)\b''',
+]
+"keywords" = [
+  '''after hours''',
+  '''closed''',
+]
+
+["funnel"]
+"stages" = [
+  '''lead_novo''',
+  '''em_qualificacao''',
+  '''qualificado''',
+  '''followup''',
+  '''agendamento_solicitado''',
+  '''agendado''',
+  '''paciente_ativo''',
+  '''pos_atendimento''',
+  '''fidelizacao''',
+  '''inativo''',
+  '''standby''',
+]
+
+["funnel"."metadata"]
+
+["funnel"."metadata"."lead_novo"]
+"description" = '''First contact; check whether the user is already a client.'''
+"next_stages" = [
+  '''em_qualificacao''',
+  '''paciente_ativo''',
+]
+"entry_conditions" = [
+  '''first_contact''',
+  '''new_session''',
+  '''saudacao''',
+]
+
+["funnel"."metadata"."em_qualificacao"]
+"description" = '''Sales flow in progress; collect name and interest.'''
+"next_stages" = [
+  '''qualificado''',
+  '''lead_novo''',
+]
+"entry_conditions" = [
+  '''interesse_tratamento''',
+  '''pedido_preco''',
+  '''name_collected''',
+]
+
+["funnel"."metadata"."qualificado"]
+"description" = '''Qualification complete; ready for scheduling decision.'''
+"next_stages" = [
+  '''followup''',
+  '''agendamento_solicitado''',
+]
+"entry_conditions" = [
+  '''qualification_complete''',
+]
+
+["funnel"."metadata"."followup"]
+"description" = '''Re-engagement after qualification; resume intent.'''
+"next_stages" = [
+  '''agendamento_solicitado''',
+  '''qualificado''',
+]
+"entry_conditions" = [
+  '''temporal_trigger''',
+  '''active_objection''',
+]
+
+["funnel"."metadata"."agendamento_solicitado"]
+"description" = '''User provided scheduling preferences (day/time).'''
+"next_stages" = [
+  '''agendado''',
+  '''qualificado''',
+]
+"entry_conditions" = [
+  '''agendar''',
+  '''preferences_informed''',
+]
+
+["funnel"."metadata"."agendado"]
+"description" = '''User confirmed scheduling.'''
+"next_stages" = [
+  '''pos_atendimento''',
+  '''agendamento_solicitado''',
+]
+"entry_conditions" = [
+  '''confirmar_presenca''',
+  '''scheduling_finalised''',
+]
+
+["funnel"."metadata"."paciente_ativo"]
+"description" = '''User is already an active client.'''
+"next_stages" = [
+  '''em_qualificacao''',
+  '''pos_atendimento''',
+]
+"entry_conditions" = [
+  '''already_patient''',
+  '''declared_client''',
+]
+
+["funnel"."metadata"."pos_atendimento"]
+"description" = '''Follow-up after an in-person visit.'''
+"next_stages" = [
+  '''fidelizacao''',
+  '''paciente_ativo''',
+]
+"entry_conditions" = [
+  '''pos_atendimento_duvida''',
+  '''post_visit_symptoms''',
+]
+
+["funnel"."metadata"."fidelizacao"]
+"description" = '''Loyalty trigger (for example 30 days after a visit).'''
+"next_stages" = [
+  '''agendamento_solicitado''',
+  '''paciente_ativo''',
+]
+"entry_conditions" = [
+  '''temporal_trigger''',
+]
+
+["funnel"."metadata"."inativo"]
+"description" = '''No interaction for a long time.'''
+"next_stages" = [
+  '''lead_novo''',
+  '''em_qualificacao''',
+]
+"entry_conditions" = [
+  '''inactivity_days''',
+]
+
+["funnel"."metadata"."standby"]
+"description" = '''Automation off; 100 percent human service.'''
+"next_stages" = []
+"entry_conditions" = [
+  '''handoff_activated''',
+]
+
+["funnel"."turn_thresholds"]
+"lead_novo" = 3
+"em_qualificacao" = 8
+"qualificado" = 5
+"followup" = 5
+"agendamento_solicitado" = 5
+"agendado" = 10
+"paciente_ativo" = 10
+"pos_atendimento" = 10
+"fidelizacao" = 5
+"inativo" = 0
+"standby" = 0
+
+[["funnel"."transitions"]]
+"from" = '''lead_novo'''
+"intent" = '''saudacao'''
+"to" = '''lead_novo'''
+
+[["funnel"."transitions"]]
+"from" = '''lead_novo'''
+"intent" = '''interesse_tratamento'''
+"to" = '''em_qualificacao'''
+
+[["funnel"."transitions"]]
+"from" = '''lead_novo'''
+"intent" = '''pedido_preco'''
+"to" = '''em_qualificacao'''
+
+[["funnel"."transitions"]]
+"from" = '''lead_novo'''
+"intent" = '''agendar'''
+"to" = '''em_qualificacao'''
+
+[["funnel"."transitions"]]
+"from" = '''lead_novo'''
+"intent" = '''duvida_generica_sem_contexto'''
+"to" = '''lead_novo'''
+
+[["funnel"."transitions"]]
+"from" = '''lead_novo'''
+"intent" = '''paciente_ativo'''
+"to" = '''paciente_ativo'''
+
+[["funnel"."transitions"]]
+"from" = '''em_qualificacao'''
+"intent" = '''agendar'''
+"to" = '''agendamento_solicitado'''
+
+[["funnel"."transitions"]]
+"from" = '''qualificado'''
+"intent" = '''agendar'''
+"to" = '''agendamento_solicitado'''
+
+[["funnel"."transitions"]]
+"from" = '''qualificado'''
+"intent" = '''objecao_vou_pensar'''
+"to" = '''qualificado'''
+
+[["funnel"."transitions"]]
+"from" = '''followup'''
+"intent" = '''agendar'''
+"to" = '''agendamento_solicitado'''
+
+[["funnel"."transitions"]]
+"from" = '''agendamento_solicitado'''
+"intent" = '''confirmar_presenca'''
+"to" = '''agendado'''
+
+[["funnel"."transitions"]]
+"from" = '''agendamento_solicitado'''
+"intent" = '''reagendar'''
+"to" = '''agendamento_solicitado'''
+
+[["funnel"."transitions"]]
+"from" = '''agendamento_solicitado'''
+"intent" = '''cancelar'''
+"to" = '''qualificado'''
+
+[["funnel"."transitions"]]
+"from" = '''agendado'''
+"intent" = '''reagendar'''
+"to" = '''agendamento_solicitado'''
+
+[["funnel"."transitions"]]
+"from" = '''agendado'''
+"intent" = '''pos_atendimento_duvida'''
+"to" = '''pos_atendimento'''
+
+[["funnel"."transitions"]]
+"from" = '''agendado'''
+"intent" = '''pos_atendimento_sintomas_preocupantes'''
+"to" = '''pos_atendimento'''
+
+[["funnel"."transitions"]]
+"from" = '''paciente_ativo'''
+"intent" = '''interesse_tratamento'''
+"to" = '''em_qualificacao'''
+
+[["funnel"."transitions"]]
+"from" = '''pos_atendimento'''
+"intent" = '''pos_atendimento_duvida'''
+"to" = '''pos_atendimento'''
+
+[["funnel"."transitions"]]
+"from" = '''pos_atendimento'''
+"intent" = '''pos_atendimento_sintomas_preocupantes'''
+"to" = '''pos_atendimento'''
+
+[["funnel"."transitions"]]
+"from" = '''inativo'''
+"intent" = '''saudacao'''
+"to" = '''lead_novo'''
+
+["safety_patterns"]
+
+["safety_patterns"."clinical_risk"]
+"description" = '''Medical or clinical safety concerns.'''
+"patterns" = [
+  '''\b(heart\s+attack|stroke|seizure|fainting)\b''',
+  '''\bcan'?t\s+breathe\b''',
+  '''\bchest\s+pain\b''',
+  '''\bsuicid(e|al)\b''',
+  '''\boverdose\b''',
+  '''\b(hemorrhage|severe\s+bleeding)\b''',
+]
+"keywords" = [
+  '''emergency room''',
+  '''ambulance''',
+  '''cannot breathe''',
+  '''help me''',
+]
+"action" = '''escalate'''
+"urgency" = '''critical'''
+
+["safety_patterns"."legal_risk"]
+"description" = '''Legal or liability concerns.'''
+"patterns" = [
+  '''\bwhat\s+is\s+my\s+diagnosis\b''',
+  '''\btell\s+me\s+what\s+i\s+have\b''',
+  '''\bwhich\s+(medication|medicine)\s+(should\s+i|to)\s+take\b''',
+  '''\b(guarantee|promise)\s+(a\s+)?(cure|result)\b''',
+]
+"keywords" = [
+  '''diagnosis''',
+  '''prescription''',
+  '''guarantee of result''',
+]
+"action" = '''warn'''
+"urgency" = '''high'''
+
+["safety_patterns"."conduct_risk"]
+"description" = '''Behavioural or conduct concerns.'''
+"patterns" = [
+  '''\b(harassment|abuse|violence)\b''',
+  '''\bi'?ll\s+(kill|hurt)\s+(you|them)\b''',
+  '''\b(threat|threaten)\b''',
+  '''\b(idiot|moron|scumbag)\b''',
+  '''\b(scam|fraud|forge)\b''',
+]
+"keywords" = [
+  '''threat''',
+  '''harassment''',
+  '''abuse''',
+  '''fraud''',
+]
+"action" = '''block'''
+"urgency" = '''high'''
+
+["rag"]
+"intent_categories" = [
+  '''question''',
+  '''information''',
+]
+"confidence_threshold" = 0.7
+
+["rag"."patterns"]
+"services" = [
+  '''\bwhat\s+(services|offerings)\b''',
+  '''\bwhat\s+do\s+you\s+(offer|provide)\b''',
+]
+"professionals" = [
+  '''\bwho\s+will\s+(treat|see|help)\s+me\b''',
+  '''\b(staff|team|specialist|professional)\b''',
+]
+"location" = [
+  '''\bwhere\s+(are\s+you|is\s+the\s+clinic)\b''',
+  '''\b(address|directions|parking)\b''',
+]
+"hours" = [
+  '''\b(business|opening|operating)\s+hours\b''',
+  '''\bwhen\s+are\s+you\s+open\b''',
+]
+"pricing" = [
+  '''\bhow\s+much\b''',
+  '''\b(price|cost|fee|rate|pricing)\b''',
+]
+"insurance" = [
+  '''\b(insurance|coverage|plan)\b''',
+  '''\bdo\s+you\s+accept\b.*\binsurance\b''',
+]
+"preparation" = [
+  '''\bbefore\s+(the|my)\s+(appointment|visit)\b''',
+  '''\b(preparation|what\s+to\s+bring|fasting)\b''',
+]
+"policies" = [
+  '''\b(policy|rule|guideline)\b.*\b(cancellation|reschedule|no.?show)\b''',
+  '''\bcancellation\s+(policy|fee)\b''',
+]
+"faq" = [
+  '''\bfrequently\s+asked\b''',
+  '''^(what|how|when|where|why|which)\b''',
+]
+
+["handoff"]
+"explicit_patterns" = [
+  '''\b(talk|speak|chat)\s+(to|with)\s+(a\s+)?(human|person|agent|real\s+person)\b''',
+  '''\btransfer\s+me\b.*\b(human|person|agent)\b''',
+  '''\b(not|don'?t\s+want)\b.*\b(bot|robot|ai)\b''',
+  '''^(agent|human|person)$''',
+  '''\bforward\s+(me\s+)?to\s+(the\s+)?(team|agent)\b''',
+]
+"escalation_keywords" = [
+  '''manager''',
+  '''supervisor''',
+  '''complaint''',
+  '''ombudsman''',
+  '''lawsuit''',
+  '''attorney''',
+]
+"max_turns" = 10
+"min_confidence" = 0.5
+
+["handoff"."regexes"]
+"scheduling_has_time" = '''\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today)\b|\b\d{1,2}\s*(am|pm|h)\b|\b\d{1,2}:\d{2}\b|\bat\s+\d{1,2}\b|\b(morning|afternoon|evening|tonight)\b|\b(next\s+week|this\s+week)\b'''
+"strong_positive" = '''\b(yes|yeah|yep|yup|sure|confirm|confirmed|accept|accepted|forward|please\s+do)\b'''
+"weak_positive" = '''^(ok|okay|go\s+ahead|sounds\s+good|alright|right|exact|exactly|fine|please)[\s!.,]*$'''
+"short_affirmative" = '''\b(perfect|great|awesome)\b'''
+"negative" = '''\b(no|nope|never|negative|not\s+now|not\s+yet|cancel|cancelled|back)\b'''
+"scheduling_completed" = '''\b(done|booked|scheduled|reserved|finished|completed|all\s+set|worked|ready)\b'''
+
+["engine"]
+"confidence_threshold" = 0.7
+"safety_threshold" = 0.5
+"max_turns_for_handoff" = 10
+
+["engine"."regexes"]
+"scheduling_has_time" = '''\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today)\b|\b\d{1,2}\s*(am|pm|h)\b|\b\d{1,2}:\d{2}\b|\bat\s+\d{1,2}\b|\b(morning|afternoon|evening|tonight)\b|\b(next\s+week|this\s+week)\b'''
+"atendimento_tipo" = '''\b(private|insurance)\b'''
+
+["engine"."intent_actions"]
+"saudacao" = '''pergunta_unica_para_destravar'''
+"interesse_tratamento" = '''iniciar_fluxo_qualificacao_srm'''
+"pedido_preco" = '''iniciar_fluxo_qualificacao_srm'''
+"comparacao_tratamentos" = '''continuar_fluxo_srm'''
+"objecao_vou_pensar" = '''continuar_fluxo_srm'''
+"duvida_generica_sem_contexto" = '''continuar_fluxo_srm'''
+"agendar" = '''coletar_preferencias_agendamento'''
+"reagendar" = '''processar_reagendamento'''
+"cancelar" = '''processar_cancelamento'''
+"confirmar_presenca" = '''processar_confirmacao_presenca'''
+"disponibilidade_horarios" = '''consultar_rag_responder'''
+"detalhes_servicos" = '''consultar_rag_responder'''
+"pre_atendimento" = '''consultar_rag_responder'''
+"faq" = '''consultar_rag_responder'''
+"cultura_historia" = '''consultar_rag_responder'''
+"qualificacao_publico" = '''consultar_rag_responder'''
+"informacoes_profissionais" = '''consultar_rag_responder'''
+"documentos_e_comprovantes" = '''handoff_administrativo'''
+"orcamento_existente" = '''handoff_administrativo'''
+"cobranca_renegociacao" = '''handoff_financeiro'''
+"pos_atendimento_duvida" = '''consultar_rag_e_se_faltar_handoff'''
+"pos_atendimento_sintomas_preocupantes" = '''ativar_modo_safety_e_handoff'''
+"pedido_alterar_medicacao" = '''ativar_modo_safety_e_handoff'''
+"reclamacao" = '''handoff_gerencia'''
+"conduta_inadequada_ameaca" = '''ativar_protocolo_conduta_inadequada'''
+
+["engine"."category_actions"]
+"greeting" = '''pergunta_unica_para_destravar'''
+"farewell" = '''continuar_fluxo_srm'''
+"scheduling" = '''coletar_preferencias_agendamento'''
+"cancellation" = '''processar_cancelamento'''
+"confirmation" = '''processar_confirmacao_presenca'''
+"question" = '''consultar_rag_responder'''
+"complaint" = '''handoff_gerencia'''
+"information" = '''continuar_fluxo_srm'''
+"feedback" = '''continuar_fluxo_srm'''
+"emergency" = '''ativar_modo_safety_e_handoff'''
+"unknown" = '''clarify'''
+
+["imperative_literals"]
+"srm.intent_classifier" = {}
+"srm.funnel_detector" = {}
+"srm.models" = {}
+
+["imperative_literals"."srm.safety_detector"]
+"SafetyDetector.get_recommended_response" = [
+  '''We detected a situation that may require urgent medical attention. Please seek immediate medical care or dial your local emergency number.''',
+  '''I cannot provide medical diagnoses, prescriptions, or guarantees of results. For these questions please consult a qualified health professional.''',
+  '''This type of content is not appropriate here. Please keep the conversation respectful.''',
+]
+
+["imperative_literals"."srm.rag_decider"]
+"RagDecider._generate_query" = [
+  '''services and offerings''',
+  '''team and specialists''',
+  '''location and address''',
+  '''opening hours''',
+  '''pricing and fees''',
+  '''insurance coverage''',
+  '''appointment preparation''',
+  '''policies and rules''',
+]
+
+["imperative_literals"."srm.handoff_decider"]
+"HandoffDecider.__init__" = [
+  '''supervisor''',
+]
+"HandoffDecider.decide" = [
+  '''management''',
+  '''Concerning post-visit symptoms; escalate as urgent''',
+  '''urgent_care''',
+  '''Inappropriate conduct or threat; forward to management''',
+  '''management''',
+  '''Medication change request; forward to the clinical or urgent team''',
+  '''clinical''',
+  '''Scheduling link sent; waiting for the patient to confirm completion''',
+  '''scheduling''',
+  '''Patient confirmed forwarding to the scheduling team''',
+  '''scheduling''',
+]
+"HandoffDecider._check_safety_handoff" = [
+  '''urgent_care''',
+  '''management''',
+]
+"HandoffDecider._check_escalation_keywords" = [
+  '''management''',
+]
+
+["imperative_literals"."srm.handoff_decider"."HandoffDecider.output_values"]
+"administrative" = '''administrative'''
+"immediate" = '''immediate'''
+"priority" = '''priority'''
+"routine" = '''routine'''
+"verification_completed" = '''completed'''
+"verification_not_completed" = '''not_completed'''
+
+["imperative_literals"."srm.engine"]
+"SRMEngine.process" = [
+  '''management''',
+  '''clinical''',
+  '''escalation_notice: The patient expressed dissatisfaction. Prioritise empathy and forward to a human attendant immediately.''',
+]
+"SRMEngine._extract_slots" = [
+  '''private''',
+  '''private''',
+  '''insurance''',
+  '''atendimento_tipo''',
+  '''atendimento_tipo''',
+]
+
+["imperative_literals"."srm.engine"."SRMEngine.output_values"]
+"high" = '''high'''
+"priority" = '''priority'''
+"verification_completed" = '''completed'''
+"verification_not_completed" = '''not_completed'''
+
+["imperative_literals"."srm.engine"."SRMEngine._get_action_details"]
+"perguntar_se_ja_e_paciente" = '''Ask whether the user is already a client'''
+"perguntar_nome" = '''Ask for the user name'''
+"pergunta_unica_para_destravar" = '''Ask the single question that unblocks the next step'''
+"iniciar_fluxo_qualificacao_srm" = '''Start the SRM qualification flow'''
+"continuar_fluxo_srm" = '''Continue the SRM flow'''
+"solicitar_decisao_agendamento" = '''Request a scheduling decision'''
+"definir_funnel_stage" = '''Set the funnel stage'''
+"coletar_preferencias_agendamento" = '''Collect scheduling preferences'''
+"rotear_para_agente_agendamento" = '''Route to the scheduling agent'''
+"handoff_agendamento" = '''Hand off to the scheduling team'''
+"processar_cancelamento" = '''Process the cancellation and hand off'''
+"processar_reagendamento" = '''Process the reschedule and hand off'''
+"processar_confirmacao_presenca" = '''Process the attendance confirmation'''
+"consultar_rag_responder" = '''Consult RAG and respond'''
+"consultar_rag_e_se_faltar_handoff" = '''Consult RAG; hand off if context is missing'''
+"handoff_financeiro" = '''Billing handoff'''
+"handoff_administrativo" = '''Administrative handoff'''
+"handoff_gerencia" = '''Management handoff'''
+"handoff_clinico" = '''Clinical handoff'''
+"handoff_urgencia" = '''Urgent handoff'''
+"ativar_modo_safety_e_handoff" = '''Activate safety mode and hand off'''
+"ativar_protocolo_conduta_inadequada" = '''Activate the inappropriate conduct protocol'''
+"enfileirar_handoff_fora_do_horario" = '''Queue an out-of-hours handoff'''
+"respond" = '''Respond to the user'''
+"clarify" = '''Clarify the user intent'''

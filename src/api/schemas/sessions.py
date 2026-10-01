@@ -4,31 +4,13 @@ Contracts for session management endpoints (/v1/sessions).
 """
 
 from datetime import datetime
-from enum import Enum
 from typing import Any, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from neurostack_core.protocol import FunnelStage as FunnelStage
 from src.core.interaction_context import InteractionOrigin
-
-
-class FunnelStage(str, Enum):
-    """
-    Funil canônico de 11 etapas (MVP v0.5).
-    """
-
-    LEAD_NOVO = "lead_novo"
-    EM_QUALIFICACAO = "em_qualificacao"
-    QUALIFICADO = "qualificado"
-    FOLLOWUP = "followup"
-    AGENDAMENTO_SOLICITADO = "agendamento_solicitado"
-    AGENDADO = "agendado"
-    PACIENTE_ATIVO = "paciente_ativo"
-    POS_ATENDIMENTO = "pos_atendimento"
-    FIDELIZACAO = "fidelizacao"
-    INATIVO = "inativo"
-    STANDBY = "standby"
 
 
 class CognitiveState(BaseModel):

@@ -2,6 +2,8 @@
 
 ## Raw
 
+- [Ativação e organização do catálogo de APIs — guarda-chuva](brainstorms/api-provider-activation-catalog/DRAFT.md) - Decomposto em catálogo, STT, fallback Dropout e OpenAI TTS; não vira um único wish.
+
 ## Simmering
 
 ## Ready
@@ -10,8 +12,12 @@
 
 ## Poured
 
+- [Retomada contextual da IA após handoff](wishes/handoff-contextual-resumption/WISH.md) - APPROVED; WRS 100/100, design e plano revisados em SHIP; execução aguarda `neurostack-core-dedomainification`.
+- [Catálogo, ordem e disponibilidade pública das APIs](wishes/api-provider-catalog-presentation/WISH.md) - APPROVED; design e plano revisados em SHIP; `work` bloqueado até `stt-openrouter-scribe-activation`, `dropout-multimodal-fallback` e `tts-openai-provider` satisfazerem o gate pré-execução.
+- [SLA de atendimento confirmado no handoff](wishes/handoff-sla-first-human-response/WISH.md) - IN_PROGRESS; dependência `handoff-export-open-closed` mergeada em `origin/main` (`bfa18f8`), iniciando o Grupo 1 sobre worktree isolado.
 - [Extração do núcleo NeuroStack](wishes/neurostack-core-extraction/WISH.md) - IN_PROGRESS; execução e gate final SHIP concluídos, aguardando commit/PR/CI e merge autorizado; `neurostack-api` depende de `neurostack-core`, e o pacote de núcleo nunca importa a árvore `src` da API.
-- [Desdomainificação do núcleo NeuroStack](wishes/neurostack-core-dedomainification/WISH.md) - BLOCKED; depende da conclusão de `neurostack-core-extraction`.
+- [Limite de recursos empacotados do núcleo NeuroStack](wishes/neurostack-core-resource-boundary/WISH.md) - IN_PROGRESS; execução concluída com QA, qualidade e final gate em SHIP; pronto para a etapa separada de review.
+- [Desdomainificação do núcleo NeuroStack](wishes/neurostack-core-dedomainification/WISH.md) - IN_PROGRESS; Grupo 1 BLOCKED até a conclusão de `neurostack-core-extraction` e `neurostack-core-resource-boundary`.
 - [Auditoria humana sobre RLHF](wishes/rlhf-auditoria-humana/WISH.md) - APPROVED; oito grupos, nota sai de `events` numa troca atômica, canal herdado do trace, parecer humano append-only e saída do Roadmap.
 - [Disponibilidade honesta de provedores](wishes/api-provider-availability/WISH.md) - SHIPPED; PR #22 mergeada e QA pós-merge verde com 19 pares `coming_soon`, selo laranja PT/EN e PATCH fail-closed.
 - [Reparo do baseline backend](wishes/backend-test-baseline-repair/WISH.md) - SHIPPED; PR #22 mergeada, QA pós-merge e gate backend agregado verdes.

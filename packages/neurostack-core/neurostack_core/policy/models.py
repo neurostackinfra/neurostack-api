@@ -5,10 +5,20 @@ Pydantic models for policy evaluation and management.
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Mapping, Optional, cast
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
+
+from neurostack_core.presets import get_preset
+
+_POLICY_IMPERATIVE_LITERALS = cast(
+    Mapping[str, Mapping[str, tuple[str, ...]]],
+    get_preset().policy["imperative_literals"],
+)
+_CONSTRAINT_PREFIXES = _POLICY_IMPERATIVE_LITERALS["policy.models"][
+    "PolicyConstraints.to_prompt_constraints"
+]
 
 
 class PolicyType(str, Enum):
@@ -207,7 +217,7 @@ class PolicyConstraints(BaseModel):
         constraints = []
 
         for item in self.must_not_say:
-            constraints.append(f"NÃO {item}")
+            constraints.append(f"{_CONSTRAINT_PREFIXES[0]}{item}")
 
         for item in self.must_include:
             constraints.append(f"SEMPRE {item}")

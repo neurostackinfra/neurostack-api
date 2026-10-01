@@ -1,0 +1,197 @@
+# Generated from pre-rewrite source containers by scripts/preset-parity.py.
+"schema_version" = 1
+
+["protocol"]
+"handoff_response_keys" = [
+  '''complex_query''',
+  '''connected''',
+  '''default''',
+  '''escalation''',
+  '''explicit_request''',
+  '''low_confidence''',
+  '''max_turns_exceeded''',
+  '''safety_concern''',
+  '''scheduling''',
+  '''waiting''',
+]
+"safety_response_keys" = [
+  '''clinical_risk''',
+  '''conduct_risk''',
+  '''default''',
+  '''emergency''',
+  '''legal_risk''',
+]
+
+["handoff_responses"]
+"explicit_request" = '''Claro! Vou encaminhar você para nossa equipe agora. Em breve alguém dará continuidade ao seu atendimento.'''
+"safety_concern" = '''Para garantir o melhor cuidado para você, vou encaminhar para nossa equipe especializada. Um profissional entrará em contato em breve.'''
+"max_turns_exceeded" = '''Para te ajudar ainda melhor, vou encaminhar para o setor da nossa equipe que poderá dar continuidade ao seu atendimento.'''
+"low_confidence" = '''Para garantir que você receba a orientação mais completa, vou encaminhar para nossa equipe especializada.'''
+"complex_query" = '''Essa questão merece uma atenção mais detalhada. Vou encaminhar para a nossa equipe especializada.'''
+"escalation" = '''Entendo a sua situação. Vou encaminhar para o setor responsável da nossa equipe, que poderá ajudá-lo da melhor forma.'''
+"scheduling" = '''Vou te encaminhar para a nossa equipe, que dará seguimento e verificará os melhores horários disponíveis para você.'''
+"default" = '''Vou encaminhar você para nossa equipe, que dará continuidade ao seu atendimento. Por favor, aguarde um momento.'''
+"waiting" = '''Você está na fila de atendimento. Nossa equipe estará disponível em breve. Tempo estimado: {wait_time} minutos.'''
+"connected" = '''Você está conectado com {agent_name}. Como posso ajudá-lo?'''
+
+["safety_responses"]
+"clinical_risk" = '''Percebo que você pode estar passando por uma situação difícil. Por favor, procure ajuda profissional imediata. CVV: 188 (24h) | SAMU: 192 | Emergência: 190'''
+"legal_risk" = '''Não posso fornecer orientação médica, diagnósticos ou prescrições. Por favor, consulte um profissional de saúde qualificado.'''
+"conduct_risk" = '''Vamos manter uma conversa respeitosa. Estou aqui para ajudar da melhor forma possível.'''
+"emergency" = '''EMERGÊNCIA DETECTADA. Por favor, ligue imediatamente para: SAMU 192 | Bombeiros 193 | Polícia 190'''
+"default" = '''Entendo sua preocupação. Para sua segurança, recomendo buscar orientação profissional adequada.'''
+
+["state_machine"]
+"flow_modes" = [
+  '''normal''',
+  '''rag''',
+  '''safety''',
+  '''handoff''',
+]
+"transition_triggers" = [
+  '''safety_concern_detected''',
+  '''safety_resolved''',
+  '''handoff_requested''',
+  '''handoff_completed''',
+  '''handoff_cancelled''',
+  '''rag_required''',
+  '''rag_completed''',
+  '''continue_normal''',
+  '''reset_to_normal''',
+  '''session_timeout''',
+  '''session_end''',
+]
+
+["state_machine"."mode_priority"]
+"normal" = 0
+"rag" = 1
+"safety" = 3
+"handoff" = 2
+
+[["state_machine"."transitions"]]
+"from" = '''normal'''
+"trigger" = '''rag_required'''
+"to" = '''rag'''
+
+[["state_machine"."transitions"]]
+"from" = '''normal'''
+"trigger" = '''safety_concern_detected'''
+"to" = '''safety'''
+
+[["state_machine"."transitions"]]
+"from" = '''normal'''
+"trigger" = '''handoff_requested'''
+"to" = '''handoff'''
+
+[["state_machine"."transitions"]]
+"from" = '''normal'''
+"trigger" = '''continue_normal'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''rag'''
+"trigger" = '''rag_completed'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''rag'''
+"trigger" = '''safety_concern_detected'''
+"to" = '''safety'''
+
+[["state_machine"."transitions"]]
+"from" = '''rag'''
+"trigger" = '''handoff_requested'''
+"to" = '''handoff'''
+
+[["state_machine"."transitions"]]
+"from" = '''rag'''
+"trigger" = '''reset_to_normal'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''safety'''
+"trigger" = '''safety_resolved'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''safety'''
+"trigger" = '''handoff_requested'''
+"to" = '''handoff'''
+
+[["state_machine"."transitions"]]
+"from" = '''safety'''
+"trigger" = '''reset_to_normal'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''handoff'''
+"trigger" = '''handoff_completed'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''handoff'''
+"trigger" = '''handoff_cancelled'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''handoff'''
+"trigger" = '''safety_concern_detected'''
+"to" = '''safety'''
+
+[["state_machine"."transitions"]]
+"from" = '''normal'''
+"trigger" = '''session_end'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''rag'''
+"trigger" = '''session_end'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''safety'''
+"trigger" = '''session_end'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''handoff'''
+"trigger" = '''session_end'''
+"to" = '''normal'''
+
+["thresholds"]
+"safety_escalation" = 2
+"rag_max_turns" = 3
+
+["imperative_literals"]
+
+["imperative_literals"."flow.handlers.handoff"]
+"HandoffModeHandler.get_mode_prompt_additions" = [
+  '''O usuário será encaminhado para nossa equipe especializada.''',
+  '''Mantenha o usuário informado sobre o status.''',
+  '''Colete informações relevantes para facilitar o atendimento.''',
+  '''Seja empático com a espera.''',
+]
+
+["imperative_literals"."flow.handlers.safety"]
+"SafetyModeHandler.get_mode_prompt_additions" = [
+  '''MODO SEGURANÇA ATIVO.''',
+  '''Priorize a segurança do usuário acima de tudo.''',
+  '''Não forneça informações que possam causar dano.''',
+  '''Direcione para recursos de ajuda profissional.''',
+  '''Mantenha tom calmo e acolhedor.''',
+]
+
+["imperative_literals"."flow.handlers.normal"]
+"NormalModeHandler.get_mode_prompt_additions" = [
+  '''Responda de forma natural e útil.''',
+  '''Mantenha o contexto da conversa.''',
+  '''Seja profissional e empático.''',
+]
+
+["imperative_literals"."flow.handlers.rag"]
+"RagModeHandler.get_mode_prompt_additions" = [
+  '''Use as informações do contexto de conhecimento para responder.''',
+  '''Cite fontes quando relevante.''',
+  '''Se não encontrar a informação, informe ao usuário.''',
+  '''Mantenha as respostas factuais e precisas.''',
+]

@@ -3,163 +3,23 @@ NeuroStack - SRM (Small Reasoning Module) - Models
 Data models for SRM decision engine.
 """
 
-from enum import Enum
 from typing import Any, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-# ============================================
-# Enums
-# ============================================
+from neurostack_core.protocol import OFFICIAL_INTENT_SEQUENCE
+from neurostack_core.protocol import ActionType as ActionType
+from neurostack_core.protocol import FlowMode as FlowMode
+from neurostack_core.protocol import FunnelStage as FunnelStage
+from neurostack_core.protocol import HandoffReason as HandoffReason
+from neurostack_core.protocol import IntentCategory as IntentCategory
+from neurostack_core.protocol import SafetyCategory as SafetyCategory
+from neurostack_core.protocol import SentimentLabel as SentimentLabel
 
-
-class IntentCategory(str, Enum):
-    """High-level intent categories for classification."""
-
-    SCHEDULING = "scheduling"
-    QUESTION = "question"
-    COMPLAINT = "complaint"
-    GREETING = "greeting"
-    FAREWELL = "farewell"
-    CONFIRMATION = "confirmation"
-    CANCELLATION = "cancellation"
-    INFORMATION = "information"
-    FEEDBACK = "feedback"
-    EMERGENCY = "emergency"
-    UNKNOWN = "unknown"
-
-
-class FunnelStage(str, Enum):
-    """
-    Funil canônico de 11 etapas (MVP v0.5).
-    Identificadores usados em eventos, state store, traces e integrações CRM.
-    """
-
-    LEAD_NOVO = "lead_novo"
-    EM_QUALIFICACAO = "em_qualificacao"
-    QUALIFICADO = "qualificado"
-    FOLLOWUP = "followup"
-    AGENDAMENTO_SOLICITADO = "agendamento_solicitado"
-    AGENDADO = "agendado"
-    PACIENTE_ATIVO = "paciente_ativo"
-    POS_ATENDIMENTO = "pos_atendimento"
-    FIDELIZACAO = "fidelizacao"
-    INATIVO = "inativo"
-    STANDBY = "standby"
-
-
-class SafetyCategory(str, Enum):
-    """Safety concern categories."""
-
-    CLINICAL_RISK = "clinical_risk"
-    LEGAL_RISK = "legal_risk"
-    CONDUCT_RISK = "conduct_risk"
-    NONE = "none"
-
-
-class SentimentLabel(str, Enum):
-    """Sentiment labels for user messages."""
-
-    POSITIVE = "positive"
-    NEUTRAL = "neutral"
-    NEGATIVE = "negative"
-
-
-class FlowMode(str, Enum):
-    """Flow modes for conversation state."""
-
-    NORMAL = "normal"
-    RAG = "rag"
-    SAFETY = "safety"
-    HANDOFF = "handoff"
-
-
-class HandoffReason(str, Enum):
-    """Reasons for human handoff."""
-
-    USER_REQUEST = "user_request"
-    SAFETY_CONCERN = "safety_concern"
-    MAX_TURNS_EXCEEDED = "max_turns_exceeded"
-    LOW_CONFIDENCE = "low_confidence"
-    COMPLEX_QUERY = "complex_query"
-    ESCALATION = "escalation"
-    SCHEDULING = "scheduling"
-
-
-# 23 intenções canônicas (CTX/SRM Intents v0.1) - documentação MVP v0.5
-OFFICIAL_INTENTS = [
-    "saudacao",
-    "interesse_tratamento",
-    "pedido_preco",
-    "comparacao_tratamentos",
-    "objecao_vou_pensar",
-    "duvida_generica_sem_contexto",
-    "agendar",
-    "reagendar",
-    "cancelar",
-    "confirmar_presenca",
-    "disponibilidade_horarios",
-    "detalhes_servicos",
-    "pre_atendimento",
-    "faq",
-    "cultura_historia",
-    "qualificacao_publico",
-    "informacoes_profissionais",
-    "documentos_e_comprovantes",
-    "orcamento_existente",
-    "cobranca_renegociacao",
-    "pos_atendimento_duvida",
-    "pos_atendimento_sintomas_preocupantes",
-    "pedido_alterar_medicacao",
-    "reclamacao",
-    "conduta_inadequada_ameaca",
-    "pedido_atendente_humano",
-    "paciente_ativo",
-    "fora_do_escopo",
-    "fora_do_horario",
-]
-
-
-class ActionType(str, Enum):
-    """
-    Catálogo de ações oficiais (CTX Action Catalog v0.1).
-    Substitui ações genéricas pelas ações da documentação.
-    """
-
-    # Coleta e clarificação
-    PERGUNTAR_SE_JA_E_PACIENTE = "perguntar_se_ja_e_paciente"
-    PERGUNTAR_NOME = "perguntar_nome"
-    PERGUNTA_UNICA_PARA_DESTRAVAR = "pergunta_unica_para_destravar"
-    # Roteamento SRM e funil
-    INICIAR_FLUXO_QUALIFICACAO_SRM = "iniciar_fluxo_qualificacao_srm"
-    CONTINUAR_FLUXO_SRM = "continuar_fluxo_srm"
-    SOLICITAR_DECISAO_AGENDAMENTO = "solicitar_decisao_agendamento"
-    DEFINIR_FUNNEL_STAGE = "definir_funnel_stage"
-    # Agendamento
-    COLETAR_PREFERENCIAS_AGENDAMENTO = "coletar_preferencias_agendamento"
-    ROTEAR_PARA_AGENTE_AGENDAMENTO = "rotear_para_agente_agendamento"
-    HANDOFF_AGENDAMENTO = "handoff_agendamento"
-    PROCESSAR_CANCELAMENTO = "processar_cancelamento"
-    PROCESSAR_REAGENDAMENTO = "processar_reagendamento"
-    PROCESSAR_CONFIRMACAO_PRESENCA = "processar_confirmacao_presenca"
-    # RAG
-    CONSULTAR_RAG_RESPONDER = "consultar_rag_responder"
-    CONSULTAR_RAG_E_SE_FALTAR_HANDOFF = "consultar_rag_e_se_faltar_handoff"
-    # Handoff por setor
-    HANDOFF_FINANCEIRO = "handoff_financeiro"
-    HANDOFF_ADMINISTRATIVO = "handoff_administrativo"
-    HANDOFF_GERENCIA = "handoff_gerencia"
-    HANDOFF_CLINICO = "handoff_clinico"
-    HANDOFF_URGENCIA = "handoff_urgencia"
-    # Segurança e conduta
-    ATIVAR_MODO_SAFETY_E_HANDOFF = "ativar_modo_safety_e_handoff"
-    ATIVAR_PROTOCOLO_CONDUTA_NADEQUADA = "ativar_protocolo_conduta_inadequada"
-    # Fora do horário
-    ENFILEIRAR_HANDOFF_FORA_DO_HORARIO = "enfileirar_handoff_fora_do_horario"
-    # Fallback genérico (compatibilidade)
-    RESPOND = "respond"
-    CLARIFY = "clarify"
+# Mutable-list compatibility for callers of the historic public symbol.  The
+# canonical contract itself is the immutable sequence in protocol.py.
+OFFICIAL_INTENTS = list(OFFICIAL_INTENT_SEQUENCE)
 
 
 # ============================================
