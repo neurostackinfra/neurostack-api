@@ -17,7 +17,7 @@ def violations(path: Path) -> list[str]:
     except (OSError, SyntaxError) as exc:
         return [f"{path}: cannot parse: {exc}"]
     problems: list[str] = []
-    for occurrence in find_forbidden_imports(tree):
+    for occurrence in find_forbidden_imports(tree, allow_packaged_resources=True):
         if occurrence.category == "static-src-import":
             detail = f"static src import {occurrence.spelling!r}"
         else:

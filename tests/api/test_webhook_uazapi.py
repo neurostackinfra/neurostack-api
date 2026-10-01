@@ -29,7 +29,10 @@ import jwt
 import pytest
 from fastapi.testclient import TestClient
 
+from src.api.routes import webhook as webhook_module
 from src.config.settings import settings
+from src.handoff.pause_policy import resolve_handoff_pause
+from tests.handoff.test_pause_policy import RUNTIME_POLICY_BUCKETS
 
 # Synthetic Uazapi webhook payloads (audio + image), derived from capture
 # SHA-256 256b7ffbea39fa09e25041172f2af217424e60470be45c8ef11aabd502fe5f40.
@@ -262,6 +265,209 @@ def _fake_uazapi_send_result(message_id: str | None = None) -> dict:
 def tenant_id() -> UUID:
     """Fresh tenant per test so each ClinicConfigTable row is isolated."""
     return uuid4()
+
+
+@pytest.mark.parametrize("bucket", RUNTIME_POLICY_BUCKETS)
+@pytest.mark.asyncio
+async def test_takeover_matches_shared_policy_with_same_clock(
+    monkeypatch: pytest.MonkeyPatch,
+    bucket: Any,
+    tenant_id: UUID,
+) -> None:
+    now = datetime(2026, 9, 29, 14, 0, tzinfo=timezone.utc)
+    session = SimpleNamespace(
+        id=uuid4(),
+        is_paused=False,
+        paused_until=None,
+    )
+
+    class Repo:
+        def __init__(self, db: Any):
+            pass
+
+        async def find_by_user(self, **kwargs: Any) -> list[Any]:
+            return [session]
+
+    monkeypatch.setattr(webhook_module, "SessionRepository", Repo)
+    monkeypatch.setattr(
+        webhook_module,
+        "_load_handoff_config",
+        AsyncMock(return_value=bucket),
+    )
+    db = SimpleNamespace(flush=AsyncMock())
+
+    result = await webhook_module._handle_clinic_message(
+        tenant_id,
+        "5511999999999",
+        "Atendimento humano em andamento",
+        db,
+        now=now,
+    )
+    expected = resolve_handoff_pause(bucket, now)
+
+    assert session.is_paused is expected.should_pause
+    assert session.paused_until == expected.paused_until
+    if expected.should_pause:
+        assert result["action"] == "human_takeover"
+        db.flush.assert_awaited_once()
+    else:
+        assert result["skipped"] == "handoff_inactive"
+        db.flush.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("offset", "still_paused", "naive_deadline"),
+    [
+        (-timedelta(microseconds=1), True, False),
+        (timedelta(0), False, False),
+        (timedelta(0), False, True),
+        (timedelta(seconds=1), False, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_lazy_unpause_before_at_and_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tenant_id: UUID,
+    offset: timedelta,
+    still_paused: bool,
+    naive_deadline: bool,
+) -> None:
+    deadline = datetime(2026, 9, 29, 15, 0, tzinfo=timezone.utc)
+    stored_deadline = deadline.replace(tzinfo=None) if naive_deadline else deadline
+    session = SimpleNamespace(
+        id=uuid4(),
+        is_paused=True,
+        paused_until=stored_deadline,
+    )
+
+    class Repo:
+        def __init__(self, db: Any):
+            pass
+
+        async def find_by_user(self, **kwargs: Any) -> list[Any]:
+            return [session]
+
+    monkeypatch.setattr(webhook_module, "SessionRepository", Repo)
+    db = SimpleNamespace(flush=AsyncMock())
+
+    result = await webhook_module._check_pause_state(
+        tenant_id,
+        "5511999999999",
+        db,
+        now=deadline + offset,
+    )
+
+    assert session.is_paused is still_paused
+    if still_paused:
+        assert result == {"ok": True, "skipped": "session_paused"}
+        assert session.paused_until == stored_deadline
+        db.flush.assert_not_awaited()
+    else:
+        assert result is None
+        assert session.paused_until is None
+        db.flush.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_malformed_master_cooldown_uses_safe_one_hour_default(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tenant_id: UUID,
+) -> None:
+    now = datetime(2026, 9, 29, 16, 0, tzinfo=timezone.utc)
+    session = SimpleNamespace(id=uuid4(), is_paused=True, paused_until=None)
+
+    class Repo:
+        def __init__(self, db: Any):
+            pass
+
+        async def find_by_user(self, **kwargs: Any) -> list[Any]:
+            return [session]
+
+    monkeypatch.setattr(webhook_module, "SessionRepository", Repo)
+    monkeypatch.setattr(
+        webhook_module,
+        "_load_handoff_config",
+        AsyncMock(
+            return_value={
+                "trigger_message": "mensagem mestra",
+                "reactivation_delay_hours": {"invalid": "raw value"},
+            }
+        ),
+    )
+    db = SimpleNamespace(flush=AsyncMock())
+
+    with caplog.at_level("WARNING", logger="src.api.routes.webhook"):
+        result = await webhook_module._handle_clinic_message(
+            tenant_id,
+            "5511999999999",
+            "Mensagem mestra",
+            db,
+            now=now,
+        )
+
+    assert result["action"] == "trigger_reactivation"
+    assert session.paused_until == now + timedelta(hours=1)
+    record = caplog.records[-1]
+    assert record.field == "reactivation_delay_hours"  # type: ignore[attr-defined]
+    assert record.reason == "invalid_duration"  # type: ignore[attr-defined]
+    assert "raw value" not in record.getMessage()
+
+
+@pytest.mark.parametrize(
+    ("configured_hours", "expected_hours", "expected_reason"),
+    [(3, 3, None), (10**100, 1, "unrepresentable_duration")],
+)
+@pytest.mark.asyncio
+async def test_master_cooldown_handles_valid_and_unrepresentable_integer_hours(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tenant_id: UUID,
+    configured_hours: int,
+    expected_hours: int,
+    expected_reason: str | None,
+) -> None:
+    now = datetime(2026, 9, 29, 17, 0, tzinfo=timezone.utc)
+    session = SimpleNamespace(id=uuid4(), is_paused=True, paused_until=None)
+
+    class Repo:
+        def __init__(self, db: Any):
+            pass
+
+        async def find_by_user(self, **kwargs: Any) -> list[Any]:
+            return [session]
+
+    monkeypatch.setattr(webhook_module, "SessionRepository", Repo)
+    monkeypatch.setattr(
+        webhook_module,
+        "_load_handoff_config",
+        AsyncMock(
+            return_value={
+                "trigger_message": "mensagem mestra",
+                "reactivation_delay_hours": configured_hours,
+            }
+        ),
+    )
+    db = SimpleNamespace(flush=AsyncMock())
+
+    with caplog.at_level("WARNING", logger="src.api.routes.webhook"):
+        result = await webhook_module._handle_clinic_message(
+            tenant_id,
+            "5511999999999",
+            "Mensagem mestra",
+            db,
+            now=now,
+        )
+
+    assert result["action"] == "trigger_reactivation"
+    assert session.paused_until == now + timedelta(hours=expected_hours)
+    if expected_reason is None:
+        assert not caplog.records
+    else:
+        record = caplog.records[-1]
+        assert record.field == "reactivation_delay_hours"  # type: ignore[attr-defined]
+        assert record.reason == expected_reason  # type: ignore[attr-defined]
+        assert str(configured_hours) not in record.getMessage()
 
 
 # ============================================
@@ -1431,19 +1637,12 @@ def _session_metadata(client: TestClient, session_id: UUID) -> dict:
     return client._submit(_run())  # type: ignore[attr-defined]
 
 
-def _seed_handoff_active(
+def _seed_handoff_config(
     client: TestClient,
     tenant_id: UUID,
-    *,
-    active: str = "yes",
+    handoff: dict[str, Any],
 ) -> None:
-    """Save the handoff bucket so ``_load_handoff_config`` returns real data.
-
-    Without an explicit save the row inherits ``{}`` and ``handoff_active``
-    resolves to its default ``"yes"``. The tests that need the default
-    behaviour therefore don't need to call this; the ``handoff_inactive``
-    test does.
-    """
+    """Persist an arbitrary legacy handoff bucket for runtime coverage."""
     from sqlalchemy import update
 
     from src.models.clinic_config_table import ClinicConfigTable
@@ -1455,13 +1654,23 @@ def _seed_handoff_active(
             await db.execute(
                 update(ClinicConfigTable)
                 .where(ClinicConfigTable.tenant_id == tenant_id)
-                .values(handoff={"handoff_active": active})
+                .values(handoff=handoff)
             )
             await db.commit()
         finally:
             await db.close()
 
     client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _seed_handoff_active(
+    client: TestClient,
+    tenant_id: UUID,
+    *,
+    active: str = "yes",
+) -> None:
+    """Save the legacy activation flag used by handoff-inactive coverage."""
+    _seed_handoff_config(client, tenant_id, {"handoff_active": active})
 
 
 class TestUazapiFromMeHumanTakeover:
@@ -1527,6 +1736,67 @@ class TestUazapiFromMeHumanTakeover:
         # Zero pipeline / send touch — takeover never enters the LLM path
         assert mock_get_service.call_count == 0
         assert mock_send.await_count == 0
+
+    def test_public_from_me_endpoint_applies_fallback_with_safe_notices(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+        raw = "RAW-STANDBY-DO-NOT-LOG"
+        _seed_handoff_config(
+            client,
+            tenant_id,
+            {
+                "handoff_active": "yes",
+                "standby_mode": "active",
+                "handoff_period": "cycle",
+                "handoff_cycle_days": raw,
+            },
+        )
+        clinic_number = "5511940589006"
+        patient_number = "5516994420699"
+        patient_session_id = _create_session(client, tenant_id, patient_number)
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone=clinic_number,
+            body="Atendimento humano em andamento",
+            message_id=f"3EB0_fallback_{uuid4().hex[:8]}",
+            from_me=True,
+            sender_pn=f"{clinic_number}@s.whatsapp.net",
+            chat_jid=f"{patient_number}@s.whatsapp.net",
+        )
+        before = datetime.now(timezone.utc)
+
+        with caplog.at_level("WARNING", logger="src.api.routes.webhook"):
+            response = client.post(WEBHOOK_PATH, json=payload)
+        after = datetime.now(timezone.utc)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["action"] == "human_takeover"
+        row = _session_row(client, patient_session_id)
+        paused_until = row["paused_until"]
+        assert paused_until is not None
+        if paused_until.tzinfo is None:
+            paused_until = paused_until.replace(tzinfo=timezone.utc)
+        assert before + timedelta(days=7) <= paused_until <= after + timedelta(days=7)
+
+        notices = [
+            record
+            for record in caplog.records
+            if record.getMessage() == "handoff_pause_policy_tolerated"
+        ]
+        assert {(record.field, record.reason) for record in notices} == {  # type: ignore[attr-defined]
+            ("handoff_cycle_days", "invalid_duration"),
+            ("handoff_cycle", "fallback_seven_days"),
+        }
+        for record in notices:
+            rendered = repr(record.__dict__)
+            assert raw not in rendered
+            assert patient_number not in rendered
 
     def test_from_me_never_creates_session_for_clinic_number(
         self,
@@ -2104,12 +2374,29 @@ def _seed_uazapi_audio_tenant(
         "uazapi_instance_name": instance_name,
     }
     if stt or stt_provider is not None:
+        provider = stt_provider or "outros"
+        fixed_bundle = {
+            "elevenlabs_scribe": (
+                "https://api.elevenlabs.io/v1",
+                "scribe_v2",
+            ),
+            "openrouter": (
+                "https://openrouter.ai/api/v1",
+                "openai/whisper-large-v3-turbo",
+            ),
+        }.get(provider)
         payload.update(
             {
-                "stt_provider": stt_provider or "outros",
+                "stt_provider": provider,
                 "stt_api_key": f"sk-fake-stt-{uuid4().hex}",
-                "stt_api_url": "https://api.groq.com/openai/v1",
-                "stt_model_name": "whisper-large-v3-turbo",
+                "stt_api_url": (
+                    fixed_bundle[0]
+                    if fixed_bundle
+                    else "https://api.groq.com/openai/v1"
+                ),
+                "stt_model_name": (
+                    fixed_bundle[1] if fixed_bundle else "whisper-large-v3-turbo"
+                ),
             }
         )
     if multimodal:
@@ -2302,6 +2589,211 @@ class TestUazapiGroup4PatientAudioTranscription:
         webhook_module._INMEM_INCOMING.clear()
         webhook_module._INMEM_SENT.clear()
         webhook_module._INMEM_STT_NOTICE.clear()
+
+    @pytest.mark.parametrize(
+        ("provider", "api_url", "model_name"),
+        [
+            (
+                "elevenlabs_scribe",
+                "https://api.elevenlabs.io/v1",
+                "scribe_v2",
+            ),
+            (
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "openai/whisper-large-v3-turbo",
+            ),
+        ],
+    )
+    def test_fixed_provider_http_dispatch_feeds_pipeline_with_raw_audio(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        provider: str,
+        api_url: str,
+        model_name: str,
+    ) -> None:
+        """Captured-shape Uazapi audio reaches each fixed adapter, never Groq."""
+        from src.services.event_service import EventService
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(
+            client,
+            tenant_id,
+            instance,
+            stt_provider=provider,
+        )
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_fixed_{uuid4().hex[:10]}",
+        )
+        raw_mime = "audio/ogg; codecs=opus"
+        audio_bytes = b"OggS_uazapi_fixed_provider"
+        transcript = f"transcript from {provider}"
+        fixed_adapter = AsyncMock(return_value=transcript)
+        legacy_adapter = AsyncMock()
+        captured: dict[str, str] = {}
+
+        async def _capture(self, event_request, session=None):
+            captured["content"] = event_request.payload.content
+            return SimpleNamespace(
+                prompt=None,
+                handoff_summary=None,
+                decision=SimpleNamespace(handoff_required=False),
+            )
+
+        with (
+            patch(
+                "src.api.routes.webhook.download_uazapi_media",
+                new=AsyncMock(return_value=(audio_bytes, raw_mime)),
+            ),
+            patch("src.services.stt_service.transcribe_audio", fixed_adapter),
+            patch("src.services.groq_service.transcribe_audio", legacy_adapter),
+            patch.object(EventService, "process_event", _capture),
+        ):
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json().get("action") != "stt_fallback"
+        assert captured == {"content": transcript}
+        fixed_adapter.assert_awaited_once()
+        kwargs = fixed_adapter.await_args.kwargs
+        assert kwargs["provider"] == provider
+        assert kwargs["api_url"] == api_url
+        assert kwargs["api_key"].startswith("sk-fake-stt-")
+        assert kwargs["audio_bytes"] == audio_bytes
+        assert kwargs["mimetype"] == raw_mime
+        assert kwargs["model_name"] == model_name
+        assert kwargs["language"] == "pt"
+        legacy_adapter.assert_not_awaited()
+
+    @pytest.mark.parametrize("provider", ["elevenlabs_scribe", "openrouter"])
+    def test_fixed_provider_operational_error_runs_multimodal_then_reroutes(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        provider: str,
+    ) -> None:
+        """A closed fixed-adapter error preserves STT→multimodal→text order."""
+        from src.api.routes.webhook import _STT_TEMPORARY_FAILURE_MSG_PT
+        from src.services.stt_service import SttTranscriptionError
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(
+            client,
+            tenant_id,
+            instance,
+            stt_provider=provider,
+            multimodal=True,
+        )
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_fixed_fail_{uuid4().hex[:10]}",
+        )
+        fixed_adapter = AsyncMock(
+            side_effect=SttTranscriptionError("stt_provider_http_error")
+        )
+        legacy_adapter = AsyncMock()
+        multimodal = AsyncMock(side_effect=RuntimeError("multimodal unavailable"))
+        send = AsyncMock(return_value=_fake_uazapi_send_result())
+
+        with (
+            patch(
+                "src.api.routes.webhook.download_uazapi_media",
+                new=AsyncMock(
+                    return_value=(b"OggS_uazapi_failed", "audio/ogg; codecs=opus")
+                ),
+            ),
+            patch("src.services.stt_service.transcribe_audio", fixed_adapter),
+            patch("src.services.groq_service.transcribe_audio", legacy_adapter),
+            patch(
+                "src.services.multimodal_service.transcribe_audio_multimodal",
+                multimodal,
+            ),
+            patch("src.api.routes.webhook.send_uazapi_text", send),
+        ):
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "ok": True,
+            "replied": True,
+            "action": "stt_fallback",
+        }
+        assert "stt_provider_http_error" not in response.text
+        assert "multimodal unavailable" not in response.text
+        fixed_adapter.assert_awaited_once()
+        assert fixed_adapter.await_args.kwargs["provider"] == provider
+        assert fixed_adapter.await_args.kwargs["mimetype"] == ("audio/ogg; codecs=opus")
+        legacy_adapter.assert_not_awaited()
+        multimodal.assert_awaited_once()
+        send.assert_awaited_once()
+        assert send.await_args.args[3] == _STT_TEMPORARY_FAILURE_MSG_PT
+
+    @pytest.mark.parametrize(
+        "provider",
+        ["google_stt", "deepgram_stt", "microsoft_stt"],
+    )
+    def test_unsupported_provider_is_zero_effect_before_uazapi_downstream(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        provider: str,
+    ) -> None:
+        """Unsupported STT exits before download, adapters, reply or session."""
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(
+            client,
+            tenant_id,
+            instance,
+            stt_provider=provider,
+            multimodal=True,
+        )
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_unsupported_{uuid4().hex[:10]}",
+        )
+        download = AsyncMock()
+        fixed_adapter = AsyncMock()
+        legacy_adapter = AsyncMock()
+        chain = AsyncMock()
+        send = AsyncMock()
+        reply = AsyncMock()
+        session = AsyncMock()
+        fallback = AsyncMock()
+
+        with (
+            patch("src.api.routes.webhook.download_uazapi_media", download),
+            patch("src.services.stt_service.transcribe_audio", fixed_adapter),
+            patch("src.services.groq_service.transcribe_audio", legacy_adapter),
+            patch("src.api.routes.webhook._transcribe_audio_chain", chain),
+            patch("src.api.routes.webhook.send_uazapi_text", send),
+            patch("src.api.routes.webhook._send_reply_with_optional_tts", reply),
+            patch("src.api.routes.webhook._get_or_create_session", session),
+            patch("src.api.routes.webhook._send_uazapi_stt_fallback", fallback),
+        ):
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "ok": True,
+            "skipped": "stt_provider_unsupported",
+            "provider": provider,
+        }
+        download.assert_not_awaited()
+        fixed_adapter.assert_not_awaited()
+        legacy_adapter.assert_not_awaited()
+        chain.assert_not_awaited()
+        send.assert_not_awaited()
+        reply.assert_not_awaited()
+        session.assert_not_awaited()
+        fallback.assert_not_awaited()
 
     def test_patient_audio_transcript_feeds_pipeline(
         self,

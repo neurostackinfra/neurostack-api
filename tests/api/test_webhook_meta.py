@@ -1933,12 +1933,29 @@ def _seed_meta_audio_tenant(
         "meta_app_secret": META_APP_SECRET,
     }
     if stt or stt_provider is not None:
+        provider = stt_provider or "outros"
+        fixed_bundle = {
+            "elevenlabs_scribe": (
+                "https://api.elevenlabs.io/v1",
+                "scribe_v2",
+            ),
+            "openrouter": (
+                "https://openrouter.ai/api/v1",
+                "openai/whisper-large-v3-turbo",
+            ),
+        }.get(provider)
         payload.update(
             {
-                "stt_provider": stt_provider or "outros",
+                "stt_provider": provider,
                 "stt_api_key": f"sk-fake-stt-{uuid4().hex}",
-                "stt_api_url": "https://api.groq.com/openai/v1",
-                "stt_model_name": "whisper-large-v3-turbo",
+                "stt_api_url": (
+                    fixed_bundle[0]
+                    if fixed_bundle
+                    else "https://api.groq.com/openai/v1"
+                ),
+                "stt_model_name": (
+                    fixed_bundle[1] if fixed_bundle else "whisper-large-v3-turbo"
+                ),
             }
         )
     if multimodal:
@@ -2011,6 +2028,86 @@ class _NoReplyResponse:
 
 
 class TestMetaSttFallbackChain:
+    @pytest.mark.parametrize(
+        ("provider", "api_url", "model_name"),
+        [
+            (
+                "elevenlabs_scribe",
+                "https://api.elevenlabs.io/v1",
+                "scribe_v2",
+            ),
+            (
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                "openai/whisper-large-v3-turbo",
+            ),
+        ],
+    )
+    def test_fixed_provider_http_dispatch_preserves_meta_mime_and_pipeline_text(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        provider: str,
+        api_url: str,
+        model_name: str,
+    ) -> None:
+        """The signed Meta route reaches each fixed adapter, never Groq."""
+        from src.services.event_service import EventService
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_audio_tenant(
+            client,
+            tenant_id,
+            phone_id,
+            stt_provider=provider,
+        )
+        raw_mime = "audio/ogg; codecs=opus"
+        audio_bytes = b"OggS_meta_fixed_provider"
+        transcript = f"transcript from {provider}"
+        fixed_adapter = AsyncMock(return_value=transcript)
+        legacy_adapter = AsyncMock()
+        captured: dict[str, str] = {}
+
+        async def _capture(self, event_request, session=None):
+            captured["content"] = event_request.payload.content
+            return _NoReplyResponse()
+
+        payload = _meta_audio_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900003131",
+            media_id=f"media_fixed_{uuid4().hex[:10]}",
+            message_id=f"wamid.fixed_{uuid4().hex[:10]}",
+            mime_type=raw_mime,
+        )
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(return_value=dict(_META_MEDIA_INFO)),
+            ),
+            patch(
+                "src.api.routes.webhook.download_meta_media_audio",
+                new=AsyncMock(return_value=audio_bytes),
+            ),
+            patch("src.services.stt_service.transcribe_audio", fixed_adapter),
+            patch("src.services.groq_service.transcribe_audio", legacy_adapter),
+            patch.object(EventService, "process_event", _capture),
+        ):
+            response = _post_meta(client, payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json().get("action") != "stt_fallback"
+        assert captured == {"content": transcript}
+        fixed_adapter.assert_awaited_once()
+        kwargs = fixed_adapter.await_args.kwargs
+        assert kwargs["provider"] == provider
+        assert kwargs["api_url"] == api_url
+        assert kwargs["api_key"].startswith("sk-fake-stt-")
+        assert kwargs["audio_bytes"] == audio_bytes
+        assert kwargs["mimetype"] == raw_mime
+        assert kwargs["model_name"] == model_name
+        assert kwargs["language"] == "pt"
+        legacy_adapter.assert_not_awaited()
+
     def test_stt_failure_without_multimodal_reroutes_and_does_not_hand_off(
         self,
         client: TestClient,
@@ -2377,7 +2474,7 @@ class TestMetaSttFallbackChain:
 
     @pytest.mark.parametrize(
         "provider",
-        ["elevenlabs_scribe", "google_stt", "deepgram_stt", "microsoft_stt"],
+        ["google_stt", "deepgram_stt", "microsoft_stt"],
     )
     def test_unsupported_provider_never_reroutes(
         self,
@@ -2407,8 +2504,16 @@ class TestMetaSttFallbackChain:
         download_mock = AsyncMock()
         send_mock = AsyncMock(return_value=_fake_meta_send_result())
         handoff_mock = AsyncMock()
+        replay_mock = MagicMock()
+        bot_mock = AsyncMock()
+        pause_mock = AsyncMock()
+        session_mock = AsyncMock()
 
         with (
+            patch("src.api.routes.webhook._claim_incoming_message", replay_mock),
+            patch("src.api.routes.webhook._check_bot_active", bot_mock),
+            patch("src.api.routes.webhook._check_pause_state", pause_mock),
+            patch("src.api.routes.webhook._get_or_create_session", session_mock),
             patch("src.api.routes.webhook.resolve_meta_media", resolve_mock),
             patch("src.api.routes.webhook.download_meta_media_audio", download_mock),
             patch("src.api.routes.webhook.send_meta_cloud_text", send_mock),
@@ -2426,6 +2531,10 @@ class TestMetaSttFallbackChain:
         download_mock.assert_not_called()
         send_mock.assert_not_called()
         handoff_mock.assert_not_called()
+        replay_mock.assert_not_called()
+        bot_mock.assert_not_awaited()
+        pause_mock.assert_not_awaited()
+        session_mock.assert_not_awaited()
 
     def test_missing_permanent_token_keeps_the_no_credentials_envelope(
         self,

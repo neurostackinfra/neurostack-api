@@ -13,9 +13,10 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from src.api.middleware.auth import TenantContext
-from src.api.routes.config import patch_config
-from src.api.schemas.config import ConfigPatchRequest
+from src.api.routes.config import _validate_handoff_policy_patch, patch_config
+from src.api.schemas.config import ConfigPatchRequest, ConfigResponse
 from src.config.settings import settings
+from src.models.clinic_config import ClinicHandoff
 from src.services.config_service import (
     ALL_BUCKETS,
     ARRAY_BUCKETS,
@@ -92,6 +93,119 @@ def test_valid_business_hours_persist_and_round_trip(client: TestClient) -> None
     loaded = client.get(PATH, headers=headers)
     assert loaded.status_code == 200, loaded.text
     assert loaded.json()["business_hours"] == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [0, 121, True, 1.0, "10", None],
+    ids=["zero", "too-high", "boolean", "float", "string", "null"],
+)
+def test_patch_rejects_invalid_handoff_service_time_without_writing(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    value: object,
+) -> None:
+    calls: list[str] = []
+
+    async def unexpected_load(*args: Any, **kwargs: Any) -> Any:
+        calls.append("load")
+        raise AssertionError("invalid SLA target must fail before loading config")
+
+    async def unexpected_cache(*args: Any, **kwargs: Any) -> None:
+        calls.append("cache")
+
+    monkeypatch.setattr("src.api.routes.config._load_config", unexpected_load)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache",
+        unexpected_cache,
+    )
+
+    response = client.patch(
+        PATH,
+        headers=_headers(),
+        json={"meta_minutos_atendimento": value},
+    )
+
+    assert response.status_code == 422
+    assert isinstance(response.json()["detail"], list)
+    assert calls == []
+
+
+@pytest.mark.parametrize("value", [1, 47, 120])
+def test_patch_persists_valid_handoff_service_time(
+    client: TestClient,
+    value: int,
+) -> None:
+    headers = _headers()
+
+    patched = client.patch(
+        PATH,
+        headers=headers,
+        json={"meta_minutos_atendimento": value},
+    )
+    loaded = client.get(PATH, headers=headers)
+
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["meta_minutos_atendimento"] == value
+    assert loaded.status_code == 200, loaded.text
+    assert loaded.json()["meta_minutos_atendimento"] == value
+
+
+@pytest.mark.asyncio
+async def test_patch_omitting_service_time_preserves_legacy_handoff_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = uuid4()
+    legacy_handoff = {
+        "meta_minutos_atendimento": "legacy-invalid",
+        "legacy_handoff_key": {"nested": True},
+    }
+    row = SimpleNamespace(
+        clinic_id=None,
+        version=1,
+        handoff=legacy_handoff,
+        **{
+            bucket: ([] if bucket in ARRAY_BUCKETS else {})
+            for bucket in ALL_BUCKETS
+            if bucket != "handoff"
+        },
+    )
+
+    class Session:
+        async def flush(self) -> None:
+            pass
+
+        async def commit(self) -> None:
+            pass
+
+    async def get_row(*args: Any, **kwargs: Any) -> Any:
+        return row
+
+    async def keep_tenant(*args: Any, **kwargs: Any) -> TenantContext:
+        return TenantContext(tenant_id=tenant_id, role="clinic_admin", user_id=None)
+
+    async def no_cache(*args: Any, **kwargs: Any) -> None:
+        pass
+
+    monkeypatch.setattr("src.api.routes.config._load_config", get_row)
+    monkeypatch.setattr("src.api.routes.config._resolve_config_tenant", keep_tenant)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache",
+        no_cache,
+    )
+
+    await patch_config(
+        request=SimpleNamespace(query_params={}),
+        body=ConfigPatchRequest(clinic_name="Nova clínica"),
+        tenant=TenantContext(tenant_id=tenant_id, role="clinic_admin", user_id=None),
+        session=Session(),  # type: ignore[arg-type]
+    )
+
+    assert row.handoff is legacy_handoff
+    assert row.handoff == {
+        "meta_minutos_atendimento": "legacy-invalid",
+        "legacy_handoff_key": {"nested": True},
+    }
 
 
 def test_operations_revalidation_preserves_existing_free_text_hours(
@@ -671,3 +785,519 @@ async def test_operations_validation_warns_when_legacy_key_is_dropped(
     assert "legacy_operation_key" not in row.operations
     assert "legacy_operation_key" in caplog.text
     assert "operations" in caplog.text
+
+
+def test_handoff_policy_round_trip_canonicalizes_legacy_days_and_preserves_keys(
+    client: TestClient,
+) -> None:
+    headers = _headers()
+    initial = client.patch(
+        PATH,
+        headers=headers,
+        json={
+            "trigger_message": "Mensagem preservada",
+            "reactivation_delay_hours": 3,
+            "clinic_name": "Clínica preservada",
+        },
+    )
+    assert initial.status_code == 200, initial.text
+
+    patched = client.patch(
+        PATH,
+        headers=headers,
+        json={
+            "handoff_active": "yes",
+            "standby_mode": "active",
+            "handoff_period": "cycle",
+            "handoff_cycle_hours": None,
+            "handoff_cycle_days": "12",
+        },
+    )
+
+    assert patched.status_code == 200, patched.text
+    body = patched.json()
+    assert body["handoff_cycle_hours"] is None
+    assert body["handoff_cycle_days"] == 12
+    assert body["trigger_message"] == "Mensagem preservada"
+    assert body["reactivation_delay_hours"] == 3
+    assert body["clinic_name"] == "Clínica preservada"
+    loaded = client.get(PATH, headers=headers)
+    assert loaded.json()["handoff_cycle_days"] == 12
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "handoff_active": "yes",
+            "standby_mode": "inactive",
+            "handoff_period": "cycle",
+            "handoff_cycle_hours": None,
+            "handoff_cycle_days": None,
+        },
+        {
+            "handoff_active": "yes",
+            "standby_mode": "active",
+            "handoff_period": "permanent",
+            "handoff_cycle_hours": 2,
+            "handoff_cycle_days": None,
+        },
+        {
+            "handoff_active": "yes",
+            "standby_mode": "active",
+            "handoff_period": "cycle",
+            "handoff_cycle_hours": None,
+            "handoff_cycle_days": None,
+        },
+        {
+            "handoff_active": "yes",
+            "standby_mode": "active",
+            "handoff_period": "cycle",
+            "handoff_cycle_hours": 2,
+            "handoff_cycle_days": 3,
+        },
+        {"handoff_cycle_hours": "2"},
+        {"handoff_cycle_hours": True},
+        {"handoff_cycle_hours": 1.5},
+        {"handoff_cycle_hours": 721},
+        {"handoff_cycle_days": " 2"},
+        {"handoff_cycle_days": "+2"},
+        {"handoff_cycle_days": "2.0"},
+        {"handoff_cycle_days": "１２"},
+        {"handoff_cycle_days": True},
+        {"handoff_cycle_days": 1.5},
+        {"handoff_cycle_days": 366},
+        {"handoff_active": None},
+        {"standby_mode": "unknown"},
+    ],
+)
+def test_handoff_policy_rejects_invalid_type_range_and_combinations(
+    client: TestClient,
+    payload: dict[str, Any],
+) -> None:
+    response = client.patch(PATH, headers=_headers(), json=payload)
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_code"),
+    [
+        ("handoff_active", None, "null_not_allowed"),
+        ("standby_mode", "invalid", "literal_error"),
+        ("handoff_cycle_hours", "2", "int_type"),
+        ("handoff_cycle_hours", 721, "less_than_equal"),
+    ],
+)
+def test_policy_request_validation_uses_secret_safe_stable_envelope(
+    client: TestClient,
+    field: str,
+    value: Any,
+    expected_code: str,
+) -> None:
+    secret = "SECRET-MUST-NOT-ECHO"
+    response = client.patch(
+        PATH,
+        headers=_headers(),
+        json={field: value, "llm_api_key": secret},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {
+            "error": "invalid_handoff_policy",
+            "violations": [{"field": field, "code": expected_code}],
+        }
+    }
+    assert secret not in response.text
+    for forbidden_key in ("input", "msg", "ctx", "body"):
+        assert forbidden_key not in response.text
+
+
+def test_credential_boundary_remains_authoritative_for_valid_policy_payload(
+    client: TestClient,
+) -> None:
+    secret = "SECRET-MUST-NOT-ECHO"
+    response = client.patch(
+        PATH,
+        headers=_headers(),
+        json={
+            "handoff_active": "yes",
+            "standby_mode": "active",
+            "handoff_period": "permanent",
+            "handoff_cycle_hours": None,
+            "handoff_cycle_days": None,
+            "llm_api_key": secret,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "error": "credential_endpoint_required",
+        "fields": ["llm_api_key"],
+    }
+    assert secret not in response.text
+
+
+def test_handoff_policy_partial_patch_validates_post_merge(client: TestClient) -> None:
+    headers = _headers()
+    seeded = client.patch(
+        PATH,
+        headers=headers,
+        json={
+            "handoff_active": "yes",
+            "standby_mode": "active",
+            "handoff_period": "cycle",
+            "handoff_cycle_hours": None,
+            "handoff_cycle_days": 4,
+        },
+    )
+    assert seeded.status_code == 200, seeded.text
+
+    conflict = client.patch(PATH, headers=headers, json={"handoff_cycle_hours": 6})
+    assert conflict.status_code == 422
+
+    repaired = client.patch(
+        PATH,
+        headers=headers,
+        json={"handoff_cycle_hours": 6, "handoff_cycle_days": None},
+    )
+    assert repaired.status_code == 200, repaired.text
+    assert repaired.json()["handoff_cycle_hours"] == 6
+    assert repaired.json()["handoff_cycle_days"] is None
+
+
+def test_legacy_days_with_leading_zeroes_persist_as_bounded_integer(
+    client: TestClient,
+) -> None:
+    response = client.patch(
+        PATH,
+        headers=_headers(),
+        json={
+            "handoff_active": "yes",
+            "standby_mode": "active",
+            "handoff_period": "cycle",
+            "handoff_cycle_hours": None,
+            "handoff_cycle_days": "000365",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["handoff_cycle_days"] == 365
+
+
+def test_legacy_days_with_5000_digits_is_rejected_without_echo(
+    client: TestClient,
+) -> None:
+    raw = "9" * 5000
+    response = client.patch(
+        PATH,
+        headers=_headers(),
+        json={
+            "handoff_active": "yes",
+            "standby_mode": "active",
+            "handoff_period": "cycle",
+            "handoff_cycle_hours": None,
+            "handoff_cycle_days": raw,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {
+            "error": "invalid_handoff_policy",
+            "violations": [{"field": "handoff_cycle_days", "code": "int_type"}],
+        }
+    }
+    assert raw not in response.text
+
+
+@pytest.mark.asyncio
+async def test_rejected_handoff_policy_is_atomic_before_row_assignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = uuid4()
+    calls: list[str] = []
+    original_handoff = {
+        "handoff_active": "yes",
+        "standby_mode": "active",
+        "handoff_period": "permanent",
+        "handoff_cycle_hours": None,
+        "handoff_cycle_days": None,
+        "trigger_message": "keep",
+    }
+    row = SimpleNamespace(
+        clinic_id=None,
+        version=9,
+        handoff=dict(original_handoff),
+        **{
+            bucket: ([] if bucket in ARRAY_BUCKETS else {})
+            for bucket in ALL_BUCKETS
+            if bucket != "handoff"
+        },
+    )
+
+    class Session:
+        def add(self, value: Any) -> None:
+            calls.append("add")
+
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+
+    async def get_row(*args: Any, **kwargs: Any) -> Any:
+        return row
+
+    async def keep_tenant(*args: Any, **kwargs: Any) -> TenantContext:
+        return TenantContext(tenant_id=tenant_id, role="clinic_admin", user_id=None)
+
+    async def no_cache(*args: Any, **kwargs: Any) -> None:
+        calls.append("cache")
+
+    monkeypatch.setattr("src.api.routes.config._load_config", get_row)
+    monkeypatch.setattr("src.api.routes.config._resolve_config_tenant", keep_tenant)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache", no_cache
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await patch_config(
+            request=SimpleNamespace(query_params={}),
+            body=ConfigPatchRequest(
+                handoff_period="cycle",
+                handoff_cycle_hours=2,
+                handoff_cycle_days=3,
+            ),
+            tenant=TenantContext(
+                tenant_id=tenant_id, role="clinic_admin", user_id=None
+            ),
+            session=Session(),  # type: ignore[arg-type]
+        )
+
+    assert exc_info.value.status_code == 422
+    assert row.handoff == original_handoff
+    assert row.version == 9
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_unrelated_patch_preserves_malformed_handoff_policy_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = uuid4()
+    malformed = {
+        "handoff_active": "YES-ish",
+        "standby_mode": ["bad"],
+        "handoff_period": "cycle",
+        "handoff_cycle_hours": "6",
+        "handoff_cycle_days": True,
+        "trigger_message": "old",
+    }
+    row = SimpleNamespace(
+        clinic_id=None,
+        version=4,
+        handoff=dict(malformed),
+        **{
+            bucket: ([] if bucket in ARRAY_BUCKETS else {})
+            for bucket in ALL_BUCKETS
+            if bucket != "handoff"
+        },
+    )
+
+    class Session:
+        async def flush(self) -> None:
+            pass
+
+        async def commit(self) -> None:
+            pass
+
+    async def get_row(*args: Any, **kwargs: Any) -> Any:
+        return row
+
+    async def keep_tenant(*args: Any, **kwargs: Any) -> TenantContext:
+        return TenantContext(tenant_id=tenant_id, role="clinic_admin", user_id=None)
+
+    async def no_cache(*args: Any, **kwargs: Any) -> None:
+        pass
+
+    monkeypatch.setattr("src.api.routes.config._load_config", get_row)
+    monkeypatch.setattr("src.api.routes.config._resolve_config_tenant", keep_tenant)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache", no_cache
+    )
+
+    await patch_config(
+        request=SimpleNamespace(query_params={}),
+        body=ConfigPatchRequest(trigger_message="new"),
+        tenant=TenantContext(tenant_id=tenant_id, role="clinic_admin", user_id=None),
+        session=Session(),  # type: ignore[arg-type]
+    )
+
+    assert row.handoff == {**malformed, "trigger_message": "new"}
+
+
+def test_handoff_openapi_contract_documents_canonical_fields_without_nullable_enums() -> (
+    None
+):
+    patch_schema = ConfigPatchRequest.model_json_schema()["properties"]
+    response_schema = ConfigResponse.model_json_schema()["properties"]
+
+    for field in ("handoff_active", "standby_mode", "handoff_period"):
+        assert patch_schema[field]["type"] == "string"
+        assert "anyOf" not in patch_schema[field]
+        assert "default" not in patch_schema[field]
+        assert field in response_schema
+    assert patch_schema["handoff_cycle_hours"]["anyOf"][0] == {
+        "maximum": 720,
+        "minimum": 1,
+        "type": "integer",
+    }
+    assert patch_schema["handoff_cycle_days"]["anyOf"][0] == {
+        "maximum": 365,
+        "minimum": 1,
+        "type": "integer",
+    }
+    assert ConfigPatchRequest().model_dump(exclude_unset=True) == {}
+
+
+@pytest.mark.asyncio
+async def test_unrelated_handoff_patch_handles_non_object_historical_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = uuid4()
+    row = SimpleNamespace(
+        clinic_id=None,
+        version=4,
+        handoff="historical-non-object",
+        **{
+            bucket: ([] if bucket in ARRAY_BUCKETS else {})
+            for bucket in ALL_BUCKETS
+            if bucket != "handoff"
+        },
+    )
+
+    class Session:
+        async def flush(self) -> None:
+            pass
+
+        async def commit(self) -> None:
+            pass
+
+    async def get_row(*args: Any, **kwargs: Any) -> Any:
+        return row
+
+    async def keep_tenant(*args: Any, **kwargs: Any) -> TenantContext:
+        return TenantContext(tenant_id=tenant_id, role="clinic_admin", user_id=None)
+
+    async def no_cache(*args: Any, **kwargs: Any) -> None:
+        pass
+
+    monkeypatch.setattr("src.api.routes.config._load_config", get_row)
+    monkeypatch.setattr("src.api.routes.config._resolve_config_tenant", keep_tenant)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache", no_cache
+    )
+
+    result = await patch_config(
+        request=SimpleNamespace(query_params={}),
+        body=ConfigPatchRequest(trigger_message="new"),
+        tenant=TenantContext(tenant_id=tenant_id, role="clinic_admin", user_id=None),
+        session=Session(),  # type: ignore[arg-type]
+    )
+
+    assert row.handoff == {"trigger_message": "new"}
+    assert result.trigger_message == "new"  # type: ignore[attr-defined]
+
+
+def test_complete_policy_patch_repairs_non_object_historical_bucket() -> None:
+    row = SimpleNamespace(handoff=["historical", "shape"])
+    patch = {
+        "handoff_active": "yes",
+        "standby_mode": "active",
+        "handoff_period": "cycle",
+        "handoff_cycle_hours": 8,
+        "handoff_cycle_days": None,
+    }
+
+    assert _validate_handoff_policy_patch(patch, row) == patch
+
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_handoff_policy_patch({"handoff_period": "permanent"}, row)
+    assert exc_info.value.detail["error"] == "invalid_handoff_policy"
+    assert all(
+        violation["code"] == "repair_required"
+        for violation in exc_info.value.detail["violations"]
+    )
+
+
+def test_typed_clinic_handoff_round_trips_policy_and_unknown_keys() -> None:
+    raw = {
+        "handoff_active": "yes",
+        "standby_mode": "active",
+        "handoff_period": "cycle",
+        "handoff_cycle_hours": 10,
+        "handoff_cycle_days": None,
+        "trigger_message": "preserve me",
+    }
+
+    dumped = ClinicHandoff.model_validate(raw).model_dump()
+    for key, value in raw.items():
+        assert dumped[key] == value
+
+
+@pytest.mark.asyncio
+async def test_invalid_first_handoff_write_does_not_add_flush_commit_or_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = uuid4()
+    calls: list[str] = []
+
+    class Session:
+        def add(self, value: Any) -> None:
+            calls.append("add")
+
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+
+    async def no_row(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def keep_tenant(*args: Any, **kwargs: Any) -> TenantContext:
+        return TenantContext(tenant_id=tenant_id, role="clinic_admin", user_id=None)
+
+    async def no_cache(*args: Any, **kwargs: Any) -> None:
+        calls.append("cache")
+
+    monkeypatch.setattr("src.api.routes.config._load_config", no_row)
+    monkeypatch.setattr("src.api.routes.config._resolve_config_tenant", keep_tenant)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache", no_cache
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await patch_config(
+            request=SimpleNamespace(query_params={}),
+            body=ConfigPatchRequest(
+                handoff_period="cycle",
+                handoff_cycle_hours=None,
+                handoff_cycle_days=None,
+            ),
+            tenant=TenantContext(
+                tenant_id=tenant_id, role="clinic_admin", user_id=None
+            ),
+            session=Session(),  # type: ignore[arg-type]
+        )
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail["violations"] == [
+        {
+            "field": "handoff_policy",
+            "code": "cycle_requires_exactly_one_duration",
+        }
+    ]
+    assert calls == []

@@ -434,11 +434,16 @@ class HandoffDetail(BaseModel):
     # Webhook
     webhook_sent: bool = False
     webhook_status: Optional[WebhookStatus] = None
+    webhook_response: Optional[dict[str, Any]] = None
 
     # Timestamps
     created_at: datetime
     updated_at: Optional[datetime] = None
+    data_hora_saida: Optional[datetime] = None
     resolved_at: Optional[datetime] = None
+
+    # Immutable first-response SLA snapshot. ``None`` identifies legacy rows.
+    sla_target_seconds: Optional[int] = Field(default=None, ge=60, le=7200)
 
     # Resolution
     resolution_notes: Optional[str] = None

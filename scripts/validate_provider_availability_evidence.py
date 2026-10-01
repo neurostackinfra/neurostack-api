@@ -74,6 +74,7 @@ EXPECTED_DECISIONS = {
     ("stt", "microsoft_stt"): "coming_soon",
     ("tts", "elevenlabs"): "coming_soon",
     ("tts", "google"): "coming_soon",
+    ("tts", "openai"): "coming_soon",
     ("tts", "microsoft"): "removed",
 }
 EXPECTED_PROMOTED_MATRIX = {
@@ -84,7 +85,18 @@ EXPECTED_PROMOTED_MATRIX = {
     }
     for capability in ("whatsapp", "llm", "multimodal", "stt", "tts")
 }
-EXPECTED_PROMOTED_MATRIX["llm"]["gemini"] = "active"
+EXPECTED_PROMOTED_MATRIX["stt"]["openrouter"] = EXPECTED_PROMOTED_MATRIX["stt"].pop(
+    "outros"
+)
+for capability, providers in {
+    "whatsapp": {"meta_cloud", "zapi", "uazapi", "evolution"},
+    "llm": {"dropout", "gemini", "openai", "outros"},
+    "stt": {"openrouter", "openai_whisper", "elevenlabs_scribe"},
+    "tts": {"elevenlabs", "google", "openai"},
+}.items():
+    for provider in providers:
+        EXPECTED_PROMOTED_MATRIX[capability][provider] = "active"
+EXPECTED_PUBLICLY_ACTIVE_LLM_PROVIDERS = {"dropout", "gemini", "openai", "outros"}
 EXPECTED_PRODUCTION_IMAGES = {
     "postgres": "postgres@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685",
     "redis": "redis@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf",
@@ -212,14 +224,14 @@ def _validate_receipts(path: Path, *, require_bound_bytes: bool = False) -> list
         ):
             errors.append(f"receipt must record unavailable validation only: {pair}")
     if seen != set(EXPECTED_DECISIONS):
-        errors.append("receipt pairs do not exactly match the 22-pair inventory")
+        errors.append("receipt pairs do not exactly match the 23-pair inventory")
     counts = {
         state: sum(row["decision"] == state for row in rows)
         for state in ("active", "coming_soon", "removed")
     }
-    if counts != {"active": 0, "coming_soon": 19, "removed": 3}:
+    if counts != {"active": 0, "coming_soon": 20, "removed": 3}:
         errors.append(
-            "base receipt decisions must remain 0 active, 19 coming_soon, 3 removed"
+            "base receipt decisions must remain 0 active, 20 coming_soon, 3 removed"
         )
     return errors
 
@@ -230,15 +242,23 @@ def _extract_gemini_receipt(
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
-        return None, None, [
-            "Gemini receipt is absent; Production Operations Owner must add the "
-            "canonical receipt in a signed receipt-only successor commit"
-        ]
+        return (
+            None,
+            None,
+            [
+                "Gemini receipt is absent; Production Operations Owner must add the "
+                "canonical receipt in a signed receipt-only successor commit"
+            ],
+        )
     except OSError:
-        return None, None, [
-            "Gemini receipt cannot be read; restore the canonical receipt path "
-            "and retry the release checker"
-        ]
+        return (
+            None,
+            None,
+            [
+                "Gemini receipt cannot be read; restore the canonical receipt path "
+                "and retry the release checker"
+            ],
+        )
     pattern = re.compile(
         rb"\A# Gemini LLM release receipt\n\n"
         rb"- smoke_artifact_sha256: ([0-9a-f]{64})\n\n"
@@ -246,10 +266,14 @@ def _extract_gemini_receipt(
     )
     match = pattern.fullmatch(raw)
     if not match:
-        return None, None, [
-            "Gemini receipt bytes are non-canonical; regenerate exact LF-only "
-            "receipt bytes with one final newline"
-        ]
+        return (
+            None,
+            None,
+            [
+                "Gemini receipt bytes are non-canonical; regenerate exact LF-only "
+                "receipt bytes with one final newline"
+            ],
+        )
     embedded = match.group(2)
     errors: list[str] = []
     if hashlib.sha256(embedded).hexdigest().encode("ascii") != match.group(1):
@@ -301,13 +325,19 @@ def _validate_commit_signature(root: Path, head: str) -> list[str]:
     verify = _git(root, "verify-commit", "--raw", head)
     identity = _git(root, "show", "-s", "--format=%G?%n%GF", head)
     identity_lines = identity.stdout.splitlines() if not identity.returncode else []
-    if verify.returncode or len(identity_lines) != 2 or identity_lines[0] not in {"G", "U"}:
+    if (
+        verify.returncode
+        or len(identity_lines) != 2
+        or identity_lines[0] not in {"G", "U"}
+    ):
         errors.append(
             "receipt HEAD signature verification failed; configure the approved "
             "GPG trust or SSH allowedSignersFile, then retry git verify-commit"
         )
     elif fingerprint_format and identity_lines[1] != fingerprint:
-        errors.append("receipt signer identity does not exactly match protected authority")
+        errors.append(
+            "receipt signer identity does not exactly match protected authority"
+        )
     return errors
 
 
@@ -347,7 +377,9 @@ def _validate_git_release(root: Path, artifact: dict[str, Any]) -> list[str]:
         names = diff.stdout.splitlines() if not diff.returncode else []
         expected_add = f"A\t{GEMINI_RECEIPT_RELATIVE.as_posix()}"
         if names != [expected_add]:
-            errors.append("receipt commit must add only the new receipt (name-status A)")
+            errors.append(
+                "receipt commit must add only the new receipt (name-status A)"
+            )
         parent_receipt = _git(
             root, "cat-file", "-e", f"{parent}:{GEMINI_RECEIPT_RELATIVE.as_posix()}"
         )
@@ -391,7 +423,7 @@ def _parse_frontend_matrix(text: str) -> dict[str, dict[str, str]] | None:
 
 
 def _validate_product_promotion(root: Path) -> list[str]:
-    """Bind the release gate to the sole approved product-matrix overlay."""
+    """Bind the release gate to the approved product-matrix overlay."""
 
     policy_path = root / "src/services/api_credentials.py"
     try:
@@ -419,9 +451,13 @@ def _validate_product_promotion(root: Path) -> list[str]:
         return ["provider availability matrix is not a static closed mapping"]
     errors: list[str] = []
     if matrix != EXPECTED_PROMOTED_MATRIX:
-        errors.append("backend provider matrix does not exactly match the approved overlay")
-    if operational != {"gemini"}:
-        errors.append("publicly active LLM membership must contain only Gemini")
+        errors.append(
+            "backend provider matrix does not exactly match the approved overlay"
+        )
+    if operational != EXPECTED_PUBLICLY_ACTIVE_LLM_PROVIDERS:
+        errors.append(
+            "publicly active LLM membership does not match the approved overlay"
+        )
     frontend_path = root / "frontend/artifacts/neurostack/src/pages/clinic-config.tsx"
     try:
         frontend = frontend_path.read_text(encoding="utf-8")
@@ -429,7 +465,9 @@ def _validate_product_promotion(root: Path) -> list[str]:
         errors.append("frontend provider matrix is unavailable")
     else:
         if _parse_frontend_matrix(frontend) != EXPECTED_PROMOTED_MATRIX:
-            errors.append("frontend provider matrix does not exactly match the approved overlay")
+            errors.append(
+                "frontend provider matrix does not exactly match the approved overlay"
+            )
     return errors
 
 
@@ -478,7 +516,9 @@ def _validate_release(
             )
         for service, image in EXPECTED_PRODUCTION_IMAGES.items():
             if f"image: {image}" not in compose_text:
-                errors.append(f"production {service} image is not pinned to its approved digest")
+                errors.append(
+                    f"production {service} image is not pinned to its approved digest"
+                )
     if not errors:
         errors.extend(_validate_git_release(root, artifact))
     return errors, str(artifact["image_digest"])

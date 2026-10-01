@@ -3,6 +3,7 @@ NeuroStack - Core Pipeline Unit Tests
 Tests for the CognitivePipeline orchestrator.
 """
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
@@ -17,10 +18,16 @@ from src.core.pipeline import (
     get_cognitive_pipeline,
     process_event,
 )
+from src.handoff.models import (
+    HandoffDetail,
+    HandoffListItem,
+    HandoffResponse,
+    HandoffStatus,
+)
+from src.handoff.pause_policy import resolve_handoff_pause
 from src.handoff.summarizer import ConversationSummarizer
-from src.handoff.webhook import WebhookDispatcher
 from src.services.event_service import EventService
-from src.services.handoff_service import HandoffService
+from tests.handoff.test_pause_policy import RUNTIME_POLICY_BUCKETS
 
 # ============================================
 # Fixtures
@@ -42,7 +49,7 @@ def session_id():
 @pytest.fixture
 def pipeline():
     """Create a CognitivePipeline instance."""
-    return CognitivePipeline()
+    return _isolated_pipeline()
 
 
 @pytest.fixture
@@ -98,13 +105,112 @@ def _find_working_hours_source(sources: list[dict]) -> dict | None:
     return None
 
 
+class _PipelineHandoffStub:
+    """Persistence-free wiring double; lifecycle behavior lives in service tests."""
+
+    def __init__(self):
+        self.summarizer = ConversationSummarizer()
+        self.details = {}
+
+    async def initiate_handoff(self, request):
+        handoff_id = uuid4()
+        created_at = datetime.now(timezone.utc)
+        summary = self.summarizer.summarize(
+            session_id=request.session_id,
+            tenant_id=request.tenant_id,
+            messages=request.recent_messages,
+            reason=request.reason,
+            urgency=request.urgency,
+            funnel_stage=request.funnel_stage,
+            slots=request.key_info,
+            sector=request.sector,
+            sla=request.sla,
+            verification_status=request.verification_status,
+        )
+        self.details[handoff_id] = HandoffDetail(
+            id=handoff_id,
+            tenant_id=request.tenant_id,
+            session_id=request.session_id,
+            status=HandoffStatus.PENDING,
+            urgency=request.urgency,
+            reason=request.reason,
+            sector=request.sector,
+            sla=request.sla,
+            verification_status=request.verification_status,
+            summary=summary.summary_text,
+            key_info=summary.key_info.model_dump(),
+            created_at=created_at,
+        )
+        return HandoffResponse(
+            id=handoff_id,
+            tenant_id=request.tenant_id,
+            session_id=request.session_id,
+            status=HandoffStatus.PENDING,
+            summary=summary,
+            user_message="handoff",
+            verification_status=request.verification_status,
+            created_at=created_at,
+        )
+
+    async def enrich_scheduling_verification(
+        self,
+        session_id,
+        verification_status,
+        handoff_id=None,
+        *,
+        tenant_id,
+    ):
+        detail = self.details.get(handoff_id)
+        if detail is None:
+            detail = next(
+                (
+                    candidate
+                    for candidate in self.details.values()
+                    if candidate.session_id == session_id
+                    and candidate.tenant_id == tenant_id
+                ),
+                None,
+            )
+        if detail is None:
+            return None
+        self.details[detail.id] = detail.model_copy(
+            update={
+                "verification_status": verification_status,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        )
+        return detail.id
+
+    async def get_handoff(self, handoff_id, tenant_id):
+        return self.details[handoff_id]
+
+    async def list_handoffs(self, tenant_id, status=None, limit=50, offset=0):
+        details = [
+            detail
+            for detail in self.details.values()
+            if detail.tenant_id == tenant_id
+            and (status is None or detail.status == status)
+        ]
+        return [
+            HandoffListItem(
+                id=detail.id,
+                session_id=detail.session_id,
+                status=detail.status,
+                urgency=detail.urgency,
+                reason=detail.reason,
+                sector=detail.sector,
+                sla=detail.sla,
+                verification_status=detail.verification_status,
+                summary_preview=detail.summary[:100],
+                created_at=detail.created_at,
+                assigned_to=detail.assigned_to,
+            )
+            for detail in details[offset : offset + limit]
+        ]
+
+
 def _isolated_pipeline():
-    handoff_service = HandoffService(
-        event_store=None,
-        summarizer=ConversationSummarizer(),
-        webhook_dispatcher=WebhookDispatcher(),
-    )
-    return CognitivePipeline(handoff_service=handoff_service)
+    return CognitivePipeline(handoff_service=_PipelineHandoffStub())
 
 
 # ============================================
@@ -183,6 +289,35 @@ class TestPipelineResult:
         assert not result.handoff_required
 
 
+@pytest.mark.parametrize("bucket", RUNTIME_POLICY_BUCKETS)
+@pytest.mark.asyncio
+async def test_pipeline_pause_matches_shared_policy_with_same_clock(
+    bucket,
+    tenant_id,
+    session_id,
+) -> None:
+    now = datetime(2026, 9, 29, 14, 0, tzinfo=timezone.utc)
+    clinic_config = {} if bucket is None else {"handoff": bucket}
+    input_data = PipelineInput(
+        tenant_id=tenant_id,
+        session_id=session_id,
+        message="handoff",
+        channel="whatsapp",
+        clinic_config=clinic_config,
+    )
+
+    should_pause, paused_until = await _isolated_pipeline()._apply_handoff_pause(
+        input_data,
+        now=now,
+    )
+    expected = resolve_handoff_pause(bucket, now)
+
+    assert should_pause is expected.should_pause
+    assert paused_until == (
+        expected.paused_until.isoformat() if expected.paused_until else None
+    )
+
+
 class TestCognitivePipeline:
     """Tests for CognitivePipeline class."""
 
@@ -253,6 +388,51 @@ class TestCognitivePipeline:
         if result.handoff_required:
             assert result.mode == "handoff"
             assert result.handoff_reason is not None
+
+    @pytest.mark.asyncio
+    async def test_public_process_applies_cycle_hours_policy(
+        self,
+        monkeypatch,
+        tenant_id,
+        session_id,
+    ) -> None:
+        pipeline = _isolated_pipeline()
+        decision = pipeline_module.SRMDecisionModel(
+            intent="atendimento_humano",
+            intent_category="information",
+            funnel_stage="em_qualificacao",
+            action="handoff_administrativo",
+            confidence=0.99,
+            handoff_required=True,
+            handoff_reason="user_request",
+        )
+        monkeypatch.setattr(pipeline, "_run_srm", AsyncMock(return_value=decision))
+        before = datetime.now(timezone.utc)
+
+        result = await pipeline.process(
+            PipelineInput(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                message="Quero falar com uma pessoa",
+                channel="whatsapp",
+                clinic_config={
+                    "handoff": {
+                        "handoff_active": "yes",
+                        "standby_mode": "active",
+                        "handoff_period": "cycle",
+                        "handoff_cycle_hours": 2,
+                        "handoff_cycle_days": None,
+                    }
+                },
+            )
+        )
+        after = datetime.now(timezone.utc)
+
+        assert result.handoff_required is True
+        assert result.should_pause is True
+        assert result.paused_until is not None
+        paused_until = datetime.fromisoformat(result.paused_until)
+        assert before + timedelta(hours=2) <= paused_until <= after + timedelta(hours=2)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("safety_concern", [True, False])
@@ -396,7 +576,7 @@ class TestCognitivePipeline:
                     clinic_config=_scheduling_link_config(),
                 )
             )
-        detail = await pipeline._handoff.get_handoff(UUID(handoff_id))
+        detail = await pipeline._handoff.get_handoff(UUID(handoff_id), tenant_id)
         handoffs = await pipeline._handoff.list_handoffs(tenant_id)
 
         assert enrich_result.handoff_required is False
