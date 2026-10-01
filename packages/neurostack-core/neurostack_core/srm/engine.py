@@ -5,7 +5,9 @@ The core deterministic decision engine for cognitive processing.
 
 import re
 import time
-from typing import Any, Optional
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import Any, Optional, cast
 from uuid import UUID
 
 from neurostack_core.metrics import (
@@ -14,22 +16,25 @@ from neurostack_core.metrics import (
     SRM_LATENCY,
     SRM_SAFETY_TRIGGERS,
 )
+from neurostack_core.presets import get_preset
+from neurostack_core.protocol import (
+    ActionType,
+    FlowMode,
+    FunnelStage,
+    HandoffReason,
+    IntentCategory,
+    SafetyCategory,
+    SentimentLabel,
+)
 from neurostack_core.srm.funnel_detector import get_funnel_detector
 from neurostack_core.srm.handoff_decider import get_handoff_decider
 from neurostack_core.srm.intent_classifier import get_intent_classifier
 from neurostack_core.srm.models import (
-    ActionType,
-    FlowMode,
     FunnelResult,
-    FunnelStage,
-    HandoffReason,
     HandoffResult,
-    IntentCategory,
     IntentResult,
     RagResult,
-    SafetyCategory,
     SafetyResult,
-    SentimentLabel,
     SRMDecision,
     SRMInput,
     StatePatch,
@@ -37,78 +42,49 @@ from neurostack_core.srm.models import (
 from neurostack_core.srm.rag_decider import get_rag_decider
 from neurostack_core.srm.safety_detector import get_safety_detector
 
-# Detects a day-of-week or time-of-day reference in a scheduling message.
-# Used to gate handoff_confirmation_pending: we only ask "can I forward you?"
-# once the user has provided a time preference — not just their name.
+_ENGINE_PRESET = cast(Mapping[str, object], get_preset().srm["engine"])
+_ENGINE_REGEXES = cast(Mapping[str, str], _ENGINE_PRESET["regexes"])
+_REGEX_FLAGS = re.IGNORECASE | re.UNICODE
 _SCHEDULING_HAS_TIME_RE = re.compile(
-    r"\b(segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado|domingo|amanh[aã]|hoje)\b"
-    r"|\b\d{1,2}\s*h\b"  # 9h, 10h
-    r"|\b\d{1,2}:\d{2}\b"  # 9:00, 14:30
-    r"|\b([aà]s?)\s+\d{1,2}\b"  # às 9, as 9
-    r"|\b(manh[aã]|tarde|noite|madrugada)\b"
-    r"|\b(dia\s+\d{1,2}|\d{1,2}/\d{1,2})\b"  # dia 12, 12/06
-    r"|\b(semana\s+que\s+vem|pr[oó]xima\s+semana)\b",  # semana que vem
-    re.IGNORECASE | re.UNICODE,
+    _ENGINE_REGEXES["scheduling_has_time"], _REGEX_FLAGS
+)
+_ATENDIMENTO_TIPO_RE = re.compile(_ENGINE_REGEXES["atendimento_tipo"], _REGEX_FLAGS)
+
+INTENT_ACTIONS: Mapping[str, ActionType] = MappingProxyType(
+    {
+        intent: ActionType(action)
+        for intent, action in cast(
+            Mapping[str, str], _ENGINE_PRESET["intent_actions"]
+        ).items()
+    }
+)
+CATEGORY_ACTIONS: Mapping[IntentCategory, ActionType] = MappingProxyType(
+    {
+        IntentCategory(category): ActionType(action)
+        for category, action in cast(
+            Mapping[str, str], _ENGINE_PRESET["category_actions"]
+        ).items()
+    }
 )
 
-# Detects the insurance/private-pay modality choice.
-# Reuses the same word-set from intent_classifier.py:262
-# (`\b(particular|convenio|convênio)\b`) — no new intent regex added; this
-# lives in the engine solely to project the existing signal into the
-# `atendimento_tipo` slot without duplicating the intent surface.
-_ATENDIMENTO_TIPO_RE = re.compile(
-    r"\b(particular|conv[eê]nio)\b",
-    re.IGNORECASE | re.UNICODE,
+_IMPERATIVE_LITERALS = cast(
+    Mapping[str, Mapping[str, tuple[str, ...]]],
+    get_preset().srm["imperative_literals"],
 )
-
-
-# ============================================
-# Action Mapping (Intent -> Action Catalog v0.1)
-# ============================================
-
-# Official intents -> official actions (doc MVP v0.5)
-INTENT_ACTIONS: dict[str, ActionType] = {
-    "saudacao": ActionType.PERGUNTA_UNICA_PARA_DESTRAVAR,
-    "interesse_tratamento": ActionType.INICIAR_FLUXO_QUALIFICACAO_SRM,
-    "pedido_preco": ActionType.INICIAR_FLUXO_QUALIFICACAO_SRM,
-    "comparacao_tratamentos": ActionType.CONTINUAR_FLUXO_SRM,
-    "objecao_vou_pensar": ActionType.CONTINUAR_FLUXO_SRM,
-    "duvida_generica_sem_contexto": ActionType.CONTINUAR_FLUXO_SRM,
-    "agendar": ActionType.COLETAR_PREFERENCIAS_AGENDAMENTO,
-    "reagendar": ActionType.PROCESSAR_REAGENDAMENTO,
-    "cancelar": ActionType.PROCESSAR_CANCELAMENTO,
-    "confirmar_presenca": ActionType.PROCESSAR_CONFIRMACAO_PRESENCA,
-    "disponibilidade_horarios": ActionType.CONSULTAR_RAG_RESPONDER,
-    "detalhes_servicos": ActionType.CONSULTAR_RAG_RESPONDER,
-    "pre_atendimento": ActionType.CONSULTAR_RAG_RESPONDER,
-    "faq": ActionType.CONSULTAR_RAG_RESPONDER,
-    "cultura_historia": ActionType.CONSULTAR_RAG_RESPONDER,
-    "qualificacao_publico": ActionType.CONSULTAR_RAG_RESPONDER,
-    "informacoes_profissionais": ActionType.CONSULTAR_RAG_RESPONDER,
-    "documentos_e_comprovantes": ActionType.HANDOFF_ADMINISTRATIVO,
-    "orcamento_existente": ActionType.HANDOFF_ADMINISTRATIVO,
-    "cobranca_renegociacao": ActionType.HANDOFF_FINANCEIRO,
-    "pos_atendimento_duvida": ActionType.CONSULTAR_RAG_E_SE_FALTAR_HANDOFF,
-    "pos_atendimento_sintomas_preocupantes": ActionType.ATIVAR_MODO_SAFETY_E_HANDOFF,
-    "pedido_alterar_medicacao": ActionType.ATIVAR_MODO_SAFETY_E_HANDOFF,
-    "reclamacao": ActionType.HANDOFF_GERENCIA,
-    "conduta_inadequada_ameaca": ActionType.ATIVAR_PROTOCOLO_CONDUTA_NADEQUADA,
-}
-
-# Intent category fallback when intent not in INTENT_ACTIONS
-CATEGORY_ACTIONS: dict[IntentCategory, ActionType] = {
-    IntentCategory.GREETING: ActionType.PERGUNTA_UNICA_PARA_DESTRAVAR,
-    IntentCategory.FAREWELL: ActionType.CONTINUAR_FLUXO_SRM,
-    IntentCategory.SCHEDULING: ActionType.COLETAR_PREFERENCIAS_AGENDAMENTO,
-    IntentCategory.CANCELLATION: ActionType.PROCESSAR_CANCELAMENTO,
-    IntentCategory.CONFIRMATION: ActionType.PROCESSAR_CONFIRMACAO_PRESENCA,
-    IntentCategory.QUESTION: ActionType.CONSULTAR_RAG_RESPONDER,
-    IntentCategory.COMPLAINT: ActionType.HANDOFF_GERENCIA,
-    IntentCategory.INFORMATION: ActionType.CONTINUAR_FLUXO_SRM,
-    IntentCategory.FEEDBACK: ActionType.CONTINUAR_FLUXO_SRM,
-    IntentCategory.EMERGENCY: ActionType.ATIVAR_MODO_SAFETY_E_HANDOFF,
-    IntentCategory.UNKNOWN: ActionType.CLARIFY,
-}
+_ENGINE_IMPERATIVES = _IMPERATIVE_LITERALS["srm.engine"]
+_PROCESS_LITERALS = _ENGINE_IMPERATIVES["SRMEngine.process"]
+_SLOT_LITERALS = _ENGINE_IMPERATIVES["SRMEngine._extract_slots"]
+_ENGINE_OUTPUTS = cast(
+    Mapping[str, str], _ENGINE_IMPERATIVES["SRMEngine.output_values"]
+)
+_RAW_ACTION_DETAILS = cast(
+    Mapping[str, str], _ENGINE_IMPERATIVES["SRMEngine._get_action_details"]
+)
+if set(_RAW_ACTION_DETAILS) != {action.value for action in ActionType}:
+    raise RuntimeError("preset action details must exactly cover ActionType")
+ACTION_DETAILS: Mapping[ActionType, str] = MappingProxyType(
+    {ActionType(action): detail for action, detail in _RAW_ACTION_DETAILS.items()}
+)
 
 
 class SRMEngine:
@@ -276,7 +252,10 @@ class SRMEngine:
         # turn is the enrich turn; the enrich turn disarms it once the outcome is read.
         if handoff_result.verification_status == "link_sent":
             state_patch.flags["scheduling_link_sent"] = True
-        elif handoff_result.verification_status in ("concluiu", "nao_concluiu"):
+        elif handoff_result.verification_status in (
+            _ENGINE_OUTPUTS["verification_completed"],
+            _ENGINE_OUTPUTS["verification_not_completed"],
+        ):
             state_patch.flags["scheduling_link_sent"] = False
 
         # Step 9: Generate reasoning
@@ -308,11 +287,11 @@ class SRMEngine:
             final_funnel_stage = FunnelStage.STANDBY
             handoff_result.required = True
             handoff_result.reason = HandoffReason.ESCALATION
-            handoff_result.urgency = "prioritario"
+            handoff_result.urgency = _ENGINE_OUTPUTS["priority"]
             if not handoff_result.sector:
-                handoff_result.sector = "gerencia"
+                handoff_result.sector = _PROCESS_LITERALS[0]
             if not handoff_result.sla:
-                handoff_result.sla = "prioritario"
+                handoff_result.sla = _ENGINE_OUTPUTS["priority"]
             mode = FlowMode.HANDOFF
 
         # Clinical-safety intents force safety_concern=True, handoff=True
@@ -325,11 +304,11 @@ class SRMEngine:
             handoff_result.required = True
             if not handoff_result.reason:
                 handoff_result.reason = HandoffReason.SAFETY_CONCERN
-            handoff_result.urgency = handoff_result.urgency or "alto"
+            handoff_result.urgency = handoff_result.urgency or _ENGINE_OUTPUTS["high"]
             if not handoff_result.sector:
-                handoff_result.sector = "clinico"
+                handoff_result.sector = _PROCESS_LITERALS[1]
             if not handoff_result.sla:
-                handoff_result.sla = "prioritario"
+                handoff_result.sla = _ENGINE_OUTPUTS["priority"]
             mode = FlowMode.SAFETY
 
         # Safety concern: safety_detector OR escalation OR clinical-safety intent
@@ -349,10 +328,7 @@ class SRMEngine:
         # Action details: include escalation_notice for escalation intents
         action_details = self._get_action_details(action, intent_result.intent)
         if is_escalation:
-            action_details = (
-                "escalation_notice: O paciente expressou insatisfação. "
-                "Priorize empatia, acolhimento e encaminhe para atendimento humano imediatamente."
-            )
+            action_details = _PROCESS_LITERALS[2]
 
         # Build decision
         decision = SRMDecision(
@@ -517,41 +493,16 @@ class SRMEngine:
         tipo_match = _ATENDIMENTO_TIPO_RE.search(message or "")
         if tipo_match:
             raw = tipo_match.group(1).lower()
-            new_tipo = "particular" if raw == "particular" else "convenio"
-            previous = (input_slots or {}).get("atendimento_tipo")
+            new_tipo = (
+                _SLOT_LITERALS[0] if raw == _SLOT_LITERALS[1] else _SLOT_LITERALS[2]
+            )
+            previous = (input_slots or {}).get(_SLOT_LITERALS[3])
             if new_tipo != previous:
-                patch.slots["atendimento_tipo"] = new_tipo
+                patch.slots[_SLOT_LITERALS[4]] = new_tipo
 
     def _get_action_details(self, action: ActionType, intent: str) -> str:
         """Get detailed description of the action (Action Catalog v0.1)."""
-        details = {
-            ActionType.PERGUNTAR_SE_JA_E_PACIENTE: "Perguntar se o usuário já é paciente",
-            ActionType.PERGUNTAR_NOME: "Perguntar nome do usuário",
-            ActionType.PERGUNTA_UNICA_PARA_DESTRAVAR: "Perguntar objetivo do contato",
-            ActionType.INICIAR_FLUXO_QUALIFICACAO_SRM: "Iniciar fluxo de qualificação no SRM",
-            ActionType.CONTINUAR_FLUXO_SRM: "Continuar fluxo SRM",
-            ActionType.SOLICITAR_DECISAO_AGENDAMENTO: "Solicitar decisão de agendamento",
-            ActionType.DEFINIR_FUNNEL_STAGE: "Definir etapa do funil",
-            ActionType.COLETAR_PREFERENCIAS_AGENDAMENTO: "Coletar preferências de agendamento",
-            ActionType.ROTEAR_PARA_AGENTE_AGENDAMENTO: "Rotear para agente de agendamento",
-            ActionType.HANDOFF_AGENDAMENTO: "Handoff para setor agendamento",
-            ActionType.PROCESSAR_CANCELAMENTO: "Processar cancelamento e handoff",
-            ActionType.PROCESSAR_REAGENDAMENTO: "Processar reagendamento e handoff",
-            ActionType.PROCESSAR_CONFIRMACAO_PRESENCA: "Processar confirmação de presença",
-            ActionType.CONSULTAR_RAG_RESPONDER: "Consultar RAG e responder",
-            ActionType.CONSULTAR_RAG_E_SE_FALTAR_HANDOFF: "Consultar RAG; handoff se faltar",
-            ActionType.HANDOFF_FINANCEIRO: "Handoff financeiro",
-            ActionType.HANDOFF_ADMINISTRATIVO: "Handoff administrativo",
-            ActionType.HANDOFF_GERENCIA: "Handoff gerência",
-            ActionType.HANDOFF_CLINICO: "Handoff clínico",
-            ActionType.HANDOFF_URGENCIA: "Handoff urgência",
-            ActionType.ATIVAR_MODO_SAFETY_E_HANDOFF: "Ativar modo safety e handoff",
-            ActionType.ATIVAR_PROTOCOLO_CONDUTA_NADEQUADA: "Ativar protocolo conduta inadequada",
-            ActionType.ENFILEIRAR_HANDOFF_FORA_DO_HORARIO: "Enfileirar handoff fora do horário",
-            ActionType.RESPOND: "Responder ao usuário",
-            ActionType.CLARIFY: "Esclarecer intenção do usuário",
-        }
-        return details.get(action, "")
+        return ACTION_DETAILS[action]
 
     def _generate_reasoning(
         self,

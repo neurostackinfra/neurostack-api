@@ -6,7 +6,10 @@ Base class for prompt templates.
 import logging
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
+from typing import cast
 
+from neurostack_core.presets import get_preset
 from neurostack_core.prompt.models import (
     MessageRole,
     PromptMessage,
@@ -15,6 +18,15 @@ from neurostack_core.prompt.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+_IMPERATIVE_LITERALS = cast(
+    Mapping[str, Mapping[str, tuple[str, ...]]],
+    get_preset().prompt["imperative_literals"],
+)
+_BASE_IMPERATIVES = _IMPERATIVE_LITERALS["prompt.templates.base"]
+_CONSTRAINT_LITERALS = _BASE_IMPERATIVES["BaseTemplate.get_constraints"]
+_SAFETY_LITERALS = _BASE_IMPERATIVES["BaseTemplate.get_safety_reminders"]
+_FORMAT_LITERALS = _BASE_IMPERATIVES["BaseTemplate._get_response_format_reminder"]
 
 
 class BaseTemplate(ABC):
@@ -74,7 +86,7 @@ class BaseTemplate(ABC):
             return ""
 
         constraints_text = "\n".join(f"- {c}" for c in variables.constraints)
-        return f"\n## Restri\u00e7\u00f5es Importantes\n{constraints_text}\n"
+        return f"{_CONSTRAINT_LITERALS[0]}{constraints_text}\n"
 
     def get_safety_reminders(self, variables: PromptVariables) -> str:
         """
@@ -92,22 +104,11 @@ class BaseTemplate(ABC):
         reminders_text = "\n".join(
             f"\u26a0\ufe0f {r}" for r in variables.safety_reminders
         )
-        return f"\n## Lembretes de Seguran\u00e7a\n{reminders_text}\n"
+        return f"{_SAFETY_LITERALS[0]}{reminders_text}\n"
 
     def _get_response_format_reminder(self) -> str:
         """Final reinforcement block — placed last so the LLM weighs it heavily."""
-        return (
-            "\n## FORMATO DA RESPOSTA (OBRIGATÓRIO)\n"
-            "- Responda em NO MÁXIMO 2-3 frases curtas (máximo 40 palavras).\n"
-            "- Faça APENAS UMA pergunta por mensagem. NUNCA duas ou mais.\n"
-            "- Estilo WhatsApp: direto, acolhedor, sem parágrafos longos.\n"
-            "- NUNCA use parênteses com observações, dicas ou meta-comentários. Ex: '(Se você tiver...)' é PROIBIDO.\n"
-            "- NUNCA invente serviços que não estão no Clinic Config. Só mencione o que está listado em Serviços Oferecidos.\n"
-            "- NUNCA invente pré-requisitos (ex: 'é necessário uma consulta antes'). Só informe o que está explícito no Clinic Config.\n"
-            "- Se 'Tipo de consulta inicial' for Gratuita/Cortesia, a consulta inicial é uma CORTESIA da clínica. NUNCA diga que custa dinheiro, NUNCA diga que será 'ressarcida'. É uma CORTESIA.\n"
-            "- NUNCA use listas com bullet points (*, -, 1.). Responda em texto corrido.\n"
-            "- NÃO se apresente novamente se já se apresentou antes (verifique o histórico).\n"
-        )
+        return _FORMAT_LITERALS[0]
 
     def build_system_message(self, variables: PromptVariables) -> PromptMessage:
         """

@@ -6,7 +6,10 @@ authors = ["NeuroStack Team <team@neurostack.ai>"]
 license = "MIT"
 readme = "README.md"
 packages = [{ include = "neurostack_core" }]
-include = [{ path = "scripts/*.py", format = "sdist" }]
+include = [
+    { path = "scripts/*.py", format = "sdist" },
+    { path = "neurostack_core/presets/**/*.toml", format = ["sdist", "wheel"] },
+]
 
 [tool.poetry.dependencies]
 python = ">=3.11,<4.0"
