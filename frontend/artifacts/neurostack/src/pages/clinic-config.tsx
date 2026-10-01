@@ -127,8 +127,12 @@ const CONFIG_SAVE_FIELD_LABELS: Record<string, Record<ConfigSaveErrorLocale, str
   scheduling_link_message: { pt: "mensagem do link de agendamento", en: "scheduling link message" },
   timezone: { pt: "fuso horário", en: "timezone" },
   business_hours: { pt: "horários de funcionamento", en: "business hours" },
-  handoff_cycle_days: { pt: "dias do ciclo de handoff", en: "handoff cycle days" },
-  handoff_inactive_default_hours: { pt: "horas de inatividade do handoff", en: "handoff inactivity hours" },
+  handoff_policy: { pt: "configuração de stand-by após handoff", en: "post-handoff stand-by settings" },
+  handoff_active: { pt: "ativação do handoff", en: "handoff activation" },
+  standby_mode: { pt: "modo de stand-by", en: "stand-by mode" },
+  handoff_period: { pt: "modo de reativação", en: "reactivation mode" },
+  handoff_cycle_hours: { pt: "horas do prazo de handoff", en: "handoff period hours" },
+  handoff_cycle_days: { pt: "dias do prazo de handoff", en: "handoff period days" },
   meta_minutos_atendimento: { pt: "meta de minutos para atendimento", en: "service-time target in minutes" },
   whatsapp_provider: { pt: "provedor do WhatsApp", en: "WhatsApp provider" },
   zapi_instance_id: { pt: "ID da instância Z-API", en: "Z-API instance ID" },
@@ -184,13 +188,16 @@ function safeConfigFieldLabel(field: unknown, locale: ConfigSaveErrorLocale): st
 }
 
 function configSaveErrorFieldNames(detail: unknown): string[] {
-  const issues = Array.isArray(detail)
-    ? detail
-    : isRecord(detail) && Array.isArray(detail.fields)
-      ? detail.fields
-      : isRecord(detail) && typeof detail.field === "string"
-        ? [detail.field]
-        : [];
+  let issues: unknown[] = [];
+  if (Array.isArray(detail)) {
+    issues = detail;
+  } else if (isRecord(detail) && Array.isArray(detail.violations)) {
+    issues = detail.violations;
+  } else if (isRecord(detail) && Array.isArray(detail.fields)) {
+    issues = detail.fields;
+  } else if (isRecord(detail) && typeof detail.field === "string") {
+    issues = [detail.field];
+  }
   return [...new Set(issues.flatMap((issue) => {
     if (typeof issue === "string") return [issue];
     if (!isRecord(issue)) return [];
@@ -258,8 +265,8 @@ export function describeConfigSaveFailure(
       en: "The API URL does not match this provider's official endpoint. Use the official endpoint shown in the API URL field.",
     },
     provider_switch_bundle_required: {
-      pt: "Para trocar o provedor, informe juntos a URL da API, uma nova API Key e o modelo.",
-      en: "To switch providers, enter the API URL, a new API key, and the model together.",
+      pt: "Para trocar o provedor ou endpoint, informe todos os campos obrigatórios junto com uma nova chave ou token.",
+      en: "To switch providers or endpoints, enter all required fields together with a new key or token.",
     },
     provider_not_available: {
       pt: "Este provedor ainda não está liberado para nova configuração.",
@@ -450,8 +457,8 @@ type SttProvider =
   | "google_stt"
   | "deepgram_stt"
   | "microsoft_stt"
-  | "outros";
-type TtsProvider = "elevenlabs" | "google";
+  | "openrouter";
+type TtsProvider = "elevenlabs" | "google" | "openai";
 type MultimodalProvider = "openrouter";
 
 // Every canonical multimodal provider id declared in the backend allowlist
@@ -486,34 +493,35 @@ export type ProviderAvailabilityMatrix = {
  */
 export const API_PROVIDER_AVAILABILITY = {
   whatsapp: {
-    meta_cloud: "coming_soon",
-    zapi: "coming_soon",
-    uazapi: "coming_soon",
-    evolution: "coming_soon",
+    meta_cloud: "active",
+    zapi: "active",
+    uazapi: "active",
+    evolution: "active",
     dialog360: "coming_soon",
     twilio: "coming_soon",
   },
   llm: {
-    dropout: "coming_soon",
+    dropout: "active",
     gemini: "active",
-    openai: "coming_soon",
-    outros: "coming_soon",
+    openai: "active",
+    outros: "active",
     slm_cortex: "coming_soon",
   },
   multimodal: {
     openrouter: "coming_soon",
   },
   stt: {
-    outros: "coming_soon",
-    openai_whisper: "coming_soon",
-    elevenlabs_scribe: "coming_soon",
+    openrouter: "active",
+    openai_whisper: "active",
+    elevenlabs_scribe: "active",
     google_stt: "coming_soon",
     deepgram_stt: "coming_soon",
     microsoft_stt: "coming_soon",
   },
   tts: {
-    elevenlabs: "coming_soon",
-    google: "coming_soon",
+    elevenlabs: "active",
+    google: "active",
+    openai: "active",
   },
 } as const satisfies ProviderAvailabilityMatrix;
 
@@ -629,25 +637,25 @@ const WA_PROVIDER_LABEL: Record<WhatsappProvider, string> = WA_PROVIDERS.reduce(
   {} as Record<WhatsappProvider, string>,
 );
 
-// Every canonical STT provider id declared in the backend allowlist
-// (`PROVIDER_ALLOWLISTS["stt"]` in `src/services/api_credentials.py`) must be
-// represented here. Missing an id would break credential save/load parity.
+// Public STT catalog. The legacy `outros` wire id remains a backend-only
+// compatibility path; new OpenRouter configurations use its explicit id.
 export const STT_PROVIDERS: { id: SttProvider; label: string; sub: string }[] = [
   { id: "openai_whisper",    label: "Whisper",    sub: "by OpenAI"    },
   { id: "elevenlabs_scribe", label: "Scribe",     sub: "by ElevenLabs" },
   { id: "google_stt",        label: "Cloud STT",  sub: "by Google"          },
   { id: "deepgram_stt",      label: "Deepgram",   sub: "by Deepgram" },
   { id: "microsoft_stt",     label: "Azure STT",  sub: "by Microsoft"       },
-  { id: "outros",            label: "Outros",     sub: "Groq / OpenRouter"    },
+  { id: "openrouter",        label: "Outros",     sub: "by OpenRouter"    },
 ];
 
 export const TTS_PROVIDERS: { id: TtsProvider; label: string; sub: string }[] = [
   { id: "elevenlabs", label: "ElevenLabs",      sub: "Voz natural e humana" },
   { id: "google",     label: "Google Cloud TTS", sub: "Escala e bom custo"       },
+  { id: "openai",     label: "OpenAI TTS",       sub: "gpt-4o-audio / tts-1" },
 ];
 
 // The display catalog is intentionally availability-agnostic: the canonical
-// Gemini-active/provider-coming-soon state lives above.
+// active/coming-soon state lives above.
 export const PROVIDERS: {
   id: LlmProvider;
   label: string;
@@ -657,7 +665,7 @@ export const PROVIDERS: {
   { id: "dropout",    label: "Dropout",    sub: "by Neuralake" },
   { id: "openai",     label: "GPT",        sub: "by OpenAI" },
   { id: "gemini",     label: "Gemini",     sub: "by Google" },
-  { id: "outros",     label: "Outros",     sub: "Custom / OSS" },
+  { id: "outros",     label: "Outros",     sub: "OpenAI-compatible / OpenRouter" },
 ];
 
 type ProviderDisplay = { id: string; label: string; sub: string };
@@ -717,6 +725,11 @@ const WHATSAPP_DECOMMISSION_LEVER: Record<string, string> = {
   uazapi: "uazapi_api_url",
 };
 
+const WHATSAPP_PROVIDER_ENDPOINT_FIELD: Record<string, string> = {
+  evolution: "evolution_api_url",
+  uazapi: "uazapi_api_url",
+};
+
 // Voice triggers (`tts_enabled`, `tts_reply_policy`) belong to
 // VoiceResponseControls and are deliberately absent here.
 const CAPABILITY_FIELDS: Record<string, readonly CredentialField[]> = {
@@ -746,15 +759,27 @@ const CAPABILITY_FIELDS: Record<string, readonly CredentialField[]> = {
 
 const GEMINI_OPENAI_COMPATIBLE_BASE_URL =
   "https://generativelanguage.googleapis.com/v1beta/openai";
+const OPENAI_BASE_URL = "https://api.openai.com/v1";
+const ELEVENLABS_BASE_URL = "https://api.elevenlabs.io/v1";
+const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
 function newProviderFieldDefault(
   capability: ApiCapabilityId,
   providerId: string,
   fieldName: string,
 ): string {
-  return capability === "llm" && providerId === "gemini" && fieldName === "llm_api_url"
-    ? GEMINI_OPENAI_COMPATIBLE_BASE_URL
-    : "";
+  if (capability === "llm" && providerId === "gemini" && fieldName === "llm_api_url") {
+    return GEMINI_OPENAI_COMPATIBLE_BASE_URL;
+  }
+  if (capability === "tts" && providerId === "openai" && fieldName === "tts_api_url") {
+    return OPENAI_BASE_URL;
+  }
+  if (capability === "stt" && fieldName === "stt_api_url") {
+    if (providerId === "openai_whisper") return OPENAI_BASE_URL;
+    if (providerId === "elevenlabs_scribe") return ELEVENLABS_BASE_URL;
+    if (providerId === "openrouter") return OPENROUTER_BASE_URL;
+  }
+  return "";
 }
 
 const CAPABILITY_PROVIDER_FIELD: Record<ApiCapabilityId, string> = {
@@ -924,28 +949,39 @@ export function ApiCredentialsForm({
   async function saveProvider(capability: ApiCapabilityId, providerId: string) {
     const requestGeneration = clinicGenerationRef.current.generation;
     const isCurrentClinic = () => clinicGenerationRef.current.generation === requestGeneration;
-    const body: Record<string, string | number> = {};
-    // Adoption only takes effect if the provider field travels with the
-    // bundle; omitting it would persist credentials under the previous
-    // provider's label and leave the card unable to reach CONFIGURADO.
+    const body: Record<string, string | number | null> = {};
     const providerField = CAPABILITY_PROVIDER_FIELD[capability];
     const held = statusText(status, providerField);
-    if (held !== providerId) {
+    const endpointField = capability === "whatsapp"
+      ? WHATSAPP_PROVIDER_ENDPOINT_FIELD[providerId]
+      : capability === "multimodal"
+        ? undefined
+        : `${capability}_api_url`;
+    const endpointChanged = endpointField !== undefined
+      && held === providerId
+      && (draft[endpointField] ?? "") !== (baseline[endpointField] ?? "");
+    const requiresFreshBundle = held !== providerId || endpointChanged;
+    // Adoption and endpoint rotation only take effect if the provider and its
+    // complete non-secret bundle travel together. Secrets remain write-only:
+    // an endpoint rotation without a newly typed key is rejected safely by
+    // the backend instead of inheriting the credential stored for the old URL.
+    if (requiresFreshBundle) {
       body[providerField] = providerId;
       // The retired bundle stays populated and goes on resolving its own
       // inbound webhooks, so it would keep replying under the new provider's
-      // name. Emptying its identity field here retires it while the switch is
-      // still expressible; afterwards its card reads empty and there is
-      // nothing left to blank.
+      // name. Nulling its identity field here retires it without violating the
+      // identifier/URL validators that reject empty strings; afterwards its
+      // card reads empty and there is nothing left to clear.
       const lever =
         capability === "whatsapp" ? WHATSAPP_DECOMMISSION_LEVER[held] : undefined;
-      if (lever) body[lever] = "";
+      if (lever) body[lever] = null;
     }
     for (const field of credentialFields(capability, providerId)) {
       const value = draft[field.name] ?? "";
       if (field.secret) {
         if (value) body[field.name] = value;
-      } else if (held !== providerId || value !== baseline[field.name]) {
+      } else if ((requiresFreshBundle && value !== "")
+        || (!requiresFreshBundle && value !== baseline[field.name])) {
         body[field.name] = field.numeric ? Number(value) : value;
       }
     }
@@ -994,8 +1030,8 @@ export function ApiCredentialsForm({
     <section className="space-y-5" data-testid="api-settings-section">
       <p className="text-sm text-muted-foreground" data-testid="api-settings-legacy-state-note">
         {txt(
-          "Gemini está disponível; os demais provedores permanecem EM BREVE.",
-          "Gemini is available; the other providers remain COMING SOON.",
+          "Selecione um provedor disponível para configurar suas credenciais.",
+          "Select an available provider to configure its credentials.",
         )}
       </p>
       {loadFailed && (
@@ -1037,17 +1073,15 @@ export function ApiCredentialsForm({
             >
               {providers.map((provider) => {
                 if (!(provider.id in availability)) return null;
-                // Until the tenant's status lands, which provider is held is
-                // unknown, so every card stays inert rather than offering an
-                // adoption that could silently displace a stored provider.
-                const state = status === null
-                  ? "coming_soon"
-                  : providerCardState(
-                      capability.id,
-                      provider.id,
-                      status,
-                      providerAvailability,
-                    );
+                // Product availability remains visible while tenant status is
+                // loading or unavailable. Interaction stays fail-closed below
+                // so an unknown held provider can never be displaced.
+                const state = providerCardState(
+                  capability.id,
+                  provider.id,
+                  status,
+                  providerAvailability,
+                );
                 const key = `${capability.id}:${provider.id}`;
                 return (
                   <ProviderCredentialCard
@@ -1058,7 +1092,7 @@ export function ApiCredentialsForm({
                     state={state}
                     badgeLabel={badgeLabel[state]}
                     isExpanded={expanded === key}
-                    onToggle={state === "coming_soon" || isReadOnly
+                    onToggle={status === null || state === "coming_soon" || isReadOnly
                       ? undefined
                       : () => toggleProvider(capability.id, provider.id)}
                   />
@@ -1247,8 +1281,6 @@ const INVESTOR_MOCK_CONFIG = {
     sat: { open: "09:00", close: "14:00" },
   },
   service_format: "both",
-  online_services_desc: "Consulta de avaliação, acompanhamento pós-procedimento, orientações nutricionais",
-  presential_services_desc: "Aplicação de toxina botulínica, preenchimento labial, limpeza de pele profunda, harmonização facial",
   differentials: "Especialistas com mais de 10 anos de experiência, atendimento humanizado e foco em resultados naturais. Equipamentos de última geração importados da Alemanha.",
   accepts_insurance: "yes",
   insurance_list: "Unimed, Bradesco Saúde, SulAmérica, Amil",
@@ -1268,8 +1300,38 @@ const INVESTOR_MOCK_CONFIG = {
   ],
 };
 
+export function HitlComingSoonControl() {
+  const { locale } = useI18n();
+  const modeTitle = locale === "en"
+    ? "Co-pilot mode - COMING SOON"
+    : "Modo co-piloto - EM BREVE";
+
+  return (
+    <div
+      className="flex items-center justify-between gap-3 rounded-lg border border-border/60 bg-muted/20 px-4 py-4"
+      data-testid="hitl-coming-soon"
+    >
+      <div className="space-y-1">
+        <p className="text-sm font-semibold text-foreground">
+          Human-in-the-loop (HITL)
+        </p>
+        <p className="text-xs text-muted-foreground">
+          {modeTitle}
+        </p>
+      </div>
+      <Switch
+        aria-label={modeTitle}
+        checked={false}
+        disabled
+        className="shrink-0"
+      />
+    </div>
+  );
+}
+
 export default function ClinicConfig() {
   const { clinicId, isReadOnly, isClinicAdmin, role, isBuilder, isSuperAdmin, isInvestor, viewingClinicId } = useAuth();
+  const canConfigureHandoff = !isClinicAdmin;
   const { t, locale } = useI18n();
   const txt = (p: string, e: string) => locale === "en" ? e : p;
   const { toast } = useToast();
@@ -1332,8 +1394,6 @@ export default function ClinicConfig() {
   const [businessHours, setBusinessHours] = useState<BusinessHoursMap | null>(null);
   const [businessHoursErrors, setBusinessHoursErrors] = useState<Record<string, string>>({});
   const [metaMinutosAtendimento, setMetaMinutosAtendimento] = useState("10");
-  const [onlineServicesDesc, setOnlineServicesDesc] = useState("");
-  const [presentialServicesDesc, setPresentialServicesDesc] = useState("");
 
   // Tab 3 — Regras de Negócio
   const [differentials, setDifferentials] = useState("");
@@ -1365,13 +1425,15 @@ export default function ClinicConfig() {
   const [isTogglingBot, setIsTogglingBot] = useState(false);
 
   // Tab 4 — Handoff
-  const [handoffActive, setHandoffActive] = useState("yes");
   const [standbyMode, setStandbyMode] = useState("active");
   const [handoffPeriod, setHandoffPeriod] = useState("permanent");
-  const [handoffCycleDays, setHandoffCycleDays] = useState("");
-  const [handoffInactiveDefaultHours, setHandoffInactiveDefaultHours] = useState("24");
-  const [hitlActive, setHitlActive] = useState(false);
-  const [hitlCooldown, setHitlCooldown] = useState("15");
+  const [handoffCycleValue, setHandoffCycleValue] = useState("");
+  const [handoffCycleUnit, setHandoffCycleUnit] = useState<"hours" | "days">("hours");
+  const [handoffCycleError, setHandoffCycleError] = useState("");
+  const handoffEditGenerationRef = useRef(0);
+  const configTarget = (isBuilder || isSuperAdmin) && viewingClinicId ? viewingClinicId : clinicId;
+  const configTargetRef = useRef(configTarget);
+  configTargetRef.current = configTarget;
 
   // Tab 5 — Catálogo de Serviços
   const [services, setServices] = useState<ClinicService[]>([]);
@@ -1424,14 +1486,22 @@ export default function ClinicConfig() {
     setLanguagePolicy(config.language_policy ?? "neurostack_default");
     setLanguagePolicyCustom(config.language_policy_custom ?? "");
     setAgentLanguage(config.agent_language ?? "pt-BR");
-    setHandoffActive(config.handoff_active ?? "yes");
-    setStandbyMode(config.standby_mode ?? "active");
-    setHandoffPeriod(config.handoff_period ?? "permanent");
-    setHandoffCycleDays(config.handoff_cycle_days ?? "");
-    setHandoffInactiveDefaultHours(config.handoff_inactive_default_hours ?? "24");
+    const hydratedStandbyMode = config.standby_mode === "inactive" ? "inactive" : "active";
+    const hydratedHours = config.handoff_cycle_hours;
+    const hydratedDays = config.handoff_cycle_days;
+    const hasHours = hydratedHours !== null && hydratedHours !== undefined && hydratedHours !== "";
+    const hasDays = hydratedDays !== null && hydratedDays !== undefined && hydratedDays !== "";
+    const hasHydratedDuration = hasHours || hasDays;
+    setStandbyMode(hydratedStandbyMode);
+    setHandoffPeriod(
+      hydratedStandbyMode === "active" && config.handoff_period === "cycle" && hasHydratedDuration
+        ? "cycle"
+        : "permanent",
+    );
+    setHandoffCycleUnit(hasHours ? "hours" : hasDays ? "days" : "hours");
+    setHandoffCycleValue(hasHours ? String(hydratedHours) : hasDays ? String(hydratedDays) : "");
+    setHandoffCycleError("");
     setMetaMinutosAtendimento(String(config.meta_minutos_atendimento ?? "10"));
-    setOnlineServicesDesc(config.online_services_desc ?? "");
-    setPresentialServicesDesc(config.presential_services_desc ?? "");
     setServices(Array.isArray(config.services) ? config.services.map(hydrateClinicService) : []);
     setServiceFormatErrors({});
     // bot_active: treat null/undefined as true (default on)
@@ -1493,6 +1563,22 @@ export default function ClinicConfig() {
     } finally {
       setIsTogglingBot(false);
     }
+  };
+
+  const validateHandoffCycle = (value: string, unit: "hours" | "days") => {
+    const maximum = unit === "hours" ? 720 : 365;
+    if (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > maximum) {
+      return unit === "hours"
+        ? txt(
+            "Informe um número inteiro de 1 a 720 horas.",
+            "Enter a whole number from 1 to 720 hours.",
+          )
+        : txt(
+            "Informe um número inteiro de 1 a 365 dias.",
+            "Enter a whole number from 1 to 365 days.",
+          );
+    }
+    return "";
   };
 
   const handleSave = async () => {
@@ -1625,6 +1711,22 @@ export default function ClinicConfig() {
     }
     setServiceFormatErrors({});
 
+    if (canConfigureHandoff && standbyMode === "active" && handoffPeriod === "cycle") {
+      const cycleError = validateHandoffCycle(handoffCycleValue, handoffCycleUnit);
+      if (cycleError) {
+        setHandoffCycleError(cycleError);
+        return;
+      }
+    }
+    setHandoffCycleError("");
+
+    const customHandoffCycle = canConfigureHandoff
+      && standbyMode === "active"
+      && handoffPeriod === "cycle";
+    const handoffCycleNumber = customHandoffCycle ? Number(handoffCycleValue) : null;
+    const submittedHandoffGeneration = handoffEditGenerationRef.current;
+    const submittedConfigTarget = configTargetRef.current;
+
     setIsSaving(true);
     const payload: Record<string, any> = {
       clinic_name: clinicName.trim(),
@@ -1668,15 +1770,19 @@ export default function ClinicConfig() {
       language_policy: languagePolicy || null,
       language_policy_custom: languagePolicyCustom.trim() || null,
       agent_language: agentLanguage || "pt-BR",
-      handoff_active: "yes",
-      standby_mode: standbyMode || null,
-      handoff_period: handoffPeriod || null,
-      handoff_cycle_days: handoffCycleDays.trim() || null,
-      handoff_inactive_default_hours: parseInt(handoffInactiveDefaultHours, 10) || 24,
       meta_minutos_atendimento: parseInt(metaMinutosAtendimento, 10) || 10,
-      online_services_desc: onlineServicesDesc.trim() || null,
-      presential_services_desc: presentialServicesDesc.trim() || null,
     };
+    if (canConfigureHandoff) {
+      Object.assign(payload, {
+        handoff_active: "yes",
+        standby_mode: standbyMode,
+        handoff_period: customHandoffCycle ? "cycle" : "permanent",
+        handoff_cycle_hours:
+          customHandoffCycle && handoffCycleUnit === "hours" ? handoffCycleNumber : null,
+        handoff_cycle_days:
+          customHandoffCycle && handoffCycleUnit === "days" ? handoffCycleNumber : null,
+      });
+    }
     try {
       const token = getToken();
       const patchUrl = (isBuilder || isSuperAdmin) && viewingClinicId
@@ -1699,8 +1805,12 @@ export default function ClinicConfig() {
         });
         return;
       }
-      const updated = responseBody;
-      setConfig(updated);
+      if (
+        handoffEditGenerationRef.current === submittedHandoffGeneration
+        && configTargetRef.current === submittedConfigTarget
+      ) {
+        setConfig(responseBody);
+      }
       toast({ title: t("config_saved"), description: t("config_saved_desc") });
     } catch {
       toast({
@@ -2108,8 +2218,8 @@ export default function ClinicConfig() {
               <SwitchRow
                 label={txt("Link de Agendamento", "Scheduling Link")}
                 hint={txt(
-                  "Quando ativo, a IA envia o link (definido abaixo) ao paciente na confirmação do agendamento e cria um handoff pendente de verificação.",
-                  "When enabled, the AI sends the link (defined below) to the patient on scheduling confirmation and creates a pending-verification handoff.",
+                  "Quando ativo, a IA envia o link (definido abaixo) ao paciente após ele confirmar a solicitação de agendamento e cria um handoff pendente de verificação.",
+                  "When enabled, the AI sends the link (defined below) after the patient confirms the scheduling request and creates a pending-verification handoff.",
                 )}
                 checked={schedulingLinkEnabled}
                 onCheckedChange={(v) => {
@@ -2212,40 +2322,6 @@ export default function ClinicConfig() {
                   </SelectContent>
                 </Select>
               </Field>
-
-              {(serviceFormat === "online" || serviceFormat === "both") && (
-                <Field
-                  label={txt("Serviços realizados Online", "Online Services")}
-                  hint={txt("Quais procedimentos ou consultas são oferecidos de forma remota.", "Which procedures or consultations are offered remotely.")}
-                >
-                  <Textarea
-                    value={onlineServicesDesc}
-                    onChange={(e) => setOnlineServicesDesc(e.target.value)}
-                    placeholder={txt("Ex: Consulta de avaliação, acompanhamento pós-procedimento, orientações nutricionais", "e.g. Assessment consultation, post-procedure follow-up, nutritional guidance")}
-                    rows={3}
-                    className="resize-none text-sm"
-                    disabled={isReadOnly}
-                    data-testid="textarea-online-services"
-                  />
-                </Field>
-              )}
-
-              {(serviceFormat === "presential" || serviceFormat === "both") && (
-                <Field
-                  label={txt("Serviços realizados Presencialmente", "In-Person Services")}
-                  hint={txt("Quais procedimentos exigem presença física na clínica.", "Which procedures require physical presence at the clinic.")}
-                >
-                  <Textarea
-                    value={presentialServicesDesc}
-                    onChange={(e) => setPresentialServicesDesc(e.target.value)}
-                    placeholder={txt("Ex: Aplicação de toxina botulínica, preenchimento labial, limpeza de pele profunda", "e.g. Botulinum toxin application, lip filler, deep skin cleansing")}
-                    rows={3}
-                    className="resize-none text-sm"
-                    disabled={isReadOnly}
-                    data-testid="textarea-presential-services"
-                  />
-                </Field>
-              )}
             </CardContent>
           </Card>
         </TabsContent>
@@ -2595,115 +2671,177 @@ export default function ClinicConfig() {
               </div>
 
               {/* ── HITL Block ─────────────────────────────────────── */}
-                  <div className="rounded-lg border border-border/60 bg-muted/20 px-4 py-4 space-y-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="space-y-1 flex-1">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-sm font-semibold text-foreground">
-                            {txt("Ativar Human-in-the-Loop (Modo Co-Piloto)", "Enable Human-in-the-Loop (Co-Pilot Mode)")}
-                          </span>
-                          <span className="inline-flex items-center rounded-full border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[10px] font-bold tracking-wider text-indigo-500">
-                            {txt("Recomendado · HITL", "Recommended · HITL")}
-                          </span>
-                          <span className="inline-flex items-center rounded-full border border-purple-500/40 bg-purple-500/10 px-2 py-0.5 text-[10px] font-bold tracking-wider text-purple-400">
-                            ROADMAP · V2
-                          </span>
-                        </div>
-                        <p className="text-xs text-muted-foreground leading-relaxed">
-                          {txt("Em vez de desligar a IA permanentemente, ela pausará e lerá as mensagens da sua equipe no WhatsApp Web, mantendo o contexto para continuar a venda depois.", "Instead of permanently disabling AI, it will pause and read your team's messages on WhatsApp Web, keeping context to continue the conversation later.")}
-                        </p>
-                      </div>
+                  <HitlComingSoonControl />
+
+                  <section
+                    aria-labelledby="handoff-standby-title"
+                    className="space-y-4 rounded-lg border border-border/60 bg-muted/10 px-4 py-4"
+                    data-testid="handoff-standby-settings"
+                  >
+                    <div className="space-y-1">
+                      <h3 id="handoff-standby-title" className="text-sm font-semibold text-foreground">
+                        {txt("Stand-by após handoff", "Stand-by after handoff")}
+                      </h3>
+                      <p className="text-xs leading-relaxed text-muted-foreground">
+                        {txt(
+                          "Defina por quanto tempo a IA permanece inativa após transferir a conversa para um atendente.",
+                          "Define how long the AI remains inactive after transferring the conversation to an attendant.",
+                        )}
+                      </p>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-4">
+                      <Label className="text-sm font-medium text-foreground">
+                        {txt("Ativar stand-by após handoff", "Enable stand-by after handoff")}
+                      </Label>
                       <Switch
-                        checked={hitlActive}
-                        disabled={isReadOnly}
-                        onCheckedChange={() => {
-                          toast({
-                            title: txt("Funcionalidade em desenvolvimento", "Feature in development"),
-                            description: txt("O Modo Co-Piloto estará disponível na V2.", "Co-Pilot Mode will be available in V2."),
-                          });
+                        aria-label={txt("Ativar stand-by após handoff", "Enable stand-by after handoff")}
+                        checked={standbyMode === "active"}
+                        onCheckedChange={(enabled) => {
+                          handoffEditGenerationRef.current += 1;
+                          setStandbyMode(enabled ? "active" : "inactive");
+                          setHandoffPeriod("permanent");
+                          setHandoffCycleValue("");
+                          setHandoffCycleUnit("hours");
+                          setHandoffCycleError("");
                         }}
-                        className="mt-0.5 shrink-0"
+                        disabled={isReadOnly}
                       />
                     </div>
 
-                    {hitlActive && (
-                      <div className="pt-1 border-t border-border/40 space-y-1.5">
-                        <label className="text-xs font-semibold text-foreground/80">
-                          {txt("Tempo de Pausa Ativa (Cooldown)", "Active Pause Time (Cooldown)")}
-                        </label>
-                        <Select value={hitlCooldown} onValueChange={setHitlCooldown} disabled={isReadOnly}>
-                          <SelectTrigger className="h-9 text-sm">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="5">5 {txt("Minutos", "Minutes")}</SelectItem>
-                            <SelectItem value="15">15 {txt("Minutos", "Minutes")}</SelectItem>
-                            <SelectItem value="30">30 {txt("Minutos", "Minutes")}</SelectItem>
-                          </SelectContent>
-                        </Select>
-                        <p className="text-[11px] text-muted-foreground">
-                          {txt("A IA ficará em silêncio por este período após cada mensagem enviada por um humano.", "AI will stay silent for this period after each message sent by a human.")}
-                        </p>
+                    <p className="text-sm font-medium text-foreground" aria-live="polite">
+                      {standbyMode === "active"
+                        ? txt("Stand-by ativado", "Stand-by enabled")
+                        : txt("Stand-by desativado", "Stand-by disabled")}
+                    </p>
+
+                    {standbyMode === "inactive" ? (
+                      <div className="rounded-md border border-sky-200 bg-sky-50 px-3 py-3 text-sm text-sky-800 dark:border-sky-800 dark:bg-sky-950/30 dark:text-sky-200">
+                        {txt(
+                          "A IA volta a responder automaticamente 24 horas após o handoff.",
+                          "The AI automatically starts responding again 24 hours after the handoff.",
+                        )}
                       </div>
+                    ) : (
+                      <>
+                        <div className="space-y-2 rounded-md border border-sky-200 bg-sky-50 px-3 py-3 text-sm text-sky-800 dark:border-sky-800 dark:bg-sky-950/30 dark:text-sky-200">
+                          <p className="font-medium">
+                            {txt(
+                              "Escolha quando a IA poderá voltar a responder:",
+                              "Choose when the AI may start responding again:",
+                            )}
+                          </p>
+                          <ul className="list-disc space-y-1 pl-5">
+                            <li>
+                              {txt(
+                                "Somente após reativação manual: a IA permanece inativa até ser reativada pela mensagem mestra ou pelo painel de inativos.",
+                                "Only after manual reactivation: the AI remains inactive until it is reactivated by the master message or the inactive conversations panel.",
+                              )}
+                            </li>
+                            <li>
+                              {txt(
+                                "Após um prazo personalizado: a IA volta a responder automaticamente após o número de horas ou dias definido abaixo.",
+                                "After a custom period: the AI starts responding again automatically after the number of hours or days defined below.",
+                              )}
+                            </li>
+                          </ul>
+                        </div>
+
+                        <Field label={txt("Quando reativar a IA?", "When should the AI be reactivated?")}>
+                          <Select
+                            value={handoffPeriod}
+                            onValueChange={(period) => {
+                              handoffEditGenerationRef.current += 1;
+                              setHandoffPeriod(period);
+                              setHandoffCycleValue("");
+                              setHandoffCycleUnit("hours");
+                              setHandoffCycleError("");
+                            }}
+                            disabled={isReadOnly}
+                          >
+                            <SelectTrigger
+                              aria-label={txt("Quando reativar a IA?", "When should the AI be reactivated?")}
+                              className="h-9 text-sm"
+                            >
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="permanent">
+                                {txt("Somente manualmente", "Manually only")}
+                              </SelectItem>
+                              <SelectItem value="cycle">
+                                {txt("Após um prazo personalizado", "After a custom period")}
+                              </SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </Field>
+
+                        {handoffPeriod === "cycle" && (
+                          <div className="space-y-1.5">
+                            <Label
+                              htmlFor="handoff-cycle-value"
+                              className="text-xs font-medium uppercase tracking-wider text-muted-foreground"
+                            >
+                              {txt(
+                                "Prazo para reativação automática",
+                                "Automatic reactivation period",
+                              )}
+                            </Label>
+                            <div className="flex items-start gap-2">
+                              <Input
+                                id="handoff-cycle-value"
+                                type="number"
+                                inputMode="numeric"
+                                min="1"
+                                max={handoffCycleUnit === "hours" ? "720" : "365"}
+                                step="1"
+                                value={handoffCycleValue}
+                                onChange={(event) => {
+                                  const value = event.target.value;
+                                  handoffEditGenerationRef.current += 1;
+                                  setHandoffCycleValue(value);
+                                  if (handoffCycleError) {
+                                    setHandoffCycleError(validateHandoffCycle(value, handoffCycleUnit));
+                                  }
+                                }}
+                                aria-invalid={handoffCycleError ? "true" : "false"}
+                                aria-describedby={handoffCycleError ? "handoff-cycle-error" : undefined}
+                                className="w-32 text-sm"
+                                disabled={isReadOnly}
+                              />
+                              <Select
+                                value={handoffCycleUnit}
+                                onValueChange={(unit: "hours" | "days") => {
+                                  handoffEditGenerationRef.current += 1;
+                                  setHandoffCycleUnit(unit);
+                                  if (handoffCycleError) {
+                                    setHandoffCycleError(validateHandoffCycle(handoffCycleValue, unit));
+                                  }
+                                }}
+                                disabled={isReadOnly}
+                              >
+                                <SelectTrigger
+                                  aria-label={txt("Unidade do prazo", "Period unit")}
+                                  className="h-9 w-32 text-sm"
+                                >
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="hours">{txt("Horas", "Hours")}</SelectItem>
+                                  <SelectItem value="days">{txt("Dias", "Days")}</SelectItem>
+                                </SelectContent>
+                              </Select>
+                            </div>
+                            {handoffCycleError && (
+                              <p id="handoff-cycle-error" role="alert" className="text-xs text-destructive">
+                                {handoffCycleError}
+                              </p>
+                            )}
+                          </div>
+                        )}
+                      </>
                     )}
-                  </div>
-
-                  <SwitchRow
-                    label={txt("Modo Stand-by pós-Handoff", "Post-Handoff Stand-by Mode")}
-                    hint={txt("A IA fica inativa após acionar handoff até o ciclo se encerrar", "AI goes inactive after triggering handoff until the cycle ends")}
-                    checked={standbyMode === "active"}
-                    onCheckedChange={(v) => setStandbyMode(v ? "active" : "inactive")}
-                    disabled={isReadOnly}
-                  />
-                  <div className="text-[11px] text-muted-foreground -mt-1 ml-1">
-                    {txt(
-                      `Se inativo, opera em handoff padrão de ${handoffInactiveDefaultHours}h (janela WhatsApp API)`,
-                      `If inactive, operates with default handoff of ${handoffInactiveDefaultHours}h (WhatsApp API window)`
-                    )}
-                  </div>
-
-                  <Field label={txt("Período de Handoff", "Handoff Period")}>
-                    <Select value={handoffPeriod} onValueChange={setHandoffPeriod} disabled={isReadOnly}>
-                      <SelectTrigger className="h-9 text-sm">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="permanent">{txt("Permanente (até reativação manual)", "Permanent (until manual reactivation)")}</SelectItem>
-                        <SelectItem value="cycle">{txt("Ciclo de X dias", "X-day Cycle")}</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </Field>
-
-                  {handoffPeriod === "cycle" && (
-                    <Field label={txt("Duração do Ciclo (dias)", "Cycle Duration (days)")}>
-                      <Input
-                        type="number"
-                        min="1"
-                        max="365"
-                        value={handoffCycleDays}
-                        onChange={(e) => setHandoffCycleDays(e.target.value)}
-                        placeholder={txt("Ex: 7", "e.g. 7")}
-                        className="w-32 text-sm"
-                        disabled={isReadOnly}
-                      />
-                    </Field>
-                  )}
-
-                  <Field
-                    label={txt("Período padrão (horas) quando Standby está inativo", "Default period (hours) when Standby is inactive")}
-                    hint={txt("Padrão: 24h. Aplicado automaticamente quando o modo Stand-by está desativado.", "Default: 24h. Applied automatically when Stand-by mode is off.")}
-                  >
-                    <Input
-                      type="number"
-                      min="1"
-                      max="720"
-                      value={handoffInactiveDefaultHours}
-                      onChange={(e) => setHandoffInactiveDefaultHours(e.target.value)}
-                      placeholder="24"
-                      className="w-32 text-sm"
-                      disabled={isReadOnly}
-                    />
-                  </Field>
+                  </section>
 
             </CardContent>
           </Card>

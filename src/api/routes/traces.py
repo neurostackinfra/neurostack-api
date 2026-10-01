@@ -7,11 +7,13 @@ through the cognitive pipeline, including SRM decisions, context, and prompts.
 """
 
 from collections.abc import Iterator
-from datetime import datetime
-from typing import Any, Optional
+from datetime import date, datetime
+from typing import Annotated, Any, Optional, TypeAlias
 from uuid import UUID
+from zoneinfo import ZoneInfoNotFoundError
 
 import jwt as pyjwt
+from annotated_types import Ge, Le
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,6 +35,7 @@ from src.observability.pii import mask_carteirinha
 from src.repositories import get_db_session_dependency
 from src.services.trace_service import (
     _event_to_trace_dict,
+    daily_utc_window,
     export_traces_csv,
     get_prompt_event_for_trace,
     get_trace,
@@ -41,6 +44,12 @@ from src.services.trace_service import (
 )
 
 _logger = get_logger(__name__)
+
+_SafeTraceDay: TypeAlias = Annotated[
+    date,
+    Ge(date(1, 1, 2)),
+    Le(date(9999, 12, 30)),
+]
 
 
 async def _resolve_tenant(
@@ -343,7 +352,40 @@ Traces are read-only views over processed message events. Each trace
 includes the SRM decision, processing metadata, and flow mode.
 
 Supports filtering by date range, safety flag, and handoff requirement.
+For an exact civil day, provide both `day` and its IANA `timezone`;
+that pair cannot be combined with `start_date` or `end_date`.
     """,
+    responses={
+        400: {
+            "description": "Invalid day/timezone pair, timezone, or date-range combination",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "timezone_required": {
+                            "value": {"detail": "timezone_required_with_day"}
+                        },
+                        "day_required": {
+                            "value": {"detail": "day_required_with_timezone"}
+                        },
+                        "invalid_timezone": {"value": {"detail": "invalid_timezone"}},
+                        "date_range_conflict": {
+                            "value": {"detail": "day_conflicts_with_date_range"}
+                        },
+                    }
+                }
+            },
+        },
+        422: {
+            "description": "Query parameter validation error",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "$ref": "#/components/schemas/HTTPValidationError",
+                    }
+                }
+            },
+        },
+    },
     tags=["Traces"],
 )
 async def trace_list(
@@ -357,6 +399,24 @@ async def trace_list(
     ),
     end_date: Optional[datetime] = Query(
         default=None, description="Filter to date (ISO 8601)"
+    ),
+    day: Optional[_SafeTraceDay] = Query(
+        default=None,
+        json_schema_extra={
+            "minimum": "0001-01-02",
+            "maximum": "9999-12-30",
+        },
+        description=(
+            "Exact local civil day. Requires timezone and cannot be combined "
+            "with start_date or end_date."
+        ),
+    ),
+    timezone: Optional[str] = Query(
+        default=None,
+        description=(
+            "IANA timezone for day (for example, America/Sao_Paulo). Requires "
+            "day and cannot be combined with start_date or end_date."
+        ),
     ),
     safety_flag: Optional[bool] = Query(
         default=None, description="Filter by safety concern flag"
@@ -374,6 +434,33 @@ async def trace_list(
     db: AsyncSession = Depends(get_db_session_dependency),
 ) -> TraceListResponse:
     """List traces with pagination and filtering."""
+    if day is not None and (start_date is not None or end_date is not None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="day_conflicts_with_date_range",
+        )
+    if day is not None and timezone is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="timezone_required_with_day",
+        )
+    if timezone is not None and day is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="day_required_with_timezone",
+        )
+
+    day_start_utc: Optional[datetime] = None
+    day_end_utc: Optional[datetime] = None
+    if day is not None and timezone is not None:
+        try:
+            day_start_utc, day_end_utc = daily_utc_window(day, timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="invalid_timezone",
+            ) from None
+
     effective_tenant_id = await _resolve_tenant(request, tenant, override_tenant_id, db)
     events, total = await list_traces(
         db=db,
@@ -385,6 +472,8 @@ async def trace_list(
         safety_flag=safety_flag,
         handoff_required=handoff_required,
         channel=channel,
+        day_start_utc=day_start_utc,
+        day_end_utc=day_end_utc,
     )
 
     items = [TraceItem.model_validate(_event_to_trace_dict(event)) for event in events]

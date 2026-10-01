@@ -26,6 +26,7 @@ from src.api.middleware.rate_limit import (
 from src.api.schemas.events import EventPayload, EventRequest, EventType
 from src.config.settings import settings
 from src.core.lgpd_utils import resolve_privacy_link
+from src.handoff.pause_policy import resolve_handoff_pause
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.tenant import Tenant as TenantModel
 from src.repositories import SessionRepository, get_db_session_dependency
@@ -66,9 +67,7 @@ META_SIGNATURE_HEADER = "X-Hub-Signature-256"
 
 # STT providers with no runtime adapter: they must skip before any
 # download / request / reply / handoff / session mutation happens.
-UNSUPPORTED_STT_PROVIDERS = frozenset(
-    {"elevenlabs_scribe", "google_stt", "deepgram_stt", "microsoft_stt"}
-)
+UNSUPPORTED_STT_PROVIDERS = frozenset({"google_stt", "deepgram_stt", "microsoft_stt"})
 
 # Replay claim retention: 31 days covers Z-API's documented 30-day media
 # availability plus one extra day of dedup guarantee.
@@ -948,19 +947,22 @@ async def _load_tenant_credentials(
 async def _load_handoff_config(
     tenant_id: UUID,
     db: AsyncSession,
-) -> dict[str, Any]:
+) -> Any:
     """Load handoff config bucket for a tenant."""
     stmt = select(ClinicConfigTable.handoff).where(
         ClinicConfigTable.tenant_id == tenant_id,
     )
     result = await db.execute(stmt)
-    return result.scalar_one_or_none() or {}
+    loaded = result.scalar_one_or_none()
+    return loaded if loaded is not None else {}
 
 
 async def _check_pause_state(
     tenant_id: UUID,
     phone: str,
     db: AsyncSession,
+    *,
+    now: datetime | None = None,
 ) -> Optional[dict[str, Any]]:
     """Check if session is paused. Returns action dict or None to continue.
 
@@ -980,10 +982,19 @@ async def _check_pause_state(
     if not session.is_paused:
         return None
 
-    now = datetime.now(timezone.utc)
+    current_time = now or datetime.now(timezone.utc)
 
-    # Lazy unpause: paused_until expired
-    if session.paused_until and session.paused_until <= now:
+    # Lazy unpause: paused_until expired. SQLite test/dev storage may return a
+    # naive UTC datetime even though PostgreSQL preserves timezone metadata.
+    deadline = session.paused_until
+    comparable_deadline = deadline
+    if (
+        comparable_deadline is not None
+        and comparable_deadline.tzinfo is None
+        and current_time.tzinfo is not None
+    ):
+        comparable_deadline = comparable_deadline.replace(tzinfo=current_time.tzinfo)
+    if comparable_deadline and comparable_deadline <= current_time:
         session.is_paused = False
         session.paused_until = None
         await db.flush()
@@ -1045,6 +1056,8 @@ async def _handle_clinic_message(
     message_text: str,
     db: AsyncSession,
     message_id: Optional[str] = None,
+    *,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Handle fromMe=true messages (clinic/secretary).
 
@@ -1082,9 +1095,9 @@ async def _handle_clinic_message(
         await db.flush()
         return {"ok": True, "skipped": "ai_echo_db"}
 
-    handoff_cfg = await _load_handoff_config(tenant_id, db)
-
-    handoff_active = str(handoff_cfg.get("handoff_active", "yes")).lower()
+    handoff_bucket = await _load_handoff_config(tenant_id, db)
+    handoff_cfg = handoff_bucket if isinstance(handoff_bucket, dict) else {}
+    current_time = now or datetime.now(timezone.utc)
     import re as _re
 
     def _normalize_for_match(s: str) -> str:
@@ -1101,16 +1114,44 @@ async def _handle_clinic_message(
             )
         )
     )
-    reactivation_hours = int(handoff_cfg.get("reactivation_delay_hours", 1))
-
     normalized_text = _normalize_for_match(message_text)
 
     # Check if message contains the trigger phrase (flexible match, punctuation-tolerant)
     if trigger_msg in normalized_text:
         if session.is_paused:
-            session.paused_until = datetime.now(timezone.utc) + timedelta(
-                hours=reactivation_hours
-            )
+            raw_reactivation_hours = handoff_cfg.get("reactivation_delay_hours", 1)
+            fallback_reason: str | None = None
+            if isinstance(raw_reactivation_hours, bool) or not isinstance(
+                raw_reactivation_hours, (int, str)
+            ):
+                reactivation_hours = 1
+                fallback_reason = "invalid_duration"
+            else:
+                try:
+                    reactivation_hours = int(raw_reactivation_hours)
+                    if reactivation_hours <= 0:
+                        reactivation_hours = 1
+                        fallback_reason = "invalid_duration"
+                except ValueError:
+                    reactivation_hours = 1
+                    fallback_reason = "invalid_duration"
+            try:
+                reactivates_at = current_time + timedelta(hours=reactivation_hours)
+            except OverflowError:
+                reactivation_hours = 1
+                reactivates_at = current_time + timedelta(hours=reactivation_hours)
+                fallback_reason = "unrepresentable_duration"
+            if fallback_reason is not None:
+                logger.warning(
+                    "handoff_reactivation_config_tolerated",
+                    extra={
+                        "tenant_id": str(tenant_id),
+                        "session_id": str(session.id),
+                        "field": "reactivation_delay_hours",
+                        "reason": fallback_reason,
+                    },
+                )
+            session.paused_until = reactivates_at
             await db.flush()
             logger.info(
                 "trigger_reactivation",
@@ -1125,8 +1166,19 @@ async def _handle_clinic_message(
             return {"ok": True, "action": "trigger_reactivation"}
         return {"ok": True, "action": "already_active"}
 
-    # Not trigger message — check for human takeover
-    if handoff_active != "yes":
+    # Not trigger message — resolve the shared human-takeover pause policy.
+    decision = resolve_handoff_pause(handoff_bucket, current_time)
+    for notice in decision.notices:
+        logger.warning(
+            "handoff_pause_policy_tolerated",
+            extra={
+                "tenant_id": str(tenant_id),
+                "session_id": str(session.id),
+                "field": notice.field,
+                "reason": notice.reason,
+            },
+        )
+    if not decision.should_pause:
         return {"ok": True, "skipped": "handoff_inactive"}
 
     if session.is_paused:
@@ -1134,19 +1186,7 @@ async def _handle_clinic_message(
 
     # Human takeover: pause session (no mark-unread — secretary is in conversation)
     session.is_paused = True
-
-    standby_mode = str(handoff_cfg.get("standby_mode", "active")).lower()
-    handoff_period = str(handoff_cfg.get("handoff_period", "permanent")).lower()
-    if standby_mode == "inactive":
-        fallback_hours = int(handoff_cfg.get("handoff_inactive_default_hours", 24))
-        session.paused_until = datetime.now(timezone.utc) + timedelta(
-            hours=fallback_hours
-        )
-    elif handoff_period == "cycle":
-        cycle_days = int(handoff_cfg.get("handoff_cycle_days", 7))
-        session.paused_until = datetime.now(timezone.utc) + timedelta(days=cycle_days)
-    else:
-        session.paused_until = None  # permanent — espera frase mestra
+    session.paused_until = decision.paused_until
 
     await db.flush()
     logger.info(
@@ -1226,9 +1266,36 @@ async def _stt_transcribe_audio(
     a legacy ``whisper_api_key`` is only a fallback for rows written before
     ``stt_api_key`` existed.
     """
+    stt_provider = _stt_canonical_provider(creds.get("stt_provider"))
     whisper_key = (creds.get("stt_api_key") or "").strip() or (
         creds.get("whisper_api_key") or ""
     ).strip()
+    lang_hint = "en" if agent_language == "en" else "pt"
+
+    if stt_provider in {"elevenlabs_scribe", "openrouter"}:
+        api_url = creds.get("stt_api_url")
+        api_key = creds.get("stt_api_key")
+        model_name = creds.get("stt_model_name")
+        if not all(
+            isinstance(value, str) and bool(value.strip())
+            for value in (api_url, api_key, model_name)
+        ):
+            from src.services.stt_service import SttTranscriptionError
+
+            raise SttTranscriptionError("stt_configuration_invalid")
+
+        from src.services.stt_service import transcribe_audio as transcribe_fixed_stt
+
+        return await transcribe_fixed_stt(
+            provider=stt_provider,
+            api_url=cast(str, api_url),
+            api_key=cast(str, api_key),
+            audio_bytes=audio_bytes,
+            mimetype=mime_type,
+            model_name=cast(str, model_name),
+            language=lang_hint,
+        )
+
     if not whisper_key:
         return None
 
@@ -1238,9 +1305,7 @@ async def _stt_transcribe_audio(
         transcribe_audio,
     )
 
-    stt_provider = _stt_canonical_provider(creds.get("stt_provider"))
     stt_api_url = (creds.get("stt_api_url") or "").strip()
-    lang_hint = "en" if agent_language == "en" else "pt"
 
     # Resolve STT base URL: use the saved URL (set by the UI for any
     # provider), fall back to known defaults, then Groq as last resort for
@@ -1308,7 +1373,8 @@ async def _transcribe_audio_chain(
     returns ``""`` for silent or unintelligible audio, and letting that
     through would drop the patient into a silent skip with no fallback.
     """
-    has_stt = bool(
+    stt_provider = _stt_canonical_provider(credentials.get("stt_provider"))
+    has_stt = stt_provider in {"elevenlabs_scribe", "openrouter"} or bool(
         (credentials.get("stt_api_key") or "").strip()
         or (credentials.get("whisper_api_key") or "").strip()
     )
@@ -2963,12 +3029,11 @@ async def _meta_initiate_file_handoff(
     session_id: UUID,
     from_phone: str,
     note: str,
-) -> None:
+) -> Any:
     """Initiate a human handoff signalling that a file/audio is pending review.
 
-    Failures are logged at exception level (matching the "send failed"
-    parity requirement) but never re-raised — the webhook should still
-    return 200 so Meta does not retry.
+    PostgreSQL insertion is mandatory. Failures propagate to the route so it
+    cannot clear state or acknowledge a handoff that does not exist.
     """
     from src.handoff.models import HandoffReason, HandoffRequest, HandoffUrgency
     from src.services.handoff_service import get_handoff_service
@@ -2986,20 +3051,21 @@ async def _meta_initiate_file_handoff(
         },
     )
     try:
-        await handoff_service.initiate_handoff(request)
-        logger.info(
-            "Meta file handoff initiated for %s (session=%s, note=%s)",
-            from_phone,
-            session_id,
-            note,
-        )
-    except Exception as exc:
+        response = await handoff_service.initiate_handoff(request)
+    except Exception:
         logger.exception(
-            "Meta file handoff init failed for %s (session=%s) — %s",
-            from_phone,
+            "Meta file handoff creation failed tenant=%s session=%s",
+            tenant_id,
             session_id,
-            exc,
         )
+        raise
+    logger.info(
+        "Meta file handoff initiated for %s (session=%s, note=%s)",
+        from_phone,
+        session_id,
+        note,
+    )
+    return response
 
 
 @router.get(
@@ -3208,6 +3274,17 @@ async def meta_webhook(
     first_message_id = str(msg.get("id") or "").strip()
     if not first_message_id:
         return {"ok": True, "skipped": "missing_message_id"}
+
+    # Preserve the authenticated Meta boundary, then reject providers without
+    # adapters before replay state, bot/pause checks, session creation, media
+    # resolution/download, reply, or handoff. ``tenant_creds`` is the same raw
+    # row resolved together with the HMAC secret above.
+    first_message_type = str(msg.get("type") or "")
+    if first_message_type in _META_AUDIO_TYPES:
+        early_stt_provider = _stt_canonical_provider(tenant_creds.get("stt_provider"))
+        if early_stt_provider in UNSUPPORTED_STT_PROVIDERS:
+            return _stt_skip_envelope(early_stt_provider)
+
     try:
         first_delivery = _claim_incoming_message("meta", tenant_id, first_message_id)
     except ReplayStoreUnavailable:
@@ -3384,12 +3461,6 @@ async def meta_webhook(
                     )
                     return {"ok": True, "skipped": "no_credentials"}
 
-                # Gate: STT providers without a runtime adapter must not
-                # produce any effect — skip before resolve/download/STT/reply.
-                _meta_stt_provider = _stt_canonical_provider(creds.get("stt_provider"))
-                if _meta_stt_provider in UNSUPPORTED_STT_PROVIDERS:
-                    return _stt_skip_envelope(_meta_stt_provider)
-
                 # 1) Resolve media_id → signed URL (+ file_size / mime)
                 try:
                     media_info = await resolve_meta_media(media_id, meta_token)
@@ -3433,6 +3504,12 @@ async def meta_webhook(
                         if agent_lang == "en"
                         else _AUDIO_TOO_LONG_MSG_PT
                     )
+                    await _meta_initiate_file_handoff(
+                        tenant_id,
+                        session_id,
+                        from_phone,
+                        "audio_too_long",
+                    )
                     if meta_pnid and meta_token:
                         try:
                             await send_meta_cloud_text(
@@ -3447,12 +3524,6 @@ async def meta_webhook(
                                 from_phone,
                                 exc,
                             )
-                    await _meta_initiate_file_handoff(
-                        tenant_id,
-                        session_id,
-                        from_phone,
-                        "audio_too_long",
-                    )
                     logger.info(
                         "Meta audio too long (%d bytes > ~%ds*%dB) for %s — handoff",
                         file_size,

@@ -3,6 +3,7 @@
 | Field | Value |
 |-------|-------|
 | **Status** | APPROVED |
+| **Execution** | BLOCKED — aguardando census WhatsApp e contrato de áudio NeuraLake |
 | **Slug** | `api-provider-catalog-presentation` |
 | **Date** | 2026-09-28 |
 | **Author** | Lorenzo |
@@ -105,17 +106,24 @@ assurance de credenciais e gates de rollout.
 **depends-on:** whatsapp-inbound-provider-activation, stt-openrouter-scribe-activation, dropout-multimodal-fallback, tts-openai-provider
 **blocks:** none
 
-Os três primeiros slugs ainda não existem e continuam hard-blocking para qualquer `work`.
-`tts-openai-provider` está `SHIPPED`: o PR #40 foi mergeado em
-`be0a6547c6c7462c1cbeeeb39030a7d10ee781b8`, e execution review, delta review e final review
-retornaram `SHIP`. O DESIGN alterado está
-liberado para este plan review pelo `SHIP` oficial do digest
-`025c397a0af4335e5266a3c19230d8a8a0ef405b818991a02ee4d1a9adc529f3`. Ainda assim, **todo work
-permanece bloqueado** até os três slugs ausentes existirem, conformarem exatamente a esse conteúdo,
-estarem `SHIPPED` e terem execution review independente `SHIP`. Não se presume que IDs, campos,
-rotas ou invariantes ainda desconhecidos já estejam fixos. Se uma dependência alterar qualquer ID,
-campo, rota ou invariante nomeado neste WISH/design, este WISH retorna automaticamente a `DRAFT`, o
-work para e o plano passa por nova review antes de qualquer dispatch ou continuidade.
+Os quatro slugs existem e possuem contratos explícitos. `tts-openai-provider` está `SHIPPED`: o PR
+#40 foi mergeado em `be0a6547c6c7462c1cbeeeb39030a7d10ee781b8`, e execution review, delta review
+e final review retornaram `SHIP`. `stt-openrouter-scribe-activation` está `SHIPPED`: o PR #43 foi
+mergeado em `acf7586c91dd2101129da202d4e9b4c2b4c3ca5b`, execution review e hardening re-review
+retornaram `SHIP`, e o smoke pós-merge passou 569 testes mantendo `Δ public = ∅`.
+`dropout-multimodal-fallback` permanece `DRAFT/BLOCKED` até existir contrato autoritativo e
+versionado da NeuraLake para áudio OGG/Opus bruto; `whatsapp-inbound-provider-activation` permanece
+`DRAFT/BLOCKED` até receipt externo agregado e verificável provar counts zero de incumbents
+Evolution/Uazapi sem capability digest. Nenhum desses dois blockers pode ser satisfeito por mocks,
+suposição ou alteração neste wish.
+
+O DESIGN governante está liberado pelo `SHIP` oficial do reviewed-content digest
+`025c397a0af4335e5266a3c19230d8a8a0ef405b818991a02ee4d1a9adc529f3`. Ainda assim, **o work dos
+grupos deste catálogo permanece bloqueado** até as quatro dependências estarem `SHIPPED` e terem
+execution review independente `SHIP`; executar uma dependência aprovada de delta público vazio não
+equivale a iniciar os grupos deste wish. Se uma dependência alterar qualquer ID, campo, rota ou
+invariante nomeado neste WISH/design, este WISH retorna automaticamente a `DRAFT`, o work para e o
+plano passa por nova review antes de qualquer dispatch ou continuidade.
 
 ### Pre-work dependency gate
 
@@ -583,7 +591,7 @@ cd frontend && pnpm --filter @workspace/neurostack run typecheck && pnpm --filte
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| Três wishes dependentes ainda não existem | High | O DESIGN já tem review oficial `SHIP`; work continua bloqueado até os três wishes conformarem ao conteúdo revisado e chegarem a `SHIPPED` + execution review `SHIP`. |
+| Dependências não concluídas bloquearem a integração | High | Os quatro wishes existem; work do catálogo continua bloqueado até WhatsApp, STT e Dropout, além do TTS já concluído, chegarem a `SHIPPED` + execution review `SHIP`. |
 | `tts-openai-provider` divergir depois do merge SHIPPED | Medium | Pinar o merge `be0a6547c6c7462c1cbeeeb39030a7d10ee781b8`, cujas execution/delta/final reviews são `SHIP`; qualquer mudança de contrato retorna este WISH a `DRAFT`. |
 | WhatsApp ativar com inbound incompleto | High | Wish dedicado e obrigações separadas por provider/auth/zero-effect. |
 | Evidência nomeada não cobrir o comportamento alegado | High | Taxonomia fechada, node IDs coletados, unique evidence e source/tree digests. |
@@ -727,6 +735,33 @@ cd frontend && pnpm --filter @workspace/neurostack run typecheck && pnpm --filte
 - **Resolution:** zero gaps agregados. O status foi persistido como `APPROVED`; isso não autoriza
   checkout, dispatch, candidate B ou deploy enquanto as três dependências ausentes não estiverem
   `SHIPPED` e com execution review independente `SHIP`.
+
+### Dependency Continuation Re-review — 2026-09-29T02:09:09Z — BLOCKED externally
+
+- **Target SHA-256 after doc fixes:**
+  `abf47ee0ea6522cac3061059ccd8def2f6c919e850189f358990f4aae281f7ea`.
+- **Reviewer:** `/root/catalog_dependency_gate`; os dois gaps documentais MEDIUM receberam re-review
+  `SHIP`, sem gaps internos restantes.
+- **Dependency state:** TTS está `SHIPPED`; STT está `APPROVED`/plan `SHIP` e pode executar
+  isoladamente com `Δ public = ∅`; WhatsApp aguarda o census externo zero/zero; Dropout aguarda o
+  contrato autoritativo NeuraLake para áudio OGG/Opus.
+- **Outcome:** o WISH do catálogo permanece `APPROVED`, porém nenhum de seus grupos pode iniciar.
+  O estado agregado é `BLOCKED` somente pelas duas evidências externas, sem impedir a execução da
+  dependência STT. A redação histórica “três dependências ausentes” acima é superseded por esta
+  fotografia e pela seção Dependencies atual.
+
+### Post-STT Dependency Snapshot — 2026-09-29 — BLOCKED externally
+
+- **STT:** `stt-openrouter-scribe-activation` está `SHIPPED`; PR #43 mergeado em
+  `acf7586c91dd2101129da202d4e9b4c2b4c3ca5b`, reviews independentes `SHIP` e smoke pós-merge com
+  569 testes verdes. A matriz pública permaneceu inalterada.
+- **Satisfied dependencies:** `tts-openai-provider` e `stt-openrouter-scribe-activation`.
+- **Remaining hard gates:** `whatsapp-inbound-provider-activation` ainda exige receipt externo
+  agregado, verificável e recente com counts `{evolution: 0, uazapi: 0}`; `dropout-multimodal-fallback`
+  ainda exige contrato NeuraLake autoritativo/versionado para áudio OGG/Opus bruto.
+- **Outcome:** nenhum Grupo 1–6 do catálogo pode ser claimed ou iniciado. O próximo avanço legítimo
+  é fornecer e revisar esses dois artefatos externos; mocks, inferência ou alteração local não os
+  substituem.
 
 ## Files to Create/Modify
 

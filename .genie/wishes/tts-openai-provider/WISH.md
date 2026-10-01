@@ -296,4 +296,6 @@ frontend/artifacts/neurostack/src/pages/clinic-config-api-settings.test.tsx
   `be0a6547c6c7462c1cbeeeb39030a7d10ee781b8`; `0d9d7a7` é ancestral do commit publicado.
 - **Post-merge smoke:** no commit publicado, 254 testes focados e 41 testes do validador passaram;
   scoped mypy, inventory e diff-check saíram com código 0. O wish está `SHIPPED`.
-- Delivery of the amendment: committed as `0d9d7a7` on `fix/tts-openai-status-errors` and opened as PR #40 against `main` (2026-09-28, at the user's request). Merge into `main` is a human step; wish stays `IN_PROGRESS` until then. The dedomainification working tree was intentionally left untouched (user decision).
+- **Superseded delivery checkpoint:** `0d9d7a7` foi inicialmente aberto como PR #40 aguardando
+  integração; o Completion Gate acima registra a integração posterior e é a fonte atual de verdade.
+  A árvore de trabalho `neurostack-core-dedomainification` permaneceu intencionalmente intocada.

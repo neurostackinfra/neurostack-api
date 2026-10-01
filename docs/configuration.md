@@ -319,7 +319,7 @@ Use esse JSON como corpo do objeto `config` ao criar ou atualizar um tenant. O b
 - **Criar/atualizar ClinicConfig:** use `TenantRepository.upsert_clinic_config(tenant_id, clinic_config: ClinicConfig)` para gravar na tabela `clinic_configs`.
 - **Migração Alembic:** revisão `002` cria a tabela `clinic_configs`. Execute `alembic upgrade head` para aplicar.
 
-## Credenciais LLM e Gemini
+## Credenciais e catálogo público de provedores
 
 As credenciais de provedores pertencem à fronteira dedicada
 `/v1/config/api-credentials`. A rota genérica de configuração não aceita
@@ -329,11 +329,36 @@ builder só pode selecionar uma clínica que pertence ao seu próprio
 `builder_id`. Segredos nunca são retornados: a resposta expõe apenas o estado
 `*_set` e a máscara de tamanho constante.
 
+O catálogo público atual é:
+
+| Capacidade | Configuráveis | Ainda `coming_soon` |
+|---|---|---|
+| WhatsApp | Meta Cloud API (`meta_cloud`), Z-API (`zapi`), Uazapi (`uazapi`) e Evolution API (`evolution`) | 360dialog (`dialog360`) e Twilio (`twilio`) |
+| LLM | Dropout (`dropout`), Gemini (`gemini`), GPT/OpenAI (`openai`) e Outros (`outros`) | SLM Cortex (`slm_cortex`) |
+| STT | Whisper/OpenAI (`openai_whisper`), Scribe/ElevenLabs (`elevenlabs_scribe`) e Outros by OpenRouter (`openrouter`) | Google Cloud STT (`google_stt`), Deepgram (`deepgram_stt`) e Azure STT (`microsoft_stt`) |
+| TTS | ElevenLabs (`elevenlabs`), Google Cloud TTS (`google`) e OpenAI TTS (`openai`) | — |
+| Fallback multimodal | — | OpenRouter (`openrouter`) |
+
+Em STT, o card público “Outros by OpenRouter” usa o ID explícito
+`openrouter`. O ID genérico `outros` continua reconhecido somente para leitura e
+migração de configurações legadas; ele não aparece como opção para uma nova
+configuração.
+
+Evolution e Uazapi aceitam hosts configuráveis e, por isso, não podem herdar o
+segredo associado a uma URL anterior. Entrar ou trocar para um desses providers
+exige o bundle completo no mesmo PATCH: `whatsapp_provider`, URL, nome da
+instância e uma chave/token nova. Alterar uma `evolution_api_url` ou
+`uazapi_api_url` para outro valor não vazio exige o mesmo bundle e a seleção
+explícita do provider, inclusive quando os campos estão dormentes sob outro
+provider. Um patch apenas de nome da instância continua válido quando provider
+e endpoint não mudam. Ao sair ou descomissionar a integração, a URL pode ser
+limpa explicitamente com `null` sem reapresentar o segredo antigo.
+
 O contrato compartilhado de LLM usa exatamente quatro campos:
 
 | Campo | Regra |
 |-------|-------|
-| `llm_provider` | Identificador wire; Gemini usa `gemini` |
+| `llm_provider` | Identificador wire: `dropout`, `gemini`, `openai` ou `outros` no catálogo público atual |
 | `llm_api_url` | Base HTTPS do provedor |
 | `llm_api_key` | Segredo write-only |
 | `llm_model_name` | Modelo habilitado pelo provedor |
@@ -347,12 +372,18 @@ de saída. O transporte resolve DNS na fronteira, valida todos os endereços com
 públicos, fixa o IP da conexão e preserva
 `generativelanguage.googleapis.com` em Host/SNI. Redirects são proibidos.
 
-Qualquer troca **para ou de** `gemini` exige que os quatro campos sejam enviados
-juntos com chave nova. Um patch parcial falha atomicamente com
-`provider_switch_bundle_required`; nenhum campo é gravado. Quando o provider
-não muda, um patch apenas de modelo preserva a URL e a chave existentes. Valores
-vazios, `null` e máscaras (`••••…` ou `****…`) nunca apagam nem substituem um
-segredo salvo; numa troca de provider eles não contam como chave nova.
+`llm_provider=outros` é o campo aberto para provedores com API compatível com
+OpenAI, inclusive OpenRouter. A `llm_api_url` deve ser uma base HTTPS pública e
+passa pelas mesmas proteções de saída segura; portanto, um provedor compatível
+não precisa ganhar um card próprio para poder ser usado por esse caminho.
+
+Qualquer entrada ou troca para um provider LLM ativo, assim como uma mudança de
+`llm_api_url`, exige que os quatro campos sejam enviados juntos com chave nova.
+Um patch parcial falha atomicamente com `provider_switch_bundle_required`;
+nenhum campo é gravado. Quando provider e endpoint não mudam, um patch apenas
+de modelo preserva a URL e a chave existentes. Valores vazios, `null` e máscaras
+(`••••…` ou `****…`) nunca apagam nem substituem um segredo salvo; numa troca de
+provider ou endpoint eles não contam como chave nova.
 
 Um `llm_provider` presente na clínica é autoritativo mesmo se estiver incompleto
 ou inválido. A herança do builder só ocorre quando a clínica não
@@ -365,21 +396,25 @@ chamada externa.
 
 Erros públicos são estáveis e não incluem entrada ou segredo:
 
-- `invalid_provider_endpoint` (`field=llm_api_url`): a base Gemini não é
-  exatamente a base canônica;
-- `provider_switch_bundle_required`: troca Gemini parcial ou sem chave nova;
+- `invalid_provider_endpoint`: a base não corresponde ao endpoint canônico de
+  um provider fixo (Gemini em LLM; Scribe ou OpenRouter em STT);
+- `provider_switch_bundle_required`: entrada ou troca para Evolution/Uazapi,
+  mutação não vazia de seus endpoints configuráveis, ou entrada/troca/mudança
+  de endpoint em LLM/STT/TTS sem todos os campos obrigatórios e uma nova
+  chave/token;
 - `provider_not_available`: provider reconhecido, mas indisponível;
-- `invalid_provider_for_capability`: wire id desconhecido para LLM;
+- `invalid_provider_for_capability`: wire id desconhecido para a capacidade
+  informada;
 - `invalid_credentials_payload` / `unsafe_api_url`: payload ou URL recusado na
   fronteira genérica.
 
 ### Limitação beta e smoke sanitizado
 
-O endpoint compatível com OpenAI está em `v1beta`. Gemini é o único overlay
-`active` sobre o inventário imutável anterior: um bundle completo fica ativo em
-readiness, overlay e runtime. Todos os outros pares conservam suas decisões.
-Essa promoção de produto não autoriza por si só um deploy: apenas o sucessor
-receipt-only assinado do candidate homologado passa o gate de produção.
+O endpoint compatível com OpenAI do Gemini está em `v1beta`. Gemini permanece
+publicamente configurável, agora junto de Dropout, OpenAI e `outros`. Para o
+fluxo de release específico do Gemini, essa disponibilidade de produto não
+substitui o gate operacional: apenas o sucessor receipt-only assinado do
+candidate homologado passa o gate de produção.
 
 O smoke independente usa somente duas entradas de ambiente privadas:
 
@@ -412,6 +447,69 @@ Para troubleshooting do gate de release:
    beta do modelo;
 5. smoke verde não libera sozinho: Operations precisa embutir os bytes e SHA no
    receipt, criar o sucessor assinado receipt-only e manter esse commit como HEAD.
+
+## STT: Scribe e OpenRouter no catálogo público
+
+Os IDs wire explícitos são `elevenlabs_scribe` (ElevenLabs Scribe) e
+`openrouter` (OpenRouter). Ambos estão no catálogo público e podem ser
+selecionados por tenants novos ou existentes. `outros` permanece um adapter
+legado distinto e oculto: não é alias, rótulo alternativo nem fallback de
+OpenRouter. Configurações legadas continuam legíveis e podem migrar para um dos
+IDs explícitos sem que o card antigo volte ao catálogo.
+
+A promoção pública habilita seleção e persistência das credenciais; ela não é
+homologação live de chave, quota, modelo ou formato em produção. Os mocks
+determinísticos provam o contrato local de configuração e transporte. Nenhum
+probe live foi executado ou é autorizado por esta documentação.
+
+### Bundle operacional e compatibilidade legado
+
+Uma entrada ou troca para qualquer provider STT ativo, assim como uma mudança de
+`stt_api_url`, exige no mesmo PATCH um bundle fresco com `stt_provider`,
+`stt_api_url`, `stt_api_key` e `stt_model_name`. A chave precisa ser nova;
+máscara, vazio e `null` não contam. Quando provider e endpoint não mudam, uma
+edição apenas de modelo ou controle pode ser parcial. Para Scribe ou OpenRouter,
+a URL precisa ser a base canônica da tabela abaixo. `audio_max_seconds` não
+integra o bundle e mantém o default 60 quando ausente.
+
+Um incumbent legado resolvido como `outros` pode repetir exatamente sua visão
+canônica sem reescrever o JSON persistido ou migrar com um bundle fresco para
+`elevenlabs_scribe` ou `openrouter`. `outros` não pode ser escolhido para uma
+configuração nova nem reintroduzido pelo catálogo público.
+
+### Bases, paths e wire contract
+
+| ID | Base persistida exata | Sufixo POST | Autenticação | Campos multipart |
+|---|---|---|---|---|
+| `elevenlabs_scribe` | `https://api.elevenlabs.io/v1` | `/speech-to-text` | `xi-api-key: <secret>` | `file`, `model_id=<stt_model_name>` |
+| `openrouter` | `https://openrouter.ai/api/v1` | `/audio/transcriptions` | `Authorization: Bearer <secret>` | `file`, `model=<stt_model_name>`, `language` quando informado |
+
+As bases são literais: porta explícita (inclusive `:443`), query, fragmento,
+userinfo, host/path alternativo ou URL já contendo o sufixo são recusados. O
+modelo não é hardcoded: `stt_model_name` é obrigatório e é repassado no campo
+próprio de cada provedor.
+
+Ambos enviam os bytes originais em multipart `file`; este contrato escolhe
+multipart e não JSON/base64. O MIME recebido é normalizado para lowercase e sem
+parâmetros válidos antes do envio (por exemplo,
+`audio/ogg; codecs=opus` vira `audio/ogg`), preservando os bytes. Os tipos
+fechados são `audio/wav`, `audio/mpeg`, `audio/flac`, `audio/mp4`, `audio/ogg`,
+`application/ogg`, `audio/webm` e `audio/aac`; tipo ou parâmetro malformado é
+recusado antes da rede. A resposta deve ser JSON objeto e o transcript vem
+exclusivamente de `.text`, após trim; texto ausente/inválido ou vazio falha.
+
+A taxonomia pública/configuração permanece fechada:
+`invalid_provider_endpoint`, `provider_switch_bundle_required`,
+`provider_not_available`, `invalid_provider_for_capability`,
+`invalid_credentials_payload` e `unsafe_api_url`. A fronteira de transporte
+usa somente `stt_provider_unsupported`, `unsupported_audio_mime`,
+`stt_configuration_invalid`,
+`stt_provider_http_error`, `stt_provider_transport_error`,
+`stt_malformed_response` e `stt_empty_transcript`. Corpo, header, URL, modelo e
+segredo externos não são encadeados nesses erros.
+
+Referências oficiais: [OpenRouter — transcription](https://openrouter.ai/blog/tutorials/transcription-on-openrouter/)
+e [ElevenLabs — speech-to-text convert](https://elevenlabs.io/docs/api-reference/speech-to-text/convert).
 
 ---
 

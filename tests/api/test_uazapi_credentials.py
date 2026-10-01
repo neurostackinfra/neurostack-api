@@ -6,7 +6,7 @@ Covers save/status flow for Uazapi (wuzapi self-hosted) credentials:
   uazapi_instance_name)
 - The secret field (uazapi_token) is masked in status responses
 - ``apis_configured`` becomes true when the three Uazapi fields are set
-- Effective public writes stay fail closed while Uazapi is coming soon
+- Active Uazapi credentials can be saved through the public boundary
 - Directly seeded legacy credentials retain masking and readiness behavior;
   exact echoes remain accepted without changing stored material
 """
@@ -78,9 +78,9 @@ def headers(tenant_id: UUID) -> dict[str, str]:
 
 
 class TestUazapiProviderAvailability:
-    """Uazapi writes fail closed while exact legacy echoes remain valid."""
+    """Uazapi writes are public while token material remains masked."""
 
-    def test_rejects_effective_uazapi_bundle_atomically(
+    def test_accepts_effective_uazapi_bundle_atomically(
         self,
         client: TestClient,
         headers: dict[str, str],
@@ -93,27 +93,23 @@ class TestUazapiProviderAvailability:
         }
         response = client.patch(API_CRED_PATH, json=payload, headers=headers)
 
-        assert response.status_code == 422, response.text
-        assert response.json()["detail"] == {
-            "error": "provider_not_available",
-            "capability": "whatsapp",
-            "provider": "uazapi",
-        }
+        assert response.status_code == 200, response.text
         assert "uz_token_abcdefghij1234567890" not in response.text
 
         stored = client.get(API_CRED_PATH, headers=headers)
         assert stored.status_code == 200
         data = stored.json()
-        assert data["whatsapp_provider"] is None
-        assert data["uazapi_api_url"] is None
-        assert data["uazapi_instance_name"] is None
-        assert data["uazapi_token_set"] is False
+        assert data["whatsapp_provider"] == "uazapi"
+        assert data["uazapi_api_url"] == "https://uazapi.example.com"
+        assert data["uazapi_instance_name"] == "clinica-x"
+        assert data["uazapi_token_set"] is True
+        assert data["whatsapp_readiness"] == "active"
 
-    def test_rejects_sibling_provider_bundle_atomically(
+    def test_accepts_active_sibling_provider_bundle_atomically(
         self,
         client: TestClient,
     ) -> None:
-        """Adopting a sibling WhatsApp provider leaves the Uazapi fields empty."""
+        """Adopting an active sibling does not populate Uazapi fields."""
         headers = _headers(uuid4())
         resp = client.patch(
             API_CRED_PATH,
@@ -124,16 +120,11 @@ class TestUazapiProviderAvailability:
             },
             headers=headers,
         )
-        assert resp.status_code == 422, resp.text
-        assert resp.json()["detail"] == {
-            "error": "provider_not_available",
-            "capability": "whatsapp",
-            "provider": "zapi",
-        }
+        assert resp.status_code == 200, resp.text
         assert "zapi_token_1234567890" not in resp.text
         data = client.get(API_CRED_PATH, headers=headers).json()
-        assert data["whatsapp_provider"] is None
-        assert data["zapi_instance_id"] is None
+        assert data["whatsapp_provider"] == "zapi"
+        assert data["zapi_instance_id"] == "instance-xyz"
         assert data["uazapi_api_url"] is None
         assert data["uazapi_token_set"] is False
 
@@ -252,14 +243,55 @@ class TestUazapiIsConfigured:
         assert resp.json()["apis_configured"] is False
 
 
-class TestUnavailableProviders:
-    """Public writes report the same availability state for every provider."""
+class TestProviderCatalog:
+    """Active and unavailable WhatsApp IDs follow the public matrix."""
 
     @pytest.mark.parametrize(
         "provider",
-        ["meta_cloud", "zapi", "uazapi", "evolution", "dialog360", "twilio"],
+        ["meta_cloud", "zapi"],
     )
-    def test_all_whatsapp_provider_writes_fail_closed(
+    def test_active_whatsapp_provider_selection_is_accepted(
+        self,
+        client: TestClient,
+        provider: str,
+    ) -> None:
+        headers = _headers(uuid4())
+        resp = client.patch(
+            API_CRED_PATH,
+            json={"whatsapp_provider": provider},
+            headers=headers,
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["whatsapp_provider"] == provider
+        assert (
+            client.get(API_CRED_PATH, headers=headers).json()["whatsapp_provider"]
+            == provider
+        )
+
+    @pytest.mark.parametrize("provider", ["uazapi", "evolution"])
+    def test_configurable_endpoint_provider_selection_requires_a_fresh_bundle(
+        self,
+        client: TestClient,
+        provider: str,
+    ) -> None:
+        headers = _headers(uuid4())
+        resp = client.patch(
+            API_CRED_PATH,
+            json={"whatsapp_provider": provider},
+            headers=headers,
+        )
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["detail"] == {
+            "error": "provider_switch_bundle_required",
+            "capability": "whatsapp",
+        }
+        assert (
+            client.get(API_CRED_PATH, headers=headers).json()["whatsapp_provider"]
+            is None
+        )
+
+    @pytest.mark.parametrize("provider", ["dialog360", "twilio"])
+    def test_unavailable_whatsapp_provider_selection_fails_closed(
         self,
         client: TestClient,
         provider: str,
