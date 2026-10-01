@@ -23,6 +23,10 @@ from neurostack_core.policy import (
     get_policy_engine,
 )
 from neurostack_core.prompt import (
+    CAN_QUOTE_PRIVATE_PAY_CUSTOM_KEY,
+    CARE_MODALITY_SLOT,
+    INSURANCE_TRIAGE_CUSTOM_KEY,
+    PRIVATE_PAY_CARE_MODALITY,
     GeneratedPrompt,
     PromptEngine,
     PromptMode,
@@ -806,20 +810,22 @@ class CognitivePipeline:
         # ── Convênio vs Particular gating (deterministic in pipeline) ──
         # The choice of asking / holding prices is code, not LLM reasoning.
         # Priority: state_patch slot (this turn) overrides stored session slot.
-        _patch_tipo = srm_decision.state_patch.slots.get("atendimento_tipo")
-        atendimento_tipo = _patch_tipo or input_data.slots.get("atendimento_tipo")
-        custom_vars["atendimento_tipo"] = atendimento_tipo or ""
+        _patch_tipo = srm_decision.state_patch.slots.get(CARE_MODALITY_SLOT)
+        atendimento_tipo = _patch_tipo or input_data.slots.get(CARE_MODALITY_SLOT)
+        custom_vars[CARE_MODALITY_SLOT] = atendimento_tipo or ""
 
         _accepts_insurance = bool(custom_vars.get("accepts_insurance"))
         _price_or_schedule_intent = srm_decision.intent in ("pedido_preco", "agendar")
-        custom_vars["ask_convenio_triage"] = (
+        custom_vars[INSURANCE_TRIAGE_CUSTOM_KEY] = (
             _accepts_insurance
             and not atendimento_tipo
             and (input_data.turn_count == 2 or _price_or_schedule_intent)
         )
         # Collapses 3 states (convenio / particular / undefined) → 2 (quote / hold).
         # Prompt only emits monetary values when this is True.
-        custom_vars["can_quote_particular"] = atendimento_tipo == "particular"
+        custom_vars[CAN_QUOTE_PRIVATE_PAY_CUSTOM_KEY] = (
+            atendimento_tipo == PRIVATE_PAY_CARE_MODALITY
+        )
 
         _verification_status = getattr(
             srm_decision, "handoff_verification_status", None
@@ -1252,8 +1258,8 @@ class CognitivePipeline:
         # Effective modality: SRM only writes atendimento_tipo into the
         # patch when it changes, so we merge with the prior slot to
         # expose the current value to the observability guard.
-        _patch_tipo = srm_decision.state_patch.slots.get("atendimento_tipo")
-        _effective_tipo = _patch_tipo or input_data.slots.get("atendimento_tipo")
+        _patch_tipo = srm_decision.state_patch.slots.get(CARE_MODALITY_SLOT)
+        _effective_tipo = _patch_tipo or input_data.slots.get(CARE_MODALITY_SLOT)
 
         return PipelineResult(
             event_id=uuid4(),

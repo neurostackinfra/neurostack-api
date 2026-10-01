@@ -1,0 +1,29 @@
+PROTOCOL ALLOWLIST: 134 exact identifiers (verified)
+FILE	LOCALIZED	ALLOWLISTED
+packages/neurostack-core/neurostack_core/flow/handlers/handoff.py	14	18
+packages/neurostack-core/neurostack_core/flow/handlers/normal.py	2	1
+packages/neurostack-core/neurostack_core/flow/handlers/rag.py	2	1
+packages/neurostack-core/neurostack_core/flow/handlers/safety.py	9	14
+packages/neurostack-core/neurostack_core/flow/models.py	0	4
+packages/neurostack-core/neurostack_core/flow/transitions.py	0	1
+packages/neurostack-core/neurostack_core/policy/engine.py	0	3
+packages/neurostack-core/neurostack_core/policy/global_rules.py	69	16
+packages/neurostack-core/neurostack_core/policy/models.py	1	3
+packages/neurostack-core/neurostack_core/presets/loader.py	0	25
+packages/neurostack-core/neurostack_core/prompt/models.py	0	6
+packages/neurostack-core/neurostack_core/prompt/renderer.py	4	1
+packages/neurostack-core/neurostack_core/prompt/templates/base.py	3	0
+packages/neurostack-core/neurostack_core/prompt/templates/handoff.py	23	9
+packages/neurostack-core/neurostack_core/prompt/templates/normal.py	116	50
+packages/neurostack-core/neurostack_core/prompt/templates/safety.py	14	5
+packages/neurostack-core/neurostack_core/protocol.py	0	163
+packages/neurostack-core/neurostack_core/srm/engine.py	23	51
+packages/neurostack-core/neurostack_core/srm/funnel_detector.py	17	45
+packages/neurostack-core/neurostack_core/srm/handoff_decider.py	25	17
+packages/neurostack-core/neurostack_core/srm/intent_classifier.py	259	67
+packages/neurostack-core/neurostack_core/srm/intent_naive_bayes.py	0	2
+packages/neurostack-core/neurostack_core/srm/models.py	0	4
+packages/neurostack-core/neurostack_core/srm/rag_decider.py	23	2
+packages/neurostack-core/neurostack_core/srm/safety_detector.py	25	0
+ALLOWLIST OCCURRENCES: 508 exact literals
+CLOSED INVENTORY: 629 literals across 17 files

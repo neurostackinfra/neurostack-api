@@ -17,7 +17,7 @@ from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 
 DOMAINS = ("flow", "policy", "prompt", "srm")
-ROOT_PAYLOAD = {"__init__.py", "metrics.py", "py.typed"}
+ROOT_PAYLOAD = {"__init__.py", "metrics.py", "protocol.py", "py.typed"}
 DIST_INFO_PAYLOAD = {"METADATA", "RECORD", "WHEEL"}
 
 
@@ -35,13 +35,18 @@ DIST_INFO_ROOT = f"{ARCHIVE_NAME}-{VERSION}.dist-info"
 
 
 def expected_package_payload() -> set[str]:
-    """Derive the recursive Python payload from the reviewed source roots."""
+    """Derive the recursive runtime payload from the reviewed source roots."""
     source = PACKAGE / "neurostack_core"
     expected = {f"neurostack_core/{name}" for name in ROOT_PAYLOAD}
     for domain in DOMAINS:
         expected.update(
             path.relative_to(PACKAGE).as_posix()
             for path in (source / domain).rglob("*.py")
+        )
+    for pattern in ("*.py", "*.toml"):
+        expected.update(
+            path.relative_to(PACKAGE).as_posix()
+            for path in (source / "presets").rglob(pattern)
         )
     return expected
 

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | APPROVED |
+| **Status** | IN_PROGRESS |
 | **Slug** | `neurostack-core-dedomainification` |
 | **Date** | 2026-09-25 |
 | **Author** | Lorenzo |
@@ -137,7 +137,7 @@ hardcoded content. No registry, inheritance, merging, mutable module tables or h
 
 ## Dependencies
 
-**depends-on:** neurostack-core-extraction
+**depends-on:** neurostack-core-extraction, neurostack-core-resource-boundary
 
 **blocks:** none
 
@@ -297,6 +297,10 @@ prove the loader and inventory gates fail closed.
    support module-scoped comparisons after each consumer conversion.
 11. `tests/fixtures/presets/prompt-parity-before.txt` and `prompt-parity-session.json` captured here,
     before any module begins reading the preset.
+12. `tests/package_artifact/test_archives.py` updates its exact wheel/sdist payload oracle for the
+    eight Group 1 runtime files required by this approved wish: `protocol.py`, the three preset
+    Python modules, and the four `pt_br_clinic` TOMLs. Existing byte-for-byte archive checks remain
+    intact; this is an oracle migration, not a relaxation of artifact coverage.
 
 **Acceptance criteria.**
 
@@ -330,6 +334,8 @@ prove the loader and inventory gates fail closed.
       are documented and tested as trusted operator input.
 - [ ] `from neurostack_core import use_preset, get_preset, Preset, PresetError` succeeds, and
       lifecycle errors name selected/requested sources plus the restart requirement.
+- [ ] Exact wheel and sdist payload tests include the eight required protocol/preset files and still
+      reject every unexpected archive member while comparing packaged bytes to source bytes.
 - [ ] `core_suite_gate` and `full_suite_gate` green — this group copies content but changes no runtime
       behavior; the parity-oracle test directories are unchanged.
 
@@ -373,6 +379,12 @@ preset_loader_gate
 pt_br_preset_unchanged
 poetry run python scripts/preset-parity.py compare \
   --baseline tests/fixtures/presets/pt-br-containers.json --preset pt_br_clinic
+
+# the exact artifact oracle must recognize, and byte-compare, the required new runtime payload
+poetry run pytest \
+  tests/package_artifact/test_archives.py::test_wheel_has_the_exact_recursive_payload \
+  tests/package_artifact/test_archives.py::test_sdist_has_exact_build_and_consumer_inputs \
+  -q -p no:cacheprovider
 
 core_suite_gate
 full_suite_gate
@@ -427,6 +439,10 @@ API declaration in the same group.
    existing unknown-value fallback, and rejection of missing or extra preset stage ids.
 7. No Group 1 preset file is edited; discrepancies are loader/schema failures, not ad hoc data fixes
    hidden inside the consumer conversion.
+8. `tests/scripts/test_application_core_imports.py` recognizes exactly one new app-side protocol
+   consumer: `src/api/schemas/sessions.py` may import only `neurostack_core.protocol`. Existing
+   consumers remain facade-only, unknown consumer paths still fail exact-set equality, and this
+   exception does not make the protocol leaf a globally allowed facade.
 
 **Acceptance criteria.**
 
@@ -441,6 +457,8 @@ API declaration in the same group.
       raise `PresetError` before selection.
 - [ ] `src/api/schemas/sessions.py` declares no enum, imports the exact canonical class, and its
       default and every existing persisted value validate unchanged.
+- [ ] The application-import oracle permits only the approved sessions-to-protocol leaf edge while
+      continuing to reject unknown consumers, deep imports and protocol imports from other paths.
 - [ ] Unknown stage ids in a preset raise `PresetError`, not `KeyError` or a silent skip.
 - [ ] `core_suite_gate` green and the four parity-oracle directories are unchanged; additive preset
       contract tests are allowed and collected.
@@ -509,6 +527,7 @@ from neurostack_core.srm import get_srm_engine, SRMInput, FunnelStage
 assert FunnelStage.LEAD_NOVO.value == 'lead_novo'
 "
 poetry run pytest tests/presets/test_protocol_compatibility.py -q -p no:cacheprovider
+poetry run pytest tests/scripts/test_application_core_imports.py -q -p no:cacheprovider
 preset_loader_gate
 core_suite_gate
 full_suite_gate
@@ -1010,6 +1029,326 @@ _What must be verified on dev after merge. The QA agent tests each criterion._
 - **Verdict:** SHIP — the plan has complete, executable, risk-proportional evidence and retains its
   aggregate release gate.
 
+### 2026-09-27 — Group 1 execution — **BLOCKED**
+
+- **Task:** `t_muhbvik05b9193ff`, claimed by Curie and left `in_progress` with its implementation
+  preserved in the working tree.
+- **Diagnosis:** wish-level contract conflict; no implementation fix attempt consumed (0/2). The
+  extraction boundary deliberately rejects every source-visible `importlib` spelling, while Group 1
+  requires bundled preset resolution through `importlib.resources`.
+- **Reproduction:** `source scripts/wish-gates.sh && static_gate` exits 1 with
+  `presets/loader.py:5` and `presets/loader.py:100` reported as reserved dynamic-import syntax.
+- **Passing evidence before the stop:** inventory baseline 632 literals/17 files with 132 exact
+  protocol exemptions; preset inventory 633 literals; loader suite 49 passed; core suite 1017
+  passed; wish-gate tests 11 passed; normalized four-module parity, prompt capture, preset hashes,
+  package mypy, targeted Flake8 and wheel TOML payload checks passed.
+- **Corrective route:** return to wish/dependency design. The extraction WISH explicitly says a
+  legitimate future `importlib` consumer triggers a separate boundary-policy wish. Approve that
+  dependency (or explicitly revise this WISH's resource-loading contract), re-review the amended
+  plan, then resume this claimed group. Do not evade the gate or broaden Group 1 implicitly.
+
+### 2026-10-01 — Group 1 archive-oracle scope amendment — **AUTHORIZED**
+
+- **Observed failure:** after the resource-boundary dependency was merged and Group 1 resumed, the
+  focused loader, boundary, parity, core and static gates passed, while `full_suite_gate` gained two
+  failures at `tests/package_artifact/test_archives.py:125` and `:160` in addition to the two pinned
+  unrelated config-service failures.
+- **Diagnosis:** both exact-set assertions rejected exactly the eight runtime files already required
+  by Group 1. Production packaging is correct; excluding those files would violate Deliverables 4–6
+  and Decision 9. This is a plan file-scope omission, not an implementation or packaging defect.
+- **Authorization:** Lorenzo explicitly authorized delivery of the plan and the minimal scope
+  amendment. Group 1 now owns the exact archive-oracle migration described in Deliverable 12; no
+  other artifact-test behavior or production scope is added.
+- **Required revalidation:** the two focused wheel/sdist tests, `full_suite_gate`, the original Group
+  1 validation, independent execution review, and quality review must all pass before task
+  `t_muhbvik05b9193ff` may be marked done.
+
+### 2026-10-01 — Group 1 execution review — **FIX-FIRST**
+
+- **Verified clean surfaces:** dependency boundary blobs match approved commit `6355cbd`; inventory
+  baseline and preset totals are 633/18 and 633/4; four-module normalized parity, TOML hashes,
+  prompt capture, lazy root import, protocol isolation, public exports, lifecycle basics, unchanged
+  parity-oracle directories, and exact archive membership/byte comparisons are intact.
+- **HIGH — inventory closure:** `presets/loader.py` contains the measured literal
+  `atendimento_tipo`, so the eventual whole-package `inventory_gate --max 0` cannot pass even after
+  consumer conversion. Move this persisted slot key into an exact canonical protocol namespace,
+  use that namespace in loader validation, update the exact allowlist/data/hash/parity fixtures, and
+  add a regression proving Group 1 loader/protocol sources are inventory-clean.
+- **HIGH — incomplete threshold schema:** `flow.thresholds` has no exact-key or scalar type/range
+  validation; missing `rag_max_turns`, unknown keys, and invalid threshold types are accepted. Add
+  fail-closed validation and nested missing/extra/type regressions.
+- **HIGH — malformed placeholders:** unmatched or residual `{{`/`}}` can survive when no complete
+  supported placeholder is found, including mixed valid/malformed strings. Reject residual brace
+  syntax after recognized placeholders are removed and add both malformed-only and mixed cases.
+- **Diagnosis:** implementation/test defect; specification and context are complete, environment is
+  functional, and no model/effort escalation is authorized.
+- **Verdict:** FIX-FIRST. Correct in fix loop 2/2, then rerun the complete original Group 1
+  validation and repeat independent execution review.
+
+### 2026-10-01 — Group 1 execution re-review (fix loop 2/2) — **SHIP**
+
+- **Corrected:** the loader now consumes the exact canonical `ENGINE_REGEX_KEYS` namespace;
+  inventory is clean for loader/protocol sources, the allowlist equals all 134 protocol identifiers,
+  and unlisted variants still fail. Exact threshold keys/types/ranges and residual malformed prompt
+  placeholders now fail closed with focused regressions.
+- **Authoritative measurements:** source baseline 629 literals across 17 files; preset corpus 630
+  literals across four TOMLs. The four-literal delta from the earlier 633 baseline is exactly the
+  newly canonical `atendimento_tipo` key in one former loader literal plus three existing container
+  key occurrences; no content or regex was removed.
+- **Independent evidence:** original counterexamples reject; missing/extra engine regex keys reject;
+  four-module normalized parity, four TOML hashes, byte-identical prompt capture, protocol isolation,
+  lazy selection/public exports, lifecycle basics, archive exactness and unchanged parity-oracle
+  directories all pass.
+- **Exact-tree gate evidence:** loader 83 passed; boundary 102 passed; core 1,017 passed; artifact
+  oracle 2 passed; full gate 3,479 passed and 19 skipped with only the two pinned config-service
+  failures; static, package-boundary and planted parity-guard gates passed.
+- **Findings:** no CRITICAL, HIGH, MEDIUM or LOW gaps.
+- **Verdict:** SHIP.
+
+### 2026-10-01 — Group 1 quality review — **FIX-FIRST**
+
+- **HIGH — reachable mutability:** `FrozenMap._data` can be rebound after construction, replacing a
+  selected preset mapping with a mutable container. Block attribute reassignment after
+  initialization and add top-level plus nested rebinding regressions.
+- **HIGH — incomplete leaf typing:** exact keys and selected cross-references are validated, but
+  malformed consumed leaf values such as string `prompt.chars_per_token`, string flow mode priority,
+  and string policy `enabled` can publish. Add small reusable validators covering every consumed
+  leaf across all four modules, with representative fail-closed regressions.
+- **HIGH — prompt leakage in errors:** short rejected prompt strings are rendered verbatim by the
+  generic value summary. Redact prompt values regardless of length while retaining filename,
+  dotted key, type/length, expected contract and next action; assert a private sentinel never
+  appears.
+- **Clean evidence:** dependency boundary blobs, preset hashes, source/preset inventory, exact
+  allowlist, unchanged parity-oracle directories, archive exactness, configure-once locking and
+  first-use-only I/O remain sound.
+- **Diagnosis:** implementation/test defect; one quality fix loop is available, with no model or
+  effort escalation justified.
+- **Verdict:** FIX-FIRST. Limit remediation to `presets/models.py`, `presets/loader.py`, and
+  `tests/presets/test_preset_loader.py`, then rerun the complete Group 1 validation and quality
+  re-review.
+
+### 2026-10-01 — Group 1 quality re-review — **BLOCKED**
+
+- **Corrected:** top-level/nested `FrozenMap._data` rebinding now fails; the original malformed leaf
+  types reject; malformed/unknown placeholder sentinels are redacted with actionable structural
+  diagnostics.
+- **HIGH — non-finite numbers:** intent weights accept TOML `nan`/`inf`, which can suppress an intent
+  or force maximum confidence. Numeric validators must reject every non-finite float.
+- **HIGH — raw type errors:** non-string cross-references in SRM/flow membership checks and
+  TOML-native date/time values can escape as raw `TypeError` instead of actionable `PresetError`.
+  Validate string types before membership and recursively validate the freezeable metadata domain
+  with dotted paths (or immutably support every accepted TOML scalar).
+- **Clean evidence:** hashes, inventory 629/17, preset corpus 630/4, exact 134-id allowlist,
+  dependency boundary, archive/parity-oracle scope, core/static/full gate evidence, locking and
+  byte-parity remain clean.
+- **Diagnosis:** implementation/test defect; complete context and functional environment; no model
+  escalation. The normal quality fix budget is exhausted.
+- **Verdict:** BLOCKED pending explicit authority for another narrowly scoped correction or human
+  acceptance of residual risk.
+
+### 2026-10-01 — Additional quality remediation — **AUTHORIZED**
+
+- **Human direction:** Lorenzo instructed the orchestrator to deliver this plan “a qualquer custo”.
+  This authorizes persistence through an additional correction cycle inside the already-approved
+  Group 1 code/test scope; it does not authorize weakening gates, accepting the two HIGH risks,
+  changing behavior, or expanding product scope.
+- **Authorized correction:** reject non-finite numerics, type-check cross-references before set
+  membership, and convert unsupported TOML scalar/container values into dotted, sanitized
+  `PresetError` diagnostics. Add exact regressions and rerun the complete Group 1 validation plus
+  quality re-review.
+
+### 2026-10-01 — Group 1 final quality re-review — **SHIP**
+
+- **Corrected:** all finite-number validators reject `nan` and positive/negative infinity;
+  enum/set/mapping references validate strings before membership; nested TOML datetime/date/time
+  values reject before freezing; failed public loads leave selection unpublished; error summaries
+  remain sanitized.
+- **Independent counterexamples:** top-level/nested immutability, malformed leaves, prompt
+  redaction, non-finite SRM/flow values, four list-valued cross-references and nested temporal values
+  all raise actionable `PresetError`; no raw `TypeError` or `KeyError` remains.
+- **Regression evidence:** fixture hashes, inventory 629/17, loader/protocol zero-literal gate,
+  dependency boundary, parity-oracle scope, shell syntax and exact artifact byte/membership contracts
+  pass. Exact-tree evidence records loader 110, core 1,017, archive 2 and full suite 3,506 passed/19
+  skipped with only the two pinned failures, plus static/type/parity gates.
+- **Findings:** no CRITICAL, HIGH, MEDIUM or LOW gaps; no residual security, maintainability,
+  performance or scope-fidelity issue.
+- **Verdict:** SHIP.
+
+### 2026-10-01 — Group 1 orchestrator validation — **PASS**
+
+- **Scope rationale:** Group 1 establishes shared executable schema/lifecycle/gate machinery,
+  packaged runtime resources and public API boundaries; the full repository gate, focused
+  adversarial probes, artifact builds and static/type gates are proportional and required.
+- **Inventory:** authoritative source fixture byte-matches 629 localized literals across 17 files;
+  loader/protocol are zero; exact allowlist has 134 identifiers; accented and unaccented planted
+  literals fail, English/docstring probes pass; preset corpus remains nonzero at 630/4.
+- **Focused behavior:** loader 110 passed; four TOML hashes, four-module normalized parity,
+  byte-identical prompt capture and exact artifact tests 2/2 passed.
+- **Aggregate behavior:** core parity 1,017/1,017 passed. `full_suite_gate` accepted 3,506 passed and
+  19 skipped with only the two exact pinned `test_config_service.py` failures; completion validation
+  passed.
+- **Static/artifact boundary:** package boundary clean across 45 Python files; Black, isort, Flake8,
+  mypy over 173 files, isolated wheel builds, typed-wheel/public-API checks and `git diff --check`
+  passed.
+- **Gate falsification:** an untracked planted edit under `tests/srm` made
+  `parity_tests_unchanged` exit 1; after the probe was removed the guard and diff check passed.
+- **Result:** acceptance review SHIP, final quality re-review SHIP, and orchestrator validation PASS;
+  task `t_muhbvik05b9193ff` is eligible for `done`.
+
+### 2026-10-01 — Group 2 dependency discovery — Group 1 evidence **INVALIDATED**
+
+- **Observed contradiction:** Group 2 reached SRM inventory 372→0 and passed normalized parity, but
+  the required decoded-text gate found 84 literal `\\u00XX` sequences across 51 regex strings in
+  `srm.toml`. Group 1's hash and baseline JSON had captured the same representation, so their green
+  checks did not prove Decision 2.
+- **Behavioral diagnosis:** the 51 escaped and decoded regexes compile to identical `re` opcodes;
+  runtime behavior is preserved accidentally, but TOML literal strings retain the six-character
+  escape and violate the extraction contract. Cause is `missing-context`: parity normalization did
+  not model raw-Python-regex Unicode escapes versus TOML literal-string representation.
+- **Corrective route:** reopen Group 1. Decode only Unicode `\\uXXXX` sequences in regex fields,
+  never generic `unicode_escape`; make extraction/parity normalize those fields deliberately; update
+  baseline/hash fixtures; add lexical rejection and 51-pattern compiled-equivalence coverage; rerun
+  Group 1 review, quality and full validation. Preserve the Group 2 consumer rewrite pending repair.
+
+### 2026-10-01 — Group 2 stale import-oracle scope amendment — **AUTHORIZED**
+
+- **Observed failure:** the full suite added one failure because
+  `tests/scripts/test_application_core_imports.py` discovered the newly required
+  `src/api/schemas/sessions.py` consumer but its fixed consumer set predates Group 2.
+- **Architecture:** `sessions.py -> neurostack_core.protocol.FunnelStage` is the approved
+  dependency-free leaf edge; routing through `neurostack_core.srm` would contradict the deliverable
+  and eagerly load content/preset modules.
+- **Authorized migration:** Group 2 now owns the path-specific oracle change in Deliverable 8. Only
+  `sessions.py` may import only `neurostack_core.protocol`; all legacy facade, unknown-consumer and
+  deep-import prohibitions remain fail-closed. This uses Lorenzo's explicit authorization to deliver
+  the plan and does not broaden application imports generally.
+- **Diagnosis:** `missing-context` / plan file-scope omission, not implementation drift, ambiguity,
+  environment failure, overdesign or model capacity.
+
+### 2026-10-01 — Corrective task 1R execution review — **SHIP**
+
+- **Evidence:** `srm.toml` and canonical baseline contain zero literal Unicode regex escapes; exactly
+  84 decoded characters span the 51 affected regexes; reconstructed legacy and decoded forms have
+  zero structural/opcode mismatches; all four module parity checks and hashes pass, with only the
+  SRM hash changed.
+- **Scope:** normalization is confined to explicit regex containers; no generic `unicode_escape`,
+  runtime consumer, API schema or non-regex content changed. Loader/default/lazy/protocol/immutability
+  guarantees and compilation of all 480 SRM regexes reproduce cleanly.
+- **Findings:** no CRITICAL, HIGH, MEDIUM or LOW acceptance gaps.
+- **Verdict:** SHIP.
+
+### 2026-10-01 — Corrective task 1R quality review — **FIX-FIRST**
+
+- **HIGH — unsafe normalization:** the initial regex replacement cannot distinguish an active
+  Unicode escape from the second slash of a doubled literal and can decode codepoints into regex
+  metacharacters. Reproductions include doubled `\\\\u00e3`, `\\u002e` becoming wildcard `.`, and
+  `\\u005b` becoming an invalid `[` pattern while parity/hash could remain green.
+- **Required correction:** preserve doubled-backslash literals, decode only active intended Unicode
+  letter/mark escapes, reject unsafe or unsupported codepoints and malformed active escapes, and add
+  mutation-sensitive semantic-equivalence tests. Current TOML, baseline and hashes must not change.
+- **Clean evidence:** current 51 patterns remain opcode-equivalent; normalization is linear,
+  capture-only and deterministic; no production hot path or trust boundary changed.
+- **Diagnosis:** implementation/test defect; one narrow quality fix loop is authorized in
+  `scripts/preset-parity.py` and `tests/presets/test_preset_loader.py`.
+- **Verdict:** FIX-FIRST.
+
+### 2026-10-01 — Corrective task 1R final quality re-review — **SHIP**
+
+- **Corrected:** the linear scanner preserves exactly doubled escapes; decodes exactly one active
+  slash only for four-hex non-ASCII Unicode letter/mark codepoints; and rejects ambiguous runs,
+  malformed escapes, ASCII/metacharacter/control/surrogate/unsupported codepoints.
+- **Independent counterexamples:** doubled `\\\\u00e3` remains byte/opcode-identical; active
+  `\\u002e`, `\\u005b` and `\\u005c` fail closed; three/four/five slash runs reject; safe Greek,
+  accented and combining-mark escapes remain equivalent. All 51 current patterns/84 escapes match
+  the checked-in decoded forms with zero text/opcode mismatch.
+- **Quality:** scanner is single-pass, bounded-memory, deterministic and capture-only; non-regex
+  strings, `\\x`, `\\N`, ordinary regex tokens, TOML, baseline and hashes remain unchanged.
+- **Findings:** no CRITICAL, HIGH, MEDIUM or LOW gaps.
+- **Verdict:** SHIP.
+
+### 2026-10-01 — Corrective task 1R orchestrator validation — **PASS**
+
+- **Scope rationale:** parity is the migration oracle for all downstream conversions, so focused
+  semantic falsifiers plus full runtime, artifact and static gates are required.
+- **Direct evidence:** zero `\\u00XX` remains in `srm.toml`; loader/normalizer 130 passed; all four
+  hashes and SRM parity pass; prompt capture is byte-identical; artifact/import/protocol tests 21
+  passed; core parity 1,017/1,017 passed.
+- **Aggregate evidence:** `full_suite_gate` accepted 3,543 passed and 19 skipped with exactly the two
+  pinned config-service failures; package boundary, Black, isort, Flake8, mypy, isolated builds,
+  parity-oracle guard and `git diff --check` passed.
+- **Result:** execution review SHIP, quality re-review SHIP, orchestrator validation PASS; corrective
+  task `t_muplwb536ea560e1` is eligible for `done`.
+
+### 2026-10-01 — Group 2 execution review — **FIX-FIRST**
+
+- **HIGH — import-oracle bypass:** `from neurostack_core import protocol` is recorded only as the
+  root package and evades the path-specific protocol policy. Normalize package-root submodule alias
+  imports while preserving the intentional root-symbol `enable_metrics` edge, and add source-level
+  falsifiers for unknown, legacy and sessions consumers.
+- **HIGH — mutable module defaults:** preset-derived globals recreate mutable dict/list tables. A
+  supported `SafetyDetector(custom_patterns=...)` instance mutates shallow-copied nested default
+  lists, contaminating subsequent instances. Keep module defaults deeply immutable and copy only
+  into per-instance customization state; audit all Group 2 preset-derived globals and regress cross-
+  instance/preset isolation.
+- **MEDIUM — incomplete persisted-value pin:** compatibility tests literally pin only
+  `LEAD_NOVO`; coordinated enum/preset drift could pass. Add the full literal 11-member name/value
+  mapping and assert exact equality.
+- **Clean evidence:** SRM inventory 372→0; normalized parity and hashes pass; `srm.toml` has 307
+  accented literals, zero literal Unicode escapes and all 480 regexes compile; current enum mapping,
+  lazy cached access, unchanged parity-oracle directories and aggregate/static evidence are clean.
+- **Diagnosis:** implementation/test defect; use fix loop 1/2 with no model escalation.
+- **Verdict:** FIX-FIRST.
+
+### 2026-10-01 — Group 2 execution re-review (fix loop 1/2) — **SHIP**
+
+- **Corrected:** package-root submodule syntax is normalized into the path-specific oracle while all
+  19 legitimate root exports remain valid; legacy, unknown, additional sessions, mixed, deep and
+  unknown-root imports reject.
+- **Immutability:** all 41 preset-derived globals rejected 315 top-level/nested mutation attempts;
+  custom intent/safety/RAG/funnel/handoff instances remain isolated from defaults, selected preset
+  and later instances.
+- **Protocol pin:** a literal expected mapping fixes all 11 `FunnelStage` names/values independently
+  of enum and preset data.
+- **Regression evidence:** inventory 372→0; SRM parity/hashes pass; preset contains 307 accented
+  literals and zero Unicode escape text; 480 regexes compile; enum identity, round-trip, fallback,
+  dependency-free protocol and unchanged parity-oracle scope pass. Exact-tree gates report focused
+  22, loader 130, core 1,017, full 3,546 passed/19 skipped with two pinned failures, and clean
+  static/type/build gates.
+- **Findings:** no CRITICAL, HIGH, MEDIUM or LOW gaps.
+- **Verdict:** SHIP.
+
+### 2026-10-01 — Group 2 quality review — **SHIP**
+
+- **Concurrency/lifecycle:** 64 concurrent accesses across 16 workers build one preset and publish
+  one identity; protocol-only import leaves selection open; app package imports select the default
+  through existing content consumers as allowed by Decision 12.
+- **Performance:** all 480 regexes validate before publication; compilation is bounded to module or
+  singleton construction with no repeated preset I/O. Per-instance copies are small and linear; no
+  measured need for another cache.
+- **Architecture/security:** immutable globals preserve customization APIs without cross-instance
+  contamination; enum serialization and list-returning compatibility remain; direct/aliased/root/
+  nested/parenthesized/deep/star import forms fail closed under the static oracle's declared scope;
+  trusted preset path boundary is unchanged.
+- **Findings:** no CRITICAL, HIGH, MEDIUM or LOW security, maintainability, performance, regression
+  or scope-fidelity gaps.
+- **Verdict:** SHIP.
+
+### 2026-10-01 — Group 2 orchestrator validation — **PASS**
+
+- **Scope rationale:** Group 2 rewrites shared SRM behavior and consolidates an app persistence/type
+  boundary, so module parity, persistence/import-oracle probes, repository full gate and static/type/
+  artifact checks are proportional.
+- **Direct content evidence:** SRM inventory is zero; all four preset hashes and SRM normalized parity
+  pass; `srm.toml` carries 307 accented literals, decoded characters and zero literal Unicode escape
+  text; canonical stages equal preset stages and unknown stage injection raises `PresetError`.
+- **Focused evidence:** protocol compatibility plus import-oracle suites 22 passed; preset loader 130
+  passed; public SRM imports and canonical `LEAD_NOVO` value pass.
+- **Aggregate evidence:** core parity 1,017/1,017 passed; `full_suite_gate` accepted 3,546 passed and
+  19 skipped with exactly the two pinned config-service failures; package boundary, Black, isort,
+  Flake8, mypy over 173 files, isolated builds, parity guard and `git diff --check` passed.
+- **Result:** execution re-review SHIP, quality review SHIP and orchestrator validation PASS; task
+  `t_muhbviqz8f0103ed` is eligible for `done`.
+
 ---
 
 ## Files to Create/Modify
@@ -1060,6 +1399,8 @@ MODIFY  packages/neurostack-core/neurostack_core/flow/handlers/safety.py     # 9
 MODIFY  packages/neurostack-core/neurostack_core/flow/handlers/normal.py     # 2
 MODIFY  packages/neurostack-core/neurostack_core/flow/handlers/rag.py        # 2
 MODIFY  packages/neurostack-core/pyproject.toml            # ship presets/**/*.toml in the wheel
+MODIFY  tests/package_artifact/test_archives.py             # Group 1 exact wheel/sdist oracle
+MODIFY  tests/scripts/test_application_core_imports.py      # Group 2 exact protocol-leaf edge
 MODIFY  packages/neurostack-core/README.md                 # how to write a preset
 MODIFY  scripts/wish-gates.sh                              # inventory, loader, parity gates
 MODIFY  src/api/schemas/sessions.py                        # Group 2 — canonical FunnelStage import

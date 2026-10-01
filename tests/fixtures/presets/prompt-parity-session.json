@@ -1,0 +1,43 @@
+{
+  "config": {
+    "include_constraints": true,
+    "include_history": true,
+    "include_knowledge": true,
+    "include_system": true,
+    "max_tokens": 12000,
+    "mode": "normal",
+    "temperature": 0.7
+  },
+  "history": [
+    {
+      "content": "Olá!",
+      "role": "user"
+    }
+  ],
+  "now": "2026-09-25T10:30:00-03:00",
+  "variables": {
+    "channel": "web",
+    "constraints": [
+      "Fazer apenas uma pergunta por mensagem"
+    ],
+    "custom": {
+      "agent_name": "Nina",
+      "agent_presentation": "Nina, assistente da Clínica Aurora.",
+      "clinic_name": "Clínica Aurora",
+      "timezone": "America/Sao_Paulo",
+      "use_emojis": false
+    },
+    "funnel_stage": "em_qualificacao",
+    "language": "pt-BR",
+    "last_intent": "interesse_tratamento",
+    "safety_reminders": [
+      "Não fornecer diagnóstico"
+    ],
+    "slots": {
+      "lead_name": "Marina"
+    },
+    "turn_count": 3,
+    "user_journey": "Lead novo → em qualificação; nome já coletado: Marina.",
+    "user_message": "Quero entender melhor o tratamento antes de agendar."
+  }
+}

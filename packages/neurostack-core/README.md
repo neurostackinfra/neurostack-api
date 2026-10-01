@@ -22,6 +22,7 @@ API cannot change underneath that project.
 
 ## Quickstart
 
+<!-- readme-example: quickstart -->
 ```python
 from uuid import uuid4
 
@@ -41,6 +42,7 @@ print(
     f"stage={decision.funnel_stage.value}"
 )
 ```
+<!-- end-readme-example -->
 
 The example runs locally without services or environment variables and prints:
 
@@ -69,10 +71,177 @@ The supported provisional facades are `neurostack_core.srm`,
 `neurostack_core.prompt`. Modules below those facades are implementation
 details.
 
-## Known limitation: pt-BR clinic domain
+## Preset reference
 
-The package currently ships Brazilian Portuguese (`pt-BR`) aesthetic-clinic
-intents, rules, prompts, and response content as built-in data. It is not yet a
-domain-neutral reasoning library. That extraction is tracked separately by the
-`neurostack-core-dedomainification` wish; consumers must not assume other
-languages or domains are supported until that work ships.
+The preset subsystem replaces the previous hard-coded domain content. Every
+localized string, regex, and threshold lives in a bundled preset directory
+and is loaded fail-closed on first access. The engine refuses to boot without
+a valid preset.
+
+### Public signatures
+
+```text
+neurostack_core.use_preset(name_or_path: str | os.PathLike[str]) -> Preset
+neurostack_core.get_preset() -> Preset
+neurostack_core.Preset           # frozen dataclass with name, source_id, srm, flow, policy, prompt
+neurostack_core.PresetError      # raised for every rejection; subclass of RuntimeError
+```
+
+- `use_preset(name_or_path)` validates and atomically selects one source.
+  A `str` is a bundled preset name matching `[a-z0-9_]+`; a `pathlib.Path`
+  is an explicit trusted operator-supplied directory that is canonicalised
+  with `realpath()`. Selection is configure-once; a second call with a
+  different `source_id` raises `PresetError` and prompts a process restart.
+- `get_preset()` returns the selected preset. If nothing has been selected
+  yet it falls back atomically to `pt_br_clinic`.
+- Both calls return the same `Preset` object; the `.srm`, `.flow`, `.policy`,
+  and `.prompt` attributes are deeply immutable `FrozenMap` instances backed
+  by `MappingProxyType` and recursively frozen tuples.
+
+### The four TOML files
+
+Every preset directory contains exactly these files:
+
+```
+<preset>/
+  srm.toml      # intents, funnel, safety patterns, RAG, handoff, engine
+  flow.toml     # handoff/safety responses, state machine, imperative literals
+  policy.toml   # constraints, rule set, global policy, imperative literals
+  prompt.toml   # system prompts, funnel instructions, imperative literals
+```
+
+A missing file, an unknown extra `*.toml`, or a file above the 1 MiB cap is
+rejected before parsing with a redacted `PresetError`.
+
+### Namespaced identifier contract
+
+Preset `protocol` sections must exactly match the canonical namespaces
+exported by `neurostack_core.protocol`:
+
+- `srm.toml` → `protocol.intent_categories`, `protocol.funnel_stages`,
+  `protocol.safety_categories`, `protocol.sentiment_labels`,
+  `protocol.flow_modes`, `protocol.handoff_reasons`,
+  `protocol.official_intents`, `protocol.actions`,
+  `protocol.engine_regex_keys`.
+- `flow.toml` → `protocol.handoff_response_keys`,
+  `protocol.safety_response_keys`.
+- `policy.toml` → `protocol.rule_ids`, `protocol.rule_names`,
+  plus the canonical `(rule_id, rule)` pairs declared in
+  `POLICY_RULE_PAIRS`.
+- `prompt.toml` → `protocol.lookup_keys`.
+
+Any missing canonical value, any extra value outside the canonical set, and
+any mismatched `(rule_id, rule)` pair raise `PresetError`. Canonical values
+are shown by name; private values that fail validation are redacted.
+
+### Import order and process lifecycle
+
+```python
+from neurostack_core import use_preset
+
+# Optional explicit selection — must happen before any content accessor
+# imports the preset.  Omit the call to default to pt_br_clinic.
+use_preset("en_generic")
+
+# Only now import engines that read preset content.
+from neurostack_core.srm import SRMInput, get_srm_engine
+```
+
+The import order matters because every engine module eagerly calls
+`get_preset()` at import time to materialise its lookup tables. Importing
+an engine before `use_preset()` therefore pins the default `pt_br_clinic`
+preset for the lifetime of the process.
+
+### Error recovery
+
+- `PresetError` always names the file, dotted key, rejected summary,
+  expected shape, and the next action to take. Prompt-file errors redact
+  the rejected string value to avoid leaking private content.
+- A failed `use_preset()` leaves `_selected` unset, so `get_preset()` falls
+  back to `pt_br_clinic` on the next call. The caller may re-attempt
+  selection with a different source after fixing the underlying file.
+- A lifecycle conflict (`use_preset(a)` then `use_preset(b)` where
+  `b.source_id != a.source_id`) is final: restart the process to swap.
+
+### Trusted-path boundary
+
+- `str` inputs are restricted to the `[a-z0-9_]+` bundled-name allowlist.
+  Traversal, separators, mixed case, and empty strings are rejected before
+  disk I/O so that `str` can never reach the filesystem.
+- `pathlib.Path` inputs are canonicalised with `realpath()` and must point
+  at an existing directory. The resolved directory becomes the
+  `source_id`; symlink aliases are deduplicated to a single `source_id`.
+- Only `str` or `os.PathLike[str]` are accepted. `bytes` paths, non-text
+  `__fspath__` returns, and `None` are rejected.
+
+### Bundled presets
+
+- `pt_br_clinic` — the production Brazilian Portuguese (pt-BR)
+  aesthetic-clinic preset. It ships the full regex set and prompt library
+  every current consumer depends on and is the implicit default of
+  `get_preset()`.
+- `en_generic` — a compact English proof fixture that exists solely to
+  show the engine is genuinely preset-driven. It is intentionally generic
+  and small; do not depend on it for real workloads.
+
+### Known limitation: pt-BR clinic domain
+
+Until a true domain-neutral content set ships, `neurostack-core` continues
+to ship Brazilian Portuguese (`pt-BR`) aesthetic-clinic intents, rules,
+prompts, and response content as the default bundled preset. That domain
+tie-in is tracked by the `neurostack-core-dedomainification` wish;
+consumers must not assume other languages or domains are production-ready
+until that work ships.
+
+### Preset-driven example (English)
+
+<!-- readme-example: en_generic -->
+```python
+from uuid import uuid4
+
+from neurostack_core import use_preset
+use_preset("en_generic")
+
+from neurostack_core.srm import SRMInput, get_srm_engine
+
+decision = get_srm_engine().process(
+    SRMInput(
+        tenant_id=uuid4(),
+        session_id=uuid4(),
+        message="I would like to book an appointment for monday at 10am",
+        language="en",
+    )
+)
+
+print(
+    f"intent={decision.intent} "
+    f"category={decision.intent_category.value} "
+    f"mode={decision.mode.value}"
+)
+```
+<!-- end-readme-example -->
+
+That example runs against the installed wheel and prints:
+
+```text
+intent=agendar category=scheduling mode=normal
+```
+
+### Lifecycle lock
+
+<!-- readme-example: lifecycle_lock -->
+```python
+from neurostack_core import PresetError, use_preset
+
+use_preset("en_generic")
+try:
+    use_preset("pt_br_clinic")
+except PresetError as error:
+    print("locked:", "restart" in str(error))
+else:
+    raise AssertionError("preset swap unexpectedly succeeded")
+```
+<!-- end-readme-example -->
+
+That example prints `locked: True` — the only way to swap presets is a
+process restart.

@@ -48,6 +48,35 @@ core_suite_gate() {
     _pytest_gate focused tests/srm tests/flow tests/policy tests/prompt
 }
 
+inventory_gate() (
+    cd "$_WISH_GATES_ROOT" || return 1
+    poetry run python scripts/pt-br-inventory.py --max 0 "$@"
+)
+
+preset_loader_gate() (
+    cd "$_WISH_GATES_ROOT" || return 1
+    poetry run pytest -q -p no:cacheprovider tests/presets/test_preset_loader.py
+)
+
+pt_br_preset_unchanged() (
+    cd "$_WISH_GATES_ROOT" || return 1
+    sha256sum --check tests/fixtures/presets/pt-br-preset.sha256
+)
+
+parity_tests_unchanged() (
+    cd "$_WISH_GATES_ROOT" || return 1
+    local base
+    base="$(git merge-base HEAD origin/main)" || return 1
+    if {
+        git diff --name-only "$base" -- tests/srm tests/flow tests/policy tests/prompt
+        git ls-files --others --exclude-standard -- \
+            tests/srm tests/flow tests/policy tests/prompt
+    } | grep -q .; then
+        echo "parity-oracle tests were modified" >&2
+        return 1
+    fi
+)
+
 full_suite_gate() {
     _pytest_gate full tests
 }

@@ -4,47 +4,31 @@ Determines when human handoff is required based on conversation state.
 """
 
 import re
-from typing import Optional
+from collections.abc import Mapping
+from typing import Optional, cast
 
-from neurostack_core.srm.models import (
+from neurostack_core.presets import get_preset
+from neurostack_core.protocol import (
     FunnelStage,
     HandoffReason,
-    HandoffResult,
     IntentCategory,
     SafetyCategory,
-    SafetyResult,
 )
+from neurostack_core.srm.models import HandoffResult, SafetyResult
 
 # ============================================
 # Handoff Trigger Patterns
 # ============================================
 
-EXPLICIT_HANDOFF_PATTERNS = [
-    r"\b(falar|conversar|atendimento)\b.*\b(humano|pessoa|atendente|real)\b",
-    r"\b(quero|preciso|pode)\b.*\b(falar|conversar)\b.*\b(algu\u00e9m|alguem|atendente)\b",
-    r"\b(n\u00e3o|nao)\b.*\b(robo|rob\u00f4|bot|m\u00e1quina|maquina|autom\u00e1tico)\b",
-    r"\b(transferir?|passar?)\b.*\b(para|atendente|humano)\b",
-    r"\b(atendente|operador|funcion\u00e1rio)\b.*\b(humano|real|verdadeiro)\b",
-    r"^(atendente|humano|pessoa)$",
-    # User-initiated forwarding requests \u2014 mirrors intent_classifier pedido_atendente_humano
-    r"\b(encaminh(ar|e|a|em))\b.*\b(equipe|atendente|pessoa|agendamento|secretaria)\b",
-    r"\b(gostaria|quero|preciso)\b.*\bencaminh",
-    r"\bme encaminh(e|ar|em)\b",
-    r"\b(pode|podes|poderia|podia)\b.*\bencaminh(ar|a|e)\b(?:\s*\?|\s+(?:agora|j\u00e1|ja|logo|direto|ent\u00e3o|entao))",
-    r"\bencaminh(ar|a|e)\b.*\b(agora|j\u00e1|ja|direto|logo|ent\u00e3o|entao)\b",
-]
+_HANDOFF_PRESET = cast(Mapping[str, object], get_preset().srm["handoff"])
+EXPLICIT_HANDOFF_PATTERNS = cast(tuple[str, ...], _HANDOFF_PRESET["explicit_patterns"])
+_HANDOFF_REGEXES = cast(Mapping[str, str], _HANDOFF_PRESET["regexes"])
+_REGEX_FLAGS = re.IGNORECASE | re.UNICODE
 
 # Regex to detect a scheduling time/date preference in the current message.
 # Duplicated from engine.py so handoff_decider has no circular import.
 _SCHEDULING_HAS_TIME_RE = re.compile(
-    r"\b(segunda|ter[c\u00e7]a|quarta|quinta|sexta|s[a\u00e1]bado|domingo|amanh[a\u00e3]|hoje)\b"
-    r"|\b\d{1,2}\s*h\b"
-    r"|\b\d{1,2}:\d{2}\b"
-    r"|\b([a\u00e0]s?)\s+\d{1,2}\b"
-    r"|\b(manh[a\u00e3]|tarde|noite|madrugada)\b"
-    r"|\b(dia\s+\d{1,2}|\d{1,2}/\d{1,2})\b"  # dia 12, 12/06
-    r"|\b(semana\s+que\s+vem|pr[o\u00f3]xima\s+semana)\b",  # semana que vem
-    re.IGNORECASE | re.UNICODE,
+    _HANDOFF_REGEXES["scheduling_has_time"], _REGEX_FLAGS
 )
 
 # Confirmation response patterns for the scheduling two-step flow.
@@ -53,44 +37,40 @@ _SCHEDULING_HAS_TIME_RE = re.compile(
 #   STRONG   \u2014 match at any message length (sim, claro, confirmo, encaminhe\u2026)
 #   WEAK     \u2014 whole-message anchor, \u2264 3 words (pode, ok, vai, manda\u2026)
 #   SHORT    \u2014 word-boundary, \u2264 4 words (perfeito, \u00f3timo, beleza)
-_STRONG_POSITIVE_RE = re.compile(
-    r"\b(sim|s[\u00edi]m|yes|claro|com\s+certeza|confirmo|confirmar|aceito|aceitar"
-    r"|encaminhe|encaminha)\b",
-    re.IGNORECASE | re.UNICODE,
-)
+_STRONG_POSITIVE_RE = re.compile(_HANDOFF_REGEXES["strong_positive"], _REGEX_FLAGS)
 # Weak positives only fire when the ENTIRE trimmed message is \u2264 3 words.
 # These are ambiguous single-word replies (pode, ok, vai\u2026) that only count
 # when nothing else is in the message.
 # NOTE: "pode encaminhar" is added here (not to STRONG) to avoid bare "encaminhar"
 # matching inside negations like "n\u00e3o encaminhar" or "prefiro n\u00e3o encaminhar agora".
 # The whole-message anchor makes this safe.
-_WEAK_POSITIVE_RE = re.compile(
-    r"^(pode\s+encaminhar|pode|quero|ok|okay|isso|vai|v[a\u00e1]|manda|mande|tudo\s+bem|por\s+favor"
-    r"|certo|exato|exatamente|boa)[\s!.,]*$",
-    re.IGNORECASE | re.UNICODE,
-)
+_WEAK_POSITIVE_RE = re.compile(_HANDOFF_REGEXES["weak_positive"], _REGEX_FLAGS)
 # Short-affirmative positives: perfeito / \u00f3timo / beleza fire via word-boundary
 # search when the message is \u2264 4 words.  This catches "est\u00e1 \u00f3timo", "beleza
 # ent\u00e3o", "perfeito pra mim" (genuine confirmations) while keeping long
 # preference sentences like "segunda \u00e0s 9h fica perfeito pra mim" (10 words)
 # safely blocked.
-_SHORT_AFFIRMATIVE_RE = re.compile(
-    r"\b(perfeito|[\u00f3o]timo|beleza)\b",
-    re.IGNORECASE | re.UNICODE,
-)
-_NEGATIVE_RE = re.compile(
-    r"\b(n[a\u00e3]o|no|nunca|negativo|nem|agora\s+n[a\u00e3]o|ainda\s+n[a\u00e3]o"
-    r"|por\s+enquanto\s+n[a\u00e3]o|cancel|cancela|desist|volta)\b",
-    re.IGNORECASE | re.UNICODE,
-)
+_SHORT_AFFIRMATIVE_RE = re.compile(_HANDOFF_REGEXES["short_affirmative"], _REGEX_FLAGS)
+_NEGATIVE_RE = re.compile(_HANDOFF_REGEXES["negative"], _REGEX_FLAGS)
 # Scheduling-link enrich turn: patient reports the booking outcome. This vocabulary
 # ("consegui", "agendei", "deu certo"\u2026) is distinct from the yes/no confirmation
 # words, so it needs its own positive-completion matcher. Negation is vetoed first,
 # so "n\u00e3o consegui" / "n\u00e3o deu certo" correctly read as NOT concluded.
 _SCHEDULING_COMPLETED_RE = re.compile(
-    r"\b(consegui|agendei|agendad|marquei|marcad|reservei|finalizei|conclu[\u00edi]"
-    r"|deu\s+certo|funcionou|prontinho|pronto)\b",
-    re.IGNORECASE | re.UNICODE,
+    _HANDOFF_REGEXES["scheduling_completed"], _REGEX_FLAGS
+)
+
+_IMPERATIVE_LITERALS = cast(
+    Mapping[str, Mapping[str, tuple[str, ...]]],
+    get_preset().srm["imperative_literals"],
+)
+_HANDOFF_IMPERATIVES = _IMPERATIVE_LITERALS["srm.handoff_decider"]
+_INIT_LITERALS = _HANDOFF_IMPERATIVES["HandoffDecider.__init__"]
+_DECIDE_LITERALS = _HANDOFF_IMPERATIVES["HandoffDecider.decide"]
+_SAFETY_LITERALS = _HANDOFF_IMPERATIVES["HandoffDecider._check_safety_handoff"]
+_ESCALATION_LITERALS = _HANDOFF_IMPERATIVES["HandoffDecider._check_escalation_keywords"]
+_OUTPUT_VALUES = cast(
+    Mapping[str, str], _HANDOFF_IMPERATIVES["HandoffDecider.output_values"]
 )
 
 
@@ -123,16 +103,9 @@ class HandoffDecider:
         """
         self.max_turns = max_turns
         self.min_confidence = min_confidence
-        self.escalation_keywords = escalation_keywords or [
-            "gerente",
-            "supervisor",
-            "respons\u00e1vel",
-            "reclamar",
-            "ouvidoria",
-            "procon",
-            "processo",
-            "advogado",
-        ]
+        self.escalation_keywords = escalation_keywords or list(
+            cast(tuple[str, ...], _HANDOFF_PRESET["escalation_keywords"])
+        )
 
         # Compile explicit handoff patterns
         self._patterns = [
@@ -175,8 +148,8 @@ class HandoffDecider:
                 reason=HandoffReason.ESCALATION,
                 urgency="high",
                 summary="User has a complaint that requires human attention",
-                sector="gerencia",
-                sla="prioritario",
+                sector=_DECIDE_LITERALS[0],
+                sla=_OUTPUT_VALUES["priority"],
             )
 
         # Intent-based handoff (doc: pos_atendimento_sintomas, conduta_inadequada, pedido_alterar_medicacao)
@@ -185,27 +158,27 @@ class HandoffDecider:
                 required=True,
                 reason=HandoffReason.SAFETY_CONCERN,
                 urgency="critical",
-                summary="Sintomas preocupantes pós-atendimento; encaminhar urgência",
-                sector="urgencia",
-                sla="imediato",
+                summary=_DECIDE_LITERALS[1],
+                sector=_DECIDE_LITERALS[2],
+                sla=_OUTPUT_VALUES["immediate"],
             )
         if intent == "conduta_inadequada_ameaca":
             return HandoffResult(
                 required=True,
                 reason=HandoffReason.ESCALATION,
                 urgency="high",
-                summary="Conduta inadequada ou ameaça; encaminhar gerência",
-                sector="gerencia",
-                sla="prioritario",
+                summary=_DECIDE_LITERALS[3],
+                sector=_DECIDE_LITERALS[4],
+                sla=_OUTPUT_VALUES["priority"],
             )
         if intent == "pedido_alterar_medicacao":
             return HandoffResult(
                 required=True,
                 reason=HandoffReason.SAFETY_CONCERN,
                 urgency="high",
-                summary="Pedido de alteração de medicação; encaminhar clínico/urgência",
-                sector="clinico",
-                sla="prioritario",
+                summary=_DECIDE_LITERALS[5],
+                sector=_DECIDE_LITERALS[6],
+                sla=_OUTPUT_VALUES["priority"],
             )
 
         # Priority 4: Scheduling — three-step flow with explicit confirmation
@@ -234,7 +207,11 @@ class HandoffDecider:
             concluded = is_positive and not is_negative
             return HandoffResult(
                 required=False,
-                verification_status="concluiu" if concluded else "nao_concluiu",
+                verification_status=(
+                    _OUTPUT_VALUES["verification_completed"]
+                    if concluded
+                    else _OUTPUT_VALUES["verification_not_completed"]
+                ),
             )
 
         # P1a fix: _extract_slots() runs AFTER decide(), so scheduling_has_time is
@@ -260,18 +237,18 @@ class HandoffDecider:
                         required=True,
                         reason=HandoffReason.SCHEDULING,
                         urgency="normal",
-                        summary="Link de agendamento enviado; aguardando o paciente confirmar se concluiu",
-                        sector="agendamento",
-                        sla="prioritario",
+                        summary=_DECIDE_LITERALS[7],
+                        sector=_DECIDE_LITERALS[8],
+                        sla=_OUTPUT_VALUES["priority"],
                         verification_status="link_sent",
                     )
                 return HandoffResult(
                     required=True,
                     reason=HandoffReason.SCHEDULING,
                     urgency="normal",
-                    summary="Paciente confirmou encaminhamento para equipe de agendamento",
-                    sector="agendamento",
-                    sla="prioritario",
+                    summary=_DECIDE_LITERALS[9],
+                    sector=_DECIDE_LITERALS[10],
+                    sla=_OUTPUT_VALUES["priority"],
                 )
             if is_negative:
                 # User declined → clear flags, continue normally
@@ -297,8 +274,8 @@ class HandoffDecider:
                 reason=HandoffReason.MAX_TURNS_EXCEEDED,
                 urgency="normal",
                 summary=f"Conversation exceeded {self.max_turns} turns without resolution",
-                sector="administrativo",
-                sla="rotina",
+                sector=_OUTPUT_VALUES["administrative"],
+                sla=_OUTPUT_VALUES["routine"],
             )
 
         # Priority 6: Low confidence → administrativo, rotina
@@ -311,8 +288,8 @@ class HandoffDecider:
                 reason=HandoffReason.LOW_CONFIDENCE,
                 urgency="normal",
                 summary="Multiple low-confidence responses suggest human intervention needed",
-                sector="administrativo",
-                sla="rotina",
+                sector=_OUTPUT_VALUES["administrative"],
+                sla=_OUTPUT_VALUES["routine"],
             )
 
         # Priority 7: Already in handoff waiting state
@@ -322,8 +299,8 @@ class HandoffDecider:
                 reason=HandoffReason.USER_REQUEST,
                 urgency="normal",
                 summary="User previously requested handoff and is still waiting",
-                sector="administrativo",
-                sla="prioritario",
+                sector=_OUTPUT_VALUES["administrative"],
+                sla=_OUTPUT_VALUES["priority"],
             )
 
         return HandoffResult(required=False)
@@ -367,8 +344,8 @@ class HandoffDecider:
                     reason=HandoffReason.USER_REQUEST,
                     urgency="normal",
                     summary="User explicitly requested to speak with a human",
-                    sector="administrativo",
-                    sla="prioritario",
+                    sector=_OUTPUT_VALUES["administrative"],
+                    sla=_OUTPUT_VALUES["priority"],
                 )
         return None
 
@@ -382,8 +359,8 @@ class HandoffDecider:
                 reason=HandoffReason.SAFETY_CONCERN,
                 urgency="critical",
                 summary=f"Clinical safety concern detected: {', '.join(safety_result.triggers[:3])}",
-                sector="urgencia",
-                sla="imediato",
+                sector=_SAFETY_LITERALS[0],
+                sla=_OUTPUT_VALUES["immediate"],
             )
         if safety_result.category == SafetyCategory.CONDUCT_RISK:
             if safety_result.confidence >= 0.7:
@@ -392,8 +369,8 @@ class HandoffDecider:
                     reason=HandoffReason.SAFETY_CONCERN,
                     urgency="high",
                     summary=f"Conduct concern detected: {', '.join(safety_result.triggers[:3])}",
-                    sector="gerencia",
-                    sla="prioritario",
+                    sector=_SAFETY_LITERALS[1],
+                    sla=_OUTPUT_VALUES["priority"],
                 )
         if safety_result.category == SafetyCategory.LEGAL_RISK:
             if safety_result.action == "escalate":
@@ -402,8 +379,8 @@ class HandoffDecider:
                     reason=HandoffReason.SAFETY_CONCERN,
                     urgency="normal",
                     summary="Legal risk requires human verification",
-                    sector="administrativo",
-                    sla="rotina",
+                    sector=_OUTPUT_VALUES["administrative"],
+                    sla=_OUTPUT_VALUES["routine"],
                 )
         return None
 
@@ -416,8 +393,8 @@ class HandoffDecider:
                 reason=HandoffReason.ESCALATION,
                 urgency="high" if len(matched) > 1 else "normal",
                 summary=f"Escalation keywords detected: {', '.join(matched[:3])}",
-                sector="gerencia",
-                sla="prioritario",
+                sector=_ESCALATION_LITERALS[0],
+                sla=_OUTPUT_VALUES["priority"],
             )
         return None
 

@@ -1,0 +1,253 @@
+# Compact English proof-only preset for neurostack-core.
+"schema_version" = 1
+"constraint_ids" = [
+  '''C_SEQUENCE_AUTHORITY_BEFORE_PRICE''',
+  '''C_OBJECTION_NO_PASSIVE_CLOSE''',
+]
+"flow_policy_ids" = [
+  '''POL_ONB_001_PRESENTATION_OBJECTIVE_NAME_SEQUENCE''',
+  '''POL_QUAL_001_KEY_QUESTION_AND_PROFILE_CLASSIFICATION''',
+  '''POL_OBJ_001_CLARIFY_OBJECTION_BEFORE_CLOSING''',
+  '''POL_PRICE_002_RANGE_FIRST_EXACT_ON_INSISTENCE''',
+  '''POL_HANDOFF_001_USER_REQUESTS_HUMAN_OR_AI_DETECTED''',
+]
+
+["protocol"]
+"rule_ids" = [
+  '''C_COMPLIANCE_NO_PROMISE_OF_RESULTS''',
+  '''C_MEDICAL_NO_DIAGNOSIS''',
+  '''C_MEDICAL_NO_MED_CHANGE_POSTCARE''',
+  '''POL_SAFETY_001_EMERGENCY_POSTCARE_OUT_OF_HOURS''',
+  '''global_no_false_promises''',
+  '''global_no_legal_advice''',
+  '''global_privacy''',
+  '''global_professional_tone''',
+]
+"rule_names" = [
+  '''emergency_redirect''',
+  '''no_false_promises''',
+  '''no_legal_advice''',
+  '''no_medical_diagnosis''',
+  '''no_medication_prescription''',
+  '''no_treatment_guarantee''',
+  '''privacy_compliance''',
+  '''professional_tone''',
+]
+
+["global_policy"]
+"name" = '''NeuroStack Global Safety Policy'''
+"description" = '''Global safety policy applied to every tenant.'''
+"policy_type" = '''global'''
+"priority" = 1000
+"is_active" = true
+
+["constraints"]
+"must_not_say" = [
+  '''provide medical diagnoses''',
+  '''prescribe or recommend medication''',
+  '''guarantee the outcome of a treatment''',
+  '''offer legal advice''',
+  '''make promises about specific results''',
+  '''share information about other users''',
+  '''criticise other health professionals''',
+  '''suggest changes to dosage or medication''',
+  '''minimise reported post-visit symptoms''',
+  '''invent services that are not offered''',
+]
+"must_include" = []
+"tone_guidelines" = [
+  '''Keep a professional and welcoming tone.''',
+  '''Be empathetic yet objective.''',
+  '''Use clear and accessible language.''',
+  '''Avoid unnecessary medical jargon.''',
+  '''Ask only one question per message.''',
+  '''Introduce yourself with name and clinic on the first contact.''',
+]
+"safety_reminders" = [
+  '''In an emergency, direct the user to the local emergency line.''',
+  '''For a diagnosis, always recommend an in-person consultation.''',
+  '''Medication can only be prescribed by a licensed physician.''',
+  '''Concerning post-visit symptoms must be escalated immediately.''',
+  '''Medication change requests must be forwarded to the prescribing physician.''',
+]
+"custom_instructions" = [
+  '''C_SEQUENCE_AUTHORITY_BEFORE_PRICE: Share price only after authority is established (authority_done==true).''',
+  '''C_OBJECTION_NO_PASSIVE_CLOSE: Do not close passively when an objection is active. Ask a clarifying question.''',
+  '''C_ONE_QUESTION_PER_MESSAGE: Ask only one question per message and wait for the answer.''',
+  '''C_QUALIFY_BEFORE_SCHEDULE: Ask about prior experience before scheduling (New / Disappointed / Continuing).''',
+  '''C_MEDICAL_REDIRECT: Any question about a medical condition should be redirected to the professional.''',
+  '''C_OUT_OF_SCOPE_CHECK: Confirm the service exists in Clinic Config before answering; otherwise say it is not offered.''',
+]
+
+["imperative_literals"]
+"policy.global_rules" = {}
+
+["imperative_literals"."policy.models"]
+"PolicyConstraints.to_prompt_constraints" = [
+  '''DO NOT ''',
+]
+
+[["rules"]]
+"rule_id" = '''C_MEDICAL_NO_DIAGNOSIS'''
+"rule" = '''no_medical_diagnosis'''
+"message" = '''I cannot provide medical diagnoses. For a proper evaluation please consult a health professional.'''
+"description" = '''Prohibits the agent from providing medical diagnoses.'''
+"category" = '''safety_clinical'''
+"severity" = '''critical'''
+"action" = '''block'''
+"patterns" = [
+  '''what is my diagnosis''',
+  '''tell me what i have''',
+  '''what disease do i have''',
+  '''diagnose me''',
+]
+"keywords" = [
+  '''diagnosis''',
+  '''diagnose''',
+  '''what disease''',
+]
+"enabled" = true
+"metadata" = {}
+
+[["rules"]]
+"rule_id" = '''C_MEDICAL_NO_MED_CHANGE_POSTCARE'''
+"rule" = '''no_medication_prescription'''
+"message" = '''I cannot recommend or prescribe medication. Only a physician can prescribe after a proper evaluation.'''
+"description" = '''Prohibits the agent from recommending or prescribing medication.'''
+"category" = '''safety_clinical'''
+"severity" = '''critical'''
+"action" = '''block'''
+"patterns" = [
+  '''which medicine should i take''',
+  '''which medication should i take''',
+  '''prescribe me''',
+  '''recommend me a medicine''',
+  '''can i take''',
+]
+"keywords" = [
+  '''prescription''',
+  '''prescribe''',
+  '''medicate''',
+]
+"enabled" = true
+"metadata" = {}
+
+[["rules"]]
+"rule_id" = '''C_COMPLIANCE_NO_PROMISE_OF_RESULTS'''
+"rule" = '''no_treatment_guarantee'''
+"message" = '''I cannot guarantee the outcome of a treatment. Results may vary per patient.'''
+"description" = '''Prohibits promises of treatment results.'''
+"category" = '''safety_legal'''
+"severity" = '''error'''
+"action" = '''warn'''
+"patterns" = [
+  '''guarantee a cure''',
+  '''promise it will work''',
+  '''100% success''',
+  '''guaranteed result''',
+]
+"keywords" = [
+  '''guarantee cure''',
+  '''guaranteed result''',
+]
+"enabled" = true
+"metadata" = {}
+
+[["rules"]]
+"rule_id" = '''global_no_legal_advice'''
+"rule" = '''no_legal_advice'''
+"message" = '''I cannot provide legal advice. For legal questions please consult a lawyer.'''
+"description" = '''Prohibits the agent from giving legal advice.'''
+"category" = '''safety_legal'''
+"severity" = '''error'''
+"action" = '''warn'''
+"patterns" = [
+  '''can i sue''',
+  '''should i sue''',
+  '''i will sue you''',
+  '''compensation claim''',
+]
+"keywords" = [
+  '''lawsuit''',
+  '''lawyer''',
+  '''compensation''',
+  '''legal''',
+]
+"enabled" = true
+"metadata" = {}
+
+[["rules"]]
+"rule_id" = '''global_no_false_promises'''
+"rule" = '''no_false_promises'''
+"message" = '''I cannot promise specific results. Each case is evaluated individually.'''
+"description" = '''Prohibits false promises or unrealistic guarantees.'''
+"category" = '''safety_ethical'''
+"severity" = '''warning'''
+"action" = '''warn'''
+"patterns" = [
+  '''i promise that''',
+  '''i guarantee that''',
+  '''certainly will''',
+  '''100% guaranteed''',
+]
+"keywords" = []
+"enabled" = true
+"metadata" = {}
+
+[["rules"]]
+"rule_id" = '''global_privacy'''
+"rule" = '''privacy_compliance'''
+"message" = '''Your information is handled confidentially according to privacy regulations.'''
+"description" = '''Reinforces privacy and regulatory compliance.'''
+"category" = '''compliance'''
+"severity" = '''info'''
+"action" = '''log'''
+"patterns" = [
+  '''personal data''',
+  '''privacy''',
+  '''confidentiality''',
+  '''data protection''',
+]
+"keywords" = [
+  '''my data''',
+  '''personal information''',
+]
+"enabled" = true
+"metadata" = {}
+
+[["rules"]]
+"rule_id" = '''global_professional_tone'''
+"rule" = '''professional_tone'''
+"message" = '''Keep a professional and welcoming tone across every interaction.'''
+"description" = '''Defines the agent communication tone.'''
+"category" = '''tone'''
+"severity" = '''info'''
+"action" = '''log'''
+"patterns" = []
+"keywords" = []
+"enabled" = true
+"metadata" = {}
+
+[["rules"]]
+"rule_id" = '''POL_SAFETY_001_EMERGENCY_POSTCARE_OUT_OF_HOURS'''
+"rule" = '''emergency_redirect'''
+"message" = '''In a medical emergency, dial your local emergency number immediately or go to the nearest emergency room.'''
+"description" = '''Redirects emergencies to the appropriate services.'''
+"category" = '''safety_clinical'''
+"severity" = '''critical'''
+"action" = '''handoff'''
+"patterns" = [
+  '''emergency''',
+  '''urgent''',
+  '''cannot breathe''',
+  '''severe pain''',
+  '''severe bleeding''',
+  '''i lost consciousness''',
+]
+"keywords" = [
+  '''ambulance''',
+  '''emergency room''',
+  '''medical emergency''',
+]
+"enabled" = true
+"metadata" = {}

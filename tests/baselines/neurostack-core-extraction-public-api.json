@@ -23,7 +23,12 @@
     "get_policy_store"
   ],
   "neurostack_core.prompt": [
+    "CAN_QUOTE_PRIVATE_PAY_CUSTOM_KEY",
+    "CARE_MODALITY_SLOT",
     "GeneratedPrompt",
+    "INSURANCE_CARE_MODALITY",
+    "INSURANCE_TRIAGE_CUSTOM_KEY",
+    "PRIVATE_PAY_CARE_MODALITY",
     "PromptEngine",
     "PromptMode",
     "PromptVariables",

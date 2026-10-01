@@ -1,0 +1,197 @@
+# Compact English proof-only preset for neurostack-core.
+"schema_version" = 1
+
+["protocol"]
+"handoff_response_keys" = [
+  '''complex_query''',
+  '''connected''',
+  '''default''',
+  '''escalation''',
+  '''explicit_request''',
+  '''low_confidence''',
+  '''max_turns_exceeded''',
+  '''safety_concern''',
+  '''scheduling''',
+  '''waiting''',
+]
+"safety_response_keys" = [
+  '''clinical_risk''',
+  '''conduct_risk''',
+  '''default''',
+  '''emergency''',
+  '''legal_risk''',
+]
+
+["handoff_responses"]
+"explicit_request" = '''Sure! I will forward you to our team now. Someone will continue the conversation shortly.'''
+"safety_concern" = '''To give you the best support, I am forwarding you to our specialist team. A professional will reach out shortly.'''
+"max_turns_exceeded" = '''So that we can help you even better, I will forward you to the team that can continue the conversation.'''
+"low_confidence" = '''To make sure you get the most accurate guidance, I am forwarding you to our specialist team.'''
+"complex_query" = '''This question deserves closer attention. I will forward you to our specialist team.'''
+"escalation" = '''I understand your situation. I will forward you to the responsible team so they can help you.'''
+"scheduling" = '''I will forward you to our team to continue the conversation and confirm the best available times.'''
+"default" = '''I will forward you to our team to continue the conversation. Please hold on a moment.'''
+"waiting" = '''You are in the queue. Our team will be available shortly. Estimated time: {wait_time} minutes.'''
+"connected" = '''You are now connected with {agent_name}. How can I help you?'''
+
+["safety_responses"]
+"clinical_risk" = '''I can tell you may be going through a difficult situation. Please seek professional help right away. Local emergency line: 911.'''
+"legal_risk" = '''I cannot provide medical guidance, diagnoses, or prescriptions. Please consult a qualified health professional.'''
+"conduct_risk" = '''Let us keep this conversation respectful. I am here to help as best I can.'''
+"emergency" = '''EMERGENCY DETECTED. Please dial 911 or your local emergency number immediately.'''
+"default" = '''I understand your concern. For your safety please seek appropriate professional guidance.'''
+
+["state_machine"]
+"flow_modes" = [
+  '''normal''',
+  '''rag''',
+  '''safety''',
+  '''handoff''',
+]
+"transition_triggers" = [
+  '''safety_concern_detected''',
+  '''safety_resolved''',
+  '''handoff_requested''',
+  '''handoff_completed''',
+  '''handoff_cancelled''',
+  '''rag_required''',
+  '''rag_completed''',
+  '''continue_normal''',
+  '''reset_to_normal''',
+  '''session_timeout''',
+  '''session_end''',
+]
+
+["state_machine"."mode_priority"]
+"normal" = 0
+"rag" = 1
+"safety" = 3
+"handoff" = 2
+
+[["state_machine"."transitions"]]
+"from" = '''normal'''
+"trigger" = '''rag_required'''
+"to" = '''rag'''
+
+[["state_machine"."transitions"]]
+"from" = '''normal'''
+"trigger" = '''safety_concern_detected'''
+"to" = '''safety'''
+
+[["state_machine"."transitions"]]
+"from" = '''normal'''
+"trigger" = '''handoff_requested'''
+"to" = '''handoff'''
+
+[["state_machine"."transitions"]]
+"from" = '''normal'''
+"trigger" = '''continue_normal'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''rag'''
+"trigger" = '''rag_completed'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''rag'''
+"trigger" = '''safety_concern_detected'''
+"to" = '''safety'''
+
+[["state_machine"."transitions"]]
+"from" = '''rag'''
+"trigger" = '''handoff_requested'''
+"to" = '''handoff'''
+
+[["state_machine"."transitions"]]
+"from" = '''rag'''
+"trigger" = '''reset_to_normal'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''safety'''
+"trigger" = '''safety_resolved'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''safety'''
+"trigger" = '''handoff_requested'''
+"to" = '''handoff'''
+
+[["state_machine"."transitions"]]
+"from" = '''safety'''
+"trigger" = '''reset_to_normal'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''handoff'''
+"trigger" = '''handoff_completed'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''handoff'''
+"trigger" = '''handoff_cancelled'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''handoff'''
+"trigger" = '''safety_concern_detected'''
+"to" = '''safety'''
+
+[["state_machine"."transitions"]]
+"from" = '''normal'''
+"trigger" = '''session_end'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''rag'''
+"trigger" = '''session_end'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''safety'''
+"trigger" = '''session_end'''
+"to" = '''normal'''
+
+[["state_machine"."transitions"]]
+"from" = '''handoff'''
+"trigger" = '''session_end'''
+"to" = '''normal'''
+
+["thresholds"]
+"safety_escalation" = 2
+"rag_max_turns" = 3
+
+["imperative_literals"]
+
+["imperative_literals"."flow.handlers.handoff"]
+"HandoffModeHandler.get_mode_prompt_additions" = [
+  '''The user will be forwarded to our specialist team.''',
+  '''Keep the user informed about the status.''',
+  '''Collect relevant information to make the handoff smooth.''',
+  '''Be empathetic about the wait.''',
+]
+
+["imperative_literals"."flow.handlers.safety"]
+"SafetyModeHandler.get_mode_prompt_additions" = [
+  '''SAFETY MODE ACTIVE.''',
+  '''Prioritise user safety above everything else.''',
+  '''Do not provide information that could cause harm.''',
+  '''Point to professional help resources.''',
+  '''Keep a calm and welcoming tone.''',
+]
+
+["imperative_literals"."flow.handlers.normal"]
+"NormalModeHandler.get_mode_prompt_additions" = [
+  '''Reply naturally and helpfully.''',
+  '''Keep the conversation context.''',
+  '''Be professional and empathetic.''',
+]
+
+["imperative_literals"."flow.handlers.rag"]
+"RagModeHandler.get_mode_prompt_additions" = [
+  '''Use the retrieved knowledge context to answer.''',
+  '''Cite sources when relevant.''',
+  '''If the information is not available, say so plainly.''',
+  '''Keep answers factual and precise.''',
+]
