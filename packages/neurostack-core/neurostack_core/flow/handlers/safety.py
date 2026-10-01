@@ -5,7 +5,8 @@ Handles safety-critical conversation states.
 
 import logging
 import time
-from typing import Optional
+from collections.abc import Mapping
+from typing import Optional, cast
 
 from neurostack_core.flow.handlers.base import BaseModeHandler
 from neurostack_core.flow.models import (
@@ -14,34 +15,20 @@ from neurostack_core.flow.models import (
     ModeHandlerResult,
     TransitionTrigger,
 )
+from neurostack_core.presets import get_preset
 
 logger = logging.getLogger(__name__)
 
 
-# Safety response templates
-SAFETY_RESPONSES = {
-    "clinical_risk": (
-        "Percebo que voc\u00ea pode estar passando por uma situa\u00e7\u00e3o dif\u00edcil. "
-        "Por favor, procure ajuda profissional imediata. "
-        "CVV: 188 (24h) | SAMU: 192 | Emerg\u00eancia: 190"
-    ),
-    "legal_risk": (
-        "N\u00e3o posso fornecer orienta\u00e7\u00e3o m\u00e9dica, diagn\u00f3sticos ou prescri\u00e7\u00f5es. "
-        "Por favor, consulte um profissional de sa\u00fade qualificado."
-    ),
-    "conduct_risk": (
-        "Vamos manter uma conversa respeitosa. "
-        "Estou aqui para ajudar da melhor forma poss\u00edvel."
-    ),
-    "emergency": (
-        "EMERG\u00caNCIA DETECTADA. Por favor, ligue imediatamente para: "
-        "SAMU 192 | Bombeiros 193 | Pol\u00edcia 190"
-    ),
-    "default": (
-        "Entendo sua preocupa\u00e7\u00e3o. Para sua seguran\u00e7a, recomendo "
-        "buscar orienta\u00e7\u00e3o profissional adequada."
-    ),
-}
+SAFETY_RESPONSES = cast(Mapping[str, str], get_preset().flow["safety_responses"])
+
+_IMPERATIVE_LITERALS = cast(
+    Mapping[str, Mapping[str, tuple[str, ...]]],
+    get_preset().flow["imperative_literals"],
+)
+_PROMPT_ADDITIONS = _IMPERATIVE_LITERALS["flow.handlers.safety"][
+    "SafetyModeHandler.get_mode_prompt_additions"
+]
 
 
 class SafetyModeHandler(BaseModeHandler):
@@ -182,13 +169,7 @@ class SafetyModeHandler(BaseModeHandler):
 
     def get_mode_prompt_additions(self) -> list[str]:
         """Get additional prompt instructions for SAFETY mode."""
-        return [
-            "MODO SEGURAN\u00c7A ATIVO.",
-            "Priorize a seguran\u00e7a do usu\u00e1rio acima de tudo.",
-            "N\u00e3o forne\u00e7a informa\u00e7\u00f5es que possam causar dano.",
-            "Direcione para recursos de ajuda profissional.",
-            "Mantenha tom calmo e acolhedor.",
-        ]
+        return list(_PROMPT_ADDITIONS)
 
     def get_response_modifiers(self) -> list[str]:
         """Get response modifiers for SAFETY mode."""

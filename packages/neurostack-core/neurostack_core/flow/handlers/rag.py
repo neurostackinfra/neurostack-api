@@ -5,7 +5,8 @@ Handles Retrieval Augmented Generation flow.
 
 import logging
 import time
-from typing import Optional
+from collections.abc import Mapping
+from typing import Optional, cast
 
 from neurostack_core.flow.handlers.base import BaseModeHandler
 from neurostack_core.flow.models import (
@@ -14,8 +15,17 @@ from neurostack_core.flow.models import (
     ModeHandlerResult,
     TransitionTrigger,
 )
+from neurostack_core.presets import get_preset
 
 logger = logging.getLogger(__name__)
+
+_IMPERATIVE_LITERALS = cast(
+    Mapping[str, Mapping[str, tuple[str, ...]]],
+    get_preset().flow["imperative_literals"],
+)
+_PROMPT_ADDITIONS = _IMPERATIVE_LITERALS["flow.handlers.rag"][
+    "RagModeHandler.get_mode_prompt_additions"
+]
 
 
 class RagModeHandler(BaseModeHandler):
@@ -124,12 +134,7 @@ class RagModeHandler(BaseModeHandler):
 
     def get_mode_prompt_additions(self) -> list[str]:
         """Get additional prompt instructions for RAG mode."""
-        return [
-            "Use as informa\u00e7\u00f5es do contexto de conhecimento para responder.",
-            "Cite fontes quando relevante.",
-            "Se n\u00e3o encontrar a informa\u00e7\u00e3o, informe ao usu\u00e1rio.",
-            "Mantenha as respostas factuais e precisas.",
-        ]
+        return list(_PROMPT_ADDITIONS)
 
     def get_response_modifiers(self) -> list[str]:
         """Get response modifiers for RAG mode."""

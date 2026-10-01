@@ -5,8 +5,11 @@ Renders prompt templates with variables.
 
 import logging
 import time
-from typing import Any, Optional
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import Any, Optional, cast
 
+from neurostack_core.presets import get_preset
 from neurostack_core.prompt.models import (
     GeneratedPrompt,
     MessageRole,
@@ -22,9 +25,24 @@ from neurostack_core.prompt.templates.safety import SafetyTemplate
 
 logger = logging.getLogger(__name__)
 
+_PROMPT_PRESET = cast(Mapping[str, object], get_preset().prompt)
+_IMPERATIVE_LITERALS = cast(Mapping[str, object], _PROMPT_PRESET["imperative_literals"])
+_RENDERER_IMPERATIVES = cast(
+    Mapping[str, tuple[str, ...]],
+    _IMPERATIVE_LITERALS["prompt.renderer"],
+)
+_RESIDUAL_GROUPS = cast(
+    Mapping[str, tuple[str, ...]],
+    _IMPERATIVE_LITERALS["prompt.renderer.residual"],
+)
+_RESIDUAL_LITERALS: Mapping[str, str] = MappingProxyType(
+    {key: values[0] for key, values in _RESIDUAL_GROUPS.items()}
+)
+_CONTEXT_LITERALS = _RENDERER_IMPERATIVES["VariableResolver.from_context_window"]
+_RENDER_LITERALS = _RENDERER_IMPERATIVES["PromptRenderer.render"]
 
 # Characters per token (approximation)
-CHARS_PER_TOKEN = 4
+CHARS_PER_TOKEN = cast(int, _PROMPT_PRESET["chars_per_token"])
 
 
 class PromptRenderer:
@@ -115,14 +133,13 @@ class PromptRenderer:
             f"Rendered prompt: mode={config.mode.value}, "
             f"messages={len(messages)}, tokens≈{total_tokens}"
         )
-        # Temporary: log system prompt for debugging greeting issue
         if messages and messages[0].role == MessageRole.SYSTEM:
             sys_content = messages[0].content
-            if "Saudação" in sys_content or "saudacao" in sys_content.lower():
-                logger.warning(
-                    f"[GREETING_DEBUG] System prompt excerpt (last 500 chars): ...{sys_content[-500:]}"
+            if _RENDER_LITERALS[0] in sys_content or "saudacao" in sys_content.lower():
+                logger.debug(
+                    "System prompt contains greeting section; last 500 chars: ...%s",
+                    sys_content[-500:],
                 )
-
         return GeneratedPrompt(
             messages=messages,
             mode=config.mode,
@@ -226,16 +243,16 @@ class VariableResolver:
         # Jornada do usuário a partir do estado cognitivo (condução pelo funil)
         cog = context.cognitive
         journey_parts = [
-            f"**Etapa atual do funil:** {cog.funnel_stage}",
-            f"**Última intenção:** {cog.last_intent or '—'}",
+            f"{_RESIDUAL_LITERALS['current_stage_label']}{cog.funnel_stage}",
+            f"{_CONTEXT_LITERALS[0]}{cog.last_intent or '—'}",
         ]
         if cog.intent_history:
             journey_parts.append(
-                f"**Intenções já percorridas:** {', '.join(cog.intent_history[-10:])}"
+                f"{_CONTEXT_LITERALS[1]}{', '.join(cog.intent_history[-10:])}"
             )
         if cog.slots:
             journey_parts.append(
-                "**Dados já coletados:** "
+                _CONTEXT_LITERALS[2]
                 + ", ".join(f"{k}={v}" for k, v in list(cog.slots.items())[:15])
             )
         user_journey = "\n".join(journey_parts)

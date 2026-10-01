@@ -3,114 +3,35 @@ NeuroStack - Prompt Engine - Handoff Template
 Template for human handoff transitions.
 """
 
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import cast
+
+from neurostack_core.presets import get_preset
 from neurostack_core.prompt.models import PromptMessage, PromptMode, PromptVariables
 from neurostack_core.prompt.templates.base import BaseTemplate, TemplateSection
 
-# ============================================
-# Handoff System Prompt
-# ============================================
+_PROMPT_PRESET = cast(Mapping[str, object], get_preset().prompt)
 
-HANDOFF_SYSTEM_PROMPT = """# Modo de Encaminhamento para Nossa Equipe
+HANDOFF_SYSTEM_PROMPT = cast(str, _PROMPT_PRESET["handoff_system_prompt"])
+HANDOFF_REASON_INSTRUCTIONS = cast(
+    Mapping[str, str], _PROMPT_PRESET["handoff_reason_instructions"]
+)
 
-Voc\u00ea \u00e9 {{agent_name}}, assistente virtual da {{clinic_name}}.
-Voc\u00ea est\u00e1 auxiliando na transi\u00e7\u00e3o do usu\u00e1rio para nossa equipe especializada.
-
-## Identidade
-- Nome: {{agent_name}}
-- Cl\u00ednica: {{clinic_name}}
-- Canal atual: {{channel}}
-
-## Status: {{handoff_status}}
-## Motivo: {{handoff_reason}}
-
-## Seu Papel Neste Momento
-1. Manter o usu\u00e1rio informado de forma positiva
-2. Preparar um resumo da conversa para nossa equipe
-3. Manter o usu\u00e1rio confort\u00e1vel durante a espera
-
-## Diretrizes
-- NUNCA diga "atendente humano", "transferir para humano" ou exponha que \u00e9 IA
-- Use sempre: "nossa equipe", "nossa equipe especializada" ou "o setor respons\u00e1vel"
-- N\u00e3o tente resolver quest\u00f5es complexas \u2014 encaminhe com cuidado
-- Mantenha tom emp\u00e1tico e profissional
-"""
-
-HANDOFF_REASON_INSTRUCTIONS = {
-    "explicit_request": """
-## Usu\u00e1rio Solicitou Atendente
-
-O usu\u00e1rio expressamente pediu para falar com um humano.
-
-### A\u00e7\u00f5es:
-1. Confirme que entendeu a solicita\u00e7\u00e3o
-2. Informe que est\u00e1 transferindo
-3. Pergunte se h\u00e1 algo espec\u00edfico que o atendente deve saber
-4. Forne\u00e7a estimativa de tempo se dispon\u00edvel
-""",
-    "safety_concern": """
-## Transfer\u00eancia por Seguran\u00e7a
-
-Uma situa\u00e7\u00e3o de seguran\u00e7a requer aten\u00e7\u00e3o humana.
-
-### PROIBI\u00c7\u00d5ES ABSOLUTAS (NUNCA viole):
-- **NUNCA** forne\u00e7a orienta\u00e7\u00e3o m\u00e9dica, dosagens, posologias ou nomes de medicamentos
-- **NUNCA** sugira se o usu\u00e1rio pode ou n\u00e3o tomar qualquer medica\u00e7\u00e3o
-- **NUNCA** liste contraindica\u00e7\u00f5es, efeitos colaterais ou intera\u00e7\u00f5es medicamentosas
-- **NUNCA** atue como m\u00e9dico, farmac\u00eautico ou profissional de sa\u00fade
-- Qualquer pergunta sobre medica\u00e7\u00e3o, sintomas ou tratamento deve ser respondida APENAS com: encaminhamento para o profissional de sa\u00fade respons\u00e1vel
-
-### A\u00e7\u00f5es:
-1. Mantenha o usu\u00e1rio calmo
-2. Informe que um especialista ir\u00e1 ajudar
-3. N\u00c3O minimize a situa\u00e7\u00e3o
-4. Garanta que recursos de emerg\u00eancia foram fornecidos
-5. Redirecione TODA pergunta cl\u00ednica para o profissional de sa\u00fade
-""",
-    "max_turns_exceeded": """
-## Transfer\u00eancia por Complexidade
-
-A conversa excedeu os limites de resolu\u00e7\u00e3o autom\u00e1tica.
-
-### A\u00e7\u00f5es:
-1. Reconhe\u00e7a que a situa\u00e7\u00e3o precisa de aten\u00e7\u00e3o especial
-2. Agrade\u00e7a a paci\u00eancia do usu\u00e1rio
-3. Prepare resumo detalhado para o atendente
-4. Informe que um especialista resolver\u00e1
-""",
-    "low_confidence": """
-## Transfer\u00eancia por Incerteza
-
-N\u00e3o foi poss\u00edvel entender claramente a necessidade do usu\u00e1rio.
-
-### A\u00e7\u00f5es:
-1. Pe\u00e7a desculpas pela dificuldade
-2. Explique que um atendente ajudar\u00e1 melhor
-3. Tente coletar mais contexto para o atendente
-4. Mantenha tom positivo
-""",
-    "complex_query": """
-## Transfer\u00eancia por Consulta Complexa
-
-A solicita\u00e7\u00e3o requer conhecimento especializado.
-
-### A\u00e7\u00f5es:
-1. Reconhe\u00e7a a complexidade da quest\u00e3o
-2. Informe que especialista ir\u00e1 auxiliar
-3. Colete detalhes relevantes
-4. Prepare contexto completo
-""",
-    "escalation": """
-## Escala\u00e7\u00e3o de Reclama\u00e7\u00e3o
-
-O usu\u00e1rio expressou insatisfa\u00e7\u00e3o ou pediu supervisor.
-
-### A\u00e7\u00f5es:
-1. Demonstre que a preocupa\u00e7\u00e3o \u00e9 levada a s\u00e9rio
-2. N\u00c3O seja defensivo
-3. Confirme os pontos de insatisfa\u00e7\u00e3o
-4. Assegure que ser\u00e1 resolvido
-""",
-}
+_IMPERATIVE_LITERALS = cast(Mapping[str, object], _PROMPT_PRESET["imperative_literals"])
+_HANDOFF_IMPERATIVES = cast(
+    Mapping[str, tuple[str, ...]],
+    _IMPERATIVE_LITERALS["prompt.templates.handoff"],
+)
+_RESIDUAL_GROUPS = cast(
+    Mapping[str, tuple[str, ...]],
+    _IMPERATIVE_LITERALS["prompt.templates.handoff.residual"],
+)
+_RESIDUAL_LITERALS: Mapping[str, str] = MappingProxyType(
+    {key: values[0] for key, values in _RESIDUAL_GROUPS.items()}
+)
+_CONTEXT_LITERALS = _HANDOFF_IMPERATIVES["HandoffTemplate.get_context_instructions"]
+_SUMMARY_LITERALS = _HANDOFF_IMPERATIVES["HandoffTemplate.generate_handoff_summary"]
 
 
 class HandoffTemplate(BaseTemplate):
@@ -128,12 +49,7 @@ class HandoffTemplate(BaseTemplate):
         """Override to append language override as the absolute last instruction."""
         msg = super().build_system_message(variables)
         if variables.language == "en":
-            msg.content += (
-                "\n\n## FINAL LANGUAGE INSTRUCTION (HIGHEST PRIORITY)\n"
-                "**You MUST respond ONLY in English.** "
-                "All Portuguese instructions above are structural references only. "
-                "Your entire response must be in English. Never write a single Portuguese word."
-            )
+            msg.content += _RESIDUAL_LITERALS["language_instruction_en"]
         return msg
 
     def get_system_prompt(self, variables: PromptVariables) -> str:
@@ -150,53 +66,37 @@ class HandoffTemplate(BaseTemplate):
             parts.append(HANDOFF_REASON_INSTRUCTIONS[reason])
 
         # Information collection section
-        collection_section = TemplateSection("Informa\u00e7\u00f5es a Coletar")
+        collection_section = TemplateSection(_CONTEXT_LITERALS[0])
         collection_section.add_list(
             [
-                "Nome do usu\u00e1rio (se n\u00e3o tiver)",
-                "Resumo do problema/solicita\u00e7\u00e3o",
-                "Tentativas anteriores de resolu\u00e7\u00e3o",
-                "Urg\u00eancia da quest\u00e3o",
-                "Prefer\u00eancia de contato (se aplic\u00e1vel)",
+                _CONTEXT_LITERALS[1],
+                _CONTEXT_LITERALS[2],
+                _CONTEXT_LITERALS[3],
+                _CONTEXT_LITERALS[4],
+                _CONTEXT_LITERALS[5],
             ]
         )
         parts.append(collection_section.build())
 
         # Slots j\u00e1 coletados
         if variables.slots:
-            collected_section = TemplateSection(
-                "Informa\u00e7\u00f5es J\u00e1 Coletadas"
-            )
+            collected_section = TemplateSection(_CONTEXT_LITERALS[6])
             for key, value in variables.slots.items():
                 collected_section.add(f"**{key}**: {value}")
             parts.append(collected_section.build())
 
         # History summary
         if variables.history_summary:
-            history_section = TemplateSection("Resumo da Conversa")
+            history_section = TemplateSection(_RESIDUAL_LITERALS["history_title"])
             history_section.add(variables.history_summary)
             parts.append(history_section.build())
 
         # Status instructions
         status = variables.handoff_status
         if status == "waiting":
-            parts.append(
-                """
-## Usu\u00e1rio em Espera
-- Mantenha-o engajado
-- Forne\u00e7a atualiza\u00e7\u00f5es de tempo
-- Ofere\u00e7a para coletar mais informa\u00e7\u00f5es
-"""
-            )
+            parts.append(_CONTEXT_LITERALS[7])
         elif status == "connected":
-            parts.append(
-                """
-## Atendente Conectado
-- Finalize seu papel
-- Fa\u00e7a uma passagem de contexto clara
-- Agrade\u00e7a ao usu\u00e1rio
-"""
-            )
+            parts.append(_CONTEXT_LITERALS[8])
 
         return "\n".join(parts)
 
@@ -210,39 +110,35 @@ class HandoffTemplate(BaseTemplate):
         Returns:
             Formatted summary for agent
         """
-        nao_especificado = "N\u00e3o especificado"
+        nao_especificado = _SUMMARY_LITERALS[0]
         summary_parts = [
-            "## Resumo para Atendente",
+            _SUMMARY_LITERALS[1],
             "",
-            f"**Canal:** {variables.channel}",
-            f"**Turnos:** {variables.turn_count}",
-            f"**Motivo da Transfer\u00eancia:** {variables.handoff_reason or nao_especificado}",
+            f"{_RESIDUAL_LITERALS['channel_label']}{variables.channel}",
+            f"{_RESIDUAL_LITERALS['turns_label']}{variables.turn_count}",
+            f"{_SUMMARY_LITERALS[2]}{variables.handoff_reason or nao_especificado}",
             "",
         ]
 
         if variables.funnel_stage:
-            summary_parts.append(f"**Est\u00e1gio:** {variables.funnel_stage}")
+            summary_parts.append(f"{_SUMMARY_LITERALS[3]}{variables.funnel_stage}")
 
         if variables.last_intent:
-            summary_parts.append(
-                f"**\u00daltima Inten\u00e7\u00e3o:** {variables.last_intent}"
-            )
+            summary_parts.append(f"{_SUMMARY_LITERALS[4]}{variables.last_intent}")
 
         if variables.slots:
             summary_parts.append("")
-            summary_parts.append("### Informa\u00e7\u00f5es Coletadas:")
+            summary_parts.append(_SUMMARY_LITERALS[5])
             for key, value in variables.slots.items():
                 summary_parts.append(f"- {key}: {value}")
 
         if variables.history_summary:
             summary_parts.append("")
-            summary_parts.append("### Contexto da Conversa:")
+            summary_parts.append(_RESIDUAL_LITERALS["context_title"])
             summary_parts.append(variables.history_summary)
 
         if variables.safety_category:
             summary_parts.append("")
-            summary_parts.append(
-                f"\u26a0\ufe0f **Alerta de Seguran\u00e7a:** {variables.safety_category}"
-            )
+            summary_parts.append(f"{_SUMMARY_LITERALS[6]}{variables.safety_category}")
 
         return "\n".join(summary_parts)
