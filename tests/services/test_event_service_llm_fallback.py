@@ -1145,3 +1145,67 @@ async def test_prompt_generated_remains_owner_of_response(
     assert "llm_usage_total" not in prompt_ev.event_data
     assert "llm_attempts" not in prompt_ev.event_metadata
     assert "llm_usage_total" not in prompt_ev.event_metadata
+
+
+# ============================================
+# Wish ``handoff-contextual-resumption`` Group 3 —
+# ``prior_episode_context`` framing complement
+# ============================================
+#
+# The full "same messages, same max_tokens, INCLUDING the policy framing
+# + adversarial JSON payload" AC is proven in
+# ``tests/srm/test_handoff_context_injection.py`` so this file does not
+# duplicate it. The complement below proves the negative — when the
+# session has NO stored ``prior_episode_context`` (first contact / legacy
+# turn), the outbound array stays at 2 messages: main ``system`` + the
+# current-turn ``user``. If the framing were accidentally injected
+# unconditionally, THIS test would catch it as a regression.
+
+
+@pytest.mark.asyncio
+async def test_outbound_array_omits_policy_framing_when_no_prior_episode(
+    service: EventService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legacy / first-contact turn — no ``prior_episode_context`` on the
+    result → outbound array has NO policy framing message and NO JSON
+    payload message (only main system + current-turn user)."""
+    from src.services.event_service import PRIOR_EPISODE_CONTEXT_POLICY_MESSAGE
+
+    primary, _fallback = _install_primary_and_fallback(
+        monkeypatch,
+        primary_script=[
+            {
+                "content": "resposta curta",
+                "usage": {"total_tokens": 2},
+                "model": "gpt-primary-reported",
+            }
+        ],
+        fallback_script=[],
+    )
+    result = _make_result()
+    # Explicit: no prior_episode_context on the result (first-contact).
+    result.prior_episode_context = None
+
+    await service._convert_pipeline_result_to_response(
+        result,
+        user_message="oi",
+        clinic_config={},
+        tenant_id=uuid4(),
+    )
+
+    assert primary is not None and len(primary.calls) == 1
+    messages = primary.calls[0]["messages"]
+    # Two messages: main system + current-turn user. The intent here is
+    # ``consulta`` so no saudacao-reinforcement system message is
+    # appended either.
+    assert len(messages) == 2, (
+        f"expected 2 messages when no prior_episode_context, got "
+        f"{len(messages)}: {[m['role'] for m in messages]}"
+    )
+    assert messages[0]["role"] == "system"
+    assert messages[1]["role"] == "user"
+    assert messages[1]["content"] == "oi"
+    # The policy framing message MUST NOT appear anywhere.
+    for msg in messages:
+        assert msg["content"] != PRIOR_EPISODE_CONTEXT_POLICY_MESSAGE
+        assert "memória resumida do episódio" not in msg["content"]

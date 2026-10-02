@@ -64,6 +64,23 @@ _CONTEXT_LITERALS = _NORMAL_IMPERATIVES["NormalTemplate.get_context_instructions
 _CLINIC_LITERALS = _NORMAL_IMPERATIVES["NormalTemplate._build_clinic_context"]
 _INTENT_LITERALS = _NORMAL_IMPERATIVES["NormalTemplate._get_intent_instruction"]
 
+# Golden Rule #2 sentences (first-contact self-introduction) that must be
+# stripped from the rendered system prompt when the session is resuming
+# a prior care episode (``variables.custom["prior_episode_context"]``
+# truthy — wish deliverable 7 / Decision 21). The literals mirror
+# ``normal_system_prompt`` / ``normal_system_prompt_en`` byte-for-byte so
+# this is a pure runtime transformation on the ALREADY-LOADED string; the
+# preset files on disk are never touched and ``pt_br_preset_unchanged()``
+# stays trivially green.
+_RESUME_SUPPRESSED_PT_GOLDEN_RULE_2 = (
+    "2. **Apresente-se sempre no primeiro contato.** "
+    "Use seu nome e o nome da clínica."
+)
+_RESUME_SUPPRESSED_EN_GOLDEN_RULE_2 = (
+    "2. **Always introduce yourself on first contact.** "
+    "Use your name and the clinic name."
+)
+
 
 class NormalTemplate(BaseTemplate):
     """
@@ -192,6 +209,19 @@ class NormalTemplate(BaseTemplate):
         agent_presentation = variables.custom.get("agent_presentation", "")
 
         base = EN_SYSTEM_PROMPT if variables.language == "en" else NORMAL_SYSTEM_PROMPT
+        # Resume-mode suppression (wish deliverable 7 / Decision 21): when
+        # the session is picking up a prior care episode, strip Golden
+        # Rule #2 ("Always introduce yourself on first contact.") from the
+        # rendered text. The TOML preset on disk is never edited; this is
+        # a pure runtime ``.replace()`` on the already-loaded string so
+        # ``pt_br_preset_unchanged()`` keeps passing without being wired
+        # into this delivery's gates. First-contact sessions keep both
+        # the Golden Rule and the funnel instruction intact.
+        if variables.custom.get("prior_episode_context"):
+            if variables.language == "en":
+                base = base.replace(_RESUME_SUPPRESSED_EN_GOLDEN_RULE_2, "")
+            else:
+                base = base.replace(_RESUME_SUPPRESSED_PT_GOLDEN_RULE_2, "")
         prompt = base.replace("{{agent_name}}", agent_name)
         prompt = prompt.replace("{{clinic_name}}", clinic_name)
         prompt = prompt.replace("{{agent_presentation}}", agent_presentation)
@@ -228,7 +258,17 @@ class NormalTemplate(BaseTemplate):
             else FUNNEL_INSTRUCTIONS
         )
         instruction = funnel_dict.get(funnel_stage)
-        if instruction is not None:
+        # Resume-mode suppression (wish deliverable 7 / Decision 21): on
+        # ``lead_novo`` turns where the session is resuming a prior care
+        # episode, drop the whole "Instruções para Lead Novo (Primeiro
+        # Contato)" block (and its convenio-scheduling addendum) so the
+        # agent does not re-introduce itself to someone it already knows.
+        # First-contact ``lead_novo`` turns — where ``prior_episode_context``
+        # is absent — keep the block exactly as before.
+        resume_mode_suppresses_lead_novo = funnel_stage == "lead_novo" and bool(
+            variables.custom.get("prior_episode_context")
+        )
+        if instruction is not None and not resume_mode_suppresses_lead_novo:
             instruction = instruction.replace("{{agent_name}}", agent_name)
             instruction = instruction.replace("{{clinic_name}}", clinic_name)
             parts.append(instruction)
@@ -250,7 +290,11 @@ class NormalTemplate(BaseTemplate):
         # Intent-specific instructions
         if variables.last_intent:
             intent_instruction = self._get_intent_instruction(
-                variables.last_intent, agent_name, clinic_name, now_local
+                variables.last_intent,
+                agent_name,
+                clinic_name,
+                now_local,
+                resume_mode=bool(variables.custom.get("prior_episode_context")),
             )
             if intent_instruction:
                 parts.append(intent_instruction)
@@ -443,8 +487,22 @@ class NormalTemplate(BaseTemplate):
         agent_name: str = _RESIDUAL_LITERALS["assistant_default"],
         clinic_name: str = _INTENT_LITERALS[0],
         now_local: datetime | None = None,
+        *,
+        resume_mode: bool = False,
     ) -> str:
-        """Get instruction for specific intent — NeuroStack v0.6 methodology."""
+        """Get instruction for specific intent — NeuroStack v0.6 methodology.
+
+        ``resume_mode`` (wish ``handoff-contextual-resumption`` Group 4,
+        extension of Decision 21): when the caller signals that this turn
+        is a resumed session (``variables.custom["prior_episode_context"]``
+        is truthy), the ``saudacao`` branch strips its third first-contact
+        self-introduction line in runtime so the agent does not re-introduce
+        itself to someone it already knows. The preset TOML on disk is
+        never touched; this is a pure ``.replace()`` on the assembled
+        string, matching the pattern Group 3 used in ``get_system_prompt``
+        and ``get_context_instructions``. First-contact saudacao turns
+        (``resume_mode=False``) keep the full instruction verbatim.
+        """
         # Compute correct greeting for current clinic-local time
         if now_local is not None:
             hour = now_local.hour
@@ -503,4 +561,27 @@ class NormalTemplate(BaseTemplate):
             "duvida_generica_sem_contexto": _INTENT_LITERALS[32],
         }
 
-        return intent_instructions.get(intent, "")
+        result = intent_instructions.get(intent, "")
+        # Resume-mode suppression for the ``saudacao`` branch (wish
+        # ``handoff-contextual-resumption`` Group 4): the preset text for
+        # ``saudacao`` embeds a third first-contact self-introduction —
+        # ``- Apresente-se: "Meu nome é <agent>, da <clinic>."`` — assembled
+        # from ``_INTENT_LITERALS[7]`` + the clinic identity + the opening of
+        # ``_INTENT_LITERALS[8]``. Group 3's existing suppressions in
+        # ``get_system_prompt`` and ``get_context_instructions`` do not reach
+        # this intent branch, which is independent of ``funnel_stage`` and
+        # ``prior_episode_context``. Strip exactly the composed line when the
+        # caller passes ``resume_mode=True`` so a resumed session whose
+        # detected intent is ``saudacao`` does not re-introduce the agent.
+        # The TOML preset on disk is never touched and
+        # ``pt_br_preset_unchanged()`` stays trivially green — this is a
+        # runtime ``.replace()`` on the ALREADY-assembled string.
+        if resume_mode and intent == "saudacao" and result:
+            suppressed_line = (
+                '\n- Apresente-se: "Meu nome é '
+                f"{agent_name}"
+                f"{_RESIDUAL_LITERALS['agent_clinic_joiner']}"
+                f'{clinic_name}."'
+            )
+            result = result.replace(suppressed_line, "")
+        return result

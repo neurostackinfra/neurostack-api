@@ -491,6 +491,67 @@ class TestCognitiveStateOperations:
         assert cognitive.slots["date"] == "2025-01-15"
         assert cognitive.flags["appointment_confirmed"] is True
 
+    @pytest.mark.asyncio
+    async def test_update_cognitive_state_round_trips_context_episode_fields(
+        self,
+        sample_tenant_id: UUID,
+        sample_session_id: UUID,
+        sample_session_state: SessionState,
+        mock_redis: AsyncMock,
+        mock_connection_pool: MagicMock,
+    ):
+        """New JSONB fields survive a write/read cycle (Group 1 deliverable 1)."""
+        store = StateStore()
+        store._redis = mock_redis
+        store._pool = mock_connection_pool
+
+        serialized = store._serialize_session(sample_session_state)
+        mock_redis.get.side_effect = [serialized, None]
+
+        new_state = CognitiveStateData(
+            funnel_stage="lead_novo",
+            slots={"lead_name": "Ana", "already_patient": True},
+            context_episode_id="episode-xyz",
+            prior_episode_context={
+                "schema_version": 1,
+                "lead_name": "Ana",
+                "summary": "Resumo bounded sem PII.",
+            },
+        )
+
+        result = await store.update_cognitive_state(
+            sample_tenant_id,
+            sample_session_id,
+            new_state,
+        )
+
+        assert result.cognitive_state["context_episode_id"] == "episode-xyz"
+        assert result.cognitive_state["prior_episode_context"] == {
+            "schema_version": 1,
+            "lead_name": "Ana",
+            "summary": "Resumo bounded sem PII.",
+        }
+
+    def test_legacy_cognitive_state_dict_hydrates_with_default_none(
+        self,
+        sample_cognitive_state: dict,
+    ) -> None:
+        """Legacy JSON without the two new fields hydrates without error."""
+        assert "context_episode_id" not in sample_cognitive_state
+        assert "prior_episode_context" not in sample_cognitive_state
+
+        hydrated = CognitiveStateData.from_dict(sample_cognitive_state)
+
+        assert hydrated.context_episode_id is None
+        assert hydrated.prior_episode_context is None
+
+        dumped = hydrated.to_dict()
+        for key, value in sample_cognitive_state.items():
+            assert dumped[key] == value
+        # New write always carries both fields so the next reader is unambiguous.
+        assert dumped["context_episode_id"] is None
+        assert dumped["prior_episode_context"] is None
+
 
 # ============================================
 # Unit Tests - Tenant Operations

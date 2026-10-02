@@ -91,6 +91,15 @@ class FlowState(BaseModel):
     is_locked: bool = False  # Prevents transitions when true
     pending_transition: Optional[TransitionTrigger] = None
 
+    # Current conversational episode the cached state belongs to. The
+    # FlowManager stamps this at creation and compares it against the
+    # context flowing in with each request — a mismatch means a durable
+    # reactivation happened on some other worker, so the single cached
+    # entry per ``session_id`` is replaced atomically by a fresh
+    # NORMAL-mode state (wish deliverable 4, Decision 10). ``None`` keeps
+    # legacy / pre-reactivation sessions on the pre-existing behaviour.
+    context_episode_id: Optional[str] = None
+
     def get_time_in_mode(self) -> float:
         """Get seconds spent in current mode."""
         return (datetime.now(timezone.utc) - self.mode_entry_time).total_seconds()
@@ -115,6 +124,13 @@ class FlowContext(BaseModel):
     # Session info
     turn_count: int = 0
     message: str = ""
+
+    # Durable conversational episode id — propagated by the pipeline from
+    # the session's cognitive_state so the FlowManager can invalidate its
+    # per-session cache when a reactivation happened on a different worker
+    # (wish deliverable 4). Legacy sessions pass ``None`` and nothing
+    # changes.
+    context_episode_id: Optional[str] = None
 
     # Additional context
     metadata: dict[str, Any] = Field(default_factory=dict)

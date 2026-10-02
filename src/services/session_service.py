@@ -4,8 +4,9 @@ Business logic for session management.
 """
 
 from typing import Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.schemas.sessions import (
@@ -22,9 +23,63 @@ from src.api.schemas.sessions import (
     SessionUpdateRequest,
 )
 from src.core.interaction_context import InteractionOrigin
+from src.handoff.episode_context import (
+    build_prior_episode_context,
+    project_resume_state,
+)
 from src.models.event import Event, EventType
 from src.models.session import CognitiveStateData, Session
 from src.repositories import EventRepository, SessionRepository, TenantRepository
+
+
+async def _load_ai_person_history(
+    tenant_id: UUID,
+    session_id: UUID,
+    db: AsyncSession,
+    *,
+    limit: int = 20,
+) -> list[dict[str, str]]:
+    """Load the last ``limit`` AI/person events for a session.
+
+    Mirrors the shape produced by ``EventService._load_message_history`` so the
+    legacy-fallback composer in ``reactivate_session`` consumes the same input
+    layout as the pause-time and auto-reactivation composers. Returns ``[]``
+    on any error so composition degrades to the neutral fallback instead of
+    propagating a load failure to the operator.
+    """
+    try:
+        stmt = (
+            select(Event)
+            .where(
+                Event.session_id == session_id,
+                Event.tenant_id == tenant_id,
+                or_(
+                    Event.event_type == "message.in",
+                    Event.event_type == "prompt.generated",
+                ),
+            )
+            .order_by(Event.created_at.desc())
+            .limit(limit)
+        )
+        result = await db.execute(stmt)
+        events = list(result.scalars().all())
+        events.reverse()  # chronological order
+        history: list[dict[str, str]] = []
+        for e in events:
+            if (e.event_metadata or {}).get("paused_capture"):
+                continue
+            data = e.event_data or {}
+            if e.event_type == "message.in":
+                content = data.get("content", "")
+                if content:
+                    history.append({"role": "user", "content": content})
+            elif e.event_type == "prompt.generated":
+                resp = data.get("suggested_response", "")
+                if resp:
+                    history.append({"role": "assistant", "content": resp})
+        return history
+    except Exception:
+        return []
 
 
 class SessionService:
@@ -151,10 +206,58 @@ class SessionService:
         session_id: UUID,
         db: AsyncSession,
     ) -> SessionReactivationResponse:
-        """Reactivate the effective active session without touching handoffs."""
-        result = await SessionRepository(db).reactivate_effective(
+        """Reactivate the effective active session without touching handoffs.
+
+        Operator-triggered flow: loads the current row, builds the Group 1
+        resume projection via
+        :func:`src.handoff.episode_context.project_resume_state`, generates the
+        new episode UUID exactly once (so repository retries reuse it, per A3),
+        bakes that UUID into ``context_episode_id`` on the projected state, and
+        hands the serialized state to
+        :meth:`SessionRepository.reactivate_effective_manual` which performs the
+        single-statement CAS.
+
+        The externally-visible HTTP contract (status ``reactivated`` /
+        ``already_active`` on success, :class:`SessionReactivationError` with
+        the repository literal otherwise) is preserved.
+        """
+        session_repo = SessionRepository(db)
+        current = await session_repo.get_by_tenant(session_id, tenant_id)
+        if current is None:
+            raise SessionReactivationError("not_found")
+
+        prior_state = current.get_cognitive_state()
+        new_episode_id = uuid4()
+        prior_ctx = getattr(prior_state, "prior_episode_context", None)
+        # Legacy fallback (wish deliverable 7): a session paused before this
+        # feature existed — or whose pause path somehow failed to compose one —
+        # has prior_episode_context=None. Compose it now from bounded AI/person
+        # events so the resumed episode carries continuity instead of a null.
+        # build_prior_episode_context never raises; empty history yields a
+        # neutral object. This path is read-only and runs after get_by_tenant.
+        if prior_ctx is None:
+            ai_person_events = await _load_ai_person_history(
+                tenant_id, session_id, db, limit=20
+            )
+            prior_ctx = build_prior_episode_context(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                events=ai_person_events,
+                current_message=None,
+            )
+
+        projected = project_resume_state(
+            prior_state,
+            context_episode_id=str(new_episode_id),
+            prior_episode_context=prior_ctx,
+        )
+        new_cognitive_state = projected.to_dict()
+
+        result = await session_repo.reactivate_effective_manual(
             tenant_id=tenant_id,
             session_id=session_id,
+            new_cognitive_state=new_cognitive_state,
+            new_episode_id=new_episode_id,
         )
         if result in ("reactivated", "already_active"):
             return SessionReactivationResponse(
