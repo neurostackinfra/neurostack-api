@@ -1,5 +1,6 @@
 """Contract tests for exact-day trace history queries."""
 
+import csv
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
@@ -54,6 +55,7 @@ def _event(
     channel: str = "whatsapp",
     safety_flag: bool = False,
     handoff_required: bool = False,
+    decision: dict[str, object] | None = None,
 ) -> Event:
     return Event(
         id=event_id or uuid4(),
@@ -62,7 +64,7 @@ def _event(
         event_data={
             "content": label,
             "channel": channel,
-            "decision": {"intent": "test"},
+            "decision": {"intent": "test"} if decision is None else decision,
         },
         event_metadata={
             "safety_concern": safety_flag,
@@ -419,3 +421,55 @@ async def test_export_still_supports_a_multi_day_range(
     assert response.status_code == 200
     assert "first-day" in response.text
     assert "second-day" in response.text
+
+
+@pytest.mark.asyncio
+async def test_export_omits_intent_category_and_action_columns(
+    async_client: AsyncClient,
+) -> None:
+    tenant_id = uuid4()
+    await _seed(
+        _tenant(tenant_id),
+        events=[
+            _event(
+                tenant_id,
+                datetime(2026, 9, 28, 15, tzinfo=timezone.utc),
+                "exported-trace",
+                decision={
+                    "intent": "test-intent",
+                    "intent_category": "must-not-be-exported",
+                    "funnel_stage": "qualification",
+                    "action": "must-not-be-exported",
+                    "confidence": 0.91,
+                },
+            )
+        ],
+    )
+
+    response = await async_client.get(
+        "/v1/traces/export",
+        headers=_clinic_headers(tenant_id),
+    )
+
+    assert response.status_code == 200
+    rows = list(csv.reader(response.text.splitlines()))
+    assert rows[0] == [
+        "id",
+        "timestamp",
+        "user_message",
+        "intent",
+        "funnel_stage",
+        "confidence",
+        "safety_concern",
+        "handoff_required",
+        "processing_time_ms",
+        "mode",
+        "context_summary",
+    ]
+    assert rows[1][2:6] == [
+        "exported-trace",
+        "test-intent",
+        "qualification",
+        "0.91",
+    ]
+    assert "must-not-be-exported" not in rows[1]
