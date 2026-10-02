@@ -17,6 +17,7 @@ interface CredentialFixture {
   zapi_token_masked: string | null;
   zapi_inbound_token_digest_set: boolean;
   whatsapp_provider: string;
+  whatsapp_readiness: string;
   evolution_api_url: string | null;
   evolution_instance_name: string | null;
   evolution_api_key_set: boolean;
@@ -34,14 +35,25 @@ interface CredentialFixture {
   uazapi_token_masked: string | null;
   llm_api_key_set: boolean;
   llm_api_key_masked: string | null;
+  llm_provider: string;
+  llm_readiness: string;
   llm_base_url: string | null;
   llm_model_name: string | null;
   whisper_api_key_set: boolean;
   whisper_api_key_masked: string | null;
   whisper_model: string | null;
   stt_provider: string | null;
+  stt_readiness: string;
   stt_api_url: string | null;
+  stt_api_key_set: boolean;
+  stt_model_name: string | null;
   audio_max_seconds: number | null;
+  multimodal_provider: string | null;
+  multimodal_readiness: string;
+  tts_provider: string | null;
+  tts_readiness: string;
+  tts_enabled: boolean;
+  tts_reply_policy: "audio_input" | "all_inputs";
   apis_configured: boolean;
 }
 
@@ -51,6 +63,7 @@ const CREDENTIAL_FIXTURE: CredentialFixture = {
   zapi_token_masked: "abcd****wxyz",
   zapi_inbound_token_digest_set: false,
   whatsapp_provider: "zapi",
+  whatsapp_readiness: "active",
   evolution_api_url: null,
   evolution_instance_name: null,
   evolution_api_key_set: false,
@@ -68,14 +81,25 @@ const CREDENTIAL_FIXTURE: CredentialFixture = {
   uazapi_token_masked: null,
   llm_api_key_set: true,
   llm_api_key_masked: "sk-pr****9xyz",
+  llm_provider: "openai",
+  llm_readiness: "active",
   llm_base_url: "https://api.openai.com/v1",
   llm_model_name: "gpt-4o-mini",
   whisper_api_key_set: true,
   whisper_api_key_masked: "sk-wh****9xyz",
   whisper_model: "whisper-1",
   stt_provider: "openai_whisper",
+  stt_readiness: "active",
   stt_api_url: "https://api.openai.com/v1",
+  stt_api_key_set: true,
+  stt_model_name: "whisper-1",
   audio_max_seconds: 60,
+  multimodal_provider: null,
+  multimodal_readiness: "incomplete",
+  tts_provider: null,
+  tts_readiness: "incomplete",
+  tts_enabled: false,
+  tts_reply_policy: "audio_input",
   apis_configured: true,
 };
 
@@ -178,15 +202,14 @@ test.describe("API Provider Settings — integracoes tab baselines", () => {
     await expect(
       page.locator('[data-testid="api-settings-section"]'),
     ).toBeVisible();
-    // Only one WhatsApp provider "expanded" (fields visible) at a time.
-    await expect(page.locator('[data-testid="zapi-inbound-token-panel"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid^="provider-editor-"]')).toHaveCount(0);
     await expect(page).toHaveScreenshot(`01-closed-${testInfo.project.name}.png`, {
       maxDiffPixelRatio: 0.001,
       fullPage: true,
     });
   });
 
-  test("02 Meta expanded — signature pending banner", async ({ page }, testInfo) => {
+  test("02 Meta expanded — incomplete credentials", async ({ page }, testInfo) => {
     await setupRoutes(page, {
       whatsapp_provider: "meta_cloud",
       meta_phone_number_id: "123456789012345",
@@ -195,12 +218,15 @@ test.describe("API Provider Settings — integracoes tab baselines", () => {
       meta_permanent_token_masked: "EAAG****9xyz",
       meta_app_secret_set: false,
       meta_verify_token: "verify-token-demo",
+      whatsapp_readiness: "signature_pending",
     });
     await loginAndNavigate(page);
-    await page.locator('[data-testid="whatsapp-card-meta_cloud"]').click();
-    await expect(
-      page.locator('[data-testid="meta-signature-pending-banner"]'),
-    ).toBeVisible();
+    const metaCard = page.getByTestId("provider-card-whatsapp-meta_cloud");
+    await expect(metaCard).toHaveAttribute("data-card-state", "incomplete");
+    await metaCard.click();
+    await expect(page.getByTestId("provider-editor-whatsapp-meta_cloud")).toBeVisible();
+    await expect(page.getByTestId("field-meta_phone_number_id"))
+      .toHaveValue("123456789012345");
     await expect(page).toHaveScreenshot(`02-meta-expanded-${testInfo.project.name}.png`, {
       maxDiffPixelRatio: 0.001,
       fullPage: true,
@@ -211,8 +237,9 @@ test.describe("API Provider Settings — integracoes tab baselines", () => {
     await loginAndNavigate(page);
     // OpenAI is the default LLM provider — click to (re)assert selection and
     // ensure the panel is scrolled into view for the screenshot.
-    await page.locator('[data-testid="llm-provider-openai"]').click();
-    await page.locator('[data-testid="llm-provider-openai"]').scrollIntoViewIfNeeded();
+    await page.getByTestId("provider-card-llm-openai").click();
+    await page.getByTestId("provider-card-llm-openai").scrollIntoViewIfNeeded();
+    await expect(page.getByTestId("provider-editor-llm-openai")).toBeVisible();
     await expect(page).toHaveScreenshot(`03-llm-expanded-${testInfo.project.name}.png`, {
       maxDiffPixelRatio: 0.001,
       fullPage: true,
@@ -221,17 +248,16 @@ test.describe("API Provider Settings — integracoes tab baselines", () => {
 
   test("04 STT expanded — OpenAI Whisper configured", async ({ page }, testInfo) => {
     await loginAndNavigate(page);
-    await page.locator('[data-testid="stt-provider-openai_whisper"]').click();
-    await page
-      .locator('[data-testid="stt-provider-openai_whisper"]')
-      .scrollIntoViewIfNeeded();
+    await page.getByTestId("provider-card-stt-openai_whisper").click();
+    await page.getByTestId("provider-card-stt-openai_whisper").scrollIntoViewIfNeeded();
+    await expect(page.getByTestId("provider-editor-stt-openai_whisper")).toBeVisible();
     await expect(page).toHaveScreenshot(`04-stt-expanded-${testInfo.project.name}.png`, {
       maxDiffPixelRatio: 0.001,
       fullPage: true,
     });
   });
 
-  test("05 Z-API inbound token configured — no raw token rendered", async ({
+  test("05 Z-API configured — secrets remain write-only", async ({
     page,
   }, testInfo) => {
     await setupRoutes(page, {
@@ -241,17 +267,14 @@ test.describe("API Provider Settings — integracoes tab baselines", () => {
       zapi_inbound_token_digest_set: true,
     });
     await loginAndNavigate(page);
-    // The "configured" placeholder must be visible; the one-time URL panel
-    // (which would contain a raw token) must NOT be present.
-    await expect(
-      page.locator('[data-testid="zapi-inbound-token-configured"]'),
-    ).toBeVisible();
-    await expect(
-      page.locator('[data-testid="zapi-inbound-token-panel"]'),
-    ).toHaveCount(0);
-    await expect(
-      page.locator('[data-testid="zapi-inbound-token-url"]'),
-    ).toHaveCount(0);
+    const zapiCard = page.getByTestId("provider-card-whatsapp-zapi");
+    await expect(zapiCard).toHaveAttribute("data-card-state", "configured");
+    await zapiCard.click();
+    await expect(page.getByTestId("provider-editor-whatsapp-zapi")).toBeVisible();
+    await expect(page.getByTestId("field-zapi_token")).toHaveValue("");
+    await expect(page.getByTestId("field-zapi_token"))
+      .toHaveAttribute("placeholder", "•••••••• (keep current)");
+    await expect(page.locator("body")).not.toContainText("abcd****wxyz");
     await expect(page).toHaveScreenshot(`05-zapi-configured-${testInfo.project.name}.png`, {
       maxDiffPixelRatio: 0.001,
       fullPage: true,
@@ -264,6 +287,32 @@ test.describe("API Provider Settings — integracoes tab baselines", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 test.describe("Layout invariants", () => {
+  test("renders the API and voice hierarchy in product order", async ({ page }) => {
+    await setupRoutes(page);
+    await loginAndNavigate(page);
+
+    const hierarchyIds = await page.locator(
+      '[data-testid="api-settings-section"] > [data-testid]',
+    ).evaluateAll((elements) => elements
+      .map((element) => element.getAttribute("data-testid"))
+      .filter((testId) => testId?.startsWith("api-capability-")
+        || testId === "voice-module-heading"
+        || testId === "voice-response-controls"));
+    expect(hierarchyIds).toEqual([
+      "api-capability-whatsapp",
+      "api-capability-llm",
+      "api-capability-multimodal",
+      "voice-module-heading",
+      "api-capability-stt",
+      "api-capability-tts",
+      "voice-response-controls",
+    ]);
+    await expect(page.getByTestId("voice-module-heading")).toHaveText("Voice Module");
+    await expect(page.getByTestId("voice-response-controls")).toHaveCount(1);
+    await expect(page.getByRole("heading", { name: "Voice Triggers" })).toBeVisible();
+    await expect(page.getByText("More voice triggers coming soon", { exact: true })).toBeVisible();
+  });
+
   test("cards stay within viewport bounds and do not overlap", async ({
     page,
   }) => {
@@ -273,7 +322,7 @@ test.describe("Layout invariants", () => {
     if (!viewport) test.skip();
     const cards = await page
       .locator(
-        '[data-testid^="whatsapp-card-"], [data-testid^="llm-provider-"], [data-testid^="stt-provider-"]',
+        '[data-testid^="provider-card-"]',
       )
       .all();
     expect(cards.length).toBeGreaterThan(0);
@@ -288,32 +337,31 @@ test.describe("Layout invariants", () => {
   test("only one WhatsApp provider is active at a time", async ({ page }) => {
     await setupRoutes(page);
     await loginAndNavigate(page);
-    await page.locator('[data-testid="whatsapp-card-meta_cloud"]').click();
-    // At most one provider card carries the border-2 active class — but the
-    // stronger invariant is that at most one provider-specific field group
-    // renders. Meta shows the phone_number_id input; Z-API shows instance id.
-    const metaFields = page.locator('[data-testid="meta-app-secret-field"]');
-    await expect(metaFields).toHaveCount(1);
+    await page.getByTestId("provider-card-whatsapp-meta_cloud").click();
+    await expect(page.getByTestId("provider-editor-whatsapp-meta_cloud")).toHaveCount(1);
+    await page.getByTestId("provider-card-whatsapp-zapi").click();
+    await expect(page.getByTestId("provider-editor-whatsapp-meta_cloud")).toHaveCount(0);
+    await expect(page.getByTestId("provider-editor-whatsapp-zapi")).toHaveCount(1);
   });
 
   test("coming-soon LLM providers are non-interactive", async ({ page }) => {
     await setupRoutes(page);
     await loginAndNavigate(page);
-    const comingSoon = page.locator('[data-coming-soon="true"]');
-    const count = await comingSoon.count();
-    for (let i = 0; i < count; i++) {
-      const btn = comingSoon.nth(i);
-      await expect(btn).toBeDisabled();
+    const comingSoon = page.locator('[data-card-state="coming_soon"]');
+    await expect(comingSoon).toHaveCount(7);
+    for (let i = 0; i < await comingSoon.count(); i++) {
+      await expect(comingSoon.nth(i)).toHaveJSProperty("tagName", "ARTICLE");
     }
+    await expect(page.locator('[data-card-state="coming_soon"] button')).toHaveCount(0);
   });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Meta signature-pending — variant-specific assertions
+// Meta readiness — variant-specific assertions
 // ─────────────────────────────────────────────────────────────────────────────
 
-test.describe("Meta signature_pending banner", () => {
-  test("warns when identity is saved but app secret is missing", async ({
+test.describe("Meta credential readiness", () => {
+  test("keeps incomplete credentials write-only when app secret is missing", async ({
     page,
   }, testInfo) => {
     test.skip(testInfo.project.name !== "desktop");
@@ -322,30 +370,31 @@ test.describe("Meta signature_pending banner", () => {
       meta_phone_number_id: "123456789012345",
       meta_permanent_token_set: true,
       meta_app_secret_set: false,
+      whatsapp_readiness: "signature_pending",
     });
     await loginAndNavigate(page);
-    await page.locator('[data-testid="whatsapp-card-meta_cloud"]').click();
-    await expect(
-      page.locator('[data-testid="meta-signature-pending-banner"]'),
-    ).toBeVisible();
-    await expect(
-      page.locator('[data-testid="meta-signature-pending-badge"]'),
-    ).toBeVisible();
+    const metaCard = page.getByTestId("provider-card-whatsapp-meta_cloud");
+    await expect(metaCard).toHaveAttribute("data-card-state", "incomplete");
+    await metaCard.click();
+    await expect(page.getByTestId("field-meta_app_secret")).toHaveValue("");
+    await expect(page.getByTestId("field-meta_app_secret")).not.toHaveAttribute("placeholder");
   });
 
-  test("hides the banner once app secret is set", async ({ page }, testInfo) => {
+  test("marks Meta configured once the complete bundle is active", async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== "desktop");
     await setupRoutes(page, {
       whatsapp_provider: "meta_cloud",
       meta_phone_number_id: "123456789012345",
       meta_permanent_token_set: true,
       meta_app_secret_set: true,
+      whatsapp_readiness: "active",
     });
     await loginAndNavigate(page);
-    await page.locator('[data-testid="whatsapp-card-meta_cloud"]').click();
-    await expect(
-      page.locator('[data-testid="meta-signature-pending-banner"]'),
-    ).toHaveCount(0);
+    const metaCard = page.getByTestId("provider-card-whatsapp-meta_cloud");
+    await expect(metaCard).toHaveAttribute("data-card-state", "configured");
+    await metaCard.click();
+    await expect(page.getByTestId("field-meta_app_secret"))
+      .toHaveAttribute("placeholder", "•••••••• (keep current)");
   });
 });
 
@@ -353,8 +402,8 @@ test.describe("Meta signature_pending banner", () => {
 // Z-API capability URL — one-time-only, redaction guarantees
 // ─────────────────────────────────────────────────────────────────────────────
 
-test.describe("Z-API capability token flow", () => {
-  test("token panel is hidden before save and never captured", async ({
+test.describe("Z-API secret handling", () => {
+  test("stored tokens never hydrate into the editor", async ({
     page,
   }, testInfo) => {
     test.skip(testInfo.project.name !== "desktop");
@@ -364,13 +413,10 @@ test.describe("Z-API capability token flow", () => {
       zapi_token_set: true,
     });
     await loginAndNavigate(page);
-    // Before any save is triggered, no raw token URL should be in the DOM.
-    await expect(
-      page.locator('[data-testid="zapi-inbound-token-panel"]'),
-    ).toHaveCount(0);
-    await expect(
-      page.locator('[data-testid="zapi-inbound-token-url"]'),
-    ).toHaveCount(0);
+    await page.getByTestId("provider-card-whatsapp-zapi").click();
+    await expect(page.getByTestId("field-zapi_token")).toHaveValue("");
+    await expect(page.getByTestId("field-zapi_client_token")).toHaveValue("");
+    await expect(page.locator("body")).not.toContainText("abcd****wxyz");
   });
 });
 

@@ -70,7 +70,7 @@ export function VoiceResponseControls({
         comingSoon: "More voice triggers coming soon",
       }
     : {
-        title: "Gatilhos de Voz",
+        title: "Gatilhos de voz",
         intro: "Escolha quando a geração de voz configurada pode responder a uma pergunta.",
         masterLabel: "Responder em áudio",
         masterDescription: "Pause respostas em áudio sem remover a configuração de voz salva.",
@@ -84,7 +84,7 @@ export function VoiceResponseControls({
         readOnly: "Prévia somente leitura. Ela não representa as configurações persistidas da clínica.",
         loadError: "Não foi possível carregar as configurações de voz. Recarregue a página.",
         saveError: "Não foi possível salvar a configuração de voz. O valor anterior foi restaurado.",
-        comingSoon: "Em breve mais gatilhos de voz",
+        comingSoon: "Outros gatilhos em breve",
       };
 
   const credentialsUrl = `/v1/config/api-credentials?tenant_id=${encodeURIComponent(clinicId)}`;

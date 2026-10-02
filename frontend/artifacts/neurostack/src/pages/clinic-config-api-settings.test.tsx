@@ -412,14 +412,81 @@ describe("<ApiCredentialsForm /> card states", () => {
     vi.restoreAllMocks();
   });
 
-  it("keeps the multimodal fallback capability copy", () => {
+  it("keeps the capability registry in rendered order with the agreed qualifiers", () => {
+    expect(API_CAPABILITIES.map(({ id, short, required }) => ({ id, short, required }))).toEqual([
+      { id: "whatsapp", short: "API WhatsApp", required: true },
+      { id: "llm", short: "API LLM", required: true },
+      { id: "multimodal", short: "API LLM Fallback Multimodal", required: false },
+      { id: "stt", short: "API STT", required: true },
+      { id: "tts", short: "API TTS", required: false },
+    ]);
     expect(API_CAPABILITIES.find(({ id }) => id === "multimodal")).toMatchObject({
-      short: "FallBack LLM Multimodal",
+      short: "API LLM Fallback Multimodal",
       desc: {
         pt: expect.stringContaining("LLM primário falhar"),
         en: expect.stringContaining("primary LLM fails"),
       },
     });
+  });
+
+  it.each([
+    [
+      "pt",
+      "Módulo Voz",
+      "Gatilhos de voz",
+      "Outros gatilhos em breve",
+      "obrigatório",
+      "opcional",
+    ],
+    [
+      "en",
+      "Voice Module",
+      "Voice Triggers",
+      "More voice triggers coming soon",
+      "Required",
+      "Optional",
+    ],
+  ])("renders the complete %s hierarchy in DOM order", async (
+    locale,
+    voiceModule,
+    voiceTriggers,
+    moreTriggers,
+    required,
+    optional,
+  ) => {
+    localStorage.setItem("ns_locale", locale);
+    await renderForm(emptyStatus(), {
+      voiceControlsSlot: (
+        <VoiceResponseControls clinicId="preview" isReadOnly role="investor" />
+      ),
+    });
+
+    const section = screen.getByTestId("api-settings-section");
+    const hierarchyIds = Array.from(section.children)
+      .map((element) => element.getAttribute("data-testid"))
+      .filter((testId) => testId?.startsWith("api-capability-")
+        || testId === "voice-module-heading"
+        || testId === "voice-response-controls");
+    expect(hierarchyIds).toEqual([
+      "api-capability-whatsapp",
+      "api-capability-llm",
+      "api-capability-multimodal",
+      "voice-module-heading",
+      "api-capability-stt",
+      "api-capability-tts",
+      "voice-response-controls",
+    ]);
+
+    expect(screen.getByTestId("voice-module-heading")).toHaveTextContent(voiceModule);
+    expect(screen.getAllByTestId("voice-response-controls")).toHaveLength(1);
+    expect(screen.getByRole("heading", { name: voiceTriggers })).toBeInTheDocument();
+    expect(screen.getByText(moreTriggers)).toBeInTheDocument();
+    for (const id of ["whatsapp", "llm", "stt"]) {
+      expect(screen.getByTestId(`capability-requirement-${id}`)).toHaveTextContent(required);
+    }
+    for (const id of ["multimodal", "tts"]) {
+      expect(screen.getByTestId(`capability-requirement-${id}`)).toHaveTextContent(optional);
+    }
   });
 
   it.each([
@@ -1097,24 +1164,36 @@ describe("<ApiCredentialsForm /> card states", () => {
     expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH")).toHaveLength(0);
   });
 
-  it("keeps voice controls as a sibling of the provider grid", async () => {
+  it("renders the voice controls slot after TTS without adding a credential request", async () => {
     const fetchMock = vi.fn().mockResolvedValue(response(emptyStatus()));
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
     render(
       <Wrapper>
         <div data-testid="integrations-content">
-          <VoiceResponseControls clinicId="preview" isReadOnly role="investor" />
-          <ApiCredentialsForm clinicId="preview" isReadOnly isSuperAdmin={false} />
+          <ApiCredentialsForm
+            clinicId="preview"
+            isReadOnly
+            isSuperAdmin={false}
+            voiceControlsSlot={(
+              <VoiceResponseControls clinicId="preview" isReadOnly role="investor" />
+            )}
+          />
         </div>
       </Wrapper>,
     );
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
 
     const voiceSection = screen.getByTestId("voice-response-controls");
     const apiSection = screen.getByTestId("api-settings-section");
-    expect(apiSection.contains(voiceSection)).toBe(false);
+    expect(apiSection.contains(voiceSection)).toBe(true);
+    expect(screen.getAllByTestId("voice-response-controls")).toHaveLength(1);
+    expect(screen.getByTestId("api-capability-tts").nextElementSibling).toBe(voiceSection);
     expect(within(apiSection).getAllByTestId(/provider-card-/)).toHaveLength(TOTAL_PROVIDER_CARD_COUNT);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/config/api-credentials?tenant_id=preview",
+      { headers: {} },
+    );
   });
 
   it("does not expose the Integrations tab or voice section to clinic admins", async () => {
