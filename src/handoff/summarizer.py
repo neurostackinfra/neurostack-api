@@ -127,6 +127,8 @@ class ConversationSummarizer:
         sector: Optional[Any] = None,
         sla: Optional[Any] = None,
         verification_status: Optional[str] = None,
+        max_recent_messages: Optional[int] = None,
+        omit_contact_symptoms_reason: bool = False,
     ) -> ConversationSummary:
         """
         Generate a structured summary of the conversation.
@@ -142,6 +144,18 @@ class ConversationSummarizer:
             slots: Extracted slot values
             safety_flags: Any safety flags triggered
             session_start: When the session started
+            max_recent_messages: Optional per-call override for the number of
+                recent messages included in the output. When ``None`` the
+                constructor-time default (``self.max_recent_messages``, 5 by
+                default) is preserved — existing handoff-summary callers see
+                no change in behavior. New callers (e.g. the
+                ``prior_episode_context`` composer) pass ``20``.
+            omit_contact_symptoms_reason: When ``True``, generate the summary
+                text in the dedicated output mode used for
+                ``prior_episode_context.summary``: ``Contato:``,
+                ``Sintomas mencionados:`` and ``Motivo do encaminhamento:``
+                lines are suppressed. The full human-facing summary that
+                ``HandoffRecord`` persists always calls with ``False``.
 
         Returns:
             ConversationSummary with all extracted information
@@ -164,6 +178,7 @@ class ConversationSummarizer:
             key_info=key_info,
             reason=reason,
             intents=intents or [],
+            omit_contact_symptoms_reason=omit_contact_symptoms_reason,
         )
 
         if verification_status == "link_sent":
@@ -172,8 +187,16 @@ class ConversationSummarizer:
                 + summary_text
             )
 
-        # Get recent messages
-        recent = conv_messages[-self.max_recent_messages :] if conv_messages else []
+        # Get recent messages — explicit per-call override wins over the
+        # constructor default so a single shared singleton can serve both the
+        # 5-event handoff summary and the 20-event prior-episode composition
+        # without being reconstructed.
+        effective_limit = (
+            max_recent_messages
+            if max_recent_messages is not None
+            else self.max_recent_messages
+        )
+        recent = conv_messages[-effective_limit:] if conv_messages else []
 
         return ConversationSummary(
             session_id=session_id,
@@ -329,8 +352,19 @@ class ConversationSummarizer:
         key_info: KeyInformation,
         reason: HandoffReason,
         intents: list[str],
+        omit_contact_symptoms_reason: bool = False,
     ) -> str:
-        """Generate human-readable summary text."""
+        """Generate human-readable summary text.
+
+        Args:
+            omit_contact_symptoms_reason: When ``True`` (dedicated output mode
+                used by ``prior_episode_context.summary``), the three
+                PII-carrying / stale-demand fields are omitted:
+                ``Contato:``, ``Sintomas mencionados:`` and
+                ``Motivo do encaminhamento:``. The full human-facing summary
+                that only ``HandoffRecord`` persists always calls with
+                ``False`` so these three lines keep existing exactly there.
+        """
         parts = []
 
         # Opening with user info if available
@@ -341,9 +375,12 @@ class ConversationSummarizer:
         if key_info.main_topic:
             parts.append(f"Assunto principal: {key_info.main_topic}")
 
-        # Handoff reason
-        reason_text = self._get_reason_text(reason)
-        parts.append(f"Motivo do encaminhamento: {reason_text}")
+        # Handoff reason — omitted from the prior-episode output mode because
+        # the stale reason would push the next episode back toward re-handoff
+        # on the same demand.
+        if not omit_contact_symptoms_reason:
+            reason_text = self._get_reason_text(reason)
+            parts.append(f"Motivo do encaminhamento: {reason_text}")
 
         # Specific request
         if key_info.specific_request:
@@ -352,14 +389,16 @@ class ConversationSummarizer:
                 truncated += "..."
             parts.append(f'Última solicitação: "{truncated}"')
 
-        # Symptoms if any
-        if key_info.symptoms_mentioned:
+        # Symptoms if any — raw health data, omitted from the prior-episode
+        # output mode (LGPD art. 11).
+        if key_info.symptoms_mentioned and not omit_contact_symptoms_reason:
             parts.append(
                 f"Sintomas mencionados: {', '.join(key_info.symptoms_mentioned)}"
             )
 
-        # Contact info
-        if key_info.contact_info:
+        # Contact info — telephone/email, omitted from the prior-episode
+        # output mode.
+        if key_info.contact_info and not omit_contact_symptoms_reason:
             parts.append(f"Contato: {key_info.contact_info}")
 
         # Appointment preferences

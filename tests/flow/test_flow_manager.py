@@ -3,6 +3,7 @@ NeuroStack - Flow Manager Unit Tests
 Tests for the Flow Manager and all components.
 """
 
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pytest
@@ -13,6 +14,9 @@ from neurostack_core.flow.handlers import (
     RagModeHandler,
     SafetyModeHandler,
 )
+
+if TYPE_CHECKING:
+    from neurostack_core.prompt.models import PromptVariables  # noqa: F401
 from neurostack_core.flow.manager import FlowManager, get_flow_manager, process_flow
 from neurostack_core.flow.models import (
     FlowContext,
@@ -665,3 +669,488 @@ class TestIntegration:
         decision = await manager.process(context)
 
         assert decision.next_mode == FlowMode.SAFETY
+
+
+# ============================================
+# Context-episode (wish deliverable 4) Tests
+# ============================================
+
+
+class TestFlowManagerContextEpisodeBoundary:
+    """Episode-aware single-entry cache replacement in FlowManager.
+
+    These tests cover wish ``handoff-contextual-resumption`` deliverable 4
+    and the matching acceptance criteria:
+
+      * "Dois managers independentes, ambos em HANDOFF no episódio antigo,
+        substituem a entrada ao observar o novo ID e mantêm tamanho um por
+        sessão." — two independent managers (two workers) with HANDOFF
+        cached under the old episode id both drop and replace to NORMAL
+        when the new id arrives; size stays one entry per session.
+      * "Mesmo ID reutiliza estado; ID diferente nunca reutiliza HANDOFF;
+        ``reset_session`` continua opcional e não participa da correção
+        cross-worker." — same id reuses the cached mode (HANDOFF
+        persistence survives), a different id never reuses HANDOFF, and
+        ``reset_session`` is not required anywhere here.
+    """
+
+    @pytest.mark.asyncio
+    async def test_first_touch_stamps_episode_id(
+        self, sample_session_id, sample_tenant_id
+    ):
+        """A fresh session accepts the incoming episode id as its tag."""
+        manager = FlowManager()
+        episode = "ep-first"
+        context = FlowContext(
+            session_id=sample_session_id,
+            tenant_id=sample_tenant_id,
+            current_mode=FlowMode.NORMAL,
+            message="hi",
+            context_episode_id=episode,
+        )
+        await manager.process(context)
+        state = manager.get_state(sample_session_id)
+        assert state is not None
+        assert state.context_episode_id == episode
+        # Single entry per session_id always.
+        assert len(manager._states) == 1
+
+    @pytest.mark.asyncio
+    async def test_same_episode_id_reuses_cached_handoff_mode(
+        self, sample_session_id, sample_tenant_id
+    ):
+        """Same id → HANDOFF mode cached across turns stays HANDOFF.
+
+        We keep ``handoff_required=True`` on both calls because the
+        existing ``HandoffHandler.should_exit`` interprets a mid-pending
+        ``handoff_required=False`` as an explicit cancellation trigger
+        (``HANDOFF_CANCELLED``) that is independent of the episode id.
+        The scenario this test proves — "same episode id across turns
+        reuses the cached HANDOFF state" — must therefore simulate the
+        natural next turn where the handoff is still active, not a
+        cancellation. We assert the cache was reused (no episode-boundary
+        reset log fired, state object preserved) by watching the manager
+        log stream.
+        """
+        manager = FlowManager()
+        episode = "ep-same"
+        context = FlowContext(
+            session_id=sample_session_id,
+            tenant_id=sample_tenant_id,
+            current_mode=FlowMode.NORMAL,
+            message="handoff",
+            handoff_required=True,
+            handoff_reason="explicit_request",
+            context_episode_id=episode,
+        )
+        decision1 = await manager.process(context)
+        assert decision1.next_mode == FlowMode.HANDOFF
+        state_after_first = manager.get_state(sample_session_id)
+        assert state_after_first is not None
+
+        # Second turn — same episode id, handoff is still active (another
+        # user message arrived mid-handoff). Cache reuse keeps the
+        # manager in HANDOFF; crucially, no ``flow_manager_episode_
+        # boundary_reset`` must fire — that log line is reserved for
+        # genuine mismatches. ``decision.next_mode`` is the authoritative
+        # mode after this turn; ``decision.current_mode`` is the
+        # ``state.previous_mode`` from the first NORMAL→HANDOFF transition
+        # (see ``FlowManager.process``) so we deliberately don't assert
+        # on it here.
+        with self._capture_manager_logs() as records:
+            decision2 = await manager.process(context)
+        assert decision2.next_mode == FlowMode.HANDOFF
+        assert decision2.transition_required is False
+        boundary_resets = [
+            r
+            for r in records
+            if r.getMessage() == "flow_manager_episode_boundary_reset"
+        ]
+        assert (
+            boundary_resets == []
+        ), "same episode id must not trigger an episode-boundary reset"
+        state = manager.get_state(sample_session_id)
+        assert state is not None
+        # Cache survived: still the same stored entry, same episode tag.
+        assert state is state_after_first
+        assert state.current_mode == FlowMode.HANDOFF
+        assert state.context_episode_id == episode
+        assert len(manager._states) == 1
+
+    @staticmethod
+    def _capture_manager_logs():
+        """Yield a list of log records emitted by ``flow.manager``.
+
+        The manager logs ``flow_manager_episode_boundary_reset`` only on
+        actual cache replacement, so the presence/absence of that record
+        is the deterministic probe for "cache was reused vs replaced".
+        """
+        import logging
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx():
+            records: list[logging.LogRecord] = []
+
+            class _Handler(logging.Handler):
+                def emit(self, record: logging.LogRecord) -> None:
+                    records.append(record)
+
+            handler = _Handler(level=logging.DEBUG)
+            logger = logging.getLogger("neurostack_core.flow.manager")
+            previous_level = logger.level
+            logger.addHandler(handler)
+            logger.setLevel(logging.DEBUG)
+            try:
+                yield records
+            finally:
+                logger.removeHandler(handler)
+                logger.setLevel(previous_level)
+
+        return _ctx()
+
+    @pytest.mark.asyncio
+    async def test_different_episode_id_replaces_handoff_with_normal(
+        self, sample_session_id, sample_tenant_id
+    ):
+        """A different incoming episode id drops the cached HANDOFF."""
+        manager = FlowManager()
+        context = FlowContext(
+            session_id=sample_session_id,
+            tenant_id=sample_tenant_id,
+            current_mode=FlowMode.NORMAL,
+            message="handoff",
+            handoff_required=True,
+            handoff_reason="explicit_request",
+            context_episode_id="ep-old",
+        )
+        decision1 = await manager.process(context)
+        assert decision1.next_mode == FlowMode.HANDOFF
+
+        # Fresh turn under a new episode id — no SRM trigger. The cache
+        # must be replaced so the mode resets to NORMAL (not stuck in
+        # HANDOFF from the stale episode).
+        context.handoff_required = False
+        context.handoff_reason = None
+        context.context_episode_id = "ep-new"
+        decision2 = await manager.process(context)
+
+        assert decision2.current_mode == FlowMode.NORMAL
+        assert decision2.next_mode == FlowMode.NORMAL
+        state = manager.get_state(sample_session_id)
+        assert state is not None
+        assert state.context_episode_id == "ep-new"
+        # Entry size still one — the cache was replaced, not accumulated.
+        assert len(manager._states) == 1
+
+    @pytest.mark.asyncio
+    async def test_two_independent_managers_replace_handoff_on_new_episode_id(
+        self, sample_session_id, sample_tenant_id
+    ):
+        """Two workers (two managers) with the same cached HANDOFF both
+        drop their cache atomically when they see the new episode id."""
+        worker_a = FlowManager()
+        worker_b = FlowManager()
+        base_ctx_kwargs: dict = dict(
+            session_id=sample_session_id,
+            tenant_id=sample_tenant_id,
+            current_mode=FlowMode.NORMAL,
+            message="handoff",
+            handoff_required=True,
+            handoff_reason="explicit_request",
+            context_episode_id="ep-stale",
+        )
+        await worker_a.process(FlowContext(**base_ctx_kwargs))
+        await worker_b.process(FlowContext(**base_ctx_kwargs))
+
+        # Both workers cached HANDOFF under the stale id.
+        for worker in (worker_a, worker_b):
+            cached = worker.get_state(sample_session_id)
+            assert cached is not None
+            assert cached.current_mode == FlowMode.HANDOFF
+            assert cached.context_episode_id == "ep-stale"
+
+        # The reactivation lands on a third worker; a and b both observe
+        # the new id on their next turn and must replace their cache.
+        fresh_ctx = FlowContext(
+            session_id=sample_session_id,
+            tenant_id=sample_tenant_id,
+            current_mode=FlowMode.NORMAL,
+            message="olá, podemos continuar?",
+            context_episode_id="ep-fresh",
+        )
+        decision_a = await worker_a.process(fresh_ctx.model_copy())
+        decision_b = await worker_b.process(fresh_ctx.model_copy())
+
+        assert decision_a.next_mode == FlowMode.NORMAL
+        assert decision_b.next_mode == FlowMode.NORMAL
+        for worker in (worker_a, worker_b):
+            state = worker.get_state(sample_session_id)
+            assert state is not None
+            assert state.current_mode == FlowMode.NORMAL
+            assert state.context_episode_id == "ep-fresh"
+            assert len(worker._states) == 1
+
+    @pytest.mark.asyncio
+    async def test_legacy_untagged_sessions_keep_prior_behaviour(
+        self, sample_session_id, sample_tenant_id
+    ):
+        """Both-None episode ids (legacy / pre-reactivation) → cache reuse.
+
+        As in :meth:`test_same_episode_id_reuses_cached_handoff_mode`,
+        we keep ``handoff_required=True`` on both calls so the existing
+        ``HandoffHandler.should_exit`` logic — which treats a mid-pending
+        ``handoff_required=False`` as an explicit cancellation
+        independent of the episode id — does not short-circuit the
+        cache-reuse scenario we are proving. The point of this test is
+        that the ``None`` → ``None`` id transition is NOT an episode
+        boundary; HANDOFF persists exactly like a tagged same-id reuse,
+        and no ``flow_manager_episode_boundary_reset`` log fires.
+        """
+        manager = FlowManager()
+        ctx = FlowContext(
+            session_id=sample_session_id,
+            tenant_id=sample_tenant_id,
+            current_mode=FlowMode.NORMAL,
+            message="hi",
+            handoff_required=True,
+            handoff_reason="explicit_request",
+            context_episode_id=None,
+        )
+        await manager.process(ctx)
+        state = manager.get_state(sample_session_id)
+        assert state is not None
+        assert state.current_mode == FlowMode.HANDOFF
+        assert state.context_episode_id is None
+
+        # Same None id on the next turn is still "same episode" — cache
+        # survives, so HANDOFF persists exactly as before this delivery.
+        # Only ``decision.next_mode`` is asserted: ``decision.current_mode``
+        # is derived from ``state.previous_mode`` and will still carry the
+        # NORMAL baseline from the first NORMAL→HANDOFF transition.
+        with self._capture_manager_logs() as records:
+            decision = await manager.process(ctx)
+        assert decision.next_mode == FlowMode.HANDOFF
+        assert decision.transition_required is False
+        boundary_resets = [
+            r
+            for r in records
+            if r.getMessage() == "flow_manager_episode_boundary_reset"
+        ]
+        assert (
+            boundary_resets == []
+        ), "legacy None→None episode ids must not trigger an episode-boundary reset"
+        state_after_second = manager.get_state(sample_session_id)
+        assert state_after_second is not None
+        assert state_after_second.current_mode == FlowMode.HANDOFF
+        assert state_after_second.context_episode_id is None
+        assert len(manager._states) == 1
+
+    @pytest.mark.asyncio
+    async def test_reset_session_still_optional_and_independent(
+        self, sample_session_id, sample_tenant_id
+    ):
+        """``reset_session`` is NOT required for the cross-worker fix."""
+        manager = FlowManager()
+        ctx = FlowContext(
+            session_id=sample_session_id,
+            tenant_id=sample_tenant_id,
+            current_mode=FlowMode.NORMAL,
+            message="handoff",
+            handoff_required=True,
+            handoff_reason="explicit_request",
+            context_episode_id="ep-a",
+        )
+        await manager.process(ctx)
+
+        # Episode-boundary replacement never calls reset_session.
+        ctx.handoff_required = False
+        ctx.handoff_reason = None
+        ctx.context_episode_id = "ep-b"
+        await manager.process(ctx)
+
+        # And reset_session remains a working, independent affordance.
+        assert await manager.reset_session(sample_session_id) is True
+        assert manager.get_state(sample_session_id) is None
+
+
+# ============================================
+# Rendered-prompt resume-mode suppression (wish A4) Tests
+# ============================================
+
+
+class TestNormalPromptResumeModeSuppression:
+    """A4 rendered-prompt proof for wish ``handoff-contextual-resumption``.
+
+    Verifies the two Python-only suppressions in
+    ``neurostack_core.prompt.templates.normal.NormalTemplate``:
+
+      * Golden Rule #2 "Apresente-se sempre no primeiro contato."
+        disappears from the rendered system prompt when
+        ``variables.custom["prior_episode_context"]`` is present
+        (``get_system_prompt``).
+      * The "## Instruções para Lead Novo (Primeiro Contato)" funnel
+        block is NOT appended by ``get_context_instructions`` when
+        ``funnel_stage == "lead_novo"`` AND
+        ``prior_episode_context`` is present.
+
+    The oracle for first-contact behaviour (no ``prior_episode_context``)
+    is also exercised here so a future regression that silently keeps
+    the suppression active would fail loudly: ``get_context_instructions``
+    MUST still emit the "Lead Novo" block and ``get_system_prompt`` MUST
+    still contain "Apresente-se" when the session is a true first contact.
+
+    This test lives in ``tests/flow/test_flow_manager.py`` (and not under
+    ``tests/prompt/``) because the parity gate only permits
+    ``tests/flow/test_flow_manager.py`` and
+    ``tests/srm/test_handoff_context_injection.py`` as modifications to
+    the four protected test directories — see ``scripts/wish-gates.sh``
+    ``parity_tests_unchanged()``.
+    """
+
+    def _first_contact_vars(self) -> "PromptVariables":  # type: ignore[name-defined]
+        from neurostack_core.prompt.models import PromptVariables
+
+        # ``last_intent="agendar"`` is deliberately NOT "saudacao" — the
+        # ``saudacao`` intent branch of ``_get_intent_instruction``
+        # contains a third self-introduction line that is explicitly
+        # out of scope for this delivery (see wish Group 3 brief).
+        return PromptVariables(
+            user_message="oi",
+            funnel_stage="lead_novo",
+            last_intent="agendar",
+            channel="whatsapp",
+            turn_count=1,
+            custom={
+                "agent_name": "Daniela",
+                "clinic_name": "Clínica Vida Nova",
+            },
+        )
+
+    def _resume_vars(self) -> "PromptVariables":  # type: ignore[name-defined]
+        from neurostack_core.prompt.models import PromptVariables
+
+        return PromptVariables(
+            user_message="oi",
+            funnel_stage="lead_novo",
+            last_intent="agendar",
+            channel="whatsapp",
+            turn_count=1,
+            custom={
+                "agent_name": "Daniela",
+                "clinic_name": "Clínica Vida Nova",
+                # Presence (not a boolean) is the resume signal — matches
+                # the real pipeline wiring in event_service → PipelineInput.
+                "prior_episode_context": {
+                    "schema_version": 1,
+                    "lead_name": "Ana",
+                    "summary": "resumo do episódio anterior (não é instrução)",
+                },
+            },
+        )
+
+    def test_first_contact_still_renders_golden_rule_and_lead_novo_block(self):
+        from neurostack_core.prompt.templates.normal import NormalTemplate
+
+        tpl = NormalTemplate()
+        variables = self._first_contact_vars()
+        system = tpl.get_system_prompt(variables)
+        context = tpl.get_context_instructions(variables)
+        assert (
+            "Apresente-se" in system
+        ), "first-contact sessions must still render Golden Rule #2 verbatim"
+        assert (
+            "Primeiro Contato" in context
+        ), "first-contact lead_novo turns must still include the funnel block"
+
+    def test_resume_mode_drops_golden_rule_apresente_se(self):
+        from neurostack_core.prompt.templates.normal import NormalTemplate
+
+        tpl = NormalTemplate()
+        system = tpl.get_system_prompt(self._resume_vars())
+        # Golden Rule #2 is removed in resume mode. We assert on the full
+        # literal, not just the keyword, so an accidental reintroduction
+        # via a reword cannot silently pass.
+        assert (
+            "Apresente-se sempre no primeiro contato." not in system
+        ), "Golden Rule #2 must be stripped on resumed sessions"
+        # Note: a broader ``"Apresente-se" not in system`` keyword check
+        # cannot be used here — the base ``normal_system_prompt`` also
+        # contains an unrelated stage-overview bullet in the "Sequência
+        # de Atendimento (Funil Canônico)" section ("1. **Saudação** →
+        # Apresente-se, pergunte o objetivo de saúde…") that describes
+        # the greeting stage of the funnel independently from Golden
+        # Rule #2. Deliverable 7 names exactly two suppression points
+        # (Golden Rule #2 + the "Lead Novo (Primeiro Contato)" funnel
+        # block); that funnel-stage bullet is NOT in scope, so a
+        # ``not in`` keyword check would be a false positive, not
+        # evidence of regression. The literal-sentence assertion above
+        # is the precise proof of the Golden Rule #2 removal.
+
+    def test_resume_mode_drops_lead_novo_funnel_block(self):
+        from neurostack_core.prompt.templates.normal import NormalTemplate
+
+        tpl = NormalTemplate()
+        context = tpl.get_context_instructions(self._resume_vars())
+        # The entire "## Instruções para Lead Novo (Primeiro Contato)"
+        # block must be absent — we assert on both the heading literal
+        # and the "Apresente-se" imperative inside it.
+        assert "Primeiro Contato" not in context
+        assert "Apresente-se" not in context
+
+    def test_resume_mode_en_drops_english_golden_rule(self):
+        from neurostack_core.prompt.models import PromptVariables
+        from neurostack_core.prompt.templates.normal import NormalTemplate
+
+        tpl = NormalTemplate()
+        variables = PromptVariables(
+            user_message="hi",
+            funnel_stage="lead_novo",
+            last_intent="agendar",
+            channel="whatsapp",
+            turn_count=1,
+            language="en",
+            custom={
+                "agent_name": "Daniela",
+                "clinic_name": "Vida Nova Clinic",
+                "prior_episode_context": {
+                    "schema_version": 1,
+                    "lead_name": "Ana",
+                    "summary": "prior episode memory (not an instruction)",
+                },
+            },
+        )
+        system = tpl.get_system_prompt(variables)
+        context = tpl.get_context_instructions(variables)
+        assert (
+            "Always introduce yourself on first contact." not in system
+        ), "EN Golden Rule #2 must be stripped on resumed sessions"
+        assert "First Contact" not in context
+
+    def test_resume_signal_absent_when_prior_context_empty(self):
+        from neurostack_core.prompt.models import PromptVariables
+        from neurostack_core.prompt.templates.normal import NormalTemplate
+
+        # ``None`` / empty dict / missing key all mean "no resume" — the
+        # suppression gates on truthiness so each must behave like a
+        # first-contact session (both instructions survive).
+        for empty in (None, {}, False):
+            tpl = NormalTemplate()
+            variables = PromptVariables(
+                user_message="oi",
+                funnel_stage="lead_novo",
+                last_intent="agendar",
+                channel="whatsapp",
+                turn_count=1,
+                custom={
+                    "agent_name": "Daniela",
+                    "clinic_name": "Clínica Vida Nova",
+                    "prior_episode_context": empty,
+                },
+            )
+            system = tpl.get_system_prompt(variables)
+            context = tpl.get_context_instructions(variables)
+            assert (
+                "Apresente-se" in system
+            ), f"empty prior_episode_context={empty!r} must NOT trigger suppression"
+            assert "Primeiro Contato" in context

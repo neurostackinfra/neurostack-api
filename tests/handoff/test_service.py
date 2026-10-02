@@ -561,6 +561,81 @@ class TestConversationSummarizer:
 
         assert summary.key_info.contact_info == "joao@example.com"
 
+    def test_default_handoff_summary_keeps_five_recent_messages(
+        self,
+        summarizer,
+        tenant_id,
+        session_id,
+        sample_messages,
+    ):
+        """A7 — default call path is byte-equivalent to the pre-change behavior.
+
+        The handoff summary used by ``HandoffRecord`` must keep seeing the
+        constructor-time limit (5 events) when no explicit kwarg is passed,
+        so the pre-existing call site in ``handoff_service.py`` remains
+        unchanged.
+        """
+        # Pad sample_messages to clearly exceed 5 so we can observe the cap.
+        now = datetime.now(timezone.utc).isoformat()
+        padded = sample_messages + [
+            {"role": "user", "content": f"extra-{i}", "timestamp": now}
+            for i in range(10)
+        ]
+
+        summary = summarizer.summarize(
+            session_id=session_id,
+            tenant_id=tenant_id,
+            messages=padded,
+            reason=HandoffReason.USER_REQUEST,
+        )
+
+        assert len(summary.recent_messages) == 5
+
+    def test_prior_episode_summary_mode_omits_three_pii_fields(
+        self,
+        summarizer,
+        tenant_id,
+        session_id,
+        sample_messages,
+    ):
+        """A5 — dedicated output mode drops contact/symptoms/reason lines.
+
+        The pre-existing default call path still emits all three lines; only
+        the explicit ``omit_contact_symptoms_reason=True`` call used by the
+        prior_episode_context composer suppresses them.
+        """
+        # Add explicit phone and symptom content so the baseline summary
+        # clearly contains both forbidden lines in the full mode.
+        now = datetime.now(timezone.utc).isoformat()
+        enriched = sample_messages + [
+            {
+                "role": "user",
+                "content": "meu telefone é 11 98765-4321 e sinto muita dor",
+                "timestamp": now,
+            },
+        ]
+
+        full = summarizer.summarize(
+            session_id=session_id,
+            tenant_id=tenant_id,
+            messages=enriched,
+            reason=HandoffReason.USER_REQUEST,
+        )
+        assert "Contato:" in full.summary_text
+        assert "Sintomas mencionados:" in full.summary_text
+        assert "Motivo do encaminhamento:" in full.summary_text
+
+        reduced = summarizer.summarize(
+            session_id=session_id,
+            tenant_id=tenant_id,
+            messages=enriched,
+            reason=HandoffReason.USER_REQUEST,
+            omit_contact_symptoms_reason=True,
+        )
+        assert "Contato:" not in reduced.summary_text
+        assert "Sintomas mencionados:" not in reduced.summary_text
+        assert "Motivo do encaminhamento:" not in reduced.summary_text
+
 
 # ============================================
 # WebhookDispatcher Tests

@@ -11,8 +11,7 @@
 - [Templates Meta para follow-up](brainstorms/meta-templates-followup/DESIGN.md) - Infra de templates da Meta Cloud API para futuros agentes ativos de follow-up.
 
 ## Poured
-
-- [Retomada contextual da IA após handoff](wishes/handoff-contextual-resumption/WISH.md) - APPROVED; WRS 100/100, design e plano revisados em SHIP; execução aguarda `neurostack-core-dedomainification`.
+- [Retomada contextual da IA após handoff](wishes/handoff-contextual-resumption/WISH.md) - APPROVED; plan review SHIP em 2026-10-01 (fix loop 1/2) após council pós-merge de `neurostack-core-dedomainification` (B1 resolvida via PR #48) e emendas B2/A1–A8/D1–D3; pronto para `work`.
 - [Catálogo, ordem e disponibilidade pública das APIs](wishes/api-provider-catalog-presentation/WISH.md) - APPROVED; design e plano revisados em SHIP; `work` bloqueado até `stt-openrouter-scribe-activation`, `dropout-multimodal-fallback` e `tts-openai-provider` satisfazerem o gate pré-execução.
 - [SLA de atendimento confirmado no handoff](wishes/handoff-sla-first-human-response/WISH.md) - IN_PROGRESS; dependência `handoff-export-open-closed` mergeada em `origin/main` (`bfa18f8`), iniciando o Grupo 1 sobre worktree isolado.
 - [Extração do núcleo NeuroStack](wishes/neurostack-core-extraction/WISH.md) - IN_PROGRESS; execução e gate final SHIP concluídos, aguardando commit/PR/CI e merge autorizado; `neurostack-api` depende de `neurostack-core`, e o pacote de núcleo nunca importa a árvore `src` da API.
