@@ -380,13 +380,14 @@ async def checkout_handoff(
     summary="Export Handoffs CSV",
     description=(
         "Export handoffs whose created_at is within the requested clinic-local-date "
-        "window and whose current status is pending, accepted, completed with a "
-        "confirmation timestamp, or confirmed in_progress. The UTF-8 CSV columns, "
+        "window and whose current status is pending, accepted, in_progress, or "
+        "completed with a confirmation timestamp. The UTF-8 CSV columns, "
         "in order, are numero_whatsapp, session_id, created_at, data_hora_saida, "
         "tempo_espera_segundos, status, and exported_at. For pending and accepted "
-        "rows, data_hora_saida is empty and tempo_espera_segundos runs from "
-        "created_at to exported_at. For confirmed completed and in_progress rows, "
-        "tempo_espera_segundos runs from created_at to data_hora_saida. Timestamps "
+        "and unattended in_progress rows, data_hora_saida is empty and "
+        "tempo_espera_segundos runs from created_at to exported_at. For attended "
+        "in_progress and completed rows, tempo_espera_segundos runs from created_at "
+        "to data_hora_saida. Timestamps "
         "are emitted in UTC and exports over 10,000 rows are rejected."
     ),
     response_class=StreamingResponse,
@@ -423,11 +424,11 @@ async def export_handoffs_csv(
     """Export the handoff entry cohort, including open and completed waits.
 
     The requested inclusive dates filter created_at after conversion from the
-    clinic's IANA timezone to a semi-open UTC window. Current pending and accepted
-    states are open and use one export instant for their wait; confirmed completed
-    and in_progress rows use their recorded confirmation timestamp. Invalid requests
-    return max_window_90_days, invalid_date_range, invalid_handoff_timestamps,
-    or export_limit_10000_exceeded.
+    clinic's IANA timezone to a semi-open UTC window. Rows without a queue-exit
+    timestamp are open and use one export instant for their wait; attended
+    in_progress and completed rows use their recorded confirmation timestamp.
+    Invalid requests return max_window_90_days, invalid_date_range,
+    invalid_handoff_timestamps, or export_limit_10000_exceeded.
     """
     effective_tenant_id = await resolve_effective_tenant(
         request,
@@ -460,9 +461,9 @@ async def export_handoffs_csv(
             HandoffRecord.tenant_id == effective_tenant_id,
             HandoffRecord.created_at >= resolved_period.start_utc,
             HandoffRecord.created_at < resolved_period.end_exclusive_utc,
-            HandoffRecord.status.in_(["pending", "accepted"])
+            HandoffRecord.status.in_(["pending", "accepted", "in_progress"])
             | (
-                HandoffRecord.status.in_(["in_progress", "completed"])
+                (HandoffRecord.status == "completed")
                 & HandoffRecord.data_hora_saida.isnot(None)
             ),
         )
@@ -488,7 +489,7 @@ async def export_handoffs_csv(
 
     for _, _, created_at_value, checked_out_at_value, handoff_status in records:
         created_at = as_utc(created_at_value)
-        if handoff_status in {"pending", "accepted"}:
+        if handoff_status in {"pending", "accepted"} or checked_out_at_value is None:
             invalid_timestamp_order = created_at > exported_at
         else:
             invalid_timestamp_order = (
@@ -523,7 +524,9 @@ async def export_handoffs_csv(
         handoff_status,
     ) in records:
         created_at = as_utc(created_at_value)
-        is_open = handoff_status in {"pending", "accepted"}
+        is_open = (
+            handoff_status in {"pending", "accepted"} or checked_out_at_value is None
+        )
         checked_out_at = None
         if not is_open and checked_out_at_value is not None:
             checked_out_at = as_utc(checked_out_at_value)
