@@ -259,6 +259,13 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
         checked_out_at=datetime(2026, 1, 10, 10, 31, 0, 500000, tzinfo=timezone.utc),
         phone="confirmed-in-progress",
     )
+    unconfirmed_in_progress = _handoff(
+        tenant.id,
+        session.id,
+        created_at=datetime(2026, 1, 10, 12, tzinfo=timezone.utc),
+        status="in_progress",
+        phone="unconfirmed-in-progress",
+    )
     excluded = [
         _handoff(
             tenant.id,
@@ -266,13 +273,6 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
             created_at=datetime(2026, 1, 10, 11, tzinfo=timezone.utc),
             status="completed",
             phone="completed-without-checkout",
-        ),
-        _handoff(
-            tenant.id,
-            session.id,
-            created_at=datetime(2026, 1, 10, 12, tzinfo=timezone.utc),
-            status="in_progress",
-            phone="unconfirmed-in-progress",
         ),
         _handoff(
             tenant.id,
@@ -319,6 +319,7 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
         accepted,
         completed,
         confirmed_in_progress,
+        unconfirmed_in_progress,
         *excluded,
     )
 
@@ -337,6 +338,7 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
     )
     _, rows = _csv_rows(response)
     assert [row["numero_whatsapp"] for row in rows] == [
+        "unconfirmed-in-progress",
         "confirmed-in-progress",
         "accepted",
         "completed-after-window",
@@ -344,18 +346,21 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
     ]
     assert [row["status"] for row in rows] == [
         "in_progress",
+        "in_progress",
         "accepted",
         "completed",
         "pending",
     ]
-    assert rows[0]["tempo_espera_segundos"] == "60.5"
-    assert rows[1]["tempo_espera_segundos"] == "180000.0"
-    assert rows[2]["tempo_espera_segundos"] == "86430.3"
-    assert rows[3]["tempo_espera_segundos"] == "187199.6"
-    assert rows[0]["data_hora_saida"] == "2026-01-10T10:31:00.500000+00:00"
-    assert rows[1]["data_hora_saida"] == ""
-    assert rows[3]["data_hora_saida"] == ""
-    assert rows[2]["data_hora_saida"] == "2026-01-11T09:00:30.260000+00:00"
+    assert rows[0]["tempo_espera_segundos"] == "172800.0"
+    assert rows[1]["tempo_espera_segundos"] == "60.5"
+    assert rows[2]["tempo_espera_segundos"] == "180000.0"
+    assert rows[3]["tempo_espera_segundos"] == "86430.3"
+    assert rows[4]["tempo_espera_segundos"] == "187199.6"
+    assert rows[0]["data_hora_saida"] == ""
+    assert rows[1]["data_hora_saida"] == "2026-01-10T10:31:00.500000+00:00"
+    assert rows[2]["data_hora_saida"] == ""
+    assert rows[4]["data_hora_saida"] == ""
+    assert rows[3]["data_hora_saida"] == "2026-01-11T09:00:30.260000+00:00"
     assert all(row["created_at"].endswith("+00:00") for row in rows)
     assert {row["exported_at"] for row in rows} == {"2026-01-12T12:00:00+00:00"}
     assert now_calls == 1
