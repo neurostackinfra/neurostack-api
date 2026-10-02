@@ -12,11 +12,11 @@ import time as _time
 from collections import OrderedDict as _OrderedDict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.middleware.rate_limit import (
@@ -26,10 +26,19 @@ from src.api.middleware.rate_limit import (
 from src.api.schemas.events import EventPayload, EventRequest, EventType
 from src.config.settings import settings
 from src.core.lgpd_utils import resolve_privacy_link
+from src.handoff.episode_context import (
+    build_prior_episode_context,
+    project_resume_state,
+)
 from src.handoff.pause_policy import resolve_handoff_pause
 from src.models.clinic_config_table import ClinicConfigTable
+from src.models.event import Event as EventModel
 from src.models.tenant import Tenant as TenantModel
-from src.repositories import SessionRepository, get_db_session_dependency
+from src.repositories import (
+    EventRepository,
+    SessionRepository,
+    get_db_session_dependency,
+)
 from src.services.api_credentials import OPERATIONAL_MULTIMODAL_PROVIDERS
 from src.services.event_service import get_event_service
 from src.services.meta_service import (
@@ -957,12 +966,71 @@ async def _load_handoff_config(
     return loaded if loaded is not None else {}
 
 
+async def _load_ai_person_history(
+    tenant_id: UUID,
+    session_id: UUID,
+    db: AsyncSession,
+    *,
+    limit: int = 20,
+) -> list[dict[str, str]]:
+    """Load the last ``limit`` ai/person events for a session as role/content dicts.
+
+    Mirrors ``EventService._load_message_history`` (bounded to 20 by default,
+    ``message.in`` -> ``user``, ``prompt.generated`` -> ``assistant``) so the
+    pause/reactivation composers in this module see exactly the same input shape
+    as the pipeline composer. Returns ``[]`` on any error so composition can
+    fall back to the neutral episode context without failing the webhook.
+    """
+    try:
+        stmt = (
+            select(EventModel)
+            .where(
+                EventModel.session_id == session_id,
+                EventModel.tenant_id == tenant_id,
+                or_(
+                    EventModel.event_type == "message.in",
+                    EventModel.event_type == "prompt.generated",
+                ),
+            )
+            .order_by(EventModel.created_at.desc())
+            .limit(limit)
+        )
+        result = await db.execute(stmt)
+        events = list(result.scalars().all())
+        events.reverse()  # chronological order
+        history: list[dict[str, str]] = []
+        for e in events:
+            if (e.event_metadata or {}).get("paused_capture"):
+                continue
+            data = e.event_data or {}
+            if e.event_type == "message.in":
+                content = data.get("content", "")
+                if content:
+                    history.append({"role": "user", "content": content})
+            elif e.event_type == "prompt.generated":
+                resp = data.get("suggested_response", "")
+                if resp:
+                    history.append({"role": "assistant", "content": resp})
+        return history
+    except Exception as exc:
+        logger.warning(
+            "Failed to load ai/person history for pause composer",
+            extra={
+                "tenant_id": str(tenant_id),
+                "session_id": str(session_id),
+                "error": str(exc),
+            },
+        )
+        return []
+
+
 async def _check_pause_state(
     tenant_id: UUID,
     phone: str,
     db: AsyncSession,
     *,
     now: datetime | None = None,
+    message_text: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """Check if session is paused. Returns action dict or None to continue.
 
@@ -995,20 +1063,80 @@ async def _check_pause_state(
     ):
         comparable_deadline = comparable_deadline.replace(tzinfo=current_time.tzinfo)
     if comparable_deadline and comparable_deadline <= current_time:
-        session.is_paused = False
-        session.paused_until = None
-        await db.flush()
+        # Auto-reactivation CAS (wish deliverables 6 + 10/A1): project a fresh
+        # resume state with a brand-new episode id and let
+        # reactivate_effective_auto flip is_paused/paused_until and overwrite
+        # cognitive_state in a single UPDATE. The episode id is generated once
+        # here so retries inside the repository loop reuse the same uuid (A3).
+        prior_state = session.get_cognitive_state()
+        new_episode_id = uuid4()
+        projected = project_resume_state(
+            prior_state,
+            context_episode_id=str(new_episode_id),
+            prior_episode_context=getattr(prior_state, "prior_episode_context", None),
+        )
+        outcome = await repo.reactivate_effective_auto(
+            tenant_id=tenant_id,
+            session_id=session.id,
+            new_cognitive_state=projected.to_dict(),
+            new_episode_id=new_episode_id,
+            now=current_time,
+        )
+        if outcome == "reactivated":
+            # Winner: refresh identity-mapped attributes so downstream code in
+            # the same request sees the post-CAS state (A1).
+            await db.refresh(
+                session,
+                attribute_names=["cognitive_state", "is_paused", "paused_until"],
+            )
+            logger.info(
+                "session_auto_unpause",
+                extra={
+                    "session_id": str(session.id),
+                    "tenant_id": str(tenant_id),
+                    "phone": phone,
+                    "outcome": outcome,
+                },
+            )
+            return None  # Continue processing
+        # Non-winner (already_active / not_yet_expired / superseded_session /
+        # not_found / reactivation_conflict): fall through to the still-paused
+        # skip-response behavior below. Do not fail the webhook.
         logger.info(
-            "session_auto_unpause",
+            "session_auto_unpause_non_winner",
             extra={
                 "session_id": str(session.id),
                 "tenant_id": str(tenant_id),
-                "phone": phone,
+                "field": "cognitive_state",
+                "outcome": outcome,
             },
         )
-        return None  # Continue processing
 
     # Still paused
+    if message_text:
+        try:
+            await EventRepository(db).create(
+                tenant_id=tenant_id,
+                session_id=session.id,
+                event_type=EventType.MESSAGE_IN.value,
+                event_data={
+                    "content": message_text,
+                    "channel": "whatsapp",
+                    "user_id": phone,
+                    "role": "user",
+                },
+                event_metadata={"paused_capture": True},
+            )
+        except Exception as exc:
+            # Never fail the webhook over a best-effort audit write (D2).
+            logger.warning(
+                "Failed to persist paused-capture message event",
+                extra={
+                    "tenant_id": str(tenant_id),
+                    "session_id": str(session.id),
+                    "error": str(exc),
+                },
+            )
     logger.info(
         "message_skipped_paused",
         extra={
@@ -1184,25 +1312,64 @@ async def _handle_clinic_message(
     if session.is_paused:
         return {"ok": True, "action": "already_paused"}
 
-    # Human takeover: pause session (no mark-unread — secretary is in conversation)
-    session.is_paused = True
-    session.paused_until = decision.paused_until
+    # Human takeover: compose the prior_episode_context from AI/person events
+    # ONLY (no current message — this is a fromMe clinic message, never a
+    # patient turn), merge it onto the current cognitive state, and route the
+    # pause write through the single tenant-scoped CAS so an AI-handoff pause
+    # racing against this takeover does not last-writer-wins (D13/A2).
+    ai_person_events = await _load_ai_person_history(
+        tenant_id, session.id, db, limit=20
+    )
+    prior_context = build_prior_episode_context(
+        tenant_id=tenant_id,
+        session_id=session.id,
+        events=ai_person_events,
+        current_message=None,
+    )
+    cognitive = session.get_cognitive_state()
+    cognitive.prior_episode_context = prior_context
 
-    await db.flush()
+    outcome = await repo.pause_effective(
+        tenant_id,
+        session.id,
+        cognitive_state=cognitive.to_dict(),
+        paused_until=decision.paused_until,
+    )
+
+    if outcome == "paused":
+        await db.refresh(
+            session,
+            attribute_names=["cognitive_state", "is_paused", "paused_until"],
+        )
+        logger.info(
+            "session_paused",
+            extra={
+                "event": "session_paused",
+                "reason": "human_takeover",
+                "session_id": str(session.id),
+                "tenant_id": str(tenant_id),
+                "phone": phone,
+                "paused_until": (
+                    session.paused_until.isoformat() if session.paused_until else None
+                ),
+            },
+        )
+        return {"ok": True, "action": "human_takeover"}
+
+    # Non-winner outcomes (already_paused, superseded_session, not_found):
+    # another writer already paused this row — surface the existing
+    # already_paused action without failing the webhook, and never overwrite
+    # the concurrent winner's cognitive_state.
     logger.info(
-        "session_paused",
+        "session_pause_cas_non_winner",
         extra={
-            "event": "session_paused",
-            "reason": "human_takeover",
             "session_id": str(session.id),
             "tenant_id": str(tenant_id),
-            "phone": phone,
-            "paused_until": (
-                session.paused_until.isoformat() if session.paused_until else None
-            ),
+            "field": "cognitive_state",
+            "outcome": outcome,
         },
     )
-    return {"ok": True, "action": "human_takeover"}
+    return {"ok": True, "action": "already_paused"}
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1959,7 +2126,9 @@ async def _process_zapi_authenticated_body(
         return JSONResponse(status_code=202, content=bot_skip)
 
     # ── pause check for patient messages ──
-    pause_result = await _check_pause_state(tenant_id, phone, db)
+    pause_result = await _check_pause_state(
+        tenant_id, phone, db, message_text=message_text
+    )
     if pause_result:
         await db.commit()
         return JSONResponse(status_code=202, content=pause_result)
@@ -2234,7 +2403,9 @@ async def evolution_webhook(
         return JSONResponse(status_code=202, content=bot_skip)
 
     # ── pause check for patient messages ──
-    pause_result = await _check_pause_state(tenant_id, phone, db)
+    pause_result = await _check_pause_state(
+        tenant_id, phone, db, message_text=message_text
+    )
     if pause_result:
         await db.commit()
         return JSONResponse(status_code=202, content=pause_result)
@@ -2694,7 +2865,9 @@ async def uazapi_webhook(
         return JSONResponse(status_code=202, content=bot_skip)
 
     # ── pause check for patient messages ──
-    pause_result = await _check_pause_state(tenant_id, from_phone, db)
+    pause_result = await _check_pause_state(
+        tenant_id, from_phone, db, message_text=message_text
+    )
     if pause_result:
         await db.commit()
         return JSONResponse(status_code=202, content=pause_result)
@@ -3362,7 +3535,21 @@ async def meta_webhook(
                 return JSONResponse(status_code=202, content=bot_skip)
 
             # ── pause check for patient messages ──
-            pause_result = await _check_pause_state(tenant_id, from_phone, db)
+            # D2: best-effort text extraction so a plain-text message received
+            # during pause can still be captured with retention. Non-text types
+            # (audio/image/document/video/sticker) are intentionally left
+            # uncaptured here — resolving them requires a network round-trip
+            # (media download/STT) that should not run against an already-
+            # paused session; this is an accepted scope boundary, not a
+            # regression (they were never captured before).
+            _pause_check_text: Optional[str] = None
+            if msg_type == "text":
+                _pause_check_text = (msg.get("text") or {}).get(
+                    "body", ""
+                ).strip() or None
+            pause_result = await _check_pause_state(
+                tenant_id, from_phone, db, message_text=_pause_check_text
+            )
             if pause_result:
                 await db.commit()
                 return JSONResponse(status_code=202, content=pause_result)

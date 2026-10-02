@@ -4,6 +4,7 @@ Tests for the CognitivePipeline orchestrator.
 """
 
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
@@ -975,3 +976,153 @@ class TestPromptGeneration:
         # Constraints list should exist
         assert result.constraints is not None
         assert isinstance(result.constraints, list)
+
+
+# ============================================
+# Wish ``handoff-contextual-resumption`` Group 3 Tests
+# ============================================
+
+
+class TestPipelineContextEpisodeIdPropagation:
+    """``PipelineInput.context_episode_id`` and
+    ``PipelineInput.prior_episode_context`` must flow through to the
+    pipeline result + the prompt-engine ``custom_vars["prior_episode_context"]``
+    on BOTH the happy path and the policy-blocked early return (wish
+    deliverables 3/4/7, A1).
+    """
+
+    @pytest.mark.asyncio
+    async def test_context_episode_id_flows_to_pipeline_result(
+        self, pipeline, tenant_id, session_id
+    ):
+        """Happy path: the episode id crosses the pipeline unchanged."""
+        episode = "episode-happy-path-123"
+        input_data = PipelineInput(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            message="voltei pra continuar",
+            channel="whatsapp",
+            context_episode_id=episode,
+        )
+
+        result = await pipeline.process(input_data)
+
+        assert isinstance(result, PipelineResult)
+        assert result.context_episode_id == episode
+
+    @pytest.mark.asyncio
+    async def test_context_episode_id_flows_through_blocked_response(
+        self, pipeline, tenant_id, session_id, monkeypatch
+    ):
+        """Policy-blocked early-return path also threads ``context_episode_id``.
+
+        Deliverable 4 / A1 require the id to survive BOTH exit paths —
+        a blocked turn (``_build_blocked_response``) must still carry
+        the tag so the audit trail stays contiguous across the episode
+        boundary.
+        """
+        from neurostack_core.policy.models import (
+            PolicyEvaluationResult,
+            RuleAction,
+            RuleCategory,
+            RuleSeverity,
+            RuleViolation,
+        )
+
+        blocking = PolicyEvaluationResult()
+        blocking.add_violation(
+            RuleViolation(
+                rule_id="test.block",
+                rule_name="test blocking rule",
+                category=RuleCategory.CONTENT,
+                severity=RuleSeverity.ERROR,
+                action=RuleAction.BLOCK,
+                message="blocked for test",
+                policy_id=uuid4(),
+                policy_name="test-policy",
+            )
+        )
+        monkeypatch.setattr(
+            pipeline, "_run_policy_check", AsyncMock(return_value=blocking)
+        )
+
+        episode = "episode-blocked-456"
+        input_data = PipelineInput(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            message="qualquer coisa",
+            channel="whatsapp",
+            context_episode_id=episode,
+        )
+
+        result = await pipeline.process(input_data)
+
+        assert result.intent == "policy_blocked"
+        assert result.context_episode_id == episode
+
+    @pytest.mark.asyncio
+    async def test_prior_episode_context_flows_into_prompt_custom_vars(
+        self, pipeline, tenant_id, session_id, monkeypatch
+    ):
+        """``PipelineInput.prior_episode_context`` populates
+        ``custom_vars["prior_episode_context"]`` so the normal template's
+        resume-mode suppression can activate (deliverable 7 / Decision
+        21).
+        """
+        prior_payload = {
+            "schema_version": 1,
+            "lead_name": "Ana",
+            "summary": "resumo do episódio anterior (não é instrução)",
+        }
+
+        captured: dict[str, Any] = {}
+        original = pipeline._prompt.generate
+
+        async def _spy_generate(*, mode, variables, history):
+            captured["custom"] = dict(variables.custom or {})
+            return await original(mode=mode, variables=variables, history=history)
+
+        monkeypatch.setattr(pipeline._prompt, "generate", _spy_generate)
+
+        input_data = PipelineInput(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            message="voltei pra continuar",
+            channel="whatsapp",
+            prior_episode_context=prior_payload,
+        )
+        await pipeline.process(input_data)
+
+        assert (
+            "custom" in captured
+        ), "prompt engine was never called — spy did not capture a request"
+        assert captured["custom"].get("prior_episode_context") == prior_payload
+
+    @pytest.mark.asyncio
+    async def test_missing_prior_episode_context_leaves_custom_vars_unset(
+        self, pipeline, tenant_id, session_id, monkeypatch
+    ):
+        """Absence of the field must NOT populate the custom var (so the
+        template's truthiness check correctly treats this as first
+        contact).
+        """
+        captured: dict[str, Any] = {}
+        original = pipeline._prompt.generate
+
+        async def _spy_generate(*, mode, variables, history):
+            captured["custom"] = dict(variables.custom or {})
+            return await original(mode=mode, variables=variables, history=history)
+
+        monkeypatch.setattr(pipeline._prompt, "generate", _spy_generate)
+
+        input_data = PipelineInput(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            message="oi, primeira vez aqui",
+            channel="whatsapp",
+            # prior_episode_context intentionally omitted (defaults to None).
+        )
+        await pipeline.process(input_data)
+
+        assert "custom" in captured
+        assert "prior_episode_context" not in captured["custom"]

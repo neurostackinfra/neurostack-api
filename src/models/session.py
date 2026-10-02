@@ -47,6 +47,8 @@ class CognitiveStateData:
         first_contact_at: Optional[str] = None,
         pos_atendimento_started_at: Optional[str] = None,
         last_message_at: Optional[str] = None,
+        context_episode_id: Optional[str] = None,
+        prior_episode_context: Optional[dict[str, Any]] = None,
     ):
         self.funnel_stage = funnel_stage
         self.intent_history = intent_history or []
@@ -67,6 +69,8 @@ class CognitiveStateData:
         self.first_contact_at = first_contact_at
         self.pos_atendimento_started_at = pos_atendimento_started_at
         self.last_message_at = last_message_at
+        self.context_episode_id = context_episode_id
+        self.prior_episode_context = prior_episode_context
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON storage (UserState completo)."""
@@ -92,11 +96,18 @@ class CognitiveStateData:
                 self, "pos_atendimento_started_at", None
             ),
             "last_message_at": getattr(self, "last_message_at", None),
+            "context_episode_id": getattr(self, "context_episode_id", None),
+            "prior_episode_context": getattr(self, "prior_episode_context", None),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CognitiveStateData":
-        """Create from dictionary (UserState completo)."""
+        """Create from dictionary (UserState completo).
+
+        Compatible with legacy rows that lack ``context_episode_id`` or
+        ``prior_episode_context``; both default to ``None`` and the resulting
+        ``to_dict`` always re-emits every existing field unchanged.
+        """
         return cls(
             funnel_stage=data.get("funnel_stage", "lead_novo"),
             intent_history=data.get("intent_history", []),
@@ -117,6 +128,8 @@ class CognitiveStateData:
             first_contact_at=data.get("first_contact_at"),
             pos_atendimento_started_at=data.get("pos_atendimento_started_at"),
             last_message_at=data.get("last_message_at"),
+            context_episode_id=data.get("context_episode_id"),
+            prior_episode_context=data.get("prior_episode_context"),
         )
 
     def add_intent(self, intent: str) -> None:

@@ -48,6 +48,7 @@ from src.ctx.models import (
     MessageRole,
 )
 from src.ctx.orchestrator import ContextOrchestrator, get_context_orchestrator
+from src.handoff.episode_context import build_prior_episode_context
 from src.handoff.models import (
     HandoffReason,
     HandoffRequest,
@@ -169,6 +170,23 @@ class PipelineInput(BaseModel):
     user_state: Optional[dict[str, JsonValue]] = None
     # Response language code (pt-BR default to preserve existing behavior)
     language: str = "pt-BR"
+    # Current conversational episode id — set by the caller (event service)
+    # from the durable session row (CognitiveStateData.context_episode_id).
+    # ``None`` on legacy sessions that never reactivated; after the first
+    # reactivation this UUID string flows through the pipeline, the
+    # FlowManager and both terminal result constructions so each worker
+    # and each LLM request can treat the prior episode as memory only.
+    context_episode_id: Optional[str] = None
+    # Stored prior_episode_context carried from the session's cognitive_state
+    # on the TURN AFTER reactivation. The event service threads it from
+    # ``CognitiveStateData.prior_episode_context`` so the prompt template
+    # (``NormalTemplate.get_system_prompt`` / ``get_context_instructions``)
+    # can treat its presence as the resume signal and suppress the two
+    # first-contact instructions (wish deliverable 7 / Decision 21). This
+    # is independent of the ``prior_episode_context`` composed inside the
+    # pipeline when the current turn pauses — that one is written back to
+    # the session via ``PipelineResult.prior_episode_context``.
+    prior_episode_context: Optional[dict[str, Any]] = None
 
 
 class PipelineResult(BaseModel):
@@ -223,6 +241,17 @@ class PipelineResult(BaseModel):
     # Pause (set by handoff engine when session should be paused)
     should_pause: bool = False
     paused_until: Optional[str] = None  # ISO datetime string or None (permanent)
+    # Candidate prior_episode_context composed by the pipeline when the turn
+    # pauses the session. The event service persists it atomically inside the
+    # pause CAS (see src.repositories.session.SessionRepository.pause_effective
+    # and WISH deliverables 2/9/A2). ``None`` when the turn does not pause.
+    prior_episode_context: Optional[dict[str, Any]] = None
+    # Durable episode id carried through the turn (threaded from
+    # ``PipelineInput.context_episode_id``). The event service tags the
+    # ``message.in``/``prompt.generated`` events with this value so the
+    # episode-equality filter in ``_load_message_history`` can draw the
+    # boundary without erasing the audit trail (wish deliverables 1/2).
+    context_episode_id: Optional[str] = None
 
     # Effective modality slot after merging state_patch with prior state
     # (convenio-particular-triage) — populated by the pipeline so the
@@ -318,7 +347,10 @@ class CognitivePipeline:
             # If message is blocked by policy, return early
             if policy_result.should_block:
                 return self._build_blocked_response(
-                    input_data, policy_result, stage_timings
+                    input_data,
+                    policy_result,
+                    stage_timings,
+                    context_episode_id=input_data.context_episode_id,
                 )
 
             # Stage 2: SRM Processing
@@ -356,6 +388,7 @@ class CognitivePipeline:
             handoff_response = None
             should_pause = False
             paused_until_iso: Optional[str] = None
+            prior_episode_context: Optional[dict[str, Any]] = None
             deterministic_response: Optional[str] = None
             verification_status = getattr(
                 srm_decision, "handoff_verification_status", None
@@ -387,6 +420,17 @@ class CognitivePipeline:
                     should_pause, paused_until_iso = await self._apply_handoff_pause(
                         input_data
                     )
+                    if should_pause:
+                        # Compose the bounded, PII-free prior_episode_context
+                        # candidate so the event service can persist it inside
+                        # the single pause CAS. Never raises (fallback neutral
+                        # object documented in build_prior_episode_context).
+                        prior_episode_context = build_prior_episode_context(
+                            tenant_id=input_data.tenant_id,
+                            session_id=input_data.session_id,
+                            events=input_data.message_history,
+                            current_message=input_data.message,
+                        )
 
                 stage_timings["handoff"] = (time.perf_counter() - stage_start) * 1000
             elif verification_status in ("concluiu", "nao_concluiu"):
@@ -414,6 +458,13 @@ class CognitivePipeline:
                 should_pause, paused_until_iso = await self._apply_handoff_pause(
                     input_data
                 )
+                if should_pause:
+                    prior_episode_context = build_prior_episode_context(
+                        tenant_id=input_data.tenant_id,
+                        session_id=input_data.session_id,
+                        events=input_data.message_history,
+                        current_message=input_data.message,
+                    )
                 logger.info(
                     "scheduling_link_verified",
                     tenant_id=str(input_data.tenant_id),
@@ -429,6 +480,14 @@ class CognitivePipeline:
             # Build final result
             total_time = int((time.perf_counter() - start_time) * 1000)
 
+            # Resumed-session outbound framing (wish deliverable 3, Decision 9): a
+            # continuing turn doesn't compose a new candidate (that only happens on
+            # the pause branch above), but the context stored at turn start must
+            # still carry forward so event_service.py's outbound-array framing can
+            # see it on turns that don't re-pause.
+            if prior_episode_context is None:
+                prior_episode_context = input_data.prior_episode_context
+
             result = self._build_result(
                 input_data=input_data,
                 srm_decision=srm_decision,
@@ -442,6 +501,8 @@ class CognitivePipeline:
                 should_pause=should_pause,
                 paused_until=paused_until_iso,
                 deterministic_response=deterministic_response,
+                prior_episode_context=prior_episode_context,
+                context_episode_id=input_data.context_episode_id,
             )
 
             # Record metrics
@@ -543,6 +604,11 @@ class CognitivePipeline:
             needs_rag=srm_decision.needs_rag,
             turn_count=input_data.turn_count,
             message=input_data.message,
+            # Propagate the durable episode id so FlowManager's single
+            # entry per session_id can detect a mismatch and reset
+            # itself atomically — any worker observing the new id
+            # drops a stale HANDOFF cache (wish deliverable 4).
+            context_episode_id=input_data.context_episode_id,
         )
 
         return await self._flow.process(flow_context)
@@ -620,6 +686,14 @@ class CognitivePipeline:
 
         # Build custom variables from clinic_config (identity, services, pricing, etc.)
         custom_vars: dict[str, Any] = {}
+        # Expose the stored prior_episode_context (set only on the turn
+        # AFTER a reactivation) so the normal prompt template can treat its
+        # presence as the resume signal and suppress the two first-contact
+        # instructions (wish deliverable 7 / Decision 21). Legacy / first-
+        # contact turns never populate this and the template continues to
+        # render both instructions unchanged.
+        if input_data.prior_episode_context:
+            custom_vars["prior_episode_context"] = input_data.prior_episode_context
         if input_data.clinic_config:
             cfg = input_data.clinic_config
             identity = _json_object(cfg.get("identity"))
@@ -1137,6 +1211,7 @@ class CognitivePipeline:
         input_data: PipelineInput,
         policy_result: PolicyEvaluationResult,
         stage_timings: dict[str, float],
+        context_episode_id: Optional[str] = None,
     ) -> PipelineResult:
         """Build a response for blocked messages."""
         violation = policy_result.violations[0] if policy_result.violations else None
@@ -1162,6 +1237,7 @@ class CognitivePipeline:
             mode="safety",
             processing_time_ms=int(sum(stage_timings.values())),
             stage_timings=stage_timings,
+            context_episode_id=context_episode_id,
         )
 
     def _build_result(
@@ -1178,6 +1254,8 @@ class CognitivePipeline:
         should_pause: bool = False,
         paused_until: Optional[str] = None,
         deterministic_response: Optional[str] = None,
+        prior_episode_context: Optional[dict[str, Any]] = None,
+        context_episode_id: Optional[str] = None,
     ) -> PipelineResult:
         """Build the final pipeline result."""
         # Extract prompt messages
@@ -1309,6 +1387,8 @@ class CognitivePipeline:
             handoff_user_message=handoff_user_message,
             should_pause=should_pause,
             paused_until=paused_until,
+            prior_episode_context=prior_episode_context,
+            context_episode_id=context_episode_id,
             atendimento_tipo=(
                 _effective_tipo if isinstance(_effective_tipo, str) else None
             ),

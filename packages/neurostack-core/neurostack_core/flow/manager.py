@@ -92,10 +92,14 @@ class FlowManager:
         """
         start_time = time.perf_counter()
 
-        # Get or create session state
+        # Get or create session state. The context_episode_id is threaded
+        # by the pipeline so the manager can replace a stale per-session
+        # cache atomically when a reactivation happened elsewhere
+        # (wish deliverable 4 / Decision 10).
         state = self._get_or_create_state(
             context.session_id,
             context.tenant_id,
+            context.context_episode_id,
         )
 
         # Update context with current mode
@@ -241,13 +245,63 @@ class FlowManager:
         self,
         session_id: UUID,
         tenant_id: UUID,
+        context_episode_id: Optional[str] = None,
     ) -> FlowState:
-        """Get or create flow state for a session."""
-        if session_id not in self._states:
+        """Get or create flow state for a session.
+
+        Episode-aware single-entry cache (wish deliverable 4, Decision 10):
+
+        * No cached state → create a fresh NORMAL state carrying
+          ``context_episode_id`` and store it under ``session_id``.
+        * Cached state's ``context_episode_id`` matches the incoming id
+          (including the legacy ``None == None`` case) → reuse the entry
+          as-is so HANDOFF / RAG / SAFETY mode persistence survives.
+        * Cached state's ``context_episode_id`` differs — including the
+          ``None → <uuid>`` first-reactivation transition, the
+          ``<uuid-A> → <uuid-B>`` cross-worker reactivation, and the
+          symmetric ``<uuid> → None`` case — the entry is REPLACED
+          atomically by a fresh NORMAL state tagged with the new id.
+          Replacement is a single dict assignment so size per
+          ``session_id`` stays one and the stale HANDOFF cache never
+          leaks across the episode boundary.
+        """
+        cached = self._states.get(session_id)
+        if cached is None:
+            # First touch for this session — stamp with the current id so
+            # the next turn can detect a mismatch.
             self._states[session_id] = FlowState(
                 session_id=session_id,
                 tenant_id=tenant_id,
+                context_episode_id=context_episode_id,
             )
+            return self._states[session_id]
+
+        if cached.context_episode_id == context_episode_id:
+            return cached
+
+        # Episode mismatch — a reactivation landed on another worker (or
+        # on this one between calls). Replace the single cached entry
+        # atomically with a fresh NORMAL state so no HANDOFF / RAG /
+        # SAFETY mode from the prior episode survives into the new one.
+        # ID-only log: never dump the raw cached state (which can carry
+        # user-visible transition reasons) — only the booleans / ids
+        # needed to audit the boundary cross cleanly (deliverable 6).
+        logger.info(
+            "flow_manager_episode_boundary_reset",
+            extra={
+                "session_id": str(session_id),
+                "tenant_id": str(tenant_id),
+                "had_cached_entry": True,
+                "cached_had_episode_tag": cached.context_episode_id is not None,
+                "incoming_has_episode_tag": context_episode_id is not None,
+                "previous_mode": cached.current_mode.value,
+            },
+        )
+        self._states[session_id] = FlowState(
+            session_id=session_id,
+            tenant_id=tenant_id,
+            context_episode_id=context_episode_id,
+        )
         return self._states[session_id]
 
     def _build_decision_reason(
@@ -323,6 +377,7 @@ async def process_flow(
     needs_rag: bool = False,
     turn_count: int = 0,
     metadata: Optional[dict[str, Any]] = None,
+    context_episode_id: Optional[str] = None,
 ) -> FlowDecision:
     """
     Convenience function for processing flow.
@@ -340,6 +395,8 @@ async def process_flow(
         needs_rag: Whether RAG is needed
         turn_count: Current turn count
         metadata: Additional metadata
+        context_episode_id: Durable episode id for the single-entry cache
+            replacement in :meth:`FlowManager._get_or_create_state`.
 
     Returns:
         FlowDecision
@@ -360,6 +417,7 @@ async def process_flow(
         turn_count=turn_count,
         message=message,
         metadata=metadata or {},
+        context_episode_id=context_episode_id,
     )
 
     return await manager.process(context)
