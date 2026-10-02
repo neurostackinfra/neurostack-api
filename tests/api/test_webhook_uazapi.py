@@ -275,10 +275,20 @@ async def test_takeover_matches_shared_policy_with_same_clock(
     tenant_id: UUID,
 ) -> None:
     now = datetime(2026, 9, 29, 14, 0, tzinfo=timezone.utc)
+    # NOTE: pause now flows through SessionRepository.pause_effective (CAS)
+    # instead of a raw ``session.is_paused = True`` + flush. The externally
+    # visible behavior under test (action/skipped) is preserved; the
+    # implementation-detail of which ORM attribute was written is replaced
+    # by observing the repo call and the "paused" classification.
+    pause_calls: list[dict[str, Any]] = []
     session = SimpleNamespace(
         id=uuid4(),
         is_paused=False,
         paused_until=None,
+        get_cognitive_state=lambda: SimpleNamespace(
+            prior_episode_context=None,
+            to_dict=lambda: {},
+        ),
     )
 
     class Repo:
@@ -288,13 +298,37 @@ async def test_takeover_matches_shared_policy_with_same_clock(
         async def find_by_user(self, **kwargs: Any) -> list[Any]:
             return [session]
 
+        async def pause_effective(
+            self,
+            tenant_id: UUID,
+            session_id: UUID,
+            *,
+            cognitive_state: dict[str, Any],
+            paused_until: Any,
+        ) -> str:
+            pause_calls.append(
+                {
+                    "tenant_id": tenant_id,
+                    "session_id": session_id,
+                    "paused_until": paused_until,
+                }
+            )
+            session.is_paused = True
+            session.paused_until = paused_until
+            return "paused"
+
     monkeypatch.setattr(webhook_module, "SessionRepository", Repo)
     monkeypatch.setattr(
         webhook_module,
         "_load_handoff_config",
         AsyncMock(return_value=bucket),
     )
-    db = SimpleNamespace(flush=AsyncMock())
+    monkeypatch.setattr(
+        webhook_module,
+        "_load_ai_person_history",
+        AsyncMock(return_value=[]),
+    )
+    db = SimpleNamespace(flush=AsyncMock(), refresh=AsyncMock())
 
     result = await webhook_module._handle_clinic_message(
         tenant_id,
@@ -305,13 +339,14 @@ async def test_takeover_matches_shared_policy_with_same_clock(
     )
     expected = resolve_handoff_pause(bucket, now)
 
-    assert session.is_paused is expected.should_pause
-    assert session.paused_until == expected.paused_until
     if expected.should_pause:
         assert result["action"] == "human_takeover"
-        db.flush.assert_awaited_once()
+        assert len(pause_calls) == 1
+        assert pause_calls[0]["paused_until"] == expected.paused_until
+        db.refresh.assert_awaited_once()
     else:
         assert result["skipped"] == "handoff_inactive"
+        assert pause_calls == []
         db.flush.assert_not_awaited()
 
 
@@ -334,10 +369,19 @@ async def test_lazy_unpause_before_at_and_after_deadline(
 ) -> None:
     deadline = datetime(2026, 9, 29, 15, 0, tzinfo=timezone.utc)
     stored_deadline = deadline.replace(tzinfo=None) if naive_deadline else deadline
+    # Auto-reactivation now routes through reactivate_effective_auto (CAS)
+    # instead of a raw ``session.is_paused = False`` + flush. The externally
+    # visible contract (returned skip-dict or None) is preserved; the test
+    # asserts the repo call rather than the ORM attribute mutation.
+    auto_calls: list[dict[str, Any]] = []
     session = SimpleNamespace(
         id=uuid4(),
         is_paused=True,
         paused_until=stored_deadline,
+        get_cognitive_state=lambda: SimpleNamespace(
+            prior_episode_context=None,
+            to_dict=lambda: {},
+        ),
     )
 
     class Repo:
@@ -347,8 +391,28 @@ async def test_lazy_unpause_before_at_and_after_deadline(
         async def find_by_user(self, **kwargs: Any) -> list[Any]:
             return [session]
 
+        async def reactivate_effective_auto(
+            self,
+            *,
+            tenant_id: UUID,
+            session_id: UUID,
+            new_cognitive_state: dict[str, Any],
+            new_episode_id: UUID,
+            now: datetime,
+        ) -> str:
+            auto_calls.append(
+                {
+                    "tenant_id": tenant_id,
+                    "session_id": session_id,
+                    "now": now,
+                }
+            )
+            session.is_paused = False
+            session.paused_until = None
+            return "reactivated"
+
     monkeypatch.setattr(webhook_module, "SessionRepository", Repo)
-    db = SimpleNamespace(flush=AsyncMock())
+    db = SimpleNamespace(flush=AsyncMock(), refresh=AsyncMock())
 
     result = await webhook_module._check_pause_state(
         tenant_id,
@@ -357,15 +421,17 @@ async def test_lazy_unpause_before_at_and_after_deadline(
         now=deadline + offset,
     )
 
-    assert session.is_paused is still_paused
     if still_paused:
         assert result == {"ok": True, "skipped": "session_paused"}
+        assert session.is_paused is True
         assert session.paused_until == stored_deadline
-        db.flush.assert_not_awaited()
+        assert auto_calls == []
     else:
         assert result is None
+        assert session.is_paused is False
         assert session.paused_until is None
-        db.flush.assert_awaited_once()
+        assert len(auto_calls) == 1
+        db.refresh.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -2290,6 +2356,198 @@ class TestUazapiFromMeHandoffInactive:
         assert resp.json() == {"ok": True, "skipped": "handoff_inactive"}
         row = _session_row(client, patient_session_id)
         assert row["is_paused"] is False
+
+
+def _patient_events(client: TestClient, session_id: UUID) -> list[dict[str, Any]]:
+    """Return every event row for a session as dicts, ordered by created_at.
+
+    Reads back through a *new* ``AsyncSession`` (mirrors ``_session_row``) so
+    assertions see the committed state rather than anything cached on the
+    request handler's own session.
+    """
+    from sqlalchemy import select
+
+    from src.models.event import Event as EventRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> list[dict[str, Any]]:
+        db = get_db_session()
+        try:
+            result = await db.execute(
+                select(EventRow)
+                .where(EventRow.session_id == session_id)
+                .order_by(EventRow.created_at)
+            )
+            rows = list(result.scalars().all())
+            return [
+                {
+                    "event_type": r.event_type,
+                    "event_data": dict(r.event_data or {}),
+                    "event_metadata": dict(r.event_metadata or {}),
+                }
+                for r in rows
+            ]
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+class TestUazapiPausedPatientMessageRetention:
+    """AC12 (D2): a patient message arriving mid-pause is retained, not
+    dropped, yet stays out of ``prior_episode_context``/the AI's automatic
+    history composer.
+
+    Before D2, ``_check_pause_state`` returned the ``session_paused`` skip
+    dict without writing anything — the message simply vanished. It now
+    persists a ``message.in`` event tagged ``paused_capture: True`` using the
+    session's existing event retention, while the externally visible skip
+    response is unchanged (non-regression check).
+    """
+
+    def _clear_state(self) -> None:
+        from src.api.routes import webhook as webhook_module
+
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+
+    def _pause_session(self, client: TestClient, session_id: UUID) -> None:
+        from sqlalchemy import update
+
+        from src.models.session import Session as SessionRow
+        from src.repositories.database import get_db_session
+
+        async def _run() -> None:
+            db = get_db_session()
+            try:
+                await db.execute(
+                    update(SessionRow)
+                    .where(SessionRow.id == session_id)
+                    .values(is_paused=True, paused_until=None)
+                )
+                await db.commit()
+            finally:
+                await db.close()
+
+        client._submit(_run())  # type: ignore[attr-defined]
+
+    def test_patient_message_persisted_during_pause(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        """AC12: the skip response is unchanged, but the message is now
+        persisted instead of silently dropped."""
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        patient_number = "5516994420699"
+        session_id = _create_session(client, tenant_id, patient_number)
+        self._pause_session(client, session_id)
+
+        message_text = "Oi, ainda estou esperando a resposta"
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone=patient_number,
+            body=message_text,
+            message_id=f"3EB0_paused_{uuid4().hex[:10]}",
+        )
+
+        resp = client.post(WEBHOOK_PATH, json=payload)
+
+        # Externally-visible contract is unchanged — only the internal
+        # persistence changed.
+        assert resp.status_code == 202, resp.text
+        assert resp.json() == {"ok": True, "skipped": "session_paused"}
+
+        events = _patient_events(client, session_id)
+        matching = [
+            e
+            for e in events
+            if e["event_type"] == "message.in"
+            and e["event_data"].get("content") == message_text
+        ]
+        assert matching, events
+        assert matching[0]["event_metadata"].get("paused_capture") is True
+
+    def test_paused_capture_message_excluded_from_ai_person_history(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        """AC12: the retained message stays out of the automatic AI context,
+        proven end-to-end against a message that went through the real
+        webhook route (not a hand-built ``Event``).
+
+        A sanity-control ordinary ``message.in`` event (no ``paused_capture``
+        flag) is seeded for the same session and must still surface in the
+        composer's output — proving the filter discriminates rather than the
+        history simply being empty.
+        """
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+
+        patient_number = "5516994420700"
+        session_id = _create_session(client, tenant_id, patient_number)
+        self._pause_session(client, session_id)
+
+        paused_message_text = "Alguém pode me responder, por favor?"
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone=patient_number,
+            body=paused_message_text,
+            message_id=f"3EB0_paused_ctx_{uuid4().hex[:10]}",
+        )
+
+        resp = client.post(WEBHOOK_PATH, json=payload)
+        assert resp.status_code == 202, resp.text
+        assert resp.json() == {"ok": True, "skipped": "session_paused"}
+
+        control_text = "Mensagem de controle sem paused_capture"
+
+        async def _seed_control() -> None:
+            from src.repositories import EventRepository
+            from src.repositories.database import get_db_session
+
+            db = get_db_session()
+            try:
+                await EventRepository(db).create(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    event_type="message.in",
+                    event_data={
+                        "content": control_text,
+                        "channel": "whatsapp",
+                        "user_id": patient_number,
+                        "role": "user",
+                    },
+                    event_metadata={},
+                )
+                await db.commit()
+            finally:
+                await db.close()
+
+        client._submit(_seed_control())  # type: ignore[attr-defined]
+
+        async def _load_history() -> list[dict[str, str]]:
+            from src.api.routes.webhook import _load_ai_person_history
+            from src.repositories.database import get_db_session
+
+            db = get_db_session()
+            try:
+                return await _load_ai_person_history(
+                    tenant_id, session_id, db, limit=20
+                )
+            finally:
+                await db.close()
+
+        history = client._submit(_load_history())  # type: ignore[attr-defined]
+
+        contents = [h.get("content") for h in history]
+        assert paused_message_text not in contents, history
+        assert control_text in contents, history
 
 
 class TestUazapiPatientMessageUnchanged:

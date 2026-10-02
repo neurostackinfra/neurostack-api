@@ -109,3 +109,17 @@ Manter todo o estado/histórico e acrescentar “não repita o handoff” ao pro
 - [ ] Reativação manual e automática produzem o mesmo estado conversacional efetivo.
 - [ ] Um novo motivo real de handoff após a retomada continua gerando handoff normalmente.
 - [ ] Histórico auditável anterior permanece disponível; a reinicialização afeta a condução futura, não os registros passados.
+
+## Revisão pós-council (2026-10-01)
+
+O plano original (WRS 100/100, design e wish plan revisados em SHIP) ficou `BLOCKED` em plan review por um council de cinco lentes depois que `neurostack-core-dedomainification` mergeou (PR #48, verificado por diff zero contra `origin/main`, não apenas por status `done`). O council identificou uma precondição bloqueante já resolvida (B1), uma colisão de gate ainda aberta (B2: `parity_tests_unchanged()` rejeitaria os arquivos de teste que este wish precisa tocar), oito emendas obrigatórias (A1–A8, principalmente sobre consistência do identity map ORM, escritor único na coluna `cognitive_state`, geração de UUID de episódio, resumo sem PII, e supressão do prompt de primeiro contato) e três decisões de design em aberto (D1–D3).
+
+Decisões humanas explícitas, registradas em `DESIGN.md` (linhas 14–16 da tabela de Decisions):
+
+- **D1 — timing do contexto:** manter o congelamento na pausa (não compor na reativação), mesmo pagando a disciplina adicional de escritor único e `refresh()`/`expire()` do identity map para eliminar A1/A2 por disciplina de implementação em vez de eliminá-los arquiteturalmente.
+- **D2 — mensagens do paciente durante a pausa:** passam a ser retidas com a retenção já existente da sessão (deixam de ser descartadas), mas continuam fora do contexto automático enviado à IA.
+- **D3 — tamanho da entrega:** permanece uma única entrega; todas as emendas A1–A8 e a exceção de gate B2 precisam estar resolvidas em `DESIGN.md` antes de uma nova revisão de plano, em vez de dividir em bug fix + feature de continuidade.
+
+A emenda B2 foi resolvida com uma exceção nomeada por arquivo (não por diretório) em `parity_tests_unchanged()` para `tests/flow/test_flow_manager.py`, e com a suite adversarial nova vivendo em `tests/srm/test_handoff_context_injection.py` — fora da árvore de `tests/srm/test_prompt_injection.py`, que é hoje `TestPromptConfigInjection` (paridade de configuração de clínica, não defesa de prompt injection). As emendas A1–A8 foram incorporadas ao `DESIGN.md` (seções "Escritor único e consistência do identity map", parágrafo de UUID/classificação em "Episódio novo na mesma sessão", parametrização do `ConversationSummarizer` e modo de saída sem PII em "Resumo bounded sem conversa humana", e caminho de funil de retomada em "Fronteira do histórico e prompt"), com critérios de aceite e riscos/mitigações correspondentes adicionados.
+
+Próximo passo: nova revisão de design independente sobre o `DESIGN.md` revisado, seguida de atualização do `WISH.md` e nova revisão de plano antes de reabrir execução.

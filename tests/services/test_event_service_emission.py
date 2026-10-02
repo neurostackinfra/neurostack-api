@@ -27,7 +27,12 @@ def _make_request(content: str) -> EventRequest:
     )
 
 
-def _make_result(request: EventRequest, slots: dict) -> PipelineResult:
+def _make_result(
+    request: EventRequest,
+    slots: dict,
+    *,
+    context_episode_id: str | None = None,
+) -> PipelineResult:
     return PipelineResult(
         tenant_id=request.tenant_id,
         session_id=request.session_id,
@@ -44,6 +49,7 @@ def _make_result(request: EventRequest, slots: dict) -> PipelineResult:
         instructions="inst",
         mode="normal",
         state_patch={"slots": slots},
+        context_episode_id=context_episode_id,
     )
 
 
@@ -97,3 +103,67 @@ class TestAtendimentoTipoSetEvent:
         tipo = _tipo_events(await _appended_events(request, result))
 
         assert tipo == []
+
+
+class TestContextEpisodeIdEventTagging:
+    """Wish ``handoff-contextual-resumption`` Group 3 deliverable 1 /
+    AC A1 — ``message.in`` and ``prompt.generated`` carry the current
+    ``context_episode_id`` in ``event_metadata`` without dropping any
+    existing field.
+    """
+
+    @pytest.mark.asyncio
+    async def test_message_in_metadata_tags_context_episode_id(self) -> None:
+        request = _make_request("oi")
+        episode = "episode-abc-123"
+        result = _make_result(request, {}, context_episode_id=episode)
+
+        events = await _appended_events(request, result)
+        message_in = next(e for e in events if e.event_type == "message.in")
+        md = message_in.event_metadata
+
+        assert md["context_episode_id"] == episode
+        # Existing fields must still be present — the tag is ADDED, not
+        # a replacement of the audit metadata.
+        for existing in (
+            "processing_time_ms",
+            "mode",
+            "safety_concern",
+            "handoff_required",
+            "intent",
+            "funnel_stage",
+            "llm_model",
+            "llm_usage",
+            "llm_attempts",
+            "llm_usage_total",
+        ):
+            assert existing in md, f"existing metadata field {existing!r} dropped"
+
+    @pytest.mark.asyncio
+    async def test_prompt_generated_metadata_tags_context_episode_id(self) -> None:
+        request = _make_request("oi")
+        episode = "episode-xyz-999"
+        result = _make_result(request, {}, context_episode_id=episode)
+
+        events = await _appended_events(request, result)
+        prompt_ev = next(e for e in events if e.event_type == "prompt.generated")
+        md = prompt_ev.event_metadata
+
+        assert md["context_episode_id"] == episode
+        # Existing prompt.generated metadata fields untouched.
+        for existing in ("processing_time_ms", "processed_at", "stage_timings"):
+            assert existing in md, f"existing metadata field {existing!r} dropped"
+
+    @pytest.mark.asyncio
+    async def test_legacy_untagged_result_persists_none_tag(self) -> None:
+        """Legacy sessions (no reactivation yet) persist ``None`` for the
+        tag — the audit trail is intact, just un-filterable."""
+        request = _make_request("oi")
+        result = _make_result(request, {})  # context_episode_id=None by default
+
+        events = await _appended_events(request, result)
+        message_in = next(e for e in events if e.event_type == "message.in")
+        prompt_ev = next(e for e in events if e.event_type == "prompt.generated")
+
+        assert message_in.event_metadata["context_episode_id"] is None
+        assert prompt_ev.event_metadata["context_episode_id"] is None

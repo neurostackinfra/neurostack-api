@@ -67,12 +67,48 @@ parity_tests_unchanged() (
     cd "$_WISH_GATES_ROOT" || return 1
     local base
     base="$(git merge-base HEAD origin/main)" || return 1
-    if {
-        git diff --name-only "$base" -- tests/srm tests/flow tests/policy tests/prompt
-        git ls-files --others --exclude-standard -- \
-            tests/srm tests/flow tests/policy tests/prompt
-    } | grep -q .; then
-        echo "parity-oracle tests were modified" >&2
+    # Named, versioned exceptions — exactly two files owned by the
+    # ``handoff-contextual-resumption`` wish Group 3 from 2026-10-02:
+    #
+    #   * tests/flow/test_flow_manager.py — hosts the rendered-prompt A4
+    #     test and the FlowManager episode-boundary / cross-worker tests
+    #     (wish deliverable 4 / A4). The gate itself still forbids any
+    #     ``tests/prompt`` path, so the A4 test lives here, next to the
+    #     FlowManager suite that the same deliverable touches.
+    #   * tests/srm/test_handoff_context_injection.py — new adversarial
+    #     suite (wish deliverable 8 / A6). ``tests/srm/test_prompt_
+    #     injection.py`` keeps its ``TestPromptConfigInjection`` scope
+    #     unchanged — the gate still rejects any diff to that file or any
+    #     other file under the four protected directories.
+    #
+    # No other file under tests/srm, tests/flow, tests/policy or
+    # tests/prompt may change (added, modified or untracked). Expanding
+    # this list requires editing this gate explicitly (wish deliverable 9,
+    # AC B2).
+    local allowed='tests/flow/test_flow_manager.py tests/srm/test_handoff_context_injection.py'
+    local candidate
+    local offending=0
+    while IFS= read -r candidate; do
+        [ -z "$candidate" ] && continue
+        local matched=0
+        for allowed_path in $allowed; do
+            if [ "$candidate" = "$allowed_path" ]; then
+                matched=1
+                break
+            fi
+        done
+        if [ "$matched" -ne 1 ]; then
+            echo "parity-oracle test modified outside the exception list: $candidate" >&2
+            offending=1
+        fi
+    done < <(
+        {
+            git diff --name-only "$base" -- tests/srm tests/flow tests/policy tests/prompt
+            git ls-files --others --exclude-standard -- \
+                tests/srm tests/flow tests/policy tests/prompt
+        } | sort -u
+    )
+    if [ "$offending" -ne 0 ]; then
         return 1
     fi
 )
@@ -115,6 +151,28 @@ _typed_marker_gate() (
     grep -q 'no_such_attribute' "$temporary/typed.out"
 )
 
+# Public-API coverage scope — honest statement (wish
+# ``handoff-contextual-resumption`` Group 4 deliverable 7 / A8b):
+#
+# ``static_gate`` extracts the public API tree by walking the six
+# ``CONSUMERS`` files hard-coded in ``scripts/extract-branch-public-api.py``
+# (``src/api/routes/policies.py``, ``src/core/pipeline.py``,
+# ``src/memory/__init__.py``, ``src/memory/models.py``,
+# ``src/services/business_hours.py``, ``src/services/trace_adapter.py``)
+# and resolving the symbols they import from the four ``CORE_PREFIXES``
+# (``src.flow``, ``src.policy``, ``src.prompt``, ``src.srm``) under a
+# frozen ``git archive <sha>`` tree, then ``cmp``'ing the resulting JSON
+# against ``tests/baselines/neurostack-core-extraction-public-api.json``.
+#
+# This gate therefore proves facade stability for the subset of symbols
+# those six consumers actually import. It does NOT re-check the full
+# surface of ``packages/neurostack-core/neurostack_core/flow/manager.py``
+# (or any other package module) beyond the specific symbols the
+# consumers reach through ``src.flow``/``src.policy``/``src.prompt``/
+# ``src.srm``. Changes to ``flow/manager.py`` internals that no consumer
+# re-exports — e.g. new private helpers, altered cache mechanics — are
+# intentionally outside this gate's scope and are gated instead by
+# ``core_suite_gate`` / ``full_suite_gate``.
 static_gate() (
     local generated archive_tree
     generated="$(mktemp /tmp/neurostack-public-api.XXXXXX.json)" || return 1
