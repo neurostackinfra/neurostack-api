@@ -44,6 +44,9 @@ describe("multimodal provider boundary", () => {
     await waitFor(() => expect(
       within(section).getByTestId("provider-card-multimodal-openrouter").tagName,
     ).toBe("ARTICLE"));
+    expect(within(section).getByText("API LLM Fallback Multimodal")).toBeInTheDocument();
+    expect(within(section).getByTestId("capability-requirement-multimodal"))
+      .toHaveTextContent("opcional");
     expect(within(section).getAllByTestId(/provider-card-/)).toHaveLength(1);
     expect(within(section).getByText("EM BREVE"))
       .toHaveClass("text-[10px]", "text-orange-400", "bg-orange-500/10");

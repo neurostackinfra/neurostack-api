@@ -59,7 +59,7 @@ describe("<VoiceResponseControls />", () => {
 
       renderControls({ clinicId: "tenant/a", role });
 
-      expect(screen.getByRole("heading", { name: "Gatilhos de Voz" })).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Gatilhos de voz" })).toBeInTheDocument();
       expect(screen.getByRole("status")).toHaveTextContent("Carregando configurações de voz");
       expect(screen.getByRole("switch", { name: "Responder em áudio" })).toBeDisabled();
 
@@ -70,7 +70,7 @@ describe("<VoiceResponseControls />", () => {
       expect(screen.getByRole("radio", { name: /Em todos os tipos/ })).not.toBeChecked();
       expect(screen.getByText(/Perguntas em texto mantêm a resposta em texto/)).toBeInTheDocument();
       expect(screen.getByText(/Envie áudio para qualquer tipo de pergunta/)).toBeInTheDocument();
-      expect(screen.getByText("Em breve mais gatilhos de voz")).toBeInTheDocument();
+      expect(screen.getByText("Outros gatilhos em breve")).toBeInTheDocument();
       expect(fetchMock).toHaveBeenCalledWith(
         "/v1/config/api-credentials?tenant_id=tenant%2Fa",
         { headers: { Authorization: "Bearer editor-token" } },

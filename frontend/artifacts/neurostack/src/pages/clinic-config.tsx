@@ -1,4 +1,5 @@
-import { useEffect, useState, useCallback, useRef } from "react";
+import { Fragment, useEffect, useState, useCallback, useRef } from "react";
+import type { ReactNode } from "react";
 import { useSearch, useLocation } from "wouter";
 import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
@@ -550,22 +551,22 @@ export const API_CAPABILITIES: readonly {
     required: true,
   },
   {
+    id: "multimodal",
+    short: "API LLM Fallback Multimodal",
+    desc: {
+      pt: "Fallback multimodal para duas contingências: quando o LLM primário falhar (com prompt e histórico enviados ao provedor multimodal) e quando o STT falhar (o modelo ouve o áudio direto).",
+      en: "Multimodal fallback for two contingencies: when the primary LLM fails (prompt and history are sent to the multimodal provider) and when STT fails (the model listens to the audio directly).",
+    },
+    required: false,
+  },
+  {
     id: "stt",
     short: "API STT",
     desc: {
       pt: "Speech to Text (transcrição de áudio)",
       en: "Speech to Text (audio transcription)",
     },
-    required: false,
-  },
-  {
-    id: "multimodal",
-    short: "FallBack LLM Multimodal",
-    desc: {
-      pt: "Fallback multimodal para duas contingências: quando o LLM primário falhar (com prompt e histórico enviados ao provedor multimodal) e quando o STT falhar (o modelo ouve o áudio direto).",
-      en: "Multimodal fallback for two contingencies: when the primary LLM fails (prompt and history are sent to the multimodal provider) and when STT fails (the model listens to the audio directly).",
-    },
-    required: false,
+    required: true,
   },
   {
     id: "tts",
@@ -858,11 +859,13 @@ export function ApiCredentialsForm({
   clinicId,
   isReadOnly,
   providerAvailability = API_PROVIDER_AVAILABILITY,
+  voiceControlsSlot,
 }: {
   clinicId: string;
   isReadOnly: boolean;
   isSuperAdmin: boolean;
   providerAvailability?: ProviderAvailabilityMatrix;
+  voiceControlsSlot?: ReactNode;
 }) {
   const { locale } = useI18n();
   const { toast } = useToast();
@@ -1048,121 +1051,131 @@ export function ApiCredentialsForm({
         const availability = providerAvailability[capability.id];
 
         return (
-          <div
-            key={capability.id}
-            className="space-y-3 rounded-lg border border-slate-700/50 bg-muted/20 p-4"
-            data-testid={`api-capability-${capability.id}`}
-          >
-            <div className="flex flex-wrap items-center gap-2">
-              <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-                {capability.short}
-              </p>
-              <span
-                data-testid={`capability-requirement-${capability.id}`}
-                className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/80"
+          <Fragment key={capability.id}>
+            {capability.id === "stt" && (
+              <h2
+                className="pt-1 text-sm font-semibold uppercase tracking-wider text-foreground"
+                data-testid="voice-module-heading"
               >
-                {capability.required ? txt("obrigatório", "Required") : txt("opcional", "Optional")}
-              </span>
-            </div>
-            <p className="text-[11px] text-muted-foreground">
-              {locale === "en" ? capability.desc.en : capability.desc.pt}
-            </p>
+                {txt("Módulo Voz", "Voice Module")}
+              </h2>
+            )}
             <div
-              className="grid grid-cols-2 gap-2 sm:grid-cols-3"
-              data-testid={`${capability.id}-provider-list`}
+              className="space-y-3 rounded-lg border border-slate-700/50 bg-muted/20 p-4"
+              data-testid={`api-capability-${capability.id}`}
             >
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  {capability.short}
+                </p>
+                <span
+                  data-testid={`capability-requirement-${capability.id}`}
+                  className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/80"
+                >
+                  {capability.required ? txt("obrigatório", "Required") : txt("opcional", "Optional")}
+                </span>
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                {locale === "en" ? capability.desc.en : capability.desc.pt}
+              </p>
+              <div
+                className="grid grid-cols-2 gap-2 sm:grid-cols-3"
+                data-testid={`${capability.id}-provider-list`}
+              >
+                {providers.map((provider) => {
+                  if (!(provider.id in availability)) return null;
+                  // Product availability remains visible while tenant status is
+                  // loading or unavailable. Interaction stays fail-closed below
+                  // so an unknown held provider can never be displaced.
+                  const state = providerCardState(
+                    capability.id,
+                    provider.id,
+                    status,
+                    providerAvailability,
+                  );
+                  const key = `${capability.id}:${provider.id}`;
+                  return (
+                    <ProviderCredentialCard
+                      key={provider.id}
+                      id={`${capability.id}-${provider.id}`}
+                      label={provider.label}
+                      sub={provider.sub}
+                      state={state}
+                      badgeLabel={badgeLabel[state]}
+                      isExpanded={expanded === key}
+                      onToggle={status === null || state === "coming_soon" || isReadOnly
+                        ? undefined
+                        : () => toggleProvider(capability.id, provider.id)}
+                    />
+                  );
+                })}
+              </div>
+
               {providers.map((provider) => {
-                if (!(provider.id in availability)) return null;
-                // Product availability remains visible while tenant status is
-                // loading or unavailable. Interaction stays fail-closed below
-                // so an unknown held provider can never be displaced.
-                const state = providerCardState(
-                  capability.id,
-                  provider.id,
-                  status,
-                  providerAvailability,
-                );
-                const key = `${capability.id}:${provider.id}`;
+                if (expanded !== `${capability.id}:${provider.id}`) return null;
+                const fields = credentialFields(capability.id, provider.id);
                 return (
-                  <ProviderCredentialCard
-                    key={provider.id}
-                    id={`${capability.id}-${provider.id}`}
-                    label={provider.label}
-                    sub={provider.sub}
-                    state={state}
-                    badgeLabel={badgeLabel[state]}
-                    isExpanded={expanded === key}
-                    onToggle={status === null || state === "coming_soon" || isReadOnly
-                      ? undefined
-                      : () => toggleProvider(capability.id, provider.id)}
-                  />
+                  <div
+                    key={`${provider.id}-editor`}
+                    className="space-y-3 rounded-md border border-border bg-background p-3"
+                    data-testid={`provider-editor-${capability.id}-${provider.id}`}
+                  >
+                    {fields.length === 0 ? (
+                      <p className="text-[11px] text-muted-foreground">
+                        {txt(
+                          "Este provedor não tem campos editáveis nesta versão.",
+                          "This provider has no editable fields in this release.",
+                        )}
+                      </p>
+                    ) : (
+                      <>
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          {fields.map((field) => (
+                            <div key={field.name} className="space-y-1">
+                              <Label
+                                htmlFor={`field-${field.name}`}
+                                className="text-xs font-medium text-muted-foreground"
+                              >
+                                {locale === "en" ? field.label.en : field.label.pt}
+                              </Label>
+                              <Input
+                                id={`field-${field.name}`}
+                                data-testid={`field-${field.name}`}
+                                type={field.secret ? "password" : field.numeric ? "number" : "text"}
+                                value={draft[field.name] ?? ""}
+                                placeholder={field.secret
+                                  && statusText(status, CAPABILITY_PROVIDER_FIELD[capability.id]) === provider.id
+                                  && status?.[`${field.name}_set`] === true
+                                  ? txt("•••••••• (manter atual)", "•••••••• (keep current)")
+                                  : undefined}
+                                onChange={(e) => setDraft(
+                                  (prev) => ({ ...prev, [field.name]: e.target.value }),
+                                )}
+                                className="text-xs"
+                              />
+                            </div>
+                          ))}
+                        </div>
+                        <Button
+                          type="button"
+                          size="sm"
+                          disabled={saving}
+                          data-testid={`save-${capability.id}-${provider.id}`}
+                          onClick={() => void saveProvider(capability.id, provider.id)}
+                        >
+                          {saving
+                            ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            : <Save className="h-3.5 w-3.5" />}
+                          <span className="ml-1.5">{txt("Salvar", "Save")}</span>
+                        </Button>
+                      </>
+                    )}
+                  </div>
                 );
               })}
             </div>
-
-            {providers.map((provider) => {
-              if (expanded !== `${capability.id}:${provider.id}`) return null;
-              const fields = credentialFields(capability.id, provider.id);
-              return (
-                <div
-                  key={`${provider.id}-editor`}
-                  className="space-y-3 rounded-md border border-border bg-background p-3"
-                  data-testid={`provider-editor-${capability.id}-${provider.id}`}
-                >
-                  {fields.length === 0 ? (
-                    <p className="text-[11px] text-muted-foreground">
-                      {txt(
-                        "Este provedor não tem campos editáveis nesta versão.",
-                        "This provider has no editable fields in this release.",
-                      )}
-                    </p>
-                  ) : (
-                    <>
-                      <div className="grid gap-3 sm:grid-cols-2">
-                        {fields.map((field) => (
-                          <div key={field.name} className="space-y-1">
-                            <Label
-                              htmlFor={`field-${field.name}`}
-                              className="text-xs font-medium text-muted-foreground"
-                            >
-                              {locale === "en" ? field.label.en : field.label.pt}
-                            </Label>
-                            <Input
-                              id={`field-${field.name}`}
-                              data-testid={`field-${field.name}`}
-                              type={field.secret ? "password" : field.numeric ? "number" : "text"}
-                              value={draft[field.name] ?? ""}
-                              placeholder={field.secret
-                                && statusText(status, CAPABILITY_PROVIDER_FIELD[capability.id]) === provider.id
-                                && status?.[`${field.name}_set`] === true
-                                ? txt("•••••••• (manter atual)", "•••••••• (keep current)")
-                                : undefined}
-                              onChange={(e) => setDraft(
-                                (prev) => ({ ...prev, [field.name]: e.target.value }),
-                              )}
-                              className="text-xs"
-                            />
-                          </div>
-                        ))}
-                      </div>
-                      <Button
-                        type="button"
-                        size="sm"
-                        disabled={saving}
-                        data-testid={`save-${capability.id}-${provider.id}`}
-                        onClick={() => void saveProvider(capability.id, provider.id)}
-                      >
-                        {saving
-                          ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          : <Save className="h-3.5 w-3.5" />}
-                        <span className="ml-1.5">{txt("Salvar", "Save")}</span>
-                      </Button>
-                    </>
-                  )}
-                </div>
-              );
-            })}
-          </div>
+            {capability.id === "tts" && voiceControlsSlot}
+          </Fragment>
         );
       })}
     </section>
@@ -2995,15 +3008,17 @@ export default function ClinicConfig() {
               <CardDescription className="text-xs">{t("config_integrations_desc")}</CardDescription>
             </CardHeader>
             <CardContent className="space-y-5 pt-5">
-              <VoiceResponseControls
-                clinicId={(isBuilder || isSuperAdmin) && viewingClinicId ? viewingClinicId : clinicId}
-                isReadOnly={isReadOnly}
-                role={role}
-              />
               <ApiCredentialsForm
                 clinicId={(isBuilder || isSuperAdmin) && viewingClinicId ? viewingClinicId : clinicId}
                 isReadOnly={isReadOnly}
                 isSuperAdmin={role === "super_admin"}
+                voiceControlsSlot={(
+                  <VoiceResponseControls
+                    clinicId={(isBuilder || isSuperAdmin) && viewingClinicId ? viewingClinicId : clinicId}
+                    isReadOnly={isReadOnly}
+                    role={role}
+                  />
+                )}
               />
             </CardContent>
           </Card>
