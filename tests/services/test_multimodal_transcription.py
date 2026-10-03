@@ -272,6 +272,39 @@ class TestTranscribeSuccess:
             "text": "transcribe",
         }
 
+    def test_default_prompt_is_language_neutral(self) -> None:
+        """The transcription prompt must not pin PT or EN.
+
+        The conversation-language-switching wish (Group 3) requires audio
+        turns to feed the same text decision machine without translation,
+        so the multimodal rung must transcribe literally in whichever
+        language was spoken. The policy is enforced *in the prompt bytes*:
+        no PT or EN phrasing, and no "respond in <language>" instruction.
+        """
+        prompt = DEFAULT_TRANSCRIPTION_PROMPT
+        lowered = prompt.lower()
+        # No PT-only phrases that would steer the model toward Portuguese.
+        assert "português" not in lowered
+        assert "portugues" not in lowered
+        assert "em português do brasil" not in lowered
+        # No "respond in English" / "em inglês" / "translate to <lang>"
+        # directives — the model must preserve the spoken language. The
+        # prompt is allowed to say "do not translate" (that enforces the
+        # same contract), so we check against positive translate orders.
+        assert "em inglês" not in lowered
+        assert "em português" not in lowered
+        assert "translate to" not in lowered
+        assert "respond in" not in lowered
+        # The literal-transcription contract and the neutral marker remain.
+        assert "literally" in lowered or "literal" in lowered
+        from src.services.multimodal_service import NO_SPEECH_MARKER
+
+        assert NO_SPEECH_MARKER in prompt
+        # The marker itself must not be a PT- or EN-specific utterance so
+        # that forwarding it would never masquerade as a patient message.
+        assert "sem fala" not in NO_SPEECH_MARKER.lower()
+        assert "no speech" not in NO_SPEECH_MARKER.lower()
+
     def test_openai_base_url_pins_to_openai_host(self) -> None:
         transport, seen = recording_transport(chat_response("hello"))
         with egress_env(transport):

@@ -116,6 +116,7 @@ def _fake_event_response(suggested: str | None = "Olá, tudo bem?"):
         prompt=prompt,
         handoff_summary=None,
         decision=decision,
+        response_language="pt-BR",
     )
 
 
@@ -204,8 +205,9 @@ class TestEvolutionPrivacyNotice:
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=True),
             )
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Reply body"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Reply body")
             )
             mock_get_service.return_value = service
 
@@ -256,8 +258,9 @@ class TestEvolutionPrivacyNotice:
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=True),
             )
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Reply body"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Reply body")
             )
             mock_get_service.return_value = service
 
@@ -304,8 +307,9 @@ class TestEvolutionPrivacyNotice:
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=False),
             )
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Reply body"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Reply body")
             )
             mock_get_service.return_value = service
 
@@ -370,8 +374,9 @@ class TestEvolutionReplyIdNormalisation:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Reply body"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Reply body")
             )
             mock_get_service.return_value = service
 
@@ -419,8 +424,9 @@ class TestEvolutionVoiceReplyOrigin:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Resposta"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Resposta")
             )
             get_service.return_value = service
             response = client.post(WEBHOOK_PATH, json=payload)
@@ -455,3 +461,128 @@ class TestEvolutionVoiceReplyOrigin:
         assert response.status_code == 200, response.text
         assert response.json() == {"ok": True, "skipped": "non-text"}
         reply_gate.assert_not_awaited()
+
+
+class TestEvolutionReplayBoundary:
+    def test_missing_message_id_returns_existing_200_envelope_before_effects(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        instance = f"evo_{uuid4().hex[:8]}"
+        _seed_evolution_credentials(client, tenant_id, instance)
+        payload = _evolution_text_payload(
+            instance_name=instance,
+            from_phone="5511900000400",
+            text_body="Olá",
+            message_id="",
+        )
+
+        with patch("src.api.routes.webhook.get_event_service") as get_service:
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True, "skipped": "missing_message_id"}
+        get_service.assert_not_called()
+
+    def test_duplicate_is_claimed_before_config_session_or_effects(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        instance = f"evo_{uuid4().hex[:8]}"
+        _seed_evolution_credentials(client, tenant_id, instance)
+        payload = _evolution_text_payload(
+            instance_name=instance,
+            from_phone="5511900000401",
+            text_body="Olá",
+            message_id=f"evo_dup_{uuid4().hex[:8]}",
+        )
+
+        with (
+            patch(
+                "src.api.routes.webhook._claim_incoming_message",
+                return_value=False,
+            ) as claim,
+            patch("src.api.routes.webhook.get_event_service") as get_service,
+            patch("src.api.routes.webhook._get_or_create_session") as create_session,
+        ):
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True, "skipped": "duplicate_message"}
+        claim.assert_called_once_with(
+            "evolution",
+            tenant_id,
+            payload["data"]["key"]["id"],
+        )
+        get_service.assert_not_called()
+        create_session.assert_not_called()
+
+    def test_replay_store_unavailable_returns_exact_503(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        from src.api.routes.webhook import ReplayStoreUnavailable
+
+        instance = f"evo_{uuid4().hex[:8]}"
+        _seed_evolution_credentials(client, tenant_id, instance)
+        payload = _evolution_text_payload(
+            instance_name=instance,
+            from_phone="5511900000402",
+            text_body="Olá",
+            message_id=f"evo_unavailable_{uuid4().hex[:8]}",
+        )
+
+        with patch(
+            "src.api.routes.webhook._claim_incoming_message",
+            side_effect=ReplayStoreUnavailable("redis down"),
+        ):
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 503
+        assert response.json() == {"error": "replay_store_unavailable"}
+
+    def test_retry_after_post_commit_send_failure_does_not_run_transition_twice(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        instance = f"evo_{uuid4().hex[:8]}"
+        _seed_evolution_credentials(client, tenant_id, instance)
+        payload = _evolution_text_payload(
+            instance_name=instance,
+            from_phone="5511900000403",
+            text_body="Olá, gostaria de saber mais sobre a clínica",
+            message_id=f"evo_retry_{uuid4().hex[:8]}",
+        )
+
+        with (
+            patch(
+                "src.api.routes.webhook._get_or_create_session",
+                new=AsyncMock(return_value=(uuid4(), False)),
+            ),
+            patch("src.api.routes.webhook.get_event_service") as get_service,
+            patch(
+                "src.api.routes.webhook.send_evolution_text",
+                new=AsyncMock(side_effect=RuntimeError("post-commit send failed")),
+            ),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Resposta")
+            )
+            get_service.return_value = service
+
+            first = client.post(WEBHOOK_PATH, json=payload)
+            second = client.post(WEBHOOK_PATH, json=payload)
+
+        assert first.status_code == 200
+        assert first.json() == {"ok": True, "replied": False, "reason": "send_failed"}
+        assert second.status_code == 200
+        assert second.json() == {"ok": True, "skipped": "duplicate_message"}
+        service.run_pipeline.assert_awaited_once()
+        service.finish_response.assert_awaited_once()

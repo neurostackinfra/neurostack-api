@@ -552,6 +552,55 @@ class TestCognitiveStateOperations:
         assert dumped["context_episode_id"] is None
         assert dumped["prior_episode_context"] is None
 
+    def test_language_state_round_trip_preserves_all_other_fields(self) -> None:
+        original = CognitiveStateData(
+            funnel_stage="qualificado",
+            intent_history=["greeting", "scheduling"],
+            slots={"name": "João"},
+            flags={"first_visit": True},
+            turn_count=2,
+            context_episode_id="episode-123",
+            prior_episode_context={"schema_version": 1},
+            active_language="en",
+            pending_language="pt-BR",
+        ).to_dict()
+
+        restored = CognitiveStateData.from_dict(original).to_dict()
+
+        assert restored == original
+        assert restored["active_language"] == "en"
+        assert restored["pending_language"] == "pt-BR"
+
+    def test_legacy_language_state_defaults_to_none_without_changing_fields(
+        self,
+        sample_cognitive_state: dict,
+    ) -> None:
+        original = dict(sample_cognitive_state)
+
+        restored = CognitiveStateData.from_dict(original).to_dict()
+
+        assert restored["active_language"] is None
+        assert restored["pending_language"] is None
+        assert {key: restored[key] for key in original} == original
+
+    @pytest.mark.parametrize(
+        ("active", "pending", "expected_active", "expected_pending"),
+        [
+            ("es", "en", None, "en"),
+            ("pt", "pt-BR", None, "pt-BR"),
+            (42, {"language": "en"}, None, None),
+        ],
+    )
+    def test_invalid_language_state_fails_closed(
+        self, active, pending, expected_active, expected_pending
+    ) -> None:
+        restored = CognitiveStateData.from_dict(
+            {"active_language": active, "pending_language": pending}
+        )
+
+        assert restored.active_language == expected_active
+        assert restored.pending_language == expected_pending
+
 
 # ============================================
 # Unit Tests - Tenant Operations

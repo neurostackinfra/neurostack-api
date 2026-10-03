@@ -145,7 +145,12 @@ def _zapi_body(
 def _fake_event_response(text: str | None = "Resposta"):
     prompt = SimpleNamespace(suggested_response=text)
     decision = SimpleNamespace(handoff_required=False)
-    return SimpleNamespace(prompt=prompt, handoff_summary=None, decision=decision)
+    return SimpleNamespace(
+        prompt=prompt,
+        handoff_summary=None,
+        decision=decision,
+        response_language="pt-BR",
+    )
 
 
 def _fake_send_result(message_id: str = "zapi_mid_reply") -> dict:
@@ -209,8 +214,9 @@ class TestZapiCanonicalToken:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Oi!"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Oi!")
             )
             mock_get_service.return_value = service
 
@@ -218,7 +224,7 @@ class TestZapiCanonicalToken:
 
         assert resp.status_code == 200, resp.text
         assert resp.json() == {"ok": True, "replied": True}
-        assert service.process_event.await_count == 1
+        assert service.run_pipeline.await_count == 1
         assert mock_send.await_count == 1
 
     @pytest.mark.parametrize(
@@ -419,9 +425,8 @@ class TestZapiDigestRotation:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Ok"),
-            )
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(return_value=_fake_event_response("Ok"))
             mock_get_service.return_value = service
 
             new_resp = client.post(
@@ -533,8 +538,9 @@ class TestZapiReplay:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("First"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("First")
             )
             mock_get_service.return_value = service
 
@@ -542,8 +548,9 @@ class TestZapiReplay:
             assert first.status_code == 200
             assert first.json() == {"ok": True, "replied": True}
 
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("should not fire"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("should not fire")
             )
             mock_send.reset_mock()
 
@@ -551,7 +558,7 @@ class TestZapiReplay:
 
         assert second.status_code == 200
         assert second.json() == {"ok": True, "skipped": "duplicate_message"}
-        assert service.process_event.await_count == 0
+        assert service.run_pipeline.await_count == 0
         assert mock_send.await_count == 0
 
     def test_redis_unavailable_in_production_returns_503(
@@ -846,7 +853,7 @@ class TestZapiSttFallbackChain:
 
         async def _capture(self, event_request, session=None):
             captured["content"] = event_request.payload.content
-            return _NoReplyResponse()
+            return MagicMock(), {}, []
 
         with (
             patch(
@@ -861,7 +868,12 @@ class TestZapiSttFallbackChain:
             patch("src.services.stt_service.transcribe_audio", fixed_adapter),
             patch("src.services.groq_service.transcribe_audio", legacy_adapter),
             patch("src.api.routes.webhook.mark_message_read", AsyncMock()),
-            patch.object(EventService, "process_event", _capture),
+            patch.object(EventService, "run_pipeline", _capture),
+            patch.object(
+                EventService,
+                "finish_response",
+                AsyncMock(return_value=_NoReplyResponse()),
+            ),
         ):
             response = client.post(
                 f"/v1/webhook/zapi/{raw_token}",
@@ -883,7 +895,10 @@ class TestZapiSttFallbackChain:
         assert kwargs["audio_bytes"] == audio_bytes
         assert kwargs["mimetype"] == raw_mime
         assert kwargs["model_name"] == model_name
-        assert kwargs["language"] == "pt"
+        # Autodetect mode: no language hint forwarded to the fixed STT
+        # adapters so PT and EN audio feed the same decision machine the
+        # text turns feed, without any STT-side translation.
+        assert "language" not in kwargs or kwargs["language"] is None
         legacy_adapter.assert_not_awaited()
 
     def test_stt_failure_without_multimodal_reroutes_to_text(
@@ -954,7 +969,7 @@ class TestZapiSttFallbackChain:
 
         async def _capture(self, event_request, session=None):
             captured["content"] = event_request.payload.content
-            return _NoReplyResponse()
+            return MagicMock(), {}, []
 
         send_mock = AsyncMock(return_value=_fake_send_result())
 
@@ -970,7 +985,12 @@ class TestZapiSttFallbackChain:
             ),
             patch("src.api.routes.webhook.send_text_message", send_mock),
             patch("src.api.routes.webhook.mark_message_read", AsyncMock()),
-            patch.object(EventService, "process_event", _capture),
+            patch.object(EventService, "run_pipeline", _capture),
+            patch.object(
+                EventService,
+                "finish_response",
+                AsyncMock(return_value=_NoReplyResponse()),
+            ),
         ):
             resp = client.post(
                 f"/v1/webhook/zapi/{raw_token}",
@@ -1079,7 +1099,7 @@ class TestZapiSttFallbackChain:
 
         async def _capture(self, event_request, session=None):
             captured["content"] = event_request.payload.content
-            return _NoReplyResponse()
+            return MagicMock(), {}, []
 
         send_mock = AsyncMock(return_value=_fake_send_result())
 
@@ -1092,7 +1112,12 @@ class TestZapiSttFallbackChain:
             ),
             patch("src.api.routes.webhook.send_text_message", send_mock),
             patch("src.api.routes.webhook.mark_message_read", AsyncMock()),
-            patch.object(EventService, "process_event", _capture),
+            patch.object(EventService, "run_pipeline", _capture),
+            patch.object(
+                EventService,
+                "finish_response",
+                AsyncMock(return_value=_NoReplyResponse()),
+            ),
         ):
             resp = client.post(
                 f"/v1/webhook/zapi/{raw_token}",
@@ -1564,8 +1589,9 @@ class TestZapiVoiceReplyOrigin:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Resposta"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Resposta")
             )
             get_service.return_value = service
 
@@ -1623,8 +1649,9 @@ class TestZapiVoiceReplyOrigin:
             service._load_clinic_config = AsyncMock(
                 return_value={"business_rules": {}},
             )
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Resposta"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Resposta")
             )
             get_service.return_value = service
 

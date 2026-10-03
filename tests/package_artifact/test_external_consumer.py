@@ -21,7 +21,7 @@ from conftest import (
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
-EXPECTED = ROOT / "tests" / "baselines" / "neurostack-core-extraction-public-api.json"
+EXPECTED = ROOT / "tests" / "baselines" / "neurostack-core-public-facade.json"
 CHECKER = PACKAGE / "scripts" / "check_public_api.py"
 EXTRACTOR = ROOT / "scripts" / "extract-readme-quickstart.py"
 FORBIDDEN_APP_DEPENDENCIES = {
