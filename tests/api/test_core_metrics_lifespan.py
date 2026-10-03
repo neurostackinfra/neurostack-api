@@ -100,7 +100,7 @@ def test_configured_lifespan_registers_core_metrics_and_exposes_decision() -> No
 
         service = get_event_service()
         service._load_clinic_config = AsyncMock(return_value=None)
-        service._load_session_state = AsyncMock(return_value=CognitiveStateData())
+        service._lock_session_state = AsyncMock(return_value=(None, CognitiveStateData()))
         service._load_message_history = AsyncMock(return_value=[])
         service._persist_session_state = AsyncMock(return_value=None)
         service._save_events_to_store = AsyncMock(return_value=None)

@@ -49,6 +49,8 @@ class CognitiveStateData:
         last_message_at: Optional[str] = None,
         context_episode_id: Optional[str] = None,
         prior_episode_context: Optional[dict[str, Any]] = None,
+        active_language: Optional[str] = None,
+        pending_language: Optional[str] = None,
     ):
         self.funnel_stage = funnel_stage
         self.intent_history = intent_history or []
@@ -71,6 +73,13 @@ class CognitiveStateData:
         self.last_message_at = last_message_at
         self.context_episode_id = context_episode_id
         self.prior_episode_context = prior_episode_context
+        self.active_language = self._valid_language_or_none(active_language)
+        self.pending_language = self._valid_language_or_none(pending_language)
+
+    @staticmethod
+    def _valid_language_or_none(value: Any) -> Optional[str]:
+        """Fail closed for corrupt or unsupported persisted language state."""
+        return value if isinstance(value, str) and value in {"pt-BR", "en"} else None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON storage (UserState completo)."""
@@ -98,6 +107,8 @@ class CognitiveStateData:
             "last_message_at": getattr(self, "last_message_at", None),
             "context_episode_id": getattr(self, "context_episode_id", None),
             "prior_episode_context": getattr(self, "prior_episode_context", None),
+            "active_language": getattr(self, "active_language", None),
+            "pending_language": getattr(self, "pending_language", None),
         }
 
     @classmethod
@@ -130,6 +141,8 @@ class CognitiveStateData:
             last_message_at=data.get("last_message_at"),
             context_episode_id=data.get("context_episode_id"),
             prior_episode_context=data.get("prior_episode_context"),
+            active_language=data.get("active_language"),
+            pending_language=data.get("pending_language"),
         )
 
     def add_intent(self, intent: str) -> None:

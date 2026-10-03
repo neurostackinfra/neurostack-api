@@ -6,7 +6,7 @@ Business logic for event processing and management.
 import json
 from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,7 +29,7 @@ from src.config.logging import get_logger
 from src.core.exceptions import EventStoreError
 from src.handoff.episode_context import extract_self_identified_name
 from src.memory import EventData, get_event_store
-from src.models.session import CognitiveStateData
+from src.models.session import CognitiveStateData, Session
 from src.observability.metrics import LLM_GENERATION_ATTEMPTS_TOTAL
 from src.repositories import EventRepository
 from src.repositories.session import SessionRepository
@@ -39,6 +39,12 @@ from src.services.api_credentials import (
     compose_llm_credentials,
     config_cache_key,
     is_cache_v2_payload,
+)
+from src.services.conversation_language import (
+    ConfiguredLanguage,
+    LanguageSwitchResult,
+    evaluate_conversation_language,
+    normalize_configured_language,
 )
 
 if TYPE_CHECKING:
@@ -739,12 +745,45 @@ class EventService:
         )
         return CognitiveStateData()
 
+    async def _lock_session_state(
+        self,
+        tenant_id: UUID,
+        session_id: UUID,
+        db: AsyncSession,
+    ) -> tuple[Optional[Session], CognitiveStateData]:
+        """Lock one tenant-scoped session and deserialize its state once."""
+        repo = SessionRepository(db)
+        session_row = await repo.get_by_tenant_for_update(session_id, tenant_id)
+        if session_row is None:
+            logger.info(
+                "session_state_loaded",
+                state_source="default",
+                session_id=str(session_id),
+                tenant_id=str(tenant_id),
+                turn_count=0,
+            )
+            return None, CognitiveStateData()
+
+        state = session_row.get_cognitive_state()
+        logger.info(
+            "session_state_loaded",
+            state_source="pg_locked",
+            session_id=str(session_id),
+            tenant_id=str(tenant_id),
+            turn_count=state.turn_count,
+            funnel_stage=state.funnel_stage,
+        )
+        return session_row, state
+
     async def _persist_session_state(
         self,
         session_id: UUID,
         result: "PipelineResult",
         db: Optional[AsyncSession],
         user_message: Optional[str] = None,
+        *,
+        session_row: Optional[Session] = None,
+        cognitive: Optional[CognitiveStateData] = None,
     ) -> None:
         """Persist pipeline result back to PG Session cognitive_state.
 
@@ -761,12 +800,9 @@ class EventService:
         """
         if not db:
             return
-        repo = SessionRepository(db)
-        session_row = await repo.get_by_id(session_id)
-        if not session_row:
+        if session_row is None or cognitive is None:
             return
-
-        cognitive = session_row.get_cognitive_state()
+        repo = SessionRepository(db)
         cognitive.add_intent(result.intent)
         cognitive.funnel_stage = result.funnel_stage
         cognitive.sentiment_label = result.sentiment_label
@@ -954,6 +990,40 @@ class EventService:
             )
             return []
 
+    @staticmethod
+    def _configured_language(
+        clinic_config: Optional[dict[str, Any]],
+    ) -> ConfiguredLanguage:
+        business_rules = (clinic_config or {}).get("business_rules") or {}
+        raw_language = (
+            business_rules.get("agent_language")
+            if isinstance(business_rules, dict)
+            else None
+        )
+        return normalize_configured_language(raw_language)
+
+    @staticmethod
+    def _analysis_language(
+        language_result: LanguageSwitchResult,
+    ) -> ConfiguredLanguage:
+        if (
+            language_result.decision == "propose"
+            and language_result.detected_language in {"pt-BR", "en"}
+        ):
+            return cast(ConfiguredLanguage, language_result.detected_language)
+        return language_result.active_language
+
+    @staticmethod
+    def _language_proposal_is_preempted(result: "PipelineResult") -> bool:
+        """Return whether a higher-priority final output owns this turn."""
+        return bool(
+            result.safety_concern
+            or result.handoff_required
+            or result.mode in {"safety", "handoff"}
+            or result.handoff_reason == "scheduling"
+            or result.deterministic_response is not None
+        )
+
     async def run_pipeline(
         self,
         request: EventRequest,
@@ -980,8 +1050,38 @@ class EventService:
         # Load clinic config for the tenant (provides identity, services, pricing)
         clinic_config = await self._load_clinic_config(request.tenant_id)
 
-        # Load session state from PG
-        state = await self._load_session_state(request.session_id, session)
+        # A stateful call owns the PostgreSQL row lock from this point through
+        # language selection, pipeline processing and the final state flush.
+        # The session-less path is deliberately stateless and persists nothing.
+        session_row: Optional[Session] = None
+        if session is None:
+            state = CognitiveStateData()
+        else:
+            session_row, state = await self._lock_session_state(
+                request.tenant_id,
+                request.session_id,
+                session,
+            )
+
+        configured_language = self._configured_language(clinic_config)
+        handoff_confirmation_pending = bool(
+            state.flags.get("handoff_confirmation_pending")
+        )
+        language_result = evaluate_conversation_language(
+            # A pending handoff confirmation owns the reply before the language
+            # machine.  Feed the real message only to the SRM below so a terse
+            # yes/sim cannot accidentally accept an unrelated language switch.
+            text="" if handoff_confirmation_pending else request.payload.content,
+            configured_language=configured_language,
+            active_language=state.active_language,
+            pending_language=(
+                None if handoff_confirmation_pending else state.pending_language
+            ),
+            tenant_id=request.tenant_id,
+            session_id=request.session_id,
+        )
+        analysis_language = self._analysis_language(language_result)
+        active_language = language_result.active_language
 
         # Load message history from Event Store, filtered to the current
         # conversational episode when the session has already been
@@ -1011,7 +1111,9 @@ class EventService:
             flags=state.flags,
             message_history=message_history,
             clinic_config=clinic_config,
-            language=request.payload.language,
+            detected_language=language_result.detected_language,
+            analysis_language=analysis_language,
+            active_language=active_language,
             # Durable episode id (threads to FlowManager + both terminal
             # result constructions) and the previously-frozen prior
             # episode context (presence drives the normal template's
@@ -1027,6 +1129,26 @@ class EventService:
 
         result: PipelineResult = await self._pipeline.process(pipeline_input)
 
+        # A proposal is only durable when its canonical confirmation prompt is
+        # the selected final output. Safety, handoff, scheduling-confirmation
+        # and an existing deterministic result own the turn and clear it.
+        pending_language = language_result.pending_language
+        response_language = active_language
+        if language_result.decision == "propose":
+            if self._language_proposal_is_preempted(result):
+                pending_language = None
+            else:
+                result.deterministic_response = language_result.prompt
+                # The canonical question is written in the candidate language,
+                # even though that language is not active until confirmation.
+                response_language = cast(
+                    ConfiguredLanguage, language_result.detected_language
+                )
+
+        result.response_language = response_language
+        state.active_language = active_language
+        state.pending_language = pending_language
+
         # Persist state back to PG (flush only — caller must commit)
         # Raises on failure so the caller can rollback before starting LLM
         await self._persist_session_state(
@@ -1034,6 +1156,8 @@ class EventService:
             result,
             session,
             user_message=request.payload.content,
+            session_row=session_row,
+            cognitive=state,
         )
 
         return result, clinic_config, message_history
@@ -1064,7 +1188,7 @@ class EventService:
             clinic_config=clinic_config,
             tenant_id=request.tenant_id,
             message_history=message_history,
-            language=request.payload.language,
+            active_language=result.response_language,
         )
 
         # Save events to Event Store (separate DB connections, committed independently)
@@ -1086,20 +1210,15 @@ class EventService:
     async def process_event(
         self,
         request: EventRequest,
-        session: Optional[AsyncSession] = None,
     ) -> EventResponse:
         """
-        Backwards-compatible entry point (session=None path, used by tests and
-        internal callers that don't need state persistence).
+        Explicit stateless entry point for tests and persistence-free callers.
 
         The /v1/events route handler calls run_pipeline() + finish_response()
-        directly so it can commit between the two phases.
+        directly so it can commit between the two phases. Stateful callers
+        must do the same and may not inject an unmanaged external session here.
         """
-        result, clinic_config, message_history = await self.run_pipeline(
-            request, session
-        )
-        # When session is provided the caller must commit — here we don't have
-        # that responsibility, so just proceed to finish (stateless path).
+        result, clinic_config, message_history = await self.run_pipeline(request)
         return await self.finish_response(
             request, result, clinic_config, message_history
         )
@@ -1111,7 +1230,7 @@ class EventService:
         clinic_config: Optional[dict[str, Any]] = None,
         tenant_id: Optional[UUID] = None,
         message_history: Optional[list[dict[str, str]]] = None,
-        language: str = "pt-BR",
+        active_language: Optional[str] = None,
     ) -> tuple[
         EventResponse,
         dict[str, int],
@@ -1169,9 +1288,7 @@ class EventService:
         llm_usage: dict[str, int] = {}
         llm_model: str = ""
         llm_attempts: list[dict[str, Any]] = []
-        language_code = (
-            language or "pt-BR"
-        )  # initialised here so handoff block can use it
+        language_code = active_language or result.response_language or "pt-BR"
         deterministic_response = getattr(result, "deterministic_response", None)
         if deterministic_response is not None:
             suggested_response = deterministic_response
@@ -1603,6 +1720,7 @@ class EventService:
         return (
             EventResponse(
                 event_id=result.event_id,
+                response_language=result.response_language,
                 decision=decision,
                 state_patch=state_patch,
                 prompt=prompt,

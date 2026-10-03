@@ -249,6 +249,7 @@ def _fake_event_response(suggested: str | None = "Olá, tudo bem?"):
         prompt=prompt,
         handoff_summary=None,
         decision=decision,
+        response_language="pt-BR",
     )
 
 
@@ -570,8 +571,9 @@ class TestUazapiWebhookTextFlow:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Claro, para quando gostaria?"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Claro, para quando gostaria?")
             )
             mock_get_service.return_value = service
 
@@ -582,8 +584,8 @@ class TestUazapiWebhookTextFlow:
         assert resp.json() == {"ok": True, "replied": True}
 
         # Pipeline was called with the parsed text + Uazapi metadata
-        assert service.process_event.await_count == 1
-        event_arg = service.process_event.await_args.args[0]
+        assert service.run_pipeline.await_count == 1
+        event_arg = service.run_pipeline.await_args.args[0]
         assert event_arg.payload.content == "Quero agendar uma consulta"
         assert event_arg.payload.metadata["source"] == "uazapi"
         assert event_arg.payload.metadata["messageId"] == msg_id
@@ -640,7 +642,8 @@ class TestUazapiWebhookDuplicateMessage:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
                 return_value=_fake_event_response("Claro, posso ajudar.")
             )
             mock_get_service.return_value = service
@@ -652,7 +655,7 @@ class TestUazapiWebhookDuplicateMessage:
         assert first.json() == {"ok": True, "replied": True}
         assert second.status_code == 200, second.text
         assert second.json() == {"ok": True, "skipped": "duplicate_message"}
-        assert service.process_event.await_count == 1
+        assert service.run_pipeline.await_count == 1
         assert mock_send.await_count == 1
 
         webhook_module._INMEM_INCOMING.clear()
@@ -753,7 +756,8 @@ class TestUazapiWebhookNonText:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock()
+            service.run_pipeline = AsyncMock()
+            service.finish_response = AsyncMock()
             mock_get_service.return_value = service
 
             resp = client.post(WEBHOOK_PATH, json=payload)
@@ -761,7 +765,7 @@ class TestUazapiWebhookNonText:
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "skipped": "non-text"}
         # Never touched the pipeline or the send helper
-        assert service.process_event.await_count == 0
+        assert service.run_pipeline.await_count == 0
         assert mock_send.await_count == 0
 
     def test_media_audio_predicate_wins_even_with_text_present(
@@ -902,16 +906,15 @@ class TestUazapiWebhookContentExtraction:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("ok"),
-            )
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(return_value=_fake_event_response("ok"))
             mock_get_service.return_value = service
 
             resp = client.post(WEBHOOK_PATH, json=payload)
 
         assert resp.status_code == 200, resp.text
         assert resp.json() == {"ok": True, "replied": True}
-        event_arg = service.process_event.await_args.args[0]
+        event_arg = service.run_pipeline.await_args.args[0]
         assert event_arg.payload.content == "texto real do content"
         assert not event_arg.payload.content.startswith("{")
 
@@ -1008,8 +1011,9 @@ class TestUazapiWebhookBotPaused:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("blocked"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("blocked")
             )
             mock_get_service.return_value = service
 
@@ -1018,7 +1022,7 @@ class TestUazapiWebhookBotPaused:
         # Same 202 semantics as Z-API/Evolution/Meta paths when bot is paused
         assert resp.status_code == 202
         assert resp.json() == {"ok": True, "skipped": "bot_paused"}
-        assert service.process_event.await_count == 0
+        assert service.run_pipeline.await_count == 0
         assert mock_send.await_count == 0
 
 
@@ -1055,8 +1059,9 @@ class TestUazapiWebhookMissingCredentials:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Reply body"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Reply body")
             )
             mock_get_service.return_value = service
 
@@ -1138,8 +1143,9 @@ class TestUazapiPrivacyNoticeSend:
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=True),
             )
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Reply body"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Reply body")
             )
             mock_get_service.return_value = service
 
@@ -1190,8 +1196,9 @@ class TestUazapiPrivacyNoticeSend:
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=True),
             )
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Reply body"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Reply body")
             )
             mock_get_service.return_value = service
 
@@ -1235,8 +1242,9 @@ class TestUazapiPrivacyNoticeSend:
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=False),
             )
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Reply body"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Reply body")
             )
             mock_get_service.return_value = service
 
@@ -1287,8 +1295,9 @@ class TestUazapiPrivacyNoticeSend:
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=True),
             )
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Reply body"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Reply body")
             )
             mock_get_service.return_value = service
 
@@ -1340,8 +1349,9 @@ class TestUazapiPrivacyNoticeSend:
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=True),
             )
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Resposta"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Resposta")
             )
             mock_get_service.return_value = service
 
@@ -1395,8 +1405,9 @@ class TestUazapiPrivacyNoticeSend:
             service._load_clinic_config = AsyncMock(
                 return_value=en_clinic_config,
             )
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Reply"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Reply")
             )
             mock_get_service.return_value = service
 
@@ -1451,8 +1462,9 @@ class TestUazapiPrivacyNoticeSend:
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=True),
             )
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Reply body"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Reply body")
             )
             mock_get_service.return_value = service
 
@@ -1529,8 +1541,9 @@ class TestUazapiEchoIdNormalisation:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Reply"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Reply")
             )
             mock_get_service.return_value = service
 
@@ -1604,8 +1617,9 @@ class TestUazapiEchoIdNormalisation:
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=True),
             )
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Reply"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Reply")
             )
             mock_get_service.return_value = service
 
@@ -2014,8 +2028,9 @@ class TestUazapiFromMeAiEcho:
             service._load_clinic_config = AsyncMock(
                 return_value=_lgpd_config(enabled=True),
             )
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Reply body"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Reply body")
             )
             mock_get_service.return_value = service
 
@@ -2587,8 +2602,9 @@ class TestUazapiPatientMessageUnchanged:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Claro!"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Claro!")
             )
             mock_get_service.return_value = service
 
@@ -2596,7 +2612,7 @@ class TestUazapiPatientMessageUnchanged:
 
         assert resp.status_code == 200, resp.text
         assert resp.json() == {"ok": True, "replied": True}
-        assert service.process_event.await_count == 1
+        assert service.run_pipeline.await_count == 1
         assert mock_send.await_count == 1
 
 
@@ -2896,11 +2912,14 @@ class TestUazapiGroup4PatientAudioTranscription:
 
         async def _capture(self, event_request, session=None):
             captured["content"] = event_request.payload.content
-            return SimpleNamespace(
-                prompt=None,
-                handoff_summary=None,
-                decision=SimpleNamespace(handoff_required=False),
-            )
+            return MagicMock(), {}, []
+
+        no_reply = SimpleNamespace(
+            prompt=None,
+            handoff_summary=None,
+            decision=SimpleNamespace(handoff_required=False),
+            response_language="pt-BR",
+        )
 
         with (
             patch(
@@ -2909,7 +2928,12 @@ class TestUazapiGroup4PatientAudioTranscription:
             ),
             patch("src.services.stt_service.transcribe_audio", fixed_adapter),
             patch("src.services.groq_service.transcribe_audio", legacy_adapter),
-            patch.object(EventService, "process_event", _capture),
+            patch.object(EventService, "run_pipeline", _capture),
+            patch.object(
+                EventService,
+                "finish_response",
+                AsyncMock(return_value=no_reply),
+            ),
         ):
             response = client.post(WEBHOOK_PATH, json=payload)
 
@@ -2924,7 +2948,10 @@ class TestUazapiGroup4PatientAudioTranscription:
         assert kwargs["audio_bytes"] == audio_bytes
         assert kwargs["mimetype"] == raw_mime
         assert kwargs["model_name"] == model_name
-        assert kwargs["language"] == "pt"
+        # Language hint must NOT be forwarded: the fixed STT adapters are now
+        # driven in autodetect mode so audio turns feed the same PT/EN
+        # decision machine the text turns feed, with no translation.
+        assert "language" not in kwargs or kwargs["language"] is None
         legacy_adapter.assert_not_awaited()
 
     @pytest.mark.parametrize("provider", ["elevenlabs_scribe", "openrouter"])
@@ -3075,11 +3102,14 @@ class TestUazapiGroup4PatientAudioTranscription:
 
         async def _capture(self, event_request, session=None):
             captured["content"] = event_request.payload.content
-            return SimpleNamespace(
-                prompt=None,
-                handoff_summary=None,
-                decision=SimpleNamespace(handoff_required=False),
-            )
+            return MagicMock(), {}, []
+
+        no_reply = SimpleNamespace(
+            prompt=None,
+            handoff_summary=None,
+            decision=SimpleNamespace(handoff_required=False),
+            response_language="pt-BR",
+        )
 
         download_mock = AsyncMock(
             return_value=(b"OggS_fake_bytes", "audio/ogg; codecs=opus")
@@ -3093,7 +3123,12 @@ class TestUazapiGroup4PatientAudioTranscription:
                 new=AsyncMock(return_value="quero remarcar minha consulta"),
             ),
             patch("src.api.routes.webhook.send_uazapi_text", send_mock),
-            patch.object(EventService, "process_event", _capture),
+            patch.object(EventService, "run_pipeline", _capture),
+            patch.object(
+                EventService,
+                "finish_response",
+                AsyncMock(return_value=no_reply),
+            ),
         ):
             resp = client.post(WEBHOOK_PATH, json=payload)
 
@@ -3402,8 +3437,9 @@ class TestInactiveQueueReactivationRuntimeRegression:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Atendimento retomado"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Atendimento retomado")
             )
             mock_get_service.return_value = service
 
@@ -3411,8 +3447,8 @@ class TestInactiveQueueReactivationRuntimeRegression:
 
         assert response.status_code == 200, response.text
         assert response.json() == {"ok": True, "replied": True}
-        assert service.process_event.await_count == 1
-        event = service.process_event.await_args.args[0]
+        assert service.run_pipeline.await_count == 1
+        event = service.run_pipeline.await_args.args[0]
         assert event.session_id == effective_session_id
         assert _session_row(client, effective_session_id)["is_paused"] is False
         assert _session_row(client, old_session_id)["is_paused"] is True
@@ -3458,8 +3494,9 @@ class TestUazapiVoiceReplyOrigin:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Resposta"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Resposta")
             )
             get_service.return_value = service
             response = client.post(WEBHOOK_PATH, json=payload)
@@ -3507,8 +3544,9 @@ class TestUazapiVoiceReplyOrigin:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Resposta"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Resposta")
             )
             get_service.return_value = service
             response = client.post(WEBHOOK_PATH, json=payload)

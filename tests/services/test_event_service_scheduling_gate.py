@@ -113,7 +113,7 @@ def _run_convert(
                 clinic_config=clinic_config or {},
                 tenant_id=result.tenant_id,
                 message_history=[],
-                language=language,
+                active_language=language,
             )
 
     loop = asyncio.new_event_loop()

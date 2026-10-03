@@ -34,6 +34,7 @@ python-dotenv>=1.0.0
 # Utilities
 tenacity>=8.2.3
 structlog>=24.1.0
+lingua-language-detector==2.1.1
 tzdata>=2024.1  # zoneinfo tz database for python:3.11-slim (no OS tzdata)
 
 # Observability

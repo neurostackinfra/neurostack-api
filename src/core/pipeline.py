@@ -168,8 +168,12 @@ class PipelineInput(BaseModel):
     # Doc MVP v0.5: ClinicConfig e UserState (quando carregados)
     clinic_config: Optional[dict[str, JsonValue]] = None
     user_state: Optional[dict[str, JsonValue]] = None
-    # Response language code (pt-BR default to preserve existing behavior)
-    language: str = "pt-BR"
+    # Per-turn language boundary. Only the SRM/classifiers receive
+    # ``analysis_language``; every patient-facing component receives
+    # ``active_language``. ``detected_language`` is evidence, not state.
+    detected_language: Optional[str] = None
+    analysis_language: str = "pt-BR"
+    active_language: str = "pt-BR"
     # Current conversational episode id — set by the caller (event service)
     # from the durable session row (CognitiveStateData.context_episode_id).
     # ``None`` on legacy sessions that never reactivated; after the first
@@ -196,6 +200,7 @@ class PipelineResult(BaseModel):
     event_id: UUID = Field(default_factory=uuid4)
     tenant_id: UUID
     session_id: UUID
+    response_language: str = "pt-BR"
 
     # SRM Decision (Decision Trace doc: funnel_stage_before/after)
     intent: str
@@ -573,7 +578,7 @@ class CognitivePipeline:
             flags=input_data.flags,
             clinic_config=getattr(input_data, "clinic_config", None),
             user_state=getattr(input_data, "user_state", None),
-            language=input_data.language,
+            language=input_data.analysis_language,
         )
         return self._srm.process(srm_input)
 
@@ -1016,7 +1021,7 @@ class CognitivePipeline:
             constraints=policy_result.constraints or [],
             user_journey=user_journey,
             custom=custom_vars,
-            language=input_data.language,
+            language=input_data.active_language,
         )
 
         # Add safety context if needed
@@ -1220,6 +1225,7 @@ class CognitivePipeline:
             event_id=uuid4(),
             tenant_id=input_data.tenant_id,
             session_id=input_data.session_id,
+            response_language=input_data.active_language,
             intent="policy_blocked",
             intent_category="blocked",
             funnel_stage=input_data.current_funnel_stage,
@@ -1343,6 +1349,7 @@ class CognitivePipeline:
             event_id=uuid4(),
             tenant_id=input_data.tenant_id,
             session_id=input_data.session_id,
+            response_language=input_data.active_language,
             intent=srm_decision.intent,
             intent_category=srm_decision.intent_category.value,
             funnel_stage=srm_decision.funnel_stage.value,
