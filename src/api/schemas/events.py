@@ -606,6 +606,11 @@ class EventResponse(BaseModel):
         description="Unique identifier for this event",
         json_schema_extra={"example": "c3d4e5f6-a7b8-9012-cdef-123456789012"},
     )
+    response_language: str = Field(
+        default="pt-BR",
+        description="Effective language selected for this response turn",
+        json_schema_extra={"example": "pt-BR"},
+    )
     decision: SRMDecision = Field(
         ...,
         description="Cognitive decision from the SRM",

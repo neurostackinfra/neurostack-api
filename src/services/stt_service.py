@@ -192,7 +192,7 @@ async def transcribe_audio(
     audio_bytes: bytes,
     mimetype: str,
     model_name: str,
-    language: str | None = "pt",
+    language: str | None = None,
     resolver: Any = None,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> str:
@@ -201,6 +201,11 @@ async def transcribe_audio(
     Both explicit provider bases are exact contracts. Any custom host, alternate
     path, explicit port, query, userinfo, fragment, or operation URL is rejected
     before MIME processing, DNS resolution, or HTTP client construction.
+
+    ``language`` defaults to ``None`` so the provider autodetects (wish
+    deliverable: text and audio turns feed the same decision machine without
+    translation). Pass an explicit ISO-639-1 code only when the caller has a
+    reason to pin the hint; ElevenLabs always autodetects natively regardless.
     """
 
     expected_base = {

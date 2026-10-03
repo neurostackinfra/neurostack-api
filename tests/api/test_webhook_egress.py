@@ -62,7 +62,6 @@ async def test_new_stt_providers_dispatch_with_raw_mime_and_no_legacy_call(
                 "stt_api_key": "fixed-provider-key",
                 "stt_model_name": "configured-model",
             },
-            "pt-BR",
         )
 
     assert result == "transcript"
@@ -73,7 +72,6 @@ async def test_new_stt_providers_dispatch_with_raw_mime_and_no_legacy_call(
         audio_bytes=audio,
         mimetype="audio/ogg; codecs=opus",
         model_name="configured-model",
-        language="pt",
     )
     legacy.assert_not_awaited()
 
@@ -95,7 +93,6 @@ async def test_legacy_stt_providers_keep_groq_dispatch(provider: str) -> None:
                 "stt_api_key": "legacy-key",
                 "stt_model_name": "legacy-model",
             },
-            "en",
         )
 
     assert result == "legacy transcript"
@@ -140,7 +137,6 @@ async def test_corrupt_explicit_stt_bundle_fails_with_closed_token_pre_network(
                 b"audio",
                 "audio/ogg",
                 credentials,
-                "pt-BR",
             )
     assert caught.value.code == "stt_configuration_invalid"
     assert str(caught.value) == "stt_configuration_invalid"
@@ -671,7 +667,7 @@ class TestZapiAudioEventMetadataModel:
 
         async def _capture(self: Any, event_request: Any, session: Any = None) -> Any:
             captured["metadata"] = dict(event_request.payload.metadata or {})
-            return _StubResponse()
+            return object(), {}, []
 
         transcribe_mock = AsyncMock(return_value="quero agendar")
 
@@ -684,7 +680,12 @@ class TestZapiAudioEventMetadataModel:
             ),
             patch("src.services.groq_service.transcribe_audio", transcribe_mock),
             patch("src.api.routes.webhook.mark_message_read", AsyncMock()),
-            patch.object(EventService, "process_event", _capture),
+            patch.object(EventService, "run_pipeline", _capture),
+            patch.object(
+                EventService,
+                "finish_response",
+                AsyncMock(return_value=_StubResponse()),
+            ),
         ):
             resp = client.post(
                 f"/v1/webhook/zapi/{raw_token}",

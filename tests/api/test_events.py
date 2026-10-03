@@ -29,6 +29,7 @@ class TestEventsEndpoint:
         assert "state_patch" in data
         assert "prompt" in data
         assert "context" in data
+        assert data["response_language"] == "pt-BR"
 
     def test_process_event_returns_decision(
         self,

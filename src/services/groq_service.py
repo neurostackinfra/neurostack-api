@@ -41,7 +41,7 @@ async def transcribe_audio(
     audio_bytes: bytes,
     mimetype: str,
     model: str = "whisper-large-v3-turbo",
-    language: str = "pt",
+    language: str | None = None,
     base_url: str | None = None,
 ) -> str:
     """Transcribe audio using an OpenAI-compatible STT API. Returns transcribed text.
@@ -51,7 +51,9 @@ async def transcribe_audio(
         audio_bytes: Raw audio file content.
         mimetype: MIME type of the audio (e.g. "audio/ogg").
         model: Model identifier (provider-specific).
-        language: ISO-639-1 language hint for the transcription.
+        language: Optional ISO-639-1 language hint. Defaults to ``None`` so the
+            provider autodetects — text and audio turns must feed the same
+            PT/EN language-decision machine without any STT-side translation.
         base_url: Base URL for the STT endpoint. Defaults to Groq's API.
                   Examples: GROQ_API_BASE, OPENAI_API_BASE, or a custom URL.
     """
@@ -64,7 +66,9 @@ async def transcribe_audio(
         timeout=httpx.Timeout(60.0, connect=10.0),
     ) as (client, validated):
         files = {"file": ("audio.ogg", audio_bytes, mimetype)}
-        data = {"model": model, "language": language, "response_format": "text"}
+        data: dict[str, str] = {"model": model, "response_format": "text"}
+        if language is not None:
+            data["language"] = language
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Host": validated.sni_host,

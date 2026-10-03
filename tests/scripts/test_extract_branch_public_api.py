@@ -29,27 +29,44 @@ def make_tree(path: Path, policy_consumer: str | None = None) -> None:
         write(path / consumer, "")
     write(
         path / "src/api/routes/policies.py",
-        policy_consumer or "from src.policy import PublicThing as DomainThing\n",
+        policy_consumer
+        or "from neurostack_core.policy import PublicThing as DomainThing\n",
     )
     write(
         path / "src/core/pipeline.py",
-        "from src.srm.models import DeepThing as Alias\n"
-        "import src.prompt.timeutils as timeutils\n"
+        "from neurostack_core.srm.models import DeepThing as Alias\n"
+        "import neurostack_core.prompt.timeutils as timeutils\n"
         "timezone = timeutils.resolve_clinic_tz\n",
     )
     write(
-        path / "src/policy/__init__.py",
-        "from src.policy.models import PublicThing\n__all__ = ['PublicThing']\n",
+        path / "packages/neurostack-core/neurostack_core/policy/__init__.py",
+        "from neurostack_core.policy.models import PublicThing\n"
+        "__all__ = ['PublicThing']\n",
     )
-    write(path / "src/policy/models.py", "class PublicThing: pass\n")
-    write(path / "src/srm/models.py", "class DeepThing: pass\n")
-    write(path / "src/prompt/timeutils.py", "def resolve_clinic_tz(): pass\n")
-    write(path / "src/flow/models.py", "class FlowMode: pass\n")
-    write(path / "src/ctx/__init__.py", "__all__ = ['Context']\nclass Context: pass\n")
+    write(
+        path / "packages/neurostack-core/neurostack_core/policy/models.py",
+        "class PublicThing: pass\n",
+    )
+    write(
+        path / "packages/neurostack-core/neurostack_core/srm/models.py",
+        "class DeepThing: pass\n",
+    )
+    write(
+        path / "packages/neurostack-core/neurostack_core/prompt/timeutils.py",
+        "def resolve_clinic_tz(): pass\n",
+    )
+    write(
+        path / "packages/neurostack-core/neurostack_core/flow/models.py",
+        "class FlowMode: pass\n",
+    )
+    write(
+        path / "packages/neurostack-core/neurostack_core/ctx/__init__.py",
+        "__all__ = ['Context']\nclass Context: pass\n",
+    )
     write(
         path / "README.md",
         "# Project\n\n## Quick Start\n\n```python\n"
-        "from src.flow.models import FlowMode as Mode\n"
+        "from neurostack_core.flow.models import FlowMode as Mode\n"
         "```\n\n## Other\n",
     )
 
@@ -90,8 +107,20 @@ def test_captures_minimal_facade_deterministically(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("source", "message"),
     [
-        ("from src.policy import *\n", "star import"),
-        ("from src.policy import Missing\n", "missing facade export"),
+        ("from neurostack_core.policy import *\n", "star import"),
+        (
+            "from neurostack_core.policy import Missing\n",
+            "missing facade export",
+        ),
+        (
+            "from neurostack_core.policy.missing import Thing\n",
+            "unresolved module",
+        ),
+        (
+            "import neurostack_core.policy.missing as domain\n"
+            "value = domain.Thing\n",
+            "unresolved module",
+        ),
     ],
 )
 def test_rejects_unproved_direct_imports(
@@ -140,7 +169,7 @@ def test_skips_syntactic_type_checking_body_independent_of_order(
     make_tree(
         tree,
         f"if {guard}:\n"
-        "    from src.policy import Missing\n"
+        "    from neurostack_core.policy import Missing\n"
         "    import importlib\n"
         "    class builtins:\n"
         "        pass\n"
@@ -156,32 +185,34 @@ def test_skips_syntactic_type_checking_body_independent_of_order(
     ("source", "message"),
     [
         (
-            "import src.policy.models as domain\n" "import src.flow.models as domain\n",
+            "import neurostack_core.policy.models as domain\n"
+            "import neurostack_core.flow.models as domain\n",
             "conflicting facade alias",
         ),
         (
-            "import src.policy.models as domain\n"
+            "import neurostack_core.policy.models as domain\n"
             "domain = object()\n"
             "value = domain.PublicThing\n",
             "rebound facade alias",
         ),
         (
-            "import src.policy.models as domain\n"
+            "import neurostack_core.policy.models as domain\n"
             "def nested(domain):\n"
             "    return domain\n",
             "rebound facade alias",
         ),
         (
-            "import ordinary as domain\n" "import src.policy.models as domain\n",
+            "import ordinary as domain\n"
+            "import neurostack_core.policy.models as domain\n",
             "rebound facade alias",
         ),
         (
-            "import src.policy.models as domain\n"
-            "from src.policy import PublicThing as domain\n",
+            "import neurostack_core.policy.models as domain\n"
+            "from neurostack_core.policy import PublicThing as domain\n",
             "rebound facade alias",
         ),
         (
-            "import src.policy.models as domain\n" "del domain\n",
+            "import neurostack_core.policy.models as domain\n" "del domain\n",
             "rebound facade alias",
         ),
     ],
@@ -204,7 +235,7 @@ def test_accepts_runtime_injected_loader(tmp_path: Path) -> None:
         tree,
         "def load(loader, module_name):\n"
         "    return loader(module_name)\n"
-        "load(callback, 'src.policy')\n",
+        "load(callback, 'neurostack_core.policy')\n",
     )
     result = extract(tree, tmp_path / "output.json")
     assert result.returncode == 0, result.stderr
@@ -213,7 +244,7 @@ def test_accepts_runtime_injected_loader(tmp_path: Path) -> None:
 def test_ignores_modules_outside_the_four_domain_contract(tmp_path: Path) -> None:
     tree = tmp_path / "tree"
     tree.mkdir()
-    make_tree(tree, "from src.ctx import Context\n")
+    make_tree(tree, "from neurostack_core.ctx import Context\n")
     output = tmp_path / "output.json"
     result = extract(tree, output)
     assert result.returncode == 0, result.stderr

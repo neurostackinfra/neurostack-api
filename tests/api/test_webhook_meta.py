@@ -208,6 +208,7 @@ def _fake_event_response(suggested: str | None = "Olá, tudo bem?"):
         prompt=prompt,
         handoff_summary=None,
         decision=decision,
+        response_language="pt-BR",
     )
 
 
@@ -344,8 +345,9 @@ class TestMetaWebhookTextFlow:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Claro, para quando gostaria?"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Claro, para quando gostaria?")
             )
             mock_get_service.return_value = service
 
@@ -357,8 +359,8 @@ class TestMetaWebhookTextFlow:
         assert body == {"ok": True, "replied": True}
 
         # Pipeline was called with the parsed text
-        assert service.process_event.await_count == 1
-        event_arg = service.process_event.await_args.args[0]
+        assert service.run_pipeline.await_count == 1
+        event_arg = service.run_pipeline.await_args.args[0]
         assert event_arg.payload.content == "Quero agendar uma consulta"
         assert event_arg.payload.metadata["source"] == "meta_cloud"
         assert event_arg.payload.metadata["messageId"] == wamid
@@ -524,8 +526,9 @@ class TestMetaWebhookTextFlow:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Reply text"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Reply text")
             )
             mock_get_service.return_value = service
 
@@ -583,8 +586,9 @@ class TestMetaWebhookEchoDedup:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("should never fire"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("should never fire")
             )
             mock_get_service.return_value = service
 
@@ -593,7 +597,7 @@ class TestMetaWebhookEchoDedup:
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "skipped": "ai_echo"}
         # Neither the pipeline nor the send helper is called for an echo
-        assert service.process_event.await_count == 0
+        assert service.run_pipeline.await_count == 0
         assert mock_send.await_count == 0
 
 
@@ -634,8 +638,9 @@ class TestMetaWebhookBotActiveAndPause:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("blocked"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("blocked")
             )
             mock_get_service.return_value = service
 
@@ -644,7 +649,7 @@ class TestMetaWebhookBotActiveAndPause:
         # Same 202 semantics as Z-API/Evolution when bot is paused
         assert resp.status_code == 202
         assert resp.json() == {"ok": True, "skipped": "bot_paused"}
-        assert service.process_event.await_count == 0
+        assert service.run_pipeline.await_count == 0
         assert mock_send.await_count == 0
 
     def test_session_paused_blocks_reply(
@@ -680,8 +685,9 @@ class TestMetaWebhookBotActiveAndPause:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("blocked"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("blocked")
             )
             mock_get_service.return_value = service
 
@@ -689,7 +695,7 @@ class TestMetaWebhookBotActiveAndPause:
 
         assert resp.status_code == 202
         assert resp.json() == {"ok": True, "skipped": "session_paused"}
-        assert service.process_event.await_count == 0
+        assert service.run_pipeline.await_count == 0
         assert mock_send.await_count == 0
 
 
@@ -891,8 +897,9 @@ class TestMetaWebhookAudioFlow:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Sem problemas, para quando?"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Sem problemas, para quando?")
             )
             mock_get_service.return_value = service
 
@@ -914,8 +921,8 @@ class TestMetaWebhookAudioFlow:
         assert kw["mime_type"] == "audio/ogg; codecs=opus"
 
         # Pipeline got the transcribed text
-        assert service.process_event.await_count == 1
-        event_arg = service.process_event.await_args.args[0]
+        assert service.run_pipeline.await_count == 1
+        event_arg = service.run_pipeline.await_args.args[0]
         assert event_arg.payload.content == "Quero remarcar minha consulta"
 
         # Reply was sent
@@ -979,7 +986,8 @@ class TestMetaWebhookAudioFlow:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock()
+            service.run_pipeline = AsyncMock()
+            service.finish_response = AsyncMock()
             mock_get_service.return_value = service
 
             with caplog.at_level("INFO", logger="src.api.routes.webhook"):
@@ -1032,7 +1040,8 @@ class TestMetaWebhookAudioFlow:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock()
+            service.run_pipeline = AsyncMock()
+            service.finish_response = AsyncMock()
             mock_get_service.return_value = service
 
             with caplog.at_level("WARNING", logger="src.api.routes.webhook"):
@@ -1099,7 +1108,8 @@ class TestMetaWebhookAudioFlow:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock()
+            service.run_pipeline = AsyncMock()
+            service.finish_response = AsyncMock()
             mock_get_service.return_value = service
 
             with caplog.at_level("ERROR", logger="src.api.routes.webhook"):
@@ -1182,7 +1192,8 @@ class TestMetaWebhookFileFlow:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock()
+            service.run_pipeline = AsyncMock()
+            service.finish_response = AsyncMock()
             mock_get_service.return_value = service
 
             resp = _post_meta(client, payload)
@@ -1196,7 +1207,7 @@ class TestMetaWebhookFileFlow:
         # Content was never touched
         assert mock_resolve.await_count == 0
         assert mock_download.await_count == 0
-        assert service.process_event.await_count == 0
+        assert service.run_pipeline.await_count == 0
 
         # But the fixed ack message was sent
         assert mock_send.await_count == 1
@@ -1239,7 +1250,8 @@ class TestMetaWebhookFileFlow:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock()
+            service.run_pipeline = AsyncMock()
+            service.finish_response = AsyncMock()
             mock_get_service.return_value = service
 
             resp = _post_meta(client, payload)
@@ -1291,7 +1303,8 @@ class TestMetaWebhookFileFlow:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock()
+            service.run_pipeline = AsyncMock()
+            service.finish_response = AsyncMock()
             mock_get_service.return_value = service
 
             resp = _post_meta(client, payload)
@@ -1299,7 +1312,7 @@ class TestMetaWebhookFileFlow:
         assert resp.status_code == 200
         assert mock_resolve.await_count == 0
         assert mock_download.await_count == 0
-        assert service.process_event.await_count == 0
+        assert service.run_pipeline.await_count == 0
 
 
 # ============================================
@@ -1352,8 +1365,9 @@ class TestMetaWebhookFileForwardChoice:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("should never fire"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("should never fire")
             )
             mock_get_service.return_value = service
 
@@ -1380,7 +1394,7 @@ class TestMetaWebhookFileForwardChoice:
         assert "equipe" in sent_body.lower() or "team" in sent_body.lower()
 
         # Pipeline was NOT invoked
-        assert service.process_event.await_count == 0
+        assert service.run_pipeline.await_count == 0
 
     def test_description_text_after_file_falls_through_to_pipeline(
         self,
@@ -1426,8 +1440,9 @@ class TestMetaWebhookFileForwardChoice:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("A consulta é R$ 200"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("A consulta é R$ 200")
             )
             mock_get_service.return_value = service
 
@@ -1441,9 +1456,9 @@ class TestMetaWebhookFileForwardChoice:
         # Flag cleared exactly once
         assert clear_mock.await_count >= 1
         # Pipeline was invoked with the description text
-        assert service.process_event.await_count == 1
+        assert service.run_pipeline.await_count == 1
         assert (
-            service.process_event.await_args.args[0].payload.content
+            service.run_pipeline.await_args.args[0].payload.content
             == "Na verdade queria saber o valor da consulta"
         )
 
@@ -1488,7 +1503,8 @@ class TestMetaWebhookHmacAuthenticity:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock()
+            service.run_pipeline = AsyncMock()
+            service.finish_response = AsyncMock()
             mock_get_service.return_value = service
 
             resp = client.post(
@@ -1499,7 +1515,7 @@ class TestMetaWebhookHmacAuthenticity:
 
         assert resp.status_code == 401
         assert resp.json() == {"error": "invalid_webhook_auth"}
-        assert service.process_event.await_count == 0
+        assert service.run_pipeline.await_count == 0
         assert mock_send.await_count == 0
 
     def test_invalid_signature_returns_401_and_no_effects(
@@ -1529,7 +1545,8 @@ class TestMetaWebhookHmacAuthenticity:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock()
+            service.run_pipeline = AsyncMock()
+            service.finish_response = AsyncMock()
             mock_get_service.return_value = service
 
             resp = client.post(
@@ -1543,7 +1560,7 @@ class TestMetaWebhookHmacAuthenticity:
 
         assert resp.status_code == 401
         assert resp.json() == {"error": "invalid_webhook_auth"}
-        assert service.process_event.await_count == 0
+        assert service.run_pipeline.await_count == 0
         assert mock_send.await_count == 0
 
     def test_hmac_signed_with_wrong_tenant_secret_returns_401(
@@ -1574,7 +1591,8 @@ class TestMetaWebhookHmacAuthenticity:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock()
+            service.run_pipeline = AsyncMock()
+            service.finish_response = AsyncMock()
             mock_get_service.return_value = service
 
             # Signature computed with a DIFFERENT (wrong) secret
@@ -1582,7 +1600,7 @@ class TestMetaWebhookHmacAuthenticity:
 
         assert resp.status_code == 401
         assert resp.json() == {"error": "invalid_webhook_auth"}
-        assert service.process_event.await_count == 0
+        assert service.run_pipeline.await_count == 0
         assert mock_send.await_count == 0
 
     def test_zero_message_bearing_phone_ids_after_signature(
@@ -1722,14 +1740,15 @@ class TestMetaWebhookReplay:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock()
+            service.run_pipeline = AsyncMock()
+            service.finish_response = AsyncMock()
             mock_get_service.return_value = service
 
             resp = _post_meta(client, payload)
 
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "skipped": "missing_message_id"}
-        assert service.process_event.await_count == 0
+        assert service.run_pipeline.await_count == 0
         assert mock_send.await_count == 0
 
     def test_duplicate_message_id_returns_duplicate_message_before_effects(
@@ -1759,8 +1778,9 @@ class TestMetaWebhookReplay:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("first"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("first")
             )
             mock_get_service.return_value = service
 
@@ -1769,8 +1789,9 @@ class TestMetaWebhookReplay:
             assert first.json() == {"ok": True, "replied": True}
 
             # Reset the pipeline mock: second post must not invoke it.
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("should never fire"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("should never fire")
             )
             mock_send.reset_mock()
 
@@ -1778,7 +1799,7 @@ class TestMetaWebhookReplay:
 
         assert second.status_code == 200
         assert second.json() == {"ok": True, "skipped": "duplicate_message"}
-        assert service.process_event.await_count == 0
+        assert service.run_pipeline.await_count == 0
         assert mock_send.await_count == 0
 
     def test_redis_unavailable_returns_503_in_production(
@@ -1822,14 +1843,15 @@ class TestMetaWebhookReplay:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock()
+            service.run_pipeline = AsyncMock()
+            service.finish_response = AsyncMock()
             mock_get_service.return_value = service
 
             resp = _post_meta(client, payload)
 
         assert resp.status_code == 503
         assert resp.json() == {"error": "replay_store_unavailable"}
-        assert service.process_event.await_count == 0
+        assert service.run_pipeline.await_count == 0
         assert mock_send.await_count == 0
 
 
@@ -1878,7 +1900,8 @@ class TestMetaWebhookRateLimit:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock()
+            service.run_pipeline = AsyncMock()
+            service.finish_response = AsyncMock()
             mock_get_service.return_value = service
 
             resp = _post_meta(client, payload)
@@ -1894,7 +1917,7 @@ class TestMetaWebhookRateLimit:
         )
         assert resp.headers["X-RateLimit-Remaining"] == "0"
         assert resp.headers["Retry-After"] == str(body["retry_after"])
-        assert service.process_event.await_count == 0
+        assert service.run_pipeline.await_count == 0
         assert mock_send.await_count == 0
 
 
@@ -2070,7 +2093,7 @@ class TestMetaSttFallbackChain:
 
         async def _capture(self, event_request, session=None):
             captured["content"] = event_request.payload.content
-            return _NoReplyResponse()
+            return MagicMock(), {}, []
 
         payload = _meta_audio_payload(
             phone_number_id=phone_id,
@@ -2090,7 +2113,12 @@ class TestMetaSttFallbackChain:
             ),
             patch("src.services.stt_service.transcribe_audio", fixed_adapter),
             patch("src.services.groq_service.transcribe_audio", legacy_adapter),
-            patch.object(EventService, "process_event", _capture),
+            patch.object(EventService, "run_pipeline", _capture),
+            patch.object(
+                EventService,
+                "finish_response",
+                AsyncMock(return_value=_NoReplyResponse()),
+            ),
         ):
             response = _post_meta(client, payload)
 
@@ -2105,7 +2133,10 @@ class TestMetaSttFallbackChain:
         assert kwargs["audio_bytes"] == audio_bytes
         assert kwargs["mimetype"] == raw_mime
         assert kwargs["model_name"] == model_name
-        assert kwargs["language"] == "pt"
+        # Autodetect mode: no language hint forwarded to the fixed STT
+        # adapters so PT and EN audio feed the same decision machine the
+        # text turns feed, without any STT-side translation.
+        assert "language" not in kwargs or kwargs["language"] is None
         legacy_adapter.assert_not_awaited()
 
     def test_stt_failure_without_multimodal_reroutes_and_does_not_hand_off(
@@ -2276,7 +2307,7 @@ class TestMetaSttFallbackChain:
 
         async def _capture(self, event_request, session=None):
             captured["content"] = event_request.payload.content
-            return _NoReplyResponse()
+            return MagicMock(), {}, []
 
         with (
             patch(
@@ -2293,7 +2324,12 @@ class TestMetaSttFallbackChain:
                 new=AsyncMock(return_value="preciso remarcar"),
             ),
             patch("src.api.routes.webhook.send_meta_cloud_text", send_mock),
-            patch.object(EventService, "process_event", _capture),
+            patch.object(EventService, "run_pipeline", _capture),
+            patch.object(
+                EventService,
+                "finish_response",
+                AsyncMock(return_value=_NoReplyResponse()),
+            ),
         ):
             resp = _post_meta(client, payload)
 
@@ -2607,8 +2643,9 @@ class TestMetaVoiceReplyOrigin:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Resposta"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Resposta")
             )
             get_service.return_value = service
             response = _post_meta(client, payload)
@@ -2660,8 +2697,9 @@ class TestMetaVoiceReplyOrigin:
         ):
             service = MagicMock()
             service._load_clinic_config = AsyncMock(return_value={})
-            service.process_event = AsyncMock(
-                return_value=_fake_event_response("Resposta"),
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Resposta")
             )
             get_service.return_value = service
             response = _post_meta(client, payload)
