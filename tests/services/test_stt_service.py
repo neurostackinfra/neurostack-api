@@ -151,6 +151,39 @@ def test_provider_contracts_use_exact_multipart_request(
     assert base64.b64encode(RAW_AUDIO) not in request.content
 
 
+def test_default_call_omits_language_for_autodetect() -> None:
+    """``transcribe_audio`` must default to autodetect.
+
+    The conversation-language-switching wish (Group 3) feeds audio and text
+    turns into the same PT/EN decision machine without translation. The
+    fixed OpenRouter adapter accepts an optional ``language`` form field,
+    but the default call site must omit it so the provider autodetects —
+    forcing a hint from the clinic's configured language would collapse
+    the dual-language path back to a monolingual one.
+    """
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"text": "ok"})
+
+    result = asyncio.run(
+        transcribe_audio(
+            provider="openrouter",
+            api_url=OPENROUTER_API_BASE,
+            api_key="stt-secret-sentinel",
+            audio_bytes=RAW_AUDIO,
+            mimetype="audio/ogg; codecs=opus",
+            model_name="vendor-model-sentinel",
+            resolver=_resolver,
+            transport=httpx.MockTransport(handler),
+        )
+    )
+    assert result == "ok"
+    # The multipart body carries ``model`` but no ``language``.
+    assert "language" not in _multipart_parts(seen[0])
+
+
 def test_openrouter_omits_optional_language() -> None:
     seen: list[httpx.Request] = []
 

@@ -23,7 +23,7 @@ from src.api.middleware.rate_limit import (
     check_webhook_rate_limit,
     webhook_rate_limit_response,
 )
-from src.api.schemas.events import EventPayload, EventRequest, EventType
+from src.api.schemas.events import EventPayload, EventRequest, EventResponse, EventType
 from src.config.settings import settings
 from src.core.lgpd_utils import resolve_privacy_link
 from src.handoff.episode_context import (
@@ -169,6 +169,40 @@ def _get_agent_language(clinic_config: Optional[dict[str, Any]]) -> str:
         return "pt-BR"
     business = clinic_config.get("business_rules") or {}
     return cast(str, business.get("agent_language") or "pt-BR")
+
+
+async def _run_pipeline_transactionally(
+    *,
+    service: Any,
+    event_request: EventRequest,
+    db: AsyncSession,
+) -> EventResponse:
+    """Run the locked phase, commit it, then start post-commit response I/O.
+
+    Pipeline or commit failures roll back and never reach ``finish_response``.
+    Once commit succeeds, failures from response generation are deliberately
+    not followed by rollback because the language/state transition is already
+    durable and the PostgreSQL row lock has been released.
+    """
+    try:
+        result, clinic_config, message_history = await service.run_pipeline(
+            event_request,
+            session=db,
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    return cast(
+        EventResponse,
+        await service.finish_response(
+            event_request,
+            result,
+            clinic_config,
+            message_history,
+        ),
+    )
 
 
 async def _send_reply_with_optional_tts(
@@ -1420,7 +1454,6 @@ async def _stt_transcribe_audio(
     audio_bytes: bytes,
     mime_type: str,
     creds: dict[str, Any],
-    agent_language: str,
 ) -> Optional[str]:
     """First rung: the dedicated speech-to-text provider.
 
@@ -1428,6 +1461,11 @@ async def _stt_transcribe_audio(
     audio), or ``None`` when no STT key is configured at all. Raises the
     underlying exception on transcription failure so the chain can log it
     with a stack trace and move to the next rung.
+
+    Language hint is deliberately **omitted**: the audio turn must feed the
+    same PT/EN decision machine the text turn feeds, with no STT-side
+    translation. ElevenLabs autodetects natively; the OpenAI-compatible
+    adapters pass no ``language`` so Whisper autodetects as well.
 
     Key resolution is canonical-first, matching ``resolve_stt_credentials``:
     a legacy ``whisper_api_key`` is only a fallback for rows written before
@@ -1437,7 +1475,6 @@ async def _stt_transcribe_audio(
     whisper_key = (creds.get("stt_api_key") or "").strip() or (
         creds.get("whisper_api_key") or ""
     ).strip()
-    lang_hint = "en" if agent_language == "en" else "pt"
 
     if stt_provider in {"elevenlabs_scribe", "openrouter"}:
         api_url = creds.get("stt_api_url")
@@ -1460,7 +1497,6 @@ async def _stt_transcribe_audio(
             audio_bytes=audio_bytes,
             mimetype=mime_type,
             model_name=cast(str, model_name),
-            language=lang_hint,
         )
 
     if not whisper_key:
@@ -1489,7 +1525,6 @@ async def _stt_transcribe_audio(
         audio_bytes=audio_bytes,
         mimetype=mime_type,
         model=_resolve_stt_model(creds),
-        language=lang_hint,
         base_url=stt_base_url,
     )
 
@@ -1562,7 +1597,6 @@ async def _transcribe_audio_chain(
                 audio_bytes=audio_bytes,
                 mime_type=mime_type,
                 creds=credentials,
-                agent_language=agent_language,
             )
         except Exception as exc:
             logger.exception(
@@ -2206,8 +2240,11 @@ async def _process_zapi_authenticated_body(
         ),
     )
 
-    response = await service.process_event(event_request, session=db)
-    await db.commit()
+    response = await _run_pipeline_transactionally(
+        service=service,
+        event_request=event_request,
+        db=db,
+    )
 
     # ── send LLM response back via Z-API ──
     suggested = (
@@ -2235,7 +2272,7 @@ async def _process_zapi_authenticated_body(
         send_result, sent_as_audio = await _send_reply_with_optional_tts(
             credentials=creds,
             text=suggested,
-            language_code=_get_agent_language(clinic_config),
+            language_code=response.response_language,
             channel="Z-API",
             phone=phone,
             input_was_audio=patient_audio_input,
@@ -2346,6 +2383,8 @@ async def evolution_webhook(
         return {"ok": True, "skipped": "invalid_data"}
 
     key = data.get("key", {})
+    if not isinstance(key, dict):
+        return {"ok": True, "skipped": "missing_message_id"}
     is_from_me = key.get("fromMe", False)
 
     # ── extract message text ──
@@ -2379,13 +2418,26 @@ async def evolution_webhook(
         logger.warning("Evolution webhook: no tenant for instance %s", instance_name)
         return {"ok": True, "skipped": "unknown_instance"}
 
+    # ── require and claim the provider message id before downstream effects ──
+    webhook_msg_id = str(key.get("id") or "").strip()
+    if not webhook_msg_id:
+        return {"ok": True, "skipped": "missing_message_id"}
+    try:
+        first_delivery = _claim_incoming_message("evolution", tenant_id, webhook_msg_id)
+    except ReplayStoreUnavailable:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "replay_store_unavailable"},
+        )
+    if not first_delivery:
+        return {"ok": True, "skipped": "duplicate_message"}
+
     # ── load clinic_config early (needed for bot_active offline_message + LGPD) ──
     service = get_event_service()
     clinic_config = await service._load_clinic_config(tenant_id)
 
     # ── fromMe=true: check if AI-sent echo or real clinic message ──
     if is_from_me:
-        webhook_msg_id = key.get("id", "")
         # Fast path: in-memory + Redis check (same worker, Redis available)
         if webhook_msg_id and _is_ai_sent_message(webhook_msg_id):
             return {"ok": True, "skipped": "ai_echo"}
@@ -2456,14 +2508,17 @@ async def evolution_webhook(
             metadata={
                 "phone": phone,
                 "pushName": sender_name,
-                "messageId": key.get("id", ""),
+                "messageId": webhook_msg_id,
                 "source": "evolution",
             },
         ),
     )
 
-    response = await service.process_event(event_request, session=db)
-    await db.commit()
+    response = await _run_pipeline_transactionally(
+        service=service,
+        event_request=event_request,
+        db=db,
+    )
 
     # ── send LLM response back via Evolution API ──
     suggested = (
@@ -2489,7 +2544,7 @@ async def evolution_webhook(
         send_result, sent_as_audio = await _send_reply_with_optional_tts(
             credentials=creds,
             text=suggested,
-            language_code=_get_agent_language(clinic_config),
+            language_code=response.response_language,
             channel="Evolution",
             phone=phone,
             input_was_audio=False,
@@ -2930,8 +2985,11 @@ async def uazapi_webhook(
         ),
     )
 
-    response = await service.process_event(event_request, session=db)
-    await db.commit()
+    response = await _run_pipeline_transactionally(
+        service=service,
+        event_request=event_request,
+        db=db,
+    )
 
     suggested = (
         response.prompt.suggested_response
@@ -2951,7 +3009,7 @@ async def uazapi_webhook(
         send_result, sent_as_audio = await _send_reply_with_optional_tts(
             credentials=creds,
             text=suggested,
-            language_code=_get_agent_language(clinic_config),
+            language_code=response.response_language,
             channel="Uazapi",
             phone=from_phone,
             input_was_audio=audio_is_transcribable,
@@ -3861,8 +3919,11 @@ async def meta_webhook(
                 ),
             )
 
-            response = await service.process_event(event_request, session=db)
-            await db.commit()
+            response = await _run_pipeline_transactionally(
+                service=service,
+                event_request=event_request,
+                db=db,
+            )
 
             suggested = (
                 response.prompt.suggested_response
@@ -3882,7 +3943,7 @@ async def meta_webhook(
                 send_result, sent_as_audio = await _send_reply_with_optional_tts(
                     credentials=creds,
                     text=suggested,
-                    language_code=_get_agent_language(clinic_config),
+                    language_code=response.response_language,
                     channel="Meta",
                     phone=from_phone,
                     input_was_audio=input_was_audio,

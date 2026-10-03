@@ -102,6 +102,21 @@ from src.services.session_service import SessionService
 # ============================================================
 
 
+async def _process_stateful_event(
+    service: EventService,
+    request: Any,
+    *,
+    session: Any,
+) -> Any:
+    """Exercise the production two-phase contract from a stateful test."""
+    result, clinic_config, history = await service.run_pipeline(
+        request,
+        session=session,
+    )
+    await session.commit()
+    return await service.finish_response(request, result, clinic_config, history)
+
+
 class _NoOpHandoffStub:
     """Persistence-free handoff double for scenarios whose SRM decision path
     does not take the ``verification_status == "link_sent"`` branch.
@@ -443,7 +458,8 @@ def test_demand_b_after_resume_does_not_re_trigger_handoff(
         )
         db = get_db_session()
         try:
-            response = await service.process_event(
+            response = await _process_stateful_event(
+                service,
                 _event_request(
                     tenant_id=tenant_id,
                     session_id=session_id,
@@ -506,7 +522,8 @@ def test_demand_b_after_resume_does_not_re_trigger_handoff(
         )
         db = get_db_session()
         try:
-            response = await service.process_event(
+            response = await _process_stateful_event(
+                service,
                 _event_request(
                     tenant_id=tenant_id,
                     session_id=session_id,
@@ -589,7 +606,8 @@ def test_substantive_demand_b_after_resume_is_answered_directly(
         )
         db = get_db_session()
         try:
-            return await service.process_event(
+            return await _process_stateful_event(
+                service,
                 _event_request(
                     tenant_id=tenant_id,
                     session_id=session_id,
@@ -724,7 +742,8 @@ def test_saudacao_on_resumed_session_strips_self_introduction(
         )
         db = get_db_session()
         try:
-            return await service.process_event(
+            return await _process_stateful_event(
+                service,
                 _event_request(
                     tenant_id=tenant_id,
                     session_id=session_id,
@@ -824,7 +843,8 @@ def test_llm_outbound_array_frames_prior_context_as_user_payload_only(
         )
         db = get_db_session()
         try:
-            return await service.process_event(
+            return await _process_stateful_event(
+                service,
                 _event_request(
                     tenant_id=tenant_id,
                     session_id=session_id,
@@ -958,7 +978,8 @@ def test_llm_history_after_resume_excludes_prior_episode_events(
         )
         db = get_db_session()
         try:
-            return await service.process_event(
+            return await _process_stateful_event(
+                service,
                 _event_request(
                     tenant_id=tenant_id,
                     session_id=session_id,
@@ -1148,7 +1169,8 @@ def test_explicit_human_request_after_resume_still_triggers_handoff(
         )
         db = get_db_session()
         try:
-            response = await service.process_event(
+            response = await _process_stateful_event(
+                service,
                 _event_request(
                     tenant_id=tenant_id,
                     session_id=session_id,
@@ -1214,7 +1236,8 @@ def test_safety_concern_after_resume_still_triggers_handoff(
         )
         db = get_db_session()
         try:
-            response = await service.process_event(
+            response = await _process_stateful_event(
+                service,
                 _event_request(
                     tenant_id=tenant_id,
                     session_id=session_id,
@@ -1401,7 +1424,8 @@ def test_resume_mode_logs_contain_no_pii(
         )
         db = get_db_session()
         try:
-            await service.process_event(
+            await _process_stateful_event(
+                service,
                 _event_request(
                     tenant_id=tenant_id,
                     session_id=session_id,
@@ -1427,7 +1451,8 @@ def test_resume_mode_logs_contain_no_pii(
         )
         db = get_db_session()
         try:
-            await service.process_event(
+            await _process_stateful_event(
+                service,
                 _event_request(
                     tenant_id=tenant_id,
                     session_id=session_id,
@@ -1466,3 +1491,354 @@ def test_resume_mode_logs_contain_no_pii(
             f"PII leaked into log record {record.getMessage()!r}: "
             f"forbidden token {match.group(0)!r} in {rendered!r}"
         )
+
+
+# ============================================================
+# Group 3 (conversation-language-switching) — language reset on resume
+# ============================================================
+
+
+def _install_clinic_config_language(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    initial_language: str,
+) -> dict[str, Any]:
+    """Stub ``EventService._load_clinic_config`` with a mutable language.
+
+    Returns the mutable container; tests may rewrite its ``agent_language``
+    value between turns to simulate a clinic that changed its configured
+    language while the session was paused in handoff.
+    """
+    container: dict[str, Any] = {"agent_language": initial_language}
+
+    async def _loader(self: Any, _tenant_id: Any) -> dict[str, Any]:  # noqa: ANN401
+        return {"business_rules": {"agent_language": container["agent_language"]}}
+
+    monkeypatch.setattr(EventService, "_load_clinic_config", _loader)
+    return container
+
+
+def test_handoff_closing_message_uses_temporary_language(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A handoff raised in a temporarily-accepted language keeps that language.
+
+    Clinic is configured in PT. The session has already accepted EN (the
+    language-decision machine has set ``active_language='en'``). The
+    patient then types a short request to speak with a human; the SRM
+    returns a user-request handoff. The pipeline's canned reply is wrapped
+    through the real response path, so the test asserts the resulting
+    ``response_language`` is ``en``, not ``pt-BR`` — the clinic's
+    configured value must NOT override the accepted temporary language on
+    the handoff-closing turn (Group 3 acceptance criterion 4).
+    """
+    _install_clinic_config_language(monkeypatch, initial_language="pt-BR")
+    service, pipeline = _build_real_event_service(monkeypatch)
+    _install_llm_capture(monkeypatch, canned_reply="Transferring now.")
+
+    tenant_id = uuid4()
+    session_id = uuid4()
+    phone = "5511977770501"
+
+    # Seed the session with active_language='en' so the handoff turn runs
+    # while EN is the temporarily-accepted language.
+    _seed_tenant_and_session(
+        client,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        user_id=phone,
+        cognitive_state={
+            "active_language": "en",
+            "pending_language": None,
+        },
+    )
+
+    from src.repositories.database import get_db_session
+
+    async def _turn_handoff() -> Any:
+        monkeypatch.setattr(
+            pipeline,
+            "_run_srm",
+            AsyncMock(return_value=_handoff_pause_request_decision()),
+        )
+        db = get_db_session()
+        try:
+            response = await _process_stateful_event(
+                service,
+                _event_request(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    content="I want to talk to a human now",
+                    phone=phone,
+                ),
+                session=db,
+            )
+            await db.commit()
+            return response
+        finally:
+            await db.close()
+
+    response = client._submit(_turn_handoff())  # type: ignore[attr-defined]
+
+    # The handoff fires on this turn (session will be paused).
+    assert response.decision.handoff_required is True
+    # And the closing message must speak the accepted temporary language,
+    # even though the clinic is configured in PT. This is the whole point
+    # of Group 3 wiring ``response_language`` through the pipeline instead
+    # of resolving the clinic default at the webhook boundary.
+    assert response.response_language == "en", (
+        "handoff closing message must preserve the temporarily-accepted "
+        f"language, got {response.response_language!r}"
+    )
+
+    paused_row = _read_session_row(client, session_id)
+    assert paused_row["is_paused"] is True, paused_row
+
+
+def test_first_turn_after_reactivation_uses_current_clinic_language(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resumption drops the temp language; the next turn reads the config.
+
+    Scenario: clinic starts PT, patient accepts EN mid-conversation (so
+    ``active_language='en'``) and then asks for a human → pause. While the
+    session is paused the clinic rewrites ``agent_language`` to ``en``,
+    then back to ``pt-BR`` (realistic churn — a staff member toggling the
+    setting during the handoff). On resumption the projection must clear
+    both language fields; the first turn after reactivation must read the
+    *current* clinic value (``pt-BR``), NOT a cached copy of what the
+    config was at pause time.
+
+    This proves two linked invariants at once:
+
+    * ``project_resume_state`` wipes ``active_language`` / ``pending_language``
+      (Group 3 deliverable 4);
+    * the next ``run_pipeline`` call reloads clinic_config fresh via
+      ``_load_clinic_config`` (Group 3 acceptance criterion 5).
+    """
+    clinic_config_lang = _install_clinic_config_language(
+        monkeypatch, initial_language="pt-BR"
+    )
+    service, pipeline = _build_real_event_service(monkeypatch)
+    _install_llm_capture(monkeypatch, canned_reply="Perfeito, vamos agendar.")
+
+    tenant_id = uuid4()
+    session_id = uuid4()
+    phone = "5511977770502"
+
+    _seed_tenant_and_session(
+        client,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        user_id=phone,
+        cognitive_state={
+            "active_language": "en",
+            "pending_language": None,
+        },
+    )
+
+    from src.repositories.database import get_db_session
+
+    # ── Turn A (EN handoff). ──
+    async def _turn_a() -> Any:
+        monkeypatch.setattr(
+            pipeline,
+            "_run_srm",
+            AsyncMock(return_value=_handoff_pause_request_decision()),
+        )
+        db = get_db_session()
+        try:
+            response = await _process_stateful_event(
+                service,
+                _event_request(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    content="I need a human attendant",
+                    phone=phone,
+                ),
+                session=db,
+            )
+            await db.commit()
+            return response
+        finally:
+            await db.close()
+
+    response_a = client._submit(_turn_a())  # type: ignore[attr-defined]
+    assert response_a.response_language == "en"
+
+    # The pause CAS wrote the row; snapshot both language fields to prove
+    # they survive the handoff (they are only wiped by the resume path).
+    paused = _read_session_row(client, session_id)
+    assert paused["is_paused"] is True
+    assert paused["cognitive_state"].get("active_language") == "en"
+
+    # ── Clinic config churns while the session is paused in handoff. ──
+    clinic_config_lang["agent_language"] = "en"
+    clinic_config_lang["agent_language"] = "pt-BR"
+
+    # ── Reactivate. ──
+    async def _reactivate() -> str:
+        db = get_db_session()
+        try:
+            resp = await SessionService().reactivate_session(tenant_id, session_id, db)
+            await db.commit()
+            return resp.status
+        finally:
+            await db.close()
+
+    status = client._submit(_reactivate())  # type: ignore[attr-defined]
+    assert status == "reactivated"
+
+    # Projection invariant: both language fields are wiped on resume.
+    resumed = _read_session_row(client, session_id)
+    assert resumed["is_paused"] is False
+    cs = resumed["cognitive_state"]
+    assert cs.get("active_language") in (None, ""), cs
+    assert cs.get("pending_language") in (None, ""), cs
+
+    # ── Turn B after reactivation: must speak the *current* clinic lang. ──
+    async def _turn_b() -> Any:
+        monkeypatch.setattr(
+            pipeline,
+            "_run_srm",
+            AsyncMock(return_value=_benign_normal_decision()),
+        )
+        db = get_db_session()
+        try:
+            response = await _process_stateful_event(
+                service,
+                _event_request(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    # Deliberately ambiguous text so the detector does not
+                    # flip the language on its own; the clinic default is
+                    # what must win on an empty-slot resumed turn.
+                    content="ok",
+                    phone=phone,
+                ),
+                session=db,
+            )
+            await db.commit()
+            return response
+        finally:
+            await db.close()
+
+    response_b = client._submit(_turn_b())  # type: ignore[attr-defined]
+
+    # The first turn after reactivation must read the *current* clinic
+    # value (``pt-BR``), NOT the stale ``en`` that was accepted in the
+    # previous episode. If this fails, resumption cached the old config.
+    assert response_b.response_language == "pt-BR", (
+        "first turn after reactivation must use the clinic's current "
+        f"configured language, got {response_b.response_language!r}"
+    )
+
+
+def test_configured_language_change_during_handoff_wins_on_resume(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clinic that flips ``agent_language`` during handoff gets the new value.
+
+    Clinic starts PT. Patient accepts EN. Handoff pause fires. While paused,
+    the clinic rewrites ``agent_language`` to ``en`` (a real operational
+    scenario: the staff realises the patient only speaks English and
+    retrains the agent for English before resuming). After reactivation,
+    the first turn's ``response_language`` must be ``en`` because the
+    projection wiped the old ``active_language`` *and* ``_load_clinic_config``
+    was called fresh — never a cached copy from the pause moment.
+    """
+    clinic_config_lang = _install_clinic_config_language(
+        monkeypatch, initial_language="pt-BR"
+    )
+    service, pipeline = _build_real_event_service(monkeypatch)
+    _install_llm_capture(monkeypatch, canned_reply="Hello, how can I help?")
+
+    tenant_id = uuid4()
+    session_id = uuid4()
+    phone = "5511977770503"
+
+    _seed_tenant_and_session(
+        client,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        user_id=phone,
+        cognitive_state={
+            "active_language": "en",
+            "pending_language": None,
+        },
+    )
+
+    from src.repositories.database import get_db_session
+
+    async def _turn_a() -> Any:
+        monkeypatch.setattr(
+            pipeline,
+            "_run_srm",
+            AsyncMock(return_value=_handoff_pause_request_decision()),
+        )
+        db = get_db_session()
+        try:
+            response = await _process_stateful_event(
+                service,
+                _event_request(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    content="I want a human now",
+                    phone=phone,
+                ),
+                session=db,
+            )
+            await db.commit()
+            return response
+        finally:
+            await db.close()
+
+    client._submit(_turn_a())  # type: ignore[attr-defined]
+
+    # Clinic config flips to EN while paused.
+    clinic_config_lang["agent_language"] = "en"
+
+    async def _reactivate() -> str:
+        db = get_db_session()
+        try:
+            resp = await SessionService().reactivate_session(tenant_id, session_id, db)
+            await db.commit()
+            return resp.status
+        finally:
+            await db.close()
+
+    assert client._submit(_reactivate()) == "reactivated"  # type: ignore[attr-defined]
+
+    async def _turn_b() -> Any:
+        monkeypatch.setattr(
+            pipeline,
+            "_run_srm",
+            AsyncMock(return_value=_benign_normal_decision()),
+        )
+        db = get_db_session()
+        try:
+            response = await _process_stateful_event(
+                service,
+                _event_request(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    content="ok",
+                    phone=phone,
+                ),
+                session=db,
+            )
+            await db.commit()
+            return response
+        finally:
+            await db.close()
+
+    response_b = client._submit(_turn_b())  # type: ignore[attr-defined]
+
+    # The *new* clinic value is read fresh — nothing stale from pause time.
+    assert response_b.response_language == "en", (
+        "resumption must read the clinic's current configured language "
+        f"(now 'en'), got {response_b.response_language!r}"
+    )

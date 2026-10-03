@@ -50,16 +50,22 @@ GROQ_API_BASE = "https://api.groq.com/openai/v1"
 DEFAULT_MULTIMODAL_MODEL = "google/gemini-2.5-flash"
 
 #: Marker the prompt asks for when the audio carries no intelligible speech,
-#: so a caller can tell "nothing was said" from "transcription failed".
-NO_SPEECH_MARKER = "(sem fala)"
+#: so a caller can tell "nothing was said" from "transcription failed". The
+#: marker is intentionally language-neutral (no PT or EN text) so the audio
+#: and text turns share the same downstream language-decision machine.
+NO_SPEECH_MARKER = "[[NO_SPEECH]]"
 
 #: Instruction sent alongside the audio. Kept here (not at the call site) so
 #: the transcript-only contract of this function is enforced in one place.
+#: The prompt is language-neutral: the model must transcribe literally in
+#: whichever language was spoken (PT or EN) and never translate — the PT/EN
+#: response-policy decision happens later, on the text decision machine, not
+#: inside this transcription step.
 DEFAULT_TRANSCRIPTION_PROMPT = (
-    "Transcreva literalmente a fala deste áudio em português do Brasil. "
-    "Responda apenas com a transcrição, sem comentários, sem aspas e sem "
-    "qualquer prefixo. Se não houver fala inteligível, responda exatamente: "
-    f"{NO_SPEECH_MARKER}"
+    "Transcribe this audio literally, in the exact language that was spoken. "
+    "Do not translate. Do not add commentary, quotes, prefixes, or any other "
+    "text — reply with only the raw transcription. "
+    f"If no intelligible speech is present, reply exactly: {NO_SPEECH_MARKER}"
 )
 
 #: MIME type -> ``input_audio.format`` label. The key is the MIME type with

@@ -19,7 +19,13 @@ CONSUMERS = (
     "src/services/business_hours.py",
     "src/services/trace_adapter.py",
 )
-CORE_PREFIXES = ("src.flow", "src.policy", "src.prompt", "src.srm")
+CORE_PREFIXES = (
+    "neurostack_core.flow",
+    "neurostack_core.policy",
+    "neurostack_core.prompt",
+    "neurostack_core.srm",
+)
+CORE_ROOT = Path("packages/neurostack-core/neurostack_core")
 
 
 class ExtractionError(ValueError):
@@ -27,7 +33,10 @@ class ExtractionError(ValueError):
 
 
 def module_path(root: Path, module: str) -> Path:
-    relative = Path(*module.split("."))
+    namespace, *parts = module.split(".")
+    if namespace != "neurostack_core":
+        raise ExtractionError(f"unresolved module: {module}")
+    relative = CORE_ROOT.joinpath(*parts)
     package = root / relative / "__init__.py"
     source = root / relative.with_suffix(".py")
     if package.is_file():
@@ -167,6 +176,7 @@ def extract_tree(root: Path, tree: ast.Module, source_name: str) -> dict[str, se
             for alias in node.names:
                 local = alias.asname or alias.name.split(".")[0]
                 if is_core_module(alias.name):
+                    module_path(root, alias.name)
                     imported = alias.name if alias.asname else alias.name.split(".")[0]
                     module_aliases.setdefault(local, []).append((imported, node.lineno))
                 else:

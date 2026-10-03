@@ -49,6 +49,25 @@ class SessionRepository(BaseRepository[Session]):
         )
         return result.scalar_one_or_none()
 
+    async def get_by_tenant_for_update(
+        self, session_id: UUID, tenant_id: UUID
+    ) -> Optional[Session]:
+        """Lock and return one tenant-scoped session for the current transaction.
+
+        PostgreSQL holds the row lock until the caller commits or rolls back.
+        Keeping the tenant predicate in the locking statement prevents an
+        untrusted session UUID from locking or exposing another tenant's row.
+        """
+        result = await self.session.execute(
+            select(Session)
+            .where(
+                Session.id == session_id,
+                Session.tenant_id == tenant_id,
+            )
+            .with_for_update()
+        )
+        return result.scalar_one_or_none()
+
     async def update_for_tenant(
         self,
         session_id: UUID,

@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "packages" / "neurostack-core" / "scripts" / "check_public_api.py"
-EXPECTED = ROOT / "tests" / "baselines" / "neurostack-core-extraction-public-api.json"
+EXPECTED = ROOT / "tests" / "baselines" / "neurostack-core-public-facade.json"
 
 
 def run_checker(
