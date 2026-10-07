@@ -13,6 +13,9 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any
 
+DEFAULT_REACTIVATION_TRIGGER_MESSAGE = "Precisando de algo mais, estamos a disposição."
+DEFAULT_REACTIVATION_DELAY_HOURS = 1
+
 
 class PauseAction(str, Enum):
     """The three possible runtime outcomes."""
@@ -43,6 +46,16 @@ class PauseDecision:
         return self.action is not PauseAction.NO_PAUSE
 
 
+@dataclass(frozen=True)
+class TriggerReactivationDecision:
+    """Effective trigger phrase and cooldown for a clinic-authored message."""
+
+    trigger_message: str
+    delay_hours: int
+    reactivates_at: datetime
+    notices: tuple[PausePolicyNotice, ...] = ()
+
+
 def _enum(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -68,6 +81,62 @@ def parse_legacy_cycle_days(value: Any) -> int | None:
         parsed = int(normalized)
         return parsed if 1 <= parsed <= 365 else None
     return None
+
+
+def resolve_trigger_reactivation(
+    handoff: Any,
+    now: datetime,
+) -> TriggerReactivationDecision:
+    """Resolve persisted trigger settings into the exact effective runtime values."""
+
+    bucket = handoff if isinstance(handoff, dict) else {}
+    notices: list[PausePolicyNotice] = []
+
+    raw_trigger = bucket.get(
+        "trigger_message",
+        DEFAULT_REACTIVATION_TRIGGER_MESSAGE,
+    )
+    if isinstance(raw_trigger, str) and raw_trigger.strip():
+        trigger_message = raw_trigger
+    else:
+        trigger_message = DEFAULT_REACTIVATION_TRIGGER_MESSAGE
+        if "trigger_message" in bucket:
+            notices.append(PausePolicyNotice("trigger_message", "invalid_phrase"))
+
+    raw_delay = bucket.get(
+        "reactivation_delay_hours",
+        DEFAULT_REACTIVATION_DELAY_HOURS,
+    )
+    fallback_reason: str | None = None
+    if isinstance(raw_delay, bool) or not isinstance(raw_delay, (int, str)):
+        delay_hours = DEFAULT_REACTIVATION_DELAY_HOURS
+        fallback_reason = "invalid_duration"
+    else:
+        try:
+            delay_hours = int(raw_delay)
+            if delay_hours <= 0:
+                delay_hours = DEFAULT_REACTIVATION_DELAY_HOURS
+                fallback_reason = "invalid_duration"
+        except ValueError:
+            delay_hours = DEFAULT_REACTIVATION_DELAY_HOURS
+            fallback_reason = "invalid_duration"
+
+    try:
+        reactivates_at = now + timedelta(hours=delay_hours)
+    except OverflowError:
+        delay_hours = DEFAULT_REACTIVATION_DELAY_HOURS
+        reactivates_at = now + timedelta(hours=delay_hours)
+        fallback_reason = "unrepresentable_duration"
+
+    if fallback_reason is not None:
+        notices.append(PausePolicyNotice("reactivation_delay_hours", fallback_reason))
+
+    return TriggerReactivationDecision(
+        trigger_message=trigger_message,
+        delay_hours=delay_hours,
+        reactivates_at=reactivates_at,
+        notices=tuple(notices),
+    )
 
 
 def resolve_handoff_pause(handoff: Any, now: datetime) -> PauseDecision:

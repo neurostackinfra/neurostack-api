@@ -10,7 +10,7 @@ import logging
 import re
 import time as _time
 from collections import OrderedDict as _OrderedDict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional, cast
 from uuid import UUID, uuid4
 
@@ -30,7 +30,7 @@ from src.handoff.episode_context import (
     build_prior_episode_context,
     project_resume_state,
 )
-from src.handoff.pause_policy import resolve_handoff_pause
+from src.handoff.pause_policy import resolve_handoff_pause, resolve_trigger_reactivation
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.event import Event as EventModel
 from src.models.tenant import Tenant as TenantModel
@@ -1268,52 +1268,24 @@ async def _handle_clinic_message(
         s = _re.sub(r"\s*([,;:.!?])\s*", r"\1", s)
         return s
 
-    trigger_msg = _normalize_for_match(
-        str(
-            handoff_cfg.get(
-                "trigger_message",
-                "Precisando de algo mais,estamos a disposição.",
-            )
-        )
-    )
+    reactivation = resolve_trigger_reactivation(handoff_cfg, current_time)
+    trigger_msg = _normalize_for_match(reactivation.trigger_message)
     normalized_text = _normalize_for_match(message_text)
 
     # Check if message contains the trigger phrase (flexible match, punctuation-tolerant)
     if trigger_msg in normalized_text:
         if session.is_paused:
-            raw_reactivation_hours = handoff_cfg.get("reactivation_delay_hours", 1)
-            fallback_reason: str | None = None
-            if isinstance(raw_reactivation_hours, bool) or not isinstance(
-                raw_reactivation_hours, (int, str)
-            ):
-                reactivation_hours = 1
-                fallback_reason = "invalid_duration"
-            else:
-                try:
-                    reactivation_hours = int(raw_reactivation_hours)
-                    if reactivation_hours <= 0:
-                        reactivation_hours = 1
-                        fallback_reason = "invalid_duration"
-                except ValueError:
-                    reactivation_hours = 1
-                    fallback_reason = "invalid_duration"
-            try:
-                reactivates_at = current_time + timedelta(hours=reactivation_hours)
-            except OverflowError:
-                reactivation_hours = 1
-                reactivates_at = current_time + timedelta(hours=reactivation_hours)
-                fallback_reason = "unrepresentable_duration"
-            if fallback_reason is not None:
+            for notice in reactivation.notices:
                 logger.warning(
                     "handoff_reactivation_config_tolerated",
                     extra={
                         "tenant_id": str(tenant_id),
                         "session_id": str(session.id),
-                        "field": "reactivation_delay_hours",
-                        "reason": fallback_reason,
+                        "field": notice.field,
+                        "reason": notice.reason,
                     },
                 )
-            session.paused_until = reactivates_at
+            session.paused_until = reactivation.reactivates_at
             await db.flush()
             logger.info(
                 "trigger_reactivation",
