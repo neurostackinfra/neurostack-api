@@ -48,6 +48,7 @@ interface BuilderClinic {
   business_hours_configured: boolean;
   config_completeness: number;
   contact_phone: string | null;
+  admin_email: string | null;
 }
 
 interface BuilderTicket {
@@ -278,6 +279,10 @@ export default function BuilderPanel() {
   // Per-clinic phone editing state (map of clinicId -> current draft)
   const [phoneDrafts, setPhoneDrafts] = useState<Record<string, string>>({});
   const [savingPhoneClinicId, setSavingPhoneClinicId] = useState<string | null>(null);
+  const [emailDrafts, setEmailDrafts] = useState<Record<string, string>>({});
+  const [emailErrors, setEmailErrors] = useState<Record<string, string | undefined>>({});
+  const [savingEmailClinicId, setSavingEmailClinicId] = useState<string | null>(null);
+  const emailRequestInFlightRef = useRef(new Set<string>());
 
   // Support tickets state
   const [tickets, setTickets] = useState<BuilderTicket[]>([]);
@@ -639,6 +644,39 @@ export default function BuilderPanel() {
       body: JSON.stringify(payload),
     });
     return response.ok;
+  }
+
+  async function handleSaveClinicEmail(clinic: BuilderClinic) {
+    if (emailRequestInFlightRef.current.has(clinic.id)) return;
+
+    emailRequestInFlightRef.current.add(clinic.id);
+    setSavingEmailClinicId(clinic.id);
+    setEmailErrors((prev) => ({ ...prev, [clinic.id]: undefined }));
+    try {
+      const response = await fetch(`/v1/builder/clinics/${clinic.id}/email`, {
+        method: "PATCH",
+        headers: authHeaders(token),
+        body: JSON.stringify({ email: (emailDrafts[clinic.id] ?? clinic.admin_email ?? "").trim() }),
+      });
+      if (!response.ok) {
+        setEmailErrors((prev) => ({ ...prev, [clinic.id]: t("builder_clinic_email_error") }));
+        return;
+      }
+
+      const data = await response.json() as { ok: true; admin_email: string };
+      setClinics((prev) =>
+        prev.map((current) =>
+          current.id === clinic.id ? { ...current, admin_email: data.admin_email } : current,
+        ),
+      );
+      setEmailDrafts((prev) => ({ ...prev, [clinic.id]: data.admin_email }));
+      toast({ title: t("builder_clinic_email_saved") });
+    } catch {
+      setEmailErrors((prev) => ({ ...prev, [clinic.id]: t("builder_clinic_email_error") }));
+    } finally {
+      emailRequestInFlightRef.current.delete(clinic.id);
+      setSavingEmailClinicId((current) => current === clinic.id ? null : current);
+    }
   }
 
   // Save contact_phone for a clinic (inline edit surface)
@@ -1224,6 +1262,45 @@ export default function BuilderPanel() {
                               <span className="font-medium">{clinic.config_completeness}%</span>
                             </div>
                             <Progress value={clinic.config_completeness} className="h-2" />
+                          </div>
+
+                          {/* Login email editor */}
+                          <div className="space-y-1">
+                            <Label htmlFor={`clinic-email-${clinic.id}`} className="text-xs">
+                              {t("builder_clinic_email_label")}
+                            </Label>
+                            <div className="flex gap-2">
+                              <Input
+                                id={`clinic-email-${clinic.id}`}
+                                type="email"
+                                value={emailDrafts[clinic.id] ?? clinic.admin_email ?? ""}
+                                onChange={(event) =>
+                                  setEmailDrafts((prev) => ({ ...prev, [clinic.id]: event.target.value }))
+                                }
+                                placeholder={t("builder_clinic_email_placeholder")}
+                                className="h-8 text-xs"
+                                data-testid={`input-clinic-email-${clinic.id}`}
+                              />
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-8 text-xs"
+                                onClick={() => void handleSaveClinicEmail(clinic)}
+                                disabled={savingEmailClinicId === clinic.id}
+                                data-testid={`btn-save-clinic-email-${clinic.id}`}
+                              >
+                                {savingEmailClinicId === clinic.id ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  t("builder_clinic_email_save")
+                                )}
+                              </Button>
+                            </div>
+                            {emailErrors[clinic.id] && (
+                              <p className="text-xs text-destructive" role="alert">
+                                {emailErrors[clinic.id]}
+                              </p>
+                            )}
                           </div>
 
                           {/* Contact phone editor */}

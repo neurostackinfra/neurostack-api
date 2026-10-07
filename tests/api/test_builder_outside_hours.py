@@ -28,15 +28,14 @@ _OPERATIONS = {
 }
 
 
-def _builder_headers(builder_id: UUID, tenant_id: UUID) -> dict[str, str]:
+def _super_admin_headers() -> dict[str, str]:
     now = datetime.now(timezone.utc)
     token = jwt.encode(
         {
             "sub": str(uuid4()),
-            "tenant_id": str(tenant_id),
-            "role": "builder",
-            "email": "builder-outside-hours@test.com",
-            "builder_id": str(builder_id),
+            "tenant_id": str(uuid4()),
+            "role": "super_admin",
+            "email": "admin-outside-hours@test.com",
             "iat": now,
             "exp": now + timedelta(hours=1),
             "jti": str(uuid4()),
@@ -45,6 +44,32 @@ def _builder_headers(builder_id: UUID, tenant_id: UUID) -> dict[str, str]:
         algorithm="HS256",
     )
     return {"Authorization": f"Bearer {token}"}
+
+
+async def _create_builder_authority(
+    client: AsyncClient,
+) -> tuple[UUID, dict[str, str]]:
+    email = f"builder-{uuid4().hex}@test.com"
+    password = "builder-test-password"
+    created = await client.post(
+        "/v1/admin/builders",
+        headers=_super_admin_headers(),
+        json={
+            "name": f"Builder {uuid4().hex[:8]}",
+            "admin_email": email,
+            "admin_password": password,
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    logged_in = await client.post(
+        "/v1/auth/login",
+        json={"email": email, "password": password},
+    )
+    assert logged_in.status_code == 200, logged_in.text
+    return UUID(created.json()["id"]), {
+        "Authorization": f"Bearer {logged_in.json()['token']}"
+    }
 
 
 def _recent_business_day() -> date:
@@ -85,7 +110,7 @@ async def test_builder_metrics_are_conversational_and_tenant_scoped(
         "src.api.routes.builder._compute_health_status",
         lambda _last_trace, _is_active: "healthy",
     )
-    owner_builder_id = uuid4()
+    owner_builder_id, builder_headers = await _create_builder_authority(async_client)
     other_builder_id = uuid4()
     owned_tenant_id = uuid4()
     other_tenant_id = uuid4()
@@ -95,12 +120,6 @@ async def test_builder_metrics_are_conversational_and_tenant_scoped(
     try:
         session.add_all(
             [
-                Builder(
-                    id=owner_builder_id,
-                    name="Metric Owner",
-                    status="active",
-                    is_active=True,
-                ),
                 Builder(
                     id=other_builder_id,
                     name="Other Builder",
@@ -159,7 +178,7 @@ async def test_builder_metrics_are_conversational_and_tenant_scoped(
 
     response = await async_client.get(
         "/v1/builder/clinics",
-        headers=_builder_headers(owner_builder_id, owned_tenant_id),
+        headers=builder_headers,
     )
 
     assert response.status_code == 200
