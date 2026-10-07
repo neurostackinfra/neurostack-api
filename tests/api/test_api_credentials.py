@@ -18,6 +18,7 @@ from src.config.settings import settings
 from src.repositories import get_db_session_dependency
 from src.services.api_credentials import (
     GEMINI_API_BASE_URL,
+    MULTIMODAL_OPENROUTER_API_BASE_URL,
     PROVIDER_AVAILABILITY,
     STT_FIXED_API_BASES,
     resolve_stt_credentials,
@@ -828,15 +829,276 @@ def test_multimodal_text_fallback_gate_defaults_to_false_and_is_secret_free(
     assert "multimodal_text_fallback_enabled_masked" not in data
 
 
+def test_new_tenant_can_save_and_read_configured_openrouter_multimodal(
+    client: TestClient,
+) -> None:
+    headers = _jwt_headers("clinic_admin")
+    secret = "fresh-multimodal-secret"
+    response = client.patch(
+        PATH,
+        headers=headers,
+        json={
+            "multimodal_provider": "openrouter",
+            "multimodal_api_url": MULTIMODAL_OPENROUTER_API_BASE_URL,
+            "multimodal_api_key": secret,
+            "multimodal_model_name": "google/gemini-2.5-flash",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["multimodal_provider"] == "openrouter"
+    assert body["multimodal_api_url"] == MULTIMODAL_OPENROUTER_API_BASE_URL
+    assert body["multimodal_model_name"] == "google/gemini-2.5-flash"
+    assert body["multimodal_readiness"] == "active"
+    assert body["multimodal_api_key_set"] is True
+    assert body["multimodal_api_key_masked"] == "••••••••"
+    assert secret not in response.text
+
+    read = client.get(PATH, headers=headers)
+    assert read.status_code == 200
+    assert read.json() == {key: value for key, value in body.items() if key != "ok"}
+    assert secret not in read.text
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"multimodal_provider": "openrouter"},
+        {
+            "multimodal_provider": "openrouter",
+            "multimodal_api_url": MULTIMODAL_OPENROUTER_API_BASE_URL,
+            "multimodal_api_key": "fresh-key",
+        },
+        {
+            "multimodal_provider": "openrouter",
+            "multimodal_api_url": MULTIMODAL_OPENROUTER_API_BASE_URL,
+            "multimodal_api_key": "••••••••",
+            "multimodal_model_name": "model",
+        },
+    ],
+)
+def test_openrouter_multimodal_incomplete_adoption_is_atomic(
+    client: TestClient, payload: dict[str, object]
+) -> None:
+    headers = _jwt_headers("clinic_admin")
+    response = client.patch(PATH, headers=headers, json=payload)
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == {
+        "error": "provider_switch_bundle_required",
+        "capability": "multimodal",
+    }
+    assert "fresh-key" not in response.text
+    assert client.get(PATH, headers=headers).json()["multimodal_provider"] is None
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://evil.example/api/v1",
+        "https://openrouter.ai:443/api/v1",
+        "https://openrouter.ai:8443/api/v1",
+        "https://openrouter.ai/api/v1/chat/completions",
+        "https://openrouter.ai/api/v1?query=sentinel",
+        "https://openrouter.ai/api/v1#fragment",
+    ],
+)
+def test_openrouter_multimodal_endpoint_rejection_is_stable_secret_free_and_atomic(
+    client: TestClient, endpoint: str
+) -> None:
+    headers = _jwt_headers("clinic_admin")
+    response = client.patch(
+        PATH,
+        headers=headers,
+        json={
+            "multimodal_provider": "openrouter",
+            "multimodal_api_url": endpoint,
+            "multimodal_api_key": "secret-sentinel",
+            "multimodal_model_name": "model-sentinel",
+        },
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == {
+        "error": "invalid_provider_endpoint",
+        "capability": "multimodal",
+        "provider": "openrouter",
+        "field": "multimodal_api_url",
+    }
+    assert endpoint not in response.text
+    assert "secret-sentinel" not in response.text
+    assert "model-sentinel" not in response.text
+    assert client.get(PATH, headers=headers).json()["multimodal_provider"] is None
+
+
+def test_configured_openrouter_multimodal_allows_model_and_key_maintenance(
+    client: TestClient,
+) -> None:
+    headers = _jwt_headers("clinic_admin")
+    adopted = client.patch(
+        PATH,
+        headers=headers,
+        json={
+            "multimodal_provider": "openrouter",
+            "multimodal_api_url": MULTIMODAL_OPENROUTER_API_BASE_URL,
+            "multimodal_api_key": "initial-secret",
+            "multimodal_model_name": "initial-model",
+        },
+    )
+    assert adopted.status_code == 200, adopted.text
+
+    model_changed = client.patch(
+        PATH,
+        headers=headers,
+        json={"multimodal_model_name": "new-model"},
+    )
+    assert model_changed.status_code == 200, model_changed.text
+    assert model_changed.json()["multimodal_model_name"] == "new-model"
+    assert model_changed.json()["multimodal_readiness"] == "active"
+
+    key_changed = client.patch(
+        PATH,
+        headers=headers,
+        json={"multimodal_api_key": "replacement-secret"},
+    )
+    assert key_changed.status_code == 200, key_changed.text
+    assert key_changed.json()["multimodal_model_name"] == "new-model"
+    assert key_changed.json()["multimodal_api_key_masked"] == "••••••••"
+    assert "replacement-secret" not in key_changed.text
+
+
+def test_historical_openrouter_bundle_is_preserved_until_atomic_remediation(
+    client: TestClient,
+    test_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existing = {
+        "multimodal_provider": "openrouter",
+        "multimodal_api_url": "https://historical-openrouter-proxy.example/v1",
+        "multimodal_api_key": "stored-multimodal-secret",
+        "multimodal_model_name": "stored-model",
+        "llm_provider": "openai",
+        "llm_api_url": "https://api.openai.com/v1",
+        "llm_api_key": "stored-llm-secret",
+        "llm_model_name": "stored-llm-model",
+    }
+    row = SimpleNamespace(api_credentials=dict(existing))
+    calls: list[str] = []
+
+    class SessionSpy:
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+
+    async def override_session() -> Any:
+        yield SessionSpy()
+
+    async def load_existing(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        return row
+
+    async def invalidate(*args: Any, **kwargs: Any) -> None:
+        calls.append("cache")
+
+    monkeypatch.setattr("src.api.routes.config._load_config", load_existing)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache", invalidate
+    )
+    test_app.dependency_overrides[get_db_session_dependency] = override_session
+    headers = _jwt_headers("clinic_admin")
+    try:
+        unrelated = client.patch(
+            PATH,
+            headers=headers,
+            json={"llm_model_name": "new-llm-model"},
+        )
+        assert unrelated.status_code == 200, unrelated.text
+        assert unrelated.json()["multimodal_readiness"] == "configuration_only"
+        assert (
+            row.api_credentials["multimodal_api_url"] == existing["multimodal_api_url"]
+        )
+        assert (
+            row.api_credentials["multimodal_api_key"] == existing["multimodal_api_key"]
+        )
+        assert calls == ["flush", "commit", "cache"]
+
+        calls.clear()
+        remediated = client.patch(
+            PATH,
+            headers=headers,
+            json={
+                "multimodal_provider": "openrouter",
+                "multimodal_api_url": MULTIMODAL_OPENROUTER_API_BASE_URL,
+                "multimodal_api_key": "fresh-multimodal-secret",
+                "multimodal_model_name": "fresh-model",
+            },
+        )
+    finally:
+        test_app.dependency_overrides.pop(get_db_session_dependency, None)
+
+    assert remediated.status_code == 200, remediated.text
+    assert remediated.json()["multimodal_readiness"] == "active"
+    assert remediated.json()["multimodal_api_key_masked"] == "••••••••"
+    assert "fresh-multimodal-secret" not in remediated.text
+    assert row.api_credentials["multimodal_api_url"] == (
+        MULTIMODAL_OPENROUTER_API_BASE_URL
+    )
+    assert row.api_credentials["multimodal_api_key"] == "fresh-multimodal-secret"
+    assert calls == ["flush", "commit", "cache"]
+
+
+def test_incomplete_openrouter_incumbent_cannot_inherit_hidden_key(
+    client: TestClient,
+    test_app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existing = {
+        "multimodal_provider": "openrouter",
+        "multimodal_api_url": MULTIMODAL_OPENROUTER_API_BASE_URL,
+        "multimodal_api_key": "stored-secret-sentinel",
+    }
+    row = SimpleNamespace(api_credentials=dict(existing))
+    calls: list[str] = []
+
+    class SessionSpy:
+        async def flush(self) -> None:
+            calls.append("flush")
+
+        async def commit(self) -> None:
+            calls.append("commit")
+
+    async def override_session() -> Any:
+        yield SessionSpy()
+
+    async def load_existing(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        return row
+
+    monkeypatch.setattr("src.api.routes.config._load_config", load_existing)
+    test_app.dependency_overrides[get_db_session_dependency] = override_session
+    try:
+        response = client.patch(
+            PATH,
+            headers=_jwt_headers("clinic_admin"),
+            json={"multimodal_model_name": "fresh-model"},
+        )
+    finally:
+        test_app.dependency_overrides.pop(get_db_session_dependency, None)
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == {
+        "error": "provider_switch_bundle_required",
+        "capability": "multimodal",
+    }
+    assert "stored-secret-sentinel" not in response.text
+    assert calls == []
+    assert row.api_credentials == existing
+
+
 @pytest.mark.parametrize(
     ("payload", "capability", "provider"),
     [
-        pytest.param(
-            {"multimodal_text_fallback_enabled": True},
-            "multimodal",
-            "openrouter",
-            id="multimodal_control",
-        ),
         pytest.param(
             {"audio_max_seconds": 45},
             "stt",
@@ -848,8 +1110,8 @@ def test_multimodal_text_fallback_gate_defaults_to_false_and_is_secret_free(
                 "multimodal_text_fallback_enabled": True,
                 "audio_max_seconds": 45,
             },
-            "multimodal",
-            "openrouter",
+            "stt",
+            "outros",
             id="mixed_controls",
         ),
     ],
@@ -864,7 +1126,9 @@ def test_runtime_controls_cannot_bypass_coming_soon_provider_gate_atomically(
 ) -> None:
     existing = {
         "multimodal_provider": "openrouter",
+        "multimodal_api_url": MULTIMODAL_OPENROUTER_API_BASE_URL,
         "multimodal_api_key": "saved-secret-that-must-not-leak",
+        "multimodal_model_name": "saved-model",
         "multimodal_text_fallback_enabled": False,
         "stt_provider": "outros",
         "stt_api_key": "saved-stt-secret-that-must-not-leak",

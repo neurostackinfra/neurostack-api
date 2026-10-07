@@ -10,7 +10,9 @@ from src.services.api_credentials import (
     CONFIG_CACHE_SCHEMA_VERSION,
     CONFIG_CACHE_VERSION_FIELD,
     GEMINI_API_BASE_URL,
+    MULTIMODAL_OPENROUTER_API_BASE_URL,
     OPERATIONAL_LLM_PROVIDERS,
+    OPERATIONAL_MULTIMODAL_PROVIDERS,
     OPERATIONAL_STT_PROVIDERS,
     PROVIDER_ALLOWLISTS,
     PROVIDER_AVAILABILITY,
@@ -52,7 +54,7 @@ def test_provider_availability_matches_public_catalog() -> None:
             "outros": "active",
             "slm_cortex": "coming_soon",
         },
-        "multimodal": {"openrouter": "coming_soon"},
+        "multimodal": {"openrouter": "active"},
         "stt": {
             "openrouter": "active",
             "openai_whisper": "active",
@@ -73,8 +75,8 @@ def test_provider_availability_matches_public_catalog() -> None:
         for providers in PROVIDER_AVAILABILITY.values()
         for availability in providers.values()
     ]
-    assert states.count("active") == 14
-    assert states.count("coming_soon") == 7
+    assert states.count("active") == 15
+    assert states.count("coming_soon") == 6
     assert PUBLICLY_ACTIVE_LLM_PROVIDERS == {"dropout", "gemini", "openai", "outros"}
     expected_allowlists = {
         capability: frozenset(providers)
@@ -314,7 +316,11 @@ def test_multimodal_readiness_is_active_only_for_operational_providers(
     # removed providers that can no longer be submitted through the schema.
     credentials = {
         "multimodal_provider": provider,
-        "multimodal_api_url": "https://multimodal.example/v1",
+        "multimodal_api_url": (
+            MULTIMODAL_OPENROUTER_API_BASE_URL
+            if provider == "openrouter"
+            else "https://multimodal.example/v1"
+        ),
         "multimodal_api_key": "fake-multimodal-key",
         "multimodal_model_name": "some-audio-model",
     }
@@ -357,6 +363,172 @@ def test_multimodal_readiness_is_incomplete_until_every_field_is_present(
 
     status = credential_status(credentials)
     assert status["multimodal_readiness"] == "incomplete"
+
+
+def test_openrouter_multimodal_full_adoption_is_ready_and_secret_free() -> None:
+    patch = {
+        "multimodal_provider": "openrouter",
+        "multimodal_api_url": MULTIMODAL_OPENROUTER_API_BASE_URL,
+        "multimodal_api_key": "fresh-multimodal-secret",
+        "multimodal_model_name": "google/gemini-2.5-flash",
+    }
+
+    candidate = merge_credentials({}, patch)
+    validate_provider_availability({}, candidate, patch=patch)
+    status = credential_status(candidate)
+
+    assert PROVIDER_AVAILABILITY["multimodal"]["openrouter"] == "active"
+    assert "openrouter" in OPERATIONAL_MULTIMODAL_PROVIDERS
+    assert status["multimodal_readiness"] == "active"
+    assert status["multimodal_api_key_set"] is True
+    assert status["multimodal_api_key_masked"] == "••••••••"
+    assert "fresh-multimodal-secret" not in repr(status)
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"multimodal_provider": "openrouter"},
+        {
+            "multimodal_provider": "openrouter",
+            "multimodal_api_url": MULTIMODAL_OPENROUTER_API_BASE_URL,
+            "multimodal_api_key": "fresh-key",
+        },
+        {
+            "multimodal_provider": "openrouter",
+            "multimodal_api_url": MULTIMODAL_OPENROUTER_API_BASE_URL,
+            "multimodal_api_key": "••••••••",
+            "multimodal_model_name": "model",
+        },
+    ],
+)
+def test_openrouter_multimodal_adoption_requires_a_fresh_complete_bundle(
+    patch: dict[str, object],
+) -> None:
+    existing = {
+        "multimodal_provider": "groq",
+        "multimodal_api_url": "https://api.groq.com/openai/v1",
+        "multimodal_api_key": "stored-secret",
+        "multimodal_model_name": "stored-model",
+    }
+    snapshot = dict(existing)
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        merge_credentials(existing, patch)
+
+    assert caught.value.detail == {
+        "error": "provider_switch_bundle_required",
+        "capability": "multimodal",
+    }
+    assert existing == snapshot
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://evil.example/api/v1",
+        "https://openrouter.ai:443/api/v1",
+        "https://openrouter.ai/api/v1/chat/completions",
+        "https://openrouter.ai/api/v1?query=sentinel",
+        "https://openrouter.ai/api/v1#fragment",
+    ],
+)
+def test_openrouter_multimodal_endpoint_is_exact_and_error_is_secret_free(
+    endpoint: str,
+) -> None:
+    patch = {
+        "multimodal_provider": "openrouter",
+        "multimodal_api_url": endpoint,
+        "multimodal_api_key": "secret-sentinel",
+        "multimodal_model_name": "model-sentinel",
+    }
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        merge_credentials({}, patch)
+
+    assert caught.value.detail == {
+        "error": "invalid_provider_endpoint",
+        "capability": "multimodal",
+        "provider": "openrouter",
+        "field": "multimodal_api_url",
+    }
+    rendered = repr(caught.value.detail)
+    assert endpoint not in rendered
+    assert "secret-sentinel" not in rendered
+    assert "model-sentinel" not in rendered
+
+
+def test_existing_openrouter_multimodal_bundle_allows_model_and_key_maintenance() -> (
+    None
+):
+    existing = {
+        "multimodal_provider": "openrouter",
+        "multimodal_api_url": MULTIMODAL_OPENROUTER_API_BASE_URL,
+        "multimodal_api_key": "stored-secret",
+        "multimodal_model_name": "stored-model",
+    }
+
+    model_changed = merge_credentials(existing, {"multimodal_model_name": "new-model"})
+    validate_provider_availability(existing, model_changed)
+    assert model_changed["multimodal_model_name"] == "new-model"
+    assert model_changed["multimodal_api_key"] == "stored-secret"
+
+    key_changed = merge_credentials(existing, {"multimodal_api_key": "new-secret"})
+    validate_provider_availability(existing, key_changed)
+    assert key_changed["multimodal_api_key"] == "new-secret"
+    assert key_changed["multimodal_model_name"] == "stored-model"
+
+
+def test_incomplete_openrouter_incumbent_cannot_inherit_stored_key() -> None:
+    existing = {
+        "multimodal_provider": "openrouter",
+        "multimodal_api_url": MULTIMODAL_OPENROUTER_API_BASE_URL,
+        "multimodal_api_key": "stored-secret-sentinel",
+    }
+    snapshot = dict(existing)
+
+    with pytest.raises(CredentialPolicyError) as caught:
+        merge_credentials(existing, {"multimodal_model_name": "fresh-model"})
+
+    assert caught.value.detail == {
+        "error": "provider_switch_bundle_required",
+        "capability": "multimodal",
+    }
+    assert "stored-secret-sentinel" not in repr(caught.value.detail)
+    assert existing == snapshot
+
+
+def test_noncanonical_openrouter_incumbent_requires_atomic_remediation() -> None:
+    existing = {
+        "multimodal_provider": "openrouter",
+        "multimodal_api_url": "https://historical-openrouter-proxy.example/v1",
+        "multimodal_api_key": "stored-secret-sentinel",
+        "multimodal_model_name": "stored-model",
+        "llm_provider": "openai",
+        "llm_api_url": "https://api.openai.com/v1",
+        "llm_api_key": "stored-llm-secret",
+        "llm_model_name": "stored-llm-model",
+    }
+
+    assert credential_status(existing)["multimodal_readiness"] == "configuration_only"
+
+    unrelated = merge_credentials(existing, {"llm_model_name": "new-llm-model"})
+    validate_provider_availability(existing, unrelated)
+    assert unrelated["multimodal_api_url"] == existing["multimodal_api_url"]
+    assert unrelated["multimodal_api_key"] == existing["multimodal_api_key"]
+
+    patch = {
+        "multimodal_provider": "openrouter",
+        "multimodal_api_url": MULTIMODAL_OPENROUTER_API_BASE_URL,
+        "multimodal_api_key": "fresh-multimodal-secret",
+        "multimodal_model_name": "fresh-model",
+    }
+    remediated = merge_credentials(existing, patch)
+    validate_provider_availability(existing, remediated, patch=patch)
+    status = credential_status(remediated)
+    assert status["multimodal_readiness"] == "active"
+    assert status["multimodal_api_key_masked"] == "••••••••"
+    assert "fresh-multimodal-secret" not in repr(status)
 
 
 def test_status_and_runtime_projection_never_expose_secrets_or_digest() -> None:
@@ -1059,12 +1231,6 @@ def test_gemini_is_operational_and_ready_after_promotion() -> None:
     ("patch", "capability", "provider"),
     [
         pytest.param(
-            {"multimodal_text_fallback_enabled": True},
-            "multimodal",
-            "openrouter",
-            id="multimodal_control",
-        ),
-        pytest.param(
             {"audio_max_seconds": 45},
             "stt",
             "outros",
@@ -1075,8 +1241,8 @@ def test_gemini_is_operational_and_ready_after_promotion() -> None:
                 "multimodal_text_fallback_enabled": True,
                 "audio_max_seconds": 45,
             },
-            "multimodal",
-            "openrouter",
+            "stt",
+            "outros",
             id="mixed_controls",
         ),
     ],
@@ -1086,6 +1252,9 @@ def test_runtime_controls_cannot_bypass_coming_soon_provider_gate(
 ) -> None:
     existing = {
         "multimodal_provider": "openrouter",
+        "multimodal_api_url": MULTIMODAL_OPENROUTER_API_BASE_URL,
+        "multimodal_api_key": "saved-secret",
+        "multimodal_model_name": "saved-model",
         "multimodal_text_fallback_enabled": False,
         "stt_provider": "outros",
         "audio_max_seconds": 60,

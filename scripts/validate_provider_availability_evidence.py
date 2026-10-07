@@ -91,6 +91,7 @@ EXPECTED_PROMOTED_MATRIX["stt"]["openrouter"] = EXPECTED_PROMOTED_MATRIX["stt"].
 for capability, providers in {
     "whatsapp": {"meta_cloud", "zapi", "uazapi", "evolution"},
     "llm": {"dropout", "gemini", "openai", "outros"},
+    "multimodal": {"openrouter"},
     "stt": {"openrouter", "openai_whisper", "elevenlabs_scribe"},
     "tts": {"elevenlabs", "google", "openai"},
 }.items():
