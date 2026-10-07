@@ -457,7 +457,7 @@ export const pt: Record<TranslationKey, string> = {
   builder_clone_error_network: "Não foi possível acessar o serviço de clonagem. Sua seleção e prévia foram mantidas.",
   builder_alerts_title: "Alertas",
   builder_alerts_empty: "Nenhum alerta, tudo funcionando",
-  builder_health_grid_title: "Saude das Clinicas",
+  builder_health_grid_title: "Saúde das Clínicas",
   builder_health_legend: "Verde = ativo, Amarelo = sem traces 3-7 dias, Vermelho = sem traces 7+ dias",
   builder_last_trace: "Ultimo trace",
   builder_days_ago: "dias atras",
