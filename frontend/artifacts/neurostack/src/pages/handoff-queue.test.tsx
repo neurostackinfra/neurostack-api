@@ -762,28 +762,56 @@ describe("<HandoffQueuePage />", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows the backend numerator, denominator, and SLA context counts", async () => {
-    mocks.fetch.mockResolvedValue(queueResponse([], { pct_within_sla: 40 }));
-    renderPage();
+  it.each([
+    {
+      locale: "pt" as const,
+      title: "Dentro da Meta",
+      removedWithin: "Dentro da meta",
+      removedLabels: [
+        "Confirmados fora",
+        "Pendentes vencidos",
+        "Em maturação",
+        "Cancelados sem confirmação",
+        "Legado sem medição",
+      ],
+      context: "2 de 5 atendimentos elegíveis dentro da meta",
+    },
+    {
+      locale: "en" as const,
+      title: "Within SLA",
+      removedWithin: "Within SLA",
+      removedLabels: [
+        "Confirmed late",
+        "Unanswered overdue",
+        "Maturing",
+        "Cancelled unconfirmed",
+        "Unmeasured legacy",
+      ],
+      context: "2 of 5 eligible handoffs within SLA",
+    },
+  ])(
+    "removes the six-counter summary while preserving the $locale SLA KPI",
+    async ({ locale, title, removedWithin, removedLabels, context }) => {
+      mocks.fetch.mockResolvedValue(queueResponse([], { pct_within_sla: 40 }));
+      renderPage(locale);
 
-    expect(await screen.findByRole("img", { name: "40%" })).toBeInTheDocument();
-    expect(
-      screen.getByText("2 de 5 atendimentos elegíveis dentro da meta"),
-    ).toBeInTheDocument();
-    const expected = [
-      ["Dentro da meta", "2"],
-      ["Confirmados fora", "3"],
-      ["Pendentes vencidos", "4"],
-      ["Em maturação", "5"],
-      ["Cancelados sem confirmação", "6"],
-      ["Legado sem medição", "7"],
-    ];
-    expected.forEach(([label, value]) => {
-      expect(
-        within(screen.getByText(label).parentElement!).getByText(value),
-      ).toBeInTheDocument();
-    });
-  });
+      const gauge = await screen.findByRole("img", { name: "40%" });
+      const kpiTitle = screen.getByText(title);
+      const kpiCard = kpiTitle.parentElement!;
+
+      expect(within(kpiCard).getByRole("img", { name: "40%" })).toBe(gauge);
+      expect(within(kpiCard).getByText(context)).toBeInTheDocument();
+      removedLabels.forEach((label) => {
+        expect(screen.queryByText(label)).not.toBeInTheDocument();
+      });
+
+      if (locale === "en") {
+        expect(screen.getAllByText(removedWithin)).toHaveLength(1);
+      } else {
+        expect(screen.queryByText(removedWithin)).not.toBeInTheDocument();
+      }
+    },
+  );
 
   it("keeps decimal precision in the Portuguese accessible label while rounding the visual value", async () => {
     mocks.fetch.mockResolvedValue(queueResponse([], { pct_within_sla: 66.7 }));
