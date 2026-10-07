@@ -509,7 +509,7 @@ export const API_PROVIDER_AVAILABILITY = {
     slm_cortex: "coming_soon",
   },
   multimodal: {
-    openrouter: "coming_soon",
+    openrouter: "active",
   },
   stt: {
     openrouter: "active",
@@ -780,6 +780,11 @@ function newProviderFieldDefault(
     if (providerId === "elevenlabs_scribe") return ELEVENLABS_BASE_URL;
     if (providerId === "openrouter") return OPENROUTER_BASE_URL;
   }
+  if (capability === "multimodal"
+    && providerId === "openrouter"
+    && fieldName === "multimodal_api_url") {
+    return OPENROUTER_BASE_URL;
+  }
   return "";
 }
 
@@ -823,6 +828,17 @@ function statusCredentialText(status: CredentialStatusFields | null, field: stri
   return direct === null || direct === undefined
     ? statusText(status, "llm_base_url")
     : String(direct);
+}
+
+function requiresFreshMultimodalBundle(
+  capability: ApiCapabilityId,
+  providerId: string,
+  status: CredentialStatusFields | null,
+): boolean {
+  return capability === "multimodal"
+    && providerId === "openrouter"
+    && statusText(status, "multimodal_provider") === providerId
+    && statusText(status, "multimodal_readiness") !== "active";
 }
 
 // Allowlist rather than denylist: `signature_pending` means a Meta bundle is
@@ -935,11 +951,18 @@ export function ApiCredentialsForm({
     // provider's endpoint and model as if they belonged to the other.
     const held =
       statusText(status, CAPABILITY_PROVIDER_FIELD[capability]) === providerId;
+    const freshMultimodalBundle = requiresFreshMultimodalBundle(
+      capability,
+      providerId,
+      status,
+    );
     const hydrated: Record<string, string> = {};
     for (const field of credentialFields(capability, providerId)) {
       hydrated[field.name] =
         field.secret
           ? ""
+          : freshMultimodalBundle && field.name === "multimodal_api_url"
+            ? newProviderFieldDefault(capability, providerId, field.name)
           : held
             ? statusCredentialText(status, field.name)
             : newProviderFieldDefault(capability, providerId, field.name);
@@ -963,7 +986,9 @@ export function ApiCredentialsForm({
     const endpointChanged = endpointField !== undefined
       && held === providerId
       && (draft[endpointField] ?? "") !== (baseline[endpointField] ?? "");
-    const requiresFreshBundle = held !== providerId || endpointChanged;
+    const requiresFreshBundle = held !== providerId
+      || endpointChanged
+      || requiresFreshMultimodalBundle(capability, providerId, status);
     // Adoption and endpoint rotation only take effect if the provider and its
     // complete non-secret bundle travel together. Secrets remain write-only:
     // an endpoint rotation without a newly typed key is rejected safely by
