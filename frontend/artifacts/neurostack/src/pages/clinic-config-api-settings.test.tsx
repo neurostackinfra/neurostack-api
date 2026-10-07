@@ -111,13 +111,13 @@ async function renderForm(
 const BACKEND_PROVIDER_AVAILABILITY = {
   whatsapp: { meta_cloud: "active", zapi: "active", uazapi: "active", evolution: "active", dialog360: "coming_soon", twilio: "coming_soon" },
   llm: { dropout: "active", gemini: "active", openai: "active", outros: "active", slm_cortex: "coming_soon" },
-  multimodal: { openrouter: "coming_soon" },
+  multimodal: { openrouter: "active" },
   stt: { openrouter: "active", openai_whisper: "active", elevenlabs_scribe: "active", google_stt: "coming_soon", deepgram_stt: "coming_soon", microsoft_stt: "coming_soon" },
   tts: { elevenlabs: "active", google: "active", openai: "active" },
 } as const;
 const TOTAL_PROVIDER_CARD_COUNT = 21;
-const ACTIVE_PROVIDER_COUNT = 14;
-const COMING_SOON_PROVIDER_COUNT = 7;
+const ACTIVE_PROVIDER_COUNT = 15;
+const COMING_SOON_PROVIDER_COUNT = 6;
 
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
 const OPENAI_BASE_URL = "https://api.openai.com/v1";
@@ -295,7 +295,7 @@ describe("describeConfigSaveFailure", () => {
 });
 
 describe("frontend provider availability mirror", () => {
-  it("contains the exact 21 backend pairs with 14 active providers", () => {
+  it("contains the exact 21 backend pairs with 15 active providers", () => {
     expect(API_PROVIDER_AVAILABILITY).toEqual(BACKEND_PROVIDER_AVAILABILITY);
     const states = Object.values(API_PROVIDER_AVAILABILITY).flatMap(Object.values);
     expect(states).toHaveLength(TOTAL_PROVIDER_CARD_COUNT);
@@ -316,6 +316,7 @@ describe("frontend provider availability mirror", () => {
       "llm:gemini",
       "llm:openai",
       "llm:outros",
+      "multimodal:openrouter",
       "stt:elevenlabs_scribe",
       "stt:openai_whisper",
       "stt:openrouter",
@@ -329,7 +330,6 @@ describe("frontend provider availability mirror", () => {
     ]);
     expect(pairsByState("coming_soon")).toEqual([
       "llm:slm_cortex",
-      "multimodal:openrouter",
       "stt:deepgram_stt",
       "stt:google_stt",
       "stt:microsoft_stt",
@@ -373,8 +373,18 @@ describe("providerCardState", () => {
     expect(providerCardState("llm", "slm_cortex", status)).toBe("coming_soon");
   });
 
-  it("keeps the multimodal fallback coming soon without tenant status", () => {
-    expect(providerCardState("multimodal", "openrouter", null)).toBe("coming_soon");
+  it("exercises every active multimodal card state", () => {
+    expect(providerCardState("multimodal", "openrouter", null)).toBe("available");
+    expect(providerCardState(
+      "multimodal",
+      "openrouter",
+      emptyStatus({ multimodal_provider: "openrouter", multimodal_readiness: "incomplete" }),
+    )).toBe("incomplete");
+    expect(providerCardState(
+      "multimodal",
+      "openrouter",
+      emptyStatus({ multimodal_provider: "openrouter", multimodal_readiness: "active" }),
+    )).toBe("configured");
   });
 
   it("promotes Gemini in the real matrix and exercises every state", () => {
@@ -492,7 +502,7 @@ describe("<ApiCredentialsForm /> card states", () => {
   it.each([
     ["pt", "EM BREVE", "DISPONÍVEL", "Configuração apenas"],
     ["en", "COMING SOON", "AVAILABLE", "Configuration only"],
-  ])("renders 7 coming-soon cards and 14 active cards in %s", async (
+  ])("renders 6 coming-soon cards and 15 active cards in %s", async (
     locale,
     comingSoonLabel,
     availableLabel,
@@ -663,7 +673,7 @@ describe("<ApiCredentialsForm /> card states", () => {
     });
   });
 
-  it("uses the English badges for the 7 coming-soon and 14 active cards", async () => {
+  it("uses the English badges for the 6 coming-soon and 15 active cards", async () => {
     localStorage.setItem("ns_locale", "en");
     await renderForm(emptyStatus());
 
