@@ -269,6 +269,7 @@ def create_app() -> FastAPI:
         bearer_only_operations = {
             (f"{settings.api_prefix}/auth/me/password", "patch"),
             (f"{settings.api_prefix}/builder/clinics/{{clinic_id}}/password", "patch"),
+            (f"{settings.api_prefix}/builder/clinics/{{clinic_id}}/email", "patch"),
             (
                 f"{settings.api_prefix}/builder/clinics/{{source_id}}/clone-preview",
                 "get",
