@@ -75,6 +75,7 @@ class BuilderClinicResponse(BaseModel):
     is_active: bool = True
     created_at: Optional[datetime] = None
     contact_phone: Optional[str] = None
+    admin_email: Optional[EmailStr] = None
     # Health fields (enriched)
     last_trace_at: Optional[datetime] = None
     health_status: str = "critical"
@@ -108,6 +109,14 @@ class UpdateBuilderClinicRequest(BaseModel):
     """
 
     contact_phone: Optional[str] = None
+
+
+class UpdateClinicAdminEmailRequest(BaseModel):
+    """Strict payload for changing a linked clinic administrator's email."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
 
 
 class ClinicClonePreviewResponse(BaseModel):

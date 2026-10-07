@@ -42,6 +42,15 @@ const clinic = {
   conversational_trace_count_7d: 0,
   business_hours_configured: false,
   config_completeness: 0,
+  contact_phone: null,
+  admin_email: "admin@aurora.test",
+};
+
+const secondClinic = {
+  ...clinic,
+  id: "clinic-99",
+  name: "Clinic Boreal",
+  admin_email: "admin@boreal.test",
 };
 
 const billingUsage = {
@@ -91,6 +100,28 @@ function ok(data: unknown) {
   return Promise.resolve({ ok: true, json: async () => data } as Response);
 }
 
+function error(status: number, data: unknown) {
+  return Promise.resolve({ ok: false, status, json: async () => data } as Response);
+}
+
+async function openClinicDetails(name = "Clinic Aurora") {
+  const clinicsTab = await screen.findByRole("tab", { name: "Clinics" });
+  fireEvent.mouseDown(clinicsTab, { button: 0, ctrlKey: false });
+  await waitFor(() =>
+    expect(clinicsTab).toHaveAttribute("aria-selected", "true"),
+  );
+  const clinicToggle = await waitFor(() => {
+    const heading = screen.getByText(name);
+    const card = heading.closest(".border");
+    const toggle = card?.querySelector<HTMLButtonElement>(
+      'button[data-state="closed"]',
+    );
+    expect(toggle).toBeDefined();
+    return toggle!;
+  });
+  fireEvent.click(clinicToggle);
+}
+
 beforeEach(() => {
   localStorage.setItem("ns_auth", JSON.stringify({ token: "builder-token" }));
   localStorage.setItem("ns_locale", "en");
@@ -125,12 +156,16 @@ beforeEach(() => {
         time_series: [],
         alerts: [],
       });
-    if (url === "/v1/builder/clinics") return ok([clinic]);
+    if (url === "/v1/builder/clinics") return ok([clinic, secondClinic]);
     if (url === "/v1/billing/usage") return ok(billingUsage);
     if (url === "/v1/builder/tickets") return ok([]);
     if (url === "/v1/builder/profile") return ok({ support_email: null });
     if (url === "/v1/builder/clinics/clinic-42/password")
       return ok({ ok: true });
+    if (url === "/v1/builder/clinics/clinic-42/email")
+      return ok({ ok: true, admin_email: "stored-admin@aurora.test" });
+    if (url === "/v1/builder/clinics/clinic-99/email")
+      return ok({ ok: true, admin_email: "stored-admin@boreal.test" });
     throw new Error(`Unexpected fetch: ${url}`);
   });
   vi.stubGlobal("fetch", mocks.fetch);
@@ -144,19 +179,7 @@ describe("BuilderPanel password reset", () => {
         <BuilderPanel />
       </I18nProvider>,
     );
-    const clinicsTab = await screen.findByRole("tab", { name: "Clinics" });
-    fireEvent.mouseDown(clinicsTab, { button: 0, ctrlKey: false });
-    await waitFor(() =>
-      expect(clinicsTab).toHaveAttribute("aria-selected", "true"),
-    );
-    const clinicToggle = await waitFor(() => {
-      const toggle = screen
-        .getAllByRole("button")
-        .find((button) => button.dataset.state === "closed");
-      expect(toggle).toBeDefined();
-      return toggle!;
-    });
-    fireEvent.click(clinicToggle);
+    await openClinicDetails();
     fireEvent.click(
       await screen.findByTestId("btn-change-clinic-password-clinic-42"),
     );
@@ -175,12 +198,75 @@ describe("BuilderPanel password reset", () => {
         "/v1/builder/clinics/clinic-42/password",
         expect.objectContaining({
           method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer builder-token",
+          },
           body: JSON.stringify({
             new_password: "secret",
             confirm_password: "secret",
           }),
         }),
       ),
+    );
+    expect(mocks.logout).not.toHaveBeenCalled();
+  });
+});
+
+describe("BuilderPanel clinic login email", () => {
+  it("targets the selected clinic once and syncs the stored server value", async () => {
+    render(
+      <I18nProvider>
+        <BuilderPanel />
+      </I18nProvider>,
+    );
+    await openClinicDetails("Clinic Boreal");
+
+    const emailInput = await screen.findByTestId("input-clinic-email-clinic-99");
+    expect(emailInput).toHaveValue("admin@boreal.test");
+    fireEvent.change(emailInput, { target: { value: "draft@boreal.test" } });
+    const save = screen.getByTestId("btn-save-clinic-email-clinic-99");
+    fireEvent.click(save);
+    fireEvent.click(save);
+
+    await waitFor(() =>
+      expect(emailInput).toHaveValue("stored-admin@boreal.test"),
+    );
+    const emailCalls = mocks.fetch.mock.calls.filter(
+      ([input]) => String(input) === "/v1/builder/clinics/clinic-99/email",
+    );
+    expect(emailCalls).toHaveLength(1);
+    expect(emailCalls[0][1]).toEqual(expect.objectContaining({
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer builder-token",
+      },
+      body: JSON.stringify({ email: "draft@boreal.test" }),
+    }));
+    expect(mocks.logout).not.toHaveBeenCalled();
+  });
+
+  it("keeps the editor open with its draft when the server rejects the email", async () => {
+    render(
+      <I18nProvider>
+        <BuilderPanel />
+      </I18nProvider>,
+    );
+    await openClinicDetails();
+    const emailInput = await screen.findByLabelText("Clinic login email");
+    fireEvent.change(emailInput, { target: { value: "duplicate@aurora.test" } });
+    mocks.fetch.mockImplementationOnce(() =>
+      error(409, { detail: { error: "email_already_in_use" } }),
+    );
+
+    fireEvent.click(screen.getByTestId("btn-save-clinic-email-clinic-42"));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not save the clinic login email",
+    );
+    expect(screen.getByLabelText("Clinic login email")).toHaveValue(
+      "duplicate@aurora.test",
     );
     expect(mocks.logout).not.toHaveBeenCalled();
   });
