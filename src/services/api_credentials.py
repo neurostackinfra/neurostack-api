@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 MASKED_SECRET = "••••••••"
 GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+MULTIMODAL_OPENROUTER_API_BASE_URL = "https://openrouter.ai/api/v1"
 STT_FIXED_API_BASES: dict[str, str] = {
     "elevenlabs_scribe": "https://api.elevenlabs.io/v1",
     "openrouter": "https://openrouter.ai/api/v1",
@@ -38,7 +39,7 @@ PROVIDER_AVAILABILITY: dict[str, dict[str, ProviderAvailability]] = {
         "outros": "active",
         "slm_cortex": "coming_soon",
     },
-    "multimodal": {"openrouter": "coming_soon"},
+    "multimodal": {"openrouter": "active"},
     "stt": {
         "openrouter": "active",
         "openai_whisper": "active",
@@ -118,12 +119,15 @@ WHATSAPP_FIELDS = frozenset(
     }
 )
 LLM_FIELDS = frozenset({"llm_provider", "llm_api_url", "llm_api_key", "llm_model_name"})
+MULTIMODAL_BUNDLE_FIELDS = (
+    "multimodal_provider",
+    "multimodal_api_url",
+    "multimodal_api_key",
+    "multimodal_model_name",
+)
 MULTIMODAL_FIELDS = frozenset(
     {
-        "multimodal_provider",
-        "multimodal_api_url",
-        "multimodal_api_key",
-        "multimodal_model_name",
+        *MULTIMODAL_BUNDLE_FIELDS,
         # HTTP opt-in gate for the text-only multimodal fallback. Non-secret
         # (default `false` legacy, must round-trip verbatim through the GET
         # projection alongside the rest of the non-secret credential fields).
@@ -328,6 +332,47 @@ def validate_stt_provider_endpoint(provider: Any, value: Any) -> None:
         )
 
 
+def validate_multimodal_openrouter_endpoint(value: Any) -> None:
+    """Require OpenRouter's immutable official multimodal API base."""
+
+    if not isinstance(value, str):
+        raise CredentialPolicyError(
+            "invalid_provider_endpoint",
+            capability="multimodal",
+            provider="openrouter",
+            field="multimodal_api_url",
+        )
+    try:
+        parsed = urlsplit(value)
+        explicit_port = parsed.port is not None
+    except ValueError:
+        explicit_port = True
+    if explicit_port or value != MULTIMODAL_OPENROUTER_API_BASE_URL:
+        raise CredentialPolicyError(
+            "invalid_provider_endpoint",
+            capability="multimodal",
+            provider="openrouter",
+            field="multimodal_api_url",
+        )
+
+
+def _canonical_multimodal_openrouter_bundle(
+    credentials: Mapping[str, Any],
+) -> bool:
+    """Whether stored OpenRouter credentials are complete and canonical."""
+
+    return (
+        credentials.get("multimodal_provider") == "openrouter"
+        and credentials.get("multimodal_api_url") == MULTIMODAL_OPENROUTER_API_BASE_URL
+        and is_fresh_secret(credentials.get("multimodal_api_key"))
+        and all(
+            isinstance(credentials.get(field), str)
+            and bool(str(credentials.get(field)).strip())
+            for field in MULTIMODAL_BUNDLE_FIELDS
+        )
+    )
+
+
 def _validate_whatsapp_egress_switch(
     existing: Mapping[str, Any], patch: Mapping[str, Any]
 ) -> None:
@@ -435,6 +480,31 @@ def _validate_stt_provider_switch(
     validate_stt_provider_endpoint(target_provider, patch.get("stt_api_url"))
 
 
+def _validate_multimodal_provider_switch(
+    existing: Mapping[str, Any], patch: Mapping[str, Any]
+) -> None:
+    """Require a fresh complete bundle when adopting untrusted OpenRouter."""
+
+    existing_provider = existing.get("multimodal_provider")
+    target_provider = patch.get("multimodal_provider", existing_provider)
+    if not any(field in patch for field in MULTIMODAL_BUNDLE_FIELDS):
+        return
+    if PROVIDER_AVAILABILITY["multimodal"].get(target_provider) != "active":
+        return
+    if _canonical_multimodal_openrouter_bundle(existing):
+        return
+    complete = all(
+        field in patch
+        and isinstance(patch.get(field), str)
+        and bool(str(patch.get(field)).strip())
+        for field in MULTIMODAL_BUNDLE_FIELDS
+    )
+    if not complete or not is_fresh_secret(patch.get("multimodal_api_key")):
+        raise CredentialPolicyError(
+            "provider_switch_bundle_required", capability="multimodal"
+        )
+
+
 def _validate_tts_provider_switch(
     existing: Mapping[str, Any], patch: Mapping[str, Any]
 ) -> None:
@@ -475,8 +545,11 @@ def merge_credentials(
     for capability, provider_field in CAPABILITY_PROVIDER_FIELDS.items():
         if provider_field in patch:
             validate_provider(capability, patch[provider_field])
+    if "multimodal_api_url" in patch:
+        validate_multimodal_openrouter_endpoint(patch.get("multimodal_api_url"))
     _validate_whatsapp_egress_switch(existing, patch)
     _validate_llm_provider_switch(existing, patch)
+    _validate_multimodal_provider_switch(existing, patch)
     _validate_stt_provider_switch(existing, patch)
     _validate_tts_provider_switch(existing, patch)
 
@@ -492,6 +565,11 @@ def merge_credentials(
     if "stt_model_name" in patch:
         merged.pop("whisper_model", None)
     validate_llm_provider_endpoint(merged)
+    if (
+        any(field in patch for field in MULTIMODAL_BUNDLE_FIELDS)
+        and merged.get("multimodal_provider") == "openrouter"
+    ):
+        validate_multimodal_openrouter_endpoint(merged.get("multimodal_api_url"))
     validate_stt_provider_endpoint(
         merged.get("stt_provider"), merged.get("stt_api_url")
     )
@@ -819,15 +897,9 @@ def credential_status(credentials: Mapping[str, Any]) -> dict[str, Any]:
     ) in OPERATIONAL_LLM_PROVIDERS and _complete(
         credentials, ("llm_api_url", "llm_api_key", "llm_model_name")
     )
-    multimodal_provider = credentials.get("multimodal_provider")
     multimodal_complete = _complete(
         credentials,
-        (
-            "multimodal_provider",
-            "multimodal_api_url",
-            "multimodal_api_key",
-            "multimodal_model_name",
-        ),
+        MULTIMODAL_BUNDLE_FIELDS,
     )
     stt_provider = resolved.get("stt_provider", "outros")
     stt_complete = _complete(resolved, ("stt_api_url", "stt_api_key", "stt_model_name"))
@@ -850,8 +922,7 @@ def credential_status(credentials: Mapping[str, Any]) -> dict[str, Any]:
             # adapter cannot deliver.
             "multimodal_readiness": (
                 "active"
-                if multimodal_complete
-                and multimodal_provider in OPERATIONAL_MULTIMODAL_PROVIDERS
+                if _canonical_multimodal_openrouter_bundle(credentials)
                 else "configuration_only" if multimodal_complete else "incomplete"
             ),
             "stt_readiness": (

@@ -24,6 +24,7 @@ from src.services.api_credentials import (
     STT_FIXED_API_BASES,
     CredentialPolicyError,
     validate_gemini_endpoint,
+    validate_multimodal_openrouter_endpoint,
     validate_stt_provider_endpoint,
 )
 
@@ -184,6 +185,28 @@ class MultimodalCredentialsPatch(BaseModel):
     # the field before it reaches the merge; the validator below only fires
     # when the caller sent an explicit `null`.
     multimodal_text_fallback_enabled: bool | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw_openrouter_endpoint(cls, value: Any) -> Any:
+        """Reject endpoint variants before shared URL normalization."""
+
+        if not isinstance(value, Mapping) or "multimodal_api_url" not in value:
+            return value
+        raw_url = value.get("multimodal_api_url")
+        try:
+            validate_multimodal_openrouter_endpoint(raw_url)
+        except CredentialPolicyError:
+            raise PydanticCustomError(
+                "invalid_provider_endpoint",
+                "invalid_provider_endpoint",
+                {
+                    "capability": "multimodal",
+                    "provider": "openrouter",
+                    "field": "multimodal_api_url",
+                },
+            ) from None
+        return value
 
     @field_validator("multimodal_text_fallback_enabled", mode="before")
     @classmethod

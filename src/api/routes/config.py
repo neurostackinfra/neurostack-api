@@ -177,6 +177,11 @@ class _CredentialValidationRoute(APIRoute):
                     field = context.get("field")
                     if (capability, provider, field) not in {
                         ("llm", "gemini", "llm_api_url"),
+                        (
+                            "multimodal",
+                            "openrouter",
+                            "multimodal_api_url",
+                        ),
                         ("stt", "elevenlabs_scribe", "stt_api_url"),
                         ("stt", "openrouter", "stt_api_url"),
                     }:
