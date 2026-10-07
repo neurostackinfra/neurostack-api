@@ -874,26 +874,6 @@ export default function HandoffQueuePage() {
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-3 lg:grid-cols-6">
-        {[
-          ["handoff_count_within", stats.within_sla_count],
-          ["handoff_count_late", stats.confirmed_late_count],
-          ["handoff_count_overdue", stats.unanswered_overdue_count],
-          ["handoff_count_maturing", stats.maturing_count],
-          ["handoff_count_cancelled", stats.cancelled_unconfirmed_count],
-          ["handoff_count_legacy", stats.unmeasured_legacy_count],
-        ].map(([label, count]) => (
-          <div key={label} className="rounded-md border bg-card px-3 py-2">
-            <span className="block text-muted-foreground">
-              {t(label as Parameters<typeof t>[0])}
-            </span>
-            <span className="text-base font-semibold tabular-nums">
-              {count}
-            </span>
-          </div>
-        ))}
-      </div>
-
       {/* Color legend */}
       <div className="flex flex-wrap gap-4 text-xs">
         <span className="inline-flex items-center gap-1.5">
