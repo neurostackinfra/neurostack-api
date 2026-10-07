@@ -195,6 +195,9 @@ alembic/versions/*.pyc
 !.genie/INDEX.md
 !.genie/wishes/
 .genie/wishes/*
+!.genie/wishes/builder-subaccount-clinic-search/
+.genie/wishes/builder-subaccount-clinic-search/*
+!.genie/wishes/builder-subaccount-clinic-search/WISH.md
 !.genie/wishes/neurostack-core-extraction/
 .genie/wishes/neurostack-core-extraction/*
 !.genie/wishes/neurostack-core-extraction/WISH.md
