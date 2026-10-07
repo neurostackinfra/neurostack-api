@@ -30,6 +30,7 @@ const mocks = vi.hoisted(() => ({
   },
   toast: vi.fn(),
   fetch: vi.fn(),
+  configFetch: vi.fn(),
 }));
 
 vi.mock("@/context/auth", () => ({
@@ -176,7 +177,14 @@ beforeEach(() => {
   mocks.auth.leadSubmitted = true;
   mocks.toast.mockReset();
   mocks.fetch.mockReset();
-  vi.stubGlobal("fetch", mocks.fetch);
+  mocks.configFetch.mockReset();
+  mocks.configFetch.mockImplementation(() => response({}));
+  vi.stubGlobal("fetch", (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    return url === "/v1/config" || url.startsWith("/v1/config?")
+      ? mocks.configFetch(input, init)
+      : mocks.fetch(input, init);
+  });
 });
 
 afterEach(() => {
@@ -186,6 +194,153 @@ afterEach(() => {
 });
 
 describe("<InactiveQueuePage />", () => {
+  it("shows the exact master reactivation guidance and copies the registered phrase", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    mocks.fetch.mockImplementation(() => response(queueResponse([])));
+    renderPage();
+
+    expect(screen.getByRole("heading", { name: "Frase mestra de reativação" })).toBeInTheDocument();
+    expect(await screen.findByText(
+      "Quando a frase de gatilho for enviada exatamente como cadastrada, inclusive com a mesma pontuação, a IA voltará a atender após 1 hora. Nesse intervalo, o paciente poderá continuar conversando com a equipe humana para esclarecer dúvidas pendentes.",
+    )).toBeInTheDocument();
+    expect(screen.getByText("Frase mestra")).toHaveClass("uppercase");
+    expect(screen.getByText("Precisando de algo mais, estamos a disposição.")).toBeInTheDocument();
+
+    const copyButton = screen.getByRole("button", { name: "Copiar frase mestra" });
+    fireEvent.click(copyButton);
+
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(
+      "Precisando de algo mais, estamos a disposição.",
+    ));
+    expect(copyButton).toHaveTextContent("Copiado!");
+    expect(copyButton).toHaveAccessibleName("Frase mestra copiada");
+  });
+
+  it("loads and copies the selected clinic's configured phrase and reactivation delay", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    setBuilder("selected-tenant");
+    mocks.configFetch.mockImplementation(() => response({
+      trigger_message: { invalid: "legacy value" },
+      reactivation_delay_hours: 3.0,
+      effective_trigger_message: "Encerramos por aqui; posso ajudar em algo mais?",
+      effective_reactivation_delay_hours: 3,
+    }));
+    mocks.fetch.mockImplementation(() => response(queueResponse([])));
+    renderPage();
+
+    expect(await screen.findByText("Encerramos por aqui; posso ajudar em algo mais?")).toBeInTheDocument();
+    expect(screen.getByText(
+      "Quando a frase de gatilho for enviada exatamente como cadastrada, inclusive com a mesma pontuação, a IA voltará a atender após 3 horas. Nesse intervalo, o paciente poderá continuar conversando com a equipe humana para esclarecer dúvidas pendentes.",
+    )).toBeInTheDocument();
+    expect(String(mocks.configFetch.mock.calls[0][0])).toBe(
+      "/v1/config?tenant_id=selected-tenant",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Copiar frase mestra" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(
+      "Encerramos por aqui; posso ajudar em algo mais?",
+    ));
+  });
+
+  it("does not show a stale master phrase after the selected clinic changes", async () => {
+    setBuilder("old-tenant");
+    const oldConfig = deferredResponse();
+    mocks.configFetch
+      .mockImplementationOnce(() => oldConfig.promise)
+      .mockImplementationOnce(() => response({
+        trigger_message: "Frase da clínica nova.",
+        reactivation_delay_hours: 2,
+      }));
+    mocks.fetch.mockImplementation(() => response(queueResponse([])));
+
+    const view = renderPage();
+    await waitFor(() => expect(mocks.configFetch).toHaveBeenCalledTimes(1));
+
+    setBuilder("new-tenant");
+    view.rerender(<I18nProvider><InactiveQueuePage /></I18nProvider>);
+    expect(await screen.findByText("Frase da clínica nova.")).toBeInTheDocument();
+    expect(String(mocks.configFetch.mock.calls[1][0])).toBe(
+      "/v1/config?tenant_id=new-tenant",
+    );
+
+    await act(async () => {
+      oldConfig.resolve({
+        trigger_message: "Frase obsoleta da clínica anterior.",
+        reactivation_delay_hours: 9,
+      });
+      await oldConfig.promise;
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("Frase obsoleta da clínica anterior.")).not.toBeInTheDocument();
+    expect(screen.getByText("Frase da clínica nova.")).toBeInTheDocument();
+  });
+
+  it("ignores a pending clipboard result after the selected clinic changes", async () => {
+    let resolveCopy!: () => void;
+    const pendingCopy = new Promise<void>((resolve) => {
+      resolveCopy = resolve;
+    });
+    const writeText = vi.fn().mockReturnValue(pendingCopy);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    setBuilder("old-tenant");
+    mocks.configFetch
+      .mockImplementationOnce(() => response({ trigger_message: "Frase para copiar da clínica antiga." }))
+      .mockImplementationOnce(() => response({ trigger_message: "Frase atual da clínica nova." }));
+    mocks.fetch.mockImplementation(() => response(queueResponse([])));
+
+    const view = renderPage();
+    expect(await screen.findByText("Frase para copiar da clínica antiga.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Copiar frase mestra" }));
+
+    setBuilder("new-tenant");
+    view.rerender(<I18nProvider><InactiveQueuePage /></I18nProvider>);
+    expect(await screen.findByText("Frase atual da clínica nova.")).toBeInTheDocument();
+
+    await act(async () => {
+      resolveCopy();
+      await pendingCopy;
+      await Promise.resolve();
+    });
+
+    expect(writeText).toHaveBeenCalledWith("Frase para copiar da clínica antiga.");
+    expect(screen.getByRole("button", { name: "Copiar frase mestra" })).toHaveTextContent("Copiar");
+    expect(mocks.toast).not.toHaveBeenCalled();
+  });
+
+  it("offers a retry when the clinic master phrase cannot be loaded", async () => {
+    mocks.configFetch
+      .mockImplementationOnce(() => response({}, false))
+      .mockImplementationOnce(() => response({ trigger_message: "Frase recuperada." }));
+    mocks.fetch.mockImplementation(() => response(queueResponse([])));
+    renderPage();
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Não foi possível carregar a frase mestra desta clínica.");
+    fireEvent.click(screen.getByRole("button", { name: "Tentar novamente" }));
+
+    expect(await screen.findByText("Frase recuperada.")).toBeInTheDocument();
+    expect(mocks.configFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the phrase selectable and reports a clipboard failure", async () => {
+    const writeText = vi.fn().mockRejectedValue(new Error("permission denied"));
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    mocks.fetch.mockImplementation(() => response(queueResponse([])));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Copiar frase mestra" }));
+
+    await waitFor(() => expect(mocks.toast).toHaveBeenCalledWith({
+      title: "Não foi possível copiar a frase mestra",
+      description: "Selecione e copie a frase manualmente.",
+      variant: "destructive",
+    }));
+    expect(screen.getByText("Precisando de algo mais, estamos a disposição.")).toBeInTheDocument();
+  });
+
   it("renders the em-dash fallback for a null last_intent without falling into the Outras bucket", async () => {
     const nullIntentItem = {
       ...firstItem,
@@ -597,7 +752,9 @@ describe("<InactiveQueuePage />", () => {
     setBuilder("");
     const view = renderPage();
     expect(screen.getByText("Selecione uma clínica para ver a fila de inativos.")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Frase mestra de reativação" })).not.toBeInTheDocument();
     expect(mocks.fetch).not.toHaveBeenCalled();
+    expect(mocks.configFetch).not.toHaveBeenCalled();
 
     setSuperAdmin("super-tenant");
     mocks.fetch

@@ -279,6 +279,15 @@ class ConfigResponse(BaseModel):
 
     clinic_id: Any = None
     version: int = 1
+    effective_trigger_message: str = Field(
+        default="Precisando de algo mais, estamos a disposição.",
+        description="Trigger phrase after applying runtime compatibility fallbacks.",
+    )
+    effective_reactivation_delay_hours: int = Field(
+        default=1,
+        ge=1,
+        description="Reactivation cooldown after applying runtime compatibility fallbacks.",
+    )
     handoff_active: Any = Field(
         default="yes",
         description="Canonical writes use `yes` or `no`; historical JSON is returned unchanged.",
