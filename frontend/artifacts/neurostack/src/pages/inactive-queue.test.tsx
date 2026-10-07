@@ -373,6 +373,10 @@ describe("<InactiveQueuePage />", () => {
     expect(screen.getAllByRole("switch", { name: "Voltar atendimento para IA" })[0]).toHaveAttribute("data-state", "checked");
     expect(screen.getAllByText("Voltar atendimento para IA")).toHaveLength(2);
     expect(screen.getByText("IA no controle")).toHaveClass("text-emerald-600");
+    expect(mocks.toast).toHaveBeenCalledWith({
+      title: "Atendimento retornado para IA",
+      description: "O bot reassumiu o controle desta conversa.",
+    });
     expect(screen.getByTestId(`inactive-row-${firstItem.session_id}`)).toBeInTheDocument();
 
     await act(async () => {

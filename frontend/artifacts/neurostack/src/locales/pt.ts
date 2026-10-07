@@ -613,6 +613,8 @@ export const pt: Record<TranslationKey, string> = {
   inactive_page: "Página",
   inactive_of: "de",
   inactive_total: "conversas inativas",
+  inactive_reactivate_success_title: "Atendimento retornado para IA",
+  inactive_reactivate_success_description: "O bot reassumiu o controle desta conversa.",
   inactive_reactivate_error_title: "Não foi possível devolver o atendimento para a IA",
   inactive_reactivate_error_description: "A conversa continua inativa. Tente novamente.",
 
