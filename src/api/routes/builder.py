@@ -5,14 +5,14 @@ Builder-scoped routes with SQL-level tenant isolation.
 
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 from typing import cast as type_cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from passlib.context import CryptContext
 from sqlalchemy import and_, cast, func, select, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, selectinload
 from sqlalchemy.types import String
@@ -42,6 +42,7 @@ from src.api.schemas.builder import (
     ToggleClinicStatusRequest,
     UpdateBuilderClinicRequest,
     UpdateBuilderProfileRequest,
+    UpdateClinicAdminEmailRequest,
     UpdateTicketStatusRequest,
 )
 from src.models.builder import Builder
@@ -324,6 +325,51 @@ async def update_builder_profile(
 # ============================================
 
 
+def _builder_access_forbidden() -> HTTPException:
+    """Return the stable response for an invalid or stale Builder identity."""
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "detail": (
+                "Builder profile not found. Contact admin to enable builder access."
+            ),
+            "error_code": "BUILDER_NOT_CONFIGURED",
+        },
+    )
+
+
+async def _validated_current_builder_id(
+    session: AsyncSession,
+    tenant: TenantContext,
+    claimed_builder_id: UUID,
+) -> UUID:
+    """Revalidate the current Builder identity before exposing clinic data."""
+    if (
+        tenant.api_key
+        or tenant.user_id is None
+        or tenant.role != UserRole.builder.value
+        or tenant.builder_id != claimed_builder_id
+    ):
+        raise _builder_access_forbidden()
+
+    current_builder_id = await session.scalar(
+        select(User.builder_id)
+        .join(Builder, Builder.id == User.builder_id)
+        .where(
+            User.id == tenant.user_id,
+            User.is_active.is_(True),
+            User.role == UserRole.builder,
+            User.tenant_id == tenant.tenant_id,
+            User.builder_id == claimed_builder_id,
+            Builder.is_active.is_(True),
+            Builder.status == "active",
+        )
+    )
+    if current_builder_id is None:
+        raise _builder_access_forbidden()
+    return current_builder_id
+
+
 @router.get(
     "/clinics",
     summary="List Builder Clinics",
@@ -332,8 +378,11 @@ async def update_builder_profile(
 )
 async def list_clinics(
     builder_id: UUID = Depends(require_builder),
+    tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> list[dict[str, Any]]:
+    builder_id = await _validated_current_builder_id(session, tenant, builder_id)
+
     # Fetch tenants with config
     stmt = (
         select(Tenant)
@@ -350,6 +399,25 @@ async def list_clinics(
     tenant_ids = [t.id for t in tenants]
     now = datetime.now(timezone.utc)
     seven_days_ago = now - timedelta(days=7)
+
+    # Batch query: expose an email only when the clinic has exactly one admin.
+    admin_email_stmt = (
+        select(
+            User.tenant_id,
+            func.count(User.id).label("admin_count"),
+            func.min(User.email).label("admin_email"),
+        )
+        .where(
+            User.tenant_id.in_(tenant_ids),
+            User.role == UserRole.clinic_admin,
+        )
+        .group_by(User.tenant_id)
+    )
+    admin_email_result = await session.execute(admin_email_stmt)
+    admin_email_map: dict[UUID, Optional[str]] = {
+        row.tenant_id: row.admin_email if row.admin_count == 1 else None
+        for row in admin_email_result
+    }
 
     # Batch query: last_trace_at per tenant
     last_trace_stmt = (
@@ -456,6 +524,7 @@ async def list_clinics(
                 is_active=t.is_active,
                 created_at=t.created_at,
                 contact_phone=t.contact_phone,
+                admin_email=admin_email_map.get(t.id),
                 last_trace_at=last_trace,
                 health_status=health,
                 trace_count_7d=trace_7d_map.get(t.id, 0),
@@ -823,27 +892,19 @@ def _password_change_forbidden() -> HTTPException:
     )
 
 
-@password_router.patch(
-    "/clinics/{clinic_id}/password",
-    status_code=status.HTTP_200_OK,
-    summary="Reset Linked Clinic Password",
-    description="Reset the one clinic administrator password for a currently linked clinic.",
-    responses={
-        200: {"description": "Password changed"},
-        401: {"description": "Missing, invalid, or expired Bearer JWT"},
-        403: {"description": "Password change is not authorized"},
-        404: {"description": "Clinic is not available to this builder"},
-        409: {"description": "Clinic does not have exactly one administrator"},
-        422: {"description": "Invalid password payload without echoed input values"},
-    },
-)
-async def reset_linked_clinic_password(
+class _LinkedClinicAdminSnapshot(NamedTuple):
+    """Current, database-backed target selected for a delegated credential change."""
+
+    user_id: UUID
+    email: str
+
+
+async def _linked_clinic_admin_snapshot(
+    session: AsyncSession,
+    tenant: TenantContext,
     clinic_id: str,
-    body: PasswordChangeRequest,
-    tenant: TenantContext = Depends(get_tenant_context),
-    session: AsyncSession = Depends(get_db_session_dependency),
-) -> dict[str, bool]:
-    """Reset a linked clinic password using one authorization snapshot query."""
+) -> _LinkedClinicAdminSnapshot:
+    """Authorize a Builder and resolve exactly one linked clinic administrator."""
     if tenant.api_key or tenant.user_id is None:
         raise _password_change_forbidden()
 
@@ -867,6 +928,7 @@ async def reset_linked_clinic_password(
             Tenant.id.label("clinic_tenant_id"),
             func.count(clinic_admin.id).label("clinic_admin_count"),
             func.min(cast(clinic_admin.id, String)).label("clinic_admin_id"),
+            func.min(clinic_admin.email).label("clinic_admin_email"),
         )
         .select_from(builder_user)
         .outerjoin(
@@ -874,6 +936,7 @@ async def reset_linked_clinic_password(
             and_(
                 Builder.id == builder_user.builder_id,
                 Builder.is_active.is_(True),
+                Builder.status == "active",
             ),
         )
         .outerjoin(
@@ -921,19 +984,106 @@ async def reset_linked_clinic_password(
             detail={"error": "clinic_not_available"},
         )
 
-    if snapshot["clinic_admin_count"] != 1 or snapshot["clinic_admin_id"] is None:
+    if (
+        snapshot["clinic_admin_count"] != 1
+        or snapshot["clinic_admin_id"] is None
+        or snapshot["clinic_admin_email"] is None
+    ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"error": "clinic_admin_unavailable"},
         )
 
+    return _LinkedClinicAdminSnapshot(
+        user_id=UUID(str(snapshot["clinic_admin_id"])),
+        email=str(snapshot["clinic_admin_email"]),
+    )
+
+
+@password_router.patch(
+    "/clinics/{clinic_id}/password",
+    status_code=status.HTTP_200_OK,
+    summary="Reset Linked Clinic Password",
+    description="Reset the one clinic administrator password for a currently linked clinic.",
+    responses={
+        200: {"description": "Password changed"},
+        401: {"description": "Missing, invalid, or expired Bearer JWT"},
+        403: {"description": "Password change is not authorized"},
+        404: {"description": "Clinic is not available to this builder"},
+        409: {"description": "Clinic does not have exactly one administrator"},
+        422: {"description": "Invalid password payload without echoed input values"},
+    },
+)
+async def reset_linked_clinic_password(
+    clinic_id: str,
+    body: PasswordChangeRequest,
+    tenant: TenantContext = Depends(get_tenant_context),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> dict[str, bool]:
+    """Reset a linked clinic password using one authorization snapshot query."""
+    snapshot = await _linked_clinic_admin_snapshot(session, tenant, clinic_id)
+
     await session.execute(
         update(User)
-        .where(User.id == UUID(str(snapshot["clinic_admin_id"])))
+        .where(User.id == snapshot.user_id)
         .values(password_hash=pwd_context.hash(body.new_password))
     )
     await session.commit()
     return {"ok": True}
+
+
+@router.patch(
+    "/clinics/{clinic_id}/email",
+    status_code=status.HTTP_200_OK,
+    summary="Change Linked Clinic Login Email",
+    description="Change the one clinic administrator email for a currently linked clinic.",
+    responses={
+        200: {"description": "Email changed"},
+        401: {"description": "Missing, invalid, or expired Bearer JWT"},
+        403: {"description": "Credential change is not authorized"},
+        404: {"description": "Clinic is not available to this builder"},
+        409: {"description": "Clinic administrator or email is unavailable"},
+        422: {"description": "Invalid email payload"},
+    },
+)
+async def update_linked_clinic_email(
+    clinic_id: str,
+    body: UpdateClinicAdminEmailRequest,
+    tenant: TenantContext = Depends(get_tenant_context),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> dict[str, Any]:
+    """Change a linked clinic login email using the shared authority snapshot."""
+    snapshot = await _linked_clinic_admin_snapshot(session, tenant, clinic_id)
+    stored_email = str(body.email)
+    if stored_email == snapshot.email:
+        return {"ok": True, "admin_email": snapshot.email}
+
+    conflicting_user_id = await session.scalar(
+        select(User.id).where(
+            User.email == stored_email,
+            User.id != snapshot.user_id,
+        )
+    )
+    if conflicting_user_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"error": "email_already_in_use"},
+        )
+
+    try:
+        await session.execute(
+            update(User).where(User.id == snapshot.user_id).values(email=stored_email)
+        )
+        await session.flush()
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"error": "email_already_in_use"},
+        ) from None
+
+    return {"ok": True, "admin_email": stored_email}
 
 
 # The parent builder router retains all existing endpoints; the narrow subrouter

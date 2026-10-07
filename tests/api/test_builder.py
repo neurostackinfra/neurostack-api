@@ -77,30 +77,42 @@ def _make_super_admin_token(tenant_id=None, user_id=None) -> str:
 # ============================================
 
 
-@pytest.fixture
-def builder_a_id():
-    return uuid4()
+def _create_builder_headers(client: TestClient) -> dict[str, str]:
+    email = f"builder-{uuid4().hex}@test.com"
+    password = "builder-test-password"
+    created = client.post(
+        "/v1/admin/builders",
+        headers={
+            "Authorization": f"Bearer {_make_super_admin_token()}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "name": f"Builder {uuid4().hex[:8]}",
+            "admin_email": email,
+            "admin_password": password,
+        },
+    )
+    assert created.status_code == 201, created.text
 
-
-@pytest.fixture
-def builder_b_id():
-    return uuid4()
-
-
-@pytest.fixture
-def builder_a_headers(builder_a_id) -> dict[str, str]:
+    logged_in = client.post(
+        "/v1/auth/login",
+        json={"email": email, "password": password},
+    )
+    assert logged_in.status_code == 200, logged_in.text
     return {
-        "Authorization": f"Bearer {_make_builder_token(builder_id=builder_a_id)}",
+        "Authorization": f"Bearer {logged_in.json()['token']}",
         "Content-Type": "application/json",
     }
 
 
 @pytest.fixture
-def builder_b_headers(builder_b_id) -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {_make_builder_token(builder_id=builder_b_id)}",
-        "Content-Type": "application/json",
-    }
+def builder_a_headers(client: TestClient) -> dict[str, str]:
+    return _create_builder_headers(client)
+
+
+@pytest.fixture
+def builder_b_headers(client: TestClient) -> dict[str, str]:
+    return _create_builder_headers(client)
 
 
 @pytest.fixture
@@ -240,6 +252,14 @@ class TestBuilderListClinics:
                 professionals=[],
             ),
         )
+        token = builder_a_headers["Authorization"].removeprefix("Bearer ")
+        builder_id = UUID(
+            jwt.decode(
+                token,
+                settings.secret_key,
+                algorithms=["HS256"],
+            )["builder_id"]
+        )
 
         class _Result:
             def __init__(self, tenants=None):
@@ -257,6 +277,9 @@ class TestBuilderListClinics:
         class _Session:
             def __init__(self):
                 self.call_count = 0
+
+            async def scalar(self, _statement: object) -> UUID:
+                return builder_id
 
             async def execute(self, _statement):
                 self.call_count += 1
@@ -870,6 +893,42 @@ class TestBuilderClinicContactPhone:
             await session.close()
 
     @staticmethod
+    async def _seed_builder_authority(builder_id: UUID) -> dict[str, str]:
+        """Persist the User/Tenant authority represented by a builder JWT."""
+        from src.models.tenant import Tenant
+        from src.models.user import User, UserRole
+        from src.repositories import get_db_session
+
+        session = get_db_session()
+        try:
+            tenant = Tenant(
+                id=uuid4(),
+                name=f"Builder Authority {uuid4().hex[:6]}",
+                slug=f"builder-authority-{uuid4().hex[:8]}",
+                api_key_hash=f"test-hash-{uuid4().hex}",
+                is_active=True,
+                plan_type="admin",
+                config={},
+            )
+            user = User(
+                id=uuid4(),
+                tenant_id=tenant.id,
+                email=f"builder-{uuid4().hex}@test.com",
+                password_hash="not-used-in-this-test",
+                role=UserRole.builder,
+                builder_id=builder_id,
+                is_active=True,
+            )
+            session.add_all([tenant, user])
+            await session.commit()
+            return {
+                "Authorization": f"Bearer {_make_builder_token(builder_id=builder_id, tenant_id=tenant.id, user_id=user.id)}",
+                "Content-Type": "application/json",
+            }
+        finally:
+            await session.close()
+
+    @staticmethod
     async def _fetch_tenant(tenant_id):
         from sqlalchemy import select
 
@@ -1046,7 +1105,7 @@ class TestBuilderClinicContactPhone:
         builder = await self._seed_builder()
         tenant_with = await self._seed_tenant(builder.id, contact_phone="11988887777")
         tenant_without = await self._seed_tenant(builder.id, contact_phone=None)
-        headers = self._headers_for(builder.id)
+        headers = await self._seed_builder_authority(builder.id)
         resp = await async_client.get("/v1/builder/clinics", headers=headers)
         assert resp.status_code == 200, resp.text
         data = resp.json()
