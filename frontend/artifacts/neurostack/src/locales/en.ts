@@ -605,6 +605,8 @@ export const en = {
   inactive_page: "Page",
   inactive_of: "of",
   inactive_total: "inactive conversations",
+  inactive_reactivate_success_title: "Service returned to AI",
+  inactive_reactivate_success_description: "The bot has resumed control of this conversation.",
   inactive_reactivate_error_title: "Could not return service to AI",
   inactive_reactivate_error_description: "The conversation remains inactive. Please try again.",
 

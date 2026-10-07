@@ -350,6 +350,10 @@ export default function InactiveQueuePage() {
           successfulIds: new Set(current.successfulIds).add(sessionId),
         };
       });
+      toast({
+        title: t("inactive_reactivate_success_title"),
+        description: t("inactive_reactivate_success_description"),
+      });
       const timer = setTimeout(() => {
         if (!isCurrentContext(identity)) return;
         activeRequestRef.current?.abort();
