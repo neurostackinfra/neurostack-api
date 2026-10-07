@@ -555,12 +555,6 @@ export const pt: Record<TranslationKey, string> = {
   handoff_no_data: "Sem dados",
   handoff_sla_context:
     "{within} de {eligible} atendimentos elegíveis dentro da meta",
-  handoff_count_within: "Dentro da meta",
-  handoff_count_late: "Confirmados fora",
-  handoff_count_overdue: "Pendentes vencidos",
-  handoff_count_maturing: "Em maturação",
-  handoff_count_cancelled: "Cancelados sem confirmação",
-  handoff_count_legacy: "Legado sem medição",
   handoff_legend_green: "Abaixo de 50% do SLA individual",
   handoff_legend_yellow: "De 50% a 100% do SLA individual",
   handoff_legend_red: "Acima de 100% do SLA individual",
