@@ -237,6 +237,14 @@ function relativeTime(dateStr: string | null, locale: string): string {
   return formatter.format(-Math.floor(hours / 24), "day");
 }
 
+function normalizeClinicSearch(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
 // ── Builder Panel ─────────────────────────────────────────────────────────────
 
 export default function BuilderPanel() {
@@ -256,6 +264,7 @@ export default function BuilderPanel() {
 
   // Tab state
   const [activeTab, setActiveTab] = useState("overview");
+  const [clinicSearchQuery, setClinicSearchQuery] = useState("");
 
   // Create clinic form state
   const [showCreateForm, setShowCreateForm] = useState(false);
@@ -381,6 +390,16 @@ export default function BuilderPanel() {
       (a, b) => (order[a.health_status] ?? 2) - (order[b.health_status] ?? 2)
     );
   }, [clinics]);
+
+  const normalizedClinicSearchQuery = normalizeClinicSearch(clinicSearchQuery);
+  const filteredClinics = useMemo(
+    () => normalizedClinicSearchQuery
+      ? sortedClinics.filter((clinic) =>
+          normalizeClinicSearch(clinic.name).includes(normalizedClinicSearchQuery),
+        )
+      : sortedClinics,
+    [normalizedClinicSearchQuery, sortedClinics],
+  );
 
   // Trend calculation
   const trend = useMemo(
@@ -1083,6 +1102,22 @@ export default function BuilderPanel() {
               </Card>
             )}
 
+            {clinics.length > 0 && (
+              <div className="space-y-1">
+                <Label htmlFor="builder-clinic-search" className="text-xs">
+                  {t("label_search_clinics")}
+                </Label>
+                <Input
+                  id="builder-clinic-search"
+                  type="search"
+                  value={clinicSearchQuery}
+                  onChange={(event) => setClinicSearchQuery(event.target.value)}
+                  placeholder={t("placeholder_search_clinics")}
+                  className="h-9 text-sm"
+                />
+              </div>
+            )}
+
             {/* Empty state */}
             {clinics.length === 0 && (
               <Card className="border-dashed">
@@ -1101,10 +1136,18 @@ export default function BuilderPanel() {
               </Card>
             )}
 
+            {clinics.length > 0 && normalizedClinicSearchQuery && filteredClinics.length === 0 && (
+              <Card className="border-dashed">
+                <CardContent className="py-8 text-center text-sm text-muted-foreground">
+                  {t("clinic_search_no_results")}
+                </CardContent>
+              </Card>
+            )}
+
             {/* Clinic list */}
-            {sortedClinics.length > 0 && (
+            {filteredClinics.length > 0 && (
               <div className="space-y-3">
-                {sortedClinics.map((clinic) => (
+                {filteredClinics.map((clinic) => (
                   <Collapsible
                     key={clinic.id}
                     open={expandedClinicId === clinic.id}
