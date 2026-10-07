@@ -955,7 +955,7 @@ export default function RlhfAudit() {
       <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-gray-900 border border-black w-fit">
         <ShieldAlert className="h-3.5 w-3.5 text-white shrink-0" />
         <span className="text-xs font-bold text-white">
-          Acesso restrito: Somente Master Admin. Contém metodologia proprietária de alinhamento SRM.
+          Somente Master Admin. Contém metodologia proprietária de alinhamento SRM.
         </span>
       </div>
 

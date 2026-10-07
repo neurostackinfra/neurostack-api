@@ -204,6 +204,15 @@ async function renderAndSettle() {
 }
 
 describe("<RlhfAudit /> — Auditoria RLHF panel", () => {
+  it("omits the restricted-access wording from the audit notice", async () => {
+    await renderAndSettle();
+
+    expect(
+      screen.getByText("Somente Master Admin. Contém metodologia proprietária de alinhamento SRM."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/acesso restrito/i)).not.toBeInTheDocument();
+  });
+
   it("narrows the clinic dropdown to the selected builder's clinics and hides null-builder clinics", async () => {
     await renderAndSettle();
 
