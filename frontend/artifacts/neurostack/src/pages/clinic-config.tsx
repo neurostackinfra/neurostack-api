@@ -2417,7 +2417,7 @@ export default function ClinicConfig() {
               </div>
 
               <SwitchRow
-                label={txt("Ativar LGPD no Atendimento", "Enable LGPD in Attendance")}
+                label={txt("Exibir mensagem inicial da LGPD", "Display initial LGPD message")}
                 hint={txt("Envia mensagem de abertura com aviso de privacidade na primeira interação", "Sends a privacy notice on the first interaction")}
                 checked={lgpdEnabled}
                 onCheckedChange={setLgpdEnabled}
