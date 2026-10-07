@@ -6,9 +6,11 @@ from typing import Any
 import pytest
 
 from src.handoff.pause_policy import (
+    DEFAULT_REACTIVATION_TRIGGER_MESSAGE,
     PauseAction,
     parse_legacy_cycle_days,
     resolve_handoff_pause,
+    resolve_trigger_reactivation,
 )
 
 NOW = datetime(2026, 9, 29, 12, 30, tzinfo=timezone.utc)
@@ -217,6 +219,64 @@ def test_bounded_legacy_days_parser_accepts_canonical_values(
     value: Any, expected: int
 ) -> None:
     assert parse_legacy_cycle_days(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("bucket", "trigger", "hours", "notices"),
+    [
+        ({}, DEFAULT_REACTIVATION_TRIGGER_MESSAGE, 1, ()),
+        (
+            {
+                "trigger_message": "Mensagem mestra personalizada.",
+                "reactivation_delay_hours": "3",
+            },
+            "Mensagem mestra personalizada.",
+            3,
+            (),
+        ),
+        (
+            {"trigger_message": "", "reactivation_delay_hours": 0},
+            DEFAULT_REACTIVATION_TRIGGER_MESSAGE,
+            1,
+            (
+                ("trigger_message", "invalid_phrase"),
+                ("reactivation_delay_hours", "invalid_duration"),
+            ),
+        ),
+        (
+            {
+                "trigger_message": {"invalid": "shape"},
+                "reactivation_delay_hours": 3.0,
+            },
+            DEFAULT_REACTIVATION_TRIGGER_MESSAGE,
+            1,
+            (
+                ("trigger_message", "invalid_phrase"),
+                ("reactivation_delay_hours", "invalid_duration"),
+            ),
+        ),
+        (
+            {"reactivation_delay_hours": 10**100},
+            DEFAULT_REACTIVATION_TRIGGER_MESSAGE,
+            1,
+            (("reactivation_delay_hours", "unrepresentable_duration"),),
+        ),
+    ],
+)
+def test_trigger_reactivation_resolver_exposes_effective_runtime_values(
+    bucket: Any,
+    trigger: str,
+    hours: int,
+    notices: tuple[tuple[str, str], ...],
+) -> None:
+    decision = resolve_trigger_reactivation(bucket, NOW)
+
+    assert decision.trigger_message == trigger
+    assert decision.delay_hours == hours
+    assert decision.reactivates_at == NOW + timedelta(hours=hours)
+    assert (
+        tuple((notice.field, notice.reason) for notice in decision.notices) == notices
+    )
 
 
 @pytest.mark.parametrize(

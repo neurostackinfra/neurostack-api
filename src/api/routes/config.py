@@ -5,6 +5,7 @@ CRUD clinic configuration for the admin panel.
 
 import logging
 from collections.abc import Callable, Coroutine
+from datetime import datetime, timezone
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -31,6 +32,7 @@ from src.api.schemas.config import (
 )
 from src.config.logging import get_logger as get_structured_logger
 from src.config.settings import settings
+from src.handoff.pause_policy import resolve_trigger_reactivation
 from src.models.clinic_config import (
     ClinicOperations,
     ClinicScheduling,
@@ -65,6 +67,20 @@ _HANDOFF_POLICY_FIELDS = (
     "handoff_cycle_days",
 )
 _HANDOFF_POLICY_FIELD_SET = frozenset(_HANDOFF_POLICY_FIELDS)
+
+
+def _add_effective_reactivation_fields(
+    flat: dict[str, Any],
+    row: ClinicConfigTable,
+) -> None:
+    """Expose the same tolerant trigger values consumed by the webhook."""
+
+    reactivation = resolve_trigger_reactivation(
+        row.handoff,
+        datetime.now(timezone.utc),
+    )
+    flat["effective_trigger_message"] = reactivation.trigger_message
+    flat["effective_reactivation_delay_hours"] = reactivation.delay_hours
 
 
 class _PolicyValidationRoute(APIRoute):
@@ -533,6 +549,7 @@ async def get_config(
     tenant = await _resolve_config_tenant(request, tenant, session)
     row = await _get_or_create_config(session, tenant)
     flat = flatten_config(row)
+    _add_effective_reactivation_fields(flat, row)
     # Also return bot_active and clinic_name from the Tenant row
     t_result = await session.execute(
         select(Tenant.name, Tenant.bot_active).where(Tenant.id == tenant.tenant_id)
@@ -711,6 +728,7 @@ async def patch_config(
     await invalidate_clinic_config_cache(tenant.tenant_id)
 
     flat = flatten_config(row)
+    _add_effective_reactivation_fields(flat, row)
     return ConfigResponse(**flat)
 
 

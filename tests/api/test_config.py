@@ -820,9 +820,35 @@ def test_handoff_policy_round_trip_canonicalizes_legacy_days_and_preserves_keys(
     assert body["handoff_cycle_days"] == 12
     assert body["trigger_message"] == "Mensagem preservada"
     assert body["reactivation_delay_hours"] == 3
+    assert body["effective_trigger_message"] == "Mensagem preservada"
+    assert body["effective_reactivation_delay_hours"] == 3
     assert body["clinic_name"] == "Clínica preservada"
     loaded = client.get(PATH, headers=headers)
     assert loaded.json()["handoff_cycle_days"] == 12
+    assert loaded.json()["effective_trigger_message"] == "Mensagem preservada"
+    assert loaded.json()["effective_reactivation_delay_hours"] == 3
+
+
+def test_config_response_exposes_safe_effective_reactivation_fallbacks(
+    client: TestClient,
+) -> None:
+    response = client.patch(
+        PATH,
+        headers=_headers(),
+        json={
+            "trigger_message": {"invalid": "legacy shape"},
+            "reactivation_delay_hours": 3.0,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["trigger_message"] == {"invalid": "legacy shape"}
+    assert body["reactivation_delay_hours"] == 3.0
+    assert body["effective_trigger_message"] == (
+        "Precisando de algo mais, estamos a disposição."
+    )
+    assert body["effective_reactivation_delay_hours"] == 1
 
 
 @pytest.mark.parametrize(
