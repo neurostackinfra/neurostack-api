@@ -13,6 +13,7 @@ import { useAuth } from "@/context/auth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -112,6 +113,7 @@ interface BuilderClinic {
   health_status?: "healthy" | "warning" | "critical";
   last_trace_at?: string | null;
   config_completeness?: number;
+  audit_extended_access: boolean;
 }
 
 interface BuilderWithClinics {
@@ -143,6 +145,7 @@ interface ClinicSlot {
   health_status?: "healthy" | "warning" | "critical";
   last_trace_at?: string | null;
   config_completeness?: number;
+  audit_extended_access: boolean;
 }
 
 interface ClinicRowData {
@@ -155,6 +158,7 @@ interface ClinicRowData {
   health_status?: "healthy" | "warning" | "critical";
   last_trace_at?: string | null;
   config_completeness?: number;
+  audit_extended_access: boolean;
 }
 
 interface Transaction {
@@ -432,8 +436,8 @@ function HealthDot({ status }: { status?: "healthy" | "warning" | "critical" }) 
 
 function ClinicRow({
   clinic, isExpanded, onToggleExpand, canManage,
-  onRename, onToggleStatus, onUnlink, onDelete,
-  onViewTraces, onAccessPanel, onConfigure,
+  onRename, onToggleStatus, onToggleAuditAddon, auditAddonSaving = false,
+  onUnlink, onDelete, onViewTraces, onAccessPanel, onConfigure,
 }: {
   clinic: ClinicRowData;
   isExpanded: boolean;
@@ -441,6 +445,8 @@ function ClinicRow({
   canManage: boolean;
   onRename?: () => void;
   onToggleStatus: () => void;
+  onToggleAuditAddon: (enabled: boolean) => void;
+  auditAddonSaving?: boolean;
   onUnlink?: () => void;
   onDelete?: () => void;
   onViewTraces: () => void;
@@ -506,6 +512,25 @@ function ClinicRow({
             </div>
             <Progress value={clinic.config_completeness ?? 0} className="h-1.5" />
           </div>
+          {canManage && (
+            <div className="flex items-start justify-between gap-3 rounded-md border border-border/40 px-2.5 py-2">
+              <div className="min-w-0 space-y-0.5">
+                <Label htmlFor={`audit-addon-${clinic.clinic_id}`} className="text-[11px] font-medium">
+                  {t("admin_audit_addon_label")}
+                </Label>
+                <p id={`audit-addon-${clinic.clinic_id}-desc`} className="text-[10px] text-muted-foreground">
+                  {t("admin_audit_addon_desc")}
+                </p>
+              </div>
+              <Switch
+                id={`audit-addon-${clinic.clinic_id}`}
+                aria-describedby={`audit-addon-${clinic.clinic_id}-desc`}
+                checked={clinic.audit_extended_access}
+                disabled={auditAddonSaving}
+                onCheckedChange={onToggleAuditAddon}
+              />
+            </div>
+          )}
           <div className="flex items-center gap-1.5">
             <Button variant="outline" size="sm" className="h-7 text-[11px] gap-1.5 flex-1" onClick={onViewTraces}>
               <Eye className="h-3.5 w-3.5" /> {t("admin_view_traces")}
@@ -531,28 +556,28 @@ const DEMO_CLINICS: ClinicSlot[] = [
     slug: "clinica-1", status: "active", plan_type: "pilot", trace_count: 12_500,
     apis_configured: true,
     users: [{ id: 10, email: "pilot1@clinic.com", role: "clinic_admin" }],
-    health_status: "healthy", last_trace_at: "2026-05-02T08:30:00Z", config_completeness: 95,
+    health_status: "healthy", last_trace_at: "2026-05-02T08:30:00Z", config_completeness: 95, audit_extended_access: false,
   },
   {
     clinic_id: 2, clinic_name: "Instituto Face SP", agent_name: "Face SP",
     slug: "clinica-2", status: "active", plan_type: "pilot", trace_count: 5_200,
     apis_configured: true,
     users: [{ id: 11, email: "pilot2@clinic.com", role: "clinic_admin" }],
-    health_status: "healthy", last_trace_at: "2026-05-01T22:15:00Z", config_completeness: 88,
+    health_status: "healthy", last_trace_at: "2026-05-01T22:15:00Z", config_completeness: 88, audit_extended_access: false,
   },
   {
     clinic_id: 3, clinic_name: "Estética Rio Norte", agent_name: "Rio Norte",
     slug: "clinica-3", status: "active", plan_type: "pilot", trace_count: 1_100,
     apis_configured: false,
     users: [{ id: 12, email: "pilot3@clinic.com", role: "clinic_admin" }],
-    health_status: "warning", last_trace_at: "2026-04-28T14:00:00Z", config_completeness: 42,
+    health_status: "warning", last_trace_at: "2026-04-28T14:00:00Z", config_completeness: 42, audit_extended_access: false,
   },
   {
     clinic_id: 5, clinic_name: "Lumina Derma Clinic", agent_name: "Lumina Derma",
     slug: "clinica-4", status: "active", plan_type: "pilot", trace_count: 8_400,
     apis_configured: true,
     users: [{ id: 13, email: "pilot4@clinic.com", role: "clinic_admin" }],
-    health_status: "critical", last_trace_at: null, config_completeness: 70,
+    health_status: "critical", last_trace_at: null, config_completeness: 70, audit_extended_access: false,
   },
 ];
 
@@ -562,16 +587,16 @@ const DEMO_BUILDERS: BuilderWithClinics[] = [
   {
     id: 1, name: "Builder Alfa", status: "active", subscription_status: "active", created_at: "2026-01-15T10:00:00Z",
     clinics: [
-      { clinic_id: 8,  clinic_name: "Clínica Alfa 1", slug: "alfa-1", status: "active", plan_type: "pilot", builder_id: 1, trace_count: 3200, apis_configured: true, health_status: "healthy", last_trace_at: "2026-05-02T07:00:00Z", config_completeness: 100 },
-      { clinic_id: 9,  clinic_name: "Clínica Alfa 2", slug: "alfa-2", status: "active", plan_type: "pilot", builder_id: 1, trace_count: 1800, apis_configured: true, health_status: "healthy", last_trace_at: "2026-05-01T18:30:00Z", config_completeness: 85 },
-      { clinic_id: 10, clinic_name: "Clínica Alfa 3", slug: "alfa-3", status: "active", plan_type: "pilot", builder_id: 1, trace_count: 950,  apis_configured: false, health_status: "warning", last_trace_at: "2026-04-27T10:00:00Z", config_completeness: 35 },
+      { clinic_id: 8,  clinic_name: "Clínica Alfa 1", slug: "alfa-1", status: "active", plan_type: "pilot", builder_id: 1, trace_count: 3200, apis_configured: true, health_status: "healthy", last_trace_at: "2026-05-02T07:00:00Z", config_completeness: 100, audit_extended_access: false },
+      { clinic_id: 9,  clinic_name: "Clínica Alfa 2", slug: "alfa-2", status: "active", plan_type: "pilot", builder_id: 1, trace_count: 1800, apis_configured: true, health_status: "healthy", last_trace_at: "2026-05-01T18:30:00Z", config_completeness: 85, audit_extended_access: false },
+      { clinic_id: 10, clinic_name: "Clínica Alfa 3", slug: "alfa-3", status: "active", plan_type: "pilot", builder_id: 1, trace_count: 950,  apis_configured: false, health_status: "warning", last_trace_at: "2026-04-27T10:00:00Z", config_completeness: 35, audit_extended_access: false },
     ],
   },
   {
     id: 2, name: "Builder Beta", status: "active", subscription_status: "trial", created_at: "2026-02-01T10:00:00Z",
     clinics: [
-      { clinic_id: 11, clinic_name: "Clínica Beta 1", slug: "beta-1", status: "active", plan_type: "pilot", builder_id: 2, trace_count: 2100, apis_configured: true, health_status: "healthy", last_trace_at: "2026-05-02T06:45:00Z", config_completeness: 92 },
-      { clinic_id: 12, clinic_name: "Clínica Beta 2", slug: "beta-2", status: "active", plan_type: "pilot", builder_id: 2, trace_count: 890,  apis_configured: false, health_status: "critical", last_trace_at: null, config_completeness: 20 },
+      { clinic_id: 11, clinic_name: "Clínica Beta 1", slug: "beta-1", status: "active", plan_type: "pilot", builder_id: 2, trace_count: 2100, apis_configured: true, health_status: "healthy", last_trace_at: "2026-05-02T06:45:00Z", config_completeness: 92, audit_extended_access: false },
+      { clinic_id: 12, clinic_name: "Clínica Beta 2", slug: "beta-2", status: "active", plan_type: "pilot", builder_id: 2, trace_count: 890,  apis_configured: false, health_status: "critical", last_trace_at: null, config_completeness: 20, audit_extended_access: false },
     ],
   },
 ];
@@ -657,6 +682,7 @@ export default function MasterAdmin() {
   const [editClinicName, setEditClinicName] = useState("");
   const [editClinicEmail, setEditClinicEmail] = useState("");
   const [editClinicPassword, setEditClinicPassword] = useState("");
+  const [auditAddonSavingIds, setAuditAddonSavingIds] = useState<Set<number>>(() => new Set());
   const [addingClinicToBuilderId, setAddingClinicToBuilderId] = useState<number | null>(null);
   const [newClinicName, setNewClinicName] = useState("");
   const [newClinicEmail, setNewClinicEmail] = useState("");
@@ -1057,6 +1083,38 @@ export default function MasterAdmin() {
       });
     } catch {
       toast({ title: t("admin_create_err_network"), variant: "destructive" });
+    }
+  };
+
+  const handleToggleAuditAddon = async (id: number, enabled: boolean) => {
+    if (isInvestor) { toast({ title: "Modo Visualização: ação desabilitada." }); return; }
+    setAuditAddonSavingIds((prev) => new Set(prev).add(id));
+    try {
+      const res = await fetch(`/v1/admin/clinics/${id}`, {
+        method: "PATCH",
+        headers: authHeaders(token),
+        body: JSON.stringify({ audit_extended_access: enabled }),
+      });
+      const data = res.ok ? await res.json() as { audit_extended_access?: unknown } : null;
+      if (typeof data?.audit_extended_access !== "boolean") {
+        toast({ title: t("admin_toggle_err_title"), description: t("admin_audit_addon_err"), variant: "destructive" });
+        return;
+      }
+      const stored = data.audit_extended_access;
+      setClinics((prev) => prev.map((c) => c.clinic_id === id ? { ...c, audit_extended_access: stored } : c));
+      setBuilders((prev) => prev.map((b) => ({
+        ...b,
+        clinics: b.clinics.map((c) => c.clinic_id === id ? { ...c, audit_extended_access: stored } : c),
+      })));
+      toast({ title: stored ? t("admin_audit_addon_ok_on") : t("admin_audit_addon_ok_off"), description: `ID ${id}` });
+    } catch {
+      toast({ title: t("admin_create_err_network"), variant: "destructive" });
+    } finally {
+      setAuditAddonSavingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
     }
   };
 
@@ -1689,6 +1747,8 @@ export default function MasterAdmin() {
                                 canManage={isSuperAdmin}
                                 onRename={() => { setEditingClinicId(c.clinic_id); setEditClinicName(c.clinic_name); setEditClinicEmail(c.admin_email ?? ""); setEditClinicPassword(""); }}
                                 onToggleStatus={() => void handleToggleClinicStatus(c.clinic_id, c.status)}
+                                onToggleAuditAddon={(enabled) => void handleToggleAuditAddon(c.clinic_id, enabled)}
+                                auditAddonSaving={auditAddonSavingIds.has(c.clinic_id)}
                                 onUnlink={() => void handleUnlinkClinic(builder.id, c.clinic_id)}
                                 onDelete={() => handleDeleteClinic(c.clinic_id, c.clinic_name)}
                                 onViewTraces={() => handleViewTraces(c.clinic_id)}
@@ -1738,6 +1798,8 @@ export default function MasterAdmin() {
                   onToggleExpand={() => setExpandedClinicId(expandedClinicId === clinic.clinic_id ? null : clinic.clinic_id)}
                   canManage={isSuperAdmin}
                   onToggleStatus={() => void handleToggleClinicStatus(clinic.clinic_id, clinic.status)}
+                  onToggleAuditAddon={(enabled) => void handleToggleAuditAddon(clinic.clinic_id, enabled)}
+                  auditAddonSaving={auditAddonSavingIds.has(clinic.clinic_id)}
                   onDelete={() => handleDeleteClinic(clinic.clinic_id, clinic.clinic_name)}
                   onViewTraces={() => handleViewTraces(clinic.clinic_id)}
                   onAccessPanel={() => handleAccessClinicPanel(clinic.clinic_id)}

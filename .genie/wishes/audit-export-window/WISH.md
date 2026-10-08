@@ -254,6 +254,15 @@ _The read-only reviewer returns evidence; the invoking orchestrator appends a ti
 - **Re-validation after the fix (orchestrator):** 8 focused files → `155 passed`; `alembic heads` → exactly one (`022`); `make format-check lint typecheck` → exit 0 (mypy clean, 177 files). The full `make quality` was **not** re-run after the fix.
 - **Carried LOW notes:** `HandoffService.resolve_queue_period` is now unused and its docstring ("queue/export window") is stale — remove or fix in a follow-up; `test_upgrade_backfills_existing_rows_as_false` checks the default on new inserts, not a backfill of existing rows; the missing-`end` default (`now`) also gets the midnight stretch (one second per day at 00:00:00 UTC, edge only for API callers).
 
+### 2026-10-07 — Group 2 execution review — SHIP
+
+- **Worktree:** `.worktrees/audit-export-window`, HEAD `3f4809c` (Group 1 commit, rebased on `origin/main` `ef1a9fe`); Group 2 changes uncommitted: 7 modified + 2 new files, all under `frontend/artifacts/neurostack/src/` (`lib/export-window.ts`, `pages/{traces,handoff-queue,master-admin}.tsx`, `pages/master-admin-audit-addon.test.tsx`, tests, `locales/{pt,en}.ts`). No backend, `package.json` or lockfile changes.
+- **Frontend baseline (engineer, before edits):** focused vitest exit 0 (3 files, 74 tests); typecheck exit 0; full suite exit 0 (29 files, 379 tests).
+- **Independent reviewer:** SHIP, no CRITICAL/HIGH/MEDIUM. Date-part day count checked against an independent calculation: 146,000 date pairs × 6 timezones, 0 mismatches. Backend contract (codes, PATCH body/response, listing fields) matches `src/api/routes/{traces,handoff,admin}.py`. No test lines deleted.
+- **Orchestrator validation:** `vitest run … src/pages/traces.test.tsx src/pages/handoff-queue.test.tsx src/pages/master-admin` → `VITEST_EXIT=0`, 4 files / 90 tests passed; `run typecheck` → `TC_EXIT=0`. The full frontend suite (engineer: 395 passed) and Playwright were **not** re-run by the orchestrator or reviewer.
+- **Install workaround:** `pnpm --dir frontend install --frozen-lockfile` fails in this workspace on the root `preinstall` guard ("Use pnpm instead"); the engineer used `--ignore-scripts` (no tracked file changed). The reviewer could not reproduce the empty user-agent explanation (`npm_config_user_agent` was set in a scratch probe) — environment-specific; track separately if it recurs.
+- **Carried LOW notes (non-blocking):** (1) no test for the investor block / switch hidden for non-super-admins; (2) the add-on switch is in the row's expandable section, so its state is not visible while collapsed (optional: collapsed-header badge); (3) investor toast text `"Modo Visualização: ação desabilitada."` is hardcoded, same as three existing handlers; (4) traces export with start after end is not blocked client-side (server answers `invalid_date_range` → generic toast); (5) `invalid_date_range` has no specific toast on the handoff export (practically unreachable).
+
 ---
 
 ## Files to Create/Modify

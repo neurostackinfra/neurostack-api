@@ -13,6 +13,7 @@ import { IntentBadge } from "@/components/trace-viewer";
 import { Skeleton } from "@/components/ui/skeleton";
 import { format } from "date-fns";
 import { useToast } from "@/hooks/use-toast";
+import { exceedsExportWindow, exportWindowErrorKey } from "@/lib/export-window";
 
 const PAGE_SIZE = 50;
 
@@ -186,6 +187,7 @@ export default function TracesList() {
   const [onlyHandoff, setOnlyHandoff] = useState(false);
   const [channelFilter, setChannelFilter] = useState<"all" | "whatsapp" | "web">("all");
   const [exporting, setExporting] = useState(false);
+  const exportTooLong = exceedsExportWindow(exportStart, exportEnd);
 
   // Pagination
   const effectiveTenant = (isBuilder || isSuperAdmin) ? viewingClinicId ?? "" : "";
@@ -378,7 +380,7 @@ export default function TracesList() {
       toast({ title: t("traces_view_mode_title"), description: t("traces_view_mode_desc") });
       return;
     }
-    if (!exportStart || !exportEnd) return;
+    if (!exportStart || !exportEnd || exportTooLong) return;
     setExporting(true);
     try {
       const token = getToken();
@@ -395,7 +397,20 @@ export default function TracesList() {
       const res = await fetch(`/v1/traces/export?${params.toString()}`, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
-      if (!res.ok) throw new Error(`Export failed: ${res.status}`);
+      if (!res.ok) {
+        let detail: unknown;
+        try {
+          detail = (await res.json())?.detail;
+        } catch {
+          detail = undefined;
+        }
+        const windowErrorKey = exportWindowErrorKey(detail);
+        if (windowErrorKey) {
+          toast({ title: t("traces_export_err_title"), description: t(windowErrorKey), variant: "destructive" });
+          return;
+        }
+        throw new Error(`Export failed: ${res.status}`);
+      }
       const blob = await res.blob();
       const objectUrl = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
@@ -566,13 +581,21 @@ export default function TracesList() {
 
           <button
             onClick={handleExport}
-            disabled={exporting}
+            disabled={exporting || exportTooLong}
+            aria-describedby={exportTooLong ? "trace-export-window-hint" : undefined}
             className="inline-flex items-center gap-2 rounded-md bg-accent px-5 py-2 text-sm font-semibold text-accent-foreground shadow-sm hover:bg-accent/90 disabled:opacity-60 disabled:cursor-not-allowed transition-all shrink-0 h-[38px]"
           >
             <FileDown className="h-4 w-4" />
             {exporting ? t("traces_generating") : t("traces_export_btn")}
           </button>
         </div>
+
+        {exportTooLong && (
+          <p id="trace-export-window-hint" role="status" className="text-xs font-medium text-destructive">
+            {t("audit_export_window_exceeded_hint")}
+          </p>
+        )}
+        <p className="text-xs text-muted-foreground">{t("audit_export_window_rule")}</p>
 
         <p className="text-xs text-muted-foreground leading-relaxed">
           {t("traces_report_hint")}
