@@ -7,15 +7,16 @@ through the cognitive pipeline, including SRM decisions, context, and prompts.
 """
 
 from collections.abc import Iterator
-from datetime import date, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Annotated, Any, Optional, TypeAlias
 from uuid import UUID
-from zoneinfo import ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import jwt as pyjwt
 from annotated_types import Ge, Le
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.middleware.auth import (
@@ -31,10 +32,19 @@ from src.api.schemas.traces import (
 )
 from src.config.logging import get_logger
 from src.config.settings import settings
+from src.handoff.sla import resolve_clinic_zone
+from src.models.clinic_config_table import ClinicConfigTable
+from src.models.tenant import Tenant
 from src.observability.pii import mask_carteirinha
 from src.repositories import get_db_session_dependency
+from src.services.export_window import (
+    INVALID_DATE_RANGE,
+    ExportWindowError,
+    validate_export_window,
+)
 from src.services.trace_service import (
     _event_to_trace_dict,
+    _to_utc,
     daily_utc_window,
     export_traces_csv,
     get_prompt_event_for_trace,
@@ -137,6 +147,38 @@ async def _resolve_tenant(
     return await require_builder_clinic_access(override_tenant_id, builder_id, db)
 
 
+async def _load_export_policy(db: AsyncSession, tenant_id: UUID) -> tuple[object, bool]:
+    """Load the clinic's raw timezone setting and audit add-on flag."""
+    result = await db.execute(
+        select(Tenant.audit_extended_access, ClinicConfigTable.operations)
+        .select_from(Tenant)
+        .outerjoin(ClinicConfigTable, ClinicConfigTable.tenant_id == Tenant.id)
+        .where(Tenant.id == tenant_id)
+    )
+    row = result.one_or_none()
+    if row is None:
+        return None, False
+    extended_access, operations = row
+    configured_timezone = (
+        operations.get("timezone") if isinstance(operations, dict) else None
+    )
+    return configured_timezone, bool(extended_access)
+
+
+def _whole_day_end(value: datetime) -> datetime:
+    """Mirror ``_apply_filters``: a midnight end includes its whole day."""
+    if value.hour == 0 and value.minute == 0 and value.second == 0:
+        return value.replace(hour=23, minute=59, second=59)
+    return value
+
+
+def _export_civil_date(value: datetime, zone: ZoneInfo) -> date:
+    """Naive values keep their own date; aware values use the clinic zone."""
+    if value.tzinfo is None:
+        return value.date()
+    return value.astimezone(zone).date()
+
+
 router = APIRouter()
 
 
@@ -192,7 +234,38 @@ Export traces as a CSV download.
 
 Supports the same filters as the list endpoint. Returns a streaming
 CSV response with Content-Disposition header for download.
+
+Without dates the export runs from the clinic's current date minus 30 days
+through now (31 inclusive civil dates); a missing `start_date` defaults to
+30 clinic dates ago and a missing `end_date` to now. Naive datetimes count
+by their own date part, while timezone-aware ones are converted to the clinic
+timezone first.
+
+One file covers at most 60 inclusive civil dates and starts no earlier than
+6 calendar months before the clinic's current date (same day of month,
+clamped to month end). The clinic's `audit_extended_access` add-on waives
+only the 6-month lookback.
     """,
+    responses={
+        400: {
+            "description": "Invalid or out-of-policy export window",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "invalid_date_range": {
+                            "value": {"detail": "invalid_date_range"}
+                        },
+                        "export_window_60_days": {
+                            "value": {"detail": "export_window_60_days"}
+                        },
+                        "export_lookback_6_months": {
+                            "value": {"detail": "export_lookback_6_months"}
+                        },
+                    }
+                }
+            },
+        },
+    },
     tags=["Traces"],
 )
 async def trace_export(
@@ -222,11 +295,48 @@ async def trace_export(
 ) -> StreamingResponse:
     """Export traces as a CSV download."""
     effective_tenant_id = await _resolve_tenant(request, tenant, override_tenant_id, db)
+    configured_timezone, extended_access = await _load_export_policy(
+        db, effective_tenant_id
+    )
+    _, zone = resolve_clinic_zone(configured_timezone)
+    now = datetime.now(UTC)
+    try:
+        local_today = now.astimezone(zone).date()
+        effective_start = (
+            start_date
+            if start_date is not None
+            else datetime.combine(
+                local_today - timedelta(days=30), time.min, tzinfo=zone
+            ).astimezone(UTC)
+        )
+        effective_end = end_date if end_date is not None else now
+        filtered_end = _whole_day_end(effective_end)
+        validate_export_window(
+            _export_civil_date(effective_start, zone),
+            _export_civil_date(filtered_end, zone),
+            local_today=local_today,
+            extended_access=extended_access,
+        )
+        # Pre-check the UTC bounds the query will use so an unrepresentable
+        # value is a 400 rather than an error inside the query builder.
+        _to_utc(effective_start)
+        _to_utc(filtered_end)
+    except ExportWindowError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=exc.code,
+        ) from exc
+    except (OverflowError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=INVALID_DATE_RANGE,
+        ) from exc
+
     csv_content = await export_traces_csv(
         db=db,
         tenant_id=effective_tenant_id,
-        start_date=start_date,
-        end_date=end_date,
+        start_date=effective_start,
+        end_date=effective_end,
         safety_flag=safety_flag,
         handoff_required=handoff_required,
         channel=channel,

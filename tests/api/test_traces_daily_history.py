@@ -2,6 +2,7 @@
 
 import csv
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from uuid import UUID, uuid4
 
 import jwt
@@ -72,6 +73,21 @@ def _event(
         },
         created_at=created_at,
     )
+
+
+class _ExportClock(datetime):
+    """Clinic export "today" of 2026-10-01, inside the fixtures' export window."""
+
+    @classmethod
+    def now(cls, tz: Any = None) -> "_ExportClock":
+        value = cls(2026, 10, 1, 12, tzinfo=timezone.utc)
+        return value if tz is None else value.astimezone(tz)
+
+
+def _freeze_export_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.api.routes import traces as traces_route
+
+    monkeypatch.setattr(traces_route, "datetime", _ExportClock)
 
 
 async def _seed(*tenants: Tenant, events: list[Event]) -> None:
@@ -394,7 +410,9 @@ async def test_legacy_date_matrix_and_envelope_are_unchanged(
 @pytest.mark.asyncio
 async def test_export_still_supports_a_multi_day_range(
     async_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _freeze_export_clock(monkeypatch)
     tenant_id = uuid4()
     await _seed(
         _tenant(tenant_id),
@@ -426,7 +444,10 @@ async def test_export_still_supports_a_multi_day_range(
 @pytest.mark.asyncio
 async def test_export_omits_intent_category_and_action_columns(
     async_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # No dates: the export defaults to clinic today minus 30 days through now.
+    _freeze_export_clock(monkeypatch)
     tenant_id = uuid4()
     await _seed(
         _tenant(tenant_id),

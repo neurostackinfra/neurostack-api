@@ -316,6 +316,10 @@ export const en = {
   traces_no_filter_match: "No traces found with the selected filters in the period.",
   traces_export_err_title: "Export error",
   traces_export_err_desc: "Could not generate the report. Please try again.",
+  audit_export_window_rule: "Export: up to 6 months back, 60 days per file.",
+  audit_export_window_exceeded_hint: "The selected range is longer than 60 days. Shorten it to export.",
+  audit_export_error_window_60_days: "Each file covers at most 60 days. Shorten the range and try again.",
+  audit_export_error_lookback_6_months: "Exports reach back at most 6 months. Choose a more recent start date.",
   traces_view_mode_title: "View Mode",
   traces_view_mode_desc: "Changes not allowed in this test account.",
   traces_day_section_title: "Daily trace history",
@@ -484,6 +488,11 @@ export const en = {
   admin_health_days_ago: "days ago",
   admin_health_never: "never",
   admin_health_config_completeness: "Config completeness",
+  admin_audit_addon_label: "Extended Audit add-on",
+  admin_audit_addon_desc: "Allows trace and handoff exports further back than 6 months. The 60-days-per-file cap still applies.",
+  admin_audit_addon_ok_on: "Extended Audit add-on enabled",
+  admin_audit_addon_ok_off: "Extended Audit add-on disabled",
+  admin_audit_addon_err: "Could not change the Extended Audit add-on.",
 
   // ── Admin Alerts ──
   admin_alerts_title: "Platform Alerts",

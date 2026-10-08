@@ -139,7 +139,7 @@ async def postgres_sla_database() -> AsyncIterator[SessionMaker]:
                 await connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
                 )
-                == "021"
+                == "022"
             )
         yield factory
     finally:

@@ -318,6 +318,10 @@ export const pt: Record<TranslationKey, string> = {
   traces_no_filter_match: "Nenhum trace encontrado com os filtros selecionados no período.",
   traces_export_err_title: "Erro ao exportar",
   traces_export_err_desc: "Não foi possível gerar o relatório. Tente novamente.",
+  audit_export_window_rule: "Exportação: até 6 meses atrás, 60 dias por arquivo.",
+  audit_export_window_exceeded_hint: "O período selecionado passa de 60 dias. Reduza o intervalo para exportar.",
+  audit_export_error_window_60_days: "Cada arquivo cobre no máximo 60 dias. Reduza o período e tente novamente.",
+  audit_export_error_lookback_6_months: "A exportação alcança no máximo 6 meses atrás. Escolha uma data inicial mais recente.",
   traces_view_mode_title: "Modo Visualização",
   traces_view_mode_desc: "Alterações não permitidas nesta conta de teste.",
   traces_day_section_title: "Histórico diário de traces",
@@ -486,6 +490,11 @@ export const pt: Record<TranslationKey, string> = {
   admin_health_days_ago: "dias atrás",
   admin_health_never: "nunca",
   admin_health_config_completeness: "Config completa",
+  admin_audit_addon_label: "Add-on Auditoria Estendida",
+  admin_audit_addon_desc: "Libera exportações de traces e handoffs além de 6 meses atrás. O limite de 60 dias por arquivo continua valendo.",
+  admin_audit_addon_ok_on: "Add-on Auditoria Estendida ativado",
+  admin_audit_addon_ok_off: "Add-on Auditoria Estendida desativado",
+  admin_audit_addon_err: "Não foi possível alterar o add-on Auditoria Estendida.",
 
   // ── Admin Alerts ──
   admin_alerts_title: "Alertas da Plataforma",
