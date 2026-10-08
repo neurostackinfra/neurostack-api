@@ -12,7 +12,6 @@ from passlib.context import CryptContext
 from sqlalchemy import cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.types import String
 
 from src.api.helpers.health import (
@@ -47,6 +46,20 @@ from src.models.tenant import Tenant
 from src.models.transaction import Transaction
 from src.models.user import User, UserRole
 from src.repositories import get_db_session_dependency
+from src.services.media_assets import (
+    MediaOwnerTransition,
+    MediaStorageCapacityExceeded,
+    MediaStorageGuardError,
+    detach_builder_media_owners_for_delete,
+    lock_builder_users_before_parent,
+    lock_clinic_for_delete,
+    lock_tenant_users_before_parent,
+    transition_tenant_media_owner,
+)
+from src.services.tenant_classification import (
+    is_real_clinic_user_roles,
+    real_clinic_tenant_filter,
+)
 
 router = APIRouter()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
@@ -85,7 +98,6 @@ def _build_clinic_slot(
         health_status=health_status,
         last_trace_at=last_trace_at,
         config_completeness=config_completeness,
-        audit_extended_access=tenant.audit_extended_access,
     ).model_dump(mode="json")
 
 
@@ -93,36 +105,15 @@ def _build_clinic_slot(
 # Helper: platform-wide totals (KPI cards)
 # ============================================
 
-# Roles that mark a tenant as internal tooling (builder HQ, admin, investor
-# demo) rather than a real clinic.
-_NON_CLINIC_ROLES = (UserRole.builder, UserRole.super_admin, UserRole.investor)
-
 # Builder subscription states that count as "active" for billing purposes:
 # still on a free pilot/trial, or paying. Anything else (e.g. "past_due",
 # "canceled") is not active even if the row hasn't been manually deactivated.
 _ACTIVE_BUILDER_SUBSCRIPTION_STATUSES = ("trial", "pilot", "active")
 
 
-def _real_clinic_tenant_filter() -> ColumnElement[bool]:
-    """Whereclause selecting tenants that represent an actual clinic.
-
-    Excludes tenants whose only users are builder/super_admin/investor
-    accounts (builder HQ shells, internal admin tenants). A tenant with no
-    users yet (freshly provisioned, not onboarded) still counts as a clinic —
-    mirrors the skip condition in ``list_clinics`` below.
-    """
-    has_users = select(User.id).where(User.tenant_id == Tenant.id).exists()
-    has_clinic_user = (
-        select(User.id)
-        .where(User.tenant_id == Tenant.id, ~User.role.in_(_NON_CLINIC_ROLES))
-        .exists()
-    )
-    return ~(has_users & ~has_clinic_user)
-
-
 async def _compute_platform_totals(session: AsyncSession) -> dict[str, int]:
     """Shared clinic/builder totals for the admin stats + dashboard KPI cards."""
-    clinic_filter = _real_clinic_tenant_filter()
+    clinic_filter = real_clinic_tenant_filter()
 
     total_clinics_result = await session.execute(
         select(func.count(Tenant.id)).where(clinic_filter)
@@ -217,14 +208,11 @@ async def list_clinics(
         row.tenant_id: row.last_trace_at for row in last_trace_result
     }
 
-    # Roles that indicate non-clinic tenants (builder HQ, super-admin, investor)
-    non_clinic_roles = {UserRole.builder, UserRole.super_admin, UserRole.investor}
-
     clinics: list[dict[str, Any]] = []
     for t in tenants:
         tenant_users = users_by_tenant.get(t.id, [])
         # Skip tenants where ALL users have non-clinic roles (e.g. builder HQ tenant)
-        if tenant_users and all(u.role in non_clinic_roles for u in tenant_users):
+        if not is_real_clinic_user_roles(u.role for u in tenant_users):
             continue
 
         last_trace = last_trace_map.get(t.id)
@@ -335,8 +323,15 @@ async def delete_clinic(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid clinic ID")
 
-    result = await session.execute(select(Tenant).where(Tenant.id == cid))
-    t = result.scalar_one_or_none()
+    try:
+        t = await lock_clinic_for_delete(
+            session,
+            cid,
+            actor_user_id=tenant.user_id,
+        )
+    except MediaStorageGuardError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not t:
         raise HTTPException(status_code=404, detail="Clinic not found")
 
@@ -381,11 +376,7 @@ async def toggle_clinic_status(
 @router.patch(
     "/clinics/{clinic_id}",
     summary="Update Clinic",
-    description=(
-        "Update clinic name, admin email, password, and/or the audit add-on "
-        "(`audit_extended_access`, which waives the 6-month export lookback). "
-        "Super admin only. Responds with the stored `audit_extended_access`."
-    ),
+    description="Update clinic name, admin email, and/or password. Super admin only.",
     response_model=None,
 )
 async def update_clinic(
@@ -399,12 +390,17 @@ async def update_clinic(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid clinic ID")
 
-    result = await session.execute(
-        select(Tenant)
-        .options(selectinload(Tenant.clinic_config_row))
-        .where(Tenant.id == cid)
-    )
-    t = result.scalar_one_or_none()
+    if body.email is not None or body.password is not None:
+        t = await lock_tenant_users_before_parent(session, cid)
+        if t is not None:
+            await session.refresh(t, attribute_names=["clinic_config_row"])
+    else:
+        result = await session.execute(
+            select(Tenant)
+            .options(selectinload(Tenant.clinic_config_row))
+            .where(Tenant.id == cid)
+        )
+        t = result.scalar_one_or_none()
     if not t:
         raise HTTPException(status_code=404, detail="Clinic not found")
 
@@ -437,12 +433,8 @@ async def update_clinic(
             if body.password is not None:
                 user.password_hash = pwd_context.hash(body.password)
 
-    if body.audit_extended_access is not None:
-        t.audit_extended_access = body.audit_extended_access
-    stored_audit_extended_access = t.audit_extended_access
-
     await session.commit()
-    return {"ok": True, "audit_extended_access": stored_audit_extended_access}
+    return {"ok": True}
 
 
 @router.get(
@@ -727,7 +719,6 @@ async def list_builders(
                     health_status=health,
                     last_trace_at=last_trace,
                     config_completeness=completeness,
-                    audit_extended_access=t.audit_extended_access,
                 )
             )
         output.append(
@@ -877,8 +868,11 @@ async def update_builder(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid builder ID")
 
-    result = await session.execute(select(Builder).where(Builder.id == bid))
-    builder = result.scalar_one_or_none()
+    if body.email is not None or body.password is not None:
+        builder = await lock_builder_users_before_parent(session, bid)
+    else:
+        result = await session.execute(select(Builder).where(Builder.id == bid))
+        builder = result.scalar_one_or_none()
     if not builder:
         raise HTTPException(status_code=404, detail="Builder not found")
 
@@ -934,11 +928,15 @@ async def delete_builder(
     if not builder:
         raise HTTPException(status_code=404, detail="Builder not found")
 
-    # Unlink managed clinics (set builder_id = NULL so they aren't orphaned)
-    linked_stmt = select(Tenant).where(Tenant.builder_id == bid)
-    linked_result = await session.execute(linked_stmt)
-    for t in linked_result.scalars().all():
-        t.builder_id = None
+    try:
+        await detach_builder_media_owners_for_delete(
+            session,
+            bid,
+            actor_user_id=tenant.user_id,
+        )
+    except MediaStorageGuardError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     # Delete the builder's own tenant (cascade deletes users, sessions, events)
     builder_tenant_stmt = (
@@ -1079,7 +1077,22 @@ async def link_clinic_to_builder(
             status_code=409, detail="Esta clínica já está vinculada a um builder"
         )
 
-    clinic.builder_id = bid
+    try:
+        await transition_tenant_media_owner(
+            session,
+            MediaOwnerTransition(
+                tenant_id=cid,
+                expected_builder_id=None,
+                destination_builder_id=bid,
+            ),
+            actor_user_id=tenant.user_id,
+        )
+    except MediaStorageCapacityExceeded as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=exc.code) from exc
+    except MediaStorageGuardError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     await session.commit()
     return {"ok": True}
 
@@ -1124,7 +1137,22 @@ async def unlink_clinic_from_builder(
             status_code=409, detail="Esta clínica está vinculada a outro builder"
         )
 
-    clinic.builder_id = None
+    try:
+        await transition_tenant_media_owner(
+            session,
+            MediaOwnerTransition(
+                tenant_id=cid,
+                expected_builder_id=bid,
+                destination_builder_id=None,
+            ),
+            actor_user_id=tenant.user_id,
+        )
+    except MediaStorageCapacityExceeded as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=exc.code) from exc
+    except MediaStorageGuardError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     await session.commit()
     return {"ok": True}
 

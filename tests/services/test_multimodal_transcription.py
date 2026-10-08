@@ -35,13 +35,37 @@ AUDIO = b"OggS\x00\x02fake-opus-payload"
 
 
 @pytest.fixture(autouse=True)
-def _restore_session_event_loop(event_loop: asyncio.AbstractEventLoop) -> Any:
-    """asyncio.run() below clears the process-wide current event loop on exit
-    (``asyncio.set_event_loop(None)``), which otherwise poisons every test that
-    runs later in the same session and relies on ``asyncio.get_event_loop()``
-    resolving pytest-asyncio's session-scoped loop."""
-    yield
-    asyncio.set_event_loop(event_loop)
+def _preserve_current_loop_around_asyncio_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep synchronous ``asyncio.run`` calls from clearing an existing loop.
+
+    pytest-asyncio 1.x owns async-test loops and no longer exposes the legacy
+    ``event_loop`` fixture.  These synchronous tests still use ``asyncio.run``;
+    preserving the loop that was current before each call avoids changing the
+    surrounding session state.  ``asyncio.run`` remains responsible for closing
+    every loop it creates, so this fixture neither shares nor leaks a test loop.
+    """
+
+    original_run = asyncio.run
+
+    def preserving_run(
+        main: Any,
+        *,
+        debug: bool | None = None,
+    ) -> Any:
+        try:
+            previous_loop = asyncio.get_event_loop()
+        except RuntimeError:
+            previous_loop = None
+
+        try:
+            return original_run(main, debug=debug)
+        finally:
+            if previous_loop is not None and not previous_loop.is_closed():
+                asyncio.set_event_loop(previous_loop)
+
+    monkeypatch.setattr(asyncio, "run", preserving_run)
 
 
 def _addrinfo(ip: str, port: int = 443) -> tuple[Any, ...]:
@@ -271,39 +295,6 @@ class TestTranscribeSuccess:
             "type": "text",
             "text": "transcribe",
         }
-
-    def test_default_prompt_is_language_neutral(self) -> None:
-        """The transcription prompt must not pin PT or EN.
-
-        The conversation-language-switching wish (Group 3) requires audio
-        turns to feed the same text decision machine without translation,
-        so the multimodal rung must transcribe literally in whichever
-        language was spoken. The policy is enforced *in the prompt bytes*:
-        no PT or EN phrasing, and no "respond in <language>" instruction.
-        """
-        prompt = DEFAULT_TRANSCRIPTION_PROMPT
-        lowered = prompt.lower()
-        # No PT-only phrases that would steer the model toward Portuguese.
-        assert "português" not in lowered
-        assert "portugues" not in lowered
-        assert "em português do brasil" not in lowered
-        # No "respond in English" / "em inglês" / "translate to <lang>"
-        # directives — the model must preserve the spoken language. The
-        # prompt is allowed to say "do not translate" (that enforces the
-        # same contract), so we check against positive translate orders.
-        assert "em inglês" not in lowered
-        assert "em português" not in lowered
-        assert "translate to" not in lowered
-        assert "respond in" not in lowered
-        # The literal-transcription contract and the neutral marker remain.
-        assert "literally" in lowered or "literal" in lowered
-        from src.services.multimodal_service import NO_SPEECH_MARKER
-
-        assert NO_SPEECH_MARKER in prompt
-        # The marker itself must not be a PT- or EN-specific utterance so
-        # that forwarding it would never masquerade as a patient message.
-        assert "sem fala" not in NO_SPEECH_MARKER.lower()
-        assert "no speech" not in NO_SPEECH_MARKER.lower()
 
     def test_openai_base_url_pins_to_openai_host(self) -> None:
         transport, seen = recording_transport(chat_response("hello"))

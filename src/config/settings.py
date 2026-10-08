@@ -92,6 +92,30 @@ class Settings(BaseSettings):
     rate_limit_burst: int = Field(default=10, ge=1)
 
     # ============================================
+    # Media resource budgets (per process)
+    # ============================================
+    # These are intentionally reduction-only knobs. Raising either ceiling
+    # changes the reviewed memory/database budget and requires a code change.
+    media_max_concurrent_uploads: int = Field(default=4, ge=1, le=4)
+    media_max_concurrent_downloads: int = Field(default=8, ge=1, le=8)
+
+    @field_validator(
+        "media_max_concurrent_uploads",
+        "media_max_concurrent_downloads",
+        mode="before",
+    )
+    @classmethod
+    def validate_media_concurrency_limit(cls, value: object) -> int:
+        """Accept integer environment text without Pydantic's float coercion."""
+        if isinstance(value, bool):
+            raise ValueError("media concurrency limit must be an integer")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isascii() and value.isdecimal():
+            return int(value)
+        raise ValueError("media concurrency limit must be an integer")
+
+    # ============================================
     # Logging
     # ============================================
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"

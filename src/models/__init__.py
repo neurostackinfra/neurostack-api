@@ -14,6 +14,7 @@ from src.models.demo_lead import DemoLead
 from src.models.event import Event
 from src.models.handoff import HandoffRecord
 from src.models.knowledge import KnowledgeDocument
+from src.models.media_asset import MediaAsset
 from src.models.policy import Policy
 from src.models.rlhf_audit_review import RlhfAuditReview
 from src.models.rlhf_rating import RlhfRating
@@ -38,6 +39,7 @@ __all__ = [
     "Event",
     "Policy",
     "KnowledgeDocument",
+    "MediaAsset",
     "HandoffRecord",
     "RlhfRating",
     "RlhfAuditReview",

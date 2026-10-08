@@ -19,6 +19,10 @@ from neurostack_core import enable_metrics
 
 # Local application imports
 from src.api.middleware.auth import AuthMiddleware
+from src.api.middleware.media_limits import (
+    MediaConcurrencyLimiters,
+    MediaUploadLimitsMiddleware,
+)
 from src.api.middleware.performance import (
     CachingMiddleware,
     ConnectionOptimizationMiddleware,
@@ -43,6 +47,7 @@ from src.api.routes import (
     handoff,
     health,
     knowledge,
+    media_assets,
     policies,
     privacy,
     rlhf,
@@ -169,6 +174,12 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    media_limiters = MediaConcurrencyLimiters(
+        uploads=settings.media_max_concurrent_uploads,
+        downloads=settings.media_max_concurrent_downloads,
+    )
+    app.state.media_concurrency = media_limiters
+
     def _is_public_path(path: str) -> bool:
         """Check if a path is public (doesn't require authentication)."""
         public_paths = [
@@ -188,11 +199,8 @@ def create_app() -> FastAPI:
 
     def _ensure_openapi_structure(schema: dict[str, Any]) -> dict[str, Any]:
         """Ensure OpenAPI schema has required structure."""
-        # Use OpenAPI 3.0.3 for better ReDoc compatibility
         if "openapi" not in schema:
-            schema["openapi"] = "3.0.3"
-        elif schema.get("openapi") == "3.1.0":
-            schema["openapi"] = "3.0.3"
+            schema["openapi"] = "3.1.0"
 
         if "info" not in schema:
             schema["info"] = {
@@ -316,6 +324,23 @@ def create_app() -> FastAPI:
                     operation["security"] = [{"BearerAuth": []}]
                     continue
 
+                if "security" in operation:
+                    # Operations with an explicit security contract already declare
+                    # which credential alternatives are accepted. Do not also render
+                    # X-API-Key as an independently required parameter.
+                    _add_header_parameter(
+                        operation,
+                        header_name="X-Request-ID",
+                        required=False,
+                        description=(
+                            "Optional unique identifier for request correlation and "
+                            "tracing. If omitted, the API will generate one automatically."
+                        ),
+                        schema_type="string",
+                        schema_format="uuid",
+                    )
+                    continue
+
                 _add_headers_to_operation(operation)
 
     def custom_openapi() -> dict[str, Any]:
@@ -335,6 +360,7 @@ def create_app() -> FastAPI:
             openapi_schema = get_openapi(
                 title=settings.app_name,
                 version=settings.app_version,
+                openapi_version="3.1.0",
                 description=(
                     "NeuroStack - Cognitive Infrastructure for AI Agents in Healthcare. "
                     "Provides deterministic reasoning, memory, and policy enforcement for AI agents."
@@ -411,6 +437,7 @@ def create_app() -> FastAPI:
             app.openapi_schema = get_openapi(
                 title=settings.app_name,
                 version=settings.app_version,
+                openapi_version="3.1.0",
                 description=(
                     "NeuroStack - Cognitive Infrastructure for AI Agents in Healthcare. "
                     "Provides deterministic reasoning, memory, and policy enforcement for AI agents."
@@ -443,6 +470,14 @@ def create_app() -> FastAPI:
     # Add Rate Limiting middleware (before auth to protect from abuse)
     if settings.rate_limit_enabled:
         app.add_middleware(RateLimitMiddleware)
+
+    # Auth remains outermost, so rejected credentials do not consume a media
+    # permit. This middleware then acquires before the first multipart byte.
+    app.add_middleware(
+        MediaUploadLimitsMiddleware,
+        limiters=media_limiters,
+        upload_path=f"{settings.api_prefix}/media-assets",
+    )
 
     # Add Authentication middleware
     app.add_middleware(AuthMiddleware)
@@ -477,6 +512,11 @@ def create_app() -> FastAPI:
         knowledge.router,
         prefix=f"{settings.api_prefix}/knowledge",
         tags=["Knowledge"],
+    )
+    app.include_router(
+        media_assets.router,
+        prefix=f"{settings.api_prefix}/media-assets",
+        tags=["Media Assets"],
     )
     app.include_router(
         handoff.router,

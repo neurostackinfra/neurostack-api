@@ -6,7 +6,7 @@ Represents a builder or clinic using the NeuroStack platform.
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, ForeignKey, String, false
+from sqlalchemy import Boolean, ForeignKey, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from src.models.event import Event
     from src.models.handoff import HandoffRecord
     from src.models.knowledge import KnowledgeDocument
+    from src.models.media_asset import MediaAsset
     from src.models.policy import Policy
     from src.models.session import Session
 
@@ -172,15 +173,6 @@ class Tenant(Base, TimestampMixin):
         nullable=False,
     )
 
-    # Audit add-on: waives the 6-month lookback on trace/handoff CSV exports
-    # (the 60-day-per-file cap still applies). Only a super admin may set it.
-    audit_extended_access: Mapped[bool] = mapped_column(
-        Boolean,
-        default=False,
-        server_default=false(),
-        nullable=False,
-    )
-
     # Clinic contact phone (surfaced on support screens; not used for messaging)
     contact_phone: Mapped[Optional[str]] = mapped_column(
         String(32),
@@ -218,6 +210,13 @@ class Tenant(Base, TimestampMixin):
         back_populates="tenant",
         lazy="dynamic",
         cascade="all, delete-orphan",
+    )
+    media_assets: Mapped[list["MediaAsset"]] = relationship(
+        "MediaAsset",
+        back_populates="tenant",
+        lazy="dynamic",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
     handoff_records: Mapped[list["HandoffRecord"]] = relationship(
         "HandoffRecord",

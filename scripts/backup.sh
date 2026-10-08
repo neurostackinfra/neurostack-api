@@ -1,21 +1,16 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# ============================================
-# NeuroStack API - Script de Backup
-# ============================================
-# Este script faz backup do banco de dados PostgreSQL
-# e dos volumes Docker
+# NeuroStack API - encrypted PostgreSQL backup
 
-set -e
+set -Eeuo pipefail
 
-# Configurações
 BACKUP_DIR="${BACKUP_DIR:-/opt/backups/neurostack}"
-DATE=$(date +%Y%m%d_%H%M%S)
 RETENTION_DAYS="${RETENTION_DAYS:-7}"
+POSTGRES_SERVICE="${POSTGRES_SERVICE:-postgres}"
+POSTGRES_USER="${POSTGRES_USER:-neurostack}"
+POSTGRES_DB="${POSTGRES_DB:-neurostack}"
 
-# Cores
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
@@ -23,71 +18,102 @@ info() {
     echo -e "${GREEN}[INFO]${NC} $1"
 }
 
-warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
-
 error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "${RED}[ERROR]${NC} $1" >&2
 }
 
-# Criar diretório de backup
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        error "Required command is unavailable: $1"
+        exit 1
+    fi
+}
+
+# Encryption prerequisites are intentionally checked before Docker or pg_dump.
+require_command age
+require_command age-keygen
+if [[ -z "${BACKUP_AGE_RECIPIENT:-}" ]]; then
+    error "BACKUP_AGE_RECIPIENT is required"
+    exit 1
+fi
+if ! printf '' | age --encrypt --recipient "$BACKUP_AGE_RECIPIENT" \
+    >/dev/null 2>&1; then
+    error "BACKUP_AGE_RECIPIENT is not a valid age recipient"
+    exit 1
+fi
+
+require_command docker
+require_command gzip
+require_command find
+require_command mktemp
+require_command ln
+
+if ! docker compose version >/dev/null 2>&1; then
+    error "Docker Compose is unavailable"
+    exit 1
+fi
+if [[ ! -f docker-compose.yml ]]; then
+    error "docker-compose.yml not found; run this script from neurostack-api"
+    exit 1
+fi
+if [[ ! "$RETENTION_DAYS" =~ ^[0-9]+$ ]]; then
+    error "RETENTION_DAYS must be a non-negative integer"
+    exit 1
+fi
+
+umask 077
 mkdir -p "$BACKUP_DIR"
 
-info "Iniciando backup em: $BACKUP_DIR"
-
-# Verificar se docker compose está disponível
-if ! command -v docker compose &> /dev/null; then
-    error "Docker Compose não encontrado!"
+timestamp="$(date -u +%Y%m%d_%H%M%S)"
+backup_file="$BACKUP_DIR/postgres_${timestamp}.sql.gz.age"
+if [[ -e "$backup_file" ]]; then
+    error "Backup destination already exists"
     exit 1
 fi
 
-# Verificar se estamos no diretório correto
-if [ ! -f "docker-compose.yml" ]; then
-    error "docker-compose.yml não encontrado. Execute este script do diretório neurostack-api/"
+temp_file=""
+cleanup() {
+    if [[ -n "$temp_file" && -e "$temp_file" ]]; then
+        rm -f -- "$temp_file"
+    fi
+}
+handle_signal() {
+    local signal_status="$1"
+    trap - HUP INT TERM
+    cleanup
+    exit "$signal_status"
+}
+trap cleanup EXIT
+trap 'handle_signal 129' HUP
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
+
+temp_file="$(mktemp "$BACKUP_DIR/.postgres_${timestamp}.sql.gz.age.tmp.XXXXXX")"
+chmod 600 "$temp_file"
+
+info "Starting encrypted PostgreSQL backup"
+if ! docker compose exec -T "$POSTGRES_SERVICE" \
+    pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" 2>/dev/null \
+    | gzip -c \
+    | age --encrypt --recipient "$BACKUP_AGE_RECIPIENT" \
+        >"$temp_file" 2>/dev/null; then
+    error "Encrypted PostgreSQL backup pipeline failed"
     exit 1
 fi
 
-# Backup do banco de dados PostgreSQL
-info "Fazendo backup do PostgreSQL..."
-if docker compose exec -T postgres pg_dump -U neurostack neurostack > "$BACKUP_DIR/postgres_$DATE.sql" 2>/dev/null; then
-    # Compactar
-    gzip "$BACKUP_DIR/postgres_$DATE.sql"
-    info "✓ Backup do PostgreSQL concluído: postgres_$DATE.sql.gz"
-else
-    error "✗ Falha ao fazer backup do PostgreSQL"
+if command -v sync >/dev/null 2>&1; then
+    sync -f "$temp_file"
+fi
+if ! ln -- "$temp_file" "$backup_file"; then
+    error "Backup destination already exists; encrypted recovery point preserved"
     exit 1
 fi
+rm -f -- "$temp_file"
+temp_file=""
 
-# Backup de volumes (opcional - descomente se necessário)
-# info "Fazendo backup dos volumes Docker..."
-# 
-# # Backup PostgreSQL volume
-# docker run --rm \
-#   -v neurostack-api_postgres_data:/data:ro \
-#   -v "$BACKUP_DIR":/backup \
-#   alpine tar czf "/backup/postgres_data_$DATE.tar.gz" -C /data . 2>/dev/null || warn "Falha ao fazer backup do volume PostgreSQL"
-# 
-# # Backup Redis volume
-# docker run --rm \
-#   -v neurostack-api_redis_data:/data:ro \
-#   -v "$BACKUP_DIR":/backup \
-#   alpine tar czf "/backup/redis_data_$DATE.tar.gz" -C /data . 2>/dev/null || warn "Falha ao fazer backup do volume Redis"
-# 
-# # Backup Qdrant volume
-# docker run --rm \
-#   -v neurostack-api_qdrant_data:/data:ro \
-#   -v "$BACKUP_DIR":/backup \
-#   alpine tar czf "/backup/qdrant_data_$DATE.tar.gz" -C /data . 2>/dev/null || warn "Falha ao fazer backup do volume Qdrant"
+info "Encrypted PostgreSQL backup published"
+info "Removing encrypted PostgreSQL backups older than $RETENTION_DAYS days"
+find "$BACKUP_DIR" -maxdepth 1 -type f \
+    -name 'postgres_*.sql.gz.age' -mtime "+$RETENTION_DAYS" -delete
 
-# Limpar backups antigos
-info "Removendo backups mais antigos que $RETENTION_DAYS dias..."
-find "$BACKUP_DIR" -name "postgres_*.sql.gz" -type f -mtime +$RETENTION_DAYS -delete 2>/dev/null || true
-find "$BACKUP_DIR" -name "*_data_*.tar.gz" -type f -mtime +$RETENTION_DAYS -delete 2>/dev/null || true
-
-# Mostrar tamanho do backup
-BACKUP_SIZE=$(du -sh "$BACKUP_DIR" | cut -f1)
-info "Tamanho total dos backups: $BACKUP_SIZE"
-
-info "Backup concluído com sucesso!"
-
+info "Backup completed successfully"

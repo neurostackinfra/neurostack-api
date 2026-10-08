@@ -2,7 +2,7 @@
 # NeuroStack API - Makefile
 # ============================================
 
-.PHONY: help install dev test lint format clean docker-up docker-down run
+.PHONY: help install dev test lint format clean docker-up docker-down run typecheck-poc-runner
 
 # Default target
 help:
@@ -133,7 +133,10 @@ format-check:
 typecheck:
 	poetry run mypy src packages/neurostack-core/neurostack_core --ignore-missing-imports
 
-quality: format-check lint typecheck test
+typecheck-poc-runner:
+	poetry run mypy --ignore-missing-imports scripts/poc_functional_regression.py tests/scripts/test_poc_functional_regression.py
+
+quality: format-check lint typecheck typecheck-poc-runner test
 
 # ============================================
 # Pre-commit
