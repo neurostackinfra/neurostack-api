@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../App";
@@ -166,6 +166,17 @@ function setSuperAdmin(viewingClinicId: string) {
   });
 }
 
+function setInvestor() {
+  Object.assign(mocks.auth, {
+    role: "investor",
+    isSuperAdmin: false,
+    isInvestor: true,
+    isBuilder: false,
+    isClinicAdmin: false,
+    viewingClinicId: "",
+  });
+}
+
 beforeEach(() => {
   vi.useRealTimers();
   localStorage.clear();
@@ -194,6 +205,75 @@ afterEach(() => {
 });
 
 describe("<InactiveQueuePage />", () => {
+  it("renders recent ordered investor fixtures and default guidance without a clinic or network access", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-07T15:00:00.000Z"));
+    setInvestor();
+    renderPage();
+
+    const rows = screen.getAllByRole("listitem");
+    expect(rows).toHaveLength(3);
+    expect(rows.map((row) => row.getAttribute("data-testid"))).toEqual([
+      "inactive-row-d3e0a001-7a11-4b01-8a01-000000000001",
+      "inactive-row-d3e0a002-7a11-4b02-8a02-000000000002",
+      "inactive-row-d3e0a003-7a11-4b03-8a03-000000000003",
+    ]);
+    expect(rows[0]).toHaveTextContent("Contato demonstrativo 01");
+    expect(rows[0]).toHaveTextContent("whatsapp");
+    expect(rows[0]).toHaveTextContent("Solicitação de Agendamento");
+    expect(rows[1]).toHaveTextContent("webchat");
+    expect(rows[1]).toHaveTextContent("Pedido de Preço");
+    expect(rows[2]).toHaveTextContent("Interesse Tratamento");
+
+    const formatter = new Intl.DateTimeFormat("pt-BR", { dateStyle: "short", timeStyle: "short" });
+    expect(rows[0]).toHaveTextContent(formatter.format(new Date("2026-10-07T14:15:00.000Z")));
+    expect(rows[1]).toHaveTextContent(formatter.format(new Date("2026-10-07T12:00:00.000Z")));
+    expect(rows[2]).toHaveTextContent(formatter.format(new Date("2026-10-06T13:00:00.000Z")));
+    expect(screen.getByText("3 conversas inativas")).toBeInTheDocument();
+    expect(screen.getByText("Precisando de algo mais, estamos a disposição.")).toBeInTheDocument();
+    expect(screen.getByText(/a IA voltará a atender após 1 hora/)).toBeInTheDocument();
+
+    await act(async () => {
+      vi.advanceTimersByTime(30_000);
+      await Promise.resolve();
+    });
+    expect(mocks.fetch).not.toHaveBeenCalled();
+    expect(mocks.configFetch).not.toHaveBeenCalled();
+  });
+
+  it("reactivates only the selected investor fixture locally and restores all fixtures on remount", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-07T15:00:00.000Z"));
+    setInvestor();
+    const view = renderPage();
+
+    const selectedRowId = "inactive-row-d3e0a002-7a11-4b02-8a02-000000000002";
+    const untouchedRowId = "inactive-row-d3e0a001-7a11-4b01-8a01-000000000001";
+    const selectedRow = screen.getByTestId(selectedRowId);
+    fireEvent.click(within(selectedRow).getByRole("switch", { name: "Voltar atendimento para IA" }));
+
+    expect(within(selectedRow).getByText("IA no controle")).toBeInTheDocument();
+    expect(screen.getByTestId(untouchedRowId)).toBeInTheDocument();
+    expect(within(screen.getByTestId(untouchedRowId)).queryByText("IA no controle")).not.toBeInTheDocument();
+    expect(mocks.fetch).not.toHaveBeenCalled();
+    expect(mocks.configFetch).not.toHaveBeenCalled();
+
+    await act(async () => {
+      vi.advanceTimersByTime(600);
+      await Promise.resolve();
+    });
+    expect(screen.queryByTestId(selectedRowId)).not.toBeInTheDocument();
+    expect(screen.getByTestId(untouchedRowId)).toBeInTheDocument();
+    expect(screen.getByText("2 conversas inativas")).toBeInTheDocument();
+
+    view.unmount();
+    renderPage();
+    expect(screen.getAllByRole("listitem")).toHaveLength(3);
+    expect(screen.getByTestId(selectedRowId)).toBeInTheDocument();
+    expect(mocks.fetch).not.toHaveBeenCalled();
+    expect(mocks.configFetch).not.toHaveBeenCalled();
+  });
+
   it("shows the exact master reactivation guidance and copies the registered phrase", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     vi.stubGlobal("navigator", { clipboard: { writeText } });
@@ -932,7 +1012,7 @@ describe("<InactiveQueuePage />", () => {
 });
 
 describe("inactive queue route access", () => {
-  it("guards the direct route from investors without mounting the operational page", async () => {
+  it("mounts the local demo for investors after the lead gate without operational network access", async () => {
     Object.assign(mocks.auth, {
       role: "investor",
       isInvestor: true,
@@ -942,12 +1022,31 @@ describe("inactive queue route access", () => {
       leadSubmitted: true,
     });
     window.history.replaceState({}, "", "/inactive-queue");
-    mocks.fetch.mockImplementation(() => response(queueResponse([firstItem])));
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "404 Page Not Found" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Fila de Inativos" })).toBeInTheDocument();
+    expect(screen.getAllByRole("listitem")).toHaveLength(3);
+    expect(mocks.fetch).not.toHaveBeenCalled();
+    expect(mocks.configFetch).not.toHaveBeenCalled();
+  });
+
+  it("keeps the demo lead gate ahead of the investor inactive queue route", async () => {
+    Object.assign(mocks.auth, {
+      role: "investor",
+      isInvestor: true,
+      isClinicAdmin: false,
+      isBuilder: false,
+      isSuperAdmin: false,
+      leadSubmitted: false,
+    });
+    window.history.replaceState({}, "", "/inactive-queue");
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Welcome to the Exclusive Demo" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Fila de Inativos" })).not.toBeInTheDocument();
     expect(mocks.fetch).not.toHaveBeenCalled();
+    expect(mocks.configFetch).not.toHaveBeenCalled();
   });
 });
