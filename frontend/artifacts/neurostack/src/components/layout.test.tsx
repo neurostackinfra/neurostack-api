@@ -575,6 +575,40 @@ describe("<Layout /> clinic selector search", () => {
 });
 
 describe("<Layout /> inactive queue navigation", () => {
+  it("discards an operational config response after transitioning to investor", async () => {
+    setRole("clinic_admin");
+    mocks.auth.email = "clinic-admin@example.com";
+    mocks.auth.clinicId = "operational-clinic";
+    mocks.auth.viewingClinicId = "operational-clinic";
+    const pendingConfig = deferredResponse();
+    mocks.fetch.mockImplementationOnce(() => pendingConfig.promise);
+
+    const view = renderLayout();
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(1));
+
+    setRole("investor");
+    mocks.auth.email = "investor@example.com";
+    mocks.auth.clinicId = "investor-clinic";
+    mocks.auth.viewingClinicId = "investor-clinic";
+    view.rerender(
+      <I18nProvider>
+        <Layout>
+          <div>Page content</div>
+        </Layout>
+      </I18nProvider>,
+    );
+
+    await act(async () => {
+      pendingConfig.resolve({ clinic_name: "Operational Clinic", bot_active: false });
+      await pendingConfig.promise;
+      await Promise.resolve();
+    });
+
+    expect(mocks.fetch).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("active-clinic-name")).toBeEmptyDOMElement();
+    expect(screen.queryByTestId("badge-ia-pausada")).not.toBeInTheDocument();
+  });
+
   it("places the user-inactive item between handoff and traces and applies the normal selected style", async () => {
     localStorage.setItem("ns_locale", "pt");
     setRole("clinic_admin");
@@ -584,7 +618,9 @@ describe("<Layout /> inactive queue navigation", () => {
     window.history.replaceState({}, "", "/inactive-queue");
 
     renderLayout();
-    await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+    await act(async () => {
+      await Promise.resolve();
+    });
 
     const handoff = screen.getByTestId("nav-link-handoff-queue");
     const inactive = screen.getByTestId("nav-link-inactive-queue");
@@ -605,19 +641,31 @@ describe("<Layout /> inactive queue navigation", () => {
     expect(inactive.querySelector(".lucide-user-x")).toBeInTheDocument();
   });
 
-  it("does not show the inactive queue navigation item to investors", async () => {
+  it.each([
+    { locale: "pt", label: "Fila de Inativos" },
+    { locale: "en", label: "Inactive Queue" },
+  ])("shows the inactive queue navigation item to investors in $locale", async ({ locale, label }) => {
+    localStorage.setItem("ns_locale", locale);
     setRole("investor");
     mocks.auth.email = "investor@example.com";
     mocks.auth.clinicId = "investor-clinic";
     mocks.auth.viewingClinicId = "investor-clinic";
+    window.history.replaceState({}, "", "/inactive-queue");
 
     renderLayout();
-    await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+    await act(async () => {
+      await Promise.resolve();
+    });
 
-    expect(
-      screen.queryByTestId("nav-link-inactive-queue"),
-    ).not.toBeInTheDocument();
-    expect(screen.queryByText("Inactive Queue")).not.toBeInTheDocument();
+    const handoff = screen.getByTestId("nav-link-handoff-queue");
+    const inactive = screen.getByTestId("nav-link-inactive-queue");
+    const traces = screen.getByTestId("nav-link-trace-history");
+    expect(handoff.compareDocumentPosition(inactive) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(inactive.compareDocumentPosition(traces) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(inactive).toHaveTextContent(label);
+    expect(inactive).toHaveClass("bg-sidebar-accent", "text-sidebar-accent-foreground");
+    expect(inactive.querySelector(".lucide-user-x")).toBeInTheDocument();
+    expect(mocks.fetch).not.toHaveBeenCalled();
   });
 });
 
@@ -655,10 +703,8 @@ describe("<Layout /> RLHF audit navigation", () => {
     mocks.auth.viewingClinicId = "investor-clinic";
 
     renderLayout();
-
-    expect(
-      await screen.findByTestId("nav-link-rlhf-audit"),
-    ).toBeInTheDocument();
+    expect(await screen.findByTestId("nav-link-rlhf-audit")).toBeInTheDocument();
+    expect(mocks.fetch).not.toHaveBeenCalled();
   });
 
   it("hides /rlhf-audit from clinic_admin and builder roles", async () => {
@@ -696,7 +742,10 @@ describe("<Layout /> investor sales CTA", () => {
     mocks.auth.viewingClinicId = "investor-clinic";
 
     renderLayout();
-    await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(mocks.fetch).not.toHaveBeenCalled();
 
     const desktopCta = screen.getByRole("link", { name: "Talk to sales" });
     expect(screen.getAllByTestId("investor-sales-cta")).toHaveLength(1);
@@ -774,7 +823,14 @@ describe("<Layout /> roadmap migration", () => {
       mocks.auth.viewingClinicId = `${role}-clinic`;
 
       renderLayout();
-      await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+      if (role === "investor") {
+        await act(async () => {
+          await Promise.resolve();
+        });
+        expect(mocks.fetch).not.toHaveBeenCalled();
+      } else {
+        await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+      }
 
       expect(screen.queryByTestId("nav-link-portal-parceiros")).not.toBeInTheDocument();
       expect(screen.queryByText(/Partners Portal|Portal de Parceiros/)).not.toBeInTheDocument();

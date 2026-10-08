@@ -82,20 +82,27 @@ export function Layout({ children }: LayoutProps) {
   const [clinicName, setClinicName] = useState<string>("");
   const [botActive, setBotActive] = useState<boolean | null>(null);
   useEffect(() => {
-    if (!displayClinicId) { setClinicName(""); setBotActive(null); return; }
+    let active = true;
+    if (isInvestor || !displayClinicId) {
+      setClinicName("");
+      setBotActive(null);
+      return () => { active = false; };
+    }
     const raw = localStorage.getItem("ns_auth");
     const token = raw ? (JSON.parse(raw) as { token?: string }).token : null;
-    if (!token) return;
+    if (!token) return () => { active = false; };
     fetch(`/v1/config?clinic_id=${displayClinicId}`, {
       headers: { Authorization: `Bearer ${token}` },
     })
       .then((r) => r.ok ? r.json() : Promise.reject(r))
       .then((cfg: { clinic_name?: string; bot_active?: boolean }) => {
+        if (!active) return;
         setClinicName(cfg.clinic_name ?? "");
         if (cfg.bot_active !== undefined) setBotActive(cfg.bot_active);
       })
       .catch(() => {});
-  }, [displayClinicId]);
+    return () => { active = false; };
+  }, [displayClinicId, isInvestor]);
 
   // Builder clinic list for dropdown
   const [builderClinics, setBuilderClinics] = useState<ClinicOption[]>([]);
@@ -174,7 +181,7 @@ export function Layout({ children }: LayoutProps) {
   const navItems = [
     { href: "/",         label: t("nav_chat"),      icon: MessageSquare,  id: "chat-simulator", hideFor: [] },
     { href: "/handoff-queue", label: t("nav_handoff_queue"), icon: Users2, id: "handoff-queue", hideFor: [] },
-    { href: "/inactive-queue", label: t("nav_inactive_queue"), icon: UserX, id: "inactive-queue", hideFor: ["investor"] },
+    { href: "/inactive-queue", label: t("nav_inactive_queue"), icon: UserX, id: "inactive-queue", hideFor: [] },
     { href: "/traces",   label: t("nav_traces"),    icon: Activity,       id: "trace-history",  hideFor: [] },
     { href: "/dashboard",label: t("nav_dashboard"), icon: LayoutDashboard,id: "dashboard",      hideFor: [] },
     { href: "/config",   label: t("nav_config"),    icon: Sliders,        id: "clinic-config",  hideFor: [] },
