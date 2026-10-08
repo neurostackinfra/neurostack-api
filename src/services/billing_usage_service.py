@@ -1,9 +1,4 @@
-"""Builder-scoped subscription usage metering.
-
-The current product meters traces from the append-only event store and RAG
-storage from persisted knowledge documents. Media assets are still roadmap,
-so their truthful persisted usage is zero until an asset table exists.
-"""
+"""Builder-scoped subscription usage metering."""
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.event import Event
 from src.models.knowledge import KnowledgeDocument
+from src.models.media_asset import MediaAsset
 from src.models.tenant import Tenant
 
 BYTES_PER_MB = 1_000_000
@@ -115,6 +111,13 @@ async def get_builder_billing_usage(
     )
     rag_used_bytes = int(rag_result.scalar() or 0)
 
+    media_result = await db.execute(
+        select(func.coalesce(func.sum(MediaAsset.size_bytes), 0)).where(
+            MediaAsset.tenant_id.in_(tenant_ids)
+        )
+    )
+    media_used_bytes = int(media_result.scalar() or 0)
+
     return {
         "plan": plan,
         "as_of": as_of,
@@ -126,8 +129,7 @@ async def get_builder_billing_usage(
         "traces": _trace_usage(traces_used, limits.monthly_traces),
         "storage": {
             "rag": _storage_usage(rag_used_bytes, limits.rag_storage_mb),
-            # The media hub is currently roadmap and persists no assets.
-            "media": _storage_usage(0, limits.media_storage_mb),
+            "media": _storage_usage(media_used_bytes, limits.media_storage_mb),
         },
         "credits": {
             "purchase_enabled": False,

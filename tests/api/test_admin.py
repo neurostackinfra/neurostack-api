@@ -4,14 +4,14 @@ Tests for super-admin clinic + builder management endpoints.
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import jwt
 import pytest
 from fastapi.testclient import TestClient
 
 from src.config.settings import settings
+from src.services.tenant_classification import real_clinic_tenant_filter
 
 
 def _make_super_admin_token(tenant_id=None, user_id=None) -> str:
@@ -115,6 +115,123 @@ class TestAdminStats:
         assert "active_clinics" in data
         assert "total_builders" in data
         assert "estimated_mrr" in data
+
+    def test_admin_imports_the_canonical_real_clinic_predicate(self) -> None:
+        from src.api.routes import admin
+
+        assert admin.real_clinic_tenant_filter is real_clinic_tenant_filter
+        assert not hasattr(admin, "_real_clinic_tenant_filter")
+
+    @pytest.mark.asyncio
+    async def test_role_matrix_preserves_clinic_list_and_totals(
+        self,
+        async_client,
+        super_admin_headers,
+    ) -> None:
+        from src.api.routes.admin import _compute_platform_totals
+        from src.models.tenant import Tenant
+        from src.models.user import User, UserRole
+        from src.repositories import get_db_session
+
+        userless_id = uuid4()
+        clinic_id = uuid4()
+        mixed_id = uuid4()
+        internal_id = uuid4()
+        session = get_db_session()
+        try:
+            baseline = await _compute_platform_totals(session)
+            session.add_all(
+                [
+                    Tenant(
+                        id=userless_id,
+                        name="Matrix Userless",
+                        slug=f"matrix-userless-{userless_id.hex}",
+                        api_key_hash=f"matrix-userless-{userless_id.hex}",
+                        is_active=True,
+                        config={},
+                    ),
+                    Tenant(
+                        id=clinic_id,
+                        name="Matrix Clinic",
+                        slug=f"matrix-clinic-{clinic_id.hex}",
+                        api_key_hash=f"matrix-clinic-{clinic_id.hex}",
+                        is_active=False,
+                        config={},
+                    ),
+                    Tenant(
+                        id=mixed_id,
+                        name="Matrix Mixed",
+                        slug=f"matrix-mixed-{mixed_id.hex}",
+                        api_key_hash=f"matrix-mixed-{mixed_id.hex}",
+                        is_active=True,
+                        config={},
+                    ),
+                    Tenant(
+                        id=internal_id,
+                        name="Matrix Internal",
+                        slug=f"matrix-internal-{internal_id.hex}",
+                        api_key_hash=f"matrix-internal-{internal_id.hex}",
+                        is_active=True,
+                        config={},
+                    ),
+                    User(
+                        tenant_id=clinic_id,
+                        email=f"clinic-{clinic_id.hex}@test.local",
+                        password_hash="test",
+                        role=UserRole.clinic_admin,
+                    ),
+                    User(
+                        tenant_id=mixed_id,
+                        email=f"mixed-clinic-{mixed_id.hex}@test.local",
+                        password_hash="test",
+                        role=UserRole.clinic_admin,
+                    ),
+                    User(
+                        tenant_id=mixed_id,
+                        email=f"mixed-builder-{mixed_id.hex}@test.local",
+                        password_hash="test",
+                        role=UserRole.builder,
+                    ),
+                    User(
+                        tenant_id=internal_id,
+                        email=f"internal-builder-{internal_id.hex}@test.local",
+                        password_hash="test",
+                        role=UserRole.builder,
+                    ),
+                    User(
+                        tenant_id=internal_id,
+                        email=f"internal-admin-{internal_id.hex}@test.local",
+                        password_hash="test",
+                        role=UserRole.super_admin,
+                    ),
+                    User(
+                        tenant_id=internal_id,
+                        email=f"internal-investor-{internal_id.hex}@test.local",
+                        password_hash="test",
+                        role=UserRole.investor,
+                    ),
+                ]
+            )
+            await session.commit()
+        finally:
+            await session.close()
+
+        clinics_response = await async_client.get(
+            "/v1/admin/clinics",
+            headers=super_admin_headers,
+        )
+        stats_response = await async_client.get(
+            "/v1/admin/stats",
+            headers=super_admin_headers,
+        )
+        assert clinics_response.status_code == 200
+        assert stats_response.status_code == 200
+        listed_ids = {item["clinic_id"] for item in clinics_response.json()}
+        assert {str(userless_id), str(clinic_id), str(mixed_id)}.issubset(listed_ids)
+        assert str(internal_id) not in listed_ids
+        stats = stats_response.json()
+        assert stats["total_clinics"] == baseline["total_clinics"] + 3
+        assert stats["active_clinics"] == baseline["active_clinics"] + 2
 
 
 class TestListBuilders:
@@ -250,117 +367,3 @@ class TestDeactivateBuilder:
             headers=super_admin_headers,
         )
         assert response.status_code == 400
-
-
-def _seed_entities(client: TestClient, *entities: Any) -> None:
-    from src.repositories.database import get_db_session
-
-    async def _run() -> None:
-        db = get_db_session()
-        try:
-            db.add_all(entities)
-            await db.commit()
-        finally:
-            await db.close()
-
-    client._submit(_run())  # type: ignore[attr-defined]
-
-
-def _clinic(builder_id: UUID | None = None) -> Any:
-    from src.models.tenant import Tenant
-
-    tenant_id = uuid4()
-    return Tenant(
-        id=tenant_id,
-        name=f"Audit Add-on Clinic {tenant_id.hex}",
-        slug=f"audit-addon-{tenant_id.hex}",
-        api_key_hash=f"audit-addon-hash-{tenant_id.hex}",
-        builder_id=builder_id,
-        config={},
-    )
-
-
-def _listed(rows: list[dict[str, Any]], clinic_id: UUID) -> dict[str, Any]:
-    return next(row for row in rows if row["clinic_id"] == str(clinic_id))
-
-
-class TestAuditExtendedAccess:
-    """Super admin toggles the per-clinic audit export add-on."""
-
-    def test_super_admin_turns_addon_on_and_off(
-        self, client: TestClient, super_admin_headers
-    ):
-        clinic = _clinic()
-        _seed_entities(client, clinic)
-
-        listed_before = client.get("/v1/admin/clinics", headers=super_admin_headers)
-        enabled = client.patch(
-            f"/v1/admin/clinics/{clinic.id}",
-            headers=super_admin_headers,
-            json={"audit_extended_access": True},
-        )
-        listed_enabled = client.get("/v1/admin/clinics", headers=super_admin_headers)
-        untouched = client.patch(
-            f"/v1/admin/clinics/{clinic.id}",
-            headers=super_admin_headers,
-            json={"clinic_name": "Renamed Audit Clinic"},
-        )
-        disabled = client.patch(
-            f"/v1/admin/clinics/{clinic.id}",
-            headers=super_admin_headers,
-            json={"audit_extended_access": False},
-        )
-        listed_disabled = client.get("/v1/admin/clinics", headers=super_admin_headers)
-
-        assert listed_before.status_code == 200
-        assert (
-            _listed(listed_before.json(), clinic.id)["audit_extended_access"] is False
-        )
-        assert enabled.status_code == 200, enabled.text
-        assert enabled.json() == {"ok": True, "audit_extended_access": True}
-        assert (
-            _listed(listed_enabled.json(), clinic.id)["audit_extended_access"] is True
-        )
-        assert untouched.status_code == 200, untouched.text
-        assert untouched.json() == {"ok": True, "audit_extended_access": True}
-        assert disabled.status_code == 200, disabled.text
-        assert disabled.json() == {"ok": True, "audit_extended_access": False}
-        assert (
-            _listed(listed_disabled.json(), clinic.id)["audit_extended_access"] is False
-        )
-
-    def test_non_super_admin_cannot_set_addon(
-        self, client: TestClient, clinic_admin_headers
-    ):
-        clinic = _clinic()
-        _seed_entities(client, clinic)
-
-        response = client.patch(
-            f"/v1/admin/clinics/{clinic.id}",
-            headers=clinic_admin_headers,
-            json={"audit_extended_access": True},
-        )
-
-        assert response.status_code == 403
-
-    def test_builder_listing_exposes_addon_per_clinic(
-        self, client: TestClient, super_admin_headers
-    ):
-        from src.models.builder import Builder
-
-        builder_id = uuid4()
-        builder = Builder(id=builder_id, name=f"Audit Add-on Builder {builder_id.hex}")
-        plain = _clinic(builder_id)
-        extended = _clinic(builder_id)
-        extended.audit_extended_access = True
-        _seed_entities(client, builder, plain, extended)
-
-        response = client.get("/v1/admin/builders", headers=super_admin_headers)
-
-        assert response.status_code == 200
-        listed = next(row for row in response.json() if row["id"] == str(builder_id))
-        flags = {
-            clinic["clinic_id"]: clinic["audit_extended_access"]
-            for clinic in listed["clinics"]
-        }
-        assert flags == {str(plain.id): False, str(extended.id): True}

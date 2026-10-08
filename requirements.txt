@@ -5,10 +5,10 @@
 -e ./packages/neurostack-core
 
 # Core Framework
-fastapi>=0.109.0
+fastapi>=0.142.4,<0.143.0
 uvicorn[standard]>=0.27.0
 pydantic>=2.5.3
-pydantic-settings>=2.1.0
+pydantic-settings>=2.14.2
 email-validator>=2.1.0
 
 # Database & Cache
@@ -22,11 +22,11 @@ httpx>=0.26.0
 requests>=2.31.0  # sync HTTP client used by src/services/abacatepay.py
 
 # Authentication & Security
-python-jose[cryptography]>=3.3.0
-PyJWT>=2.8
+PyJWT>=2.15.0
+cryptography>=50.0.0
 passlib[bcrypt]>=1.7.4
 bcrypt==4.0.1  # Fix: passlib 1.7.4 is incompatible with bcrypt >= 4.1.0
-python-multipart>=0.0.6
+python-multipart>=0.0.32,<0.1.0
 
 # Configuration
 python-dotenv>=1.0.0
@@ -34,15 +34,20 @@ python-dotenv>=1.0.0
 # Utilities
 tenacity>=8.2.3
 structlog>=24.1.0
-lingua-language-detector==2.1.1
 tzdata>=2024.1  # zoneinfo tz database for python:3.11-slim (no OS tzdata)
+aiosmtplib>=5.1.2
+anyio>=4.14.2,<5
+h2>=4.4.1,<5
+hpack>=4.2.0,<5
+idna>=3.15,<4
+urllib3>=2.8.0,<3
 
 # Observability
-opentelemetry-api>=1.22.0
-opentelemetry-sdk>=1.22.0
-opentelemetry-instrumentation-fastapi>=0.43b0
-opentelemetry-instrumentation-redis>=0.43b0
-opentelemetry-instrumentation-sqlalchemy>=0.43b0
+opentelemetry-api>=1.44.0
+opentelemetry-sdk>=1.44.0
+opentelemetry-instrumentation-fastapi>=0.65b0
+opentelemetry-instrumentation-redis>=0.65b0
+opentelemetry-instrumentation-sqlalchemy>=0.65b0
 prometheus-client>=0.19.0
 
 # Vector Database (RAG)
