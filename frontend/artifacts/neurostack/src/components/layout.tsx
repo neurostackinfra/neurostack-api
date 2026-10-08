@@ -164,6 +164,10 @@ export function Layout({ children }: LayoutProps) {
   const builderSelectionVisible = filteredBuilderClinics.some((clinic) => clinic.id === viewingClinicId);
   const superAdminSelectionVisible = filteredSuperAdminClinics.some((clinic) => clinic.id === viewingClinicId);
   const canChangeOwnPassword = isBuilder || isClinicAdmin;
+  const canAccessMedia =
+    !isInvestor &&
+    (isClinicAdmin ||
+      ((isBuilder || isSuperAdmin) && Boolean(viewingClinicId)));
 
   async function changeOwnPassword(payload: { new_password: string; confirm_password: string }) {
     const raw = localStorage.getItem("ns_auth");
@@ -188,6 +192,7 @@ export function Layout({ children }: LayoutProps) {
     { href: "/rlhf-audit",label: t("nav_rlhf"),     icon: Brain,          id: "rlhf-audit",     hideFor: ["clinic_admin", "builder"] },
     { href: "/suporte",  label: t("nav_support"),    icon: HelpCircle,    id: "suporte",        hideFor: ["super_admin"] },
     { href: "/billing",  label: t("nav_billing"),    icon: CreditCard,    id: "billing",        hideFor: ["clinic_admin", "super_admin", "investor"] },
+    ...(canAccessMedia ? [{ href: "/midias", label: t("nav_media"), icon: FolderOpen, id: "midias", hideFor: [] }] : []),
   ].filter(item => !(item.hideFor as string[]).includes(role));
 
   const roadmapItems = [
@@ -199,7 +204,6 @@ export function Layout({ children }: LayoutProps) {
     { href: "/slm-cortex",     label: "SLM Cortex",            icon: Cpu,           id: "slm-cortex",     v: "v3",  hideFor: ["clinic_admin"] },
 
     { href: "/consultoria",    label: t("nav_consulting"),     icon: Lightbulb,     id: "consultoria",    v: "v2",  hideFor: [] },
-    { href: "/midias",         label: t("nav_media"),          icon: FolderOpen,    id: "midias",         v: "v3",  hideFor: ["clinic_admin"] },
   ].filter(item => !item.hideFor.includes(role));
 
   const renderSidebarContent = () => (

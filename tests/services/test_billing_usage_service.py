@@ -1,6 +1,7 @@
 """Tests for builder subscription usage aggregation."""
 
 import asyncio
+import hashlib
 from collections.abc import AsyncGenerator
 from contextlib import suppress
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ from src.models.base import Base
 from src.models.builder import Builder
 from src.models.event import Event
 from src.models.knowledge import KnowledgeDocument
+from src.models.media_asset import MediaAsset
 from src.models.tenant import Tenant
 from src.repositories.database import _patch_jsonb_for_sqlite
 from src.services.billing_usage_service import (
@@ -66,6 +68,21 @@ def _event(tenant_id: UUID, event_type: str, created_at: datetime) -> Event:
     )
 
 
+def _media_asset(tenant_id: UUID, payload: bytes) -> MediaAsset:
+    return MediaAsset(
+        tenant_id=tenant_id,
+        display_name="Billing asset",
+        original_filename="billing.pdf",
+        category="pdf",
+        mime_type="application/pdf",
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).digest(),
+        payload=payload,
+        usage_trigger=None,
+        auto_suggest=False,
+    )
+
+
 @pytest.mark.asyncio
 async def test_aggregates_only_current_month_message_traces_and_rag_bytes(
     usage_db,
@@ -81,7 +98,14 @@ async def test_aggregates_only_current_month_message_traces_and_rag_bytes(
     clinic_a = _tenant(builder_id)
     clinic_b = _tenant(builder_id)
     other_clinic = _tenant(other_builder_id)
-    usage_db.add_all([clinic_a, clinic_b, other_clinic])
+    independent_clinic = Tenant(
+        id=uuid4(),
+        name="Independent clinic",
+        slug=f"independent-{uuid4().hex}",
+        api_key_hash=f"hash-{uuid4().hex}",
+        config={},
+    )
+    usage_db.add_all([clinic_a, clinic_b, other_clinic, independent_clinic])
 
     month_start = datetime(2026, 8, 1, tzinfo=timezone.utc)
     next_month = datetime(2026, 9, 1, tzinfo=timezone.utc)
@@ -105,6 +129,15 @@ async def test_aggregates_only_current_month_message_traces_and_rag_bytes(
                 "message.in",
                 datetime(2026, 8, 20, tzinfo=timezone.utc),
             ),
+        ]
+    )
+    builder_media = [b"%PDF-1.7\na", b"%PDF-1.7\nsecond"]
+    usage_db.add_all(
+        [
+            _media_asset(clinic_a.id, builder_media[0]),
+            _media_asset(clinic_b.id, builder_media[1]),
+            _media_asset(other_clinic.id, b"%PDF-1.7\nother-builder"),
+            _media_asset(independent_clinic.id, b"%PDF-1.7\nindependent"),
         ]
     )
 
@@ -165,8 +198,11 @@ async def test_aggregates_only_current_month_message_traces_and_rag_bytes(
     assert usage["storage"]["rag"]["available_bytes"] == (
         BYTES_PER_MB - expected_rag_bytes
     )
-    assert usage["storage"]["media"]["used_bytes"] == 0
-    assert usage["storage"]["media"]["available_mb"] == 2.0
+    expected_media_bytes = sum(map(len, builder_media))
+    assert usage["storage"]["media"]["used_bytes"] == expected_media_bytes
+    assert usage["storage"]["media"]["available_bytes"] == (
+        2 * BYTES_PER_MB - expected_media_bytes
+    )
     assert usage["credits"] == {
         "purchase_enabled": False,
         "coming_soon": True,

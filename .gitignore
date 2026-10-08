@@ -53,6 +53,11 @@ coverage.xml
 .pytest_cache/
 cover/
 
+# Release gate artifacts (JUnit XML, pip-audit JSON, operator logs)
+# The media release preflight writes JUnit here and removes the directory
+# on success and failure; nothing under .artifacts/ is allowed in VCS.
+.artifacts/
+
 # Translations
 *.mo
 *.pot
@@ -207,6 +212,12 @@ alembic/versions/*.pyc
 !.genie/wishes/clinic-modality-source-of-truth/
 .genie/wishes/clinic-modality-source-of-truth/*
 !.genie/wishes/clinic-modality-source-of-truth/WISH.md
+!.genie/wishes/poc-functional-regression/
+.genie/wishes/poc-functional-regression/*
+!.genie/wishes/poc-functional-regression/WISH.md
+!.genie/wishes/audit-export-window/
+.genie/wishes/audit-export-window/*
+!.genie/wishes/audit-export-window/WISH.md
 # Replit artifacts
 .replit-artifact/
 .genie/genie.db
@@ -232,7 +243,3 @@ frontend/artifacts/neurostack/blob-report/
 .pnpm-store/
 .mcp.json
 *.bak
-
-!.genie/wishes/audit-export-window/
-.genie/wishes/audit-export-window/*
-!.genie/wishes/audit-export-window/WISH.md

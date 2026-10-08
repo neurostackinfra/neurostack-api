@@ -70,6 +70,17 @@ class TestHealthEndpoints:
             assert "name" in component
             assert "status" in component
 
+    def test_openapi_endpoints_start_with_media_contract(
+        self, client: TestClient
+    ) -> None:
+        """Both published schema URLs remain healthy after router registration."""
+        for path in ("/openapi.json", "/v1/openapi.json"):
+            response = client.get(path)
+            assert response.status_code == 200
+            schema = response.json()
+            assert schema["openapi"] == "3.1.0"
+            assert "/v1/media-assets" in schema["paths"]
+
 
 class TestHealthEndpointsAsync:
     """Async test suite for health check endpoints."""
