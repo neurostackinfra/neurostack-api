@@ -734,6 +734,56 @@ describe("<Layout /> RLHF audit navigation", () => {
   });
 });
 
+describe("<Layout /> media navigation", () => {
+  it.each([
+    { role: "clinic_admin" as const, clinic: "clinic-own" },
+    { role: "builder" as const, clinic: "builder-clinic-1" },
+    { role: "super_admin" as const, clinic: "super-clinic-1" },
+  ])("shows Media as an active, non-roadmap item for $role", async ({ role, clinic }) => {
+    setRole(role);
+    mocks.auth.email = `${role}@example.com`;
+    mocks.auth.clinicId = role === "clinic_admin" ? clinic : "";
+    mocks.auth.viewingClinicId = clinic;
+
+    renderLayout();
+    const link = await screen.findByTestId("nav-link-midias");
+    expect(link).toHaveTextContent("Media & Assets");
+    expect(link.textContent).not.toMatch(/\bv3\b|roadmap/i);
+
+    const nav = link.closest("nav");
+    const roadmapHeading = within(nav!).getByText("Roadmap");
+    expect(
+      link.compareDocumentPosition(roadmapHeading.parentElement!) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it.each(["builder", "super_admin"] as const)(
+    "hides Media from %s until a clinic is selected",
+    async (role) => {
+      setRole(role);
+      mocks.auth.email = `${role}@example.com`;
+      mocks.auth.clinicId = "";
+      mocks.auth.viewingClinicId = "";
+
+      renderLayout();
+      await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+      expect(screen.queryByTestId("nav-link-midias")).not.toBeInTheDocument();
+    },
+  );
+
+  it("hides Media from investors", () => {
+    setRole("investor");
+    mocks.auth.email = "investor@example.com";
+    mocks.auth.clinicId = "investor-clinic";
+    mocks.auth.viewingClinicId = "investor-clinic";
+
+    renderLayout();
+    expect(screen.queryByTestId("nav-link-midias")).not.toBeInTheDocument();
+    expect(mocks.fetch).not.toHaveBeenCalled();
+  });
+});
+
 describe("<Layout /> investor sales CTA", () => {
   it("renders one secure, styled English CTA in each mounted sidebar at the required position", async () => {
     setRole("investor");
