@@ -481,6 +481,93 @@ describe("<TracesList /> presentation contract", () => {
     });
   });
 
+  it("counts export days by date part only, blocking 61 days and allowing 60", async () => {
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    renderTraces([]);
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledOnce());
+    mocks.fetch.mockClear();
+
+    expect(
+      screen.getByText("Exportação: até 6 meses atrás, 60 dias por arquivo."),
+    ).toBeInTheDocument();
+    const exportButton = screen.getByRole("button", { name: "Exportar para Excel (CSV)" });
+    const hint = "O período selecionado passa de 60 dias. Reduza o intervalo para exportar.";
+    expect(exportButton).toBeEnabled();
+    expect(screen.queryByText(hint)).not.toBeInTheDocument();
+
+    // Under 60 elapsed days, but 30/07..28/09 spans 61 civil dates.
+    fireEvent.change(screen.getByLabelText("Data Final"), { target: { value: "2026-09-28T00:15" } });
+    fireEvent.change(screen.getByLabelText("Data Inicial"), { target: { value: "2026-07-30T23:30" } });
+    expect(exportButton).toBeDisabled();
+    expect(screen.getByText(hint)).toBeInTheDocument();
+    expect(exportButton).toHaveAttribute("aria-describedby", "trace-export-window-hint");
+    fireEvent.click(exportButton);
+    expect(mocks.fetch).not.toHaveBeenCalled();
+
+    // 31/07..28/09 is exactly 60 civil dates whatever the times are.
+    fireEvent.change(screen.getByLabelText("Data Inicial"), { target: { value: "2026-07-31T23:30" } });
+    expect(exportButton).toBeEnabled();
+    expect(screen.queryByText(hint)).not.toBeInTheDocument();
+    fireEvent.click(exportButton);
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledOnce());
+    const url = String(mocks.fetch.mock.calls[0][0]);
+    expect(url).toContain("start_date=2026-07-31T23%3A30");
+    expect(url).toContain("end_date=2026-09-28T00%3A15");
+  });
+
+  it.each([
+    {
+      locale: "pt" as const,
+      detail: "export_window_60_days",
+      button: "Exportar para Excel (CSV)",
+      title: "Erro ao exportar",
+      description: "Cada arquivo cobre no máximo 60 dias. Reduza o período e tente novamente.",
+    },
+    {
+      locale: "pt" as const,
+      detail: "export_lookback_6_months",
+      button: "Exportar para Excel (CSV)",
+      title: "Erro ao exportar",
+      description: "A exportação alcança no máximo 6 meses atrás. Escolha uma data inicial mais recente.",
+    },
+    {
+      locale: "en" as const,
+      detail: "export_window_60_days",
+      button: "Export to Excel (CSV)",
+      title: "Export error",
+      description: "Each file covers at most 60 days. Shorten the range and try again.",
+    },
+    {
+      locale: "en" as const,
+      detail: "export_lookback_6_months",
+      button: "Export to Excel (CSV)",
+      title: "Export error",
+      description: "Exports reach back at most 6 months. Choose a more recent start date.",
+    },
+    {
+      locale: "pt" as const,
+      detail: "invalid_date_range",
+      button: "Exportar para Excel (CSV)",
+      title: "Erro ao exportar",
+      description: "Não foi possível gerar o relatório. Tente novamente.",
+    },
+  ])("toasts the $detail export error in $locale", async ({ locale, detail, button, title, description }) => {
+    mocks.fetch.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input).startsWith("/v1/traces/export?")) return errorResponse(400, detail);
+      return jsonResponse(tracesResponse([]));
+    });
+    mountTraces(locale);
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledOnce());
+
+    fireEvent.click(screen.getByRole("button", { name: button }));
+
+    await waitFor(() =>
+      expect(mocks.toast).toHaveBeenCalledWith({ title, description, variant: "destructive" }),
+    );
+    expect(mocks.toast).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: button })).toBeEnabled();
+  });
+
   it("hides a resolved tenant result immediately while the next tenant is pending", async () => {
     mocks.auth.isBuilder = true;
     const clinicTwo = deferred<Response>();

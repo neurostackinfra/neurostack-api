@@ -1156,6 +1156,160 @@ describe("<HandoffQueuePage />", () => {
     },
   );
 
+  it.each([
+    {
+      locale: "pt" as const,
+      detail: "export_window_60_days",
+      button: "Exportar CSV",
+      message:
+        "Cada arquivo cobre no máximo 60 dias. Reduza o período e tente novamente.",
+    },
+    {
+      locale: "pt" as const,
+      detail: "export_lookback_6_months",
+      button: "Exportar CSV",
+      message:
+        "A exportação alcança no máximo 6 meses atrás. Escolha uma data inicial mais recente.",
+    },
+    {
+      locale: "en" as const,
+      detail: "export_window_60_days",
+      button: "Export CSV",
+      message: "Each file covers at most 60 days. Shorten the range and try again.",
+    },
+    {
+      locale: "en" as const,
+      detail: "export_lookback_6_months",
+      button: "Export CSV",
+      message:
+        "Exports reach back at most 6 months. Choose a more recent start date.",
+    },
+  ])(
+    "toasts the $detail export error in $locale",
+    async ({ locale, detail, button, message }) => {
+      mocks.fetch.mockImplementation(async (input: RequestInfo | URL) => {
+        if (String(input).includes("/export?")) {
+          return {
+            ok: false,
+            status: 400,
+            json: async () => ({ detail }),
+          } as Response;
+        }
+        return queueResponse();
+      });
+      renderPage(locale);
+      await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
+
+      fireEvent.click(screen.getByRole("button", { name: button }));
+
+      await waitFor(() =>
+        expect(mocks.toast).toHaveBeenCalledWith({
+          title: message,
+          variant: "destructive",
+        }),
+      );
+      expect(mocks.toast).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("keeps loading 61-90 day queue windows while export stays blocked above 60 days", async () => {
+    const hint =
+      "O período selecionado passa de 60 dias. Reduza o intervalo para exportar.";
+    mocks.fetch.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input).includes("/export?")) {
+        return { ok: false, status: 500, json: async () => ({}) } as Response;
+      }
+      return queueResponse();
+    });
+    renderPage();
+    await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
+    expect(
+      screen.getByText("Exportação: até 6 meses atrás, 60 dias por arquivo."),
+    ).toBeInTheDocument();
+    const exportButton = screen.getByRole("button", { name: "Exportar CSV" });
+    expect(exportButton).toBeEnabled();
+    expect(screen.queryByText(hint)).not.toBeInTheDocument();
+
+    // 03/07..30/09 = 90 civil dates: the queue loads, the export does not.
+    fireEvent.change(dateInputs()[0], { target: { value: "2026-07-03" } });
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(2));
+    expect(String(mocks.fetch.mock.calls[1][0])).toBe(
+      "/v1/handoffs/queue?tenant_id=clinic-id&from_date=2026-07-03&to_date=2026-09-30",
+    );
+    await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
+    expect(exportButton).toBeDisabled();
+    expect(screen.getByText(hint)).toBeInTheDocument();
+    expect(exportButton).toHaveAttribute(
+      "aria-describedby",
+      "handoff-export-window-hint",
+    );
+
+    // 01/08..30/09 = 61 civil dates: still blocked.
+    fireEvent.change(dateInputs()[0], { target: { value: "2026-08-01" } });
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
+    expect(exportButton).toBeDisabled();
+    fireEvent.click(exportButton);
+    expect(mocks.fetch).toHaveBeenCalledTimes(3);
+
+    // 02/08..30/09 = 60 civil dates: export allowed.
+    fireEvent.change(dateInputs()[0], { target: { value: "2026-08-02" } });
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(4));
+    await waitFor(() => expect(exportButton).toBeEnabled());
+    expect(screen.queryByText(hint)).not.toBeInTheDocument();
+    fireEvent.click(exportButton);
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(5));
+    expect(String(mocks.fetch.mock.calls[4][0])).toBe(
+      "/v1/handoffs/queue/export?tenant_id=clinic-id&from_date=2026-08-02&to_date=2026-09-30",
+    );
+  });
+
+  it("leaves a partial range to the server and toasts its verdict", async () => {
+    mocks.fetch.mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input).includes("/export?")) {
+        return {
+          ok: false,
+          status: 400,
+          json: async () => ({ detail: "export_lookback_6_months" }),
+        } as Response;
+      }
+      return queueResponse();
+    });
+    renderPage();
+    await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
+    const exportButton = screen.getByRole("button", { name: "Exportar CSV" });
+
+    fireEvent.change(dateInputs()[0], { target: { value: "2026-03-01" } });
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
+    expect(exportButton).toBeDisabled();
+
+    fireEvent.change(dateInputs()[1], { target: { value: "" } });
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(3));
+    expect(String(mocks.fetch.mock.calls[2][0])).toBe(
+      "/v1/handoffs/queue?tenant_id=clinic-id&from_date=2026-03-01",
+    );
+    await waitFor(() => expect(exportButton).toBeEnabled());
+    expect(
+      screen.queryByText(
+        "O período selecionado passa de 60 dias. Reduza o intervalo para exportar.",
+      ),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(exportButton);
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(4));
+    expect(String(mocks.fetch.mock.calls[3][0])).toBe(
+      "/v1/handoffs/queue/export?tenant_id=clinic-id&from_date=2026-03-01",
+    );
+    await waitFor(() =>
+      expect(mocks.toast).toHaveBeenCalledWith({
+        title:
+          "A exportação alcança no máximo 6 meses atrás. Escolha uma data inicial mais recente.",
+        variant: "destructive",
+      }),
+    );
+  });
+
   it("keeps investor filtering local and does not reveal internal stage values", async () => {
     Object.assign(mocks.auth, { isInvestor: true, tenantId: null });
     renderPage();
