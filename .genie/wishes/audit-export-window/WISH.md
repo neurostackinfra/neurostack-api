@@ -263,6 +263,14 @@ _The read-only reviewer returns evidence; the invoking orchestrator appends a ti
 - **Install workaround:** `pnpm --dir frontend install --frozen-lockfile` fails in this workspace on the root `preinstall` guard ("Use pnpm instead"); the engineer used `--ignore-scripts` (no tracked file changed). The reviewer could not reproduce the empty user-agent explanation (`npm_config_user_agent` was set in a scratch probe) — environment-specific; track separately if it recurs.
 - **Carried LOW notes (non-blocking):** (1) no test for the investor block / switch hidden for non-super-admins; (2) the add-on switch is in the row's expandable section, so its state is not visible while collapsed (optional: collapsed-header badge); (3) investor toast text `"Modo Visualização: ação desabilitada."` is hardcoded, same as three existing handlers; (4) traces export with start after end is not blocked client-side (server answers `invalid_date_range` → generic toast); (5) `invalid_date_range` has no specific toast on the handoff export (practically unreachable).
 
+### 2026-10-07 — Whole-wish PR review — SHIP
+
+- **Target:** branch `wish/audit-export-window`, HEAD `97c31c8` (2 commits on `origin/main` `ef1a9fe`); `origin/main` later moved to `6b60344` (PR #63, 5 frontend files outside this diff, no migration → no overlap, no second Alembic head).
+- **Independent reviewer:** SHIP, no CRITICAL/HIGH/MEDIUM. Checked end to end: backend error codes vs frontend toast mapping; PATCH request/response vs the master-admin handler; `audit_extended_access` in both admin listings and the TS types; client date-part day count vs server civil dates; queue 90 days vs export 60; target-clinic flag for overrides; super-admin-only write path; migration 022 (NOT NULL + `server_default false`, chained on 021, one head); no secrets/TODOs; commit messages reference the wish.
+- **Final gates on `97c31c8` (orchestrator, read from logs):** `make quality` → exit 0, `4189 passed, 28 skipped`, zero `FAILED`/`ERROR`, mypy clean (177 files) — above the 4164 of the earlier run because the rebase brought in upstream tests. Full frontend unit suite → 30 files / 395 tests passed, no failures. Playwright e2e was not run. This WISH.md update is the only change after those gates.
+- **PR body must state (deploy order):** (1) run `alembic upgrade head` **before** `up -d` — `scripts/deploy-vps.sh:145-147` starts the new containers first, and until 022 runs every full-entity `select(Tenant)` (21 places in 8 modules, incl. the API-key lookup) returns 500; (2) deploy backend before frontend, otherwise the add-on switch loses its controlled value and shows an error toast; (3) backward compatible: old code ignores the new column, rollback of the backend is safe.
+- **Follow-ups (not in this wish):** stale comment `src/handoff/sla.py:13` ("queue/export windows"); `HandoffService.resolve_queue_period` is unused and its docstring is stale; rename `test_upgrade_backfills_existing_rows_as_false` (it checks the insert default); widen `test_non_super_admin_cannot_set_addon` to builder headers and assert the value stays `False`; investor-block test and hardcoded investor toast; traces start>end not blocked client-side; retention copy "90 dias" in `docs/troubleshooting.md:629` and `frontend/artifacts/neurostack/src/pages/seguranca.tsx:274` contradicts Decision 3 — hand to the retention/cost wish.
+
 ---
 
 ## Files to Create/Modify
@@ -293,4 +301,10 @@ frontend/artifacts/neurostack/src/locales/en.ts
 frontend/artifacts/neurostack/src/pages/traces.test.tsx
 frontend/artifacts/neurostack/src/pages/handoff-queue.test.tsx
 frontend/artifacts/neurostack/src/pages/master-admin-*.test.tsx
+frontend/artifacts/neurostack/src/lib/export-window.ts   (new)
+frontend/artifacts/neurostack/src/pages/master-admin-audit-addon.test.tsx   (new)
+tests/integration/test_handoff_sla_postgres.py             (head revision 021 -> 022)
+tests/integration/test_conversation_language_postgres.py   (head revision 021 -> 022)
+.gitignore                                         (allowlist for this wish)
+.genie/wishes/audit-export-window/WISH.md
 ```
