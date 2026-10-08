@@ -4,7 +4,8 @@ Tests for super-admin clinic + builder management endpoints.
 """
 
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
+from typing import Any
+from uuid import UUID, uuid4
 
 import jwt
 import pytest
@@ -249,3 +250,117 @@ class TestDeactivateBuilder:
             headers=super_admin_headers,
         )
         assert response.status_code == 400
+
+
+def _seed_entities(client: TestClient, *entities: Any) -> None:
+    from src.repositories.database import get_db_session
+
+    async def _run() -> None:
+        db = get_db_session()
+        try:
+            db.add_all(entities)
+            await db.commit()
+        finally:
+            await db.close()
+
+    client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _clinic(builder_id: UUID | None = None) -> Any:
+    from src.models.tenant import Tenant
+
+    tenant_id = uuid4()
+    return Tenant(
+        id=tenant_id,
+        name=f"Audit Add-on Clinic {tenant_id.hex}",
+        slug=f"audit-addon-{tenant_id.hex}",
+        api_key_hash=f"audit-addon-hash-{tenant_id.hex}",
+        builder_id=builder_id,
+        config={},
+    )
+
+
+def _listed(rows: list[dict[str, Any]], clinic_id: UUID) -> dict[str, Any]:
+    return next(row for row in rows if row["clinic_id"] == str(clinic_id))
+
+
+class TestAuditExtendedAccess:
+    """Super admin toggles the per-clinic audit export add-on."""
+
+    def test_super_admin_turns_addon_on_and_off(
+        self, client: TestClient, super_admin_headers
+    ):
+        clinic = _clinic()
+        _seed_entities(client, clinic)
+
+        listed_before = client.get("/v1/admin/clinics", headers=super_admin_headers)
+        enabled = client.patch(
+            f"/v1/admin/clinics/{clinic.id}",
+            headers=super_admin_headers,
+            json={"audit_extended_access": True},
+        )
+        listed_enabled = client.get("/v1/admin/clinics", headers=super_admin_headers)
+        untouched = client.patch(
+            f"/v1/admin/clinics/{clinic.id}",
+            headers=super_admin_headers,
+            json={"clinic_name": "Renamed Audit Clinic"},
+        )
+        disabled = client.patch(
+            f"/v1/admin/clinics/{clinic.id}",
+            headers=super_admin_headers,
+            json={"audit_extended_access": False},
+        )
+        listed_disabled = client.get("/v1/admin/clinics", headers=super_admin_headers)
+
+        assert listed_before.status_code == 200
+        assert (
+            _listed(listed_before.json(), clinic.id)["audit_extended_access"] is False
+        )
+        assert enabled.status_code == 200, enabled.text
+        assert enabled.json() == {"ok": True, "audit_extended_access": True}
+        assert (
+            _listed(listed_enabled.json(), clinic.id)["audit_extended_access"] is True
+        )
+        assert untouched.status_code == 200, untouched.text
+        assert untouched.json() == {"ok": True, "audit_extended_access": True}
+        assert disabled.status_code == 200, disabled.text
+        assert disabled.json() == {"ok": True, "audit_extended_access": False}
+        assert (
+            _listed(listed_disabled.json(), clinic.id)["audit_extended_access"] is False
+        )
+
+    def test_non_super_admin_cannot_set_addon(
+        self, client: TestClient, clinic_admin_headers
+    ):
+        clinic = _clinic()
+        _seed_entities(client, clinic)
+
+        response = client.patch(
+            f"/v1/admin/clinics/{clinic.id}",
+            headers=clinic_admin_headers,
+            json={"audit_extended_access": True},
+        )
+
+        assert response.status_code == 403
+
+    def test_builder_listing_exposes_addon_per_clinic(
+        self, client: TestClient, super_admin_headers
+    ):
+        from src.models.builder import Builder
+
+        builder_id = uuid4()
+        builder = Builder(id=builder_id, name=f"Audit Add-on Builder {builder_id.hex}")
+        plain = _clinic(builder_id)
+        extended = _clinic(builder_id)
+        extended.audit_extended_access = True
+        _seed_entities(client, builder, plain, extended)
+
+        response = client.get("/v1/admin/builders", headers=super_admin_headers)
+
+        assert response.status_code == 200
+        listed = next(row for row in response.json() if row["id"] == str(builder_id))
+        flags = {
+            clinic["clinic_id"]: clinic["audit_extended_access"]
+            for clinic in listed["clinics"]
+        }
+        assert flags == {str(plain.id): False, str(extended.id): True}

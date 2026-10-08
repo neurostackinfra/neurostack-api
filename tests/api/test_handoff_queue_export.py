@@ -43,6 +43,7 @@ def _tenant(
     *,
     builder_id: UUID | None = None,
     timezone_name: str | None = "UTC",
+    audit_extended_access: bool = False,
 ) -> Tenant:
     tenant_id = uuid4()
     tenant = Tenant(
@@ -52,6 +53,7 @@ def _tenant(
         api_key_hash=f"hash-{tenant_id}",
         builder_id=builder_id,
         config={},
+        audit_extended_access=audit_extended_access,
     )
     if timezone_name is not None:
         tenant.clinic_config_row = ClinicConfigTable(
@@ -59,6 +61,19 @@ def _tenant(
             operations={"timezone": timezone_name},
         )
     return tenant
+
+
+def _freeze_service_clock(monkeypatch: pytest.MonkeyPatch, frozen: datetime) -> None:
+    """Freeze the export period clock (clinic "today") read by the service."""
+    from src.services import handoff_service
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            value = cls.fromtimestamp(frozen.timestamp(), tz=timezone.utc)
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr(handoff_service, "datetime", FrozenDatetime)
 
 
 def _session(tenant_id: UUID) -> Session:
@@ -149,13 +164,15 @@ def _csv_rows(response: Any) -> tuple[list[str], list[dict[str, str]]]:
 
 def test_export_empty_preserves_bom_headers_defaults_and_window_limit(
     client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _freeze_service_clock(monkeypatch, datetime(2026, 4, 15, 12, tzinfo=timezone.utc))
     tenant = _tenant()
     _seed(client, tenant)
 
     response = _export(client, tenant.id)
 
-    today = datetime.now(timezone.utc).date()
+    today = datetime(2026, 4, 15).date()
     assert response.status_code == 200
     assert response.content.startswith(b"\xef\xbb\xbf")
     assert response.headers["content-type"] == "text/csv; charset=utf-8"
@@ -177,10 +194,16 @@ def test_export_empty_preserves_bom_headers_defaults_and_window_limit(
     accepted = _export(
         client,
         tenant.id,
-        from_date="2026-01-01",
+        from_date="2026-02-01",
         to_date="2026-04-01",
     )
     rejected = _export(
+        client,
+        tenant.id,
+        from_date="2026-01-31",
+        to_date="2026-04-01",
+    )
+    formerly_queue_limited = _export(
         client,
         tenant.id,
         from_date="2026-01-01",
@@ -188,7 +211,9 @@ def test_export_empty_preserves_bom_headers_defaults_and_window_limit(
     )
     assert accepted.status_code == 200
     assert rejected.status_code == 400
-    assert rejected.json() == {"detail": "max_window_90_days"}
+    assert rejected.json() == {"detail": "export_window_60_days"}
+    assert formerly_queue_limited.status_code == 400
+    assert formerly_queue_limited.json() == {"detail": "export_window_60_days"}
 
 
 def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
@@ -223,6 +248,9 @@ def test_export_uses_entry_cohort_states_waits_utc_and_descending_order(
 
     monkeypatch.setattr(AsyncSession, "execute", tracked_execute)
     monkeypatch.setattr(route, "datetime", ExportDatetime)
+    # The period clock lives in the service; the route clock above stays
+    # unread until the handoff query has run.
+    _freeze_service_clock(monkeypatch, exported_at)
 
     tenant = _tenant()
     other_tenant = _tenant()
@@ -463,9 +491,11 @@ def test_privileged_checkout_remains_exportable_in_selected_tenant_cohort(
 )
 def test_export_uses_clinic_timezone_fallback_and_ignores_browser_timezone(
     client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
     clinic_timezone: str | None,
     browser_timezone: str,
 ) -> None:
+    _freeze_service_clock(monkeypatch, datetime(2026, 1, 12, 12, tzinfo=timezone.utc))
     tenant = _tenant(timezone_name=clinic_timezone)
     session = _session(tenant.id)
     records = [
@@ -528,7 +558,8 @@ def test_export_uses_clinic_timezone_fallback_and_ignores_browser_timezone(
 def test_export_queue_and_radar_share_clinic_dst_cohort(
     client: TestClient,
 ) -> None:
-    tenant = _tenant(timezone_name="America/New_York")
+    # Fixed 2026-03-08 cohort: the add-on keeps it exportable past the lookback.
+    tenant = _tenant(timezone_name="America/New_York", audit_extended_access=True)
     before_session = _session(tenant.id)
     start_session = _session(tenant.id)
     end_minus_session = _session(tenant.id)
@@ -637,6 +668,7 @@ def test_export_fails_closed_for_invalid_temporal_invariants(
             return datetime(2026, 6, 1, 12, tzinfo=timezone.utc)
 
     monkeypatch.setattr(route, "datetime", ExportDatetime)
+    _freeze_service_clock(monkeypatch, datetime(2026, 6, 1, 12, tzinfo=timezone.utc))
     tenant = _tenant()
     session = _session(tenant.id)
     record = _handoff(
@@ -704,7 +736,10 @@ def test_export_rejects_unrepresentable_utc_windows_before_querying_handoffs(
     assert query_calls == 0
 
 
-def test_export_uses_configured_utc_clinic_timezone(client: TestClient) -> None:
+def test_export_uses_configured_utc_clinic_timezone(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _freeze_service_clock(monkeypatch, datetime(2026, 2, 5, 12, tzinfo=timezone.utc))
     tenant = _tenant()
     session = _session(tenant.id)
     at_utc_start = _handoff(
@@ -735,7 +770,9 @@ def test_export_uses_configured_utc_clinic_timezone(client: TestClient) -> None:
 
 def test_export_escapes_only_dangerous_whatsapp_csv_prefixes(
     client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _freeze_service_clock(monkeypatch, datetime(2026, 2, 5, 12, tzinfo=timezone.utc))
     tenant = _tenant()
     session = _session(tenant.id)
     phones = [
@@ -851,7 +888,9 @@ def test_export_preserves_legacy_partial_date_defaults(
 
 def test_export_enforces_ten_thousand_limit_without_partial_csv(
     client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _freeze_service_clock(monkeypatch, datetime(2026, 3, 5, 12, tzinfo=timezone.utc))
     tenant = _tenant()
     session = _session(tenant.id)
     created_at = datetime(2026, 3, 1, 12, tzinfo=timezone.utc)
@@ -896,7 +935,9 @@ def test_export_enforces_ten_thousand_limit_without_partial_csv(
 
 def test_export_requires_credentials_and_honors_api_key_tenant_boundary(
     client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _freeze_service_clock(monkeypatch, datetime(2026, 4, 5, 12, tzinfo=timezone.utc))
     api_key = "handoff-export-api-key"
     owner = _tenant()
     owner.api_key_hash = pwd_context.hash(api_key)
@@ -937,7 +978,9 @@ def test_export_requires_credentials_and_honors_api_key_tenant_boundary(
 
 def test_export_preserves_clinic_builder_super_admin_and_tenant_boundaries(
     client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _freeze_service_clock(monkeypatch, datetime(2026, 4, 5, 12, tzinfo=timezone.utc))
     builder_id = uuid4()
     builder = Builder(id=builder_id, name="Export Builder")
     clinic = _tenant(builder_id=builder_id)
@@ -998,3 +1041,169 @@ def test_export_preserves_clinic_builder_super_admin_and_tenant_boundaries(
     for response in (own, builder_response, super_admin):
         _, rows = _csv_rows(response)
         assert [row["numero_whatsapp"] for row in rows] == ["authorized"]
+
+
+# Audit export window: 60 inclusive dates per file, 6-month lookback unless the
+# target clinic holds the audit_extended_access add-on. Clinic "today" below is
+# 2026-10-07 (UTC clinics), so the lookback floor is 2026-04-07.
+_AUDIT_NOW = datetime(2026, 10, 7, 12, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    ("from_date", "to_date", "expected_detail"),
+    [
+        ("2026-08-09", "2026-10-07", None),
+        ("2026-08-08", "2026-10-07", "export_window_60_days"),
+        ("2026-07-09", "2026-10-07", "export_window_60_days"),
+        ("2026-07-08", "2026-10-07", "export_window_60_days"),
+    ],
+)
+def test_export_caps_sixty_dates_and_never_returns_queue_window_code(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    from_date: str,
+    to_date: str,
+    expected_detail: str | None,
+) -> None:
+    _freeze_service_clock(monkeypatch, _AUDIT_NOW)
+    tenant = _tenant()
+    _seed(client, tenant)
+
+    response = _export(client, tenant.id, from_date=from_date, to_date=to_date)
+
+    if expected_detail is None:
+        assert response.status_code == 200, response.text
+    else:
+        assert response.status_code == 400
+        assert response.json() == {"detail": expected_detail}
+    assert "max_window_90_days" not in response.text
+
+
+def test_export_sixty_day_cap_applies_even_with_the_addon(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _freeze_service_clock(monkeypatch, _AUDIT_NOW)
+    tenant = _tenant(audit_extended_access=True)
+    _seed(client, tenant)
+
+    response = _export(client, tenant.id, from_date="2025-01-01", to_date="2025-03-02")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "export_window_60_days"}
+
+
+def test_export_lookback_rejects_without_addon_and_accepts_with_it(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _freeze_service_clock(monkeypatch, _AUDIT_NOW)
+    plain = _tenant()
+    extended = _tenant(audit_extended_access=True)
+    plain_session = _session(plain.id)
+    extended_session = _session(extended.id)
+    created_at = datetime(2026, 4, 8, 12, tzinfo=timezone.utc)
+    _seed(
+        client,
+        plain,
+        extended,
+        plain_session,
+        extended_session,
+        _handoff(plain.id, plain_session.id, created_at=created_at, phone="plain"),
+        _handoff(
+            extended.id, extended_session.id, created_at=created_at, phone="extended"
+        ),
+    )
+    before_floor = {"from_date": "2026-04-06", "to_date": "2026-04-10"}
+
+    plain_rejected = _export(client, plain.id, **before_floor)
+    extended_accepted = _export(client, extended.id, **before_floor)
+    plain_at_floor = _export(
+        client, plain.id, from_date="2026-04-07", to_date="2026-04-10"
+    )
+
+    assert plain_rejected.status_code == 400
+    assert plain_rejected.json() == {"detail": "export_lookback_6_months"}
+    assert extended_accepted.status_code == 200, extended_accepted.text
+    _, extended_rows = _csv_rows(extended_accepted)
+    assert [row["numero_whatsapp"] for row in extended_rows] == ["extended"]
+    assert plain_at_floor.status_code == 200, plain_at_floor.text
+    _, plain_rows = _csv_rows(plain_at_floor)
+    assert [row["numero_whatsapp"] for row in plain_rows] == ["plain"]
+
+
+def test_export_lookback_uses_the_clinic_timezone_today(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 2026-10-08 01:00 UTC is still 2026-10-07 in Sao Paulo (floor 2026-04-07),
+    # while a UTC clinic is already on 2026-10-08 (floor 2026-04-08).
+    _freeze_service_clock(monkeypatch, datetime(2026, 10, 8, 1, tzinfo=timezone.utc))
+    sao_paulo = _tenant(timezone_name="America/Sao_Paulo")
+    utc_clinic = _tenant()
+    _seed(client, sao_paulo, utc_clinic)
+    params = {"from_date": "2026-04-07", "to_date": "2026-04-07"}
+
+    sao_paulo_response = _export(client, sao_paulo.id, **params)
+    utc_response = _export(client, utc_clinic.id, **params)
+
+    assert sao_paulo_response.status_code == 200, sao_paulo_response.text
+    assert utc_response.status_code == 400
+    assert utc_response.json() == {"detail": "export_lookback_6_months"}
+
+
+def test_export_builder_override_uses_target_clinic_audit_flag(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _freeze_service_clock(monkeypatch, _AUDIT_NOW)
+    builder_id = uuid4()
+    builder = Builder(id=builder_id, name="Audit Window Builder")
+    builder_home = _tenant(builder_id=builder_id, audit_extended_access=True)
+    plain = _tenant(builder_id=builder_id)
+    extended = _tenant(builder_id=builder_id, audit_extended_access=True)
+    _seed(client, builder, builder_home, plain, extended)
+    headers = _jwt_headers("builder", builder_home.id, builder_id=builder_id)
+    params = {"from_date": "2026-01-01", "to_date": "2026-01-31"}
+
+    plain_response = _export(client, plain.id, headers=headers, **params)
+    extended_response = _export(client, extended.id, headers=headers, **params)
+
+    assert plain_response.status_code == 400
+    assert plain_response.json() == {"detail": "export_lookback_6_months"}
+    assert extended_response.status_code == 200, extended_response.text
+
+
+def test_export_super_admin_override_uses_target_clinic_audit_flag(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _freeze_service_clock(monkeypatch, _AUDIT_NOW)
+    admin_home = _tenant(audit_extended_access=True)
+    plain = _tenant()
+    extended = _tenant(audit_extended_access=True)
+    _seed(client, admin_home, plain, extended)
+    headers = _jwt_headers("super_admin", admin_home.id)
+    seven_months_back = {"from_date": "2026-03-01", "to_date": "2026-03-10"}
+
+    plain_response = _export(client, plain.id, headers=headers, **seven_months_back)
+    extended_response = _export(
+        client, extended.id, headers=headers, **seven_months_back
+    )
+
+    assert plain_response.status_code == 400
+    assert plain_response.json() == {"detail": "export_lookback_6_months"}
+    assert extended_response.status_code == 200, extended_response.text
+
+
+def test_export_openapi_documents_audit_window_codes(client: TestClient) -> None:
+    operation = client.get("/openapi.json").json()["paths"][
+        "/v1/handoffs/queue/export"
+    ]["get"]
+    documented = operation["responses"]["400"]["description"]
+
+    assert "export_window_60_days" in documented
+    assert "export_lookback_6_months" in documented
+    assert "invalid_date_range" in documented
+    assert "max_window_90_days" not in documented
+    assert "max_window_90_days" not in operation["description"]

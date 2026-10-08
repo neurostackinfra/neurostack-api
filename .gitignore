@@ -232,3 +232,7 @@ frontend/artifacts/neurostack/blob-report/
 .pnpm-store/
 .mcp.json
 *.bak
+
+!.genie/wishes/audit-export-window/
+.genie/wishes/audit-export-window/*
+!.genie/wishes/audit-export-window/WISH.md

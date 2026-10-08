@@ -9,6 +9,7 @@ import {
   getIntentBucket,
   type IntentBucket,
 } from "@/lib/intent-presentation";
+import { exceedsExportWindow, exportWindowErrorKey } from "@/lib/export-window";
 import {
   Repeat,
   Gauge,
@@ -442,6 +443,9 @@ export default function HandoffQueuePage() {
     dateScopeMatchesTenant && dateScope.explicit ? startDate : "";
   const requestedEndDate =
     dateScopeMatchesTenant && dateScope.explicit ? endDate : "";
+  // Only a complete range is checked here; with one date the server applies its
+  // defaults and answers with a 400 detail. The queue itself keeps 90 days.
+  const exportTooLong = exceedsExportWindow(startDate, endDate);
   const [onlySafety, setOnlySafety] = useState(false);
   const [intentBucket, setIntentBucket] = useState<"all" | IntentBucket>("all");
   const requestScope = `${effectiveTenantId ?? ""}|${requestedStartDate}|${requestedEndDate}`;
@@ -671,7 +675,7 @@ export default function HandoffQueuePage() {
       effectiveTenantRef.current === exportTenant &&
       requestScopeRef.current === exportScope &&
       loadedScopeRef.current === exportScope;
-    if (!exportTenant || !exportIsCurrent()) return;
+    if (!exportTenant || !exportIsCurrent() || exportTooLong) return;
     const token = getToken();
     if (!token) return;
     try {
@@ -694,11 +698,14 @@ export default function HandoffQueuePage() {
           detail = undefined;
         }
         if (!exportIsCurrent()) return;
+        const windowErrorKey = exportWindowErrorKey(detail);
         if (detail === "export_limit_10000_exceeded") {
           toast({
             title: t("handoff_export_limit_error"),
             variant: "destructive",
           });
+        } else if (windowErrorKey) {
+          toast({ title: t(windowErrorKey), variant: "destructive" });
         }
         return;
       }
@@ -772,55 +779,72 @@ export default function HandoffQueuePage() {
           )}
         </div>
 
-        <div className="flex flex-wrap items-end gap-3">
-          <div className="space-y-1">
-            <label className="text-[11px] font-medium text-muted-foreground flex items-center gap-1">
-              <CalendarRange className="h-3 w-3" /> {t("handoff_date_start")}
-            </label>
-            <input
-              type="date"
-              value={startDate}
-              max={endDate || undefined}
-              onChange={(event) =>
-                setDateScope({
-                  tenantId: effectiveTenantId,
-                  startDate: event.target.value,
-                  endDate,
-                  explicit: true,
-                })
+        <div className="space-y-1.5">
+          <div className="flex flex-wrap items-end gap-3">
+            <div className="space-y-1">
+              <label className="text-[11px] font-medium text-muted-foreground flex items-center gap-1">
+                <CalendarRange className="h-3 w-3" /> {t("handoff_date_start")}
+              </label>
+              <input
+                type="date"
+                value={startDate}
+                max={endDate || undefined}
+                onChange={(event) =>
+                  setDateScope({
+                    tenantId: effectiveTenantId,
+                    startDate: event.target.value,
+                    endDate,
+                    explicit: true,
+                  })
+                }
+                className="rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="text-[11px] font-medium text-muted-foreground flex items-center gap-1">
+                <CalendarRange className="h-3 w-3" /> {t("handoff_date_end")}
+              </label>
+              <input
+                type="date"
+                value={endDate}
+                min={startDate || undefined}
+                onChange={(event) =>
+                  setDateScope({
+                    tenantId: effectiveTenantId,
+                    startDate,
+                    endDate: event.target.value,
+                    explicit: true,
+                  })
+                }
+                className="rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+              />
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!canExport || exportTooLong}
+              aria-describedby={
+                exportTooLong ? "handoff-export-window-hint" : undefined
               }
-              className="rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
-            />
+              onClick={handleExport}
+              className="gap-1.5 h-[34px]"
+            >
+              <Download className="h-4 w-4" />
+              {t("handoff_export_csv")}
+            </Button>
           </div>
-          <div className="space-y-1">
-            <label className="text-[11px] font-medium text-muted-foreground flex items-center gap-1">
-              <CalendarRange className="h-3 w-3" /> {t("handoff_date_end")}
-            </label>
-            <input
-              type="date"
-              value={endDate}
-              min={startDate || undefined}
-              onChange={(event) =>
-                setDateScope({
-                  tenantId: effectiveTenantId,
-                  startDate,
-                  endDate: event.target.value,
-                  explicit: true,
-                })
-              }
-              className="rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
-            />
-          </div>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={!canExport}
-            onClick={handleExport}
-            className="gap-1.5 h-[34px]"
-          >
-            <Download className="h-4 w-4" />
-            {t("handoff_export_csv")}
-          </Button>
+          <p className="text-[11px] text-muted-foreground">
+            {t("audit_export_window_rule")}
+          </p>
+          {exportTooLong && (
+            <p
+              id="handoff-export-window-hint"
+              role="status"
+              className="text-[11px] font-medium text-destructive"
+            >
+              {t("audit_export_window_exceeded_hint")}
+            </p>
+          )}
         </div>
       </div>
 
