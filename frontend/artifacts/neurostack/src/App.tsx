@@ -97,7 +97,7 @@ function AuthenticatedRouter() {
         <Route path="/suporte" component={Suporte} />
         <Route path="/portal-parceiros" component={PortalParceiros} />
         <Route path="/handoff-queue" component={HandoffQueuePage} />
-        {!isInvestor && <Route path="/inactive-queue" component={InactiveQueuePage} />}
+        <Route path="/inactive-queue" component={InactiveQueuePage} />
         <Route component={NotFound} />
       </Switch>
     </Layout>

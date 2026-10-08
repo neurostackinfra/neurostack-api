@@ -79,6 +79,46 @@ function initialQueueState(contextKey: string, loading: boolean): QueueState {
   };
 }
 
+function demoQueueState(contextKey: string, items: InactiveSessionItem[]): QueueState {
+  return {
+    ...initialQueueState(contextKey, false),
+    items,
+    total: items.length,
+  };
+}
+
+function buildDemoInactiveSessions(): InactiveSessionItem[] {
+  const mountedAt = Date.now();
+  const minutesAgo = (minutes: number) => new Date(mountedAt - minutes * 60_000).toISOString();
+
+  return [
+    {
+      session_id: "d3e0a001-7a11-4b01-8a01-000000000001",
+      contact_identifier: "Contato demonstrativo 01",
+      channel: "whatsapp",
+      last_intent: "agendar",
+      funnel_stage: "decisao",
+      last_activity_at: minutesAgo(45),
+    },
+    {
+      session_id: "d3e0a002-7a11-4b02-8a02-000000000002",
+      contact_identifier: "Contato demonstrativo 02",
+      channel: "webchat",
+      last_intent: "pedido_preco",
+      funnel_stage: "consideracao",
+      last_activity_at: minutesAgo(180),
+    },
+    {
+      session_id: "d3e0a003-7a11-4b03-8a03-000000000003",
+      contact_identifier: "Contato demonstrativo 03",
+      channel: "whatsapp",
+      last_intent: "interesse_tratamento",
+      funnel_stage: "descoberta",
+      last_activity_at: minutesAgo(1_560),
+    },
+  ];
+}
+
 function initialMasterPhraseState(tenantContextKey: string): MasterPhraseState {
   return {
     tenantContextKey,
@@ -169,27 +209,36 @@ function shortSessionCode(sessionId: string) {
 }
 
 export default function InactiveQueuePage() {
-  const { tenantId, isBuilder, isSuperAdmin, viewingClinicId } = useAuth();
+  const { tenantId, isBuilder, isInvestor, isSuperAdmin, viewingClinicId } = useAuth();
   const { locale, t } = useI18n();
   const { toast } = useToast();
   const selectedTenantId = isBuilder || isSuperAdmin ? viewingClinicId : null;
-  const hasRequiredClinic = !(isBuilder || isSuperAdmin) || Boolean(selectedTenantId);
-  const tenantContextKey = hasRequiredClinic
+  const hasRequiredClinic = isInvestor || !(isBuilder || isSuperAdmin) || Boolean(selectedTenantId);
+  const tenantContextKey = isInvestor
+    ? "investor-demo"
+    : hasRequiredClinic
     ? `${isBuilder || isSuperAdmin ? "override" : "own"}:${selectedTenantId ?? tenantId ?? ""}`
     : "no-clinic";
+  const [demoItems] = useState(buildDemoInactiveSessions);
 
   const [pagination, setPagination] = useState({ tenantContextKey, page: 1 });
   const page = pagination.tenantContextKey === tenantContextKey ? pagination.page : 1;
   const contextKey = `${tenantContextKey}:page:${page}`;
-  const [queueState, setQueueState] = useState<QueueState>(() => initialQueueState(contextKey, hasRequiredClinic));
+  const [queueState, setQueueState] = useState<QueueState>(() => (
+    isInvestor ? demoQueueState(contextKey, demoItems) : initialQueueState(contextKey, hasRequiredClinic)
+  ));
   const [masterPhraseCopied, setMasterPhraseCopied] = useState(false);
   const [masterPhraseState, setMasterPhraseState] = useState<MasterPhraseState>(
-    () => initialMasterPhraseState(tenantContextKey),
+    () => isInvestor
+      ? { ...initialMasterPhraseState(tenantContextKey), status: "ready" }
+      : initialMasterPhraseState(tenantContextKey),
   );
   const [masterPhraseRequestVersion, setMasterPhraseRequestVersion] = useState(0);
   const visibleState = queueState.contextKey === contextKey
     ? queueState
-    : initialQueueState(contextKey, hasRequiredClinic);
+    : isInvestor
+      ? demoQueueState(contextKey, demoItems)
+      : initialQueueState(contextKey, hasRequiredClinic);
   const { items, total, hasNext, hasPrevious, loading, error, pendingIds, successfulIds } = visibleState;
 
   const requestSequenceRef = useRef(0);
@@ -207,7 +256,9 @@ export default function InactiveQueuePage() {
 
   const visibleMasterPhraseState = masterPhraseState.tenantContextKey === tenantContextKey
     ? masterPhraseState
-    : initialMasterPhraseState(tenantContextKey);
+    : isInvestor
+      ? { ...initialMasterPhraseState(tenantContextKey), status: "ready" }
+      : initialMasterPhraseState(tenantContextKey);
 
   useEffect(() => {
     setPagination({ tenantContextKey, page: 1 });
@@ -249,7 +300,9 @@ export default function InactiveQueuePage() {
       mounted: true,
     };
     contextIdentityRef.current = identity;
-    setQueueState(initialQueueState(contextKey, hasRequiredClinic));
+    setQueueState(isInvestor
+      ? demoQueueState(contextKey, demoItems)
+      : initialQueueState(contextKey, hasRequiredClinic));
 
     return () => {
       if (contextIdentityRef.current.generation === identity.generation) {
@@ -257,10 +310,11 @@ export default function InactiveQueuePage() {
       }
       clearAsyncWork();
     };
-  }, [clearAsyncWork, contextKey, hasRequiredClinic]);
+  }, [clearAsyncWork, contextKey, demoItems, hasRequiredClinic, isInvestor]);
 
   const fetchQueue = useCallback(async (identity: ContextIdentity, showLoading = false) => {
     if (!isCurrentContext(identity)) return;
+    if (isInvestor) return;
     const requestSequence = ++requestSequenceRef.current;
     activeRequestRef.current?.abort();
     const controller = new AbortController();
@@ -332,9 +386,10 @@ export default function InactiveQueuePage() {
         setQueueState((current) => current.contextKey === identity.key ? { ...current, loading: false } : current);
       }
     }
-  }, [hasRequiredClinic, isCurrentContext, page, selectedTenantId]);
+  }, [hasRequiredClinic, isCurrentContext, isInvestor, page, selectedTenantId]);
 
   useEffect(() => {
+    if (isInvestor) return;
     const identity = contextIdentityRef.current;
     void fetchQueue(identity, true);
     const pollId = window.setInterval(() => void fetchQueue(identity, false), POLL_INTERVAL_MS);
@@ -342,7 +397,7 @@ export default function InactiveQueuePage() {
       window.clearInterval(pollId);
       activeRequestRef.current?.abort();
     };
-  }, [contextKey, fetchQueue]);
+  }, [contextKey, fetchQueue, isInvestor]);
 
   useEffect(() => {
     masterPhraseRequestRef.current?.abort();
@@ -355,6 +410,15 @@ export default function InactiveQueuePage() {
     }
     setMasterPhraseCopied(false);
     setMasterPhraseState(initialMasterPhraseState(tenantContextKey));
+
+    if (isInvestor) {
+      masterPhraseRequestRef.current = null;
+      setMasterPhraseState({
+        ...initialMasterPhraseState(tenantContextKey),
+        status: "ready",
+      });
+      return () => controller.abort();
+    }
 
     if (!hasRequiredClinic) {
       masterPhraseRequestRef.current = null;
@@ -394,7 +458,7 @@ export default function InactiveQueuePage() {
     })();
 
     return () => controller.abort();
-  }, [hasRequiredClinic, masterPhraseRequestVersion, selectedTenantId, tenantContextKey]);
+  }, [hasRequiredClinic, isInvestor, masterPhraseRequestVersion, selectedTenantId, tenantContextKey]);
 
   useEffect(() => () => {
     if (copyFeedbackTimerRef.current) clearTimeout(copyFeedbackTimerRef.current);
@@ -467,14 +531,16 @@ export default function InactiveQueuePage() {
     let succeeded = false;
 
     try {
-      const response = await fetch(`/v1/sessions/${encodeURIComponent(sessionId)}/reactivate${query}`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${getToken()}` },
-        signal: controller.signal,
-      });
-      if (!response.ok) throw new Error("inactive_reactivation_failed");
-      const result: unknown = await response.json();
-      if (!isReactivationResponse(result, sessionId)) throw new Error("inactive_reactivation_invalid_response");
+      if (!isInvestor) {
+        const response = await fetch(`/v1/sessions/${encodeURIComponent(sessionId)}/reactivate${query}`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${getToken()}` },
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error("inactive_reactivation_failed");
+        const result: unknown = await response.json();
+        if (!isReactivationResponse(result, sessionId)) throw new Error("inactive_reactivation_invalid_response");
+      }
       if (controller.signal.aborted || !isCurrentContext(identity)) return;
 
       succeeded = true;
@@ -513,11 +579,12 @@ export default function InactiveQueuePage() {
           return {
             ...current,
             items: current.items.filter((currentItem) => currentItem.session_id !== sessionId),
+            ...(isInvestor ? { total: Math.max(0, current.total - 1) } : {}),
             successfulIds: next,
           };
         });
         removalTimersRef.current.delete(sessionId);
-        void fetchQueue(identity, false);
+        if (!isInvestor) void fetchQueue(identity, false);
       }, SUCCESS_TRANSITION_MS);
       removalTimersRef.current.set(sessionId, timer);
     } catch {
