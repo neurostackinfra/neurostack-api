@@ -9,6 +9,7 @@ import time as time_module
 from datetime import date, datetime, timezone
 from typing import Any, Optional
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
@@ -53,9 +54,11 @@ from src.handoff.models import (
     WebhookConfig,
 )
 from src.models.handoff import HandoffRecord
+from src.models.tenant import Tenant
 from src.repositories import get_db_session_dependency
 from src.repositories.handoff import HandoffSlaCohortRow
 from src.services import HandoffService, get_handoff_service
+from src.services.export_window import ExportWindowError, validate_export_window
 from src.services.handoff_service import (
     HandoffConflictError,
     HandoffPersistenceError,
@@ -388,7 +391,11 @@ async def checkout_handoff(
         "tempo_espera_segundos runs from created_at to exported_at. For attended "
         "in_progress and completed rows, tempo_espera_segundos runs from created_at "
         "to data_hora_saida. Timestamps "
-        "are emitted in UTC and exports over 10,000 rows are rejected."
+        "are emitted in UTC and exports over 10,000 rows are rejected. "
+        "One file covers at most 60 inclusive clinic dates, starting no earlier "
+        "than 6 calendar months before the clinic's current date (same day of "
+        "month, clamped to month end); the clinic's audit_extended_access add-on "
+        "waives only the 6-month lookback."
     ),
     response_class=StreamingResponse,
     responses={
@@ -398,8 +405,9 @@ async def checkout_handoff(
         },
         400: {
             "description": (
-                "Invalid request: max_window_90_days, invalid_date_range, "
-                "invalid_handoff_timestamps, or export_limit_10000_exceeded."
+                "Invalid request: invalid_date_range, export_window_60_days, "
+                "export_lookback_6_months, invalid_handoff_timestamps, or "
+                "export_limit_10000_exceeded."
             )
         },
     },
@@ -427,7 +435,10 @@ async def export_handoffs_csv(
     clinic's IANA timezone to a semi-open UTC window. Rows without a queue-exit
     timestamp are open and use one export instant for their wait; attended
     in_progress and completed rows use their recorded confirmation timestamp.
-    Invalid requests return max_window_90_days, invalid_date_range,
+    A file spans at most 60 inclusive clinic dates and, unless the clinic has
+    the audit_extended_access add-on, starts no earlier than 6 calendar months
+    before the clinic's current date. Invalid requests return
+    invalid_date_range, export_window_60_days, export_lookback_6_months,
     invalid_handoff_timestamps, or export_limit_10000_exceeded.
     """
     effective_tenant_id = await resolve_effective_tenant(
@@ -438,12 +449,37 @@ async def export_handoffs_csv(
     )
 
     try:
-        resolved_period = await service.resolve_queue_period(
+        resolved_period = await service.resolve_export_period(
             effective_tenant_id,
             from_date=from_date,
             to_date=to_date,
         )
     except HandoffSlaPeriodError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=exc.code,
+        ) from exc
+
+    audit_extended_access = bool(
+        (
+            await db.execute(
+                select(Tenant.audit_extended_access).where(
+                    Tenant.id == effective_tenant_id
+                )
+            )
+        ).scalar_one_or_none()
+    )
+    clinic_today = resolved_period.as_of.astimezone(
+        ZoneInfo(resolved_period.timezone_name)
+    ).date()
+    try:
+        validate_export_window(
+            resolved_period.start_date,
+            resolved_period.end_date,
+            local_today=clinic_today,
+            extended_access=audit_extended_access,
+        )
+    except ExportWindowError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=exc.code,

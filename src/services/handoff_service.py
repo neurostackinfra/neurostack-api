@@ -936,6 +936,33 @@ class HandoffService:
             to_date=to_date,
         )
 
+    async def resolve_export_period(
+        self,
+        tenant_id: UUID,
+        *,
+        from_date: date | None = None,
+        to_date: date | None = None,
+        as_of: datetime | None = None,
+    ) -> CivilDateRange:
+        """Resolve the clinic-civil CSV export window without the queue cap.
+
+        The export enforces its own audit window policy, so unlike
+        ``resolve_queue_period`` this never raises ``max_window_90_days``.
+        """
+        resolved_as_of = as_of or datetime.now(timezone.utc)
+        async with self._open_session() as session:
+            repository = self._repository_factory(session)
+            configured_timezone = await repository.load_clinic_timezone(tenant_id)
+        try:
+            return resolve_clinic_civil_date_range(
+                clinic_timezone=configured_timezone,
+                as_of=resolved_as_of,
+                start_date=from_date,
+                end_date=to_date,
+            )
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise HandoffSlaPeriodError("invalid_date_range") from exc
+
     @staticmethod
     def _resolve_queue_period(
         *,

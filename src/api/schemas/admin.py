@@ -38,6 +38,8 @@ class ClinicSlotResponse(BaseModel):
     health_status: Optional[str] = None
     last_trace_at: Optional[datetime] = None
     config_completeness: int = 0
+    # Audit add-on: waives the 6-month export lookback (super admin only)
+    audit_extended_access: bool = False
 
 
 class CreateClinicRequest(BaseModel):
@@ -95,6 +97,13 @@ class UpdateClinicRequest(BaseModel):
     clinic_name: Optional[str] = Field(default=None, max_length=255)
     email: Optional[EmailStr] = None
     password: Optional[str] = Field(default=None, min_length=6)
+    audit_extended_access: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Audit add-on: when true, trace and handoff CSV exports skip the "
+            "6-month lookback (the 60-day-per-file cap still applies)."
+        ),
+    )
 
 
 class BuilderClinicResponse(BaseModel):
@@ -112,6 +121,8 @@ class BuilderClinicResponse(BaseModel):
     health_status: Optional[str] = None
     last_trace_at: Optional[datetime] = None
     config_completeness: int = 0
+    # Audit add-on: waives the 6-month export lookback (super admin only)
+    audit_extended_access: bool = False
 
 
 class BuilderWithClinicsResponse(BaseModel):

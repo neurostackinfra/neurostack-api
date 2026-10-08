@@ -154,7 +154,7 @@ def resolve_clinic_civil_period(
     """
 
     _require_aware("as_of", as_of)
-    zone_name, zone = _resolve_clinic_zone(clinic_timezone)
+    zone_name, zone = resolve_clinic_zone(clinic_timezone)
     resolved_day = local_day or as_of.astimezone(zone).date()
     if resolved_day == date.max:
         raise ValueError("local_day must be earlier than date.max")
@@ -190,7 +190,7 @@ def resolve_clinic_civil_date_range(
     if end_date is not None and type(end_date) is not date:
         raise TypeError("end_date must be a civil date")
 
-    zone_name, zone = _resolve_clinic_zone(clinic_timezone)
+    zone_name, zone = resolve_clinic_zone(clinic_timezone)
     resolved_as_of = as_of.astimezone(timezone.utc)
     local_today = resolved_as_of.astimezone(zone).date()
     resolved_start = start_date or local_today - timedelta(days=30)
@@ -216,7 +216,12 @@ def resolve_clinic_civil_date_range(
     )
 
 
-def _resolve_clinic_zone(configured_timezone: object) -> tuple[str, ZoneInfo]:
+def resolve_clinic_zone(configured_timezone: object) -> tuple[str, ZoneInfo]:
+    """Resolve a raw clinic timezone setting to an IANA zone, with fallback.
+
+    Missing, blank, non-IANA or unknown values fall back to the product
+    default timezone instead of failing.
+    """
     if isinstance(configured_timezone, str):
         candidate = configured_timezone.strip()
         if candidate and candidate not in _NON_IANA_ZONE_KEYS:

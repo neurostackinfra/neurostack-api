@@ -85,6 +85,7 @@ def _build_clinic_slot(
         health_status=health_status,
         last_trace_at=last_trace_at,
         config_completeness=config_completeness,
+        audit_extended_access=tenant.audit_extended_access,
     ).model_dump(mode="json")
 
 
@@ -380,7 +381,11 @@ async def toggle_clinic_status(
 @router.patch(
     "/clinics/{clinic_id}",
     summary="Update Clinic",
-    description="Update clinic name, admin email, and/or password. Super admin only.",
+    description=(
+        "Update clinic name, admin email, password, and/or the audit add-on "
+        "(`audit_extended_access`, which waives the 6-month export lookback). "
+        "Super admin only. Responds with the stored `audit_extended_access`."
+    ),
     response_model=None,
 )
 async def update_clinic(
@@ -432,8 +437,12 @@ async def update_clinic(
             if body.password is not None:
                 user.password_hash = pwd_context.hash(body.password)
 
+    if body.audit_extended_access is not None:
+        t.audit_extended_access = body.audit_extended_access
+    stored_audit_extended_access = t.audit_extended_access
+
     await session.commit()
-    return {"ok": True}
+    return {"ok": True, "audit_extended_access": stored_audit_extended_access}
 
 
 @router.get(
@@ -718,6 +727,7 @@ async def list_builders(
                     health_status=health,
                     last_trace_at=last_trace,
                     config_completeness=completeness,
+                    audit_extended_access=t.audit_extended_access,
                 )
             )
         output.append(

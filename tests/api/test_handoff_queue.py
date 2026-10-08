@@ -850,6 +850,57 @@ def test_queue_allows_90_elapsed_date_days_and_rejects_91_with_typed_code(
     assert error.value.code == "max_window_90_days"
 
 
+def test_queue_ignores_export_lookback_without_addon(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.services import handoff_service
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            value = cls(2026, 10, 7, 12, tzinfo=timezone.utc)
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr(handoff_service, "datetime", FrozenDatetime)
+    tenant_id = uuid4()
+    session = _session(tenant_id, "queue-ignores-export-lookback")
+    _seed(
+        client,
+        tenants=[tenant_id],
+        sessions=[session],
+        handoffs=[
+            _record(
+                tenant_id,
+                session.id,
+                created_at=datetime(2026, 3, 10, 12, tzinfo=timezone.utc),
+                reason=HandoffReason.USER_REQUEST.value,
+                intent=None,
+                context={},
+                first_message="seven months old",
+            )
+        ],
+        clinic_timezones={tenant_id: "UTC"},
+    )
+
+    # Seven months before the frozen clinic today, within the queue's 90 days;
+    # the 6-month lookback belongs to the CSV exports only.
+    response = client.get(
+        "/v1/handoffs/queue",
+        params={
+            "tenant_id": str(tenant_id),
+            "from_date": "2026-03-07",
+            "to_date": "2026-06-04",
+        },
+        headers=_jwt_headers("clinic_admin", tenant_id),
+    )
+
+    assert response.status_code == 200, response.text
+    assert [item["session_id"] for item in response.json()["items"]] == [
+        str(session.id)
+    ]
+
+
 def test_queue_rejects_unrepresentable_local_start_before_cohort_query(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,

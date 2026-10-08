@@ -274,7 +274,7 @@ def test_master_can_still_change_builder_and_clinic_email_and_password(
         json={"email": new_clinic_email, "password": "clinic-master-password"},
     )
     assert clinic_changed.status_code == 200, clinic_changed.text
-    assert clinic_changed.json() == {"ok": True}
+    assert clinic_changed.json() == {"ok": True, "audit_extended_access": False}
     assert (
         client.post(
             "/v1/auth/login",
