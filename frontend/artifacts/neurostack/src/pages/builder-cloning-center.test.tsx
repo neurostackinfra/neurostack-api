@@ -1,8 +1,12 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider, type Locale } from "@/context/i18n";
 import cloneContract from "../../../../../tests/fixtures/clinic_clone_contract.json";
 import BuilderPanel from "./builder";
+
+const CONSENT_PT = "Estou ciente dos itens que serão copiados e zerados. E compreendo que uma revisão dos dados para a nova clínica deve ser feita antes de ativar o agente.";
+const CONSENT_EN = "I am aware of the items that will be copied and reset. I also understand that the new clinic's data must be reviewed before activating the agent.";
+const preview = cloneContract.preview.body;
 
 const mocks = vi.hoisted(() => ({
   isBuilder: true,
@@ -130,6 +134,7 @@ let clinicsRefreshStatus: number;
 let billingRefreshStatus: number;
 let previewResponses: Map<string, () => Promise<Response>>;
 let servedContracts: ServedContract[];
+let cloneRequestBodies: unknown[];
 
 function contractPath(path: string) {
   return path.replace("{source_id}", sourceClinic.id);
@@ -167,6 +172,39 @@ async function loadPreview() {
   await screen.findByText(cloneContract.preview.body.suggested_name);
 }
 
+function consentCheckbox() {
+  return screen.getByRole("checkbox", { name: CONSENT_EN });
+}
+
+function ragCheckbox() {
+  return screen.getByRole("checkbox", { name: "RAG" });
+}
+
+function mediaCheckbox() {
+  return screen.getByRole("checkbox", { name: "Media" });
+}
+
+function submitButton() {
+  return screen.getByRole("button", { name: "Create clone" });
+}
+
+function summarySection(title: string) {
+  return screen.getByRole("region", { name: title });
+}
+
+function previewRequestCount() {
+  return mocks.fetch.mock.calls.filter(([path]) => String(path).endsWith("/clone-preview")).length;
+}
+
+function lastCloneRequest() {
+  const body = cloneRequestBodies.at(-1);
+  return typeof body === "string" ? JSON.parse(body) as unknown : body;
+}
+
+function definitionFor(term: string) {
+  return screen.getByText(term).nextElementSibling;
+}
+
 beforeEach(() => {
   localStorage.setItem("ns_auth", JSON.stringify({ token: "builder-token" }));
   mocks.isBuilder = true;
@@ -185,6 +223,7 @@ beforeEach(() => {
   billingRefreshStatus = 200;
   previewResponses = new Map();
   servedContracts = [];
+  cloneRequestBodies = [];
 
   vi.stubGlobal(
     "ResizeObserver",
@@ -266,8 +305,9 @@ beforeEach(() => {
       if (previewResponse) return previewResponse();
       return Promise.resolve(response(cloneContract.preview.status, cloneContract.preview.body));
     }
-    if (path === contractPath(cloneContract.success.path)) {
+    if (/^\/v1\/builder\/clinics\/[^/]+\/clone$/.test(path)) {
       servedContracts.push({ method, path, status: cloneStatus, body: cloneBody });
+      cloneRequestBodies.push(init?.body);
       cloneSucceeded = cloneStatus === cloneContract.success.status;
       return cloneResponsePromise ?? Promise.resolve(response(cloneStatus, cloneBody));
     }
@@ -282,6 +322,8 @@ describe("BuilderPanel Cloning Center", () => {
       id: "22222222-2222-4222-8222-22222222222b",
       name: "Clínica Ocular cópia 3",
       is_active: false,
+      copied_rag_documents: cloneContract.success.body.copied_rag_documents,
+      copied_media_assets: cloneContract.success.body.copied_media_assets,
     };
     cloneBody = authoritativeResult;
     renderBuilder();
@@ -294,11 +336,13 @@ describe("BuilderPanel Cloning Center", () => {
       body: cloneContract.preview.body,
     });
     expect(screen.getByText("This name is advisory and may change when the clone is created.")).toBeInTheDocument();
-    expect(screen.getByText(String(cloneContract.preview.body.document_count))).toBeInTheDocument();
-    expect(screen.getByText(`${cloneContract.preview.body.total_bytes} B`)).toBeInTheDocument();
+    expect(ragCheckbox()).toHaveAccessibleDescription(`${preview.document_count} documents · ${preview.total_bytes} B available`);
+    expect(mediaCheckbox()).toHaveAccessibleDescription(`${preview.media_asset_count} files · ${preview.media_total_bytes} B available`);
 
-    fireEvent.click(screen.getByRole("checkbox", { name: /I understand what will be copied/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Create clone" }));
+    fireEvent.click(ragCheckbox());
+    fireEvent.click(mediaCheckbox());
+    fireEvent.click(consentCheckbox());
+    fireEvent.click(submitButton());
 
     await screen.findByText(`ID: ${authoritativeResult.id}`);
     expect(servedContracts[1]).toEqual({
@@ -307,6 +351,7 @@ describe("BuilderPanel Cloning Center", () => {
       status: cloneContract.success.status,
       body: authoritativeResult,
     });
+    expect(lastCloneRequest()).toEqual(cloneContract.success.request);
     expect(screen.queryByText("Clone preview")).not.toBeInTheDocument();
     expect(screen.queryByText("Suggested name")).not.toBeInTheDocument();
     expect(screen.queryByText(cloneContract.preview.body.suggested_name)).not.toBeInTheDocument();
@@ -342,6 +387,8 @@ describe("BuilderPanel Cloning Center", () => {
       suggested_name: "Clínica Retina cópia 4",
       document_count: 7,
       total_bytes: 987,
+      media_asset_count: 4,
+      media_total_bytes: 654,
     };
 
     renderBuilder();
@@ -355,8 +402,8 @@ describe("BuilderPanel Cloning Center", () => {
 
     expect(select).toHaveValue(secondClinic.id);
     expect(screen.getByText(latestPreview.suggested_name)).toBeInTheDocument();
-    expect(screen.getByText(String(latestPreview.document_count))).toBeInTheDocument();
-    expect(screen.getByText(`${latestPreview.total_bytes} B`)).toBeInTheDocument();
+    expect(ragCheckbox()).toHaveAccessibleDescription("7 documents · 987 B available");
+    expect(mediaCheckbox()).toHaveAccessibleDescription("4 files · 654 B available");
     expect(screen.queryByText(cloneContract.preview.body.suggested_name)).not.toBeInTheDocument();
   });
 
@@ -369,7 +416,7 @@ describe("BuilderPanel Cloning Center", () => {
     availableClinics = [sourceClinic, secondClinic];
     renderBuilder();
     await loadPreview();
-    fireEvent.click(screen.getByRole("checkbox", { name: /I understand what will be copied/ }));
+    fireEvent.click(consentCheckbox());
     previewResponses.set(secondClinic.id, () => Promise.resolve(response(status, { detail: { error: "preview_failed" } })));
 
     fireEvent.change(screen.getByLabelText("Source clinic"), { target: { value: secondClinic.id } });
@@ -377,7 +424,7 @@ describe("BuilderPanel Cloning Center", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(message);
     expect(screen.getByLabelText("Source clinic")).toHaveValue(secondClinic.id);
     expect(screen.queryByText(cloneContract.preview.body.suggested_name)).not.toBeInTheDocument();
-    expect(screen.queryByRole("checkbox", { name: /I understand what will be copied/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: CONSENT_EN })).not.toBeInTheDocument();
   });
 
   it("reports a successful clone whose lists did not refresh and retries the refresh", async () => {
@@ -385,8 +432,8 @@ describe("BuilderPanel Cloning Center", () => {
     billingRefreshStatus = 500;
     renderBuilder();
     await loadPreview();
-    fireEvent.click(screen.getByRole("checkbox", { name: /I understand what will be copied/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Create clone" }));
+    fireEvent.click(consentCheckbox());
+    fireEvent.click(submitButton());
 
     await screen.findByText(`ID: ${cloneContract.success.body.id}`);
     expect(screen.getByText("The clone was created, but clinics or billing could not be refreshed.")).toBeInTheDocument();
@@ -401,20 +448,33 @@ describe("BuilderPanel Cloning Center", () => {
     expect(billingRequestCount).toBe(3);
   });
 
+  const postErrorMessages: Record<string, string> = {
+    403: "You no longer have permission to clone this clinic. Your source selection and preview were kept.",
+    404: "The source clinic could not be found. Your source selection and preview were kept.",
+    409: "The clinic cannot be cloned with its current configuration. Your source selection and preview were kept.",
+    "409_media_storage_cap": "Copying the media would exceed your media storage limit. No clinic was created; unselect Media or free up space. Your source selection and preview were kept.",
+    422: "The clone selection could not be processed. No clinic was created; your source selection and preview were kept.",
+    500: "The clone could not be saved. No clinic was created; your source selection and preview were kept.",
+  };
+
   it.each(Object.entries(cloneContract.errors))(
-    "keeps the selected source and preview when POST returns %s",
-    async (_statusKey, errorContract) => {
+    "keeps the selected source, selection, and preview when POST returns %s",
+    async (statusKey, errorContract) => {
       cloneStatus = errorContract.status;
       cloneBody = errorContract.body;
       renderBuilder();
       await loadPreview();
 
-      fireEvent.click(screen.getByRole("checkbox", { name: /I understand what will be copied/ }));
-      fireEvent.click(screen.getByRole("button", { name: "Create clone" }));
+      fireEvent.click(ragCheckbox());
+      fireEvent.click(mediaCheckbox());
+      fireEvent.click(consentCheckbox());
+      fireEvent.click(submitButton());
 
       const alert = await screen.findByRole("alert");
-      expect(alert).toHaveTextContent(/source selection and preview were kept/i);
+      expect(alert).toHaveTextContent(postErrorMessages[statusKey]);
       expect(screen.getByLabelText("Source clinic")).toHaveValue(sourceClinic.id);
+      expect(ragCheckbox()).toBeChecked();
+      expect(mediaCheckbox()).toBeChecked();
       expect(screen.getByText(cloneContract.preview.body.suggested_name)).toBeInTheDocument();
       expect(screen.queryByText(cloneContract.success.body.id)).not.toBeInTheDocument();
       expect(servedContracts.at(-1)).toEqual({
@@ -423,38 +483,251 @@ describe("BuilderPanel Cloning Center", () => {
         status: errorContract.status,
         body: errorContract.body,
       });
+      expect(lastCloneRequest()).toEqual({ include_rag: true, include_media: true });
     },
   );
+
+  it("derives the retry request from the current selection after the media storage cap error", async () => {
+    cloneStatus = cloneContract.errors["409_media_storage_cap"].status;
+    cloneBody = cloneContract.errors["409_media_storage_cap"].body;
+    renderBuilder();
+    await loadPreview();
+    fireEvent.click(ragCheckbox());
+    fireEvent.click(mediaCheckbox());
+    fireEvent.click(consentCheckbox());
+    fireEvent.click(submitButton());
+    expect(await screen.findByRole("alert")).toHaveTextContent(/exceed your media storage limit/);
+
+    fireEvent.click(mediaCheckbox());
+    // The error described the previous selection, so it leaves with it.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(consentCheckbox()).not.toBeChecked();
+    expect(submitButton()).toBeDisabled();
+
+    cloneStatus = cloneContract.success.status;
+    cloneBody = { ...cloneContract.success.body, copied_media_assets: 0 };
+    fireEvent.click(consentCheckbox());
+    fireEvent.click(submitButton());
+
+    await screen.findByText(`ID: ${cloneContract.success.body.id}`);
+    expect(lastCloneRequest()).toEqual({ include_rag: true, include_media: false });
+    expect(definitionFor("Media files copied")).toHaveTextContent("0");
+  });
+
+  it("renders configuration locked with its note and RAG/Media unchecked by default", async () => {
+    renderBuilder();
+    await loadPreview();
+
+    expect(screen.getByRole("group", { name: "Clone" })).toBeInTheDocument();
+    const config = screen.getByRole("checkbox", { name: "Clinic configuration" });
+    expect(config).toBeChecked();
+    expect(config).toBeDisabled();
+    expect(config).toHaveAccessibleDescription("except APIs and scheduling link");
+    expect(ragCheckbox()).not.toBeChecked();
+    expect(ragCheckbox()).toBeEnabled();
+    expect(mediaCheckbox()).not.toBeChecked();
+    expect(mediaCheckbox()).toBeEnabled();
+    expect(consentCheckbox()).not.toBeChecked();
+    expect(submitButton()).toBeDisabled();
+
+    const copied = summarySection("Will be copied");
+    expect(within(copied).getByText("Clinic configuration: services, professionals, persona, and business rules.")).toBeInTheDocument();
+    expect(within(copied).queryByText(/^RAG:/)).not.toBeInTheDocument();
+    expect(within(copied).queryByText(/^Media:/)).not.toBeInTheDocument();
+    const reset = summarySection("Will be reset");
+    expect(within(reset).getByText("API credentials and integrations are zeroed; the scheduling link is disabled and its URL is null.")).toBeInTheDocument();
+    expect(within(reset).getByText("No admin user is created.")).toBeInTheDocument();
+    expect(within(reset).getByText("The clone starts inactive.")).toBeInTheDocument();
+    const unselected = summarySection("Not selected");
+    expect(within(unselected).getByText(`RAG: ${preview.document_count} documents (${preview.total_bytes} B)`)).toBeInTheDocument();
+    expect(within(unselected).getByText(`Media: ${preview.media_asset_count} files (${preview.media_total_bytes} B)`)).toBeInTheDocument();
+    expect(within(unselected).getByText("Unselected items are not copied and stay unchanged in the source clinic.")).toBeInTheDocument();
+    expect(definitionFor("RAG storage added")).toHaveTextContent("0 B");
+    expect(definitionFor("Media storage added")).toHaveTextContent("0 B");
+  });
+
+  it("moves selected parts into the copied summary and computes the impact locally without refetching", async () => {
+    renderBuilder();
+    await loadPreview();
+    expect(previewRequestCount()).toBe(1);
+
+    fireEvent.click(ragCheckbox());
+    expect(within(summarySection("Will be copied")).getByText(`RAG: ${preview.document_count} documents (${preview.total_bytes} B)`)).toBeInTheDocument();
+    expect(within(summarySection("Not selected")).queryByText(/^RAG:/)).not.toBeInTheDocument();
+    expect(definitionFor("RAG storage added")).toHaveTextContent(`${preview.total_bytes} B`);
+    expect(screen.getByText("Knowledge documents are duplicated and their bytes count again toward RAG storage.")).toBeInTheDocument();
+
+    fireEvent.click(mediaCheckbox());
+    expect(within(summarySection("Will be copied")).getByText(`Media: ${preview.media_asset_count} files (${preview.media_total_bytes} B)`)).toBeInTheDocument();
+    expect(within(summarySection("Not selected")).getByText("All optional items are selected.")).toBeInTheDocument();
+    expect(definitionFor("Media storage added")).toHaveTextContent(`${preview.media_total_bytes} B`);
+    expect(screen.getByText("Media files are duplicated and their bytes count again toward media storage.")).toBeInTheDocument();
+
+    fireEvent.click(ragCheckbox());
+    fireEvent.click(mediaCheckbox());
+    expect(definitionFor("RAG storage added")).toHaveTextContent("0 B");
+    expect(definitionFor("Media storage added")).toHaveTextContent("0 B");
+    expect(previewRequestCount()).toBe(1);
+  });
+
+  it.each([
+    { includeRag: false, includeMedia: false, copiedRag: 0, copiedMedia: 0 },
+    { includeRag: true, includeMedia: false, copiedRag: 5, copiedMedia: 0 },
+    { includeRag: false, includeMedia: true, copiedRag: 0, copiedMedia: 7 },
+    { includeRag: true, includeMedia: true, copiedRag: 5, copiedMedia: 7 },
+  ])(
+    "sends include_rag=$includeRag include_media=$includeMedia and shows the authoritative copied counts",
+    async ({ includeRag, includeMedia, copiedRag, copiedMedia }) => {
+      cloneBody = {
+        ...cloneContract.success.body,
+        copied_rag_documents: copiedRag,
+        copied_media_assets: copiedMedia,
+      };
+      renderBuilder();
+      await loadPreview();
+
+      if (includeRag) fireEvent.click(ragCheckbox());
+      if (includeMedia) fireEvent.click(mediaCheckbox());
+      fireEvent.click(consentCheckbox());
+      fireEvent.click(submitButton());
+
+      await screen.findByText(`ID: ${cloneContract.success.body.id}`);
+      expect(cloneRequestBodies).toHaveLength(1);
+      expect(lastCloneRequest()).toEqual({ include_rag: includeRag, include_media: includeMedia });
+      expect(within(screen.getByRole("status")).getByText("RAG documents copied").nextElementSibling)
+        .toHaveTextContent(new RegExp(`^${copiedRag}$`));
+      expect(within(screen.getByRole("status")).getByText("Media files copied").nextElementSibling)
+        .toHaveTextContent(new RegExp(`^${copiedMedia}$`));
+    },
+  );
+
+  it.each([
+    { trigger: "RAG", change: () => fireEvent.click(ragCheckbox()), request: { include_rag: true, include_media: false } },
+    { trigger: "Media", change: () => fireEvent.click(mediaCheckbox()), request: { include_rag: false, include_media: true } },
+  ])("invalidates consent when $trigger is toggled and submits the current selection", async ({ change, request }) => {
+    renderBuilder();
+    await loadPreview();
+    fireEvent.click(consentCheckbox());
+    expect(consentCheckbox()).toBeChecked();
+    expect(submitButton()).toBeEnabled();
+
+    change();
+    expect(consentCheckbox()).not.toBeChecked();
+    expect(submitButton()).toBeDisabled();
+    fireEvent.click(submitButton());
+
+    // Toggling back does not resurrect the earlier acknowledgement.
+    change();
+    expect(consentCheckbox()).not.toBeChecked();
+    expect(submitButton()).toBeDisabled();
+    change();
+
+    fireEvent.click(consentCheckbox());
+    expect(submitButton()).toBeEnabled();
+    fireEvent.click(submitButton());
+
+    await screen.findByText(`ID: ${cloneContract.success.body.id}`);
+    expect(cloneRequestBodies).toHaveLength(1);
+    expect(lastCloneRequest()).toEqual(request);
+    expect(previewRequestCount()).toBe(1);
+  });
+
+  it("invalidates consent and resets RAG/Media when the source changes", async () => {
+    availableClinics = [sourceClinic, secondClinic];
+    renderBuilder();
+    await loadPreview();
+    fireEvent.click(ragCheckbox());
+    fireEvent.click(mediaCheckbox());
+    fireEvent.click(consentCheckbox());
+    expect(submitButton()).toBeEnabled();
+
+    fireEvent.change(screen.getByLabelText("Source clinic"), { target: { value: secondClinic.id } });
+    await screen.findByText(cloneContract.preview.body.suggested_name);
+    expect(ragCheckbox()).not.toBeChecked();
+    expect(mediaCheckbox()).not.toBeChecked();
+    expect(consentCheckbox()).not.toBeChecked();
+    expect(submitButton()).toBeDisabled();
+
+    fireEvent.click(ragCheckbox());
+    fireEvent.click(consentCheckbox());
+    fireEvent.click(submitButton());
+
+    await screen.findByText(`ID: ${cloneContract.success.body.id}`);
+    expect(cloneRequestBodies).toHaveLength(1);
+    expect(servedContracts.at(-1)?.path).toBe(`/v1/builder/clinics/${secondClinic.id}/clone`);
+    expect(lastCloneRequest()).toEqual({ include_rag: true, include_media: false });
+  });
 
   it.each([
     {
       locale: "en" as const,
       tab: "Cloning Center",
-      included: "Configuration, services, professionals, persona, business rules, and knowledge are copied.",
-      admin: "No admin user is created.",
-      integrations: "API credentials and integrations are zeroed; the scheduling link is disabled and its URL is null.",
-      inactive: "The clone starts inactive.",
-      rag: "Knowledge documents are duplicated and their bytes count again toward RAG storage.",
+      clone: "Clone",
+      config: "Clinic configuration",
+      note: "except APIs and scheduling link",
+      media: "Media",
+      copied: "Will be copied",
+      reset: "Will be reset",
+      unselected: "Not selected",
+      resetItems: [
+        "API credentials and integrations are zeroed; the scheduling link is disabled and its URL is null.",
+        "No admin user is created.",
+        "The clone starts inactive.",
+      ],
+      consent: CONSENT_EN,
     },
     {
       locale: "pt" as const,
       tab: "Central de Clonagem",
-      included: "Configuração, serviços, profissionais, persona, regras de negócio e conhecimento são copiados.",
-      admin: "Nenhum usuário administrador é criado.",
-      integrations: "Credenciais de API e integrações são zeradas; o link de agendamento fica desabilitado e sua URL fica nula.",
-      inactive: "A clonagem começa inativa.",
-      rag: "Os documentos de conhecimento são duplicados e seus bytes contam novamente no armazenamento RAG.",
+      clone: "Clonar",
+      config: "Configuração da clínica",
+      note: "exceto APIs e link de agendamento",
+      media: "Mídias",
+      copied: "Serão copiados",
+      reset: "Serão zerados",
+      unselected: "Não selecionados",
+      resetItems: [
+        "Credenciais de API e integrações são zeradas; o link de agendamento fica desabilitado e sua URL fica nula.",
+        "Nenhum usuário administrador é criado.",
+        "A clonagem começa inativa.",
+      ],
+      consent: CONSENT_PT,
     },
-  ])("states the included, excluded, inactive, and RAG effects in $locale", async (copy) => {
+  ])("renders the clone list, summary groups, and exact consent text in $locale", async (copy) => {
     renderBuilder(copy.locale);
     await loadPreview();
 
     expect(screen.getByRole("tab", { name: copy.tab })).toBeInTheDocument();
-    expect(screen.getByText(copy.included)).toBeInTheDocument();
-    expect(screen.getByText(copy.admin)).toBeInTheDocument();
-    expect(screen.getByText(copy.integrations)).toBeInTheDocument();
-    expect(screen.getByText(copy.inactive)).toBeInTheDocument();
-    expect(screen.getByText(copy.rag)).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: copy.clone })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: copy.config })).toHaveAccessibleDescription(copy.note);
+    expect(screen.getByRole("checkbox", { name: "RAG" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: copy.media })).not.toBeChecked();
+    expect(summarySection(copy.copied)).toBeInTheDocument();
+    const reset = summarySection(copy.reset);
+    for (const item of copy.resetItems) {
+      expect(within(reset).getByText(item)).toBeInTheDocument();
+    }
+    expect(summarySection(copy.unselected)).toBeInTheDocument();
+    const consent = screen.getByRole("checkbox", { name: copy.consent });
+    expect(screen.getByText(copy.consent).textContent).toBe(copy.consent);
+    expect(consent).not.toBeChecked();
+  });
+
+  it("shows the media storage cap error in pt", async () => {
+    const capError = cloneContract.errors["409_media_storage_cap"];
+    cloneStatus = capError.status;
+    cloneBody = capError.body;
+    renderBuilder("pt");
+    await loadPreview();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Mídias" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: CONSENT_PT }));
+    fireEvent.click(screen.getByRole("button", { name: "Criar clonagem" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Copiar as mídias excederia o limite de armazenamento de mídias. Nenhuma clínica foi criada; desmarque Mídias ou libere espaço. Sua seleção e prévia foram mantidas.",
+    );
+    expect(lastCloneRequest()).toEqual({ include_rag: false, include_media: true });
   });
 
   it("prevents duplicate POSTs and disables cloning interactions while loading", async () => {
@@ -464,21 +737,40 @@ describe("BuilderPanel Cloning Center", () => {
     });
     renderBuilder();
     await loadPreview();
-    fireEvent.click(screen.getByRole("checkbox", { name: /I understand what will be copied/ }));
+    fireEvent.click(consentCheckbox());
 
-    const submit = screen.getByRole("button", { name: "Create clone" });
-    fireEvent.click(submit);
-    fireEvent.click(submit);
+    // Both clicks land in the same tick, before React re-renders and disables
+    // the button, so only the in-flight guard can stop the second POST.
+    const submit = submitButton();
+    act(() => {
+      submit.click();
+      submit.click();
+    });
 
     const loadingButton = await screen.findByRole("button", { name: "Creating clone…" });
     expect(loadingButton).toBeDisabled();
+    expect(loadingButton).toHaveAttribute("aria-busy", "true");
+    // Exactly one live announcement for the loading phase, and the clone list
+    // itself is not a live region (it would re-announce on every toggle).
+    const announcements = screen.getAllByRole("status")
+      .filter((region) => region.textContent?.includes("Creating clone…"));
+    expect(announcements).toHaveLength(1);
+    expect(document.querySelectorAll("[aria-live]")).toHaveLength(0);
+    const cloneList = screen.getByRole("group", { name: "Clone" });
+    expect(cloneList.closest("[aria-live], [role='status'], [role='alert']")).toBeNull();
+    expect(summarySection("Will be copied").closest("[aria-live], [role='status'], [role='alert']")).toBeNull();
     expect(screen.getByLabelText("Source clinic")).toBeDisabled();
+    expect(ragCheckbox()).toBeDisabled();
+    expect(mediaCheckbox()).toBeDisabled();
+    expect(consentCheckbox()).toBeDisabled();
     expect(servedContracts.filter(({ method }) => method === cloneContract.success.method)).toHaveLength(1);
 
     await act(async () => {
       resolveClone(response(cloneContract.success.status, cloneContract.success.body));
     });
     await screen.findByText(`ID: ${cloneContract.success.body.id}`);
+    expect(definitionFor("RAG documents copied")).toHaveTextContent(String(cloneContract.success.body.copied_rag_documents));
+    expect(definitionFor("Media files copied")).toHaveTextContent(String(cloneContract.success.body.copied_media_assets));
   });
 
   it("keeps the existing tabs and clinic creation entry point keyboard-accessible", async () => {

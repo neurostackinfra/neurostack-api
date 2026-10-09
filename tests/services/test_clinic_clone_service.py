@@ -1,17 +1,25 @@
+from collections.abc import Iterator, Mapping
+from typing import Any
 from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import inspect as sqlalchemy_inspect
 
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.knowledge import KnowledgeDocument
+from src.models.media_asset import MediaAsset
 from src.services.clinic_clone_service import (
+    MEDIA_ASSET_CLONE_FIELDS,
+    MEDIA_ASSET_CLONE_REGENERATED_FIELDS,
     build_clinic_config_clone,
     build_knowledge_document_clone,
+    build_media_asset_clone,
     derive_clone_slug,
     next_clone_name,
     normalize_clone_root,
 )
+from src.services.media_assets import media_payload_sha256
 
 _EXPECTED_BUCKET_KEYS = {
     "persona": {
@@ -419,3 +427,85 @@ def test_knowledge_clone_preserves_authored_data_and_resets_derived_state():
     assert clone.size_bytes == len(source.content.encode("utf-8"))
     clone.document_metadata["tags"].append("independent")
     assert source.document_metadata["tags"] == ["visão"]
+
+
+_MEDIA_PAYLOAD = b"%PDF-1.7\n\x00\xffbinary payload"
+
+
+def _media_source_row(**overrides: Any) -> dict[str, Any]:
+    values: dict[str, Any] = {
+        "display_name": "  Tabela de preços 👁️  ",
+        "original_filename": "tabela-preços.pdf",
+        "category": "pdf",
+        "mime_type": "application/pdf",
+        "size_bytes": len(_MEDIA_PAYLOAD),
+        "sha256": media_payload_sha256(_MEDIA_PAYLOAD),
+        "payload": _MEDIA_PAYLOAD,
+        "usage_trigger": "quando pedirem preços",
+        "auto_suggest": True,
+    }
+    values.update(overrides)
+    return values
+
+
+class _AllowlistOnlyRow(Mapping[str, Any]):
+    """Expose only allowlisted media columns and fail on any other access."""
+
+    def __init__(self, values: dict[str, Any]) -> None:
+        self._values = values
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in MEDIA_ASSET_CLONE_FIELDS:
+            raise AssertionError(f"media clone accessed a non-allowlisted field: {key}")
+        return self._values[key]
+
+    def __iter__(self) -> Iterator[str]:
+        raise AssertionError("media clone must not copy by iterating the source row")
+
+    def __len__(self) -> int:
+        raise AssertionError("media clone must not size the source row")
+
+
+def test_media_clone_allowlist_classifies_every_media_asset_column() -> None:
+    columns = {column.key for column in sqlalchemy_inspect(MediaAsset).columns}
+    copied = set(MEDIA_ASSET_CLONE_FIELDS)
+
+    assert len(copied) == len(MEDIA_ASSET_CLONE_FIELDS)
+    assert not copied & MEDIA_ASSET_CLONE_REGENERATED_FIELDS
+    # A new MediaAsset column must be classified deliberately as copied or
+    # regenerated before cloning can silently drop or leak it.
+    assert columns == copied | MEDIA_ASSET_CLONE_REGENERATED_FIELDS
+
+
+def test_media_clone_copies_only_allowlisted_columns_with_new_identity() -> None:
+    destination_id = uuid4()
+    source = _media_source_row()
+
+    clone = build_media_asset_clone(_AllowlistOnlyRow(source), destination_id)
+
+    assert isinstance(clone, MediaAsset)
+    assert clone.id is not None
+    assert clone.tenant_id == destination_id
+    for field in MEDIA_ASSET_CLONE_FIELDS:
+        assert getattr(clone, field) == source[field]
+    assert clone.payload == _MEDIA_PAYLOAD
+    assert clone.sha256 == media_payload_sha256(clone.payload)
+    assert clone.created_at is None
+    assert clone.updated_at is None
+    assert sqlalchemy_inspect(clone).transient is True
+
+
+def test_media_clones_of_one_source_are_independent_instances() -> None:
+    destination_id = uuid4()
+    source = _media_source_row(usage_trigger=None, auto_suggest=False)
+
+    first = build_media_asset_clone(source, destination_id)
+    second = build_media_asset_clone(source, destination_id)
+
+    assert first is not second
+    assert first.id != second.id
+    assert first.usage_trigger is None
+    assert first.auto_suggest is False
+    first.display_name = "renamed copy"
+    assert second.display_name == source["display_name"]
+    assert source["display_name"] == "  Tabela de preços 👁️  "

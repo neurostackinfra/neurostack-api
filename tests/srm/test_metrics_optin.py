@@ -33,8 +33,7 @@ def assert_isolated_ok(source: str) -> None:
 
 
 def test_import_is_side_effect_free_and_default_first_is_idempotent() -> None:
-    assert_isolated_ok(
-        """
+    assert_isolated_ok("""
         from prometheus_client import REGISTRY
         before = set(REGISTRY._names_to_collectors)
         import neurostack_core as core
@@ -44,13 +43,11 @@ def test_import_is_side_effect_free_and_default_first_is_idempotent() -> None:
         assert len(after - before) > 14
         core.enable_metrics()
         assert set(REGISTRY._names_to_collectors) == after
-        """
-    )
+        """)
 
 
 def test_custom_first_owns_and_different_registry_rejects() -> None:
-    assert_isolated_ok(
-        """
+    assert_isolated_ok("""
         from prometheus_client import CollectorRegistry
         import neurostack_core as core
         first = CollectorRegistry()
@@ -64,13 +61,11 @@ def test_custom_first_owns_and_different_registry_rejects() -> None:
         else:
             raise AssertionError("different owner was accepted")
         assert not second._names_to_collectors
-        """
-    )
+        """)
 
 
 def test_default_then_custom_registry_rejects() -> None:
-    assert_isolated_ok(
-        """
+    assert_isolated_ok("""
         from prometheus_client import CollectorRegistry
         import neurostack_core as core
         core.enable_metrics()
@@ -82,13 +77,11 @@ def test_default_then_custom_registry_rejects() -> None:
         else:
             raise AssertionError("custom registry replaced the default owner")
         assert not other._names_to_collectors
-        """
-    )
+        """)
 
 
 def test_custom_then_default_registry_rejects() -> None:
-    assert_isolated_ok(
-        """
+    assert_isolated_ok("""
         from prometheus_client import CollectorRegistry, REGISTRY
         import neurostack_core as core
         custom = CollectorRegistry()
@@ -101,13 +94,11 @@ def test_custom_then_default_registry_rejects() -> None:
         else:
             raise AssertionError("default registry replaced the custom owner")
         assert REGISTRY._names_to_collectors == before
-        """
-    )
+        """)
 
 
 def test_exact_fourteen_metric_family_types_and_labels() -> None:
-    assert_isolated_ok(
-        """
+    assert_isolated_ok("""
         import neurostack_core.metrics as metrics
         expected = {
             "neurostack_srm_decisions": ("counter", ("intent_category", "funnel_stage", "mode")),
@@ -131,8 +122,7 @@ def test_exact_fourteen_metric_family_types_and_labels() -> None:
         }
         assert len(metrics._INSTRUMENTS) == 14
         assert actual == expected
-        """
-    )
+        """)
 
 
 @pytest.mark.parametrize(
@@ -146,8 +136,7 @@ def test_exact_fourteen_metric_family_types_and_labels() -> None:
 def test_any_family_or_generated_suffix_collision_is_atomic(
     collision_name: str,
 ) -> None:
-    assert_isolated_ok(
-        f"""
+    assert_isolated_ok(f"""
         from prometheus_client import CollectorRegistry, Gauge
         import neurostack_core as core
         registry = CollectorRegistry()
@@ -163,13 +152,11 @@ def test_any_family_or_generated_suffix_collision_is_atomic(
         clean = CollectorRegistry()
         core.enable_metrics(clean)
         assert "neurostack_output_validations_total" in clean._names_to_collectors
-        """
-    )
+        """)
 
 
 def test_observations_made_before_enable_are_retained() -> None:
-    assert_isolated_ok(
-        """
+    assert_isolated_ok("""
         from prometheus_client import CollectorRegistry
         import neurostack_core as core
         core.SRM_HANDOFFS.labels(reason="requested").inc(3)
@@ -185,13 +172,11 @@ def test_observations_made_before_enable_are_retained() -> None:
         assert values["neurostack_srm_handoffs_total"] == 3
         assert values["neurostack_flow_handler_duration_seconds_count"] == 1
         assert values["neurostack_flow_handler_duration_seconds_sum"] == 0.25
-        """
-    )
+        """)
 
 
 def test_concurrent_first_call_has_one_owner_and_no_partial_registration() -> None:
-    assert_isolated_ok(
-        """
+    assert_isolated_ok("""
         from concurrent.futures import ThreadPoolExecutor
         from prometheus_client import CollectorRegistry
         import neurostack_core as core
@@ -208,13 +193,11 @@ def test_concurrent_first_call_has_one_owner_and_no_partial_registration() -> No
         sizes = sorted(len(registry._names_to_collectors) for registry in registries)
         assert sizes[0] == 0
         assert sizes[1] > 14
-        """
-    )
+        """)
 
 
 def test_manual_reload_fails_closed_and_preserves_original_instruments() -> None:
-    assert_isolated_ok(
-        """
+    assert_isolated_ok("""
         import importlib
         from prometheus_client import CollectorRegistry
         import neurostack_core.metrics as metrics
@@ -233,5 +216,4 @@ def test_manual_reload_fails_closed_and_preserves_original_instruments() -> None
             "neurostack_prompt_tokens_total", {"mode": "normal"}
         )
         assert sample == 2
-        """
-    )
+        """)

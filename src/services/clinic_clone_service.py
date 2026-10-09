@@ -10,9 +10,28 @@ from uuid import UUID, uuid4
 from src.models.clinic_config import ClinicConfig
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.knowledge import KnowledgeDocument
+from src.models.media_asset import MediaAsset
 
 _COPY_SUFFIX = re.compile(r"\s+cópia\s+(\d+)$")
 _TENANT_NAME_MAX_LENGTH = 255
+
+# Every MediaAsset column is either copied (this allowlist) or assigned by the
+# destination (the regenerated set). A new column must be added deliberately to
+# one of them; the service tests fail on any unclassified column.
+MEDIA_ASSET_CLONE_FIELDS: tuple[str, ...] = (
+    "display_name",
+    "original_filename",
+    "category",
+    "mime_type",
+    "size_bytes",
+    "sha256",
+    "payload",
+    "usage_trigger",
+    "auto_suggest",
+)
+MEDIA_ASSET_CLONE_REGENERATED_FIELDS: frozenset[str] = frozenset(
+    {"id", "tenant_id", "created_at", "updated_at"}
+)
 _BUCKET_FIELDS: dict[str, tuple[str, ...]] = {
     "persona": (
         "clinic_display_name",
@@ -184,4 +203,19 @@ def build_knowledge_document_clone(
         chunk_count=0,
         size_bytes=len(source.content.encode("utf-8")),
         index_error=None,
+    )
+
+
+def build_media_asset_clone(
+    source: Mapping[str, Any], destination_tenant_id: UUID
+) -> MediaAsset:
+    """Create an independent media copy from the explicit column allowlist.
+
+    ``source`` holds exactly the allowlisted columns of one locked source row.
+    Timestamps are left unset so the destination row receives its own.
+    """
+    return MediaAsset(
+        id=uuid4(),
+        tenant_id=destination_tenant_id,
+        **{field: source[field] for field in MEDIA_ASSET_CLONE_FIELDS},
     )
