@@ -9,13 +9,14 @@ from typing import Any, NamedTuple, Optional
 from typing import cast as type_cast
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from passlib.context import CryptContext
+from pydantic import ValidationError
 from sqlalchemy import and_, cast, func, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, selectinload
-from sqlalchemy.types import String
+from sqlalchemy.types import BigInteger, String
 
 from src.api.helpers.health import (
     CONFIG_COMPLETENESS_BUCKETS as _CONFIG_COMPLETENESS_BUCKETS,
@@ -37,6 +38,7 @@ from src.api.schemas.builder import (
     BuilderSupportTicketResponse,
     ClinicCloneErrorResponse,
     ClinicClonePreviewResponse,
+    ClinicCloneRequest,
     ClinicCloneResponse,
     CreateBuilderClinicRequest,
     ToggleClinicStatusRequest,
@@ -45,26 +47,36 @@ from src.api.schemas.builder import (
     UpdateClinicAdminEmailRequest,
     UpdateTicketStatusRequest,
 )
+from src.config.logging import get_logger
 from src.models.builder import Builder
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.event import Event
 from src.models.knowledge import KnowledgeDocument
+from src.models.media_asset import MediaAsset
 from src.models.support_ticket import SupportTicket
 from src.models.tenant import Tenant
 from src.models.user import User, UserRole
 from src.repositories import get_db_session_dependency
 from src.services.business_hours import summarize_outside_hours
 from src.services.clinic_clone_service import (
+    MEDIA_ASSET_CLONE_FIELDS,
     build_clinic_config_clone,
     build_knowledge_document_clone,
+    build_media_asset_clone,
     derive_clone_slug,
     next_clone_name,
+)
+from src.services.media_assets import (
+    MediaStorageCapacityExceeded,
+    MediaStorageGuardError,
+    media_storage_capacity_guard,
 )
 from src.services.trace_service import _is_conversational_trace, _llm_usage_for_stats
 
 router = APIRouter()
 password_router = APIRouter(route_class=PasswordValidationRoute)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
+logger = get_logger(__name__)
 
 # Compatibility export used by dashboard consumers and tests.
 CONFIG_COMPLETENESS_BUCKETS = _CONFIG_COMPLETENESS_BUCKETS
@@ -72,16 +84,85 @@ CONFIG_COMPLETENESS_BUCKETS = _CONFIG_COMPLETENESS_BUCKETS
 _CLONE_AUTHORITY_ERROR = {"error": "clinic_clone_forbidden"}
 _CLONE_SOURCE_ERROR = {"error": "clinic_clone_source_not_found"}
 _CLONE_CONFIG_ERROR = {"error": "clinic_clone_invalid"}
+_CLONE_REQUEST_ERROR = {"error": "clinic_clone_request_invalid"}
+_CLONE_MEDIA_CAP_ERROR = {"error": "clinic_clone_media_storage_cap_exceeded"}
 _CLONE_PERSISTENCE_ERROR = {"error": "clinic_clone_persistence_failed"}
+# A valid clone request is two boolean flags (< 100 bytes); anything above this
+# bound is rejected with the same 422 before it is buffered.
+_CLONE_REQUEST_MAX_BYTES = 1024
+_MEDIA_CLONE_COLUMNS = tuple(
+    getattr(MediaAsset, field) for field in MEDIA_ASSET_CLONE_FIELDS
+)
+_CLONE_REQUEST_BODY_DOC: dict[str, Any] = {
+    "required": False,
+    "description": (
+        "Optional selective clone request. An absent body (zero bytes) or {} clones "
+        "only the configuration. Any JSON present must be this object with boolean "
+        "flags and no other fields; null, scalars, arrays, extra fields and "
+        "non-boolean flags return 422 clinic_clone_request_invalid."
+    ),
+    "content": {
+        "application/json": {"schema": ClinicCloneRequest.model_json_schema()},
+    },
+}
 
 
 class _InvalidCloneConfigError(Exception):
     """Internal marker for redacted clone name/config validation failures."""
 
 
+class _SourceMediaDriftError(Exception):
+    """A share-locked source media row changed; never expected while locked."""
+
+
+class _PersistedClone(NamedTuple):
+    """Flushed clone identity plus the number of copied knowledge documents."""
+
+    id: UUID
+    name: str
+    rag_documents: int
+
+
 def _clone_error(status_code: int, detail: dict[str, str]) -> HTTPException:
     """Build a stable clone error without including internal values."""
     return HTTPException(status_code=status_code, detail=dict(detail))
+
+
+async def _clone_request_body(request: Request) -> ClinicCloneRequest:
+    """Materialize the default request only for a body with zero bytes.
+
+    Typing the body as ``ClinicCloneRequest | None`` would collapse an absent
+    body and JSON ``null`` after parsing, so absence is decided on the raw bytes
+    first. Any JSON present (``null``, scalars, arrays, extra fields, non-boolean
+    flags or malformed JSON) gets the same redacted 422 before any DB access.
+
+    The read is bounded: a declared ``Content-Length`` above
+    ``_CLONE_REQUEST_MAX_BYTES`` is rejected without reading, and a streamed
+    (e.g. chunked) body is abandoned as soon as it exceeds that limit.
+    """
+    invalid_request = _clone_error(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        _CLONE_REQUEST_ERROR,
+    )
+    declared_length = request.headers.get("content-length")
+    if declared_length is not None:
+        try:
+            declared_bytes = int(declared_length)
+        except ValueError:
+            raise invalid_request from None
+        if declared_bytes > _CLONE_REQUEST_MAX_BYTES:
+            raise invalid_request
+    raw_body = bytearray()
+    async for chunk in request.stream():
+        raw_body += chunk
+        if len(raw_body) > _CLONE_REQUEST_MAX_BYTES:
+            raise invalid_request
+    if not raw_body:
+        return ClinicCloneRequest()
+    try:
+        return ClinicCloneRequest.model_validate_json(bytes(raw_body))
+    except ValidationError:
+        raise invalid_request from None
 
 
 async def _rollback_clone_safely(session: AsyncSession) -> None:
@@ -150,12 +231,141 @@ async def _clone_source(
         Tenant.builder_id == builder_id,
     )
     if lock:
-        source_stmt = source_stmt.with_for_update()
+        # The locked read must reflect the locked row even when an earlier
+        # unlocked read already placed the source in the identity map.
+        source_stmt = source_stmt.with_for_update().execution_options(
+            populate_existing=True
+        )
     source_result = await session.execute(source_stmt)
     source = source_result.scalar_one_or_none()
     if source is None:
         raise _clone_error(status.HTTP_404_NOT_FOUND, _CLONE_SOURCE_ERROR)
     return source
+
+
+async def _persist_clone_records(
+    session: AsyncSession,
+    builder: Builder,
+    source: Tenant,
+    *,
+    include_rag: bool,
+) -> _PersistedClone:
+    """Build and flush the inactive tenant, its configuration and selected RAG."""
+    names_result = await session.execute(
+        select(Tenant.name).where(Tenant.builder_id == builder.id)
+    )
+    try:
+        clone_name = next_clone_name(
+            source.name,
+            list(names_result.scalars().all()),
+        )
+    except ValueError as error:
+        raise _InvalidCloneConfigError from error
+
+    config_result = await session.execute(
+        select(ClinicConfigTable).where(ClinicConfigTable.tenant_id == source.id)
+    )
+    source_config = config_result.scalar_one_or_none()
+    if source_config is None:
+        raise _InvalidCloneConfigError
+    try:
+        config_payload = build_clinic_config_clone(source_config, clone_name)
+    except ValueError as error:
+        raise _InvalidCloneConfigError from error
+
+    # Knowledge documents are read only when the caller selected them.
+    source_documents: list[KnowledgeDocument] = []
+    if include_rag:
+        documents_result = await session.execute(
+            select(KnowledgeDocument)
+            .where(KnowledgeDocument.tenant_id == source.id)
+            .order_by(KnowledgeDocument.id)
+        )
+        source_documents = list(documents_result.scalars().all())
+
+    clone_id = uuid4()
+    cloned_documents = [
+        build_knowledge_document_clone(document, clone_id)
+        for document in source_documents
+    ]
+    cloned_tenant = Tenant(
+        id=clone_id,
+        name=clone_name,
+        slug=derive_clone_slug(clone_name, clone_id),
+        api_key_hash=pwd_context.hash(secrets.token_urlsafe(32)),
+        is_active=False,
+        plan_type="clinic",
+        builder_id=builder.id,
+        contact_phone=None,
+        config={},
+    )
+    cloned_config = ClinicConfigTable(
+        id=uuid4(),
+        tenant_id=clone_id,
+        **config_payload,
+    )
+
+    session.add(cloned_tenant)
+    session.add(cloned_config)
+    session.add_all(cloned_documents)
+    await session.flush()
+    return _PersistedClone(clone_id, clone_name, len(cloned_documents))
+
+
+async def _stabilize_source_media(
+    session: AsyncSession,
+    source_id: UUID,
+) -> tuple[tuple[UUID, int], ...]:
+    """Share-lock and return the complete payload-free source media set.
+
+    The whole result is consumed before the cap is validated, so every source
+    row is locked (PATCH/DELETE wait for this transaction) and the exact source
+    total is the sum of these locked sizes.
+    """
+    rows = (
+        await session.execute(
+            select(MediaAsset.id, MediaAsset.size_bytes)
+            .where(MediaAsset.tenant_id == source_id)
+            .order_by(MediaAsset.id)
+            .with_for_update(read=True)
+        )
+    ).all()
+    return tuple((row.id, int(row.size_bytes)) for row in rows)
+
+
+async def _copy_source_media(
+    session: AsyncSession,
+    source_id: UUID,
+    clone_id: UUID,
+    source_media: tuple[tuple[UUID, int], ...],
+) -> int:
+    """Copy the stabilized media set holding at most one payload at a time.
+
+    Every local reference to a row's payload (the fetched row and its copy) is
+    dropped once that copy is flushed and detached, so payload N is released
+    before payload N+1 is fetched.
+    """
+    for media_id, size_bytes in source_media:
+        source_row = (
+            await session.execute(
+                select(*_MEDIA_CLONE_COLUMNS).where(
+                    MediaAsset.id == media_id,
+                    MediaAsset.tenant_id == source_id,
+                )
+            )
+        ).one_or_none()
+        if source_row is None or source_row.size_bytes != size_bytes:
+            raise _SourceMediaDriftError
+        media_clone = build_media_asset_clone(source_row._asdict(), clone_id)
+        del source_row
+        session.add(media_clone)
+        await session.flush()
+        # The inserted row stays in this transaction; detaching the copy and
+        # dropping the last local reference frees its payload before the next
+        # fetch (the identity map alone would not keep it, but the local would).
+        session.expunge(media_clone)
+        del media_clone
+    return len(source_media)
 
 
 # ============================================
@@ -637,8 +847,10 @@ async def create_clinic(
     response_model=ClinicClonePreviewResponse,
     summary="Preview Clinic Clone",
     description=(
-        "Return an advisory generated name and authored knowledge impact for a "
-        "currently Builder-owned source clinic."
+        "Return an advisory generated name plus the knowledge (RAG) and media "
+        "counts/bytes available in a currently Builder-owned source clinic. The "
+        "aggregates describe the whole source, independent of the flags later sent "
+        "to the clone request; content and payloads are never selected."
     ),
     responses={
         status.HTTP_403_FORBIDDEN: {"model": ClinicCloneErrorResponse},
@@ -663,16 +875,35 @@ async def preview_clinic_clone(
     except ValueError:
         raise _clone_error(status.HTTP_409_CONFLICT, _CLONE_CONFIG_ERROR) from None
 
-    documents_result = await session.execute(
-        select(KnowledgeDocument.content).where(
-            KnowledgeDocument.tenant_id == source.id
+    # Separate, explicitly typed and zero-safe aggregates computed by the
+    # database; neither query transfers document content nor media payloads.
+    document_count, total_bytes = (
+        await session.execute(
+            select(
+                cast(func.coalesce(func.count(KnowledgeDocument.id), 0), BigInteger),
+                cast(
+                    func.coalesce(
+                        func.sum(func.octet_length(KnowledgeDocument.content)), 0
+                    ),
+                    BigInteger,
+                ),
+            ).where(KnowledgeDocument.tenant_id == source.id)
         )
-    )
-    contents = list(documents_result.scalars().all())
+    ).one()
+    media_asset_count, media_total_bytes = (
+        await session.execute(
+            select(
+                cast(func.coalesce(func.count(MediaAsset.id), 0), BigInteger),
+                cast(func.coalesce(func.sum(MediaAsset.size_bytes), 0), BigInteger),
+            ).where(MediaAsset.tenant_id == source.id)
+        )
+    ).one()
     return ClinicClonePreviewResponse(
         suggested_name=suggested_name,
-        document_count=len(contents),
-        total_bytes=sum(len(content.encode("utf-8")) for content in contents),
+        document_count=int(document_count),
+        total_bytes=int(total_bytes),
+        media_asset_count=int(media_asset_count),
+        media_total_bytes=int(media_total_bytes),
     )
 
 
@@ -683,77 +914,101 @@ async def preview_clinic_clone(
     summary="Clone Clinic",
     description=(
         "Atomically create an inactive clinic clone after revalidating and locking "
-        "current Builder authority and source ownership."
+        "current Builder authority and source ownership. The allowlisted "
+        "configuration is always copied with API credentials emptied and the "
+        "scheduling link disabled. Knowledge documents and media assets are copied "
+        "only when include_rag/include_media are true: an absent body or {} creates "
+        "a configuration-only clone. Media copies share the owner's 500,000,000-byte "
+        "storage cap with uploads. The response reports the counts actually copied."
     ),
     responses={
         status.HTTP_403_FORBIDDEN: {"model": ClinicCloneErrorResponse},
         status.HTTP_404_NOT_FOUND: {"model": ClinicCloneErrorResponse},
-        status.HTTP_409_CONFLICT: {"model": ClinicCloneErrorResponse},
+        status.HTTP_409_CONFLICT: {
+            "model": ClinicCloneErrorResponse,
+            "description": (
+                "The clone name or configuration is invalid (clinic_clone_invalid) "
+                "or the copied media would exceed the owner's storage cap "
+                "(clinic_clone_media_storage_cap_exceeded). Nothing is created."
+            ),
+        },
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": ClinicCloneErrorResponse,
+            "description": (
+                "A request body is present but is not a strict ClinicCloneRequest "
+                "(clinic_clone_request_invalid). Nothing is created."
+            ),
+        },
         status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": ClinicCloneErrorResponse},
     },
+    openapi_extra={"requestBody": _CLONE_REQUEST_BODY_DOC},
 )
 async def clone_clinic(
     source_id: str,
+    clone_request: ClinicCloneRequest = Depends(_clone_request_body),
     tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> ClinicCloneResponse:
+    copied_media_assets = 0
+    # Guard errors before entry mean the source changed owner or disappeared
+    # (404); any other guard error after entry is an unexpected misuse (500).
+    guard_entered = False
+    # Identifiers only, for the redacted failure warnings below.
+    failure_ids: dict[str, str] = {}
     try:
+        # Single lock order shared with media uploads: User -> Builder -> owner
+        # advisory (media only) -> source Tenant -> source media rows. The
+        # configuration-only and RAG-only branches never enter the media storage
+        # guard and never take its advisory lock.
         builder = await _current_clone_builder(session, tenant, lock=True)
-        source = await _clone_source(session, source_id, builder.id, lock=True)
-
-        names_result = await session.execute(
-            select(Tenant.name).where(Tenant.builder_id == builder.id)
-        )
-        try:
-            clone_name = next_clone_name(
-                source.name,
-                list(names_result.scalars().all()),
+        failure_ids["builder_id"] = str(builder.id)
+        if clone_request.include_media:
+            unlocked_source = await _clone_source(
+                session, source_id, builder.id, lock=False
             )
-        except ValueError as error:
-            raise _InvalidCloneConfigError from error
-
-        config_result = await session.execute(
-            select(ClinicConfigTable).where(ClinicConfigTable.tenant_id == source.id)
-        )
-        source_config = config_result.scalar_one_or_none()
-        if source_config is None:
-            raise _InvalidCloneConfigError
-        try:
-            config_payload = build_clinic_config_clone(source_config, clone_name)
-        except ValueError as error:
-            raise _InvalidCloneConfigError from error
-
-        documents_result = await session.execute(
-            select(KnowledgeDocument).where(KnowledgeDocument.tenant_id == source.id)
-        )
-        source_documents = list(documents_result.scalars().all())
-
-        clone_id = uuid4()
-        cloned_documents = [
-            build_knowledge_document_clone(document, clone_id)
-            for document in source_documents
-        ]
-        cloned_tenant = Tenant(
-            id=clone_id,
-            name=clone_name,
-            slug=derive_clone_slug(clone_name, clone_id),
-            api_key_hash=pwd_context.hash(secrets.token_urlsafe(32)),
-            is_active=False,
-            plan_type="clinic",
-            builder_id=builder.id,
-            contact_phone=None,
-            config={},
-        )
-        cloned_config = ClinicConfigTable(
-            id=uuid4(),
-            tenant_id=clone_id,
-            **config_payload,
-        )
-
-        session.add(cloned_tenant)
-        session.add(cloned_config)
-        session.add_all(cloned_documents)
-        await session.flush()
+            failure_ids["source_tenant_id"] = str(unlocked_source.id)
+            async with media_storage_capacity_guard(
+                session,
+                tenant.user_id,
+                unlocked_source,
+            ) as capacity:
+                guard_entered = True
+                source = await _clone_source(session, source_id, builder.id, lock=True)
+                source_media = await _stabilize_source_media(session, source.id)
+                await capacity.validate_projection(
+                    sum(size_bytes for _, size_bytes in source_media)
+                )
+                persisted = await _persist_clone_records(
+                    session,
+                    builder,
+                    source,
+                    include_rag=clone_request.include_rag,
+                )
+                copied_media_assets = await _copy_source_media(
+                    session,
+                    source.id,
+                    persisted.id,
+                    source_media,
+                )
+        else:
+            source = await _clone_source(session, source_id, builder.id, lock=True)
+            persisted = await _persist_clone_records(
+                session,
+                builder,
+                source,
+                include_rag=clone_request.include_rag,
+            )
+        # Identifiers, the two selection flags and final counts only: never
+        # configuration, content, payloads, filenames, triggers, hashes or secrets.
+        log_fields: dict[str, str | bool | int] = {
+            "builder_id": str(builder.id),
+            "source_tenant_id": str(source.id),
+            "clone_tenant_id": str(persisted.id),
+            "include_rag": clone_request.include_rag,
+            "include_media": clone_request.include_media,
+            "copied_rag_documents": persisted.rag_documents,
+            "copied_media_assets": copied_media_assets,
+        }
         await session.commit()
     except HTTPException:
         await _rollback_clone_safely(session)
@@ -761,6 +1016,32 @@ async def clone_clinic(
     except _InvalidCloneConfigError:
         await _rollback_clone_safely(session)
         raise _clone_error(status.HTTP_409_CONFLICT, _CLONE_CONFIG_ERROR) from None
+    except MediaStorageCapacityExceeded:
+        await _rollback_clone_safely(session)
+        raise _clone_error(status.HTTP_409_CONFLICT, _CLONE_MEDIA_CAP_ERROR) from None
+    except MediaStorageGuardError:
+        await _rollback_clone_safely(session)
+        if not guard_entered:
+            # The source changed owner or disappeared between its resolution and
+            # the guard's row lock: indistinguishable from any other
+            # inaccessible source.
+            raise _clone_error(status.HTTP_404_NOT_FOUND, _CLONE_SOURCE_ERROR) from None
+        logger.warning(
+            "clinic_clone_failed", reason="guard_unexpected_error", **failure_ids
+        )
+        raise _clone_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            _CLONE_PERSISTENCE_ERROR,
+        ) from None
+    except _SourceMediaDriftError:
+        await _rollback_clone_safely(session)
+        logger.warning(
+            "clinic_clone_failed", reason="source_media_drift", **failure_ids
+        )
+        raise _clone_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            _CLONE_PERSISTENCE_ERROR,
+        ) from None
     except SQLAlchemyError:
         await _rollback_clone_safely(session)
         raise _clone_error(
@@ -771,10 +1052,13 @@ async def clone_clinic(
         await _rollback_clone_safely(session)
         raise
 
+    logger.info("clinic_clone_created", **log_fields)
     return ClinicCloneResponse(
-        id=clone_id,
-        name=clone_name,
+        id=persisted.id,
+        name=persisted.name,
         is_active=False,
+        copied_rag_documents=persisted.rag_documents,
+        copied_media_assets=copied_media_assets,
     )
 
 

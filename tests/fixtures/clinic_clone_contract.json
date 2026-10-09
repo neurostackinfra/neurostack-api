@@ -6,17 +6,25 @@
     "body": {
       "suggested_name": "Clínica Ocular cópia 2",
       "document_count": 2,
-      "total_bytes": 31
+      "total_bytes": 31,
+      "media_asset_count": 3,
+      "media_total_bytes": 68
     }
   },
   "success": {
     "method": "POST",
     "path": "/v1/builder/clinics/{source_id}/clone",
     "status": 201,
+    "request": {
+      "include_rag": true,
+      "include_media": true
+    },
     "body": {
       "id": "22222222-2222-4222-8222-22222222222a",
       "name": "Clínica Ocular cópia 2",
-      "is_active": false
+      "is_active": false,
+      "copied_rag_documents": 2,
+      "copied_media_assets": 3
     }
   },
   "errors": {
@@ -41,6 +49,22 @@
       "body": {
         "detail": {
           "error": "clinic_clone_invalid"
+        }
+      }
+    },
+    "409_media_storage_cap": {
+      "status": 409,
+      "body": {
+        "detail": {
+          "error": "clinic_clone_media_storage_cap_exceeded"
+        }
+      }
+    },
+    "422": {
+      "status": 422,
+      "body": {
+        "detail": {
+          "error": "clinic_clone_request_invalid"
         }
       }
     },

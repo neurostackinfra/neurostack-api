@@ -119,24 +119,52 @@ class UpdateClinicAdminEmailRequest(BaseModel):
     email: EmailStr
 
 
+class ClinicCloneRequest(BaseModel):
+    """Optional selective clone request.
+
+    The allowlisted configuration is always cloned, so it has no flag. Both
+    optional sets default to ``False``: an absent body or ``{}`` clones only the
+    configuration.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    include_rag: bool = Field(
+        default=False,
+        description="Copy the source knowledge (RAG) documents.",
+    )
+    include_media: bool = Field(
+        default=False,
+        description="Copy the source media catalog assets.",
+    )
+
+
 class ClinicClonePreviewResponse(BaseModel):
-    """Advisory impact summary for cloning a Builder-owned clinic."""
+    """Advisory impact summary for cloning a Builder-owned clinic.
+
+    The four aggregates describe everything available in the source, not the
+    current selection, so one preview serves every flag combination.
+    """
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
     suggested_name: str
     document_count: int = Field(ge=0)
     total_bytes: int = Field(ge=0)
+    media_asset_count: int = Field(ge=0)
+    media_total_bytes: int = Field(ge=0)
 
 
 class ClinicCloneResponse(BaseModel):
-    """Authoritative identity and inactive state of a persisted clinic clone."""
+    """Authoritative identity, inactive state and copied counts of a clone."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
     id: UUID
     name: str
     is_active: Literal[False]
+    copied_rag_documents: int = Field(ge=0)
+    copied_media_assets: int = Field(ge=0)
 
 
 class ClinicCloneErrorDetail(BaseModel):
@@ -148,6 +176,8 @@ class ClinicCloneErrorDetail(BaseModel):
         "clinic_clone_forbidden",
         "clinic_clone_source_not_found",
         "clinic_clone_invalid",
+        "clinic_clone_request_invalid",
+        "clinic_clone_media_storage_cap_exceeded",
         "clinic_clone_persistence_failed",
     ]
 
