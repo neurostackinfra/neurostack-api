@@ -1631,7 +1631,7 @@ export default function ClinicConfig() {
     } else if (lgpdLinkMode === "custom") {
       if (!lgpdCustomLink.trim()) lgpdValidationErrors.lgpd_custom_link = requiredMsg;
     }
-    if (!builderLgpdConsent) {
+    if (isBuilder && !builderLgpdConsent) {
       lgpdValidationErrors.builder_lgpd_consent = "É necessário confirmar o contrato com a clínica antes de salvar.";
     }
     if (Object.keys(lgpdValidationErrors).length > 0) {
@@ -1803,13 +1803,17 @@ export default function ClinicConfig() {
       clinic_contact: clinicContact.trim() || null,
       dpo_name: dpoName.trim() || null,
       dpo_contact: dpoContact.trim() || null,
-      builder_lgpd_consent: builderLgpdConsent,
-      builder_slm_training: builderSlmTraining,
       language_policy: languagePolicy || null,
       language_policy_custom: languagePolicyCustom.trim() || null,
       agent_language: agentLanguage || "pt-BR",
       meta_minutos_atendimento: parseInt(metaMinutosAtendimento, 10) || 10,
     };
+    if (isBuilder) {
+      Object.assign(payload, {
+        builder_lgpd_consent: builderLgpdConsent,
+        builder_slm_training: builderSlmTraining,
+      });
+    }
     if (canConfigureHandoff) {
       Object.assign(payload, {
         handoff_active: "yes",
@@ -2639,54 +2643,56 @@ export default function ClinicConfig() {
               )}
 
               {/* ── Builder Legal Consents ── */}
-              <div className="space-y-3 rounded-lg border border-slate-700/40 bg-muted/10 p-4">
-                <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-                  Declarações do Builder
-                </p>
-
-                {/* Mandatory: LGPD contract */}
-                <label className={`flex items-start gap-3 cursor-pointer ${isReadOnly ? "opacity-50 pointer-events-none" : ""}`}>
-                  <input
-                    type="checkbox"
-                    checked={builderLgpdConsent}
-                    onChange={e => setBuilderLgpdConsent(e.target.checked)}
-                    className="mt-0.5 h-4 w-4 rounded border-border accent-violet-500"
-                  />
-                  <span className="text-xs text-foreground leading-snug">
-                    <span className="font-semibold text-red-400 mr-1">*</span>
-                    Confirmo que possuo contrato formal com esta clínica e autorização legal para processar os dados
-                    de seus pacientes via inteligência artificial, assumindo a responsabilidade como{" "}
-                    <strong>Operador dos dados</strong> perante a LGPD.
-                  </span>
-                </label>
-                {lgpdErrors.builder_lgpd_consent && (
-                  <p className="text-xs text-destructive flex items-center gap-1.5">
-                    <AlertTriangle className="h-3 w-3" /> {lgpdErrors.builder_lgpd_consent}
+              {isBuilder && (
+                <div className="space-y-3 rounded-lg border border-slate-700/40 bg-muted/10 p-4">
+                  <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    Declarações do Builder
                   </p>
-                )}
 
-                {/* Optional: SLM training */}
-                <label className={`flex items-start gap-3 cursor-pointer ${isReadOnly ? "opacity-50 pointer-events-none" : ""}`}>
-                  <input
-                    type="checkbox"
-                    checked={builderSlmTraining}
-                    onChange={e => setBuilderSlmTraining(e.target.checked)}
-                    className="mt-0.5 h-4 w-4 rounded border-border accent-violet-500"
-                  />
-                  <span className="text-xs text-foreground leading-snug">
-                    Confirmo que o contrato com a clínica autoriza expressamente a anonimização e o uso do histórico
-                    de interações para o treinamento e sintonia fina (fine-tuning) de{" "}
-                    <strong>Modelos de Linguagem Próprios (SLMs)</strong>, visando a especialização do atendimento
-                    e a redução de custos da infraestrutura.
-                  </span>
-                </label>
-                {builderSlmTraining && (
-                  <p className="text-[10px] text-amber-400/80 ml-7 leading-snug">
-                    Ao marcar esta opção, um adendo especial sobre uso de dados anonimizados para IA será exibido
-                    na Política de Privacidade pública da clínica.
-                  </p>
-                )}
-              </div>
+                  {/* Mandatory: LGPD contract */}
+                  <label className={`flex items-start gap-3 cursor-pointer ${isReadOnly ? "opacity-50 pointer-events-none" : ""}`}>
+                    <input
+                      type="checkbox"
+                      checked={builderLgpdConsent}
+                      onChange={e => setBuilderLgpdConsent(e.target.checked)}
+                      className="mt-0.5 h-4 w-4 rounded border-border accent-violet-500"
+                    />
+                    <span className="text-xs text-foreground leading-snug">
+                      <span className="font-semibold text-red-400 mr-1">*</span>
+                      Confirmo que possuo contrato formal com esta clínica e autorização legal para processar os dados
+                      de seus pacientes via inteligência artificial, assumindo a responsabilidade como{" "}
+                      <strong>Operador dos dados</strong> perante a LGPD.
+                    </span>
+                  </label>
+                  {lgpdErrors.builder_lgpd_consent && (
+                    <p className="text-xs text-destructive flex items-center gap-1.5">
+                      <AlertTriangle className="h-3 w-3" /> {lgpdErrors.builder_lgpd_consent}
+                    </p>
+                  )}
+
+                  {/* Optional: SLM training */}
+                  <label className={`flex items-start gap-3 cursor-pointer ${isReadOnly ? "opacity-50 pointer-events-none" : ""}`}>
+                    <input
+                      type="checkbox"
+                      checked={builderSlmTraining}
+                      onChange={e => setBuilderSlmTraining(e.target.checked)}
+                      className="mt-0.5 h-4 w-4 rounded border-border accent-violet-500"
+                    />
+                    <span className="text-xs text-foreground leading-snug">
+                      Confirmo que o contrato com a clínica autoriza expressamente a anonimização e o uso do histórico
+                      de interações para o treinamento e sintonia fina (fine-tuning) de{" "}
+                      <strong>Modelos de Linguagem Próprios (SLMs)</strong>, visando a especialização do atendimento
+                      e a redução de custos da infraestrutura.
+                    </span>
+                  </label>
+                  {builderSlmTraining && (
+                    <p className="text-[10px] text-amber-400/80 ml-7 leading-snug">
+                      Ao marcar esta opção, um adendo especial sobre uso de dados anonimizados para IA será exibido
+                      na Política de Privacidade pública da clínica.
+                    </p>
+                  )}
+                </div>
+              )}
             </CardContent>
           </Card>
         </TabsContent>
