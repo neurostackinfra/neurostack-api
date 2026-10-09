@@ -804,3 +804,119 @@ async def test_raw_multipart_rejects_non_ascii_compatible_charset_before_parsing
     assert response.status_code == 422, response.text
     assert response.json()["detail"]["code"] == "media_multipart_invalid"
     assert session.inserted is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        ("cap", "media_storage_cap_exceeded"),
+        ("guard", "media_storage_conflict"),
+    ],
+)
+async def test_upload_guard_receives_known_size_and_maps_failures_without_insert(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    expected_code: str,
+) -> None:
+    from fastapi import HTTPException
+
+    from src.services.media_assets import (
+        MediaStorageCapacityExceeded,
+        MediaStorageGuardError,
+    )
+
+    payload = b"%PDF-1.7\nknown-size"
+    tenant_id = uuid4()
+    user_id = uuid4()
+    target = Tenant(
+        id=tenant_id,
+        name="Clinic",
+        api_key_hash="hash",
+        is_active=True,
+        plan_type="clinic",
+        config={},
+    )
+    order: list[str] = []
+    guard_arguments: list[tuple[Any, ...]] = []
+
+    class Result:
+        def scalar_one_or_none(self) -> Tenant:
+            return target
+
+    class Session:
+        async def execute(self, statement: Any) -> Result:
+            order.append("classify_target")
+            return Result()
+
+        def add(self, asset: MediaAsset) -> None:
+            raise AssertionError("rejected projection reached insert")
+
+        async def commit(self) -> None:
+            raise AssertionError("rejected projection reached commit")
+
+        async def rollback(self) -> None:
+            order.append("rollback")
+
+    class Guard(AbstractAsyncContextManager[Any]):
+        async def __aenter__(self) -> Any:
+            order.append("guard")
+            return self
+
+        async def validate_projection(self, size: int) -> None:
+            order.append(f"projection:{size}")
+            if failure == "cap":
+                raise MediaStorageCapacityExceeded("over the cap")
+            raise MediaStorageGuardError("owner changed during locking")
+
+        async def __aexit__(self, *args: object) -> None:
+            order.append("guard_exit")
+            return None
+
+    def guard_factory(*args: Any) -> Guard:
+        guard_arguments.append(args)
+        return Guard()
+
+    async def resolve(*args: Any, **kwargs: Any) -> UUID:
+        return tenant_id
+
+    monkeypatch.setattr(route, "resolve_effective_tenant", resolve)
+    monkeypatch.setattr(route, "media_storage_capacity_guard", guard_factory)
+    session = Session()
+    request = _FakeRequest(
+        FormData(
+            [
+                (
+                    "file",
+                    UploadFile(
+                        BytesIO(payload),
+                        filename="contrato.pdf",
+                        headers=Headers({"content-type": "application/pdf"}),
+                    ),
+                ),
+                ("display_name", "Contrato"),
+                ("original_filename", "contrato.pdf"),
+            ]
+        )
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await route.upload_media_asset(
+            request=request,  # type: ignore[arg-type]
+            tenant_id=None,
+            tenant=TenantContext(
+                tenant_id=tenant_id, user_id=user_id, role="clinic_admin"
+            ),
+            session=session,  # type: ignore[arg-type]
+        )
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail == {"code": expected_code}
+    assert guard_arguments == [(session, user_id, target)]
+    assert order == [
+        "classify_target",
+        "guard",
+        f"projection:{len(payload)}",
+        "guard_exit",
+        "rollback",
+    ]

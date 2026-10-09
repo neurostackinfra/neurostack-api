@@ -10,6 +10,7 @@ import sys
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -27,6 +28,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.pool import NullPool
+from starlette.datastructures import FormData, Headers, UploadFile
 from starlette.requests import Request
 from starlette.types import Message
 
@@ -178,7 +180,7 @@ async def postgres_harness() -> AsyncIterator[_Harness]:
         await child_engine.dispose()
         child_engine = None
 
-        await _run_alembic(child_url, "downgrade", "021")
+        await _run_alembic(child_url, "downgrade", "022")
         downgrade_probe = create_async_engine(child_url, poolclass=NullPool)
         try:
             assert not await _table_exists(downgrade_probe)
@@ -1707,3 +1709,342 @@ async def test_media_route_postgres_keyset_patch_download_delete_roundtrip(
     async with postgres_harness.session() as session:
         assert await session.get(MediaAsset, assets[1].id) is None
         assert await session.get(MediaAsset, foreign_asset.id) is not None
+
+
+def _record_statements(
+    engine: AsyncEngine,
+) -> tuple[list[str], list[Any], Any]:
+    statements: list[str] = []
+    parameters: list[Any] = []
+
+    def record_statement(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        statement_parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        statements.append(" ".join(statement.lower().split()))
+        parameters.append(statement_parameters)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", record_statement)
+    return statements, parameters, record_statement
+
+
+def _assert_no_media_query_before_advisory(statements: list[str]) -> int:
+    advisory = next(
+        index
+        for index, statement in enumerate(statements)
+        if "pg_advisory_xact_lock" in statement
+    )
+    assert not any("media_assets" in sql for sql in statements[:advisory])
+    return advisory
+
+
+@pytest.mark.asyncio
+async def test_failure_after_insert_reverts_all_caller_work_and_releases_locks(
+    postgres_harness: _Harness,
+) -> None:
+    graph = await _seed_graph(postgres_harness, source_payloads=())
+    statements, _, listener = _record_statements(postgres_harness.engine)
+    try:
+        async with postgres_harness.session() as session:
+            destination = await session.get(Tenant, graph.destination_tenant_id)
+            assert destination is not None
+            await session.execute(
+                update(Tenant)
+                .where(Tenant.id == graph.source_tenant_id)
+                .values(name="Must roll back")
+            )
+            statements.clear()
+            with pytest.raises(RuntimeError, match="planted"):
+                async with media_storage_capacity_guard(
+                    session,
+                    graph.actor_user_id,
+                    destination,
+                ) as guard:
+                    await guard.validate_projection(4)
+                    session.add(_asset(graph.destination_tenant_id, b"undo"))
+                    await session.flush()
+                    raise RuntimeError("planted failure after insert")
+            assert not session.in_transaction()
+    finally:
+        event.remove(
+            postgres_harness.engine.sync_engine,
+            "before_cursor_execute",
+            listener,
+        )
+
+    advisory = _assert_no_media_query_before_advisory(statements)
+    usage = next(
+        index
+        for index, sql in enumerate(statements)
+        if "sum(media_assets.size_bytes)" in sql
+    )
+    insert = next(
+        index
+        for index, sql in enumerate(statements)
+        if "insert into media_assets" in sql
+    )
+    assert advisory < usage < insert
+    async with postgres_harness.session() as session:
+        assert (
+            await session.scalar(
+                select(func.count(MediaAsset.id)).where(
+                    MediaAsset.tenant_id == graph.destination_tenant_id
+                )
+            )
+        ) == 0
+        source = await session.get(Tenant, graph.source_tenant_id)
+        assert source is not None
+        assert source.name == "Media Source"
+
+
+@pytest.mark.asyncio
+async def test_divergent_owner_reverts_prior_caller_work_without_media_queries(
+    postgres_harness: _Harness,
+) -> None:
+    graph = await _seed_graph(postgres_harness, source_payloads=(b"kept",))
+    statements, _, listener = _record_statements(postgres_harness.engine)
+    try:
+        async with postgres_harness.session() as guarded_session:
+            stale_destination = await guarded_session.get(
+                Tenant,
+                graph.destination_tenant_id,
+            )
+            assert stale_destination is not None
+            async with postgres_harness.session() as mutating_session:
+                await mutating_session.execute(
+                    update(Tenant)
+                    .where(Tenant.id == graph.destination_tenant_id)
+                    .values(builder_id=graph.foreign_builder_id)
+                )
+                await mutating_session.commit()
+            await guarded_session.execute(
+                update(Tenant)
+                .where(Tenant.id == graph.source_tenant_id)
+                .values(name="Must roll back")
+            )
+            statements.clear()
+            with pytest.raises(MediaStorageGuardError, match="owner changed"):
+                async with media_storage_capacity_guard(
+                    guarded_session,
+                    graph.actor_user_id,
+                    stale_destination,
+                ):
+                    raise AssertionError("unreachable")
+            assert not guarded_session.in_transaction()
+    finally:
+        event.remove(
+            postgres_harness.engine.sync_engine,
+            "before_cursor_execute",
+            listener,
+        )
+
+    _assert_no_media_query_before_advisory(statements)
+    assert not any("media_assets" in sql for sql in statements)
+    async with postgres_harness.session() as session:
+        source = await session.get(Tenant, graph.source_tenant_id)
+        assert source is not None
+        assert source.name == "Media Source"
+
+
+class _UploadRequest:
+    """Minimal request surface consumed by the upload route."""
+
+    def __init__(self, payload: bytes, display_name: str) -> None:
+        self.headers = Headers()
+        self.url = SimpleNamespace(path="/v1/media-assets")
+        self._form = FormData(
+            [
+                (
+                    "file",
+                    UploadFile(
+                        BytesIO(payload),
+                        filename="upload.pdf",
+                        headers=Headers({"content-type": "application/pdf"}),
+                    ),
+                ),
+                ("display_name", display_name),
+                ("original_filename", f"{display_name}.pdf"),
+            ]
+        )
+
+    async def form(self, **_kwargs: Any) -> FormData:
+        return self._form
+
+
+def _builder_context(graph: _Graph) -> TenantContext:
+    return TenantContext(
+        graph.auth_tenant_id,
+        user_id=graph.actor_user_id,
+        role="builder",
+        builder_id=graph.builder_id,
+    )
+
+
+async def _upload_through_route(
+    harness: _Harness,
+    graph: _Graph,
+    payload: bytes,
+    display_name: str,
+) -> MediaAsset:
+    async with harness.session() as session:
+        return await media_route.upload_media_asset(
+            request=_UploadRequest(payload, display_name),  # type: ignore[arg-type]
+            tenant_id=graph.destination_tenant_id,
+            tenant=_builder_context(graph),
+            session=session,
+        )
+
+
+@pytest.mark.asyncio
+async def test_upload_route_enters_real_guard_in_canonical_order(
+    postgres_harness: _Harness,
+) -> None:
+    graph = await _seed_graph(postgres_harness, source_payloads=(b"existing",))
+    payload = b"%PDF-1.7\nroute-guard"
+    statements, parameters, listener = _record_statements(postgres_harness.engine)
+    try:
+        asset = await _upload_through_route(
+            postgres_harness,
+            graph,
+            payload,
+            "route-order",
+        )
+    finally:
+        event.remove(
+            postgres_harness.engine.sync_engine,
+            "before_cursor_execute",
+            listener,
+        )
+
+    def statement_index(fragment: str, *, after: int = -1) -> int:
+        return next(
+            index
+            for index, statement in enumerate(statements)
+            if index > after and fragment in statement
+        )
+
+    user_lock = statement_index("for key share")
+    assert "from users" in statements[user_lock]
+    builder_lock = statement_index("from builders", after=user_lock)
+    assert "for update" in statements[builder_lock]
+    advisory = statement_index("pg_advisory_xact_lock", after=builder_lock)
+    assert media_storage_advisory_key(graph.builder_id) in tuple(parameters[advisory])
+    tenant_lock = statement_index("from tenants", after=advisory)
+    assert "for update" in statements[tenant_lock]
+    usage = statement_index("sum(media_assets.size_bytes)", after=tenant_lock)
+    insert = statement_index("insert into media_assets", after=usage)
+    assert user_lock < builder_lock < advisory < tenant_lock < usage < insert
+    _assert_no_media_query_before_advisory(statements)
+    assert sum("sum(media_assets.size_bytes)" in sql for sql in statements) == 1
+
+    assert asset.tenant_id == graph.destination_tenant_id
+    assert asset.size_bytes == len(payload)
+    async with postgres_harness.session() as session:
+        persisted = await session.get(MediaAsset, asset.id)
+        assert persisted is not None
+        assert persisted.payload == payload
+        assert persisted.sha256 == media_payload_sha256(payload)
+        assert persisted.display_name == "route-order"
+
+
+@pytest.mark.asyncio
+async def test_two_route_uploads_serialize_on_cap_without_deadlock(
+    postgres_harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = await _seed_graph(postgres_harness, source_payloads=(b"s" * 60,))
+    monkeypatch.setattr(media_service, "MEDIA_STORAGE_CAP_BYTES", 100)
+    first_validated = asyncio.Event()
+    release_first = asyncio.Event()
+    guard_calls = 0
+    real_guard = media_route.media_storage_capacity_guard
+
+    class _HoldFirstGuard:
+        def __init__(self, inner: Any, hold: bool) -> None:
+            self._inner = inner
+            self._hold = hold
+
+        async def __aenter__(self) -> _HoldFirstGuard:
+            await self._inner.__aenter__()
+            return self
+
+        async def validate_projection(self, additional_bytes: int) -> Any:
+            projection = await self._inner.validate_projection(additional_bytes)
+            if self._hold:
+                first_validated.set()
+                await release_first.wait()
+            return projection
+
+        async def __aexit__(self, *exc_info: Any) -> bool:
+            return bool(await self._inner.__aexit__(*exc_info))
+
+    def hold_first_guard(*args: Any, **kwargs: Any) -> _HoldFirstGuard:
+        nonlocal guard_calls
+        guard_calls += 1
+        return _HoldFirstGuard(real_guard(*args, **kwargs), hold=guard_calls == 1)
+
+    monkeypatch.setattr(media_route, "media_storage_capacity_guard", hold_first_guard)
+
+    async def upload(display_name: str) -> str:
+        try:
+            await _upload_through_route(
+                postgres_harness,
+                graph,
+                b"%PDF-1.7\n" + b"u" * 21,
+                display_name,
+            )
+        except HTTPException as error:
+            return str(getattr(error, "detail")["code"])
+        return "created"
+
+    first_task = asyncio.create_task(upload("first"))
+    second_task: asyncio.Task[str] | None = None
+    try:
+        await asyncio.wait_for(first_validated.wait(), timeout=_TASK_TIMEOUT_SECONDS)
+        second_task = asyncio.create_task(upload("second"))
+        await asyncio.sleep(0.2)
+        assert not second_task.done()
+        release_first.set()
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(first_task, second_task),
+            timeout=_TASK_TIMEOUT_SECONDS,
+        )
+    finally:
+        # On an early failure never leave the first upload parked on the event
+        # (holding its guard locks) or either task running past the test.
+        release_first.set()
+        leftover = [
+            task
+            for task in (first_task, second_task)
+            if task is not None and not task.done()
+        ]
+        for task in leftover:
+            task.cancel()
+        await asyncio.gather(*leftover, return_exceptions=True)
+
+    assert outcomes == ["created", "media_storage_cap_exceeded"]
+    async with postgres_harness.session() as session:
+        names = (
+            (
+                await session.execute(
+                    select(MediaAsset.display_name).where(
+                        MediaAsset.tenant_id == graph.destination_tenant_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert names == ["first"]
+        owner_total = await session.scalar(
+            select(func.sum(MediaAsset.size_bytes))
+            .select_from(MediaAsset)
+            .join(Tenant, Tenant.id == MediaAsset.tenant_id)
+            .where(Tenant.builder_id == graph.builder_id)
+        )
+        assert owner_total == 90
+        assert owner_total <= 100
