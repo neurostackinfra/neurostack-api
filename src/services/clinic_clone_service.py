@@ -38,7 +38,6 @@ _BUCKET_FIELDS: dict[str, tuple[str, ...]] = {
     "handoff": (
         "default_mode",
         "sector_defaults",
-        "meta_minutos_atendimento",
         "handoff_active",
         "standby_mode",
         "handoff_period",
@@ -156,6 +155,11 @@ def build_clinic_config_clone(
         }
     )
     payload = validated.model_dump(mode="json", exclude={"clinic_id"})
+
+    # This tenant-local SLA target is intentionally not cloneable.  Validation
+    # materializes the model default even when it was absent from the allowlist,
+    # so remove it from the persistence payload explicitly.
+    payload["handoff"].pop("meta_minutos_atendimento", None)
 
     # Dedicated integration state is assigned independently from the source payload.
     payload["api_credentials"] = {}

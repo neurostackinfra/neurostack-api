@@ -112,18 +112,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  const applyToken = useCallback((token: string, email: string, clinicId: string, role = "clinic_admin") => {
+  const applyToken = useCallback((token: string, email: string, clinicId: string, role?: string) => {
     // Decode JWT to extract additional fields
     let tenantId: string | null = null;
     let userId: string | null = null;
     let builderId: string | null = null;
+    let resolvedRole: string | null = role ?? null;
     try {
       const decoded = jwtDecode<JwtPayload>(token);
       tenantId = decoded.tenant_id ?? null;
       userId = decoded.user_id ?? decoded.sub ?? null;
       builderId = decoded.builder_id ?? null;
       if (!email && decoded.email) email = decoded.email;
-      if (!role && decoded.role) role = decoded.role;
+      if (resolvedRole === null && decoded.role) resolvedRole = decoded.role;
       if (!clinicId && decoded.clinic_id) clinicId = decoded.clinic_id;
     } catch {
       // JWT decode failed — proceed with provided values
@@ -136,7 +137,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       tenantId,
       userId,
       builderId,
-      role,
+      role: resolvedRole,
       viewingClinicId: clinicId,
       leadSubmitted: false,
     };
@@ -157,11 +158,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
 
     const data = (await resp.json()) as LoginResponse;
-    applyToken(data.token, data.email, data.clinic_id, data.role ?? "clinic_admin");
+    applyToken(data.token, data.email, data.clinic_id, data.role);
   }, [applyToken]);
 
   // loginWithToken — for direct token-based login (backward compat)
-  const loginWithToken = useCallback((token: string, email: string, clinicId: string, role = "clinic_admin") => {
+  const loginWithToken = useCallback((token: string, email: string, clinicId: string, role?: string) => {
     applyToken(token, email, clinicId, role);
   }, [applyToken]);
 
@@ -186,7 +187,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
-  const role         = state.role ?? "clinic_admin";
+  const role         = state.role ?? "";
   const isSuperAdmin = role === "super_admin";
   const isInvestor   = role === "investor";
   const isBuilder    = role === "builder";

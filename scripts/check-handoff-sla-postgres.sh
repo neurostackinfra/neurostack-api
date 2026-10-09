@@ -3,6 +3,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SMOKE_NODE="tests/integration/test_handoff_sla_postgres.py::test_handoff_sla_postgres_smoke"
+CLONE_NODE="tests/integration/test_builder_cloning_postgres.py::test_builder_clone_omits_sla_target_and_preserves_runtime_snapshots"
 
 if [ -z "${POSTGRES_SMOKE_DATABASE_URL:-}" ]; then
     echo "POSTGRES_SMOKE_DATABASE_URL is required for the handoff SLA PostgreSQL gate" >&2
@@ -21,7 +22,7 @@ trap 'cleanup; exit 130' HUP INT TERM
 set +e
 (
     cd "$ROOT" &&
-        poetry run pytest "$SMOKE_NODE" -q -rs
+        poetry run pytest "$SMOKE_NODE" "$CLONE_NODE" -q -rs
 ) 2>&1 | tee "$transcript"
 pipeline_status=("${PIPESTATUS[@]}")
 set -e
@@ -39,12 +40,12 @@ if grep -Eiq '(^|[ ,=])[1-9][0-9]* (failed|errors?|skipped|xfailed|xpassed)\b' "
     exit 1
 fi
 summary_count="$(
-    grep -Ec '^[= ]*1 passed(, [0-9]+ warnings?)? in [0-9]+([.][0-9]+)?s[= ]*$' \
+    grep -Ec '^[= ]*2 passed(, [0-9]+ warnings?)? in [0-9]+([.][0-9]+)?s[= ]*$' \
         "$transcript" || true
 )"
 if [ "$summary_count" -ne 1 ]; then
-    echo "handoff SLA PostgreSQL smoke lacks one complete 1-passed summary" >&2
+    echo "handoff SLA PostgreSQL smoke lacks one complete 2-passed summary" >&2
     exit 1
 fi
 
-echo "handoff SLA PostgreSQL smoke evidence valid (1 passed, 0 skipped/xfail)"
+echo "handoff SLA PostgreSQL smoke evidence valid (2 passed, 0 skipped/xfail)"

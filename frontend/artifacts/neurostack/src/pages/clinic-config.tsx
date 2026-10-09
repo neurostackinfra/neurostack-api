@@ -1806,8 +1806,10 @@ export default function ClinicConfig() {
       language_policy: languagePolicy || null,
       language_policy_custom: languagePolicyCustom.trim() || null,
       agent_language: agentLanguage || "pt-BR",
-      meta_minutos_atendimento: parseInt(metaMinutosAtendimento, 10) || 10,
     };
+    if (isClinicAdmin) {
+      payload.meta_minutos_atendimento = parseInt(metaMinutosAtendimento, 10) || 10;
+    }
     if (isBuilder) {
       Object.assign(payload, {
         builder_lgpd_consent: builderLgpdConsent,
@@ -2239,22 +2241,24 @@ export default function ClinicConfig() {
                 </CompactHoursCard>
               </Field>
 
-              <Field
-                label={t("handoff_meta_minutos_label")}
-                hint={t("handoff_meta_minutos_hint")}
-              >
-                <Input
-                  type="number"
-                  min={1}
-                  max={120}
-                  value={metaMinutosAtendimento}
-                  onChange={(e) => setMetaMinutosAtendimento(e.target.value)}
-                  placeholder="10"
-                  className="w-32 text-sm"
-                  disabled={isReadOnly}
-                  data-testid="input-meta-minutos-atendimento"
-                />
-              </Field>
+              {isClinicAdmin && (
+                <Field
+                  label={t("handoff_meta_minutos_label")}
+                  hint={t("handoff_meta_minutos_hint")}
+                >
+                  <Input
+                    type="number"
+                    min={1}
+                    max={120}
+                    value={metaMinutosAtendimento}
+                    onChange={(e) => setMetaMinutosAtendimento(e.target.value)}
+                    placeholder="10"
+                    className="w-32 text-sm"
+                    disabled={isReadOnly}
+                    data-testid="input-meta-minutos-atendimento"
+                  />
+                </Field>
+              )}
 
               {/* Scheduling link (stopgap pré-ERP) */}
               <SwitchRow

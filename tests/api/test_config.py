@@ -28,16 +28,22 @@ from src.services.config_service import (
 PATH = "/v1/config"
 
 
-def _headers() -> dict[str, str]:
+def _headers(
+    role: str | None = "clinic_admin",
+    *,
+    tenant_id: Any | None = None,
+) -> dict[str, str]:
     now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(uuid4()),
+        "tenant_id": str(tenant_id or uuid4()),
+        "iat": now,
+        "exp": now + timedelta(hours=1),
+    }
+    if role is not None:
+        payload["role"] = role
     token = jwt.encode(
-        {
-            "sub": str(uuid4()),
-            "tenant_id": str(uuid4()),
-            "role": "clinic_admin",
-            "iat": now,
-            "exp": now + timedelta(hours=1),
-        },
+        payload,
         settings.secret_key,
         algorithm="HS256",
     )
@@ -149,6 +155,164 @@ def test_patch_persists_valid_handoff_service_time(
     assert patched.json()["meta_minutos_atendimento"] == value
     assert loaded.status_code == 200, loaded.text
     assert loaded.json()["meta_minutos_atendimento"] == value
+
+
+@pytest.mark.parametrize(
+    "role",
+    ["builder", "super_admin", "investor", None, "future_role"],
+    ids=["builder", "super-admin", "investor", "missing", "unknown"],
+)
+def test_non_clinic_jwt_cannot_read_or_write_handoff_service_time(
+    client: TestClient,
+    role: str | None,
+) -> None:
+    tenant_id = uuid4()
+    clinic_headers = _headers(tenant_id=tenant_id)
+    restricted_headers = _headers(role, tenant_id=tenant_id)
+
+    saved = client.patch(
+        PATH,
+        headers=clinic_headers,
+        json={"meta_minutos_atendimento": 37},
+    )
+    assert saved.status_code == 200, saved.text
+
+    loaded = client.get(PATH, headers=restricted_headers)
+    rejected = client.patch(
+        PATH,
+        headers=restricted_headers,
+        json={"meta_minutos_atendimento": 38},
+    )
+
+    assert loaded.status_code == 200, loaded.text
+    assert "meta_minutos_atendimento" not in loaded.json()
+    assert rejected.status_code == 403
+    assert rejected.json() == {
+        "detail": {
+            "error": "clinic_admin_only_field",
+            "field": "meta_minutos_atendimento",
+        }
+    }
+
+
+def test_api_key_cannot_read_or_write_handoff_service_time(
+    client: TestClient,
+) -> None:
+    tenant_id = "a0000000-0000-0000-0000-000000000001"
+    saved = client.patch(
+        PATH,
+        headers=_headers(tenant_id=tenant_id),
+        json={"meta_minutos_atendimento": 41},
+    )
+    assert saved.status_code == 200, saved.text
+
+    api_key_headers = {"X-API-Key": "test-api-key"}
+    loaded = client.get(PATH, headers=api_key_headers)
+    rejected = client.patch(
+        PATH,
+        headers=api_key_headers,
+        json={"meta_minutos_atendimento": 42},
+    )
+
+    assert loaded.status_code == 200, loaded.text
+    assert "meta_minutos_atendimento" not in loaded.json()
+    assert rejected.status_code == 403
+    assert rejected.json() == {
+        "detail": {
+            "error": "clinic_admin_only_field",
+            "field": "meta_minutos_atendimento",
+        }
+    }
+
+
+def test_valid_restricted_field_rejection_precedes_every_downstream_boundary(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def unexpected_credentials(*args: Any, **kwargs: Any) -> list[str]:
+        calls.append("credentials")
+        return ["llm_api_key"]
+
+    async def unexpected_resolution(*args: Any, **kwargs: Any) -> Any:
+        calls.append("resolve")
+        raise AssertionError("restricted field must fail before tenant resolution")
+
+    async def unexpected_load(*args: Any, **kwargs: Any) -> Any:
+        calls.append("load")
+        raise AssertionError("restricted field must fail before config load")
+
+    async def unexpected_cache(*args: Any, **kwargs: Any) -> None:
+        calls.append("cache")
+
+    monkeypatch.setattr(
+        "src.api.routes.config.credential_boundary_fields",
+        unexpected_credentials,
+    )
+    monkeypatch.setattr(
+        "src.api.routes.config._resolve_config_tenant",
+        unexpected_resolution,
+    )
+    monkeypatch.setattr("src.api.routes.config._load_config", unexpected_load)
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache",
+        unexpected_cache,
+    )
+
+    response = client.patch(
+        f"{PATH}?tenant_id={uuid4()}",
+        headers=_headers("builder"),
+        json={"meta_minutos_atendimento": 15, "llm_api_key": "secret"},
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {
+        "detail": {
+            "error": "clinic_admin_only_field",
+            "field": "meta_minutos_atendimento",
+        }
+    }
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param(_headers("builder"), id="builder"),
+        pytest.param(_headers("super_admin"), id="super-admin"),
+        pytest.param(_headers("investor"), id="investor"),
+        pytest.param(_headers(None), id="missing-role"),
+        pytest.param(_headers("future_role"), id="unknown-role"),
+        pytest.param({"X-API-Key": "test-api-key"}, id="api-key"),
+    ],
+)
+def test_non_clinic_identities_can_save_other_config_fields(
+    client: TestClient,
+    headers: dict[str, str],
+) -> None:
+    response = client.patch(PATH, headers=headers, json={"clinic_name": "Allowed"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["clinic_name"] == "Allowed"
+    assert "meta_minutos_atendimento" not in response.json()
+
+
+@pytest.mark.parametrize(
+    "role", ["builder", "super_admin", "investor", None, "future_role"]
+)
+def test_invalid_restricted_field_keeps_fastapi_422_for_non_clinic_jwt(
+    client: TestClient,
+    role: str | None,
+) -> None:
+    response = client.patch(
+        PATH,
+        headers=_headers(role),
+        json={"meta_minutos_atendimento": 0},
+    )
+
+    assert response.status_code == 422
+    assert isinstance(response.json()["detail"], list)
 
 
 @pytest.mark.asyncio
@@ -1186,6 +1350,26 @@ def test_handoff_openapi_contract_documents_canonical_fields_without_nullable_en
         "type": "integer",
     }
     assert ConfigPatchRequest().model_dump(exclude_unset=True) == {}
+
+
+def test_openapi_documents_clinic_admin_only_sla_without_tenant_examples(
+    client: TestClient,
+) -> None:
+    document = client.get("/openapi.json").json()
+    patch_operation = document["paths"][PATH]["patch"]
+    description = patch_operation["description"]
+    schema = ConfigPatchRequest.model_json_schema()["properties"][
+        "meta_minutos_atendimento"
+    ]
+
+    assert "human JWT" in description
+    assert "exactly `clinic_admin`" in description
+    assert "API keys remain accepted for other allowed" in description
+    assert schema["type"] == "integer"
+    assert schema["minimum"] == 1
+    assert schema["maximum"] == 120
+    assert "examples" not in schema
+    assert "example" not in schema
 
 
 @pytest.mark.asyncio

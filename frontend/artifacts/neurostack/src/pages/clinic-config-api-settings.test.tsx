@@ -1256,11 +1256,11 @@ describe("<ApiCredentialsForm /> card states", () => {
 describe("<ClinicConfig /> operations tab — business-hours UI surface", () => {
   const originalFetch = globalThis.fetch;
 
-  function mountAsRole(role: "clinic_admin" | "builder", viewingClinicId: string) {
+  function mountAsRole(role: string | undefined, viewingClinicId: string) {
     const payload = btoa(JSON.stringify({
       sub: `${role}-user`,
       clinic_id: viewingClinicId,
-      role,
+      ...(role === undefined ? {} : { role }),
       exp: 9999999999,
     }));
     localStorage.setItem("ns_locale", "en");
@@ -1314,6 +1314,7 @@ describe("<ClinicConfig /> operations tab — business-hours UI surface", () => 
     // Removed opt-in toggle — the SwitchRow's copy is unique to that control.
     expect(screen.queryByText(/Métrica de atendimentos fora do horário/)).toBeNull();
     expect(screen.queryByText(/Ativar métrica de atendimentos fora do horário/)).toBeNull();
+    expect(screen.queryByTestId("input-meta-minutos-atendimento")).toBeNull();
 
     // Confirm the operations tab actually rendered by locating the sibling
     // "Horário do Setor de Agendamento" field that must remain untouched.
@@ -1428,20 +1429,31 @@ describe("<ClinicConfig /> operations tab — business-hours UI surface", () => 
     expect(typeof body.meta_minutos_atendimento).toBe("number");
   });
 
-  it("renders one service-goal input in Operation and none after an all-tabs role opens Handoff", async () => {
-    mountAsRole("builder", "clinic-builder");
-    globalThis.fetch = vi.fn().mockResolvedValue(response(editableConfig)) as unknown as typeof fetch;
+  it.each([
+    ["builder", "clinic-builder"],
+    ["super_admin", "clinic-super"],
+    ["future_role", "clinic-future"],
+    [undefined, "clinic-missing"],
+  ] as const)("hides and omits the service goal for non-clinic role %s", async (
+    role,
+    target,
+  ) => {
+    mountAsRole(role, target);
+    const fetchMock = vi.fn().mockResolvedValue(response(editableConfig));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
 
     render(<PageWrapper><ClinicConfig /></PageWrapper>);
 
-    await screen.findByTestId("input-meta-minutos-atendimento");
-    expect(screen.getAllByTestId("input-meta-minutos-atendimento")).toHaveLength(1);
-    cleanup();
-    window.history.replaceState({}, "", "/config?tab=handoff");
-    render(<PageWrapper><ClinicConfig /></PageWrapper>);
-    await waitFor(() => expect(screen.getByRole("tab", { name: "Handoff" }))
-      .toHaveAttribute("aria-selected", "true"));
-    expect(within(screen.getByRole("tabpanel")).queryByTestId("input-meta-minutos-atendimento"))
-      .not.toBeInTheDocument();
+    await screen.findByText("Scheduling Link");
+    expect(screen.queryByTestId("input-meta-minutos-atendimento")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("btn-save-config"));
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(true);
+    });
+    const patch = fetchMock.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const body = JSON.parse(String(patch?.[1]?.body));
+    expect(body.clinic_name).toBe("Clinic");
+    expect(body).not.toHaveProperty("meta_minutos_atendimento");
   });
 });

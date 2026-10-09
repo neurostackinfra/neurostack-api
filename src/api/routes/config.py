@@ -67,6 +67,25 @@ _HANDOFF_POLICY_FIELDS = (
     "handoff_cycle_days",
 )
 _HANDOFF_POLICY_FIELD_SET = frozenset(_HANDOFF_POLICY_FIELDS)
+_CLINIC_ADMIN_ONLY_FIELD = "meta_minutos_atendimento"
+
+
+def _can_access_clinic_admin_only_fields(tenant: TenantContext) -> bool:
+    """Return whether the caller is a human clinic-admin JWT identity."""
+
+    return (
+        tenant.role == "clinic_admin"
+        and tenant.user_id is not None
+        and not tenant.api_key
+    )
+
+
+def _project_config(flat: dict[str, Any], tenant: TenantContext) -> ConfigResponse:
+    """Apply caller-specific visibility before response-model serialization."""
+
+    if not _can_access_clinic_admin_only_fields(tenant):
+        flat.pop(_CLINIC_ADMIN_ONLY_FIELD, None)
+    return ConfigResponse(**flat)
 
 
 def _add_effective_reactivation_fields(
@@ -564,7 +583,7 @@ async def get_config(
         if not flat.get("clinic_name"):
             flat["clinic_name"] = t_row[0]
         flat["bot_active"] = t_row[1] if t_row[1] is not None else True
-    return ConfigResponse(**flat)
+    return _project_config(flat, tenant)
 
 
 @router.patch(
@@ -613,7 +632,10 @@ async def toggle_bot_active(
     summary="Update Clinic Configuration",
     description=(
         "Partial update — send only the fields you want to change. "
-        "Each field is routed to its correct JSONB bucket and merged."
+        "Each field is routed to its correct JSONB bucket and merged. "
+        "Reading or writing `meta_minutos_atendimento` is exclusive to a human "
+        "JWT identity whose role is exactly `clinic_admin`. API keys remain "
+        "accepted for other allowed configuration fields."
     ),
     tags=["Config"],
 )
@@ -625,6 +647,17 @@ async def patch_config(
 ) -> ConfigResponse:
     """Apply a partial update and return the full flat config."""
     patch_data = body.model_dump(exclude_unset=True)
+    if (
+        _CLINIC_ADMIN_ONLY_FIELD in patch_data
+        and not _can_access_clinic_admin_only_fields(tenant)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "clinic_admin_only_field",
+                "field": _CLINIC_ADMIN_ONLY_FIELD,
+            },
+        )
     blocked_fields = credential_boundary_fields(patch_data)
     if blocked_fields:
         raise HTTPException(
@@ -734,7 +767,7 @@ async def patch_config(
 
     flat = flatten_config(row)
     _add_effective_reactivation_fields(flat, row)
-    return ConfigResponse(**flat)
+    return _project_config(flat, tenant)
 
 
 # ============================================
