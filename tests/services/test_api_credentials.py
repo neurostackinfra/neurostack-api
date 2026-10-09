@@ -1390,7 +1390,7 @@ def test_stt_incumbent_can_leave_only_with_fresh_fixed_bundle(
     ids=["empty", "other_provider", "explicit_new_provider"],
 )
 def test_stt_non_incumbents_can_enter_active_fixed_provider(
-    existing: dict[str, str]
+    existing: dict[str, str],
 ) -> None:
     patch = {
         "stt_provider": "openrouter",
@@ -1420,7 +1420,7 @@ def test_stt_non_incumbents_can_enter_active_fixed_provider(
     ],
 )
 def test_every_single_effective_stt_field_is_an_eligible_incumbent(
-    existing: dict[str, str]
+    existing: dict[str, str],
 ) -> None:
     patch = {
         "stt_provider": "elevenlabs_scribe",

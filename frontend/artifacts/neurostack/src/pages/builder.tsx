@@ -26,6 +26,14 @@ import {
   PlanUsageSummary,
   type BillingUsage,
 } from "@/components/plan-usage-summary";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  buildCloneRequest,
+  cloneSelectionEquals,
+  isCloneConsentValid,
+  type CloneErrorCode,
+  type CloneSelection,
+} from "@/pages/clinic-clone-selection";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -102,16 +110,21 @@ interface BuilderProfile {
   support_email: string | null;
 }
 
+// Advisory: describes everything available at the source, not the selection.
 interface ClinicClonePreview {
   suggested_name: string;
   document_count: number;
   total_bytes: number;
+  media_asset_count: number;
+  media_total_bytes: number;
 }
 
 interface ClinicCloneResult {
   id: string;
   name: string;
   is_active: false;
+  copied_rag_documents: number;
+  copied_media_assets: number;
 }
 
 // ── API helpers ───────────────────────────────────────────────────────────────
@@ -294,17 +307,27 @@ export default function BuilderPanel() {
   const [savingSupportEmail, setSavingSupportEmail] = useState(false);
 
   // Clone clinic state
-  const [cloneSourceId, setCloneSourceId] = useState("");
+  const [cloneSelection, setCloneSelection] = useState<CloneSelection>({
+    sourceId: "",
+    includeRag: false,
+    includeMedia: false,
+  });
   const [clonePreview, setClonePreview] = useState<ClinicClonePreview | null>(null);
   const [clonePreviewLoading, setClonePreviewLoading] = useState(false);
   const [clonePreviewError, setClonePreviewError] = useState<string | null>(null);
-  const [cloneConfirmed, setCloneConfirmed] = useState(false);
+  // Snapshot of the selection the user acknowledged; validity is derived below.
+  const [cloneConsent, setCloneConsent] = useState<CloneSelection | null>(null);
   const [cloning, setCloning] = useState(false);
   const [cloneError, setCloneError] = useState<string | null>(null);
   const [cloneResult, setCloneResult] = useState<ClinicCloneResult | null>(null);
   const [cloneRefreshWarning, setCloneRefreshWarning] = useState(false);
   const clonePreviewRequestRef = useRef(0);
   const cloneRequestInFlightRef = useRef(false);
+  const cloneSourceId = cloneSelection.sourceId;
+  const cloneConsentValid = isCloneConsentValid(cloneConsent, cloneSelection);
+  const cloneNumberLocale = locale === "pt" ? "pt-BR" : "en-US";
+  const formatCloneCount = (value: number) => value.toLocaleString(cloneNumberLocale);
+  const formatCloneBytes = (value: number) => `${value.toLocaleString(cloneNumberLocale)} B`;
 
   // Expandable clinic state
   const [expandedClinicId, setExpandedClinicId] = useState<string | null>(null);
@@ -461,10 +484,14 @@ export default function BuilderPanel() {
     }
   }
 
-  function cloneErrorMessage(status: number): string {
+  function cloneErrorMessage(status: number, code: CloneErrorCode | undefined): string {
     if (status === 403) return t("builder_clone_error_403");
     if (status === 404) return t("builder_clone_error_404");
+    if (status === 409 && code === "clinic_clone_media_storage_cap_exceeded") {
+      return t("builder_clone_error_media_storage_cap");
+    }
     if (status === 409) return t("builder_clone_error_409");
+    if (status === 422) return t("builder_clone_error_request_invalid");
     if (status === 500) return t("builder_clone_error_500");
     return t("builder_clone_error_network");
   }
@@ -477,12 +504,21 @@ export default function BuilderPanel() {
     return t("builder_clone_preview_error_network");
   }
 
+  // Single write path for the selection. Consent validity is derived from the
+  // stored snapshot; discarding a snapshot that no longer matches only keeps an
+  // old acknowledgement from reappearing if the user toggles back. A clone
+  // error describes the previous selection, so it is cleared on any change.
+  function updateCloneSelection(next: CloneSelection) {
+    setCloneSelection(next);
+    setCloneError(null);
+    setCloneConsent((consent) => (consent && cloneSelectionEquals(consent, next) ? consent : null));
+  }
+
   async function handleCloneSourceChange(sourceId: string) {
     const requestId = ++clonePreviewRequestRef.current;
-    setCloneSourceId(sourceId);
+    updateCloneSelection({ sourceId, includeRag: false, includeMedia: false });
     setClonePreview(null);
     setClonePreviewError(null);
-    setCloneConfirmed(false);
     setCloneError(null);
     setCloneResult(null);
     setCloneRefreshWarning(false);
@@ -547,7 +583,7 @@ export default function BuilderPanel() {
       cloneRequestInFlightRef.current
       || !cloneSourceId
       || !clonePreview
-      || !cloneConfirmed
+      || !cloneConsentValid
     ) return;
 
     cloneRequestInFlightRef.current = true;
@@ -555,18 +591,23 @@ export default function BuilderPanel() {
     setCloneError(null);
     setCloneRefreshWarning(false);
     try {
-      const response = await fetch(`/v1/builder/clinics/${cloneSourceId}/clone`, {
+      // The request always derives from the current selection, never from the
+      // stored consent snapshot or the advisory preview.
+      const response = await fetch(`/v1/builder/clinics/${cloneSelection.sourceId}/clone`, {
         method: "POST",
         headers: authHeaders(token),
+        body: JSON.stringify(buildCloneRequest(cloneSelection)),
       });
       if (!response.ok) {
-        setCloneError(cloneErrorMessage(response.status));
+        const errorBody = await response.json().catch(() => null) as
+          { detail?: { error?: CloneErrorCode } } | null;
+        setCloneError(cloneErrorMessage(response.status, errorBody?.detail?.error));
         return;
       }
       const result = await response.json() as ClinicCloneResult;
       setCloneResult(result);
       setClonePreview(null);
-      setCloneConfirmed(false);
+      setCloneConsent(null);
       try {
         setCloneRefreshWarning(!(await refreshCloneLists()));
       } catch (refreshError) {
@@ -1406,6 +1447,16 @@ export default function BuilderPanel() {
                           <p className="text-sm text-muted-foreground">{t("builder_clone_success_desc")}</p>
                           <p className="pt-2 font-medium text-foreground">{cloneResult.name}</p>
                           <p className="break-all text-xs text-muted-foreground">ID: {cloneResult.id}</p>
+                          <dl className="grid grid-cols-2 gap-3 pt-2 text-sm">
+                            <div>
+                              <dt className="text-xs text-muted-foreground">{t("builder_clone_success_copied_rag")}</dt>
+                              <dd className="font-semibold">{formatCloneCount(cloneResult.copied_rag_documents)}</dd>
+                            </div>
+                            <div>
+                              <dt className="text-xs text-muted-foreground">{t("builder_clone_success_copied_media")}</dt>
+                              <dd className="font-semibold">{formatCloneCount(cloneResult.copied_media_assets)}</dd>
+                            </div>
+                          </dl>
                           <p className="text-xs font-medium text-slate-400">{t("builder_clone_inactive")}</p>
                         </div>
                       </div>
@@ -1457,7 +1508,7 @@ export default function BuilderPanel() {
                     )}
 
                     {clonePreview && (
-                      <div className="space-y-5" aria-live="polite">
+                      <div className="space-y-5">
                         <div className="rounded-lg border border-border bg-muted/20 p-4 space-y-3">
                           <h2 className="font-semibold text-foreground">{t("builder_clone_preview_title")}</h2>
                           <div>
@@ -1465,31 +1516,148 @@ export default function BuilderPanel() {
                             <p className="font-medium">{clonePreview.suggested_name}</p>
                             <p className="mt-1 text-xs text-muted-foreground">{t("builder_clone_advisory_note")}</p>
                           </div>
-                          <dl className="grid grid-cols-2 gap-3 text-sm">
-                            <div>
-                              <dt className="text-xs text-muted-foreground">{t("builder_clone_rag_documents")}</dt>
-                              <dd className="font-semibold">{clonePreview.document_count.toLocaleString(locale === "pt" ? "pt-BR" : "en-US")}</dd>
-                            </div>
-                            <div>
-                              <dt className="text-xs text-muted-foreground">{t("builder_clone_rag_bytes")}</dt>
-                              <dd className="font-semibold">{clonePreview.total_bytes.toLocaleString(locale === "pt" ? "pt-BR" : "en-US")} B</dd>
-                            </div>
-                          </dl>
-                          <p className="text-xs text-amber-400">{t("builder_clone_rag_impact")}</p>
                         </div>
 
-                        <div className="grid gap-3 md:grid-cols-2">
-                          <section className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4" aria-labelledby="clone-included-title">
-                            <h2 id="clone-included-title" className="font-semibold text-emerald-400">{t("builder_clone_included_title")}</h2>
-                            <p className="mt-2 text-sm text-muted-foreground">{t("builder_clone_included_copy")}</p>
-                          </section>
-                          <section className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-4" aria-labelledby="clone-excluded-title">
-                            <h2 id="clone-excluded-title" className="font-semibold text-amber-400">{t("builder_clone_excluded_title")}</h2>
+                        <fieldset className="space-y-3 rounded-lg border border-border p-4">
+                          <legend className="px-1 font-semibold text-foreground">{t("builder_clone_items_title")}</legend>
+                          {/* Configuration is always copied, so it is shown checked and locked. */}
+                          <div className="flex items-start gap-3">
+                            <Checkbox
+                              id="clone-item-config"
+                              checked
+                              disabled
+                              aria-describedby="clone-item-config-note"
+                              className="mt-0.5"
+                            />
+                            <div className="space-y-0.5">
+                              <Label htmlFor="clone-item-config">{t("builder_clone_item_config")}</Label>
+                              <p id="clone-item-config-note" className="text-xs text-muted-foreground">
+                                {t("builder_clone_item_config_note")}
+                              </p>
+                            </div>
+                          </div>
+                          <div className="flex items-start gap-3">
+                            <Checkbox
+                              id="clone-item-rag"
+                              checked={cloneSelection.includeRag}
+                              onCheckedChange={(checked) => updateCloneSelection({
+                                ...cloneSelection,
+                                includeRag: checked === true,
+                              })}
+                              disabled={cloning}
+                              aria-describedby="clone-item-rag-available"
+                              className="mt-0.5"
+                            />
+                            <div className="space-y-0.5">
+                              <Label htmlFor="clone-item-rag">{t("builder_clone_item_rag")}</Label>
+                              <p id="clone-item-rag-available" className="text-xs text-muted-foreground">
+                                {t("builder_clone_item_rag_available")
+                                  .replace("{count}", formatCloneCount(clonePreview.document_count))
+                                  .replace("{bytes}", formatCloneBytes(clonePreview.total_bytes))}
+                              </p>
+                            </div>
+                          </div>
+                          <div className="flex items-start gap-3">
+                            <Checkbox
+                              id="clone-item-media"
+                              checked={cloneSelection.includeMedia}
+                              onCheckedChange={(checked) => updateCloneSelection({
+                                ...cloneSelection,
+                                includeMedia: checked === true,
+                              })}
+                              disabled={cloning}
+                              aria-describedby="clone-item-media-available"
+                              className="mt-0.5"
+                            />
+                            <div className="space-y-0.5">
+                              <Label htmlFor="clone-item-media">{t("builder_clone_item_media")}</Label>
+                              <p id="clone-item-media-available" className="text-xs text-muted-foreground">
+                                {t("builder_clone_item_media_available")
+                                  .replace("{count}", formatCloneCount(clonePreview.media_asset_count))
+                                  .replace("{bytes}", formatCloneBytes(clonePreview.media_total_bytes))}
+                              </p>
+                            </div>
+                          </div>
+                        </fieldset>
+
+                        {/* Impact of the current selection, computed locally from the advisory preview. */}
+                        <div className="space-y-2 rounded-lg border border-border bg-muted/20 p-4">
+                          <dl className="grid grid-cols-2 gap-3 text-sm">
+                            <div>
+                              <dt className="text-xs text-muted-foreground">{t("builder_clone_rag_bytes")}</dt>
+                              <dd className="font-semibold">
+                                {formatCloneBytes(cloneSelection.includeRag ? clonePreview.total_bytes : 0)}
+                              </dd>
+                            </div>
+                            <div>
+                              <dt className="text-xs text-muted-foreground">{t("builder_clone_media_bytes")}</dt>
+                              <dd className="font-semibold">
+                                {formatCloneBytes(cloneSelection.includeMedia ? clonePreview.media_total_bytes : 0)}
+                              </dd>
+                            </div>
+                          </dl>
+                          {cloneSelection.includeRag && (
+                            <p className="text-xs text-amber-400">{t("builder_clone_rag_impact")}</p>
+                          )}
+                          {cloneSelection.includeMedia && (
+                            <p className="text-xs text-amber-400">{t("builder_clone_media_impact")}</p>
+                          )}
+                        </div>
+
+                        <div className="grid gap-3 md:grid-cols-3">
+                          <section className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4" aria-labelledby="clone-copied-title">
+                            <h2 id="clone-copied-title" className="font-semibold text-emerald-400">{t("builder_clone_summary_copied_title")}</h2>
                             <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
-                              <li>{t("builder_clone_excluded_admin")}</li>
+                              <li>{t("builder_clone_summary_config")}</li>
+                              {cloneSelection.includeRag && (
+                                <li>
+                                  {t("builder_clone_summary_rag")
+                                    .replace("{count}", formatCloneCount(clonePreview.document_count))
+                                    .replace("{bytes}", formatCloneBytes(clonePreview.total_bytes))}
+                                </li>
+                              )}
+                              {cloneSelection.includeMedia && (
+                                <li>
+                                  {t("builder_clone_summary_media")
+                                    .replace("{count}", formatCloneCount(clonePreview.media_asset_count))
+                                    .replace("{bytes}", formatCloneBytes(clonePreview.media_total_bytes))}
+                                </li>
+                              )}
+                            </ul>
+                          </section>
+                          <section className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-4" aria-labelledby="clone-reset-title">
+                            <h2 id="clone-reset-title" className="font-semibold text-amber-400">{t("builder_clone_summary_reset_title")}</h2>
+                            <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
                               <li>{t("builder_clone_excluded_integrations")}</li>
+                              <li>{t("builder_clone_excluded_admin")}</li>
                               <li>{t("builder_clone_inactive")}</li>
                             </ul>
+                          </section>
+                          <section className="rounded-lg border border-border bg-muted/20 p-4" aria-labelledby="clone-unselected-title">
+                            <h2 id="clone-unselected-title" className="font-semibold text-foreground">{t("builder_clone_summary_unselected_title")}</h2>
+                            {cloneSelection.includeRag && cloneSelection.includeMedia ? (
+                              <p className="mt-2 text-sm text-muted-foreground">{t("builder_clone_summary_unselected_none")}</p>
+                            ) : (
+                              <>
+                                <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                                  {!cloneSelection.includeRag && (
+                                    <li>
+                                      {t("builder_clone_summary_rag")
+                                        .replace("{count}", formatCloneCount(clonePreview.document_count))
+                                        .replace("{bytes}", formatCloneBytes(clonePreview.total_bytes))}
+                                    </li>
+                                  )}
+                                  {!cloneSelection.includeMedia && (
+                                    <li>
+                                      {t("builder_clone_summary_media")
+                                        .replace("{count}", formatCloneCount(clonePreview.media_asset_count))
+                                        .replace("{bytes}", formatCloneBytes(clonePreview.media_total_bytes))}
+                                    </li>
+                                  )}
+                                </ul>
+                                <p className="mt-2 text-xs text-muted-foreground">{t("builder_clone_summary_unselected_note")}</p>
+                              </>
+                            )}
                           </section>
                         </div>
 
@@ -1500,24 +1668,28 @@ export default function BuilderPanel() {
                         )}
 
                         <div className="space-y-3 border-t border-border pt-4">
-                          <label className="flex cursor-pointer items-start gap-3 text-sm">
-                            <input
-                              type="checkbox"
-                              checked={cloneConfirmed}
-                              onChange={(event) => setCloneConfirmed(event.target.checked)}
+                          <div className="flex items-start gap-3 text-sm">
+                            <Checkbox
+                              id="clone-consent"
+                              checked={cloneConsentValid}
+                              onCheckedChange={(checked) => setCloneConsent(checked === true ? cloneSelection : null)}
                               disabled={cloning}
-                              className="mt-0.5 h-4 w-4 rounded border-input accent-indigo-500"
+                              className="mt-0.5"
                             />
-                            <span>{t("builder_clone_confirm")}</span>
-                          </label>
+                            <Label htmlFor="clone-consent" className="cursor-pointer leading-snug">
+                              {t("builder_clone_confirm")}
+                            </Label>
+                          </div>
                           <Button
                             onClick={() => void handleCloneClinic()}
-                            disabled={!cloneConfirmed || cloning}
+                            disabled={!cloneConsentValid || cloning}
+                            aria-busy={cloning}
                             className="gap-2"
                           >
                             {cloning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Building2 className="h-4 w-4" />}
                             {cloning ? t("builder_clone_loading") : t("builder_clone_submit")}
                           </Button>
+                          <span className="sr-only" role="status">{cloning ? t("builder_clone_loading") : ""}</span>
                         </div>
                       </div>
                     )}

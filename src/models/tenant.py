@@ -6,7 +6,7 @@ Represents a builder or clinic using the NeuroStack platform.
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, ForeignKey, String
+from sqlalchemy import Boolean, ForeignKey, String, false
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -170,6 +170,15 @@ class Tenant(Base, TimestampMixin):
         String(20),
         default="pilot",
         server_default="pilot",
+        nullable=False,
+    )
+
+    # Audit add-on: waives the 6-month lookback on trace/handoff CSV exports
+    # (the 60-day-per-file cap still applies). Only a super admin may set it.
+    audit_extended_access: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=false(),
         nullable=False,
     )
 

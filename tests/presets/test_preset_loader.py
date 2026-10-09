@@ -464,8 +464,7 @@ def _compare(preset: Path) -> subprocess.CompletedProcess[str]:
 
 
 def test_package_root_is_lazy_and_protocol_import_is_isolated() -> None:
-    completed = _run(
-        """
+    completed = _run("""
 import sys
 import neurostack_core
 assert 'neurostack_core.presets' not in sys.modules
@@ -477,14 +476,12 @@ for prefix in (
 ):
     assert not any(name == prefix or name.startswith(prefix + '.') for name in sys.modules)
 assert protocol.FunnelStage.LEAD_NOVO.value == 'lead_novo'
-"""
-    )
+""")
     assert completed.returncode == 0, completed.stderr
 
 
 def test_public_exports_and_default_first_access() -> None:
-    completed = _run(
-        """
+    completed = _run("""
 from neurostack_core import Preset, PresetError, get_preset, use_preset
 preset = get_preset()
 assert isinstance(preset, Preset)
@@ -493,14 +490,12 @@ assert preset.source_id == 'bundled:pt_br_clinic'
 assert get_preset() is preset
 assert use_preset('pt_br_clinic') is preset
 assert issubclass(PresetError, RuntimeError)
-"""
-    )
+""")
     assert completed.returncode == 0, completed.stderr
 
 
 def test_fresh_default_load_keeps_srm_and_policy_imperative_contracts() -> None:
-    completed = _run(
-        """
+    completed = _run("""
 from neurostack_core import get_preset
 preset = get_preset()
 assert 'srm.engine' in preset.srm['imperative_literals']
@@ -509,8 +504,7 @@ assert 'policy.models' in preset.policy['imperative_literals']
 assert preset.policy['imperative_literals']['policy.models'][
     'PolicyConstraints.to_prompt_constraints'
 ] == ('NÃO ',)
-"""
-    )
+""")
     assert completed.returncode == 0, completed.stderr
 
 
@@ -2367,8 +2361,7 @@ def test_parity_rejects_reintroduced_literal_unicode_regex_escape(
 
 
 def test_preset_has_no_reachable_mutable_container() -> None:
-    completed = _run(
-        """
+    completed = _run("""
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
 from neurostack_core import get_preset
@@ -2398,14 +2391,12 @@ except (FrozenInstanceError, AttributeError):
     pass
 else:
     raise AssertionError('preset mutated')
-"""
-    )
+""")
     assert completed.returncode == 0, completed.stderr
 
 
 def test_frozen_map_storage_cannot_be_rebound_at_any_depth() -> None:
-    completed = _run(
-        """
+    completed = _run("""
 from neurostack_core import get_preset
 
 preset = get_preset()
@@ -2423,8 +2414,7 @@ for value in (top_level, nested):
 assert dict(top_level) == before_top
 assert dict(nested) == before_nested
 assert 'corrupted' not in top_level and 'corrupted' not in nested
-"""
-    )
+""")
     assert completed.returncode == 0, completed.stderr
 
 

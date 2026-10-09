@@ -1,8 +1,16 @@
 """add tenant-scoped media asset catalog
 
-Revision ID: 022
-Revises: 021
+Revision ID: 023
+Revises: 022
 Create Date: 2026-10-07 00:00:01
+
+Renumbered from 022 to 023 after PR #64's audit migration
+(022_add_tenant_audit_extended_access) took revision 022. Databases migrated
+from origin/main are unaffected. A database that applied the pre-renumber
+media migration as "022" (it has ``media_assets`` but no
+``tenants.audit_extended_access``) must be repaired manually: add the audit
+column exactly as 022_add_tenant_audit_extended_access does (Boolean,
+NOT NULL, server default false), then run ``alembic stamp 023``.
 """
 
 from typing import Union
@@ -12,8 +20,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision: str = "022"
-down_revision: Union[str, None] = "021"
+revision: str = "023"
+down_revision: Union[str, None] = "022"
 branch_labels = None
 depends_on = None
 
