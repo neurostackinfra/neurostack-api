@@ -10,6 +10,7 @@ import sys
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -28,16 +29,23 @@ from sqlalchemy.pool import NullPool
 
 from src.api.middleware.auth import TenantContext
 from src.api.routes import builder as builder_routes
+from src.api.routes.config import patch_config
+from src.api.schemas.config import ConfigPatchRequest
 from src.config.settings import settings
+from src.handoff.models import HandoffReason, HandoffRequest
+from src.handoff.webhook import WebhookDispatcher
 from src.models.builder import Builder
 from src.models.clinic_config_table import ClinicConfigTable
+from src.models.handoff import HandoffRecord
 from src.models.knowledge import KnowledgeDocument
+from src.models.session import Session
 from src.models.tenant import Tenant
 from src.models.user import User, UserRole
 from src.services.billing_usage_service import (
     PlanUsageLimits,
     get_builder_billing_usage,
 )
+from src.services.handoff_service import HandoffService
 
 _ROOT = Path(__file__).resolve().parents[2]
 _ADMIN_DATABASES = {"postgres"}
@@ -1074,3 +1082,118 @@ async def test_clone_billing_delta_uses_recalculated_multibyte_utf8_bytes(
     assert sorted(cloned_sizes) == sorted(
         len(content.encode("utf-8")) for content in _CONTENTS
     )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_builder_clone_omits_sla_target_and_preserves_runtime_snapshots(
+    postgres_harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = postgres_harness
+    graph = await _seed_graph(harness, source_name="SLA Clone Source")
+    _stub_fast_unique_hash(monkeypatch)
+
+    async with harness.session() as seed:
+        source_config = (
+            await seed.execute(
+                select(ClinicConfigTable).where(
+                    ClinicConfigTable.tenant_id == graph.source_id
+                )
+            )
+        ).scalar_one()
+        source_config.handoff = {"meta_minutos_atendimento": 23}
+        await seed.commit()
+
+    async with harness.session() as clone_session:
+        clone = await builder_routes.clone_clinic(
+            str(graph.source_id),
+            graph.context,
+            clone_session,
+        )
+
+    first_session_id = uuid4()
+    second_session_id = uuid4()
+    async with harness.session() as seed:
+        destination_handoff = (
+            await seed.execute(
+                select(ClinicConfigTable.handoff).where(
+                    ClinicConfigTable.tenant_id == clone.id
+                )
+            )
+        ).scalar_one()
+        assert "meta_minutos_atendimento" not in destination_handoff
+        seed.add_all(
+            [
+                Session(
+                    id=first_session_id,
+                    tenant_id=clone.id,
+                    user_id=f"clone-sla-{first_session_id}",
+                    channel="test",
+                    cognitive_state={},
+                    session_metadata={},
+                ),
+                Session(
+                    id=second_session_id,
+                    tenant_id=clone.id,
+                    user_id=f"clone-sla-{second_session_id}",
+                    channel="test",
+                    cognitive_state={},
+                    session_metadata={},
+                ),
+            ]
+        )
+        await seed.commit()
+
+    service = HandoffService(
+        event_store=None,
+        webhook_dispatcher=WebhookDispatcher(),
+        session_factory=harness.session,
+    )
+    first = await service.initiate_handoff(
+        HandoffRequest(
+            tenant_id=clone.id,
+            session_id=first_session_id,
+            reason=HandoffReason.USER_REQUEST,
+            recent_messages=[{"role": "user", "content": "primeiro"}],
+        )
+    )
+
+    async def no_cache(_tenant_id: UUID) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "src.services.event_service.invalidate_clinic_config_cache",
+        no_cache,
+    )
+    clinic_admin = TenantContext(
+        tenant_id=clone.id,
+        user_id=uuid4(),
+        role="clinic_admin",
+    )
+    async with harness.session() as config_session:
+        patched = await patch_config(
+            request=SimpleNamespace(query_params={}),
+            body=ConfigPatchRequest(meta_minutos_atendimento=17),
+            tenant=clinic_admin,
+            session=config_session,
+        )
+    assert patched.meta_minutos_atendimento == 17
+
+    second = await service.initiate_handoff(
+        HandoffRequest(
+            tenant_id=clone.id,
+            session_id=second_session_id,
+            reason=HandoffReason.USER_REQUEST,
+            recent_messages=[{"role": "user", "content": "segundo"}],
+        )
+    )
+
+    async with harness.session() as observer:
+        first_record = await observer.get(HandoffRecord, first.id)
+        second_record = await observer.get(HandoffRecord, second.id)
+
+    assert first_record is not None
+    assert second_record is not None
+    assert first_record.sla_target_seconds == 600
+    assert second_record.sla_target_seconds == 17 * 60

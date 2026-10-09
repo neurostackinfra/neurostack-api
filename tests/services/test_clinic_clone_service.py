@@ -40,7 +40,6 @@ _EXPECTED_BUCKET_KEYS = {
     "handoff": {
         "default_mode",
         "sector_defaults",
-        "meta_minutos_atendimento",
         "handoff_active",
         "standby_mode",
         "handoff_period",
@@ -273,7 +272,7 @@ def test_config_clone_copies_every_allowlisted_field_and_applies_resets():
     assert clone["pricing"] == source.pricing
     assert clone["post_care"] == source.post_care
     assert clone["handoff"]["default_mode"] == "crm_task_create"
-    assert clone["handoff"]["meta_minutos_atendimento"] == 23
+    assert "meta_minutos_atendimento" not in clone["handoff"]
     assert clone["handoff"]["handoff_active"] == "yes"
     assert clone["handoff"]["standby_mode"] == "active"
     assert clone["handoff"]["handoff_period"] == "cycle"
@@ -372,7 +371,7 @@ def test_missing_config_values_use_current_model_defaults():
 
     assert clone["identity"]["clinic_name"] == "Empty clone"
     assert clone["persona"]["use_personal_name"] is False
-    assert clone["handoff"]["meta_minutos_atendimento"] == 10
+    assert "meta_minutos_atendimento" not in clone["handoff"]
     assert clone["professionals"] == []
     assert clone["services"] == []
     assert clone["api_credentials"] == {}
