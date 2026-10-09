@@ -380,13 +380,11 @@ class EventStore:
                 import json
 
                 # Use bindparam to properly handle JSONB casting
-                query = text(
-                    """
+                query = text("""
                     INSERT INTO events (id, tenant_id, session_id, event_type, interaction_origin, event_data, metadata, created_at)
                     VALUES (:id, :tenant_id, :session_id, :event_type, :interaction_origin, CAST(:event_data AS jsonb), CAST(:metadata AS jsonb), :created_at)
                     RETURNING id, created_at
-                """
-                )
+                """)
 
                 result = await session.execute(
                     query,
@@ -469,12 +467,10 @@ class EventStore:
 
             async with self._get_session() as session:
                 for event in events:
-                    query = text(
-                        """
+                    query = text("""
                         INSERT INTO events (id, tenant_id, session_id, event_type, interaction_origin, event_data, metadata, created_at)
                         VALUES (:id, :tenant_id, :session_id, :event_type, :interaction_origin, CAST(:event_data AS jsonb), CAST(:metadata AS jsonb), :created_at)
-                    """
-                    )
+                    """)
                     await session.execute(
                         query,
                         {
@@ -569,16 +565,14 @@ class EventStore:
                     type_filter = "AND event_type = ANY(:event_types)"
                     params["event_types"] = event_types
 
-                query = text(
-                    f"""
+                query = text(f"""
                     SELECT id, tenant_id, session_id, event_type, interaction_origin, event_data, metadata, created_at
                     FROM events
                     WHERE tenant_id = :tenant_id AND session_id = :session_id
                     {type_filter}
                     ORDER BY created_at {order}
                     LIMIT :limit OFFSET :offset
-                """
-                )
+                """)
 
                 result = await session.execute(query, params)
                 rows = result.fetchall()
@@ -591,14 +585,12 @@ class EventStore:
                 events = [self._row_to_event_data(row) for row in rows]
 
                 # Get total count
-                count_query = text(
-                    f"""
+                count_query = text(f"""
                     SELECT COUNT(*) as total
                     FROM events
                     WHERE tenant_id = :tenant_id AND session_id = :session_id
                     {type_filter}
-                """
-                )
+                """)
                 count_result = await session.execute(
                     count_query,
                     {
@@ -692,15 +684,13 @@ class EventStore:
 
                 where_clause = " AND ".join(filters)
 
-                query = text(
-                    f"""
+                query = text(f"""
                     SELECT id, tenant_id, session_id, event_type, interaction_origin, event_data, metadata, created_at
                     FROM events
                     WHERE {where_clause}
                     ORDER BY created_at DESC
                     LIMIT :limit OFFSET :offset
-                """
-                )
+                """)
 
                 result = await session.execute(query, params)
                 rows = result.fetchall()
@@ -715,13 +705,11 @@ class EventStore:
                 count_params = {
                     k: v for k, v in params.items() if k not in ("limit", "offset")
                 }
-                count_query = text(
-                    f"""
+                count_query = text(f"""
                     SELECT COUNT(*) as total
                     FROM events
                     WHERE {where_clause}
-                """
-                )
+                """)
                 count_result = await session.execute(count_query, count_params)
                 total_count = count_result.scalar()
 
@@ -774,13 +762,11 @@ class EventStore:
         start_time = time.perf_counter()
         try:
             async with self._get_session() as session:
-                query = text(
-                    """
+                query = text("""
                     SELECT id, tenant_id, session_id, event_type, interaction_origin, event_data, metadata, created_at
                     FROM events
                     WHERE id = :event_id
-                """
-                )
+                """)
                 result = await session.execute(query, {"event_id": event_id})
                 row = result.fetchone()
 
@@ -838,8 +824,7 @@ class EventStore:
         start_time = time.perf_counter()
         try:
             async with self._get_session() as session:
-                query = text(
-                    """
+                query = text("""
                     SELECT id, tenant_id, session_id, event_type, interaction_origin,
                            event_data, metadata, created_at
                     FROM events
@@ -848,8 +833,7 @@ class EventStore:
                       AND event_type = ANY(:event_types)
                     ORDER BY created_at DESC, id DESC
                     LIMIT :limit
-                    """
-                )
+                    """)
                 result = await session.execute(
                     query,
                     {
@@ -923,8 +907,7 @@ class EventStore:
 
                 where_clause = " AND ".join(filters)
 
-                query = text(
-                    f"""
+                query = text(f"""
                     SELECT
                         event_type,
                         COUNT(*) as count,
@@ -934,8 +917,7 @@ class EventStore:
                     WHERE {where_clause}
                     GROUP BY event_type
                     ORDER BY count DESC
-                """
-                )
+                """)
 
                 result = await session.execute(query, params)
                 rows = result.fetchall()
@@ -1017,13 +999,11 @@ class EventStore:
 
                 where_clause = " AND ".join(filters)
 
-                query = text(
-                    f"""
+                query = text(f"""
                     SELECT COUNT(DISTINCT session_id) as count
                     FROM events
                     WHERE {where_clause}
-                """
-                )
+                """)
 
                 result = await session.execute(query, params)
                 count = result.scalar()
