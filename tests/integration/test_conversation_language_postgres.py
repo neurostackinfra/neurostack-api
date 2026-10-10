@@ -412,10 +412,12 @@ async def test_webhook_commit_releases_lock_before_finish_response(
             self,
             body: dict[str, object],
             headers: dict[str, str] | None = None,
+            state: SimpleNamespace | None = None,
         ) -> None:
             self._body = body
             self._raw = json.dumps(body).encode()
             self.headers = headers or {}
+            self.state = state or SimpleNamespace()
 
         async def body(self) -> bytes:
             return self._raw
@@ -565,7 +567,18 @@ async def test_webhook_commit_releases_lock_before_finish_response(
                     AsyncMock(return_value=False),
                 )
                 response = await webhook_module.meta_webhook(
-                    cast(Any, RequestStub(body)), db=db
+                    cast(
+                        Any,
+                        RequestStub(
+                            body,
+                            state=SimpleNamespace(
+                                canonical_tenant_id=tenant_id,
+                                meta_credentials={"meta_app_secret": "secret"},
+                                meta_phone_number_id="pnid",
+                            ),
+                        ),
+                    ),
+                    db=db,
                 )
 
     assert isinstance(response, dict)
