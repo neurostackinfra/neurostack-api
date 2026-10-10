@@ -38,11 +38,12 @@ _engine: Optional[AsyncEngine] = None
 _session_factory: Optional[async_sessionmaker[AsyncSession]] = None
 
 
-async def init_database() -> None:
+async def init_database(*, database_url: str | None = None) -> None:
     """
     Initialize database connection pool.
 
-    Creates the async engine and session factory.
+    Creates the async engine and session factory. Tests may inject an explicit
+    isolated URL; runtime callers continue to use the configured database.
     Should be called during application startup.
     """
     # Import settings here to avoid circular import
@@ -55,21 +56,29 @@ async def init_database() -> None:
         return
 
     try:
-        # If running tests (pytest present) or environment explicitly set to 'test',
-        # prefer an in-memory sqlite database to avoid concurrency issues and external dependencies.
+        # Keep the historical implicit test fallback as defense in depth, while
+        # allowing the pytest harness to inject its isolated destination
+        # explicitly. An explicit URL always wins.
         import sys as _sys
 
-        if "pytest" in _sys.modules or getattr(settings, "environment", "") == "test":
+        if database_url is not None:
+            resolved_database_url = database_url
+        elif "pytest" in _sys.modules or getattr(settings, "environment", "") == "test":
+            resolved_database_url = "sqlite+aiosqlite:///:memory:"
+        else:
+            resolved_database_url = settings.database_url
+
+        if resolved_database_url.startswith("sqlite"):
             logger.info("Using in-memory sqlite for test environment")
             _engine = create_async_engine(
-                "sqlite+aiosqlite:///:memory:",
+                resolved_database_url,
                 echo=False,
                 future=True,
                 hide_parameters=True,
             )
         else:
             _engine = create_async_engine(
-                settings.database_url,
+                resolved_database_url,
                 pool_size=settings.database_pool_size,
                 max_overflow=settings.database_max_overflow,
                 pool_timeout=settings.database_pool_timeout,
