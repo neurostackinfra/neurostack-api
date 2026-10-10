@@ -53,12 +53,26 @@ async def client(
 ):
     """Seed the real tenant/session identity required by canonical handoffs."""
 
+    from src.api.middleware.auth import APIKeyStore, TenantContext
     from src.memory.event_store import EventStore
     from src.models.session import Session
     from src.models.tenant import Tenant
     from src.repositories.database import get_db_session
     from src.services.event_service import get_event_service
     from src.services.handoff_service import HandoffService
+
+    async def accept_seeded_tenant(_cls, api_key):
+        return TenantContext(
+            tenant_id=tenant_id,
+            api_key=api_key,
+            is_active=True,
+        )
+
+    monkeypatch.setattr(
+        APIKeyStore,
+        "validate_api_key",
+        classmethod(accept_seeded_tenant),
+    )
 
     event_store = MagicMock(spec=EventStore)
     event_store.append = AsyncMock()
@@ -553,13 +567,12 @@ class TestPipelineIntegration:
 
     @pytest.mark.asyncio
     async def test_different_channels(
-        self, client: AsyncClient, tenant_id, auth_headers
+        self, client: AsyncClient, tenant_id, session_id, auth_headers
     ):
         """Test events from different channels."""
         channels = ["whatsapp", "web", "telegram", "instagram"]
 
         for channel in channels:
-            session_id = uuid4()
             response = await client.post(
                 "/v1/events",
                 headers=auth_headers,
@@ -591,10 +604,7 @@ class TestErrorHandling:
         response = await client.post(
             "/v1/events",
             headers=auth_headers,
-            json={
-                "tenant_id": str(uuid4()),
-                # Missing session_id and payload
-            },
+            json={},
         )
 
         assert response.status_code == 422  # Validation error

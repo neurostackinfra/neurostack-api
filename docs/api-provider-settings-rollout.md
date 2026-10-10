@@ -450,7 +450,8 @@ O arquivo é dado, nunca shell. Cada linha não vazia deve ser exatamente
 redirecionamento, barra invertida, função ou controle. As únicas chaves são
 `ENVIRONMENT`, `DEBUG`, `SECRET_KEY`, `POSTGRES_USER`, `POSTGRES_PASSWORD`,
 `POSTGRES_DB`, `REDIS_PASSWORD`, `QDRANT_API_KEY`, `ALLOWED_ORIGINS`,
-`ALLOWED_HOSTS`, `API_BIND_ADDRESS` e `API_PORT`.
+`ALLOWED_HOSTS`, `API_BIND_ADDRESS`, `API_PORT`, `DATABASE_POOL_SIZE`,
+`DATABASE_MAX_OVERFLOW` e `DATABASE_POOL_TIMEOUT`.
 `PATH`, `DOCKER_HOST`, chaves desconhecidas e duplicatas são recusadas. Valores
 sensíveis têm mínimos explícitos (32 para `SECRET_KEY`/Qdrant, 24 para senhas),
 ao menos 3 classes e 10 caracteres distintos; defaults e valores repetidos são
@@ -459,8 +460,10 @@ por `--env-file`, mas nunca é executado pelo Bash.
 
 O VPS requer Python 3.11+, Git, trust GPG/SSH, Docker e Docker Compose. A única
 entrada é `scripts/deploy-vps.sh`; sua primeira operação chama diretamente o
-checker stdlib. Não instale PyYAML ou qualquer outra dependência Python para o
-gate.
+checker stdlib. O gate de orçamento também usa apenas a stdlib e o comando
+`docker compose config --format json`, já exigido pelo deploy, para resolver a
+estrutura efetiva. Não instale PyYAML ou qualquer outra dependência Python para
+o gate.
 
 Qualquer mudança posterior no candidate, módulo de smoke, receipt, imagem da API
 ou digest de Postgres/Redis/Qdrant exige re-homologação completa a partir de um

@@ -60,8 +60,23 @@ class Settings(BaseSettings):
         "postgresql+asyncpg://neurostack:neurostack@localhost:5434/neurostack"
     )
     database_pool_size: int = Field(default=5, ge=1, le=100)
-    database_max_overflow: int = Field(default=10, ge=0, le=100)
+    database_max_overflow: int = Field(default=0, ge=0, le=100)
     database_pool_timeout: int = Field(default=30, ge=1)
+
+    @field_validator(
+        "database_pool_size",
+        "database_max_overflow",
+        "database_pool_timeout",
+        mode="before",
+    )
+    @classmethod
+    def validate_database_pool_integer(cls, value: object) -> object:
+        """Reject booleans, floats, signs, whitespace, and other coercions."""
+        if type(value) is int:
+            return value
+        if isinstance(value, str) and value and value.isascii() and value.isdecimal():
+            return value
+        raise ValueError("database pool settings must be unsigned base-10 integers")
 
     # ============================================
     # Redis (State Store)

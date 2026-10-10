@@ -5,6 +5,19 @@
 
 Este documento descreve onde e como as informações de configuração do tenant e da clínica (ClinicConfig) são armazenadas, a estrutura dos dados e um exemplo completo em JSON.
 
+## Orçamento de conexões PostgreSQL
+
+Cada processo da API possui exatamente um pool SQLAlchemy compartilhado por repositórios, EventStore e HandoffService. A configuração efetiva vem de `DATABASE_POOL_SIZE`, `DATABASE_MAX_OVERFLOW` e `DATABASE_POOL_TIMEOUT`. Produção usa, por processo, `pool_size=5`, `max_overflow=0` e timeout de 30 segundos.
+
+O manifesto `config/database-connection-budgets.json` registra as topologias aprovadas. O gate calcula `tasks × workers × (pool_size + max_overflow)` e exige que o resultado permaneça estritamente abaixo de 70% de `max_connections`:
+
+| Perfil | Tasks | Workers | Pool | Overflow | Total / max_connections |
+|---|---:|---:|---:|---:|---:|
+| `vps-compose` | 1 | 4 | 5 | 0 | 20 / 100 |
+| `ecs-poc` | 2 | 4 | 5 | 0 | 40 / 100 |
+
+No VPS, o deploy confere separadamente o comando de workers do Dockerfile, a propagação das três variáveis pelo Compose, os valores do `.env` e `max_connections=100` antes de `docker pull` ou `docker compose up`. O perfil `ecs-poc` mantém um orçamento separado e versionado para o deploy ECS.
+
 ---
 
 ## Índice

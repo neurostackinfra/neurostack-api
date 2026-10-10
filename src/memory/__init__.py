@@ -1,6 +1,6 @@
 """
 NeuroStack - Memory Architecture 2.0
-OLTP State Store and Event Store
+OLTP State Store and Event Store types
 
 Memory 2.0 provides:
 - State Store (Redis): Fast OLTP operations for session state
@@ -8,7 +8,7 @@ Memory 2.0 provides:
 
 Usage:
     from src.memory import StateStore, get_state_store, close_state_store
-    from src.memory import EventStore, get_event_store, close_event_store
+    from src.memory import EventStore, get_event_store
     from src.memory.models import SessionState, CognitiveState, StatePatch
 
     # State Store as context manager
@@ -16,12 +16,7 @@ Usage:
         await store.create_session(session_state)
         state = await store.get_session(tenant_id, session_id)
 
-    # Event Store as context manager
-    async with EventStore() as store:
-        await store.append(event)
-        events = await store.query_by_session(tenant_id, session_id)
-
-    # Or use global instances
+    # Event Store consumes the shared Database session factory
     state_store = await get_state_store()
     event_store = await get_event_store()
 """
@@ -45,7 +40,6 @@ from src.memory.event_store import (
     MessageEventData,
     SafetyEventData,
     SRMDecisionEventData,
-    close_event_store,
     get_event_store,
 )
 from src.memory.models import (
@@ -94,7 +88,6 @@ __all__ = [
     "HandoffEventData",
     "FunnelTransitionEventData",
     "get_event_store",
-    "close_event_store",
     # Models
     "CognitiveState",
     "FunnelStage",

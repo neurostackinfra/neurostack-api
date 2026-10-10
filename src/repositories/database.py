@@ -1,13 +1,12 @@
-"""
-NeuroStack - Database Session Management
-Manages SQLAlchemy async engine and session factory.
-"""
+"""Process-wide SQLAlchemy engine and session-factory lifecycle."""
 
+from __future__ import annotations
+
+import asyncio
 from collections.abc import AsyncGenerator
-from typing import Optional
+from typing import Callable, Optional
 
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -25,7 +24,6 @@ def _patch_jsonb_for_sqlite() -> None:
     """Register JSONB as JSON on SQLite so create_all works in tests."""
     from sqlalchemy.dialects import sqlite as sqlite_dialect
 
-    # Teach the SQLite compiler to treat JSONB as plain JSON
     setattr(
         sqlite_dialect.base.SQLiteTypeCompiler,
         "visit_JSONB",
@@ -33,197 +31,139 @@ def _patch_jsonb_for_sqlite() -> None:
     )
 
 
-# Global engine and session factory
+SessionFactory = async_sessionmaker[AsyncSession]
+
 _engine: Optional[AsyncEngine] = None
-_session_factory: Optional[async_sessionmaker[AsyncSession]] = None
+_session_factory: Optional[SessionFactory] = None
+_lifecycle_lock = asyncio.Lock()
 
 
-async def init_database() -> None:
-    """
-    Initialize database connection pool.
+async def _dispose_once(engine: AsyncEngine) -> None:
+    """Finish one accepted/rejected engine disposal even if the caller is cancelled."""
+    disposal = asyncio.create_task(engine.dispose())
+    try:
+        await asyncio.shield(disposal)
+    except asyncio.CancelledError:
+        await disposal
+        raise
 
-    Creates the async engine and session factory.
-    Should be called during application startup.
-    """
-    # Import settings here to avoid circular import
+
+async def init_database(
+    *,
+    database_url: str | None = None,
+    engine_factory: Callable[..., AsyncEngine] | None = None,
+    session_factory_builder: Callable[..., SessionFactory] | None = None,
+) -> None:
+    """Create, probe, and atomically publish the process-wide database pool."""
     from src.config.settings import settings
 
     global _engine, _session_factory
 
-    if _engine is not None:
-        logger.warning("Database already initialized")
-        return
+    async with _lifecycle_lock:
+        if _engine is not None:
+            return
 
-    try:
-        # If running tests (pytest present) or environment explicitly set to 'test',
-        # prefer an in-memory sqlite database to avoid concurrency issues and external dependencies.
-        import sys as _sys
+        resolved_database_url = database_url or settings.database_url
+        resolved_engine_factory = engine_factory or create_async_engine
+        resolved_session_factory_builder = session_factory_builder or async_sessionmaker
 
-        if "pytest" in _sys.modules or getattr(settings, "environment", "") == "test":
-            logger.info("Using in-memory sqlite for test environment")
-            _engine = create_async_engine(
-                "sqlite+aiosqlite:///:memory:",
-                echo=False,
-                future=True,
-                hide_parameters=True,
-            )
-        else:
-            _engine = create_async_engine(
-                settings.database_url,
-                pool_size=settings.database_pool_size,
-                max_overflow=settings.database_max_overflow,
-                pool_timeout=settings.database_pool_timeout,
-                echo=settings.debug,
-                future=True,
-                hide_parameters=True,
-            )
-
-        _session_factory = async_sessionmaker(
-            _engine,
-            class_=AsyncSession,
-            expire_on_commit=False,
-            autoflush=False,
-            autocommit=False,
-        )
-
-        # Test connection
-        async with _engine.begin() as conn:
-            await conn.execute(text("SELECT 1"))
-
-        # If using an in-memory sqlite database for tests, create the schema
+        candidate: AsyncEngine | None = None
         try:
-            # Import models package to ensure all models are registered on Base.metadata
-            import src.models  # noqa: F401 - import side-effects (register models)
-
-            # Import Base lazily to avoid circular imports
-            from src.models.base import Base as _Base
-
-            if _engine.url.drivername.startswith("sqlite"):
-                _patch_jsonb_for_sqlite()
-                # Use run_sync inside an async connection — calling create_all
-                # synchronously on the sync_engine triggers MissingGreenlet.
-                async with _engine.begin() as conn:
-                    await conn.run_sync(_Base.metadata.create_all)
-                logger.info(
-                    "Created sqlite schema (in-memory or file-backed) for tests"
+            engine_options: dict[str, object] = {
+                "echo": settings.debug,
+                "future": True,
+                "hide_parameters": True,
+            }
+            if not resolved_database_url.startswith("sqlite"):
+                engine_options.update(
+                    pool_size=settings.database_pool_size,
+                    max_overflow=settings.database_max_overflow,
+                    pool_timeout=settings.database_pool_timeout,
                 )
-        except Exception:
-            # Non-fatal: if schema creation fails, we'll surface errors later when queries run
-            logger.debug(
-                "Skipping in-memory sqlite schema creation (not applicable or failed)",
-                exc_info=True,
-            )
-
-        logger.info(
-            "Database initialized successfully",
-            pool_size=settings.database_pool_size,
-            max_overflow=settings.database_max_overflow,
-        )
-    except SQLAlchemyError as e:
-        logger.error(
-            "Failed to initialize database",
-            error=str(e),
-            error_type=type(e).__name__,
-            exc_info=True,
-        )
-        # If running tests, fallback to an in-memory sqlite database to avoid
-        # requiring a Postgres instance in CI/local test runs.
-        if getattr(settings, "environment", "") == "test":
-            logger.warning("Falling back to in-memory sqlite for test environment")
-            # Create a lightweight in-memory sqlite async engine
-            _engine = create_async_engine(
-                "sqlite+aiosqlite:///:memory:",
-                echo=False,
-                future=True,
-                hide_parameters=True,
-            )
-            _session_factory = async_sessionmaker(
-                _engine,
+            candidate = resolved_engine_factory(resolved_database_url, **engine_options)
+            candidate_factory = resolved_session_factory_builder(
+                candidate,
                 class_=AsyncSession,
                 expire_on_commit=False,
                 autoflush=False,
                 autocommit=False,
             )
-            # Ensure the connection works and create schema
-            async with _engine.begin() as conn:
-                await conn.execute(text("SELECT 1"))
-            try:
-                import src.models  # noqa: F401
-                from src.models.base import Base as _Base
 
-                async with _engine.begin() as conn:
-                    await conn.run_sync(_Base.metadata.create_all)
-                logger.info("Created sqlite schema in fallback path")
-            except Exception:
-                logger.debug("Fallback schema creation failed", exc_info=True)
-            logger.info("Fallback in-memory sqlite database initialized for tests")
-            return
-        raise ConfigurationError("Failed to initialize database connection") from e
-    except Exception as e:
-        logger.error(
-            "Unexpected error initializing database",
-            error=str(e),
-            error_type=type(e).__name__,
-            exc_info=True,
+            async with candidate.begin() as connection:
+                await connection.execute(text("SELECT 1"))
+
+            if candidate.url.drivername.startswith("sqlite"):
+                import src.models  # noqa: F401 - register model metadata
+                from src.models.base import Base
+
+                _patch_jsonb_for_sqlite()
+                async with candidate.begin() as connection:
+                    await connection.run_sync(Base.metadata.create_all)
+        except BaseException as error:
+            if candidate is not None:
+                try:
+                    await _dispose_once(candidate)
+                except asyncio.CancelledError:
+                    if isinstance(error, asyncio.CancelledError):
+                        raise error
+                    raise
+                except Exception:
+                    logger.exception("Failed to dispose rejected database engine")
+            if not isinstance(error, Exception):
+                raise
+            logger.error(
+                "Failed to initialize database",
+                error_type=type(error).__name__,
+                exc_info=True,
+            )
+            raise ConfigurationError(
+                "Failed to initialize database connection"
+            ) from error
+
+        _engine = candidate
+        _session_factory = candidate_factory
+        logger.info(
+            "Database initialized successfully",
+            pool_size=settings.database_pool_size,
+            max_overflow=settings.database_max_overflow,
         )
-        raise ConfigurationError("Failed to initialize database connection") from e
 
 
 async def close_database() -> None:
-    """
-    Close database connections.
-
-    Disposes of the engine and clears session factory.
-    Should be called during application shutdown.
-    """
+    """Atomically unpublish and dispose the process-wide pool exactly once."""
     global _engine, _session_factory
 
-    if _engine is not None:
-        await _engine.dispose()
+    async with _lifecycle_lock:
+        engine = _engine
         _engine = None
         _session_factory = None
+        if engine is None:
+            return
+        await _dispose_once(engine)
         logger.info("Database connections closed")
 
 
 def get_db_engine() -> AsyncEngine:
-    """
-    Get the database engine.
-
-    Returns:
-        The async engine instance
-
-    Raises:
-        RuntimeError: If database is not initialized
-    """
+    """Return the lifespan-owned engine."""
     if _engine is None:
         raise RuntimeError("Database not initialized. Call init_database() first.")
     return _engine
 
 
-def get_db_session() -> AsyncSession:
-    """
-    Get a new database session.
-
-    Returns:
-        A new AsyncSession instance
-
-    Raises:
-        RuntimeError: If database is not initialized
-    """
+def get_db_session_factory() -> SessionFactory:
+    """Return the exact lifespan-owned session factory."""
     if _session_factory is None:
         raise RuntimeError("Database not initialized. Call init_database() first.")
-    return _session_factory()
+    return _session_factory
+
+
+def get_db_session() -> AsyncSession:
+    """Open a session from the lifespan-owned factory."""
+    return get_db_session_factory()()
 
 
 async def get_db_session_dependency() -> AsyncGenerator[AsyncSession, None]:
-    """
-    Dependency function for FastAPI dependency injection.
-
-    Yields a session and closes it when done.  Route handlers that perform
-    writes MUST call ``await db.commit()`` explicitly before returning —
-    the post-yield phase of async-generator dependencies is unreliable
-    when any Starlette middleware wraps the request.
-    """
+    """Yield a request session; writes must still commit explicitly."""
     session = get_db_session()
     try:
         yield session

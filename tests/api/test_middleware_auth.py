@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import FastAPI, HTTPException, Request
@@ -24,6 +24,30 @@ from src.api.middleware.auth import (
     resolve_effective_tenant,
 )
 from tests.conftest import LifespanTestClient
+
+
+@pytest.fixture(autouse=True)
+def scoped_session_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Authenticated event probes operate on an existing tenant session."""
+
+    from src.models.session import Session
+    from src.repositories.session import SessionRepository
+
+    async def get_by_tenant_for_update(
+        _repo: SessionRepository, session_id: UUID, tenant_id: UUID
+    ) -> Session:
+        return Session(
+            id=session_id,
+            tenant_id=tenant_id,
+            channel="test",
+            cognitive_state={},
+            session_metadata={},
+            message_count=0,
+        )
+
+    monkeypatch.setattr(
+        SessionRepository, "get_by_tenant_for_update", get_by_tenant_for_update
+    )
 
 
 def _request_with_tenant(tenant: TenantContext) -> Request:
@@ -460,6 +484,20 @@ class TestAuthMiddleware:
 
         assert response.status_code == 200
 
+    def test_event_without_tenant_assertion_uses_authenticated_tenant(
+        self,
+        client: TestClient,
+        sample_event_payload: dict[str, Any],
+        api_headers: dict[str, str],
+    ) -> None:
+        """The deprecated body tenant is optional and never routing authority."""
+
+        payload = dict(sample_event_payload)
+        payload.pop("tenant_id")
+        response = client.post("/v1/events", json=payload, headers=api_headers)
+
+        assert response.status_code == 200
+
     def test_health_endpoint_no_auth_required(
         self,
         client: TestClient,
@@ -508,16 +546,16 @@ class TestAuthMiddleware:
         sample_event_payload: dict[str, Any],
     ) -> None:
         """Test that known development keys are accepted."""
-        known_keys = [
-            "ns_dev_test_key_12345",
-            "ns_dev_builder_key_67890",
-            "test-api-key",
-        ]
+        known_keys = {
+            "ns_dev_test_key_12345": "a0000000-0000-0000-0000-000000000001",
+            "ns_dev_builder_key_67890": "a0000000-0000-0000-0000-000000000002",
+            "test-api-key": "a0000000-0000-0000-0000-000000000001",
+        }
 
-        for key in known_keys:
+        for key, tenant_id in known_keys.items():
             response = client.post(
                 "/v1/events",
-                json=sample_event_payload,
+                json={**sample_event_payload, "tenant_id": tenant_id},
                 headers={
                     "Content-Type": "application/json",
                     "X-API-Key": key,
