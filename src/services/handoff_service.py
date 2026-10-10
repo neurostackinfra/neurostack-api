@@ -11,7 +11,6 @@ from enum import Enum
 from typing import Any, Optional, TypeVar, cast, overload
 from uuid import UUID, uuid4
 
-from prometheus_client import Counter, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.logging import get_logger
@@ -47,6 +46,8 @@ from src.handoff.webhook import WebhookDispatcher, get_webhook_dispatcher
 from src.memory import event_store as event_store_module
 from src.memory.event_store import EventData, EventStore, EventType, HandoffEventData
 from src.models.handoff import HandoffRecord
+from src.observability.metric_dimensions import ContractCounter as Counter
+from src.observability.metric_dimensions import ContractHistogram as Histogram
 from src.repositories.database import get_db_session_factory
 from src.repositories.handoff import (
     HandoffCasOutcome,
@@ -682,7 +683,7 @@ class HandoffService:
         except HandoffPostCommitError:
             HANDOFF_OPERATIONS.labels(operation="update", status="error").inc()
             raise
-        HANDOFF_OPERATIONS.labels(operation="update", status=record.status).inc()
+        HANDOFF_OPERATIONS.labels(operation="update", status="success").inc()
         return record.id
 
     async def update_handoff(
@@ -1062,7 +1063,7 @@ class HandoffService:
             raise
         HANDOFF_OPERATIONS.labels(
             operation="update",
-            status=new_status.value,
+            status="success",
         ).inc()
         return _HandoffTransitionResult(
             detail=map_handoff_record(record, projection),

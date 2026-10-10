@@ -21,10 +21,12 @@ from threading import Lock
 from typing import Optional, Protocol, cast
 
 from fastapi import Request, Response
-from prometheus_client import Counter, Gauge, Histogram
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from src.config.logging import get_logger
+from src.observability.metric_dimensions import ContractCounter as Counter
+from src.observability.metric_dimensions import ContractGauge as Gauge
+from src.observability.metric_dimensions import ContractHistogram as Histogram
 
 logger = get_logger(__name__)
 
@@ -261,8 +263,7 @@ class PerformanceMiddleware(BaseHTTPMiddleware):
 
         Prefer the FastAPI route template resolved by ``call_next`` so
         capability tokens never enter the Prometheus label set. Fall back
-        to a redacted raw-path normalisation only when no route matched
-        (404 / unknown endpoint).
+        to one stable bucket when no route matched (404 / unknown endpoint).
         """
 
         route = getattr(request.scope, "get", lambda _k: None)("route")
@@ -273,39 +274,17 @@ class PerformanceMiddleware(BaseHTTPMiddleware):
         template = getattr(route, "path", None) if route is not None else None
         if isinstance(template, str) and template:
             return template
-        return self._normalize_path(request.url.path)
+        return "/{unmatched}"
 
     def _normalize_path(self, path: str) -> str:
         """
-        Normalize path for metrics labels.
+        Return the stable metrics bucket for an unresolved path.
 
-        Replaces dynamic segments (UUIDs, IDs) with placeholders
-        to prevent label explosion. Also redacts the base64url capability
-        token that appears at ``/v1/webhook/zapi/{token}`` for the rare case
-        where no route template resolved (e.g. an unmatched 404).
+        Kept as a compatibility seam for callers that previously used this
+        helper directly.  No segment of an unmatched raw path may be exported.
         """
-        import re
-
-        # Explicitly redact the Z-API capability path even without a matched
-        # route so the raw base64url segment cannot reach any metric label.
-        path = re.sub(
-            r"(/v1/webhook/zapi)/[A-Za-z0-9_-]{20,}",
-            r"\1/{capability_token}",
-            path,
-        )
-
-        # Replace UUIDs
-        path = re.sub(
-            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-            "{id}",
-            path,
-            flags=re.IGNORECASE,
-        )
-
-        # Replace numeric IDs
-        path = re.sub(r"/\d+(?=/|$)", "/{id}", path)
-
-        return path
+        _ = path
+        return "/{unmatched}"
 
 
 # ============================================

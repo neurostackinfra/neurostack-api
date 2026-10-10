@@ -18,6 +18,7 @@ import logging
 
 import httpx
 
+from src.services.egress_policy import require_uazapi_egress
 from src.services.safe_egress import safe_async_client
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,7 @@ async def send_uazapi_text(
         Uazapi response dict. The outbound message id is typically returned as
         ``MessageID`` (wuzapi) or ``id`` — callers should probe both keys.
     """
+    await require_uazapi_egress()
     url = f"{api_url.rstrip('/')}/send/text"
     payload = {"number": phone, "text": message}
 
@@ -103,6 +105,7 @@ async def send_uazapi_audio(
 ) -> dict[str, object]:
     """Send synthesized audio as a push-to-talk message through Uazapi."""
 
+    await require_uazapi_egress()
     url = f"{api_url.rstrip('/')}/send/media"
     encoded = base64.b64encode(audio_bytes).decode("ascii")
     payload = {
@@ -168,6 +171,7 @@ async def download_uazapi_media(
             missing ``base64Data``, or base64 decode errors. The webhook
             catches this and reroutes to the text fallback.
     """
+    await require_uazapi_egress()
     if not api_url or not token or not message_id:
         raise UazapiMediaDownloadError("missing_arguments")
 

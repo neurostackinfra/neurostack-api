@@ -13,14 +13,204 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from threading import Lock
+from typing import Any, TypeVar
 
-from prometheus_client import REGISTRY, CollectorRegistry, Counter, Histogram
+from prometheus_client import REGISTRY, CollectorRegistry
+from prometheus_client import Counter as PrometheusCounter
+from prometheus_client import Histogram as PrometheusHistogram
+from prometheus_client.metrics import MetricWrapperBase
 from prometheus_client.metrics_core import Metric
 from prometheus_client.registry import Collector
 
 if globals().get("_NEUROSTACK_METRICS_IMPORT_SENTINEL") is not None:
     raise RuntimeError("neurostack_core.metrics cannot be reloaded")
 _NEUROSTACK_METRICS_IMPORT_SENTINEL = object()
+
+
+_CORE_LABEL_POLICIES = {
+    "neurostack_srm_decisions": {
+        "intent_category": frozenset(
+            {
+                "scheduling",
+                "question",
+                "complaint",
+                "greeting",
+                "farewell",
+                "confirmation",
+                "cancellation",
+                "information",
+                "feedback",
+                "emergency",
+                "unknown",
+            }
+        ),
+        "funnel_stage": frozenset(
+            {
+                "lead_novo",
+                "em_qualificacao",
+                "qualificado",
+                "followup",
+                "agendamento_solicitado",
+                "agendado",
+                "paciente_ativo",
+                "pos_atendimento",
+                "fidelizacao",
+                "inativo",
+                "standby",
+                "unknown",
+            }
+        ),
+        "mode": frozenset({"normal", "rag", "safety", "handoff", "error", "unknown"}),
+    },
+    "neurostack_srm_safety_triggers": {
+        "category": frozenset(
+            {
+                "clinical_risk",
+                "legal_risk",
+                "conduct_risk",
+                "clinical",
+                "legal",
+                "conduct",
+                "emergency",
+                "none",
+                "unknown",
+            }
+        )
+    },
+    "neurostack_srm_latency_seconds": {},
+    "neurostack_srm_handoffs": {
+        "reason": frozenset(
+            {
+                "user_request",
+                "explicit_request",
+                "safety_concern",
+                "safety",
+                "max_turns_exceeded",
+                "max_turns",
+                "low_confidence",
+                "complex_query",
+                "escalation",
+                "scheduling",
+                "unknown",
+            }
+        )
+    },
+    "neurostack_flow_transitions": {
+        "from_mode": frozenset(
+            {"normal", "rag", "safety", "handoff", "error", "unknown"}
+        ),
+        "to_mode": frozenset(
+            {"normal", "rag", "safety", "handoff", "error", "unknown"}
+        ),
+        "trigger": frozenset(
+            {
+                "safety_concern_detected",
+                "safety_resolved",
+                "handoff_requested",
+                "handoff_completed",
+                "handoff_cancelled",
+                "rag_required",
+                "rag_completed",
+                "continue_normal",
+                "reset_to_normal",
+                "session_timeout",
+                "session_end",
+            }
+        ),
+    },
+    "neurostack_flow_handler_duration_seconds": {
+        "mode": frozenset({"normal", "rag", "safety", "handoff", "error", "unknown"})
+    },
+    "neurostack_flow_decisions": {
+        "mode": frozenset({"normal", "rag", "safety", "handoff", "error", "unknown"}),
+        "action": frozenset({"process", "escalate", "defer", "block"}),
+    },
+    "neurostack_policy_evaluations": {"result": frozenset({"passed", "violated"})},
+    "neurostack_policy_violations": {
+        "category": frozenset(
+            {
+                "safety_clinical",
+                "safety_legal",
+                "safety_ethical",
+                "content",
+                "behavior",
+                "compliance",
+                "tone",
+                "custom",
+            }
+        ),
+        "severity": frozenset({"info", "warning", "error", "critical"}),
+        "action": frozenset({"log", "warn", "flag", "block", "handoff"}),
+    },
+    "neurostack_policy_latency_seconds": {},
+    "neurostack_prompt_generations": {
+        "mode": frozenset({"normal", "rag", "safety", "handoff", "error", "unknown"})
+    },
+    "neurostack_prompt_generation_seconds": {},
+    "neurostack_prompt_tokens": {
+        "mode": frozenset({"normal", "rag", "safety", "handoff", "error", "unknown"})
+    },
+    "neurostack_output_validations": {
+        "mode": frozenset({"normal", "rag", "safety", "handoff", "error", "unknown"}),
+        "valid": frozenset({"true", "false"}),
+    },
+}
+_CORE_NORMALIZED_LABELS = frozenset(
+    {
+        "intent_category",
+        "funnel_stage",
+        "mode",
+        "category",
+        "reason",
+        "from_mode",
+        "to_mode",
+    }
+)
+_MetricT = TypeVar("_MetricT", bound=MetricWrapperBase)
+
+
+def _contract_metric(metric: _MetricT) -> _MetricT:
+    if metric._name not in _CORE_LABEL_POLICIES:
+        raise ValueError(f"unknown core metric family: {metric._name}")
+    policies = _CORE_LABEL_POLICIES[metric._name]
+    labelnames = tuple(metric._labelnames)
+    if labelnames != tuple(policies):
+        raise ValueError(f"missing or mismatched core metric contract: {metric._name}")
+    if not labelnames:
+        return metric
+    prometheus_labels = metric.labels
+
+    def labels(*values: Any, **kwargs: Any) -> _MetricT:
+        if values and kwargs:
+            raise ValueError("Can't pass both *args and **kwargs")
+        if kwargs:
+            if set(kwargs) != set(labelnames):
+                raise ValueError("Incorrect label names")
+            supplied = {name: str(kwargs[name]) for name in labelnames}
+        else:
+            if len(values) != len(labelnames):
+                raise ValueError("Incorrect label count")
+            supplied = {name: str(value) for name, value in zip(labelnames, values)}
+        normalized: dict[str, str] = {}
+        for name, value in supplied.items():
+            if value in policies[name]:
+                normalized[name] = value
+            elif name in _CORE_NORMALIZED_LABELS and "unknown" in policies[name]:
+                normalized[name] = "unknown"
+            else:
+                raise ValueError(f"{metric._name}.{name} rejected out-of-policy value")
+        return prometheus_labels(**normalized)
+
+    setattr(metric, "labels", labels)
+    return metric
+
+
+def Counter(*args: Any, **kwargs: Any) -> PrometheusCounter:
+    return _contract_metric(PrometheusCounter(*args, **kwargs))
+
+
+def Histogram(*args: Any, **kwargs: Any) -> PrometheusHistogram:
+    return _contract_metric(PrometheusHistogram(*args, **kwargs))
 
 
 SRM_DECISIONS = Counter(
@@ -76,7 +266,7 @@ FLOW_DECISIONS_TOTAL = Counter(
 POLICY_EVALUATIONS = Counter(
     "neurostack_policy_evaluations_total",
     "Total number of policy evaluations",
-    ["tenant_id", "result"],
+    ["result"],
     registry=None,
 )
 

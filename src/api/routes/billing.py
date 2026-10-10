@@ -30,6 +30,11 @@ from src.services.billing_usage_service import (
     PlanUsageLimits,
     get_builder_billing_usage,
 )
+from src.services.egress_policy import (
+    FINANCIAL_EGRESS_DISABLED,
+    EgressDisabledError,
+    require_financial_egress,
+)
 
 logger = get_logger(__name__)
 
@@ -214,6 +219,13 @@ async def create_checkout(
         coupon_code_used = coupon.code
 
     amount_cents = amount * 100
+    try:
+        await require_financial_egress()
+    except EgressDisabledError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=FINANCIAL_EGRESS_DISABLED,
+        ) from exc
     client = _get_client()
 
     metadata = {

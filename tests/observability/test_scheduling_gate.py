@@ -54,11 +54,11 @@ def _render_handoff_confirmation_pending(language: str) -> str:
     return content[content.index(header) :]
 
 
-def _violation_count(tenant_id: str, category: str) -> float:
+def _violation_count(category: str) -> float:
     return (
         REGISTRY.get_sample_value(
             "neurostack_scheduling_gate_violations_total",
-            {"tenant_id": tenant_id, "category": category},
+            {"category": category},
         )
         or 0.0
     )
@@ -183,19 +183,19 @@ class TestDetectSchedulingViolation:
 class TestCheckSchedulingGate:
     def test_confirmed_pt_bumps_counter(self) -> None:
         tenant = "t-sched-conf-pt"
-        before = _violation_count(tenant, CATEGORY_CONFIRMED)
+        before = _violation_count(CATEGORY_CONFIRMED)
         got = check_scheduling_gate(
             "seu agendamento está confirmado para amanhã", tenant
         )
         assert got == CATEGORY_CONFIRMED
-        assert _violation_count(tenant, CATEGORY_CONFIRMED) == before + 1
+        assert _violation_count(CATEGORY_CONFIRMED) == before + 1
 
     def test_confirmed_en_bumps_counter(self) -> None:
         tenant = "t-sched-conf-en"
-        before = _violation_count(tenant, CATEGORY_CONFIRMED)
+        before = _violation_count(CATEGORY_CONFIRMED)
         got = check_scheduling_gate("your appointment is confirmed", tenant)
         assert got == CATEGORY_CONFIRMED
-        assert _violation_count(tenant, CATEGORY_CONFIRMED) == before + 1
+        assert _violation_count(CATEGORY_CONFIRMED) == before + 1
 
     def test_later_assertion_after_negated_claim_is_counted_and_logged(
         self, caplog
@@ -203,7 +203,7 @@ class TestCheckSchedulingGate:
         import logging
 
         tenant = "t-sched-negated-then-confirmed"
-        before = _violation_count(tenant, CATEGORY_CONFIRMED)
+        before = _violation_count(CATEGORY_CONFIRMED)
         caplog.set_level(logging.WARNING)
 
         got = check_scheduling_gate(
@@ -212,7 +212,7 @@ class TestCheckSchedulingGate:
         )
 
         assert got == CATEGORY_CONFIRMED
-        assert _violation_count(tenant, CATEGORY_CONFIRMED) == before + 1
+        assert _violation_count(CATEGORY_CONFIRMED) == before + 1
         assert any(
             "scheduling_gate_violation" in record.getMessage()
             for record in caplog.records
@@ -220,31 +220,31 @@ class TestCheckSchedulingGate:
 
     def test_availability_pt_bumps_counter(self) -> None:
         tenant = "t-sched-avail-pt"
-        before = _violation_count(tenant, CATEGORY_AVAILABILITY)
+        before = _violation_count(CATEGORY_AVAILABILITY)
         got = check_scheduling_gate("esse horário está disponível", tenant)
         assert got == CATEGORY_AVAILABILITY
-        assert _violation_count(tenant, CATEGORY_AVAILABILITY) == before + 1
+        assert _violation_count(CATEGORY_AVAILABILITY) == before + 1
 
     def test_availability_en_bumps_counter(self) -> None:
         tenant = "t-sched-avail-en"
-        before = _violation_count(tenant, CATEGORY_AVAILABILITY)
+        before = _violation_count(CATEGORY_AVAILABILITY)
         got = check_scheduling_gate("that time is available", tenant)
         assert got == CATEGORY_AVAILABILITY
-        assert _violation_count(tenant, CATEGORY_AVAILABILITY) == before + 1
+        assert _violation_count(CATEGORY_AVAILABILITY) == before + 1
 
     def test_processed_change_pt_bumps_counter(self) -> None:
         tenant = "t-sched-proc-pt"
-        before = _violation_count(tenant, CATEGORY_PROCESSED_CHANGE)
+        before = _violation_count(CATEGORY_PROCESSED_CHANGE)
         got = check_scheduling_gate("seu cancelamento foi processado", tenant)
         assert got == CATEGORY_PROCESSED_CHANGE
-        assert _violation_count(tenant, CATEGORY_PROCESSED_CHANGE) == before + 1
+        assert _violation_count(CATEGORY_PROCESSED_CHANGE) == before + 1
 
     def test_processed_change_en_bumps_counter(self) -> None:
         tenant = "t-sched-proc-en"
-        before = _violation_count(tenant, CATEGORY_PROCESSED_CHANGE)
+        before = _violation_count(CATEGORY_PROCESSED_CHANGE)
         got = check_scheduling_gate("I've cancelled your appointment", tenant)
         assert got == CATEGORY_PROCESSED_CHANGE
-        assert _violation_count(tenant, CATEGORY_PROCESSED_CHANGE) == before + 1
+        assert _violation_count(CATEGORY_PROCESSED_CHANGE) == before + 1
 
     def test_clean_response_returns_none(self) -> None:
         tenant = "t-sched-clean"
@@ -261,11 +261,11 @@ class TestCheckSchedulingGate:
         assert check_scheduling_gate(None, "t-x") is None
 
     def test_missing_tenant_falls_back_to_unknown(self) -> None:
-        # No tenant_id — must not raise, must label as "unknown".
-        before = _violation_count("unknown", CATEGORY_CONFIRMED)
+        # No tenant_id is safe because identity never becomes a metric label.
+        before = _violation_count(CATEGORY_CONFIRMED)
         got = check_scheduling_gate("your appointment is confirmed", None)
         assert got == CATEGORY_CONFIRMED
-        assert _violation_count("unknown", CATEGORY_CONFIRMED) == before + 1
+        assert _violation_count(CATEGORY_CONFIRMED) == before + 1
 
     def test_log_sink_failure_does_not_break_the_gate(self, monkeypatch) -> None:
         """The guard is an observability backstop, never a new failure mode."""

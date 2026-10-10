@@ -45,6 +45,7 @@ from src.repositories import (
     get_db_session_dependency,
 )
 from src.services.api_credentials import OPERATIONAL_MULTIMODAL_PROVIDERS
+from src.services.egress_policy import EgressDisabledError
 from src.services.event_service import get_event_service
 from src.services.meta_service import (
     download_meta_media_audio,
@@ -263,6 +264,8 @@ async def _send_reply_with_optional_tts(
 
     try:
         return await send_audio(audio.content, audio.mime_type), True
+    except EgressDisabledError:
+        raise
     except Exception as exc:
         error_code = getattr(exc, "code", type(exc).__name__)
         logger.warning(
@@ -971,6 +974,8 @@ async def _send_privacy_notice(
             channel_label,
             to_phone,
         )
+    except EgressDisabledError:
+        raise
     except Exception as exc:
         logger.warning(
             "%s LGPD send failed for %s — %s",
@@ -1755,6 +1760,8 @@ async def _send_uazapi_stt_fallback(
     try:
         send_result = await send_uazapi_text(u_url, u_token, phone, message)
         _track_sent_message(send_result)
+    except EgressDisabledError:
+        raise
     except Exception as exc:
         logger.warning("Uazapi STT fallback send failed for %s — %s", phone, exc)
         return {"ok": True, "replied": False, "action": "stt_fallback_send_failed"}
@@ -2736,7 +2743,11 @@ async def uazapi_webhook(
     # on match, so without this ordering the second delivery would slip
     # past them and pause the session. The claim is ``SET NX EX`` with a
     # 31-day retention: claim-and-hold, not consume.
-    if msg_id and not _claim_incoming_message("uazapi", tenant_id, msg_id):
+    if (
+        msg_id
+        and not audio_is_transcribable
+        and not _claim_incoming_message("uazapi", tenant_id, msg_id)
+    ):
         logger.info(
             "Uazapi webhook: duplicate msg %s from %s skipped",
             msg_id,
@@ -2784,6 +2795,13 @@ async def uazapi_webhook(
             _raw_creds_memo = await _load_tenant_credentials(tenant_id, db)
         return _raw_creds_memo
 
+    def _claim_audio_message() -> dict[str, Any] | None:
+        """Claim audio only after any required provider download succeeds."""
+
+        if msg_id and not _claim_incoming_message("uazapi", tenant_id, msg_id):
+            return {"ok": True, "skipped": "duplicate_message"}
+        return None
+
     # ── patient audio: transcribe via STT → multimodal → text reroute ──
     # Mirrors the Z-API audio block (webhook.py: ``_process_zapi_authenticated_body``)
     # gate order: STT-provider-unsupported → duration → capability →
@@ -2801,6 +2819,9 @@ async def uazapi_webhook(
         # This gate is deliberate — some providers have no runtime adapter
         # and must not attempt download / transcription / reroute.
         if stt_provider in UNSUPPORTED_STT_PROVIDERS:
+            duplicate = _claim_audio_message()
+            if duplicate is not None:
+                return duplicate
             return _stt_skip_envelope(stt_provider)
 
         # Duration gate: field name confirmed against the captured evidence
@@ -2813,6 +2834,9 @@ async def uazapi_webhook(
             audio_seconds = int(content_obj.get("seconds") or 0)
         audio_max_seconds = int(creds.get("audio_max_seconds") or 60)
         if audio_seconds > audio_max_seconds:
+            duplicate = _claim_audio_message()
+            if duplicate is not None:
+                return duplicate
             if u_url and u_token:
                 handoff_msg = (
                     _AUDIO_TOO_LONG_MSG_EN
@@ -2821,6 +2845,12 @@ async def uazapi_webhook(
                 )
                 try:
                     await send_uazapi_text(u_url, u_token, from_phone, handoff_msg)
+                except EgressDisabledError:
+                    return {
+                        "ok": True,
+                        "skipped": "audio_too_long",
+                        "reason": "uazapi_egress_disabled",
+                    }
                 except Exception:
                     logger.exception(
                         "Uazapi long-audio handoff send failed for %s",
@@ -2850,7 +2880,19 @@ async def uazapi_webhook(
                 audio_bytes, downloaded_mime = await download_uazapi_media(
                     u_url, u_token, msg_id
                 )
+            except EgressDisabledError:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "ok": False,
+                        "error": "uazapi_egress_disabled",
+                        "retryable": True,
+                    },
+                )
             except UazapiMediaDownloadError as exc:
+                duplicate = _claim_audio_message()
+                if duplicate is not None:
+                    return duplicate
                 # Media never materialised — Uazapi's download endpoint
                 # rejected the request or returned garbage. There is no
                 # transcription to reroute from; skip with a distinct label
@@ -2861,6 +2903,9 @@ async def uazapi_webhook(
                     exc,
                 )
                 return {"ok": True, "skipped": "audio_download_failed"}
+            duplicate = _claim_audio_message()
+            if duplicate is not None:
+                return duplicate
             if downloaded_mime:
                 effective_mime = downloaded_mime
             logger.info(
@@ -2868,6 +2913,10 @@ async def uazapi_webhook(
                 len(audio_bytes),
                 effective_mime,
             )
+        else:
+            duplicate = _claim_audio_message()
+            if duplicate is not None:
+                return duplicate
 
         transcript, chain_failure = await _transcribe_audio_chain(
             audio_bytes,
@@ -2877,14 +2926,22 @@ async def uazapi_webhook(
             channel="Uazapi",
         )
         if chain_failure:
-            return await _send_uazapi_stt_fallback(
-                tenant_id=tenant_id,
-                phone=from_phone,
-                u_url=u_url,
-                u_token=u_token,
-                agent_language=agent_lang,
-                failure_reason=chain_failure,
-            )
+            try:
+                return await _send_uazapi_stt_fallback(
+                    tenant_id=tenant_id,
+                    phone=from_phone,
+                    u_url=u_url,
+                    u_token=u_token,
+                    agent_language=agent_lang,
+                    failure_reason=chain_failure,
+                )
+            except EgressDisabledError:
+                return {
+                    "ok": True,
+                    "replied": False,
+                    "action": "stt_fallback_suppressed",
+                    "reason": "uazapi_egress_disabled",
+                }
         # Success: feed the transcript into the normal pipeline. The
         # load-bearing ``assert message_text is not None`` below is now
         # satisfied on the patient-audio path.
@@ -2925,6 +2982,7 @@ async def uazapi_webhook(
     u_token = (creds.get("uazapi_token") or "").strip()
 
     # ── send LGPD privacy notice as the very first message of a new session ──
+    egress_suppressed = False
     if is_new:
         lgpd_cfg = (clinic_config or {}).get("lgpd") or {}
         if u_url and u_token:
@@ -2932,17 +2990,20 @@ async def uazapi_webhook(
             async def _send_uazapi_privacy(msg: str) -> dict[str, Any]:
                 return await send_uazapi_text(u_url, u_token, from_phone, msg)
 
-            await _send_privacy_notice(
-                channel_label="Uazapi",
-                is_new=is_new,
-                lgpd_cfg=lgpd_cfg,
-                clinic_config=clinic_config,
-                tenant_id=tenant_id,
-                session_id=session_id,
-                to_phone=from_phone,
-                db=db,
-                send=_send_uazapi_privacy,
-            )
+            try:
+                await _send_privacy_notice(
+                    channel_label="Uazapi",
+                    is_new=is_new,
+                    lgpd_cfg=lgpd_cfg,
+                    clinic_config=clinic_config,
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    to_phone=from_phone,
+                    db=db,
+                    send=_send_uazapi_privacy,
+                )
+            except EgressDisabledError:
+                egress_suppressed = True
 
     assert message_text is not None
     event_request = CanonicalEventRequest(
@@ -2976,6 +3037,12 @@ async def uazapi_webhook(
 
     if not suggested:
         logger.info("Uazapi webhook: no suggested_response for %s", from_phone)
+        if egress_suppressed:
+            return {
+                "ok": True,
+                "replied": False,
+                "reason": "uazapi_egress_disabled",
+            }
         return {"ok": True, "replied": False}
 
     if not u_url or not u_token:
@@ -3018,6 +3085,12 @@ async def uazapi_webhook(
             len(suggested),
             "audio" if sent_as_audio else "text",
         )
+    except EgressDisabledError:
+        return {
+            "ok": True,
+            "replied": False,
+            "reason": "uazapi_egress_disabled",
+        }
     except Exception:
         logger.exception("Uazapi send failed for %s", from_phone)
         return {"ok": True, "replied": False, "reason": "send_failed"}

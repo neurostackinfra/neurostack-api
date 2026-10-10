@@ -108,7 +108,7 @@ def test_exact_fourteen_metric_family_types_and_labels() -> None:
             "neurostack_flow_transitions": ("counter", ("from_mode", "to_mode", "trigger")),
             "neurostack_flow_handler_duration_seconds": ("histogram", ("mode",)),
             "neurostack_flow_decisions": ("counter", ("mode", "action")),
-            "neurostack_policy_evaluations": ("counter", ("tenant_id", "result")),
+            "neurostack_policy_evaluations": ("counter", ("result",)),
             "neurostack_policy_violations": ("counter", ("category", "severity", "action")),
             "neurostack_policy_latency_seconds": ("histogram", ()),
             "neurostack_prompt_generations": ("counter", ("mode",)),
@@ -167,11 +167,52 @@ def test_observations_made_before_enable_are_retained() -> None:
             sample.name: sample.value
             for metric in registry.collect()
             for sample in metric.samples
-            if sample.labels in ({"reason": "requested"}, {"mode": "normal"})
+            if sample.labels in ({"reason": "unknown"}, {"mode": "normal"})
         }
         assert values["neurostack_srm_handoffs_total"] == 3
         assert values["neurostack_flow_handler_duration_seconds_count"] == 1
         assert values["neurostack_flow_handler_duration_seconds_sum"] == 0.25
+        """)
+
+
+def test_public_core_labels_cannot_export_identity_values() -> None:
+    assert_isolated_ok("""
+        from prometheus_client import CollectorRegistry, generate_latest
+        import neurostack_core as core
+
+        rejected = (
+            "requested",
+            "patient@example.com",
+            "52998224725",
+            "request-12345678901234567890",
+            "session-12345678901234567890",
+            "trace-12345678901234567890",
+            "aBc-VeryLongCapabilityToken_0123456789xyz",
+        )
+        for value in rejected:
+            core.SRM_HANDOFFS.labels(reason=value).inc()
+        registry = CollectorRegistry()
+        core.enable_metrics(registry)
+        scrape = generate_latest(registry).decode()
+        assert 'reason="unknown"' in scrape
+        for value in rejected:
+            assert value not in scrape
+        """)
+
+
+def test_core_constructor_rejects_an_unknown_family() -> None:
+    assert_isolated_ok("""
+        import neurostack_core.metrics as metrics
+        try:
+            metrics.Counter(
+                "neurostack_unknown_total",
+                "unknown family",
+                registry=None,
+            )
+        except ValueError as exc:
+            assert "unknown core metric family" in str(exc)
+        else:
+            raise AssertionError("unknown core family was accepted")
         """)
 
 

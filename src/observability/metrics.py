@@ -14,9 +14,11 @@ visualizadas no Grafana.
 
 from typing import Optional
 
-from prometheus_client import Counter, Gauge, Histogram
-
 from src.config.logging import get_logger
+from src.observability.metric_dimensions import ContractCounter as Counter
+from src.observability.metric_dimensions import ContractGauge as Gauge
+from src.observability.metric_dimensions import ContractHistogram as Histogram
+from src.observability.metric_dimensions import bounded_metric_labels
 
 logger = get_logger(__name__)
 
@@ -32,7 +34,7 @@ SRM_DECISIONS_TOTAL = Counter(
     # labels, so it needs a distinct Prometheus identity to remain importable.
     "neurostack_business_srm_decisions_total",
     "Total de decisões de negócio tomadas pelo SRM",
-    ["tenant_id", "flow_mode"],
+    ["flow_mode"],
 )
 
 # Tempo de processamento do SRM
@@ -47,7 +49,7 @@ SRM_PROCESSING_TIME = Histogram(
 INTENT_CLASSIFICATIONS_TOTAL = Counter(
     "neurostack_intent_classifications_total",
     "Total de classificações de intent",
-    ["intent", "tenant_id"],
+    ["intent"],
 )
 
 # Confiança das classificações de intent
@@ -61,7 +63,7 @@ INTENT_CONFIDENCE = Gauge(
 FUNNEL_STAGE_TOTAL = Counter(
     "neurostack_funnel_stage_total",
     "Total de detecções por estágio do funil",
-    ["stage", "tenant_id"],
+    ["stage"],
 )
 
 
@@ -73,7 +75,7 @@ FUNNEL_STAGE_TOTAL = Counter(
 SAFETY_TRIGGERS_TOTAL = Counter(
     "neurostack_safety_triggers_total",
     "Total de triggers de safety detectados",
-    ["category", "tenant_id"],  # clinical, legal, conduct
+    ["category"],  # clinical, legal, conduct
 )
 
 # Confiança de detecção de safety
@@ -102,7 +104,7 @@ FLOW_TRANSITIONS_TOTAL = Counter(
     # different label contract; keep this legacy business view distinct.
     "neurostack_business_flow_transitions_total",
     "Total de transições de flow de negócio",
-    ["from_mode", "to_mode", "tenant_id"],
+    ["from_mode", "to_mode"],
 )
 
 # Tempo em cada modo de flow
@@ -129,7 +131,7 @@ ACTIVE_SESSIONS_BY_MODE = Gauge(
 HANDOFFS_TOTAL = Counter(
     "neurostack_handoffs_total",
     "Total de handoffs para humanos",
-    ["reason", "tenant_id"],  # explicit_request, safety, max_turns, low_confidence
+    ["reason"],  # explicit_request, safety, max_turns, low_confidence
 )
 
 # Tempo até handoff (número de turnos)
@@ -144,7 +146,7 @@ HANDOFF_TURN_COUNT = Histogram(
 HANDOFF_RESPONSE_TIME = Histogram(
     "neurostack_handoff_response_seconds",
     "Tempo de resposta do humano após handoff",
-    ["tenant_id"],
+    [],
     buckets=[30, 60, 120, 300, 600, 1800, 3600, 7200, 14400],
 )
 
@@ -152,7 +154,7 @@ HANDOFF_RESPONSE_TIME = Histogram(
 HANDOFF_WEBHOOKS = Counter(
     "neurostack_handoff_webhooks_total",
     "Total de webhooks de handoff enviados",
-    ["status", "tenant_id"],  # success, failed, timeout
+    ["status"],  # success, failed, timeout
 )
 
 
@@ -164,14 +166,14 @@ HANDOFF_WEBHOOKS = Counter(
 RAG_QUERIES_TOTAL = Counter(
     "neurostack_rag_queries_total",
     "Total de consultas ao knowledge service",
-    ["tenant_id"],
+    [],
 )
 
 # Resultados RAG
 RAG_RESULTS_COUNT = Histogram(
     "neurostack_rag_results_count",
     "Número de resultados retornados por query RAG",
-    ["tenant_id"],
+    [],
     buckets=[0, 1, 2, 3, 5, 10, 20, 50],
 )
 
@@ -192,7 +194,7 @@ RAG_LATENCY = Histogram(
 POLICIES_APPLIED_TOTAL = Counter(
     "neurostack_policies_applied_total",
     "Total de políticas aplicadas",
-    ["policy_type", "tenant_id"],  # global, tenant, session
+    ["policy_type"],  # global, tenant, session
 )
 
 # Violações de política
@@ -201,7 +203,7 @@ POLICY_VIOLATIONS_TOTAL = Counter(
     # different label contract; keep this legacy business view distinct.
     "neurostack_business_policy_violations_total",
     "Total de violações de política de negócio detectadas",
-    ["rule_id", "tenant_id"],
+    [],
 )
 
 
@@ -213,7 +215,7 @@ POLICY_VIOLATIONS_TOTAL = Counter(
 PIPELINE_TOTAL_TIME = Histogram(
     "neurostack_pipeline_total_seconds",
     "Tempo total de processamento do pipeline cognitivo",
-    ["tenant_id"],
+    [],
     buckets=[0.01, 0.025, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 2.0, 5.0],
 )
 
@@ -267,20 +269,23 @@ class SRMMetrics:
         """Registra uma decisão do SRM."""
         try:
             SRM_DECISIONS_TOTAL.labels(
-                tenant_id=tenant_id,
-                flow_mode=flow_mode,
+                **bounded_metric_labels(
+                    "neurostack_business_srm_decisions", flow_mode=flow_mode
+                )
             ).inc()
 
             INTENT_CLASSIFICATIONS_TOTAL.labels(
-                intent=intent,
-                tenant_id=tenant_id,
+                **bounded_metric_labels(
+                    "neurostack_intent_classifications", intent=intent
+                )
             ).inc()
 
-            INTENT_CONFIDENCE.labels(intent=intent).set(intent_confidence)
+            INTENT_CONFIDENCE.labels(
+                **bounded_metric_labels("neurostack_intent_confidence", intent=intent)
+            ).set(intent_confidence)
 
             FUNNEL_STAGE_TOTAL.labels(
-                stage=funnel_stage,
-                tenant_id=tenant_id,
+                **bounded_metric_labels("neurostack_funnel_stage", stage=funnel_stage)
             ).inc()
 
             SRM_PROCESSING_TIME.labels(component="total").observe(
@@ -304,7 +309,11 @@ class SRMMetrics:
     @staticmethod
     def record_component_time(component: str, time_ms: float) -> None:
         """Registra tempo de um componente específico do SRM."""
-        SRM_PROCESSING_TIME.labels(component=component).observe(time_ms / 1000)
+        SRM_PROCESSING_TIME.labels(
+            **bounded_metric_labels(
+                "neurostack_srm_processing_seconds", component=component
+            )
+        ).observe(time_ms / 1000)
 
 
 class SafetyMetrics:
@@ -320,15 +329,21 @@ class SafetyMetrics:
         """Registra um trigger de safety."""
         try:
             SAFETY_TRIGGERS_TOTAL.labels(
-                category=category,
-                tenant_id=tenant_id,
+                **bounded_metric_labels("neurostack_safety_triggers", category=category)
             ).inc()
 
-            SAFETY_CONFIDENCE.labels(category=category).observe(confidence)
+            SAFETY_CONFIDENCE.labels(
+                **bounded_metric_labels(
+                    "neurostack_safety_confidence", category=category
+                )
+            ).observe(confidence)
 
             SAFETY_SEVERITY.labels(
-                severity=severity,
-                category=category,
+                **bounded_metric_labels(
+                    "neurostack_safety_severity",
+                    severity=severity,
+                    category=category,
+                )
             ).inc()
 
             logger.info(
@@ -360,13 +375,19 @@ class FlowMetrics:
         """Registra uma transição de flow."""
         try:
             FLOW_TRANSITIONS_TOTAL.labels(
-                from_mode=from_mode,
-                to_mode=to_mode,
-                tenant_id=tenant_id,
+                **bounded_metric_labels(
+                    "neurostack_business_flow_transitions",
+                    from_mode=from_mode,
+                    to_mode=to_mode,
+                )
             ).inc()
 
             if duration_seconds is not None:
-                FLOW_MODE_DURATION.labels(mode=from_mode).observe(duration_seconds)
+                FLOW_MODE_DURATION.labels(
+                    **bounded_metric_labels(
+                        "neurostack_flow_mode_duration_seconds", mode=from_mode
+                    )
+                ).observe(duration_seconds)
 
             logger.debug(
                 "Flow transition recorded",
@@ -385,7 +406,9 @@ class FlowMetrics:
     @staticmethod
     def update_active_sessions(mode: str, count: int) -> None:
         """Atualiza contagem de sessões ativas por modo."""
-        ACTIVE_SESSIONS_BY_MODE.labels(mode=mode).set(count)
+        ACTIVE_SESSIONS_BY_MODE.labels(
+            **bounded_metric_labels("neurostack_active_sessions_by_mode", mode=mode)
+        ).set(count)
 
 
 class HandoffMetrics:
@@ -400,11 +423,12 @@ class HandoffMetrics:
         """Registra um handoff para humano."""
         try:
             HANDOFFS_TOTAL.labels(
-                reason=reason,
-                tenant_id=tenant_id,
+                **bounded_metric_labels("neurostack_handoffs", reason=reason)
             ).inc()
 
-            HANDOFF_TURN_COUNT.labels(reason=reason).observe(turn_count)
+            HANDOFF_TURN_COUNT.labels(
+                **bounded_metric_labels("neurostack_handoff_turn_count", reason=reason)
+            ).observe(turn_count)
 
             logger.info(
                 "Handoff recorded",
@@ -423,12 +447,14 @@ class HandoffMetrics:
     @staticmethod
     def record_webhook(status: str, tenant_id: str) -> None:
         """Registra resultado de webhook de handoff."""
-        HANDOFF_WEBHOOKS.labels(status=status, tenant_id=tenant_id).inc()
+        HANDOFF_WEBHOOKS.labels(
+            **bounded_metric_labels("neurostack_handoff_webhooks", status=status)
+        ).inc()
 
     @staticmethod
     def record_response_time(tenant_id: str, response_time_seconds: float) -> None:
         """Registra tempo de resposta do humano."""
-        HANDOFF_RESPONSE_TIME.labels(tenant_id=tenant_id).observe(response_time_seconds)
+        HANDOFF_RESPONSE_TIME.observe(response_time_seconds)
 
 
 class RAGMetrics:
@@ -442,8 +468,8 @@ class RAGMetrics:
     ) -> None:
         """Registra uma query RAG."""
         try:
-            RAG_QUERIES_TOTAL.labels(tenant_id=tenant_id).inc()
-            RAG_RESULTS_COUNT.labels(tenant_id=tenant_id).observe(result_count)
+            RAG_QUERIES_TOTAL.inc()
+            RAG_RESULTS_COUNT.observe(result_count)
             RAG_LATENCY.observe(latency_ms / 1000)
 
             logger.debug(
@@ -468,17 +494,15 @@ class PolicyMetrics:
     def record_application(policy_type: str, tenant_id: str) -> None:
         """Registra aplicação de política."""
         POLICIES_APPLIED_TOTAL.labels(
-            policy_type=policy_type,
-            tenant_id=tenant_id,
+            **bounded_metric_labels(
+                "neurostack_policies_applied", policy_type=policy_type
+            )
         ).inc()
 
     @staticmethod
     def record_violation(rule_id: str, tenant_id: str) -> None:
         """Registra violação de política."""
-        POLICY_VIOLATIONS_TOTAL.labels(
-            rule_id=rule_id,
-            tenant_id=tenant_id,
-        ).inc()
+        POLICY_VIOLATIONS_TOTAL.inc()
 
         logger.warning(
             "Policy violation recorded",
@@ -493,12 +517,14 @@ class PipelineMetrics:
     @staticmethod
     def record_total_time(tenant_id: str, time_ms: float) -> None:
         """Registra tempo total do pipeline."""
-        PIPELINE_TOTAL_TIME.labels(tenant_id=tenant_id).observe(time_ms / 1000)
+        PIPELINE_TOTAL_TIME.observe(time_ms / 1000)
 
     @staticmethod
     def record_stage_time(stage: str, time_ms: float) -> None:
         """Registra tempo de um estágio do pipeline."""
-        PIPELINE_STAGE_TIME.labels(stage=stage).observe(time_ms / 1000)
+        PIPELINE_STAGE_TIME.labels(
+            **bounded_metric_labels("neurostack_pipeline_stage_seconds", stage=stage)
+        ).observe(time_ms / 1000)
 
 
 class BusinessMetrics:
