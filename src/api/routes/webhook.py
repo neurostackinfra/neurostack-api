@@ -3440,12 +3440,7 @@ async def meta_webhook(
             content={"error": "invalid_webhook_auth"},
         )
 
-    # ── 3) Rate limit (after auth, before replay/session/media/reply) ──
-    rate_decision = check_webhook_rate_limit(str(tenant_id), "meta")
-    if not rate_decision.allowed:
-        return webhook_rate_limit_response(rate_decision)
-
-    # ── 4) messageId presence + replay claim (before any downstream effect) ──
+    # ── 3) messageId presence + replay claim (before any downstream effect) ──
     # We need the first message id from the single message-bearing change.
     change_for_processing: dict[str, Any] = {}
     for entry in entries:
