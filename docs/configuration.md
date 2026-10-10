@@ -45,6 +45,45 @@ O manifesto `config/database-connection-budgets.json` registra as topologias apr
 
 No VPS, o deploy confere separadamente o comando de workers do Dockerfile, a propagação das três variáveis pelo Compose, os valores do `.env` e `max_connections=100` antes de `docker pull` ou `docker compose up`. O perfil `ecs-poc` mantém um orçamento separado e versionado para o deploy ECS.
 
+## Primeiro acesso: bootstrap do super_admin
+
+Um banco novo, depois de `alembic upgrade head`, não tem nenhum usuário. O
+primeiro acesso ao painel vem de `scripts/bootstrap_admin.py`, o único arquivo de
+`scripts/` incluído na imagem `production`. Numa transação, ele cria o tenant da
+plataforma (slug `neurostack-admin`, `plan_type=admin`, UUID aleatório, API key
+descartada) e o único `super_admin`. `scripts/seed_demo.py` é só para
+desenvolvimento e não deve ser usado em ambientes acessíveis pela internet.
+
+Ordem por ambiente, sempre com a mesma imagem (tag imutável) do service:
+criação das roles do banco → task de migrations → task one-off de bootstrap. O
+service pode já estar no ar; nenhum login funciona até o bootstrap rodar.
+
+```bash
+python -m scripts.bootstrap_admin
+```
+
+| Variável | Origem | Regra |
+|---|---|---|
+| `DATABASE_URL` | secret da aplicação (role só DML) | mesma URL do service, não a de migrations |
+| `ENVIRONMENT` | env | igual à do service |
+| `BOOTSTRAP_ADMIN_EMAIL` | secret | já em minúsculas, até 255 caracteres; é o login exato, digitado em minúsculas |
+| `BOOTSTRAP_ADMIN_PASSWORD` | secret | de 16 caracteres a 72 bytes UTF-8 |
+| `BOOTSTRAP_ADMIN_RESET_PASSWORD` | env, opcional | `true` ou `false` (padrão) |
+
+A saída de resultado é uma linha `[created|skip|reset] super_admin <email> on
+tenant <id>`; a senha e os hashes nunca são impressos. Sem a flag, reexecutar
+não escreve nada: imprime `skip` se a senha do secret confere com a do banco e
+falha se não confere. Também saem com código 1, sem escrever: outro
+`super_admin` já existe, o e-mail pertence a outro papel ou a uma conta
+inativa, ou já existe um tenant com o slug `neurostack-admin` (nunca é
+adotado).
+
+`super_admin` não troca a própria senha pelo painel. Para trocar ou recuperar,
+atualize `BOOTSTRAP_ADMIN_PASSWORD` no Secrets Manager e rode a task uma vez com
+`BOOTSTRAP_ADMIN_RESET_PASSWORD=true` e o mesmo e-mail (saída `[reset]`). Não
+ative rotação automática nesse secret: a senha real só muda quando a task roda
+com a flag, e a próxima execução sem flag acusa a divergência.
+
 ---
 
 ## Índice
