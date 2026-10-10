@@ -9,15 +9,18 @@ public host is honoured.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import socket
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Coroutine
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
 
 from src.services import safe_egress, uazapi_service
+from src.services.egress_policy import EgressDisabledError, EgressPolicy
 from src.services.safe_egress import UnsafeEgressError
 
 
@@ -53,6 +56,258 @@ def egress_env(resolver, mock_transport: httpx.MockTransport | None):
     finally:
         safe_egress._default_getaddrinfo = orig_dns
         safe_egress.build_safe_async_client = orig_build
+
+
+@pytest.fixture(autouse=True)
+def _enable_uazapi_gate_for_preexisting_transport_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def allow_uazapi_egress() -> None:
+        return None
+
+    monkeypatch.setattr(
+        uazapi_service,
+        "require_uazapi_egress",
+        allow_uazapi_egress,
+    )
+
+
+class _FlagReader:
+    def __init__(self, result: object = False, error: Exception | None = None) -> None:
+        self.result = result
+        self.error = error
+        self.calls: list[str] = []
+
+    async def is_enabled(self, flag_name: str) -> bool:
+        self.calls.append(flag_name)
+        if self.error is not None:
+            raise self.error
+        return self.result  # type: ignore[return-value]
+
+
+def _invoke_operation(operation: str) -> Coroutine[Any, Any, object]:
+    if operation == "text":
+        return uazapi_service.send_uazapi_text(
+            "https://uazapi.customer.example", "TOKEN", "5511", "hello"
+        )
+    if operation == "audio":
+        return uazapi_service.send_uazapi_audio(
+            "https://uazapi.customer.example", "TOKEN", "5511", b"audio"
+        )
+    return uazapi_service.download_uazapi_media(
+        "https://uazapi.customer.example", "TOKEN", "message-1"
+    )
+
+
+def _install_enabled_policy_and_safe_client_spy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[_FlagReader, list[str]]:
+    reader = _FlagReader(True)
+    safe_client_calls: list[str] = []
+    real_safe_async_client = uazapi_service.safe_async_client
+
+    def counted_safe_async_client(
+        url: str,
+        **kwargs: object,
+    ) -> Any:
+        safe_client_calls.append(url)
+        return real_safe_async_client(url, **kwargs)
+
+    monkeypatch.setattr(
+        uazapi_service,
+        "require_uazapi_egress",
+        EgressPolicy(reader).require_uazapi_egress,
+    )
+    monkeypatch.setattr(
+        uazapi_service,
+        "safe_async_client",
+        counted_safe_async_client,
+    )
+    return reader, safe_client_calls
+
+
+@pytest.mark.asyncio
+async def test_enabled_real_policy_allows_one_safe_text_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader, safe_client_calls = _install_enabled_policy_and_safe_client_spy(monkeypatch)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"MessageID": "MID.enabled"})
+
+    with egress_env(make_resolver("1.1.1.1"), httpx.MockTransport(handler)):
+        result = await uazapi_service.send_uazapi_text(
+            "https://uazapi.customer.example",
+            "TEXT-TOKEN",
+            "5511",
+            "olá",
+        )
+
+    assert result == {"MessageID": "MID.enabled"}
+    assert reader.calls == ["uazapi_egress_enabled"]
+    assert safe_client_calls == ["https://uazapi.customer.example/send/text"]
+    assert len(seen) == 1
+    assert seen[0].url.path == "/send/text"
+    assert seen[0].headers["Token"] == "TEXT-TOKEN"
+    assert seen[0].headers["Host"] == "uazapi.customer.example"
+    assert json.loads(seen[0].content) == {"number": "5511", "text": "olá"}
+
+
+@pytest.mark.asyncio
+async def test_enabled_real_policy_allows_one_safe_audio_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader, safe_client_calls = _install_enabled_policy_and_safe_client_spy(monkeypatch)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"id": "owner:MID.enabled"})
+
+    with egress_env(make_resolver("1.1.1.1"), httpx.MockTransport(handler)):
+        result = await uazapi_service.send_uazapi_audio(
+            "https://uazapi.customer.example",
+            "AUDIO-TOKEN",
+            "5511",
+            b"mp3",
+        )
+
+    assert result == {"id": "owner:MID.enabled"}
+    assert reader.calls == ["uazapi_egress_enabled"]
+    assert safe_client_calls == ["https://uazapi.customer.example/send/media"]
+    assert len(seen) == 1
+    assert seen[0].url.path == "/send/media"
+    assert seen[0].headers["Token"] == "AUDIO-TOKEN"
+    assert seen[0].headers["Host"] == "uazapi.customer.example"
+    assert json.loads(seen[0].content) == {
+        "number": "5511",
+        "type": "ptt",
+        "file": "data:audio/mpeg;base64,bXAz",
+        "mimetype": "audio/mpeg",
+    }
+
+
+@pytest.mark.asyncio
+async def test_enabled_real_policy_allows_one_safe_download_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader, safe_client_calls = _install_enabled_policy_and_safe_client_spy(monkeypatch)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "base64Data": base64.b64encode(b"OggS").decode("ascii"),
+                "mimetype": "audio/ogg; codecs=opus",
+            },
+        )
+
+    with egress_env(make_resolver("1.1.1.1"), httpx.MockTransport(handler)):
+        result = await uazapi_service.download_uazapi_media(
+            "https://uazapi.customer.example/",
+            "DOWNLOAD-TOKEN",
+            "message-enabled",
+        )
+
+    assert result == (b"OggS", "audio/ogg; codecs=opus")
+    assert reader.calls == ["uazapi_egress_enabled"]
+    assert safe_client_calls == ["https://uazapi.customer.example/message/download"]
+    assert len(seen) == 1
+    assert seen[0].url.path == "/message/download"
+    assert seen[0].headers["Token"] == "DOWNLOAD-TOKEN"
+    assert seen[0].headers["Host"] == "uazapi.customer.example"
+    assert json.loads(seen[0].content) == {
+        "id": "message-enabled",
+        "return_base64": True,
+        "return_link": False,
+        "generate_mp3": False,
+    }
+
+
+@pytest.mark.parametrize("operation", ["text", "audio", "download"])
+@pytest.mark.parametrize(
+    "mode",
+    ["false", "invalid", "agent-error"],
+    ids=["false", "invalid", "agent-error"],
+)
+@pytest.mark.asyncio
+async def test_gate_fails_before_safe_client_dns_socket_or_http(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    mode: str,
+) -> None:
+    reader = (
+        _FlagReader(error=RuntimeError("agent_unavailable"))
+        if mode == "agent-error"
+        else _FlagReader("true" if mode == "invalid" else False)
+    )
+    network_calls: list[str] = []
+
+    def forbidden_safe_client(*_args: object, **_kwargs: object) -> Any:
+        network_calls.append("safe_async_client")
+        raise AssertionError("safe client reached")
+
+    def forbidden_dns(*_args: object, **_kwargs: object) -> Any:
+        network_calls.append("dns")
+        raise AssertionError("DNS reached")
+
+    def forbidden_socket(*_args: object, **_kwargs: object) -> Any:
+        network_calls.append("socket")
+        raise AssertionError("socket reached")
+
+    class ForbiddenAsyncClient:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            network_calls.append("http")
+            raise AssertionError("HTTP client reached")
+
+    monkeypatch.setattr(
+        uazapi_service,
+        "require_uazapi_egress",
+        EgressPolicy(reader).require_uazapi_egress,
+    )
+    monkeypatch.setattr(uazapi_service, "safe_async_client", forbidden_safe_client)
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden_dns)
+    monkeypatch.setattr(socket, "socket", forbidden_socket)
+    monkeypatch.setattr(httpx, "AsyncClient", ForbiddenAsyncClient)
+
+    with pytest.raises(EgressDisabledError) as exc_info:
+        await _invoke_operation(operation)
+
+    assert exc_info.value.code == "uazapi_egress_disabled"
+    assert reader.calls == ["uazapi_egress_enabled"]
+    assert network_calls == []
+
+
+def test_uazapi_gate_is_independent_from_financial_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class IndependentFlags:
+        calls: list[str] = []
+
+        async def is_enabled(self, flag_name: str) -> bool:
+            self.calls.append(flag_name)
+            return {"financial_egress_enabled": True, "uazapi_egress_enabled": False}[
+                flag_name
+            ]
+
+    reader = IndependentFlags()
+    safe_client = MagicMock()
+    monkeypatch.setattr(
+        uazapi_service,
+        "require_uazapi_egress",
+        EgressPolicy(reader).require_uazapi_egress,
+    )
+    monkeypatch.setattr(uazapi_service, "safe_async_client", safe_client)
+
+    with pytest.raises(EgressDisabledError):
+        asyncio.run(_invoke_operation("text"))
+
+    assert reader.calls == ["uazapi_egress_enabled"]
+    safe_client.assert_not_called()
 
 
 class TestSendUazapiText:

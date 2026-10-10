@@ -17,9 +17,9 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from prometheus_client import Counter
-
 from src.config.logging import get_logger
+from src.observability.metric_dimensions import ContractCounter as Counter
+from src.observability.metric_dimensions import bounded_metric_labels
 
 logger = get_logger(__name__)
 
@@ -32,7 +32,7 @@ logger = get_logger(__name__)
 PRICE_GATE_VIOLATIONS = Counter(
     "neurostack_price_gate_violations_total",
     "Times a monetary value appeared in the agent response while atendimento_tipo != particular",
-    ["tenant_id", "atendimento_tipo"],  # atendimento_tipo: convenio | undefined
+    ["atendimento_tipo"],  # atendimento_tipo: convenio | undefined
 )
 
 
@@ -71,12 +71,14 @@ def check_price_gate(
     if not _MONEY_RE.search(response_text):
         return False
 
-    tipo_label = atendimento_tipo or "undefined"
+    tipo_label = "convenio" if atendimento_tipo == "convenio" else "undefined"
     tenant_label = str(tenant_id) if tenant_id else "unknown"
     try:
         PRICE_GATE_VIOLATIONS.labels(
-            tenant_id=tenant_label,
-            atendimento_tipo=tipo_label,
+            **bounded_metric_labels(
+                "neurostack_price_gate_violations",
+                atendimento_tipo=tipo_label,
+            )
         ).inc()
     except Exception as exc:  # noqa: BLE001 — metrics must never break pipeline
         logger.error(

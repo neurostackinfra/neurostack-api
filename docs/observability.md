@@ -44,63 +44,60 @@ docker-compose --profile observability ps
 | `neurostack_cache_hits_total` | Counter | Cache hits |
 | `neurostack_cache_misses_total` | Counter | Cache misses |
 
-### Métricas de Negócio
+### Métricas do core cognitivo
 
-| Métrica | Tipo | Labels | Descrição |
-|---------|------|--------|-----------|
-| `neurostack_srm_decisions_total` | Counter | tenant_id, flow_mode | Decisões do SRM |
-| `neurostack_intent_classifications_total` | Counter | intent, tenant_id | Classificações de intent |
-| `neurostack_funnel_stage_total` | Counter | stage, tenant_id | Detecções de estágio do funil |
-| `neurostack_safety_triggers_total` | Counter | category, tenant_id | Triggers de safety |
-| `neurostack_handoffs_total` | Counter | reason, tenant_id | Handoffs para humanos |
-| `neurostack_flow_transitions_total` | Counter | from_mode, to_mode, tenant_id | Transições de flow |
-| `neurostack_rag_queries_total` | Counter | tenant_id | Consultas RAG |
+O pacote `neurostack-core` exporta as 14 famílias abaixo quando
+`enable_metrics()` é chamado. As labels são dimensões técnicas de vocabulário
+fechado. Identificadores de tenant, paciente, sessão, requisição ou mensagem e
+qualquer PII não podem ser labels do Prometheus; use logs estruturados ou o banco
+de dados para correlação.
 
-### Métricas de Performance
-
-| Métrica | Tipo | Labels | Descrição |
-|---------|------|--------|-----------|
-| `neurostack_srm_processing_seconds` | Histogram | component | Tempo de processamento do SRM |
-| `neurostack_pipeline_total_seconds` | Histogram | tenant_id | Tempo total do pipeline |
-| `neurostack_pipeline_stage_seconds` | Histogram | stage | Tempo por estágio |
+| Métrica | Tipo | Labels exatas | Descrição |
+|---------|------|---------------|-----------|
+| `neurostack_srm_decisions_total` | Counter | `intent_category`, `funnel_stage`, `mode` | Decisões do SRM |
+| `neurostack_srm_latency_seconds` | Histogram | nenhuma | Tempo de processamento do SRM |
+| `neurostack_srm_safety_triggers_total` | Counter | `category` | Triggers de safety |
+| `neurostack_srm_handoffs_total` | Counter | `reason` | Decisões de handoff |
+| `neurostack_flow_transitions_total` | Counter | `from_mode`, `to_mode`, `trigger` | Transições de flow |
+| `neurostack_flow_handler_duration_seconds` | Histogram | `mode` | Tempo de processamento do handler de flow |
+| `neurostack_flow_decisions_total` | Counter | `mode`, `action` | Decisões de flow |
+| `neurostack_policy_evaluations_total` | Counter | `result` | Avaliações de policy |
+| `neurostack_policy_violations_total` | Counter | `category`, `severity`, `action` | Violações de policy |
+| `neurostack_policy_latency_seconds` | Histogram | nenhuma | Tempo de avaliação de policy |
+| `neurostack_prompt_generations_total` | Counter | `mode` | Gerações de prompt |
+| `neurostack_prompt_generation_seconds` | Histogram | nenhuma | Tempo de geração de prompt |
+| `neurostack_prompt_tokens_total` | Counter | `mode` | Tokens estimados dos prompts |
+| `neurostack_output_validations_total` | Counter | `mode`, `valid` | Validações de output |
 
 ## Uso das Métricas em Código
 
 ```python
-from src.observability.metrics import BusinessMetrics
+from neurostack_core import (
+    FLOW_TRANSITIONS_TOTAL,
+    POLICY_EVALUATIONS,
+    SRM_DECISIONS,
+    SRM_HANDOFFS,
+)
 
 # Registrar decisão do SRM
-BusinessMetrics.srm.record_decision(
-    tenant_id="tenant_123",
-    flow_mode="normal",
-    intent="scheduling",
-    intent_confidence=0.92,
-    funnel_stage="consideration",
-    processing_time_ms=45.5,
-)
-
-# Registrar safety trigger
-BusinessMetrics.safety.record_trigger(
-    category="clinical",
-    tenant_id="tenant_123",
-    confidence=0.87,
-    severity="high",
-)
+SRM_DECISIONS.labels(
+    intent_category="scheduling",
+    funnel_stage="agendamento_solicitado",
+    mode="normal",
+).inc()
 
 # Registrar handoff
-BusinessMetrics.handoff.record_handoff(
-    reason="explicit_request",
-    tenant_id="tenant_123",
-    turn_count=5,
-)
+SRM_HANDOFFS.labels(reason="explicit_request").inc()
 
 # Registrar transição de flow
-BusinessMetrics.flow.record_transition(
+FLOW_TRANSITIONS_TOTAL.labels(
     from_mode="normal",
     to_mode="safety",
-    tenant_id="tenant_123",
-    duration_seconds=120.5,
-)
+    trigger="safety_concern_detected",
+).inc()
+
+# Registrar avaliação de policy; correlação por tenant fica nos logs/DB
+POLICY_EVALUATIONS.labels(result="passed").inc()
 ```
 
 ## Dashboards
@@ -372,4 +369,3 @@ curl -X POST http://localhost:3100/loki/api/v1/push \
 - [Grafana Documentation](https://grafana.com/docs/)
 - [Loki Documentation](https://grafana.com/docs/loki/)
 - [Alertmanager Documentation](https://prometheus.io/docs/alerting/latest/alertmanager/)
-

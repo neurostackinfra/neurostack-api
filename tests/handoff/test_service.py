@@ -1777,7 +1777,7 @@ class TestHandoffService:
                 operation="update",
                 status=status_name,
             )._value.get()
-            for status_name in ("accepted", "error", "conflict")
+            for status_name in ("success", "error", "conflict")
         }
         handoff_store.conflict_next = True
 
@@ -1794,7 +1794,7 @@ class TestHandoffService:
         assert len(event_store.appended) == 1
         service.webhook_dispatcher.send.assert_not_awaited()
         assert after["conflict"] == before["conflict"] + 1
-        assert after["accepted"] == before["accepted"]
+        assert after["success"] == before["success"]
         assert after["error"] == before["error"]
 
     @pytest.mark.asyncio
@@ -1848,7 +1848,7 @@ class TestHandoffService:
                 operation="update",
                 status=status_name,
             )._value.get()
-            for status_name in ("accepted", "error", "conflict")
+            for status_name in ("success", "error", "conflict")
         }
 
         detail = await service.accept_handoff(created.id, tenant_id=tenant_id)
@@ -1875,7 +1875,7 @@ class TestHandoffService:
             )._value.get()
             for status_name in before
         }
-        assert after["accepted"] == before["accepted"] + 1
+        assert after["success"] == before["success"] + 1
         assert after["error"] == before["error"]
         assert after["conflict"] == before["conflict"]
 
@@ -1912,7 +1912,7 @@ class TestHandoffService:
                 operation="update",
                 status=status_name,
             )._value.get()
-            for status_name in ("accepted", "error", "conflict")
+            for status_name in ("success", "error", "conflict")
         }
 
         with pytest.raises(HandoffPostCommitError):
@@ -1933,7 +1933,7 @@ class TestHandoffService:
             for status_name in before
         }
         assert after["error"] == before["error"] + 1
-        assert after["accepted"] == before["accepted"]
+        assert after["success"] == before["success"]
         assert after["conflict"] == before["conflict"]
 
     @pytest.mark.asyncio

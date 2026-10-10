@@ -28,7 +28,9 @@ from src.api.schemas.events import (
 from src.config.logging import get_logger
 from src.core.exceptions import EventStoreError
 from src.handoff.episode_context import extract_self_identified_name
-from src.memory import EventData, get_event_store
+from src.memory import EventData
+from src.memory import EventType as StoredEventType
+from src.memory import get_event_store
 from src.models.session import CognitiveStateData, Session
 from src.observability.metrics import LLM_GENERATION_ATTEMPTS_TOTAL
 from src.repositories import EventRepository
@@ -1972,7 +1974,7 @@ class EventService:
                     id=uuid4(),
                     tenant_id=request.tenant_id,
                     session_id=request.session_id,
-                    event_type="ns.atendimento_tipo_set",
+                    event_type=StoredEventType.NS_ATENDIMENTO_TIPO_SET.value,
                     event_data={
                         "atendimento_tipo": _new_atendimento_tipo,
                         "trigger_message": request.payload.content,

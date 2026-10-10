@@ -498,6 +498,48 @@ class TestCRUDOperations:
         assert parameters["interaction_origin"] == "unknown"
 
     @pytest.mark.asyncio
+    async def test_append_accepts_atendimento_tipo_event_metric_label(self) -> None:
+        """The real append path accepts the existing bounded event type."""
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            poolclass=StaticPool,
+        )
+        factory = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(text("""
+                        CREATE TABLE events (
+                            id CHAR(32) PRIMARY KEY,
+                            tenant_id CHAR(32) NOT NULL,
+                            session_id CHAR(32),
+                            event_type VARCHAR(100) NOT NULL,
+                            interaction_origin VARCHAR(20) NOT NULL,
+                            event_data JSON NOT NULL,
+                            metadata JSON NOT NULL,
+                            created_at DATETIME NOT NULL
+                        )
+                        """))
+
+            event = EventData(
+                tenant_id=uuid4(),
+                session_id=uuid4(),
+                event_type=EventType.NS_ATENDIMENTO_TIPO_SET.value,
+                event_data={"atendimento_tipo": "convenio"},
+            )
+
+            appended = await EventStore(session_factory=factory).append(event)
+
+            assert appended is event
+            async with factory() as verifier:
+                assert await verifier.scalar(text("SELECT COUNT(*) FROM events")) == 1
+        finally:
+            await engine.dispose()
+
+    @pytest.mark.asyncio
     async def test_append_batch(
         self,
         sample_tenant_id: UUID,
