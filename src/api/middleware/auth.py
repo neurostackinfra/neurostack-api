@@ -70,6 +70,11 @@ class TenantContext:
 # ============================================
 
 
+def _dev_api_keys_allowed() -> bool:
+    """Development API keys never authenticate in staging or production."""
+    return settings.environment in ("development", "test")
+
+
 class APIKeyStore:
     """
     API Key store for validating and retrieving tenant information.
@@ -162,11 +167,11 @@ class APIKeyStore:
                 error_type=type(e).__name__,
             )
 
-            # Allow fallback in non-production environments (development and test)
-            if not settings.is_production:
+            # Allow fallback only in development and test
+            if _dev_api_keys_allowed():
                 return cls._fallback_to_dev_keys(api_key)
 
-            # In production, fail securely
+            # In staging and production, fail securely
             return None
         except Exception as e:
             # Unexpected error during API key validation
@@ -177,16 +182,16 @@ class APIKeyStore:
                 exc_info=True,
             )
 
-            # Allow fallback in non-production environments (development and test)
-            if not settings.is_production:
+            # Allow fallback only in development and test
+            if _dev_api_keys_allowed():
                 return cls._fallback_to_dev_keys(api_key)
 
-            # In production, fail securely
+            # In staging and production, fail securely
             return None
 
         # If we get here, API key didn't match any tenant
-        # Try fallback in non-production environments
-        if not settings.is_production:
+        # Try fallback only in development and test
+        if _dev_api_keys_allowed():
             return cls._fallback_to_dev_keys(api_key)
 
         return None
