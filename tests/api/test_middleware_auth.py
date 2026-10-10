@@ -15,6 +15,7 @@ import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 from httpx import AsyncClient
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.responses import RedirectResponse
 
 from src.api.middleware.auth import (
@@ -99,6 +100,44 @@ def test_invalid_hash_does_not_block_following_valid_tenant(
     assert result.rate_limit == 42
     assert verify.call_count == 2
     fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("environment", ["staging", "production"])
+@pytest.mark.parametrize("database_fails", [False, True])
+def test_dev_keys_rejected_outside_development_and_test(
+    monkeypatch: pytest.MonkeyPatch, environment: str, database_fails: bool
+) -> None:
+    from src.api.middleware import auth
+
+    repository = MagicMock()
+    repository.find_active = AsyncMock(
+        side_effect=SQLAlchemyError("down") if database_fails else None,
+        return_value=[],
+    )
+    monkeypatch.setattr(auth, "get_db_session", _auth_session)
+    monkeypatch.setattr(auth, "TenantRepository", MagicMock(return_value=repository))
+    monkeypatch.setattr(auth.settings, "environment", environment)
+
+    for key in ("ns_dev_anything", "ns_dev_test_key_12345", "test-api-key-12345"):
+        assert asyncio.run(APIKeyStore.validate_api_key(key)) is None, key
+
+
+@pytest.mark.parametrize("environment", ["development", "test"])
+def test_dev_keys_accepted_in_development_and_test(
+    monkeypatch: pytest.MonkeyPatch, environment: str
+) -> None:
+    from src.api.middleware import auth
+
+    repository = MagicMock()
+    repository.find_active = AsyncMock(return_value=[])
+    monkeypatch.setattr(auth, "get_db_session", _auth_session)
+    monkeypatch.setattr(auth, "TenantRepository", MagicMock(return_value=repository))
+    monkeypatch.setattr(auth.settings, "environment", environment)
+
+    result = asyncio.run(APIKeyStore.validate_api_key("ns_dev_anything"))
+
+    assert result is not None
+    assert result.tenant_id == UUID("a0000000-0000-0000-0000-000000000001")
 
 
 def test_invalid_hash_only_returns_none_through_normal_contract(
