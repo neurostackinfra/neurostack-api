@@ -1871,6 +1871,50 @@ class TestMetaWebhookRateLimit:
         rate_limit_store._tenant_limits.clear()
         _INMEM_INCOMING.clear()
 
+    def test_successful_message_consumes_meta_bucket_once(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+
+        from src.api.middleware.rate_limit import rate_limit_store
+
+        bucket_key = f"webhook:{tenant_id}:meta"
+        bucket = rate_limit_store.get_or_create_bucket(bucket_key)
+        payload = _meta_text_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900011122",
+            text_body="single debit",
+            message_id=f"wamid.rl_{uuid4().hex[:8]}",
+        )
+
+        with (
+            patch.object(bucket, "consume", wraps=bucket.consume) as mock_consume,
+            patch(
+                "src.api.routes.webhook.get_event_service",
+            ) as mock_get_service,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("rate limit accepted")
+            )
+            mock_get_service.return_value = service
+
+            resp = _post_meta(client, payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True}
+        assert rate_limit_store.get_or_create_bucket(bucket_key) is bucket
+        assert mock_consume.call_count == 1
+
     def test_rate_limit_after_auth_and_before_replay(
         self,
         client: TestClient,
