@@ -180,8 +180,12 @@ async def _assert_refused(request: bootstrap.BootstrapRequest, message: str) -> 
         ({bootstrap.PASSWORD_ENV: PASSWORD + "\n"}, "surrounding whitespace"),
         ({bootstrap.PASSWORD_ENV: " " + PASSWORD}, "surrounding whitespace"),
         (
+            {bootstrap.PASSWORD_ENV: "correct-horse\u00a0battery-staple"},
+            "non-printable characters",
+        ),
+        (
             {bootstrap.PASSWORD_ENV: "correct-horse\tbattery-staple"},
-            "control characters",
+            "non-printable characters",
         ),
         ({bootstrap.RESET_ENV: "yes"}, "must be 'true' or 'false'"),
         ({bootstrap.RESET_ENV: "TRUE"}, "must be 'true' or 'false'"),
@@ -225,7 +229,7 @@ def test_request_repr_hides_password() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_row8_empty_database_creates_tenant_and_super_admin(
+async def test_row9_empty_database_creates_tenant_and_super_admin(
     database: None,
 ) -> None:
     assert await _apply(_request()) == "created"
@@ -247,7 +251,7 @@ async def test_row8_empty_database_creates_tenant_and_super_admin(
     )
 
 
-async def test_row8_dev_fallback_tenant_is_never_used(database: None) -> None:
+async def test_row9_dev_fallback_tenant_is_never_used(database: None) -> None:
     await _add_tenant(id=DEV_FALLBACK_TENANT_ID, name="Development Tenant")
 
     assert await _apply(_request()) == "created"
@@ -300,36 +304,57 @@ async def test_rows4_5_own_email_wins_over_another_super_admin(
     assert await _apply(_reset()) == "reset"
 
 
-async def test_row1_case_variants_of_the_email_are_refused(database: None) -> None:
+async def test_row6_only_case_variants_are_refused(database: None) -> None:
     await _add_user("Platform@Example.com", UserRole.super_admin, password=PASSWORD)
     await _add_user("PLATFORM@example.com", UserRole.super_admin, password=PASSWORD)
 
     for request in (_request(), _reset()):
-        await _assert_refused(request, "ignoring case; refusing to choose one")
+        await _assert_refused(
+            request, "only by case; refusing to create a case variant"
+        )
 
 
 @pytest.mark.parametrize("role", [UserRole.clinic_admin, UserRole.builder])
-async def test_row2_existing_account_is_never_promoted(
+async def test_row1_existing_account_is_never_promoted(
     database: None, role: UserRole
 ) -> None:
-    await _add_user("Platform@Example.com", role, password=PASSWORD)
+    await _add_user(EMAIL, role, password=PASSWORD)
 
     for request in (_request(), _reset()):
         await _assert_refused(request, "refusing to promote it")
 
 
-async def test_row3_inactive_super_admin_is_never_reactivated(database: None) -> None:
+async def test_row2_inactive_super_admin_is_never_reactivated(database: None) -> None:
     await _add_user(EMAIL, UserRole.super_admin, is_active=False, password=PASSWORD)
 
     for request in (_request(), _reset()):
         await _assert_refused(request, "refusing to reactivate it")
 
 
-async def test_case_only_email_difference_is_refused(database: None) -> None:
-    await _add_user("Platform@Example.com", UserRole.super_admin, password=PASSWORD)
+@pytest.mark.parametrize("role", [UserRole.super_admin, UserRole.clinic_admin])
+async def test_row6_case_only_difference_is_refused(
+    database: None, role: UserRole
+) -> None:
+    await _add_user("Platform@Example.com", role, password=PASSWORD)
 
     for request in (_request(), _reset()):
-        await _assert_refused(request, "only by case; refusing to maintain it")
+        await _assert_refused(
+            request, "only by case; refusing to create a case variant"
+        )
+
+
+@pytest.mark.parametrize("role", [UserRole.clinic_admin, UserRole.builder])
+async def test_case_variant_from_the_app_does_not_block_maintenance(
+    database: None, role: UserRole
+) -> None:
+    # Builder/admin routes check email uniqueness by exact match, so they can
+    # create a case variant next to the bootstrap super_admin.
+    await _apply(_request())
+    await _add_user("Platform@example.com", role)
+
+    assert await _apply(_request()) == "skip"
+    assert await _apply(_reset()) == "reset"
+    assert verifier.verify(NEW_PASSWORD, (await _user()).password_hash)
 
 
 @pytest.mark.parametrize(
@@ -345,7 +370,7 @@ async def test_case_only_email_difference_is_refused(database: None) -> None:
         {"slug": bootstrap.PLATFORM_TENANT_SLUG, "plan_type": "pilot"},
     ],
 )
-async def test_super_admin_outside_platform_tenant_is_never_maintained(
+async def test_row3_super_admin_outside_platform_tenant_is_never_maintained(
     database: None, tenant_fields: dict[str, object]
 ) -> None:
     tenant = await _add_tenant(**tenant_fields)
@@ -355,7 +380,9 @@ async def test_super_admin_outside_platform_tenant_is_never_maintained(
         await _assert_refused(request, "not on the bootstrap platform tenant")
 
 
-async def test_reset_flag_applies_even_with_matching_password(database: None) -> None:
+async def test_row4_reset_flag_applies_even_with_matching_password(
+    database: None,
+) -> None:
     await _apply(_request())
     _, users_before = await _snapshot()
 
@@ -366,7 +393,7 @@ async def test_reset_flag_applies_even_with_matching_password(database: None) ->
     assert verifier.verify(PASSWORD, (await _user()).password_hash)
 
 
-async def test_second_email_after_bootstrap_reports_existing_super_admin(
+async def test_row7_wins_over_row8_after_a_bootstrap(
     database: None,
 ) -> None:
     await _apply(_request())
@@ -378,7 +405,7 @@ async def test_second_email_after_bootstrap_reports_existing_super_admin(
 
 
 @pytest.mark.parametrize("is_active", [True, False])
-async def test_row6_second_super_admin_is_refused(
+async def test_row7_second_super_admin_is_refused(
     database: None, is_active: bool
 ) -> None:
     await _add_user("other@example.com", UserRole.super_admin, is_active=is_active)
@@ -397,7 +424,7 @@ async def test_row6_second_super_admin_is_refused(
         {"id": DEV_FALLBACK_TENANT_ID, "plan_type": "admin", "is_active": True},
     ],
 )
-async def test_row7_existing_platform_tenant_is_never_adopted(
+async def test_row8_existing_platform_tenant_is_never_adopted(
     database: None, tenant_fields: dict[str, object]
 ) -> None:
     await _add_tenant(slug=bootstrap.PLATFORM_TENANT_SLUG, **tenant_fields)
