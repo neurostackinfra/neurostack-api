@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from prometheus_client import REGISTRY
@@ -123,11 +123,11 @@ def _run_convert(
         loop.close()
 
 
-def _violation_count(tenant_id: UUID, category: str) -> float:
+def _violation_count(category: str) -> float:
     return (
         REGISTRY.get_sample_value(
             "neurostack_scheduling_gate_violations_total",
-            {"tenant_id": str(tenant_id), "category": category},
+            {"category": category},
         )
         or 0.0
     )
@@ -159,7 +159,7 @@ def _default_enforce_mode(monkeypatch: pytest.MonkeyPatch):
 class TestEnforceModeReplacesResponse:
     def test_pt_confirmed_is_replaced(self, service: EventService) -> None:
         result = _make_result()
-        before = _violation_count(result.tenant_id, CATEGORY_CONFIRMED)
+        before = _violation_count(CATEGORY_CONFIRMED)
 
         response, _usage, _model, _attempts, _totals = _run_convert(
             service,
@@ -174,11 +174,11 @@ class TestEnforceModeReplacesResponse:
             "seu agendamento está confirmado" not in response.prompt.suggested_response
         )
         # Counter incremented.
-        assert _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
+        assert _violation_count(CATEGORY_CONFIRMED) == before + 1
 
     def test_en_confirmed_is_replaced(self, service: EventService) -> None:
         result = _make_result()
-        before = _violation_count(result.tenant_id, CATEGORY_CONFIRMED)
+        before = _violation_count(CATEGORY_CONFIRMED)
 
         response, _u, _m, _attempts, _totals = _run_convert(
             service,
@@ -191,13 +191,13 @@ class TestEnforceModeReplacesResponse:
             "your appointment is confirmed"
             not in response.prompt.suggested_response.lower()
         )
-        assert _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
+        assert _violation_count(CATEGORY_CONFIRMED) == before + 1
 
     def test_same_sentence_adversative_confirmation_is_replaced(
         self, service: EventService
     ) -> None:
         result = _make_result()
-        before = _violation_count(result.tenant_id, CATEGORY_CONFIRMED)
+        before = _violation_count(CATEGORY_CONFIRMED)
         llm_content = (
             "Não posso confirmar que sua consulta foi marcada, mas "
             "Sua consulta foi marcada."
@@ -215,10 +215,11 @@ class TestEnforceModeReplacesResponse:
         assert (
             "sua consulta foi marcada" not in response.prompt.suggested_response.lower()
         )
-        assert _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
+        assert _violation_count(CATEGORY_CONFIRMED) == before + 1
 
     def test_pt_availability_is_replaced(self, service: EventService) -> None:
         result = _make_result()
+        before = _violation_count(CATEGORY_AVAILABILITY)
         response, _u, _m, _attempts, _totals = _run_convert(
             service,
             result,
@@ -226,7 +227,7 @@ class TestEnforceModeReplacesResponse:
             clinic_config={"business_rules": {"accepts_insurance": "no"}},
         )
         assert "esse horário está disponível" not in response.prompt.suggested_response
-        assert _violation_count(result.tenant_id, CATEGORY_AVAILABILITY) >= 1
+        assert _violation_count(CATEGORY_AVAILABILITY) == before + 1
 
     @pytest.mark.parametrize(
         "llm_content, language",
@@ -239,7 +240,7 @@ class TestEnforceModeReplacesResponse:
         self, service: EventService, llm_content: str, language: str
     ) -> None:
         result = _make_result()
-        before = _violation_count(result.tenant_id, CATEGORY_AVAILABILITY)
+        before = _violation_count(CATEGORY_AVAILABILITY)
 
         response, _u, _m, _attempts, _totals = _run_convert(
             service,
@@ -250,10 +251,11 @@ class TestEnforceModeReplacesResponse:
         )
 
         assert response.prompt.suggested_response != llm_content
-        assert _violation_count(result.tenant_id, CATEGORY_AVAILABILITY) == before + 1
+        assert _violation_count(CATEGORY_AVAILABILITY) == before + 1
 
     def test_pt_processed_change_is_replaced(self, service: EventService) -> None:
         result = _make_result(funnel_stage="agendado")
+        before = _violation_count(CATEGORY_PROCESSED_CHANGE)
         response, _u, _m, _attempts, _totals = _run_convert(
             service,
             result,
@@ -263,7 +265,7 @@ class TestEnforceModeReplacesResponse:
         assert (
             "seu cancelamento foi processado" not in response.prompt.suggested_response
         )
-        assert _violation_count(result.tenant_id, CATEGORY_PROCESSED_CHANGE) >= 1
+        assert _violation_count(CATEGORY_PROCESSED_CHANGE) == before + 1
 
 
 # ============================================
@@ -280,7 +282,7 @@ class TestDeterministicResponseNotScanned:
             "seu agendamento está confirmado ao clicar."  # ← trigger phrase inside
         )
         result = _make_result(deterministic_response=deterministic_text)
-        before = _violation_count(result.tenant_id, CATEGORY_CONFIRMED)
+        before = _violation_count(CATEGORY_CONFIRMED)
 
         response, _u, _m, _attempts, _totals = _run_convert(
             service,
@@ -292,7 +294,7 @@ class TestDeterministicResponseNotScanned:
         assert response.prompt.suggested_response == deterministic_text
         assert response.prompt.deterministic is True
         # Counter did not budge.
-        assert _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before
+        assert _violation_count(CATEGORY_CONFIRMED) == before
 
 
 # ============================================
@@ -308,7 +310,7 @@ class TestGateAppliesRegardlessOfInsurance:
         # avoided: the gate MUST NOT be nested inside the
         # ``_insurance_active`` branch.
         result = _make_result()
-        before = _violation_count(result.tenant_id, CATEGORY_CONFIRMED)
+        before = _violation_count(CATEGORY_CONFIRMED)
 
         # clinic_config with NO business_rules at all — insurance branch
         # would evaluate to False in the price gate.
@@ -322,13 +324,13 @@ class TestGateAppliesRegardlessOfInsurance:
         assert (
             "seu agendamento está confirmado" not in response.prompt.suggested_response
         )
-        assert _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
+        assert _violation_count(CATEGORY_CONFIRMED) == before + 1
 
     def test_insurance_explicitly_false_still_triggers(
         self, service: EventService
     ) -> None:
         result = _make_result()
-        before = _violation_count(result.tenant_id, CATEGORY_CONFIRMED)
+        before = _violation_count(CATEGORY_CONFIRMED)
 
         response, _u, _m, _attempts, _totals = _run_convert(
             service,
@@ -339,7 +341,7 @@ class TestGateAppliesRegardlessOfInsurance:
         assert (
             "seu agendamento está confirmado" not in response.prompt.suggested_response
         )
-        assert _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
+        assert _violation_count(CATEGORY_CONFIRMED) == before + 1
 
 
 # ============================================
@@ -353,7 +355,7 @@ class TestObserveMode:
     ) -> None:
         monkeypatch.setenv("SCHEDULING_GATE_MODE", "observe")
         result = _make_result()
-        before = _violation_count(result.tenant_id, CATEGORY_CONFIRMED)
+        before = _violation_count(CATEGORY_CONFIRMED)
 
         response, _u, _m, _attempts, _totals = _run_convert(
             service,
@@ -364,7 +366,7 @@ class TestObserveMode:
         # Original text preserved verbatim.
         assert "seu agendamento está confirmado" in response.prompt.suggested_response
         # Counter still bumped — observe means "watch, don't block".
-        assert _violation_count(result.tenant_id, CATEGORY_CONFIRMED) == before + 1
+        assert _violation_count(CATEGORY_CONFIRMED) == before + 1
 
     def test_unset_env_behaves_as_enforce(
         self, service: EventService, monkeypatch: pytest.MonkeyPatch

@@ -5,6 +5,33 @@
 
 Este documento descreve onde e como as informações de configuração do tenant e da clínica (ClinicConfig) são armazenadas, a estrutura dos dados e um exemplo completo em JSON.
 
+## Flags de egress pelo AWS AppConfig Agent
+
+A aplicação consulta o cache HTTP local do AWS AppConfig Agent imediatamente
+antes do efeito externo. `APPCONFIG_ENABLED=false` desliga o mecanismo.
+
+Antes de definir `APPCONFIG_ENABLED=true` em produção, o gate de ativação exige
+evidência sanitizada e somente leitura da revision ativa da task definition, do
+Agent marcado como essential e healthy, da imagem/versão implantada, do acesso
+IAM ao data plane, dos IDs exatos de application/environment/profile e do
+readback bem-sucedido das duas flags. Qualquer evidência ausente ou divergente
+mantém `APPCONFIG_ENABLED=false`.
+
+Quando ligado em produção, `APPCONFIG_APPLICATION`, `APPCONFIG_ENVIRONMENT` e
+`APPCONFIG_PROFILE` são obrigatórios. `APPCONFIG_ORIGIN` aceita apenas uma
+origem HTTP loopback, por exemplo `http://127.0.0.1:2772` ou
+`http://localhost:2772`, sem userinfo, path, query ou fragment. O token Bearer
+opcional vem de `APPCONFIG_TOKEN` e nunca deve ser colocado em logs ou arquivos
+versionados.
+
+Somente `financial_egress_enabled` e `uazapi_egress_enabled` são aceitas, como
+decisões independentes no formato `{nome_da_flag: {enabled: boolean}}`. A
+aplicação não mantém cache, refresher ou lifecycle próprios: cada consulta
+observa o snapshot atual do agente. Configuração incompleta, agente
+indisponível, timeout, resposta inválida ou flag ausente resultam em `false` e
+zero efeito externo. Proxies do ambiente e redirects não participam dessas
+consultas locais.
+
 ## Orçamento de conexões PostgreSQL
 
 Cada processo da API possui exatamente um pool SQLAlchemy compartilhado por repositórios, EventStore e HandoffService. A configuração efetiva vem de `DATABASE_POOL_SIZE`, `DATABASE_MAX_OVERFLOW` e `DATABASE_POOL_TIMEOUT`. Produção usa, por processo, `pool_size=5`, `max_overflow=0` e timeout de 30 segundos.

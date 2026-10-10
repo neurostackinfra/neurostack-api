@@ -24,9 +24,10 @@ import logging
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from prometheus_client import generate_latest
 
 from src.api.main import _redact_capability_token
-from src.api.middleware.performance import PerformanceMiddleware
+from src.api.middleware.performance import REQUEST_COUNT, PerformanceMiddleware
 from src.api.middleware.tracing import RequestIdMiddleware, _redact_raw_path
 from src.config.logging import configure_logging
 
@@ -81,22 +82,47 @@ class TestPerformanceMiddlewareNormalizePath:
         mw = self._mw()
         redacted = mw._normalize_path(f"/v1/webhook/zapi/{CAPABILITY_TOKEN_SENTINEL}")
         assert CAPABILITY_TOKEN_SENTINEL not in redacted
-        assert redacted == "/v1/webhook/zapi/{capability_token}"
+        assert redacted == "/{unmatched}"
 
     def test_uuid_still_normalised(self) -> None:
         mw = self._mw()
         assert (
             mw._normalize_path("/v1/tenants/12345678-1234-1234-1234-123456789012/x")
-            == "/v1/tenants/{id}/x"
+            == "/{unmatched}"
         )
 
     def test_numeric_id_still_normalised(self) -> None:
         mw = self._mw()
-        assert mw._normalize_path("/v1/foo/42/bar") == "/v1/foo/{id}/bar"
+        assert mw._normalize_path("/v1/foo/42/bar") == "/{unmatched}"
 
     def test_short_zapi_segment_untouched(self) -> None:
         mw = self._mw()
-        assert mw._normalize_path("/v1/webhook/zapi/short") == "/v1/webhook/zapi/short"
+        assert mw._normalize_path("/v1/webhook/zapi/short") == "/{unmatched}"
+
+    async def test_unmatched_paths_export_only_one_stable_bucket(self) -> None:
+        app = FastAPI()
+        app.add_middleware(PerformanceMiddleware)
+        sensitive = (
+            "patient@example.com",
+            "52998224725",
+            "+5511999999999",
+            "request-12345678901234567890",
+            "session-12345678901234567890",
+            "trace-12345678901234567890",
+            CAPABILITY_TOKEN_SENTINEL,
+            "eyJhbGciOiJIUzI1NiJ9_0123456789abcdef",
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            for value in sensitive:
+                response = await client.get(f"/missing/{value}")
+                assert response.status_code == 404
+
+        scrape = generate_latest(REQUEST_COUNT).decode()
+        assert 'endpoint="/{unmatched}"' in scrape
+        for value in sensitive:
+            assert value not in scrape
 
 
 class TestUvicornAccessLogDisabled:

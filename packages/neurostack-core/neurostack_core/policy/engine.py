@@ -124,7 +124,6 @@ class PolicyEngine:
 
         # Record metric
         POLICY_EVALUATIONS.labels(
-            tenant_id=str(context.tenant_id)[:8],
             result="passed" if result.passed else "violated",
         ).inc()
 

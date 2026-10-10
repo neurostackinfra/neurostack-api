@@ -15,7 +15,6 @@ from enum import Enum
 from typing import Any, Optional, cast
 from uuid import UUID, uuid4
 
-from prometheus_client import Counter, Histogram
 from pydantic import BaseModel, Field
 from sqlalchemy import DateTime, String, column, insert, table, text
 from sqlalchemy.dialects.postgresql import JSONB
@@ -26,6 +25,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.config.logging import get_logger
 from src.core.exceptions import EventStoreConnectionError, EventStoreError
 from src.core.interaction_context import InteractionOrigin
+from src.observability.metric_dimensions import ContractCounter as Counter
+from src.observability.metric_dimensions import ContractHistogram as Histogram
 
 logger = get_logger(__name__)
 
@@ -115,6 +116,7 @@ class EventType(str, Enum):
     PROMPT_GENERATED = "prompt.generated"
 
     # CRM integration (doc MVP v0.5)
+    NS_ATENDIMENTO_TIPO_SET = "ns.atendimento_tipo_set"
     NS_FUNNEL_STAGE_CHANGED = "ns.funnel_stage_changed"
     NS_HANDOFF_CREATED = "ns.handoff_created"
 

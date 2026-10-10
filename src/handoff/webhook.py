@@ -13,7 +13,6 @@ from typing import Any, Optional
 from uuid import UUID
 
 import httpx
-from prometheus_client import Counter, Histogram
 
 from src.config.logging import get_logger
 from src.core.exceptions import WebhookConfigError, WebhookDeliveryError, WebhookError
@@ -28,6 +27,8 @@ from src.handoff.models import (
     WebhookPayload,
     WebhookStatus,
 )
+from src.observability.metric_dimensions import ContractCounter as Counter
+from src.observability.metric_dimensions import ContractHistogram as Histogram
 
 logger = get_logger(__name__)
 
@@ -52,7 +53,7 @@ WEBHOOK_LATENCY = Histogram(
 WEBHOOK_RETRIES = Counter(
     "neurostack_handoff_webhook_retries_total",
     "Total number of webhook retries",
-    ["tenant_id"],
+    [],
 )
 
 
@@ -344,7 +345,7 @@ class WebhookDispatcher:
                     # Exponential backoff
                     delay = config.retry_delay_seconds * (2 ** (attempt - 1))
                     delivery.status = WebhookStatus.RETRYING
-                    WEBHOOK_RETRIES.labels(tenant_id=str(tenant_id)).inc()
+                    WEBHOOK_RETRIES.inc()
                     await asyncio.sleep(delay)
 
         # All retries failed

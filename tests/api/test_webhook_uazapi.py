@@ -661,6 +661,170 @@ class TestUazapiWebhookDuplicateMessage:
         webhook_module._INMEM_INCOMING.clear()
 
 
+class TestUazapiInboundWhenEgressClosed:
+    @pytest.mark.parametrize("flag_failure", ["false", "error"])
+    def test_new_session_privacy_and_reply_are_suppressed_after_processing(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        flag_failure: str,
+    ) -> None:
+        webhook_module._INMEM_INCOMING.clear()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511988887777",
+            body="Primeiro contato",
+            message_id=f"3EB0_closed_new_{uuid4().hex[:8]}",
+        )
+        flag_reader = AsyncMock(
+            return_value=False,
+            side_effect=(
+                RuntimeError("agent unavailable") if flag_failure == "error" else None
+            ),
+        )
+        safe_client = MagicMock()
+
+        with (
+            patch("src.api.routes.webhook._get_redis", return_value=None),
+            patch("src.api.routes.webhook.get_event_service") as mock_get_service,
+            patch(
+                "src.services.egress_policy.AppConfigClient.is_enabled",
+                flag_reader,
+            ),
+            patch("src.services.uazapi_service.safe_async_client", safe_client),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(
+                return_value=_lgpd_config(enabled=True)
+            )
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Resposta local")
+            )
+            mock_get_service.return_value = service
+
+            first = client.post(WEBHOOK_PATH, json=payload)
+            duplicate = client.post(WEBHOOK_PATH, json=payload)
+
+        assert first.status_code == 200, first.text
+        assert first.json() == {
+            "ok": True,
+            "replied": False,
+            "reason": "uazapi_egress_disabled",
+        }
+        assert duplicate.status_code == 200, duplicate.text
+        assert duplicate.json() == {"ok": True, "skipped": "duplicate_message"}
+        service.run_pipeline.assert_awaited_once()
+        service.finish_response.assert_awaited_once()
+        assert flag_reader.await_count == 2
+        safe_client.assert_not_called()
+        webhook_module._INMEM_INCOMING.clear()
+
+    def test_privacy_suppression_is_reported_without_a_suggested_response(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        webhook_module._INMEM_INCOMING.clear()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511988887777",
+            body="Primeiro contato sem resposta",
+            message_id=f"3EB0_closed_no_reply_{uuid4().hex[:8]}",
+        )
+        flag_reader = AsyncMock(return_value=False)
+        safe_client = MagicMock()
+
+        with (
+            patch("src.api.routes.webhook._get_redis", return_value=None),
+            patch("src.api.routes.webhook.get_event_service") as mock_get_service,
+            patch(
+                "src.services.egress_policy.AppConfigClient.is_enabled",
+                flag_reader,
+            ),
+            patch("src.services.uazapi_service.safe_async_client", safe_client),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(
+                return_value=_lgpd_config(enabled=True)
+            )
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(return_value=_fake_event_response(None))
+            mock_get_service.return_value = service
+
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "ok": True,
+            "replied": False,
+            "reason": "uazapi_egress_disabled",
+        }
+        service.run_pipeline.assert_awaited_once()
+        service.finish_response.assert_awaited_once()
+        flag_reader.assert_awaited_once_with("uazapi_egress_enabled")
+        safe_client.assert_not_called()
+        webhook_module._INMEM_INCOMING.clear()
+
+    @pytest.mark.parametrize("flag_failure", ["false", "error"])
+    def test_text_processes_once_and_suppresses_normal_reply(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        flag_failure: str,
+    ) -> None:
+        webhook_module._INMEM_INCOMING.clear()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511988887777",
+            body="Mensagem normal",
+            message_id=f"3EB0_closed_existing_{uuid4().hex[:8]}",
+        )
+        flag_reader = AsyncMock(
+            return_value=False,
+            side_effect=(
+                RuntimeError("agent unavailable") if flag_failure == "error" else None
+            ),
+        )
+        safe_client = MagicMock()
+
+        with (
+            patch("src.api.routes.webhook._get_redis", return_value=None),
+            patch("src.api.routes.webhook.get_event_service") as mock_get_service,
+            patch(
+                "src.services.egress_policy.AppConfigClient.is_enabled",
+                flag_reader,
+            ),
+            patch("src.services.uazapi_service.safe_async_client", safe_client),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Resposta local")
+            )
+            mock_get_service.return_value = service
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "ok": True,
+            "replied": False,
+            "reason": "uazapi_egress_disabled",
+        }
+        service.run_pipeline.assert_awaited_once()
+        service.finish_response.assert_awaited_once()
+        flag_reader.assert_awaited_once_with("uazapi_egress_enabled")
+        safe_client.assert_not_called()
+        webhook_module._INMEM_INCOMING.clear()
+
+
 class TestUazapiWebhookUnknownInstance:
     def test_unknown_instance_warns_and_skips(
         self,
@@ -2716,6 +2880,252 @@ def _build_uazapi_media_body(
         content = body["message"].setdefault("content", {})
         content["seconds"] = seconds_override
     return body
+
+
+class TestUazapiAudioWhenEgressClosed:
+    def _clear_state(self) -> None:
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+        webhook_module._INMEM_STT_NOTICE.clear()
+
+    @pytest.mark.parametrize("flag_failure", ["false", "error"])
+    def test_blocked_download_is_retryable_without_consuming_replay_claim(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        flag_failure: str,
+    ) -> None:
+        from src.services.event_service import EventService
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(client, tenant_id, instance, stt=True)
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_closed_download_{uuid4().hex[:8]}",
+        )
+        flag_reader = AsyncMock(
+            return_value=False,
+            side_effect=(
+                RuntimeError("agent unavailable") if flag_failure == "error" else None
+            ),
+        )
+        safe_client = MagicMock()
+        run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+        finish_response = AsyncMock(return_value=_fake_event_response(None))
+
+        with (
+            patch("src.api.routes.webhook._get_redis", return_value=None),
+            patch(
+                "src.services.egress_policy.AppConfigClient.is_enabled",
+                flag_reader,
+            ),
+            patch("src.services.uazapi_service.safe_async_client", safe_client),
+        ):
+            blocked = client.post(WEBHOOK_PATH, json=payload)
+
+        assert blocked.status_code == 503, blocked.text
+        assert blocked.json() == {
+            "ok": False,
+            "error": "uazapi_egress_disabled",
+            "retryable": True,
+        }
+        flag_reader.assert_awaited_once_with("uazapi_egress_enabled")
+        safe_client.assert_not_called()
+
+        with (
+            patch("src.api.routes.webhook._get_redis", return_value=None),
+            patch(
+                "src.api.routes.webhook.download_uazapi_media",
+                new=AsyncMock(return_value=(b"OggS_retry", "audio/ogg")),
+            ) as download,
+            patch(
+                "src.services.groq_service.transcribe_audio",
+                new=AsyncMock(return_value="transcrição após retry"),
+            ),
+            patch.object(EventService, "run_pipeline", run_pipeline),
+            patch.object(EventService, "finish_response", finish_response),
+        ):
+            retried = client.post(WEBHOOK_PATH, json=payload)
+            duplicate = client.post(WEBHOOK_PATH, json=payload)
+
+        assert retried.status_code == 200, retried.text
+        assert retried.json() == {"ok": True, "replied": False}
+        assert duplicate.status_code == 200, duplicate.text
+        assert duplicate.json() == {"ok": True, "skipped": "duplicate_message"}
+        assert download.await_count == 2
+        run_pipeline.assert_awaited_once()
+        finish_response.assert_awaited_once()
+        self._clear_state()
+
+    def test_closed_stt_fallback_does_not_attempt_an_alternate_send(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(
+            client,
+            tenant_id,
+            instance,
+            stt=True,
+            multimodal=True,
+        )
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_closed_fallback_{uuid4().hex[:8]}",
+        )
+        safe_client = MagicMock()
+
+        with (
+            patch("src.api.routes.webhook._get_redis", return_value=None),
+            patch(
+                "src.api.routes.webhook.download_uazapi_media",
+                new=AsyncMock(return_value=(b"OggS_failed", "audio/ogg")),
+            ),
+            patch(
+                "src.services.groq_service.transcribe_audio",
+                new=AsyncMock(side_effect=RuntimeError("stt failed")),
+            ),
+            patch(
+                "src.services.multimodal_service.transcribe_audio_multimodal",
+                new=AsyncMock(side_effect=RuntimeError("multimodal failed")),
+            ),
+            patch(
+                "src.services.egress_policy.AppConfigClient.is_enabled",
+                new=AsyncMock(return_value=False),
+            ),
+            patch("src.services.uazapi_service.safe_async_client", safe_client),
+        ):
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "ok": True,
+            "replied": False,
+            "action": "stt_fallback_suppressed",
+            "reason": "uazapi_egress_disabled",
+        }
+        safe_client.assert_not_called()
+        self._clear_state()
+
+    def test_closed_long_audio_notice_is_acknowledged_without_download(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(
+            client,
+            tenant_id,
+            instance,
+            stt=True,
+            audio_max_seconds=10,
+        )
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_closed_long_{uuid4().hex[:8]}",
+            seconds_override=30,
+        )
+        download = AsyncMock()
+        safe_client = MagicMock()
+
+        with (
+            patch("src.api.routes.webhook._get_redis", return_value=None),
+            patch("src.api.routes.webhook.download_uazapi_media", download),
+            patch(
+                "src.services.egress_policy.AppConfigClient.is_enabled",
+                new=AsyncMock(side_effect=RuntimeError("agent unavailable")),
+            ),
+            patch("src.services.uazapi_service.safe_async_client", safe_client),
+        ):
+            response = client.post(WEBHOOK_PATH, json=payload)
+            duplicate = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "ok": True,
+            "skipped": "audio_too_long",
+            "reason": "uazapi_egress_disabled",
+        }
+        assert duplicate.status_code == 200, duplicate.text
+        assert duplicate.json() == {"ok": True, "skipped": "duplicate_message"}
+        download.assert_not_awaited()
+        safe_client.assert_not_called()
+        self._clear_state()
+
+    def test_closed_tts_audio_does_not_fallback_to_text(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_legacy_uazapi_credentials(
+            client,
+            tenant_id,
+            {
+                "whatsapp_provider": "uazapi",
+                "uazapi_api_url": "https://uazapi.example.com",
+                "uazapi_token": f"uz_token_{uuid4().hex}",
+                "uazapi_instance_name": instance,
+                "tts_enabled": True,
+                "tts_reply_policy": "all_inputs",
+            },
+        )
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511988887777",
+            body="Responder em áudio",
+            message_id=f"3EB0_closed_tts_{uuid4().hex[:8]}",
+        )
+        send_text = AsyncMock()
+        safe_client = MagicMock()
+
+        with (
+            patch("src.api.routes.webhook._get_redis", return_value=None),
+            patch("src.api.routes.webhook.get_event_service") as mock_get_service,
+            patch(
+                "src.api.routes.webhook.synthesize_speech",
+                new=AsyncMock(
+                    return_value=SimpleNamespace(
+                        content=b"audio",
+                        mime_type="audio/mpeg",
+                    )
+                ),
+            ),
+            patch("src.api.routes.webhook.send_uazapi_text", send_text),
+            patch(
+                "src.services.egress_policy.AppConfigClient.is_enabled",
+                new=AsyncMock(return_value=False),
+            ),
+            patch("src.services.uazapi_service.safe_async_client", safe_client),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Resposta em áudio")
+            )
+            mock_get_service.return_value = service
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "ok": True,
+            "replied": False,
+            "reason": "uazapi_egress_disabled",
+        }
+        service.run_pipeline.assert_awaited_once()
+        service.finish_response.assert_awaited_once()
+        send_text.assert_not_awaited()
+        safe_client.assert_not_called()
+        self._clear_state()
 
 
 class TestUazapiGroup4MediaEvidenceShape:

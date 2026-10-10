@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from typing import Any, Optional, Union
 from uuid import UUID, uuid4
 
-from prometheus_client import Counter, Histogram
 from pydantic import BaseModel, Field, JsonValue
 
 from neurostack_core.flow import FlowContext, FlowDecision, FlowManager
@@ -58,6 +57,8 @@ from src.handoff.models import (
     HandoffUrgency,
 )
 from src.handoff.pause_policy import resolve_handoff_pause
+from src.observability.metric_dimensions import ContractCounter as Counter
+from src.observability.metric_dimensions import ContractHistogram as Histogram
 from src.observability.price_gate import check_price_gate
 from src.observability.scheduling_gate import (
     GATE_MODE_OBSERVE,
