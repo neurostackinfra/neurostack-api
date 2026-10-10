@@ -10,9 +10,11 @@ Re-running never writes unless BOOTSTRAP_ADMIN_RESET_PASSWORD=true, which
 re-applies the password to the same super_admin; without the flag a password
 that differs from the stored one is an error, so the secret and the database
 cannot drift silently. super_admin has no self-service password change, so this
-is its rotation and recovery path. Unexpected states (another super_admin,
-another role, inactive account, an existing platform tenant) are refused
-without writing anything.
+is its rotation and recovery path. Only the super_admin on the platform
+tenant created by this script is maintained. Unexpected states (another
+super_admin, another role, inactive account, an email differing only by case,
+an account outside the platform tenant, an existing platform tenant) are
+refused without writing anything.
 
 Run once per environment, after ``alembic upgrade head``:
     python -m scripts.bootstrap_admin
@@ -24,13 +26,15 @@ import secrets
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from passlib.context import CryptContext
 from sqlalchemy import String, cast, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# Keep src.core.exceptions as the first src import: importing src.models or
+# src.repositories first fails with a circular import in the production image.
 from src.core.exceptions import ConfigurationError
 from src.models.tenant import Tenant
 from src.models.user import User, UserRole
@@ -50,6 +54,8 @@ MAX_PASSWORD_BYTES = 72  # bcrypt silently truncates beyond this
 PLATFORM_TENANT_NAME = "NeuroStack Admin"
 PLATFORM_TENANT_SLUG = "neurostack-admin"
 PLATFORM_PLAN_TYPE = "admin"
+# Tenant the development API key fallback resolves to; never a platform tenant.
+DEV_FALLBACK_TENANT_ID = UUID("a0000000-0000-0000-0000-000000000001")
 
 
 class BootstrapError(Exception):
@@ -103,6 +109,12 @@ def load_request(environ: Mapping[str, str]) -> BootstrapRequest:
         raise BootstrapError(
             f"{PASSWORD_ENV} must have at most {MAX_PASSWORD_BYTES} bytes"
         )
+    # A trailing newline from a file-based secret would never match a login.
+    if password != password.strip() or not password.isprintable():
+        raise BootstrapError(
+            f"{PASSWORD_ENV} must not have surrounding whitespace "
+            "or control characters"
+        )
 
     if reset_raw not in ("", "true", "false"):
         raise BootstrapError(f"{RESET_ENV} must be 'true' or 'false'")
@@ -140,8 +152,10 @@ async def _create_platform_tenant(session: AsyncSession) -> Tenant:
     return tenant
 
 
-def _maintain(existing: User, request: BootstrapRequest) -> str:
-    """Skip or reset the super_admin already bound to the requested email."""
+async def _maintain(
+    session: AsyncSession, existing: User, request: BootstrapRequest
+) -> str:
+    """Skip or reset the bootstrap super_admin bound to the requested email."""
     if existing.role != UserRole.super_admin:
         raise BootstrapError(
             f"user {request.email} already exists with role "
@@ -150,6 +164,22 @@ def _maintain(existing: User, request: BootstrapRequest) -> str:
     if not existing.is_active:
         raise BootstrapError(
             f"super_admin {request.email} is inactive; refusing to reactivate it"
+        )
+    if existing.email != request.email:
+        raise BootstrapError(
+            f"stored email {existing.email} differs from {request.email} "
+            "only by case; refusing to maintain it"
+        )
+    tenant = await session.get(Tenant, existing.tenant_id)
+    if (
+        tenant is None
+        or tenant.id == DEV_FALLBACK_TENANT_ID
+        or tenant.slug != PLATFORM_TENANT_SLUG
+        or tenant.plan_type != PLATFORM_PLAN_TYPE
+    ):
+        raise BootstrapError(
+            f"super_admin {request.email} is not on the bootstrap platform "
+            "tenant; refusing to maintain it"
         )
     if request.reset_password:
         existing.password_hash = pwd_context.hash(request.password)
@@ -176,7 +206,7 @@ async def bootstrap_admin(
             "refusing to choose one"
         )
     if matches:
-        outcome = _maintain(matches[0], request)
+        outcome = await _maintain(session, matches[0], request)
         await session.flush()
         return outcome, matches[0]
 
@@ -189,7 +219,7 @@ async def bootstrap_admin(
     if other_email is not None:
         raise BootstrapError(
             f"another super_admin already exists ({other_email}); "
-            f"use {RESET_ENV}=true with that email to recover it"
+            "refusing to create a second one"
         )
 
     tenant = await _create_platform_tenant(session)
