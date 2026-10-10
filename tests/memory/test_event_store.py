@@ -13,7 +13,10 @@ from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import insert, text
+from sqlalchemy.dialects import postgresql, sqlite
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
 
 import src.memory.event_store as event_store_module
 from src.core.exceptions import EventStoreConnectionError, EventStoreError
@@ -142,213 +145,37 @@ class TestEventStoreInit:
     """Tests for EventStore initialization."""
 
     def test_init_with_defaults(self):
-        """Test EventStore initialization with default settings."""
+        """An unbound store owns no database resources."""
         store = EventStore()
-        assert store._engine is None
         assert store._session_factory is None
 
-    def test_init_with_custom_settings(self):
-        """Test EventStore initialization with custom settings."""
-        store = EventStore(
-            database_url="postgresql+asyncpg://custom:5432/test",
-            pool_size=20,
-            max_overflow=15,
-        )
-        assert store._database_url == "postgresql+asyncpg://custom:5432/test"
-        assert store._pool_size == 20
-        assert store._max_overflow == 15
-
-    @pytest.mark.asyncio
-    async def test_connect_publishes_only_after_probe_and_disposes_failed_engine(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        mock_engine: AsyncMock,
-    ) -> None:
-        failed_engine = AsyncMock()
-        failed_engine.dispose = AsyncMock()
-        failed_connection = AsyncMock()
-        failed_connection.execute = AsyncMock(
-            side_effect=SQLAlchemyError("probe failed")
-        )
-        failed_connection.__aenter__ = AsyncMock(return_value=failed_connection)
-        failed_connection.__aexit__ = AsyncMock(return_value=None)
-        failed_engine.begin = MagicMock(return_value=failed_connection)
-        monkeypatch.setattr(
-            event_store_module,
-            "create_async_engine",
-            MagicMock(side_effect=[failed_engine, mock_engine]),
-        )
-        store = EventStore()
-
-        with pytest.raises(EventStoreConnectionError):
-            await store.connect()
-
-        assert store._engine is None
-        assert store._session_factory is None
-        failed_engine.dispose.assert_awaited_once()
-
-        await store.connect()
-
-        assert store._engine is mock_engine
-        assert store._session_factory is not None
-
-    @pytest.mark.asyncio
-    async def test_cancelled_connect_disposes_candidate_without_publishing(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        probe_started = asyncio.Event()
-        never_release = asyncio.Event()
-        candidate = AsyncMock()
-        candidate.dispose = AsyncMock()
-        connection = AsyncMock()
-
-        async def blocked_probe(*_args: object) -> None:
-            probe_started.set()
-            await never_release.wait()
-
-        connection.execute = AsyncMock(side_effect=blocked_probe)
-        connection.__aenter__ = AsyncMock(return_value=connection)
-        connection.__aexit__ = AsyncMock(return_value=None)
-        candidate.begin = MagicMock(return_value=connection)
-        monkeypatch.setattr(
-            event_store_module,
-            "create_async_engine",
-            MagicMock(return_value=candidate),
-        )
-        store = EventStore()
-
-        connecting = asyncio.create_task(store.connect())
-        await probe_started.wait()
-        connecting.cancel()
-
-        with pytest.raises(asyncio.CancelledError):
-            await connecting
-
-        candidate.dispose.assert_awaited_once()
-        assert store._engine is None
-        assert store._session_factory is None
-
-
-class _LifecycleEventStore:
-    def __init__(
-        self,
-        *,
-        release_connect: asyncio.Event | None = None,
-        connect_error: Exception | None = None,
-    ) -> None:
-        self.release_connect = release_connect
-        self.connect_error = connect_error
-        self.connect_started = asyncio.Event()
-        self.connected = False
-        self.disconnect_calls = 0
-
-    async def connect(self) -> None:
-        self.connect_started.set()
-        if self.release_connect is not None:
-            await self.release_connect.wait()
-        if self.connect_error is not None:
-            raise self.connect_error
-        self.connected = True
-
-    async def disconnect(self) -> None:
-        self.disconnect_calls += 1
-        self.connected = False
+    def test_init_with_injected_factory(self, mock_session_factory: MagicMock) -> None:
+        store = EventStore(session_factory=mock_session_factory)
+        assert store._session_factory is mock_session_factory
+        assert not hasattr(store, "connect")
+        assert not hasattr(store, "disconnect")
 
 
 class TestGlobalEventStoreLifecycle:
-    @staticmethod
-    def _reset_globals(monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(event_store_module, "_event_store", None)
+    @pytest.mark.asyncio
+    async def test_each_consumer_uses_shared_database_factory_without_pool_creation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        shared_factory = MagicMock()
         monkeypatch.setattr(
-            event_store_module,
-            "_event_store_lifecycle_lock",
-            asyncio.Lock(),
+            "src.repositories.database.get_db_session_factory",
+            MagicMock(return_value=shared_factory),
         )
 
-    @pytest.mark.asyncio
-    async def test_concurrent_first_callers_receive_one_connected_singleton(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        self._reset_globals(monkeypatch)
-        release_connect = asyncio.Event()
-        candidate = _LifecycleEventStore(release_connect=release_connect)
-        factory = MagicMock(return_value=candidate)
-        monkeypatch.setattr(event_store_module, "EventStore", factory)
-
-        first = asyncio.create_task(event_store_module.get_event_store())
-        await candidate.connect_started.wait()
-        second = asyncio.create_task(event_store_module.get_event_store())
-        await asyncio.sleep(0)
-
-        factory.assert_called_once_with()
-        assert event_store_module._event_store is None
-        assert not first.done()
-        assert not second.done()
-
-        release_connect.set()
-        first_result, second_result = await asyncio.gather(first, second)
-
-        assert first_result is candidate
-        assert second_result is candidate
-        assert candidate.connected is True
-        assert event_store_module._event_store is candidate
-
-    @pytest.mark.asyncio
-    async def test_failed_initialization_disposes_and_next_call_retries(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        self._reset_globals(monkeypatch)
-        rejected = _LifecycleEventStore(
-            connect_error=EventStoreConnectionError("unavailable")
-        )
-        connected = _LifecycleEventStore()
-        factory = MagicMock(side_effect=[rejected, connected])
-        monkeypatch.setattr(event_store_module, "EventStore", factory)
-
-        with pytest.raises(EventStoreConnectionError):
-            await event_store_module.get_event_store()
-
-        assert rejected.disconnect_calls == 1
-        assert event_store_module._event_store is None
-
-        result = await event_store_module.get_event_store()
-
-        assert result is connected
-        assert connected.connected is True
-        assert factory.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_close_waits_for_initialization_then_disconnects_it(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        self._reset_globals(monkeypatch)
-        release_connect = asyncio.Event()
-        candidate = _LifecycleEventStore(release_connect=release_connect)
-        monkeypatch.setattr(
-            event_store_module,
-            "EventStore",
-            MagicMock(return_value=candidate),
+        first_result, second_result = await asyncio.gather(
+            event_store_module.get_event_store(), event_store_module.get_event_store()
         )
 
-        initialization = asyncio.create_task(event_store_module.get_event_store())
-        await candidate.connect_started.wait()
-        closing = asyncio.create_task(event_store_module.close_event_store())
-        await asyncio.sleep(0)
-
-        assert not closing.done()
-        assert event_store_module._event_store is None
-
-        release_connect.set()
-        assert await initialization is candidate
-        await closing
-
-        assert candidate.disconnect_calls == 1
-        assert candidate.connected is False
-        assert event_store_module._event_store is None
+        assert first_result is not second_result
+        assert first_result._session_factory is shared_factory
+        assert second_result._session_factory is shared_factory
+        assert not hasattr(event_store_module, "close_event_store")
 
 
 # ============================================
@@ -626,6 +453,22 @@ class TestFactoryMethods:
 class TestCRUDOperations:
     """Tests for CRUD operations with mocked database."""
 
+    def test_append_statement_keeps_postgres_types_and_sqlite_portability(
+        self,
+    ) -> None:
+        statement = insert(event_store_module._EVENTS_TABLE).returning(
+            event_store_module._EVENTS_TABLE.c.id,
+            event_store_module._EVENTS_TABLE.c.created_at,
+        )
+
+        postgres_sql = str(statement.compile(dialect=postgresql.dialect()))
+        sqlite_sql = str(statement.compile(dialect=sqlite.dialect()))
+
+        assert "::UUID" in postgres_sql
+        assert "::JSONB" in postgres_sql
+        assert "jsonb" not in sqlite_sql.lower()
+        assert "uuid" not in sqlite_sql.lower()
+
     @pytest.mark.asyncio
     async def test_append_event(
         self,
@@ -635,9 +478,7 @@ class TestCRUDOperations:
         mock_engine: AsyncMock,
     ):
         """Test appending a single event."""
-        store = EventStore()
-        store._engine = mock_engine
-        store._session_factory = mock_session_factory
+        store = EventStore(session_factory=mock_session_factory)
 
         # Mock the execute result
         mock_result = MagicMock()
@@ -666,9 +507,7 @@ class TestCRUDOperations:
         mock_engine: AsyncMock,
     ):
         """Test appending multiple events in batch."""
-        store = EventStore()
-        store._engine = mock_engine
-        store._session_factory = mock_session_factory
+        store = EventStore(session_factory=mock_session_factory)
 
         events = [
             EventData(
@@ -694,14 +533,96 @@ class TestCRUDOperations:
         mock_engine: AsyncMock,
     ):
         """Test appending empty batch."""
-        store = EventStore()
-        store._engine = mock_engine
-        store._session_factory = mock_session_factory
+        store = EventStore(session_factory=mock_session_factory)
 
         result = await store.append_batch([])
 
         assert result == []
         mock_session.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sqlite_append_paths_preserve_prior_committed_work(self) -> None:
+        """Typed inserts adapt UUID/JSON without rolling back earlier work."""
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            poolclass=StaticPool,
+        )
+        factory = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text("CREATE TABLE committed_state (value TEXT NOT NULL)")
+                )
+                await connection.execute(text("""
+                        CREATE TABLE events (
+                            id CHAR(32) PRIMARY KEY,
+                            tenant_id CHAR(32) NOT NULL,
+                            session_id CHAR(32),
+                            event_type VARCHAR(100) NOT NULL,
+                            interaction_origin VARCHAR(20) NOT NULL,
+                            event_data JSON NOT NULL,
+                            metadata JSON NOT NULL,
+                            created_at DATETIME NOT NULL
+                        )
+                        """))
+
+            async with factory() as caller_session:
+                await caller_session.execute(
+                    text("INSERT INTO committed_state (value) VALUES ('paused')")
+                )
+                await caller_session.commit()
+
+            tenant_id = uuid4()
+            session_id = uuid4()
+            single = EventData(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                event_type=EventType.MESSAGE_IN.value,
+                event_data={"content": "single"},
+                event_metadata={"source": "sqlite"},
+            )
+            batch = [
+                EventData(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    event_type=EventType.MESSAGE_OUT.value,
+                    event_data={"content": f"batch-{index}"},
+                    event_metadata={"index": index},
+                )
+                for index in range(2)
+            ]
+
+            store = EventStore(session_factory=factory)
+            await store.append(single)
+            await store.append_batch(batch)
+
+            async with factory() as verifier:
+                committed_value = await verifier.scalar(
+                    text("SELECT value FROM committed_state")
+                )
+                event_count = await verifier.scalar(text("SELECT COUNT(*) FROM events"))
+                json_values = (
+                    (
+                        await verifier.execute(
+                            text(
+                                "SELECT json_extract(event_data, '$.content') "
+                                "FROM events ORDER BY created_at, id"
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+
+            assert committed_value == "paused"
+            assert event_count == 3
+            assert set(json_values) == {"single", "batch-0", "batch-1"}
+        finally:
+            await engine.dispose()
 
     @pytest.mark.asyncio
     async def test_get_event_found(
@@ -713,9 +634,7 @@ class TestCRUDOperations:
         mock_engine: AsyncMock,
     ):
         """Test getting an existing event."""
-        store = EventStore()
-        store._engine = mock_engine
-        store._session_factory = mock_session_factory
+        store = EventStore(session_factory=mock_session_factory)
 
         mock_result = MagicMock()
         mock_result.fetchone.return_value = MagicMock(
@@ -744,9 +663,7 @@ class TestCRUDOperations:
         mock_engine: AsyncMock,
     ):
         """Test getting a non-existent event."""
-        store = EventStore()
-        store._engine = mock_engine
-        store._session_factory = mock_session_factory
+        store = EventStore(session_factory=mock_session_factory)
 
         mock_result = MagicMock()
         mock_result.fetchone.return_value = None
@@ -776,9 +693,7 @@ class TestQueryOperations:
         mock_engine: AsyncMock,
     ):
         """Test querying events by session."""
-        store = EventStore()
-        store._engine = mock_engine
-        store._session_factory = mock_session_factory
+        store = EventStore(session_factory=mock_session_factory)
 
         # Mock fetch result
         mock_row = MagicMock(
@@ -841,9 +756,7 @@ class TestQueryOperations:
         query_result = MagicMock()
         query_result.fetchall.return_value = [newest, older]
         mock_session.execute.return_value = query_result
-        store = EventStore()
-        store._engine = mock_engine
-        store._session_factory = mock_session_factory
+        store = EventStore(session_factory=mock_session_factory)
 
         events = await store.get_recent_messages(
             sample_tenant_id,
@@ -879,9 +792,7 @@ class TestQueryOperations:
         mock_engine: AsyncMock,
     ):
         """Test querying events with type filter."""
-        store = EventStore()
-        store._engine = mock_engine
-        store._session_factory = mock_session_factory
+        store = EventStore(session_factory=mock_session_factory)
 
         mock_result = MagicMock()
         mock_result.fetchall.return_value = []
@@ -925,9 +836,7 @@ class TestQueryOperations:
         count_result = MagicMock()
         count_result.scalar.return_value = 1
 
-        store = EventStore()
-        store._engine = mock_engine
-        store._session_factory = mock_session_factory
+        store = EventStore(session_factory=mock_session_factory)
 
         mock_session.execute.side_effect = [rows_result, count_result]
         by_session = await store.query_by_session(
@@ -970,9 +879,7 @@ class TestQueryOperations:
         )
         mock_session.execute.return_value = append_result
 
-        store = EventStore()
-        store._engine = mock_engine
-        store._session_factory = mock_session_factory
+        store = EventStore(session_factory=mock_session_factory)
 
         await store.append(event)
         assert (
@@ -1003,9 +910,7 @@ class TestAggregationOperations:
         mock_engine: AsyncMock,
     ):
         """Test counting events by type."""
-        store = EventStore()
-        store._engine = mock_engine
-        store._session_factory = mock_session_factory
+        store = EventStore(session_factory=mock_session_factory)
 
         mock_rows = [
             MagicMock(
@@ -1040,9 +945,7 @@ class TestAggregationOperations:
         mock_engine: AsyncMock,
     ):
         """Test counting sessions with specific event type."""
-        store = EventStore()
-        store._engine = mock_engine
-        store._session_factory = mock_session_factory
+        store = EventStore(session_factory=mock_session_factory)
 
         mock_result = MagicMock()
         mock_result.scalar.return_value = 5
@@ -1067,17 +970,16 @@ class TestHealthCheck:
     @pytest.mark.asyncio
     async def test_health_check_healthy(
         self,
-        mock_engine: AsyncMock,
+        mock_session: AsyncMock,
+        mock_session_factory: MagicMock,
     ):
         """Test health check when PostgreSQL is healthy."""
-        store = EventStore()
-        store._engine = mock_engine
+        store = EventStore(session_factory=mock_session_factory)
 
         # Mock version result
-        conn_mock = mock_engine.begin.return_value.__aenter__.return_value
         mock_result = MagicMock()
         mock_result.scalar.return_value = "PostgreSQL 16.0"
-        conn_mock.execute.return_value = mock_result
+        mock_session.execute.return_value = mock_result
 
         result = await store.health_check()
 
@@ -1121,9 +1023,7 @@ class TestErrorHandling:
         mock_engine: AsyncMock,
     ):
         """Test database errors are wrapped in EventStoreError."""
-        store = EventStore()
-        store._engine = mock_engine
-        store._session_factory = mock_session_factory
+        store = EventStore(session_factory=mock_session_factory)
 
         mock_session.execute.side_effect = Exception("Database connection lost")
 

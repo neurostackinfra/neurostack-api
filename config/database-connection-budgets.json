@@ -1,0 +1,22 @@
+{
+  "profiles": {
+    "vps-compose": {
+      "tasks": 1,
+      "workers": 4,
+      "pool_size": 5,
+      "max_overflow": 0,
+      "pool_timeout": 30,
+      "max_connections": 100,
+      "threshold_percent": 70
+    },
+    "ecs-poc": {
+      "tasks": 2,
+      "workers": 4,
+      "pool_size": 5,
+      "max_overflow": 0,
+      "pool_timeout": 30,
+      "max_connections": 100,
+      "threshold_percent": 70
+    }
+  }
+}

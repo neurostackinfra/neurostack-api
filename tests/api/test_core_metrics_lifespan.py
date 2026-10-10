@@ -100,7 +100,9 @@ def test_configured_lifespan_registers_core_metrics_and_exposes_decision() -> No
 
         service = get_event_service()
         service._load_clinic_config = AsyncMock(return_value=None)
-        service._lock_session_state = AsyncMock(return_value=(None, CognitiveStateData()))
+        service._lock_session_state = AsyncMock(
+            return_value=(object(), CognitiveStateData())
+        )
         service._load_message_history = AsyncMock(return_value=[])
         service._persist_session_state = AsyncMock(return_value=None)
         service._save_events_to_store = AsyncMock(return_value=None)
@@ -136,7 +138,9 @@ def test_configured_lifespan_registers_core_metrics_and_exposes_decision() -> No
                         "/v1/events",
                         headers={"X-API-Key": "test-api-key"},
                         json={
-                            "tenant_id": str(uuid4()),
+                            "tenant_id": str(
+                                UUID("a0000000-0000-0000-0000-000000000001")
+                            ),
                             "session_id": str(uuid4()),
                             "event_type": "message.in",
                             "payload": {

@@ -30,6 +30,13 @@ class EventRepository(BaseRepository[Event]):
     def __init__(self, session: AsyncSession):
         super().__init__(session, Event)
 
+    async def get_for_tenant(self, event_id: UUID, tenant_id: UUID) -> Optional[Event]:
+        """Return an event only inside the authenticated tenant boundary."""
+        result = await self.session.execute(
+            select(Event).where(Event.id == event_id, Event.tenant_id == tenant_id)
+        )
+        return result.scalar_one_or_none()
+
     async def find_by_session(
         self,
         tenant_id: UUID,

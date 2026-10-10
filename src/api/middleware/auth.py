@@ -3,7 +3,7 @@ NeuroStack API - Authentication Middleware
 JWT and API Key based authentication for tenant identification.
 """
 
-from typing import Any, Optional, cast
+from typing import Any, Literal, Optional, cast
 from uuid import UUID
 
 import jwt
@@ -51,6 +51,7 @@ class TenantContext:
         user_id: Optional[UUID] = None,
         role: Optional[str] = None,
         builder_id: Optional[UUID] = None,
+        authentication_mode: Literal["jwt", "api_key", "meta_hmac"] | None = None,
     ) -> None:
         self.tenant_id = tenant_id
         self.api_key = api_key
@@ -59,6 +60,9 @@ class TenantContext:
         self.user_id = user_id
         self.role = role
         self.builder_id = builder_id
+        self.authentication_mode = authentication_mode or (
+            "api_key" if api_key else "jwt"
+        )
 
 
 # ============================================
@@ -298,6 +302,7 @@ class AuthMiddleware:
                         else None
                     ),
                     is_active=True,
+                    authentication_mode="jwt",
                 )
             except jwt.ExpiredSignatureError:
                 response = JSONResponse(
@@ -385,6 +390,9 @@ class AuthMiddleware:
 
         # Attach tenant context to request state
         request.state.tenant = tenant_context
+        tenant_context.authentication_mode = (
+            "jwt" if auth_header.startswith("Bearer ") else "api_key"
+        )
         request.state.api_key = tenant_context.api_key
 
         # Log successful authentication

@@ -168,7 +168,6 @@ class EventRequest(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "tenant_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
                 "session_id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
                 "event_type": "message.in",
                 "payload": {
@@ -180,10 +179,16 @@ class EventRequest(BaseModel):
         }
     )
 
-    tenant_id: UUID = Field(
-        ...,
-        description="Unique identifier for the tenant (clinic/builder)",
-        json_schema_extra={"example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"},
+    tenant_id: Optional[UUID] = Field(
+        default=None,
+        description=(
+            "Deprecated compatibility assertion. The authenticated credential "
+            "always supplies the operational tenant; a different value is rejected."
+        ),
+        json_schema_extra={
+            "deprecated": True,
+            "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        },
     )
     session_id: UUID = Field(
         ...,
@@ -199,6 +204,15 @@ class EventRequest(BaseModel):
         ...,
         description="Event payload with message content",
     )
+
+
+class CanonicalEventRequest(BaseModel):
+    """Internal event contract after authentication has fixed the tenant."""
+
+    tenant_id: UUID
+    session_id: UUID
+    event_type: EventType = EventType.MESSAGE_IN
+    payload: EventPayload
 
 
 # ============================================

@@ -50,6 +50,16 @@ def test_compose_uses_only_approved_app_digest_and_named_volumes() -> None:
     assert api_env["DEBUG"] == "false"
     assert "SECRET_KEY:?" in api_env["SECRET_KEY"]
     assert "ALLOWED_ORIGINS:?" in api_env["ALLOWED_ORIGINS"]
+    assert api_env["DATABASE_POOL_SIZE"] == "${DATABASE_POOL_SIZE:?required}"
+    assert api_env["DATABASE_MAX_OVERFLOW"] == ("${DATABASE_MAX_OVERFLOW:?required}")
+    assert api_env["DATABASE_POOL_TIMEOUT"] == ("${DATABASE_POOL_TIMEOUT:?required}")
+    assert "command" not in services["api"]
+    assert "entrypoint" not in services["api"]
+    assert services["postgres"]["command"] == [
+        "postgres",
+        "-c",
+        "max_connections=100",
+    ]
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker CLI unavailable")
@@ -66,6 +76,9 @@ def test_docker_compose_config_accepts_strong_synthetic_inputs() -> None:
         "POSTGRES_DB": "prod_db",
         "REDIS_PASSWORD": "R" * 32,
         "QDRANT_API_KEY": "Q" * 32,
+        "DATABASE_POOL_SIZE": "5",
+        "DATABASE_MAX_OVERFLOW": "0",
+        "DATABASE_POOL_TIMEOUT": "30",
     }
     completed = subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE), "config"],

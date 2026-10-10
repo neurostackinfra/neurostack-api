@@ -3,17 +3,97 @@ NeuroStack API - Pytest Configuration and Fixtures
 """
 
 import asyncio
+import importlib
+import os
 import threading
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
 from concurrent.futures import Future
 from contextlib import suppress
 from typing import Any
+from unittest.mock import Mock
 from uuid import UUID
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from src.api.main import app
+from src.repositories import database as database_module
+
+repositories = importlib.import_module("src.repositories")
+
+_DEFAULT_TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
+_production_init_database = database_module.init_database
+_production_create_async_engine = getattr(database_module, "create_async_engine")
+_database_callable_stack: list[tuple[Any, Any, Any]] = []
+
+
+def _validate_test_database_url(raw_url: str) -> str:
+    """Accept only the canonical process-local pytest database."""
+    if raw_url != _DEFAULT_TEST_DATABASE_URL:
+        raise pytest.UsageError(
+            "PYTEST_DATABASE_URL must be exactly "
+            "sqlite+aiosqlite:///:memory:; PostgreSQL gates use their "
+            "disposable smoke-test harnesses"
+        )
+    return raw_url
+
+
+def _configured_test_database_url() -> str:
+    return _validate_test_database_url(
+        os.environ.get("PYTEST_DATABASE_URL", _DEFAULT_TEST_DATABASE_URL)
+    )
+
+
+def _guarded_create_async_engine(database_url: str, **options: Any) -> Any:
+    validated_url = _validate_test_database_url(database_url)
+    return _production_create_async_engine(validated_url, **options)
+
+
+async def _guarded_init_database(
+    *,
+    database_url: str | None = None,
+    engine_factory: Callable[..., Any] | None = None,
+    session_factory_builder: Callable[..., Any] | None = None,
+) -> None:
+    """Initialize only the explicitly isolated pytest database."""
+    resolved_url = (
+        _configured_test_database_url() if database_url is None else database_url
+    )
+    await _production_init_database(
+        database_url=_validate_test_database_url(resolved_url),
+        engine_factory=engine_factory,
+        session_factory_builder=session_factory_builder,
+    )
+
+
+def pytest_configure() -> None:
+    """Fail before collection and guard aliases imported by test modules."""
+    _configured_test_database_url()
+    _database_callable_stack.append(
+        (
+            database_module.init_database,
+            getattr(database_module, "create_async_engine"),
+            getattr(repositories, "init_database"),
+        )
+    )
+    setattr(database_module, "create_async_engine", _guarded_create_async_engine)
+    setattr(database_module, "init_database", _guarded_init_database)
+    setattr(repositories, "init_database", _guarded_init_database)
+
+
+def pytest_unconfigure() -> None:
+    """Restore exact callable identities after embedded pytest runs."""
+    if not _database_callable_stack:
+        return
+    database_init, engine_factory, repositories_init = _database_callable_stack.pop()
+    setattr(database_module, "init_database", database_init)
+    setattr(database_module, "create_async_engine", engine_factory)
+    setattr(repositories, "init_database", repositories_init)
+
+
+def pytest_report_header() -> str:
+    _configured_test_database_url()
+    return "isolated database: sqlite/:memory:"
 
 
 async def _keep_event_loop_responsive() -> None:
@@ -173,6 +253,61 @@ class LifespanTestClient:
 # ============================================
 # Application Fixtures
 # ============================================
+
+
+@pytest.fixture
+def test_database_url() -> str:
+    """Return the validated process-local pytest database URL."""
+    return _configured_test_database_url()
+
+
+@pytest.fixture
+def database_url_validator() -> Callable[[str], str]:
+    """Expose the fail-closed URL validator to regression tests."""
+    return _validate_test_database_url
+
+
+@pytest.fixture
+def lifespan_test_client_factory() -> Callable[[Any], LifespanTestClient]:
+    return LifespanTestClient
+
+
+@pytest.fixture
+def production_database_lifecycle() -> Callable[..., Awaitable[None]]:
+    """Expose production lifecycle semantics only with an explicit fake engine."""
+
+    async def initialize(
+        *,
+        engine_factory: Callable[..., Any],
+        database_url: str | None = None,
+        session_factory_builder: Callable[..., Any] | None = None,
+    ) -> None:
+        if not isinstance(engine_factory, Mock):
+            raise TypeError("production lifecycle tests require a mock engine factory")
+        await _production_init_database(
+            database_url=database_url,
+            engine_factory=engine_factory,
+            session_factory_builder=session_factory_builder,
+        )
+
+    return initialize
+
+
+@pytest.fixture(autouse=True)
+def _inject_isolated_database(
+    monkeypatch: pytest.MonkeyPatch,
+    test_database_url: str,
+) -> Generator[None, None, None]:
+    """Keep every application lifespan on the canonical in-memory database."""
+    monkeypatch.setattr(repositories, "init_database", _guarded_init_database)
+    monkeypatch.setattr(database_module, "init_database", _guarded_init_database)
+    monkeypatch.setattr(
+        database_module,
+        "create_async_engine",
+        _guarded_create_async_engine,
+    )
+    assert test_database_url == _DEFAULT_TEST_DATABASE_URL
+    yield
 
 
 @pytest.fixture(scope="session")

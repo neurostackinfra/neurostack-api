@@ -64,6 +64,10 @@ class TokenBucket:
         self._refill()
         return int(self.tokens)
 
+    def refund(self, tokens: int = 1) -> None:
+        """Return a consumed token when authorization rejects downstream."""
+        self.tokens = min(float(self.capacity), self.tokens + tokens)
+
     def get_reset_time(self) -> int:
         """Get Unix timestamp when bucket will be full."""
         self._refill()
@@ -174,10 +178,6 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     ) -> Response:
         """Process request through rate limiting."""
 
-        # Skip rate limiting if disabled
-        if not settings.rate_limit_enabled:
-            return await call_next(request)
-
         # Skip rate limiting for exempt paths
         if self._is_exempt_path(request.url.path):
             return await call_next(request)
@@ -197,8 +197,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         tenant_id = str(tenant_context.tenant_id)
         rate_limit = tenant_context.rate_limit
 
+        if not settings.rate_limit_enabled:
+            return await call_next(request)
+
+        # Meta identity is published only after raw-body HMAC verification.
+        # Preserve the established tenant+channel bucket while moving its
+        # consumption ahead of FastAPI route dependencies.
+        bucket_key = tenant_id
+        if request.method == "POST" and request.url.path == "/v1/webhook/meta":
+            bucket_key = f"webhook:{tenant_id}:meta"
+
         # Get or create token bucket for tenant
-        bucket = rate_limit_store.get_or_create_bucket(tenant_id, rate_limit)
+        bucket = rate_limit_store.get_or_create_bucket(bucket_key, rate_limit)
 
         # Try to consume a token
         if not bucket.consume():
@@ -229,6 +239,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         # Process request
         response = await call_next(request)
+
+        if getattr(request.state, "rate_limit_refund", False):
+            bucket.refund()
+            return response
 
         # Add rate limit headers to response
         remaining = bucket.get_remaining()

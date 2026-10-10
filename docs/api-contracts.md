@@ -155,7 +155,6 @@ Processa um evento através do pipeline cognitivo NeuroStack.
 
 ```json
 {
-  "tenant_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "session_id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
   "event_type": "message.in",
   "payload": {
@@ -166,6 +165,12 @@ Processa um evento através do pipeline cognitivo NeuroStack.
   }
 }
 ```
+
+O tenant operacional é sempre derivado da credencial autenticada (`Bearer`
+JWT ou `X-API-Key`). O campo `tenant_id` no corpo é opcional e obsoleto: ele é
+aceito apenas como uma asserção de compatibilidade. Quando informado, deve ser
+igual ao tenant autenticado; divergências retornam `403` com
+`tenant_identity_mismatch` e nunca alteram o roteamento da requisição.
 
 **Response (200):**
 
