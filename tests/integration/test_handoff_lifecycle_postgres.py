@@ -430,7 +430,7 @@ async def _run_confirmation_first_service_race(
     second_task: asyncio.Task[Any] | None = None
     success_before = HANDOFF_OPERATIONS.labels(
         operation="update",
-        status=HandoffStatus.IN_PROGRESS.value,
+        status="success",
     )._value.get()
     conflict_before = HANDOFF_OPERATIONS.labels(
         operation="update",
@@ -501,7 +501,7 @@ async def _run_confirmation_first_service_race(
     assert (
         HANDOFF_OPERATIONS.labels(
             operation="update",
-            status=HandoffStatus.IN_PROGRESS.value,
+            status="success",
         )._value.get()
         - success_before
         == 1

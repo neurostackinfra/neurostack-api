@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from src.config.settings import settings
@@ -188,7 +188,6 @@ async def test_interaction_origin_postgres_smoke() -> None:
         poolclass=NullPool,
     )
     child_engine: AsyncEngine | None = None
-    store: EventStore | None = None
     created_database: str | None = None
 
     try:
@@ -306,10 +305,9 @@ async def test_interaction_origin_postgres_smoke() -> None:
                 )
             await transaction.rollback()
 
-        await child_engine.dispose()
-        child_engine = None
-        store = EventStore(database_url=child_url.render_as_string(hide_password=False))
-        await store.connect()
+        store = EventStore(
+            session_factory=async_sessionmaker(child_engine, expire_on_commit=False)
+        )
         events = [
             EventData(
                 tenant_id=tenant_id,
@@ -333,11 +331,7 @@ async def test_interaction_origin_postgres_smoke() -> None:
             event.interaction_origin
             for event in (await store.query_by_tenant(tenant_id)).events
         }.issuperset(set(InteractionOrigin))
-        await store.disconnect()
-        store = None
-
         await _run_alembic(child_url, "downgrade", "017")
-        child_engine = create_async_engine(child_url, poolclass=NullPool)
         async with child_engine.connect() as connection:
             assert (
                 await connection.execute(
@@ -349,8 +343,6 @@ async def test_interaction_origin_postgres_smoke() -> None:
                 )
             ).scalar_one() == 0
     finally:
-        if store is not None:
-            await store.disconnect()
         if child_engine is not None:
             await child_engine.dispose()
         if created_database is not None:
