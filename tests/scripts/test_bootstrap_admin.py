@@ -1,6 +1,10 @@
 """Tests for the one-off platform super_admin bootstrap."""
 
+import os
+import subprocess
+import sys
 from collections.abc import AsyncIterator
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -18,6 +22,7 @@ EMAIL = "platform@example.com"
 PASSWORD = "correct-horse-battery-staple"
 NEW_PASSWORD = "another-long-password-0042"
 DEV_FALLBACK_TENANT_ID = UUID("a0000000-0000-0000-0000-000000000001")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # Sample of API keys versioned in the repository (seed, init-db.sql, fallback).
 VERSIONED_API_KEYS = (
     "ns_admin_key",
@@ -87,11 +92,13 @@ async def _add_user(
     *,
     is_active: bool = True,
     password: str = "existing-password-123",
+    tenant_id: UUID | None = None,
 ) -> User:
-    tenant = await _add_tenant()
+    if tenant_id is None:
+        tenant_id = (await _add_tenant()).id
     user = User(
         id=uuid4(),
-        tenant_id=tenant.id,
+        tenant_id=tenant_id,
         email=email,
         password_hash=verifier.hash(password),
         role=role,
@@ -166,9 +173,16 @@ async def _assert_refused(request: bootstrap.BootstrapRequest, message: str) -> 
         ({bootstrap.EMAIL_ENV: "a@b@example.com"}, "not a valid email"),
         ({bootstrap.EMAIL_ENV: "platform@localhost"}, "not a valid email"),
         ({bootstrap.EMAIL_ENV: "platform@example."}, "not a valid email"),
+        ({bootstrap.EMAIL_ENV: "platform@.example.com"}, "not a valid email"),
         ({bootstrap.EMAIL_ENV: "x" * 244 + "@example.com"}, "not a valid email"),
         ({bootstrap.PASSWORD_ENV: "x" * 15}, "at least 16 characters"),
         ({bootstrap.PASSWORD_ENV: "é" * 37}, "at most 72 bytes"),
+        ({bootstrap.PASSWORD_ENV: PASSWORD + "\n"}, "surrounding whitespace"),
+        ({bootstrap.PASSWORD_ENV: " " + PASSWORD}, "surrounding whitespace"),
+        (
+            {bootstrap.PASSWORD_ENV: "correct-horse\tbattery-staple"},
+            "control characters",
+        ),
         ({bootstrap.RESET_ENV: "yes"}, "must be 'true' or 'false'"),
         ({bootstrap.RESET_ENV: "TRUE"}, "must be 'true' or 'false'"),
     ],
@@ -189,7 +203,8 @@ async def test_invalid_input_fails_before_touching_the_database(
     out, err = capsys.readouterr()
     assert out == ""
     assert message in err
-    assert PASSWORD not in err
+    rejected_password = overrides.get(bootstrap.PASSWORD_ENV) or PASSWORD
+    assert rejected_password.strip() not in err
 
 
 def test_valid_input_accepts_boundaries() -> None:
@@ -310,13 +325,56 @@ async def test_row3_inactive_super_admin_is_never_reactivated(database: None) ->
         await _assert_refused(request, "refusing to reactivate it")
 
 
-async def test_case_insensitive_match_maintains_existing_super_admin(
-    database: None,
-) -> None:
+async def test_case_only_email_difference_is_refused(database: None) -> None:
     await _add_user("Platform@Example.com", UserRole.super_admin, password=PASSWORD)
 
-    assert await _apply(_request()) == "skip"
-    assert await _apply(_reset()) == "reset"
+    for request in (_request(), _reset()):
+        await _assert_refused(request, "only by case; refusing to maintain it")
+
+
+@pytest.mark.parametrize(
+    "tenant_fields",
+    [
+        # Shape created by scripts/seed_demo.py: fallback ID with the platform slug.
+        {
+            "id": DEV_FALLBACK_TENANT_ID,
+            "slug": bootstrap.PLATFORM_TENANT_SLUG,
+            "plan_type": "admin",
+        },
+        {"slug": "other-tenant", "plan_type": "admin"},
+        {"slug": bootstrap.PLATFORM_TENANT_SLUG, "plan_type": "pilot"},
+    ],
+)
+async def test_super_admin_outside_platform_tenant_is_never_maintained(
+    database: None, tenant_fields: dict[str, object]
+) -> None:
+    tenant = await _add_tenant(**tenant_fields)
+    await _add_user(EMAIL, UserRole.super_admin, password=PASSWORD, tenant_id=tenant.id)
+
+    for request in (_request(), _reset()):
+        await _assert_refused(request, "not on the bootstrap platform tenant")
+
+
+async def test_reset_flag_applies_even_with_matching_password(database: None) -> None:
+    await _apply(_request())
+    _, users_before = await _snapshot()
+
+    assert await _apply(_reset(PASSWORD)) == "reset"
+
+    _, users_after = await _snapshot()
+    assert users_after[0][6] != users_before[0][6]  # fresh bcrypt salt
+    assert verifier.verify(PASSWORD, (await _user()).password_hash)
+
+
+async def test_second_email_after_bootstrap_reports_existing_super_admin(
+    database: None,
+) -> None:
+    await _apply(_request())
+
+    await _assert_refused(
+        _request(**{bootstrap.EMAIL_ENV: "other@example.com"}),
+        "another super_admin already exists",
+    )
 
 
 @pytest.mark.parametrize("is_active", [True, False])
@@ -415,6 +473,52 @@ async def test_main_refusal_exits_nonzero(
     assert out == ""
     assert err.startswith("[error] ")
     _assert_no_secret(err)
+
+
+@pytest.fixture
+def keep_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    """main() disposes the engine, which would drop the in-memory database."""
+
+    async def keep_open() -> None:
+        return None
+
+    monkeypatch.setattr(bootstrap, "close_database", keep_open)
+
+
+async def test_main_commits_created_super_admin(
+    database: None, keep_database: None
+) -> None:
+    assert await bootstrap.main(_env()) == 0
+
+    user = await _user()
+    assert verifier.verify(PASSWORD, user.password_hash)
+    async with get_db_session() as session:
+        tenant = await session.get(Tenant, user.tenant_id)
+    assert tenant is not None
+    assert tenant.slug == bootstrap.PLATFORM_TENANT_SLUG
+
+
+async def test_main_commits_reset_password(database: None, keep_database: None) -> None:
+    await _apply(_request())
+
+    env = _env(**{bootstrap.PASSWORD_ENV: NEW_PASSWORD, bootstrap.RESET_ENV: "true"})
+    assert await bootstrap.main(env) == 0
+
+    assert verifier.verify(NEW_PASSWORD, (await _user()).password_hash)
+
+
+def test_module_imports_before_any_other_src_module() -> None:
+    """The image runs the module directly, so its own import order must work."""
+    result = subprocess.run(
+        [sys.executable, "-c", "import scripts.bootstrap_admin"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+    assert result.returncode == 0, result.stderr[-2000:]
 
 
 async def test_main_database_error_prints_type_only(

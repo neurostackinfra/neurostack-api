@@ -55,8 +55,12 @@ descartada) e o único `super_admin`. `scripts/seed_demo.py` é só para
 desenvolvimento e não deve ser usado em ambientes acessíveis pela internet.
 
 Ordem por ambiente, sempre com a mesma imagem (tag imutável) do service:
-criação das roles do banco → task de migrations → task one-off de bootstrap. O
-service pode já estar no ar; nenhum login funciona até o bootstrap rodar.
+criação das roles do banco → task de migrations → task one-off de bootstrap. Ao
+trocar de imagem, registre uma nova revisão de cada task definition apontando
+para a mesma tag. O service pode já estar no ar; nenhum login funciona até o
+bootstrap rodar. A role da aplicação precisa de DML nas tabelas criadas pelas
+migrations (por exemplo, `ALTER DEFAULT PRIVILEGES` do dono do schema); sem
+isso o bootstrap sai com `database error` sem escrever nada.
 
 ```bash
 python -m scripts.bootstrap_admin
@@ -67,22 +71,35 @@ python -m scripts.bootstrap_admin
 | `DATABASE_URL` | secret da aplicação (role só DML) | mesma URL do service, não a de migrations |
 | `ENVIRONMENT` | env | igual à do service |
 | `BOOTSTRAP_ADMIN_EMAIL` | secret | já em minúsculas, até 255 caracteres; é o login exato, digitado em minúsculas |
-| `BOOTSTRAP_ADMIN_PASSWORD` | secret | de 16 caracteres a 72 bytes UTF-8 |
-| `BOOTSTRAP_ADMIN_RESET_PASSWORD` | env, opcional | `true` ou `false` (padrão) |
+| `BOOTSTRAP_ADMIN_PASSWORD` | secret | de 16 caracteres a 72 bytes UTF-8, sem espaço nas pontas nem caracteres de controle (cuidado com a quebra de linha final de secrets criados a partir de arquivo) |
+| `BOOTSTRAP_ADMIN_RESET_PASSWORD` | override do `run-task`, opcional | `true` ou `false` (padrão); não fixe `true` na task definition |
+
+`SECRET_KEY` e `REDIS_URL` não são necessários para essa task. No staging
+(`us-east-1`), os secrets são `neurostack/staging/database-url`,
+`neurostack/staging/bootstrap-admin-email` e
+`neurostack/staging/bootstrap-admin-password`.
 
 A saída de resultado é uma linha `[created|skip|reset] super_admin <email> on
 tenant <id>`; a senha e os hashes nunca são impressos. Sem a flag, reexecutar
 não escreve nada: imprime `skip` se a senha do secret confere com a do banco e
-falha se não confere. Também saem com código 1, sem escrever: outro
-`super_admin` já existe, o e-mail pertence a outro papel ou a uma conta
-inativa, ou já existe um tenant com o slug `neurostack-admin` (nunca é
-adotado).
+falha se não confere. Toda recusa é uma linha `[error] <motivo>` em stderr, com
+código 1 e nada escrito. Duas execuções simultâneas não criam dois
+`super_admin`s: uma sai com `[error] database error: IntegrityError` e a próxima
+execução imprime `skip`.
 
 `super_admin` não troca a própria senha pelo painel. Para trocar ou recuperar,
 atualize `BOOTSTRAP_ADMIN_PASSWORD` no Secrets Manager e rode a task uma vez com
-`BOOTSTRAP_ADMIN_RESET_PASSWORD=true` e o mesmo e-mail (saída `[reset]`). Não
-ative rotação automática nesse secret: a senha real só muda quando a task roda
-com a flag, e a próxima execução sem flag acusa a divergência.
+`BOOTSTRAP_ADMIN_RESET_PASSWORD=true` como override e o mesmo e-mail (saída
+`[reset]`). Não ative rotação automática nesse secret: a senha real só muda
+quando a task roda com a flag, e a próxima execução sem flag acusa a divergência.
+
+O script só mantém o `super_admin` que ele mesmo criou no tenant de plataforma.
+Os estados abaixo são recusados sempre e só se resolvem com SQL manual revisado:
+outro `super_admin` já existe; o e-mail pertence a outro papel, a uma conta
+inativa ou difere do gravado só por maiúsculas; o `super_admin` está fora do
+tenant de plataforma (por exemplo, o criado por `seed_demo.py` no tenant
+`a0000000-0000-0000-0000-000000000001`); ou já existe um tenant com o slug
+`neurostack-admin` sem `super_admin`.
 
 ---
 
