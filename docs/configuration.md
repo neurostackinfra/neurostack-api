@@ -71,7 +71,7 @@ python -m scripts.bootstrap_admin
 | `DATABASE_URL` | secret da aplicação (role só DML) | mesma URL do service, não a de migrations |
 | `ENVIRONMENT` | env | igual à do service |
 | `BOOTSTRAP_ADMIN_EMAIL` | secret | já em minúsculas, até 255 caracteres; é o login exato, digitado em minúsculas |
-| `BOOTSTRAP_ADMIN_PASSWORD` | secret | de 16 caracteres a 72 bytes UTF-8, sem espaço nas pontas nem caracteres de controle (cuidado com a quebra de linha final de secrets criados a partir de arquivo) |
+| `BOOTSTRAP_ADMIN_PASSWORD` | secret | de 16 caracteres a 72 bytes UTF-8, sem espaço nas pontas nem caracteres não imprimíveis (cuidado com a quebra de linha final de secrets criados a partir de arquivo) |
 | `BOOTSTRAP_ADMIN_RESET_PASSWORD` | override do `run-task`, opcional | `true` ou `false` (padrão); não fixe `true` na task definition |
 
 `SECRET_KEY` e `REDIS_URL` não são necessários para essa task. No staging
@@ -93,13 +93,26 @@ atualize `BOOTSTRAP_ADMIN_PASSWORD` no Secrets Manager e rode a task uma vez com
 `[reset]`). Não ative rotação automática nesse secret: a senha real só muda
 quando a task roda com a flag, e a próxima execução sem flag acusa a divergência.
 
-O script só mantém o `super_admin` que ele mesmo criou no tenant de plataforma.
-Os estados abaixo são recusados sempre e só se resolvem com SQL manual revisado:
-outro `super_admin` já existe; o e-mail pertence a outro papel, a uma conta
-inativa ou difere do gravado só por maiúsculas; o `super_admin` está fora do
-tenant de plataforma (por exemplo, o criado por `seed_demo.py` no tenant
-`a0000000-0000-0000-0000-000000000001`); ou já existe um tenant com o slug
-`neurostack-admin` sem `super_admin`.
+O script só mantém o `super_admin` que ele mesmo criou no tenant de plataforma,
+com exatamente o e-mail informado. Usuários que diferem só por maiúsculas (as
+rotas de admin e de builder permitem criá-los) não atrapalham a manutenção
+desse `super_admin`; sem o e-mail exato, porém, o script recusa criar mais uma
+variante de caixa.
+
+Estes estados são recusados sempre:
+
+- outro `super_admin` já existe: se for a conta do próprio bootstrap com o
+  e-mail anterior (o secret de e-mail foi trocado), restaure o e-mail antigo no
+  secret; o erro mostra qual é;
+- o e-mail pertence a outro papel ou a uma conta inativa, ou só existem
+  variantes de caixa dele;
+- o `super_admin` está fora do tenant de plataforma (por exemplo, o criado por
+  `seed_demo.py` no tenant `a0000000-0000-0000-0000-000000000001`);
+- já existe um tenant com o slug `neurostack-admin` sem `super_admin`.
+
+Fora o caso do e-mail anterior, eles se resolvem com SQL manual revisado. Apagar
+o tenant de plataforma pela rota de admin remove também os usuários dele, e a
+próxima execução volta a criar a conta.
 
 ---
 
