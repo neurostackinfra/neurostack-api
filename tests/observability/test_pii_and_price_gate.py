@@ -96,7 +96,7 @@ def _violation_count(tenant_id: str, atendimento_tipo: str) -> float:
     return (
         REGISTRY.get_sample_value(
             "neurostack_price_gate_violations_total",
-            {"tenant_id": tenant_id, "atendimento_tipo": atendimento_tipo},
+            {"atendimento_tipo": atendimento_tipo},
         )
         or 0.0
     )
@@ -120,10 +120,11 @@ class TestCheckPriceGate:
 
     def test_no_violation_without_price(self):
         tenant = "t-noprice-1"
+        before = _violation_count(tenant, "convenio")
         assert (
             check_price_gate("Vamos agendar sua consulta", "convenio", tenant) is False
         )
-        assert _violation_count(tenant, "convenio") == 0.0
+        assert _violation_count(tenant, "convenio") == before
 
     def test_undefined_tipo_with_price_is_violation(self):
         tenant = "t-undef-1"
@@ -146,5 +147,10 @@ class TestCheckPriceGate:
         assert check_price_gate("seu protocolo é 200", "convenio", "t-int") is False
 
     def test_never_raises_on_missing_tenant(self):
-        # tenant_id is optional; must fall back to "unknown" without raising.
+        # Tenant identity is retained only in logs, never in metric labels.
         assert check_price_gate("R$ 100", "convenio", None) is True
+
+    def test_arbitrary_care_modality_collapses_to_bounded_value(self):
+        before = _violation_count("ignored", "undefined")
+        assert check_price_gate("R$ 100", "patient@example.com", "tenant") is True
+        assert _violation_count("ignored", "undefined") == before + 1

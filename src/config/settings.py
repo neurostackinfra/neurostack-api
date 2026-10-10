@@ -4,12 +4,43 @@ Centralized configuration using Pydantic Settings
 """
 
 from functools import lru_cache
+from ipaddress import ip_address
 from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import Field, ValidationInfo, field_validator, model_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.core.exceptions import ConfigurationError
+
+
+def _is_loopback_http_origin(value: str) -> bool:
+    """Return whether a URL is a plain HTTP loopback origin."""
+
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme != "http"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in ("", "/")
+    ):
+        return False
+    if port is not None and not 1 <= port <= 65535:
+        return False
+    hostname = parsed.hostname.lower()
+    if hostname == "localhost":
+        return True
+    try:
+        return ip_address(hostname).is_loopback
+    except ValueError:
+        return False
 
 
 class Settings(BaseSettings):
@@ -20,6 +51,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     # ============================================
@@ -40,6 +72,16 @@ class Settings(BaseSettings):
     port: int = 8000
     workers: int = Field(default=1, ge=1, le=32)
     reload: bool = False
+
+    # ============================================
+    # AWS AppConfig Agent (localhost cache)
+    # ============================================
+    appconfig_enabled: bool = False
+    appconfig_origin: str = "http://127.0.0.1:2772"
+    appconfig_application: str = ""
+    appconfig_environment: str = ""
+    appconfig_profile: str = ""
+    appconfig_token: SecretStr = SecretStr("")
 
     # ============================================
     # Security
@@ -236,6 +278,31 @@ class Settings(BaseSettings):
         """Validate critical settings for production environment."""
         if self.environment == "production":
             errors = []
+
+            if self.appconfig_enabled:
+                missing_appconfig = [
+                    name
+                    for name, value in (
+                        ("APPCONFIG_APPLICATION", self.appconfig_application),
+                        ("APPCONFIG_ENVIRONMENT", self.appconfig_environment),
+                        ("APPCONFIG_PROFILE", self.appconfig_profile),
+                    )
+                    if not value.strip()
+                ]
+                if missing_appconfig:
+                    errors.append(
+                        "AppConfig Agent requires " + ", ".join(missing_appconfig)
+                    )
+                if not _is_loopback_http_origin(self.appconfig_origin):
+                    errors.append(
+                        "APPCONFIG_ORIGIN must be an HTTP loopback origin without "
+                        "userinfo, path, query, or fragment"
+                    )
+                if any(
+                    ord(character) < 32
+                    for character in self.appconfig_token.get_secret_value()
+                ):
+                    errors.append("APPCONFIG_TOKEN contains invalid control characters")
 
             # Check secret key
             if (

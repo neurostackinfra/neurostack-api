@@ -8,8 +8,6 @@ import time
 from typing import Optional
 from uuid import UUID
 
-from prometheus_client import Counter, Histogram
-
 from src.ctx.compression import HistoryCompressor, get_history_compressor
 from src.ctx.context_builder import ContextBuilder, get_context_builder
 from src.ctx.models import (
@@ -22,6 +20,8 @@ from src.ctx.models import (
     MessageRole,
 )
 from src.ctx.relevance import RelevanceFilter, get_relevance_filter
+from src.observability.metric_dimensions import ContractCounter as Counter
+from src.observability.metric_dimensions import ContractHistogram as Histogram
 from src.services import KnowledgeService, get_knowledge_service
 
 logger = logging.getLogger(__name__)
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 CTX_BUILD_TOTAL = Counter(
     "neurostack_ctx_builds_total",
     "Total number of context builds",
-    ["tenant_id", "mode"],
+    ["mode"],
 )
 
 CTX_BUILD_LATENCY = Histogram(
@@ -217,10 +217,7 @@ class ContextOrchestrator:
         """Record Prometheus metrics."""
         mode = "rag" if request.needs_rag else "normal"
 
-        CTX_BUILD_TOTAL.labels(
-            tenant_id=str(request.tenant_id)[:8],
-            mode=mode,
-        ).inc()
+        CTX_BUILD_TOTAL.labels(mode=mode).inc()
 
         if context.build_time_ms:
             CTX_BUILD_LATENCY.observe(context.build_time_ms / 1000)

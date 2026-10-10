@@ -17,7 +17,6 @@ from typing import Any, Optional, TypeVar
 from uuid import UUID
 
 import redis.asyncio as redis
-from prometheus_client import Counter, Histogram
 from pydantic import BaseModel, Field
 
 from src.core.exceptions import (
@@ -26,6 +25,8 @@ from src.core.exceptions import (
     StateStoreError,
 )
 from src.models.session import CognitiveStateData
+from src.observability.metric_dimensions import ContractCounter as Counter
+from src.observability.metric_dimensions import ContractHistogram as Histogram
 
 RedisResult = TypeVar("RedisResult")
 

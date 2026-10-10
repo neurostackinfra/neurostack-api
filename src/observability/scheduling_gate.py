@@ -27,9 +27,9 @@ import os
 import re
 from typing import Optional
 
-from prometheus_client import Counter
-
 from src.config.logging import get_logger
+from src.observability.metric_dimensions import ContractCounter as Counter
+from src.observability.metric_dimensions import bounded_metric_labels
 
 logger = get_logger(__name__)
 
@@ -49,7 +49,7 @@ CATEGORY_PROCESSED_CHANGE = "processed_change"
 SCHEDULING_GATE_VIOLATIONS = Counter(
     "neurostack_scheduling_gate_violations_total",
     "Times the finalized LLM response asserted a scheduling outcome the agent cannot deliver",
-    ["tenant_id", "category"],
+    ["category"],
 )
 
 
@@ -298,7 +298,7 @@ def check_scheduling_gate(
     """Return the violated category, or ``None`` if the response is clean.
 
     Side effects on violation:
-      * bump ``neurostack_scheduling_gate_violations_total{category,tenant_id}``
+      * bump ``neurostack_scheduling_gate_violations_total{category}``
       * emit a structured ``scheduling_gate_violation`` warning log with
         ``tenant_id``, ``category``, and the match offset — deliberately
         **no response snippet**, because this conversation flow collects
@@ -326,8 +326,9 @@ def check_scheduling_gate(
     tenant_label = str(tenant_id) if tenant_id else "unknown"
     try:
         SCHEDULING_GATE_VIOLATIONS.labels(
-            tenant_id=tenant_label,
-            category=category,
+            **bounded_metric_labels(
+                "neurostack_scheduling_gate_violations", category=category
+            )
         ).inc()
     except Exception as exc:  # noqa: BLE001 — metrics must never break pipeline
         try:
