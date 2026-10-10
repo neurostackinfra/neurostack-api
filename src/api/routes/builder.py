@@ -568,7 +568,7 @@ async def _validated_current_builder_id(
         .where(
             User.id == tenant.user_id,
             User.is_active.is_(True),
-            User.role == UserRole.builder,
+            cast(User.role, String) == UserRole.builder.value,
             User.tenant_id == tenant.tenant_id,
             User.builder_id == claimed_builder_id,
             Builder.is_active.is_(True),
@@ -619,7 +619,7 @@ async def list_clinics(
         )
         .where(
             User.tenant_id.in_(tenant_ids),
-            User.role == UserRole.clinic_admin,
+            cast(User.role, String) == UserRole.clinic_admin.value,
         )
         .group_by(User.tenant_id)
     )
@@ -1234,7 +1234,7 @@ async def _linked_clinic_admin_snapshot(
             clinic_admin,
             and_(
                 clinic_admin.tenant_id == Tenant.id,
-                clinic_admin.role == UserRole.clinic_admin,
+                cast(clinic_admin.role, String) == UserRole.clinic_admin.value,
             ),
         )
         .where(builder_user.id == tenant.user_id)
