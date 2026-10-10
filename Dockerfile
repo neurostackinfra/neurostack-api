@@ -87,6 +87,8 @@ COPY --chown=neurostack:neurostack src ./src
 COPY --chown=neurostack:neurostack config ./config
 COPY --chown=neurostack:neurostack alembic.ini ./
 COPY --chown=neurostack:neurostack alembic ./alembic
+# One-off first-access bootstrap; the rest of scripts/ stays out of the image.
+COPY --chown=neurostack:neurostack scripts/bootstrap_admin.py ./scripts/bootstrap_admin.py
 
 # Switch to non-root user
 USER neurostack
