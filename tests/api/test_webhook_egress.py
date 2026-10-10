@@ -182,11 +182,23 @@ def _seed_legacy_credentials(
 ) -> None:
     """Insert legacy runtime credentials without reopening public writes."""
     from src.models.clinic_config_table import ClinicConfigTable
+    from src.models.tenant import Tenant
     from src.repositories.database import get_db_session
 
     async def _run() -> None:
         db = get_db_session()
         try:
+            if await db.get(Tenant, tenant_id) is None:
+                db.add(
+                    Tenant(
+                        id=tenant_id,
+                        name=f"Clinic {tenant_id}",
+                        slug=f"clinic-{tenant_id}",
+                        api_key_hash=f"hash-{tenant_id}",
+                        config={},
+                    )
+                )
+                await db.flush()
             db.add(ClinicConfigTable(tenant_id=tenant_id, api_credentials=credentials))
             await db.commit()
         finally:

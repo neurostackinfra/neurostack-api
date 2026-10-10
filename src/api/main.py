@@ -19,6 +19,7 @@ from neurostack_core import enable_metrics
 
 # Local application imports
 from src.api.middleware.auth import AuthMiddleware
+from src.api.middleware.ingress_body_limit import IngressBodyLimitMiddleware
 from src.api.middleware.media_limits import (
     MediaConcurrencyLimiters,
     MediaUploadLimitsMiddleware,
@@ -29,6 +30,7 @@ from src.api.middleware.performance import (
     PerformanceMiddleware,
 )
 from src.api.middleware.rate_limit import RateLimitMiddleware
+from src.api.middleware.tenant_identity import TenantIdentityMiddleware
 from src.api.middleware.tracing import (
     RequestIdMiddleware,
     configure_tracing,
@@ -80,6 +82,17 @@ def _redact_capability_token(path: str) -> str:
     )
 
 
+def _install_outermost_ingress_body_limit(app: FastAPI) -> None:
+    """Keep the ingress cap outside wrappers installed by instrumentation."""
+
+    build_instrumented_stack = app.build_middleware_stack
+
+    def build_middleware_stack() -> IngressBodyLimitMiddleware:
+        return IngressBodyLimitMiddleware(build_instrumented_stack())
+
+    app.build_middleware_stack = build_middleware_stack  # type: ignore[method-assign]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan handler for startup and shutdown events."""
@@ -122,22 +135,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     instrument_redis()
     instrument_sqlalchemy()
 
-    # Initialize database connection
     from src.repositories import init_database
 
     await init_database()
-
-    # Initialize other connections (will be implemented in later tasks)
-    # await init_redis()
-    # await init_qdrant()
-
     try:
         yield
     finally:
         # Shutdown shared services before their database dependency. Each
         # boundary remains eligible for cleanup even when an earlier one fails.
         logger.info("Shutting down NeuroStack API")
-        from src.memory.event_store import close_event_store
         from src.repositories import close_database
         from src.services.handoff_service import close_handoff_service
 
@@ -147,11 +153,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             try:
                 await close_handoff_service()
             finally:
-                try:
-                    await close_event_store()
-                finally:
-                    await close_database()
-    # await close_redis()
+                await close_database()
 
 
 def create_app() -> FastAPI:
@@ -446,7 +448,8 @@ def create_app() -> FastAPI:
             )
             return app.openapi_schema
 
-    # Configure CORS (must be first/outermost middleware)
+    # Starlette wraps middleware in reverse registration order. Keep ancillary
+    # response/performance middleware inside the security boundary below.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
@@ -454,9 +457,6 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    # Add Request ID middleware (for tracing correlation)
-    app.add_middleware(RequestIdMiddleware)
 
     # Add Performance monitoring middleware
     app.add_middleware(PerformanceMiddleware)
@@ -467,24 +467,31 @@ def create_app() -> FastAPI:
     # Add Response caching middleware for GET requests
     app.add_middleware(CachingMiddleware)
 
-    # Add Rate Limiting middleware (before auth to protect from abuse)
-    if settings.rate_limit_enabled:
-        app.add_middleware(RateLimitMiddleware)
-
-    # Auth remains outermost, so rejected credentials do not consume a media
-    # permit. This middleware then acquires before the first multipart byte.
+    # Media concurrency remains inside auth and the identity/rate boundary.
     app.add_middleware(
         MediaUploadLimitsMiddleware,
         limiters=media_limiters,
         upload_path=f"{settings.api_prefix}/media-assets",
     )
 
-    # Add Authentication middleware
-    app.add_middleware(AuthMiddleware)
-
-    # Instrument FastAPI with OpenTelemetry
+    # Install tracing first so later security middleware remains outside it.
     if settings.tracing_enabled:
         instrument_fastapi(app)
+
+    # Security order is explicit. Because registration order is reversed at
+    # runtime, these calls produce:
+    # auth -> request ID -> tenant identity -> rate limit -> routes.
+    if settings.rate_limit_enabled:
+        app.add_middleware(RateLimitMiddleware)
+    app.add_middleware(TenantIdentityMiddleware)
+    app.add_middleware(RequestIdMiddleware)
+    app.add_middleware(AuthMiddleware)
+
+    # OpenTelemetry replaces ``build_middleware_stack`` and wraps its result,
+    # so registering the body cap as ordinary middleware would still leave
+    # tracing outside it. Wrap the instrumented builder itself to guarantee:
+    # body cap -> tracing -> auth -> request ID -> tenant identity -> rate limit.
+    _install_outermost_ingress_body_limit(app)
 
     # Add Prometheus metrics endpoint
     if settings.metrics_enabled:

@@ -9,30 +9,38 @@ The Event Store provides:
 - Training data generation support
 """
 
-import asyncio
 import time
 from datetime import datetime, timezone
 from enum import Enum
-from types import TracebackType
 from typing import Any, Optional, cast
 from uuid import UUID, uuid4
 
 from prometheus_client import Counter, Histogram
 from pydantic import BaseModel, Field
-from sqlalchemy import text
+from sqlalchemy import DateTime, String, column, insert, table, text
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.config.logging import get_logger
 from src.core.exceptions import EventStoreConnectionError, EventStoreError
 from src.core.interaction_context import InteractionOrigin
 
 logger = get_logger(__name__)
+
+
+_EVENTS_TABLE = table(
+    "events",
+    column("id", PG_UUID(as_uuid=True)),
+    column("tenant_id", PG_UUID(as_uuid=True)),
+    column("session_id", PG_UUID(as_uuid=True)),
+    column("event_type", String(100)),
+    column("interaction_origin", String(20)),
+    column("event_data", JSONB),
+    column("metadata", JSONB),
+    column("created_at", DateTime(timezone=True)),
+)
 
 
 # ============================================
@@ -231,111 +239,15 @@ class EventStore:
     - Provides complete audit trail
     - Supports event sourcing patterns
 
-    Usage:
-        async with EventStore() as store:
-            await store.append(event)
-            events = await store.query_by_session(tenant_id, session_id)
+    The store consumes a session factory. Engine creation, probing, and disposal
+    belong exclusively to :mod:`src.repositories.database`.
     """
 
     def __init__(
         self,
-        database_url: Optional[str] = None,
-        pool_size: Optional[int] = None,
-        max_overflow: Optional[int] = None,
+        session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
     ) -> None:
-        """
-        Initialize Event Store.
-
-        Args:
-            database_url: PostgreSQL connection URL
-            pool_size: Connection pool size
-            max_overflow: Maximum pool overflow
-        """
-        # Import settings here to avoid circular import
-        from src.config.settings import settings
-
-        self._database_url = database_url or settings.database_url
-        self._pool_size = pool_size or settings.database_pool_size
-        self._max_overflow = max_overflow or settings.database_max_overflow
-        self._engine: Optional[AsyncEngine] = None
-        self._session_factory: Optional[async_sessionmaker[AsyncSession]] = None
-        self._connection_lock = asyncio.Lock()
-
-    async def connect(self) -> None:
-        """Establish a probed connection without publishing partial state."""
-        # Import settings here to avoid circular import
-        from src.config.settings import settings
-
-        async with self._connection_lock:
-            if self._engine is not None and self._session_factory is not None:
-                return
-
-            engine: AsyncEngine | None = None
-            try:
-                engine = create_async_engine(
-                    self._database_url,
-                    pool_size=self._pool_size,
-                    max_overflow=self._max_overflow,
-                    echo=settings.debug,
-                )
-                session_factory = async_sessionmaker(
-                    engine,
-                    class_=AsyncSession,
-                    expire_on_commit=False,
-                )
-                async with engine.begin() as conn:
-                    await conn.execute(text("SELECT 1"))
-            except BaseException as exc:
-                self._engine = None
-                self._session_factory = None
-                if engine is not None:
-                    try:
-                        await engine.dispose()
-                    except Exception as dispose_exc:
-                        logger.error(
-                            "Failed to dispose rejected Event Store engine",
-                            error_type=type(dispose_exc).__name__,
-                            exc_info=True,
-                        )
-                if not isinstance(exc, Exception):
-                    raise
-                EVENT_STORE_OPERATIONS.labels(operation="connect", status="error").inc()
-                if not isinstance(exc, SQLAlchemyError):
-                    logger.error(
-                        "Unexpected error connecting to Event Store",
-                        error=str(exc),
-                        error_type=type(exc).__name__,
-                        exc_info=True,
-                    )
-                raise EventStoreConnectionError(
-                    f"Failed to connect to PostgreSQL: {exc}"
-                ) from exc
-
-            self._engine = engine
-            self._session_factory = session_factory
-
-    async def disconnect(self) -> None:
-        """Close PostgreSQL connection and clear published state first."""
-        async with self._connection_lock:
-            engine = self._engine
-            self._engine = None
-            self._session_factory = None
-            if engine is not None:
-                await engine.dispose()
-
-    async def __aenter__(self) -> "EventStore":
-        """Async context manager entry."""
-        await self.connect()
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: Optional[type[BaseException]],
-        exc_val: Optional[BaseException],
-        exc_tb: Optional[TracebackType],
-    ) -> None:
-        """Async context manager exit."""
-        await self.disconnect()
+        self._session_factory = session_factory
 
     def _get_session(self) -> AsyncSession:
         """Get a database session."""
@@ -377,14 +289,10 @@ class EventStore:
         start_time = time.perf_counter()
         try:
             async with self._get_session() as session:
-                import json
-
-                # Use bindparam to properly handle JSONB casting
-                query = text("""
-                    INSERT INTO events (id, tenant_id, session_id, event_type, interaction_origin, event_data, metadata, created_at)
-                    VALUES (:id, :tenant_id, :session_id, :event_type, :interaction_origin, CAST(:event_data AS jsonb), CAST(:metadata AS jsonb), :created_at)
-                    RETURNING id, created_at
-                """)
+                query = insert(_EVENTS_TABLE).returning(
+                    _EVENTS_TABLE.c.id,
+                    _EVENTS_TABLE.c.created_at,
+                )
 
                 result = await session.execute(
                     query,
@@ -394,8 +302,8 @@ class EventStore:
                         "session_id": event.session_id,
                         "event_type": event.event_type,
                         "interaction_origin": event.interaction_origin.value,
-                        "event_data": json.dumps(event.event_data),
-                        "metadata": json.dumps(event.event_metadata),
+                        "event_data": event.event_data,
+                        "metadata": event.event_metadata,
                         "created_at": event.created_at,
                     },
                 )
@@ -463,14 +371,9 @@ class EventStore:
 
         start_time = time.perf_counter()
         try:
-            import json
-
             async with self._get_session() as session:
+                query = insert(_EVENTS_TABLE)
                 for event in events:
-                    query = text("""
-                        INSERT INTO events (id, tenant_id, session_id, event_type, interaction_origin, event_data, metadata, created_at)
-                        VALUES (:id, :tenant_id, :session_id, :event_type, :interaction_origin, CAST(:event_data AS jsonb), CAST(:metadata AS jsonb), :created_at)
-                    """)
                     await session.execute(
                         query,
                         {
@@ -479,8 +382,8 @@ class EventStore:
                             "session_id": event.session_id,
                             "event_type": event.event_type,
                             "interaction_origin": event.interaction_origin.value,
-                            "event_data": json.dumps(event.event_data),
-                            "metadata": json.dumps(event.event_metadata),
+                            "event_data": event.event_data,
+                            "metadata": event.event_metadata,
                             "created_at": event.created_at,
                         },
                     )
@@ -1182,7 +1085,7 @@ class EventStore:
         Returns:
             Health check result with status and latency
         """
-        if not self._engine:
+        if not self._session_factory:
             return {
                 "status": "unhealthy",
                 "error": "Not connected",
@@ -1190,8 +1093,8 @@ class EventStore:
 
         start_time = time.perf_counter()
         try:
-            async with self._engine.begin() as conn:
-                result = await conn.execute(text("SELECT version()"))
+            async with self._get_session() as session:
+                result = await session.execute(text("SELECT version()"))
                 version = result.scalar()
 
             latency = time.perf_counter() - start_time
@@ -1223,47 +1126,8 @@ class EventStore:
             }
 
 
-# ============================================
-# Singleton Instance
-# ============================================
-
-_event_store: Optional[EventStore] = None
-_event_store_lifecycle_lock = asyncio.Lock()
-
-
 async def get_event_store() -> EventStore:
-    """
-    Get or create the global EventStore instance.
+    """Return a thin consumer of the lifespan-owned database session factory."""
+    from src.repositories.database import get_db_session_factory
 
-    Returns:
-        EventStore instance
-    """
-    global _event_store
-    async with _event_store_lifecycle_lock:
-        if _event_store is not None:
-            return _event_store
-
-        candidate = EventStore()
-        try:
-            await candidate.connect()
-        except BaseException:
-            try:
-                await candidate.disconnect()
-            except Exception:
-                logger.error(
-                    "Failed to dispose rejected global Event Store candidate",
-                    exc_info=True,
-                )
-            raise
-        _event_store = candidate
-        return candidate
-
-
-async def close_event_store() -> None:
-    """Close the global EventStore instance."""
-    global _event_store
-    async with _event_store_lifecycle_lock:
-        store = _event_store
-        _event_store = None
-        if store is not None:
-            await store.disconnect()
+    return EventStore(session_factory=get_db_session_factory())

@@ -1559,14 +1559,6 @@ class TestHandoffService:
             provider,
         )
 
-        def _no_application_engine():
-            raise RuntimeError("application database not initialized")
-
-        monkeypatch.setattr(
-            handoff_service_module,
-            "get_db_engine",
-            _no_application_engine,
-        )
         service = HandoffService(
             webhook_dispatcher=webhook_dispatcher,
             session_factory=lambda: _FakeSession(handoff_store),

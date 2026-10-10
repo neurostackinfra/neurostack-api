@@ -6,10 +6,11 @@ import asyncio
 import importlib
 import os
 import threading
-from collections.abc import AsyncGenerator, Callable, Generator
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
 from concurrent.futures import Future
 from contextlib import suppress
 from typing import Any
+from unittest.mock import Mock
 from uuid import UUID
 
 import pytest
@@ -48,13 +49,20 @@ def _guarded_create_async_engine(database_url: str, **options: Any) -> Any:
     return _production_create_async_engine(validated_url, **options)
 
 
-async def _guarded_init_database(*, database_url: str | None = None) -> None:
+async def _guarded_init_database(
+    *,
+    database_url: str | None = None,
+    engine_factory: Callable[..., Any] | None = None,
+    session_factory_builder: Callable[..., Any] | None = None,
+) -> None:
     """Initialize only the explicitly isolated pytest database."""
     resolved_url = (
         _configured_test_database_url() if database_url is None else database_url
     )
     await _production_init_database(
-        database_url=_validate_test_database_url(resolved_url)
+        database_url=_validate_test_database_url(resolved_url),
+        engine_factory=engine_factory,
+        session_factory_builder=session_factory_builder,
     )
 
 
@@ -262,6 +270,27 @@ def database_url_validator() -> Callable[[str], str]:
 @pytest.fixture
 def lifespan_test_client_factory() -> Callable[[Any], LifespanTestClient]:
     return LifespanTestClient
+
+
+@pytest.fixture
+def production_database_lifecycle() -> Callable[..., Awaitable[None]]:
+    """Expose production lifecycle semantics only with an explicit fake engine."""
+
+    async def initialize(
+        *,
+        engine_factory: Callable[..., Any],
+        database_url: str | None = None,
+        session_factory_builder: Callable[..., Any] | None = None,
+    ) -> None:
+        if not isinstance(engine_factory, Mock):
+            raise TypeError("production lifecycle tests require a mock engine factory")
+        await _production_init_database(
+            database_url=database_url,
+            engine_factory=engine_factory,
+            session_factory_builder=session_factory_builder,
+        )
+
+    return initialize
 
 
 @pytest.fixture(autouse=True)

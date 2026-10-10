@@ -47,7 +47,7 @@ from src.handoff.webhook import WebhookDispatcher, get_webhook_dispatcher
 from src.memory import event_store as event_store_module
 from src.memory.event_store import EventData, EventStore, EventType, HandoffEventData
 from src.models.handoff import HandoffRecord
-from src.repositories.database import get_db_engine, get_db_session
+from src.repositories.database import get_db_session_factory
 from src.repositories.handoff import (
     HandoffCasOutcome,
     HandoffCasResult,
@@ -78,6 +78,13 @@ HANDOFF_LATENCY = Histogram(
 
 SessionFactory = Callable[[], AsyncSession]
 RepositoryFactory = Callable[[AsyncSession], HandoffRecordRepository]
+
+
+def get_db_session() -> AsyncSession:
+    """Open from the shared factory while retaining a patchable test seam."""
+    return get_db_session_factory()()
+
+
 _DEFAULT_EVENT_STORE = object()
 _EnumT = TypeVar("_EnumT", bound=Enum)
 _INTERNAL_CONTEXT_KEYS = frozenset(
@@ -363,22 +370,10 @@ class HandoffService:
         self._repository_factory = repository_factory or HandoffRecordRepository
 
     def _open_session(self) -> AsyncSession:
-        return (self._session_factory or get_db_session)()
+        return self._session_factory() if self._session_factory else get_db_session()
 
     async def _event_store_for_operation(self) -> EventStore | None:
         if self._resolve_default_event_store:
-            try:
-                application_engine = get_db_engine()
-            except RuntimeError:
-                application_engine = None
-            if (
-                application_engine is not None
-                and application_engine.dialect.name != "postgresql"
-            ):
-                # EventStore is PostgreSQL-only. The application database uses
-                # SQLite solely in the in-process test runtime, where there is
-                # no truthful production Event Store to resolve.
-                return None
             return await event_store_module.get_event_store()
         return self.event_store
 

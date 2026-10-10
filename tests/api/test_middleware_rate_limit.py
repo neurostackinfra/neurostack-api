@@ -5,12 +5,37 @@ NeuroStack API - Rate Limiting Middleware Tests
 import time
 from types import SimpleNamespace
 from typing import Any
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
 
 import src.api.middleware.rate_limit as rate_limit_module
 from src.api.middleware.rate_limit import rate_limit_store
+
+
+@pytest.fixture(autouse=True)
+def scoped_session_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rate-limit event probes operate on an existing tenant session."""
+
+    from src.models.session import Session
+    from src.repositories.session import SessionRepository
+
+    async def get_by_tenant_for_update(
+        _repo: SessionRepository, session_id: UUID, tenant_id: UUID
+    ) -> Session:
+        return Session(
+            id=session_id,
+            tenant_id=tenant_id,
+            channel="test",
+            cognitive_state={},
+            session_metadata={},
+            message_count=0,
+        )
+
+    monkeypatch.setattr(
+        SessionRepository, "get_by_tenant_for_update", get_by_tenant_for_update
+    )
 
 
 class TestRateLimitMiddleware:

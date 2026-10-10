@@ -458,19 +458,15 @@ def test_demand_b_after_resume_does_not_re_trigger_handoff(
         )
         db = get_db_session()
         try:
-            response = await _process_stateful_event(
-                service,
-                _event_request(
-                    tenant_id=tenant_id,
-                    session_id=session_id,
-                    content="quero falar com um atendente humano agora",
-                    phone=phone,
-                ),
-                session=db,
+            request = _event_request(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                content="quero falar com um atendente humano agora",
+                phone=phone,
             )
-            # process_event never commits; the pause CAS already issued the
-            # UPDATE but we must commit the transaction so later readers see it.
+            result, config, history = await service.run_pipeline(request, db)
             await db.commit()
+            response = await service.finish_response(request, result, config, history)
             return bool(response.decision.handoff_required)
         finally:
             await db.close()
@@ -522,16 +518,15 @@ def test_demand_b_after_resume_does_not_re_trigger_handoff(
         )
         db = get_db_session()
         try:
-            response = await _process_stateful_event(
-                service,
-                _event_request(
-                    tenant_id=tenant_id,
-                    session_id=session_id,
-                    content="quero agendar na quinta às 15h",
-                    phone=phone,
-                ),
-                session=db,
+            request = _event_request(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                content="quero agendar na quinta às 15h",
+                phone=phone,
             )
+            result, config, history = await service.run_pipeline(request, db)
+            await db.commit()
+            response = await service.finish_response(request, result, config, history)
             captured_b.append(response)
             return response
         finally:
@@ -1169,19 +1164,15 @@ def test_explicit_human_request_after_resume_still_triggers_handoff(
         )
         db = get_db_session()
         try:
-            response = await _process_stateful_event(
-                service,
-                _event_request(
-                    tenant_id=tenant_id,
-                    session_id=session_id,
-                    content="quero falar com um atendente humano, por favor",
-                    phone=phone,
-                ),
-                session=db,
+            request = _event_request(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                content="quero falar com um atendente humano, por favor",
+                phone=phone,
             )
-            # process_event never commits; the pause CAS already issued the
-            # UPDATE but we must commit the transaction so later readers see it.
+            result, config, history = await service.run_pipeline(request, db)
             await db.commit()
+            response = await service.finish_response(request, result, config, history)
             return response
         finally:
             await db.close()
@@ -1236,19 +1227,15 @@ def test_safety_concern_after_resume_still_triggers_handoff(
         )
         db = get_db_session()
         try:
-            response = await _process_stateful_event(
-                service,
-                _event_request(
-                    tenant_id=tenant_id,
-                    session_id=session_id,
-                    content="estou sentindo dor forte depois da consulta",
-                    phone=phone,
-                ),
-                session=db,
+            request = _event_request(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                content="estou sentindo dor forte depois da consulta",
+                phone=phone,
             )
-            # process_event never commits; the pause CAS already issued the
-            # UPDATE but we must commit the transaction so later readers see it.
+            result, config, history = await service.run_pipeline(request, db)
             await db.commit()
+            response = await service.finish_response(request, result, config, history)
             return response
         finally:
             await db.close()

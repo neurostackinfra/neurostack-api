@@ -23,7 +23,12 @@ from src.api.middleware.rate_limit import (
     check_webhook_rate_limit,
     webhook_rate_limit_response,
 )
-from src.api.schemas.events import EventPayload, EventRequest, EventResponse, EventType
+from src.api.schemas.events import (
+    CanonicalEventRequest,
+    EventPayload,
+    EventResponse,
+    EventType,
+)
 from src.config.settings import settings
 from src.core.lgpd_utils import resolve_privacy_link
 from src.handoff.episode_context import (
@@ -174,7 +179,7 @@ def _get_agent_language(clinic_config: Optional[dict[str, Any]]) -> str:
 async def _run_pipeline_transactionally(
     *,
     service: Any,
-    event_request: EventRequest,
+    event_request: CanonicalEventRequest,
     db: AsyncSession,
 ) -> EventResponse:
     """Run the locked phase, commit it, then start post-commit response I/O.
@@ -2199,7 +2204,7 @@ async def _process_zapi_authenticated_body(
         )
         _event_metadata["audio_seconds"] = audio_obj.get("seconds") or 0
         _event_metadata["is_audio"] = True
-    event_request = EventRequest(
+    event_request = CanonicalEventRequest(
         tenant_id=tenant_id,
         session_id=session_id,
         event_type=EventType.MESSAGE_IN,
@@ -2468,7 +2473,7 @@ async def evolution_webhook(
                 send=_send_evolution_privacy,
             )
 
-    event_request = EventRequest(
+    event_request = CanonicalEventRequest(
         tenant_id=tenant_id,
         session_id=session_id,
         event_type=EventType.MESSAGE_IN,
@@ -2940,7 +2945,7 @@ async def uazapi_webhook(
             )
 
     assert message_text is not None
-    event_request = EventRequest(
+    event_request = CanonicalEventRequest(
         tenant_id=tenant_id,
         session_id=session_id,
         event_type=EventType.MESSAGE_IN,
@@ -3356,8 +3361,9 @@ async def meta_webhook(
       }]
     }
     """
-    # ── 1) Read the exact raw bytes BEFORE anything else so HMAC can bind
-    # to them (json parsing does not preserve byte-for-byte). ──
+    # TenantIdentityMiddleware has already verified the exact raw bytes and
+    # bound this request to the receiver's active tenant. The route consumes
+    # only that canonical state; payload tenant fields are never authority.
     raw_body = await request.body()
     try:
         import json as _json
@@ -3369,6 +3375,20 @@ async def meta_webhook(
             content={"error": "invalid_webhook_auth"},
         )
     if not isinstance(body, dict):
+        return JSONResponse(
+            status_code=401,
+            content={"error": "invalid_webhook_auth"},
+        )
+
+    tenant_id = getattr(request.state, "canonical_tenant_id", None)
+    tenant_creds = getattr(request.state, "meta_credentials", None)
+    phone_number_id = getattr(request.state, "meta_phone_number_id", None)
+    if (
+        not isinstance(tenant_id, UUID)
+        or not isinstance(tenant_creds, dict)
+        or not isinstance(phone_number_id, str)
+        or not phone_number_id
+    ):
         return JSONResponse(
             status_code=401,
             content={"error": "invalid_webhook_auth"},
@@ -3409,7 +3429,10 @@ async def meta_webhook(
             return {"ok": True, "skipped": "missing_phone_number_id"}
         return {"ok": True, "skipped": "status_only"}
 
-    if len(message_bearing_phone_ids) != 1:
+    if (
+        len(message_bearing_phone_ids) != 1
+        or message_bearing_phone_ids[0] != phone_number_id
+    ):
         # Zero or multiple message-bearing phone ids — fail closed with a
         # generic error so multi-tenant confusion cannot bleed downstream.
         return JSONResponse(
@@ -3417,37 +3440,12 @@ async def meta_webhook(
             content={"error": "invalid_webhook_auth"},
         )
 
-    phone_number_id = message_bearing_phone_ids[0]
-
-    # ── 3) Resolve exactly one tenant + credentials for that phone id ──
-    resolved = await _resolve_tenant_by_meta_phone_number_id(phone_number_id, db)
-    if resolved is None:
-        logger.warning(
-            "Meta webhook: no tenant for phone_number_id %s",
-            phone_number_id,
-        )
-        return {"ok": True, "skipped": "unknown_phone_number_id"}
-    tenant_id, tenant_creds = resolved
-
-    # ── 4) HMAC-SHA256 authenticity over the raw body bytes ──
-    app_secret = str(tenant_creds.get("meta_app_secret") or "").strip()
-    signature_header = request.headers.get(
-        META_SIGNATURE_HEADER
-    ) or request.headers.get(META_SIGNATURE_HEADER.lower())
-    if not app_secret or not _verify_meta_signature(
-        signature_header, raw_body, app_secret
-    ):
-        return JSONResponse(
-            status_code=401,
-            content={"error": "invalid_webhook_auth"},
-        )
-
-    # ── 5) Rate limit (after auth, before replay/session/media/reply) ──
+    # ── 3) Rate limit (after auth, before replay/session/media/reply) ──
     rate_decision = check_webhook_rate_limit(str(tenant_id), "meta")
     if not rate_decision.allowed:
         return webhook_rate_limit_response(rate_decision)
 
-    # ── 6) messageId presence + replay claim (before any downstream effect) ──
+    # ── 4) messageId presence + replay claim (before any downstream effect) ──
     # We need the first message id from the single message-bearing change.
     change_for_processing: dict[str, Any] = {}
     for entry in entries:
@@ -3873,7 +3871,7 @@ async def meta_webhook(
                 )
 
             # ── pipeline ──
-            event_request = EventRequest(
+            event_request = CanonicalEventRequest(
                 tenant_id=tenant_id,
                 session_id=session_id,
                 event_type=EventType.MESSAGE_IN,
