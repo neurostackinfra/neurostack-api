@@ -11,10 +11,10 @@ re-applies the password to the same super_admin; without the flag a password
 that differs from the stored one is an error, so the secret and the database
 cannot drift silently. super_admin has no self-service password change, so this
 is its rotation and recovery path. Only the super_admin on the platform
-tenant created by this script is maintained. Unexpected states (another
-super_admin, another role, inactive account, an email differing only by case,
-an account outside the platform tenant, an existing platform tenant) are
-refused without writing anything.
+tenant created by this script, with exactly the requested email, is
+maintained. Unexpected states (another super_admin, another role, inactive
+account, only case variants of the email, an account outside the platform
+tenant, an existing platform tenant) are refused without writing anything.
 
 Run once per environment, after ``alembic upgrade head``:
     python -m scripts.bootstrap_admin
@@ -113,7 +113,7 @@ def load_request(environ: Mapping[str, str]) -> BootstrapRequest:
     if password != password.strip() or not password.isprintable():
         raise BootstrapError(
             f"{PASSWORD_ENV} must not have surrounding whitespace "
-            "or control characters"
+            "or non-printable characters"
         )
 
     if reset_raw not in ("", "true", "false"):
@@ -165,11 +165,6 @@ async def _maintain(
         raise BootstrapError(
             f"super_admin {request.email} is inactive; refusing to reactivate it"
         )
-    if existing.email != request.email:
-        raise BootstrapError(
-            f"stored email {existing.email} differs from {request.email} "
-            "only by case; refusing to maintain it"
-        )
     tenant = await session.get(Tenant, existing.tenant_id)
     if (
         tenant is None
@@ -200,15 +195,18 @@ async def bootstrap_admin(
         select(User).where(func.lower(User.email) == request.email)
     )
     matches = result.scalars().all()
-    if len(matches) > 1:
-        raise BootstrapError(
-            f"{len(matches)} users match {request.email} ignoring case; "
-            "refusing to choose one"
-        )
-    if matches:
-        outcome = await _maintain(session, matches[0], request)
+    # users.email is unique case-sensitively and the application can create
+    # case variants, so only the exact match is the account to maintain.
+    exact = next((user for user in matches if user.email == request.email), None)
+    if exact is not None:
+        outcome = await _maintain(session, exact, request)
         await session.flush()
-        return outcome, matches[0]
+        return outcome, exact
+    if matches:
+        raise BootstrapError(
+            f"{len(matches)} user(s) match {request.email} only by case; "
+            "refusing to create a case variant"
+        )
 
     # users.role is VARCHAR in the migrated schema; compare as text like the
     # rest of the application does.
