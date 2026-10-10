@@ -12,11 +12,18 @@ Implements Task 13.0 - End-to-End Integration.
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.middleware.auth import TenantContext, get_tenant_context
+from src.api.middleware.tenant_identity import (
+    audit_tenant_identity_mismatch,
+    tenant_identity_mismatch_response,
+)
 from src.api.schemas.base import ErrorResponse
 from src.api.schemas.events import (
+    CanonicalEventRequest,
     EventDetailResponse,
     EventRequest,
     EventResponse,
@@ -24,6 +31,7 @@ from src.api.schemas.events import (
 )
 from src.repositories import get_db_session_dependency
 from src.services import get_event_service
+from src.services.event_service import SessionNotFoundError
 
 router = APIRouter()
 
@@ -64,6 +72,17 @@ RESPONSES_PROCESS_EVENT: dict[int | str, dict[str, Any]] = {
                 "example": {
                     "error": "unauthorized",
                     "message": "Invalid or missing API key",
+                }
+            }
+        },
+    },
+    403: {
+        "description": "Tenant identity assertion failed",
+        "content": {
+            "application/json": {
+                "example": {
+                    "error": "tenant_identity_mismatch",
+                    "message": "Tenant identity does not match the authenticated request",
                 }
             }
         },
@@ -148,7 +167,6 @@ here to receive structured cognitive decisions.
   -H "Content-Type: application/json" \\
   -H "X-API-Key: your-api-key" \\
   -d '{
-    "tenant_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
     "session_id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
     "event_type": "message.in",
     "payload": {
@@ -170,7 +188,6 @@ response = requests.post(
         "X-API-Key": "your-api-key",
     },
     json={
-        "tenant_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
         "session_id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
         "event_type": "message.in",
         "payload": {
@@ -191,8 +208,10 @@ decision = response.json()
 )
 async def process_event(
     request: EventRequest,
+    http_request: Request,
+    tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db_session_dependency),
-) -> EventResponse:
+) -> EventResponse | JSONResponse:
     """
     Process an incoming event through the NeuroStack cognitive pipeline.
 
@@ -202,14 +221,35 @@ async def process_event(
 
     _logger = _get_logger(__name__)
 
+    # TenantIdentityMiddleware treated the optional payload value as an
+    # assertion. Canonicalize the model before any service/store receives it.
+    canonical_request = CanonicalEventRequest(
+        tenant_id=tenant.tenant_id,
+        session_id=request.session_id,
+        event_type=request.event_type,
+        payload=request.payload,
+    )
+
     service = get_event_service()
 
     # ── Phase 1: fast DB work (load state → pipeline → flush state) ──────────
     # Any exception here rolls back the transaction so nothing is left dirty.
     try:
         result, clinic_config, message_history = await service.run_pipeline(
-            request, session=db
+            canonical_request, session=db
         )
+    except SessionNotFoundError:
+        await db.rollback()
+        http_request.state.rate_limit_refund = True
+        audit_tenant_identity_mismatch(
+            request_id=getattr(http_request.state, "request_id", None),
+            route=http_request.url.path,
+            method=http_request.method,
+            authentication_mode=tenant.authentication_mode,
+            authenticated_tenant=tenant.tenant_id,
+            claimed_tenant=None,
+        )
+        return tenant_identity_mismatch_response()
     except HTTPException:
         await db.rollback()
         raise
@@ -217,8 +257,8 @@ async def process_event(
         await db.rollback()
         _logger.error(
             "Pipeline error in process_event (phase 1 — no LLM called)",
-            tenant_id=str(request.tenant_id),
-            session_id=str(request.session_id),
+            tenant_id=str(canonical_request.tenant_id),
+            session_id=str(canonical_request.session_id),
             error=str(e),
             error_type=type(e).__name__,
             exc_info=True,
@@ -237,8 +277,8 @@ async def process_event(
         await db.rollback()
         _logger.error(
             "DB commit failed after state flush (phase 1 commit)",
-            tenant_id=str(request.tenant_id),
-            session_id=str(request.session_id),
+            tenant_id=str(canonical_request.tenant_id),
+            session_id=str(canonical_request.session_id),
             error=str(e),
             exc_info=True,
         )
@@ -251,15 +291,15 @@ async def process_event(
     # DB session is already committed/released; failures here are independent.
     try:
         return await service.finish_response(
-            request, result, clinic_config, message_history
+            canonical_request, result, clinic_config, message_history
         )
     except HTTPException:
         raise
     except Exception as e:
         _logger.error(
             "Error in process_event phase 2 (LLM/event-store)",
-            tenant_id=str(request.tenant_id),
-            session_id=str(request.session_id),
+            tenant_id=str(canonical_request.tenant_id),
+            session_id=str(canonical_request.session_id),
             error=str(e),
             error_type=type(e).__name__,
             exc_info=True,
@@ -306,6 +346,7 @@ Events are stored in the Event Store and retained according to tenant configurat
 )
 async def get_event(
     event_id: UUID,
+    tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> EventDetailResponse:
     """
@@ -313,7 +354,7 @@ async def get_event(
     """
     service = get_event_service()
     try:
-        return await service.get_event(event_id, session)
+        return await service.get_event(tenant.tenant_id, event_id, session)
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -349,11 +390,17 @@ async def list_events(
         default=50, ge=1, le=100, description="Maximum events to return"
     ),
     offset: int = Query(default=0, ge=0, description="Offset for pagination"),
+    tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> list[EventDetailResponse]:
     """
     List events with filtering and pagination.
     """
+    if tenant_id != tenant.tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Tenant or session not found",
+        )
     service = get_event_service()
     return await service.list_events(
         tenant_id=tenant_id,

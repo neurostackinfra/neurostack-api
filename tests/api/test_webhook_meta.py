@@ -109,15 +109,30 @@ def _admin_headers(tenant_id: UUID) -> dict[str, str]:
 
 
 def _seed_legacy_meta_credentials(
-    client: TestClient, tenant_id: UUID, credentials: dict
+    client: TestClient,
+    tenant_id: UUID,
+    credentials: dict,
+    *,
+    is_active: bool = True,
 ) -> None:
     """Insert legacy credential state without reopening public provisioning."""
     from src.models.clinic_config_table import ClinicConfigTable
+    from src.models.tenant import Tenant
     from src.repositories.database import get_db_session
 
     async def _run() -> None:
         db = get_db_session()
         try:
+            db.add(
+                Tenant(
+                    id=tenant_id,
+                    name=f"Webhook test {tenant_id}",
+                    api_key_hash=f"webhook-test-{tenant_id}",
+                    is_active=is_active,
+                    config={},
+                )
+            )
+            await db.flush()
             db.add(ClinicConfigTable(tenant_id=tenant_id, api_credentials=credentials))
             await db.commit()
         finally:
@@ -139,7 +154,7 @@ def _seed_meta_credentials(
         {
             "whatsapp_provider": "meta_cloud",
             "meta_phone_number_id": phone_number_id,
-            "meta_waba_id": f"waba_{uuid4().hex[:8]}",
+            "meta_waba_id": f"waba_{phone_number_id}",
             "meta_permanent_token": f"EAAG_test_token_{uuid4().hex}",
             "meta_verify_token": verify_token,
             "meta_app_secret": META_APP_SECRET,
@@ -161,7 +176,7 @@ def _meta_text_payload(
         "object": "whatsapp_business_account",
         "entry": [
             {
-                "id": f"waba_{uuid4().hex[:8]}",
+                "id": f"waba_{phone_number_id}",
                 "changes": [
                     {
                         "field": "messages",
@@ -382,7 +397,7 @@ class TestMetaWebhookTextFlow:
         assert receipt_logs, "expected a receipt log line"
         assert wamid in receipt_logs[0].getMessage()
 
-    def test_unknown_phone_number_id_warns_and_skips(
+    def test_unknown_phone_number_id_returns_generic_401(
         self,
         client: TestClient,
         tenant_id: UUID,
@@ -400,18 +415,10 @@ class TestMetaWebhookTextFlow:
             message_id=wamid,
         )
 
-        with caplog.at_level("WARNING", logger="src.api.routes.webhook"):
-            resp = _post_meta(client, payload)
+        resp = _post_meta(client, payload)
 
-        assert resp.status_code == 200
-        assert resp.json() == {"ok": True, "skipped": "unknown_phone_number_id"}
-        # Parity with Z-API/Evolution "no tenant for" warning
-        warn_msgs = [
-            rec.getMessage() for rec in caplog.records if rec.levelname == "WARNING"
-        ]
-        assert any(
-            "no tenant for phone_number_id" in m and stranger_pn in m for m in warn_msgs
-        ), warn_msgs
+        assert resp.status_code == 401
+        assert resp.json() == {"error": "invalid_webhook_auth"}
 
     def test_audio_without_media_id_is_skipped(
         self,
@@ -1627,7 +1634,7 @@ class TestMetaWebhookHmacAuthenticity:
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "skipped": "status_only"}
 
-    def test_multiple_message_bearing_phone_ids_return_401(
+    def test_multiple_message_bearing_phone_ids_return_audited_403(
         self,
         client: TestClient,
         tenant_id: UUID,
@@ -1670,8 +1677,8 @@ class TestMetaWebhookHmacAuthenticity:
         )
 
         resp = _post_meta(client, payload_a)
-        assert resp.status_code == 401
-        assert resp.json() == {"error": "invalid_webhook_auth"}
+        assert resp.status_code == 403
+        assert resp.json()["error"] == "tenant_identity_mismatch"
 
     def test_missing_meta_app_secret_returns_401(
         self,

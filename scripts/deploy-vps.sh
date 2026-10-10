@@ -8,7 +8,10 @@ readonly SCRIPT_PATH="$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="${SCRIPT_PATH%/*}"
 readonly REPO_ROOT="${SCRIPT_DIR%/*}"
 readonly CHECKER="${SCRIPT_DIR}/validate_provider_availability_evidence.py"
+readonly DATABASE_BUDGET_CHECKER="${SCRIPT_DIR}/check_database_connection_budget.py"
+readonly DATABASE_BUDGET_MANIFEST="${REPO_ROOT}/config/database-connection-budgets.json"
 readonly COMPOSE_FILE="${REPO_ROOT}/docker-compose.production.yml"
+readonly DOCKERFILE="${REPO_ROOT}/Dockerfile"
 readonly ENV_FILE="${REPO_ROOT}/.env"
 
 fail() {
@@ -65,6 +68,7 @@ load_runtime_environment() {
     unset ENVIRONMENT DEBUG SECRET_KEY POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB
     unset REDIS_PASSWORD QDRANT_API_KEY ALLOWED_ORIGINS ALLOWED_HOSTS
     unset API_BIND_ADDRESS API_PORT
+    unset DATABASE_POOL_SIZE DATABASE_MAX_OVERFLOW DATABASE_POOL_TIMEOUT
     local line key value line_number=0
     local -A seen=()
     while IFS= read -r line || [ -n "$line" ]; do
@@ -81,7 +85,7 @@ load_runtime_environment() {
         key="${BASH_REMATCH[1]}"
         value="${BASH_REMATCH[2]}"
         case "$key" in
-            ENVIRONMENT|DEBUG|SECRET_KEY|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|REDIS_PASSWORD|QDRANT_API_KEY|ALLOWED_ORIGINS|ALLOWED_HOSTS|API_BIND_ADDRESS|API_PORT) ;;
+            ENVIRONMENT|DEBUG|SECRET_KEY|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|REDIS_PASSWORD|QDRANT_API_KEY|ALLOWED_ORIGINS|ALLOWED_HOSTS|API_BIND_ADDRESS|API_PORT|DATABASE_POOL_SIZE|DATABASE_MAX_OVERFLOW|DATABASE_POOL_TIMEOUT) ;;
             *)
                 fail ".env line $line_number uses an unknown key"
                 return 1
@@ -139,6 +143,13 @@ main() {
     unset DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
     printf 'NeuroStack production deploy: signed release gate passed\n'
     validate_runtime_environment
+    /usr/bin/python3 "$DATABASE_BUDGET_CHECKER" \
+        --manifest "$DATABASE_BUDGET_MANIFEST" \
+        --profile vps-compose \
+        --verify-vps-compose \
+        --compose "$COMPOSE_FILE" \
+        --dockerfile "$DOCKERFILE" \
+        --env-file "$ENV_FILE"
     [ -x /usr/bin/docker ] || fail "Docker is required at /usr/bin/docker"
     /usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" version >/dev/null 2>&1 || fail "Docker Compose is required"
 

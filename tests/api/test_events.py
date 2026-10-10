@@ -3,9 +3,34 @@ NeuroStack API - Events Endpoint Tests
 """
 
 from typing import Any
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+
+
+@pytest.fixture(autouse=True)
+def scoped_session_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These response-shape tests operate on an existing tenant session."""
+
+    from src.models.session import Session
+    from src.repositories.session import SessionRepository
+
+    async def get_by_tenant_for_update(
+        _repo: SessionRepository, session_id: UUID, tenant_id: UUID
+    ) -> Session:
+        return Session(
+            id=session_id,
+            tenant_id=tenant_id,
+            channel="test",
+            cognitive_state={},
+            session_metadata={},
+            message_count=0,
+        )
+
+    monkeypatch.setattr(
+        SessionRepository, "get_by_tenant_for_update", get_by_tenant_for_update
+    )
 
 
 class TestEventsEndpoint:

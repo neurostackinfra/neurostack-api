@@ -1,13 +1,11 @@
 """Application teardown coverage for handoff-owned shared resources."""
 
-import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 import src.api.main as main_module
-import src.memory.event_store as event_store_module
 import src.repositories as repositories_module
 import src.services.handoff_service as handoff_service_module
 
@@ -15,7 +13,7 @@ import src.services.handoff_service as handoff_service_module
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure_stage",
-    [None, "rlhf", "handoff", "event_store", "database"],
+    [None, "rlhf", "handoff", "database"],
 )
 async def test_lifespan_runs_every_cleanup_in_dependency_order(
     monkeypatch: pytest.MonkeyPatch,
@@ -32,10 +30,6 @@ async def test_lifespan_runs_every_cleanup_in_dependency_order(
         async def close(self) -> None:
             await step("handoff")
 
-    class Store:
-        async def disconnect(self) -> None:
-            await step("event_store")
-
     async def init_database() -> None:
         order.append("database_init")
 
@@ -46,7 +40,6 @@ async def test_lifespan_runs_every_cleanup_in_dependency_order(
         await step("rlhf")
 
     service = SimpleNamespace(webhook_dispatcher=Dispatcher())
-    store = Store()
     monkeypatch.setattr(main_module.settings, "metrics_enabled", False)
     monkeypatch.setattr(main_module, "configure_tracing", MagicMock())
     monkeypatch.setattr(main_module, "instrument_redis", MagicMock())
@@ -55,17 +48,10 @@ async def test_lifespan_runs_every_cleanup_in_dependency_order(
     monkeypatch.setattr(repositories_module, "close_database", close_database)
     monkeypatch.setattr(main_module.rlhf, "shutdown", shutdown_rlhf)
     monkeypatch.setattr(handoff_service_module, "_service", service)
-    monkeypatch.setattr(event_store_module, "_event_store", store)
-    monkeypatch.setattr(
-        event_store_module,
-        "_event_store_lifecycle_lock",
-        asyncio.Lock(),
-    )
 
     async def run_lifespan() -> None:
         async with main_module.lifespan(main_module.app):
             assert handoff_service_module._service is service
-            assert event_store_module._event_store is store
 
     if failure_stage is None:
         await run_lifespan()
@@ -77,8 +63,6 @@ async def test_lifespan_runs_every_cleanup_in_dependency_order(
         "database_init",
         "rlhf",
         "handoff",
-        "event_store",
         "database",
     ]
     assert handoff_service_module._service is None
-    assert event_store_module._event_store is None

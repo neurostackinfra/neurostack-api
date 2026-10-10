@@ -12,10 +12,10 @@ from uuid import UUID, uuid4
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.schemas.events import (
+    CanonicalEventRequest,
     ContextOutput,
     ContextSource,
     EventDetailResponse,
-    EventRequest,
     EventResponse,
     EventType,
     FlowMode,
@@ -53,6 +53,11 @@ if TYPE_CHECKING:
     from src.core.pipeline import CognitivePipeline, PipelineResult
 
 logger = get_logger(__name__)
+
+
+class SessionNotFoundError(ValueError):
+    """The session is absent from the authorized tenant boundary."""
+
 
 # These replies bypass the LLM when a handoff is required. Keep this mapping
 # at module scope so the production literal has one inspectable source for the
@@ -713,14 +718,18 @@ class EventService:
 
     async def _load_session_state(
         self,
+        tenant_id: UUID,
         session_id: UUID,
         db: Optional[AsyncSession],
+        *,
+        session_row: Optional[Session] = None,
     ) -> CognitiveStateData:
         """Load cognitive state from PG Session, fallback to default."""
         if db:
             try:
-                repo = SessionRepository(db)
-                session_row = await repo.get_by_id(session_id)
+                if session_row is None:
+                    repo = SessionRepository(db)
+                    session_row = await repo.get_by_tenant(session_id, tenant_id)
                 if session_row and session_row.cognitive_state:
                     state = session_row.get_cognitive_state()
                     logger.info(
@@ -777,6 +786,7 @@ class EventService:
 
     async def _persist_session_state(
         self,
+        tenant_id: UUID,
         session_id: UUID,
         result: "PipelineResult",
         db: Optional[AsyncSession],
@@ -845,7 +855,6 @@ class EventService:
         if result.paused_until:
             paused_until_dt = datetime.fromisoformat(result.paused_until)
 
-        tenant_id = session_row.tenant_id
         outcome = await repo.pause_effective(
             tenant_id,
             session_id,
@@ -1026,7 +1035,7 @@ class EventService:
 
     async def run_pipeline(
         self,
-        request: EventRequest,
+        request: CanonicalEventRequest,
         session: Optional[AsyncSession] = None,
     ) -> tuple[
         "PipelineResult",
@@ -1047,12 +1056,9 @@ class EventService:
         Raises on persistence failure (does NOT swallow) so the route handler
         can detect the failure and rollback before calling finish_response().
         """
-        # Load clinic config for the tenant (provides identity, services, pricing)
-        clinic_config = await self._load_clinic_config(request.tenant_id)
-
-        # A stateful call owns the PostgreSQL row lock from this point through
-        # language selection, pipeline processing and the final state flush.
-        # The session-less path is deliberately stateless and persists nothing.
+        # Lock and resolve the session through the authenticated tenant before
+        # loading configuration or running any pipeline/effect. A bare session
+        # id must never become a cross-tenant lookup oracle.
         session_row: Optional[Session] = None
         if session is None:
             state = CognitiveStateData()
@@ -1062,6 +1068,11 @@ class EventService:
                 request.session_id,
                 session,
             )
+            if session_row is None:
+                raise SessionNotFoundError("Tenant or session not found")
+
+        # Load clinic config for the tenant (provides identity, services, pricing)
+        clinic_config = await self._load_clinic_config(request.tenant_id)
 
         configured_language = self._configured_language(clinic_config)
         handoff_confirmation_pending = bool(
@@ -1152,6 +1163,7 @@ class EventService:
         # Persist state back to PG (flush only — caller must commit)
         # Raises on failure so the caller can rollback before starting LLM
         await self._persist_session_state(
+            request.tenant_id,
             request.session_id,
             result,
             session,
@@ -1164,7 +1176,7 @@ class EventService:
 
     async def finish_response(
         self,
-        request: EventRequest,
+        request: CanonicalEventRequest,
         result: "PipelineResult",
         clinic_config: Optional[dict[str, Any]],
         message_history: list[dict[str, str]],
@@ -1209,7 +1221,7 @@ class EventService:
 
     async def process_event(
         self,
-        request: EventRequest,
+        request: CanonicalEventRequest,
     ) -> EventResponse:
         """
         Explicit stateless entry point for tests and persistence-free callers.
@@ -1738,7 +1750,7 @@ class EventService:
 
     async def _save_events_to_store(
         self,
-        request: EventRequest,
+        request: CanonicalEventRequest,
         result: "PipelineResult",
         suggested_response: Optional[str] = None,
         llm_usage: Optional[dict[str, int]] = None,
@@ -2025,7 +2037,7 @@ class EventService:
             )
 
     async def get_event(
-        self, event_id: UUID, session: AsyncSession
+        self, tenant_id: UUID, event_id: UUID, session: AsyncSession
     ) -> EventDetailResponse:
         """
         Get event details by ID.
@@ -2042,7 +2054,7 @@ class EventService:
         """
         event_repo = EventRepository(session)
 
-        event = await event_repo.get_by_id(event_id)
+        event = await event_repo.get_for_tenant(event_id, tenant_id)
 
         if not event:
             raise ValueError(f"Event {event_id} not found")

@@ -11,6 +11,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/deploy-vps.sh"
+DATABASE_BUDGET_CHECKER = ROOT / "scripts/check_database_connection_budget.py"
 
 
 def _executable(path: Path, body: str) -> None:
@@ -44,6 +45,27 @@ def test_checker_invocation_is_literal_first_command_in_main() -> None:
     checker = (ROOT / "scripts/validate_provider_availability_evidence.py").read_text()
     assert "from yaml" not in checker
     assert "import yaml" not in checker
+
+
+def test_database_budget_checker_runs_with_stdlib_only_import_isolation() -> None:
+    checker = DATABASE_BUDGET_CHECKER.read_text(encoding="utf-8")
+    assert "import yaml" not in checker
+    completed = subprocess.run(
+        [
+            "/usr/bin/python3",
+            "-I",
+            str(DATABASE_BUDGET_CHECKER),
+            "--manifest",
+            str(ROOT / "config/database-connection-budgets.json"),
+            "--profile",
+            "vps-compose",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert '"total": 20' in completed.stdout
 
 
 def test_foreign_cwd_cannot_substitute_checker_python_env_or_docker(
@@ -244,3 +266,21 @@ def test_deploy_never_builds_mutates_secrets_or_uses_default_compose() -> None:
     assert any(" pull api" in line for line in compose_calls)
     assert any(" up -d" in line for line in compose_calls)
     assert any("alembic upgrade head" in line for line in compose_calls)
+
+
+def test_database_budget_gate_runs_before_any_docker_effect() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    budget = text.index('/usr/bin/python3 "$DATABASE_BUDGET_CHECKER"')
+    pull = text.index(" pull api")
+    up = text.index(" up -d")
+    migration = text.index("alembic upgrade head")
+    assert budget < pull < up < migration
+    for argument in (
+        '--manifest "$DATABASE_BUDGET_MANIFEST"',
+        "--profile vps-compose",
+        "--verify-vps-compose",
+        '--compose "$COMPOSE_FILE"',
+        '--dockerfile "$DOCKERFILE"',
+        '--env-file "$ENV_FILE"',
+    ):
+        assert argument in text

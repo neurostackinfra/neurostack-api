@@ -11,6 +11,9 @@ services:
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?explicit production origins required}
       ALLOWED_HOSTS: ${ALLOWED_HOSTS:?explicit production hosts required}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?required}:${POSTGRES_PASSWORD:?required}@postgres:5432/${POSTGRES_DB:?required}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:?required}
+      DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW:?required}
+      DATABASE_POOL_TIMEOUT: ${DATABASE_POOL_TIMEOUT:?required}
       REDIS_URL: redis://:${REDIS_PASSWORD:?required}@redis:6379/0
       QDRANT_HOST: qdrant
       QDRANT_PORT: "6333"
@@ -27,6 +30,7 @@ services:
   postgres:
     image: postgres@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     restart: unless-stopped
+    command: ["postgres", "-c", "max_connections=100"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?non-default database user required}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?strong database password required}
