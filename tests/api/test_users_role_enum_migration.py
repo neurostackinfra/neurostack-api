@@ -21,6 +21,9 @@ MIGRATION_PATH = (
     / "20261011_000001_024_align_users_role_enum.py"
 )
 ENUM_LABELS = ["builder", "clinic_admin", "investor", "super_admin"]
+LOCK_TIMEOUT = "SET LOCAL lock_timeout = '5s'"
+TO_ENUM = "ALTER TABLE users ALTER COLUMN role TYPE userrole USING role::userrole"
+TO_VARCHAR = "ALTER TABLE users ALTER COLUMN role TYPE VARCHAR(50) USING role::text"
 
 
 class FakeResult:
@@ -83,43 +86,32 @@ def test_revision_extends_migration_023() -> None:
 def test_upgrade_converts_varchar_column() -> None:
     database = FakeDatabase("varchar", ["builder", "super_admin"])
     _load(database).upgrade()
-    assert database.executed == [
-        "ALTER TABLE users ALTER COLUMN role TYPE userrole USING role::userrole"
-    ]
+    assert database.executed == [LOCK_TIMEOUT, TO_ENUM]
 
 
 def test_upgrade_leaves_enum_column_untouched() -> None:
     database = FakeDatabase("userrole", ["builder"])
     _load(database).upgrade()
-    assert database.executed == []
+    assert database.executed == [LOCK_TIMEOUT]
 
 
 def test_upgrade_refuses_values_outside_the_enum() -> None:
     database = FakeDatabase("varchar", ["builder", "ghost"])
     with pytest.raises(RuntimeError, match=r"\['ghost'\]"):
         _load(database).upgrade()
-    assert database.executed == []
+    assert database.executed == [LOCK_TIMEOUT]
 
 
 def test_offline_upgrade_and_downgrade_emit_the_alter() -> None:
     migration = _load(None, offline=True)
     migration.upgrade()
     migration.downgrade()
-    assert migration.executed == [
-        "ALTER TABLE users ALTER COLUMN role TYPE userrole USING role::userrole",
-        "ALTER TABLE users ALTER COLUMN role TYPE VARCHAR(50) USING role::text",
-    ]
+    assert migration.executed == [LOCK_TIMEOUT, TO_ENUM, LOCK_TIMEOUT, TO_VARCHAR]
 
 
 @pytest.mark.parametrize(
     ("column_type", "expected"),
-    [
-        (
-            "userrole",
-            ["ALTER TABLE users ALTER COLUMN role TYPE VARCHAR(50) USING role::text"],
-        ),
-        ("varchar", []),
-    ],
+    [("userrole", [LOCK_TIMEOUT, TO_VARCHAR]), ("varchar", [LOCK_TIMEOUT])],
 )
 def test_downgrade_restores_varchar_only_from_the_enum(
     column_type: str, expected: list[str]
