@@ -60,6 +60,7 @@ from src.services.tenant_classification import (
     is_real_clinic_user_roles,
     real_clinic_tenant_filter,
 )
+from src.services.user_email import email_in_use
 
 router = APIRouter()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
@@ -250,8 +251,7 @@ async def create_clinic(
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> dict[str, Any]:
     # Check email uniqueness
-    existing = await session.execute(select(User).where(User.email == body.admin_email))
-    if existing.scalar_one_or_none():
+    if await email_in_use(session, str(body.admin_email)):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Email already in use",
@@ -427,10 +427,9 @@ async def update_clinic(
         user = user_result.scalar_one_or_none()
         if user:
             if body.email is not None and body.email != user.email:
-                existing = await session.execute(
-                    select(User).where(User.email == body.email)
-                )
-                if existing.scalar_one_or_none():
+                if await email_in_use(
+                    session, str(body.email), exclude_user_id=user.id
+                ):
                     raise HTTPException(
                         status_code=409, detail=f"O email {body.email} já está em uso."
                     )
@@ -759,8 +758,7 @@ async def create_builder(
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> dict[str, Any]:
     # Check email uniqueness
-    existing = await session.execute(select(User).where(User.email == body.admin_email))
-    if existing.scalar_one_or_none():
+    if await email_in_use(session, str(body.admin_email)):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"O email {body.admin_email} já está em uso. Use um email diferente.",
@@ -902,10 +900,9 @@ async def update_builder(
         if user:
             if body.email is not None and body.email != user.email:
                 # Check email uniqueness
-                existing = await session.execute(
-                    select(User).where(User.email == body.email)
-                )
-                if existing.scalar_one_or_none():
+                if await email_in_use(
+                    session, str(body.email), exclude_user_id=user.id
+                ):
                     raise HTTPException(
                         status_code=409, detail=f"O email {body.email} já está em uso."
                     )
@@ -989,8 +986,7 @@ async def create_builder_clinic(
         raise HTTPException(status_code=404, detail="Builder not found")
 
     # Check email uniqueness
-    existing = await session.execute(select(User).where(User.email == body.admin_email))
-    if existing.scalar_one_or_none():
+    if await email_in_use(session, str(body.admin_email)):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"O email {body.admin_email} já está em uso. Cada clínica precisa de um email diferente.",

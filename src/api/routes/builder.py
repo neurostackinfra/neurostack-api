@@ -72,6 +72,7 @@ from src.services.media_assets import (
     media_storage_capacity_guard,
 )
 from src.services.trace_service import _is_conversational_trace, _llm_usage_for_stats
+from src.services.user_email import email_in_use
 
 router = APIRouter()
 password_router = APIRouter(route_class=PasswordValidationRoute)
@@ -772,8 +773,7 @@ async def create_clinic(
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> dict[str, Any]:
     # Check email uniqueness
-    existing = await session.execute(select(User).where(User.email == body.admin_email))
-    if existing.scalar_one_or_none():
+    if await email_in_use(session, str(body.admin_email)):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Email already in use",
@@ -1342,13 +1342,7 @@ async def update_linked_clinic_email(
     if stored_email == snapshot.email:
         return {"ok": True, "admin_email": snapshot.email}
 
-    conflicting_user_id = await session.scalar(
-        select(User.id).where(
-            User.email == stored_email,
-            User.id != snapshot.user_id,
-        )
-    )
-    if conflicting_user_id is not None:
+    if await email_in_use(session, stored_email, exclude_user_id=snapshot.user_id):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"error": "email_already_in_use"},
