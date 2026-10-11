@@ -103,7 +103,9 @@ async def _run_alembic(database_url: URL) -> None:
 
 
 @pytest.fixture(scope="module")
-async def postgres_language_database() -> AsyncIterator[SessionMaker]:
+async def postgres_language_database(
+    alembic_head: str,
+) -> AsyncIterator[SessionMaker]:
     raw_admin_url = os.getenv("POSTGRES_SMOKE_DATABASE_URL")
     if raw_admin_url is None:
         pytest.skip("POSTGRES_SMOKE_DATABASE_URL is not configured")
@@ -146,7 +148,7 @@ async def postgres_language_database() -> AsyncIterator[SessionMaker]:
                 await connection.scalar(
                     sa.text("SELECT version_num FROM alembic_version")
                 )
-                == "023"
+                == alembic_head
             )
         yield factory
     finally:
