@@ -311,6 +311,19 @@ def _inject_isolated_database(
 
 
 @pytest.fixture(scope="session")
+def alembic_head() -> str:
+    """Single head of the migration chain, for smokes that upgrade to head.
+
+    Read from the scripts instead of a literal so a new migration does not
+    break every Postgres gate (tests/test_alembic_revision_graph.py keeps the
+    chain to one head).
+    """
+    from tests.alembic_graph import current_head
+
+    return current_head()
+
+
+@pytest.fixture(scope="session")
 def test_app() -> Any:
     """Get the test application instance."""
     return app
