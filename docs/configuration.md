@@ -105,14 +105,16 @@ Estes estados são recusados sempre:
   e-mail anterior (o secret de e-mail foi trocado), restaure o e-mail antigo no
   secret; o erro mostra qual é;
 - o e-mail pertence a outro papel ou a uma conta inativa, ou só existem
-  variantes de caixa dele;
+  variantes de caixa dele: no primeiro bootstrap, basta usar outro e-mail no
+  secret;
 - o `super_admin` está fora do tenant de plataforma (por exemplo, o criado por
   `seed_demo.py` no tenant `a0000000-0000-0000-0000-000000000001`);
 - já existe um tenant com o slug `neurostack-admin` sem `super_admin`.
 
-Fora o caso do e-mail anterior, eles se resolvem com SQL manual revisado. Apagar
-o tenant de plataforma pela rota de admin remove também os usuários dele, e a
-próxima execução volta a criar a conta.
+Os casos sem saída pelo secret se resolvem com SQL manual revisado. A rota de
+admin que apaga um tenant (só um `super_admin` pode chamá-la) remove também os
+usuários dele; a próxima execução só volta a criar a conta se não sobrar nenhum
+`super_admin` em outro tenant.
 
 ---
 
