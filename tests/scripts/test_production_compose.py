@@ -79,6 +79,10 @@ def test_docker_compose_config_accepts_strong_synthetic_inputs() -> None:
         "DATABASE_POOL_SIZE": "5",
         "DATABASE_MAX_OVERFLOW": "0",
         "DATABASE_POOL_TIMEOUT": "30",
+        "ASAAS_API_KEY": "test-asaas-api-key",
+        "ASAAS_WEBHOOK_TOKEN": "test-asaas-webhook-token",
+        "ABACATEPAY_WEBHOOK_SECRET": "test-abacatepay-webhook-secret",
+        "ABACATEPAY_API_KEY": "",
     }
     completed = subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE), "config"],

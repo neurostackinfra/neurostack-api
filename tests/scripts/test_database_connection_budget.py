@@ -101,7 +101,10 @@ def _vps_files(tmp_path: Path) -> tuple[Path, Path, Path]:
         "DATABASE_MAX_OVERFLOW=0\n"
         "DATABASE_POOL_TIMEOUT=30\n"
         "REDIS_PASSWORD=test_redis\n"
-        "QDRANT_API_KEY=test_qdrant\n",
+        "QDRANT_API_KEY=test_qdrant\n"
+        "ASAAS_API_KEY=test_asaas_api_key\n"
+        "ASAAS_WEBHOOK_TOKEN=test_asaas_webhook_token\n"
+        "ABACATEPAY_WEBHOOK_SECRET=test_abacatepay_webhook_secret\n",
         encoding="utf-8",
     )
     return compose, dockerfile, env_file

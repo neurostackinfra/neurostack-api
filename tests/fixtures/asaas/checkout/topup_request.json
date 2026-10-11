@@ -1,0 +1,13 @@
+{
+  "billingTypes": ["CREDIT_CARD", "PIX"],
+  "chargeTypes": ["DETACHED"],
+  "externalReference": "00000000-0000-4000-8000-000000000002",
+  "items": [
+    {
+      "description": "NeuroStack 500-credit package",
+      "name": "500 credits",
+      "quantity": 1,
+      "value": 100.0
+    }
+  ]
+}

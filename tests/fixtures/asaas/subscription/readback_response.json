@@ -1,0 +1,10 @@
+{
+  "billingType": "CREDIT_CARD",
+  "cycle": "MONTHLY",
+  "deleted": false,
+  "externalReference": "00000000-0000-4000-8000-000000000001",
+  "id": "sub_000000000000001",
+  "nextDueDate": "2026-11-10",
+  "status": "ACTIVE",
+  "value": 999.0
+}

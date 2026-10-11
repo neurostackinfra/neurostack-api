@@ -19,17 +19,18 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
 # Import settings and models
-from src.config.settings import settings
-from src.models.base import Base
-from src.models import (
-    Tenant,
+from src.config.settings import settings  # noqa: E402
+from src.models import (  # noqa: E402,F401
+    BillingSubscription,
     ClinicConfigTable,
-    Session,
     Event,
-    Policy,
-    KnowledgeDocument,
     HandoffRecord,
+    KnowledgeDocument,
+    Policy,
+    Session,
+    Tenant,
 )
+from src.models.base import Base  # noqa: E402
 
 # Alembic Config object
 config = context.config

@@ -13,7 +13,7 @@ Endpoints:
 import time
 from datetime import datetime
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Response, status
 
 from src.api.schemas.health import (
     ComponentHealth,
@@ -150,7 +150,7 @@ readinessProbe:
     """,
     tags=["Health"],
 )
-async def readiness_check() -> ReadinessResponse:
+async def readiness_check(response: Response) -> ReadinessResponse:
     """
     Readiness check endpoint.
 
@@ -162,9 +162,14 @@ async def readiness_check() -> ReadinessResponse:
         "database": True,  # TODO: Implement actual check
         "redis": True,  # TODO: Implement actual check
         "qdrant": True,  # TODO: Implement actual check
+        # Production must be able to authenticate legacy Abacate deliveries.
+        "abacatepay_webhook": not settings.is_production
+        or bool(settings.abacatepay_webhook_secret.get_secret_value().strip()),
     }
 
     all_ready = all(checks.values())
+    if not all_ready:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     message = None if all_ready else "Some dependencies are not available"
 
     return ReadinessResponse(

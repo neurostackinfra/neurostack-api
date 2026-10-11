@@ -6,6 +6,21 @@ This module exports all ORM models for database operations.
 """
 
 from src.models.base import Base, TimestampMixin
+from src.models.billing import (
+    BillingCheckoutSession,
+    BillingMigration,
+    BillingMigrationReceipt,
+    BillingOutboxEvent,
+    BillingPaymentEffect,
+    BillingPaymentProjection,
+    BillingRolloutControl,
+    BillingRolloutReceipt,
+    BillingRosterControl,
+    BillingSubscription,
+    BillingTopupCapabilityReceipt,
+    BillingTopupOrder,
+    BillingWebhookDelivery,
+)
 from src.models.builder import Builder
 from src.models.clinic_config import ClinicConfig
 from src.models.clinic_config_table import ClinicConfigTable
@@ -28,6 +43,20 @@ __all__ = [
     # Base
     "Base",
     "TimestampMixin",
+    # Billing Models
+    "BillingSubscription",
+    "BillingMigration",
+    "BillingCheckoutSession",
+    "BillingMigrationReceipt",
+    "BillingWebhookDelivery",
+    "BillingPaymentProjection",
+    "BillingPaymentEffect",
+    "BillingRolloutControl",
+    "BillingRolloutReceipt",
+    "BillingRosterControl",
+    "BillingTopupCapabilityReceipt",
+    "BillingTopupOrder",
+    "BillingOutboxEvent",
     # Core Models
     "Builder",
     "Coupon",

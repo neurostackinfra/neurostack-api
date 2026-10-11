@@ -18,6 +18,11 @@ services:
       QDRANT_HOST: qdrant
       QDRANT_PORT: "6333"
       QDRANT_API_KEY: ${QDRANT_API_KEY:?strong Qdrant API key required}
+      ASAAS_API_KEY: ${ASAAS_API_KEY:?ASAAS production API key required}
+      ASAAS_WEBHOOK_TOKEN: ${ASAAS_WEBHOOK_TOKEN:?ASAAS webhook token required}
+      ASAAS_USER_AGENT: ${ASAAS_USER_AGENT:-NeuroStack/asaas-payment-gateway}
+      ABACATEPAY_API_KEY: ${ABACATEPAY_API_KEY:-}
+      ABACATEPAY_WEBHOOK_SECRET: ${ABACATEPAY_WEBHOOK_SECRET:?legacy webhook secret required}
     depends_on:
       postgres:
         condition: service_healthy

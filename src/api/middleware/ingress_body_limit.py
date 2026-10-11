@@ -1,11 +1,17 @@
-"""Early request-body limits for tenant-authoritative JSON ingress."""
+"""Early authentication and request-body limits for JSON ingress."""
 
+import asyncio
 from collections.abc import Awaitable, Callable
 
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from src.config.settings import settings
+
 MAX_INGRESS_BODY_BYTES = 1024 * 1024
+ABACATEPAY_WEBHOOK_BODY_BYTES = 262_144
+ABACATEPAY_WEBHOOK_READ_TIMEOUT_SECONDS = 5.0
+_ABACATEPAY_WEBHOOK_PATH = "/v1/billing/webhook"
 _FIXED_LIMITED_ENDPOINTS = frozenset(
     {
         "/v1/events",
@@ -28,40 +34,62 @@ class IngressBodyLimitMiddleware:
         app: ASGIApp,
         *,
         max_body_bytes: int = MAX_INGRESS_BODY_BYTES,
+        abacatepay_read_timeout_seconds: float = ABACATEPAY_WEBHOOK_READ_TIMEOUT_SECONDS,
     ) -> None:
         self.app = app
         self.max_body_bytes = max_body_bytes
+        self.abacatepay_read_timeout_seconds = abacatepay_read_timeout_seconds
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if not self._is_limited_request(scope):
             await self.app(scope, receive, send)
             return
 
+        is_abacatepay = scope.get("path") == _ABACATEPAY_WEBHOOK_PATH
+        if is_abacatepay:
+            if not settings.abacatepay_webhook_secret.get_secret_value():
+                await self._reject_unavailable_billing_webhook(scope, receive, send)
+                return
+            if not self._has_header(scope, b"x-webhook-signature"):
+                await self._reject_missing_billing_signature(scope, receive, send)
+                return
+
+        body_limit = (
+            ABACATEPAY_WEBHOOK_BODY_BYTES if is_abacatepay else self.max_body_bytes
+        )
+
         declared_length, valid_length = self._content_length(scope)
         if not valid_length or self._has_ambiguous_framing(scope):
             await self._reject_malformed(scope, receive, send)
             return
-        if declared_length is not None and declared_length > self.max_body_bytes:
+        if declared_length is not None and declared_length > body_limit:
             await self._reject(scope, receive, send)
             return
 
         body = bytearray()
         terminal: Message | None = None
         received = 0
-        while True:
-            message = await receive()
-            if message["type"] != "http.request":
-                # A disconnect is not a completed request body. Do not turn
-                # accumulated bytes into a synthetic terminal request frame.
-                return
-            chunk = message.get("body", b"")
-            received += len(chunk)
-            if received > self.max_body_bytes:
-                await self._reject(scope, receive, send)
-                return
-            body.extend(chunk)
-            if not message.get("more_body", False):
-                break
+        try:
+            async with asyncio.timeout(
+                self.abacatepay_read_timeout_seconds if is_abacatepay else None
+            ):
+                while True:
+                    message = await receive()
+                    if message["type"] != "http.request":
+                        # A disconnect is not a completed request body. Do not turn
+                        # accumulated bytes into a synthetic terminal request frame.
+                        return
+                    chunk = message.get("body", b"")
+                    received += len(chunk)
+                    if received > body_limit:
+                        await self._reject(scope, receive, send)
+                        return
+                    body.extend(chunk)
+                    if not message.get("more_body", False):
+                        break
+        except TimeoutError:
+            await self._reject_body_timeout(scope, receive, send)
+            return
 
         if declared_length is not None and received != declared_length:
             await self._reject_malformed(scope, receive, send)
@@ -79,7 +107,7 @@ class IngressBodyLimitMiddleware:
         return (
             scope["type"] == "http"
             and scope.get("method") == "POST"
-            and path in _FIXED_LIMITED_ENDPOINTS
+            and (path in _FIXED_LIMITED_ENDPOINTS or path == _ABACATEPAY_WEBHOOK_PATH)
         )
 
     @staticmethod
@@ -107,12 +135,19 @@ class IngressBodyLimitMiddleware:
         names = [name.lower() for name, _value in scope.get("headers", [])]
         return b"content-length" in names and b"transfer-encoding" in names
 
+    @staticmethod
+    def _has_header(scope: Scope, expected_name: bytes) -> bool:
+        return any(
+            name.lower() == expected_name and bool(value)
+            for name, value in scope.get("headers", [])
+        )
+
     async def _reject(self, scope: Scope, receive: Receive, send: Send) -> None:
         response = JSONResponse(
             status_code=413,
             content={
                 "error": "request_body_too_large",
-                "message": "Request body exceeds the 1 MiB limit",
+                "message": "Request body exceeds the configured limit",
             },
         )
         await response(scope, receive, send)
@@ -126,6 +161,33 @@ class IngressBodyLimitMiddleware:
                 "error": "malformed_request_body",
                 "message": "Request body framing is invalid or incomplete",
             },
+        )
+        await response(scope, receive, send)
+
+    @staticmethod
+    async def _reject_body_timeout(scope: Scope, receive: Receive, send: Send) -> None:
+        response = JSONResponse(
+            status_code=408,
+            content={"error": "request_body_timeout"},
+        )
+        await response(scope, receive, send)
+
+    @staticmethod
+    async def _reject_missing_billing_signature(
+        scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        response = JSONResponse(
+            status_code=400, content={"detail": "Invalid signature"}
+        )
+        await response(scope, receive, send)
+
+    @staticmethod
+    async def _reject_unavailable_billing_webhook(
+        scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        response = JSONResponse(
+            status_code=503,
+            content={"detail": "billing_webhook_unavailable"},
         )
         await response(scope, receive, send)
 

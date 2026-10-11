@@ -1,0 +1,17 @@
+{
+  "billingTypes": ["CREDIT_CARD"],
+  "chargeTypes": ["RECURRENT"],
+  "externalReference": "00000000-0000-4000-8000-000000000001",
+  "items": [
+    {
+      "description": "NeuroStack Plus monthly subscription",
+      "name": "NeuroStack Plus",
+      "quantity": 1,
+      "value": 999.0
+    }
+  ],
+  "subscription": {
+    "cycle": "MONTHLY",
+    "nextDueDate": "2026-10-10"
+  }
+}

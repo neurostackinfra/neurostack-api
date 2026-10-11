@@ -5,13 +5,17 @@ Centralized configuration using Pydantic Settings
 
 from functools import lru_cache
 from ipaddress import ip_address
-from typing import Literal
+from typing import Final, Literal
 from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.core.exceptions import ConfigurationError
+
+ASAAS_API_BASE_URL: Final = "https://api.asaas.com/v3"
+ASAAS_AUTH_HEADER: Final = "access_token"
+ASAAS_DEFAULT_USER_AGENT: Final = "NeuroStack/asaas-payment-gateway"
 
 
 def _is_loopback_http_origin(value: str) -> bool:
@@ -217,11 +221,52 @@ class Settings(BaseSettings):
     # ============================================
     # AbacatePay (Payment Gateway)
     # ============================================
-    abacatepay_api_key: str = ""
+    abacatepay_api_key: SecretStr = SecretStr("")
     # ABACATEPAY_WEBHOOK_SECRET: string gerada pela AbacatePay ao cadastrar o endpoint
     # webhook em app.abacatepay.com → Webhooks → Criar endpoint → copiar o "Secret"
     # NÃO colocar a URL do webhook aqui — apenas o token/secret HMAC.
-    abacatepay_webhook_secret: str = ""
+    abacatepay_webhook_secret: SecretStr = SecretStr("")
+
+    # ============================================
+    # ASAAS (Payment Gateway)
+    # ============================================
+    # The production API origin and authentication header are code constants;
+    # deployment input cannot redirect payment credentials to another host.
+    asaas_api_key: SecretStr = SecretStr("")
+    asaas_webhook_token: SecretStr = SecretStr("")
+    asaas_user_agent: str = ASAAS_DEFAULT_USER_AGENT
+
+    @field_validator("asaas_api_key")
+    @classmethod
+    def validate_asaas_api_key(cls, value: SecretStr) -> SecretStr:
+        """Accept only an absent key or the ASAAS production-key namespace."""
+
+        raw_value = value.get_secret_value()
+        if raw_value and not raw_value.startswith("$aact_prod_"):
+            raise ValueError("ASAAS_API_KEY must use the production key namespace")
+        return value
+
+    @field_validator("asaas_webhook_token")
+    @classmethod
+    def validate_asaas_webhook_token(cls, value: SecretStr) -> SecretStr:
+        """Reject unsafe token bytes without disclosing the token."""
+
+        if any(ord(character) < 32 for character in value.get_secret_value()):
+            raise ValueError("ASAAS_WEBHOOK_TOKEN contains invalid control characters")
+        return value
+
+    @field_validator("asaas_user_agent")
+    @classmethod
+    def validate_asaas_user_agent(cls, value: str) -> str:
+        """Require a stable, identifiable HTTP User-Agent value."""
+
+        if (
+            not value.strip()
+            or "/" not in value
+            or any(ord(character) < 32 or ord(character) > 126 for character in value)
+        ):
+            raise ValueError("ASAAS_USER_AGENT must be an identifiable ASCII product")
+        return value
 
     # ============================================
     # Subscription plan usage limits
@@ -329,6 +374,11 @@ class Settings(BaseSettings):
                     "ALLOWED_ORIGINS should not contain '*' in production for security"
                 )
 
+            # The legacy Abacate receiver must be able to authenticate every
+            # delivery; production never starts without its HMAC secret.
+            if not self.abacatepay_webhook_secret.get_secret_value().strip():
+                errors.append("ABACATEPAY_WEBHOOK_SECRET is required in production")
+
             if errors:
                 error_msg = "Production configuration validation failed:\n" + "\n".join(
                     f"  - {e}" for e in errors
@@ -346,6 +396,20 @@ class Settings(BaseSettings):
     def is_development(self) -> bool:
         """Check if running in development environment."""
         return self.environment == "development"
+
+    @property
+    def is_asaas_configuration_compatible(self) -> bool:
+        """Return whether required ASAAS settings are complete and compatible."""
+
+        api_key = self.asaas_api_key.get_secret_value()
+        webhook_token = self.asaas_webhook_token.get_secret_value()
+        return bool(
+            api_key.startswith("$aact_prod_")
+            and webhook_token
+            and self.asaas_user_agent.strip()
+            and ASAAS_API_BASE_URL == "https://api.asaas.com/v3"
+            and ASAAS_AUTH_HEADER == "access_token"
+        )
 
 
 @lru_cache
