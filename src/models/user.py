@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import Boolean
 from sqlalchemy import Enum as PGEnum
-from sqlalchemy import ForeignKey, String
+from sqlalchemy import ForeignKey, Index, String, func
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -97,3 +97,8 @@ class User(Base, TimestampMixin):
 
     def __repr__(self) -> str:
         return f"<User(id={self.id}, email='{self.email}', role={self.role.value})>"
+
+
+# Emails are unique ignoring case (migration 025); login still compares the
+# exact text, so a case variant of an existing account must not be creatable.
+Index("uq_users_email_lower", func.lower(User.email), unique=True)
