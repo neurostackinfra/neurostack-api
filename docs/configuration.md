@@ -94,10 +94,12 @@ atualize `BOOTSTRAP_ADMIN_PASSWORD` no Secrets Manager e rode a task uma vez com
 quando a task roda com a flag, e a próxima execução sem flag acusa a divergência.
 
 O script só mantém o `super_admin` que ele mesmo criou no tenant de plataforma,
-com exatamente o e-mail informado. Usuários que diferem só por maiúsculas (as
-rotas de admin e de builder permitem criá-los) não atrapalham a manutenção
-desse `super_admin`; sem o e-mail exato, porém, o script recusa criar mais uma
-variante de caixa.
+com exatamente o e-mail informado. Desde a migration `025`, o banco não aceita
+dois e-mails que diferem só por maiúsculas (índice único em `lower(email)`), e
+as rotas de admin e de builder respondem 409 para essa variante. Em bancos
+anteriores à `025`, variantes de caixa ao lado do `super_admin` exato não
+atrapalham a manutenção dele; sem o e-mail exato, o script recusa criar mais
+uma variante.
 
 Estes estados são recusados sempre:
 

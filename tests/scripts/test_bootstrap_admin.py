@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from passlib.context import CryptContext
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from scripts import bootstrap_admin as bootstrap
@@ -108,6 +108,13 @@ async def _add_user(
         async with session.begin():
             session.add(user)
     return user
+
+
+async def _before_migration_025() -> None:
+    """Drop the lower(email) index so case variants can exist, as before 025."""
+    async with get_db_session() as session:
+        async with session.begin():
+            await session.execute(text("DROP INDEX uq_users_email_lower"))
 
 
 async def _snapshot() -> tuple[list[tuple[object, ...]], list[tuple[object, ...]]]:
@@ -305,6 +312,7 @@ async def test_rows4_5_own_email_wins_over_another_super_admin(
 
 
 async def test_row6_only_case_variants_are_refused(database: None) -> None:
+    await _before_migration_025()
     await _add_user("Platform@Example.com", UserRole.super_admin, password=PASSWORD)
     await _add_user("PLATFORM@example.com", UserRole.super_admin, password=PASSWORD)
 
@@ -347,8 +355,9 @@ async def test_row6_case_only_difference_is_refused(
 async def test_case_variant_from_the_app_does_not_block_maintenance(
     database: None, role: UserRole
 ) -> None:
-    # Builder/admin routes check email uniqueness by exact match, so they can
-    # create a case variant next to the bootstrap super_admin.
+    # Before migration 025 the admin and builder routes compared emails
+    # exactly, so a case variant could exist next to the bootstrap super_admin.
+    await _before_migration_025()
     await _apply(_request())
     await _add_user("Platform@example.com", role)
 
