@@ -119,9 +119,18 @@ def _install_general_reservation(
             return SimpleNamespace(state="general")
 
         async def reserve_general_subscription_checkout(
-            self, **_kwargs: object
+            self, **kwargs: object
         ) -> BillingCheckoutSession:
+            # Mirror the repository: the persisted attempt is the planned one.
+            checkout.id = kwargs["checkout_session_id"]  # type: ignore[assignment]
+            checkout.next_due_date = kwargs["next_due_date"]  # type: ignore[assignment]
+            checkout.amount_cents = kwargs["amount_cents"]  # type: ignore[assignment]
             return checkout
+
+        async def subscription_checkout_blocker(
+            self, *, builder_id: UUID
+        ) -> str | None:
+            return None
 
         async def authorize_reserved_checkout_egress(
             self, *, environment: str, builder_id: UUID, checkout_session_id: UUID
@@ -167,7 +176,7 @@ async def test_checkout_fails_closed_before_provider_or_network(
     reader: _FlagReader,
 ) -> None:
     builder_id = uuid4()
-    db = _Session([None, 0])
+    db = _Session([None, None, 0])
     _install_general_reservation(monkeypatch, _checkout(builder_id))
     provider_factory = MagicMock(side_effect=AssertionError("ASAAS client reached"))
     network_calls: list[str] = []
@@ -202,7 +211,7 @@ async def test_enabled_financial_gate_uses_only_hosted_asaas_contract(
 ) -> None:
     builder_id = uuid4()
     persisted = _checkout(builder_id)
-    db = _Session([None, 0])
+    db = _Session([None, None, 0])
     _install_general_reservation(monkeypatch, persisted)
     reader = _FlagReader(True)
     client = SimpleNamespace(
@@ -223,7 +232,9 @@ async def test_enabled_financial_gate_uses_only_hosted_asaas_contract(
     assert response.checkout_url == (
         "https://asaas.com/checkoutSession/show?id=chk_000000000000001"
     )
-    assert reader.calls == ["financial_egress_enabled"]
+    # Pre-reservation gate read, then the permit-minting read before the POST;
+    # never the uazapi flag.
+    assert reader.calls == ["financial_egress_enabled", "financial_egress_enabled"]
     assert factory.call_count == 1
     assert payload["chargeTypes"] == ["RECURRENT"]
     assert payload["billingTypes"] == ["CREDIT_CARD"]
@@ -310,3 +321,64 @@ async def test_incompatible_asaas_configuration_denies_before_database_or_egress
     assert exc_info.value.detail == "billing_checkout_unavailable"
     db.execute.assert_not_awaited()
     provider_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_uazapi_flag_true_never_opens_the_financial_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class IndependentFlags:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def is_enabled(self, flag_name: str) -> bool:
+            self.calls.append(flag_name)
+            return {
+                "financial_egress_enabled": False,
+                "uazapi_egress_enabled": True,
+            }[flag_name]
+
+    builder_id = uuid4()
+    db = _Session([None])
+    _install_general_reservation(monkeypatch, _checkout(builder_id))
+    reader = IndependentFlags()
+    provider_factory = MagicMock(side_effect=AssertionError("ASAAS client reached"))
+    monkeypatch.setattr(
+        checkout_module,
+        "require_financial_egress",
+        EgressPolicy(reader).require_financial_egress,
+    )
+    monkeypatch.setattr(billing, "_asaas_client", provider_factory)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await billing.create_checkout(_checkout_body(), builder_id, db)  # type: ignore[arg-type]
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "billing_checkout_unavailable"
+    # Only the financial flag is consulted; the open messaging flag is never
+    # read as a substitute and nothing is reserved or sent.
+    assert reader.calls == ["financial_egress_enabled"]
+    provider_factory.assert_not_called()
+    assert db.commits == 0
+
+
+@pytest.mark.asyncio
+async def test_ineligible_subscription_maps_to_one_fixed_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.services.billing_checkout import CheckoutNotEligible
+
+    class Service:
+        def __init__(self, db: object, *, client_factory: object) -> None:
+            del db, client_factory
+
+        async def create_checkout(self, **kwargs: object) -> object:
+            del kwargs
+            raise CheckoutNotEligible()
+
+    monkeypatch.setattr(billing, "BillingCheckoutService", Service)
+    with pytest.raises(HTTPException) as exc_info:
+        await billing.create_checkout(_checkout_body(), uuid4(), object())  # type: ignore[arg-type]
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "billing_checkout_not_eligible"

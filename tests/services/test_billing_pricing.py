@@ -68,7 +68,7 @@ def test_topup_pricing_has_integer_quantity_and_only_allowed_method() -> None:
         {
             "line_id": "topup",
             "offer_id": "package_credits_500_v1",
-            "kind": "credit_package",
+            "kind": "topup",
             "quantity": 1,
             "unit_amount_cents": 10_000,
             "line_amount_cents": 10_000,

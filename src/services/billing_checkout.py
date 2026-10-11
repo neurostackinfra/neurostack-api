@@ -26,7 +26,6 @@ from src.models.tenant import Tenant
 from src.repositories.billing import BillingRepository
 from src.services.asaas import (
     AsaasClient,
-    AsaasConfigurationError,
     AsaasOutcomeUnknown,
     AsaasRequestRejected,
     CheckoutCallback,
@@ -45,7 +44,7 @@ from src.services.billing_rollout import (
     require_billing_checkout_rollout,
     require_billing_topup_rollout,
 )
-from src.services.egress_policy import EgressDisabledError, require_financial_egress
+from src.services.egress_policy import require_financial_egress
 
 PaymentMethod = Literal["credit_card", "pix"]
 CheckoutKind = Literal["subscription", "topup"]
@@ -105,6 +104,12 @@ class CheckoutReconciliationRequired(BillingCheckoutError):
     code = "billing_checkout_reconciliation_required"
 
 
+class CheckoutNotEligible(BillingCheckoutError):
+    """One non-enumerating code for every subscription eligibility blocker."""
+
+    code = "billing_checkout_not_eligible"
+
+
 class CheckoutCouponRejected(BillingCheckoutError):
     """One non-enumerating code for absent, inactive, expired or exhausted."""
 
@@ -112,6 +117,14 @@ class CheckoutCouponRejected(BillingCheckoutError):
 
 
 COUPON_NOT_ELIGIBLE: Final = "billing_checkout_coupon_not_eligible"
+
+
+@dataclass(frozen=True, slots=True)
+class _CreationPreconditions:
+    """Side-effect-free creation inputs established before any reservation."""
+
+    callback: CheckoutCallback
+    client: AsaasClient
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,7 +345,7 @@ def topup_pricing_snapshot(
             _snapshot_line(
                 line_id="topup",
                 offer_id=offer.offer_id,
-                kind="credit_package",
+                kind="topup",
                 quantity=1,
                 unit_amount_cents=offer.amount_cents,
                 credit_grant_mc=offer.credits,
@@ -400,10 +413,22 @@ class BillingCheckoutService:
     ) -> CheckoutView:
         """Create or return a live checkout without ever blind-retrying egress.
 
-        ``coupon_code`` is only a selector.  A live session for the same offer
-        and method is returned as-is, with its persisted snapshot, before any
-        coupon is resolved; otherwise an unusable coupon is rejected with one
-        fixed code before any lock, row or network operation.
+        Order of operations (each step fails closed, with no row and no POST):
+
+        1. input validation, then a lock-free persisted-rollout pre-check;
+        2. a lock-free read of a live session for the same offer and method,
+           which is returned as-is (its frozen snapshot, no coupon resolution,
+           no flag read, no client);
+        3. coupon resolution (a selector only; one fixed code when unusable);
+        4. every side-effect-free creation precondition: the callback/return
+           URL, a financial-egress flag read and the client build;
+        5. the environment rollout lock, a live-session re-check, subscription
+           eligibility, the request build and the reservation, committed;
+        6. a fresh rollout re-authorization, a second flag read that mints the
+           single-use permit, then exactly one POST.
+
+        Steps 1-4 run before any reservation, so a closed flag, a bad return
+        URL or a client/configuration error never consumes a canary slot.
         """
 
         offer = _checked_offer(offer_id)
@@ -424,57 +449,60 @@ class BillingCheckoutService:
         except Exception as exc:
             raise CheckoutUnavailable() from exc
 
-        if coupon_selector is not None:
-            # Lock-free pre-checks: a retry with a live session reuses its
-            # frozen snapshot and never re-resolves the coupon; a fresh
-            # request with an unusable coupon is rejected before the lock.
-            try:
-                existing = await self._live_checkout(
-                    builder_id=builder_id,
-                    offer_id=offer.offer_id,
-                    payment_method=method,
-                )
-                if existing is not None:
-                    return self._view(existing)
+        try:
+            existing = await self._live_checkout(
+                builder_id=builder_id,
+                offer_id=offer.offer_id,
+                payment_method=method,
+            )
+            if existing is not None:
+                return self._view(existing)
+            if coupon_selector is not None:
                 await self._resolve_coupon(coupon_selector)
-            except CheckoutCouponRejected:
-                await self._rollback()
-                raise
-            except Exception as exc:
-                await self._rollback()
-                raise CheckoutUnavailable() from exc
+        except CheckoutCouponRejected:
+            await self._rollback()
+            raise
+        except Exception as exc:
+            await self._rollback()
+            raise CheckoutUnavailable() from exc
+
+        prepared = await self._prepare_creation()
 
         try:
             await repository.lock_rollout_control(environment=settings.environment)
+            live = await self._live_checkout(
+                builder_id=builder_id,
+                offer_id=offer.offer_id,
+                payment_method=method,
+            )
         except Exception as exc:
+            await self._rollback()
             raise CheckoutUnavailable() from exc
-
-        live = await self._live_checkout(
-            builder_id=builder_id,
-            offer_id=offer.offer_id,
-            payment_method=method,
-        )
         if live is not None:
-            return self._view(live)
+            view = self._view(live)
+            await self._rollback()
+            return view
 
         try:
             if kind == "subscription":
-                checkout = await self._reserve_subscription(
+                checkout, request = await self._reserve_subscription(
                     repository=repository,
                     builder_id=builder_id,
                     offer=offer,
+                    callback=prepared.callback,
                     coupon_code=coupon_selector,
                 )
             else:
-                checkout = await self._reserve_topup(
+                checkout, request = await self._reserve_topup(
                     builder_id=builder_id,
                     offer=offer,
                     payment_method=method,
+                    callback=prepared.callback,
                 )
             # This is the irrevocable pre-egress boundary.  A later timeout
             # leaves a durable UUID that reconciliation can correlate exactly.
             await self._db.commit()
-        except CheckoutCouponRejected:
+        except (CheckoutCouponRejected, CheckoutNotEligible):
             await self._rollback()
             raise
         except (
@@ -488,7 +516,7 @@ class BillingCheckoutService:
             await self._rollback()
             raise CheckoutUnavailable() from exc
 
-        return await self._create_provider_checkout(checkout, offer)
+        return await self._send_reserved(checkout, request, prepared)
 
     async def get_checkout(
         self, *, builder_id: UUID, checkout_session_id: UUID
@@ -545,17 +573,91 @@ class BillingCheckoutService:
             raise CheckoutReconciliationRequired() from exc
         return self._view(checkout)
 
+    async def _prepare_creation(self) -> _CreationPreconditions:
+        """Check every side-effect-free creation precondition before reserving.
+
+        Permit semantics: the financial-egress flag is read twice per creation.
+        This first read is a gate only (its permit is discarded), so a closed
+        or unreadable flag never reserves a row or a canary slot.  The permit
+        that reaches the POST is minted by a second read after the fresh
+        rollout re-authorization (``_send_reserved``), so a kill switch thrown
+        while the reservation was being made still stops the POST; that
+        attempt then ends ``failed`` like any other post-reservation denial.
+        """
+
+        try:
+            callback = CheckoutCallback.from_return_url(
+                settings.asaas_checkout_return_url
+            )
+            await authorize_creation_egress(require_financial_egress)
+            client = self._client_factory()
+        except Exception as exc:
+            await self._rollback()
+            raise CheckoutUnavailable() from exc
+        return _CreationPreconditions(callback=callback, client=client)
+
+    async def _require_subscription_eligibility(
+        self, repository: BillingRepository, builder_id: UUID
+    ) -> None:
+        """Deliverable 9: reject an ineligible builder under the rollout lock.
+
+        Called only while ``lock_rollout_control`` is held, before any row is
+        created.  Every reason maps to one stable, non-enumerating code; the
+        reason itself never leaves the process.
+        """
+
+        if await repository.subscription_checkout_blocker(builder_id=builder_id):
+            raise CheckoutNotEligible()
+
+    @staticmethod
+    def _build_request(
+        *,
+        kind: CheckoutKind,
+        checkout_session_id: UUID,
+        snapshot: Mapping[str, object],
+        offer: BillingOffer,
+        next_due_date: date | None,
+        callback: CheckoutCallback,
+    ) -> CheckoutCreateRequest:
+        return CheckoutCreateRequest(
+            kind=kind,
+            external_reference=checkout_session_id,
+            items=checkout_items(snapshot, offer),
+            callback=callback,
+            next_due_date=next_due_date,
+        )
+
+    @staticmethod
+    def _verify_reserved(
+        checkout: BillingCheckoutSession,
+        *,
+        checkout_session_id: UUID,
+        request: CheckoutCreateRequest,
+    ) -> None:
+        """The persisted attempt must be exactly the request that will be sent."""
+
+        total = sum(item.quantity * item.unit_amount_cents for item in request.items)
+        if (
+            checkout.id != checkout_session_id
+            or checkout.state != "creating"
+            or checkout.amount_cents != total
+            or checkout.next_due_date != request.next_due_date
+        ):
+            raise CheckoutUnavailable()
+
     async def _reserve_subscription(
         self,
         *,
         repository: BillingRepository,
         builder_id: UUID,
         offer: BillingOffer,
+        callback: CheckoutCallback,
         coupon_code: str | None = None,
-    ) -> BillingCheckoutSession:
+    ) -> tuple[BillingCheckoutSession, CheckoutCreateRequest]:
         control = await repository.lock_rollout_control(
             environment=settings.environment
         )
+        await self._require_subscription_eligibility(repository, builder_id)
         # Design contract: a new monthly subscription is first due on the
         # current São Paulo calendar date, whatever the host timezone is.
         next_due_date = billing_local_date(self._clock())
@@ -569,13 +671,25 @@ class BillingCheckoutService:
                 # The DB pins the canary to the canonical undiscounted Plus
                 # snapshot; a coupon-priced canary can never be created.
                 raise CheckoutCouponRejected(COUPON_NOT_ELIGIBLE)
-            return await repository.reserve_canary_subscription_checkout(
+            request = self._build_request(
+                kind="subscription",
+                checkout_session_id=checkout_session_id,
+                snapshot={"amount_cents": offer.amount_cents},
+                offer=offer,
+                next_due_date=next_due_date,
+                callback=callback,
+            )
+            checkout = await repository.reserve_canary_subscription_checkout(
                 environment=settings.environment,
                 builder_id=builder_id,
                 intent_id=uuid4(),
                 checkout_session_id=checkout_session_id,
                 next_due_date=next_due_date,
             )
+            self._verify_reserved(
+                checkout, checkout_session_id=checkout_session_id, request=request
+            )
+            return checkout, request
         if control.state != "general":
             raise CheckoutUnavailable()
         # Re-resolve under the serialized reservation: the terms frozen into
@@ -592,7 +706,15 @@ class BillingCheckoutService:
                 coupon.discount_percent if coupon is not None else 0
             ),
         )
-        return await repository.reserve_general_subscription_checkout(
+        request = self._build_request(
+            kind="subscription",
+            checkout_session_id=checkout_session_id,
+            snapshot=snapshot,
+            offer=offer,
+            next_due_date=next_due_date,
+            callback=callback,
+        )
+        checkout = await repository.reserve_general_subscription_checkout(
             environment=settings.environment,
             builder_id=builder_id,
             intent_id=uuid4(),
@@ -605,6 +727,10 @@ class BillingCheckoutService:
             pricing_snapshot=snapshot,
             next_due_date=next_due_date,
         )
+        self._verify_reserved(
+            checkout, checkout_session_id=checkout_session_id, request=request
+        )
+        return checkout, request
 
     async def _reserve_topup(
         self,
@@ -612,8 +738,18 @@ class BillingCheckoutService:
         builder_id: UUID,
         offer: BillingOffer,
         payment_method: PaymentMethod,
-    ) -> BillingCheckoutSession:
+        callback: CheckoutCallback,
+    ) -> tuple[BillingCheckoutSession, CheckoutCreateRequest]:
         snapshot = topup_pricing_snapshot(offer, payment_method=payment_method)
+        checkout_session_id = uuid4()
+        request = self._build_request(
+            kind="topup",
+            checkout_session_id=checkout_session_id,
+            snapshot=snapshot,
+            offer=offer,
+            next_due_date=None,
+            callback=callback,
+        )
         order = BillingTopupOrder(
             id=uuid4(),
             builder_id=builder_id,
@@ -628,53 +764,34 @@ class BillingCheckoutService:
         )
         self._db.add(order)
         await self._db.flush()
-        return await require_billing_topup_rollout(
+        checkout = await require_billing_topup_rollout(
             self._db,
             builder_id=builder_id,
             topup_order_id=order.id,
-            checkout_session_id=uuid4(),
+            checkout_session_id=checkout_session_id,
             attempt_no=1,
         )
+        self._verify_reserved(
+            checkout, checkout_session_id=checkout_session_id, request=request
+        )
+        return checkout, request
 
-    async def _create_provider_checkout(
-        self, checkout: BillingCheckoutSession, offer: BillingOffer
+    async def _send_reserved(
+        self,
+        checkout: BillingCheckoutSession,
+        request: CheckoutCreateRequest,
+        prepared: _CreationPreconditions,
     ) -> CheckoutView:
         # Captured before any rollback can expire the ORM instance.
         builder_id = checkout.builder_id
         checkout_session_id = checkout.id
-        try:
-            permit = await authorize_creation_egress(require_financial_egress)
-        except EgressDisabledError as exc:
-            await self._set_non_egress_failure(checkout)
-            raise CheckoutUnavailable() from exc
-
-        try:
-            callback = CheckoutCallback.from_return_url(
-                settings.asaas_checkout_return_url
-            )
-            kind: CheckoutKind
-            if checkout.intent_kind == "subscription":
-                kind = "subscription"
-            elif checkout.intent_kind == "topup":
-                kind = "topup"
-            else:
-                raise CheckoutInputRejected()
-            request = CheckoutCreateRequest(
-                kind=kind,
-                external_reference=checkout.id,
-                items=checkout_items(checkout.pricing_snapshot, offer),
-                callback=callback,
-                next_due_date=checkout.next_due_date,
-            )
-            client = self._client_factory()
-        except (AsaasConfigurationError, CheckoutInputRejected, ValueError) as exc:
-            await self._set_non_egress_failure(checkout)
-            raise CheckoutUnavailable() from exc
 
         try:
             await self._reauthorize_before_post(
                 builder_id=builder_id, checkout_session_id=checkout_session_id
             )
+            # Read after the locks are released: no flag I/O under a lock.
+            permit = await authorize_creation_egress(require_financial_egress)
         except Exception as exc:
             # Nothing was sent: this attempt ends conclusively as ``failed``
             # (non-live), so the builder can retry once rollout allows it.
@@ -685,9 +802,11 @@ class BillingCheckoutService:
             raise CheckoutUnavailable() from exc
 
         try:
-            created = await client.create_checkout(request, permit=permit)
+            created = await prepared.client.create_checkout(request, permit=permit)
         except AsaasRequestRejected as exc:
-            await self._set_non_egress_failure(checkout)
+            await self._mark_failed_not_sent(
+                builder_id=builder_id, checkout_session_id=checkout_session_id
+            )
             raise CheckoutCreationRejected() from exc
         except AsaasOutcomeUnknown as exc:
             # The client reaches this path for read/write timeouts and malformed
@@ -703,8 +822,8 @@ class BillingCheckoutService:
 
         try:
             current = await BillingRepository(self._db).lock_checkout_session(
-                builder_id=checkout.builder_id,
-                checkout_session_id=checkout.id,
+                builder_id=builder_id,
+                checkout_session_id=checkout_session_id,
             )
             if current is None or current.state != "creating":
                 raise CheckoutReconciliationRequired()
@@ -775,11 +894,6 @@ class BillingCheckoutService:
             raise CheckoutCouponRejected(COUPON_NOT_ELIGIBLE)
         return ResolvedCoupon(code=coupon.code, discount_percent=percent)
 
-    async def _set_non_egress_failure(self, checkout: BillingCheckoutSession) -> None:
-        await self._mark_failed_not_sent(
-            builder_id=checkout.builder_id, checkout_session_id=checkout.id
-        )
-
     async def _mark_failed_not_sent(
         self, *, builder_id: UUID, checkout_session_id: UUID
     ) -> None:
@@ -835,6 +949,7 @@ class BillingCheckoutService:
             )
             .order_by(BillingCheckoutSession.created_at.desc())
             .limit(1)
+            .execution_options(populate_existing=True)
         )
         candidate = result.scalar_one_or_none()
         if candidate is None:

@@ -173,7 +173,14 @@ class _Repository:
         assert kwargs["amount_cents"] > 0
         assert kwargs["pricing_snapshot"]
         assert self.checkout is not None
+        # Mirror the repository: the persisted attempt is the planned one.
+        self.checkout.id = kwargs["checkout_session_id"]  # type: ignore[assignment]
+        self.checkout.next_due_date = kwargs["next_due_date"]  # type: ignore[assignment]
+        self.checkout.amount_cents = kwargs["amount_cents"]  # type: ignore[assignment]
         return self.checkout
+
+    async def subscription_checkout_blocker(self, *, builder_id: UUID) -> str | None:
+        return None
 
     async def authorize_reserved_checkout_egress(
         self, *, environment: str, builder_id: UUID, checkout_session_id: UUID
@@ -256,7 +263,7 @@ async def test_creating_snapshot_commits_before_post_and_retry_returns_live(
 ) -> None:
     builder_id = uuid4()
     persisted = _checkout(builder_id=builder_id)
-    db = _Session([None, 2])
+    db = _Session([None, None, 2])
     _prepare_creation(monkeypatch, db, persisted)
     client = _Client(db)
 
@@ -297,7 +304,7 @@ async def test_ambiguous_timeout_marks_reconciliation_and_never_blind_retries(
 ) -> None:
     builder_id = uuid4()
     persisted = _checkout(builder_id=builder_id)
-    db = _Session([None, 1])
+    db = _Session([None, None, 1])
     _prepare_creation(monkeypatch, db, persisted)
     client = _Client(db, unknown=True)
     service = BillingCheckoutService(db, client_factory=lambda: client)
@@ -398,6 +405,8 @@ class _World:
     lock_calls: int = 0
     fail_lock_call: int | None = None
     reservations: list[dict[str, object]] = field(default_factory=list)
+    blocker: str | None = None
+    blocker_checks: int = 0
 
 
 def _general_control(**overrides: object) -> SimpleNamespace:
@@ -426,6 +435,7 @@ def _install_world(monkeypatch: pytest.MonkeyPatch, world: _World) -> None:
             self, **kwargs: object
         ) -> BillingCheckoutSession:
             world.reservations.append(kwargs)
+            world.checkout.id = kwargs["checkout_session_id"]  # type: ignore[assignment]
             world.checkout.next_due_date = kwargs["next_due_date"]  # type: ignore[assignment]
             world.checkout.pricing_snapshot = kwargs["pricing_snapshot"]  # type: ignore[assignment]
             world.checkout.amount_cents = kwargs["amount_cents"]  # type: ignore[assignment]
@@ -435,8 +445,16 @@ def _install_world(monkeypatch: pytest.MonkeyPatch, world: _World) -> None:
             self, **kwargs: object
         ) -> BillingCheckoutSession:
             world.reservations.append(kwargs)
+            world.checkout.id = kwargs["checkout_session_id"]  # type: ignore[assignment]
+            world.checkout.next_due_date = kwargs["next_due_date"]  # type: ignore[assignment]
             world.control.canary_subscription_checkout_id = world.checkout.id
             return world.checkout
+
+        async def subscription_checkout_blocker(
+            self, *, builder_id: UUID
+        ) -> str | None:
+            world.blocker_checks += 1
+            return world.blocker
 
         async def lock_checkout_session(
             self, *, builder_id: UUID, checkout_session_id: UUID
@@ -450,11 +468,15 @@ def _install_world(monkeypatch: pytest.MonkeyPatch, world: _World) -> None:
 
     monkeypatch.setattr(checkout_module, "BillingRepository", Repository)
     _prepare_settings(monkeypatch)
-    monkeypatch.setattr(
-        checkout_module,
-        "require_billing_topup_rollout",
-        AsyncMock(return_value=world.checkout),
-    )
+
+    async def reserve_topup(_db: object, **kwargs: object) -> BillingCheckoutSession:
+        world.reservations.append(kwargs)
+        world.checkout.id = kwargs["checkout_session_id"]  # type: ignore[assignment]
+        if world.checkout.canary_slot == "topup":
+            world.control.canary_topup_checkout_id = world.checkout.id
+        return world.checkout
+
+    monkeypatch.setattr(checkout_module, "require_billing_topup_rollout", reserve_topup)
 
 
 class _RecordingClient:
@@ -496,7 +518,7 @@ async def test_rollout_disabled_after_reservation_commit_sends_nothing_and_allow
     def disable() -> None:
         world.control.state = "disabled"
 
-    db = _Session([None, 1], on_commit={1: disable})
+    db = _Session([None, None, 1], on_commit={1: disable})
     client = _RecordingClient()
     factory = MagicMock(return_value=client)
 
@@ -523,7 +545,7 @@ async def test_rollout_disabled_after_reservation_commit_sends_nothing_and_allow
         control=_general_control(), checkout=_checkout(builder_id=builder_id)
     )
     _install_world(monkeypatch, retry)
-    retry_db = _Session([None, 1])
+    retry_db = _Session([None, None, 1])
     retry_client = _RecordingClient()
     view = await BillingCheckoutService(
         retry_db, client_factory=lambda: retry_client
@@ -553,7 +575,7 @@ async def test_canary_builder_changed_after_commit_sends_nothing(
     def change_allowlist() -> None:
         world.control.canary_builder_id = uuid4()
 
-    db = _Session([None], on_commit={1: change_allowlist})
+    db = _Session([None, None], on_commit={1: change_allowlist})
     client = _RecordingClient()
 
     with pytest.raises(CheckoutUnavailable):
@@ -607,7 +629,7 @@ async def test_topup_gate_or_canary_slot_invalid_after_commit_sends_nothing(
         else:
             world.control.state = "general"
 
-    db = _Session([None], scalars=scalars, on_commit={1: invalidate})
+    db = _Session([None, None], scalars=scalars, on_commit={1: invalidate})
     client = _RecordingClient()
 
     with pytest.raises(CheckoutUnavailable):
@@ -632,7 +654,7 @@ async def test_rollout_read_error_in_pre_post_recheck_fails_closed(
         fail_lock_call=3,  # the pre-POST re-check's rollout read
     )
     _install_world(monkeypatch, world)
-    db = _Session([None, 1])
+    db = _Session([None, None, 1])
     client = _RecordingClient()
 
     with pytest.raises(CheckoutUnavailable):
@@ -666,7 +688,7 @@ async def test_rollout_recheck_helper_error_fails_closed(
     monkeypatch.setattr(
         checkout_module, "require_billing_checkout_rollout", flaky_rollout
     )
-    db = _Session([None, 1])
+    db = _Session([None, None, 1])
     client = _RecordingClient()
 
     with pytest.raises(CheckoutUnavailable):
@@ -694,7 +716,7 @@ async def test_valid_general_topup_reauthorizes_and_posts_exactly_once(
         checkout=checkout,
     )
     _install_world(monkeypatch, world)
-    db = _Session([None], scalars=[_valid_capability(), "pending"])
+    db = _Session([None, None], scalars=[_valid_capability(), "pending"])
     client = _RecordingClient()
 
     view = await BillingCheckoutService(
@@ -774,7 +796,7 @@ async def test_next_due_date_is_sao_paulo_today_whatever_the_host_timezone(
         control=_general_control(), checkout=_checkout(builder_id=builder_id)
     )
     _install_world(monkeypatch, world)
-    db = _Session([None, 1])
+    db = _Session([None, None, 1])
     client = _RecordingClient()
 
     await BillingCheckoutService(
@@ -938,7 +960,8 @@ async def test_coupon_on_canary_subscription_fails_closed_before_egress(
     )
     _install_world(monkeypatch, world)
     db = _Session([None, _coupon(), None])
-    factory = MagicMock(side_effect=AssertionError("provider reached"))
+    client = _RecordingClient()
+    factory = MagicMock(return_value=client)
 
     with pytest.raises(CheckoutCouponRejected) as exc_info:
         await BillingCheckoutService(db, client_factory=factory).create_checkout(
@@ -952,7 +975,8 @@ async def test_coupon_on_canary_subscription_fails_closed_before_egress(
     assert world.reservations == []
     assert db.commits == 0
     assert db.rollbacks >= 1
-    factory.assert_not_called()
+    # Building the client is a pre-reservation precondition; no POST.
+    assert client.requests == []
 
 
 @pytest.mark.asyncio
@@ -992,7 +1016,8 @@ async def test_coupon_invalidated_between_precheck_and_lock_rolls_back(
     )
     _install_world(monkeypatch, world)
     db = _Session([None, _coupon(), None, _coupon(max_uses=1, uses_count=1)])
-    factory = MagicMock(side_effect=AssertionError("provider reached"))
+    client = _RecordingClient()
+    factory = MagicMock(return_value=client)
 
     with pytest.raises(CheckoutCouponRejected):
         await BillingCheckoutService(
@@ -1007,7 +1032,8 @@ async def test_coupon_invalidated_between_precheck_and_lock_rolls_back(
     assert world.reservations == []
     assert db.commits == 0
     assert db.rollbacks >= 1
-    factory.assert_not_called()
+    # Building the client is a pre-reservation precondition; no POST.
+    assert client.requests == []
 
 
 @pytest.mark.asyncio
@@ -1043,3 +1069,341 @@ def test_coupon_selector_normalization_matches_stored_codes(
 def test_coupon_selector_outside_stored_length_is_rejected(raw: str) -> None:
     with pytest.raises(CheckoutCouponRejected):
         normalize_coupon_code(raw)
+
+
+# ---------------------------------------------------------------------------
+# Fix loop 2 — HIGH B (eligibility) and HIGH C (pre-reservation preconditions).
+# ---------------------------------------------------------------------------
+
+
+def _canary_world(builder_id: UUID) -> _World:
+    return _World(
+        control=_general_control(
+            state="canary_allowlist", canary_builder_id=builder_id
+        ),
+        checkout=_canary_checkout(builder_id),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "abacatepay_subscription",
+        "asaas_subscription",
+        "unresolved_subscription",
+        "migration",
+        "live_subscription_checkout",
+    ],
+)
+async def test_ineligible_builder_gets_one_stable_code_with_no_row_or_post(
+    monkeypatch: pytest.MonkeyPatch,
+    blocker: str,
+) -> None:
+    builder_id = uuid4()
+    world = _World(
+        control=_general_control(),
+        checkout=_checkout(builder_id=builder_id),
+        blocker=blocker,
+    )
+    _install_world(monkeypatch, world)
+    db = _Session([None, None])
+    client = _RecordingClient()
+
+    with pytest.raises(checkout_module.CheckoutNotEligible) as exc_info:
+        await BillingCheckoutService(db, client_factory=lambda: client).create_checkout(
+            builder_id=builder_id,
+            offer_id="plan_pro_monthly_v1",
+            payment_method="credit_card",
+        )
+
+    assert exc_info.value.code == "billing_checkout_not_eligible"
+    assert blocker not in repr(exc_info.value)  # the reason never leaves
+    assert world.blocker_checks == 1
+    assert world.lock_calls == 2  # checked while the rollout lock is held
+    assert world.reservations == []
+    assert client.requests == []
+    assert db.commits == 0
+    assert db.rollbacks >= 1
+
+
+@pytest.mark.asyncio
+async def test_canary_subscription_is_also_eligibility_checked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder_id = uuid4()
+    world = _canary_world(builder_id)
+    world.blocker = "abacatepay_subscription"
+    _install_world(monkeypatch, world)
+    client = _RecordingClient()
+
+    with pytest.raises(checkout_module.CheckoutNotEligible):
+        await BillingCheckoutService(
+            _Session([None, None]), client_factory=lambda: client
+        ).create_checkout(
+            builder_id=builder_id,
+            offer_id="plan_plus_monthly_v1",
+            payment_method="credit_card",
+        )
+
+    assert world.reservations == []
+    assert world.control.canary_subscription_checkout_id is None
+    assert client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_eligible_builder_and_topups_are_not_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder_id = uuid4()
+    world = _World(
+        control=_general_control(), checkout=_checkout(builder_id=builder_id)
+    )
+    _install_world(monkeypatch, world)
+    client = _RecordingClient()
+    await BillingCheckoutService(
+        _Session([None, None, 1]), client_factory=lambda: client
+    ).create_checkout(
+        builder_id=builder_id,
+        offer_id="plan_plus_monthly_v1",
+        payment_method="credit_card",
+    )
+    assert world.blocker_checks == 1
+    assert len(client.requests) == 1
+
+    # A live subscription does not block a detached top-up (no eligibility).
+    topup = _World(
+        control=_general_control(
+            topup_commercial_enabled=True, active_topup_capability_id=uuid4()
+        ),
+        checkout=_topup_checkout(builder_id),
+        blocker="live_subscription_checkout",
+    )
+    _install_world(monkeypatch, topup)
+    topup_client = _RecordingClient()
+    await BillingCheckoutService(
+        _Session([None, None], scalars=[_valid_capability(), "pending"]),
+        client_factory=lambda: topup_client,
+    ).create_checkout(
+        builder_id=builder_id,
+        offer_id="package_credits_500_v1",
+        payment_method="pix",
+    )
+    assert topup.blocker_checks == 0
+    assert len(topup_client.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_same_offer_retry_returns_the_live_session_before_eligibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder_id = uuid4()
+    live = _checkout(builder_id=builder_id, state="active")
+    live.external_checkout_id = "chk_000000000000004"
+    world = _World(
+        control=_general_control(),
+        checkout=live,
+        blocker="live_subscription_checkout",
+    )
+    _install_world(monkeypatch, world)
+    # The race variant: absent at the lock-free read, present under the lock.
+    db = _Session([None, live])
+    client = _RecordingClient()
+
+    view = await BillingCheckoutService(
+        db, client_factory=lambda: client
+    ).create_checkout(
+        builder_id=builder_id,
+        offer_id="plan_plus_monthly_v1",
+        payment_method="credit_card",
+    )
+
+    assert view.checkout_session_id == live.id
+    assert world.blocker_checks == 0
+    assert world.reservations == []
+    assert client.requests == []
+
+
+class _Reader:
+    def __init__(self, result: object = True, error: Exception | None = None) -> None:
+        self.result = result
+        self.error = error
+        self.calls = 0
+
+    async def is_enabled(self, flag_name: str) -> bool:
+        assert flag_name == "financial_egress_enabled"
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.result  # type: ignore[return-value]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    ["flag_false", "flag_error", "empty_return_url", "client_build_error"],
+)
+@pytest.mark.parametrize("kind", ["subscription", "topup"])
+async def test_side_effect_free_precondition_failure_never_reserves_a_canary_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    kind: str,
+) -> None:
+    from src.services.egress_policy import EgressPolicy
+
+    builder_id = uuid4()
+    if kind == "subscription":
+        world = _canary_world(builder_id)
+        offer_id, method = "plan_plus_monthly_v1", "credit_card"
+    else:
+        world = _World(
+            control=_general_control(
+                state="canary_allowlist", canary_builder_id=builder_id
+            ),
+            checkout=_topup_checkout(builder_id, canary=True),
+        )
+        offer_id, method = "package_credits_500_v1", "pix"
+    _install_world(monkeypatch, world)
+    reader = _Reader(
+        result=False if failure == "flag_false" else True,
+        error=RuntimeError("agent down") if failure == "flag_error" else None,
+    )
+    from src.services import asaas as asaas_module
+
+    monkeypatch.setattr(
+        checkout_module,
+        "authorize_creation_egress",
+        asaas_module.authorize_creation_egress,
+    )
+    monkeypatch.setattr(
+        checkout_module,
+        "require_financial_egress",
+        EgressPolicy(reader).require_financial_egress,
+    )
+    if failure == "empty_return_url":
+        monkeypatch.setattr(checkout_module.settings, "asaas_checkout_return_url", "")
+    client = _RecordingClient()
+
+    def factory() -> _RecordingClient:
+        if failure == "client_build_error":
+            raise checkout_module.CheckoutInputRejected()
+        return client
+
+    db = _Session([None])
+    with pytest.raises(CheckoutUnavailable):
+        await BillingCheckoutService(db, client_factory=factory).create_checkout(
+            builder_id=builder_id, offer_id=offer_id, payment_method=method
+        )
+
+    assert world.lock_calls == 0
+    assert world.reservations == []
+    assert db.added == []  # no top-up order either
+    assert db.commits == 0
+    assert world.control.canary_subscription_checkout_id is None
+    assert world.control.canary_topup_checkout_id is None
+    assert client.requests == []
+    if failure == "empty_return_url":
+        assert reader.calls == 0  # URL is checked before the flag is read
+    else:
+        assert reader.calls == 1  # gate read only; no reservation followed
+
+
+@pytest.mark.asyncio
+async def test_permit_reaching_the_post_is_minted_after_the_rollout_recheck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.services import asaas as asaas_module
+    from src.services.egress_policy import EgressPolicy
+
+    builder_id = uuid4()
+    world = _canary_world(builder_id)
+    _install_world(monkeypatch, world)
+    reader = _Reader(True)
+    monkeypatch.setattr(
+        checkout_module,
+        "authorize_creation_egress",
+        asaas_module.authorize_creation_egress,
+    )
+    monkeypatch.setattr(
+        checkout_module,
+        "require_financial_egress",
+        EgressPolicy(reader).require_financial_egress,
+    )
+    client = _RecordingClient()
+
+    view = await BillingCheckoutService(
+        _Session([None, None]), client_factory=lambda: client
+    ).create_checkout(
+        builder_id=builder_id,
+        offer_id="plan_plus_monthly_v1",
+        payment_method="credit_card",
+    )
+
+    assert view.state == "active"
+    # One gate read before the reservation, one permit-minting read after the
+    # fresh rollout re-check.
+    assert reader.calls == 2
+    request, permit = client.requests[0]  # type: ignore[misc]
+    assert isinstance(permit, asaas_module.CreationEgressPermit)
+    assert request.external_reference == world.checkout.id  # type: ignore[attr-defined]
+    assert world.control.canary_subscription_checkout_id == world.checkout.id
+
+
+class _FlippingReader(_Reader):
+    """Open for the pre-reservation gate, closed (or broken) afterwards."""
+
+    def __init__(self, *, then_error: bool) -> None:
+        super().__init__(True)
+        self.then_error = then_error
+
+    async def is_enabled(self, flag_name: str) -> bool:
+        assert flag_name == "financial_egress_enabled"
+        self.calls += 1
+        if self.calls == 1:
+            return True
+        if self.then_error:
+            raise RuntimeError("agent down")
+        return False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("then_error", [False, True])
+async def test_kill_switch_thrown_after_the_reservation_still_sends_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    then_error: bool,
+) -> None:
+    from src.services import asaas as asaas_module
+    from src.services.egress_policy import EgressPolicy
+
+    builder_id = uuid4()
+    world = _World(
+        control=_general_control(), checkout=_checkout(builder_id=builder_id)
+    )
+    _install_world(monkeypatch, world)
+    reader = _FlippingReader(then_error=then_error)
+    monkeypatch.setattr(
+        checkout_module,
+        "authorize_creation_egress",
+        asaas_module.authorize_creation_egress,
+    )
+    monkeypatch.setattr(
+        checkout_module,
+        "require_financial_egress",
+        EgressPolicy(reader).require_financial_egress,
+    )
+    client = _RecordingClient()
+
+    with pytest.raises(CheckoutUnavailable):
+        # Results: lock-free live read, locked live re-check, clinic count.
+        await BillingCheckoutService(
+            _Session([None, None, 1]), client_factory=lambda: client
+        ).create_checkout(
+            builder_id=builder_id,
+            offer_id="plan_plus_monthly_v1",
+            payment_method="credit_card",
+        )
+
+    assert reader.calls == 2
+    assert len(world.reservations) == 1  # the race reached the reservation
+    assert client.requests == []
+    assert world.checkout.state == "failed"  # conclusive, never sent

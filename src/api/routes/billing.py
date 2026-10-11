@@ -34,6 +34,7 @@ from src.services.billing_checkout import (
     CheckoutCouponRejected,
     CheckoutCreationRejected,
     CheckoutInputRejected,
+    CheckoutNotEligible,
     CheckoutNotFound,
     CheckoutReconciliationRequired,
     CheckoutUnavailable,
@@ -243,20 +244,6 @@ async def billing_usage(
     return await _get_usage(builder, db)
 
 
-async def _validate_coupon(code: str, db: AsyncSession) -> Coupon:
-    result = await db.execute(select(Coupon).where(Coupon.code == code.upper()))
-    coupon = result.scalar_one_or_none()
-    if not coupon:
-        raise HTTPException(status_code=404, detail="Cupom não encontrado")
-    if not coupon.is_active:
-        raise HTTPException(status_code=400, detail="Cupom inativo")
-    if coupon.expires_at and coupon.expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=400, detail="Cupom expirado")
-    if coupon.max_uses is not None and coupon.uses_count >= coupon.max_uses:
-        raise HTTPException(status_code=400, detail="Cupom esgotado")
-    return coupon
-
-
 @router.get(
     "/coupon/{code}",
     summary="Validate Coupon",
@@ -304,6 +291,10 @@ async def create_checkout(
         )
     except CheckoutInputRejected as exc:
         raise HTTPException(status_code=422, detail=exc.code) from exc
+    except CheckoutNotEligible as exc:
+        # One fixed 409 for every subscription eligibility blocker (legacy or
+        # non-terminal ASAAS subscription, migration, other live plan attempt).
+        raise HTTPException(status_code=409, detail=exc.code) from exc
     except CheckoutCouponRejected as exc:
         # One fixed 400 for absent/inactive/expired/exhausted (no enumeration),
         # matching the legacy coupon route's 400 family.

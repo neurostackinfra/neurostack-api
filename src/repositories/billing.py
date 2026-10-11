@@ -8,7 +8,7 @@ from datetime import date, datetime, timezone
 from typing import Final, cast
 from uuid import UUID
 
-from sqlalchemy import and_, case, func, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.billing import (
@@ -36,6 +36,14 @@ _CANARY_CATALOG: Final = "payment-2026-10-03"
 _CANARY_TOPUP_AMOUNT_CENTS: Final = 10_000
 _CANARY_TOPUP_CREDIT_GRANT_MC: Final = 500
 _CANARY_SUBSCRIPTION_AMOUNT_CENTS: Final = 99_900
+_LIVE_CHECKOUT_STATES: Final = (
+    "creating",
+    "active",
+    "paid_pending_subscription",
+    "reconciliation_required",
+    "terminal_pending_readback",
+)
+_TERMINAL_SUBSCRIPTION_STATUSES: Final = ("inactive", "cancelled")
 
 
 class BillingStateUnavailable(RuntimeError):
@@ -133,6 +141,10 @@ class BillingRepository:
             select(BillingRolloutControl)
             .where(BillingRolloutControl.environment == environment)
             .with_for_update()
+            # The engine session keeps instances across commits
+            # (expire_on_commit=False); a locked read must never return a
+            # still-referenced pre-commit copy of the control row.
+            .execution_options(populate_existing=True)
         )
         control = result.scalar_one_or_none()
         if control is None:
@@ -704,8 +716,68 @@ class BillingRepository:
                 BillingCheckoutSession.builder_id == builder_id,
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
+
+    async def subscription_checkout_blocker(self, *, builder_id: UUID) -> str | None:
+        """Return why a NEW subscription checkout is ineligible, else ``None``.
+
+        The caller must hold the environment rollout lock
+        (``lock_rollout_control``) until its reservation commits: every
+        checkout creation takes that lock first, so two creations for the same
+        builder serialize and the second reads the first's committed attempt.
+        Only id columns are selected, so no stale identity-map copy is read and
+        no row (the builder's or anyone else's) is locked.
+
+        Blockers, in order: an unresolved provider row (``provider IS NULL``:
+        legacy cancel/unknown/manual states), an active or otherwise
+        non-terminal AbacatePay or ASAAS row (any status except
+        ``inactive``/``cancelled``, or ``is_active``), any
+        ``billing_migrations`` row (adoption of ``pending``/
+        ``recreate_pending`` arrives in Group 5, so every migration state
+        fails closed here), and any live subscription checkout attempt.
+        """
+
+        subscription = (
+            await self.session.execute(
+                select(BillingSubscription.id, BillingSubscription.provider)
+                .where(
+                    BillingSubscription.builder_id == builder_id,
+                    or_(
+                        BillingSubscription.provider.is_(None),
+                        BillingSubscription.is_active.is_(True),
+                        BillingSubscription.status.not_in(
+                            _TERMINAL_SUBSCRIPTION_STATUSES
+                        ),
+                    ),
+                )
+                .order_by(BillingSubscription.id)
+                .limit(1)
+            )
+        ).first()
+        if subscription is not None:
+            provider = subscription[1]
+            return f"{provider}_subscription" if provider else "unresolved_subscription"
+        migration = await self.session.scalar(
+            select(BillingMigration.id)
+            .where(BillingMigration.builder_id == builder_id)
+            .limit(1)
+        )
+        if migration is not None:
+            return "migration"
+        live = await self.session.scalar(
+            select(BillingCheckoutSession.id)
+            .where(
+                BillingCheckoutSession.builder_id == builder_id,
+                BillingCheckoutSession.intent_kind == "subscription",
+                BillingCheckoutSession.state.in_(_LIVE_CHECKOUT_STATES),
+            )
+            .limit(1)
+        )
+        if live is not None:
+            return "live_subscription_checkout"
+        return None
 
     async def authorize_reserved_checkout_egress(
         self,

@@ -1,17 +1,1 @@
-{
-  "billingTypes": ["CREDIT_CARD"],
-  "chargeTypes": ["RECURRENT"],
-  "externalReference": "00000000-0000-4000-8000-000000000001",
-  "items": [
-    {
-      "description": "NeuroStack Plus monthly subscription",
-      "name": "NeuroStack Plus",
-      "quantity": 1,
-      "value": 999.0
-    }
-  ],
-  "subscription": {
-    "cycle": "MONTHLY",
-    "nextDueDate": "2026-10-10"
-  }
-}
+{"billingTypes":["CREDIT_CARD"],"chargeTypes":["RECURRENT"],"minutesToExpire":60,"externalReference":"00000000-0000-4000-8000-000000000001","callback":{"successUrl":"https://app.example.test/billing?checkout=success","cancelUrl":"https://app.example.test/billing?checkout=cancel","expiredUrl":"https://app.example.test/billing?checkout=expired"},"items":[{"imageBase64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=","name":"NeuroStack Plus","description":"NeuroStack monthly subscription","quantity":1,"value":999.00}],"subscription":{"cycle":"MONTHLY","nextDueDate":"2026-10-11"}}
