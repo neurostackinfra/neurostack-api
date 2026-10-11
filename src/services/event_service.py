@@ -346,15 +346,16 @@ async def _resolve_builder_owner_tenant_id(
     Rules (see WISH Group 3 deliverable 1):
       * Tenant.builder_id must be set.
       * Owner candidates are users where ``User.builder_id == Tenant.builder_id``
-        AND ``User.role == "builder"``.
+        AND ``users.role`` is ``"builder"`` (compared as text: the migrated
+        column is VARCHAR while the model maps the PG enum).
       * Group by distinct ``User.tenant_id``. Cardinality must be exactly 1;
         zero or multiple distinct tenants is ``builder_llm_owner_ambiguous``
         and returns ``None`` without any secret exposure.
     """
-    from sqlalchemy import select
+    from sqlalchemy import String, cast, select
 
     from src.models.tenant import Tenant
-    from src.models.user import User
+    from src.models.user import User, UserRole
 
     tenant_row = (
         await db_session.execute(select(Tenant).where(Tenant.id == tenant_id))
@@ -366,7 +367,7 @@ async def _resolve_builder_owner_tenant_id(
         select(User.tenant_id)
         .where(
             User.builder_id == tenant_row.builder_id,
-            User.role == "builder",
+            cast(User.role, String) == UserRole.builder.value,
         )
         .distinct()
     )
