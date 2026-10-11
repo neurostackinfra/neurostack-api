@@ -9,7 +9,12 @@ PG enum ``userrole``. On databases built by Alembic, ORM comparisons render
 ``users.role = $1::userrole`` and Postgres rejects them (``operator does not
 exist: character varying = userrole``). This converts the column to the enum.
 Databases whose column is already the enum (created from the models) are left
-untouched. Downgrade restores migration 004's VARCHAR(50).
+untouched. Downgrade restores migration 004's VARCHAR(50), also on those
+databases.
+
+The ALTER takes an ACCESS EXCLUSIVE lock on ``users``; ``lock_timeout`` makes
+it give up after a few seconds instead of queueing logins behind a long
+transaction. Rerun the migration if it times out.
 """
 
 from typing import Union
@@ -23,6 +28,7 @@ down_revision: Union[str, None] = "023"
 branch_labels = None
 depends_on = None
 
+LOCK_TIMEOUT = "SET LOCAL lock_timeout = '5s'"
 TO_ENUM = "ALTER TABLE users ALTER COLUMN role TYPE userrole USING role::userrole"
 TO_VARCHAR = "ALTER TABLE users ALTER COLUMN role TYPE VARCHAR(50) USING role::text"
 
@@ -42,6 +48,7 @@ def _role_column_type() -> str:
 
 
 def upgrade() -> None:
+    op.execute(LOCK_TIMEOUT)
     if context.is_offline_mode():
         # Offline SQL targets a database built by this migration chain (VARCHAR).
         op.execute(TO_ENUM)
@@ -69,6 +76,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute(LOCK_TIMEOUT)
     if context.is_offline_mode():
         op.execute(TO_VARCHAR)
         return

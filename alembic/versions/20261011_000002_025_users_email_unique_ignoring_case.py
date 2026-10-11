@@ -9,7 +9,8 @@ could create ``Ops@example.com`` next to ``ops@example.com``: two accounts for
 what people read as one email. This adds a unique index on ``lower(email)``.
 The upgrade refuses, without changes, while case-only duplicates exist; they
 must be renamed or merged first. Emails are not printed (they are personal
-data); the error carries the query that lists them.
+data); the error carries the query that lists them. ``lock_timeout`` bounds
+the wait for the index build's lock on ``users``.
 """
 
 from typing import Union
@@ -24,6 +25,7 @@ branch_labels = None
 depends_on = None
 
 INDEX_NAME = "uq_users_email_lower"
+LOCK_TIMEOUT = "SET LOCAL lock_timeout = '5s'"
 DUPLICATES_QUERY = (
     "SELECT lower(email) AS email, count(*) FROM users "
     "GROUP BY lower(email) HAVING count(*) > 1"
@@ -31,6 +33,7 @@ DUPLICATES_QUERY = (
 
 
 def upgrade() -> None:
+    op.execute(LOCK_TIMEOUT)
     if not context.is_offline_mode():
         duplicates = op.get_bind().execute(sa.text(DUPLICATES_QUERY)).all()
         if duplicates:
@@ -39,8 +42,16 @@ def upgrade() -> None:
                 f"case is ignored; rename or merge them before upgrading. "
                 f"List them with: {DUPLICATES_QUERY}"
             )
-    op.create_index(INDEX_NAME, "users", [sa.text("lower(email)")], unique=True)
+    # if_not_exists: a Postgres database created from the models already has it.
+    op.create_index(
+        INDEX_NAME,
+        "users",
+        [sa.text("lower(email)")],
+        unique=True,
+        if_not_exists=True,
+    )
 
 
 def downgrade() -> None:
-    op.drop_index(INDEX_NAME, table_name="users")
+    op.execute(LOCK_TIMEOUT)
+    op.drop_index(INDEX_NAME, table_name="users", if_exists=True)
