@@ -195,8 +195,9 @@ async def bootstrap_admin(
         select(User).where(func.lower(User.email) == request.email)
     )
     matches = result.scalars().all()
-    # users.email is unique case-sensitively and the application can create
-    # case variants, so only the exact match is the account to maintain.
+    # Before migration 025 users.email was unique only case-sensitively and the
+    # application could create case variants, so only the exact match is the
+    # account to maintain.
     exact = next((user for user in matches if user.email == request.email), None)
     if exact is not None:
         outcome = await _maintain(session, exact, request)
@@ -208,8 +209,8 @@ async def bootstrap_admin(
             "refusing to create a case variant"
         )
 
-    # users.role is VARCHAR in the migrated schema; compare as text like the
-    # rest of the application does.
+    # Compared as text so this also works before migration 024, when
+    # users.role was VARCHAR.
     result = await session.execute(
         select(User.email).where(cast(User.role, String) == UserRole.super_admin.value)
     )
