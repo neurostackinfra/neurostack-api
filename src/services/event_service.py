@@ -346,8 +346,8 @@ async def _resolve_builder_owner_tenant_id(
     Rules (see WISH Group 3 deliverable 1):
       * Tenant.builder_id must be set.
       * Owner candidates are users where ``User.builder_id == Tenant.builder_id``
-        AND ``users.role`` is ``"builder"`` (compared as text: the migrated
-        column is VARCHAR while the model maps the PG enum).
+        AND ``users.role`` is ``"builder"`` (compared as text so it also works
+        before migration 024, when the column was VARCHAR).
       * Group by distinct ``User.tenant_id``. Cardinality must be exactly 1;
         zero or multiple distinct tenants is ``builder_llm_owner_ambiguous``
         and returns ``None`` without any secret exposure.
