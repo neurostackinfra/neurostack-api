@@ -1,12 +1,14 @@
-"""Fail-closed coverage for the AbacatePay checkout choke point."""
+"""Fail-closed integration tests for the authoritative hosted checkout path."""
 
 from __future__ import annotations
 
+import json
 import socket
+from datetime import date
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -15,6 +17,9 @@ from pydantic import SecretStr
 
 from src.api.routes import billing
 from src.api.schemas.billing import CheckoutRequest
+from src.models.billing import BillingCheckoutSession
+from src.services import billing_checkout as checkout_module
+from src.services.asaas import CheckoutCreated
 from src.services.egress_policy import EgressPolicy
 
 
@@ -31,13 +36,120 @@ class _FlagReader:
         return self.result  # type: ignore[return-value]
 
 
-class _BuilderResult:
-    def scalar_one_or_none(self) -> SimpleNamespace:
-        return SimpleNamespace(name="Checkout Builder")
+class _Result:
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    def scalar_one_or_none(self) -> object:
+        return self.value
+
+    def scalar_one(self) -> object:
+        return self.value
+
+
+class _Session:
+    def __init__(self, results: list[object]) -> None:
+        self.results = results
+        self.commits = 0
+        self.rollbacks = 0
+
+    async def execute(self, _statement: object) -> _Result:
+        return _Result(self.results.pop(0))
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+    async def rollback(self) -> None:
+        self.rollbacks += 1
+
+    async def flush(self) -> None:
+        return None
+
+    def add(self, _value: object) -> None:
+        return None
+
+
+def _checkout(builder_id: UUID) -> BillingCheckoutSession:
+    return BillingCheckoutSession(
+        id=uuid4(),
+        builder_id=builder_id,
+        intent_kind="subscription",
+        intent_id=uuid4(),
+        migration_id=None,
+        topup_order_id=None,
+        attempt_no=1,
+        provider="asaas",
+        state="creating",
+        catalog_version_id="payment-2026-10-03",
+        offer_id="plan_plus_monthly_v1",
+        amount_cents=99_900,
+        pricing_snapshot={
+            "catalog_version_id": "payment-2026-10-03",
+            "offer_id": "plan_plus_monthly_v1",
+            "amount_cents": 99_900,
+            "credit_grant_mc": 5_000,
+            "included_clinics": 1,
+            "additional_clinics": 0,
+            "billing_cycle": "monthly",
+            "payment_method": "credit_card",
+            "lines": [],
+        },
+        next_due_date=date(2026, 10, 12),
+        reconciliation_attempts=0,
+    )
 
 
 def _checkout_body() -> CheckoutRequest:
-    return CheckoutRequest(plan="start", cycle="monthly", method="pix")
+    return CheckoutRequest(
+        offer_id="plan_plus_monthly_v1",
+        method="credit_card",
+    )
+
+
+def _install_general_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+    checkout: BillingCheckoutSession,
+) -> None:
+    class Repository:
+        def __init__(self, _db: _Session) -> None:
+            return None
+
+        async def lock_rollout_control(self, *, environment: str) -> object:
+            assert environment == "test"
+            return SimpleNamespace(state="general")
+
+        async def reserve_general_subscription_checkout(
+            self, **_kwargs: object
+        ) -> BillingCheckoutSession:
+            return checkout
+
+        async def authorize_reserved_checkout_egress(
+            self, *, environment: str, builder_id: UUID, checkout_session_id: UUID
+        ) -> BillingCheckoutSession:
+            assert environment == "test"
+            assert builder_id == checkout.builder_id
+            assert checkout_session_id == checkout.id
+            return checkout
+
+        async def lock_checkout_session(
+            self, *, builder_id: UUID, checkout_session_id: UUID
+        ) -> BillingCheckoutSession | None:
+            if builder_id == checkout.builder_id and checkout_session_id == checkout.id:
+                return checkout
+            return None
+
+    monkeypatch.setattr(checkout_module, "BillingRepository", Repository)
+    monkeypatch.setattr(
+        checkout_module,
+        "require_billing_checkout_rollout",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(checkout_module.settings, "environment", "test")
+    monkeypatch.setattr(
+        checkout_module.settings,
+        "asaas_checkout_return_url",
+        "https://app.example.test/billing",
+    )
 
 
 @pytest.mark.asyncio
@@ -54,128 +166,72 @@ async def test_checkout_fails_closed_before_provider_or_network(
     monkeypatch: pytest.MonkeyPatch,
     reader: _FlagReader,
 ) -> None:
-    provider_factory = MagicMock(side_effect=AssertionError("provider client reached"))
+    builder_id = uuid4()
+    db = _Session([None, 0])
+    _install_general_reservation(monkeypatch, _checkout(builder_id))
+    provider_factory = MagicMock(side_effect=AssertionError("ASAAS client reached"))
     network_calls: list[str] = []
 
-    def forbidden_dns(*_args: object, **_kwargs: object) -> Any:
-        network_calls.append("dns")
-        raise AssertionError("provider DNS reached")
-
-    def forbidden_http(*_args: object, **_kwargs: object) -> Any:
-        network_calls.append("http")
-        raise AssertionError("provider HTTP reached")
-
-    def forbidden_socket(*_args: object, **_kwargs: object) -> Any:
-        network_calls.append("socket")
-        raise AssertionError("provider socket reached")
+    def forbidden_network(*_args: object, **_kwargs: object) -> Any:
+        network_calls.append("network")
+        raise AssertionError("provider network reached")
 
     monkeypatch.setattr(
-        billing,
-        "require_billing_checkout_rollout",
-        AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr(
-        billing,
+        checkout_module,
         "require_financial_egress",
         EgressPolicy(reader).require_financial_egress,
     )
-    monkeypatch.setattr(billing, "_get_client", provider_factory)
-    monkeypatch.setattr(billing, "_count_active_clinics", AsyncMock(return_value=0))
-    monkeypatch.setattr(socket, "getaddrinfo", forbidden_dns)
-    monkeypatch.setattr(socket, "socket", forbidden_socket)
-    monkeypatch.setattr(httpx, "post", forbidden_http)
-    db = SimpleNamespace(execute=AsyncMock(return_value=_BuilderResult()))
+    monkeypatch.setattr(billing, "_asaas_client", provider_factory)
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden_network)
+    monkeypatch.setattr(socket, "socket", forbidden_network)
+    monkeypatch.setattr(httpx, "post", forbidden_network)
 
     with pytest.raises(HTTPException) as exc_info:
-        await billing.create_checkout(_checkout_body(), uuid4(), db)
+        await billing.create_checkout(_checkout_body(), builder_id, db)  # type: ignore[arg-type]
 
     assert exc_info.value.status_code == 503
-    assert exc_info.value.detail == "financial_egress_disabled"
+    assert exc_info.value.detail == "billing_checkout_unavailable"
     assert reader.calls == ["financial_egress_enabled"]
     provider_factory.assert_not_called()
     assert network_calls == []
 
 
 @pytest.mark.asyncio
-async def test_financial_gate_is_independent_from_uazapi_flag(
+async def test_enabled_financial_gate_uses_only_hosted_asaas_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class IndependentFlags:
-        calls: list[str] = []
-
-        async def is_enabled(self, flag_name: str) -> bool:
-            self.calls.append(flag_name)
-            return {"financial_egress_enabled": False, "uazapi_egress_enabled": True}[
-                flag_name
-            ]
-
-    reader = IndependentFlags()
-    provider_factory = MagicMock()
-    monkeypatch.setattr(
-        billing,
-        "require_billing_checkout_rollout",
-        AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr(
-        billing,
-        "require_financial_egress",
-        EgressPolicy(reader).require_financial_egress,
-    )
-    monkeypatch.setattr(billing, "_get_client", provider_factory)
-    monkeypatch.setattr(billing, "_count_active_clinics", AsyncMock(return_value=0))
-    db = SimpleNamespace(execute=AsyncMock(return_value=_BuilderResult()))
-
-    with pytest.raises(HTTPException) as exc_info:
-        await billing.create_checkout(_checkout_body(), uuid4(), db)
-
-    assert exc_info.value.detail == "financial_egress_disabled"
-    assert reader.calls == ["financial_egress_enabled"]
-    provider_factory.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_enabled_financial_gate_preserves_checkout_provider_contract(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    reader = _FlagReader(True)
-    provider = MagicMock()
-    provider.create_pix_charge.return_value = {
-        "qr_code": "pix-code",
-        "qr_code_url": "https://pay.example.invalid/qr",
-        "charge_id": "charge-1",
-    }
-    provider_factory = MagicMock(return_value=provider)
-    monkeypatch.setattr(
-        billing,
-        "require_billing_checkout_rollout",
-        AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr(
-        billing,
-        "require_financial_egress",
-        EgressPolicy(reader).require_financial_egress,
-    )
-    monkeypatch.setattr(billing, "_get_client", provider_factory)
-    monkeypatch.setattr(billing, "_count_active_clinics", AsyncMock(return_value=0))
     builder_id = uuid4()
-    db = SimpleNamespace(execute=AsyncMock(return_value=_BuilderResult()))
-
-    response = await billing.create_checkout(_checkout_body(), builder_id, db)
-
-    assert response.method == "pix"
-    assert response.qr_code == "pix-code"
-    assert response.subscription_id == "charge-1"
-    assert reader.calls == ["financial_egress_enabled"]
-    provider_factory.assert_called_once_with()
-    provider.create_pix_charge.assert_called_once_with(
-        amount_cents=200_000,
-        description="NeuroStack Start - Mensal (PIX)",
-        metadata={
-            "builder_id": str(builder_id),
-            "plan": "start",
-            "cycle": "monthly",
-        },
+    persisted = _checkout(builder_id)
+    db = _Session([None, 0])
+    _install_general_reservation(monkeypatch, persisted)
+    reader = _FlagReader(True)
+    client = SimpleNamespace(
+        create_checkout=AsyncMock(return_value=CheckoutCreated("chk_000000000000001"))
     )
+    factory = MagicMock(return_value=client)
+    monkeypatch.setattr(
+        checkout_module,
+        "require_financial_egress",
+        EgressPolicy(reader).require_financial_egress,
+    )
+    monkeypatch.setattr(billing, "_asaas_client", factory)
+
+    response = await billing.create_checkout(_checkout_body(), builder_id, db)  # type: ignore[arg-type]
+
+    request = client.create_checkout.await_args.args[0]
+    payload = json.loads(request.body())
+    assert response.checkout_url == (
+        "https://asaas.com/checkoutSession/show?id=chk_000000000000001"
+    )
+    assert reader.calls == ["financial_egress_enabled"]
+    assert factory.call_count == 1
+    assert payload["chargeTypes"] == ["RECURRENT"]
+    assert payload["billingTypes"] == ["CREDIT_CARD"]
+    assert payload["subscription"]["cycle"] == "MONTHLY"
+    assert "customer" not in payload
+    assert "amount_cents" not in payload
+    # reservation, pre-POST rollout re-authorization, provider identity
+    assert db.commits == 3
 
 
 class _MissingRolloutRow:
@@ -209,8 +265,7 @@ async def test_missing_rollout_schema_or_row_denies_before_any_egress(
     failure: str,
 ) -> None:
     _configure_asaas(monkeypatch)
-    provider_factory = MagicMock(side_effect=AssertionError("Abacate client reached"))
-    asaas_factory = MagicMock(side_effect=AssertionError("ASAAS client reached"))
+    provider_factory = MagicMock(side_effect=AssertionError("ASAAS client reached"))
     network_calls: list[str] = []
 
     def forbidden_network(*_args: object, **_kwargs: object) -> Any:
@@ -223,19 +278,17 @@ async def test_missing_rollout_schema_or_row_denies_before_any_egress(
         execute = AsyncMock(return_value=_MissingRolloutRow())
     db = SimpleNamespace(execute=execute)
 
-    monkeypatch.setattr(billing, "_get_client", provider_factory)
-    monkeypatch.setattr(billing, "AsaasClient", asaas_factory, raising=False)
+    monkeypatch.setattr(billing, "_asaas_client", provider_factory)
     monkeypatch.setattr(socket, "getaddrinfo", forbidden_network)
     monkeypatch.setattr(socket, "socket", forbidden_network)
     monkeypatch.setattr(httpx, "post", forbidden_network)
 
     with pytest.raises(HTTPException) as exc_info:
-        await billing.create_checkout(_checkout_body(), uuid4(), db)
+        await billing.create_checkout(_checkout_body(), uuid4(), db)  # type: ignore[arg-type]
 
     assert exc_info.value.status_code == 503
     assert exc_info.value.detail == "billing_checkout_unavailable"
     provider_factory.assert_not_called()
-    asaas_factory.assert_not_called()
     assert network_calls == []
     execute.assert_awaited_once()
 
@@ -248,10 +301,10 @@ async def test_incompatible_asaas_configuration_denies_before_database_or_egress
     monkeypatch.setattr(billing.settings, "asaas_webhook_token", SecretStr(""))
     db = SimpleNamespace(execute=AsyncMock())
     provider_factory = MagicMock(side_effect=AssertionError("provider reached"))
-    monkeypatch.setattr(billing, "_get_client", provider_factory)
+    monkeypatch.setattr(billing, "_asaas_client", provider_factory)
 
     with pytest.raises(HTTPException) as exc_info:
-        await billing.create_checkout(_checkout_body(), uuid4(), db)
+        await billing.create_checkout(_checkout_body(), uuid4(), db)  # type: ignore[arg-type]
 
     assert exc_info.value.status_code == 503
     assert exc_info.value.detail == "billing_checkout_unavailable"

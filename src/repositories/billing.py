@@ -8,7 +8,7 @@ from datetime import date, datetime, timezone
 from typing import Final, cast
 from uuid import UUID
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.billing import (
@@ -25,6 +25,8 @@ from src.models.billing import (
     BillingTopupOrder,
     BillingWebhookDelivery,
 )
+from src.models.coupon import Coupon
+from src.models.transaction import Transaction
 
 _ENVIRONMENTS: Final = frozenset({"development", "staging", "production", "test"})
 _ROLLOUT_STATES: Final = frozenset({"disabled", "canary_allowlist", "general"})
@@ -625,3 +627,287 @@ class BillingRepository:
 
         self.session.add_all((order, outbox_event))
         await self.session.flush()
+
+    async def lock_rollout_control(self, *, environment: str) -> BillingRolloutControl:
+        """Serialize checkout eligibility for one environment.
+
+        Takes the same advisory+row lock as every rollout transition and
+        reservation, so eligibility reads, live-session reuse and the insert
+        of a ``creating`` attempt form one serialized decision.
+        """
+
+        return await self._lock_rollout(environment)
+
+    async def reserve_general_subscription_checkout(
+        self,
+        *,
+        environment: str,
+        builder_id: UUID,
+        intent_id: UUID,
+        migration_id: UUID | None,
+        checkout_session_id: UUID,
+        attempt_no: int,
+        catalog_version_id: str,
+        offer_id: str,
+        amount_cents: int,
+        pricing_snapshot: dict[str, object],
+        next_due_date: date,
+    ) -> BillingCheckoutSession:
+        """Insert one ``creating`` subscription attempt under ``general`` rollout.
+
+        ``disabled`` and ``canary_allowlist`` are rejected here; the canary has
+        its own budgeted reservation (``reserve_canary_subscription_checkout``).
+        The caller commits before any provider egress.
+        """
+
+        control = await self._lock_rollout(environment)
+        if control.state != "general":
+            raise BillingTransitionRejected(
+                "subscription checkout requires general rollout"
+            )
+        if migration_id is not None and intent_id != migration_id:
+            raise BillingTransitionRejected("migration attempt must reuse its intent")
+        checkout = BillingCheckoutSession(
+            id=checkout_session_id,
+            builder_id=builder_id,
+            intent_kind="subscription",
+            intent_id=intent_id,
+            migration_id=migration_id,
+            topup_order_id=None,
+            attempt_no=attempt_no,
+            provider="asaas",
+            state="creating",
+            catalog_version_id=catalog_version_id,
+            offer_id=offer_id,
+            amount_cents=amount_cents,
+            pricing_snapshot=pricing_snapshot,
+            canary_environment=None,
+            canary_slot=None,
+            next_due_date=next_due_date,
+        )
+        self.session.add(checkout)
+        await self.session.flush()
+        return checkout
+
+    async def lock_checkout_session(
+        self,
+        *,
+        builder_id: UUID,
+        checkout_session_id: UUID,
+    ) -> BillingCheckoutSession | None:
+        """Row-lock one checkout attempt inside its builder's tenant scope."""
+
+        result = await self.session.execute(
+            select(BillingCheckoutSession)
+            .where(
+                BillingCheckoutSession.id == checkout_session_id,
+                BillingCheckoutSession.builder_id == builder_id,
+            )
+            .with_for_update()
+        )
+        return result.scalar_one_or_none()
+
+    async def authorize_reserved_checkout_egress(
+        self,
+        *,
+        environment: str,
+        builder_id: UUID,
+        checkout_session_id: UUID,
+    ) -> BillingCheckoutSession:
+        """Re-authorize one committed ``creating`` attempt before its POST.
+
+        Takes the rollout advisory and row locks, then the attempt's row lock,
+        and re-applies the reservation's authorization to the current control
+        row: a canary attempt still needs the active canary for its builder
+        and to own its lifetime slot; any other attempt needs ``general`` and,
+        for a top-up, the open gate with a currently valid capability and a
+        still-pending order.  Raises without mutating anything; the caller
+        owns the transaction and must release it before network I/O.
+        """
+
+        control = await self._lock_rollout(environment)
+        checkout = await self.lock_checkout_session(
+            builder_id=builder_id, checkout_session_id=checkout_session_id
+        )
+        if (
+            checkout is None
+            or checkout.state != "creating"
+            or checkout.external_checkout_id is not None
+        ):
+            raise BillingTransitionRejected("checkout attempt is not awaiting egress")
+
+        if checkout.canary_slot is not None:
+            slot_checkout_id = {
+                "subscription": control.canary_subscription_checkout_id,
+                "topup": control.canary_topup_checkout_id,
+            }.get(checkout.canary_slot)
+            if (
+                control.state != "canary_allowlist"
+                or control.canary_builder_id != builder_id
+                or checkout.canary_environment != environment
+                or slot_checkout_id != checkout.id
+            ):
+                raise BillingTransitionRejected(
+                    "canary reservation is no longer authorized"
+                )
+            return checkout
+
+        if control.state != "general":
+            raise BillingTransitionRejected("checkout egress requires general rollout")
+        if checkout.intent_kind == "subscription":
+            return checkout
+        if checkout.intent_kind != "topup" or checkout.topup_order_id is None:
+            raise BillingTransitionRejected("unsupported checkout intent")
+        if (
+            not control.topup_commercial_enabled
+            or control.active_topup_capability_id is None
+        ):
+            raise BillingCapabilityRejected("topup capability is required")
+        capability = await self.session.scalar(
+            select(BillingTopupCapabilityReceipt).where(
+                BillingTopupCapabilityReceipt.environment == environment,
+                BillingTopupCapabilityReceipt.id == control.active_topup_capability_id,
+            )
+        )
+        if capability is None or not _capability_is_valid(
+            capability,
+            environment=environment,
+            now=datetime.now(timezone.utc),
+        ):
+            raise BillingCapabilityRejected("topup capability is not valid")
+        order_state = await self.session.scalar(
+            select(BillingTopupOrder.state).where(
+                BillingTopupOrder.id == checkout.topup_order_id,
+                BillingTopupOrder.builder_id == builder_id,
+            )
+        )
+        if order_state != "pending":
+            raise BillingTransitionRejected("canonical topup order is unavailable")
+        return checkout
+
+    async def consume_checkout_coupon(
+        self,
+        *,
+        builder_id: UUID,
+        transaction_id: UUID,
+    ) -> str | None:
+        """Consume the checkout snapshot's coupon once for a settled session.
+
+        Group 3 calls this in the caller-owned unit that records the settlement
+        ``Transaction`` (``coupon_code`` still NULL). The originating checkout
+        session row is locked first, so concurrent settlements of the same
+        session serialize; only the first Transaction of a session receives the
+        coupon, and the compare-and-set on ``transactions.coupon_code`` makes a
+        replay of the same call a no-op. The coupon counter follows the legacy
+        settlement semantics: ``uses_count + 1`` and deactivation at
+        ``max_uses``, applied atomically in SQL without a read-modify-write.
+        """
+
+        result = await self.session.execute(
+            select(Transaction, BillingCheckoutSession)
+            .join(
+                BillingPaymentEffect,
+                and_(
+                    BillingPaymentEffect.builder_id == Transaction.builder_id,
+                    BillingPaymentEffect.id == Transaction.billing_payment_effect_id,
+                    BillingPaymentEffect.provider == Transaction.provider,
+                    BillingPaymentEffect.payment_id == Transaction.provider_payment_id,
+                ),
+            )
+            .join(
+                BillingPaymentProjection,
+                and_(
+                    BillingPaymentProjection.builder_id
+                    == BillingPaymentEffect.builder_id,
+                    BillingPaymentProjection.id == BillingPaymentEffect.projection_id,
+                    BillingPaymentProjection.provider == BillingPaymentEffect.provider,
+                    BillingPaymentProjection.payment_id
+                    == BillingPaymentEffect.payment_id,
+                ),
+            )
+            .join(
+                BillingCheckoutSession,
+                and_(
+                    BillingCheckoutSession.builder_id
+                    == BillingPaymentProjection.builder_id,
+                    BillingCheckoutSession.id
+                    == BillingPaymentProjection.checkout_session_id,
+                ),
+            )
+            .where(
+                Transaction.id == transaction_id,
+                Transaction.builder_id == builder_id,
+                BillingPaymentEffect.effect_kind == "settlement",
+                BillingPaymentEffect.source_revision == "settlement:v1",
+            )
+        )
+        row = result.one_or_none()
+        if row is None:
+            raise BillingTransitionRejected("settled checkout transaction unavailable")
+        checkout = cast(BillingCheckoutSession, row[1])
+        locked = await self.lock_checkout_session(
+            builder_id=builder_id, checkout_session_id=checkout.id
+        )
+        if locked is None:
+            raise BillingTransitionRejected("settled checkout transaction unavailable")
+        snapshot_coupon = (locked.pricing_snapshot or {}).get("coupon_code")
+        if not isinstance(snapshot_coupon, str) or not snapshot_coupon:
+            return None
+
+        session_transactions = (
+            select(Transaction.id)
+            .join(
+                BillingPaymentEffect,
+                and_(
+                    BillingPaymentEffect.builder_id == Transaction.builder_id,
+                    BillingPaymentEffect.id == Transaction.billing_payment_effect_id,
+                ),
+            )
+            .join(
+                BillingPaymentProjection,
+                and_(
+                    BillingPaymentProjection.builder_id
+                    == BillingPaymentEffect.builder_id,
+                    BillingPaymentProjection.id == BillingPaymentEffect.projection_id,
+                ),
+            )
+            .where(
+                Transaction.builder_id == builder_id,
+                BillingPaymentProjection.checkout_session_id == locked.id,
+                Transaction.coupon_code.is_not(None),
+            )
+            .limit(1)
+        )
+        if (await self.session.execute(session_transactions)).first() is not None:
+            return None
+
+        marked = await self.session.execute(
+            update(Transaction)
+            .where(
+                Transaction.id == transaction_id,
+                Transaction.builder_id == builder_id,
+                Transaction.coupon_code.is_(None),
+            )
+            .values(coupon_code=snapshot_coupon)
+            .returning(Transaction.id)
+        )
+        if marked.first() is None:
+            return None
+        await self.session.execute(
+            update(Coupon)
+            .where(Coupon.code == snapshot_coupon.upper())
+            .values(
+                uses_count=Coupon.uses_count + 1,
+                is_active=case(
+                    (
+                        and_(
+                            Coupon.max_uses.is_not(None),
+                            Coupon.uses_count + 1 >= Coupon.max_uses,
+                        ),
+                        False,
+                    ),
+                    else_=Coupon.is_active,
+                ),
+            )
+        )
+        return snapshot_coupon

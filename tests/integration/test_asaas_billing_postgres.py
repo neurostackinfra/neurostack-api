@@ -4175,3 +4175,665 @@ async def test_rollbacks_leave_no_delivery_effect_or_order_outbox_partial(
             )
             == 0
         )
+
+
+# ===========================================================================
+# Group 2 (ASAAS checkout) additions — fix loop 1.
+#
+# These tests only append to the shared module harness: each seeds its own
+# fresh builder, and the two re-authorization tests run last because they
+# drive the ``development`` and ``production`` controls from the ``general``
+# state the earlier Group 1 tests leave behind (asserted, not assumed).
+# ===========================================================================
+
+
+@dataclass(frozen=True)
+class _CouponCheckout:
+    builder_id: UUID
+    code: str
+    checkout_id: UUID
+    transaction_ids: tuple[UUID, ...]
+
+
+async def _seed_settled_coupon_checkout(
+    harness: _Harness,
+    *,
+    payments: int,
+    max_uses: int | None,
+    uses_count: int,
+) -> _CouponCheckout:
+    """Seed one completed coupon checkout and ``payments`` settled transactions.
+
+    The pricing snapshot is produced by the Group 2 service function, so the
+    real ``billing_checkout_sessions`` CHECKs also validate its coupon shape.
+    """
+
+    from src.services.billing_catalog import BILLING_CATALOG
+    from src.services.billing_checkout import subscription_pricing_snapshot
+
+    builder_id = uuid4()
+    subscription_id = uuid4()
+    checkout_id = uuid4()
+    code = f"G2C{uuid4().hex[:10].upper()}"
+    snapshot = subscription_pricing_snapshot(
+        BILLING_CATALOG["plan_plus_monthly_v1"],
+        active_clinics=1,
+        coupon_code=code,
+        coupon_discount_percent=10,
+    )
+    amount = snapshot["amount_cents"]
+    assert amount == 99_900 - 99_900 * 10 // 100 == 89_910
+    transaction_ids: list[UUID] = []
+    async with harness.session() as session:
+        async with session.begin():
+            await session.execute(
+                text("INSERT INTO builders (id, name) VALUES (:id, 'G2 Coupon')"),
+                {"id": builder_id},
+            )
+            await session.execute(
+                text("""
+                    INSERT INTO coupons (
+                        id, code, discount_percent, max_uses, uses_count,
+                        is_active
+                    ) VALUES (:id, :code, 10, :max_uses, :uses_count, true)
+                """),
+                {
+                    "id": uuid4(),
+                    "code": code,
+                    "max_uses": max_uses,
+                    "uses_count": uses_count,
+                },
+            )
+            await session.execute(
+                text("""
+                    INSERT INTO billing_subscriptions (
+                        id, builder_id, provider, external_subscription_id,
+                        is_active, plan, billing_cycle, catalog_version_id,
+                        offer_id, amount_cents, status, roster_revision
+                    ) VALUES (
+                        :id, :builder_id, 'asaas', :external_id, true, 'plus',
+                        'monthly', 'payment-2026-10-03',
+                        'plan_plus_monthly_v1', :amount, 'active', 1
+                    )
+                """),
+                {
+                    "id": subscription_id,
+                    "builder_id": builder_id,
+                    "external_id": f"g2-sub-{subscription_id}",
+                    "amount": amount,
+                },
+            )
+            await session.execute(
+                text("""
+                    INSERT INTO billing_checkout_sessions (
+                        id, builder_id, intent_kind, intent_id, attempt_no,
+                        provider, state, catalog_version_id, offer_id,
+                        amount_cents, pricing_snapshot, next_due_date
+                    ) VALUES (
+                        :id, :builder_id, 'subscription', :intent_id, 1,
+                        'asaas', 'completed', 'payment-2026-10-03',
+                        'plan_plus_monthly_v1', :amount,
+                        CAST(:snapshot AS jsonb), DATE '2026-10-11'
+                    )
+                """),
+                {
+                    "id": checkout_id,
+                    "builder_id": builder_id,
+                    "intent_id": subscription_id,
+                    "amount": amount,
+                    "snapshot": json.dumps(snapshot),
+                },
+            )
+            for index in range(payments):
+                delivery_id = uuid4()
+                projection_id = uuid4()
+                effect_id = uuid4()
+                transaction_id = uuid4()
+                payment_id = f"g2-pay-{checkout_id.hex[:12]}-{index}"
+                await session.execute(
+                    text("""
+                        INSERT INTO billing_webhook_deliveries (
+                            id, builder_id, provider, event_id, event_name,
+                            provider_created_at, body_bytes, body_sha256
+                        ) VALUES (
+                            :id, :builder_id, 'asaas', :event_id,
+                            'PAYMENT_CONFIRMED', now(), 2, :sha
+                        )
+                    """),
+                    {
+                        "id": delivery_id,
+                        "builder_id": builder_id,
+                        "event_id": f"g2-event-{effect_id}",
+                        "sha": "c" * 64,
+                    },
+                )
+                await session.execute(
+                    text("""
+                        INSERT INTO billing_payment_projections (
+                            id, builder_id, provider, payment_id,
+                            aggregate_kind, subscription_id,
+                            checkout_session_id, status, amount_cents,
+                            settled_cents, provider_created_at, ordering_key,
+                            last_event_id
+                        ) VALUES (
+                            :id, :builder_id, 'asaas', :payment_id,
+                            'subscription', :subscription_id, :checkout_id,
+                            'settled', :amount, :amount, now(), :ordering_key,
+                            :last_event_id
+                        )
+                    """),
+                    {
+                        "id": projection_id,
+                        "builder_id": builder_id,
+                        "payment_id": payment_id,
+                        "subscription_id": subscription_id,
+                        "checkout_id": checkout_id,
+                        "amount": amount,
+                        "ordering_key": f"g2-order-{effect_id}",
+                        "last_event_id": f"g2-event-{effect_id}",
+                    },
+                )
+                await session.execute(
+                    text("""
+                        INSERT INTO billing_payment_effects (
+                            id, builder_id, projection_id, delivery_id,
+                            provider, payment_id, effect_kind, source_revision,
+                            amount_cents
+                        ) VALUES (
+                            :id, :builder_id, :projection_id, :delivery_id,
+                            'asaas', :payment_id, 'settlement', 'settlement:v1',
+                            :amount
+                        )
+                    """),
+                    {
+                        "id": effect_id,
+                        "builder_id": builder_id,
+                        "projection_id": projection_id,
+                        "delivery_id": delivery_id,
+                        "payment_id": payment_id,
+                        "amount": amount,
+                    },
+                )
+                await session.execute(
+                    text("""
+                        INSERT INTO transactions (
+                            id, builder_id, builder_name, amount_cents, method,
+                            cycle, plan, event_type, provider,
+                            provider_payment_id, billing_payment_effect_id
+                        ) VALUES (
+                            :id, :builder_id, 'G2 Coupon', :amount,
+                            'credit_card', 'monthly', 'plus', 'paid', 'asaas',
+                            :payment_id, :effect_id
+                        )
+                    """),
+                    {
+                        "id": transaction_id,
+                        "builder_id": builder_id,
+                        "amount": amount,
+                        "payment_id": payment_id,
+                        "effect_id": effect_id,
+                    },
+                )
+                transaction_ids.append(transaction_id)
+    return _CouponCheckout(
+        builder_id=builder_id,
+        code=code,
+        checkout_id=checkout_id,
+        transaction_ids=tuple(transaction_ids),
+    )
+
+
+async def _coupon_state(
+    harness: _Harness, seeded: _CouponCheckout
+) -> tuple[int, bool, list[str | None]]:
+    async with harness.session() as session:
+        coupon = (
+            await session.execute(
+                text("SELECT uses_count, is_active FROM coupons WHERE code = :code"),
+                {"code": seeded.code},
+            )
+        ).one()
+        codes = [
+            (
+                await session.scalar(
+                    text("SELECT coupon_code FROM transactions WHERE id = :id"),
+                    {"id": transaction_id},
+                )
+            )
+            for transaction_id in seeded.transaction_ids
+        ]
+    return int(coupon[0]), bool(coupon[1]), codes
+
+
+async def test_g2_checkout_coupon_consumption_serializes_on_the_checkout_row(
+    postgres_harness: _Harness,
+) -> None:
+    seeded = await _seed_settled_coupon_checkout(
+        postgres_harness, payments=2, max_uses=2, uses_count=1
+    )
+    first = postgres_harness.session()
+    second = postgres_harness.session()
+    replay = postgres_harness.session()
+
+    async def consume(session: AsyncSession, transaction_id: UUID) -> str | None:
+        try:
+            async with session.begin():
+                return await BillingRepository(session).consume_checkout_coupon(
+                    builder_id=seeded.builder_id, transaction_id=transaction_id
+                )
+        finally:
+            await session.close()
+
+    try:
+        await first.begin()
+        consumed = await BillingRepository(first).consume_checkout_coupon(
+            builder_id=seeded.builder_id,
+            transaction_id=seeded.transaction_ids[0],
+        )
+        assert consumed == seeded.code
+        # Another settled payment of the same checkout and a replay of the same
+        # transaction must both wait on the locked checkout row.
+        other_payment = asyncio.create_task(consume(second, seeded.transaction_ids[1]))
+        same_payment = asyncio.create_task(consume(replay, seeded.transaction_ids[0]))
+        done, _ = await asyncio.wait({other_payment, same_payment}, timeout=0.3)
+        assert not done, "concurrent coupon consumers did not wait on the lock"
+        await first.commit()
+        assert await other_payment is None
+        assert await same_payment is None
+    finally:
+        if first.in_transaction():
+            await first.rollback()
+        await first.close()
+
+    uses_count, is_active, codes = await _coupon_state(postgres_harness, seeded)
+    assert uses_count == 2
+    assert is_active is False  # deactivated on reaching max_uses
+    assert codes == [seeded.code, None]
+
+    # Sequential replay after commit is still a no-op.
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            assert (
+                await BillingRepository(session).consume_checkout_coupon(
+                    builder_id=seeded.builder_id,
+                    transaction_id=seeded.transaction_ids[0],
+                )
+                is None
+            )
+    assert await _coupon_state(postgres_harness, seeded) == (
+        2,
+        False,
+        [seeded.code, None],
+    )
+
+    # Tenant scope and settlement provenance are mandatory.
+    for builder_id, transaction_id in (
+        (postgres_harness.foreign_builder_id, seeded.transaction_ids[1]),
+        (postgres_harness.builder_id, postgres_harness.legacy_transaction_id),
+    ):
+        async with postgres_harness.session() as session:
+            with pytest.raises(
+                BillingTransitionRejected,
+                match="^settled checkout transaction unavailable$",
+            ):
+                async with session.begin():
+                    await BillingRepository(session).consume_checkout_coupon(
+                        builder_id=builder_id, transaction_id=transaction_id
+                    )
+    assert await _coupon_state(postgres_harness, seeded) == (
+        2,
+        False,
+        [seeded.code, None],
+    )
+
+
+async def test_g2_checkout_coupon_is_consumed_exactly_once_by_a_concurrent_storm(
+    postgres_harness: _Harness,
+) -> None:
+    seeded = await _seed_settled_coupon_checkout(
+        postgres_harness, payments=3, max_uses=None, uses_count=0
+    )
+    start = asyncio.Event()
+
+    async def consume(transaction_id: UUID) -> str | None:
+        async with postgres_harness.session() as session:
+            await start.wait()
+            async with session.begin():
+                return await BillingRepository(session).consume_checkout_coupon(
+                    builder_id=seeded.builder_id, transaction_id=transaction_id
+                )
+
+    tasks = [
+        asyncio.create_task(consume(transaction_id))
+        for transaction_id in seeded.transaction_ids * 2
+    ]
+    await asyncio.sleep(0)
+    start.set()
+    results = await asyncio.gather(*tasks)
+
+    assert sorted(result or "" for result in results) == [""] * 5 + [seeded.code]
+    uses_count, is_active, codes = await _coupon_state(postgres_harness, seeded)
+    assert uses_count == 1
+    assert is_active is True  # unlimited coupon stays active
+    assert sorted(code or "" for code in codes) == ["", "", seeded.code]
+
+
+async def _ensure_general_rollout(harness: _Harness, environment: str) -> int:
+    """Drive ``environment`` to ``general`` through legal transitions.
+
+    In the full module run the Group 1 tests already left it ``general``; when
+    these tests run alone the control is freshly ``disabled``.  The harness
+    builder is the canary builder because any lifetime slot belongs to it.
+    """
+
+    # One transition per transaction: each receipt must match the committed
+    # final control state (deferred Group 1 receipt trigger).
+    for _ in range(3):
+        async with harness.session() as session:
+            async with session.begin():
+                repository = BillingRepository(session)
+                control = await repository.lock_rollout_control(environment=environment)
+                if control.state == "general":
+                    return int(control.rollout_revision)
+                await repository.transition_rollout(
+                    environment=environment,
+                    expected_revision=control.rollout_revision,
+                    to_state=(
+                        "canary_allowlist" if control.state == "disabled" else "general"
+                    ),
+                    canary_builder_id=(
+                        harness.builder_id if control.state == "disabled" else None
+                    ),
+                    evidence=_evidence(),
+                )
+    raise AssertionError(f"{environment} rollout did not reach general")
+
+
+async def test_g2_prepost_recheck_denies_disabled_rollout_and_failed_frees_intent(
+    postgres_harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from src.services import billing_checkout as checkout_module
+    from src.services.billing_checkout import (
+        BillingCheckoutService,
+        CheckoutUnavailable,
+    )
+
+    revision = await _ensure_general_rollout(postgres_harness, "development")
+
+    builder_id = uuid4()
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            await session.execute(
+                text("INSERT INTO builders (id, name) VALUES (:id, 'G2 Recheck')"),
+                {"id": builder_id},
+            )
+
+    monkeypatch.setattr(checkout_module.settings, "environment", "development")
+    monkeypatch.setattr(
+        checkout_module.settings,
+        "asaas_checkout_return_url",
+        "https://app.example.test/billing",
+    )
+    monkeypatch.setattr(
+        checkout_module, "require_billing_checkout_rollout", AsyncMock()
+    )
+    monkeypatch.setattr(
+        checkout_module, "authorize_creation_egress", AsyncMock(return_value=object())
+    )
+    original = BillingCheckoutService._reauthorize_before_post
+    reserved: list[UUID] = []
+
+    async def disable_then_recheck(
+        self: BillingCheckoutService, *, builder_id: UUID, checkout_session_id: UUID
+    ) -> None:
+        reserved.append(checkout_session_id)
+        # A concurrent operator disables rollout after the reservation commit.
+        async with postgres_harness.session() as operator:
+            async with operator.begin():
+                await BillingRepository(operator).transition_rollout(
+                    environment="development",
+                    expected_revision=revision,
+                    to_state="disabled",
+                    evidence=_evidence(),
+                )
+        await original(
+            self, builder_id=builder_id, checkout_session_id=checkout_session_id
+        )
+
+    monkeypatch.setattr(
+        BillingCheckoutService, "_reauthorize_before_post", disable_then_recheck
+    )
+    posts: list[object] = []
+
+    class Client:
+        async def create_checkout(self, request: object, *, permit: object) -> None:
+            posts.append(request)
+            raise AssertionError("provider POST after a disabled rollout")
+
+    async with postgres_harness.session() as session:
+        with pytest.raises(CheckoutUnavailable):
+            await BillingCheckoutService(
+                session,
+                client_factory=Client,
+                clock=lambda: datetime(2026, 10, 12, 2, 59, 59, tzinfo=timezone.utc),
+            ).create_checkout(
+                builder_id=builder_id,
+                offer_id="plan_plus_monthly_v1",
+                payment_method="credit_card",
+            )
+
+    assert posts == []
+    assert len(reserved) == 1
+    async with postgres_harness.session() as session:
+        row = (
+            await session.execute(
+                text("""
+                    SELECT state, reconciliation_attempts, external_checkout_id,
+                           intent_id, next_due_date
+                    FROM billing_checkout_sessions WHERE id = :id
+                """),
+                {"id": reserved[0]},
+            )
+        ).one()
+    assert tuple(row[:3]) == ("failed", 0, None)
+    assert row[4] == date(2026, 10, 11)  # São Paulo date of 02:59:59Z
+
+    # The repository re-check itself denies with its pinned guard message.
+    async with postgres_harness.session() as session:
+        await session.execute(
+            text("""
+                INSERT INTO billing_checkout_sessions (
+                    id, builder_id, intent_kind, intent_id, attempt_no,
+                    provider, state, catalog_version_id, offer_id,
+                    amount_cents, pricing_snapshot, next_due_date
+                )
+                SELECT :id, builder_id, intent_kind, intent_id, 2, provider,
+                       'creating', catalog_version_id, offer_id, amount_cents,
+                       pricing_snapshot, next_due_date
+                FROM billing_checkout_sessions WHERE id = :source_id
+            """),
+            {"id": uuid4(), "source_id": reserved[0]},
+        )
+        # ^ the failed attempt no longer occupies the live-intent index: a
+        # new live attempt for the very same intent is admitted.
+        retry_id = await session.scalar(
+            text("""
+                SELECT id FROM billing_checkout_sessions
+                WHERE intent_id = :intent_id AND attempt_no = 2
+            """),
+            {"intent_id": row[3]},
+        )
+        with pytest.raises(
+            BillingTransitionRejected,
+            match="^checkout egress requires general rollout$",
+        ):
+            await BillingRepository(session).authorize_reserved_checkout_egress(
+                environment="development",
+                builder_id=builder_id,
+                checkout_session_id=retry_id,
+            )
+        await session.rollback()
+    async with postgres_harness.session() as session:
+        with pytest.raises(
+            BillingTransitionRejected,
+            match="^checkout attempt is not awaiting egress$",
+        ):
+            await BillingRepository(session).authorize_reserved_checkout_egress(
+                environment="development",
+                builder_id=builder_id,
+                checkout_session_id=reserved[0],
+            )
+        await session.rollback()
+
+
+async def test_g2_prepost_recheck_reads_topup_gate_capability_and_order(
+    postgres_harness: _Harness,
+) -> None:
+    from src.services.billing_checkout import BillingCheckoutService
+
+    await _ensure_general_rollout(postgres_harness, "production")
+    async with postgres_harness.session() as session:
+        topup_revision, gate = (await session.execute(text("""
+                    SELECT topup_revision, topup_commercial_enabled
+                    FROM billing_rollout_control
+                    WHERE environment = 'production'
+                """))).one()
+    assert gate is False, "the production top-up gate starts closed"
+
+    builder_id = uuid4()
+    order_id = uuid4()
+    checkout_id = uuid4()
+    capability_id = uuid4()
+    now = datetime.now(timezone.utc)
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            await session.execute(
+                text("INSERT INTO builders (id, name) VALUES (:id, 'G2 Topup')"),
+                {"id": builder_id},
+            )
+            await session.execute(
+                text("""
+                    INSERT INTO billing_topup_capability_receipts (
+                        id, environment, schema_version, request_id,
+                        credit_deployment_digest, billing_fact_schema_digest,
+                        producer_compatibility_digest,
+                        consumer_compatibility_digest, inbox_high_watermark,
+                        reconciliation_receipt_id, approved_by, approved_at,
+                        expires_at, reconciliation_complete, readback_complete,
+                        has_open_gap, has_backlog, has_alert
+                    ) VALUES (
+                        :id, 'production', 'credit_capability_ready.v1',
+                        :request_id, 'credit-image-sha256', :digest, :digest,
+                        :digest, 0, :reconciliation_id, :approved_by,
+                        :approved_at, :expires_at, true, true, false, false,
+                        false
+                    )
+                """),
+                {
+                    "id": capability_id,
+                    "request_id": uuid4(),
+                    "digest": "f" * 64,
+                    "reconciliation_id": uuid4(),
+                    "approved_by": uuid4(),
+                    "approved_at": now - timedelta(minutes=1),
+                    "expires_at": now + timedelta(hours=2),
+                },
+            )
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            await BillingRepository(session).set_topup_commercial_enabled(
+                environment="production",
+                expected_revision=topup_revision,
+                enabled=True,
+                evidence=_evidence(),
+                capability_receipt_id=capability_id,
+            )
+            await session.execute(
+                text("""
+                    INSERT INTO billing_topup_orders (
+                        id, builder_id, payment_method, catalog_version_id,
+                        offer_id, amount_cents, credit_grant_mc,
+                        pricing_snapshot
+                    ) VALUES (
+                        :id, :builder_id, 'pix', 'payment-2026-10-03',
+                        'package_credits_1000_v1', 20000, 1000,
+                        CAST(:snapshot AS jsonb)
+                    )
+                """),
+                {
+                    "id": order_id,
+                    "builder_id": builder_id,
+                    "snapshot": (
+                        '{"catalog_version_id":"payment-2026-10-03",'
+                        '"offer_id":"package_credits_1000_v1",'
+                        '"amount_cents":20000,"credit_grant_mc":1000,'
+                        '"payment_method":"pix"}'
+                    ),
+                },
+            )
+            await BillingRepository(session).authorize_and_reserve_topup_checkout(
+                environment="production",
+                builder_id=builder_id,
+                topup_order_id=order_id,
+                checkout_session_id=checkout_id,
+            )
+
+    # Open gate + valid capability + pending order: authorized (real SQL).
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            authorized = await BillingRepository(
+                session
+            ).authorize_reserved_checkout_egress(
+                environment="production",
+                builder_id=builder_id,
+                checkout_session_id=checkout_id,
+            )
+            assert authorized.id == checkout_id
+            assert authorized.state == "creating"
+        # A foreign builder never sees the attempt.
+        with pytest.raises(
+            BillingTransitionRejected,
+            match="^checkout attempt is not awaiting egress$",
+        ):
+            async with session.begin():
+                await BillingRepository(session).authorize_reserved_checkout_egress(
+                    environment="production",
+                    builder_id=postgres_harness.foreign_builder_id,
+                    checkout_session_id=checkout_id,
+                )
+
+    # The gate closes after the reservation commit: the re-check denies.
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            await BillingRepository(session).set_topup_commercial_enabled(
+                environment="production",
+                expected_revision=topup_revision + 1,
+                enabled=False,
+                evidence=_evidence(),
+            )
+    async with postgres_harness.session() as session:
+        with pytest.raises(
+            BillingCapabilityRejected,
+            match="^topup capability is required$",
+        ):
+            async with session.begin():
+                await BillingRepository(session).authorize_reserved_checkout_egress(
+                    environment="production",
+                    builder_id=builder_id,
+                    checkout_session_id=checkout_id,
+                )
+        # The never-sent attempt ends conclusively and legally as ``failed``.
+        await BillingCheckoutService(
+            session, client_factory=lambda: None  # type: ignore[arg-type,return-value]
+        )._mark_failed_not_sent(builder_id=builder_id, checkout_session_id=checkout_id)
+    async with postgres_harness.session() as session:
+        assert (
+            await session.scalar(
+                text("SELECT state FROM billing_checkout_sessions WHERE id = :id"),
+                {"id": checkout_id},
+            )
+            == "failed"
+        )

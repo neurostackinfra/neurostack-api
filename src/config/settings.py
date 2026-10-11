@@ -47,6 +47,34 @@ def _is_loopback_http_origin(value: str) -> bool:
         return False
 
 
+def _is_plain_https_page_url(value: str) -> bool:
+    """Return whether a URL is an absolute HTTPS page with no hidden parts."""
+
+    if (
+        len(value) > 500
+        or not value.isascii()
+        or any(ord(character) <= 32 or ord(character) == 127 for character in value)
+    ):
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or "?" in value
+        or "#" in value
+    ):
+        return False
+    return port is None or 1 <= port <= 65535
+
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
@@ -235,6 +263,23 @@ class Settings(BaseSettings):
     asaas_api_key: SecretStr = SecretStr("")
     asaas_webhook_token: SecretStr = SecretStr("")
     asaas_user_agent: str = ASAAS_DEFAULT_USER_AGENT
+    # Browser return page for hosted Checkout callbacks. Navigation only: it
+    # never changes financial state. Empty keeps checkout creation unavailable.
+    asaas_checkout_return_url: str = ""
+
+    @field_validator("asaas_checkout_return_url")
+    @classmethod
+    def validate_asaas_checkout_return_url(cls, value: str) -> str:
+        """Accept only an absent value or a plain absolute HTTPS page URL."""
+
+        if not value:
+            return value
+        if not _is_plain_https_page_url(value):
+            raise ValueError(
+                "ASAAS_CHECKOUT_RETURN_URL must be an absolute HTTPS URL without "
+                "userinfo, query, or fragment"
+            )
+        return value
 
     @field_validator("asaas_api_key")
     @classmethod

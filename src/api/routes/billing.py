@@ -1,6 +1,6 @@
 """
 NeuroStack API - Billing Endpoints
-Plan summary, checkout (AbacatePay), webhook handler, and coupon validation.
+Plan summary, hosted ASAAS checkout, legacy webhook handler, and coupon validation.
 """
 
 from dataclasses import dataclass
@@ -28,19 +28,19 @@ from src.models.transaction import Transaction
 from src.repositories import get_db_session_dependency
 from src.repositories.billing import billing_roster_advisory_key
 from src.services.abacatepay import AbacatePayClient
-from src.services.billing_rollout import (
-    BILLING_CHECKOUT_UNAVAILABLE,
-    BillingCheckoutUnavailable,
-    require_billing_checkout_rollout,
+from src.services.asaas import AsaasClient
+from src.services.billing_checkout import (
+    BillingCheckoutService,
+    CheckoutCouponRejected,
+    CheckoutCreationRejected,
+    CheckoutInputRejected,
+    CheckoutNotFound,
+    CheckoutReconciliationRequired,
+    CheckoutUnavailable,
 )
 from src.services.billing_usage_service import (
     PlanUsageLimits,
     get_builder_billing_usage,
-)
-from src.services.egress_policy import (
-    FINANCIAL_EGRESS_DISABLED,
-    EgressDisabledError,
-    require_financial_egress,
 )
 
 logger = get_logger(__name__)
@@ -53,10 +53,12 @@ FREE_TIER = 2
 ANNUAL_DISCOUNT_PCT = 15
 
 
-def _get_client() -> AbacatePayClient:
-    return AbacatePayClient(
-        api_key=settings.abacatepay_api_key.get_secret_value(),
-        env=settings.environment,
+def _asaas_client() -> AsaasClient:
+    """Build the only client permitted on the new hosted-checkout path."""
+
+    return AsaasClient(
+        api_key=settings.asaas_api_key,
+        user_agent=settings.asaas_user_agent,
     )
 
 
@@ -290,98 +292,96 @@ async def create_checkout(
     builder_id: UUID = Depends(require_builder),
     db: AsyncSession = Depends(get_db_session_dependency),
 ) -> CheckoutResponse:
+    """Start a provider-hosted checkout from server-owned commercial state."""
+
+    service = BillingCheckoutService(db, client_factory=_asaas_client)
     try:
-        await require_billing_checkout_rollout(db, builder_id)
-    except BillingCheckoutUnavailable as exc:
+        checkout = await service.create_checkout(
+            builder_id=builder_id,
+            offer_id=body.offer_id,
+            payment_method=body.method,
+            coupon_code=body.coupon_code,
+        )
+    except CheckoutInputRejected as exc:
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    except CheckoutCouponRejected as exc:
+        # One fixed 400 for absent/inactive/expired/exhausted (no enumeration),
+        # matching the legacy coupon route's 400 family.
+        raise HTTPException(status_code=400, detail=exc.code) from exc
+    except CheckoutUnavailable as exc:
         raise HTTPException(
             status_code=503,
-            detail=BILLING_CHECKOUT_UNAVAILABLE,
+            detail=exc.code,
         ) from exc
-
-    result = await db.execute(select(Builder).where(Builder.id == builder_id))
-    builder = result.scalar_one_or_none()
-    if not builder:
-        raise HTTPException(status_code=404, detail="Builder not found")
-
-    active_clinics = await _count_active_clinics(builder_id, db)
-    pricing = _calc_pricing(active_clinics)
-
-    if body.cycle == "monthly":
-        amount = pricing["total_monthly"]
-    else:
-        amount = pricing["total_annual"]
-
-    coupon_code_used: str | None = None
-    if body.coupon_code:
-        coupon = await _validate_coupon(body.coupon_code, db)
-        discount_factor = 1 - coupon.discount_percent / 100
-        amount = int(amount * discount_factor)
-        coupon_code_used = coupon.code
-
-    amount_cents = amount * 100
-    try:
-        await require_financial_egress()
-    except EgressDisabledError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=FINANCIAL_EGRESS_DISABLED,
-        ) from exc
-    client = _get_client()
-
-    metadata = {
-        "builder_id": str(builder_id),
-        "plan": body.plan,
-        "cycle": body.cycle,
-    }
-    if coupon_code_used:
-        metadata["coupon_code"] = coupon_code_used
-
-    frequency = "MONTHLY" if body.cycle == "monthly" else "YEARLY"
-
-    if body.method == "pix" and body.cycle == "monthly":
-        # PIX gera QR code para o primeiro ciclo; AbacatePay envia cobranças mensais
-        result_pay = client.create_pix_charge(
-            amount_cents=amount_cents,
-            description="NeuroStack Start - Mensal (PIX)",
-            metadata=metadata,
-        )
-        return CheckoutResponse(
-            method="pix",
-            qr_code=result_pay["qr_code"],
-            qr_code_url=result_pay.get("qr_code_url"),
-            subscription_id=result_pay.get("charge_id"),
-        )
-
-    if body.method == "pix" and body.cycle == "annual":
-        result_pay = client.create_pix_charge(
-            amount_cents=amount_cents,
-            description="NeuroStack Start - Anual (PIX)",
-            metadata=metadata,
-        )
-        return CheckoutResponse(
-            method="pix",
-            qr_code=result_pay["qr_code"],
-            qr_code_url=result_pay["qr_code_url"],
-            subscription_id=result_pay.get("charge_id"),
-        )
-
-    max_installments = None
-    if body.cycle == "annual":
-        max_installments = body.installments or 12
-
-    result_pay = client.create_subscription(
-        amount_cents=amount_cents,
-        frequency=frequency,
-        method="CREDIT_CARD",
-        description=f"NeuroStack Start - {'Mensal' if body.cycle == 'monthly' else 'Anual'} (Cartão)",
-        customer={"name": builder.name},
-        metadata=metadata,
-        max_installments=max_installments,
-    )
+    except CheckoutCreationRejected as exc:
+        raise HTTPException(status_code=502, detail=exc.code) from exc
+    except CheckoutReconciliationRequired as exc:
+        raise HTTPException(status_code=202, detail=exc.code) from exc
     return CheckoutResponse(
-        method="card",
-        payment_url=result_pay["subscription_url"],
-        subscription_id=result_pay["subscription_id"],
+        checkout_session_id=str(checkout.checkout_session_id),
+        kind=checkout.kind,
+        state=checkout.state,
+        checkout_url=checkout.checkout_url,
+    )
+
+
+@router.get(
+    "/checkout/{checkout_session_id}",
+    summary="Get Hosted Checkout",
+    response_model=CheckoutResponse,
+)
+async def get_checkout(
+    checkout_session_id: UUID,
+    builder_id: UUID = Depends(require_builder),
+    db: AsyncSession = Depends(get_db_session_dependency),
+) -> CheckoutResponse:
+    """Return only the caller's session; foreign IDs are indistinguishable 404s."""
+
+    try:
+        checkout = await BillingCheckoutService(
+            db, client_factory=_asaas_client
+        ).get_checkout(
+            builder_id=builder_id,
+            checkout_session_id=checkout_session_id,
+        )
+    except CheckoutNotFound as exc:
+        raise HTTPException(status_code=404, detail="Checkout not found") from exc
+    return CheckoutResponse(
+        checkout_session_id=str(checkout.checkout_session_id),
+        kind=checkout.kind,
+        state=checkout.state,
+        checkout_url=checkout.checkout_url,
+    )
+
+
+@router.post(
+    "/checkout/{checkout_session_id}/reconcile",
+    summary="Reconcile Hosted Checkout",
+    response_model=CheckoutResponse,
+)
+async def reconcile_checkout(
+    checkout_session_id: UUID,
+    builder_id: UUID = Depends(require_builder),
+    db: AsyncSession = Depends(get_db_session_dependency),
+) -> CheckoutResponse:
+    """Read provider evidence by the session UUID; this endpoint never creates."""
+
+    try:
+        checkout = await BillingCheckoutService(
+            db, client_factory=_asaas_client
+        ).reconcile_checkout(
+            builder_id=builder_id,
+            checkout_session_id=checkout_session_id,
+        )
+    except CheckoutNotFound as exc:
+        raise HTTPException(status_code=404, detail="Checkout not found") from exc
+    except CheckoutReconciliationRequired as exc:
+        raise HTTPException(status_code=202, detail=exc.code) from exc
+    return CheckoutResponse(
+        checkout_session_id=str(checkout.checkout_session_id),
+        kind=checkout.kind,
+        state=checkout.state,
+        checkout_url=checkout.checkout_url,
     )
 
 
