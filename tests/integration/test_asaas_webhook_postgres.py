@@ -1812,3 +1812,350 @@ async def test_subscription_with_additional_clinics_settles_its_snapshot_amount(
         b=builder_id,
     )
     assert tuple(tx) == (139_900, "plus")
+
+
+# ---------------------------------------------------------------------------
+# Fix loop 2: MEDIUM-A (restoration by cumulative cents) and MEDIUM-B
+# (service-path holes).  Documented event ids, services only.
+# ---------------------------------------------------------------------------
+
+
+async def test_restoration_survives_an_absent_value_event_on_postgres(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder_id, _session, checkout_id = await _topup(harness, monkeypatch, "M-A")
+    payment = "pay_pg_ma"
+    await _deliver(
+        harness, _payment("PAYMENT_CONFIRMED", payment, checkout=checkout_id), "test"
+    )
+    await _deliver(
+        harness, _payment("PAYMENT_REFUNDED", payment, checkout=checkout_id), "test"
+    )
+    absent = _payment("PAYMENT_RECEIVED", payment, checkout=checkout_id)
+    absent["payment"]["value"] = None
+    assert (await _deliver(harness, absent, "test")).outcome == "readback_required"
+    assert (
+        await _scalar(
+            harness,
+            "SELECT status FROM billing_payment_projections WHERE payment_id = :p",
+            p=payment,
+        )
+        == "reversed"
+    )
+    # A status-only event legitimately relabels the row; the reversed money is
+    # still in the cumulative columns, which is what restoration reads.
+    await _deliver(
+        harness,
+        _payment("PAYMENT_CHARGEBACK_REQUESTED", payment, checkout=checkout_id),
+        "test",
+    )
+    assert (
+        await _scalar(
+            harness,
+            "SELECT status FROM billing_payment_projections WHERE payment_id = :p",
+            p=payment,
+        )
+        == "chargeback_requested"
+    )
+    denied = await _deliver(
+        harness,
+        _payment("PAYMENT_REFUND_DENIED", payment, checkout=checkout_id),
+        "test",
+    )
+    reads = _Reads(payments={payment: _read(payment, "RECEIVED", 10_000, refunded=0)})
+
+    async def restorations() -> list[tuple[Any, ...]]:
+        rows = await _all(
+            harness,
+            "SELECT source_revision, amount_cents FROM billing_payment_effects "
+            "WHERE payment_id = :p AND effect_kind = 'restoration'",
+            p=payment,
+        )
+        return [tuple(r) for r in rows]
+
+    for _replay in range(2):
+        async with harness.session() as session:
+            await BillingReadbackService(
+                session, client_factory=reads, environment="test"
+            ).readback_payment(payment, delivery_id=denied.delivery_id)
+        # The FIRST exact read restores; a replay never duplicates it.
+        assert await restorations() == [("restoration_epoch:1", 10_000)]
+    (row,) = await _all(
+        harness,
+        "SELECT p.status, p.restored_cents, o.state, o.restored_cents "
+        "FROM billing_payment_projections p JOIN billing_topup_orders o "
+        "ON o.id = p.topup_order_id WHERE p.payment_id = :p",
+        p=payment,
+    )
+    assert tuple(row) == ("restored", 10_000, "restored", 10_000)
+    del builder_id
+
+
+async def test_payment_first_handoff_and_settlement_commit_as_one_transaction(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with harness.session() as session:
+        session.add(Coupon(code="PGFIRST", discount_percent=10, uses_count=0))
+        await session.commit()
+    builder_id, session_id, checkout_id, cents = await _subscription(
+        harness, monkeypatch, "payment-first", coupon="PGFIRST"
+    )
+    confirmed = _payment(
+        "PAYMENT_CONFIRMED",
+        "pay_pg_first",
+        checkout=checkout_id,
+        subscription="sub_pg_first",
+        value=_brl(cents),
+    )
+
+    async def failing_hook(self: Any, effect: Any, projection: Any) -> None:
+        raise RuntimeError("injected after handoff, effect and Transaction")
+
+    original = _FinancialState._financial_fact_hook
+    monkeypatch.setattr(_FinancialState, "_financial_fact_hook", failing_hook)
+    with pytest.raises(WebhookProcessingUnavailable):
+        await _deliver(harness, confirmed, "test")
+    monkeypatch.setattr(_FinancialState, "_financial_fact_hook", original)
+    (nothing,) = await _all(
+        harness,
+        "SELECT (SELECT count(*) FROM billing_subscriptions WHERE builder_id = :b), "
+        "(SELECT state FROM billing_checkout_sessions WHERE id = :s), "
+        "(SELECT count(*) FROM billing_payment_effects WHERE builder_id = :b), "
+        "(SELECT count(*) FROM transactions WHERE builder_id = :b), "
+        "(SELECT uses_count FROM coupons WHERE code = 'PGFIRST'), "
+        "(SELECT count(*) FROM billing_webhook_deliveries WHERE event_id = :e)",
+        b=builder_id,
+        s=session_id,
+        e=event_key(confirmed["id"]),
+    )
+    assert tuple(nothing) == (0, "active", 0, 0, 0, 0)
+
+    assert (await _deliver(harness, confirmed, "test")).outcome == "processed"
+    await _deliver(
+        harness,
+        _payment(
+            "PAYMENT_RECEIVED",
+            "pay_pg_first",
+            checkout=checkout_id,
+            subscription="sub_pg_first",
+            value=_brl(cents),
+        ),
+        "test",
+    )
+    (row,) = await _all(
+        harness,
+        "SELECT s.id = c.intent_id, s.status, s.coupon_code, c.state, "
+        "(SELECT count(*) FROM billing_payment_effects WHERE builder_id = :b), "
+        "(SELECT coupon_code FROM transactions WHERE builder_id = :b), "
+        "(SELECT uses_count FROM coupons WHERE code = 'PGFIRST'), "
+        "(SELECT subscription_plan || '/' || subscription_status FROM builders "
+        "WHERE id = :b) "
+        "FROM billing_subscriptions s JOIN billing_checkout_sessions c "
+        "ON c.resulting_external_subscription_id = s.external_subscription_id "
+        "WHERE s.builder_id = :b",
+        b=builder_id,
+    )
+    assert tuple(row) == (
+        True,
+        "active",
+        "PGFIRST",
+        "completed",
+        1,
+        "PGFIRST",
+        1,
+        "plus/active",
+    )
+
+
+async def test_already_applied_from_a_real_asyncpg_unique_violation(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from prometheus_client import REGISTRY
+
+    _builder_id, _session, checkout_id = await _topup(harness, monkeypatch, "backstop")
+    payment = "pay_pg_backstop"
+    await _deliver(
+        harness, _payment("PAYMENT_CONFIRMED", payment, checkout=checkout_id), "test"
+    )
+    # A writer that cannot see the committed effect (the race the unique key
+    # backstops): the projection looks unsettled and the lookup misses.
+    async with harness.session() as session:
+        async with session.begin():
+            await session.execute(
+                text(
+                    "UPDATE billing_payment_projections SET settled_cents = 0, "
+                    "status = 'pending' WHERE payment_id = :p"
+                ),
+                {"p": payment},
+            )
+
+    async def unseen(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(BillingRepository, "find_payment_effect", unseen)
+    labels = {"failure": "integrity", "disposition": "already_applied"}
+    before = (
+        REGISTRY.get_sample_value("neurostack_billing_webhook_failures_total", labels)
+        or 0
+    )
+    drift = (
+        REGISTRY.get_sample_value("neurostack_billing_alerts_total", {"kind": "drift"})
+        or 0
+    )
+    received = _payment("PAYMENT_RECEIVED", payment, checkout=checkout_id)
+    outcome = await _deliver(harness, received, "test")
+    assert outcome.outcome == "processed"
+    assert (
+        REGISTRY.get_sample_value("neurostack_billing_webhook_failures_total", labels)
+        == before + 1
+    )
+    assert (
+        REGISTRY.get_sample_value("neurostack_billing_alerts_total", {"kind": "drift"})
+        or 0
+    ) == drift
+    assert (
+        await _scalar(
+            harness,
+            "SELECT status FROM billing_webhook_deliveries WHERE event_id = :e",
+            e=event_key(received["id"]),
+        )
+        == "processed"
+    )
+    assert (
+        await _scalar(
+            harness,
+            "SELECT count(*) FROM billing_payment_effects WHERE payment_id = :p",
+            p=payment,
+        )
+        == 1
+    )
+
+
+async def test_quarantine_write_failure_is_503_with_nothing_reserved(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi import BackgroundTasks, HTTPException
+
+    from src.api.routes import billing as billing_route
+    from src.repositories.billing import BillingTransitionRejected
+
+    _builder_id, _session, checkout_id = await _topup(harness, monkeypatch, "q-503")
+
+    async def refuse(*_args: object, **_kwargs: object) -> str:
+        raise BillingTransitionRejected("deterministic refusal")
+
+    calls: list[int] = []
+    original = BillingRepository.reserve_webhook_delivery
+
+    async def reserve(self: Any, values: dict[str, object]) -> bool:
+        calls.append(1)
+        if len(calls) == 2:  # the quarantine write
+            raise RuntimeError("injected quarantine write failure")
+        return await original(self, values)
+
+    monkeypatch.setattr(_FinancialState, "apply_payment", refuse)
+    monkeypatch.setattr(BillingRepository, "reserve_webhook_delivery", reserve)
+    payload = _payment("PAYMENT_CONFIRMED", "pay_pg_q503", checkout=checkout_id)
+    body = encode_json(payload)
+
+    class Request:
+        scope = {
+            "state": {
+                "asaas_webhook_body": body,
+                "asaas_webhook_payload": json.loads(body, parse_float=Decimal),
+            }
+        }
+
+    async with harness.session() as session:
+        with pytest.raises(HTTPException) as exc_info:
+            await billing_route.asaas_webhook(Request(), BackgroundTasks(), session)  # type: ignore[arg-type]
+    assert exc_info.value.status_code == 503
+    assert len(calls) == 2
+    assert (
+        await _scalar(
+            harness,
+            "SELECT count(*) FROM billing_webhook_deliveries WHERE event_id = :e",
+            e=event_key(payload["id"]),
+        )
+        == 0
+    )
+
+
+async def test_checkout_expired_frees_a_subscription_attempt_on_postgres(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder_id, session_id, checkout_id, _cents = await _subscription(
+        harness, monkeypatch, "expired"
+    )
+    expired = await _deliver(
+        harness, _payload("CHECKOUT_EXPIRED", {"id": checkout_id}), "test"
+    )
+    assert expired.outcome == "readback_required"
+    async with harness.session() as session:
+        assert (
+            await BillingReadbackService(
+                session, client_factory=_Reads(), environment="test"
+            ).process_delivery(expired.delivery_id)
+            == "converged"
+        )
+    assert (
+        await _scalar(
+            harness,
+            "SELECT state FROM billing_checkout_sessions WHERE id = :i",
+            i=session_id,
+        )
+        == "expired"
+    )
+    async with harness.session() as session:
+        assert (
+            await BillingRepository(session).subscription_checkout_blocker(
+                builder_id=builder_id
+            )
+            is None
+        )
+
+
+async def test_readback_payment_hands_off_and_settles_on_postgres(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder_id, session_id, checkout_id, cents = await _subscription(
+        harness, monkeypatch, "readback handoff payment"
+    )
+    paid = await _deliver(
+        harness, _payload("CHECKOUT_PAID", {"id": checkout_id}), "test"
+    )
+    reads = _Reads(
+        payments={
+            "pay_pg_rb_first": PaymentReadback(
+                "pay_pg_rb_first",
+                "CONFIRMED",
+                False,
+                cents,
+                "sub_pg_rb_first",
+                checkout_id,
+                None,
+                "CREDIT_CARD",
+                0,
+            )
+        }
+    )
+    async with harness.session() as session:
+        assert (
+            await BillingReadbackService(
+                session, client_factory=reads, environment="test"
+            ).readback_payment("pay_pg_rb_first", delivery_id=paid.delivery_id)
+            == "converged"
+        )
+    (row,) = await _all(
+        harness,
+        "SELECT s.id = c.intent_id, s.status, c.state, "
+        "(SELECT count(*) FROM billing_payment_effects WHERE builder_id = :b "
+        "AND effect_kind = 'settlement'), "
+        "(SELECT amount_cents FROM transactions WHERE builder_id = :b) "
+        "FROM billing_subscriptions s JOIN billing_checkout_sessions c "
+        "ON c.resulting_external_subscription_id = s.external_subscription_id "
+        "WHERE c.id = :s",
+        b=builder_id,
+        s=session_id,
+    )
+    assert tuple(row) == (True, "active", "completed", 1, cents)

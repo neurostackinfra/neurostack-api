@@ -372,7 +372,9 @@ async def world(
 # ---------------------------------------------------------------------------
 
 
-def test_allowlist_is_exactly_the_design_set_with_the_design_mapping() -> None:
+def test_allowlist_is_the_design_set_plus_the_boleto_only_readback_event() -> None:
+    """DESIGN's 26 names plus ``PAYMENT_REFUND_DENIED`` (official, boleto-only,
+    readback-only): 27 subscribed events."""
     assert dict(CHECKOUT_EVENT_STATES) == {
         "CHECKOUT_CREATED": "active",
         "CHECKOUT_PAID": "paid_pending_subscription",
@@ -1977,3 +1979,131 @@ async def test_unbounded_or_unfiltered_pages_prove_nothing() -> None:
 
     with pytest.raises(AsaasOutcomeUnknown):
         await _client(foreign).list_payments_by_subscription("sub_e")
+
+
+# ---------------------------------------------------------------------------
+# Fix loop 2, MEDIUM-A: a reversed state is decided by cumulative cents, so a
+# later exact readback still restores after any event touched the row.
+# ---------------------------------------------------------------------------
+
+
+async def _refunded_topup(world: _World, payment_id: str) -> dict[str, Any]:
+    common = await _settled_topup(world, payment_id=payment_id)
+    await world.receive(
+        _event("PAYMENT_REFUNDED", when="2026-10-11 11:00:00", **common)
+    )
+    (projection,) = await world.rows(BillingPaymentProjection)
+    assert (projection.status, projection.reversed_cents) == ("reversed", 10_000)
+    return common
+
+
+async def _restorations(world: _World) -> list[tuple[str, int]]:
+    return sorted(
+        (e.source_revision, e.amount_cents)
+        for e in await world.rows(
+            BillingPaymentEffect, BillingPaymentEffect.effect_kind == "restoration"
+        )
+    )
+
+
+async def test_absent_value_event_never_hides_a_later_restoration(
+    world: _World,
+) -> None:
+    common = await _refunded_topup(world, "pay_probe_absent")
+    absent = await world.receive(
+        _event(
+            "PAYMENT_RECEIVED", when="2026-10-11 11:30:00", **{**common, "value": None}
+        )
+    )
+    assert absent.outcome == "readback_required"
+    (projection,) = await world.rows(BillingPaymentProjection)
+    assert projection.status == "reversed"  # never relabelled
+
+    denied = await world.receive(
+        _event("PAYMENT_REFUND_DENIED", when="2026-10-11 12:00:00", **common)
+    )
+    world.provider.payments["pay_probe_absent"] = _payment_read(
+        "pay_probe_absent", status="RECEIVED", value_cents=10_000, refunded_cents=0
+    )
+    for _replay in range(2):
+        async with world.sessions() as session:
+            await world.readback(session).readback_payment(
+                "pay_probe_absent", delivery_id=denied.delivery_id
+            )
+        # The first exact read restores; the replay never duplicates it.
+        assert await _restorations(world) == [("restoration_epoch:1", 10_000)]
+    (projection,) = await world.rows(BillingPaymentProjection)
+    assert (
+        projection.status,
+        projection.restored_cents,
+        projection.restoration_epoch,
+    ) == (
+        "restored",
+        10_000,
+        1,
+    )
+
+
+@pytest.mark.parametrize(
+    "touch",
+    ["PAYMENT_UPDATED", "PAYMENT_OVERDUE", "PAYMENT_CHARGEBACK_REQUESTED"],
+)
+async def test_status_events_on_a_reversed_row_never_hide_a_restoration(
+    world: _World, touch: str
+) -> None:
+    payment_id = f"pay_touch_{touch.lower()}"
+    common = await _refunded_topup(world, payment_id)
+    touched = await world.receive(_event(touch, when="2026-10-11 11:30:00", **common))
+    world.provider.payments[payment_id] = _payment_read(
+        payment_id, status="RECEIVED", value_cents=10_000, refunded_cents=0
+    )
+    async with world.sessions() as session:
+        await world.readback(session).readback_payment(
+            payment_id, delivery_id=touched.delivery_id
+        )
+    assert await _restorations(world) == [("restoration_epoch:1", 10_000)]
+
+
+async def test_rereading_an_unchanged_partial_refund_is_not_a_restoration(
+    world: _World,
+) -> None:
+    common = await _settled_topup(world, payment_id="pay_partial_reread")
+    partial = await world.receive(
+        _event("PAYMENT_PARTIALLY_REFUNDED", when="2026-10-11 11:00:00", **common)
+    )
+    world.provider.payments["pay_partial_reread"] = _payment_read(
+        "pay_partial_reread",
+        status="RECEIVED",
+        value_cents=10_000,
+        refunded_cents=3_000,
+    )
+    for _replay in range(3):
+        async with world.sessions() as session:
+            await world.readback(session).readback_payment(
+                "pay_partial_reread", delivery_id=partial.delivery_id
+            )
+    assert await _restorations(world) == []
+    (projection,) = await world.rows(BillingPaymentProjection)
+    assert (
+        projection.status,
+        projection.reversed_cents,
+        projection.restoration_epoch,
+    ) == (
+        "partially_reversed",
+        3_000,
+        0,
+    )
+
+
+async def test_quarantine_alert_is_counted_once(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    envelope = await _topup_confirmed(world)
+
+    async def refuse(*_args: object, **_kwargs: object) -> str:
+        raise BillingTransitionRejected("refused")
+
+    monkeypatch.setattr(_FinancialState, "apply_payment", refuse)
+    before = _metric("neurostack_billing_alerts_total", kind="quarantine")
+    assert (await world.receive(envelope)).outcome == "quarantined"
+    assert _metric("neurostack_billing_alerts_total", kind="quarantine") == before + 1

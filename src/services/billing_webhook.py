@@ -152,6 +152,9 @@ PAYMENT_EVENT_STATUSES: Final[Mapping[str, str]] = MappingProxyType(
         "PAYMENT_REFUND_DENIED": "readback_required",
     }
 )
+# 27 names: DESIGN's closed allowlist (26) plus ``PAYMENT_REFUND_DENIED``,
+# an official event (docs.asaas.com "Webhook para cobranças") that ASAAS emits
+# only for boleto; NeuroStack sells no boleto, so it is readback-only.
 WEBHOOK_EVENTS: Final = frozenset(
     (*CHECKOUT_EVENT_STATES, *SUBSCRIPTION_EVENT_STATUSES, *PAYMENT_EVENT_STATUSES)
 )
@@ -217,7 +220,6 @@ _MONEY_SETTLED_STATUSES: Final = frozenset(
 )
 _NON_FINANCIAL_STATUSES: Final = frozenset({"pending", "failed", "overdue"})
 _LIVE_PROVIDER_STATUSES: Final = frozenset({"pending", "overdue", "settled"})
-_REVERSED_STATUSES: Final = frozenset({"reversed", "partially_reversed", "deleted"})
 
 _LIVE_CHECKOUT_STATES: Final = (
     "creating",
@@ -404,8 +406,7 @@ def record_failure(label: str, disposition: str, exc: BaseException) -> None:
         failure_class=type(exc).__name__,
         disposition=disposition,
     )
-    if disposition == "quarantined":
-        alert("quarantine")
+    # The quarantine alert itself is raised once, from the committed outcome.
 
 
 def _opaque_id(value: object) -> str | None:
@@ -1092,10 +1093,10 @@ class _FinancialState:
             # charge the snapshot sold.  A divergent, missing or non-exact
             # ``value`` blocks it (fail closed); an exact readback that does
             # carry the right amount is the only way forward.
+            # The projection keeps its status: "needs readback" is recorded on
+            # the delivery (``readback_required``) and by the alert, never by
+            # relabelling the row (that would erase a reversed/deleted truth).
             self.alerts.append("drift")
-            if existing is not None and existing.status != "readback_required":
-                existing.status = "readback_required"
-                await self._db.flush()
             return "readback_required"
         if existing is None:
             if normalized in _NON_FINANCIAL_STATUSES:
@@ -1218,14 +1219,8 @@ class _FinancialState:
         # provider time cannot regress anything: they are never order-gated.
         if normalized == "reversed":
             if projection.settled_cents <= 0:
-                if not stale:
-                    self._touch(
-                        projection,
-                        status="readback_required",
-                        key=key,
-                        event_id=event_id,
-                    )
-                    await self._db.flush()
+                # Reversal of money we never saw settle: only a readback can
+                # establish the history.  The row keeps its status.
                 return "readback_required"
             await self._reverse(
                 projection,
@@ -1260,11 +1255,7 @@ class _FinancialState:
             "partially_reversed",
         ):
             if projection.settled_cents <= 0:
-                self._touch(
-                    projection, status="readback_required", key=key, event_id=event_id
-                )
-                await self._db.flush()
-                return "readback_required"
+                return "readback_required"  # status kept; delivery records it
             if normalized == "partially_reversed":
                 # The cumulative refunded amount is not priced by the event.
                 return "readback_required"
@@ -1319,13 +1310,17 @@ class _FinancialState:
         money_settled = normalized in _MONEY_SETTLED_STATUSES or target_reversed > 0
         net_reversed = projection.reversed_cents - projection.restored_cents
         event_id = projection.last_event_id
-        # 1. restoration: reversed/deleted -> live, proven by this read.
+        # 1. restoration: reversed/deleted -> live, proven by this read.  A
+        # reversed state is decided by the persisted cumulative cents
+        # (``net_reversed > 0``), never by the status label, which status-only
+        # events may legitimately change; money must actually come back
+        # (``target < net``), so re-reading an unchanged partial refund is not
+        # a restoration.  A deleted payment (never settled) is the only
+        # label-based case, and nothing relabels a deleted row.
         restored_now = False
-        if (
-            projection.status in _REVERSED_STATUSES
-            and normalized in _LIVE_PROVIDER_STATUSES
-            and target_reversed <= net_reversed
-        ):
+        reversed_money = net_reversed > 0 and target_reversed < net_reversed
+        deleted_row = projection.status == "deleted" and projection.settled_cents == 0
+        if normalized in _LIVE_PROVIDER_STATUSES and (reversed_money or deleted_row):
             if projection.settled_cents > 0 and not money_settled:
                 self.alerts.append("drift")  # settled money cannot be pending
                 return "readback_required"
@@ -1381,13 +1376,13 @@ class _FinancialState:
             self.alerts.append("drift")
             return "readback_required"
         status = normalized
-        if normalized == "settled" and restored_now:
-            status = "restored"
-        elif (
-            normalized == "settled"
-            and projection.reversed_cents > projection.restored_cents
-        ):
-            status = "partially_reversed"
+        # The label of a live settled payment follows its cumulative cents, so
+        # replaying the same read never flips it.
+        if normalized == "settled":
+            if projection.reversed_cents > projection.restored_cents:
+                status = "partially_reversed"
+            elif projection.restored_cents > 0 or restored_now:
+                status = "restored"
         if projection.status != status:
             self._touch(projection, status=status, key=key, event_id=event_id)
             await self._db.flush()

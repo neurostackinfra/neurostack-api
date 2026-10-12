@@ -607,6 +607,22 @@ async def test_idle_expired_gate_refreshes_before_the_checkout_takes_any_lock(
     builder_id = uuid4()
     db = _Session([None, None, 0])
     _install_general_reservation(monkeypatch, _checkout(builder_id))
+    order: list[str] = []
+    repository = checkout_module.BillingRepository
+    original_lock = repository.lock_rollout_control
+
+    async def recording_lock(self: Any, *, environment: str) -> object:
+        order.append("lock")
+        return await original_lock(self, environment=environment)
+
+    monkeypatch.setattr(repository, "lock_rollout_control", recording_lock)
+    original_rollback = db.rollback
+
+    async def recording_rollback() -> None:
+        order.append("rollback")
+        await original_rollback()
+
+    monkeypatch.setattr(db, "rollback", recording_rollback)
     monkeypatch.setattr(
         checkout_module,
         "require_financial_egress",
@@ -622,12 +638,17 @@ async def test_idle_expired_gate_refreshes_before_the_checkout_takes_any_lock(
 
     async def ready() -> WebhookReadiness:
         refreshes.append(1)
+        order.append("refresh")
         return WebhookReadiness(True, ())
 
     monkeypatch.setattr(billing, "_read_back_webhook_readiness", ready)
     response = await billing.create_checkout(_checkout_body(), builder_id, db)  # type: ignore[arg-type]
 
     assert refreshes == [1]
+    # The read transaction ends, then the provider readback runs, and only
+    # then is the first lock (the rollout lock) taken.
+    assert order.index("refresh") < order.index("lock")
+    assert "rollback" in order[: order.index("refresh")]
     assert response.checkout_url is not None
     client.create_checkout.assert_awaited_once()
 
