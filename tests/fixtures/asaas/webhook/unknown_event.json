@@ -1,0 +1,8 @@
+{
+  "id": "evt_a1b2c3d4e5f60718293a4b5c6d7e8f90&368604923",
+  "event": "INVOICE_CREATED",
+  "dateCreated": "2026-10-11 10:00:03",
+  "account": {"id": "acc_fixture", "ownerId": "own_fixture"},
+  "invoice": {"id": "inv_fixture", "customer": "cus_fixture_private", "value": 999.00},
+  "payment": {"id": "pay_000000000000001", "customer": "cus_fixture_private"}
+}

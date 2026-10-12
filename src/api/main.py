@@ -4,9 +4,10 @@ Entry point for the cognitive infrastructure API
 """
 
 # Standard library imports
+import asyncio
 import json
 import re
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, AsyncGenerator, Optional
 
 # Third-party imports
@@ -61,6 +62,7 @@ from src.api.routes import (
 from src.config.logging import configure_logging, get_logger
 from src.config.settings import settings
 from src.core.exceptions import ConfigurationError
+from src.services.billing_webhook import ASAAS_WEBHOOK_READINESS
 
 # Configure logging on module load
 configure_logging()
@@ -79,6 +81,22 @@ def _redact_capability_token(path: str) -> str:
         r"(/v1/webhook/zapi)/[A-Za-z0-9_-]{20,}",
         r"\1/{capability_token}",
         path,
+    )
+
+
+def _start_webhook_readiness_refresher() -> "asyncio.Task[None] | None":
+    """Keep this worker's ASAAS webhook verdict warm (Group 3, fail-closed).
+
+    Started only when ASAAS is configured and a webhook URL is set; each
+    worker process refreshes its own gate.  Hosted checkout stays blocked
+    whenever this worker's last readback failed or is too old.
+    """
+
+    if not (settings.is_asaas_configuration_compatible and settings.asaas_webhook_url):
+        return None
+    return asyncio.create_task(
+        ASAAS_WEBHOOK_READINESS.run_refresher(billing._read_back_webhook_readiness),
+        name="asaas-webhook-readiness",
     )
 
 
@@ -138,9 +156,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from src.repositories import init_database
 
     await init_database()
+    webhook_refresher = _start_webhook_readiness_refresher()
     try:
         yield
     finally:
+        if webhook_refresher is not None:
+            webhook_refresher.cancel()
+            with suppress(asyncio.CancelledError):
+                await webhook_refresher
         # Shutdown shared services before their database dependency. Each
         # boundary remains eligible for cleanup even when an earlier one fails.
         logger.info("Shutting down NeuroStack API")

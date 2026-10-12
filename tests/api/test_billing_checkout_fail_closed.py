@@ -224,8 +224,13 @@ async def test_enabled_financial_gate_uses_only_hosted_asaas_contract(
         EgressPolicy(reader).require_financial_egress,
     )
     monkeypatch.setattr(billing, "_asaas_client", factory)
+    # Group 3: hosted checkout requires a converged webhook/token readback.
+    billing.ASAAS_WEBHOOK_READINESS.record(billing.WebhookReadiness(True, ()))
 
-    response = await billing.create_checkout(_checkout_body(), builder_id, db)  # type: ignore[arg-type]
+    try:
+        response = await billing.create_checkout(_checkout_body(), builder_id, db)  # type: ignore[arg-type]
+    finally:
+        billing.ASAAS_WEBHOOK_READINESS.reset()
 
     request = client.create_checkout.await_args.args[0]
     payload = json.loads(request.body())
@@ -369,7 +374,9 @@ async def test_ineligible_subscription_maps_to_one_fixed_409(
     from src.services.billing_checkout import CheckoutNotEligible
 
     class Service:
-        def __init__(self, db: object, *, client_factory: object) -> None:
+        def __init__(
+            self, db: object, *, client_factory: object, **_kwargs: object
+        ) -> None:
             del db, client_factory
 
         async def create_checkout(self, **kwargs: object) -> object:

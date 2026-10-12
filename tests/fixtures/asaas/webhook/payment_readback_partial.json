@@ -1,0 +1,17 @@
+{
+  "object": "payment",
+  "id": "pay_000000000000001",
+  "customer": "cus_fixture_private",
+  "subscription": null,
+  "checkoutSession": "chk_000000000000001",
+  "value": 100.00,
+  "netValue": 97.00,
+  "billingType": "PIX",
+  "status": "RECEIVED",
+  "deleted": false,
+  "externalReference": null,
+  "refunds": [
+    {"dateCreated": "2026-10-11 11:00:00", "status": "DONE", "value": 30.00, "description": "partial"},
+    {"dateCreated": "2026-10-11 11:05:00", "status": "PENDING", "value": 10.00, "description": "pending"}
+  ]
+}

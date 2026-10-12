@@ -114,7 +114,8 @@ def test_real_registry_and_core_collector_match_the_closed_contract() -> None:
         for family in registry.collect()
         if family.name.startswith("neurostack_")
     }
-    assert len(METRIC_DIMENSION_CONTRACTS) == 61
+    # 61 pre-existing families + 7 ASAAS billing webhook/readback (Group 3).
+    assert len(METRIC_DIMENSION_CONTRACTS) == 68
     assert observed == set(METRIC_DIMENSION_CONTRACTS)
 
 

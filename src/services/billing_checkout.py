@@ -11,8 +11,8 @@ reconciled by the persisted session UUID instead of being retried.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
-from typing import Callable, Final, Literal, Mapping
+from datetime import date, datetime, timedelta, timezone
+from typing import Awaitable, Callable, Final, Literal, Mapping
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
@@ -25,6 +25,7 @@ from src.models.coupon import Coupon
 from src.models.tenant import Tenant
 from src.repositories.billing import BillingRepository
 from src.services.asaas import (
+    ASAAS_CHECKOUT_MINUTES_TO_EXPIRE,
     AsaasClient,
     AsaasOutcomeUnknown,
     AsaasRequestRejected,
@@ -63,6 +64,24 @@ _TOPUP_OFFERS: Final = frozenset(
     offer_id for offer_id, offer in BILLING_CATALOG.items() if offer.cycle == "DETACHED"
 )
 _COUPON_CODE_MAX_LENGTH: Final = 50
+
+# Group 3 (M-C) convergence of ambiguous attempts.  The provider Checkout
+# expires ``ASAAS_CHECKOUT_MINUTES_TO_EXPIRE`` after creation; reads after the
+# limit below can no longer be raced by a payer.  An attempt still
+# ``creating`` after ``ORPHANED_CREATING_AFTER`` (far beyond the client's
+# connect+write+read timeouts) belongs to a crashed request.
+CHECKOUT_CONVERGENCE_LIMIT: Final = timedelta(
+    minutes=ASAAS_CHECKOUT_MINUTES_TO_EXPIRE + 30
+)
+CONVERGENCE_READ_SPACING: Final = timedelta(minutes=5)
+ORPHANED_CREATING_AFTER: Final = timedelta(minutes=5)
+
+
+def _aware_or_none(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
 
 # The commercial calendar is São Paulo's, never the host's.  Resolving the zone
 # at import time makes missing zone data a startup failure: there is no
@@ -398,10 +417,14 @@ class BillingCheckoutService:
         *,
         client_factory: Callable[[], AsaasClient],
         clock: Callable[[], datetime] = _utc_now,
+        creation_precondition: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._db = db
         self._client_factory = client_factory
         self._clock = clock
+        # Group 3: an async, side-effect-free creation precondition (the
+        # webhook readiness readback) awaited before any reservation/lock.
+        self._creation_precondition = creation_precondition
 
     async def create_checkout(
         self,
@@ -539,35 +562,128 @@ class BillingCheckoutService:
     async def reconcile_checkout(
         self, *, builder_id: UUID, checkout_session_id: UUID
     ) -> CheckoutView:
-        """Perform read-only, exact-reference reconciliation; never create again."""
+        """Perform read-only, exact-reference reconciliation; never create again.
 
-        view = await self.get_checkout(
-            builder_id=builder_id, checkout_session_id=checkout_session_id
-        )
-        if view.state != "reconciliation_required":
-            return view
+        Provider reads happen first, with no row lock and no open database
+        transaction; the session is then row-locked and re-validated before any
+        write (a concurrent webhook or reconciliation may have moved it, in
+        which case this call is an idempotent no-op).
 
-        checkout = await BillingRepository(self._db).lock_checkout_session(
-            builder_id=builder_id,
-            checkout_session_id=checkout_session_id,
+        Convergence (Group 3, M-C):
+
+        * an orphaned ``creating`` attempt (older than
+          ``ORPHANED_CREATING_AFTER``) may already have reached ASAAS, so it
+          becomes ``reconciliation_required`` together with its first read;
+        * automatic ``abandoned`` is DORMANT unless the protected setting
+          ``ASAAS_AUTO_ABANDON_ENABLED`` is true.  The empty reads here are by
+          ``externalReference`` = our session UUID, and ASAAS does not document
+          that a Checkout copies its ``externalReference`` to the subscription
+          or payments it creates; if it does not, a checkout that timed out
+          during creation but was paid would read "empty" and could be
+          abandoned, opening the door to a second recurring subscription.
+          Enable the setting only after Group 8 proves propagation by readback.
+          With it off, such a session stays ``reconciliation_required`` and
+          keeps blocking new subscription checkouts for that builder (it is
+          counted in the readback backlog and alerted) until an operator
+          resolves it; with it on, ``abandoned`` needs TWO empty exact-ID reads
+          after ``created_at + CHECKOUT_CONVERGENCE_LIMIT`` (past the provider
+          Checkout expiry), at least ``CONVERGENCE_READ_SPACING`` apart.  The
+          first post-limit empty read is recorded by stamping ``updated_at``;
+          nothing else writes this state's row.
+        """
+
+        result = await self._db.execute(
+            select(BillingCheckoutSession)
+            .where(
+                BillingCheckoutSession.id == checkout_session_id,
+                BillingCheckoutSession.builder_id == builder_id,
+            )
+            .execution_options(populate_existing=True)
         )
-        if checkout is None:
+        observed = result.scalar_one_or_none()
+        if observed is None:
+            await self._rollback()
             raise CheckoutNotFound()
-        if checkout.state != "reconciliation_required":
-            return self._view(checkout)
+        view = self._view(observed)
+        observed_state = observed.state
+        observed_created = _aware_or_none(observed.created_at)
+        # End the read transaction before any network I/O (plain values only:
+        # a rollback expires ORM instances).
+        await self._rollback()
+        if observed_state not in ("reconciliation_required", "creating"):
+            return view
+        now = self._clock()
+        if observed_state == "creating" and (
+            observed_created is None or now - observed_created < ORPHANED_CREATING_AFTER
+        ):
+            return view  # the originating request may still be in flight
 
         try:
             client = self._client_factory()
             subscriptions = await client.list_subscriptions_by_external_reference(
-                checkout.id
+                checkout_session_id
             )
-            payments = await client.list_payments_by_external_reference(checkout.id)
-            checkout.reconciliation_attempts += 1
+            payments = await client.list_payments_by_external_reference(
+                checkout_session_id
+            )
+        except Exception as exc:
+            raise CheckoutReconciliationRequired() from exc
+
+        try:
+            checkout = await BillingRepository(self._db).lock_checkout_session(
+                builder_id=builder_id,
+                checkout_session_id=checkout_session_id,
+            )
+            if checkout is None:
+                await self._rollback()
+                raise CheckoutNotFound()
+            created_at = _aware_or_none(checkout.created_at)
+            if checkout.state not in ("reconciliation_required", "creating") or (
+                checkout.state == "creating"
+                and (created_at is None or now - created_at < ORPHANED_CREATING_AFTER)
+            ):
+                current = self._view(checkout)
+                await self._rollback()
+                return current
+            was_reconciling = checkout.state == "reconciliation_required"
+            previous_read = _aware_or_none(checkout.updated_at)
             if subscriptions or payments:
+                checkout.reconciliation_attempts += 1
                 # A matching provider record proves a request may have been
                 # applied, but settlement is owned by webhook/readback work.
                 checkout.state = "terminal_pending_readback"
+                await self._db.commit()
+                return self._view(checkout)
+            past_limit = (
+                created_at is not None
+                and now >= created_at + CHECKOUT_CONVERGENCE_LIMIT
+            )
+            prior_empty_read_after_limit = bool(
+                was_reconciling
+                and past_limit
+                and created_at is not None
+                and previous_read is not None
+                and previous_read >= created_at + CHECKOUT_CONVERGENCE_LIMIT
+            )
+            if prior_empty_read_after_limit:
+                assert previous_read is not None
+                if now - previous_read < CONVERGENCE_READ_SPACING:
+                    # Too soon to count as an independent second read.
+                    current = self._view(checkout)
+                    await self._rollback()
+                    return current
+                checkout.state = (
+                    "abandoned"
+                    if settings.asaas_auto_abandon_enabled
+                    else "reconciliation_required"
+                )
+            else:
+                checkout.state = "reconciliation_required"
+            checkout.reconciliation_attempts += 1
+            checkout.updated_at = now
             await self._db.commit()
+        except CheckoutNotFound:
+            raise
         except Exception as exc:
             await self._rollback()
             raise CheckoutReconciliationRequired() from exc
@@ -590,6 +706,11 @@ class BillingCheckoutService:
                 settings.asaas_checkout_return_url
             )
             await authorize_creation_egress(require_financial_egress)
+            if self._creation_precondition is not None:
+                # End the read transaction first: no connection idles in a
+                # transaction while the provider readback runs.
+                await self._rollback()
+                await self._creation_precondition()
             client = self._client_factory()
         except Exception as exc:
             await self._rollback()

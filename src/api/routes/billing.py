@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,6 +27,7 @@ from src.models.tenant import Tenant
 from src.models.transaction import Transaction
 from src.repositories import get_db_session_dependency
 from src.repositories.billing import billing_roster_advisory_key
+from src.repositories.database import get_db_session
 from src.services.abacatepay import AbacatePayClient
 from src.services.asaas import AsaasClient
 from src.services.billing_checkout import (
@@ -42,6 +43,20 @@ from src.services.billing_checkout import (
 from src.services.billing_usage_service import (
     PlanUsageLimits,
     get_builder_billing_usage,
+)
+from src.services.billing_webhook import (
+    ASAAS_INGRESS_BODY_STATE,
+    ASAAS_INGRESS_PAYLOAD_STATE,
+    ASAAS_WEBHOOK_READINESS,
+    AsaasWebhookProvisioner,
+    BillingWebhookService,
+    WebhookEnvelopeRejected,
+    WebhookProcessingUnavailable,
+    WebhookReadiness,
+    desired_webhook_settings,
+    parse_envelope,
+    record_rejection,
+    run_delivery_readback,
 )
 
 logger = get_logger(__name__)
@@ -61,6 +76,51 @@ def _asaas_client() -> AsaasClient:
         api_key=settings.asaas_api_key,
         user_agent=settings.asaas_user_agent,
     )
+
+
+async def _read_back_webhook_readiness() -> WebhookReadiness:
+    """Read-only provider readback of this environment's webhook and token."""
+
+    desired = desired_webhook_settings(
+        environment=settings.environment,
+        url=settings.asaas_webhook_url,
+        email=settings.asaas_webhook_notification_email,
+    )
+    return await AsaasWebhookProvisioner(
+        _asaas_client(), desired, auth_token=settings.asaas_webhook_token
+    ).readback()
+
+
+def _asaas_checkout_client() -> AsaasClient:
+    """Creation client: only built while the webhook reads back ready.
+
+    ``BillingCheckoutService`` calls this among its side-effect-free creation
+    preconditions (after the rollout pre-check and the egress flag, before any
+    reservation), so a missing, drifted or unverified provider webhook/token
+    blocks hosted checkout with zero rows and zero POSTs.  Reconciliation and
+    readback use ``_asaas_client`` and are never gated.
+    """
+
+    ASAAS_WEBHOOK_READINESS.require_ready(_read_back_webhook_readiness)
+    return _asaas_client()
+
+
+# Longest a checkout request waits for a stale verdict's readback.
+WEBHOOK_READBACK_WAIT_SECONDS = 3.0
+
+
+async def _ensure_webhook_ready() -> None:
+    """Creation precondition: refresh a stale verdict, then require ready.
+
+    Runs after the rollout pre-check and the egress flag, before any lock,
+    reservation or POST, with no open transaction.  A failed or slow readback
+    keeps the gate closed (503, zero rows, zero POSTs).
+    """
+
+    await ASAAS_WEBHOOK_READINESS.ensure_fresh(
+        _read_back_webhook_readiness, timeout=WEBHOOK_READBACK_WAIT_SECONDS
+    )
+    ASAAS_WEBHOOK_READINESS.require_ready()
 
 
 async def _count_active_clinics(builder_id: UUID, db: AsyncSession) -> int:
@@ -281,7 +341,11 @@ async def create_checkout(
 ) -> CheckoutResponse:
     """Start a provider-hosted checkout from server-owned commercial state."""
 
-    service = BillingCheckoutService(db, client_factory=_asaas_client)
+    service = BillingCheckoutService(
+        db,
+        client_factory=_asaas_checkout_client,
+        creation_precondition=_ensure_webhook_ready,
+    )
     try:
         checkout = await service.create_checkout(
             builder_id=builder_id,
@@ -374,6 +438,57 @@ async def reconcile_checkout(
         state=checkout.state,
         checkout_url=checkout.checkout_url,
     )
+
+
+@router.post(
+    "/webhook/asaas",
+    summary="ASAAS Webhook",
+    response_model=None,
+    status_code=200,
+)
+async def asaas_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db_session_dependency),
+) -> dict[str, bool]:
+    """Persist one authenticated ASAAS delivery; 200 only after commit.
+
+    The ingress boundary has already authenticated ``asaas-access-token`` and
+    bounded/parsed the body; without its state this handler fails closed.
+    Known events apply their deterministic transition in the same commit;
+    readbacks run after the response with their own session.
+    """
+
+    state = request.scope.get("state") or {}
+    body = state.get(ASAAS_INGRESS_BODY_STATE)
+    payload = state.get(ASAAS_INGRESS_PAYLOAD_STATE)
+    if not isinstance(body, bytes) or payload is None:
+        record_rejection("unavailable")
+        raise HTTPException(status_code=503, detail="billing_webhook_unavailable")
+    try:
+        envelope = parse_envelope(body, payload)
+    except WebhookEnvelopeRejected as exc:
+        record_rejection("invalid_event")
+        raise HTTPException(status_code=400, detail="invalid_event") from exc
+    try:
+        outcome = await BillingWebhookService(
+            db, environment=settings.environment
+        ).receive(envelope)
+    except WebhookProcessingUnavailable as exc:
+        record_rejection("processing_unavailable")
+        raise HTTPException(
+            status_code=503, detail="billing_webhook_unavailable"
+        ) from exc
+    if outcome.readback and outcome.delivery_id is not None:
+        background_tasks.add_task(
+            run_delivery_readback,
+            outcome.delivery_id,
+            # Resolved inside the task: a fresh session after the response.
+            session_factory=get_db_session,
+            client_factory=_asaas_client,
+            environment=settings.environment,
+        )
+    return {"ok": True}
 
 
 @router.post(

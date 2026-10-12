@@ -399,6 +399,67 @@ METRIC_DIMENSION_CONTRACTS: Mapping[str, MetricDimensionContract] = MappingProxy
             tier=_enum("primary", "multimodal_fallback"),
             outcome=_enum("response", "invalid", "empty", "error"),
         ),
+        # ASAAS billing webhook/readback (Group 3).  Only closed technical
+        # vocabularies: never builder, payment, subscription or event IDs.
+        "neurostack_billing_webhook_deliveries": _contract(
+            family=_enum("checkout", "subscription", "payment", "unknown"),
+            outcome=_enum(
+                "processed",
+                "duplicate",
+                "unknown_event",
+                "uncorrelated",
+                "readback_required",
+                "quarantined",
+            ),
+        ),
+        "neurostack_billing_webhook_rejections": _contract(
+            reason=_enum(
+                "unauthorized",
+                "unavailable",
+                "unsupported_media_type",
+                "malformed",
+                "too_large",
+                "timeout",
+                "invalid_json",
+                "invalid_event",
+                "processing_unavailable",
+            )
+        ),
+        "neurostack_billing_alerts": _contract(
+            kind=_enum(
+                "unknown_event",
+                "uncorrelated_entity",
+                "drift",
+                "backlog",
+                "readback_failure",
+                "quarantine",
+            )
+        ),
+        "neurostack_billing_webhook_failures": _contract(
+            failure=_enum(
+                "integrity",
+                "data_error",
+                "canary_budget_exceeded",
+                "transition_rejected",
+                "capability_rejected",
+                "state_unavailable",
+                "serialization",
+                "lock_timeout",
+                "database",
+                "timeout",
+                "connection",
+                "unexpected",
+            ),
+            disposition=_enum("quarantined", "already_applied", "retry"),
+        ),
+        "neurostack_billing_readbacks": _contract(
+            resource=_enum("checkout_session", "subscription", "payment", "webhook"),
+            outcome=_enum("converged", "pending", "drift", "failed"),
+        ),
+        "neurostack_billing_readback_backlog": _contract(
+            resource=_enum("delivery", "checkout_session", "subscription", "payment")
+        ),
+        "neurostack_billing_webhook_config_ready": _NONE,
         # neurostack-core opt-in collector
         "neurostack_srm_decisions": _contract(
             intent_category=_INTENT, funnel_stage=_FUNNEL_STAGE, mode=_FLOW_MODE

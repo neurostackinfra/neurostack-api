@@ -59,7 +59,9 @@ async def test_route_passes_only_offer_and_allowed_method_to_service(
     captured: dict[str, object] = {}
 
     class Service:
-        def __init__(self, db: object, *, client_factory: object) -> None:
+        def __init__(
+            self, db: object, *, client_factory: object, **_kwargs: object
+        ) -> None:
             captured["db"] = db
             captured["factory"] = client_factory
 
@@ -199,7 +201,9 @@ async def test_route_forwards_coupon_selector_and_maps_rejection_to_fixed_400(
     captured: dict[str, object] = {}
 
     class Service:
-        def __init__(self, db: object, *, client_factory: object) -> None:
+        def __init__(
+            self, db: object, *, client_factory: object, **_kwargs: object
+        ) -> None:
             del db, client_factory
 
         async def create_checkout(self, **kwargs: object) -> CheckoutView:

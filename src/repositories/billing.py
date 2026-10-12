@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Final, cast
+from typing import Any, Final, cast
 from uuid import UUID
 
 from sqlalchemy import and_, case, func, or_, select, update
@@ -983,3 +983,172 @@ class BillingRepository:
             )
         )
         return snapshot_coupon
+
+    # ------------------------------------------------------------------
+    # Group 3 webhook/projection primitives (additive).  Every method runs in
+    # the caller-owned transaction and never commits.
+    # ------------------------------------------------------------------
+
+    def _dialect_name(self) -> str:
+        return str(self.session.get_bind().dialect.name)
+
+    def _insert(self, model: type[object]) -> Any:
+        if self._dialect_name() == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+
+            return postgresql_insert(model)
+        # SQLite is the unit-test dialect; both support ON CONFLICT DO NOTHING.
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        return sqlite_insert(model)
+
+    async def reserve_webhook_delivery(self, values: dict[str, object]) -> bool:
+        """Insert one delivery envelope unless ``(provider, event_id)`` exists.
+
+        ``ON CONFLICT DO NOTHING`` makes a concurrent identical delivery wait on
+        the unique index until the first transaction ends and then insert
+        nothing, so exactly one transaction owns each provider event.
+        """
+
+        statement = (
+            self._insert(BillingWebhookDelivery)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=["provider", "event_id"])
+            .returning(BillingWebhookDelivery.id)
+        )
+        result = await self.session.execute(statement)
+        return result.scalar_one_or_none() is not None
+
+    async def lock_webhook_delivery(
+        self, *, provider: str, event_id: str
+    ) -> BillingWebhookDelivery | None:
+        """Row-lock one delivery by its idempotency key."""
+
+        result = await self.session.execute(
+            select(BillingWebhookDelivery)
+            .where(
+                BillingWebhookDelivery.provider == provider,
+                BillingWebhookDelivery.event_id == event_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
+
+    async def lock_webhook_delivery_by_id(
+        self, *, delivery_id: UUID
+    ) -> BillingWebhookDelivery | None:
+        """Row-lock one delivery by its internal identifier."""
+
+        result = await self.session.execute(
+            select(BillingWebhookDelivery)
+            .where(BillingWebhookDelivery.id == delivery_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
+
+    async def lock_billing_roster(self) -> int:
+        """Take the global roster fence and return the current revision.
+
+        Same advisory key and row lock as every roster writer and the
+        statement-level roster trigger, so a subscription row created here is
+        serialized against roster imports, legacy cancellation and flips.
+        """
+
+        if self._dialect_name() == "postgresql":
+            await self.session.execute(
+                select(func.pg_advisory_xact_lock(billing_roster_advisory_key()))
+            )
+        result = await self.session.execute(
+            select(BillingRosterControl)
+            .where(BillingRosterControl.singleton.is_(True))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        control = result.scalar_one_or_none()
+        if control is None:
+            raise BillingStateUnavailable("billing roster control is unavailable")
+        return int(control.billing_roster_revision)
+
+    async def lock_subscription(
+        self, *, builder_id: UUID, subscription_id: UUID
+    ) -> BillingSubscription | None:
+        """Row-lock one canonical subscription inside its builder scope."""
+
+        result = await self.session.execute(
+            select(BillingSubscription)
+            .where(
+                BillingSubscription.id == subscription_id,
+                BillingSubscription.builder_id == builder_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
+
+    async def lock_topup_order(
+        self, *, builder_id: UUID, order_id: UUID
+    ) -> BillingTopupOrder | None:
+        """Row-lock one top-up order inside its builder scope."""
+
+        result = await self.session.execute(
+            select(BillingTopupOrder)
+            .where(
+                BillingTopupOrder.id == order_id,
+                BillingTopupOrder.builder_id == builder_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
+
+    async def insert_payment_projection_if_absent(
+        self, values: dict[str, object]
+    ) -> None:
+        """Create the one projection of a provider payment unless it exists."""
+
+        statement = (
+            self._insert(BillingPaymentProjection)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=["provider", "payment_id"])
+        )
+        await self.session.execute(statement)
+
+    async def lock_payment_projection(
+        self, *, provider: str, payment_id: str
+    ) -> BillingPaymentProjection | None:
+        """Row-lock the projection of one provider payment."""
+
+        result = await self.session.execute(
+            select(BillingPaymentProjection)
+            .where(
+                BillingPaymentProjection.provider == provider,
+                BillingPaymentProjection.payment_id == payment_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
+
+    async def find_payment_effect(
+        self,
+        *,
+        provider: str,
+        payment_id: str,
+        effect_kind: str,
+        source_revision: str,
+    ) -> BillingPaymentEffect | None:
+        """Read one effect by its ``(provider, payment, kind, revision)`` key."""
+
+        result = await self.session.execute(
+            select(BillingPaymentEffect)
+            .where(
+                BillingPaymentEffect.provider == provider,
+                BillingPaymentEffect.payment_id == payment_id,
+                BillingPaymentEffect.effect_kind == effect_kind,
+                BillingPaymentEffect.source_revision == source_revision,
+            )
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()

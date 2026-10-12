@@ -266,6 +266,33 @@ class Settings(BaseSettings):
     # Browser return page for hosted Checkout callbacks. Navigation only: it
     # never changes financial state. Empty keeps checkout creation unavailable.
     asaas_checkout_return_url: str = ""
+    # Public HTTPS URL of ``/v1/billing/webhook/asaas`` and the operator address
+    # ASAAS notifies about queue problems.  Both only drive the provider-side
+    # webhook provisioning/readback; empty keeps hosted checkout unavailable
+    # because the webhook can never read back as ready.
+    asaas_webhook_url: str = ""
+    asaas_webhook_notification_email: str = ""
+    # Protected switch for automatic ``abandoned`` of ambiguous checkouts.
+    # Default off: the evidence (empty reads by our session UUID as ASAAS
+    # ``externalReference``) is only sound once Group 8 proves by readback
+    # that ASAAS copies a Checkout's externalReference to the subscription and
+    # payments it creates.  Off keeps such sessions blocking (operator action).
+    asaas_auto_abandon_enabled: bool = False
+
+    @field_validator("asaas_webhook_url")
+    @classmethod
+    def validate_asaas_webhook_url(cls, value: str) -> str:
+        """Accept only an absent value or the exact public receiver path."""
+
+        if not value:
+            return value
+        if not _is_plain_https_page_url(value) or not value.endswith(
+            "/v1/billing/webhook/asaas"
+        ):
+            raise ValueError(
+                "ASAAS_WEBHOOK_URL must be the HTTPS URL of /v1/billing/webhook/asaas"
+            )
+        return value
 
     @field_validator("asaas_checkout_return_url")
     @classmethod

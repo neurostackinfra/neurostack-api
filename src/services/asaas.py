@@ -46,6 +46,10 @@ ASAAS_CHECKOUT_MINUTES_TO_EXPIRE: Final = 60
 ASAAS_MAX_RESPONSE_BYTES: Final = 65_536
 ASAAS_TIMEOUT: Final = httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0)
 ASAAS_LIST_LIMIT: Final = 100
+# Group 3 paginated readbacks: one page of full payment objects (~2 KiB each)
+# stays far below ``ASAAS_MAX_RESPONSE_BYTES``.
+ASAAS_PAGE_SIZE: Final = 10
+ASAAS_MAX_PAGES: Final = 50
 MAX_AMOUNT_CENTS: Final = 100_000_000_00
 
 # Backend-owned item image: a 1x1 transparent PNG. The official OpenAPI schema
@@ -335,6 +339,246 @@ class ProviderRecord:
     external_reference: str | None
     status: str | None
     deleted: bool
+
+
+def provider_cents(value: object) -> int | None:
+    """Return exact integer cents for a provider BRL amount, else ``None``.
+
+    Responses are parsed with ``parse_float=Decimal``; a value that is not an
+    exact, non-negative two-place amount is never rounded into a number that
+    could later be compared with a persisted snapshot.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, Decimal)):
+        return None
+    amount = Decimal(value)
+    if not amount.is_finite() or amount < 0:
+        return None
+    cents = amount.scaleb(2)
+    if cents != cents.to_integral_value():
+        return None
+    result = int(cents)
+    return result if result <= MAX_AMOUNT_CENTS else None
+
+
+def _optional_provider_id(value: object) -> str | None:
+    if isinstance(value, str) and _PROVIDER_ID.fullmatch(value):
+        return value
+    return None
+
+
+def _optional_text(value: object, *, limit: int = 100) -> str | None:
+    if isinstance(value, str) and 0 < len(value) <= limit and value.isascii():
+        return value
+    return None
+
+
+def _optional_date(value: object) -> date | None:
+    if not isinstance(value, str) or len(value) != 10:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionReadback:
+    """Allowlisted fields of one exact-ID subscription read; no customer data."""
+
+    subscription_id: str
+    status: str | None
+    deleted: bool
+    cycle: str | None
+    value_cents: int | None
+    next_due_date: date | None
+    external_reference: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentReadback:
+    """Allowlisted fields of one exact-ID payment read; no customer data.
+
+    ``refunded_cents`` is the exact sum of ``DONE`` refunds, or ``None`` when
+    the refund list cannot be read exactly (the caller must not guess).
+    """
+
+    payment_id: str
+    status: str | None
+    deleted: bool
+    value_cents: int | None
+    subscription_id: str | None
+    checkout_id: str | None
+    external_reference: str | None
+    billing_type: str | None
+    refunded_cents: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookConfig:
+    """Provider-side webhook configuration as read back; never the token."""
+
+    webhook_id: str
+    name: str | None
+    url: str | None
+    enabled: bool | None
+    interrupted: bool | None
+    api_version: int | None
+    has_auth_token: bool | None
+    send_type: str | None
+    events: tuple[str, ...] | None
+    penalized_requests_count: int | None
+
+
+_WEBHOOK_SEND_TYPES: Final = frozenset({"SEQUENTIALLY", "NON_SEQUENTIALLY"})
+_WEBHOOK_EVENT = re.compile(r"^[A-Z][A-Z0-9_]{0,99}$")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class WebhookSettings:
+    """Backend-owned desired webhook configuration for one environment."""
+
+    name: str
+    url: str
+    email: str
+    events: tuple[str, ...]
+    send_type: str = "SEQUENTIALLY"
+    api_version: int = 3
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not 1 <= len(self.name) <= 100:
+            raise AsaasConfigurationError("asaas_webhook_settings_invalid")
+        if not _is_https_page_url(self.url) or "?" in self.url:
+            raise AsaasConfigurationError("asaas_webhook_settings_invalid")
+        if (
+            not isinstance(self.email, str)
+            or "@" not in self.email
+            or len(self.email) > 254
+            or any(ord(c) < 33 or ord(c) > 126 for c in self.email)
+        ):
+            raise AsaasConfigurationError("asaas_webhook_settings_invalid")
+        if (
+            not self.events
+            or len(set(self.events)) != len(self.events)
+            or not all(
+                isinstance(e, str) and _WEBHOOK_EVENT.fullmatch(e) for e in self.events
+            )
+        ):
+            raise AsaasConfigurationError("asaas_webhook_settings_invalid")
+        if self.send_type not in _WEBHOOK_SEND_TYPES or self.api_version != 3:
+            raise AsaasConfigurationError("asaas_webhook_settings_invalid")
+
+    def payload(self, *, auth_token: SecretStr, create: bool) -> dict[str, object]:
+        token = auth_token.get_secret_value() if auth_token else ""
+        # ASAAS contract: 32..255 characters and no whitespace.
+        if not 32 <= len(token) <= 255 or any(
+            ord(c) < 33 or ord(c) > 126 for c in token
+        ):
+            raise AsaasConfigurationError("asaas_webhook_token_invalid")
+        payload: dict[str, object] = {
+            "name": self.name,
+            "url": self.url,
+            "enabled": True,
+            "interrupted": False,
+            "authToken": token,
+            "sendType": self.send_type,
+            "events": list(self.events),
+        }
+        if create:
+            # ``email`` and ``apiVersion`` are creation-only fields.
+            payload["email"] = self.email
+            payload["apiVersion"] = self.api_version
+        return payload
+
+    def __repr__(self) -> str:
+        return f"WebhookSettings(events={len(self.events)})"
+
+
+def _subscription_readback(payload: Mapping[str, Any]) -> SubscriptionReadback:
+    return SubscriptionReadback(
+        subscription_id=validate_provider_id(payload.get("id")),
+        status=_optional_text(payload.get("status")),
+        deleted=payload.get("deleted") is True,
+        cycle=_optional_text(payload.get("cycle")),
+        value_cents=provider_cents(payload.get("value")),
+        next_due_date=_optional_date(payload.get("nextDueDate")),
+        external_reference=_optional_text(payload.get("externalReference"), limit=200),
+    )
+
+
+def _refunded_cents(refunds: object) -> int | None:
+    if refunds is None:
+        return 0
+    if not isinstance(refunds, list) or len(refunds) > ASAAS_LIST_LIMIT:
+        return None
+    total = 0
+    for refund in refunds:
+        if not isinstance(refund, dict):
+            return None
+        status = refund.get("status")
+        if not isinstance(status, str):
+            return None
+        if status != "DONE":
+            continue
+        cents = provider_cents(refund.get("value"))
+        if cents is None:
+            return None
+        total += cents
+    return total
+
+
+def _payment_readback(payload: Mapping[str, Any]) -> PaymentReadback:
+    return PaymentReadback(
+        payment_id=validate_provider_id(payload.get("id")),
+        status=_optional_text(payload.get("status")),
+        deleted=payload.get("deleted") is True,
+        value_cents=provider_cents(payload.get("value")),
+        subscription_id=_optional_provider_id(payload.get("subscription")),
+        checkout_id=_optional_provider_id(payload.get("checkoutSession")),
+        external_reference=_optional_text(payload.get("externalReference"), limit=200),
+        billing_type=_optional_text(payload.get("billingType"), limit=30),
+        refunded_cents=_refunded_cents(payload.get("refunds")),
+    )
+
+
+def _webhook_config(payload: Mapping[str, Any]) -> WebhookConfig:
+    events = payload.get("events")
+    parsed_events: tuple[str, ...] | None = None
+    if isinstance(events, list) and all(
+        isinstance(e, str) and _WEBHOOK_EVENT.fullmatch(e) for e in events
+    ):
+        parsed_events = tuple(events)
+    api_version = payload.get("apiVersion")
+    penalized = payload.get("penalizedRequestsCount")
+    url = payload.get("url")
+    return WebhookConfig(
+        webhook_id=validate_provider_id(payload.get("id")),
+        name=_optional_text(payload.get("name")),
+        url=url if isinstance(url, str) and len(url) <= 600 else None,
+        enabled=(
+            payload.get("enabled") if isinstance(payload.get("enabled"), bool) else None
+        ),
+        interrupted=(
+            payload.get("interrupted")
+            if isinstance(payload.get("interrupted"), bool)
+            else None
+        ),
+        api_version=(
+            api_version
+            if type(api_version) is int  # noqa: E721 - bool is not a version
+            else None
+        ),
+        has_auth_token=(
+            payload.get("hasAuthToken")
+            if isinstance(payload.get("hasAuthToken"), bool)
+            else None
+        ),
+        send_type=_optional_text(payload.get("sendType"), limit=30),
+        events=parsed_events,
+        penalized_requests_count=(
+            penalized if type(penalized) is int else None  # noqa: E721
+        ),
+    )
 
 
 _PERMIT_SEAL: Final = object()
@@ -652,3 +896,129 @@ class AsaasClient:
             filter_name="checkoutSession",
             filter_value=validate_provider_id(checkout_id),
         )
+
+    # ------------------------------------------------------------------
+    # Group 3 readback and webhook management.  None of these create a
+    # charge; they deliberately do not consult the creation gate.
+    # Contract source: https://docs.asaas.com (retrieved 2026-10-11) —
+    # ``GET /v3/subscriptions/{id}``, ``GET /v3/payments/{id}`` (``refunds[]``
+    # with status ``DONE``), ``GET /v3/payments?subscription=``,
+    # ``GET|POST /v3/webhooks`` and ``GET|PUT /v3/webhooks/{id}`` (response
+    # carries ``hasAuthToken``, never the token; ``email``/``apiVersion`` are
+    # creation-only).
+    # ------------------------------------------------------------------
+
+    async def get_subscription(self, subscription_id: str) -> SubscriptionReadback:
+        """Read one subscription by exact provider ID."""
+
+        validated = validate_provider_id(subscription_id)
+        payload = self._success_object(
+            await self._send("GET", f"/subscriptions/{validated}")
+        )
+        if payload.get("id") != validated:
+            raise AsaasOutcomeUnknown("asaas_invalid_response")
+        return _subscription_readback(payload)
+
+    async def get_payment(self, payment_id: str) -> PaymentReadback:
+        """Read one payment by exact provider ID."""
+
+        validated = validate_provider_id(payment_id)
+        payload = self._success_object(
+            await self._send("GET", f"/payments/{validated}")
+        )
+        if payload.get("id") != validated:
+            raise AsaasOutcomeUnknown("asaas_invalid_response")
+        return _payment_readback(payload)
+
+    async def _pages(
+        self, path: str, params: Mapping[str, str]
+    ) -> list[dict[str, Any]]:
+        """Read every page of a list, each page small enough for the cap.
+
+        ``ASAAS_PAGE_SIZE`` keeps one page of full payment objects far below
+        ``ASAAS_MAX_RESPONSE_BYTES``; more than ``ASAAS_MAX_PAGES`` pages, a
+        page without progress or a malformed page proves nothing and raises.
+        """
+
+        items: list[dict[str, Any]] = []
+        for page in range(ASAAS_MAX_PAGES):
+            payload = self._success_object(
+                await self._send(
+                    "GET",
+                    path,
+                    params={
+                        **params,
+                        "offset": str(page * ASAAS_PAGE_SIZE),
+                        "limit": str(ASAAS_PAGE_SIZE),
+                    },
+                )
+            )
+            data = payload.get("data")
+            has_more = payload.get("hasMore")
+            if (
+                not isinstance(data, list)
+                or not isinstance(has_more, bool)
+                or len(data) > ASAAS_PAGE_SIZE
+                or not all(isinstance(item, dict) for item in data)
+            ):
+                raise AsaasOutcomeUnknown("asaas_invalid_response")
+            items.extend(data)
+            if not has_more:
+                return items
+            if not data:
+                raise AsaasOutcomeUnknown("asaas_invalid_response")
+        raise AsaasOutcomeUnknown("asaas_readback_too_large")
+
+    async def list_payments_by_subscription(
+        self, subscription_id: str
+    ) -> tuple[PaymentReadback, ...]:
+        """Read every payment of exactly this subscription (paginated)."""
+
+        validated = validate_provider_id(subscription_id)
+        records: list[PaymentReadback] = []
+        for item in await self._pages("/payments", {"subscription": validated}):
+            if item.get("subscription") != validated:
+                raise AsaasOutcomeUnknown("asaas_unfiltered_readback")
+            records.append(_payment_readback(item))
+        return tuple(records)
+
+    async def list_webhooks(self) -> tuple[WebhookConfig, ...]:
+        """Read every webhook configuration of the account (paginated)."""
+
+        return tuple(
+            _webhook_config(item) for item in await self._pages("/webhooks", {})
+        )
+
+    async def get_webhook(self, webhook_id: str) -> WebhookConfig:
+        """Read one webhook configuration by exact provider ID."""
+
+        validated = validate_provider_id(webhook_id)
+        payload = self._success_object(
+            await self._send("GET", f"/webhooks/{validated}")
+        )
+        if payload.get("id") != validated:
+            raise AsaasOutcomeUnknown("asaas_invalid_response")
+        return _webhook_config(payload)
+
+    async def create_webhook(
+        self, desired: WebhookSettings, *, auth_token: SecretStr
+    ) -> WebhookConfig:
+        """Create the environment webhook; the token is sent, never returned."""
+
+        body = encode_json(desired.payload(auth_token=auth_token, create=True))
+        payload = self._success_object(await self._send("POST", "/webhooks", body=body))
+        return _webhook_config(payload)
+
+    async def update_webhook(
+        self, webhook_id: str, desired: WebhookSettings, *, auth_token: SecretStr
+    ) -> WebhookConfig:
+        """Converge an existing webhook to the desired configuration."""
+
+        validated = validate_provider_id(webhook_id)
+        body = encode_json(desired.payload(auth_token=auth_token, create=False))
+        payload = self._success_object(
+            await self._send("PUT", f"/webhooks/{validated}", body=body)
+        )
+        if payload.get("id") != validated:
+            raise AsaasOutcomeUnknown("asaas_invalid_response")
+        return _webhook_config(payload)
