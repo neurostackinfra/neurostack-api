@@ -1908,14 +1908,41 @@ async def test_payment_first_handoff_and_settlement_commit_as_one_transaction(
         value=_brl(cents),
     )
 
+    seen: dict[str, Any] = {}
+
     async def failing_hook(self: Any, effect: Any, projection: Any) -> None:
+        # Inside the same transaction: prove handoff, effect, Transaction and
+        # coupon were all written before the injected failure fires.
+        (row,) = (
+            await self._db.execute(
+                text(
+                    "SELECT (SELECT count(*) FROM billing_subscriptions "
+                    "WHERE builder_id = :b), "
+                    "(SELECT count(*) FROM billing_payment_effects "
+                    "WHERE builder_id = :b), "
+                    "(SELECT count(*) FROM transactions WHERE builder_id = :b "
+                    "AND coupon_code = 'PGFIRST'), "
+                    "(SELECT uses_count FROM coupons WHERE code = 'PGFIRST')"
+                ),
+                {"b": builder_id},
+            )
+        ).all()
+        seen["before_failure"] = tuple(row)
         raise RuntimeError("injected after handoff, effect and Transaction")
 
     original = _FinancialState._financial_fact_hook
     monkeypatch.setattr(_FinancialState, "_financial_fact_hook", failing_hook)
-    with pytest.raises(WebhookProcessingUnavailable):
+    with pytest.raises(
+        WebhookProcessingUnavailable, match="billing_webhook_unavailable"
+    ) as exc_info:
         await _deliver(harness, confirmed, "test")
     monkeypatch.setattr(_FinancialState, "_financial_fact_hook", original)
+    assert exc_info.value.failure_class == "unexpected"
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert str(exc_info.value.__cause__) == (
+        "injected after handoff, effect and Transaction"
+    )
+    assert seen["before_failure"] == (1, 1, 1, 1)
     (nothing,) = await _all(
         harness,
         "SELECT (SELECT count(*) FROM billing_subscriptions WHERE builder_id = :b), "
@@ -2159,3 +2186,99 @@ async def test_readback_payment_hands_off_and_settles_on_postgres(
         s=session_id,
     )
     assert tuple(row) == (True, "active", "completed", 1, cents)
+
+
+# ---------------------------------------------------------------------------
+# Fix loop 3 (MEDIUM-E): deleted never-settled payment read back live with a
+# completed refund -> settled + reversed; the totals CHECK never fires.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "refunded", "expected", "label"),
+    [
+        (
+            "RECEIVED",
+            3_000,
+            [
+                ("reversal", "reversed_cents:3000", 3_000),
+                ("settlement", "settlement:v1", 10_000),
+            ],
+            "partially_reversed",
+        ),
+        (
+            "REFUNDED",
+            10_000,
+            [
+                ("reversal", "reversed_cents:10000", 10_000),
+                ("settlement", "settlement:v1", 10_000),
+            ],
+            "reversed",
+        ),
+    ],
+)
+async def test_deleted_payment_with_refunds_settles_and_reverses_on_postgres(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    refunded: int,
+    expected: list[tuple[Any, ...]],
+    label: str,
+) -> None:
+    builder_id, _session, checkout_id = await _topup(
+        harness, monkeypatch, f"M-E {status}"
+    )
+    payment = f"pay_pg_me_{status.lower()}"
+    await _deliver(
+        harness, _payment("PAYMENT_CREATED", payment, checkout=checkout_id), "test"
+    )
+    await _deliver(
+        harness, _payment("PAYMENT_DELETED", payment, checkout=checkout_id), "test"
+    )
+    restored = await _deliver(
+        harness, _payment("PAYMENT_RESTORED", payment, checkout=checkout_id), "test"
+    )
+    assert restored.outcome == "readback_required"
+    reads = _Reads(
+        payments={payment: _read(payment, status, 10_000, refunded=refunded)}
+    )
+    for replay in range(2):
+        async with harness.session() as session:
+            outcome = await BillingReadbackService(
+                session, client_factory=reads, environment="test"
+            ).readback_payment(payment, delivery_id=restored.delivery_id)
+        assert outcome == "converged"
+        effects = await _all(
+            harness,
+            "SELECT effect_kind, source_revision, amount_cents "
+            "FROM billing_payment_effects WHERE payment_id = :p "
+            "ORDER BY effect_kind, source_revision",
+            p=payment,
+        )
+        assert [tuple(e) for e in effects] == expected
+        (row,) = await _all(
+            harness,
+            "SELECT p.status, p.settled_cents, p.reversed_cents, p.restored_cents, "
+            "p.restoration_epoch, o.state, o.settled_cents, o.reversed_cents "
+            "FROM billing_payment_projections p JOIN billing_topup_orders o "
+            "ON o.id = p.topup_order_id WHERE p.payment_id = :p",
+            p=payment,
+        )
+        assert tuple(row) == (
+            label,
+            10_000,
+            refunded,
+            0,
+            0,
+            label,
+            10_000,
+            refunded,
+        ), f"replay {replay}"
+    assert (
+        await _scalar(
+            harness,
+            "SELECT count(*) FROM transactions WHERE builder_id = :b",
+            b=builder_id,
+        )
+        == 1
+    )

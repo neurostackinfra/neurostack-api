@@ -1316,10 +1316,16 @@ class _FinancialState:
         # events may legitimately change; money must actually come back
         # (``target < net``), so re-reading an unchanged partial refund is not
         # a restoration.  A deleted payment (never settled) is the only
-        # label-based case, and nothing relabels a deleted row.
+        # label-based case, and nothing relabels a deleted row; it is restored
+        # (with zero money) only when the read shows no completed refund — a
+        # read with refunds is settled and reversed by steps 2-3 instead.
         restored_now = False
         reversed_money = net_reversed > 0 and target_reversed < net_reversed
-        deleted_row = projection.status == "deleted" and projection.settled_cents == 0
+        deleted_row = (
+            projection.status == "deleted"
+            and projection.settled_cents == 0
+            and target_reversed == 0
+        )
         if normalized in _LIVE_PROVIDER_STATUSES and (reversed_money or deleted_row):
             if projection.settled_cents > 0 and not money_settled:
                 self.alerts.append("drift")  # settled money cannot be pending
@@ -1377,7 +1383,9 @@ class _FinancialState:
             return "readback_required"
         status = normalized
         # The label of a live settled payment follows its cumulative cents, so
-        # replaying the same read never flips it.
+        # replaying the same read never flips a row with reversed or restored
+        # money; a deleted row restored with zero money is labelled
+        # ``restored`` only by the read that proved it (``settled`` after).
         if normalized == "settled":
             if projection.reversed_cents > projection.restored_cents:
                 status = "partially_reversed"

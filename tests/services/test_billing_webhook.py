@@ -2107,3 +2107,90 @@ async def test_quarantine_alert_is_counted_once(
     before = _metric("neurostack_billing_alerts_total", kind="quarantine")
     assert (await world.receive(envelope)).outcome == "quarantined"
     assert _metric("neurostack_billing_alerts_total", kind="quarantine") == before + 1
+
+
+# ---------------------------------------------------------------------------
+# Fix loop 3 (MEDIUM-E): a deleted, never-settled payment read back live WITH
+# a completed refund is settled and reversed, never "restored" by a negative
+# delta (which the totals CHECK refuses on PostgreSQL).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "refunded", "expected", "label"),
+    [
+        (
+            "RECEIVED",
+            3_000,
+            [
+                ("reversal", "reversed_cents:3000", 3_000),
+                ("settlement", "settlement:v1", 10_000),
+            ],
+            "partially_reversed",
+        ),
+        (
+            "PENDING",
+            3_000,
+            [
+                ("reversal", "reversed_cents:3000", 3_000),
+                ("settlement", "settlement:v1", 10_000),
+            ],
+            "partially_reversed",
+        ),
+        (
+            "REFUNDED",
+            10_000,
+            [
+                ("reversal", "reversed_cents:10000", 10_000),
+                ("settlement", "settlement:v1", 10_000),
+            ],
+            "reversed",
+        ),
+    ],
+)
+async def test_deleted_payment_read_back_with_refunds_settles_then_reverses(
+    world: _World, status: str, refunded: int, expected: list[Any], label: str
+) -> None:
+    checkout, _order = await world.topup_session()
+    payment_id = f"pay_deleted_{status.lower()}"
+    common = {
+        "id": payment_id,
+        "subscription": None,
+        "checkoutSession": checkout.external_checkout_id,
+        "value": Decimal("100.00"),
+    }
+    await world.receive(_event("PAYMENT_CREATED", when="2026-10-11 10:00:00", **common))
+    await world.receive(_event("PAYMENT_DELETED", when="2026-10-11 10:01:00", **common))
+    restored = await world.receive(
+        _event("PAYMENT_RESTORED", when="2026-10-11 10:02:00", **common)
+    )
+    world.provider.payments[payment_id] = _payment_read(
+        payment_id, status=status, value_cents=10_000, refunded_cents=refunded
+    )
+    for replay in range(2):
+        async with world.sessions() as session:
+            outcome = await world.readback(session).readback_payment(
+                payment_id, delivery_id=restored.delivery_id
+            )
+        assert outcome == "converged"
+        effects = sorted(
+            (e.effect_kind, e.source_revision, e.amount_cents)
+            for e in await world.rows(BillingPaymentEffect)
+        )
+        assert effects == expected  # first read applies; the replay is inert
+        (projection,) = await world.rows(BillingPaymentProjection)
+        # The migration's ck_billing_payment_projections_totals, in Python.
+        assert (
+            0
+            <= projection.restored_cents
+            <= projection.reversed_cents
+            <= projection.settled_cents
+            <= projection.amount_cents
+        )
+        assert projection.restoration_epoch == 0
+        if replay == 0:
+            # Label as at 417c8ca.  (A PENDING read carrying a DONE refund is
+            # contradictory provider data; its replay relabels ``pending``
+            # exactly like 417c8ca did — money and effects stay put.)
+            assert projection.status == label
+    assert await world.count(Transaction) == 1
