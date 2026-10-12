@@ -417,7 +417,7 @@ async def postgres_harness() -> AsyncIterator[_Harness]:
             foreign_builder_id=foreign_builder_id,
             transaction_id=legacy_transaction_id,
         )
-        await _run_alembic(migrated_url, "upgrade", "026")
+        await _run_alembic(migrated_url, "upgrade", "027")
         migrated_engine = create_async_engine(migrated_url, poolclass=NullPool)
         async with migrated_engine.connect() as connection:
             assert (
@@ -453,7 +453,7 @@ async def postgres_harness() -> AsyncIterator[_Harness]:
             )
         finally:
             await downgrade_probe.dispose()
-        await _run_alembic(migrated_url, "upgrade", "026")
+        await _run_alembic(migrated_url, "upgrade", "027")
         migrated_engine = create_async_engine(migrated_url, poolclass=NullPool)
 
         await _create_child(admin_engine, fresh_name)
@@ -716,7 +716,7 @@ async def test_upgrade_downgrade_and_fresh_schema_are_equivalent(
     async with postgres_harness.engine.connect() as connection:
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "026"
+            == "027"
         )
         legacy = (
             await connection.execute(
@@ -765,6 +765,17 @@ async def test_live_schema_matches_orm_metadata_and_required_triggers(
         ("billing_rollout_receipts", "trg_billing_rollout_receipts_immutable"),
         ("billing_migration_receipts", "trg_billing_migration_receipts_immutable"),
         ("billing_outbox", "trg_billing_outbox_immutable"),
+        ("billing_fact_handoffs", "trg_billing_fact_handoffs_immutable"),
+        ("billing_fact_acks", "trg_billing_fact_acks_immutable"),
+        (
+            "billing_fact_reconciliation_alerts",
+            "trg_billing_fact_reconciliation_alerts_immutable",
+        ),
+        ("billing_topup_orders", "trg_billing_topup_fact_atomic"),
+        (
+            "billing_subscription_cycles",
+            "trg_billing_subscription_cycle_fact_atomic",
+        ),
     }.issubset(triggers)
 
 
@@ -4175,6 +4186,188 @@ async def test_rollbacks_leave_no_delivery_effect_or_order_outbox_partial(
             )
             == 0
         )
+
+
+async def test_financial_revision_requires_atomic_effect_outbox_lineage(
+    postgres_harness: _Harness,
+) -> None:
+    """A committed financial aggregate cannot exist without its fact row."""
+
+    orphan_order_id = uuid4()
+    with pytest.raises(DBAPIError):
+        async with postgres_harness.engine.begin() as connection:
+            await connection.execute(
+                text("""
+                    INSERT INTO billing_topup_orders (
+                        id, builder_id, payment_method, catalog_version_id,
+                        offer_id, amount_cents, credit_grant_mc, pricing_snapshot,
+                        state, financial_revision, settled_cents
+                    ) VALUES (
+                        :id, :builder_id, 'pix', 'catalog-v1',
+                        'package_credits_500_v1', 10000, 500,
+                        '{"catalog_version_id":"catalog-v1"}'::jsonb,
+                        'settled', 1, 10000
+                    )
+                """),
+                {
+                    "id": orphan_order_id,
+                    "builder_id": postgres_harness.foreign_builder_id,
+                },
+            )
+
+    async with postgres_harness.engine.connect() as connection:
+        assert (
+            await connection.scalar(
+                text("SELECT count(*) FROM billing_topup_orders WHERE id = :id"),
+                {"id": orphan_order_id},
+            )
+            == 0
+        )
+
+    order_id = uuid4()
+    projection_id = uuid4()
+    delivery_id = uuid4()
+    effect_id = uuid4()
+    outbox_id = uuid4()
+    payment_id = f"pay-fact-{projection_id}"
+    async with postgres_harness.engine.begin() as connection:
+        await connection.execute(
+            text("""
+                INSERT INTO billing_topup_orders (
+                    id, builder_id, payment_method, catalog_version_id,
+                    offer_id, amount_cents, credit_grant_mc, pricing_snapshot
+                ) VALUES (
+                    :id, :builder_id, 'pix', 'catalog-v1',
+                    'package_credits_500_v1', 10000, 500,
+                    '{"catalog_version_id":"catalog-v1"}'::jsonb
+                )
+            """),
+            {"id": order_id, "builder_id": postgres_harness.foreign_builder_id},
+        )
+        await connection.execute(
+            text("""
+                INSERT INTO billing_webhook_deliveries (
+                    id, builder_id, provider, event_id, event_name,
+                    provider_created_at, body_bytes, body_sha256
+                ) VALUES (
+                    :id, :builder_id, 'asaas', :event_id, 'PAYMENT_CONFIRMED',
+                    now(), 2, :sha
+                )
+            """),
+            {
+                "id": delivery_id,
+                "builder_id": postgres_harness.foreign_builder_id,
+                "event_id": f"fact-{delivery_id}",
+                "sha": "a" * 64,
+            },
+        )
+        await connection.execute(
+            text("""
+                INSERT INTO billing_payment_projections (
+                    id, builder_id, provider, payment_id, aggregate_kind,
+                    topup_order_id, status, amount_cents, provider_created_at,
+                    ordering_key, last_event_id
+                ) VALUES (
+                    :id, :builder_id, 'asaas', :payment_id, 'topup',
+                    :order_id, 'pending', 10000, now(),
+                    '2026-10-12T00:00:00Z:0', :event_id
+                )
+            """),
+            {
+                "id": projection_id,
+                "builder_id": postgres_harness.foreign_builder_id,
+                "payment_id": payment_id,
+                "order_id": order_id,
+                "event_id": f"fact-{delivery_id}",
+            },
+        )
+        await connection.execute(
+            text("""
+                INSERT INTO billing_payment_effects (
+                    id, builder_id, projection_id, delivery_id, provider,
+                    payment_id, effect_kind, source_revision, amount_cents
+                ) VALUES (
+                    :id, :builder_id, :projection_id, :delivery_id, 'asaas',
+                    :payment_id, 'settlement', 'settlement:v1', 10000
+                )
+            """),
+            {
+                "id": effect_id,
+                "builder_id": postgres_harness.foreign_builder_id,
+                "projection_id": projection_id,
+                "delivery_id": delivery_id,
+                "payment_id": payment_id,
+            },
+        )
+        await connection.execute(
+            text("""
+                UPDATE billing_topup_orders
+                SET state = 'settled', financial_revision = 1, settled_cents = 10000
+                WHERE id = :id
+            """),
+            {"id": order_id},
+        )
+        await connection.execute(
+            text("""
+                INSERT INTO billing_outbox (
+                    id, builder_id, schema_version, event_type, aggregate_kind,
+                    aggregate_id, topup_order_id, payment_effect_id,
+                    financial_revision, payload, payload_sha256
+                ) VALUES (
+                    :id, :builder_id, 'billing.fact.v1',
+                    'topup.payment_settled.v1', 'topup_order',
+                    :order_id, :order_id, :effect_id, 1, '{}'::jsonb, :sha
+                )
+            """),
+            {
+                "id": outbox_id,
+                "builder_id": postgres_harness.foreign_builder_id,
+                "order_id": order_id,
+                "effect_id": effect_id,
+                "sha": "b" * 64,
+            },
+        )
+
+    async with postgres_harness.engine.connect() as connection:
+        assert (
+            await connection.scalar(
+                text(
+                    "SELECT financial_revision FROM billing_topup_orders WHERE id = :id"
+                ),
+                {"id": order_id},
+            )
+            == 1
+        )
+        assert (
+            await connection.scalar(
+                text("SELECT count(*) FROM billing_outbox WHERE id = :id"),
+                {"id": outbox_id},
+            )
+            == 1
+        )
+
+    with pytest.raises(IntegrityError):
+        async with postgres_harness.engine.begin() as connection:
+            unknown_order_id = uuid4()
+            await connection.execute(
+                text("""
+                    INSERT INTO billing_outbox (
+                        id, builder_id, schema_version, event_type, aggregate_kind,
+                        aggregate_id, topup_order_id, financial_revision,
+                        payload, payload_sha256
+                    ) VALUES (
+                        :id, :builder_id, 'billing.fact.v1',
+                        'topup.payment_settled.v1', 'topup_order',
+                        :order_id, :order_id, 1, '{}'::jsonb, :sha
+                    )
+                """),
+                {
+                    "id": uuid4(),
+                    "builder_id": postgres_harness.builder_id,
+                    "order_id": unknown_order_id,
+                    "sha": "c" * 64,
+                },
+            )
 
 
 # ===========================================================================

@@ -412,6 +412,7 @@ class PaymentReadback:
     external_reference: str | None
     billing_type: str | None
     refunded_cents: int | None
+    due_date: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -538,6 +539,7 @@ def _payment_readback(payload: Mapping[str, Any]) -> PaymentReadback:
         external_reference=_optional_text(payload.get("externalReference"), limit=200),
         billing_type=_optional_text(payload.get("billingType"), limit=30),
         refunded_cents=_refunded_cents(payload.get("refunds")),
+        due_date=_optional_date(payload.get("dueDate")),
     )
 
 

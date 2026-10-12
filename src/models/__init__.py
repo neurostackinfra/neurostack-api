@@ -8,6 +8,10 @@ This module exports all ORM models for database operations.
 from src.models.base import Base, TimestampMixin
 from src.models.billing import (
     BillingCheckoutSession,
+    BillingFactAck,
+    BillingFactDelivery,
+    BillingFactHandoff,
+    BillingFactReconciliationAlert,
     BillingMigration,
     BillingMigrationReceipt,
     BillingOutboxEvent,
@@ -17,6 +21,7 @@ from src.models.billing import (
     BillingRolloutReceipt,
     BillingRosterControl,
     BillingSubscription,
+    BillingSubscriptionCycle,
     BillingTopupCapabilityReceipt,
     BillingTopupOrder,
     BillingWebhookDelivery,
@@ -47,6 +52,7 @@ __all__ = [
     "BillingSubscription",
     "BillingMigration",
     "BillingCheckoutSession",
+    "BillingSubscriptionCycle",
     "BillingMigrationReceipt",
     "BillingWebhookDelivery",
     "BillingPaymentProjection",
@@ -57,6 +63,10 @@ __all__ = [
     "BillingTopupCapabilityReceipt",
     "BillingTopupOrder",
     "BillingOutboxEvent",
+    "BillingFactDelivery",
+    "BillingFactHandoff",
+    "BillingFactAck",
+    "BillingFactReconciliationAlert",
     # Core Models
     "Builder",
     "Coupon",

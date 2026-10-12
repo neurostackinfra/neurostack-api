@@ -95,6 +95,7 @@ from src.services.billing_checkout import (
     ORPHANED_CREATING_AFTER,
     BillingCheckoutService,
 )
+from src.services.billing_outbox import BillingFactProducer
 
 logger = get_logger(__name__)
 
@@ -477,6 +478,7 @@ class PaymentFacts:
     external_reference: UUID | None
     value_cents: int | None
     billing_type: str | None
+    due_date: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -624,6 +626,7 @@ def parse_envelope(body: bytes, payload: object) -> WebhookEnvelope:
             external_reference=_uuid_reference(data.get("externalReference")),
             value_cents=provider_cents(data.get("value")),
             billing_type=_billing_type(data.get("billingType")),
+            due_date=_date(data.get("dueDate")),
         ),
         **common,
     )
@@ -637,6 +640,7 @@ def _payment_facts_from_readback(readback: PaymentReadback) -> PaymentFacts:
         external_reference=_uuid_reference(readback.external_reference),
         value_cents=readback.value_cents,
         billing_type=_billing_type(readback.billing_type),
+        due_date=readback.due_date,
     )
 
 
@@ -1213,6 +1217,7 @@ class _FinancialState:
                 order=order,
                 session=session,
                 billing_type=facts.billing_type,
+                cycle_start=facts.due_date,
             )
             return "processed"
         # Monetary transitions are monotone in their cumulative key, so their
@@ -1353,6 +1358,7 @@ class _FinancialState:
                 order=order,
                 session=session,
                 billing_type=facts.billing_type,
+                cycle_start=facts.due_date,
             )
         elif not money_settled and projection.settled_cents > 0:
             self.alerts.append("drift")  # money can never un-settle
@@ -1446,6 +1452,7 @@ class _FinancialState:
         order: BillingTopupOrder | None,
         session: BillingCheckoutSession | None,
         billing_type: str | None,
+        cycle_start: date | None,
     ) -> None:
         amount = projection.amount_cents
         self._touch(projection, status="settled", key=key, event_id=event_id)
@@ -1476,7 +1483,7 @@ class _FinancialState:
             session=session,
             billing_type=billing_type,
         )
-        await self._financial_fact_hook(effect, projection)
+        await self._financial_fact_hook(effect, projection, cycle_start=cycle_start)
 
     async def _commercial_settlement(
         self,
@@ -1625,16 +1632,17 @@ class _FinancialState:
             await self._financial_fact_hook(effect, projection)
 
     async def _financial_fact_hook(
-        self, effect: BillingPaymentEffect, projection: BillingPaymentProjection
+        self,
+        effect: BillingPaymentEffect,
+        projection: BillingPaymentProjection,
+        *,
+        cycle_start: date | None = None,
     ) -> None:
-        """Group 4 inserts the ``billing.fact.v1`` outbox row here.
+        """Atomically append the Group 4 fact after a newly persisted effect."""
 
-        Called once per new settlement/reversal/restoration effect, inside the
-        same transaction, after every aggregate row is flushed.  Group 3 does
-        not publish facts, schemas or acks.
-        """
-
-        return None
+        await BillingFactProducer(self._db, now=self._clock).record_effect(
+            effect, projection, cycle_start=cycle_start
+        )
 
 
 # ---------------------------------------------------------------------------

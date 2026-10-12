@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neurostack.example/contracts/billing.fact.v1.schema.json",
+  "title": "billing.fact.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "event_type",
+    "producer",
+    "occurred_at",
+    "produced_at",
+    "builder_id",
+    "aggregate_kind",
+    "aggregate_id",
+    "payment_id",
+    "catalog_version_id",
+    "offer_id",
+    "currency",
+    "financial_revision",
+    "total_amount_cents",
+    "settled_cents",
+    "reversed_cents",
+    "restored_cents",
+    "credit_grant_mc",
+    "lines"
+  ],
+  "properties": {
+    "schema_version": {"const": "billing.fact.v1"},
+    "event_id": {"type": "string", "format": "uuid"},
+    "event_type": {
+      "enum": [
+        "subscription.cycle_settled.v1",
+        "subscription.cycle_reversed.v1",
+        "subscription.cycle_restored.v1",
+        "topup.payment_settled.v1",
+        "topup.payment_reversed.v1",
+        "topup.payment_restored.v1"
+      ]
+    },
+    "producer": {"const": "asaas-payment-gateway"},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "produced_at": {"type": "string", "format": "date-time"},
+    "builder_id": {"type": "string", "format": "uuid"},
+    "aggregate_kind": {"enum": ["subscription_cycle", "topup_order"]},
+    "aggregate_id": {"type": "string", "format": "uuid"},
+    "payment_id": {"type": "string", "minLength": 1, "maxLength": 160},
+    "catalog_version_id": {"type": "string", "minLength": 1, "maxLength": 80},
+    "offer_id": {"type": "string", "minLength": 1, "maxLength": 100},
+    "currency": {"const": "BRL"},
+    "financial_revision": {"type": "integer", "minimum": 1},
+    "total_amount_cents": {"type": "integer", "minimum": 1},
+    "settled_cents": {"type": "integer", "minimum": 0},
+    "reversed_cents": {"type": "integer", "minimum": 0},
+    "restored_cents": {"type": "integer", "minimum": 0},
+    "credit_grant_mc": {"type": "integer", "minimum": 0},
+    "subscription_cycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cycle_start", "cycle_end"],
+      "properties": {
+        "cycle_start": {"type": "string", "format": "date"},
+        "cycle_end": {"type": "string", "format": "date"}
+      }
+    },
+    "lines": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/line"}
+    }
+  },
+  "$defs": {
+    "line": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "line_id",
+        "offer_id",
+        "kind",
+        "quantity",
+        "unit_amount_cents",
+        "line_amount_cents",
+        "credit_grant_mc",
+        "settled_cents",
+        "reversed_cents",
+        "restored_cents",
+        "financial_state"
+      ],
+      "properties": {
+        "line_id": {"type": "string", "minLength": 1, "maxLength": 100},
+        "offer_id": {"type": "string", "minLength": 1, "maxLength": 100},
+        "kind": {"enum": ["plan", "additional_clinic", "topup", "tax"]},
+        "quantity": {"type": "integer", "minimum": 1},
+        "unit_amount_cents": {"type": "integer", "minimum": 0},
+        "line_amount_cents": {"type": "integer", "minimum": 0},
+        "credit_grant_mc": {"type": "integer", "minimum": 0},
+        "settled_cents": {"type": "integer", "minimum": 0},
+        "reversed_cents": {"type": "integer", "minimum": 0},
+        "restored_cents": {"type": "integer", "minimum": 0},
+        "financial_state": {"enum": ["pending", "settled", "reversed", "restored"]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"enum": ["additional_clinic", "tax"]}}},
+          "then": {"properties": {"credit_grant_mc": {"const": 0}}}
+        }
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "aggregate_kind": {"const": "subscription_cycle"},
+        "event_type": {"enum": ["subscription.cycle_settled.v1", "subscription.cycle_reversed.v1", "subscription.cycle_restored.v1"]}
+      },
+      "required": ["subscription_cycle"]
+    },
+    {
+      "properties": {
+        "aggregate_kind": {"const": "topup_order"},
+        "event_type": {"enum": ["topup.payment_settled.v1", "topup.payment_reversed.v1", "topup.payment_restored.v1"]}
+      },
+      "not": {"required": ["subscription_cycle"]}
+    }
+  ]
+}

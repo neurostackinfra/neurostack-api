@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from src.models.base import Base
 from src.models.billing import (
     BillingCheckoutSession,
+    BillingOutboxEvent,
     BillingPaymentEffect,
     BillingPaymentProjection,
     BillingRolloutControl,
@@ -651,6 +652,11 @@ async def test_topup_settlement_uses_snapshot_and_runs_once(world: _World) -> No
         "settlement",
         "settlement:v1",
         10_000,
+    )
+    (outbox,) = await world.rows(BillingOutboxEvent)
+    assert (outbox.event_type, outbox.payment_effect_id) == (
+        "topup.payment_settled.v1",
+        effect.id,
     )
     (transaction,) = await world.rows(Transaction)
     assert transaction.provider == "asaas"
@@ -1784,6 +1790,7 @@ async def test_settlement_without_an_exact_amount_waits_for_readback(
             == "converged"
         )
     assert await world.count(BillingPaymentEffect) == 1
+    assert await world.count(BillingOutboxEvent) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -160,6 +160,9 @@ class BillingSubscription(Base, TimestampMixin):
     outbox_events: Mapped[list["BillingOutboxEvent"]] = relationship(
         "BillingOutboxEvent", back_populates="subscription", viewonly=True
     )
+    financial_cycles: Mapped[list["BillingSubscriptionCycle"]] = relationship(
+        "BillingSubscriptionCycle", viewonly=True
+    )
 
 
 class BillingMigration(Base, TimestampMixin):
@@ -374,6 +377,12 @@ class BillingTopupOrder(Base, TimestampMixin):
     restored_cents: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0, server_default="0"
     )
+    # The immutable pricing snapshot remains the commercial source of truth.
+    # This separate snapshot records only the producer's cumulative financial
+    # view, so a fact can be rebuilt without consulting a projection label.
+    financial_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'")
+    )
 
     builder: Mapped["Builder"] = relationship(
         "Builder", back_populates="billing_topup_orders"
@@ -386,6 +395,95 @@ class BillingTopupOrder(Base, TimestampMixin):
     )
     outbox_events: Mapped[list["BillingOutboxEvent"]] = relationship(
         "BillingOutboxEvent", back_populates="topup_order", viewonly=True
+    )
+
+
+class BillingSubscriptionCycle(Base, TimestampMixin):
+    """One immutable-priced, cumulatively accounted monthly payment cycle."""
+
+    __tablename__ = "billing_subscription_cycles"
+    __table_args__ = (
+        CheckConstraint(
+            "provider = 'asaas'",
+            name="ck_billing_subscription_cycles_provider",
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'settled', 'reversed', 'restored', 'quarantined')",
+            name="ck_billing_subscription_cycles_state",
+        ),
+        CheckConstraint(
+            "financial_revision >= 0",
+            name="ck_billing_subscription_cycles_financial_revision",
+        ),
+        CheckConstraint(
+            "amount_cents > 0 AND credit_grant_mc >= 0",
+            name="ck_billing_subscription_cycles_positive_amounts",
+        ),
+        CheckConstraint(
+            "settled_cents >= 0 AND reversed_cents >= 0 AND restored_cents >= 0 "
+            "AND restored_cents <= reversed_cents "
+            "AND reversed_cents <= settled_cents "
+            "AND settled_cents <= amount_cents",
+            name="ck_billing_subscription_cycles_financial_totals",
+        ),
+        CheckConstraint(
+            "cycle_start < cycle_end",
+            name="ck_billing_subscription_cycles_dates",
+        ),
+        ForeignKeyConstraint(
+            ["builder_id", "subscription_id"],
+            ["billing_subscriptions.builder_id", "billing_subscriptions.id"],
+            ondelete="RESTRICT",
+            name="fk_billing_subscription_cycles_builder_subscription",
+        ),
+        UniqueConstraint(
+            "provider",
+            "payment_id",
+            name="uq_billing_subscription_cycles_provider_payment",
+        ),
+        UniqueConstraint(
+            "builder_id",
+            "id",
+            name="uq_billing_subscription_cycles_builder_id_id",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    builder_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("builders.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    subscription_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    provider: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="asaas", server_default="asaas"
+    )
+    payment_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    catalog_version_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    offer_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    cycle_start: Mapped[date] = mapped_column(Date, nullable=False)
+    cycle_end: Mapped[date] = mapped_column(Date, nullable=False)
+    amount_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    credit_grant_mc: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    pricing_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    financial_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    state: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending", server_default="pending"
+    )
+    financial_revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    settled_cents: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    reversed_cents: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    restored_cents: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
     )
 
 
@@ -831,6 +929,15 @@ class BillingPaymentProjection(Base, TimestampMixin):
             name="fk_billing_payment_projections_builder_topup",
         ),
         ForeignKeyConstraint(
+            ["builder_id", "subscription_cycle_id"],
+            [
+                "billing_subscription_cycles.builder_id",
+                "billing_subscription_cycles.id",
+            ],
+            ondelete="RESTRICT",
+            name="fk_billing_payment_projections_builder_cycle",
+        ),
+        ForeignKeyConstraint(
             ["builder_id", "checkout_session_id"],
             ["billing_checkout_sessions.builder_id", "billing_checkout_sessions.id"],
             ondelete="RESTRICT",
@@ -901,6 +1008,9 @@ class BillingPaymentProjection(Base, TimestampMixin):
         PG_UUID(as_uuid=True), nullable=True
     )
     topup_order_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True
+    )
+    subscription_cycle_id: Mapped[UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), nullable=True
     )
     checkout_session_id: Mapped[UUID | None] = mapped_column(
@@ -1483,9 +1593,12 @@ class BillingOutboxEvent(Base):
         ),
         CheckConstraint(
             "(aggregate_kind = 'subscription_cycle' AND subscription_id IS NOT NULL "
-            "AND topup_order_id IS NULL AND aggregate_id = subscription_id) OR "
+            "AND topup_order_id IS NULL AND "
+            "((subscription_cycle_id IS NOT NULL AND aggregate_id = subscription_cycle_id) "
+            "OR (subscription_cycle_id IS NULL AND aggregate_id = subscription_id))) OR "
             "(aggregate_kind = 'topup_order' AND topup_order_id IS NOT NULL "
-            "AND subscription_id IS NULL AND aggregate_id = topup_order_id)",
+            "AND subscription_id IS NULL AND subscription_cycle_id IS NULL "
+            "AND aggregate_id = topup_order_id)",
             name="ck_billing_outbox_aggregate_target",
         ),
         _postgresql_check(
@@ -1504,12 +1617,28 @@ class BillingOutboxEvent(Base):
             ondelete="RESTRICT",
             name="fk_billing_outbox_builder_topup",
         ),
+        ForeignKeyConstraint(
+            ["builder_id", "subscription_cycle_id"],
+            [
+                "billing_subscription_cycles.builder_id",
+                "billing_subscription_cycles.id",
+            ],
+            ondelete="RESTRICT",
+            name="fk_billing_outbox_builder_cycle",
+        ),
+        ForeignKeyConstraint(
+            ["payment_effect_id"],
+            ["billing_payment_effects.id"],
+            ondelete="RESTRICT",
+            name="fk_billing_outbox_payment_effect",
+        ),
         UniqueConstraint(
             "aggregate_kind",
             "aggregate_id",
             "financial_revision",
             name="uq_billing_outbox_aggregate_revision",
         ),
+        UniqueConstraint("payment_effect_id", name="uq_billing_outbox_payment_effect"),
     )
 
     id: Mapped[UUID] = mapped_column(
@@ -1531,9 +1660,17 @@ class BillingOutboxEvent(Base):
     topup_order_id: Mapped[UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), nullable=True
     )
+    subscription_cycle_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True
+    )
+    payment_effect_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True
+    )
     financial_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    bundle_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    deployment_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -1543,4 +1680,172 @@ class BillingOutboxEvent(Base):
     )
     topup_order: Mapped["BillingTopupOrder | None"] = relationship(
         "BillingTopupOrder", back_populates="outbox_events", viewonly=True
+    )
+
+
+class BillingFactDelivery(Base, TimestampMixin):
+    """Relational retry record; an acknowledged fact is never discarded."""
+
+    __tablename__ = "billing_fact_deliveries"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending', 'awaiting_ack', 'acknowledged', 'blocked')",
+            name="ck_billing_fact_deliveries_state",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_billing_fact_deliveries_attempt_count",
+        ),
+        ForeignKeyConstraint(
+            ["outbox_event_id"],
+            ["billing_outbox.id"],
+            ondelete="RESTRICT",
+            name="fk_billing_fact_deliveries_outbox",
+        ),
+        UniqueConstraint("outbox_event_id", name="uq_billing_fact_deliveries_outbox"),
+        UniqueConstraint("event_id", name="uq_billing_fact_deliveries_event_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    outbox_event_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    event_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    state: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending", server_default="pending"
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    acknowledged_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class BillingFactHandoff(Base):
+    """Append-only producer evidence binding one fact to its contract bundle."""
+
+    __tablename__ = "billing_fact_handoffs"
+    __table_args__ = (
+        CheckConstraint(
+            "schema_version = 'billing.fact.v1'",
+            name="ck_billing_fact_handoffs_schema_version",
+        ),
+        _postgresql_check(
+            f"bundle_digest ~ '{_SHA256_CHECK}' AND deployment_digest ~ '{_SHA256_CHECK}'",
+            name="ck_billing_fact_handoffs_digests",
+        ),
+        ForeignKeyConstraint(
+            ["outbox_event_id"],
+            ["billing_outbox.id"],
+            ondelete="RESTRICT",
+            name="fk_billing_fact_handoffs_outbox",
+        ),
+        ForeignKeyConstraint(
+            ["delivery_id"],
+            ["billing_fact_deliveries.id"],
+            ondelete="RESTRICT",
+            name="fk_billing_fact_handoffs_delivery",
+        ),
+        UniqueConstraint("outbox_event_id", name="uq_billing_fact_handoffs_outbox"),
+        UniqueConstraint("delivery_id", name="uq_billing_fact_handoffs_delivery"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    outbox_event_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    delivery_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    bundle_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    deployment_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    handed_off_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class BillingFactAck(Base):
+    """Consumer-owned append-only acknowledgement read by this producer only."""
+
+    __tablename__ = "billing_fact_acks"
+    __table_args__ = (
+        CheckConstraint(
+            "schema_version = 'billing.fact.ack.v1'",
+            name="ck_billing_fact_acks_schema_version",
+        ),
+        CheckConstraint(
+            "outcome IN ('accepted', 'rejected')",
+            name="ck_billing_fact_acks_outcome",
+        ),
+        _postgresql_check(
+            f"fact_sha256 ~ '{_SHA256_CHECK}' AND bundle_digest ~ '{_SHA256_CHECK}' "
+            f"AND deployment_digest ~ '{_SHA256_CHECK}' AND effects_digest ~ '{_SHA256_CHECK}'",
+            name="ck_billing_fact_acks_digests",
+        ),
+        ForeignKeyConstraint(
+            ["outbox_event_id"],
+            ["billing_outbox.id"],
+            ondelete="RESTRICT",
+            name="fk_billing_fact_acks_outbox",
+        ),
+        UniqueConstraint("outbox_event_id", name="uq_billing_fact_acks_outbox"),
+        UniqueConstraint("event_id", name="uq_billing_fact_acks_event_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    outbox_event_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    event_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(20), nullable=False)
+    inbox_event_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    fact_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    bundle_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    deployment_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    effects_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    acknowledged_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class BillingFactReconciliationAlert(Base):
+    """Append-only sanitized evidence of a producer/consumer reconciliation gap."""
+
+    __tablename__ = "billing_fact_reconciliation_alerts"
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('backlog', 'collision', 'schema_mismatch', 'digest_mismatch', "
+            "'gap', 'partial_credit_settlement')",
+            name="ck_billing_fact_reconciliation_alerts_kind",
+        ),
+        _postgresql_check(
+            f"detail_sha256 ~ '{_SHA256_CHECK}'",
+            name="ck_billing_fact_reconciliation_alerts_digest",
+        ),
+        ForeignKeyConstraint(
+            ["outbox_event_id"],
+            ["billing_outbox.id"],
+            ondelete="RESTRICT",
+            name="fk_billing_fact_reconciliation_alerts_outbox",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    outbox_event_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    kind: Mapped[str] = mapped_column(String(40), nullable=False)
+    detail_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
