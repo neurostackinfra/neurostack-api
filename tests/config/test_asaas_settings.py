@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import SecretStr, ValidationError
 
 from src.config.settings import (
@@ -10,11 +16,47 @@ from src.config.settings import (
     ASAAS_AUTH_HEADER,
     ASAAS_DEFAULT_USER_AGENT,
     Settings,
+    _runtime_acknowledgement_signed_bytes,
+    runtime_acknowledgement_challenge_digest,
 )
 from src.core.exceptions import ConfigurationError
 
+ROOT = Path(__file__).resolve().parents[2]
+
 
 def _production_settings(**overrides: object) -> Settings:
+    observed_at = datetime.now(timezone.utc).isoformat()
+    challenge_nonce = "settings-test-challenge"
+    rules_digest = hashlib.sha256(
+        (ROOT / "config/prometheus_rules.yml").read_bytes()
+    ).hexdigest()
+    smoke_digest = hashlib.sha256(
+        (ROOT / "config/billing-observability-smoke.json").read_bytes()
+    ).hexdigest()
+    challenge_digest = runtime_acknowledgement_challenge_digest(
+        nonce=challenge_nonce,
+        receiver_url="https://alerts.neurostack.example/v1/billing",
+        rules_digest=rules_digest,
+        smoke_digest=smoke_digest,
+    )
+    acknowledgement = {
+        "acknowledged": True,
+        "challenge_digest": challenge_digest,
+        "nonce": "settings-test-nonce",
+        "observed_at": observed_at,
+        "receipt_id": "settings-receipt-1",
+        "receiver_url": "https://alerts.neurostack.example/v1/billing",
+        "rules_digest": rules_digest,
+        "smoke_digest": smoke_digest,
+    }
+    acknowledgement["nonce"] = challenge_nonce
+    private_key = Ed25519PrivateKey.from_private_bytes(bytes(range(1, 33)))
+    acknowledgement["signature"] = private_key.sign(
+        _runtime_acknowledgement_signed_bytes(acknowledgement)
+    ).hex()
+    acknowledgement_raw = json.dumps(
+        acknowledgement, sort_keys=True, separators=(",", ":")
+    )
     values: dict[str, object] = {
         "environment": "production",
         "secret_key": "production-secret-key-at-least-32-characters",
@@ -22,6 +64,20 @@ def _production_settings(**overrides: object) -> Settings:
         "redis_url": "redis://redis:6379/0",
         "allowed_origins": ["https://app.neurostack.example"],
         "allowed_hosts": ["api.neurostack.example"],
+        "billing_operation_receipt_signing_key": "k" * 32,
+        "billing_observability_smoke_token": "smoke-token",
+        "billing_prometheus_rules_digest": rules_digest,
+        "billing_observability_smoke_digest": smoke_digest,
+        "billing_alert_receiver_url": "https://alerts.neurostack.example/v1/billing",
+        "billing_observability_acknowledgement": acknowledgement_raw,
+        "billing_observability_acknowledgement_digest": hashlib.sha256(
+            acknowledgement_raw.encode("utf-8")
+        ).hexdigest(),
+        "billing_observability_challenge_nonce": challenge_nonce,
+        "billing_observability_challenge_digest": challenge_digest,
+        "billing_observability_acknowledgement_public_key": private_key.public_key()
+        .public_bytes_raw()
+        .hex(),
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)  # type: ignore[call-arg]
@@ -126,3 +182,21 @@ def test_production_startup_accepts_injected_legacy_webhook_secret() -> None:
         == "legacy-fixture-secret"
     )
     assert "legacy-fixture-secret" not in repr(configured)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"billing_alert_receiver_url": "http://127.0.0.1:9093/webhook"},
+        {"billing_prometheus_rules_digest": "not-a-digest"},
+        {"billing_observability_smoke_digest": ""},
+        {"billing_observability_smoke_digest": "a" * 64},
+    ],
+)
+def test_production_billing_observability_fails_closed(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises((ConfigurationError, ValidationError)):
+        _production_settings(
+            abacatepay_webhook_secret="legacy-fixture-secret", **overrides
+        )

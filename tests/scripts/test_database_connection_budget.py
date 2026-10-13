@@ -104,7 +104,20 @@ def _vps_files(tmp_path: Path) -> tuple[Path, Path, Path]:
         "QDRANT_API_KEY=test_qdrant\n"
         "ASAAS_API_KEY=test_asaas_api_key\n"
         "ASAAS_WEBHOOK_TOKEN=test_asaas_webhook_token\n"
-        "ABACATEPAY_WEBHOOK_SECRET=test_abacatepay_webhook_secret\n",
+        "ABACATEPAY_WEBHOOK_SECRET=test_abacatepay_webhook_secret\n"
+        # Group 5 production requirements (``${VAR:?...}`` in the production
+        # Compose file): provider evidence key, receipt signing key, mounted
+        # rule/smoke/schema digests, runtime acknowledgement and receiver.
+        "ASAAS_PROVIDER_EVIDENCE_KEY_ID=test-provider-key\n"
+        "ASAAS_PROVIDER_EVIDENCE_PUBLIC_KEY=" + "b" * 64 + "\n"
+        "BILLING_OPERATION_RECEIPT_SIGNING_KEY=" + "k" * 32 + "\n"
+        "BILLING_PROMETHEUS_RULES_DIGEST=" + "c" * 64 + "\n"
+        "BILLING_OBSERVABILITY_SMOKE_DIGEST=" + "d" * 64 + "\n"
+        "BILLING_OBSERVABILITY_SMOKE_TOKEN=test_smoke_token\n"
+        "BILLING_FACT_SCHEMA_DIGEST=" + "e" * 64 + "\n"
+        "BILLING_OBSERVABILITY_ACKNOWLEDGEMENT=test_acknowledgement\n"
+        "BILLING_OBSERVABILITY_ACKNOWLEDGEMENT_DIGEST=" + "f" * 64 + "\n"
+        "BILLING_ALERT_RECEIVER_URL=https://alerts.example.test/hook\n",
         encoding="utf-8",
     )
     return compose, dockerfile, env_file
@@ -295,3 +308,31 @@ def test_docker_effective_entrypoint_and_cmd_reject_mixed_worker_options(
     )
     with pytest.raises(budget.BudgetError, match="unambiguous"):
         budget._production_workers(dockerfile)
+
+
+@requires_docker_compose
+@pytest.mark.parametrize(
+    "variable",
+    ["BILLING_OPERATION_RECEIPT_SIGNING_KEY", "BILLING_ALERT_RECEIVER_URL"],
+)
+def test_vps_structure_still_refuses_missing_group5_production_secret(
+    tmp_path: Path, variable: str
+) -> None:
+    compose, dockerfile, env_file = _vps_files(tmp_path)
+    env_file.write_text(
+        "".join(
+            line + "\n"
+            for line in env_file.read_text(encoding="utf-8").splitlines()
+            if not line.startswith(f"{variable}=")
+        ),
+        encoding="utf-8",
+    )
+    profile = budget.load_profile(
+        Path("config/database-connection-budgets.json"), "vps-compose"
+    )
+    with pytest.raises(
+        budget.BudgetError, match="^cannot render authoritative Compose structure$"
+    ):
+        budget.validate_vps_facts(
+            profile, compose=compose, dockerfile=dockerfile, env_file=env_file
+        )

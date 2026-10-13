@@ -3,11 +3,18 @@ NeuroStack API - Settings Configuration
 Centralized configuration using Pydantic Settings
 """
 
+import hashlib
+import json
 from functools import lru_cache
 from ipaddress import ip_address
+from pathlib import Path
+import stat
+from datetime import datetime, timezone
 from typing import Final, Literal
 from urllib.parse import urlsplit
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -73,6 +80,89 @@ def _is_plain_https_page_url(value: str) -> bool:
     ):
         return False
     return port is None or 1 <= port <= 65535
+
+
+def _is_safe_https_receiver(value: str) -> bool:
+    """Return whether an Alertmanager receiver is HTTPS and non-loopback."""
+
+    if not value or len(value) > 500 or not value.isascii():
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or port is not None
+        and not 1 <= port <= 65535
+    ):
+        return False
+    hostname = parsed.hostname.lower()
+    if hostname == "localhost":
+        return False
+    try:
+        return not ip_address(hostname).is_loopback
+    except ValueError:
+        return True
+
+
+def _is_sha256_digest(value: str) -> bool:
+    return len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _file_matches_sha256(path: Path, expected_digest: str) -> bool:
+    """Bind readiness evidence to a real local regular file, fail closed."""
+
+    if not _is_sha256_digest(expected_digest):
+        return False
+    try:
+        metadata = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+            return False
+        if metadata.st_size <= 0 or metadata.st_size > 2_000_000:
+            return False
+        observed = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return False
+    return observed == expected_digest
+
+
+def runtime_acknowledgement_challenge_digest(
+    *, nonce: str, receiver_url: str, rules_digest: str, smoke_digest: str
+) -> str:
+    """Digest the backend-issued challenge that the receiver must sign."""
+
+    payload = {
+        "nonce": nonce,
+        "receiver_url": receiver_url,
+        "rules_digest": rules_digest,
+        "smoke_digest": smoke_digest,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+        "ascii"
+    )
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _runtime_acknowledgement_signed_bytes(evidence: dict[str, object]) -> bytes:
+    signed = {
+        "acknowledged": evidence["acknowledged"],
+        "challenge_digest": evidence["challenge_digest"],
+        "nonce": evidence["nonce"],
+        "observed_at": evidence["observed_at"],
+        "receipt_id": evidence["receipt_id"],
+        "receiver_url": evidence["receiver_url"],
+        "rules_digest": evidence["rules_digest"],
+        "smoke_digest": evidence["smoke_digest"],
+    }
+    return json.dumps(signed, sort_keys=True, separators=(",", ":")).encode("ascii")
 
 
 class Settings(BaseSettings):
@@ -261,6 +351,10 @@ class Settings(BaseSettings):
     # The production API origin and authentication header are code constants;
     # deployment input cannot redirect payment credentials to another host.
     asaas_api_key: SecretStr = SecretStr("")
+    # Staged rotation material is never selected automatically.  A local
+    # receipt/proof must demonstrate next->current before an operator changes
+    # the deployment secret outside this codebase.
+    asaas_api_key_next: SecretStr = SecretStr("")
     asaas_webhook_token: SecretStr = SecretStr("")
     asaas_user_agent: str = ASAAS_DEFAULT_USER_AGENT
     # Browser return page for hosted Checkout callbacks. Navigation only: it
@@ -272,12 +366,37 @@ class Settings(BaseSettings):
     # because the webhook can never read back as ready.
     asaas_webhook_url: str = ""
     asaas_webhook_notification_email: str = ""
+    # Provider evidence is verified locally with this public key.  The private
+    # key belongs to the provider fixture/authority and is never configured in
+    # the migration service.
+    asaas_provider_evidence_key_id: str = ""
+    asaas_provider_evidence_public_key: str = ""
     # Protected switch for automatic ``abandoned`` of ambiguous checkouts.
     # Default off: the evidence (empty reads by our session UUID as ASAAS
     # ``externalReference``) is only sound once Group 8 proves by readback
     # that ASAAS copies a Checkout's externalReference to the subscription and
     # payments it creates.  Off keeps such sessions blocking (operator action).
     asaas_auto_abandon_enabled: bool = False
+    # Local control-plane authentication.  It signs only closed receipt
+    # digests, never provider payloads, customer data, or API credentials.
+    billing_operation_receipt_signing_key: SecretStr = SecretStr("")
+    billing_fact_schema_digest: str = ""
+    billing_prometheus_rules_digest: str = ""
+    billing_prometheus_rules_path: Path = Path("config/prometheus_rules.yml")
+    billing_observability_smoke_digest: str = ""
+    billing_observability_smoke_path: Path = Path(
+        "config/billing-observability-smoke.json"
+    )
+    billing_observability_smoke_token: SecretStr = SecretStr("")
+    billing_alert_receiver_url: str = ""
+    billing_observability_acknowledgement: str = ""
+    billing_observability_acknowledgement_path: Path = Path("")
+    billing_observability_acknowledgement_digest: str = ""
+    # The challenge is backend/deployment-owned; the receiver signs a receipt
+    # for this exact nonce and digest.  It is not accepted from the receipt.
+    billing_observability_challenge_nonce: str = ""
+    billing_observability_challenge_digest: str = ""
+    billing_observability_acknowledgement_public_key: str = ""
 
     @field_validator("asaas_webhook_url")
     @classmethod
@@ -325,6 +444,17 @@ class Settings(BaseSettings):
 
         if any(ord(character) < 32 for character in value.get_secret_value()):
             raise ValueError("ASAAS_WEBHOOK_TOKEN contains invalid control characters")
+        return value
+
+    @field_validator("billing_alert_receiver_url")
+    @classmethod
+    def validate_billing_alert_receiver_url(cls, value: str) -> str:
+        """Reject loopback and non-HTTPS alert targets before readiness."""
+
+        if value and not _is_safe_https_receiver(value):
+            raise ValueError(
+                "BILLING_ALERT_RECEIVER_URL must be a non-loopback HTTPS URL"
+            )
         return value
 
     @field_validator("asaas_user_agent")
@@ -451,6 +581,21 @@ class Settings(BaseSettings):
             if not self.abacatepay_webhook_secret.get_secret_value().strip():
                 errors.append("ABACATEPAY_WEBHOOK_SECRET is required in production")
 
+            if not self.is_billing_observability_compatible:
+                errors.append(
+                    "billing observability requires non-loopback HTTPS receiver, "
+                    "rules/smoke digests, and fresh authenticated runtime acknowledgement"
+                )
+            if len(self.billing_operation_receipt_signing_key.get_secret_value()) < 32:
+                errors.append(
+                    "BILLING_OPERATION_RECEIPT_SIGNING_KEY must be at least 32 bytes "
+                    "in production"
+                )
+            if not self.billing_observability_smoke_token.get_secret_value().strip():
+                errors.append(
+                    "BILLING_OBSERVABILITY_SMOKE_TOKEN is required in production"
+                )
+
             if errors:
                 error_msg = "Production configuration validation failed:\n" + "\n".join(
                     f"  - {e}" for e in errors
@@ -482,6 +627,120 @@ class Settings(BaseSettings):
             and ASAAS_API_BASE_URL == "https://api.asaas.com/v3"
             and ASAAS_AUTH_HEADER == "access_token"
         )
+
+    @property
+    def is_billing_observability_compatible(self) -> bool:
+        """Readiness input for the production billing control plane."""
+
+        return bool(
+            _is_safe_https_receiver(self.billing_alert_receiver_url)
+            and _file_matches_sha256(
+                self.billing_prometheus_rules_path,
+                self.billing_prometheus_rules_digest,
+            )
+            and _file_matches_sha256(
+                self.billing_observability_smoke_path,
+                self.billing_observability_smoke_digest,
+            )
+            and bool(self.billing_observability_smoke_token.get_secret_value().strip())
+            and self._runtime_acknowledgement_is_valid()
+        )
+
+    @property
+    def is_billing_runtime_acknowledgement_compatible(self) -> bool:
+        """Expose the dynamic receiver proof as a separate readiness input."""
+
+        return self._runtime_acknowledgement_is_valid()
+
+    def _runtime_acknowledgement_is_valid(self) -> bool:
+        """Require a fresh receiver-signed receipt for a live backend challenge."""
+
+        raw: bytes
+        try:
+            if self.billing_observability_acknowledgement.strip():
+                raw = self.billing_observability_acknowledgement.encode("utf-8")
+            else:
+                path = self.billing_observability_acknowledgement_path
+                metadata = path.lstat()
+                if (
+                    path.is_symlink()
+                    or not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                    or metadata.st_size <= 0
+                    or metadata.st_size > 16_384
+                ):
+                    return False
+                raw = path.read_bytes()
+        except (OSError, UnicodeError):
+            return False
+        if (
+            not _is_sha256_digest(self.billing_observability_challenge_digest)
+            or not self.billing_observability_challenge_nonce
+            or hashlib.sha256(raw).hexdigest()
+            != self.billing_observability_acknowledgement_digest
+        ):
+            return False
+        try:
+            evidence = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(evidence, dict):
+            return False
+        nonce = evidence.get("nonce")
+        observed_at = evidence.get("observed_at")
+        signature = evidence.get("signature")
+        receipt_id = evidence.get("receipt_id")
+        challenge_digest = evidence.get("challenge_digest")
+        if (
+            not isinstance(nonce, str)
+            or nonce != self.billing_observability_challenge_nonce
+            or not isinstance(observed_at, str)
+            or not isinstance(receipt_id, str)
+            or not receipt_id
+            or not isinstance(challenge_digest, str)
+            or challenge_digest != self.billing_observability_challenge_digest
+            or not isinstance(signature, str)
+            or len(signature) != 128
+            or any(character not in "0123456789abcdef" for character in signature)
+            or evidence.get("acknowledged") is not True
+            or evidence.get("receiver_url") != self.billing_alert_receiver_url
+            or evidence.get("rules_digest") != self.billing_prometheus_rules_digest
+            or evidence.get("smoke_digest") != self.billing_observability_smoke_digest
+            or challenge_digest
+            != runtime_acknowledgement_challenge_digest(
+                nonce=nonce,
+                receiver_url=self.billing_alert_receiver_url,
+                rules_digest=self.billing_prometheus_rules_digest,
+                smoke_digest=self.billing_observability_smoke_digest,
+            )
+        ):
+            return False
+        try:
+            timestamp = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        now = datetime.now(timezone.utc)
+        if (
+            timestamp.tzinfo is None
+            or timestamp > now
+            or (now - timestamp).total_seconds() > 300
+        ):
+            return False
+        signed = dict(evidence)
+        signed["observed_at"] = timestamp.astimezone(timezone.utc).isoformat()
+        public_key = self.billing_observability_acknowledgement_public_key
+        if len(public_key) != 64 or any(
+            character not in "0123456789abcdef" for character in public_key
+        ):
+            return False
+        try:
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key)).verify(
+                bytes.fromhex(signature), _runtime_acknowledgement_signed_bytes(signed)
+            )
+        except (InvalidSignature, ValueError, TypeError):
+            return False
+        return True
 
 
 @lru_cache

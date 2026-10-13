@@ -10,10 +10,14 @@ Endpoints:
 - GET /live - Liveness probe (process is alive)
 """
 
+import asyncio
 import time
 from datetime import datetime
+from typing import Any, cast
 
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, Depends, Response, status
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.schemas.health import (
     ComponentHealth,
@@ -24,6 +28,7 @@ from src.api.schemas.health import (
     ReadinessResponse,
 )
 from src.config.settings import settings
+from src.repositories import get_db_session_dependency
 
 router = APIRouter()
 
@@ -121,6 +126,48 @@ async def health_check() -> HealthResponse:
     )
 
 
+async def _database_ready(db: AsyncSession | None) -> bool:
+    """Production probe: one bounded ``SELECT 1`` on the request session."""
+
+    if not isinstance(db, AsyncSession):
+        return False
+    try:
+        await asyncio.wait_for(db.execute(text("SELECT 1")), timeout=1.0)
+    except Exception:
+        return False
+    return True
+
+
+async def _redis_ready() -> bool:
+    """Production probe: a bounded Redis ``PING``."""
+
+    try:
+        import redis.asyncio as redis
+
+        client = cast(Any, redis.from_url)(settings.redis_url, socket_timeout=1.0)
+        try:
+            return (await asyncio.wait_for(client.ping(), timeout=1.0)) is True
+        finally:
+            await client.aclose()
+    except Exception:
+        return False
+
+
+async def _qdrant_ready() -> bool:
+    """Production probe: Qdrant ``/healthz`` with a one-second budget."""
+
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=1.0) as client:
+            response_qdrant = await client.get(
+                f"http://{settings.qdrant_host}:{settings.qdrant_port}/healthz"
+            )
+            return bool(response_qdrant.is_success)
+    except Exception:
+        return False
+
+
 @router.get(
     "/ready",
     response_model=ReadinessResponse,
@@ -150,21 +197,41 @@ readinessProbe:
     """,
     tags=["Health"],
 )
-async def readiness_check(response: Response) -> ReadinessResponse:
+async def readiness_check(
+    response: Response,
+    db: AsyncSession | None = Depends(get_db_session_dependency),
+) -> ReadinessResponse:
     """
     Readiness check endpoint.
 
     Verifies all dependencies (database, redis, etc.) are available.
     """
-    # TODO: Implement actual dependency checks
+    if settings.is_production:
+        database_ok = await _database_ready(db)
+        redis_ok = await _redis_ready()
+        qdrant_ok = await _qdrant_ready()
+    else:
+        # Outside production the readiness contract is unchanged from before
+        # Group 5: dependency reachability is not a readiness condition (local
+        # and test runs have no Redis/Qdrant).  Production probes them live.
+        database_ok = redis_ok = qdrant_ok = True
     checks = {
         "api": True,
-        "database": True,  # TODO: Implement actual check
-        "redis": True,  # TODO: Implement actual check
-        "qdrant": True,  # TODO: Implement actual check
+        "database": database_ok,
+        "redis": redis_ok,
+        "qdrant": qdrant_ok,
         # Production must be able to authenticate legacy Abacate deliveries.
         "abacatepay_webhook": not settings.is_production
         or bool(settings.abacatepay_webhook_secret.get_secret_value().strip()),
+        # A production payment rollout is not ready when alert delivery could
+        # loop locally or when its rule/smoke digests are absent or malformed.
+        "billing_observability": not settings.is_production
+        or (
+            settings.is_billing_observability_compatible
+            and getattr(
+                settings, "is_billing_runtime_acknowledgement_compatible", False
+            )
+        ),
     }
 
     all_ready = all(checks.values())

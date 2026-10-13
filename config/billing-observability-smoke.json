@@ -1,0 +1,1 @@
+{"acknowledgement":{"readback":true,"receiver_url":"https://alerts.neurostack.io/v1/billing","timestamp":"2026-10-12T12:00:00Z"},"receiver_url":"https://alerts.neurostack.io/v1/billing","result":"acknowledged","scope":"billing_observability","version":1}

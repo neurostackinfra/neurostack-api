@@ -734,13 +734,42 @@ class BillingMigrationReceipt(Base):
             name="ck_billing_migration_receipts_external_reference",
         ),
         CheckConstraint(
-            "receipt_kind NOT IN ('cancel_observation', 'provider_flip') "
+            "receipt_kind NOT IN ('cancel_observation', 'provider_flip', "
+            "'recreate_authorized') "
             "OR (receipt_kind = 'cancel_observation' "
             "AND provider = 'abacatepay' "
             "AND external_reference IS NOT NULL AND status = 'cancelled') "
-            "OR (receipt_kind = 'provider_flip' AND provider = 'asaas' "
-            "AND external_reference IS NOT NULL AND status = 'verified')",
+            "OR (receipt_kind IN ('provider_flip', 'recreate_authorized') "
+            "AND provider = 'asaas' "
+            "AND external_reference IS NOT NULL "
+            "AND ((receipt_kind = 'provider_flip' AND status = 'verified') "
+            "OR (receipt_kind = 'recreate_authorized' AND status = 'absent')) "
+            "AND provider_event_id IS NOT NULL "
+            "AND provider_key_id IS NOT NULL "
+            "AND provider_operation IS NOT NULL "
+            "AND provider_authority = 'asaas.api.v3' "
+            "AND provider_signature IS NOT NULL "
+            "AND provider_observed_at IS NOT NULL "
+            "AND provider_expires_at IS NOT NULL "
+            "AND provider_snapshot_digest IS NOT NULL "
+            "AND provider_evidence_digest IS NOT NULL)",
             name="ck_billing_migration_receipts_saga_shape",
+        ),
+        CheckConstraint(
+            "provider_expires_at IS NULL OR provider_observed_at IS NULL "
+            "OR provider_expires_at > provider_observed_at",
+            name="ck_billing_migration_receipts_provider_expiry",
+        ),
+        _postgresql_check(
+            "provider_event_id IS NULL OR provider_event_id ~ '^[A-Za-z0-9._:-]{1,160}$' "
+            "AND provider_key_id ~ '^[A-Za-z0-9._:-]{1,80}$' "
+            "AND provider_operation IN ('subscription.migration.provider_flip', "
+            "'subscription.migration.absence') "
+            "AND provider_authority = 'asaas.api.v3' "
+            "AND provider_signature ~ '^[0-9a-f]{128}$' "
+            "AND provider_snapshot_digest ~ '^[0-9a-f]{64}$' "
+            "AND provider_evidence_digest ~ '^[0-9a-f]{64}$'",
+            name="ck_billing_migration_receipts_provider_evidence",
         ),
         ForeignKeyConstraint(
             ["builder_id", "migration_id"],
@@ -753,6 +782,11 @@ class BillingMigrationReceipt(Base):
             "operation_id",
             "receipt_kind",
             name="uq_billing_migration_receipts_operation_kind",
+        ),
+        UniqueConstraint(
+            "provider",
+            "provider_event_id",
+            name="uq_billing_migration_receipts_provider_event",
         ),
     )
 
@@ -767,6 +801,23 @@ class BillingMigrationReceipt(Base):
     receipt_kind: Mapped[str] = mapped_column(String(40), nullable=False)
     provider: Mapped[str | None] = mapped_column(String(20), nullable=True)
     external_reference: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    provider_event_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    provider_authority: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    provider_key_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    provider_operation: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    provider_signature: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    provider_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    provider_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    provider_snapshot_digest: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    provider_evidence_digest: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     status: Mapped[str] = mapped_column(String(30), nullable=False)
     content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     actor_user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
@@ -779,6 +830,104 @@ class BillingMigrationReceipt(Base):
 
     migration: Mapped["BillingMigration"] = relationship(
         "BillingMigration", back_populates="receipts"
+    )
+
+
+class BillingMigrationAbsenceRead(Base):
+    """One provider-signed empty ASAAS read before a recreate is authorized.
+
+    Exactly two reads (``read_no`` 1 and 2) per migration operation, each
+    bound to the prior checkout attempt (or none) and to the convergence
+    limit that the backend derived under the roster lock.  Append-only.
+    """
+
+    __tablename__ = "billing_migration_absence_reads"
+    __table_args__ = (
+        CheckConstraint(
+            "read_no IN (1, 2)",
+            name="ck_billing_migration_absence_reads_read_no",
+        ),
+        CheckConstraint(
+            "provider = 'asaas' AND status = 'absent' "
+            "AND provider_authority = 'asaas.api.v3' "
+            "AND provider_operation = 'subscription.migration.absence'",
+            name="ck_billing_migration_absence_reads_shape",
+        ),
+        _postgresql_check(
+            "provider_event_id ~ '^[A-Za-z0-9._:-]{1,160}$' "
+            "AND external_reference ~ '^[A-Za-z0-9._:-]{1,160}$' "
+            "AND provider_key_id ~ '^[A-Za-z0-9._:-]{1,80}$' "
+            "AND provider_signature ~ '^[0-9a-f]{128}$' "
+            "AND provider_snapshot_digest ~ '^[0-9a-f]{64}$' "
+            "AND provider_evidence_digest ~ '^[0-9a-f]{64}$'",
+            name="ck_billing_migration_absence_reads_evidence",
+        ),
+        _postgresql_check(
+            "provider_expires_at > provider_observed_at "
+            "AND provider_observed_at > convergence_limit_at "
+            "AND provider_observed_at <= observed_at",
+            name="ck_billing_migration_absence_reads_times",
+        ),
+        ForeignKeyConstraint(
+            ["builder_id", "migration_id"],
+            ["billing_migrations.builder_id", "billing_migrations.id"],
+            ondelete="RESTRICT",
+            name="fk_billing_migration_absence_reads_migration",
+        ),
+        ForeignKeyConstraint(
+            ["builder_id", "prior_checkout_session_id"],
+            ["billing_checkout_sessions.builder_id", "billing_checkout_sessions.id"],
+            ondelete="RESTRICT",
+            name="fk_billing_migration_absence_reads_checkout",
+        ),
+        UniqueConstraint(
+            "migration_id",
+            "operation_id",
+            "read_no",
+            name="uq_billing_migration_absence_reads_slot",
+        ),
+        UniqueConstraint(
+            "provider",
+            "provider_event_id",
+            name="uq_billing_migration_absence_reads_event",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    builder_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    migration_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    operation_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    read_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    prior_checkout_session_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True
+    )
+    convergence_limit_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    provider: Mapped[str] = mapped_column(String(20), nullable=False)
+    external_reference: Mapped[str] = mapped_column(String(160), nullable=False)
+    provider_event_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    provider_authority: Mapped[str] = mapped_column(String(80), nullable=False)
+    provider_key_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    provider_operation: Mapped[str] = mapped_column(String(80), nullable=False)
+    provider_signature: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider_observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    provider_expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    provider_snapshot_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_evidence_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    actor_user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
 
@@ -1255,6 +1404,12 @@ class BillingTopupCapabilityReceipt(Base):
     environment: Mapped[str] = mapped_column(String(20), nullable=False)
     schema_version: Mapped[str] = mapped_column(String(40), nullable=False)
     request_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    operation_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True
+    )
+    deployment_digest: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     credit_deployment_digest: Mapped[str] = mapped_column(String(100), nullable=False)
     billing_fact_schema_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     producer_compatibility_digest: Mapped[str] = mapped_column(
@@ -1282,6 +1437,340 @@ class BillingTopupCapabilityReceipt(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class BillingOperationAssignment(Base, TimestampMixin):
+    """One active duty in an auditable three-person billing operation.
+
+    Assignments do not contain a token, provider payload, customer attribute,
+    or display name.  They only bind an authenticated administrator to a
+    bounded, expiring operation.  A receipt consumes the assignment once.
+    """
+
+    __tablename__ = "billing_operation_assignments"
+    __table_args__ = (
+        CheckConstraint(
+            "environment IN ('development', 'staging', 'production', 'test')",
+            name="ck_billing_operation_assignments_environment",
+        ),
+        CheckConstraint(
+            "scope IN ('migration', 'rollout', 'topup_capability', 'incident')",
+            name="ck_billing_operation_assignments_scope",
+        ),
+        CheckConstraint(
+            "role IN ('deployer', 'approver', 'reviewer')",
+            name="ck_billing_operation_assignments_role",
+        ),
+        CheckConstraint(
+            "expires_at > created_at",
+            name="ck_billing_operation_assignments_expiry",
+        ),
+        _postgresql_check(
+            f"payload_digest ~ '{_SHA256_CHECK}'",
+            name="ck_billing_operation_assignments_digest",
+        ),
+        UniqueConstraint(
+            "operation_id",
+            "actor_user_id",
+            name="uq_billing_operation_assignments_actor",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    operation_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    environment: Mapped[str] = mapped_column(String(20), nullable=False)
+    scope: Mapped[str] = mapped_column(String(30), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    actor_user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    payload_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    consumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class BillingTopupCapabilityBinding(Base):
+    """One-use cross-service proof bound to a top-up capability receipt."""
+
+    __tablename__ = "billing_topup_capability_bindings"
+    __table_args__ = (
+        CheckConstraint(
+            "environment IN ('development', 'staging', 'production', 'test')",
+            name="ck_billing_topup_capability_bindings_environment",
+        ),
+        _postgresql_check(
+            f"producer_digest ~ '{_SHA256_CHECK}' "
+            f"AND credit_digest ~ '{_SHA256_CHECK}' "
+            f"AND reconciliation_digest ~ '{_SHA256_CHECK}' "
+            f"AND verification_digest ~ '{_SHA256_CHECK}'",
+            name="ck_billing_topup_capability_bindings_digests",
+        ),
+        ForeignKeyConstraint(
+            ["environment", "capability_receipt_id"],
+            [
+                "billing_topup_capability_receipts.environment",
+                "billing_topup_capability_receipts.id",
+            ],
+            ondelete="RESTRICT",
+            name="fk_billing_topup_capability_bindings_capability",
+        ),
+        ForeignKeyConstraint(
+            ["environment", "producer_receipt_id"],
+            ["billing_operation_receipts.environment", "billing_operation_receipts.id"],
+            ondelete="RESTRICT",
+            name="fk_billing_topup_bindings_producer_receipt",
+        ),
+        ForeignKeyConstraint(
+            ["environment", "credit_receipt_id"],
+            ["billing_operation_receipts.environment", "billing_operation_receipts.id"],
+            ondelete="RESTRICT",
+            name="fk_billing_topup_bindings_credit_receipt",
+        ),
+        ForeignKeyConstraint(
+            ["environment", "reconciliation_receipt_id"],
+            ["billing_operation_receipts.environment", "billing_operation_receipts.id"],
+            ondelete="RESTRICT",
+            name="fk_billing_topup_bindings_reconciliation_receipt",
+        ),
+        ForeignKeyConstraint(
+            ["environment", "verification_receipt_id"],
+            ["billing_operation_receipts.environment", "billing_operation_receipts.id"],
+            ondelete="RESTRICT",
+            name="fk_billing_topup_bindings_verification_receipt",
+        ),
+        UniqueConstraint(
+            "environment",
+            "capability_receipt_id",
+            name="uq_billing_topup_capability_bindings_capability",
+        ),
+        UniqueConstraint(
+            "environment",
+            "producer_receipt_id",
+            name="uq_billing_topup_bindings_producer",
+        ),
+        UniqueConstraint(
+            "environment", "credit_receipt_id", name="uq_billing_topup_bindings_credit"
+        ),
+        UniqueConstraint(
+            "environment",
+            "reconciliation_receipt_id",
+            name="uq_billing_topup_bindings_reconciliation",
+        ),
+        UniqueConstraint(
+            "environment",
+            "verification_receipt_id",
+            name="uq_billing_topup_bindings_verification",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    environment: Mapped[str] = mapped_column(String(20), nullable=False)
+    capability_receipt_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=False
+    )
+    producer_receipt_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=False
+    )
+    credit_receipt_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=False
+    )
+    reconciliation_receipt_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=False
+    )
+    verification_receipt_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=False
+    )
+    producer_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    credit_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    reconciliation_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    verification_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    producer_actor_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=False
+    )
+    credit_actor_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    reconciliation_actor_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=False
+    )
+    verification_actor_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=False
+    )
+    verified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class BillingOperationReceipt(Base):
+    """Append-only signed evidence, consumed once by a control transition."""
+
+    __tablename__ = "billing_operation_receipts"
+    __table_args__ = (
+        CheckConstraint(
+            "environment IN ('development', 'staging', 'production', 'test')",
+            name="ck_billing_operation_receipts_environment",
+        ),
+        CheckConstraint(
+            "scope IN ('migration', 'rollout', 'topup_capability', 'incident')",
+            name="ck_billing_operation_receipts_scope",
+        ),
+        CheckConstraint(
+            "role IN ('deployer', 'approver', 'reviewer')",
+            name="ck_billing_operation_receipts_role",
+        ),
+        CheckConstraint(
+            "evidence_type IS NULL OR evidence_type IN "
+            "('producer', 'credit', 'reconciliation', 'verification')",
+            name="ck_billing_operation_receipts_evidence_type",
+        ),
+        CheckConstraint(
+            "inbox_high_watermark IS NULL OR inbox_high_watermark >= 0",
+            name="ck_billing_operation_receipts_watermark",
+        ),
+        _postgresql_check(
+            f"billing_fact_schema_digest IS NULL OR billing_fact_schema_digest ~ '{_SHA256_CHECK}'",
+            name="ck_billing_operation_receipts_fact_schema_digest",
+        ),
+        CheckConstraint(
+            "expires_at > created_at",
+            name="ck_billing_operation_receipts_expiry",
+        ),
+        _postgresql_check(
+            f"payload_digest ~ '{_SHA256_CHECK}' "
+            f"AND deployment_digest ~ '{_SHA256_CHECK}' "
+            f"AND budget_digest ~ '{_SHA256_CHECK}' "
+            f"AND signature_sha256 ~ '{_SHA256_CHECK}'",
+            name="ck_billing_operation_receipts_digests",
+        ),
+        UniqueConstraint("nonce", name="uq_billing_operation_receipts_nonce"),
+        UniqueConstraint("environment", "id", name="uq_billing_operation_receipts_environment_id"),
+        UniqueConstraint(
+            "assignment_id", name="uq_billing_operation_receipts_assignment"
+        ),
+        ForeignKeyConstraint(
+            ["assignment_id"],
+            ["billing_operation_assignments.id"],
+            ondelete="RESTRICT",
+            name="fk_billing_operation_receipts_assignment",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    assignment_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    operation_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    environment: Mapped[str] = mapped_column(String(20), nullable=False)
+    scope: Mapped[str] = mapped_column(String(30), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    actor_user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    nonce: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    payload_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    deployment_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    budget_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    from_state: Mapped[str] = mapped_column(String(40), nullable=False)
+    to_state: Mapped[str] = mapped_column(String(40), nullable=False)
+    evidence_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    request_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True
+    )
+    inbox_high_watermark: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    # Typed capability attestations carry the deployed fact-contract digest
+    # independently of the operation payload/deployment identities.  It is
+    # nullable for the ordinary rollout/migration quorum rows.
+    billing_fact_schema_digest: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    signature_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    applied_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class BillingRolloutReadinessReceipt(Base):
+    """Fresh, exact backend readiness evidence required for general rollout."""
+
+    __tablename__ = "billing_rollout_readiness_receipts"
+    __table_args__ = (
+        CheckConstraint(
+            "environment IN ('development', 'staging', 'production', 'test')",
+            name="ck_billing_rollout_readiness_environment",
+        ),
+        CheckConstraint(
+            "receipt_kind IN ('readiness', 'backlog', 'provisioning', 'smoke')",
+            name="ck_billing_rollout_readiness_kind",
+        ),
+        CheckConstraint("status = 'passed'", name="ck_billing_rollout_readiness_status"),
+        CheckConstraint(
+            "roster_revision >= 0",
+            name="ck_billing_rollout_readiness_roster_revision",
+        ),
+        _postgresql_check(
+            f"content_sha256 ~ '{_SHA256_CHECK}' "
+            f"AND rule_digest ~ '{_SHA256_CHECK}' "
+            f"AND bundle_digest ~ '{_SHA256_CHECK}' "
+            f"AND app_digest ~ '{_SHA256_CHECK}'",
+            name="ck_billing_rollout_readiness_digest",
+        ),
+        CheckConstraint(
+            "expires_at > observed_at",
+            name="ck_billing_rollout_readiness_fresh",
+        ),
+        UniqueConstraint(
+            "environment", "receipt_kind", "rollout_revision",
+            name="uq_billing_rollout_readiness_revision",
+        ),
+        ForeignKeyConstraint(
+            ["environment", "operation_receipt_id"],
+            ["billing_operation_receipts.environment", "billing_operation_receipts.id"],
+            ondelete="RESTRICT",
+            name="fk_billing_rollout_readiness_operation_receipt",
+        ),
+        ForeignKeyConstraint(
+            ["environment", "provider_receipt_id"],
+            ["billing_operation_receipts.environment", "billing_operation_receipts.id"],
+            ondelete="RESTRICT",
+            name="fk_billing_rollout_readiness_provider_receipt",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
+    environment: Mapped[str] = mapped_column(String(20), nullable=False)
+    receipt_kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    rollout_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    operation_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    operation_receipt_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=False
+    )
+    provider_receipt_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=False
+    )
+    roster_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    rule_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    bundle_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    app_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class BillingRolloutControl(Base):

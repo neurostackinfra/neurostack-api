@@ -732,7 +732,10 @@ async def test_coupon_is_consumed_once_inside_the_settlement_transaction(
         value=_brl(cents),
     )
 
-    async def failing_hook(self: Any, effect: Any, projection: Any) -> None:
+    async def failing_hook(
+        self: Any, effect: Any, projection: Any, **_fact_context: Any
+    ) -> None:
+        # Group 4 passes the fact context (``cycle_start``) to this hook.
         raise RuntimeError("simulated failure at the Group 4 outbox insertion point")
 
     original = _FinancialState._financial_fact_hook
@@ -1910,7 +1913,10 @@ async def test_payment_first_handoff_and_settlement_commit_as_one_transaction(
 
     seen: dict[str, Any] = {}
 
-    async def failing_hook(self: Any, effect: Any, projection: Any) -> None:
+    async def failing_hook(
+        self: Any, effect: Any, projection: Any, **_fact_context: Any
+    ) -> None:
+        # Group 4 passes the fact context (``cycle_start``) to this hook.
         # Inside the same transaction: prove handoff, effect, Transaction and
         # coupon were all written before the injected failure fires.
         (row,) = (

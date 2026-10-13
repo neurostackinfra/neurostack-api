@@ -501,6 +501,23 @@ def require_super_admin(request: Request) -> TenantContext:
     return tenant
 
 
+def require_super_admin_jwt(request: Request) -> TenantContext:
+    """Require a JWT-authenticated super administrator for billing operations.
+
+    API keys must never authorize cross-builder billing migration, rollout, or
+    receipt consumption.  This uses the already verified request context and
+    never re-emits the raw bearer token.
+    """
+
+    tenant = require_super_admin(request)
+    if tenant.authentication_mode != "jwt" or tenant.api_key or tenant.user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "billing_super_admin_jwt_required"},
+        )
+    return tenant
+
+
 def require_builder(request: Request) -> UUID:
     """
     FastAPI dependency that enforces builder role and extracts builder_id from JWT.

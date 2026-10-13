@@ -93,13 +93,13 @@ receivers:
   # Receiver padrão (webhook genérico)
   - name: 'default-receiver'
     webhook_configs:
-      - url: 'http://localhost:9093/webhook'
+      - url: '${BILLING_ALERT_RECEIVER_URL}/default'
         send_resolved: true
 
   # Alertas críticos - múltiplos canais
   - name: 'critical-receiver'
     webhook_configs:
-      - url: 'http://localhost:9093/webhook/critical'
+      - url: '${BILLING_ALERT_RECEIVER_URL}/critical'
         send_resolved: true
     # Descomente e configure para usar Slack
     # slack_configs:
@@ -111,7 +111,7 @@ receivers:
   # Alertas clínicos
   - name: 'clinical-receiver'
     webhook_configs:
-      - url: 'http://localhost:9093/webhook/clinical'
+      - url: '${BILLING_ALERT_RECEIVER_URL}/clinical'
         send_resolved: true
     # Configurar notificação para equipe clínica
     # pagerduty_configs:
@@ -121,7 +121,7 @@ receivers:
   # Alertas de backend
   - name: 'backend-receiver'
     webhook_configs:
-      - url: 'http://localhost:9093/webhook/backend'
+      - url: '${BILLING_ALERT_RECEIVER_URL}/backend'
         send_resolved: true
     # slack_configs:
     #   - channel: '#backend-alerts'
@@ -130,7 +130,7 @@ receivers:
   # Alertas de produto
   - name: 'product-receiver'
     webhook_configs:
-      - url: 'http://localhost:9093/webhook/product'
+      - url: '${BILLING_ALERT_RECEIVER_URL}/product'
         send_resolved: true
     # slack_configs:
     #   - channel: '#product-alerts'
@@ -139,6 +139,5 @@ receivers:
   # Alertas informativos
   - name: 'info-receiver'
     webhook_configs:
-      - url: 'http://localhost:9093/webhook/info'
+      - url: '${BILLING_ALERT_RECEIVER_URL}/info'
         send_resolved: true
-

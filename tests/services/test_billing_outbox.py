@@ -57,6 +57,8 @@ async def session_factory(
 
 async def _settled_topup(
     session: AsyncSession,
+    *,
+    ordered: bool = False,
 ) -> tuple[BillingPaymentEffect, BillingPaymentProjection, BillingTopupOrder]:
     builder_id = uuid4()
     order_id = uuid4()
@@ -117,16 +119,21 @@ async def _settled_topup(
         source_revision="settlement:v1",
         amount_cents=10_000,
     )
-    session.add_all(
-        (
-            Builder(id=builder_id, name="Outbox Fixture"),
-            order,
-            delivery,
-            projection,
-            effect,
-        )
+    rows = (
+        Builder(id=builder_id, name="Outbox Fixture"),
+        order,
+        delivery,
+        projection,
+        effect,
     )
-    await session.flush()
+    if ordered:
+        # Parents first, so the fixture itself satisfies enforced foreign keys.
+        for row in rows:
+            session.add(row)
+            await session.flush()
+    else:
+        session.add_all(rows)
+        await session.flush()
     return effect, projection, order
 
 
@@ -441,3 +448,52 @@ async def test_cumulative_reversal_restoration_and_zero_restoration_are_ordered(
         assert facts[-1].payload["restored_cents"] == 2_500
         assert order.state == "restored"
         assert order.financial_revision == 4
+
+
+async def test_fact_rows_satisfy_enforced_foreign_keys_on_sqlite(
+    tmp_path: Path,
+) -> None:
+    """Unit-tier guard for the outbox -> delivery -> handoff insert order.
+
+    SQLite ignores foreign keys unless ``PRAGMA foreign_keys=ON``; with it on,
+    a single flush that lets the unit of work insert ``billing_fact_deliveries``
+    before ``billing_outbox`` fails here exactly as it does on PostgreSQL.
+    """
+
+    from sqlalchemy import event
+
+    _patch_jsonb_for_sqlite()
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'fk.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enforce_foreign_keys(dbapi_connection, _record):  # type: ignore[no-untyped-def]
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        assert (await connection.exec_driver_sql("PRAGMA foreign_keys")).scalar() == 1
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        async with factory() as session:
+            effect, projection, _order = await _settled_topup(session, ordered=True)
+            outbox = await BillingFactProducer(session).record_effect(
+                effect, projection
+            )
+            assert outbox is not None
+            await session.commit()
+            assert (
+                await session.scalar(
+                    select(BillingFactHandoff.delivery_id).where(
+                        BillingFactHandoff.outbox_event_id == outbox.id
+                    )
+                )
+                == await session.scalar(
+                    select(BillingFactDelivery.id).where(
+                        BillingFactDelivery.outbox_event_id == outbox.id
+                    )
+                )
+            )
+    finally:
+        await engine.dispose()

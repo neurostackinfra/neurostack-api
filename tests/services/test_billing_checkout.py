@@ -18,6 +18,7 @@ from src.models.coupon import Coupon
 from src.repositories.billing import BillingRepository
 from src.services import billing_checkout as checkout_module
 from src.services.asaas import AsaasOutcomeUnknown, CheckoutCreated
+from src.services.billing_outbox import billing_fact_schema_digest
 from src.services.billing_checkout import (
     COUPON_NOT_ELIGIBLE,
     BillingCheckoutService,
@@ -497,12 +498,47 @@ def _valid_capability() -> SimpleNamespace:
         schema_version="credit_capability_ready.v1",
         approved_at=now - timedelta(minutes=5),
         expires_at=now + timedelta(hours=1),
+        # Group 5 binding: operation, deployment, request, watermark and the
+        # authoritative billing.fact.v1 schema digest.
+        operation_id=uuid4(),
+        deployment_digest="d" * 64,
+        request_id=uuid4(),
+        inbox_high_watermark=0,
+        billing_fact_schema_digest=billing_fact_schema_digest(),
         reconciliation_complete=True,
         readback_complete=True,
         has_open_gap=False,
         has_backlog=False,
         has_alert=False,
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (None, None),
+        ("operation_id", None),
+        ("deployment_digest", None),
+        ("deployment_digest", "d" * 63),
+        ("request_id", None),
+        ("inbox_high_watermark", -1),
+        ("billing_fact_schema_digest", "0" * 64),
+        ("has_alert", True),
+    ],
+)
+def test_capability_stub_exercises_every_group5_binding(
+    field: str | None, value: object
+) -> None:
+    from src.repositories.billing import _capability_is_valid
+
+    capability = _valid_capability()
+    if field is not None:
+        setattr(capability, field, value)
+    assert _capability_is_valid(
+        capability,  # type: ignore[arg-type]
+        environment="test",
+        now=datetime.now(timezone.utc),
+    ) is (field is None)
 
 
 @pytest.mark.asyncio

@@ -278,6 +278,29 @@ BILLING_WEBHOOK_CONFIG_READY = Gauge(
     "neurostack_billing_webhook_config_ready",
     "1 when the provider webhook configuration and token converged",
 )
+# Group 5 control-plane metrics intentionally expose only bounded state/action
+# names.  Migration, subscription, receipt, actor, provider and deployment
+# identities never enter Prometheus labels.
+BILLING_MIGRATION_OPERATIONS_TOTAL = Counter(
+    "neurostack_billing_migration_operations_total",
+    "Local billing migration actions by bounded operation and outcome",
+    ["operation", "outcome"],
+)
+BILLING_MIGRATION_BACKLOG = Gauge(
+    "neurostack_billing_migration_backlog",
+    "Current billing migration backlog by bounded saga state",
+    ["state"],
+)
+BILLING_OPERATION_RECEIPTS_TOTAL = Counter(
+    "neurostack_billing_operation_receipts_total",
+    "Signed billing operation receipts by role and bounded outcome",
+    ["role", "outcome"],
+)
+BILLING_TOPUP_CAPABILITY_TRANSITIONS_TOTAL = Counter(
+    "neurostack_billing_topup_capability_transitions_total",
+    "Top-up capability gate transitions by bounded direction and outcome",
+    ["direction", "outcome"],
+)
 
 # Deliberately label-free: a telemetry failure must never create tenant,
 # provider, endpoint, model, or secret cardinality in Prometheus.

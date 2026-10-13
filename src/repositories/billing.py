@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.billing import (
     BillingCheckoutSession,
+    BillingOperationReceipt,
     BillingMigration,
     BillingOutboxEvent,
     BillingPaymentEffect,
@@ -21,12 +22,14 @@ from src.models.billing import (
     BillingRolloutReceipt,
     BillingRosterControl,
     BillingSubscription,
+    BillingTopupCapabilityBinding,
     BillingTopupCapabilityReceipt,
     BillingTopupOrder,
     BillingWebhookDelivery,
 )
 from src.models.coupon import Coupon
 from src.models.transaction import Transaction
+from src.services.billing_outbox import authoritative_billing_fact_schema_digest
 
 _ENVIRONMENTS: Final = frozenset({"development", "staging", "production", "test"})
 _ROLLOUT_STATES: Final = frozenset({"disabled", "canary_allowlist", "general"})
@@ -111,11 +114,24 @@ def _capability_is_valid(
     environment: str,
     now: datetime,
 ) -> bool:
+    try:
+        schema_valid = (
+            capability.billing_fact_schema_digest
+            == authoritative_billing_fact_schema_digest(environment)
+        )
+    except Exception:
+        schema_valid = False
     return bool(
         capability.environment == environment
         and capability.schema_version == "credit_capability_ready.v1"
         and capability.approved_at <= now
         and capability.expires_at > now
+        and capability.operation_id is not None
+        and capability.deployment_digest is not None
+        and len(capability.deployment_digest) == 64
+        and capability.request_id is not None
+        and capability.inbox_high_watermark >= 0
+        and schema_valid
         and capability.reconciliation_complete
         and capability.readback_complete
         and not capability.has_open_gap
@@ -225,6 +241,7 @@ class BillingRepository:
         enabled: bool,
         evidence: BillingTransitionEvidence,
         capability_receipt_id: UUID | None = None,
+        disable_reason: str | None = None,
     ) -> BillingRolloutControl:
         """Change only the independent top-up gate with validated capability."""
 
@@ -237,7 +254,7 @@ class BillingRepository:
 
         capability: BillingTopupCapabilityReceipt | None = None
         if enabled:
-            if capability_receipt_id is None:
+            if capability_receipt_id is None or disable_reason is not None:
                 raise BillingCapabilityRejected("topup capability is required")
             result = await self.session.execute(
                 select(BillingTopupCapabilityReceipt)
@@ -252,8 +269,88 @@ class BillingRepository:
                 capability,
                 environment=environment,
                 now=datetime.now(timezone.utc),
-            ):
+            ) or capability.deployment_digest != evidence.deployment_digest:
                 raise BillingCapabilityRejected("topup capability is not valid")
+            binding = await self.session.scalar(
+                select(BillingTopupCapabilityBinding)
+                .where(
+                    BillingTopupCapabilityBinding.environment == environment,
+                    BillingTopupCapabilityBinding.capability_receipt_id
+                    == capability_receipt_id,
+                )
+                .with_for_update()
+            )
+            if binding is None:
+                raise BillingCapabilityRejected("topup capability binding is required")
+            now = datetime.now(timezone.utc)
+            bound_receipts = list(
+                (
+                    await self.session.execute(
+                        select(BillingOperationReceipt).where(
+                    BillingOperationReceipt.environment == environment,
+                    BillingOperationReceipt.operation_id == capability.operation_id,
+                    BillingOperationReceipt.id.in_(
+                        (
+                            binding.producer_receipt_id,
+                            binding.credit_receipt_id,
+                            binding.reconciliation_receipt_id,
+                            binding.verification_receipt_id,
+                        )
+                    ),
+                    BillingOperationReceipt.scope == "topup_capability",
+                    BillingOperationReceipt.applied_at.is_(None),
+                    BillingOperationReceipt.request_id == capability.request_id,
+                    BillingOperationReceipt.inbox_high_watermark
+                    == capability.inbox_high_watermark,
+                    BillingOperationReceipt.deployment_digest
+                    == capability.deployment_digest,
+                    BillingOperationReceipt.billing_fact_schema_digest
+                    == capability.billing_fact_schema_digest,
+                    BillingOperationReceipt.expires_at > now,
+                )
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+            expected_receipts = {
+                binding.producer_receipt_id: (
+                    "producer",
+                    binding.producer_digest,
+                    binding.producer_actor_id,
+                    capability.billing_fact_schema_digest,
+                ),
+                binding.credit_receipt_id: (
+                    "credit",
+                    binding.credit_digest,
+                    binding.credit_actor_id,
+                    capability.billing_fact_schema_digest,
+                ),
+                binding.reconciliation_receipt_id: (
+                    "reconciliation",
+                    binding.reconciliation_digest,
+                    binding.reconciliation_actor_id,
+                    capability.billing_fact_schema_digest,
+                ),
+                binding.verification_receipt_id: (
+                    "verification",
+                    binding.verification_digest,
+                    binding.verification_actor_id,
+                    capability.billing_fact_schema_digest,
+                ),
+            }
+            if len(bound_receipts) != 4 or any(
+                expected_receipts.get(receipt.id)
+                != (
+                    receipt.evidence_type,
+                    receipt.payload_digest,
+                    receipt.actor_user_id,
+                    receipt.billing_fact_schema_digest,
+                )
+                for receipt in bound_receipts
+            ):
+                raise BillingCapabilityRejected(
+                    "topup capability receipt operation is stale"
+                )
             consumed = await self.session.scalar(
                 select(func.count(BillingRolloutReceipt.id)).where(
                     BillingRolloutReceipt.environment == environment,
@@ -263,10 +360,11 @@ class BillingRepository:
             )
             if consumed:
                 raise BillingCapabilityRejected("topup capability was already consumed")
-        elif capability_receipt_id is not None:
-            raise BillingTransitionRejected(
-                "disabled topup gate cannot retain a capability"
-            )
+        elif capability_receipt_id is not None or disable_reason not in {
+            "health",
+            "revocation",
+        }:
+            raise BillingTransitionRejected("topup disable reason is invalid")
 
         from_state = (
             "topup_enabled" if control.topup_commercial_enabled else "topup_disabled"
@@ -338,6 +436,82 @@ class BillingRepository:
         subscription.roster_revision = control.billing_roster_revision
         await self.session.flush()
         return subscription.roster_revision
+
+    async def _topup_capability_binding_is_current(
+        self,
+        *,
+        capability: BillingTopupCapabilityReceipt,
+        environment: str,
+        now: datetime,
+    ) -> bool:
+        """Revalidate the immutable capability evidence at every active gate."""
+
+        binding = await self.session.scalar(
+            select(BillingTopupCapabilityBinding)
+            .where(
+                BillingTopupCapabilityBinding.environment == environment,
+                BillingTopupCapabilityBinding.capability_receipt_id == capability.id,
+            )
+            .with_for_update()
+        )
+        if binding is None or capability.operation_id is None:
+            return False
+        receipt_ids = (
+            binding.producer_receipt_id,
+            binding.credit_receipt_id,
+            binding.reconciliation_receipt_id,
+            binding.verification_receipt_id,
+        )
+        rows = list(
+            (
+                await self.session.execute(
+                    select(BillingOperationReceipt)
+                    .where(
+                        BillingOperationReceipt.environment == environment,
+                        BillingOperationReceipt.operation_id == capability.operation_id,
+                        BillingOperationReceipt.id.in_(receipt_ids),
+                        BillingOperationReceipt.scope == "topup_capability",
+                        BillingOperationReceipt.applied_at.is_(None),
+                        BillingOperationReceipt.request_id == capability.request_id,
+                        BillingOperationReceipt.inbox_high_watermark
+                        == capability.inbox_high_watermark,
+                        BillingOperationReceipt.deployment_digest
+                        == capability.deployment_digest,
+                        BillingOperationReceipt.billing_fact_schema_digest
+                        == capability.billing_fact_schema_digest,
+                        BillingOperationReceipt.expires_at > now,
+                    )
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        expected = {
+            binding.producer_receipt_id: (
+                "producer",
+                binding.producer_digest,
+                binding.producer_actor_id,
+            ),
+            binding.credit_receipt_id: (
+                "credit",
+                binding.credit_digest,
+                binding.credit_actor_id,
+            ),
+            binding.reconciliation_receipt_id: (
+                "reconciliation",
+                binding.reconciliation_digest,
+                binding.reconciliation_actor_id,
+            ),
+            binding.verification_receipt_id: (
+                "verification",
+                binding.verification_digest,
+                binding.verification_actor_id,
+            ),
+        }
+        return len(rows) == 4 and all(
+            expected.get(row.id)
+            == (row.evidence_type, row.payload_digest, row.actor_user_id)
+            for row in rows
+        )
 
     async def authorize_and_reserve_topup_checkout(
         self,
@@ -413,6 +587,10 @@ class BillingRepository:
             capability = capability_result.scalar_one_or_none()
             if capability is None or not _capability_is_valid(
                 capability,
+                environment=environment,
+                now=datetime.now(timezone.utc),
+            ) or not await self._topup_capability_binding_is_current(
+                capability=capability,
                 environment=environment,
                 now=datetime.now(timezone.utc),
             ):

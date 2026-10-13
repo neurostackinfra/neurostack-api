@@ -32,7 +32,7 @@ from sqlalchemy.pool import NullPool
 
 from src.config.settings import settings
 from src.models.billing import BillingCheckoutSession, BillingRolloutControl
-from src.repositories.billing import BillingRepository
+from src.repositories.billing import BillingCapabilityRejected, BillingRepository
 from src.services import billing_checkout as checkout_module
 from src.services.asaas import AsaasClient
 from src.services.billing_checkout import (
@@ -41,12 +41,14 @@ from src.services.billing_checkout import (
     CheckoutUnavailable,
     CheckoutView,
 )
+from src.services.billing_outbox import billing_fact_schema_digest
 from src.services.egress_policy import EgressPolicy
 from tests.integration.test_asaas_billing_postgres import (
     _create_child,
     _drop_child,
     _evidence,
     _run_alembic,
+    _seed_capability_binding,
     _validated_admin_url,
 )
 
@@ -211,40 +213,68 @@ async def _transition(
             )
 
 
-async def _open_topup_gate(harness: _Harness, environment: str) -> None:
+async def _insert_topup_capability(
+    session: AsyncSession,
+    environment: str,
+    *,
+    schema_digest: str | None = None,
+    bind: bool = True,
+) -> UUID:
+    """A ``credit_capability_ready.v1`` receipt in the Group 5 production shape.
+
+    The receipt carries the operation, deployment digest (the one the
+    transition evidence signs), request, watermark and the authoritative
+    ``billing.fact.v1`` schema digest; ``bind`` adds the typed
+    producer/credit/reconciliation/verification operation receipts and the
+    binding row exactly as the repository gate re-reads them.
+    """
+
     capability_id = uuid4()
     now = datetime.now(timezone.utc)
-    async with harness.session() as session:
-        async with session.begin():
-            await session.execute(
-                text("""
-                    INSERT INTO billing_topup_capability_receipts (
-                        id, environment, schema_version, request_id,
-                        credit_deployment_digest, billing_fact_schema_digest,
-                        producer_compatibility_digest,
-                        consumer_compatibility_digest, inbox_high_watermark,
-                        reconciliation_receipt_id, approved_by, approved_at,
-                        expires_at, reconciliation_complete, readback_complete,
-                        has_open_gap, has_backlog, has_alert
-                    ) VALUES (
-                        :id, :environment, 'credit_capability_ready.v1',
-                        :request_id, 'credit-image-sha256', :digest, :digest,
-                        :digest, 0, :reconciliation_id, :approved_by,
-                        :approved_at, :expires_at, true, true, false, false,
-                        false
-                    )
-                """),
-                {
-                    "id": capability_id,
-                    "environment": environment,
-                    "request_id": uuid4(),
-                    "digest": "f" * 64,
-                    "reconciliation_id": uuid4(),
-                    "approved_by": uuid4(),
-                    "approved_at": now - timedelta(minutes=1),
-                    "expires_at": now + timedelta(hours=2),
-                },
+    await session.execute(
+        text("""
+            INSERT INTO billing_topup_capability_receipts (
+                id, environment, schema_version, request_id,
+                operation_id, deployment_digest,
+                credit_deployment_digest, billing_fact_schema_digest,
+                producer_compatibility_digest,
+                consumer_compatibility_digest, inbox_high_watermark,
+                reconciliation_receipt_id, approved_by, approved_at,
+                expires_at, reconciliation_complete, readback_complete,
+                has_open_gap, has_backlog, has_alert
+            ) VALUES (
+                :id, :environment, 'credit_capability_ready.v1',
+                :request_id, :operation_id, :deployment_digest,
+                'credit-image-sha256', :schema_digest, :digest,
+                :digest, 0, :reconciliation_id, :approved_by,
+                :approved_at, :expires_at, true, true, false, false,
+                false
             )
+        """),
+        {
+            "id": capability_id,
+            "environment": environment,
+            "request_id": uuid4(),
+            "operation_id": uuid4(),
+            "deployment_digest": _evidence().deployment_digest,
+            "schema_digest": schema_digest or billing_fact_schema_digest(),
+            "digest": "f" * 64,
+            "reconciliation_id": uuid4(),
+            "approved_by": uuid4(),
+            "approved_at": now - timedelta(minutes=1),
+            "expires_at": now + timedelta(hours=2),
+        },
+    )
+    if bind:
+        await _seed_capability_binding(
+            session, environment=environment, capability_receipt_id=capability_id
+        )
+    return capability_id
+
+
+async def _enable_topup_gate(
+    harness: _Harness, environment: str, capability_id: UUID
+) -> None:
     async with harness.session() as session:
         async with session.begin():
             repository = BillingRepository(session)
@@ -256,6 +286,13 @@ async def _open_topup_gate(harness: _Harness, environment: str) -> None:
                 evidence=_evidence(),
                 capability_receipt_id=capability_id,
             )
+
+
+async def _open_topup_gate(harness: _Harness, environment: str) -> None:
+    async with harness.session() as session:
+        async with session.begin():
+            capability_id = await _insert_topup_capability(session, environment)
+    await _enable_topup_gate(harness, environment, capability_id)
 
 
 _general_ready: set[str] = set()
@@ -783,3 +820,304 @@ async def test_locked_reads_refresh_references_held_across_a_foreign_commit(
         assert control.rollout_revision == initial_revision + 1
         assert locked.state == "failed"
         await service.rollback()
+
+
+@pytest.mark.parametrize(
+    ("bind", "schema_digest", "reason"),
+    [
+        (False, None, "topup capability binding is required"),
+        (True, "0" * 64, "topup capability is not valid"),
+    ],
+)
+async def test_topup_gate_helper_still_refuses_unbound_or_stale_capability(
+    harness: _Harness, bind: bool, schema_digest: str | None, reason: str
+) -> None:
+    """The fixture's production shape is what opens the gate, nothing less."""
+
+    environment = "staging"
+    async with harness.session() as session:
+        async with session.begin():
+            capability_id = await _insert_topup_capability(
+                session, environment, schema_digest=schema_digest, bind=bind
+            )
+    with pytest.raises(BillingCapabilityRejected, match=f"^{reason}$"):
+        await _enable_topup_gate(harness, environment, capability_id)
+    async with harness.session() as session:
+        control = await BillingRepository(session).lock_rollout_control(
+            environment=environment
+        )
+        assert control.topup_commercial_enabled is False
+        assert control.active_topup_capability_id is None
+        await session.rollback()
+
+
+# ---------------------------------------------------------------------------
+# Group 5 deliverable 8: the ASAAS-owned top-up capability endpoint's service,
+# on a session built like production (autoflush=False, expire_on_commit=False).
+# ---------------------------------------------------------------------------
+
+_CAPABILITY_SIGNING_KEY = b"capability-proof-signing-key-0123456789"
+
+
+def _capability_material(
+    environment: str,
+    operation_id: UUID,
+    *,
+    from_state: str,
+    to_state: str,
+    budget_digest: str,
+    expires_at: datetime,
+) -> Any:
+    from src.services.billing_operations import OperationMaterial
+
+    return OperationMaterial(
+        scope="topup_capability",
+        operation_id=operation_id,
+        environment=environment,
+        from_state=from_state,
+        to_state=to_state,
+        budget_digest=budget_digest,
+        deployment_digest=_evidence().deployment_digest,
+        expires_at=expires_at,
+    )
+
+
+async def _signed_receipt(
+    session: AsyncSession,
+    material: Any,
+    *,
+    role: str,
+    evidence_type: str | None = None,
+    request_id: UUID | None = None,
+    inbox_high_watermark: int | None = None,
+) -> Any:
+    """Assignment + receipt through the production operation authority."""
+
+    from src.services.billing_operations import (
+        BillingOperationAuthority,
+        sign_operation_payload,
+    )
+
+    authority = BillingOperationAuthority(
+        session, signing_key=_CAPABILITY_SIGNING_KEY
+    )
+    actor_id = uuid4()
+    assignment = await authority.assign(
+        material=material, role=role, actor_user_id=actor_id  # type: ignore[arg-type]
+    )
+    return await authority.record_receipt(
+        assignment_id=assignment.id,
+        actor_user_id=actor_id,
+        nonce=uuid4(),
+        material=material,
+        signature=sign_operation_payload(
+            material.payload_digest, _CAPABILITY_SIGNING_KEY
+        ),
+        evidence_type=evidence_type,
+        request_id=request_id,
+        inbox_high_watermark=inbox_high_watermark,
+    )
+
+
+async def _quorum(session: AsyncSession, material: Any) -> None:
+    for role in ("deployer", "approver", "reviewer"):
+        await _signed_receipt(session, material, role=role)
+
+
+async def test_capability_service_enables_and_disables_the_gate_on_a_production_session(
+    harness: _Harness,
+) -> None:
+    from src.services.billing_capability import (
+        BillingCapabilityRejected as CapabilityServiceRejected,
+    )
+    from src.services.billing_capability import (
+        BillingTopupCapabilityService,
+        TopupCapabilityEvidence,
+    )
+
+    environment = "test"
+    # The harness sessions are the application's: autoflush=False,
+    # expire_on_commit=False (src/repositories/database.py).
+    assert harness.sessions.kw["autoflush"] is False
+    assert harness.sessions.kw["expire_on_commit"] is False
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=2)).replace(
+        microsecond=0
+    )
+    operation_id, request_id, capability_id = uuid4(), uuid4(), uuid4()
+    enable_material = _capability_material(
+        environment,
+        operation_id,
+        from_state="topup_disabled",
+        to_state="topup_enabled",
+        budget_digest="b" * 64,
+        expires_at=expires_at,
+    )
+    typed: dict[str, Any] = {}
+    async with harness.session() as session:
+        async with session.begin():
+            await _quorum(session, enable_material)
+            for evidence_type, budget in zip(
+                ("producer", "credit", "reconciliation", "verification"),
+                ("1", "2", "3", "4"),
+                strict=True,
+            ):
+                typed[evidence_type] = await _signed_receipt(
+                    session,
+                    _capability_material(
+                        environment,
+                        operation_id,
+                        from_state="topup_disabled",
+                        to_state="topup_enabled",
+                        budget_digest=budget * 64,
+                        expires_at=expires_at,
+                    ),
+                    role="reviewer",
+                    evidence_type=evidence_type,
+                    request_id=request_id,
+                    inbox_high_watermark=0,
+                )
+            # The credit system's readiness receipt (input to this service).
+            now = datetime.now(timezone.utc)
+            await session.execute(
+                text("""
+                    INSERT INTO billing_topup_capability_receipts (
+                        id, environment, schema_version, request_id,
+                        operation_id, deployment_digest,
+                        credit_deployment_digest, billing_fact_schema_digest,
+                        producer_compatibility_digest,
+                        consumer_compatibility_digest, inbox_high_watermark,
+                        reconciliation_receipt_id, approved_by, approved_at,
+                        expires_at, reconciliation_complete, readback_complete,
+                        has_open_gap, has_backlog, has_alert
+                    ) VALUES (
+                        :id, :environment, 'credit_capability_ready.v1',
+                        :request_id, :operation_id, :deployment_digest,
+                        :credit_digest, :schema_digest, :producer_digest,
+                        :reconciliation_digest, 0, :reconciliation_receipt_id,
+                        :approved_by, :approved_at, :expires_at, true, true,
+                        false, false, false
+                    )
+                """),
+                {
+                    "id": capability_id,
+                    "environment": environment,
+                    "request_id": request_id,
+                    "operation_id": operation_id,
+                    "deployment_digest": _evidence().deployment_digest,
+                    "credit_digest": typed["credit"].payload_digest,
+                    "schema_digest": billing_fact_schema_digest(),
+                    "producer_digest": typed["producer"].payload_digest,
+                    "reconciliation_digest": typed["reconciliation"].payload_digest,
+                    "reconciliation_receipt_id": typed["reconciliation"].id,
+                    "approved_by": typed["verification"].actor_user_id,
+                    "approved_at": now - timedelta(minutes=1),
+                    "expires_at": now + timedelta(hours=2),
+                },
+            )
+    evidence = TopupCapabilityEvidence(
+        environment=environment,
+        capability_receipt_id=capability_id,
+        producer_receipt_id=typed["producer"].id,
+        credit_receipt_id=typed["credit"].id,
+        reconciliation_receipt_id=typed["reconciliation"].id,
+        verification_receipt_id=typed["verification"].id,
+        producer_digest=typed["producer"].payload_digest,
+        credit_digest=typed["credit"].payload_digest,
+        reconciliation_digest=typed["reconciliation"].payload_digest,
+        verification_digest=typed["verification"].payload_digest,
+        billing_fact_schema_digest=billing_fact_schema_digest(),
+        producer_actor_id=typed["producer"].actor_user_id,
+        credit_actor_id=typed["credit"].actor_user_id,
+        reconciliation_actor_id=typed["reconciliation"].actor_user_id,
+        verification_actor_id=typed["verification"].actor_user_id,
+        verified_at=datetime.now(timezone.utc),
+        operation_id=operation_id,
+        deployment_digest=_evidence().deployment_digest,
+        request_id=request_id,
+        inbox_high_watermark=0,
+    )
+
+    async def gate() -> tuple[Any, ...]:
+        async with harness.session() as session:
+            row = (
+                await session.execute(
+                    text("""
+                        SELECT topup_commercial_enabled, topup_revision,
+                               active_topup_capability_id
+                        FROM billing_rollout_control WHERE environment = :env
+                    """),
+                    {"env": environment},
+                )
+            ).one()
+            return tuple(row)
+
+    before = await gate()
+    assert before[0] is False
+    async with harness.session() as session:
+        async with session.begin():
+            control = await BillingTopupCapabilityService(
+                session, signing_key=_CAPABILITY_SIGNING_KEY
+            ).enable(
+                expected_revision=before[1],
+                material=enable_material,
+                evidence=evidence,
+            )
+            assert control.topup_commercial_enabled is True
+    enabled = await gate()
+    assert enabled == (True, before[1] + 1, capability_id)
+    async with harness.session() as session:
+        counts = (
+            await session.execute(
+                text("""
+                    SELECT
+                      (SELECT count(*) FROM billing_topup_capability_bindings
+                       WHERE capability_receipt_id = :capability_id),
+                      (SELECT count(*) FROM billing_rollout_receipts
+                       WHERE capability_receipt_id = :capability_id),
+                      (SELECT count(*) FROM billing_operation_receipts
+                       WHERE operation_id = :operation_id
+                         AND evidence_type IS NULL AND applied_at IS NOT NULL)
+                """),
+                {"capability_id": capability_id, "operation_id": operation_id},
+            )
+        ).one()
+    assert tuple(counts) == (1, 1, 3)
+
+    # Single use: replaying the consumed quorum is refused, nothing changes.
+    async with harness.session() as session:
+        with pytest.raises(
+            CapabilityServiceRejected, match="^billing_operation_receipt_invalid$"
+        ):
+            async with session.begin():
+                await BillingTopupCapabilityService(
+                    session, signing_key=_CAPABILITY_SIGNING_KEY
+                ).enable(
+                    expected_revision=enabled[1],
+                    material=enable_material,
+                    evidence=evidence,
+                )
+    assert await gate() == enabled
+
+    # The reverse transition: health disable with its own quorum.
+    disable_material = _capability_material(
+        environment,
+        uuid4(),
+        from_state="topup_enabled",
+        to_state="topup_disabled",
+        budget_digest="c" * 64,
+        expires_at=expires_at,
+    )
+    async with harness.session() as session:
+        async with session.begin():
+            await _quorum(session, disable_material)
+    async with harness.session() as session:
+        async with session.begin():
+            disabled_control = await BillingTopupCapabilityService(
+                session, signing_key=_CAPABILITY_SIGNING_KEY
+            ).disable(
+                expected_revision=enabled[1],
+                material=disable_material,
+                reason="health",
+            )
+            assert disabled_control.topup_commercial_enabled is False
+    assert await gate() == (False, enabled[1] + 1, None)

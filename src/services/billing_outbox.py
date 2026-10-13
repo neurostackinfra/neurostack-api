@@ -11,6 +11,7 @@ from __future__ import annotations
 import calendar
 import hashlib
 import json
+import os
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -180,6 +181,46 @@ def billing_fact_bundle_digest(
         raise BillingFactViolation(
             "billing fact bundle manifest is unavailable"
         ) from exc
+
+
+def billing_fact_schema_digest(schema: Path | None = None) -> str:
+    """Hash the deployed billing fact schema bytes used by every producer."""
+
+    path = schema or (
+        Path(__file__).resolve().parents[2]
+        / "src/contracts/billing_fact_v1.schema.json"
+    )
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise BillingFactViolation(
+            "billing fact schema is unavailable"
+        ) from exc
+
+
+def authoritative_billing_fact_schema_digest(environment: str) -> str:
+    """Return the deployed schema digest used by capability authority.
+
+    Production must receive this digest from the deployed artifact/secret
+    contract; it may not silently derive authority from a mutable checkout
+    source tree.  Non-production fixtures may use the checked-in schema when
+    no deployment manifest is supplied.
+    """
+
+    configured = os.environ.get("BILLING_FACT_SCHEMA_DIGEST", "").strip()
+    if not configured:
+        try:
+            from src.config.settings import settings
+
+            configured = settings.billing_fact_schema_digest.strip()
+        except (AttributeError, ImportError):
+            configured = ""
+    if environment == "production" and not configured:
+        raise BillingFactViolation("authoritative billing fact schema is unavailable")
+    expected = billing_fact_schema_digest()
+    if configured and configured != expected:
+        raise BillingFactViolation("authoritative billing fact schema is stale")
+    return configured or expected
 
 
 def _integer(value: object, field: str, *, minimum: int = 0) -> int:
@@ -840,7 +881,15 @@ class BillingFactProducer:
             deployment_digest=self._deployment_digest,
             handed_off_at=produced_at,
         )
-        self._db.add_all((outbox, delivery, handoff))
+        # No relationship() links these mappers, so one flush would let the
+        # unit of work order them by class name (deliveries before the outbox)
+        # and PostgreSQL refuses the non-deferrable foreign keys.  Insert the
+        # parents explicitly: outbox, then delivery, then handoff.
+        self._db.add(outbox)
+        await self._db.flush()
+        self._db.add(delivery)
+        await self._db.flush()
+        self._db.add(handoff)
         await self._db.flush()
         return outbox
 

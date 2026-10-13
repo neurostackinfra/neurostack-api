@@ -501,16 +501,29 @@ async def test_production_readiness_fails_when_legacy_secret_is_whitespace(
     assert result.checks["abacatepay_webhook"] is False
 
 
+def _live_production_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def reachable(*_args: object) -> bool:
+        return True
+
+    for probe in ("_database_ready", "_redis_ready", "_qdrant_ready"):
+        monkeypatch.setattr(health, probe, reachable)
+
+
 @pytest.mark.asyncio
 async def test_production_readiness_accepts_injected_legacy_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(health.settings, "environment", "production")
+    # A production readiness pass now also needs the Group 5 billing
+    # observability evidence and reachable dependencies; provide a complete,
+    # validated production configuration instead of flipping one field.
+    from tests.config.test_asaas_settings import _production_settings
+
     monkeypatch.setattr(
-        health.settings,
-        "abacatepay_webhook_secret",
-        SecretStr("legacy-fixture-secret"),
+        health,
+        "settings",
+        _production_settings(abacatepay_webhook_secret="legacy-fixture-secret"),
     )
+    _live_production_dependencies(monkeypatch)
     response = Response()
 
     result = await health.readiness_check(response)
@@ -519,3 +532,56 @@ async def test_production_readiness_accepts_injected_legacy_secret(
     assert result.ready is True
     assert result.checks["abacatepay_webhook"] is True
     assert "legacy-fixture-secret" not in result.model_dump_json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probe", ["_database_ready", "_redis_ready", "_qdrant_ready"])
+async def test_production_readiness_still_requires_live_dependencies(
+    monkeypatch: pytest.MonkeyPatch, probe: str
+) -> None:
+    from tests.config.test_asaas_settings import _production_settings
+
+    monkeypatch.setattr(
+        health,
+        "settings",
+        _production_settings(abacatepay_webhook_secret="legacy-fixture-secret"),
+    )
+    _live_production_dependencies(monkeypatch)
+
+    async def unreachable(*_args: object) -> bool:
+        return False
+
+    monkeypatch.setattr(health, probe, unreachable)
+    response = Response()
+
+    result = await health.readiness_check(response)
+
+    assert response.status_code == 503
+    assert result.ready is False
+    failed = {name for name, ok in result.checks.items() if not ok}
+    assert failed == {probe.removeprefix("_").removesuffix("_ready")}
+
+
+@pytest.mark.asyncio
+async def test_production_readiness_rejects_missing_runtime_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.config.test_asaas_settings import _production_settings
+
+    configured = _production_settings(abacatepay_webhook_secret="legacy-fixture-secret")
+    monkeypatch.setattr(
+        health,
+        "settings",
+        configured.model_copy(
+            update={"billing_observability_acknowledgement": ""}
+        ),
+    )
+    _live_production_dependencies(monkeypatch)
+    response = Response()
+
+    result = await health.readiness_check(response)
+
+    assert response.status_code == 503
+    assert {name for name, ok in result.checks.items() if not ok} == {
+        "billing_observability"
+    }

@@ -37,6 +37,7 @@ from src.repositories.billing import (
     BillingTransitionEvidence,
     BillingTransitionRejected,
 )
+from src.services.billing_outbox import billing_fact_schema_digest
 
 pytestmark = pytest.mark.integration
 
@@ -395,6 +396,12 @@ async def postgres_harness() -> AsyncIterator[_Harness]:
     migrated_engine: AsyncEngine | None = None
     fresh_engine: AsyncEngine | None = None
     created: list[str] = []
+    previous_schema_digest = os.environ.get("BILLING_FACT_SCHEMA_DIGEST")
+    if previous_schema_digest is None:
+        # The smoke database is local test infrastructure.  Model the
+        # deployed-artifact contract explicitly without allowing production
+        # code to derive authority from its checkout.
+        os.environ["BILLING_FACT_SCHEMA_DIGEST"] = billing_fact_schema_digest()
     try:
         async with admin_engine.connect() as connection:
             can_create = bool(
@@ -417,7 +424,7 @@ async def postgres_harness() -> AsyncIterator[_Harness]:
             foreign_builder_id=foreign_builder_id,
             transaction_id=legacy_transaction_id,
         )
-        await _run_alembic(migrated_url, "upgrade", "027")
+        await _run_alembic(migrated_url, "upgrade", "head")
         migrated_engine = create_async_engine(migrated_url, poolclass=NullPool)
         async with migrated_engine.connect() as connection:
             assert (
@@ -453,7 +460,7 @@ async def postgres_harness() -> AsyncIterator[_Harness]:
             )
         finally:
             await downgrade_probe.dispose()
-        await _run_alembic(migrated_url, "upgrade", "027")
+        await _run_alembic(migrated_url, "upgrade", "head")
         migrated_engine = create_async_engine(migrated_url, poolclass=NullPool)
 
         await _create_child(admin_engine, fresh_name)
@@ -498,6 +505,10 @@ async def postgres_harness() -> AsyncIterator[_Harness]:
             legacy_survived_downgrade=legacy_survived_downgrade,
         )
     finally:
+        if previous_schema_digest is None:
+            os.environ.pop("BILLING_FACT_SCHEMA_DIGEST", None)
+        else:
+            os.environ["BILLING_FACT_SCHEMA_DIGEST"] = previous_schema_digest
         if fresh_engine is not None:
             await fresh_engine.dispose()
         if migrated_engine is not None:
@@ -513,6 +524,136 @@ def _evidence() -> BillingTransitionEvidence:
         deployment_digest="d" * 64,
         actor_user_id=uuid4(),
         expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+
+
+async def _seed_capability_binding(
+    session: AsyncSession,
+    *,
+    environment: str,
+    capability_receipt_id: UUID,
+) -> None:
+    """Seed backend-issued capability receipts for repository-level gates."""
+
+    receipt_ids: list[UUID] = []
+    actor_ids: list[UUID] = []
+    operation_id, deployment_digest, request_id, inbox_high_watermark, fact_schema_digest = (
+        await session.execute(
+            text("""
+                SELECT operation_id, deployment_digest, request_id,
+                       inbox_high_watermark, billing_fact_schema_digest
+                FROM billing_topup_capability_receipts
+                WHERE id = :capability_receipt_id
+            """),
+            {"capability_receipt_id": capability_receipt_id},
+        )
+    ).one()
+    digests = ["a" * 64, "b" * 64, "c" * 64, "d" * 64]
+    roles = ("deployer", "approver", "reviewer", "deployer")
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=2)
+    evidence_types = ("producer", "credit", "reconciliation", "verification")
+    for digest, role, evidence_type in zip(
+        digests, roles, evidence_types, strict=True
+    ):
+        assignment_id = uuid4()
+        receipt_id = uuid4()
+        actor_id = uuid4()
+        receipt_ids.append(receipt_id)
+        actor_ids.append(actor_id)
+        await session.execute(
+            text("""
+                INSERT INTO billing_operation_assignments (
+                    id, operation_id, environment, scope, role,
+                    actor_user_id, payload_digest, expires_at
+                ) VALUES (
+                    :assignment_id, :operation_id, :environment,
+                    'topup_capability', :role, :actor_id, :payload_digest,
+                    :expires_at
+                )
+            """),
+            {
+                "assignment_id": assignment_id,
+                "operation_id": operation_id,
+                "environment": environment,
+                "role": role,
+                "actor_id": actor_id,
+                "payload_digest": digest,
+                "expires_at": expires_at,
+            },
+        )
+        await session.execute(
+            text("""
+                INSERT INTO billing_operation_receipts (
+                    id, assignment_id, operation_id, environment, scope,
+                    role, actor_user_id, nonce, payload_digest,
+                    deployment_digest, budget_digest, from_state, to_state,
+                    evidence_type, request_id, inbox_high_watermark,
+                    billing_fact_schema_digest, expires_at, signature_sha256
+                ) VALUES (
+                    :receipt_id, :assignment_id, :operation_id, :environment,
+                    'topup_capability', :role, :actor_id, :nonce,
+                    :payload_digest, :deployment_digest, :budget_digest,
+                    'topup_disabled', 'topup_enabled', :evidence_type,
+                    :request_id, :inbox_high_watermark, :fact_schema_digest,
+                    :expires_at,
+                    :signature_sha256
+                )
+            """),
+            {
+                "receipt_id": receipt_id,
+                "assignment_id": assignment_id,
+                "operation_id": operation_id,
+                "environment": environment,
+                "role": role,
+                "actor_id": actor_id,
+                "nonce": uuid4(),
+                "payload_digest": digest,
+                "deployment_digest": deployment_digest,
+                "budget_digest": digest,
+                "expires_at": expires_at,
+                "signature_sha256": "f" * 64,
+                "evidence_type": evidence_type,
+                "request_id": request_id,
+                "inbox_high_watermark": inbox_high_watermark,
+                "fact_schema_digest": fact_schema_digest,
+            },
+        )
+    await session.execute(
+        text("""
+            INSERT INTO billing_topup_capability_bindings (
+                id, environment, capability_receipt_id,
+                producer_receipt_id, credit_receipt_id,
+                reconciliation_receipt_id, verification_receipt_id,
+                producer_digest, credit_digest, reconciliation_digest,
+                verification_digest, producer_actor_id, credit_actor_id,
+                reconciliation_actor_id, verification_actor_id, verified_at
+            ) VALUES (
+                :id, :environment, :capability_receipt_id,
+                :producer_receipt_id, :credit_receipt_id,
+                :reconciliation_receipt_id, :verification_receipt_id,
+                :producer_digest, :credit_digest, :reconciliation_digest,
+                :verification_digest, :producer_actor_id, :credit_actor_id,
+                :reconciliation_actor_id, :verification_actor_id, :verified_at
+            )
+        """),
+        {
+            "id": uuid4(),
+            "environment": environment,
+            "capability_receipt_id": capability_receipt_id,
+            "producer_receipt_id": receipt_ids[0],
+            "credit_receipt_id": receipt_ids[1],
+            "reconciliation_receipt_id": receipt_ids[2],
+            "verification_receipt_id": receipt_ids[3],
+            "producer_digest": digests[0],
+            "credit_digest": digests[1],
+            "reconciliation_digest": digests[2],
+            "verification_digest": digests[3],
+            "producer_actor_id": actor_ids[0],
+            "credit_actor_id": actor_ids[1],
+            "reconciliation_actor_id": actor_ids[2],
+            "verification_actor_id": actor_ids[3],
+            "verified_at": datetime.now(timezone.utc),
+        },
     )
 
 
@@ -577,20 +718,46 @@ async def _insert_provider_flip_receipt(
         if valid_digest
         else "repeat('a', 64)"
     )
+    event_id = f"evt-provider-{uuid4()}"
+    # Migration 032's canonical evidence digest (shared with Python's
+    # ``provider_evidence_digest``); argument order follows its signature.
+    evidence_digest_sql = f"""
+        billing_provider_evidence_digest(
+            'asaas.api.v3', CAST(:provider_event_id AS TEXT),
+            now() + interval '15 minutes',
+            migration.target_external_subscription_id, migration.id, now(),
+            'subscription.migration.provider_flip', migration.operation_id,
+            'asaas', {digest_sql})
+    """
     await session.execute(
         text(f"""
             INSERT INTO billing_migration_receipts (
                 id, builder_id, migration_id, operation_id, receipt_kind,
-                provider, external_reference, status, content_sha256,
+                provider, external_reference, provider_event_id,
+                provider_authority, provider_key_id, provider_operation,
+                provider_signature, provider_observed_at,
+                provider_expires_at, provider_snapshot_digest,
+                provider_evidence_digest, status, content_sha256,
                 actor_user_id, observed_at
             ) SELECT :id, migration.builder_id, migration.id,
                 migration.operation_id, 'provider_flip', 'asaas',
-                migration.target_external_subscription_id, 'verified',
+                migration.target_external_subscription_id,
+                CAST(:provider_event_id AS TEXT),
+                'asaas.api.v3', 'fixture-v1',
+                'subscription.migration.provider_flip', :provider_signature,
+                now(), now() + interval '15 minutes',
+                {digest_sql}, {evidence_digest_sql}, 'verified',
                 {digest_sql}, :actor, now()
             FROM billing_migrations AS migration
             WHERE migration.id = :migration_id
         """),
-        {"id": uuid4(), "migration_id": migration_id, "actor": uuid4()},
+        {
+            "id": uuid4(),
+            "migration_id": migration_id,
+            "actor": uuid4(),
+            "provider_event_id": event_id,
+            "provider_signature": "a" * 128,
+        },
     )
 
 
@@ -716,7 +883,7 @@ async def test_upgrade_downgrade_and_fresh_schema_are_equivalent(
     async with postgres_harness.engine.connect() as connection:
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "027"
+            == "032"
         )
         legacy = (
             await connection.execute(
@@ -1192,42 +1359,7 @@ async def test_legacy_provider_flip_requires_exact_approved_roster_target(
                          SET status = 'legacy_cancelled' WHERE id = :id"""),
                 {"id": subscription_id},
             )
-            await session.execute(
-                text("""
-                    INSERT INTO billing_migration_receipts (
-                        id, builder_id, migration_id, operation_id, receipt_kind,
-                        provider, external_reference, status, content_sha256,
-                        actor_user_id, observed_at
-                    ) SELECT :id, migration.builder_id, migration.id,
-                        migration.operation_id, 'provider_flip', 'asaas',
-                        migration.target_external_subscription_id, 'verified',
-                        encode(sha256(convert_to(jsonb_build_object(
-                            'migration_id', migration.id,
-                            'builder_id', migration.builder_id,
-                            'subscription_id', migration.subscription_id,
-                            'operation_id', migration.operation_id,
-                            'source_roster_revision', migration.source_roster_revision,
-                            'target_provider', migration.target_provider,
-                            'target_external_subscription_id',
-                                migration.target_external_subscription_id,
-                            'target_catalog_version_id',
-                                migration.target_catalog_version_id,
-                            'target_offer_id', migration.target_offer_id,
-                            'target_plan', migration.target_plan,
-                            'target_billing_cycle', migration.target_billing_cycle,
-                            'target_coupon_code', migration.target_coupon_code,
-                            'target_amount_cents', migration.target_amount_cents,
-                            'target_snapshot', migration.target_snapshot
-                        )::text, 'UTF8')), 'hex'), :actor, now()
-                    FROM billing_migrations AS migration
-                    WHERE migration.id = :migration_id
-                """),
-                {
-                    "id": uuid4(),
-                    "migration_id": migration_id,
-                    "actor": uuid4(),
-                },
-            )
+            await _insert_provider_flip_receipt(session, migration_id)
             with pytest.raises(DBAPIError):
                 async with session.begin_nested():
                     await session.execute(
@@ -1425,6 +1557,14 @@ async def test_provider_flip_rejects_receipt_bound_to_stale_source(
                     source_revision=source_revision,
                     include_provider_receipt=False,
                 )
+            )
+            await setup.execute(
+                text("""
+                    UPDATE billing_subscriptions
+                    SET status = 'legacy_cancelled'
+                    WHERE id = :subscription_id
+                """),
+                {"subscription_id": stale_subscription_id},
             )
 
     async with postgres_harness.session() as session:
@@ -1644,10 +1784,22 @@ async def test_provider_receipt_and_target_updates_are_serialized(
     insert_receipt = text("""
         INSERT INTO billing_migration_receipts (
             id, builder_id, migration_id, operation_id, receipt_kind,
-            provider, external_reference, status, content_sha256,
+            provider, external_reference, provider_event_id,
+            provider_authority, provider_key_id, provider_operation,
+            provider_signature, provider_observed_at,
+            provider_expires_at, provider_snapshot_digest,
+            provider_evidence_digest, status, content_sha256,
             actor_user_id, observed_at
         ) SELECT :id, builder_id, id, operation_id, 'provider_flip',
-            'asaas', target_external_subscription_id, 'verified', :digest,
+            'asaas', target_external_subscription_id, CAST(:event_id AS TEXT),
+            'asaas.api.v3', 'fixture-v1', 'subscription.migration.provider_flip',
+            repeat('a', 128),
+            now(), now() + interval '15 minutes', CAST(:digest AS TEXT),
+            billing_provider_evidence_digest(
+                'asaas.api.v3', CAST(:event_id AS TEXT),
+                now() + interval '15 minutes', target_external_subscription_id,
+                id, now(), 'subscription.migration.provider_flip', operation_id,
+                'asaas', CAST(:digest AS TEXT)), 'verified', CAST(:digest AS TEXT),
             :actor, now()
         FROM billing_migrations WHERE id = :migration_id
     """)
@@ -1695,6 +1847,7 @@ async def test_provider_receipt_and_target_updates_are_serialized(
                     "id": uuid4(),
                     "migration_id": stale_migration_id,
                     "digest": stale_digest,
+                    "event_id": f"evt-stale-{uuid4()}",
                     "actor": uuid4(),
                 },
             )
@@ -1739,6 +1892,7 @@ async def test_provider_receipt_and_target_updates_are_serialized(
                 "id": uuid4(),
                 "migration_id": bound_migration_id,
                 "digest": bound_digest,
+                "event_id": f"evt-bound-{uuid4()}",
                 "actor": uuid4(),
             },
         )
@@ -1923,7 +2077,7 @@ async def test_three_transaction_target_receipt_flip_order_has_no_deadlock(
         WHERE id=:id
     """)
     expected_failures = {
-        "receipt": "invalid provider flip receipt",
+        "receipt": "provider evidence envelope is invalid",
         "flip": "ASAAS provider flip requires exact bound target",
     }
 
@@ -3410,6 +3564,7 @@ async def test_topup_authorization_reserves_budget_atomically_and_disable_wins(
                 text("""
                     INSERT INTO billing_topup_capability_receipts (
                         id, environment, schema_version, request_id,
+                        operation_id, deployment_digest,
                         credit_deployment_digest, billing_fact_schema_digest,
                         producer_compatibility_digest,
                         consumer_compatibility_digest, inbox_high_watermark,
@@ -3418,7 +3573,8 @@ async def test_topup_authorization_reserves_budget_atomically_and_disable_wins(
                         has_open_gap, has_backlog, has_alert
                     ) VALUES (
                         :id, 'production', 'credit_capability_ready.v1', :request_id,
-                        'credit-image-sha256', :digest, :digest, :digest, 0,
+                        :operation_id, :deployment_digest,
+                        'credit-image-sha256', :schema_digest, :digest, :digest, 0,
                         :reconciliation_id, :approved_by, :approved_at,
                         :expires_at, true, true, false, false, false
                     )
@@ -3426,12 +3582,20 @@ async def test_topup_authorization_reserves_budget_atomically_and_disable_wins(
                 {
                     "id": capability_id,
                     "request_id": uuid4(),
+                    "operation_id": uuid4(),
+                    "deployment_digest": "d" * 64,
                     "digest": "e" * 64,
+                    "schema_digest": billing_fact_schema_digest(),
                     "reconciliation_id": uuid4(),
                     "approved_by": uuid4(),
                     "approved_at": now,
                     "expires_at": now + timedelta(hours=2),
                 },
+            )
+            await _seed_capability_binding(
+                session,
+                environment="production",
+                capability_receipt_id=capability_id,
             )
     async with postgres_harness.session() as session:
         with pytest.raises(DBAPIError):
@@ -3522,6 +3686,7 @@ async def test_topup_authorization_reserves_budget_atomically_and_disable_wins(
                 expected_revision=1,
                 enabled=False,
                 evidence=_evidence(),
+                disable_reason="health",
             )
         async with session.begin():
             with pytest.raises(BillingCapabilityRejected):
@@ -4041,7 +4206,7 @@ async def test_receipts_and_outbox_reject_update_and_delete(
                     status, content_sha256, actor_user_id, observed_at
                 ) VALUES (
                     :id, :builder_id, :migration_id, :operation_id,
-                    'recreate_authorized', 'verified', :sha, :actor, now()
+                    'provider_delete', 'inconclusive', :sha, :actor, now()
                 )
             """),
             {
@@ -4887,6 +5052,18 @@ async def test_g2_prepost_recheck_reads_topup_gate_capability_and_order(
 ) -> None:
     from src.services.billing_checkout import BillingCheckoutService
 
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            repository = BillingRepository(session)
+            control = await repository.lock_rollout_control(environment="production")
+            if control.topup_commercial_enabled:
+                await repository.set_topup_commercial_enabled(
+                    environment="production",
+                    expected_revision=control.topup_revision,
+                    enabled=False,
+                    evidence=_evidence(),
+                    disable_reason="health",
+                )
     await _ensure_general_rollout(postgres_harness, "production")
     async with postgres_harness.session() as session:
         topup_revision, gate = (await session.execute(text("""
@@ -4911,6 +5088,7 @@ async def test_g2_prepost_recheck_reads_topup_gate_capability_and_order(
                 text("""
                     INSERT INTO billing_topup_capability_receipts (
                         id, environment, schema_version, request_id,
+                        operation_id, deployment_digest,
                         credit_deployment_digest, billing_fact_schema_digest,
                         producer_compatibility_digest,
                         consumer_compatibility_digest, inbox_high_watermark,
@@ -4919,7 +5097,8 @@ async def test_g2_prepost_recheck_reads_topup_gate_capability_and_order(
                         has_open_gap, has_backlog, has_alert
                     ) VALUES (
                         :id, 'production', 'credit_capability_ready.v1',
-                        :request_id, 'credit-image-sha256', :digest, :digest,
+                        :request_id, :operation_id, :deployment_digest,
+                        'credit-image-sha256', :schema_digest, :digest,
                         :digest, 0, :reconciliation_id, :approved_by,
                         :approved_at, :expires_at, true, true, false, false,
                         false
@@ -4928,12 +5107,20 @@ async def test_g2_prepost_recheck_reads_topup_gate_capability_and_order(
                 {
                     "id": capability_id,
                     "request_id": uuid4(),
+                    "operation_id": uuid4(),
+                    "deployment_digest": "d" * 64,
                     "digest": "f" * 64,
+                    "schema_digest": billing_fact_schema_digest(),
                     "reconciliation_id": uuid4(),
                     "approved_by": uuid4(),
                     "approved_at": now - timedelta(minutes=1),
                     "expires_at": now + timedelta(hours=2),
                 },
+            )
+            await _seed_capability_binding(
+                session,
+                environment="production",
+                capability_receipt_id=capability_id,
             )
     async with postgres_harness.session() as session:
         async with session.begin():
@@ -5006,6 +5193,7 @@ async def test_g2_prepost_recheck_reads_topup_gate_capability_and_order(
                 expected_revision=topup_revision + 1,
                 enabled=False,
                 evidence=_evidence(),
+                disable_reason="health",
             )
     async with postgres_harness.session() as session:
         with pytest.raises(
@@ -5030,3 +5218,1452 @@ async def test_g2_prepost_recheck_reads_topup_gate_capability_and_order(
             )
             == "failed"
         )
+
+
+# ---------------------------------------------------------------------------
+# Group 5 fix cycle 7: the saga through its production service paths.
+#
+# Only the pre-existing legacy AbacatePay row is seeded with SQL (it is input
+# to the migration, not something the migration produces).  Every receipt,
+# binding and transition below is written by ``BillingMigrationService``; the
+# test plays only the external provider-evidence authority (it signs).
+# ---------------------------------------------------------------------------
+
+_G5_PROVIDER_PRIVATE_KEY = bytes(range(101, 133))
+_G5_PROVIDER_KEY_ID = "g5-fixture-v1"
+
+
+def _g5_public_key_hex() -> str:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    return (
+        Ed25519PrivateKey.from_private_bytes(_G5_PROVIDER_PRIVATE_KEY)
+        .public_key()
+        .public_bytes_raw()
+        .hex()
+    )
+
+
+@pytest.fixture
+def g5_provider_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        settings, "asaas_provider_evidence_key_id", _G5_PROVIDER_KEY_ID
+    )
+    monkeypatch.setattr(
+        settings, "asaas_provider_evidence_public_key", _g5_public_key_hex()
+    )
+
+
+def _g5_target() -> Any:
+    from src.services.billing_migration import MigrationTarget
+
+    snapshot = json.loads(_MIGRATION_SNAPSHOT_JSON)
+    return MigrationTarget(
+        catalog_version_id="catalog-v1",
+        offer_id="plan_plus_monthly_v1",
+        plan="plus",
+        coupon_code=None,
+        amount_cents=99900,
+        snapshot=snapshot,
+    )
+
+
+def _g5_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+async def _g5_seed_legacy_subscription(
+    harness: _Harness, builder_id: UUID | None = None
+) -> UUID:
+    subscription_id = uuid4()
+    async with harness.session() as session:
+        async with session.begin():
+            await session.execute(text("""
+                UPDATE billing_roster_control SET billing_roster_revision = 1
+                WHERE singleton = true AND billing_roster_revision = 0
+            """))
+            revision = await session.scalar(text("""
+                SELECT billing_roster_revision FROM billing_roster_control
+                WHERE singleton = true FOR UPDATE
+            """))
+            await session.execute(
+                text("""
+                    INSERT INTO billing_subscriptions (
+                        id, builder_id, provider, external_subscription_id,
+                        is_active, plan, billing_cycle, status, roster_revision
+                    ) VALUES (
+                        :id, :builder_id, 'abacatepay', :external_id, true,
+                        'start', 'monthly', 'active', :revision
+                    )
+                """),
+                {
+                    "id": subscription_id,
+                    "builder_id": builder_id or harness.builder_id,
+                    "external_id": f"legacy-{subscription_id}",
+                    "revision": revision,
+                },
+            )
+    return subscription_id
+
+
+async def _g5_saga(harness: _Harness, migration_id: UUID) -> dict[str, Any]:
+    async with harness.session() as session:
+        row = (
+            await session.execute(
+                text("""
+                    SELECT migration.state, migration.target_external_subscription_id,
+                           migration.operation_id, migration.legacy_cancelled_at,
+                           migration.attempt_count, migration.source_roster_revision,
+                           subscription.provider, subscription.status,
+                           subscription.is_active, subscription.roster_revision,
+                           subscription.external_subscription_id,
+                           roster.billing_roster_revision,
+                           (SELECT count(*) FROM billing_migration_receipts receipt
+                            WHERE receipt.migration_id = migration.id) AS receipts,
+                           (SELECT count(*) FROM billing_migration_absence_reads read
+                            WHERE read.migration_id = migration.id) AS reads
+                    FROM billing_migrations migration
+                    JOIN billing_subscriptions subscription
+                      ON subscription.id = migration.subscription_id
+                    CROSS JOIN billing_roster_control roster
+                    WHERE migration.id = :id
+                """),
+                {"id": migration_id},
+            )
+        ).mappings().one()
+    return dict(row)
+
+
+async def _g5_import(
+    harness: _Harness,
+    *,
+    renewal: date,
+    clock: Any = _g5_now,
+    builder_id: UUID | None = None,
+) -> tuple[UUID, UUID]:
+    from src.services.billing_migration import BillingMigrationService
+
+    builder = builder_id or harness.builder_id
+    subscription_id = await _g5_seed_legacy_subscription(harness, builder)
+    async with harness.session() as session:
+        async with session.begin():
+            view = await BillingMigrationService(session, clock=clock).import_roster_entry(
+                builder_id=builder,
+                subscription_id=subscription_id,
+                renewal=renewal,
+                target=_g5_target(),
+            )
+    return view.migration_id, subscription_id
+
+
+async def _g5_legacy_cancelled(
+    harness: _Harness,
+    *,
+    renewal: date = date(2027, 6, 10),
+    age: timedelta | None = None,
+    builder_id: UUID | None = None,
+) -> tuple[UUID, UUID]:
+    """import -> cancel-begin -> cancel-reconcile(cancelled), all through the service.
+
+    ``age`` simulates a migration imported that long ago (its ``created_at``
+    is moved back) so that convergence windows can elapse inside a test; the
+    reconcile then observes the panel at ``now - age + 30 min``.
+    """
+
+    from src.services.billing_migration import BillingMigrationService
+
+    migration_id, _ = await _g5_import(harness, renewal=renewal, builder_id=builder_id)
+    if age is not None:
+        async with harness.session() as session:
+            async with session.begin():
+                await session.execute(
+                    text("""
+                        UPDATE billing_migrations
+                        SET created_at = created_at - CAST(:age AS INTERVAL)
+                        WHERE id = :id
+                    """),
+                    {"id": migration_id, "age": age},
+                )
+    async with harness.session() as session:
+        async with session.begin():
+            await BillingMigrationService(session).begin_legacy_cancel(
+                migration_id=migration_id, operation_id=uuid4()
+            )
+    reconcile_clock = _g5_now
+    if age is not None:
+        observed = _g5_now() - age + timedelta(minutes=30)
+        reconcile_clock = lambda: observed  # noqa: E731
+    async with harness.session() as session:
+        async with session.begin():
+            view = await BillingMigrationService(
+                session, clock=reconcile_clock
+            ).reconcile_legacy_cancel(
+                migration_id=migration_id, actor_user_id=uuid4(), cancelled=True
+            )
+    assert view.state == "legacy_cancelled"
+    saga = await _g5_saga(harness, migration_id)
+    return migration_id, saga["operation_id"]
+
+
+async def _g5_provider_delete_receipt_key(
+    harness: _Harness, migration_id: UUID
+) -> tuple[int, int, UUID | None]:
+    async with harness.session() as session:
+        row = (
+            await session.execute(
+                text("""
+                    SELECT count(*), count(DISTINCT operation_id),
+                           (array_agg(operation_id))[1]
+                    FROM billing_migration_receipts
+                    WHERE migration_id = :migration_id
+                      AND receipt_kind = 'provider_delete'
+                """),
+                {"migration_id": migration_id},
+            )
+        ).one()
+    return tuple(row)  # type: ignore[return-value]
+
+
+async def test_g5_manual_intervention_replay_reuses_quarantine_receipt(
+    postgres_harness: _Harness,
+) -> None:
+    from src.services.billing_migration import BillingMigrationService
+
+    migration_id, operation_id = await _g5_legacy_cancelled(postgres_harness)
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            first = await BillingMigrationService(session).mark_manual_intervention(
+                migration_id=migration_id, actor_user_id=uuid4()
+            )
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            replay = await BillingMigrationService(session).mark_manual_intervention(
+                migration_id=migration_id, actor_user_id=uuid4()
+            )
+
+    assert first.state == replay.state == "manual_intervention"
+    assert await _g5_provider_delete_receipt_key(postgres_harness, migration_id) == (
+        1,
+        1,
+        operation_id,
+    )
+
+
+async def test_g5_recover_then_manual_intervention_reuses_quarantine_receipt(
+    postgres_harness: _Harness,
+) -> None:
+    from src.services.billing_migration import (
+        BillingMigrationService,
+        checkout_pricing_snapshot,
+    )
+
+    migration_id, operation_id = await _g5_legacy_cancelled(
+        postgres_harness, builder_id=postgres_harness.foreign_builder_id
+    )
+    checkout_id = uuid4()
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            target = (
+                await session.execute(
+                    text("""
+                        SELECT target_catalog_version_id, target_offer_id,
+                               target_amount_cents, target_snapshot
+                        FROM billing_migrations
+                        WHERE id = :migration_id
+                    """),
+                    {"migration_id": migration_id},
+                )
+            ).mappings().one()
+            await session.execute(
+                text("""
+                    INSERT INTO billing_checkout_sessions (
+                        id, builder_id, intent_kind, intent_id, migration_id,
+                        attempt_no, provider, state, catalog_version_id, offer_id,
+                        amount_cents, pricing_snapshot, next_due_date
+                    )
+                    SELECT :checkout_id, builder_id, 'subscription', id, id,
+                           1, 'asaas', 'creating', target_catalog_version_id,
+                           target_offer_id, target_amount_cents,
+                           CAST(:pricing_snapshot AS JSONB), renewal_date
+                    FROM billing_migrations
+                    WHERE id = :migration_id
+                """),
+                {
+                    "checkout_id": checkout_id,
+                    "migration_id": migration_id,
+                    "pricing_snapshot": json.dumps(
+                        checkout_pricing_snapshot(target["target_snapshot"])
+                    ),
+                },
+            )
+            recovered = await BillingMigrationService(session).recover_stuck_checkout(
+                migration_id=migration_id,
+                checkout_session_id=checkout_id,
+                environment="development",
+                actor_user_id=uuid4(),
+            )
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            manual = await BillingMigrationService(session).mark_manual_intervention(
+                migration_id=migration_id, actor_user_id=uuid4()
+            )
+
+    assert recovered.state == "recreate_pending"
+    assert manual.state == "manual_intervention"
+    assert await _g5_provider_delete_receipt_key(postgres_harness, migration_id) == (
+        1,
+        1,
+        operation_id,
+    )
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            await session.execute(
+                text("""
+                    UPDATE billing_checkout_sessions
+                    SET state = 'failed'
+                    WHERE id = :checkout_id
+                """),
+                {"checkout_id": checkout_id},
+            )
+
+
+async def test_g5_reconcile_not_cancelled_then_manual_reuses_quarantine_receipt(
+    postgres_harness: _Harness,
+) -> None:
+    from src.services.billing_migration import BillingMigrationService
+
+    migration_id, _ = await _g5_import(
+        postgres_harness, renewal=date(2027, 6, 10)
+    )
+    operation_id = uuid4()
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            await BillingMigrationService(session).begin_legacy_cancel(
+                migration_id=migration_id, operation_id=operation_id
+            )
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            reconciled = await BillingMigrationService(session).reconcile_legacy_cancel(
+                migration_id=migration_id, actor_user_id=uuid4(), cancelled=False
+            )
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            manual = await BillingMigrationService(session).mark_manual_intervention(
+                migration_id=migration_id, actor_user_id=uuid4()
+            )
+
+    assert reconciled.state == manual.state == "manual_intervention"
+    assert await _g5_provider_delete_receipt_key(postgres_harness, migration_id) == (
+        1,
+        1,
+        operation_id,
+    )
+
+
+async def test_g5_recreate_pending_after_t2_can_enter_manual_without_unique_violation(
+    postgres_harness: _Harness,
+) -> None:
+    from src.services.billing_migration import BillingMigrationService
+
+    migration_id, operation_id = await _g5_legacy_cancelled(
+        postgres_harness, renewal=date(2027, 6, 10)
+    )
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            pending = await BillingMigrationService(session).mark_recreate_pending(
+                migration_id=migration_id, actor_user_id=uuid4()
+            )
+    late = datetime(2027, 6, 9, 3, 0, tzinfo=timezone.utc)
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            manual = await BillingMigrationService(
+                session, clock=lambda: late
+            ).mark_manual_intervention(
+                migration_id=migration_id, actor_user_id=uuid4()
+            )
+
+    assert pending.state == "recreate_pending"
+    assert manual.state == "manual_intervention"
+    assert await _g5_provider_delete_receipt_key(postgres_harness, migration_id) == (
+        1,
+        1,
+        operation_id,
+    )
+
+
+async def _g5_snapshot_digest(
+    harness: _Harness, migration_id: UUID, target: str | None = None
+) -> str:
+    """The provider authority's own computation of the target digest."""
+
+    async with harness.session() as session:
+        digest = await session.scalar(
+            text("""
+                SELECT encode(sha256(convert_to(jsonb_build_object(
+                    'migration_id', id, 'builder_id', builder_id,
+                    'subscription_id', subscription_id, 'operation_id', operation_id,
+                    'source_roster_revision', source_roster_revision,
+                    'target_provider', target_provider,
+                    'target_external_subscription_id',
+                        COALESCE(CAST(:target AS TEXT), target_external_subscription_id),
+                    'target_catalog_version_id', target_catalog_version_id,
+                    'target_offer_id', target_offer_id, 'target_plan', target_plan,
+                    'target_billing_cycle', target_billing_cycle,
+                    'target_coupon_code', target_coupon_code,
+                    'target_amount_cents', target_amount_cents,
+                    'target_snapshot', target_snapshot)::text, 'UTF8')), 'hex')
+                FROM billing_migrations WHERE id = :id
+            """),
+            {"id": migration_id, "target": target},
+        )
+    assert isinstance(digest, str)
+    return digest
+
+
+def _g5_sign(
+    *,
+    migration_id: UUID,
+    operation_id: UUID,
+    external_reference: str,
+    snapshot_digest: str,
+    operation: str,
+    observed_at: datetime,
+    expires_at: datetime | None = None,
+    event_id: str | None = None,
+    signing_key: bytes = _G5_PROVIDER_PRIVATE_KEY,
+) -> Any:
+    from src.services.billing_migration import (
+        ProviderEvidenceEnvelope,
+        provider_evidence_digest,
+        provider_evidence_signature,
+    )
+
+    expires = expires_at or observed_at + timedelta(hours=2)
+    event = event_id or f"evt_{uuid4().hex}"
+    digest = provider_evidence_digest(
+        migration_id=migration_id,
+        operation_id=operation_id,
+        provider="asaas",
+        external_reference=external_reference,
+        provider_event_id=event,
+        provider_authority="asaas.api.v3",
+        provider_snapshot_digest=snapshot_digest,
+        provider_observed_at=observed_at,
+        provider_expires_at=expires,
+        provider_operation=operation,
+    )
+    return ProviderEvidenceEnvelope(
+        external_reference=external_reference,
+        provider_event_id=event,
+        provider_key_id=_G5_PROVIDER_KEY_ID,
+        provider_operation=operation,
+        provider_signature=provider_evidence_signature(
+            provider_authority="asaas.api.v3",
+            provider_digest=digest,
+            signing_key=signing_key,
+        ),
+        provider_observed_at=observed_at,
+        provider_expires_at=expires,
+        provider_snapshot_digest=snapshot_digest,
+        provider_evidence_digest=digest,
+    )
+
+
+_FLIP = "subscription.migration.provider_flip"
+_ABSENCE = "subscription.migration.absence"
+
+
+async def _g5_flip_envelope(
+    harness: _Harness,
+    migration_id: UUID,
+    operation_id: UUID,
+    asaas_id: str,
+    **overrides: Any,
+) -> Any:
+    values: dict[str, Any] = {
+        "migration_id": migration_id,
+        "operation_id": operation_id,
+        "external_reference": asaas_id,
+        "snapshot_digest": await _g5_snapshot_digest(harness, migration_id, asaas_id),
+        "operation": _FLIP,
+        "observed_at": _g5_now(),
+    }
+    values.update(overrides)
+    return _g5_sign(**values)
+
+
+async def _g5_flip(
+    harness: _Harness, migration_id: UUID, envelope: Any
+) -> Any:
+    from src.services.billing_migration import BillingMigrationService
+
+    async with harness.session() as session:
+        async with session.begin():
+            return await BillingMigrationService(session).record_provider_flip(
+                migration_id=migration_id, actor_user_id=uuid4(), evidence=envelope
+            )
+
+
+async def test_g5_canonical_evidence_digest_matches_python_in_every_timezone(
+    postgres_harness: _Harness,
+) -> None:
+    from src.services.billing_migration import provider_evidence_digest
+
+    instants = (
+        datetime(2026, 10, 12, 20, 0, tzinfo=timezone.utc),
+        datetime(2026, 10, 12, 17, 0, 0, 123456, tzinfo=timezone(timedelta(hours=-3))),
+        datetime(2026, 12, 31, 23, 59, 59, 1, tzinfo=timezone.utc),
+    )
+    async with postgres_harness.engine.connect() as connection:
+        for zone in ("UTC", "America/Sao_Paulo", "Asia/Tokyo"):
+            await connection.execute(text(f"SET TIME ZONE '{zone}'"))
+            for observed in instants:
+                expires = observed + timedelta(minutes=15)
+                migration_id, operation_id = uuid4(), uuid4()
+                expected = provider_evidence_digest(
+                    migration_id=migration_id,
+                    operation_id=operation_id,
+                    provider="asaas",
+                    external_reference="sub_x.1:-y",
+                    provider_event_id="evt_1",
+                    provider_authority="asaas.api.v3",
+                    provider_snapshot_digest="e" * 64,
+                    provider_observed_at=observed,
+                    provider_expires_at=expires,
+                    provider_operation=_ABSENCE,
+                )
+                actual = await connection.scalar(
+                    text("""
+                        SELECT billing_provider_evidence_digest(
+                            'asaas.api.v3', 'evt_1', :expires, 'sub_x.1:-y',
+                            :migration_id, :observed, :operation, :operation_id,
+                            'asaas', :snapshot)
+                    """),
+                    {
+                        "expires": expires,
+                        "migration_id": migration_id,
+                        "observed": observed,
+                        "operation": _ABSENCE,
+                        "operation_id": operation_id,
+                        "snapshot": "e" * 64,
+                    },
+                )
+                assert actual == expected, (zone, observed)
+        # Values outside the CHECK-constrained alphabet cannot be canonicalized.
+        assert (
+            await connection.scalar(text("""
+                SELECT billing_provider_evidence_digest(
+                    'asaas.api.v3', 'evt"1', now(), 'sub', gen_random_uuid(), now(),
+                    'subscription.migration.absence', gen_random_uuid(), 'asaas',
+                    repeat('e', 64))
+            """))
+            is None
+        )
+        await connection.rollback()
+
+
+async def test_g5_late_cancel_begin_is_rejected_before_any_state_change(
+    postgres_harness: _Harness,
+) -> None:
+    from src.services.billing_migration import (
+        BillingMigrationRejected,
+        BillingMigrationService,
+    )
+
+    # T = 2026-12-10, T-2 = 2026-12-08; São Paulo is UTC-03:00 (no DST).
+    last_local_second = datetime(2026, 12, 9, 2, 59, 59, tzinfo=timezone.utc)
+    first_late_second = datetime(2026, 12, 9, 3, 0, 0, tzinfo=timezone.utc)
+    import_clock = lambda: datetime(2026, 12, 1, 12, tzinfo=timezone.utc)  # noqa: E731
+
+    late_id, _ = await _g5_import(
+        postgres_harness, renewal=date(2026, 12, 10), clock=import_clock
+    )
+    before = await _g5_saga(postgres_harness, late_id)
+    async with postgres_harness.session() as session:
+        with pytest.raises(BillingMigrationRejected, match="^billing_migration_cutover_late$"):
+            async with session.begin():
+                await BillingMigrationService(
+                    session, clock=lambda: first_late_second
+                ).begin_legacy_cancel(migration_id=late_id, operation_id=uuid4())
+    after = await _g5_saga(postgres_harness, late_id)
+    assert after == before
+    assert after["state"] == "pending"
+    assert after["operation_id"] is None
+    assert (after["provider"], after["is_active"], after["status"]) == (
+        "abacatepay",
+        True,
+        "active",
+    )
+    assert after["roster_revision"] == before["roster_revision"]
+    assert after["billing_roster_revision"] == before["billing_roster_revision"]
+
+    on_time_id, _ = await _g5_import(
+        postgres_harness, renewal=date(2026, 12, 10), clock=import_clock
+    )
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            view = await BillingMigrationService(
+                session, clock=lambda: last_local_second
+            ).begin_legacy_cancel(migration_id=on_time_id, operation_id=uuid4())
+    assert view.state == "legacy_cancel_pending"
+    accepted = await _g5_saga(postgres_harness, on_time_id)
+    assert (accepted["provider"], accepted["status"]) == (None, "legacy_cancel_pending")
+
+
+async def test_g5_normal_path_converges_through_signed_provider_flip(
+    postgres_harness: _Harness, g5_provider_authority: None
+) -> None:
+    migration_id, operation_id = await _g5_legacy_cancelled(postgres_harness)
+    cancelled = await _g5_saga(postgres_harness, migration_id)
+    assert cancelled["target_external_subscription_id"] is None
+    assert cancelled["legacy_cancelled_at"] is not None
+    assert (cancelled["provider"], cancelled["status"]) == (None, "legacy_cancelled")
+
+    asaas_id = f"sub_{uuid4().hex[:16]}"
+    envelope = await _g5_flip_envelope(
+        postgres_harness, migration_id, operation_id, asaas_id
+    )
+    view = await _g5_flip(postgres_harness, migration_id, envelope)
+
+    assert view.state == "migrated"
+    migrated = await _g5_saga(postgres_harness, migration_id)
+    assert migrated["state"] == "migrated"
+    assert migrated["target_external_subscription_id"] == asaas_id
+    assert (migrated["provider"], migrated["status"], migrated["is_active"]) == (
+        "asaas",
+        "active_linked",
+        True,
+    )
+    assert migrated["external_subscription_id"] == asaas_id
+    assert migrated["roster_revision"] == cancelled["roster_revision"] + 1
+    assert migrated["billing_roster_revision"] == migrated["roster_revision"]
+    async with postgres_harness.session() as session:
+        receipt = (
+            await session.execute(
+                text("""
+                    SELECT receipt.external_reference, receipt.provider_event_id,
+                           receipt.provider_evidence_digest, receipt.content_sha256
+                    FROM billing_migration_receipts receipt
+                    WHERE receipt.migration_id = :id
+                      AND receipt.receipt_kind = 'provider_flip'
+                """),
+                {"id": migration_id},
+            )
+        ).one()
+    assert receipt.external_reference == asaas_id
+    assert receipt.provider_event_id == envelope.provider_event_id
+    assert receipt.provider_evidence_digest == envelope.provider_evidence_digest
+    assert receipt.content_sha256 == await _g5_snapshot_digest(
+        postgres_harness, migration_id
+    )
+
+    # Replay of the very same signed envelope: the flip advanced the roster
+    # past the saga's source revision, so the fence refuses before any write.
+    with pytest.raises(
+        BillingRevisionConflict, match="^billing migration roster revision changed$"
+    ):
+        await _g5_flip(postgres_harness, migration_id, envelope)
+    assert await _g5_saga(postgres_harness, migration_id) == migrated
+
+
+async def _g5_raw_flip_receipt(session: AsyncSession, migration_id: UUID) -> None:
+    """A structurally perfect provider_flip receipt for the row as it stands."""
+
+    await session.execute(
+        text("""
+            INSERT INTO billing_migration_receipts (
+                id, builder_id, migration_id, operation_id, receipt_kind,
+                provider, external_reference, provider_event_id,
+                provider_authority, provider_key_id, provider_operation,
+                provider_signature, provider_observed_at, provider_expires_at,
+                provider_snapshot_digest, provider_evidence_digest, status,
+                content_sha256, actor_user_id, observed_at
+            )
+            SELECT :id, row.builder_id, row.id, row.operation_id, 'provider_flip',
+                'asaas', row.reference, CAST(:event_id AS TEXT), 'asaas.api.v3',
+                'g5-fixture-v1', 'subscription.migration.provider_flip',
+                repeat('a', 128), row.observed, row.observed + interval '2 hours',
+                row.snapshot,
+                billing_provider_evidence_digest(
+                    'asaas.api.v3', CAST(:event_id AS TEXT),
+                    row.observed + interval '2 hours', row.reference, row.id,
+                    row.observed, 'subscription.migration.provider_flip',
+                    row.operation_id, 'asaas', row.snapshot),
+                'verified', row.snapshot, :actor, row.observed
+            FROM (
+                SELECT migration.*, clock_timestamp() AS observed,
+                    COALESCE(migration.target_external_subscription_id,
+                             'migration:' || migration.id::text) AS reference,
+                    encode(sha256(convert_to(jsonb_build_object(
+                        'migration_id', migration.id,
+                        'builder_id', migration.builder_id,
+                        'subscription_id', migration.subscription_id,
+                        'operation_id', migration.operation_id,
+                        'source_roster_revision', migration.source_roster_revision,
+                        'target_provider', migration.target_provider,
+                        'target_external_subscription_id',
+                            migration.target_external_subscription_id,
+                        'target_catalog_version_id', migration.target_catalog_version_id,
+                        'target_offer_id', migration.target_offer_id,
+                        'target_plan', migration.target_plan,
+                        'target_billing_cycle', migration.target_billing_cycle,
+                        'target_coupon_code', migration.target_coupon_code,
+                        'target_amount_cents', migration.target_amount_cents,
+                        'target_snapshot', migration.target_snapshot
+                    )::text, 'UTF8')), 'hex') AS snapshot
+                FROM billing_migrations migration WHERE migration.id = :migration_id
+            ) AS row
+        """),
+        {"id": uuid4(), "event_id": f"evt_{uuid4().hex}", "actor": uuid4(),
+         "migration_id": migration_id},
+    )
+
+
+async def test_g5_provider_flip_rejects_unbound_or_forged_evidence(
+    postgres_harness: _Harness, g5_provider_authority: None
+) -> None:
+    from src.services.billing_migration import (
+        BillingMigrationRejected,
+        BillingMigrationService,
+    )
+
+    # Every roster-advancing setup happens before the saga under test, so its
+    # source revision stays current for each refused attempt below.
+    # Evidence presented while the saga is not legacy_cancelled.
+    pending_id, _ = await _g5_import(postgres_harness, renewal=date(2027, 6, 10))
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            await BillingMigrationService(session).begin_legacy_cancel(
+                migration_id=pending_id, operation_id=uuid4()
+            )
+    pending = await _g5_saga(postgres_harness, pending_id)
+    assert pending["state"] == "legacy_cancel_pending"
+    pending_envelope = await _g5_flip_envelope(
+        postgres_harness, pending_id, pending["operation_id"], f"sub_{uuid4().hex[:16]}"
+    )
+    with pytest.raises(BillingMigrationRejected, match="^billing_migration_flip_not_allowed$"):
+        await _g5_flip(postgres_harness, pending_id, pending_envelope)
+    assert await _g5_saga(postgres_harness, pending_id) == pending
+    # The database refuses a well-formed receipt (every digest recomputed in
+    # SQL, so only the saga state is wrong) even without the service.
+    async with postgres_harness.session() as session:
+        with pytest.raises(IntegrityError, match="provider evidence envelope is invalid"):
+            async with session.begin():
+                await _g5_raw_flip_receipt(session, pending_id)
+
+    other_id, other_operation_id = await _g5_legacy_cancelled(postgres_harness)
+    migration_id, operation_id = await _g5_legacy_cancelled(postgres_harness)
+    asaas_id = f"sub_{uuid4().hex[:16]}"
+    before = await _g5_saga(postgres_harness, migration_id)
+
+    async def rejected(envelope: Any, reason: str) -> None:
+        with pytest.raises(
+            BillingMigrationRejected, match="^billing_migration_readback_unverified$"
+        ) as caught:
+            await _g5_flip(postgres_harness, migration_id, envelope)
+        assert caught.value.reason == reason
+        assert await _g5_saga(postgres_harness, migration_id) == before
+
+    async with postgres_harness.session() as session:
+        with pytest.raises(
+            IntegrityError, match="provider flip receipt requires migrated saga at commit"
+        ):
+            async with session.begin():
+                await _g5_raw_flip_receipt(session, migration_id)
+    assert await _g5_saga(postgres_harness, migration_id) == before
+
+    good = await _g5_flip_envelope(
+        postgres_harness, migration_id, operation_id, asaas_id
+    )
+    # Signed for another ASAAS id, then presented for this one.
+    other_asaas = f"sub_{uuid4().hex[:16]}"
+    from dataclasses import replace as dc_replace
+
+    signed_for_other = await _g5_flip_envelope(
+        postgres_harness, migration_id, operation_id, other_asaas
+    )
+    await rejected(dc_replace(signed_for_other, external_reference=asaas_id), "snapshot_digest")
+    # Signed for another migration and for another operation (the target
+    # digest is this saga's, so only the signed envelope binding differs).
+    this_snapshot = await _g5_snapshot_digest(postgres_harness, migration_id, asaas_id)
+    for foreign_migration, foreign_operation in (
+        (other_id, operation_id),
+        (migration_id, other_operation_id),
+    ):
+        await rejected(
+            _g5_sign(
+                migration_id=foreign_migration,
+                operation_id=foreign_operation,
+                external_reference=asaas_id,
+                snapshot_digest=this_snapshot,
+                operation=_FLIP,
+                observed_at=_g5_now(),
+            ),
+            "evidence_digest",
+        )
+    # Expired, wrong kind and a signature by a key that is not the provider's.
+    signed_at = _g5_now()
+    short_lived = await _g5_flip_envelope(
+        postgres_harness,
+        migration_id,
+        operation_id,
+        asaas_id,
+        observed_at=signed_at,
+        expires_at=signed_at + timedelta(milliseconds=1),
+    )
+    await asyncio.sleep(0.01)
+    await rejected(short_lived, "expired")
+    await rejected(
+        await _g5_flip_envelope(
+            postgres_harness, migration_id, operation_id, asaas_id, operation=_ABSENCE
+        ),
+        "operation",
+    )
+    await rejected(
+        await _g5_flip_envelope(
+            postgres_harness,
+            migration_id,
+            operation_id,
+            asaas_id,
+            signing_key=bytes(range(1, 33)),
+        ),
+        "signature",
+    )
+    # The placeholder namespace is never a bindable ASAAS id.
+    with pytest.raises(BillingMigrationRejected, match="^billing_migration_provider_id_invalid$"):
+        await _g5_flip(
+            postgres_harness,
+            migration_id,
+            dc_replace(good, external_reference=f"migration:{migration_id}"),
+        )
+    assert await _g5_saga(postgres_harness, migration_id) == before
+
+    # The genuine envelope still converges after all refused attempts.
+    assert (await _g5_flip(postgres_harness, migration_id, good)).state == "migrated"
+
+
+async def test_g5_one_asaas_id_binds_at_most_one_migration_and_subscription(
+    postgres_harness: _Harness, g5_provider_authority: None
+) -> None:
+    from src.services.billing_migration import BillingMigrationService
+
+    first_id, first_operation = await _g5_legacy_cancelled(postgres_harness)
+    second_id, second_operation = await _g5_legacy_cancelled(postgres_harness)
+    third_id, third_operation = await _g5_legacy_cancelled(postgres_harness)
+    asaas_id = f"sub_{uuid4().hex[:16]}"
+
+    async def rebase(migration_id: UUID) -> None:
+        # Each cancel-begin/flip advances the global roster; a legacy_cancelled
+        # saga is re-based through the production repository path.
+        saga = await _g5_saga(postgres_harness, migration_id)
+        async with postgres_harness.session() as session:
+            async with session.begin():
+                await BillingRepository(session).rebase_legacy_migration(
+                    migration_id=migration_id,
+                    expected_source_revision=saga["source_roster_revision"],
+                )
+
+    await rebase(first_id)
+    await _g5_flip(
+        postgres_harness,
+        first_id,
+        await _g5_flip_envelope(postgres_harness, first_id, first_operation, asaas_id),
+    )
+    await rebase(second_id)
+    before = await _g5_saga(postgres_harness, second_id)
+    replayed_event = await _g5_flip_envelope(
+        postgres_harness, second_id, second_operation, asaas_id
+    )
+    with pytest.raises(IntegrityError, match="uq_billing_migrations_target_external"):
+        await _g5_flip(postgres_harness, second_id, replayed_event)
+    assert await _g5_saga(postgres_harness, second_id) == before
+
+    # Same provider event id signed for another migration: append-only replay.
+    async with postgres_harness.session() as session:
+        first_event = await session.scalar(
+            text("""
+                SELECT provider_event_id FROM billing_migration_receipts
+                WHERE migration_id = :id AND receipt_kind = 'provider_flip'
+            """),
+            {"id": first_id},
+        )
+    with pytest.raises(IntegrityError, match="uq_billing_migration_receipts_provider_event"):
+        await _g5_flip(
+            postgres_harness,
+            second_id,
+            await _g5_flip_envelope(
+                postgres_harness,
+                second_id,
+                second_operation,
+                f"sub_{uuid4().hex[:16]}",
+                event_id=first_event,
+            ),
+        )
+    assert await _g5_saga(postgres_harness, second_id) == before
+
+    # An ASAAS id already held by another canonical subscription row.
+    await rebase(third_id)
+    held_id = f"sub_{uuid4().hex[:16]}"
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            revision = await session.scalar(
+                text("SELECT billing_roster_revision FROM billing_roster_control")
+            )
+            await session.execute(
+                text("""
+                    INSERT INTO billing_subscriptions (
+                        id, builder_id, provider, external_subscription_id,
+                        is_active, plan, billing_cycle, status, roster_revision
+                    ) VALUES (
+                        :id, :builder_id, 'asaas', :external_id, true,
+                        'plus', 'monthly', 'active_linked', :revision
+                    )
+                """),
+                {
+                    "id": uuid4(),
+                    "builder_id": postgres_harness.foreign_builder_id,
+                    "external_id": held_id,
+                    "revision": revision,
+                },
+            )
+    third_before = await _g5_saga(postgres_harness, third_id)
+    with pytest.raises(IntegrityError, match="uq_billing_subscriptions_provider_external"):
+        await _g5_flip(
+            postgres_harness,
+            third_id,
+            await _g5_flip_envelope(postgres_harness, third_id, third_operation, held_id),
+        )
+    assert await _g5_saga(postgres_harness, third_id) == third_before
+    del BillingMigrationService
+
+
+async def _g5_read(
+    harness: _Harness,
+    migration_id: UUID,
+    envelope: Any,
+    *,
+    at: datetime | None = None,
+) -> Any:
+    from src.services.billing_migration import BillingMigrationService
+
+    clock = (lambda: at) if at is not None else _g5_now
+    async with harness.session() as session:
+        async with session.begin():
+            return await BillingMigrationService(
+                session, clock=clock
+            ).record_absence_read(
+                migration_id=migration_id, actor_user_id=uuid4(), evidence=envelope
+            )
+
+
+async def _g5_absence_envelope(
+    harness: _Harness,
+    migration_id: UUID,
+    operation_id: UUID,
+    observed_at: datetime,
+    **overrides: Any,
+) -> Any:
+    values: dict[str, Any] = {
+        "migration_id": migration_id,
+        "operation_id": operation_id,
+        "external_reference": f"migration:{migration_id}",
+        "snapshot_digest": await _g5_snapshot_digest(harness, migration_id),
+        "operation": _ABSENCE,
+        "observed_at": observed_at,
+    }
+    values.update(overrides)
+    return _g5_sign(**values)
+
+
+async def test_g5_recreate_requires_two_converged_empty_reads(
+    postgres_harness: _Harness, g5_provider_authority: None
+) -> None:
+    from src.services.billing_migration import (
+        BillingMigrationRejected,
+        BillingMigrationService,
+    )
+
+    # Imported 3 h ago and cancelled 2 h 30 min ago: the convergence limit
+    # (cancellation + 90 min) is one hour in the past.
+    # The foreign builder is never a canary builder, so the reservation below
+    # is an ordinary ``general`` attempt in every module ordering.
+    migration_id, operation_id = await _g5_legacy_cancelled(
+        postgres_harness,
+        renewal=date(2027, 6, 10),
+        age=timedelta(hours=3),
+        builder_id=postgres_harness.foreign_builder_id,
+    )
+    other_id = uuid4()
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            await BillingMigrationService(session).mark_recreate_pending(
+                migration_id=migration_id, actor_user_id=uuid4()
+            )
+    quarantined = await _g5_saga(postgres_harness, migration_id)
+    assert quarantined["state"] == "recreate_pending"
+    limit = quarantined["legacy_cancelled_at"] + timedelta(minutes=90)
+    now = _g5_now()
+
+    async def refused(code: str, envelope: Any, *, at: datetime | None = None) -> None:
+        state = await _g5_saga(postgres_harness, migration_id)
+        with pytest.raises(BillingMigrationRejected, match=f"^{code}$"):
+            await _g5_read(postgres_harness, migration_id, envelope, at=at)
+        assert await _g5_saga(postgres_harness, migration_id) == state
+
+    # Before the convergence limit, and a read signed for another migration.
+    await refused(
+        "billing_migration_absence_read_before_convergence",
+        await _g5_absence_envelope(
+            postgres_harness, migration_id, operation_id, limit - timedelta(seconds=1)
+        ),
+        at=limit + timedelta(minutes=1),
+    )
+    with pytest.raises(
+        BillingMigrationRejected, match="^billing_migration_readback_unverified$"
+    ) as foreign:
+        await _g5_read(
+            postgres_harness,
+            migration_id,
+            await _g5_absence_envelope(
+                postgres_harness,
+                migration_id,
+                operation_id,
+                now - timedelta(minutes=1),
+                external_reference=f"migration:{other_id}",
+            ),
+        )
+    assert foreign.value.reason == "external_reference"
+
+    first_observed = now - timedelta(minutes=20)
+    first = await _g5_read(
+        postgres_harness,
+        migration_id,
+        await _g5_absence_envelope(
+            postgres_harness, migration_id, operation_id, first_observed
+        ),
+        at=first_observed + timedelta(seconds=30),
+    )
+    assert (first.read_no, first.authorization_receipt_id) == (1, None)
+    assert first.prior_checkout_session_id is None
+    assert first.convergence_limit_at == limit
+    first_event = (await _g5_saga(postgres_harness, migration_id))["reads"]
+    assert first_event == 1
+
+    # One read is not enough: no authorization exists, and the database
+    # refuses a hand-made one.
+    async with postgres_harness.session() as session:
+        read_one = (
+            await session.execute(
+                text("""
+                    SELECT * FROM billing_migration_absence_reads
+                    WHERE migration_id = :id AND read_no = 1
+                """),
+                {"id": migration_id},
+            )
+        ).mappings().one()
+        assert (
+            await session.scalar(
+                text("""
+                    SELECT count(*) FROM billing_migration_receipts
+                    WHERE migration_id = :id AND receipt_kind = 'recreate_authorized'
+                """),
+                {"id": migration_id},
+            )
+            == 0
+        )
+    async with postgres_harness.session() as session:
+        with pytest.raises(IntegrityError, match="provider evidence envelope is invalid"):
+            async with session.begin():
+                await session.execute(
+                    text("""
+                        INSERT INTO billing_migration_receipts (
+                            id, builder_id, migration_id, operation_id, receipt_kind,
+                            provider, external_reference, provider_event_id,
+                            provider_authority, provider_key_id, provider_operation,
+                            provider_signature, provider_observed_at,
+                            provider_expires_at, provider_snapshot_digest,
+                            provider_evidence_digest, status, content_sha256,
+                            actor_user_id, observed_at
+                        ) VALUES (
+                            :id, :builder_id, :migration_id, :operation_id,
+                            'recreate_authorized', 'asaas', :reference, :event_id,
+                            'asaas.api.v3', :key_id, :operation, :signature,
+                            :observed, :expires, :snapshot, :digest, 'absent',
+                            :digest, :actor, :recorded
+                        )
+                    """),
+                    {
+                        "id": uuid4(),
+                        "builder_id": read_one["builder_id"],
+                        "migration_id": migration_id,
+                        "operation_id": operation_id,
+                        "reference": read_one["external_reference"],
+                        "event_id": read_one["provider_event_id"],
+                        "key_id": read_one["provider_key_id"],
+                        "operation": _ABSENCE,
+                        "signature": read_one["provider_signature"],
+                        "observed": read_one["provider_observed_at"],
+                        "expires": read_one["provider_expires_at"],
+                        "snapshot": read_one["provider_snapshot_digest"],
+                        "digest": read_one["provider_evidence_digest"],
+                        "actor": uuid4(),
+                        "recorded": read_one["observed_at"],
+                    },
+                )
+    async with postgres_harness.session() as session:
+        with pytest.raises(
+            BillingMigrationRejected, match="^billing_migration_readback_unverified$"
+        ):
+            async with session.begin():
+                await BillingMigrationService(session).reopen_recreate_after_absent_readback(
+                    migration_id=migration_id,
+                    actor_user_id=uuid4(),
+                    readback_receipt_id=uuid4(),
+                )
+
+    # Two reads with the same provider event id, and a second read too soon.
+    await refused(
+        "billing_migration_absence_read_duplicate",
+        await _g5_absence_envelope(
+            postgres_harness,
+            migration_id,
+            operation_id,
+            now - timedelta(minutes=1),
+            event_id=read_one["provider_event_id"],
+        ),
+    )
+    await refused(
+        "billing_migration_absence_read_too_soon",
+        await _g5_absence_envelope(
+            postgres_harness,
+            migration_id,
+            operation_id,
+            first_observed + timedelta(minutes=4, seconds=59),
+        ),
+        at=first_observed + timedelta(minutes=5, seconds=30),
+    )
+    # The database independently refuses a duplicate event id as read 2.
+    async with postgres_harness.session() as session:
+        with pytest.raises(
+            IntegrityError, match="second absence read must follow a distinct first read"
+        ):
+            async with session.begin():
+                await session.execute(
+                    text("""
+                        INSERT INTO billing_migration_absence_reads (
+                            id, builder_id, migration_id, operation_id, read_no,
+                            prior_checkout_session_id, convergence_limit_at, provider,
+                            external_reference, provider_event_id, provider_authority,
+                            provider_key_id, provider_operation, provider_signature,
+                            provider_observed_at, provider_expires_at,
+                            provider_snapshot_digest, provider_evidence_digest, status,
+                            actor_user_id, observed_at
+                        )
+                        SELECT :id, builder_id, migration_id, operation_id, 2,
+                            prior_checkout_session_id, convergence_limit_at, provider,
+                            external_reference, CAST(:event_id AS TEXT),
+                            provider_authority,
+                            provider_key_id, provider_operation, provider_signature,
+                            provider_observed_at, provider_expires_at,
+                            provider_snapshot_digest,
+                            billing_provider_evidence_digest(
+                                provider_authority, CAST(:event_id AS TEXT),
+                                provider_expires_at, external_reference,
+                                migration_id, provider_observed_at,
+                                provider_operation, operation_id, provider,
+                                provider_snapshot_digest),
+                            status, actor_user_id, observed_at
+                        FROM billing_migration_absence_reads
+                        WHERE migration_id = :migration_id AND read_no = 1
+                    """),
+                    {
+                        "id": uuid4(),
+                        "migration_id": migration_id,
+                        "event_id": read_one["provider_event_id"] + "-copy",
+                    },
+                )
+
+    second_observed = now - timedelta(minutes=1)
+    second = await _g5_read(
+        postgres_harness,
+        migration_id,
+        await _g5_absence_envelope(
+            postgres_harness, migration_id, operation_id, second_observed
+        ),
+    )
+    assert second.read_no == 2
+    assert second.authorization_receipt_id is not None
+    await refused(
+        "billing_migration_absence_reads_complete",
+        await _g5_absence_envelope(
+            postgres_harness, migration_id, operation_id, _g5_now()
+        ),
+    )
+
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            reopened = await BillingMigrationService(
+                session
+            ).reopen_recreate_after_absent_readback(
+                migration_id=migration_id,
+                actor_user_id=uuid4(),
+                readback_receipt_id=second.authorization_receipt_id,
+            )
+    assert reopened.state == "legacy_cancelled"
+
+    await _ensure_general_rollout(postgres_harness, "development")
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            checkout = await BillingMigrationService(session).reserve_recreate_attempt(
+                migration_id=migration_id,
+                environment="development",
+                absence_receipt_id=second.authorization_receipt_id,
+            )
+            checkout_id = checkout.id
+    async with postgres_harness.session() as session:
+        attempt = (
+            await session.execute(
+                text("""
+                    SELECT checkout.attempt_no, checkout.state, checkout.next_due_date,
+                           checkout.intent_id, checkout.amount_cents,
+                           checkout.pricing_snapshot
+                               = migration.target_snapshot - 'plan'
+                               AS same_snapshot,
+                           migration.target_snapshot ->> 'plan' AS plan,
+                           migration.renewal_date, migration.open_by_date,
+                           migration.cutover_by_date, migration.attempt_count
+                    FROM billing_checkout_sessions checkout
+                    JOIN billing_migrations migration
+                      ON migration.id = checkout.migration_id
+                    WHERE checkout.id = :id
+                """),
+                {"id": checkout_id},
+            )
+        ).mappings().one()
+    assert attempt["attempt_no"] == 1
+    assert attempt["state"] == "creating"
+    assert attempt["intent_id"] == migration_id
+    assert attempt["next_due_date"] == attempt["renewal_date"] == date(2027, 6, 10)
+    assert (attempt["open_by_date"], attempt["cutover_by_date"]) == (
+        date(2027, 6, 3),
+        date(2027, 6, 8),
+    )
+    assert attempt["amount_cents"] == 99900
+    assert attempt["same_snapshot"] is True
+    assert attempt["plan"] == "plus"
+    assert attempt["attempt_count"] == 1
+
+    # Replaying the same authorization never reserves a second attempt.
+    async with postgres_harness.session() as session:
+        with pytest.raises(
+            BillingMigrationRejected, match="^billing_migration_recreate_not_allowed$"
+        ):
+            async with session.begin():
+                await BillingMigrationService(session).reserve_recreate_attempt(
+                    migration_id=migration_id,
+                    environment="development",
+                    absence_receipt_id=second.authorization_receipt_id,
+                )
+    async with postgres_harness.session() as session:
+        assert (
+            await session.scalar(
+                text("SELECT count(*) FROM billing_checkout_sessions WHERE migration_id = :id"),
+                {"id": migration_id},
+            )
+            == 1
+        )
+
+
+async def test_g5_absence_reads_bind_the_prior_attempt(
+    postgres_harness: _Harness, g5_provider_authority: None
+) -> None:
+    from src.services.billing_migration import BillingMigrationRejected
+
+    migration_id, operation_id = await _g5_legacy_cancelled(
+        postgres_harness,
+        renewal=date(2027, 6, 10),
+        age=timedelta(hours=6),
+        builder_id=postgres_harness.foreign_builder_id,
+    )
+    now = _g5_now()
+    first_observed = now - timedelta(minutes=20)
+    first = await _g5_read(
+        postgres_harness,
+        migration_id,
+        await _g5_absence_envelope(
+            postgres_harness, migration_id, operation_id, first_observed
+        ),
+        at=first_observed + timedelta(seconds=30),
+    )
+    assert first.prior_checkout_session_id is None
+    # A terminal attempt for this migration appears after the first read
+    # (fixture: an older attempt's row, already expired).
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            await session.execute(
+                text("""
+                    INSERT INTO billing_checkout_sessions (
+                        id, builder_id, intent_kind, intent_id, migration_id,
+                        attempt_no, provider, state, catalog_version_id, offer_id,
+                        amount_cents, pricing_snapshot, next_due_date, created_at
+                    )
+                    SELECT :id, builder_id, 'subscription', id, id, 1, 'asaas',
+                           'expired', target_catalog_version_id, target_offer_id,
+                           target_amount_cents, target_snapshot - 'plan', renewal_date,
+                           now() - interval '5 hours'
+                    FROM billing_migrations WHERE id = :migration_id
+                """),
+                {"id": uuid4(), "migration_id": migration_id},
+            )
+    state = await _g5_saga(postgres_harness, migration_id)
+    with pytest.raises(
+        BillingMigrationRejected, match="^billing_migration_absence_read_attempt_changed$"
+    ):
+        await _g5_read(
+            postgres_harness,
+            migration_id,
+            await _g5_absence_envelope(
+                postgres_harness, migration_id, operation_id, now - timedelta(minutes=1)
+            ),
+        )
+    assert await _g5_saga(postgres_harness, migration_id) == state
+
+
+async def test_fact_producer_inserts_outbox_delivery_and_handoff_in_fk_order(
+    postgres_harness: _Harness,
+) -> None:
+    """Group 4 defect found by the Group 5 cycle: one transaction, three FK rows.
+
+    ``BillingFactProducer.record_effect`` inserts the outbox fact, its delivery
+    retry row and its handoff.  The mappers have no ``relationship()``, so a
+    single flush let the unit of work emit ``billing_fact_deliveries`` before
+    ``billing_outbox`` and PostgreSQL refused ``fk_billing_fact_deliveries_outbox``.
+    Inputs (order, webhook delivery, settled projection, settlement effect) are
+    pre-existing webhook state; only the producer writes the three rows.
+    """
+
+    from src.models.billing import BillingPaymentEffect, BillingPaymentProjection
+    from src.services.billing_catalog import BILLING_CATALOG
+    from src.services.billing_checkout import topup_pricing_snapshot
+    from src.services.billing_outbox import BillingFactProducer
+
+    builder_id = postgres_harness.foreign_builder_id
+    order_id, delivery_id, projection_id, effect_id = (uuid4() for _ in range(4))
+    payment_id = f"pay-fk-order-{projection_id}"
+    snapshot = topup_pricing_snapshot(
+        BILLING_CATALOG["package_credits_500_v1"], payment_method="pix"
+    )
+    async with postgres_harness.engine.begin() as connection:
+        await connection.execute(
+            text("""
+                INSERT INTO billing_topup_orders (
+                    id, builder_id, payment_method, catalog_version_id,
+                    offer_id, amount_cents, credit_grant_mc, pricing_snapshot
+                ) VALUES (
+                    :id, :builder_id, 'pix', :catalog_version_id,
+                    'package_credits_500_v1', 10000, 500,
+                    CAST(:snapshot AS JSONB)
+                )
+            """),
+            {
+                "id": order_id,
+                "builder_id": builder_id,
+                "catalog_version_id": snapshot["catalog_version_id"],
+                "snapshot": json.dumps(snapshot),
+            },
+        )
+        await connection.execute(
+            text("""
+                INSERT INTO billing_webhook_deliveries (
+                    id, builder_id, provider, event_id, event_name,
+                    provider_created_at, body_bytes, body_sha256
+                ) VALUES (
+                    :id, :builder_id, 'asaas', :event_id, 'PAYMENT_CONFIRMED',
+                    now(), 2, :sha
+                )
+            """),
+            {
+                "id": delivery_id,
+                "builder_id": builder_id,
+                "event_id": f"fk-order-{delivery_id}",
+                "sha": "a" * 64,
+            },
+        )
+        await connection.execute(
+            text("""
+                INSERT INTO billing_payment_projections (
+                    id, builder_id, provider, payment_id, aggregate_kind,
+                    topup_order_id, status, amount_cents, settled_cents,
+                    provider_created_at, ordering_key, last_event_id
+                ) VALUES (
+                    :id, :builder_id, 'asaas', :payment_id, 'topup',
+                    :order_id, 'settled', 10000, 10000, now(),
+                    '2026-10-12T00:00:00Z:0', :event_id
+                )
+            """),
+            {
+                "id": projection_id,
+                "builder_id": builder_id,
+                "payment_id": payment_id,
+                "order_id": order_id,
+                "event_id": f"fk-order-{delivery_id}",
+            },
+        )
+    async with postgres_harness.session() as session:
+        async with session.begin():
+            await session.execute(
+                text("""
+                    INSERT INTO billing_payment_effects (
+                        id, builder_id, projection_id, delivery_id, provider,
+                        payment_id, effect_kind, source_revision, amount_cents
+                    ) VALUES (
+                        :id, :builder_id, :projection_id, :delivery_id, 'asaas',
+                        :payment_id, 'settlement', 'settlement:v1', 10000
+                    )
+                """),
+                {
+                    "id": effect_id,
+                    "builder_id": builder_id,
+                    "projection_id": projection_id,
+                    "delivery_id": delivery_id,
+                    "payment_id": payment_id,
+                },
+            )
+            effect = await session.get(BillingPaymentEffect, effect_id)
+            projection = await session.get(BillingPaymentProjection, projection_id)
+            assert effect is not None and projection is not None
+            outbox = await BillingFactProducer(session).record_effect(
+                effect, projection
+            )
+            assert outbox is not None
+            outbox_id = outbox.id
+
+    async with postgres_harness.session() as session:
+        row = (
+            await session.execute(
+                text("""
+                    SELECT outbox.payment_effect_id, outbox.topup_order_id,
+                           delivery.outbox_event_id, delivery.event_id,
+                           handoff.outbox_event_id, handoff.delivery_id = delivery.id,
+                           orders.financial_revision, orders.state
+                    FROM billing_outbox outbox
+                    JOIN billing_fact_deliveries delivery
+                      ON delivery.outbox_event_id = outbox.id
+                    JOIN billing_fact_handoffs handoff
+                      ON handoff.outbox_event_id = outbox.id
+                    JOIN billing_topup_orders orders ON orders.id = outbox.topup_order_id
+                    WHERE outbox.id = :id
+                """),
+                {"id": outbox_id},
+            )
+        ).one()
+    assert tuple(row) == (
+        effect_id,
+        order_id,
+        outbox_id,
+        outbox_id,
+        outbox_id,
+        True,
+        1,
+        "settled",
+    )
