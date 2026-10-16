@@ -1645,17 +1645,6 @@ def test_attestation_workflow_gates_all_aws_and_push_steps_after_live_preflight(
     assert "bootstrap_operation_already_used" in preflight_script
     assert "bootstrap_run_attempt_must_be_first" in preflight_script
     assert set(jobs) == {"preflight", "build-attestation"}
-    runbook = (
-        _WORKFLOW.parents[2]
-        / "docs"
-        / "billing"
-        / "asaas-producer-build-trust-bootstrap.md"
-    ).read_text(encoding="utf-8")
-    assert runbook.index("Group 4 to register") < runbook.index("Group 5 deploys")
-    assert "current sequence is a" in runbook and "**hard stop**" in runbook
-    assert "Do not start Group 5" in runbook
-    assert "or defer registration until after deployment" in runbook
-    assert "github-actions:neurostack-build" in runbook
     assert preflight["permissions"] == {
         "actions": "read",
         "administration": "read",
@@ -1782,11 +1771,69 @@ def test_attestation_workflow_gates_all_aws_and_push_steps_after_live_preflight(
     assert "billing_build_attestation.v1" not in source
     assert "refund payment" not in source.lower()
 
-    approval_source = _APPROVAL_SCRIPT.read_text(encoding="utf-8")
-    assert "_NoBackendTrustRedirect" in preflight_script
-    assert 'if mode == "bootstrap":' in approval_source
-    assert "_PREFLIGHT.probe_backend_trust_absent(" in approval_source
-    assert "bootstrap_trust_probe_changed" in preflight_script
+
+def test_build_trust_bootstrap_runbook_matches_approved_group_sequence_and_controls():
+    runbook = (
+        _WORKFLOW.parents[2]
+        / "docs"
+        / "billing"
+        / "asaas-producer-build-trust-bootstrap.md"
+    ).read_text(encoding="utf-8")
+    normalized = " ".join(runbook.split())
+    group4 = runbook.index("Group 4 publishes and signs only")
+    group5 = runbook.index("## Group 5 one-time deployment bootstrap")
+    later = runbook.index("## Later deployments")
+
+    assert "eb217bef741981537e6b6277242e0fb7fccd05b3e8b5e216768d7c7926d8ccb8" in runbook
+    assert "It never deploys or registers the attestation" in normalized
+    assert group4 < group5 < later
+    assert "exactly one protected deployment" in normalized
+    assert (
+        "asaas-producer-image-rollout/WISH.md#2026-10-15-separate-build-and-rollout-plan-approved"
+        in normalized
+    )
+    assert "before backend registration" in normalized
+    assert "Immediately after successful healthy readbacks" in normalized
+    assert "byte-identical envelope" in normalized
+    assert "before its protected deployment approval" in normalized
+    assert "Felps (`felps-json`) remains the sole independent PR reviewer" in normalized
+    assert (
+        "Felps (`felps-json`) remains the sole independent PR reviewer and the current "
+        "protected-environment reviewer required by live settings" in normalized
+    )
+    assert "Lorenzo performs final PR approval and merge" in normalized
+    assert "do not change settings to bypass last-push review" in normalized
+    assert (
+        "A distinct preallocated deployment operation UUID binds the run to the exact "
+        "Group 4 artifact tuple: attestation ID, immutable image digest, build run ID, "
+        "and signed-envelope SHA-256" in normalized
+    )
+    assert (
+        "This operation ID is deployment metadata; it is not added to the signed envelope"
+        in normalized
+    )
+    assert (
+        "Pending or rejected-before-start environment records do not consume the slot"
+        in normalized
+    )
+    assert (
+        "once the protected job starts, any failure or cancellation consumes it"
+        in normalized
+    )
+    assert "No retry or second unregistered bootstrap is allowed" in normalized
+    assert "no user JWT" in normalized
+    assert "PostgreSQL console/session" in normalized
+    assert (
+        "If either is absent, withhold approval; do not substitute ad hoc SQL"
+        in normalized
+    )
+    assert "`pg_stat_activity`" in normalized
+    assert "Never call `GetSecretValue`" in normalized
+    assert "at least 60 seconds" in normalized
+    assert "`createdAt`" in normalized and "`startedAt`" in normalized
+    assert "pre-approved rollback path" in normalized
+    assert "ASAAS/credit egress and commercial top-up disabled" in normalized
+    assert "before, during, and after the bootstrap" in normalized
 
 
 def test_attestation_workflow_installs_signer_from_hash_locked_requirements():

@@ -1,15 +1,25 @@
 # ASAAS producer build trust bootstrap
 
-This runbook covers the one-time first build while staging does not yet serve
-`GET /v1/admin/billing/producer-build-trust`. The default workflow mode is
-`normal`; it always requires a live canonical backend trust readback before the
-build job can request AWS credentials. Bootstrap is an explicit, single
-operation exception for build-trust initialization. This workflow never deploys.
+This runbook documents the one-time build-trust bootstrap for Group 3/4. The
+`asaas-build-attestation.yml` workflow may validate trust readiness, build and
+publish one immutable image digest, sign its canonical
+`billing_build_attestation.v1` envelope, and upload that artifact. It never
+deploys or registers the attestation. Group 5 uses a separate protected deploy
+workflow and role.
 
-## Committed pins
+This sequence follows the SHIP-approved plan review recorded in WISH SHA
+`eb217bef741981537e6b6277242e0fb7fccd05b3e8b5e216768d7c7926d8ccb8`.
+
+The build bootstrap is not the deployment bootstrap. Group 5 permits exactly one
+protected deployment of the exact Group 4 signed digest before backend
+registration, followed immediately by human registration of that identical
+envelope. Every later deployment requires canonical registration before its
+protected deployment approval.
+
+## Committed build-trust pins
 
 Bootstrap pins the build identity to the reviewed workflow commit and to the
-read-only KMS inventory recorded on 2026-10-15. The public key fingerprint is
+read-only KMS inventory recorded on 2026-10-15. The public-key fingerprint is
 SHA-256 over the KMS SubjectPublicKeyInfo DER:
 
 | Pin | Value |
@@ -18,79 +28,142 @@ SHA-256 over the KMS SubjectPublicKeyInfo DER:
 | BuildRole | `arn:aws:iam::388460142431:role/neurostack-asaas-producer-release-BuildRole-ptpxs3j9NIZM` |
 | KMS signing key | `arn:aws:kms:us-east-1:388460142431:key/6a74b35d-b97f-4a0a-9269-240a762d633b` |
 | Attestation issuer | `github-actions:neurostack-build` |
-| Public key fingerprint | `86d440d5c7f2248499bd6fefc37064ec4b5eae2fae0b3aebb30c43819bbd384b` |
+| Public-key fingerprint | `86d440d5c7f2248499bd6fefc37064ec4b5eae2fae0b3aebb30c43819bbd384b` |
 | ECR repository | `388460142431.dkr.ecr.us-east-1.amazonaws.com/neurostack-asaas-producer-release-producerimagerepository-jqtdjqst9o1j` |
 | Application audience | `billing-api:producer-build-attestation` |
 
 The repository variable `BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM` must contain the
 public key returned by the administrative KMS `GetPublicKey` readback. The
 workflow checks its fingerprint against the committed value before any OIDC
-request. The build role remains restricted to ECR publication/readback and
-`kms:Sign`; the workflow does not call `GetPublicKey`, ECS, Secrets Manager, or
+request. Bootstrap also pins the issuer to `github-actions:neurostack-build`.
+The build role remains restricted to ECR publication/readback and `kms:Sign`;
+the build workflow does not call `GetPublicKey`, ECS, Secrets Manager, or
 payment services.
 
-## Bootstrap sequence
+## Group 3/4 build bootstrap
 
-1. Merge the reviewed commit through the protected `main` ruleset. The
-   preflight reads the ruleset and both protected environments, rejects
-   bypasses, and requires the exact `main` branch policy. Bootstrap is allowed
-   only for rollout group `4`, run attempt `1`, the committed repository,
-workflow, role, KMS key, issuer, audience, ECR repository, and public-key
-fingerprint. The issuer is fixed to `github-actions:neurostack-build`, the
-canonical value used by the backend trust contract; a different GitHub
-variable is rejected. This is the committed trust choice, not a claim that
-the active rev8 runtime was independently read to confirm its setting.
-2. Dispatch `asaas-build-attestation.yml` with `trust_mode=bootstrap` and a
-   newly allocated operation UUID. The run name binds the UUID; a serialized
-   concurrency group and complete workflow-run history check reject a prior
-   run for that operation. Any failed or retried bootstrap attempt consumes
-   that operation UUID. Use only the explicit operational WISH authorization
-   reference
-   `asaas-producer-image-rollout/WISH.md#2026-10-15-separate-build-and-rollout-plan-approved`;
-   every run still requires approval in the protected `asaas-build`
-   environment. The WISH reference is the recorded operational authorization;
-   the environment approval must bind to the exact run. Do not carry an
-   environment approval from a failed attempt to a new operation.
-3. Before OIDC, the preflight probes only the committed HTTPS backend origin
-   and exact trust path. It accepts only the staging app's known unauthenticated
-   `401` response shape as evidence that the public route is not deployed yet.
-   A `200`, `404`, redirect, malformed body, timeout, or any other response
-   blocks bootstrap. The probe's canonical SHA-256 is included in the review
-   evidence. After the `asaas-build` required reviewer approves the run, the
-   approval verifier repeats the probe and requires the same digest before
-   `configure-aws-credentials`.
-4. Only the approved `build-attestation` job receives `id-token: write`. It
-   assumes the committed BuildRole, builds and pushes a run-specific image tag,
-   reads back and validates the immutable ECR digest, then signs and locally
-   verifies a `billing_build_attestation.v1` envelope. The signed artifact is
-   uploaded as the Group 4 artifact. This workflow has no deployment step and
-   no ECS permission; do not use the BuildRole to deploy.
-5. The rollout WISH requires Group 4 to register the canonical attestation
-   before Group 5 deploys that registered digest. The current sequence is a
-   **hard stop** after artifact creation: the active `neurostack-staging`
-   service's rev8 task definition has no `BILLING_PRODUCER_BUILD_*` settings,
-   and the live trust route is not available. The backend's
-   `_build_attestation_entry()` therefore cannot read a configured trust tuple
-   there, and the human `register-build-attestation` command cannot establish
-   registration/readback before Group 5. Do not start Group 5, deploy an
-   unregistered digest, or defer registration until after deployment.
-6. Resuming requires a separately reviewed and explicitly authorized plan
-   that makes the exact build-trust tuple and both the readback and registration
-   routes available on a backend before Group 5. The required tuple includes
-   the committed issuer, KMS key ID, audience, public key, repository ID/name,
-   workflow path/ref, and OIDC issuer/subject. That plan must define how this
-   pre-deploy backend capability is provided without using the unregistered
-   application digest as its own prerequisite. No such path is implemented or
-   authorized by this bootstrap. Keep payment egress and commercial top-ups
-   disabled while blocked.
-7. Only after Group 4 registration and trust readback are independently
-   verified may a separately approved Group 5 use the registered immutable
-   digest with its distinct deploy identity. Receipts and grants remain blocked
-   until their own WISH criteria pass. Normal build mode continues to require
-   an active backend trust readback; bootstrap does not provide a post-deploy
-   registration exception.
+1. Merge the reviewed commit through the protected `main` ruleset. Before any
+   OIDC-enabled job runs, the no-OIDC preflight re-reads the active source-ref
+   ruleset, build and deployment environment settings, allowed ref, and exact
+   Actions run identity. The ruleset must require a PR review and named checks,
+   block force-push/deletion, and have no bypass actors. The environment
+   approval must be bound to this run and ref; self-review and administrator
+   bypass remain disabled. An administrator separately verifies the
+   hidden-bypass controls in the GitHub UI and retains sanitized evidence.
+   Felps (`felps-json`) remains the sole independent PR reviewer and the
+   current protected-environment reviewer required by live settings. Lorenzo
+   performs final PR approval and merge. Add no other reviewers or approvers,
+   and do not change settings to bypass last-push review.
+2. Use `trust_mode=bootstrap` only for Group 3/4 trust/build readiness, with a
+   newly allocated operation UUID and the explicit operational authorization
+   at `asaas-producer-image-rollout/WISH.md#2026-10-15-separate-build-and-rollout-plan-approved`.
+   The run title binds the UUID; concurrency and a complete, paginated
+   workflow-run history check reject reuse. A failed or retried build attempt
+   consumes that operation UUID. The protected `asaas-build` environment
+   still requires approval for the exact run.
+3. Before OIDC, preflight probes only the committed HTTPS backend origin and
+   exact trust path. It accepts only the known unauthenticated `401` response
+   shape as evidence that the trust route is not yet active. A `200`, `404`,
+   redirect, malformed response, timeout, or other status blocks bootstrap.
+   The canonical probe digest is included in evidence. After environment
+   approval and before `configure-aws-credentials`, the verifier repeats the
+   probe and requires the same digest.
+4. Only the approved build/sign job receives `id-token: write`. It assumes the
+   committed BuildRole, builds and publishes a run-specific ECR tag, reads
+   back the immutable image digest, and signs/verifies an envelope binding the
+   digest to the clean reviewed commit, tree, workflow and run. Upload the
+   canonical artifact for Group 5. Group 4 publishes and signs only: it does
+   not register the attestation, deploy the image, or enable payment egress.
+   CI never receives a user JWT.
 
-Bootstrap does not create or register backend trust, and it does not enable
-payments. If any pin, approval, probe, signature, digest readback, or backend
-trust field differs, stop. Resolve the hard-stop dependency through an amended,
-explicitly authorized plan; do not weaken the Group 4 registration gate.
+## Group 5 one-time deployment bootstrap
+
+The replacement image is production-impacting: the service named
+`neurostack-staging` currently serves production traffic. Keep ASAAS/credit
+egress and commercial top-up disabled before, during, and after the bootstrap.
+Use the distinct deploy role; the build role cannot deploy, and the deploy role
+cannot publish images or sign attestations.
+
+1. Before deployment approval, the no-OIDC deploy preflight re-reads the live
+   source-ref and `asaas-production-deployment` protections and exact run
+   identity. The environment must allow only the protected release branch,
+   require its designated human approval, prevent self-review, and disable
+   administrator bypass. A live UI check confirms hidden bypass controls.
+   Felps (`felps-json`) remains the sole independent PR reviewer and the
+   current protected-environment reviewer required by live settings. Lorenzo
+   performs final PR approval and merge. Add no other reviewers or approvers,
+   and do not change settings to bypass last-push review. No AWS OIDC
+   credentials are available to the readback job. This protected run must also
+   reference the explicit operational authorization at
+   `asaas-producer-image-rollout/WISH.md#2026-10-15-separate-build-and-rollout-plan-approved`.
+2. Before protected deployment approval, require the checked-in Group 5
+   registration-readiness SQL query and its static safety test. If either is
+   absent, withhold approval; do not substitute ad hoc SQL. Obtain current
+   running task ENI addresses through read-only ECS metadata and run the
+   no-write query from the existing authenticated PostgreSQL console/session.
+   It must map those task
+   connections to the API runtime role using `pg_stat_activity` and verify
+   the registration table, required columns/constraints, and the role's
+   read/insert/row-lock privileges through catalogs. It must not use ECS Exec,
+   retrieve or print `DATABASE_URL` or any secret, read application rows or
+   query text, run migrations, or issue DML. If the runtime role or required
+   schema/privileges cannot be confirmed without reading a secret, withhold
+   deployment approval and leave the bootstrap slot unused. Schema remediation
+   requires separate approval.
+3. Prove the currently loaded `DATABASE_URL` version from metadata before
+   deployment approval. Read every running task's task-definition ARN,
+   `createdAt`, and `startedAt`; inspect the secret's ARN, JSON-key selector,
+   `VersionIdsToStages`, and `LastChangedDate` with read-only metadata calls.
+   Never call `GetSecretValue`. For a stage/default selector, resolve exactly
+   one VersionId and prove `LastChangedDate` precedes the earliest active
+   task's `createdAt` by at least 60 seconds, preserving source timestamp
+   precision. `createdAt` is the conservative `PENDING`-entry bound before
+   startup secret injection. A change after `createdAt` but before
+   `startedAt`, equal/rounded/ambiguous timestamps, a margin under 60 seconds,
+   mixed active versions, or an unresolved selector blocks deployment. For an
+   explicit VersionId, prove that exact version exists. Pin the replacement
+   task definition to the same secret ARN, JSON key, and proven immutable
+   VersionId. Record no secret value or database URL.
+4. Bootstrap mode is available for exactly one started protected deployment
+   job. A distinct preallocated deployment operation UUID binds the run to the
+   exact Group 4 artifact tuple: attestation ID, immutable image digest, build
+   run ID, and signed-envelope SHA-256. This operation ID is deployment
+   metadata; it is not added to the signed envelope. A serialized, paginated
+   history check fails closed if any earlier bootstrap deployment job started
+   or if identity/history is ambiguous. Pending or rejected-before-start
+   environment records do not consume the slot; once the protected job starts,
+   any failure or cancellation consumes it. No retry or second unregistered
+   bootstrap is allowed.
+5. After the deployment environment approval, independently verify the exact
+   signed envelope, trust claims, build run/ref, ECR digest, and configured
+   public-key pin before requesting deploy-role OIDC. Change only the pinned
+   production-serving service and image digest; preserve desired count and
+   unrelated resources. Pin the replacement task definition to the verified
+   trust settings and the proven active secret version. Read back the entire
+   running task cohort, readiness, immutable digest, task role, trust settings,
+   target, desired count, and disabled financial/commercial gates.
+6. Immediately after successful healthy readbacks, a human staging
+   `super_admin` registers the exact Group 4 envelope through
+   `POST /v1/admin/billing/producer-build-attestations`. Confirm that the
+   backend returns the same canonical attestation ID, envelope digest, and
+   registration time. CI receives no user JWT; the human registration uses
+   the established out-of-band authentication flow. If the response is lost,
+   only the byte-identical envelope may be resubmitted for its idempotent
+   result. Do not use a different envelope, direct database writes, or delayed
+   registration.
+7. Any signature, trust, digest, health, cohort, secret-version, or registration
+   mismatch stops acceptance and rolls back to the recorded prior task
+   definition using the pre-approved rollback path. Keep payment and commercial
+   gates disabled through rollback and recovery. Once this bootstrap has
+   started, a failed run does not reopen the one-time slot; another unregistered
+   deployment requires a separately revised and explicitly approved WISH.
+
+## Later deployments
+
+Every deployment after the one-time bootstrap uses registered mode. Before its
+protected deployment approval, a human staging `super_admin` submits the exact
+signed envelope to the authenticated idempotent registration endpoint and
+retains the canonical attestation ID, digest, and timestamp. The deploy
+preflight requires that registration to match the immutable digest/run tuple.
+No later deployment accepts an unregistered digest, and CI never receives a
+user JWT.
