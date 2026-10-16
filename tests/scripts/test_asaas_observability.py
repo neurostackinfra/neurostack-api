@@ -71,7 +71,9 @@ def test_required_smoke_uses_fresh_runtime_challenge_acknowledgement(
         return acknowledgement
 
     monkeypatch.setenv("BILLING_OBSERVABILITY_SMOKE_TOKEN", "test-only-token")
-    monkeypatch.setattr(module, "_production_runtime_challenge", _test_only_fake_receiver_challenge)
+    monkeypatch.setattr(
+        module, "_production_runtime_challenge", _test_only_fake_receiver_challenge
+    )
     errors = module.verify(
         rules_digest=hashlib.sha256(rules.read_bytes()).hexdigest(),
         smoke_file=smoke,
@@ -97,6 +99,7 @@ def test_required_smoke_rejects_static_ack_without_runtime_proof(
     monkeypatch.setenv(
         "BILLING_ALERT_RECEIVER_URL", "https://receiver.example.test/v1/billing"
     )
+
     def _test_only_fake_receiver_challenge(**_kwargs: object) -> dict[str, object]:
         raise RuntimeError("runtime smoke challenge failed")
 
@@ -122,7 +125,9 @@ def test_production_required_smoke_rejects_missing_acknowledgement(
 ) -> None:
     module = _module()
     smoke = tmp_path / "smoke.json"
-    smoke.write_text('{"scope":"billing_observability","version":1}\n', encoding="utf-8")
+    smoke.write_text(
+        '{"scope":"billing_observability","version":1}\n', encoding="utf-8"
+    )
     rules = ROOT / "config" / "prometheus_rules.yml"
     monkeypatch.setenv(
         "BILLING_ALERT_RECEIVER_URL", "https://receiver.example.test/v1/billing"

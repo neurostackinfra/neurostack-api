@@ -193,6 +193,11 @@ temp/
 alembic/versions/*.pyc
 
 .github/
+!.github/
+.github/*
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/asaas-build-attestation.yml
 # Genie CLI
 .genie/
 !.genie/

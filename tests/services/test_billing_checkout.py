@@ -18,7 +18,6 @@ from src.models.coupon import Coupon
 from src.repositories.billing import BillingRepository
 from src.services import billing_checkout as checkout_module
 from src.services.asaas import AsaasOutcomeUnknown, CheckoutCreated
-from src.services.billing_outbox import billing_fact_schema_digest
 from src.services.billing_checkout import (
     COUPON_NOT_ELIGIBLE,
     BillingCheckoutService,
@@ -29,6 +28,7 @@ from src.services.billing_checkout import (
     billing_local_date,
     normalize_coupon_code,
 )
+from src.services.billing_outbox import billing_fact_schema_digest
 
 # 23:59:59 on 2026-10-11 in São Paulo (UTC-03:00, no DST since 2019).
 _LATE_EVENING_UTC = datetime(2026, 10, 12, 2, 59, 59, tzinfo=timezone.utc)

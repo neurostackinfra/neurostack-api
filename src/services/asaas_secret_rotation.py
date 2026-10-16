@@ -131,11 +131,15 @@ def sign_secret_rotation_receipt(
 
     if len(signing_key) != 32:
         raise AsaasSecretRotationRejected("asaas_secret_rotation_key_invalid")
-    return Ed25519PrivateKey.from_private_bytes(signing_key).sign(
-        json.dumps(_receipt_payload(receipt), sort_keys=True, separators=(",", ":")).encode(
-            "ascii"
+    return (
+        Ed25519PrivateKey.from_private_bytes(signing_key)
+        .sign(
+            json.dumps(
+                _receipt_payload(receipt), sort_keys=True, separators=(",", ":")
+            ).encode("ascii")
         )
-    ).hex()
+        .hex()
+    )
 
 
 def _public_key(value: bytes | str) -> Ed25519PublicKey:
@@ -234,7 +238,9 @@ def verify_next_to_current(
         )
     ):
         raise AsaasSecretRotationRejected("asaas_secret_rotation_digest_invalid")
-    if proof.observed_at.tzinfo is None or proof.observed_at > datetime.now(timezone.utc):
+    if proof.observed_at.tzinfo is None or proof.observed_at > datetime.now(
+        timezone.utc
+    ):
         raise AsaasSecretRotationRejected("asaas_secret_rotation_time_invalid")
     if proof.incident_open:
         raise AsaasSecretRotationRejected("asaas_secret_rotation_incident_open")

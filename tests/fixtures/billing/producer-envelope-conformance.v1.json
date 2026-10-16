@@ -1,0 +1,63 @@
+{
+  "envelope": {
+    "issuer": "test:billing-producer-conformance",
+    "kid": "arn:aws:kms:us-east-1:388460142431:key/11111111-2222-4333-8444-555555555555",
+    "algorithm": "ECDSA_SHA_256",
+    "audience": "test:billing-producer-conformance",
+    "type": "billing_producer_assignment.v1",
+    "purpose": "billing-producer-grant.v1",
+    "schema_version": "v1",
+    "environment": "staging",
+    "operation_id": "89bf1556-9f6d-4f39-b5c8-8dcb041877da",
+    "request_id": null,
+    "issued_at": "2026-10-15T12:00:00.000000Z",
+    "expires_at": "2026-10-15T12:05:00.000000Z",
+    "payload_digest": "8d5cf66f777cfd41ee6c1786072a248cfc8f4755962cf488a682f1f8f4220e49",
+    "payload": {
+      "action": "read_billing_producer_pair",
+      "cluster_arn": "arn:aws:ecs:us-east-1:388460142431:cluster/neurostack-staging",
+      "environment": "staging",
+      "executor_user_id": "922ce4c9-8aa3-4b69-83db-80bc0703b1ec",
+      "expires_at": "2026-10-15T12:05:00.000000Z",
+      "grant_kind": "assignment",
+      "id": "8b84213a-2ac9-4066-8cbf-b2b0445295c0",
+      "issued_at": "2026-10-15T12:00:00.000000Z",
+      "issuer_user_id": "9b00c461-67db-4e47-a20b-98f521cfe9ca",
+      "operation_id": "89bf1556-9f6d-4f39-b5c8-8dcb041877da",
+      "operational_role": "production-serving",
+      "receipt_id": null,
+      "scope": {
+        "action": "read_billing_producer_pair",
+        "cluster_arn": "arn:aws:ecs:us-east-1:388460142431:cluster/neurostack-staging",
+        "environment": "staging",
+        "minimum_grant_validity_seconds": 60,
+        "minimum_pair_validity_seconds": 300,
+        "operation_id": "89bf1556-9f6d-4f39-b5c8-8dcb041877da",
+        "operational_role": "production-serving",
+        "readback_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "service_arn": "arn:aws:ecs:us-east-1:388460142431:service/neurostack-staging/neurostack-staging-app"
+      },
+      "scope_digest": "7e1c1610e582ecaaabf7a06dcc300e6556229b5b722528c6455b083f87868146",
+      "service_arn": "arn:aws:ecs:us-east-1:388460142431:service/neurostack-staging/neurostack-staging-app",
+      "verification_receipt_id": null
+    },
+    "signature": "MEUCIQCNr7VtBNVyJ3FKw5C_Y6wmQkfj7e0m3nEbFFx3-JmxbgIgcKUikLquMu2vmVAeYfGMQClBYV3W5PnzwNCF9JqQ48Q"
+  },
+  "envelope_digest": "6ede07d739711e0b5e8736fe3cb0a722ea2c0660b280986e2145da8c62f15e73",
+  "envelope_jcs_base64": "eyJhbGdvcml0aG0iOiJFQ0RTQV9TSEFfMjU2IiwiYXVkaWVuY2UiOiJ0ZXN0OmJpbGxpbmctcHJvZHVjZXItY29uZm9ybWFuY2UiLCJlbnZpcm9ubWVudCI6InN0YWdpbmciLCJleHBpcmVzX2F0IjoiMjAyNi0xMC0xNVQxMjowNTowMC4wMDAwMDBaIiwiaXNzdWVkX2F0IjoiMjAyNi0xMC0xNVQxMjowMDowMC4wMDAwMDBaIiwiaXNzdWVyIjoidGVzdDpiaWxsaW5nLXByb2R1Y2VyLWNvbmZvcm1hbmNlIiwia2lkIjoiYXJuOmF3czprbXM6dXMtZWFzdC0xOjM4ODQ2MDE0MjQzMTprZXkvMTExMTExMTEtMjIyMi00MzMzLTg0NDQtNTU1NTU1NTU1NTU1Iiwib3BlcmF0aW9uX2lkIjoiODliZjE1NTYtOWY2ZC00ZjM5LWI1YzgtOGRjYjA0MTg3N2RhIiwicGF5bG9hZCI6eyJhY3Rpb24iOiJyZWFkX2JpbGxpbmdfcHJvZHVjZXJfcGFpciIsImNsdXN0ZXJfYXJuIjoiYXJuOmF3czplY3M6dXMtZWFzdC0xOjM4ODQ2MDE0MjQzMTpjbHVzdGVyL25ldXJvc3RhY2stc3RhZ2luZyIsImVudmlyb25tZW50Ijoic3RhZ2luZyIsImV4ZWN1dG9yX3VzZXJfaWQiOiI5MjJjZTRjOS04YWEzLTRiNjktODNkYi04MGJjMDcwM2IxZWMiLCJleHBpcmVzX2F0IjoiMjAyNi0xMC0xNVQxMjowNTowMC4wMDAwMDBaIiwiZ3JhbnRfa2luZCI6ImFzc2lnbm1lbnQiLCJpZCI6IjhiODQyMTNhLTJhYzktNDA2Ni04Y2JmLWIyYjA0NDUyOTVjMCIsImlzc3VlZF9hdCI6IjIwMjYtMTAtMTVUMTI6MDA6MDAuMDAwMDAwWiIsImlzc3Vlcl91c2VyX2lkIjoiOWIwMGM0NjEtNjdkYi00ZTQ3LWEyMGItOThmNTIxY2ZlOWNhIiwib3BlcmF0aW9uX2lkIjoiODliZjE1NTYtOWY2ZC00ZjM5LWI1YzgtOGRjYjA0MTg3N2RhIiwib3BlcmF0aW9uYWxfcm9sZSI6InByb2R1Y3Rpb24tc2VydmluZyIsInJlY2VpcHRfaWQiOm51bGwsInNjb3BlIjp7ImFjdGlvbiI6InJlYWRfYmlsbGluZ19wcm9kdWNlcl9wYWlyIiwiY2x1c3Rlcl9hcm4iOiJhcm46YXdzOmVjczp1cy1lYXN0LTE6Mzg4NDYwMTQyNDMxOmNsdXN0ZXIvbmV1cm9zdGFjay1zdGFnaW5nIiwiZW52aXJvbm1lbnQiOiJzdGFnaW5nIiwibWluaW11bV9ncmFudF92YWxpZGl0eV9zZWNvbmRzIjo2MCwibWluaW11bV9wYWlyX3ZhbGlkaXR5X3NlY29uZHMiOjMwMCwib3BlcmF0aW9uX2lkIjoiODliZjE1NTYtOWY2ZC00ZjM5LWI1YzgtOGRjYjA0MTg3N2RhIiwib3BlcmF0aW9uYWxfcm9sZSI6InByb2R1Y3Rpb24tc2VydmluZyIsInJlYWRiYWNrX2RpZ2VzdCI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEiLCJzZXJ2aWNlX2FybiI6ImFybjphd3M6ZWNzOnVzLWVhc3QtMTozODg0NjAxNDI0MzE6c2VydmljZS9uZXVyb3N0YWNrLXN0YWdpbmcvbmV1cm9zdGFjay1zdGFnaW5nLWFwcCJ9LCJzY29wZV9kaWdlc3QiOiI3ZTFjMTYxMGU1ODJlY2FhYWJmN2EwNmRjYzMwMGU2NTU2MjI5YjViNzIyNTI4YzY0NTViMDgzZjg3ODY4MTQ2Iiwic2VydmljZV9hcm4iOiJhcm46YXdzOmVjczp1cy1lYXN0LTE6Mzg4NDYwMTQyNDMxOnNlcnZpY2UvbmV1cm9zdGFjay1zdGFnaW5nL25ldXJvc3RhY2stc3RhZ2luZy1hcHAiLCJ2ZXJpZmljYXRpb25fcmVjZWlwdF9pZCI6bnVsbH0sInBheWxvYWRfZGlnZXN0IjoiOGQ1Y2Y2NmY3NzdjZmQ0MWVlNmMxNzg2MDcyYTI0OGNmYzhmNDc1NTk2MmNmNDg4YTY4MmYxZjhmNDIyMGU0OSIsInB1cnBvc2UiOiJiaWxsaW5nLXByb2R1Y2VyLWdyYW50LnYxIiwicmVxdWVzdF9pZCI6bnVsbCwic2NoZW1hX3ZlcnNpb24iOiJ2MSIsInNpZ25hdHVyZSI6Ik1FVUNJUUNOcjdWdEJOVnlKM0ZLdzVDX1k2d21Ra2ZqN2UwbTNuRWJGRngzLUpteGJnSWdjS1Vpa0xxdU11MnZtVkFlWWZHTVFDbEJZVjNXNVBuendOQ0Y5SnFRNDhRIiwidHlwZSI6ImJpbGxpbmdfcHJvZHVjZXJfYXNzaWdubWVudC52MSJ9",
+  "fixture_schema_version": "billing_producer_envelope_conformance.v1",
+  "payload_digest": "8d5cf66f777cfd41ee6c1786072a248cfc8f4755962cf488a682f1f8f4220e49",
+  "signature": "MEUCIQCNr7VtBNVyJ3FKw5C_Y6wmQkfj7e0m3nEbFFx3-JmxbgIgcKUikLquMu2vmVAeYfGMQClBYV3W5PnzwNCF9JqQ48Q",
+  "trust_entry": {
+    "algorithm": "ECDSA_SHA_256",
+    "audience": "test:billing-producer-conformance",
+    "environment": "staging",
+    "issuer": "test:billing-producer-conformance",
+    "kid": "arn:aws:kms:us-east-1:388460142431:key/11111111-2222-4333-8444-555555555555",
+    "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExiZSGTYVAVrlNgusRDEqLGxaQVi3\nPRT1jW2dYURbx+fQ8oz+RAi/4woxlYuZ+mJUKsVtamuToS7jZd2cFAAlxw==\n-----END PUBLIC KEY-----\n",
+    "purpose": "billing-producer-grant.v1",
+    "schema_version": "v1",
+    "type": "billing_producer_assignment.v1"
+  },
+  "unsigned_header_jcs_base64": "eyJhbGdvcml0aG0iOiJFQ0RTQV9TSEFfMjU2IiwiYXVkaWVuY2UiOiJ0ZXN0OmJpbGxpbmctcHJvZHVjZXItY29uZm9ybWFuY2UiLCJlbnZpcm9ubWVudCI6InN0YWdpbmciLCJleHBpcmVzX2F0IjoiMjAyNi0xMC0xNVQxMjowNTowMC4wMDAwMDBaIiwiaXNzdWVkX2F0IjoiMjAyNi0xMC0xNVQxMjowMDowMC4wMDAwMDBaIiwiaXNzdWVyIjoidGVzdDpiaWxsaW5nLXByb2R1Y2VyLWNvbmZvcm1hbmNlIiwia2lkIjoiYXJuOmF3czprbXM6dXMtZWFzdC0xOjM4ODQ2MDE0MjQzMTprZXkvMTExMTExMTEtMjIyMi00MzMzLTg0NDQtNTU1NTU1NTU1NTU1Iiwib3BlcmF0aW9uX2lkIjoiODliZjE1NTYtOWY2ZC00ZjM5LWI1YzgtOGRjYjA0MTg3N2RhIiwicGF5bG9hZF9kaWdlc3QiOiI4ZDVjZjY2Zjc3N2NmZDQxZWU2YzE3ODYwNzJhMjQ4Y2ZjOGY0NzU1OTYyY2Y0ODhhNjgyZjFmOGY0MjIwZTQ5IiwicHVycG9zZSI6ImJpbGxpbmctcHJvZHVjZXItZ3JhbnQudjEiLCJyZXF1ZXN0X2lkIjpudWxsLCJzY2hlbWFfdmVyc2lvbiI6InYxIiwidHlwZSI6ImJpbGxpbmdfcHJvZHVjZXJfYXNzaWdubWVudC52MSJ9"
+}

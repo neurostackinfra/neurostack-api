@@ -537,7 +537,13 @@ async def _seed_capability_binding(
 
     receipt_ids: list[UUID] = []
     actor_ids: list[UUID] = []
-    operation_id, deployment_digest, request_id, inbox_high_watermark, fact_schema_digest = (
+    (
+        operation_id,
+        deployment_digest,
+        request_id,
+        inbox_high_watermark,
+        fact_schema_digest,
+    ) = (
         await session.execute(
             text("""
                 SELECT operation_id, deployment_digest, request_id,
@@ -552,9 +558,7 @@ async def _seed_capability_binding(
     roles = ("deployer", "approver", "reviewer", "deployer")
     expires_at = datetime.now(timezone.utc) + timedelta(hours=2)
     evidence_types = ("producer", "credit", "reconciliation", "verification")
-    for digest, role, evidence_type in zip(
-        digests, roles, evidence_types, strict=True
-    ):
+    for digest, role, evidence_type in zip(digests, roles, evidence_types, strict=True):
         assignment_id = uuid4()
         receipt_id = uuid4()
         actor_id = uuid4()
@@ -5246,9 +5250,7 @@ def _g5_public_key_hex() -> str:
 
 @pytest.fixture
 def g5_provider_authority(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        settings, "asaas_provider_evidence_key_id", _G5_PROVIDER_KEY_ID
-    )
+    monkeypatch.setattr(settings, "asaas_provider_evidence_key_id", _G5_PROVIDER_KEY_ID)
     monkeypatch.setattr(
         settings, "asaas_provider_evidence_public_key", _g5_public_key_hex()
     )
@@ -5309,8 +5311,9 @@ async def _g5_seed_legacy_subscription(
 async def _g5_saga(harness: _Harness, migration_id: UUID) -> dict[str, Any]:
     async with harness.session() as session:
         row = (
-            await session.execute(
-                text("""
+            (
+                await session.execute(
+                    text("""
                     SELECT migration.state, migration.target_external_subscription_id,
                            migration.operation_id, migration.legacy_cancelled_at,
                            migration.attempt_count, migration.source_roster_revision,
@@ -5328,9 +5331,12 @@ async def _g5_saga(harness: _Harness, migration_id: UUID) -> dict[str, Any]:
                     CROSS JOIN billing_roster_control roster
                     WHERE migration.id = :id
                 """),
-                {"id": migration_id},
+                    {"id": migration_id},
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
     return dict(row)
 
 
@@ -5347,7 +5353,9 @@ async def _g5_import(
     subscription_id = await _g5_seed_legacy_subscription(harness, builder)
     async with harness.session() as session:
         async with session.begin():
-            view = await BillingMigrationService(session, clock=clock).import_roster_entry(
+            view = await BillingMigrationService(
+                session, clock=clock
+            ).import_roster_entry(
                 builder_id=builder,
                 subscription_id=subscription_id,
                 renewal=renewal,
@@ -5464,16 +5472,20 @@ async def test_g5_recover_then_manual_intervention_reuses_quarantine_receipt(
     async with postgres_harness.session() as session:
         async with session.begin():
             target = (
-                await session.execute(
-                    text("""
+                (
+                    await session.execute(
+                        text("""
                         SELECT target_catalog_version_id, target_offer_id,
                                target_amount_cents, target_snapshot
                         FROM billing_migrations
                         WHERE id = :migration_id
                     """),
-                    {"migration_id": migration_id},
+                        {"migration_id": migration_id},
+                    )
                 )
-            ).mappings().one()
+                .mappings()
+                .one()
+            )
             await session.execute(
                 text("""
                     INSERT INTO billing_checkout_sessions (
@@ -5532,9 +5544,7 @@ async def test_g5_reconcile_not_cancelled_then_manual_reuses_quarantine_receipt(
 ) -> None:
     from src.services.billing_migration import BillingMigrationService
 
-    migration_id, _ = await _g5_import(
-        postgres_harness, renewal=date(2027, 6, 10)
-    )
+    migration_id, _ = await _g5_import(postgres_harness, renewal=date(2027, 6, 10))
     operation_id = uuid4()
     async with postgres_harness.session() as session:
         async with session.begin():
@@ -5578,9 +5588,7 @@ async def test_g5_recreate_pending_after_t2_can_enter_manual_without_unique_viol
         async with session.begin():
             manual = await BillingMigrationService(
                 session, clock=lambda: late
-            ).mark_manual_intervention(
-                migration_id=migration_id, actor_user_id=uuid4()
-            )
+            ).mark_manual_intervention(migration_id=migration_id, actor_user_id=uuid4())
 
     assert pending.state == "recreate_pending"
     assert manual.state == "manual_intervention"
@@ -5692,9 +5700,7 @@ async def _g5_flip_envelope(
     return _g5_sign(**values)
 
 
-async def _g5_flip(
-    harness: _Harness, migration_id: UUID, envelope: Any
-) -> Any:
+async def _g5_flip(harness: _Harness, migration_id: UUID, envelope: Any) -> Any:
     from src.services.billing_migration import BillingMigrationService
 
     async with harness.session() as session:
@@ -5750,15 +5756,12 @@ async def test_g5_canonical_evidence_digest_matches_python_in_every_timezone(
                 )
                 assert actual == expected, (zone, observed)
         # Values outside the CHECK-constrained alphabet cannot be canonicalized.
-        assert (
-            await connection.scalar(text("""
+        assert await connection.scalar(text("""
                 SELECT billing_provider_evidence_digest(
                     'asaas.api.v3', 'evt"1', now(), 'sub', gen_random_uuid(), now(),
                     'subscription.migration.absence', gen_random_uuid(), 'asaas',
                     repeat('e', 64))
-            """))
-            is None
-        )
+            """)) is None
         await connection.rollback()
 
 
@@ -5780,7 +5783,9 @@ async def test_g5_late_cancel_begin_is_rejected_before_any_state_change(
     )
     before = await _g5_saga(postgres_harness, late_id)
     async with postgres_harness.session() as session:
-        with pytest.raises(BillingMigrationRejected, match="^billing_migration_cutover_late$"):
+        with pytest.raises(
+            BillingMigrationRejected, match="^billing_migration_cutover_late$"
+        ):
             async with session.begin():
                 await BillingMigrationService(
                     session, clock=lambda: first_late_second
@@ -5914,8 +5919,12 @@ async def _g5_raw_flip_receipt(session: AsyncSession, migration_id: UUID) -> Non
                 FROM billing_migrations migration WHERE migration.id = :migration_id
             ) AS row
         """),
-        {"id": uuid4(), "event_id": f"evt_{uuid4().hex}", "actor": uuid4(),
-         "migration_id": migration_id},
+        {
+            "id": uuid4(),
+            "event_id": f"evt_{uuid4().hex}",
+            "actor": uuid4(),
+            "migration_id": migration_id,
+        },
     )
 
 
@@ -5941,13 +5950,17 @@ async def test_g5_provider_flip_rejects_unbound_or_forged_evidence(
     pending_envelope = await _g5_flip_envelope(
         postgres_harness, pending_id, pending["operation_id"], f"sub_{uuid4().hex[:16]}"
     )
-    with pytest.raises(BillingMigrationRejected, match="^billing_migration_flip_not_allowed$"):
+    with pytest.raises(
+        BillingMigrationRejected, match="^billing_migration_flip_not_allowed$"
+    ):
         await _g5_flip(postgres_harness, pending_id, pending_envelope)
     assert await _g5_saga(postgres_harness, pending_id) == pending
     # The database refuses a well-formed receipt (every digest recomputed in
     # SQL, so only the saga state is wrong) even without the service.
     async with postgres_harness.session() as session:
-        with pytest.raises(IntegrityError, match="provider evidence envelope is invalid"):
+        with pytest.raises(
+            IntegrityError, match="provider evidence envelope is invalid"
+        ):
             async with session.begin():
                 await _g5_raw_flip_receipt(session, pending_id)
 
@@ -5966,7 +5979,8 @@ async def test_g5_provider_flip_rejects_unbound_or_forged_evidence(
 
     async with postgres_harness.session() as session:
         with pytest.raises(
-            IntegrityError, match="provider flip receipt requires migrated saga at commit"
+            IntegrityError,
+            match="provider flip receipt requires migrated saga at commit",
         ):
             async with session.begin():
                 await _g5_raw_flip_receipt(session, migration_id)
@@ -5982,7 +5996,9 @@ async def test_g5_provider_flip_rejects_unbound_or_forged_evidence(
     signed_for_other = await _g5_flip_envelope(
         postgres_harness, migration_id, operation_id, other_asaas
     )
-    await rejected(dc_replace(signed_for_other, external_reference=asaas_id), "snapshot_digest")
+    await rejected(
+        dc_replace(signed_for_other, external_reference=asaas_id), "snapshot_digest"
+    )
     # Signed for another migration and for another operation (the target
     # digest is this saga's, so only the signed envelope binding differs).
     this_snapshot = await _g5_snapshot_digest(postgres_harness, migration_id, asaas_id)
@@ -6030,7 +6046,9 @@ async def test_g5_provider_flip_rejects_unbound_or_forged_evidence(
         "signature",
     )
     # The placeholder namespace is never a bindable ASAAS id.
-    with pytest.raises(BillingMigrationRejected, match="^billing_migration_provider_id_invalid$"):
+    with pytest.raises(
+        BillingMigrationRejected, match="^billing_migration_provider_id_invalid$"
+    ):
         await _g5_flip(
             postgres_harness,
             migration_id,
@@ -6087,7 +6105,9 @@ async def test_g5_one_asaas_id_binds_at_most_one_migration_and_subscription(
             """),
             {"id": first_id},
         )
-    with pytest.raises(IntegrityError, match="uq_billing_migration_receipts_provider_event"):
+    with pytest.raises(
+        IntegrityError, match="uq_billing_migration_receipts_provider_event"
+    ):
         await _g5_flip(
             postgres_harness,
             second_id,
@@ -6127,11 +6147,15 @@ async def test_g5_one_asaas_id_binds_at_most_one_migration_and_subscription(
                 },
             )
     third_before = await _g5_saga(postgres_harness, third_id)
-    with pytest.raises(IntegrityError, match="uq_billing_subscriptions_provider_external"):
+    with pytest.raises(
+        IntegrityError, match="uq_billing_subscriptions_provider_external"
+    ):
         await _g5_flip(
             postgres_harness,
             third_id,
-            await _g5_flip_envelope(postgres_harness, third_id, third_operation, held_id),
+            await _g5_flip_envelope(
+                postgres_harness, third_id, third_operation, held_id
+            ),
         )
     assert await _g5_saga(postgres_harness, third_id) == third_before
     del BillingMigrationService
@@ -6253,14 +6277,18 @@ async def test_g5_recreate_requires_two_converged_empty_reads(
     # refuses a hand-made one.
     async with postgres_harness.session() as session:
         read_one = (
-            await session.execute(
-                text("""
+            (
+                await session.execute(
+                    text("""
                     SELECT * FROM billing_migration_absence_reads
                     WHERE migration_id = :id AND read_no = 1
                 """),
-                {"id": migration_id},
+                    {"id": migration_id},
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         assert (
             await session.scalar(
                 text("""
@@ -6272,7 +6300,9 @@ async def test_g5_recreate_requires_two_converged_empty_reads(
             == 0
         )
     async with postgres_harness.session() as session:
-        with pytest.raises(IntegrityError, match="provider evidence envelope is invalid"):
+        with pytest.raises(
+            IntegrityError, match="provider evidence envelope is invalid"
+        ):
             async with session.begin():
                 await session.execute(
                     text("""
@@ -6315,7 +6345,9 @@ async def test_g5_recreate_requires_two_converged_empty_reads(
             BillingMigrationRejected, match="^billing_migration_readback_unverified$"
         ):
             async with session.begin():
-                await BillingMigrationService(session).reopen_recreate_after_absent_readback(
+                await BillingMigrationService(
+                    session
+                ).reopen_recreate_after_absent_readback(
                     migration_id=migration_id,
                     actor_user_id=uuid4(),
                     readback_receipt_id=uuid4(),
@@ -6345,7 +6377,8 @@ async def test_g5_recreate_requires_two_converged_empty_reads(
     # The database independently refuses a duplicate event id as read 2.
     async with postgres_harness.session() as session:
         with pytest.raises(
-            IntegrityError, match="second absence read must follow a distinct first read"
+            IntegrityError,
+            match="second absence read must follow a distinct first read",
         ):
             async with session.begin():
                 await session.execute(
@@ -6422,8 +6455,9 @@ async def test_g5_recreate_requires_two_converged_empty_reads(
             checkout_id = checkout.id
     async with postgres_harness.session() as session:
         attempt = (
-            await session.execute(
-                text("""
+            (
+                await session.execute(
+                    text("""
                     SELECT checkout.attempt_no, checkout.state, checkout.next_due_date,
                            checkout.intent_id, checkout.amount_cents,
                            checkout.pricing_snapshot
@@ -6437,9 +6471,12 @@ async def test_g5_recreate_requires_two_converged_empty_reads(
                       ON migration.id = checkout.migration_id
                     WHERE checkout.id = :id
                 """),
-                {"id": checkout_id},
+                    {"id": checkout_id},
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
     assert attempt["attempt_no"] == 1
     assert attempt["state"] == "creating"
     assert attempt["intent_id"] == migration_id
@@ -6467,7 +6504,9 @@ async def test_g5_recreate_requires_two_converged_empty_reads(
     async with postgres_harness.session() as session:
         assert (
             await session.scalar(
-                text("SELECT count(*) FROM billing_checkout_sessions WHERE migration_id = :id"),
+                text(
+                    "SELECT count(*) FROM billing_checkout_sessions WHERE migration_id = :id"
+                ),
                 {"id": migration_id},
             )
             == 1
@@ -6517,7 +6556,8 @@ async def test_g5_absence_reads_bind_the_prior_attempt(
             )
     state = await _g5_saga(postgres_harness, migration_id)
     with pytest.raises(
-        BillingMigrationRejected, match="^billing_migration_absence_read_attempt_changed$"
+        BillingMigrationRejected,
+        match="^billing_migration_absence_read_attempt_changed$",
     ):
         await _g5_read(
             postgres_harness,

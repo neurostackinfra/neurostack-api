@@ -3,19 +3,33 @@ NeuroStack API - Auth Endpoint
 User login with JWT token generation.
 """
 
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import uuid4
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from passlib.context import CryptContext
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.helpers.password_validation import PasswordValidationRoute
-from src.api.middleware.auth import TenantContext, get_tenant_context
-from src.api.schemas.auth import LoginRequest, LoginResponse, PasswordChangeRequest
+from src.api.middleware.auth import (
+    STAGING_REHEARSAL_TOKEN_ENVIRONMENT,
+    STAGING_REHEARSAL_TOKEN_SCOPE,
+    STAGING_REHEARSAL_TOKEN_TTL_SECONDS,
+    STAGING_REHEARSAL_TOKEN_USE,
+    TenantContext,
+    get_tenant_context,
+)
+from src.api.schemas.auth import (
+    LoginRequest,
+    LoginResponse,
+    PasswordChangeRequest,
+    StagingRehearsalTokenRequest,
+    StagingRehearsalTokenResponse,
+)
 from src.config.settings import settings
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.user import User, UserRole
@@ -117,6 +131,97 @@ async def login(body: LoginRequest) -> LoginResponse:
             clinic_id=clinic_id,
             role=user.role.value,
         )
+
+
+@router.post(
+    "/staging-rehearsal-token",
+    response_model=StagingRehearsalTokenResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Issue a short-lived staging rehearsal token",
+    description=(
+        "Authenticate an active super administrator and issue a ten-minute JWT "
+        "limited to the staging billing rehearsal authorization and readback routes."
+    ),
+    responses={
+        200: {"description": "Staging rehearsal token issued"},
+        400: {"description": "Malformed credentials payload"},
+        401: {"description": "Invalid email or password"},
+        403: {"description": "User is inactive or is not a super administrator"},
+        404: {"description": "Issuer is available only in staging"},
+        429: {"description": "Staging token issuance rate limit exceeded"},
+        503: {"description": "Staging token issuer is unavailable"},
+    },
+    tags=["Auth"],
+)
+async def issue_staging_rehearsal_token(
+    body: StagingRehearsalTokenRequest,
+    request: Request,
+) -> StagingRehearsalTokenResponse:
+    """Issue a staging-only JWT after the always-on ingress throttle admits it."""
+    if settings.environment != STAGING_REHEARSAL_TOKEN_ENVIRONMENT:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Not found",
+            headers={"Cache-Control": "no-store"},
+        )
+    if not getattr(request.state, "staging_rehearsal_issuer_admitted", False):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Staging token issuer is unavailable",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    normalized_email = str(body.email)
+    async with get_db_session() as session:
+        result = await session.execute(
+            select(User).where(func.lower(User.email) == normalized_email)
+        )
+        user = result.scalar_one_or_none()
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email or password",
+                headers={"Cache-Control": "no-store"},
+            )
+
+        try:
+            password_matches = pwd_context.verify(body.password, user.password_hash)
+        except Exception:
+            password_matches = False
+        if not password_matches:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email or password",
+                headers={"Cache-Control": "no-store"},
+            )
+
+        if not user.is_active or user.role != UserRole.super_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User is not authorized for staging rehearsal",
+                headers={"Cache-Control": "no-store"},
+            )
+
+        issued_at = int(time.time())
+        claims = {
+            "sub": str(user.id),
+            "tenant_id": str(user.tenant_id),
+            "role": user.role.value,
+            "email": user.email,
+            "iat": issued_at,
+            "exp": issued_at + STAGING_REHEARSAL_TOKEN_TTL_SECONDS,
+            "jti": str(uuid4()),
+            "token_use": STAGING_REHEARSAL_TOKEN_USE,
+            "token_environment": STAGING_REHEARSAL_TOKEN_ENVIRONMENT,
+            "scope": STAGING_REHEARSAL_TOKEN_SCOPE,
+        }
+        token = jwt.encode(claims, settings.secret_key, algorithm=JWT_ALGORITHM)
+
+    return StagingRehearsalTokenResponse(
+        token=token,
+        expires_in=STAGING_REHEARSAL_TOKEN_TTL_SECONDS,
+        token_use=STAGING_REHEARSAL_TOKEN_USE,
+    )
 
 
 def _password_change_forbidden() -> HTTPException:

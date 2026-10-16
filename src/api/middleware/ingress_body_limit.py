@@ -25,6 +25,9 @@ from src.services.billing_webhook import (
 MAX_INGRESS_BODY_BYTES = 1024 * 1024
 ABACATEPAY_WEBHOOK_BODY_BYTES = 262_144
 ABACATEPAY_WEBHOOK_READ_TIMEOUT_SECONDS = 5.0
+STAGING_REHEARSAL_TOKEN_BODY_BYTES = 2 * 1024
+STAGING_REHEARSAL_TOKEN_READ_TIMEOUT_SECONDS = 2.0
+_STAGING_REHEARSAL_TOKEN_PATH = "/v1/auth/staging-rehearsal-token"
 _ABACATEPAY_WEBHOOK_PATH = "/v1/billing/webhook"
 _FIXED_LIMITED_ENDPOINTS = frozenset(
     {
@@ -57,6 +60,13 @@ class IngressBodyLimitMiddleware:
         self.asaas_read_timeout_seconds = asaas_read_timeout_seconds
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        is_staging_rehearsal_token = (
+            scope.get("type") == "http"
+            and scope.get("method") == "POST"
+            and scope.get("path") == _STAGING_REHEARSAL_TOKEN_PATH
+        )
+        if is_staging_rehearsal_token:
+            send = self._no_store_send(send)
         if self._is_asaas_webhook(scope):
             # Separate, exact-path boundary: the Abacate rule and the generic
             # 1 MiB cap below never see this path, and this branch never sees
@@ -77,7 +87,11 @@ class IngressBodyLimitMiddleware:
                 return
 
         body_limit = (
-            ABACATEPAY_WEBHOOK_BODY_BYTES if is_abacatepay else self.max_body_bytes
+            STAGING_REHEARSAL_TOKEN_BODY_BYTES
+            if is_staging_rehearsal_token
+            else (
+                ABACATEPAY_WEBHOOK_BODY_BYTES if is_abacatepay else self.max_body_bytes
+            )
         )
 
         declared_length, valid_length = self._content_length(scope)
@@ -93,7 +107,13 @@ class IngressBodyLimitMiddleware:
         received = 0
         try:
             async with asyncio.timeout(
-                self.abacatepay_read_timeout_seconds if is_abacatepay else None
+                (
+                    STAGING_REHEARSAL_TOKEN_READ_TIMEOUT_SECONDS
+                    if is_staging_rehearsal_token
+                    else (
+                        self.abacatepay_read_timeout_seconds if is_abacatepay else None
+                    )
+                )
             ):
                 while True:
                     message = await receive()
@@ -247,8 +267,27 @@ class IngressBodyLimitMiddleware:
         return (
             scope["type"] == "http"
             and scope.get("method") == "POST"
-            and (path in _FIXED_LIMITED_ENDPOINTS or path == _ABACATEPAY_WEBHOOK_PATH)
+            and (
+                path in _FIXED_LIMITED_ENDPOINTS
+                or path == _ABACATEPAY_WEBHOOK_PATH
+                or path == _STAGING_REHEARSAL_TOKEN_PATH
+            )
         )
+
+    @staticmethod
+    def _no_store_send(send: Send) -> Send:
+        async def send_no_store(message: Message) -> None:
+            if message.get("type") == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() != b"cache-control"
+                ]
+                headers.append((b"cache-control", b"no-store"))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        return send_no_store
 
     @staticmethod
     def _content_length(scope: Scope) -> tuple[int | None, bool]:

@@ -24,13 +24,13 @@ from src.models.billing import (
 )
 from src.observability.metrics import BILLING_TOPUP_CAPABILITY_TRANSITIONS_TOTAL
 from src.repositories.billing import BillingRepository, BillingTransitionEvidence
-from src.services.billing_outbox import authoritative_billing_fact_schema_digest
 from src.services.billing_operations import (
     BillingOperationAuthority,
     BillingOperationRejected,
     OperationMaterial,
     is_sha256_digest,
 )
+from src.services.billing_outbox import authoritative_billing_fact_schema_digest
 
 _ENVIRONMENTS: Final = frozenset({"development", "staging", "production", "test"})
 # The role-specific capability digest is the signed operation payload digest.
@@ -293,10 +293,9 @@ class BillingTopupCapabilityService:
             or capability.producer_compatibility_digest != evidence.producer_digest
             or capability.consumer_compatibility_digest
             != evidence.reconciliation_digest
+            or capability.billing_fact_schema_digest != authoritative_fact_schema_digest
             or capability.billing_fact_schema_digest
-            != authoritative_fact_schema_digest
-            or capability.billing_fact_schema_digest
-                != evidence.billing_fact_schema_digest
+            != evidence.billing_fact_schema_digest
             or capability.operation_id != evidence.operation_id
             or capability.deployment_digest != evidence.deployment_digest
             or capability.reconciliation_receipt_id
@@ -338,7 +337,9 @@ class BillingTopupCapabilityService:
         receipts_by_id = {receipt.id: receipt for receipt in result.scalars()}
         expected = _typed_receipt_pairs(evidence)
         if len(receipts_by_id) != 4:
-            raise BillingCapabilityRejected("billing_topup_capability_receipt_unverified")
+            raise BillingCapabilityRejected(
+                "billing_topup_capability_receipt_unverified"
+            )
         if evidence.request_id is None or evidence.inbox_high_watermark is None:
             raise BillingCapabilityRejected("billing_topup_capability_incomplete")
         for receipt_id, evidence_type, digest, actor_id in expected:

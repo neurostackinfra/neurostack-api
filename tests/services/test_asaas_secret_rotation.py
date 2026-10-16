@@ -19,7 +19,9 @@ from src.services.asaas_secret_rotation import (
 )
 
 _PRIVATE_KEY = bytes(range(1, 33))
-_PUBLIC_KEY = Ed25519PrivateKey.from_private_bytes(_PRIVATE_KEY).public_key().public_bytes_raw()
+_PUBLIC_KEY = (
+    Ed25519PrivateKey.from_private_bytes(_PRIVATE_KEY).public_key().public_bytes_raw()
+)
 
 
 def _receipt(
@@ -44,14 +46,18 @@ def _receipt(
     }
     values.update(overrides)
     unsigned = AsaasSecretRotationReceipt(**values)  # type: ignore[arg-type]
-    signed_content = replace(unsigned, evidence_digest=secret_rotation_receipt_digest(unsigned))
+    signed_content = replace(
+        unsigned, evidence_digest=secret_rotation_receipt_digest(unsigned)
+    )
     return replace(
         signed_content,
         signature=sign_secret_rotation_receipt(signed_content, _PRIVATE_KEY),
     )
 
 
-def _proof(**overrides: object) -> tuple[AsaasSecretRotationProof, bytes, object, object, object]:
+def _proof(
+    **overrides: object,
+) -> tuple[AsaasSecretRotationProof, bytes, object, object, object]:
     now = datetime.now(timezone.utc)
     operation_id = uuid4()
     actor_id = uuid4()
@@ -122,9 +128,20 @@ def _proof(**overrides: object) -> tuple[AsaasSecretRotationProof, bytes, object
         revocation_receipt=revocation,
         compromise_recovery_receipt=recovery,
     )
-    values = {"proof": proof, "public_key": _PUBLIC_KEY, "operation_id": operation_id, "actor_id": actor_id}
+    values = {
+        "proof": proof,
+        "public_key": _PUBLIC_KEY,
+        "operation_id": operation_id,
+        "actor_id": actor_id,
+    }
     values.update(overrides)
-    return values["proof"], values["public_key"], values["operation_id"], actor_id, deployment_digest
+    return (
+        values["proof"],
+        values["public_key"],
+        values["operation_id"],
+        actor_id,
+        deployment_digest,
+    )
 
 
 def test_rotation_requires_signed_evidence_for_every_boundary() -> None:
@@ -157,9 +174,7 @@ def test_rotation_rejects_tampered_or_cross_operation_receipts() -> None:
     proof, public_key, operation_id, actor_id, deployment_digest = _proof()
     tampered = replace(
         proof,
-        promotion_receipt=replace(
-            proof.promotion_receipt, signature="0" * 128
-        ),
+        promotion_receipt=replace(proof.promotion_receipt, signature="0" * 128),
     )
     with pytest.raises(AsaasSecretRotationRejected, match="receipt_unverified"):
         verify_next_to_current(
@@ -186,7 +201,8 @@ def test_rotation_rejects_overlap_longer_than_fifteen_minutes() -> None:
     assert overlap is not None
     expired_overlap = replace(
         overlap,
-        webhook_overlap_started_at=overlap.webhook_overlap_ended_at - timedelta(minutes=16),
+        webhook_overlap_started_at=overlap.webhook_overlap_ended_at
+        - timedelta(minutes=16),
     )
     with pytest.raises(AsaasSecretRotationRejected, match="receipt_invalid"):
         verify_next_to_current(
@@ -222,7 +238,9 @@ def _sequence(
     operation_id, actor_id, deployment_digest = uuid4(), uuid4(), "d" * 64
     current, next_fingerprint = "a" * 64, "b" * 64
 
-    def signed(kind: str, minutes: float, **extra: object) -> AsaasSecretRotationReceipt:
+    def signed(
+        kind: str, minutes: float, **extra: object
+    ) -> AsaasSecretRotationReceipt:
         return _receipt(
             kind,
             operation_id=uuid4() if kind == foreign_kind else operation_id,
@@ -260,7 +278,9 @@ def _sequence(
             current_fingerprint=next_fingerprint,
             candidate_fingerprint=next_fingerprint,
         ),
-        revocation_receipt=signed("revocation", revocation, current_fingerprint=current),
+        revocation_receipt=signed(
+            "revocation", revocation, current_fingerprint=current
+        ),
         compromise_recovery_receipt=signed(
             "compromise_recovery",
             recovery,
@@ -315,7 +335,9 @@ def test_out_of_order_rotation_steps_are_rejected(offsets: dict[str, float]) -> 
 
 def test_overlap_window_is_measured_from_receipts_at_most_fifteen_minutes() -> None:
     # Window = revocation readback - overlap start: exactly 15:00 is legal.
-    _verify(_sequence(candidate=-17, started=-16, overlap=-15.5, ended=-1, revocation=-1))
+    _verify(
+        _sequence(candidate=-17, started=-16, overlap=-15.5, ended=-1, revocation=-1)
+    )
     # 15:01 measured by the receipts although the signed claim says 15:00.
     with pytest.raises(
         AsaasSecretRotationRejected, match="^asaas_secret_rotation_overlap_unproven$"
@@ -354,7 +376,14 @@ def test_missing_or_duplicated_steps_are_rejected() -> None:
     with pytest.raises(
         AsaasSecretRotationRejected, match="^asaas_secret_rotation_evidence_incomplete$"
     ):
-        _verify((replace(proof, candidate_validation_receipt=None), operation_id, actor_id, deployment_digest))
+        _verify(
+            (
+                replace(proof, candidate_validation_receipt=None),
+                operation_id,
+                actor_id,
+                deployment_digest,
+            )
+        )
     with pytest.raises(
         AsaasSecretRotationRejected, match="^asaas_secret_rotation_receipt_reused$"
     ):
@@ -370,7 +399,13 @@ def test_missing_or_duplicated_steps_are_rejected() -> None:
 
 @pytest.mark.parametrize(
     "kind",
-    ["candidate_validation", "webhook_overlap", "promotion", "revocation", "compromise_recovery"],
+    [
+        "candidate_validation",
+        "webhook_overlap",
+        "promotion",
+        "revocation",
+        "compromise_recovery",
+    ],
 )
 def test_a_receipt_from_another_rotation_is_rejected(kind: str) -> None:
     with pytest.raises(

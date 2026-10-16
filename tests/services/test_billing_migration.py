@@ -14,14 +14,16 @@ from src.services.billing_migration import (
     migration_window,
     provider_evidence_digest,
     provider_evidence_signature,
-    validate_target,
     validate_provider_evidence_envelope,
+    validate_target,
 )
 
 _PROVIDER_PRIVATE_KEY = bytes(range(1, 33))
-_PROVIDER_PUBLIC_KEY = Ed25519PrivateKey.from_private_bytes(
-    _PROVIDER_PRIVATE_KEY
-).public_key().public_bytes_raw()
+_PROVIDER_PUBLIC_KEY = (
+    Ed25519PrivateKey.from_private_bytes(_PROVIDER_PRIVATE_KEY)
+    .public_key()
+    .public_bytes_raw()
+)
 
 
 def _target(**overrides: object) -> MigrationTarget:
@@ -180,7 +182,6 @@ def test_provider_evidence_fixture_binds_every_boundary() -> None:
 # Fix cycle 7: São Paulo deadlines (CRITICAL-1) and two-read absence (HIGH-1).
 # ---------------------------------------------------------------------------
 
-import src.api.main  # noqa: E402,F401  (model registry import order, as in conftest)
 from collections.abc import AsyncIterator  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from pathlib import Path  # noqa: E402
@@ -193,6 +194,7 @@ from sqlalchemy.ext.asyncio import (  # noqa: E402
     create_async_engine,
 )
 
+import src.api.main  # noqa: E402,F401  (model registry import order, as in conftest)
 from src.config.settings import settings  # noqa: E402
 from src.models.base import Base  # noqa: E402
 from src.models.billing import (  # noqa: E402
@@ -237,7 +239,10 @@ _T7_FIRST_LATE = datetime(2026, 12, 4, 3, 0, 0, tzinfo=timezone.utc)
         # The same instants carried in other offsets are judged in São Paulo.
         (datetime(2026, 12, 9, 11, 59, 59, tzinfo=timezone(timedelta(hours=9))), False),
         (datetime(2026, 12, 9, 12, 0, 0, tzinfo=timezone(timedelta(hours=9))), True),
-        (datetime(2026, 12, 8, 23, 59, 59, tzinfo=timezone(timedelta(hours=-3))), False),
+        (
+            datetime(2026, 12, 8, 23, 59, 59, tzinfo=timezone(timedelta(hours=-3))),
+            False,
+        ),
         (datetime(2026, 12, 8, 0, 0, tzinfo=timezone.utc), False),
     ],
 )
@@ -248,7 +253,9 @@ def test_cutover_deadline_is_inclusive_through_the_sao_paulo_day(
 
 
 def test_deadline_rejects_a_naive_clock() -> None:
-    with pytest.raises(BillingMigrationRejected, match="^billing_migration_clock_invalid$"):
+    with pytest.raises(
+        BillingMigrationRejected, match="^billing_migration_clock_invalid$"
+    ):
         migration_deadline_passed(datetime(2026, 12, 9, 12, 0), date(2026, 12, 8))
 
 
@@ -315,7 +322,9 @@ async def _seed_subscription(world: _World) -> UUID:
 async def _import(world: _World, *, at: datetime) -> UUID:
     subscription_id = await _seed_subscription(world)
     async with world.sessions() as session:
-        view = await BillingMigrationService(session, clock=lambda: at).import_roster_entry(
+        view = await BillingMigrationService(
+            session, clock=lambda: at
+        ).import_roster_entry(
             builder_id=world.builder_id,
             subscription_id=subscription_id,
             renewal=_T,
@@ -331,7 +340,9 @@ async def _row(world: _World, migration_id: UUID) -> tuple[object, ...]:
         assert migration is not None
         subscription = await session.get(BillingSubscription, migration.subscription_id)
         assert subscription is not None
-        revision = await session.scalar(select(BillingRosterControl.billing_roster_revision))
+        revision = await session.scalar(
+            select(BillingRosterControl.billing_roster_revision)
+        )
         receipts = await session.scalar(
             select(func.count()).select_from(BillingMigrationReceipt)
         )
@@ -362,7 +373,9 @@ async def test_late_cancel_begin_changes_nothing_and_emits_rejected_metric(
     rejected_before = _rejected_count("cancel_begin")
 
     async with world.sessions() as session:
-        with pytest.raises(BillingMigrationRejected, match=f"^{MIGRATION_CUTOVER_LATE}$"):
+        with pytest.raises(
+            BillingMigrationRejected, match=f"^{MIGRATION_CUTOVER_LATE}$"
+        ):
             await BillingMigrationService(
                 session, clock=lambda: _T2_FIRST_LATE
             ).begin_legacy_cancel(migration_id=migration_id, operation_id=uuid4())
@@ -397,7 +410,10 @@ async def test_late_roster_row_is_not_adopted(world: _World) -> None:
             )
         await session.rollback()
     async with world.sessions() as session:
-        assert await session.scalar(select(func.count()).select_from(BillingMigration)) == 0
+        assert (
+            await session.scalar(select(func.count()).select_from(BillingMigration))
+            == 0
+        )
     assert _rejected_count("roster_import") == rejected_before + 1
 
     async with world.sessions() as session:
@@ -410,7 +426,10 @@ async def test_late_roster_row_is_not_adopted(world: _World) -> None:
             target=_legacy_target(),
         )
         await session.commit()
-    assert (view.open_by_date, view.cutover_by_date) == (date(2026, 12, 3), date(2026, 12, 8))
+    assert (view.open_by_date, view.cutover_by_date) == (
+        date(2026, 12, 3),
+        date(2026, 12, 8),
+    )
 
 
 async def _force_state(
@@ -453,7 +472,9 @@ async def test_late_recreate_is_refused_before_any_evidence_check(
     before = await _row(world, migration_id)
     async with world.sessions() as session:
         service = BillingMigrationService(session, clock=lambda: _T2_FIRST_LATE)
-        with pytest.raises(BillingMigrationRejected, match=f"^{MIGRATION_CUTOVER_LATE}$"):
+        with pytest.raises(
+            BillingMigrationRejected, match=f"^{MIGRATION_CUTOVER_LATE}$"
+        ):
             if operation == "recreate_reopen":
                 await service.reopen_recreate_after_absent_readback(
                     migration_id=migration_id, actor_user_id=uuid4()

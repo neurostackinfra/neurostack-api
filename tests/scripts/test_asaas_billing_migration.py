@@ -9,8 +9,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-import src.services.billing_export as billing_export
 
+import src.services.billing_export as billing_export
 from src.services.billing_export import (
     BillingExportRejected,
     discard_expired_export,
@@ -368,12 +368,17 @@ def test_cli_export_refuses_repository_symlinked_and_shared_parents(
     shared = tmp_path / "shared"
     shared.mkdir()
     shared.chmod(0o777)
-    with pytest.raises(BillingExportRejected, match="^billing_export_directory_invalid$"):
+    with pytest.raises(
+        BillingExportRejected, match="^billing_export_directory_invalid$"
+    ):
         module._write_export(shared / "roster.jsonl", data)
     assert list(private.iterdir()) == [] and list(shared.iterdir()) == []
 
     digest, count = module._write_export(private / "roster.jsonl", data)
     assert (digest, count) == (hashlib.sha256(data).hexdigest(), 1)
-    assert validate_migration_export(
-        private / "roster.jsonl", expected_digest=digest, expected_count=1
-    ).row_count == 1
+    assert (
+        validate_migration_export(
+            private / "roster.jsonl", expected_digest=digest, expected_count=1
+        ).row_count
+        == 1
+    )

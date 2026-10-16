@@ -13,8 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.billing import (
     BillingCheckoutSession,
-    BillingOperationReceipt,
     BillingMigration,
+    BillingOperationReceipt,
     BillingOutboxEvent,
     BillingPaymentEffect,
     BillingPaymentProjection,
@@ -265,11 +265,15 @@ class BillingRepository:
                 .with_for_update()
             )
             capability = result.scalar_one_or_none()
-            if capability is None or not _capability_is_valid(
-                capability,
-                environment=environment,
-                now=datetime.now(timezone.utc),
-            ) or capability.deployment_digest != evidence.deployment_digest:
+            if (
+                capability is None
+                or not _capability_is_valid(
+                    capability,
+                    environment=environment,
+                    now=datetime.now(timezone.utc),
+                )
+                or capability.deployment_digest != evidence.deployment_digest
+            ):
                 raise BillingCapabilityRejected("topup capability is not valid")
             binding = await self.session.scalar(
                 select(BillingTopupCapabilityBinding)
@@ -286,28 +290,30 @@ class BillingRepository:
             bound_receipts = list(
                 (
                     await self.session.execute(
-                        select(BillingOperationReceipt).where(
-                    BillingOperationReceipt.environment == environment,
-                    BillingOperationReceipt.operation_id == capability.operation_id,
-                    BillingOperationReceipt.id.in_(
-                        (
-                            binding.producer_receipt_id,
-                            binding.credit_receipt_id,
-                            binding.reconciliation_receipt_id,
-                            binding.verification_receipt_id,
+                        select(BillingOperationReceipt)
+                        .where(
+                            BillingOperationReceipt.environment == environment,
+                            BillingOperationReceipt.operation_id
+                            == capability.operation_id,
+                            BillingOperationReceipt.id.in_(
+                                (
+                                    binding.producer_receipt_id,
+                                    binding.credit_receipt_id,
+                                    binding.reconciliation_receipt_id,
+                                    binding.verification_receipt_id,
+                                )
+                            ),
+                            BillingOperationReceipt.scope == "topup_capability",
+                            BillingOperationReceipt.applied_at.is_(None),
+                            BillingOperationReceipt.request_id == capability.request_id,
+                            BillingOperationReceipt.inbox_high_watermark
+                            == capability.inbox_high_watermark,
+                            BillingOperationReceipt.deployment_digest
+                            == capability.deployment_digest,
+                            BillingOperationReceipt.billing_fact_schema_digest
+                            == capability.billing_fact_schema_digest,
+                            BillingOperationReceipt.expires_at > now,
                         )
-                    ),
-                    BillingOperationReceipt.scope == "topup_capability",
-                    BillingOperationReceipt.applied_at.is_(None),
-                    BillingOperationReceipt.request_id == capability.request_id,
-                    BillingOperationReceipt.inbox_high_watermark
-                    == capability.inbox_high_watermark,
-                    BillingOperationReceipt.deployment_digest
-                    == capability.deployment_digest,
-                    BillingOperationReceipt.billing_fact_schema_digest
-                    == capability.billing_fact_schema_digest,
-                    BillingOperationReceipt.expires_at > now,
-                )
                         .with_for_update()
                     )
                 ).scalars()
@@ -585,14 +591,18 @@ class BillingRepository:
                 .with_for_update()
             )
             capability = capability_result.scalar_one_or_none()
-            if capability is None or not _capability_is_valid(
-                capability,
-                environment=environment,
-                now=datetime.now(timezone.utc),
-            ) or not await self._topup_capability_binding_is_current(
-                capability=capability,
-                environment=environment,
-                now=datetime.now(timezone.utc),
+            if (
+                capability is None
+                or not _capability_is_valid(
+                    capability,
+                    environment=environment,
+                    now=datetime.now(timezone.utc),
+                )
+                or not await self._topup_capability_binding_is_current(
+                    capability=capability,
+                    environment=environment,
+                    now=datetime.now(timezone.utc),
+                )
             ):
                 raise BillingCapabilityRejected("topup capability is not valid")
         else:

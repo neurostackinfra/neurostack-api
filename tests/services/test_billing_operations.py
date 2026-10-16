@@ -7,16 +7,16 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from src.models.billing import BillingOperationReceipt, BillingRolloutReadinessReceipt
 from src.services.billing_operations import (
     BillingOperationRejected,
-    OperatorReceipt,
     OperationMaterial,
+    OperatorReceipt,
     operation_payload_digest,
     require_operator_quorum,
     sign_operation_payload,
     verify_operation_signature,
 )
-from src.models.billing import BillingOperationReceipt, BillingRolloutReadinessReceipt
 from src.services.billing_rollout import (
     _readiness_content_digest,
     _readiness_evidence_is_bound,
@@ -188,13 +188,16 @@ def _readiness_fixture(
         "actor_user_id": uuid4(),
         "signature_sha256": "c" * 64,
     }
-    deployer = BillingOperationReceipt(
-        id=deployer_id, role="deployer", **common
-    )
+    deployer = BillingOperationReceipt(id=deployer_id, role="deployer", **common)
     reviewer = BillingOperationReceipt(
         id=reviewer_id,
         role="reviewer",
-        **{**common, "nonce": uuid4(), "assignment_id": uuid4(), "actor_user_id": uuid4()},
+        **{
+            **common,
+            "nonce": uuid4(),
+            "assignment_id": uuid4(),
+            "actor_user_id": uuid4(),
+        },
     )
     row = BillingRolloutReadinessReceipt(
         id=uuid4(),
@@ -250,7 +253,9 @@ def test_readiness_rejects_expired_referenced_operation_evidence() -> None:
 
 def test_readiness_rejects_fresh_row_with_mismatched_deployment_evidence() -> None:
     now = datetime.now(timezone.utc)
-    row, evidence = _readiness_fixture(now=now, operation_expires_at=now + timedelta(minutes=10))
+    row, evidence = _readiness_fixture(
+        now=now, operation_expires_at=now + timedelta(minutes=10)
+    )
     row.app_digest = "e" * 64
 
     assert (

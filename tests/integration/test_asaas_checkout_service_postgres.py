@@ -898,9 +898,7 @@ async def _signed_receipt(
         sign_operation_payload,
     )
 
-    authority = BillingOperationAuthority(
-        session, signing_key=_CAPABILITY_SIGNING_KEY
-    )
+    authority = BillingOperationAuthority(session, signing_key=_CAPABILITY_SIGNING_KEY)
     actor_id = uuid4()
     assignment = await authority.assign(
         material=material, role=role, actor_user_id=actor_id  # type: ignore[arg-type]

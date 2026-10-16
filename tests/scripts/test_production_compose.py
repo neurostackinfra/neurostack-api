@@ -72,9 +72,10 @@ def test_compose_uses_only_approved_app_digest_and_named_volumes() -> None:
         "BILLING_OBSERVABILITY_SMOKE_DIGEST:?"
         in api_env["BILLING_OBSERVABILITY_SMOKE_DIGEST"]
     )
-    assert "BILLING_OBSERVABILITY_SMOKE_TOKEN:?" in api_env[
-        "BILLING_OBSERVABILITY_SMOKE_TOKEN"
-    ]
+    assert (
+        "BILLING_OBSERVABILITY_SMOKE_TOKEN:?"
+        in api_env["BILLING_OBSERVABILITY_SMOKE_TOKEN"]
+    )
     assert "BILLING_ALERT_RECEIVER_URL:?" in api_env["BILLING_ALERT_RECEIVER_URL"]
     assert "command" not in services["api"]
     assert "entrypoint" not in services["api"]

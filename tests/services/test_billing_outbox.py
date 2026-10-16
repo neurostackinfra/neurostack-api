@@ -483,16 +483,13 @@ async def test_fact_rows_satisfy_enforced_foreign_keys_on_sqlite(
             )
             assert outbox is not None
             await session.commit()
-            assert (
-                await session.scalar(
-                    select(BillingFactHandoff.delivery_id).where(
-                        BillingFactHandoff.outbox_event_id == outbox.id
-                    )
+            assert await session.scalar(
+                select(BillingFactHandoff.delivery_id).where(
+                    BillingFactHandoff.outbox_event_id == outbox.id
                 )
-                == await session.scalar(
-                    select(BillingFactDelivery.id).where(
-                        BillingFactDelivery.outbox_event_id == outbox.id
-                    )
+            ) == await session.scalar(
+                select(BillingFactDelivery.id).where(
+                    BillingFactDelivery.outbox_event_id == outbox.id
                 )
             )
     finally:

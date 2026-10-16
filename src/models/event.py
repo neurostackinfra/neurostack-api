@@ -13,7 +13,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from src.core.interaction_context import InteractionOrigin
+from src.interaction_context import InteractionOrigin
 from src.models.base import Base
 
 if TYPE_CHECKING:

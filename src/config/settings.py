@@ -5,11 +5,13 @@ Centralized configuration using Pydantic Settings
 
 import hashlib
 import json
+import os
+import stat
+from collections.abc import Mapping
+from datetime import datetime, timezone
 from functools import lru_cache
 from ipaddress import ip_address
 from pathlib import Path
-import stat
-from datetime import datetime, timezone
 from typing import Final, Literal
 from urllib.parse import urlsplit
 
@@ -111,6 +113,26 @@ def _is_safe_https_receiver(value: str) -> bool:
         return True
 
 
+def _is_kms_key_arn(value: str) -> bool:
+    """Accept immutable KMS key ARNs, never aliases or arbitrary strings."""
+
+    parts = value.split(":", 5)
+    if len(parts) != 6:
+        return False
+    arn, partition, service, region, account_id, resource = parts
+    return (
+        arn == "arn"
+        and partition in {"aws", "aws-us-gov", "aws-cn"}
+        and service == "kms"
+        and bool(region)
+        and len(account_id) == 12
+        and account_id.isdecimal()
+        and resource.startswith("key/")
+        and bool(resource.removeprefix("key/"))
+        and not resource.startswith("key/alias/")
+    )
+
+
 def _is_sha256_digest(value: str) -> bool:
     return len(value) == 64 and all(
         character in "0123456789abcdef" for character in value
@@ -145,9 +167,7 @@ def runtime_acknowledgement_challenge_digest(
         "rules_digest": rules_digest,
         "smoke_digest": smoke_digest,
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
-        "ascii"
-    )
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -380,6 +400,29 @@ class Settings(BaseSettings):
     # Local control-plane authentication.  It signs only closed receipt
     # digests, never provider payloads, customer data, or API credentials.
     billing_operation_receipt_signing_key: SecretStr = SecretStr("")
+    # Group 7b canonical producer signing and verification configuration.
+    billing_receipt_signing_key: SecretStr = SecretStr("")
+    billing_receipt_verification_public_key: str = ""
+    billing_deploy_authorization_public_key: str = ""
+    billing_build_attestation_public_key: str = ""
+    billing_producer_grant_issuer: str = ""
+    billing_producer_grant_kid: str = ""
+    billing_producer_grant_audience: str = ""
+    billing_producer_grant_public_key: str = ""
+    billing_producer_build_issuer: str = ""
+    billing_producer_build_kid: str = ""
+    billing_producer_build_audience: str = ""
+    billing_producer_build_public_key: str = ""
+    billing_producer_build_repository_id: str = ""
+    billing_producer_build_repository_name: str = ""
+    billing_producer_build_workflow_path: str = ""
+    billing_producer_build_workflow_ref: str = ""
+    billing_producer_build_oidc_issuer: str = ""
+    billing_producer_build_oidc_subject: str = ""
+    billing_producer_receipt_issuer: str = ""
+    billing_producer_receipt_kid: str = ""
+    billing_producer_receipt_audience: str = ""
+    billing_producer_receipt_public_key: str = ""
     billing_fact_schema_digest: str = ""
     billing_prometheus_rules_digest: str = ""
     billing_prometheus_rules_path: Path = Path("config/prometheus_rules.yml")
@@ -518,11 +561,34 @@ class Settings(BaseSettings):
                     "SECRET_KEY must be changed from default value in production. "
                     "Set a secure SECRET_KEY environment variable."
                 )
+        elif environment == "staging" and v == (
+            "dev-secret-key-change-in-production-min-32-chars-required"
+        ):
+            raise ValueError(
+                "SECRET_KEY must be changed from the default value in staging. "
+                "Set a secure SECRET_KEY environment variable."
+            )
         return v
 
     @model_validator(mode="after")
     def validate_production_settings(self) -> "Settings":
         """Validate critical settings for production environment."""
+        producer_key_arns = (
+            self.billing_producer_grant_kid,
+            self.billing_producer_build_kid,
+            self.billing_producer_receipt_kid,
+        )
+        configured_producer_keys = tuple(key for key in producer_key_arns if key)
+        if configured_producer_keys and (
+            len(configured_producer_keys) != len(producer_key_arns)
+            or len(set(configured_producer_keys)) != len(producer_key_arns)
+            or any(not _is_kms_key_arn(key) for key in configured_producer_keys)
+        ):
+            raise ValueError(
+                "producer grant, build and receipt KMS key ARNs must be configured "
+                "and distinct"
+            )
+
         if self.environment == "production":
             errors = []
 
@@ -603,6 +669,45 @@ class Settings(BaseSettings):
                 raise ConfigurationError(error_msg)
 
         return self
+
+    def validate_runtime_environment(
+        self,
+        environ: Mapping[str, str] | None = None,
+    ) -> None:
+        """Require staging's JWT signing key to come from runtime injection."""
+
+        if self.environment != "staging":
+            return
+
+        if self.api_prefix != "/v1":
+            raise ConfigurationError(
+                "Invalid staging API_PREFIX; the canonical prefix is /v1."
+            )
+
+        source = os.environ if environ is None else environ
+        missing = sorted(
+            name
+            for name in ("ENVIRONMENT", "SECRET_KEY")
+            if not source.get(name, "").strip()
+        )
+        if missing:
+            raise ConfigurationError(
+                "Missing required staging runtime settings: " + ", ".join(missing)
+            )
+
+        runtime_secret_key = source["SECRET_KEY"]
+        if (
+            source["ENVIRONMENT"] != "staging"
+            or len(runtime_secret_key) < 32
+            or runtime_secret_key
+            == "dev-secret-key-change-in-production-min-32-chars-required"
+            or runtime_secret_key != self.secret_key
+        ):
+            raise ConfigurationError(
+                "Invalid staging SECRET_KEY runtime injection; provide a "
+                "non-default key of at least 32 characters matching the "
+                "loaded setting."
+            )
 
     @property
     def is_production(self) -> bool:

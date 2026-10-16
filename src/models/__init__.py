@@ -26,6 +26,20 @@ from src.models.billing import (
     BillingTopupOrder,
     BillingWebhookDelivery,
 )
+from src.models.billing_producer import (
+    BillingProducerActivePair,
+    BillingProducerBuildAttestation,
+    BillingProducerGrant,
+    BillingProducerReceipt,
+)
+from src.models.billing_producer_signed import (
+    BillingProducerV1ActivePair,
+    BillingProducerV1BuildAttestation,
+    BillingProducerV1Grant,
+    BillingProducerV1GrantConsumption,
+    BillingProducerV1GrantRevocation,
+    BillingProducerV1Receipt,
+)
 from src.models.builder import Builder
 from src.models.clinic_config import ClinicConfig
 from src.models.clinic_config_table import ClinicConfigTable
@@ -67,6 +81,16 @@ __all__ = [
     "BillingFactHandoff",
     "BillingFactAck",
     "BillingFactReconciliationAlert",
+    "BillingProducerGrant",
+    "BillingProducerBuildAttestation",
+    "BillingProducerReceipt",
+    "BillingProducerActivePair",
+    "BillingProducerV1Grant",
+    "BillingProducerV1GrantConsumption",
+    "BillingProducerV1GrantRevocation",
+    "BillingProducerV1BuildAttestation",
+    "BillingProducerV1Receipt",
+    "BillingProducerV1ActivePair",
     # Core Models
     "Builder",
     "Coupon",

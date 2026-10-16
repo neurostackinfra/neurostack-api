@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from passlib.context import CryptContext
 from sqlalchemy import cast, func, select
 from sqlalchemy.exc import IntegrityError
@@ -1556,7 +1556,7 @@ async def list_billing_migrations(
     # Revision equality is not a fence: webhook ingestion may create rows
     # without advancing it.  Bind the global roster lock, capture IDs, then
     # re-read the exact rows while the lock is held.
-    roster_revision = await BillingRepository(session).lock_billing_roster()
+    await BillingRepository(session).lock_billing_roster()
     id_result = await session.execute(
         select(BillingMigration.id).order_by(
             BillingMigration.created_at, BillingMigration.id
@@ -1821,7 +1821,9 @@ async def manually_intervene_billing_migration(
     return _migration_response(view)
 
 
-def _provider_evidence(body: BillingProviderEvidenceRequest) -> ProviderEvidenceEnvelope:
+def _provider_evidence(
+    body: BillingProviderEvidenceRequest,
+) -> ProviderEvidenceEnvelope:
     return ProviderEvidenceEnvelope(
         external_reference=body.external_reference,
         provider_event_id=body.provider_event_id,
@@ -1939,6 +1941,38 @@ async def transition_billing_rollout_control(
     ) as exc:
         await session.rollback()
         raise _billing_http_error(exc) from exc
+    return _rollout_response(control)
+
+
+@router.get(
+    "/billing/rollout/readback",
+    response_model=BillingRolloutControlResponse,
+    summary="Read the persisted staging billing rollout state",
+)
+async def read_staging_billing_rollout(
+    response: Response,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingRolloutControlResponse:
+    """Return only the closed rollout gate snapshot used by the rehearsal."""
+
+    _billing_actor(tenant)
+    if settings.environment != "staging":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="billing_rollout_readback_unavailable",
+        )
+    try:
+        control = await BillingRepository(session).lock_rollout_control(
+            environment="staging"
+        )
+    except BillingStateUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="billing_rollout_readback_unavailable",
+        ) from exc
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     return _rollout_response(control)
 
 

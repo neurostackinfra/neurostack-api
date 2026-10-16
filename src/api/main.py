@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import make_asgi_app
+from redis.asyncio import Redis
 
 from neurostack_core import enable_metrics
 
@@ -43,6 +44,8 @@ from src.api.routes import (
     admin,
     auth,
     billing,
+    billing_producer,
+    billing_producer_setup,
     builder,
     config,
     demo_leads,
@@ -116,6 +119,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan handler for startup and shutdown events."""
     # Startup - Validate configuration
     try:
+        settings.validate_runtime_environment()
         # Settings validation happens during instantiation, but we log it here
         logger.info(
             "Starting NeuroStack API",
@@ -157,7 +161,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     await init_database()
     webhook_refresher = _start_webhook_readiness_refresher()
+    redis_client: Redis | None = None
     try:
+        if settings.environment == "staging":
+            redis_client = Redis.from_url(
+                settings.redis_url,
+                max_connections=settings.redis_max_connections,
+                socket_timeout=settings.redis_socket_timeout,
+                decode_responses=True,
+            )
+        app.state.redis = redis_client
         yield
     finally:
         if webhook_refresher is not None:
@@ -176,7 +189,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             try:
                 await close_handoff_service()
             finally:
-                await close_database()
+                try:
+                    if redis_client is not None:
+                        await redis_client.aclose()
+                finally:
+                    app.state.redis = None
+                    await close_database()
 
 
 def create_app() -> FastAPI:
@@ -587,6 +605,16 @@ def create_app() -> FastAPI:
         admin.router,
         prefix=f"{settings.api_prefix}/admin",
         tags=["Admin"],
+    )
+    app.include_router(
+        billing_producer.router,
+        prefix=f"{settings.api_prefix}/admin/billing/producer-receipts",
+        tags=["Billing Producer"],
+    )
+    app.include_router(
+        billing_producer_setup.router,
+        prefix=f"{settings.api_prefix}/admin/billing",
+        tags=["Billing Producer Setup"],
     )
     app.include_router(
         rlhf.router,

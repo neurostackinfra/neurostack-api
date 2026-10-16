@@ -20,7 +20,6 @@ from src.models.billing import (
     BillingRolloutReadinessReceipt,
     BillingRosterControl,
 )
-from src.services.billing_outbox import billing_fact_bundle_digest
 from src.repositories.billing import (
     BillingRepository,
     BillingTransitionEvidence,
@@ -31,6 +30,7 @@ from src.services.billing_operations import (
     BillingOperationRejected,
     OperationMaterial,
 )
+from src.services.billing_outbox import billing_fact_bundle_digest
 
 BILLING_CHECKOUT_UNAVAILABLE = "billing_checkout_unavailable"
 
@@ -476,7 +476,9 @@ class BillingRolloutOperationService:
                 select(BillingRosterControl).with_for_update()
             )
             if roster is None:
-                raise BillingOperationRejected("billing_rollout_readiness_roster_invalid")
+                raise BillingOperationRejected(
+                    "billing_rollout_readiness_roster_invalid"
+                )
             result = await self._repository.session.execute(
                 select(BillingRolloutReadinessReceipt)
                 .where(

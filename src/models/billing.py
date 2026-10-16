@@ -1407,9 +1407,7 @@ class BillingTopupCapabilityReceipt(Base):
     operation_id: Mapped[UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), nullable=True
     )
-    deployment_digest: Mapped[str | None] = mapped_column(
-        String(64), nullable=True
-    )
+    deployment_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     credit_deployment_digest: Mapped[str] = mapped_column(String(100), nullable=False)
     billing_fact_schema_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     producer_compatibility_digest: Mapped[str] = mapped_column(
@@ -1653,7 +1651,9 @@ class BillingOperationReceipt(Base):
             name="ck_billing_operation_receipts_digests",
         ),
         UniqueConstraint("nonce", name="uq_billing_operation_receipts_nonce"),
-        UniqueConstraint("environment", "id", name="uq_billing_operation_receipts_environment_id"),
+        UniqueConstraint(
+            "environment", "id", name="uq_billing_operation_receipts_environment_id"
+        ),
         UniqueConstraint(
             "assignment_id", name="uq_billing_operation_receipts_assignment"
         ),
@@ -1684,9 +1684,7 @@ class BillingOperationReceipt(Base):
     request_id: Mapped[UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), nullable=True
     )
-    inbox_high_watermark: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True
-    )
+    inbox_high_watermark: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Typed capability attestations carry the deployed fact-contract digest
     # independently of the operation payload/deployment identities.  It is
     # nullable for the ordinary rollout/migration quorum rows.
@@ -1718,7 +1716,9 @@ class BillingRolloutReadinessReceipt(Base):
             "receipt_kind IN ('readiness', 'backlog', 'provisioning', 'smoke')",
             name="ck_billing_rollout_readiness_kind",
         ),
-        CheckConstraint("status = 'passed'", name="ck_billing_rollout_readiness_status"),
+        CheckConstraint(
+            "status = 'passed'", name="ck_billing_rollout_readiness_status"
+        ),
         CheckConstraint(
             "roster_revision >= 0",
             name="ck_billing_rollout_readiness_roster_revision",
@@ -1735,7 +1735,9 @@ class BillingRolloutReadinessReceipt(Base):
             name="ck_billing_rollout_readiness_fresh",
         ),
         UniqueConstraint(
-            "environment", "receipt_kind", "rollout_revision",
+            "environment",
+            "receipt_kind",
+            "rollout_revision",
             name="uq_billing_rollout_readiness_revision",
         ),
         ForeignKeyConstraint(
@@ -1752,7 +1754,9 @@ class BillingRolloutReadinessReceipt(Base):
         ),
     )
 
-    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid4
+    )
     environment: Mapped[str] = mapped_column(String(20), nullable=False)
     receipt_kind: Mapped[str] = mapped_column(String(20), nullable=False)
     rollout_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -1769,8 +1773,12 @@ class BillingRolloutReadinessReceipt(Base):
     rule_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     bundle_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     app_digest: Mapped[str] = mapped_column(String(64), nullable=False)
-    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
 
 
 class BillingRolloutControl(Base):

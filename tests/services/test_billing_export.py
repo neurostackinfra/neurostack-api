@@ -21,17 +21,22 @@ def _write_expired(path: Path) -> None:
     os.utime(path, (old, old))
 
 
-def test_discard_records_unlinked_only_after_successful_disposal(tmp_path: Path) -> None:
+def test_discard_records_unlinked_only_after_successful_disposal(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "roster.jsonl"
     _write_expired(path)
     receipts: list[export.ExportDiscardReceipt] = []
 
-    assert export.discard_expired_export_with_receipt(
-        path,
-        receipt_writer=receipts.append,
-        now=datetime.now(timezone.utc),
-        actor="operator-1",
-    ) is True
+    assert (
+        export.discard_expired_export_with_receipt(
+            path,
+            receipt_writer=receipts.append,
+            now=datetime.now(timezone.utc),
+            actor="operator-1",
+        )
+        is True
+    )
 
     assert not path.exists()
     assert len(receipts) == 1
@@ -144,13 +149,17 @@ def test_validation_never_reads_through_a_swapped_path(
     with pytest.raises(BillingExportRejected, match="^billing_export_file_invalid$"):
         export.validate_migration_export(
             path,
-            expected_digest=original_digest if expected == "original" else attacker_digest,
+            expected_digest=(
+                original_digest if expected == "original" else attacker_digest
+            ),
             expected_count=1,
         )
     assert swapped == [True]
 
 
-def test_validation_rejects_hardlink_fifo_owner_mode_and_symlink(tmp_path: Path) -> None:
+def test_validation_rejects_hardlink_fifo_owner_mode_and_symlink(
+    tmp_path: Path,
+) -> None:
     content = _rows("m")
     path = tmp_path / "roster.jsonl"
     digest = _fresh(path, content)
@@ -179,14 +188,22 @@ def test_parent_must_be_private_unlinked_and_outside_the_repository(
 
     # Symlinked parent (and symlinked grandparent).
     for path in (tmp_path / "link" / "roster.jsonl",):
-        with pytest.raises(BillingExportRejected, match="^billing_export_path_invalid$"):
-            export.validate_migration_export(path, expected_digest=digest, expected_count=1)
-        with pytest.raises(BillingExportRejected, match="^billing_export_path_invalid$"):
+        with pytest.raises(
+            BillingExportRejected, match="^billing_export_path_invalid$"
+        ):
+            export.validate_migration_export(
+                path, expected_digest=digest, expected_count=1
+            )
+        with pytest.raises(
+            BillingExportRejected, match="^billing_export_path_invalid$"
+        ):
             export.create_migration_export(tmp_path / "link" / "new.jsonl", content)
     nested = real / "nested"
     nested.mkdir(mode=0o700)
     with pytest.raises(BillingExportRejected, match="^billing_export_path_invalid$"):
-        export.create_migration_export(tmp_path / "link" / "nested" / "new.jsonl", content)
+        export.create_migration_export(
+            tmp_path / "link" / "nested" / "new.jsonl", content
+        )
 
     # Group/world-accessible parents.
     for mode in (0o777, 0o770, 0o750):
@@ -253,9 +270,7 @@ def test_create_is_exclusive_private_and_leaves_nothing_on_failure(
 
     real_write = os.write
 
-    def short_write(
-        fd: int, payload: bytes, *, failure_code: str = "x"
-    ) -> None:
+    def short_write(fd: int, payload: bytes, *, failure_code: str = "x") -> None:
         real_write(fd, payload[: len(payload) // 2])
         raise BillingExportRejected(failure_code)
 

@@ -572,9 +572,7 @@ async def test_production_readiness_rejects_missing_runtime_acknowledgement(
     monkeypatch.setattr(
         health,
         "settings",
-        configured.model_copy(
-            update={"billing_observability_acknowledgement": ""}
-        ),
+        configured.model_copy(update={"billing_observability_acknowledgement": ""}),
     )
     _live_production_dependencies(monkeypatch)
     response = Response()

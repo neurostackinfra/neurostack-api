@@ -116,7 +116,9 @@ def test_every_billing_admin_route_including_absence_reads_requires_jwt() -> Non
         for route in router.routes
         if getattr(route, "path", "").startswith(("/admin/billing/", "/billing/"))
     }
-    assert any(path.endswith("/billing/migrations/absence-reads") for path in billing_routes)
+    assert any(
+        path.endswith("/billing/migrations/absence-reads") for path in billing_routes
+    )
     for path, route in billing_routes.items():
         dependencies = {
             dependency.call for dependency in route.dependant.dependencies  # type: ignore[attr-defined]
@@ -132,7 +134,9 @@ def test_provider_flip_takes_the_asaas_id_only_from_the_signed_envelope() -> Non
         BillingProviderEvidenceRequest,
     )
 
-    assert "asaas_subscription_id" not in BillingMigrationProviderFlipRequest.model_fields
+    assert (
+        "asaas_subscription_id" not in BillingMigrationProviderFlipRequest.model_fields
+    )
     assert BillingMigrationProviderFlipRequest.model_fields["evidence"].is_required()
     with pytest.raises(ValidationError):
         BillingProviderEvidenceRequest.model_validate(

@@ -11,8 +11,8 @@ from src.models.billing import BillingOperationReceipt
 from src.services.billing_capability import (
     BillingCapabilityRejected,
     TopupCapabilityEvidence,
-    validate_capability_receipt_binding,
     validate_capability_evidence,
+    validate_capability_receipt_binding,
 )
 from src.services.billing_outbox import billing_fact_schema_digest
 

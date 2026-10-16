@@ -200,3 +200,135 @@ def test_production_billing_observability_fails_closed(
         _production_settings(
             abacatepay_webhook_secret="legacy-fixture-secret", **overrides
         )
+
+
+@pytest.mark.parametrize(
+    "keys",
+    [
+        (
+            "arn:aws:kms:us-east-1:123456789012:key/grant",
+            "arn:aws:kms:us-east-1:123456789012:key/build",
+            "arn:aws:kms:us-east-1:123456789012:key/build",
+        ),
+        (
+            "arn:aws:kms:us-east-1:123456789012:key/grant",
+            "arn:aws:kms:us-east-1:123456789012:key/build",
+            "",
+        ),
+        ("grant", "build", "receipt"),
+        (
+            "arn:aws:kms:us-east-1:123456789012:key/alias/grant",
+            "arn:aws:kms:us-east-1:123456789012:key/build",
+            "arn:aws:kms:us-east-1:123456789012:key/receipt",
+        ),
+    ],
+)
+def test_producer_kms_key_arns_must_be_complete_distinct_key_arns(
+    keys: tuple[str, str, str],
+) -> None:
+    with pytest.raises(ValidationError, match="producer grant, build and receipt"):
+        Settings(
+            _env_file=None,
+            billing_producer_grant_kid=keys[0],
+            billing_producer_build_kid=keys[1],
+            billing_producer_receipt_kid=keys[2],
+        )
+
+
+def test_producer_kms_key_arns_accept_three_distinct_keys() -> None:
+    configured = Settings(
+        _env_file=None,
+        billing_producer_grant_kid="arn:aws:kms:us-east-1:123456789012:key/grant",
+        billing_producer_build_kid="arn:aws:kms:us-east-1:123456789012:key/build",
+        billing_producer_receipt_kid="arn:aws:kms:us-east-1:123456789012:key/receipt",
+    )
+
+    assert (
+        len(
+            {
+                configured.billing_producer_grant_kid,
+                configured.billing_producer_build_kid,
+                configured.billing_producer_receipt_kid,
+            }
+        )
+        == 3
+    )
+
+
+def _staging_settings(secret_key: str) -> Settings:
+    return Settings(_env_file=None, environment="staging", secret_key=secret_key)
+
+
+def test_staging_rejects_default_signing_key_without_disclosure() -> None:
+    default_key = "dev-secret-key-change-in-production-min-32-chars-required"
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(_env_file=None, environment="staging", secret_key=default_key)
+
+    assert default_key not in str(exc_info.value)
+    assert "changed from the default value in staging" in str(exc_info.value)
+
+
+def test_staging_runtime_requires_secret_key_injection() -> None:
+    configured_key = "configured-staging-signing-key-at-least-32"
+    configured = _staging_settings(configured_key)
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        configured.validate_runtime_environment({"ENVIRONMENT": "staging"})
+
+    assert "SECRET_KEY" in str(exc_info.value)
+    assert configured_key not in str(exc_info.value)
+
+
+def test_staging_runtime_rejects_noncanonical_api_prefix() -> None:
+    signing_key = "configured-staging-signing-key-at-least-32"
+    configured = Settings(
+        _env_file=None,
+        environment="staging",
+        secret_key=signing_key,
+        api_prefix="/internal",
+    )
+
+    with pytest.raises(ConfigurationError, match="canonical prefix is /v1"):
+        configured.validate_runtime_environment(
+            {"ENVIRONMENT": "staging", "SECRET_KEY": signing_key}
+        )
+
+
+@pytest.mark.parametrize(
+    ("runtime_environment", "runtime_secret_key"),
+    [
+        ("staging", "dev-secret-key-change-in-production-min-32-chars-required"),
+        ("staging", "short-staging-key"),
+        ("production", "injected-staging-signing-key-at-least-32-characters"),
+        ("staging", "different-staging-signing-key-at-least-32-characters"),
+    ],
+)
+def test_staging_runtime_rejects_bad_or_mismatched_secret_without_disclosure(
+    runtime_environment: str,
+    runtime_secret_key: str,
+) -> None:
+    configured_key = "configured-staging-signing-key-at-least-32"
+    configured = _staging_settings(configured_key)
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        configured.validate_runtime_environment(
+            {
+                "ENVIRONMENT": runtime_environment,
+                "SECRET_KEY": runtime_secret_key,
+            }
+        )
+
+    rendered_error = str(exc_info.value)
+    assert runtime_secret_key not in rendered_error
+    assert configured_key not in rendered_error
+    assert "Invalid staging SECRET_KEY runtime injection" in rendered_error
+
+
+def test_staging_runtime_accepts_valid_injected_signing_key() -> None:
+    signing_key = "injected-staging-signing-key-at-least-32-characters"
+    configured = _staging_settings(signing_key)
+
+    configured.validate_runtime_environment(
+        {"ENVIRONMENT": "staging", "SECRET_KEY": signing_key}
+    )

@@ -39,7 +39,6 @@ from src.repositories.billing import (
     BillingRepository,
     BillingRevisionConflict,
     BillingStateUnavailable,
-    BillingTransitionRejected,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -290,7 +289,9 @@ def validate_target(target: MigrationTarget) -> dict[str, object]:
     return snapshot
 
 
-def checkout_pricing_snapshot(target_snapshot: Mapping[str, object]) -> dict[str, object]:
+def checkout_pricing_snapshot(
+    target_snapshot: Mapping[str, object],
+) -> dict[str, object]:
     """Project the migration target onto the checkout snapshot allowlist.
 
     ``billing_checkout_sessions`` (Group 1 CHECK
@@ -393,9 +394,11 @@ def provider_evidence_signature(
         or len(signing_key) != 32
     ):
         raise BillingMigrationRejected("billing_migration_receipt_invalid")
-    return Ed25519PrivateKey.from_private_bytes(signing_key).sign(
-        provider_digest.encode("ascii")
-    ).hex()
+    return (
+        Ed25519PrivateKey.from_private_bytes(signing_key)
+        .sign(provider_digest.encode("ascii"))
+        .hex()
+    )
 
 
 def _provider_public_key(value: bytes | str | None) -> Ed25519PublicKey:
@@ -999,10 +1002,9 @@ class BillingMigrationService:
             self._record_operation("cancel_reconcile")
             return self._view(migration)
 
-        if (
-            not _PROVIDER_ID.fullmatch(subscription.external_subscription_id)
-            or observed < _aware_utc(migration.created_at)
-        ):
+        if not _PROVIDER_ID.fullmatch(
+            subscription.external_subscription_id
+        ) or observed < _aware_utc(migration.created_at):
             raise BillingMigrationRejected("billing_migration_receipt_invalid")
         self._session.add(
             BillingMigrationReceipt(
@@ -1319,7 +1321,9 @@ class BillingMigrationService:
         elif len(reads) == 1 and reads[0].read_no == 1:
             first = reads[0]
             if first.provider_event_id == evidence.provider_event_id:
-                raise BillingMigrationRejected("billing_migration_absence_read_duplicate")
+                raise BillingMigrationRejected(
+                    "billing_migration_absence_read_duplicate"
+                )
             if (
                 first.prior_checkout_session_id != prior_id
                 or _aware_utc(first.convergence_limit_at) != limit
@@ -1331,7 +1335,9 @@ class BillingMigrationService:
                 evidence.provider_observed_at
                 < _aware_utc(first.provider_observed_at) + ABSENCE_READ_SPACING
             ):
-                raise BillingMigrationRejected("billing_migration_absence_read_too_soon")
+                raise BillingMigrationRejected(
+                    "billing_migration_absence_read_too_soon"
+                )
             read_no = 2
         else:
             raise BillingMigrationRejected("billing_migration_absence_reads_complete")
@@ -1505,9 +1511,11 @@ class BillingMigrationService:
                 expected_provider_key_id=key_id,
                 expected_provider_operation=PROVIDER_ABSENCE_OPERATION,
             )
-        if first.provider_event_id == second.provider_event_id or _aware_utc(
-            second.provider_observed_at
-        ) < _aware_utc(first.provider_observed_at) + ABSENCE_READ_SPACING:
+        if (
+            first.provider_event_id == second.provider_event_id
+            or _aware_utc(second.provider_observed_at)
+            < _aware_utc(first.provider_observed_at) + ABSENCE_READ_SPACING
+        ):
             raise BillingMigrationRejected("billing_migration_absence_reads_invalid")
         if (
             receipt.provider_event_id != second.provider_event_id

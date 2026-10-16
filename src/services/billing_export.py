@@ -157,7 +157,10 @@ def _repository_roots() -> tuple[Path, ...]:
                 if not gitdir.is_absolute():
                     gitdir = candidate / gitdir
                 gitdir = gitdir.resolve()
-                if gitdir.parent.name == "worktrees" and gitdir.parent.parent.name == ".git":
+                if (
+                    gitdir.parent.name == "worktrees"
+                    and gitdir.parent.parent.name == ".git"
+                ):
                     roots.append(gitdir.parent.parent.parent)
             break
     return tuple(dict.fromkeys(root.resolve() for root in roots))
@@ -387,7 +390,9 @@ def _append_discard_receipt(path: Path, receipt: ExportDiscardReceipt) -> None:
         + b"\n"
     )
     location = _open_export_location(
-        Path(os.fspath(path)).with_name(f"{Path(os.fspath(path)).name}.discard.receipts.jsonl")
+        Path(os.fspath(path)).with_name(
+            f"{Path(os.fspath(path)).name}.discard.receipts.jsonl"
+        )
     )
     try:
         try:
@@ -398,7 +403,9 @@ def _append_discard_receipt(path: Path, receipt: ExportDiscardReceipt) -> None:
                 dir_fd=location.directory_fd,
             )
         except OSError as exc:
-            raise BillingExportRejected("billing_export_discard_receipt_failed") from exc
+            raise BillingExportRejected(
+                "billing_export_discard_receipt_failed"
+            ) from exc
         try:
             metadata = os.fstat(fd)
             if (
@@ -533,7 +540,9 @@ def discard_expired_export_with_receipt(
                     ) from receipt_exc
                 raise exc
             receipt_writer(
-                replace(receipt, path_disposition="unlinked", disposal_path="quarantine")
+                replace(
+                    receipt, path_disposition="unlinked", disposal_path="quarantine"
+                )
             )
         finally:
             os.close(fd)

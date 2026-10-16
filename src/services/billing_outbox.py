@@ -193,9 +193,7 @@ def billing_fact_schema_digest(schema: Path | None = None) -> str:
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError as exc:
-        raise BillingFactViolation(
-            "billing fact schema is unavailable"
-        ) from exc
+        raise BillingFactViolation("billing fact schema is unavailable") from exc
 
 
 def authoritative_billing_fact_schema_digest(environment: str) -> str:
