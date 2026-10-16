@@ -1,0 +1,41 @@
+name: ASAAS Release CI
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  release-preflight:
+    name: ASAAS Release Preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the reviewed commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Install the locked project dependencies
+        run: |
+          python -m pip install --disable-pip-version-check "poetry==2.4.1"
+          poetry install --with dev --no-root
+
+      - name: Validate build and release preflight contracts
+        run: >-
+          poetry run pytest -q -p no:cacheprovider
+          tests/scripts/test_asaas_build_workflow.py
+          tests/scripts/test_asaas_release_preflight_workflow.py
