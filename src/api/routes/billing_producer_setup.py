@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -193,6 +194,70 @@ def _build_attestation_entry() -> TrustEntry:
         oidc_issuer=values["oidc_issuer"],
         oidc_subject=values["oidc_subject"],
     )
+
+
+def _build_attestation_public_key_fingerprint(entry: TrustEntry) -> str:
+    """Return the SHA-256 fingerprint of the configured DER public key."""
+    try:
+        from cryptography.exceptions import UnsupportedAlgorithm
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        public_key = serialization.load_pem_public_key(
+            entry.public_key_pem.encode("ascii")
+        )
+        if not isinstance(public_key, ec.EllipticCurvePublicKey) or not isinstance(
+            public_key.curve, ec.SECP256R1
+        ):
+            raise ValueError("unsupported build verification key")
+        der = public_key.public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    except ImportError:
+        raise SignedEnvelopeRejected(
+            "administrator build verification key is invalid"
+        ) from None
+    except (UnsupportedAlgorithm, ValueError, UnicodeEncodeError):
+        raise SignedEnvelopeRejected(
+            "administrator build verification key is invalid"
+        ) from None
+    return hashlib.sha256(der).hexdigest()
+
+
+@router.get(
+    "/producer-build-trust",
+    summary="Read the active public trust for CI build attestations",
+)
+async def read_producer_build_trust(response: Response) -> dict[str, str]:
+    """Expose the active staging trust tuple needed by protected CI preflight."""
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    if settings.environment != ENVIRONMENT:
+        raise HTTPException(status_code=404, detail="build_trust_unavailable")
+    try:
+        entry = _build_attestation_entry()
+        fingerprint = _build_attestation_public_key_fingerprint(entry)
+    except (SignedEnvelopeRejected, ValueError):
+        raise HTTPException(status_code=503, detail="build_trust_unavailable") from None
+    return {
+        "schema": "billing_producer_build_trust_readback.v1",
+        "schema_version": entry.schema_version,
+        "environment": entry.environment,
+        "type": entry.type,
+        "purpose": entry.purpose,
+        "algorithm": entry.algorithm,
+        "issuer": entry.issuer,
+        "kid": entry.kid,
+        "audience": entry.audience,
+        "public_key_fingerprint_sha256": fingerprint,
+        "repository_id": entry.repository_id or "",
+        "repository_name": entry.repository_name or "",
+        "workflow_path": entry.workflow_path or "",
+        "workflow_ref": entry.workflow_ref or "",
+        "oidc_issuer": entry.oidc_issuer or "",
+        "oidc_subject": entry.oidc_subject or "",
+    }
 
 
 def _require_staging_super_admin(request: Request, tenant: TenantContext) -> UUID:

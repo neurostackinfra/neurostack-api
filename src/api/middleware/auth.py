@@ -39,6 +39,7 @@ STAGING_REHEARSAL_WINDOW_SECONDS = 900
 STAGING_REHEARSAL_REDIS_TIMEOUT_SECONDS = 0.1
 STAGING_REHEARSAL_READBACK_PATH = "/v1/admin/billing/rollout/readback"
 STAGING_PRODUCER_RECEIPT_PATH = "/v1/admin/billing/producer-receipts"
+PRODUCER_BUILD_TRUST_READBACK_PATH = "/v1/admin/billing/producer-build-trust"
 _STAGING_REHEARSAL_PURPOSE_CLAIMS = frozenset(
     {"token_use", "token_environment", "scope"}
 )
@@ -342,6 +343,15 @@ class AuthMiddleware:
                     scope, receive, send, status_code, error
                 )
                 return
+            await self.app(scope, receive, self._no_store_send(send))
+            return
+
+        # CI may read only the active public build-trust tuple. Keep this
+        # method-and-path exception exact; neighboring admin routes stay gated.
+        if (
+            request.method == "GET"
+            and request.url.path == PRODUCER_BUILD_TRUST_READBACK_PATH
+        ):
             await self.app(scope, receive, self._no_store_send(send))
             return
 

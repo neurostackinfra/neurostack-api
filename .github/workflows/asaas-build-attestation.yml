@@ -1,4 +1,5 @@
 name: ASAAS producer build attestation
+run-name: ASAAS producer build ${{ inputs.trust_mode }} ${{ inputs.operation_id }}
 
 on:
   workflow_dispatch:
@@ -22,6 +23,18 @@ on:
         description: Exact recorded operational approval reference URL
         required: true
         type: string
+      trust_mode:
+        description: Use normal active backend readback or the single bootstrap operation
+        required: true
+        default: normal
+        type: choice
+        options:
+          - normal
+          - bootstrap
+
+concurrency:
+  group: asaas-producer-operation-${{ inputs.operation_id }}
+  cancel-in-progress: false
 
 permissions: {}
 
@@ -32,10 +45,22 @@ jobs:
     permissions:
       actions: read
       administration: read
+      contents: read
     outputs:
       rollout_scope: ${{ steps.gate.outputs.rollout_scope }}
+      preflight_readback_sha256: ${{ steps.gate.outputs.preflight_readback_sha256 }}
+      backend_trust_readback_sha256: ${{ steps.gate.outputs.backend_trust_readback_sha256 }}
+      backend_trust_probe_sha256: ${{ steps.gate.outputs.backend_trust_probe_sha256 }}
+      backend_trust_origin: ${{ steps.gate.outputs.backend_trust_origin }}
+      build_trust_mode: ${{ steps.gate.outputs.build_trust_mode }}
+      preflight_observed_at: ${{ steps.gate.outputs.preflight_observed_at }}
     steps:
-      - name: Fail closed on scope, authorization, trust pins, or live GitHub controls
+      - name: Checkout the dispatched protected commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Re-read scope, source protection, environments, and run identity
         id: gate
         shell: bash
         env:
@@ -43,6 +68,7 @@ jobs:
           INPUT_WISH: ${{ inputs.rollout_wish }}
           INPUT_GROUP: ${{ inputs.rollout_group }}
           INPUT_AUTHORIZATION_REFERENCE: ${{ inputs.authorization_reference }}
+          INPUT_TRUST_MODE: ${{ inputs.trust_mode }}
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
@@ -51,322 +77,22 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
           PIN_REPOSITORY_ID: ${{ vars.BILLING_PRODUCER_BUILD_REPOSITORY_ID }}
           PIN_REPOSITORY_NAME: ${{ vars.BILLING_PRODUCER_BUILD_REPOSITORY_NAME }}
           PIN_WORKFLOW_PATH: ${{ vars.BILLING_PRODUCER_BUILD_WORKFLOW_PATH }}
           PIN_WORKFLOW_REF: ${{ vars.BILLING_PRODUCER_BUILD_WORKFLOW_REF }}
           PIN_ROLE_ARN: ${{ vars.BILLING_PRODUCER_BUILD_ROLE_ARN }}
           PIN_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_BUILD_KMS_KEY_ARN }}
-          PIN_AUDIENCE: ${{ vars.BILLING_PRODUCER_BUILD_AUDIENCE }}
+          PIN_BUILD_AUDIENCE: ${{ vars.BILLING_PRODUCER_BUILD_AUDIENCE }}
+          PIN_OIDC_AUDIENCE: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_AUDIENCE }}
           PIN_ISSUER: ${{ vars.BILLING_PRODUCER_BUILD_ISSUER }}
           PIN_OIDC_ISSUER: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_ISSUER }}
           PIN_OIDC_SUBJECT: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_SUBJECT }}
           PIN_ECR_URI: ${{ vars.BILLING_PRODUCER_ECR_REPOSITORY_URI }}
+          PIN_BACKEND_BASE_URL: ${{ vars.BILLING_PRODUCER_BUILD_BACKEND_BASE_URL }}
           BUILD_PUBLIC_KEY: ${{ vars.BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import os
-          import re
-          import sys
-          from datetime import datetime, timedelta, timezone
-          from urllib.error import HTTPError, URLError
-          from urllib.parse import quote, urljoin, urlsplit
-          from urllib.request import Request, urlopen
-          from uuid import UUID
-
-          REPOSITORY = "neurostackinfra/neurostack-api"
-          REPOSITORY_ID = 1152335815
-          OWNER_ID = 340698182
-          RELEASE_REF = "refs/heads/main"
-          WORKFLOW_PATH = ".github/workflows/asaas-build-attestation.yml"
-          EXPECTED_RULESET = "asaas-producer-release-main"
-          ENVIRONMENTS = ("asaas-build", "asaas-production-deployment")
-          OPERATIONAL_AUTHORIZATION_REFERENCE = (
-              "asaas-producer-image-rollout/WISH.md#"
-              "2026-10-15-separate-build-and-rollout-plan-approved"
-          )
-          EXPECTED_BUILD_SUBJECT = (
-              "repo:neurostackinfra@340698182/neurostack-api@1152335815:environment:"
-              "asaas-build:ref:refs/heads/main:workflow_ref:"
-              "neurostackinfra/neurostack-api/.github/workflows/"
-              "asaas-build-attestation.yml@refs/heads/main"
-          )
-          API_ROOT = "https://api.github.com"
-          API_PREFIX = f"/repos/{REPOSITORY}"
-          MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-
-          class GateError(ValueError):
-              pass
-
-          def require(condition, reason):
-              if not condition:
-                  raise GateError(reason)
-
-          def validate_scope(env):
-              require(env.get("INPUT_WISH") == "asaas-producer-image-rollout", "wish_scope_invalid")
-              require(env.get("INPUT_GROUP") in {"3", "4"}, "group_scope_invalid")
-              reference = env.get("INPUT_AUTHORIZATION_REFERENCE", "")
-              require(reference == OPERATIONAL_AUTHORIZATION_REFERENCE, "authorization_reference_unrecorded")
-              try:
-                  operation_id = UUID(env.get("INPUT_OPERATION_ID", ""))
-              except (TypeError, ValueError):
-                  raise GateError("operation_id_invalid") from None
-              require(str(operation_id) == env.get("INPUT_OPERATION_ID"), "operation_id_not_canonical")
-              require(env.get("GITHUB_REPOSITORY") == REPOSITORY, "repository_name_mismatch")
-              require(env.get("GITHUB_REPOSITORY_ID") == str(REPOSITORY_ID), "repository_id_mismatch")
-              require(env.get("GITHUB_REPOSITORY_OWNER_ID") == str(OWNER_ID), "repository_owner_id_mismatch")
-              require(env.get("GITHUB_REF") == RELEASE_REF, "source_ref_mismatch")
-              expected_workflow_ref = f"{REPOSITORY}/{WORKFLOW_PATH}@{RELEASE_REF}"
-              require(env.get("GITHUB_WORKFLOW_REF") == expected_workflow_ref, "workflow_ref_mismatch")
-              require(env.get("PIN_REPOSITORY_ID") == str(REPOSITORY_ID), "repository_id_pin_mismatch")
-              require(env.get("PIN_REPOSITORY_NAME") == REPOSITORY, "repository_name_pin_mismatch")
-              require(env.get("PIN_WORKFLOW_PATH") == WORKFLOW_PATH, "workflow_path_pin_mismatch")
-              require(env.get("PIN_WORKFLOW_REF") == RELEASE_REF, "workflow_ref_pin_mismatch")
-              require(env.get("PIN_ROLE_ARN", "").startswith("arn:aws:iam::388460142431:role/"), "build_role_pin_missing")
-              require(bool(re.fullmatch(r"arn:aws:kms:us-east-1:388460142431:key/[A-Za-z0-9-]+", env.get("PIN_KMS_KEY_ARN", ""))), "build_key_pin_invalid")
-              require(env.get("PIN_AUDIENCE") == "sts.amazonaws.com", "audience_pin_mismatch")
-              require(bool(env.get("PIN_ISSUER", "").strip()), "attestation_issuer_pin_missing")
-              require(env.get("PIN_OIDC_ISSUER") == "https://token.actions.githubusercontent.com", "oidc_issuer_pin_mismatch")
-              require(env.get("PIN_OIDC_SUBJECT") == EXPECTED_BUILD_SUBJECT, "oidc_subject_pin_mismatch")
-              require(bool(re.fullmatch(r"388460142431\.dkr\.ecr\.us-east-1\.amazonaws\.com/[A-Za-z0-9._/-]+", env.get("PIN_ECR_URI", ""))), "ecr_repository_pin_invalid")
-              require(bool(env.get("BUILD_PUBLIC_KEY", "").strip()), "build_public_key_pin_missing")
-
-          def _next_link(link_header):
-              if not link_header:
-                  return None
-              for item in link_header.split(","):
-                  if 'rel="next"' in item:
-                      match = re.search(r"<([^>]+)>", item)
-                      return match.group(1) if match else "invalid"
-              return None
-
-          def github_get(url, token):
-              parsed = urlsplit(url)
-              require(parsed.scheme == "https" and parsed.netloc == "api.github.com", "github_api_url_invalid")
-              require(parsed.path == API_PREFIX or parsed.path.startswith(API_PREFIX + "/"), "github_api_path_invalid")
-              request = Request(
-                  url,
-                  headers={
-                      "Accept": "application/vnd.github+json",
-                      "Authorization": f"Bearer {token}",
-                      "Cache-Control": "no-cache",
-                      "X-GitHub-Api-Version": "2022-11-28",
-                  },
-                  method="GET",
-              )
-              try:
-                  with urlopen(request, timeout=10) as response:
-                      status = getattr(response, "status", None)
-                      if status is None:
-                          status = response.getcode()
-                      require(status == 200, "github_api_readback_failed")
-                      final_url = urlsplit(response.geturl())
-                      require(
-                          final_url.scheme == "https"
-                          and final_url.netloc == "api.github.com"
-                          and final_url.path == parsed.path,
-                          "github_api_redirect_invalid",
-                      )
-                      raw = response.read(MAX_RESPONSE_BYTES + 1)
-                      require(len(raw) <= MAX_RESPONSE_BYTES, "github_api_response_too_large")
-                      value = json.loads(raw)
-                      return value, response.headers.get("Link")
-              except GateError:
-                  raise
-              except (HTTPError, URLError, OSError, json.JSONDecodeError):
-                  raise GateError("github_api_readback_failed") from None
-
-          def github_collection(url, token, *, list_field=None):
-              collected = []
-              expected_total = None
-              page = 0
-              while url:
-                  page += 1
-                  require(page <= 100, "github_api_pagination_limit")
-                  value, link = github_get(url, token)
-                  if list_field is None:
-                      require(isinstance(value, list), "github_api_collection_invalid")
-                      collected.extend(value)
-                  else:
-                      require(isinstance(value, dict), "github_api_collection_invalid")
-                      total = value.get("total_count")
-                      rows = value.get(list_field)
-                      require(type(total) is int and total >= 0, "github_api_total_count_missing")
-                      require(isinstance(rows, list), "github_api_collection_invalid")
-                      if expected_total is None:
-                          expected_total = total
-                      require(total == expected_total, "github_api_pagination_changed")
-                      collected.extend(rows)
-                  next_url = _next_link(link)
-                  if next_url is not None:
-                      url = urljoin(url, next_url)
-                  else:
-                      url = None
-              if expected_total is not None:
-                  require(len(collected) == expected_total, "github_api_pagination_incomplete")
-              return collected
-
-          def validate_ruleset(rulesets, token):
-              require(len(rulesets) == 1, "ruleset_count_mismatch")
-              summary = rulesets[0]
-              require(isinstance(summary, dict) and summary.get("name") == EXPECTED_RULESET, "ruleset_identity_mismatch")
-              ruleset_id = summary.get("id")
-              require(type(ruleset_id) is int and ruleset_id > 0, "ruleset_id_invalid")
-              url = f"{API_ROOT}{API_PREFIX}/rulesets/{ruleset_id}"
-              ruleset, _ = github_get(url, token)
-              require(isinstance(ruleset, dict), "ruleset_readback_invalid")
-              require(ruleset.get("name") == EXPECTED_RULESET and ruleset.get("target") == "branch" and ruleset.get("enforcement") == "active", "ruleset_inactive_or_mismatched")
-              conditions = ruleset.get("conditions")
-              ref_name = conditions.get("ref_name") if isinstance(conditions, dict) else None
-              require(isinstance(ref_name, dict) and ref_name.get("include") == [RELEASE_REF] and ref_name.get("exclude") == [], "ruleset_ref_scope_mismatch")
-              require(ruleset.get("bypass_actors") == [], "ruleset_bypass_not_empty_or_unreadable")
-              rows = ruleset.get("rules")
-              require(isinstance(rows, list), "ruleset_rules_missing")
-              by_type = {}
-              for row in rows:
-                  require(isinstance(row, dict) and isinstance(row.get("type"), str), "ruleset_rule_invalid")
-                  rule_type = row["type"]
-                  require(rule_type not in by_type, "ruleset_rule_duplicate")
-                  by_type[rule_type] = row
-              require(set(by_type) == {"pull_request", "required_status_checks", "deletion", "non_fast_forward"}, "ruleset_required_controls_missing")
-              pr = by_type["pull_request"].get("parameters")
-              require(isinstance(pr, dict), "ruleset_pull_request_controls_missing")
-              require(type(pr.get("required_approving_review_count")) is int and pr["required_approving_review_count"] >= 1, "ruleset_review_required")
-              require(pr.get("dismiss_stale_reviews_on_push") is True and pr.get("require_last_push_approval") is True, "ruleset_review_controls_weak")
-              checks = by_type["required_status_checks"].get("parameters")
-              require(isinstance(checks, dict) and type(checks.get("strict_required_status_checks_policy")) is bool, "ruleset_named_checks_missing")
-              required_checks = checks.get("required_status_checks") if isinstance(checks, dict) else None
-              require(isinstance(required_checks, list) and required_checks, "ruleset_named_checks_missing")
-              check_names = []
-              for check in required_checks:
-                  require(isinstance(check, dict) and isinstance(check.get("context"), str) and bool(check["context"].strip()), "ruleset_named_check_invalid")
-                  check_names.append(check["context"])
-              require(len(check_names) == len(set(check_names)), "ruleset_named_check_duplicate")
-              return ruleset
-
-          def validate_environment(name, token):
-              escaped = quote(name, safe="")
-              root = f"{API_ROOT}{API_PREFIX}/environments/{escaped}"
-              environment, _ = github_get(root, token)
-              require(isinstance(environment, dict) and environment.get("name") == name, "environment_identity_missing")
-              require(environment.get("can_admins_bypass") is False, "environment_admin_bypass_enabled_or_unreadable")
-              protection_rules = environment.get("protection_rules")
-              require(isinstance(protection_rules, list) and len(protection_rules) == 1, "environment_reviewer_rule_missing")
-              rule = protection_rules[0]
-              require(isinstance(rule, dict) and rule.get("type") == "required_reviewers", "environment_required_reviewer_missing")
-              reviewers = rule.get("reviewers")
-              require(isinstance(reviewers, list) and reviewers, "environment_reviewer_missing")
-              require(rule.get("prevent_self_review") is True, "environment_self_review_allowed_or_unreadable")
-              for reviewer in reviewers:
-                  require(isinstance(reviewer, dict) and reviewer.get("type") in {"User", "Team"} and type(reviewer.get("id")) is int and reviewer["id"] > 0 and isinstance(reviewer.get("name"), str) and reviewer["name"].strip(), "environment_reviewer_identity_invalid")
-              policy = environment.get("deployment_branch_policy")
-              require(policy == {"protected_branches": False, "custom_branch_policies": True}, "environment_branch_policy_unrestricted_or_mismatched")
-              rows = github_collection(root + "/deployment-branch-policies?per_page=100&page=1", token, list_field="branch_policies")
-              require(len(rows) == 1, "environment_branch_policy_count_mismatch")
-              row = rows[0]
-              require(isinstance(row, dict), "environment_branch_policy_invalid")
-              # GitHub's documented deployment-branch-policy response is
-              # {id, node_id, name}; it does not include a branch/tag type.
-              # Permit that exact shape, but require a reviewer to confirm the
-              # UI's branch-only meaning at the run-bound environment gate.
-              require(set(row) in ({"id", "node_id", "name"}, {"name", "type"}), "environment_branch_policy_shape_invalid")
-              if "id" in row:
-                  require(type(row.get("id")) is int and row["id"] > 0, "environment_branch_policy_id_invalid")
-                  require(isinstance(row.get("node_id"), str) and bool(row["node_id"].strip()), "environment_branch_policy_node_id_invalid")
-              else:
-                  require(row.get("type") in {"branch", "branch_name"}, "environment_policy_is_not_exact_branch_only")
-              require(row.get("name") == "main", "environment_policy_is_not_exact_branch_only")
-
-          def validate_current_run(token, env):
-              run_id = env.get("GITHUB_RUN_ID", "")
-              require(bool(re.fullmatch(r"[1-9][0-9]*", run_id)), "actions_run_id_invalid")
-              run, _ = github_get(f"{API_ROOT}{API_PREFIX}/actions/runs/{run_id}", token)
-              require(isinstance(run, dict), "actions_run_readback_invalid")
-              require(type(run.get("id")) is int and run["id"] == int(run_id), "actions_run_id_mismatch")
-              require(run.get("event") == "workflow_dispatch" and run.get("status") == "in_progress", "actions_run_not_current_dispatch")
-              require(run.get("head_sha") == env.get("GITHUB_SHA") and run.get("head_branch") == "main", "actions_run_commit_or_ref_mismatch")
-              require(bool(re.fullmatch(r"[0-9a-f]{40}", run.get("head_sha", ""))), "actions_run_commit_or_ref_mismatch")
-              expected_path = f"{WORKFLOW_PATH}@{RELEASE_REF}"
-              require(run.get("path") == expected_path, "actions_run_workflow_path_mismatch")
-              run_repository = run.get("repository")
-              require(isinstance(run_repository, dict) and run_repository.get("full_name") == REPOSITORY and run_repository.get("id") == REPOSITORY_ID, "actions_run_repository_mismatch")
-              repo = run.get("head_repository")
-              require(isinstance(repo, dict) and repo.get("id") == REPOSITORY_ID, "actions_run_head_repository_mismatch")
-              created_at = run.get("created_at")
-              require(isinstance(created_at, str), "actions_run_timestamp_missing")
-              try:
-                  created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-              except ValueError:
-                  raise GateError("actions_run_timestamp_invalid") from None
-              now = datetime.now(timezone.utc)
-              require(created.tzinfo is not None and created <= now + timedelta(minutes=5) and now - created <= timedelta(hours=1), "actions_run_is_stale")
-              jobs = github_collection(f"{API_ROOT}{API_PREFIX}/actions/runs/{run_id}/jobs?per_page=100&page=1", token, list_field="jobs")
-              preflight_jobs = [job for job in jobs if isinstance(job, dict) and job.get("name") == "preflight" and job.get("head_sha") == env.get("GITHUB_SHA")]
-              require(len(preflight_jobs) == 1 and preflight_jobs[0].get("status") == "in_progress", "actions_preflight_job_readback_mismatch")
-              return {
-                  "run_id": run_id,
-                  "workflow_path": WORKFLOW_PATH,
-                  "sha": run["head_sha"],
-                  "ref": RELEASE_REF,
-              }
-
-          def require_run_bound_admin_ui_evidence(run_context, environment_name):
-              require(isinstance(run_context, dict), "environment_approval_context_missing")
-              require(bool(re.fullmatch(r"[1-9][0-9]*", run_context.get("run_id", ""))), "environment_approval_context_missing")
-              require(run_context.get("workflow_path") == WORKFLOW_PATH, "environment_approval_context_missing")
-              require(bool(re.fullmatch(r"[0-9a-f]{40}", run_context.get("sha", ""))), "environment_approval_context_missing")
-              require(run_context.get("ref") == RELEASE_REF, "environment_approval_context_missing")
-              require(environment_name == "asaas-build", "environment_approval_context_missing")
-              summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")
-              require(bool(summary_path), "environment_approval_context_missing")
-              with open(summary_path, "a", encoding="utf-8") as summary:
-                  summary.write(
-                      "## BLOCKED: run-bound administrator UI evidence unavailable\n\n"
-                      "This run has no configured trusted mechanism to verify an "
-                      "independent administrator's UI inspection and bind that proof "
-                      "to this run, reviewer, and approval time. A required-reviewer "
-                      "environment approval alone does not expose that evidence to "
-                      "this preflight. No OIDC-enabled job will start.\n\n"
-                      f"- Run ID: `{run_context['run_id']}`\n"
-                      f"- Workflow: `{run_context['workflow_path']}`\n"
-                      f"- SHA: `{run_context['sha']}`\n"
-                      f"- Ref: `{run_context['ref']}`\n"
-                      f"- Protected environment requiring approval: `{environment_name}`\n"
-                  )
-              raise GateError("run_bound_admin_ui_evidence_unavailable")
-
-          def main():
-              env = os.environ
-              validate_scope(env)
-              token = env.get("GH_TOKEN", "")
-              require(bool(token), "github_read_token_unavailable")
-              repository, _ = github_get(f"{API_ROOT}{API_PREFIX}", token)
-              require(isinstance(repository, dict) and repository.get("full_name") == REPOSITORY and repository.get("id") == REPOSITORY_ID, "repository_readback_mismatch")
-              owner = repository.get("owner")
-              require(isinstance(owner, dict) and owner.get("id") == OWNER_ID, "repository_owner_readback_mismatch")
-              require(repository.get("default_branch") == "main", "repository_default_branch_mismatch")
-              rulesets = github_collection(f"{API_ROOT}{API_PREFIX}/rulesets?includes_parents=true&per_page=100&page=1", token)
-              validate_ruleset(rulesets, token)
-              for environment_name in ENVIRONMENTS:
-                  validate_environment(environment_name, token)
-              run_context = validate_current_run(token, env)
-              require_run_bound_admin_ui_evidence(run_context, "asaas-build")
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-                  output.write("rollout_scope=validated\n")
-              print("GitHub protection and rollout preflight passed")
-
-          if __name__ == "__main__":
-              try:
-                  main()
-              except GateError as exc:
-                  print(f"blocked: {exc}", file=sys.stderr)
-                  raise SystemExit(1) from None
-              except (OSError, ValueError, TypeError):
-                  print("blocked: GitHub protection preflight failed", file=sys.stderr)
-                  raise SystemExit(1) from None
-          PY
+        run: python3 scripts/asaas_build_release_preflight.py
 
   build-attestation:
     name: Build and sign after live protections and environment approval
@@ -376,6 +102,8 @@ jobs:
     environment: asaas-build
     timeout-minutes: 30
     permissions:
+      actions: read
+      administration: read
       contents: read
       id-token: write
     steps:
@@ -388,6 +116,58 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.12"
+
+      - name: Verify run-bound administrator UI approval before OIDC
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          GITHUB_REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          INPUT_OPERATION_ID: ${{ inputs.operation_id }}
+          ASAAS_BUILD_TRUST_MODE: ${{ inputs.trust_mode }}
+          ASAAS_PREFLIGHT_READBACK_SHA256: ${{ needs.preflight.outputs.preflight_readback_sha256 }}
+          ASAAS_PREFLIGHT_BUILD_TRUST_MODE: ${{ needs.preflight.outputs.build_trust_mode }}
+          ASAAS_PREFLIGHT_BACKEND_TRUST_SHA256: ${{ needs.preflight.outputs.backend_trust_readback_sha256 }}
+          ASAAS_PREFLIGHT_BACKEND_TRUST_PROBE_SHA256: ${{ needs.preflight.outputs.backend_trust_probe_sha256 }}
+          ASAAS_PREFLIGHT_BACKEND_ORIGIN: ${{ needs.preflight.outputs.backend_trust_origin }}
+          ASAAS_PREFLIGHT_OBSERVED_AT: ${{ needs.preflight.outputs.preflight_observed_at }}
+          PIN_BACKEND_BASE_URL: ${{ vars.BILLING_PRODUCER_BUILD_BACKEND_BASE_URL }}
+          PIN_REPOSITORY_ID: ${{ vars.BILLING_PRODUCER_BUILD_REPOSITORY_ID }}
+          PIN_REPOSITORY_NAME: ${{ vars.BILLING_PRODUCER_BUILD_REPOSITORY_NAME }}
+          PIN_WORKFLOW_PATH: ${{ vars.BILLING_PRODUCER_BUILD_WORKFLOW_PATH }}
+          PIN_WORKFLOW_REF: ${{ vars.BILLING_PRODUCER_BUILD_WORKFLOW_REF }}
+          PIN_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_BUILD_KMS_KEY_ARN }}
+          PIN_BUILD_AUDIENCE: ${{ vars.BILLING_PRODUCER_BUILD_AUDIENCE }}
+          PIN_ISSUER: ${{ vars.BILLING_PRODUCER_BUILD_ISSUER }}
+          PIN_OIDC_ISSUER: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_ISSUER }}
+          PIN_OIDC_SUBJECT: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_SUBJECT }}
+          BUILD_PUBLIC_KEY: ${{ vars.BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM }}
+        run: >-
+          python3 scripts/verify_asaas_build_environment_approval.py
+          --evidence-output
+          "$RUNNER_TEMP/asaas-admin-ui-approval.json"
+
+      - name: Verify clean protected source and hash the build bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$GITHUB_WORKFLOW_REF" = "neurostackinfra/neurostack-api/.github/workflows/asaas-build-attestation.yml@refs/heads/main"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          commit_object_sha256="$(git cat-file commit "$GITHUB_SHA" | sha256sum | cut -d ' ' -f 1)"
+          tree_id="$(git rev-parse "$GITHUB_SHA^{tree}")"
+          tree_sha256="$(git cat-file tree "$tree_id" | sha256sum | cut -d ' ' -f 1)"
+          bundle_sha256="$(git archive --format=tar "$GITHUB_SHA" | sha256sum | cut -d ' ' -f 1)"
+          printf 'GIT_COMMIT_OBJECT_SHA256=%s\n' "$commit_object_sha256" >> "$GITHUB_ENV"
+          printf 'GIT_TREE_SHA=%s\n' "$tree_sha256" >> "$GITHUB_ENV"
+          printf 'BUNDLE_DIGEST=%s\n' "$bundle_sha256" >> "$GITHUB_ENV"
 
       - name: Install signing dependencies
         shell: bash
@@ -405,6 +185,7 @@ jobs:
           BILLING_PRODUCER_BUILD_ISSUER: ${{ vars.BILLING_PRODUCER_BUILD_ISSUER }}
           BILLING_PRODUCER_BUILD_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_BUILD_KMS_KEY_ARN }}
           BILLING_PRODUCER_BUILD_AUDIENCE: ${{ vars.BILLING_PRODUCER_BUILD_AUDIENCE }}
+          BILLING_PRODUCER_BUILD_OIDC_AUDIENCE: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_AUDIENCE }}
           BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM: ${{ vars.BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM }}
           BILLING_PRODUCER_BUILD_ROLE_ARN: ${{ vars.BILLING_PRODUCER_BUILD_ROLE_ARN }}
           BILLING_PRODUCER_BUILD_REPOSITORY_ID: ${{ vars.BILLING_PRODUCER_BUILD_REPOSITORY_ID }}
@@ -413,14 +194,22 @@ jobs:
           BILLING_PRODUCER_BUILD_WORKFLOW_REF: ${{ vars.BILLING_PRODUCER_BUILD_WORKFLOW_REF }}
           BILLING_PRODUCER_BUILD_OIDC_ISSUER: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_ISSUER }}
           BILLING_PRODUCER_BUILD_OIDC_SUBJECT: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_SUBJECT }}
+          PIN_BACKEND_BASE_URL: ${{ vars.BILLING_PRODUCER_BUILD_BACKEND_BASE_URL }}
+          ASAAS_PREFLIGHT_BACKEND_TRUST_SHA256: ${{ needs.preflight.outputs.backend_trust_readback_sha256 }}
+          ASAAS_PREFLIGHT_BACKEND_TRUST_PROBE_SHA256: ${{ needs.preflight.outputs.backend_trust_probe_sha256 }}
+          ASAAS_PREFLIGHT_BACKEND_ORIGIN: ${{ needs.preflight.outputs.backend_trust_origin }}
+          ASAAS_PREFLIGHT_BUILD_TRUST_MODE: ${{ needs.preflight.outputs.build_trust_mode }}
+          ASAAS_BUILD_TRUST_MODE: ${{ inputs.trust_mode }}
           BILLING_PRODUCER_ECR_REPOSITORY_URI: ${{ vars.BILLING_PRODUCER_ECR_REPOSITORY_URI }}
           GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
           GITHUB_REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REF: ${{ github.ref }}
           GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          test "$BILLING_PRODUCER_BUILD_OIDC_AUDIENCE" = "sts.amazonaws.com"
           "$RUNNER_TEMP/attestation-venv/bin/python" \
             scripts/sign_asaas_build_attestation.py --validate-pins
 
@@ -430,7 +219,7 @@ jobs:
           role-to-assume: ${{ vars.BILLING_PRODUCER_BUILD_ROLE_ARN }}
           role-session-name: asaas-build-${{ github.run_id }}
           aws-region: us-east-1
-          audience: ${{ vars.BILLING_PRODUCER_BUILD_AUDIENCE }}
+          audience: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_AUDIENCE }}
 
       - name: Build and publish an immutable image candidate
         id: image
@@ -454,18 +243,6 @@ jobs:
           test "$built_digest" = "$readback_digest"
           printf 'APP_IMAGE_DIGEST=%s\n' "$readback_digest" >> "$GITHUB_ENV"
 
-      - name: Hash the source and Docker build bundle
-        shell: bash
-        run: |
-          set -euo pipefail
-          commit_object_sha256="$(git cat-file commit "$GITHUB_SHA" | sha256sum | cut -d ' ' -f 1)"
-          tree_id="$(git rev-parse "$GITHUB_SHA^{tree}")"
-          tree_sha256="$(git cat-file tree "$tree_id" | sha256sum | cut -d ' ' -f 1)"
-          bundle_sha256="$(git archive --format=tar "$GITHUB_SHA" | sha256sum | cut -d ' ' -f 1)"
-          printf 'GIT_COMMIT_OBJECT_SHA256=%s\n' "$commit_object_sha256" >> "$GITHUB_ENV"
-          printf 'GIT_TREE_SHA=%s\n' "$tree_sha256" >> "$GITHUB_ENV"
-          printf 'BUNDLE_DIGEST=%s\n' "$bundle_sha256" >> "$GITHUB_ENV"
-
       - name: Sign and verify the canonical CI attestation
         shell: bash
         env:
@@ -481,6 +258,10 @@ jobs:
           BILLING_PRODUCER_BUILD_WORKFLOW_REF: ${{ vars.BILLING_PRODUCER_BUILD_WORKFLOW_REF }}
           BILLING_PRODUCER_BUILD_OIDC_ISSUER: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_ISSUER }}
           BILLING_PRODUCER_BUILD_OIDC_SUBJECT: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_SUBJECT }}
+          PIN_BACKEND_BASE_URL: ${{ vars.BILLING_PRODUCER_BUILD_BACKEND_BASE_URL }}
+          ASAAS_PREFLIGHT_BACKEND_TRUST_SHA256: ${{ needs.preflight.outputs.backend_trust_readback_sha256 }}
+          ASAAS_PREFLIGHT_BACKEND_TRUST_PROBE_SHA256: ${{ needs.preflight.outputs.backend_trust_probe_sha256 }}
+          ASAAS_PREFLIGHT_BACKEND_ORIGIN: ${{ needs.preflight.outputs.backend_trust_origin }}
           BILLING_PRODUCER_ECR_REPOSITORY_URI: ${{ vars.BILLING_PRODUCER_ECR_REPOSITORY_URI }}
           RUNNER_TEMP: ${{ runner.temp }}
           GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
@@ -489,6 +270,10 @@ jobs:
           GITHUB_REF: ${{ github.ref }}
           GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          ASAAS_BUILD_TRUST_MODE: ${{ inputs.trust_mode }}
+          ASAAS_PREFLIGHT_BUILD_TRUST_MODE: ${{ needs.preflight.outputs.build_trust_mode }}
+          ASAAS_PREFLIGHT_BACKEND_TRUST_PROBE_SHA256: ${{ needs.preflight.outputs.backend_trust_probe_sha256 }}
           GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail

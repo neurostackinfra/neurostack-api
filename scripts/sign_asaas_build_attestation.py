@@ -11,7 +11,18 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
+
+_PREFLIGHT_PATH = Path(__file__).resolve().with_name("asaas_build_release_preflight.py")
+_PREFLIGHT_SPEC = importlib.util.spec_from_file_location(
+    "asaas_build_backend_trust_preflight", _PREFLIGHT_PATH
+)
+if _PREFLIGHT_SPEC is None or _PREFLIGHT_SPEC.loader is None:
+    raise RuntimeError("ASAAS build trust preflight module is unavailable")
+_PREFLIGHT = importlib.util.module_from_spec(_PREFLIGHT_SPEC)
+sys.modules[_PREFLIGHT_SPEC.name] = _PREFLIGHT
+_PREFLIGHT_SPEC.loader.exec_module(_PREFLIGHT)
 
 
 class AttestationCliError(ValueError):
@@ -261,8 +272,117 @@ def _validate_context(environment: dict[str, str]) -> dict[str, str]:
     return pins
 
 
+def _backend_trust_environment(
+    pins: dict[str, str], environment: dict[str, str]
+) -> dict[str, str]:
+    return {
+        "PIN_BACKEND_BASE_URL": environment.get("PIN_BACKEND_BASE_URL", ""),
+        "ASAAS_PREFLIGHT_BACKEND_ORIGIN": environment.get(
+            "ASAAS_PREFLIGHT_BACKEND_ORIGIN", ""
+        ),
+        "PIN_ISSUER": pins["BILLING_PRODUCER_BUILD_ISSUER"],
+        "PIN_KMS_KEY_ARN": pins["BILLING_PRODUCER_BUILD_KMS_KEY_ARN"],
+        "PIN_BUILD_AUDIENCE": pins["BILLING_PRODUCER_BUILD_AUDIENCE"],
+        "PIN_REPOSITORY_ID": pins["BILLING_PRODUCER_BUILD_REPOSITORY_ID"],
+        "PIN_REPOSITORY_NAME": pins["BILLING_PRODUCER_BUILD_REPOSITORY_NAME"],
+        "PIN_WORKFLOW_PATH": pins["BILLING_PRODUCER_BUILD_WORKFLOW_PATH"],
+        "PIN_WORKFLOW_REF": pins["BILLING_PRODUCER_BUILD_WORKFLOW_REF"],
+        "PIN_OIDC_ISSUER": pins["BILLING_PRODUCER_BUILD_OIDC_ISSUER"],
+        "PIN_OIDC_SUBJECT": pins["BILLING_PRODUCER_BUILD_OIDC_SUBJECT"],
+        "BUILD_PUBLIC_KEY": pins["BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM"],
+    }
+
+
+def _validate_bootstrap_pins(pins: dict[str, str], environment: dict[str, str]) -> None:
+    trust_environment = _backend_trust_environment(pins, environment)
+    trust_environment.update(
+        {
+            "PIN_ROLE_ARN": pins["BILLING_PRODUCER_BUILD_ROLE_ARN"],
+            "PIN_ECR_URI": pins["BILLING_PRODUCER_ECR_REPOSITORY_URI"],
+        }
+    )
+    _PREFLIGHT._bootstrap_pins(trust_environment)
+
+
+def _trust_entry_from_pins(pins: dict[str, str]) -> Any:
+    module = _load_envelope_module()
+    return module.TrustEntry(
+        issuer=pins["BILLING_PRODUCER_BUILD_ISSUER"],
+        kid=pins["BILLING_PRODUCER_BUILD_KMS_KEY_ARN"],
+        environment="staging",
+        audience=pins["BILLING_PRODUCER_BUILD_AUDIENCE"],
+        type="billing_build_attestation.v1",
+        purpose="billing-build-attestation.v1",
+        schema_version="v1",
+        algorithm="ECDSA_SHA_256",
+        public_key_pem=pins["BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM"],
+        repository_id=pins["BILLING_PRODUCER_BUILD_REPOSITORY_ID"],
+        repository_name=pins["BILLING_PRODUCER_BUILD_REPOSITORY_NAME"],
+        workflow_path=pins["BILLING_PRODUCER_BUILD_WORKFLOW_PATH"],
+        workflow_ref=pins["BILLING_PRODUCER_BUILD_WORKFLOW_REF"],
+        oidc_issuer=pins["BILLING_PRODUCER_BUILD_OIDC_ISSUER"],
+        oidc_subject=pins["BILLING_PRODUCER_BUILD_OIDC_SUBJECT"],
+    )
+
+
+def _trust_entry_from_backend_readback(
+    pins: dict[str, str], readback: dict[str, str]
+) -> Any:
+    module = _load_envelope_module()
+    return module.TrustEntry(
+        issuer=readback["issuer"],
+        kid=readback["kid"],
+        environment=readback["environment"],
+        audience=readback["audience"],
+        type=readback["type"],
+        purpose=readback["purpose"],
+        schema_version=readback["schema_version"],
+        algorithm=readback["algorithm"],
+        public_key_pem=pins["BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM"],
+        repository_id=readback["repository_id"],
+        repository_name=readback["repository_name"],
+        workflow_path=readback["workflow_path"],
+        workflow_ref=readback["workflow_ref"],
+        oidc_issuer=readback["oidc_issuer"],
+        oidc_subject=readback["oidc_subject"],
+    )
+
+
+def _active_backend_trust(
+    pins: dict[str, str], environment: dict[str, str]
+) -> tuple[Any, str]:
+    mode = _PREFLIGHT.trust_mode(environment)
+    if environment.get("ASAAS_PREFLIGHT_BUILD_TRUST_MODE") != mode:
+        raise AttestationCliError("build trust mode differs from preflight evidence")
+    trust_environment = _backend_trust_environment(pins, environment)
+    if mode == "normal":
+        expected_digest = _required(environment, "ASAAS_PREFLIGHT_BACKEND_TRUST_SHA256")
+        readback, digest = _PREFLIGHT.fetch_backend_trust_readback(
+            trust_environment, expected_digest=expected_digest
+        )
+        return _trust_entry_from_backend_readback(pins, readback), digest
+
+    if environment.get("GITHUB_RUN_ATTEMPT") != "1":
+        raise AttestationCliError("bootstrap mode requires the first run attempt")
+    _validate_bootstrap_pins(pins, environment)
+    expected_probe = _required(
+        environment, "ASAAS_PREFLIGHT_BACKEND_TRUST_PROBE_SHA256"
+    )
+    try:
+        digest = _PREFLIGHT.probe_backend_trust_absent(
+            trust_environment, expected_digest=expected_probe
+        )
+    except _PREFLIGHT.GateError as exc:
+        raise AttestationCliError(str(exc)) from None
+    return _trust_entry_from_pins(pins), digest
+
+
 def _create_envelope(
-    pins: dict[str, str], *, signer: object, now: datetime | None = None
+    pins: dict[str, str],
+    *,
+    signer: object,
+    trust_entry: Any,
+    now: datetime | None = None,
 ) -> dict[str, object]:
     module = _load_envelope_module()
     now = now or datetime.now(timezone.utc)
@@ -289,27 +409,10 @@ def _create_envelope(
             f"{pins['BILLING_PRODUCER_ECR_REPOSITORY_URI']}@{app_digest}"
         ),
     }
-    entry = module.TrustEntry(
-        issuer=pins["BILLING_PRODUCER_BUILD_ISSUER"],
-        kid=pins["BILLING_PRODUCER_BUILD_KMS_KEY_ARN"],
-        environment=module.ENVIRONMENT,
-        audience=pins["BILLING_PRODUCER_BUILD_AUDIENCE"],
-        type="billing_build_attestation.v1",
-        purpose=module.PURPOSE_BY_TYPE["billing_build_attestation.v1"],
-        schema_version=module.SCHEMA_VERSION,
-        algorithm=module.ALGORITHM,
-        public_key_pem=pins["BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM"],
-        repository_id=repository_id,
-        repository_name=pins["GITHUB_REPOSITORY"],
-        workflow_path=workflow_path,
-        workflow_ref=pins["GITHUB_REF"],
-        oidc_issuer=pins["BILLING_PRODUCER_BUILD_OIDC_ISSUER"],
-        oidc_subject=pins["BILLING_PRODUCER_BUILD_OIDC_SUBJECT"],
-    )
     # KMS signing keys are asymmetric; only the returned signature is placed in
-    # the artifact. The administrator-pinned public key is used at registration.
+    # the artifact. The backend readback supplies the verification trust tuple.
     return module.build_envelope(
-        entry=entry,
+        entry=trust_entry,
         payload=payload,
         operation_id=operation_id,
         issued_at=now,
@@ -329,11 +432,14 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.validate_pins:
-            _validate_administrator_pins(dict(os.environ))
+            environment = dict(os.environ)
+            pins = _validate_administrator_pins(environment)
+            _active_backend_trust(pins, environment)
             return 0
         if not args.output:
             raise AttestationCliError("output path is required")
         pins = _validate_context(dict(os.environ))
+        trust_entry, _trust_digest = _active_backend_trust(pins, dict(os.environ))
         output = Path(args.output)
         runner_temp = Path(_required(dict(os.environ), "RUNNER_TEMP")).resolve()
         if (
@@ -357,28 +463,13 @@ def main() -> int:
         )
         module = _load_envelope_module()
         envelope = _create_envelope(
-            pins, signer=module.Boto3KmsDigestSigner(kms_client)
-        )
-        entry = module.TrustEntry(
-            issuer=pins["BILLING_PRODUCER_BUILD_ISSUER"],
-            kid=pins["BILLING_PRODUCER_BUILD_KMS_KEY_ARN"],
-            environment=module.ENVIRONMENT,
-            audience=pins["BILLING_PRODUCER_BUILD_AUDIENCE"],
-            type="billing_build_attestation.v1",
-            purpose=module.PURPOSE_BY_TYPE["billing_build_attestation.v1"],
-            schema_version=module.SCHEMA_VERSION,
-            algorithm=module.ALGORITHM,
-            public_key_pem=pins["BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM"],
-            repository_id=pins["GITHUB_REPOSITORY_ID"],
-            repository_name=pins["GITHUB_REPOSITORY"],
-            workflow_path=pins["BILLING_PRODUCER_BUILD_WORKFLOW_PATH"],
-            workflow_ref=pins["GITHUB_REF"],
-            oidc_issuer=pins["BILLING_PRODUCER_BUILD_OIDC_ISSUER"],
-            oidc_subject=pins["BILLING_PRODUCER_BUILD_OIDC_SUBJECT"],
+            pins,
+            signer=module.Boto3KmsDigestSigner(kms_client),
+            trust_entry=trust_entry,
         )
         verified_entry = module.verify_envelope(
             envelope,
-            module.TrustRegistry([entry]),
+            module.TrustRegistry([trust_entry]),
             expected_type="billing_build_attestation.v1",
         )
         module.validate_attestation_trust(verified_entry, envelope)
