@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +33,10 @@ _ROOT_FIELDS = {
     "builder_id",
     "aggregate_kind",
     "aggregate_id",
+    "subscription_id",
+    "order_id",
     "payment_id",
+    "paid_at",
     "catalog_version_id",
     "offer_id",
     "currency",
@@ -112,6 +116,18 @@ def _verify_schema(value: Any) -> None:
         _fail("schema producer is divergent")
     if properties.get("currency", {}).get("const") != "BRL":
         _fail("schema currency is divergent")
+    if properties.get("paid_at") != {
+        "type": ["string", "null"],
+        "format": "date",
+    }:
+        _fail("schema paid_at property is divergent")
+    paid_at_rule = {
+        "if": {"properties": {"settled_cents": {"minimum": 1}}},
+        "then": {"properties": {"paid_at": {"type": "string", "format": "date"}}},
+        "else": {"properties": {"paid_at": {"type": "null"}}},
+    }
+    if paid_at_rule not in value.get("allOf", []):
+        _fail("schema paid_at settlement condition is divergent")
     if set(properties.get("aggregate_kind", {}).get("enum", ())) != {
         "subscription_cycle",
         "topup_order",
@@ -182,10 +198,15 @@ def _verify_schema(value: Any) -> None:
         or set(subscription.get("properties", {}).get("event_type", {}).get("enum", ()))
         != _SUBSCRIPTION_EVENTS
         or subscription.get("required") != ["subscription_cycle"]
+        or subscription.get("properties", {}).get("subscription_id", {}).get("type")
+        != "string"
+        or subscription.get("properties", {}).get("order_id", {}).get("type") != "null"
         or not isinstance(topup, dict)
         or set(topup.get("properties", {}).get("event_type", {}).get("enum", ()))
         != _TOPUP_EVENTS
         or topup.get("not") != {"required": ["subscription_cycle"]}
+        or topup.get("properties", {}).get("subscription_id", {}).get("type") != "null"
+        or topup.get("properties", {}).get("order_id", {}).get("type") != "string"
     ):
         _fail("schema aggregate xor is divergent")
 
@@ -224,6 +245,20 @@ def _verify_fixture(value: dict[str, object]) -> None:
         expected.add("subscription_cycle")
     if kind not in {"subscription_cycle", "topup_order"} or set(value) != expected:
         _fail("fixture root is not the closed envelope")
+    if kind == "subscription_cycle":
+        if (
+            not isinstance(value.get("subscription_id"), str)
+            or value.get("order_id") is not None
+        ):
+            _fail("fixture subscription identity xor is invalid")
+        if value.get("subscription_id") == value.get("aggregate_id"):
+            _fail("fixture cycle aggregate aliases its subscription")
+    elif (
+        value.get("subscription_id") is not None
+        or not isinstance(value.get("order_id"), str)
+        or value.get("order_id") != value.get("aggregate_id")
+    ):
+        _fail("fixture top-up identity xor is invalid")
     if value.get("schema_version") != _SCHEMA_VERSION:
         _fail("fixture has wrong schema version")
     event_type = value.get("event_type")
@@ -241,6 +276,18 @@ def _verify_fixture(value: dict[str, object]) -> None:
     reversed_cents = _fixture_integer(value.get("reversed_cents"), "reversed cents")
     restored = _fixture_integer(value.get("restored_cents"), "restored cents")
     grant = _fixture_integer(value.get("credit_grant_mc"), "credit amount")
+    paid_at = value.get("paid_at")
+    if settled > 0:
+        if not isinstance(paid_at, str) or len(paid_at) != 10:
+            _fail("fixture paid_at is missing or invalid")
+        try:
+            parsed_paid_at = date.fromisoformat(paid_at)
+        except ValueError:
+            _fail("fixture paid_at is invalid")
+        if parsed_paid_at.isoformat() != paid_at:
+            _fail("fixture paid_at is not canonical")
+    elif paid_at is not None:
+        _fail("fixture without settlement has paid_at")
     if not 0 <= restored <= reversed_cents <= settled <= amount:
         _fail("fixture cumulative totals are invalid")
     lines = value.get("lines")
@@ -255,6 +302,8 @@ def _verify_fixture(value: dict[str, object]) -> None:
         if not isinstance(line_id, str) or not line_id:
             _fail("fixture line id is invalid")
         line_ids.append(line_id)
+        if raw_line.get("offer_id") != value.get("offer_id"):
+            _fail("fixture line offer differs from fact offer")
         line_kind = raw_line.get("kind")
         if line_kind not in {"plan", "additional_clinic", "topup", "tax"}:
             _fail("fixture line kind is invalid")
@@ -289,6 +338,12 @@ def _verify_fixture(value: dict[str, object]) -> None:
         )
         if raw_line.get("financial_state") != expected_state:
             _fail("fixture line state disagrees with totals")
+        if (
+            line_grant > 0
+            and line_settled > 0
+            and (paid_at is None or line_settled != line_amount)
+        ):
+            _fail("fixture credit grant is not fully paid")
         sums[0] += line_amount
         sums[1] += line_settled
         sums[2] += line_reversed

@@ -48,3 +48,30 @@ def test_fact_rejects_pii_and_line_equation_drift() -> None:
     lines[0]["line_amount_cents"] = 9_999
     with pytest.raises(BillingFactViolation):
         validate_fact(wrong_amount)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda fact: fact.update(paid_at=None),
+        lambda fact: fact.update(order_id="30000000-0000-4000-8000-000000000002"),
+        lambda fact: fact.update(
+            subscription_id="50000000-0000-4000-8000-000000000001"
+        ),
+        lambda fact: fact["lines"][0].update(offer_id="another_offer"),
+        lambda fact: fact["lines"][0].update(financial_state="pending"),
+        lambda fact: fact["lines"][0].update(credit_grant_mc=499_999),
+    ],
+)
+def test_fact_rejects_settlement_identity_and_credit_drift(mutate) -> None:
+    fact = _fixture("topup_payment_settled.json")
+    mutate(fact)
+    with pytest.raises(BillingFactViolation):
+        validate_fact(fact)
+
+
+def test_subscription_cycle_identity_is_distinct_from_cycle_aggregate() -> None:
+    fact = _fixture("subscription_cycle_settled.json")
+    validate_fact(fact)
+    assert fact["subscription_id"] != fact["aggregate_id"]
+    assert fact["order_id"] is None

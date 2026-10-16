@@ -34,6 +34,7 @@ from src.models.billing import (
     BillingSubscriptionCycle,
     BillingTopupOrder,
 )
+from src.services.billing_catalog import BILLING_CATALOG, CATALOG_VERSION_ID
 
 SCHEMA_VERSION: Final = "billing.fact.v1"
 ACK_SCHEMA_VERSION: Final = "billing.fact.ack.v1"
@@ -61,7 +62,10 @@ _FACT_ROOT: Final = frozenset(
         "builder_id",
         "aggregate_kind",
         "aggregate_id",
+        "subscription_id",
+        "order_id",
         "payment_id",
+        "paid_at",
         "catalog_version_id",
         "offer_id",
         "currency",
@@ -114,6 +118,10 @@ class BillingFactViolation(ValueError):
 
 class PartialCreditLine(BillingFactViolation):
     """A partial settlement would make a credit-bearing line ambiguous."""
+
+
+class AmbiguousLineAllocation(BillingFactViolation):
+    """Aggregate provider money cannot be attributed to individual lines."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,7 +287,10 @@ def _fact_date(value: object, field: str) -> date:
     if not isinstance(value, str):
         raise BillingFactViolation(f"invalid {field}")
     try:
-        return date.fromisoformat(value)
+        parsed = date.fromisoformat(value)
+        if parsed.isoformat() != value:
+            raise ValueError("non-canonical date")
+        return parsed
     except ValueError as exc:
         raise BillingFactViolation(f"invalid {field}") from exc
 
@@ -309,17 +320,21 @@ def _line_state(*, settled: int, reversed_cents: int, restored: int) -> str:
 
 
 def _allocate(cumulative: int, amounts: list[int]) -> list[int]:
-    """Allocate a cumulative payment deterministically over ordered lines."""
+    """Copy only line-safe cumulative totals; never synthesize a split."""
 
-    remaining = cumulative
-    allocated: list[int] = []
-    for amount in amounts:
-        portion = min(remaining, amount)
-        allocated.append(portion)
-        remaining -= portion
-    if remaining:
+    total = sum(amounts)
+    if len(amounts) > 1:
+        if cumulative == 0:
+            return [0 for _ in amounts]
+        if cumulative != total:
+            raise AmbiguousLineAllocation(
+                "provider aggregate cannot identify multi-line allocation"
+            )
+        return list(amounts)
+
+    if cumulative > total:
         raise BillingFactViolation("cumulative total exceeds line amounts")
-    return allocated
+    return [cumulative] if amounts else []
 
 
 def _copy_lines(
@@ -369,9 +384,24 @@ def _copy_lines(
                 _CREDIT_FIELD: grant,
             }
         )
+    total_amount = sum(amounts)
     settled = _allocate(settled_cents, amounts)
+    # The provider refund/readback is payment-level.  For multiple lines it
+    # proves only a whole aggregate refund/restoration, never a line split.
     reversed_values = _allocate(reversed_cents, amounts)
     restored = _allocate(restored_cents, amounts)
+    if len(amounts) > 1 and settled_cents not in (0, total_amount):
+        raise AmbiguousLineAllocation(
+            "provider aggregate cannot identify multi-line settlement"
+        )
+    if len(amounts) > 1 and reversed_cents not in (0, settled_cents):
+        raise AmbiguousLineAllocation(
+            "provider aggregate cannot identify multi-line refund"
+        )
+    if len(amounts) > 1 and restored_cents not in (0, reversed_cents):
+        raise AmbiguousLineAllocation(
+            "provider aggregate cannot identify multi-line restoration"
+        )
     for index, line in enumerate(copied):
         line_settled = settled[index]
         line_reversed = reversed_values[index]
@@ -387,6 +417,160 @@ def _copy_lines(
             restored=line_restored,
         )
     return copied
+
+
+def _validate_offer_snapshot(
+    snapshot: Mapping[str, object], *, offer_id: str, catalog_version_id: str
+) -> None:
+    """Fail closed on stale or malformed persisted catalog credit amounts."""
+
+    if catalog_version_id != CATALOG_VERSION_ID:
+        raise BillingFactViolation("unsupported billing catalog snapshot")
+    offer = BILLING_CATALOG.get(offer_id)
+    if offer is None or snapshot.get("offer_id") != offer_id:
+        raise BillingFactViolation("pricing snapshot offer is not in the catalog")
+    if snapshot.get("catalog_version_id") != catalog_version_id:
+        raise BillingFactViolation("pricing snapshot catalog version mismatch")
+    expected_grant = offer.credits * 1_000
+    if snapshot.get(_CREDIT_FIELD) != expected_grant:
+        raise BillingFactViolation("pricing snapshot credit amount is stale")
+    allowed_keys = (
+        {
+            "catalog_version_id",
+            "offer_id",
+            "amount_cents",
+            _CREDIT_FIELD,
+            "payment_method",
+            "lines",
+        }
+        if offer.cycle == "DETACHED"
+        else {
+            "catalog_version_id",
+            "offer_id",
+            "amount_cents",
+            _CREDIT_FIELD,
+            "included_clinics",
+            "additional_clinics",
+            "billing_cycle",
+            "payment_method",
+            "lines",
+            "coupon_code",
+        }
+    )
+    required_keys = allowed_keys - {"coupon_code", "additional_clinics"}
+    if not required_keys.issubset(snapshot) or set(snapshot) - allowed_keys:
+        raise BillingFactViolation("pricing snapshot fields are not closed")
+    raw_lines = snapshot.get("lines")
+    if not isinstance(raw_lines, list) or not raw_lines:
+        raise BillingFactViolation("pricing snapshot has no lines")
+    lines = [_mapping(item, "pricing line") for item in raw_lines]
+    kinds = [line.get("kind") for line in lines]
+    grants = [line.get(_CREDIT_FIELD) for line in lines]
+    line_amounts = [
+        _integer(line.get("line_amount_cents"), "line amount") for line in lines
+    ]
+    amount = _integer(snapshot.get("amount_cents"), "snapshot amount", minimum=1)
+    if any(line.get("offer_id") != offer_id for line in lines):
+        raise BillingFactViolation("pricing line offer differs from catalog offer")
+    if (
+        any(
+            line_amount
+            != _integer(line.get("quantity"), "line quantity", minimum=1)
+            * _integer(line.get("unit_amount_cents"), "line unit amount")
+            for line, line_amount in zip(lines, line_amounts)
+        )
+        or sum(line_amounts) != amount
+    ):
+        raise BillingFactViolation("pricing line totals differ from snapshot amount")
+    if any(
+        line.get("settled_cents") != 0
+        or line.get("reversed_cents") != 0
+        or line.get("restored_cents") != 0
+        or line.get("line_financial_state") != "pending"
+        for line in lines
+    ):
+        raise BillingFactViolation("pricing snapshot has non-pending line state")
+    if "DETACHED" == offer.cycle:
+        if (
+            len(lines) != 1
+            or kinds != ["topup"]
+            or grants != [expected_grant]
+            or lines[0].get("offer_id") != offer_id
+            or lines[0].get("unit_amount_cents") != offer.amount_cents
+            or lines[0].get("quantity") != 1
+            or amount != offer.amount_cents
+            or snapshot.get("payment_method") not in {"credit_card", "pix"}
+        ):
+            raise BillingFactViolation("top-up pricing snapshot differs from catalog")
+    else:
+        plan_lines = [line for line in lines if line.get("kind") == "plan"]
+        additional_lines = [
+            line for line in lines if line.get("kind") == "additional_clinic"
+        ]
+        if (
+            len(plan_lines) != 1
+            or len(additional_lines) > 1
+            or len(plan_lines) + len(additional_lines) != len(lines)
+            or plan_lines[0].get("offer_id") != offer_id
+            or plan_lines[0].get("quantity") != 1
+            or plan_lines[0].get(_CREDIT_FIELD) != expected_grant
+            or snapshot.get("included_clinics") != offer.included_clinics
+            or snapshot.get("credit_grant_mc") != expected_grant
+            or snapshot.get("billing_cycle") != "monthly"
+            or snapshot.get("payment_method") != "credit_card"
+        ):
+            raise BillingFactViolation(
+                "subscription pricing snapshot differs from catalog"
+            )
+        additional_quantity = _integer(
+            snapshot.get("additional_clinics", 0), "additional clinic quantity"
+        )
+        gross = (
+            offer.amount_cents
+            + additional_quantity * offer.additional_clinic_amount_cents
+        )
+        matching_discount = next(
+            (
+                percent
+                for percent in range(101)
+                if offer.amount_cents - offer.amount_cents * percent // 100
+                == plan_lines[0].get("unit_amount_cents")
+                and (
+                    not additional_lines
+                    or offer.additional_clinic_amount_cents
+                    - offer.additional_clinic_amount_cents * percent // 100
+                    == additional_lines[0].get("unit_amount_cents")
+                )
+            ),
+            None,
+        )
+        coupon_code = snapshot.get("coupon_code")
+        if (
+            matching_discount is None
+            or (coupon_code is None and matching_discount != 0)
+            or (
+                coupon_code is not None
+                and (not isinstance(coupon_code, str) or not coupon_code)
+            )
+        ):
+            raise BillingFactViolation("subscription discount does not match catalog")
+        if (additional_quantity > 0) != bool(additional_lines):
+            raise BillingFactViolation("subscription add-on quantity is inconsistent")
+        expected_total = gross - gross * matching_discount // 100
+        if amount != expected_total:
+            raise BillingFactViolation(
+                "subscription discount total differs from catalog"
+            )
+        if additional_lines:
+            addon = additional_lines[0]
+            if (
+                addon.get("offer_id") != offer_id
+                or addon.get(_CREDIT_FIELD) != 0
+                or addon.get("quantity") != snapshot.get("additional_clinics")
+            ):
+                raise BillingFactViolation(
+                    "subscription add-on snapshot differs from catalog"
+                )
 
 
 def validate_fact(value: Mapping[str, object]) -> None:
@@ -409,8 +593,22 @@ def validate_fact(value: Mapping[str, object]) -> None:
     _require_uuid(value.get("event_id"), "event_id")
     _require_uuid(value.get("builder_id"), "builder_id")
     _require_uuid(value.get("aggregate_id"), "aggregate_id")
+    subscription_id = value.get("subscription_id")
+    order_id = value.get("order_id")
+    if aggregate_kind == "subscription_cycle":
+        _require_uuid(subscription_id, "subscription_id")
+        if order_id is not None:
+            raise BillingFactViolation("subscription fact has an order id")
+    else:
+        if subscription_id is not None:
+            raise BillingFactViolation("top-up fact has a subscription id")
+        _require_uuid(order_id, "order_id")
+        if value.get("aggregate_id") != order_id:
+            raise BillingFactViolation("top-up aggregate id must equal order id")
     _fact_datetime(value.get("occurred_at"), "occurred_at")
     _fact_datetime(value.get("produced_at"), "produced_at")
+    paid_at_value = value.get("paid_at")
+    paid_at = None if paid_at_value is None else _fact_date(paid_at_value, "paid_at")
     event_type = value.get("event_type")
     expected_prefix = (
         "subscription.cycle_"
@@ -438,6 +636,8 @@ def validate_fact(value: Mapping[str, object]) -> None:
     reversed_cents = _integer(value.get("reversed_cents"), "reversed")
     restored = _integer(value.get("restored_cents"), "restored")
     grant = _integer(value.get(_CREDIT_FIELD), "credit amount")
+    if (settled > 0) != (paid_at is not None):
+        raise BillingFactViolation("paid_at must match settlement presence")
     if not 0 <= restored <= reversed_cents <= settled <= amount:
         raise BillingFactViolation("fact cumulative totals are invalid")
     raw_lines = value.get("lines")
@@ -452,6 +652,8 @@ def validate_fact(value: Mapping[str, object]) -> None:
         line_id = _text(line.get("line_id"), "line_id", maximum=100)
         ids.append(line_id)
         _text(line.get("offer_id"), "line offer_id", maximum=100)
+        if line.get("offer_id") != value.get("offer_id"):
+            raise BillingFactViolation("line offer differs from fact offer")
         kind = line.get("kind")
         if kind not in _LINE_KINDS:
             raise BillingFactViolation("invalid line kind")
@@ -470,12 +672,19 @@ def validate_fact(value: Mapping[str, object]) -> None:
             raise BillingFactViolation("non-credit line grants credits")
         if line.get("financial_state") not in _LINE_STATES:
             raise BillingFactViolation("invalid line financial state")
-        if line.get("financial_state") != _line_state(
+        expected_line_state = _line_state(
             settled=line_settled,
             reversed_cents=line_reversed,
             restored=line_restored,
-        ):
+        )
+        if line.get("financial_state") != expected_line_state:
             raise BillingFactViolation("line financial state disagrees with totals")
+        if (
+            line_grant > 0
+            and line_settled > 0
+            and (paid_at is None or line_settled != line_amount)
+        ):
+            raise BillingFactViolation("credit grant requires full paid settlement")
         total_amount += line_amount
         total_settled += line_settled
         total_reversed += line_reversed
@@ -560,6 +769,8 @@ class BillingFactProducer:
         )
         if existing is not None:
             return existing
+        if projection.settled_cents > 0 and projection.paid_at is None:
+            raise BillingFactViolation("settled projection lacks provider payment date")
         if projection.aggregate_kind == "topup":
             return await self._record_topup(effect, projection)
         if projection.aggregate_kind == "subscription":
@@ -581,9 +792,23 @@ class BillingFactProducer:
         )
         if order is None or order.builder_id != projection.builder_id:
             raise BillingFactViolation("top-up aggregate is unavailable")
+        snapshot = _mapping(order.pricing_snapshot, "top-up pricing snapshot")
+        _validate_offer_snapshot(
+            snapshot,
+            offer_id=order.offer_id,
+            catalog_version_id=order.catalog_version_id,
+        )
+        if _integer(snapshot.get("amount_cents"), "snapshot amount", minimum=1) != int(
+            order.amount_cents
+        ) or _integer(snapshot.get(_CREDIT_FIELD), "snapshot credit amount") != int(
+            order.credit_grant_mc
+        ):
+            raise BillingFactViolation(
+                "top-up aggregate differs from its pricing snapshot"
+            )
         try:
             lines = _copy_lines(
-                _mapping(order.pricing_snapshot, "top-up pricing snapshot"),
+                snapshot,
                 settled_cents=int(projection.settled_cents),
                 reversed_cents=int(projection.reversed_cents),
                 restored_cents=int(projection.restored_cents),
@@ -597,6 +822,18 @@ class BillingFactProducer:
             )
             await self._append_alert(
                 kind="partial_credit_settlement",
+                outbox_event_id=None,
+                detail=f"effect:{effect.id}",
+            )
+            await self._db.flush()
+            return None
+        except AmbiguousLineAllocation:
+            order.state = "quarantined"
+            order.settled_cents = int(projection.settled_cents)
+            order.reversed_cents = int(projection.reversed_cents)
+            order.restored_cents = int(projection.restored_cents)
+            await self._append_alert(
+                kind="ambiguous_line_allocation",
                 outbox_event_id=None,
                 detail=f"effect:{effect.id}",
             )
@@ -625,6 +862,7 @@ class BillingFactProducer:
             lines=lines,
             revision=revision,
             subscription_cycle=None,
+            paid_at=projection.paid_at,
         )
 
     async def _record_subscription(
@@ -639,9 +877,23 @@ class BillingFactProducer:
                 "subscription projection is missing its subscription"
             )
         cycle = await self._cycle_for_projection(projection, cycle_start=cycle_start)
+        snapshot = _mapping(cycle.pricing_snapshot, "subscription pricing snapshot")
+        _validate_offer_snapshot(
+            snapshot,
+            offer_id=cycle.offer_id,
+            catalog_version_id=cycle.catalog_version_id,
+        )
+        if _integer(snapshot.get("amount_cents"), "snapshot amount", minimum=1) != int(
+            cycle.amount_cents
+        ) or _integer(snapshot.get(_CREDIT_FIELD), "snapshot credit amount") != int(
+            cycle.credit_grant_mc
+        ):
+            raise BillingFactViolation(
+                "subscription cycle differs from its pricing snapshot"
+            )
         try:
             lines = _copy_lines(
-                _mapping(cycle.pricing_snapshot, "subscription pricing snapshot"),
+                snapshot,
                 settled_cents=int(projection.settled_cents),
                 reversed_cents=int(projection.reversed_cents),
                 restored_cents=int(projection.restored_cents),
@@ -655,6 +907,18 @@ class BillingFactProducer:
             )
             await self._append_alert(
                 kind="partial_credit_settlement",
+                outbox_event_id=None,
+                detail=f"effect:{effect.id}",
+            )
+            await self._db.flush()
+            return None
+        except AmbiguousLineAllocation:
+            cycle.state = "quarantined"
+            cycle.settled_cents = int(projection.settled_cents)
+            cycle.reversed_cents = int(projection.reversed_cents)
+            cycle.restored_cents = int(projection.restored_cents)
+            await self._append_alert(
+                kind="ambiguous_line_allocation",
                 outbox_event_id=None,
                 detail=f"effect:{effect.id}",
             )
@@ -690,6 +954,7 @@ class BillingFactProducer:
                 "cycle_start": cycle.cycle_start.isoformat(),
                 "cycle_end": cycle.cycle_end.isoformat(),
             },
+            paid_at=projection.paid_at,
         )
 
     async def _cycle_for_projection(
@@ -811,6 +1076,7 @@ class BillingFactProducer:
         lines: list[dict[str, object]],
         revision: int,
         subscription_cycle: dict[str, object] | None,
+        paid_at: date | None,
     ) -> BillingOutboxEvent:
         event_type = _EVENT_TYPES.get((aggregate_kind, effect.effect_kind))
         if event_type is None:
@@ -830,7 +1096,10 @@ class BillingFactProducer:
             "builder_id": str(projection.builder_id),
             "aggregate_kind": aggregate_kind,
             "aggregate_id": str(aggregate_id),
+            "subscription_id": str(subscription_id) if subscription_id else None,
+            "order_id": str(topup_order_id) if topup_order_id else None,
             "payment_id": projection.payment_id,
+            "paid_at": paid_at.isoformat() if paid_at is not None else None,
             "catalog_version_id": catalog_version_id,
             "offer_id": offer_id,
             "currency": "BRL",

@@ -478,6 +478,7 @@ def test_canary_plus_snapshot_and_transitive_provenance_are_closed() -> None:
         BillingCheckoutSession, "ck_billing_checkout_sessions_canary_exact"
     )
     assert "'included_clinics', 1" in exact
+    assert "'credit_grant_mc', 5000000" in exact
     assert "'credit_grant_mc', 5000" in exact
     assert "'line_financial_state', 'pending'" in exact
     migration = (
@@ -490,6 +491,21 @@ def test_canary_plus_snapshot_and_transitive_provenance_are_closed() -> None:
     assert "historical canary lineage is required" in migration
     assert "provider checkout identity is required" in migration
     assert "provider subscription lineage is required" in migration
+
+
+def test_migration_035_preserves_legacy_canary_rows_and_guards_downgrade() -> None:
+    migration_path = (
+        _ROOT / "alembic/versions/20261015_000003_035_billing_payment_paid_at.py"
+    )
+    migration = migration_path.read_text(encoding="utf-8")
+    assert "_canary_subscription_snapshot(5_000_000)" in migration
+    assert "_canary_subscription_snapshot(5_000)" in migration
+    assert "refunded_before_settlement" in migration
+    assert "cannot downgrade 035" in migration
+    assert "else [_canary_subscription_snapshot(5_000)]" in migration
+    assert "pre_settlement_refund_cents" in migration
+    assert "pre_settlement_refund_status" in migration
+    assert "pre_settlement_refund_observed_at" in migration
 
 
 def test_postgresql_model_constraints_match_migration_names() -> None:

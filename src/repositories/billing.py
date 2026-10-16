@@ -37,7 +37,7 @@ _CANARY_TOPUP_OFFER: Final = "package_credits_500_v1"
 _CANARY_SUBSCRIPTION_OFFER: Final = "plan_plus_monthly_v1"
 _CANARY_CATALOG: Final = "payment-2026-10-03"
 _CANARY_TOPUP_AMOUNT_CENTS: Final = 10_000
-_CANARY_TOPUP_CREDIT_GRANT_MC: Final = 500
+_CANARY_TOPUP_CREDIT_GRANT_MC: Final = 500_000
 _CANARY_SUBSCRIPTION_AMOUNT_CENTS: Final = 99_900
 _LIVE_CHECKOUT_STATES: Final = (
     "creating",
@@ -688,7 +688,7 @@ class BillingRepository:
                 "catalog_version_id": _CANARY_CATALOG,
                 "offer_id": _CANARY_SUBSCRIPTION_OFFER,
                 "amount_cents": _CANARY_SUBSCRIPTION_AMOUNT_CENTS,
-                "credit_grant_mc": 5_000,
+                "credit_grant_mc": 5_000_000,
                 "included_clinics": 1,
                 "billing_cycle": "monthly",
                 "payment_method": "credit_card",
@@ -700,7 +700,7 @@ class BillingRepository:
                         "quantity": 1,
                         "unit_amount_cents": _CANARY_SUBSCRIPTION_AMOUNT_CENTS,
                         "line_amount_cents": _CANARY_SUBSCRIPTION_AMOUNT_CENTS,
-                        "credit_grant_mc": 5_000,
+                        "credit_grant_mc": 5_000_000,
                         "settled_cents": 0,
                         "reversed_cents": 0,
                         "restored_cents": 0,

@@ -29,10 +29,10 @@ def upgrade() -> None:
             "created_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.func.now(),
+            server_default=sa.text("CURRENT_TIMESTAMP"),
         ),
         sa.CheckConstraint(
-            "payload_digest ~ '^[0-9a-f]{64}$'",
+            "length(payload_digest) = 64 AND payload_digest ~ '^[0-9a-f]{64}$'",
             name="ck_billing_producer_build_attestations_digest",
         ),
         sa.UniqueConstraint(
@@ -91,7 +91,7 @@ def upgrade() -> None:
             name="ck_billing_producer_grants_service",
         ),
         sa.CheckConstraint(
-            "scope_digest ~ '^[0-9a-f]{64}$'",
+            "length(scope_digest) = 64 AND scope_digest ~ '^[0-9a-f]{64}$'",
             name="ck_billing_producer_grants_digest",
         ),
         sa.CheckConstraint(
@@ -193,7 +193,7 @@ def upgrade() -> None:
             name="ck_billing_producer_receipts_service",
         ),
         sa.CheckConstraint(
-            "payload_digest ~ '^[0-9a-f]{64}$'",
+            "length(payload_digest) = 64 AND payload_digest ~ '^[0-9a-f]{64}$'",
             name="ck_billing_producer_receipts_digest",
         ),
         sa.CheckConstraint(
@@ -281,7 +281,7 @@ def upgrade() -> None:
             "updated_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.func.now(),
+            server_default=sa.text("CURRENT_TIMESTAMP"),
         ),
         sa.CheckConstraint(
             "environment = 'staging'", name="ck_billing_producer_active_environment"

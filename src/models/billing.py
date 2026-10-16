@@ -559,6 +559,17 @@ class BillingCheckoutSession(Base, TimestampMixin):
             "pricing_snapshot ->> 'amount_cents' = '99900' AND "
             "pricing_snapshot ->> 'payment_method' = 'credit_card' AND "
             "pricing_snapshot ->> 'billing_cycle' = 'monthly' AND "
+            "(pricing_snapshot = jsonb_build_object("
+            "'catalog_version_id', 'payment-2026-10-03', "
+            "'offer_id', 'plan_plus_monthly_v1', 'amount_cents', 99900, "
+            "'credit_grant_mc', 5000000, 'included_clinics', 1, "
+            "'billing_cycle', 'monthly', 'payment_method', 'credit_card', "
+            "'lines', jsonb_build_array(jsonb_build_object("
+            "'line_id', 'plan', 'offer_id', 'plan_plus_monthly_v1', "
+            "'kind', 'plan', 'quantity', 1, 'unit_amount_cents', 99900, "
+            "'line_amount_cents', 99900, 'credit_grant_mc', 5000000, "
+            "'settled_cents', 0, 'reversed_cents', 0, 'restored_cents', 0, "
+            "'line_financial_state', 'pending'))) OR "
             "pricing_snapshot = jsonb_build_object("
             "'catalog_version_id', 'payment-2026-10-03', "
             "'offer_id', 'plan_plus_monthly_v1', 'amount_cents', 99900, "
@@ -569,7 +580,7 @@ class BillingCheckoutSession(Base, TimestampMixin):
             "'kind', 'plan', 'quantity', 1, 'unit_amount_cents', 99900, "
             "'line_amount_cents', 99900, 'credit_grant_mc', 5000, "
             "'settled_cents', 0, 'reversed_cents', 0, 'restored_cents', 0, "
-            "'line_financial_state', 'pending')))) OR "
+            "'line_financial_state', 'pending'))))) OR "
             "(canary_slot = 'topup' AND intent_kind = 'topup' AND "
             "migration_id IS NULL AND topup_order_id IS NOT NULL AND "
             "intent_id = topup_order_id AND "
@@ -577,7 +588,7 @@ class BillingCheckoutSession(Base, TimestampMixin):
             "pricing_snapshot ->> 'catalog_version_id' = 'payment-2026-10-03' AND "
             "pricing_snapshot ->> 'offer_id' = 'package_credits_500_v1' AND "
             "pricing_snapshot ->> 'amount_cents' = '10000' AND "
-            "pricing_snapshot ->> 'credit_grant_mc' = '500')))",
+            "pricing_snapshot ->> 'credit_grant_mc' = '500000')))",
             name="ck_billing_checkout_sessions_canary_exact",
         ),
         ForeignKeyConstraint(
@@ -1035,7 +1046,8 @@ class BillingPaymentProjection(Base, TimestampMixin):
             "status IN ('pending', 'failed', 'overdue', 'settled', "
             "'reversal_pending', 'partially_reversed', 'reversed', "
             "'chargeback_requested', 'chargeback_dispute', "
-            "'restoration_pending', 'deleted', 'readback_required', 'restored')",
+            "'restoration_pending', 'deleted', 'readback_required', 'restored', "
+            "'refunded_before_settlement')",
             name="ck_billing_payment_projections_status",
         ),
         CheckConstraint(
@@ -1043,6 +1055,22 @@ class BillingPaymentProjection(Base, TimestampMixin):
             "AND restored_cents >= 0 AND restored_cents <= reversed_cents "
             "AND reversed_cents <= settled_cents AND settled_cents <= amount_cents",
             name="ck_billing_payment_projections_totals",
+        ),
+        CheckConstraint(
+            "(pre_settlement_refund_cents IS NULL AND "
+            "pre_settlement_refund_status IS NULL AND "
+            "pre_settlement_refund_observed_at IS NULL) OR "
+            "(status = 'refunded_before_settlement' AND settled_cents = 0 AND "
+            "pre_settlement_refund_cents > 0 AND "
+            "pre_settlement_refund_cents <= amount_cents AND "
+            "pre_settlement_refund_status IN ('PENDING', "
+            "'AWAITING_RISK_ANALYSIS', 'OVERDUE', 'CONFIRMED', "
+            "'RECEIVED', 'RECEIVED_IN_CASH', 'REFUND_REQUESTED', "
+            "'REFUND_IN_PROGRESS', "
+            "'REFUNDED', 'CHARGEBACK_REQUESTED', 'CHARGEBACK_DISPUTE', "
+            "'AWAITING_CHARGEBACK_REVERSAL') AND "
+            "pre_settlement_refund_observed_at IS NOT NULL)",
+            name="ck_billing_payment_projections_pre_settlement_refund_evidence",
         ),
         CheckConstraint(
             "restoration_epoch >= 0",
@@ -1180,6 +1208,17 @@ class BillingPaymentProjection(Base, TimestampMixin):
     )
     restoration_epoch: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
+    )
+    # ASAAS's civil settlement date; never derived from event or processing time.
+    paid_at: Mapped[date | None] = mapped_column(Date, nullable=True)
+    pre_settlement_refund_cents: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    pre_settlement_refund_status: Mapped[str | None] = mapped_column(
+        String(40), nullable=True
+    )
+    pre_settlement_refund_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     provider_created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
@@ -2319,7 +2358,7 @@ class BillingFactReconciliationAlert(Base):
     __table_args__ = (
         CheckConstraint(
             "kind IN ('backlog', 'collision', 'schema_mismatch', 'digest_mismatch', "
-            "'gap', 'partial_credit_settlement')",
+            "'gap', 'partial_credit_settlement', 'ambiguous_line_allocation')",
             name="ck_billing_fact_reconciliation_alerts_kind",
         ),
         _postgresql_check(

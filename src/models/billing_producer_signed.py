@@ -282,6 +282,11 @@ class BillingProducerV1Receipt(Base):
             "expires_at > issued_at AND expires_at <= issued_at + interval '7 days'",
             name="ck_billing_producer_v1_receipts_ttl",
         ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "(receipt_type = 'billing_producer_deployed.v1' AND verifier_user_id IS NULL) OR "
+            "(receipt_type = 'billing_producer_deploy_verified.v1' AND verifier_user_id IS NOT NULL)",
+            name="ck_billing_producer_v1_receipts_actor_shape",
+        ),
         UniqueConstraint(
             "id",
             "operation_id",

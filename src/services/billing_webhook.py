@@ -138,7 +138,7 @@ PAYMENT_EVENT_STATUSES: Final[Mapping[str, str]] = MappingProxyType(
         "PAYMENT_REPROVED_BY_RISK_ANALYSIS": "failed",
         "PAYMENT_CREDIT_CARD_CAPTURE_REFUSED": "failed",
         "PAYMENT_OVERDUE": "overdue",
-        "PAYMENT_CONFIRMED": "settled",
+        "PAYMENT_CONFIRMED": "pending",
         "PAYMENT_RECEIVED": "settled",
         "PAYMENT_REFUND_IN_PROGRESS": "reversal_pending",
         "PAYMENT_PARTIALLY_REFUNDED": "partially_reversed",
@@ -173,9 +173,9 @@ _READBACK_PAYMENT_STATUSES: Final[Mapping[str, str]] = MappingProxyType(
         "PENDING": "pending",
         "AWAITING_RISK_ANALYSIS": "pending",
         "OVERDUE": "overdue",
-        "CONFIRMED": "settled",
+        "CONFIRMED": "pending",
         "RECEIVED": "settled",
-        "RECEIVED_IN_CASH": "settled",
+        "RECEIVED_IN_CASH": "pending",
         "REFUND_REQUESTED": "reversal_pending",
         "REFUND_IN_PROGRESS": "reversal_pending",
         "REFUNDED": "reversed",
@@ -245,6 +245,7 @@ OFFER_PLANS: Final[Mapping[str, str]] = MappingProxyType(
     }
 )
 SETTLEMENT_REVISION: Final = "settlement:v1"
+REFUNDED_BEFORE_SETTLEMENT: Final = "refunded_before_settlement"
 
 # Provider event ids are opaque: the documented shape is
 # ``evt_<32 hex>&<digits>`` and ``&`` is outside the Group 1 delivery CHECK
@@ -479,6 +480,7 @@ class PaymentFacts:
     value_cents: int | None
     billing_type: str | None
     due_date: date | None = None
+    payment_date: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -555,7 +557,8 @@ def _date(value: object) -> date | None:
     if not isinstance(value, str) or len(value) != 10:
         return None
     try:
-        return date.fromisoformat(value)
+        parsed = date.fromisoformat(value)
+        return parsed if parsed.isoformat() == value else None
     except ValueError:
         return None
 
@@ -627,6 +630,7 @@ def parse_envelope(body: bytes, payload: object) -> WebhookEnvelope:
             value_cents=provider_cents(data.get("value")),
             billing_type=_billing_type(data.get("billingType")),
             due_date=_date(data.get("dueDate")),
+            payment_date=_date(data.get("paymentDate")),
         ),
         **common,
     )
@@ -641,6 +645,7 @@ def _payment_facts_from_readback(readback: PaymentReadback) -> PaymentFacts:
         value_cents=readback.value_cents,
         billing_type=_billing_type(readback.billing_type),
         due_date=readback.due_date,
+        payment_date=readback.payment_date,
     )
 
 
@@ -1134,9 +1139,18 @@ class _FinancialState:
                     event_id=event_id,
                 )
                 return "readback_required"
-        if normalized == "settled" or (
-            readback is not None and normalized in _MONEY_SETTLED_STATUSES
-        ):
+        terminal_pre_settlement_refund = bool(
+            existing is not None and existing.status == REFUNDED_BEFORE_SETTLEMENT
+        )
+        has_prior_settlement = bool(existing is not None and existing.settled_cents > 0)
+        should_activate_subscription = (
+            normalized == "settled" and not terminal_pre_settlement_refund
+        ) or (
+            readback is not None
+            and has_prior_settlement
+            and normalized in _MONEY_SETTLED_STATUSES
+        )
+        if should_activate_subscription:
             await self._activate_subscription_before_projection(subscription, canary)
         projection = existing or await self.ensure_projection(
             target,
@@ -1160,6 +1174,7 @@ class _FinancialState:
                 order=order,
                 session=session,
                 facts=facts,
+                observed_at=provider_created_at,
             )
         return await self._apply_event(
             projection,
@@ -1201,9 +1216,27 @@ class _FinancialState:
         facts: PaymentFacts,
     ) -> str:
         stale = key <= projection.ordering_key
+        if projection.status == REFUNDED_BEFORE_SETTLEMENT:
+            # An exact provider readback already established a completed
+            # refund before any accepted receipt.  A delayed receipt event is
+            # contradictory evidence and must never create a settlement.
+            self.alerts.append("drift")
+            return "readback_required"
+        if projection.settled_cents > 0 and projection.paid_at is None:
+            # 035 cannot backfill historical settlement dates. Require an
+            # exact provider read before a later event can emit a fact.
+            return "readback_required"
+        if (
+            normalized == "settled"
+            and projection.settled_cents > 0
+            and (projection.paid_at is None or facts.payment_date != projection.paid_at)
+        ):
+            return "readback_required"
         if normalized == "settled":
             if projection.settled_cents > 0:
                 return "processed"  # second settlement event: same settlement:v1
+            if facts.payment_date is None:
+                return "readback_required"
             if projection.status not in (*_NON_FINANCIAL_STATUSES, "readback_required"):
                 return "readback_required"
             await self._settle(
@@ -1218,6 +1251,7 @@ class _FinancialState:
                 session=session,
                 billing_type=facts.billing_type,
                 cycle_start=facts.due_date,
+                paid_at=facts.payment_date,
             )
             return "processed"
         # Monetary transitions are monotone in their cumulative key, so their
@@ -1299,20 +1333,78 @@ class _FinancialState:
         order: BillingTopupOrder | None,
         session: BillingCheckoutSession | None,
         facts: PaymentFacts,
+        observed_at: datetime,
     ) -> str:
         """Converge the projection to one exact provider read."""
 
-        if normalized == "unknown" or readback.refunded_cents is None:
+        if (
+            normalized == "unknown"
+            or readback.status not in _READBACK_PAYMENT_STATUSES
+            or readback.refunded_cents is None
+        ):
             self.alerts.append("drift")
             return "readback_required"
         amount = projection.amount_cents
-        target_reversed = (
-            amount if normalized == "reversed" else readback.refunded_cents
-        )
+        target_reversed = readback.refunded_cents
         if target_reversed > amount:
             self.alerts.append("drift")
             return "readback_required"
+        if readback.status == "REFUNDED" and target_reversed == 0:
+            # A REFUNDED label without any exact DONE refund value is
+            # contradictory provider evidence. paymentDate alone cannot
+            # prove settlement or authorize a grant.
+            self.alerts.append("drift")
+            return "readback_required"
+        if projection.status == REFUNDED_BEFORE_SETTLEMENT:
+            # The marker is terminal for automatic financial projection.  A
+            # provider read that continues to show a completed refund is
+            # consistent; any receipt or loss of the refund is quarantined.
+            if projection.settled_cents == 0 and normalized != "settled":
+                evidence_matches = (
+                    projection.pre_settlement_refund_cents == target_reversed
+                    and projection.pre_settlement_refund_status == readback.status
+                    and projection.pre_settlement_refund_observed_at is not None
+                )
+                if evidence_matches and target_reversed > 0:
+                    return "processed"
+            self.alerts.append("drift")
+            return "readback_required"
+        if (
+            projection.settled_cents == 0
+            and target_reversed > 0
+            and normalized != "settled"
+        ):
+            # ASAAS can complete a refund before we have accepted a PAYMENT_
+            # RECEIVED / RECEIVED read.  Preserve that history as a terminal
+            # marker and never manufacture a temporary grant/reversal pair.
+            self._touch(
+                projection,
+                status=REFUNDED_BEFORE_SETTLEMENT,
+                key=key,
+                event_id=projection.last_event_id,
+            )
+            projection.pre_settlement_refund_cents = target_reversed
+            projection.pre_settlement_refund_status = readback.status
+            projection.pre_settlement_refund_observed_at = observed_at
+            self.alerts.append("drift")
+            await self._db.flush()
+            return "processed"
         money_settled = normalized in _MONEY_SETTLED_STATUSES or target_reversed > 0
+        if projection.settled_cents > 0:
+            if projection.paid_at is None:
+                if facts.payment_date is None:
+                    self.alerts.append("drift")
+                    return "readback_required"
+                projection.paid_at = facts.payment_date
+            elif (
+                facts.payment_date is not None
+                and facts.payment_date != projection.paid_at
+            ):
+                self.alerts.append("drift")
+                return "readback_required"
+        elif money_settled and facts.payment_date is None:
+            self.alerts.append("drift")
+            return "readback_required"
         net_reversed = projection.reversed_cents - projection.restored_cents
         event_id = projection.last_event_id
         # 1. restoration: reversed/deleted -> live, proven by this read.  A
@@ -1359,6 +1451,7 @@ class _FinancialState:
                 session=session,
                 billing_type=facts.billing_type,
                 cycle_start=facts.due_date,
+                paid_at=facts.payment_date,
             )
         elif not money_settled and projection.settled_cents > 0:
             self.alerts.append("drift")  # money can never un-settle
@@ -1453,7 +1546,13 @@ class _FinancialState:
         session: BillingCheckoutSession | None,
         billing_type: str | None,
         cycle_start: date | None,
+        paid_at: date | None,
     ) -> None:
+        if paid_at is None:
+            raise RuntimeError("ASAAS settlement is missing paymentDate")
+        if projection.paid_at is not None and projection.paid_at != paid_at:
+            raise RuntimeError("ASAAS paymentDate changed after settlement")
+        projection.paid_at = paid_at
         amount = projection.amount_cents
         self._touch(projection, status="settled", key=key, event_id=event_id)
         projection.settled_cents = amount

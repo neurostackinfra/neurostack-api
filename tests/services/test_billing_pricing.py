@@ -19,6 +19,7 @@ def test_additional_clinic_pricing_is_integer_only_and_snapshot_bound() -> None:
 
     assert snapshot["additional_clinics"] == 2
     assert snapshot["amount_cents"] == 280_000
+    assert snapshot["credit_grant_mc"] == offer.credits * 1_000
     assert all(
         isinstance(value, int)
         for value in (snapshot["amount_cents"], snapshot["credit_grant_mc"])
@@ -63,6 +64,7 @@ def test_topup_pricing_has_integer_quantity_and_only_allowed_method() -> None:
     snapshot = topup_pricing_snapshot(offer, payment_method="pix")
 
     assert snapshot["amount_cents"] == 10_000
+    assert snapshot["credit_grant_mc"] == 500_000
     assert snapshot["payment_method"] == "pix"
     assert snapshot["lines"] == [
         {
@@ -72,7 +74,7 @@ def test_topup_pricing_has_integer_quantity_and_only_allowed_method() -> None:
             "quantity": 1,
             "unit_amount_cents": 10_000,
             "line_amount_cents": 10_000,
-            "credit_grant_mc": 500,
+            "credit_grant_mc": 500_000,
             "settled_cents": 0,
             "reversed_cents": 0,
             "restored_cents": 0,

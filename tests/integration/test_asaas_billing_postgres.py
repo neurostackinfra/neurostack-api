@@ -887,7 +887,7 @@ async def test_upgrade_downgrade_and_fresh_schema_are_equivalent(
     async with postgres_harness.engine.connect() as connection:
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "032"
+            == "035"
         )
         legacy = (
             await connection.execute(
@@ -2875,7 +2875,7 @@ async def test_topup_authorization_reserves_budget_atomically_and_disable_wins(
                             pricing_snapshot
                         ) VALUES (
                             :id, :builder_id, 'pix', 'payment-2026-10-03',
-                            'package_credits_500_v1', 10000, 500,
+                            'package_credits_500_v1', 10000, 500000,
                             CAST(:snapshot AS jsonb)
                         )
                     """),
@@ -2885,7 +2885,7 @@ async def test_topup_authorization_reserves_budget_atomically_and_disable_wins(
                         "snapshot": (
                             '{"catalog_version_id":"payment-2026-10-03",'
                             '"offer_id":"package_credits_500_v1",'
-                            '"amount_cents":10000,"credit_grant_mc":500,'
+                            '"amount_cents":10000,"credit_grant_mc":500000,'
                             '"payment_method":"pix",'
                             '"lines":[{"line_id":"topup"}]}'
                         ),
@@ -3752,7 +3752,7 @@ async def test_canary_typed_slots_reject_two_topups_without_plus(
                             pricing_snapshot
                         ) VALUES (
                             :id, :builder_id, 'pix', 'payment-2026-10-03',
-                            'package_credits_500_v1', 10000, 500,
+                            'package_credits_500_v1', 10000, 500000,
                             CAST(:snapshot AS jsonb)
                         )
                     """),
@@ -3762,7 +3762,7 @@ async def test_canary_typed_slots_reject_two_topups_without_plus(
                         "snapshot": (
                             '{"catalog_version_id":"payment-2026-10-03",'
                             '"offer_id":"package_credits_500_v1",'
-                            '"amount_cents":10000,"credit_grant_mc":500,'
+                            '"amount_cents":10000,"credit_grant_mc":500000,'
                             '"payment_method":"pix"}'
                         ),
                     },
@@ -6601,7 +6601,7 @@ async def test_fact_producer_inserts_outbox_delivery_and_handoff_in_fk_order(
                     offer_id, amount_cents, credit_grant_mc, pricing_snapshot
                 ) VALUES (
                     :id, :builder_id, 'pix', :catalog_version_id,
-                    'package_credits_500_v1', 10000, 500,
+                    'package_credits_500_v1', 10000, :credit_grant_mc,
                     CAST(:snapshot AS JSONB)
                 )
             """),
@@ -6609,6 +6609,7 @@ async def test_fact_producer_inserts_outbox_delivery_and_handoff_in_fk_order(
                 "id": order_id,
                 "builder_id": builder_id,
                 "catalog_version_id": snapshot["catalog_version_id"],
+                "credit_grant_mc": snapshot["credit_grant_mc"],
                 "snapshot": json.dumps(snapshot),
             },
         )
@@ -6618,7 +6619,7 @@ async def test_fact_producer_inserts_outbox_delivery_and_handoff_in_fk_order(
                     id, builder_id, provider, event_id, event_name,
                     provider_created_at, body_bytes, body_sha256
                 ) VALUES (
-                    :id, :builder_id, 'asaas', :event_id, 'PAYMENT_CONFIRMED',
+                    :id, :builder_id, 'asaas', :event_id, 'PAYMENT_RECEIVED',
                     now(), 2, :sha
                 )
             """),
@@ -6634,10 +6635,10 @@ async def test_fact_producer_inserts_outbox_delivery_and_handoff_in_fk_order(
                 INSERT INTO billing_payment_projections (
                     id, builder_id, provider, payment_id, aggregate_kind,
                     topup_order_id, status, amount_cents, settled_cents,
-                    provider_created_at, ordering_key, last_event_id
+                    paid_at, provider_created_at, ordering_key, last_event_id
                 ) VALUES (
                     :id, :builder_id, 'asaas', :payment_id, 'topup',
-                    :order_id, 'settled', 10000, 10000, now(),
+                    :order_id, 'settled', 10000, 10000, DATE '2026-10-11', now(),
                     '2026-10-12T00:00:00Z:0', :event_id
                 )
             """),

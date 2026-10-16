@@ -377,7 +377,8 @@ def _optional_date(value: object) -> date | None:
     if not isinstance(value, str) or len(value) != 10:
         return None
     try:
-        return date.fromisoformat(value)
+        parsed = date.fromisoformat(value)
+        return parsed if parsed.isoformat() == value else None
     except ValueError:
         return None
 
@@ -413,6 +414,7 @@ class PaymentReadback:
     billing_type: str | None
     refunded_cents: int | None
     due_date: date | None = None
+    payment_date: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -540,6 +542,7 @@ def _payment_readback(payload: Mapping[str, Any]) -> PaymentReadback:
         billing_type=_optional_text(payload.get("billingType"), limit=30),
         refunded_cents=_refunded_cents(payload.get("refunds")),
         due_date=_optional_date(payload.get("dueDate")),
+        payment_date=_optional_date(payload.get("paymentDate")),
     )
 
 

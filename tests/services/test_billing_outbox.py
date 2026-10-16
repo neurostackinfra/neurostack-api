@@ -36,6 +36,9 @@ from src.services.billing_outbox import (
     BillingFactProducer,
     BillingFactPublisher,
     BillingFactReconciler,
+    BillingFactViolation,
+    _copy_lines,
+    _validate_offer_snapshot,
     billing_fact_bundle_digest,
 )
 
@@ -75,7 +78,7 @@ async def _settled_topup(
         offer_id="package_credits_500_v1",
         payment_method="pix",
         amount_cents=10_000,
-        credit_grant_mc=500,
+        credit_grant_mc=500_000,
         pricing_snapshot=snapshot,
     )
     delivery = BillingWebhookDelivery(
@@ -104,6 +107,7 @@ async def _settled_topup(
         reversed_cents=0,
         restored_cents=0,
         restoration_epoch=0,
+        paid_at=date(2026, 10, 11),
         provider_created_at=now,
         ordering_key="00000000000000001.00:fixture",
         last_event_id="fixture",
@@ -207,6 +211,7 @@ async def _settled_subscription(
         reversed_cents=0,
         restored_cents=0,
         restoration_epoch=0,
+        paid_at=date(2026, 10, 11),
         provider_created_at=now,
         ordering_key="00000000000000001.00:fixture",
         last_event_id="fixture",
@@ -369,6 +374,69 @@ async def test_partial_credit_settlement_is_quarantined_without_a_fact(
         assert await session.scalar(select(BillingOutboxEvent.id)) is None
 
 
+def test_multi_line_financial_cumulatives_are_never_synthetically_allocated() -> None:
+    offer = BILLING_CATALOG["plan_plus_monthly_v1"]
+    snapshot = subscription_pricing_snapshot(offer, active_clinics=2)
+    with pytest.raises(BillingFactViolation, match="cannot identify multi-line"):
+        _copy_lines(
+            snapshot,
+            settled_cents=100_000,
+            reversed_cents=0,
+            restored_cents=0,
+        )
+    with pytest.raises(BillingFactViolation, match="cannot identify multi-line"):
+        _copy_lines(
+            snapshot,
+            settled_cents=offer.amount_cents + offer.additional_clinic_amount_cents,
+            reversed_cents=50_000,
+            restored_cents=0,
+        )
+    fully_reversed = _copy_lines(
+        snapshot,
+        settled_cents=offer.amount_cents + offer.additional_clinic_amount_cents,
+        reversed_cents=offer.amount_cents + offer.additional_clinic_amount_cents,
+        restored_cents=offer.amount_cents + offer.additional_clinic_amount_cents,
+    )
+    assert all(
+        line["settled_cents"] == line["line_amount_cents"] for line in fully_reversed
+    )
+    assert all(
+        line["reversed_cents"] == line["line_amount_cents"] for line in fully_reversed
+    )
+    assert all(
+        line["restored_cents"] == line["line_amount_cents"] for line in fully_reversed
+    )
+
+
+async def test_stale_persisted_credit_snapshot_fails_closed_without_fact(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        effect, projection, order = await _settled_topup(session)
+        snapshot = dict(order.pricing_snapshot)
+        snapshot["credit_grant_mc"] = 500
+        lines = [dict(line) for line in snapshot["lines"]]
+        lines[0]["credit_grant_mc"] = 500
+        snapshot["lines"] = lines
+        order.pricing_snapshot = snapshot
+        with pytest.raises(BillingFactViolation, match="credit amount is stale"):
+            await BillingFactProducer(session).record_effect(effect, projection)
+        assert await session.scalar(select(BillingOutboxEvent.id)) is None
+
+
+def test_offer_snapshot_validator_rejects_old_credit_scale() -> None:
+    offer = BILLING_CATALOG["package_credits_500_v1"]
+    snapshot = topup_pricing_snapshot(offer, payment_method="credit_card")
+    snapshot["credit_grant_mc"] = 500
+    snapshot["lines"][0]["credit_grant_mc"] = 500
+    with pytest.raises(BillingFactViolation, match="credit amount is stale"):
+        _validate_offer_snapshot(
+            snapshot,
+            offer_id=offer.offer_id,
+            catalog_version_id="payment-2026-10-03",
+        )
+
+
 async def test_cumulative_reversal_restoration_and_zero_restoration_are_ordered(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -494,3 +562,16 @@ async def test_fact_rows_satisfy_enforced_foreign_keys_on_sqlite(
             )
     finally:
         await engine.dispose()
+
+
+async def test_settled_legacy_projection_without_paid_at_cannot_emit_fact(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        effect, projection, _order = await _settled_topup(session)
+        projection.paid_at = None
+        with pytest.raises(
+            BillingFactViolation, match="settled projection lacks provider payment date"
+        ):
+            await BillingFactProducer(session).record_effect(effect, projection)
+        assert await session.scalar(select(BillingOutboxEvent.id)) is None

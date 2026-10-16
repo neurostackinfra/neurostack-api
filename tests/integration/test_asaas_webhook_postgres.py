@@ -165,19 +165,25 @@ def _payment(
     value: str = "100.00",
     when: str | None = None,
     event_id: str | None = None,
+    payment_date: str | None = None,
 ) -> dict[str, Any]:
+    if payment_date is None and event == "PAYMENT_RECEIVED":
+        payment_date = "2026-10-11"
+    resource = {
+        "object": "payment",
+        "id": payment_id,
+        "subscription": subscription,
+        "checkoutSession": checkout,
+        "value": Decimal(value),
+        "billingType": "CREDIT_CARD" if subscription else "PIX",
+        "externalReference": None,
+        "creditCard": {"creditCardToken": "tok_private"},
+    }
+    if payment_date is not None:
+        resource["paymentDate"] = payment_date
     return _payload(
         event,
-        {
-            "object": "payment",
-            "id": payment_id,
-            "subscription": subscription,
-            "checkoutSession": checkout,
-            "value": Decimal(value),
-            "billingType": "CREDIT_CARD" if subscription else "PIX",
-            "externalReference": None,
-            "creditCard": {"creditCardToken": "tok_private"},
-        },
+        resource,
         when=when,
         event_id=event_id,
     )
@@ -236,10 +242,34 @@ class _Reads:
 
 
 def _read(
-    payment_id: str, status: str, cents: int, refunded: int = 0, deleted: bool = False
+    payment_id: str,
+    status: str,
+    cents: int,
+    refunded: int = 0,
+    deleted: bool = False,
+    *,
+    omit_payment_date: bool = False,
+    include_payment_date: bool = False,
 ) -> PaymentReadback:
     return PaymentReadback(
-        payment_id, status, deleted, cents, None, None, None, "PIX", refunded
+        payment_id,
+        status,
+        deleted,
+        cents,
+        None,
+        None,
+        None,
+        "PIX",
+        refunded,
+        payment_date=(
+            date(2026, 10, 11)
+            if not omit_payment_date
+            and (
+                include_payment_date
+                or status in {"RECEIVED", "CHARGEBACK_DISPUTE", "CHARGEBACK_REQUESTED"}
+            )
+            else None
+        ),
     )
 
 
@@ -384,7 +414,7 @@ async def test_topup_settles_once_and_reverses_cumulatively(
         harness, _payment("PAYMENT_CREATED", payment, checkout=checkout_id), "test"
     )
     await _deliver(
-        harness, _payment("PAYMENT_CONFIRMED", payment, checkout=checkout_id), "test"
+        harness, _payment("PAYMENT_RECEIVED", payment, checkout=checkout_id), "test"
     )
     await _deliver(
         harness, _payment("PAYMENT_RECEIVED", payment, checkout=checkout_id), "test"
@@ -491,7 +521,7 @@ async def test_each_idempotency_key_is_its_own_postgres_constraint(
         harness, monkeypatch, "constraints"
     )
     payment = "pay_pg_constraint"
-    confirmed = _payment("PAYMENT_CONFIRMED", payment, checkout=checkout_id)
+    confirmed = _payment("PAYMENT_RECEIVED", payment, checkout=checkout_id)
     await _deliver(harness, confirmed, "test")
     (effect,) = await _all(
         harness,
@@ -552,7 +582,7 @@ async def test_concurrent_identical_deliveries_wait_and_apply_once(
 ) -> None:
     builder_id, _session, checkout_id = await _topup(harness, monkeypatch, "dup race")
     envelope = _envelope(
-        _payment("PAYMENT_CONFIRMED", "pay_pg_dup", checkout=checkout_id)
+        _payment("PAYMENT_RECEIVED", "pay_pg_dup", checkout=checkout_id)
     )
     first = harness.session()
     second = harness.session()
@@ -725,7 +755,7 @@ async def test_coupon_is_consumed_once_inside_the_settlement_transaction(
         harness, _subscription_created(session_id, "sub_pg_coupon", cents), "test"
     )
     confirmed = _payment(
-        "PAYMENT_CONFIRMED",
+        "PAYMENT_RECEIVED",
         "pay_pg_coupon_1",
         checkout=checkout_id,
         subscription="sub_pg_coupon",
@@ -770,7 +800,7 @@ async def test_coupon_is_consumed_once_inside_the_settlement_transaction(
     await _deliver(
         harness,
         _payment(
-            "PAYMENT_CONFIRMED",
+            "PAYMENT_RECEIVED",
             "pay_pg_coupon_2",
             subscription="sub_pg_coupon",
             value=_brl(cents),
@@ -934,7 +964,7 @@ async def test_canary_subscription_settles_into_its_slot_and_quarantines_refusal
     renewal = await _deliver(
         harness,
         _payment(
-            "PAYMENT_CONFIRMED",
+            "PAYMENT_RECEIVED",
             "pay_pg_canary_renewal",
             subscription="sub_pg_canary",
             value="999.00",
@@ -1135,9 +1165,9 @@ async def test_every_status_group3_writes_is_accepted_by_postgres(
         ("pay_s_rsp", "PAYMENT_AWAITING_CHARGEBACK_REVERSAL"),
         ("pay_s_full", "PAYMENT_REFUNDED"),
     ):
-        await send("PAYMENT_CONFIRMED", payment)
+        await send("PAYMENT_RECEIVED", payment)
         await send(follow, payment)
-    await send("PAYMENT_CONFIRMED", "pay_s_partial")
+    await send("PAYMENT_RECEIVED", "pay_s_partial")
     partial = await send("PAYMENT_PARTIALLY_REFUNDED", "pay_s_partial")
     await readback(
         partial, "pay_s_partial", _read("pay_s_partial", "RECEIVED", 10_000, 2_500)
@@ -1672,7 +1702,7 @@ async def test_subscription_readback_converges_back_to_active(
             "SELECT status FROM billing_subscriptions WHERE id = :i",
             i=subscription_id,
         )
-        == "active"
+        == "active_linked"
     )
 
 
@@ -1682,7 +1712,7 @@ async def test_refund_denied_restores_a_non_zero_amount_by_readback(
     builder_id, _session, checkout_id = await _topup(harness, monkeypatch, "restore")
     payment = "pay_pg_restore"
     await _deliver(
-        harness, _payment("PAYMENT_CONFIRMED", payment, checkout=checkout_id), "test"
+        harness, _payment("PAYMENT_RECEIVED", payment, checkout=checkout_id), "test"
     )
     await _deliver(
         harness, _payment("PAYMENT_REFUNDED", payment, checkout=checkout_id), "test"
@@ -1731,7 +1761,7 @@ async def test_chargeback_status_converges_by_readback(
     )
     payment = "pay_pg_chargeback"
     await _deliver(
-        harness, _payment("PAYMENT_CONFIRMED", payment, checkout=checkout_id), "test"
+        harness, _payment("PAYMENT_RECEIVED", payment, checkout=checkout_id), "test"
     )
     requested = await _deliver(
         harness,
@@ -1754,6 +1784,115 @@ async def test_chargeback_status_converges_by_readback(
         )
         == "chargeback_dispute"
     )
+
+
+@pytest.mark.parametrize(
+    ("event_name", "provider_status", "refunded_cents"),
+    [
+        ("PAYMENT_PARTIALLY_REFUNDED", "RECEIVED", 3_000),
+        ("PAYMENT_CHARGEBACK_REQUESTED", "CHARGEBACK_DISPUTE", 0),
+    ],
+)
+async def test_post_settlement_readback_without_payment_date_preserves_paid_at(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    event_name: str,
+    provider_status: str,
+    refunded_cents: int,
+) -> None:
+    _builder_id, _session, checkout_id = await _topup(
+        harness, monkeypatch, f"readback without date {event_name}"
+    )
+    payment = f"pay_pg_no_date_{event_name.lower()}"
+    await _deliver(
+        harness, _payment("PAYMENT_RECEIVED", payment, checkout=checkout_id), "test"
+    )
+    outcome = await _deliver(
+        harness, _payment(event_name, payment, checkout=checkout_id), "test"
+    )
+    reads = _Reads(
+        payments={
+            payment: _read(
+                payment,
+                provider_status,
+                10_000,
+                refunded=refunded_cents,
+                omit_payment_date=True,
+            )
+        }
+    )
+    async with harness.session() as session:
+        assert (
+            await BillingReadbackService(
+                session, client_factory=reads, environment="test"
+            ).readback_payment(payment, delivery_id=outcome.delivery_id)
+            == "converged"
+        )
+    (projection,) = await _all(
+        harness,
+        "SELECT status, paid_at FROM billing_payment_projections WHERE payment_id = :p",
+        p=payment,
+    )
+    assert projection[1] == date(2026, 10, 11)
+
+
+async def test_legacy_settlement_without_paid_at_requires_readback_before_fact(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder_id, _session, checkout_id = await _topup(
+        harness, monkeypatch, "legacy paid_at repair"
+    )
+    payment = "pay_pg_legacy_paid_at"
+    await _deliver(
+        harness, _payment("PAYMENT_RECEIVED", payment, checkout=checkout_id), "test"
+    )
+    async with harness.session() as session:
+        await session.execute(
+            text(
+                "UPDATE billing_payment_projections SET paid_at = NULL "
+                "WHERE payment_id = :p"
+            ),
+            {"p": payment},
+        )
+        await session.commit()
+    refunded = await _deliver(
+        harness, _payment("PAYMENT_REFUNDED", payment, checkout=checkout_id), "test"
+    )
+    assert refunded.outcome == "readback_required"
+    assert (
+        await _scalar(
+            harness,
+            "SELECT count(*) FROM billing_payment_effects "
+            "WHERE payment_id = :p AND effect_kind = 'reversal'",
+            p=payment,
+        )
+        == 0
+    )
+    reads = _Reads(
+        payments={
+            payment: _read(
+                payment,
+                "REFUNDED",
+                10_000,
+                refunded=10_000,
+                include_payment_date=True,
+            )
+        }
+    )
+    async with harness.session() as session:
+        assert (
+            await BillingReadbackService(
+                session, client_factory=reads, environment="test"
+            ).process_delivery(refunded.delivery_id)
+            == "converged"
+        )
+    (projection,) = await _all(
+        harness,
+        "SELECT paid_at, reversed_cents FROM billing_payment_projections "
+        "WHERE payment_id = :p",
+        p=payment,
+    )
+    assert tuple(projection) == (date(2026, 10, 11), 10_000)
 
 
 async def test_subscription_with_additional_clinics_settles_its_snapshot_amount(
@@ -1801,7 +1940,7 @@ async def test_subscription_with_additional_clinics_settles_its_snapshot_amount(
     await _deliver(
         harness,
         _payment(
-            "PAYMENT_CONFIRMED",
+            "PAYMENT_RECEIVED",
             "pay_pg_clinics",
             checkout=checkout_id,
             subscription="sub_pg_clinics",
@@ -1829,7 +1968,7 @@ async def test_restoration_survives_an_absent_value_event_on_postgres(
     builder_id, _session, checkout_id = await _topup(harness, monkeypatch, "M-A")
     payment = "pay_pg_ma"
     await _deliver(
-        harness, _payment("PAYMENT_CONFIRMED", payment, checkout=checkout_id), "test"
+        harness, _payment("PAYMENT_RECEIVED", payment, checkout=checkout_id), "test"
     )
     await _deliver(
         harness, _payment("PAYMENT_REFUNDED", payment, checkout=checkout_id), "test"
@@ -1904,7 +2043,7 @@ async def test_payment_first_handoff_and_settlement_commit_as_one_transaction(
         harness, monkeypatch, "payment-first", coupon="PGFIRST"
     )
     confirmed = _payment(
-        "PAYMENT_CONFIRMED",
+        "PAYMENT_RECEIVED",
         "pay_pg_first",
         checkout=checkout_id,
         subscription="sub_pg_first",
@@ -2008,7 +2147,7 @@ async def test_already_applied_from_a_real_asyncpg_unique_violation(
     _builder_id, _session, checkout_id = await _topup(harness, monkeypatch, "backstop")
     payment = "pay_pg_backstop"
     await _deliver(
-        harness, _payment("PAYMENT_CONFIRMED", payment, checkout=checkout_id), "test"
+        harness, _payment("PAYMENT_RECEIVED", payment, checkout=checkout_id), "test"
     )
     # A writer that cannot see the committed effect (the race the unique key
     # backstops): the projection looks unsettled and the lookup misses.
@@ -2161,7 +2300,7 @@ async def test_readback_payment_hands_off_and_settles_on_postgres(
         payments={
             "pay_pg_rb_first": PaymentReadback(
                 "pay_pg_rb_first",
-                "CONFIRMED",
+                "RECEIVED",
                 False,
                 cents,
                 "sub_pg_rb_first",
@@ -2169,6 +2308,7 @@ async def test_readback_payment_hands_off_and_settles_on_postgres(
                 None,
                 "CREDIT_CARD",
                 0,
+                payment_date=date(2026, 10, 11),
             )
         }
     )
@@ -2213,13 +2353,16 @@ async def test_readback_payment_hands_off_and_settles_on_postgres(
             "partially_reversed",
         ),
         (
+            "PENDING",
+            3_000,
+            [],
+            "refunded_before_settlement",
+        ),
+        (
             "REFUNDED",
             10_000,
-            [
-                ("reversal", "reversed_cents:10000", 10_000),
-                ("settlement", "settlement:v1", 10_000),
-            ],
-            "reversed",
+            [],
+            "refunded_before_settlement",
         ),
     ],
 )
@@ -2248,10 +2391,14 @@ async def test_deleted_payment_with_refunds_settles_and_reverses_on_postgres(
     reads = _Reads(
         payments={payment: _read(payment, status, 10_000, refunded=refunded)}
     )
+    observed_at = datetime(2026, 10, 16, 12, tzinfo=timezone.utc)
     for replay in range(2):
         async with harness.session() as session:
             outcome = await BillingReadbackService(
-                session, client_factory=reads, environment="test"
+                session,
+                client_factory=reads,
+                environment="test",
+                clock=lambda: observed_at,
             ).readback_payment(payment, delivery_id=restored.delivery_id)
         assert outcome == "converged"
         effects = await _all(
@@ -2266,25 +2413,42 @@ async def test_deleted_payment_with_refunds_settles_and_reverses_on_postgres(
             harness,
             "SELECT p.status, p.settled_cents, p.reversed_cents, p.restored_cents, "
             "p.restoration_epoch, o.state, o.settled_cents, o.reversed_cents "
+            ", p.pre_settlement_refund_cents, p.pre_settlement_refund_status, "
+            "p.pre_settlement_refund_observed_at "
             "FROM billing_payment_projections p JOIN billing_topup_orders o "
             "ON o.id = p.topup_order_id WHERE p.payment_id = :p",
             p=payment,
         )
-        assert tuple(row) == (
-            label,
-            10_000,
-            refunded,
-            0,
-            0,
-            label,
-            10_000,
-            refunded,
-        ), f"replay {replay}"
-    assert (
-        await _scalar(
-            harness,
-            "SELECT count(*) FROM transactions WHERE builder_id = :b",
-            b=builder_id,
-        )
-        == 1
-    )
+        if status == "RECEIVED":
+            assert tuple(row) == (
+                label,
+                10_000,
+                refunded,
+                0,
+                0,
+                label,
+                10_000,
+                refunded,
+                None,
+                None,
+                None,
+            ), f"replay {replay}"
+        else:
+            assert tuple(row) == (
+                label,
+                0,
+                0,
+                0,
+                0,
+                "pending",
+                0,
+                0,
+                refunded,
+                status,
+                observed_at,
+            ), f"replay {replay}"
+    assert await _scalar(
+        harness,
+        "SELECT count(*) FROM transactions WHERE builder_id = :b",
+        b=builder_id,
+    ) == (1 if status == "RECEIVED" else 0)

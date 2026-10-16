@@ -14,7 +14,10 @@
     "builder_id",
     "aggregate_kind",
     "aggregate_id",
+    "subscription_id",
+    "order_id",
     "payment_id",
+    "paid_at",
     "catalog_version_id",
     "offer_id",
     "currency",
@@ -45,7 +48,10 @@
     "builder_id": {"type": "string", "format": "uuid"},
     "aggregate_kind": {"enum": ["subscription_cycle", "topup_order"]},
     "aggregate_id": {"type": "string", "format": "uuid"},
+    "subscription_id": {"type": ["string", "null"], "format": "uuid"},
+    "order_id": {"type": ["string", "null"], "format": "uuid"},
     "payment_id": {"type": "string", "minLength": 1, "maxLength": 160},
+    "paid_at": {"type": ["string", "null"], "format": "date"},
     "catalog_version_id": {"type": "string", "minLength": 1, "maxLength": 80},
     "offer_id": {"type": "string", "minLength": 1, "maxLength": 100},
     "currency": {"const": "BRL"},
@@ -112,6 +118,8 @@
     {
       "properties": {
         "aggregate_kind": {"const": "subscription_cycle"},
+        "subscription_id": {"type": "string", "format": "uuid"},
+        "order_id": {"type": "null"},
         "event_type": {"enum": ["subscription.cycle_settled.v1", "subscription.cycle_reversed.v1", "subscription.cycle_restored.v1"]}
       },
       "required": ["subscription_cycle"]
@@ -119,9 +127,18 @@
     {
       "properties": {
         "aggregate_kind": {"const": "topup_order"},
+        "subscription_id": {"type": "null"},
+        "order_id": {"type": "string", "format": "uuid"},
         "event_type": {"enum": ["topup.payment_settled.v1", "topup.payment_reversed.v1", "topup.payment_restored.v1"]}
       },
       "not": {"required": ["subscription_cycle"]}
+    }
+  ],
+  "allOf": [
+    {
+      "if": {"properties": {"settled_cents": {"minimum": 1}}},
+      "then": {"properties": {"paid_at": {"type": "string", "format": "date"}}},
+      "else": {"properties": {"paid_at": {"type": "null"}}}
     }
   ]
 }

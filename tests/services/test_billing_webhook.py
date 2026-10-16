@@ -121,6 +121,8 @@ def _event(
         # The template's externalReference is a foreign UUID; it must be
         # chosen explicitly by each test (a foreign one is a conflict).
         payload[family]["externalReference"] = None
+        if family == "payment":
+            payload[family]["paymentDate"] = "2026-10-11"
         for key, value in resource.items():
             payload[family][key] = value
     return parse_envelope(_body(payload), payload)
@@ -207,6 +209,7 @@ def _payment_read(
     deleted: bool = False,
     subscription_id: str | None = None,
     checkout_id: str | None = None,
+    payment_date: date | None = date(2026, 10, 11),
 ) -> PaymentReadback:
     return PaymentReadback(
         payment_id=payment_id,
@@ -218,6 +221,7 @@ def _payment_read(
         external_reference=None,
         billing_type="PIX",
         refunded_cents=refunded_cents,
+        payment_date=payment_date,
     )
 
 
@@ -277,7 +281,7 @@ class _World:
             offer_id="package_credits_500_v1",
             payment_method="pix",
             amount_cents=10_000,
-            credit_grant_mc=500,
+            credit_grant_mc=500_000,
             pricing_snapshot=snapshot,
             state="pending",
         )
@@ -388,7 +392,7 @@ def test_allowlist_is_the_design_set_plus_the_boleto_only_readback_event() -> No
         "SUBSCRIPTION_INACTIVATED": "non_billable_pending_readback",
         "SUBSCRIPTION_DELETED": "non_billable_pending_readback",
     }
-    assert PAYMENT_EVENT_STATUSES["PAYMENT_CONFIRMED"] == "settled"
+    assert PAYMENT_EVENT_STATUSES["PAYMENT_CONFIRMED"] == "pending"
     assert PAYMENT_EVENT_STATUSES["PAYMENT_RECEIVED"] == "settled"
     assert PAYMENT_EVENT_STATUSES["PAYMENT_RESTORED"] == "readback_required"
     assert PAYMENT_EVENT_STATUSES["PAYMENT_AWAITING_CHARGEBACK_REVERSAL"] == (
@@ -435,7 +439,7 @@ def test_event_without_valid_identity_is_rejected(mutation: Any) -> None:
 
 
 def test_envelope_keeps_only_allowlisted_identifiers() -> None:
-    envelope = _event("PAYMENT_CONFIRMED", event_id="evt_fixture_1")
+    envelope = _event("PAYMENT_RECEIVED", event_id="evt_fixture_1")
 
     assert envelope.event_id == event_key("evt_fixture_1")
     assert envelope.family == "payment"
@@ -523,7 +527,7 @@ async def test_unknown_event_correlates_resource_only_when_already_internal(
 async def test_duplicate_delivery_is_a_noop(world: _World) -> None:
     checkout, _order = await world.topup_session()
     envelope = _event(
-        "PAYMENT_CONFIRMED",
+        "PAYMENT_RECEIVED",
         event_id="evt_dup_1",
         id="pay_dup_1",
         subscription=None,
@@ -546,7 +550,7 @@ async def test_known_event_without_exact_entity_blocks_and_alerts(
     before = _metric("neurostack_billing_alerts_total", kind="uncorrelated_entity")
     outcome = await world.receive(
         _event(
-            "PAYMENT_CONFIRMED",
+            "PAYMENT_RECEIVED",
             id="pay_orphan_1",
             subscription="sub_unknown",
             checkoutSession="chk_unknown",
@@ -583,7 +587,7 @@ async def test_payload_can_never_choose_or_mix_builders(world: _World) -> None:
     # checkoutSession resolves to builder A while subscription is builder B.
     outcome = await world.receive(
         _event(
-            "PAYMENT_CONFIRMED",
+            "PAYMENT_RECEIVED",
             id="pay_mixed_1",
             subscription="sub_foreign_01",
             checkoutSession=checkout.external_checkout_id,
@@ -632,7 +636,7 @@ async def test_topup_settlement_uses_snapshot_and_runs_once(world: _World) -> No
     await world.receive(_event("CHECKOUT_PAID", id=checkout.external_checkout_id))
     await world.receive(_event("PAYMENT_CREATED", when="2026-10-11 10:00:00", **common))
     confirmed = await world.receive(
-        _event("PAYMENT_CONFIRMED", when="2026-10-11 10:00:05", **common)
+        _event("PAYMENT_RECEIVED", when="2026-10-11 10:00:05", **common)
     )
     received = await world.receive(
         _event("PAYMENT_RECEIVED", when="2026-10-11 10:00:09", **common)
@@ -669,8 +673,97 @@ async def test_topup_settlement_uses_snapshot_and_runs_once(world: _World) -> No
     )
     (stored_order,) = await world.rows(BillingTopupOrder)
     assert (stored_order.state, stored_order.settled_cents) == ("settled", 10_000)
+    assert stored_order.credit_grant_mc == 500_000
+    assert stored_order.pricing_snapshot["credit_grant_mc"] == 500_000
+    assert projection.paid_at == date(2026, 10, 11)
     (builder,) = await world.rows(Builder, Builder.id == world.builder_id)
     assert builder.subscription_status == "trial"  # top-up never changes the plan
+
+
+async def test_payment_confirmed_does_not_settle_or_grant(world: _World) -> None:
+    checkout, _order = await world.topup_session()
+    outcome = await world.receive(
+        _event(
+            "PAYMENT_CONFIRMED",
+            id="pay_confirmed_not_received",
+            subscription=None,
+            checkoutSession=checkout.external_checkout_id,
+            value=Decimal("100.00"),
+        )
+    )
+
+    assert outcome.outcome == "processed"
+    (projection,) = await world.rows(BillingPaymentProjection)
+    assert projection.status == "pending"
+    assert projection.settled_cents == 0
+    assert projection.paid_at is None
+    assert await world.count(BillingPaymentEffect) == 0
+    assert await world.count(BillingOutboxEvent) == 0
+    assert await world.count(Transaction) == 0
+
+
+async def test_received_without_provider_payment_date_is_quarantined(
+    world: _World,
+) -> None:
+    checkout, _order = await world.topup_session()
+    outcome = await world.receive(
+        _event(
+            "PAYMENT_RECEIVED",
+            id="pay_received_missing_date",
+            subscription=None,
+            checkoutSession=checkout.external_checkout_id,
+            value=Decimal("100.00"),
+            paymentDate=None,
+        )
+    )
+
+    assert outcome.outcome == "readback_required"
+    assert await world.count(BillingPaymentEffect) == 0
+    assert await world.count(BillingOutboxEvent) == 0
+    assert await world.count(Transaction) == 0
+
+
+def test_provider_payment_date_is_parsed_as_a_strict_civil_date() -> None:
+    from src.services.asaas import _payment_readback
+
+    base = {
+        "id": "pay_date_parser",
+        "status": "RECEIVED",
+        "value": "100.00",
+        "refunds": [],
+    }
+    valid = _payment_readback({**base, "paymentDate": "2026-04-30"})
+    impossible = _payment_readback({**base, "paymentDate": "2026-02-30"})
+    noncanonical = _payment_readback({**base, "paymentDate": "2026-4-3"})
+
+    assert valid.payment_date == date(2026, 4, 30)
+    assert impossible.payment_date is None
+    assert noncanonical.payment_date is None
+
+
+def test_only_completed_refunds_are_counted_and_confirmed_is_not_settlement() -> None:
+    from src.services.asaas import _payment_readback
+    from src.services.billing_webhook import _READBACK_PAYMENT_STATUSES
+
+    base = {
+        "id": "pay_refund_statuses",
+        "status": "RECEIVED",
+        "value": Decimal("100.00"),
+    }
+    pending = _payment_readback(
+        {**base, "refunds": [{"status": "PENDING", "value": Decimal("10.00")}]}
+    )
+    cancelled = _payment_readback(
+        {**base, "refunds": [{"status": "CANCELLED", "value": Decimal("10.00")}]}
+    )
+    done = _payment_readback(
+        {**base, "refunds": [{"status": "DONE", "value": Decimal("10.00")}]}
+    )
+    assert pending.refunded_cents == 0
+    assert cancelled.refunded_cents == 0
+    assert done.refunded_cents == 1_000
+    assert PAYMENT_EVENT_STATUSES["PAYMENT_CONFIRMED"] == "pending"
+    assert _READBACK_PAYMENT_STATUSES["CONFIRMED"] == "pending"
 
 
 async def test_old_event_never_regresses_the_projection(world: _World) -> None:
@@ -687,7 +780,7 @@ async def test_old_event_never_regresses_the_projection(world: _World) -> None:
     await world.receive(_event("PAYMENT_CREATED", when="2026-10-11 10:00:00", **common))
     await world.receive(_event("PAYMENT_OVERDUE", when="2026-10-11 10:00:01", **common))
     await world.receive(
-        _event("PAYMENT_CONFIRMED", when="2026-10-11 10:00:05", **common)
+        _event("PAYMENT_RECEIVED", when="2026-10-11 10:00:05", **common)
     )
 
     (projection,) = await world.rows(BillingPaymentProjection)
@@ -701,7 +794,7 @@ async def test_provider_amount_drift_blocks_settlement(world: _World) -> None:
     before = _metric("neurostack_billing_alerts_total", kind="drift")
     outcome = await world.receive(
         _event(
-            "PAYMENT_CONFIRMED",
+            "PAYMENT_RECEIVED",
             id="pay_drift_1",
             subscription=None,
             checkoutSession=checkout.external_checkout_id,
@@ -753,7 +846,7 @@ async def test_subscription_created_hands_off_and_settlement_activates_once(
         "value": value,
     }
     await world.receive(
-        _event("PAYMENT_CONFIRMED", when="2026-10-11 10:00:05", **common)
+        _event("PAYMENT_RECEIVED", when="2026-10-11 10:00:05", **common)
     )
     await world.receive(
         _event("PAYMENT_RECEIVED", when="2026-10-11 10:00:06", **common)
@@ -761,7 +854,7 @@ async def test_subscription_created_hands_off_and_settlement_activates_once(
     # Next cycle: a new payment of the same subscription.
     await world.receive(
         _event(
-            "PAYMENT_CONFIRMED",
+            "PAYMENT_RECEIVED",
             when="2026-11-11 10:00:05",
             id="pay_cycle_2",
             subscription="sub_handoff_01",
@@ -795,7 +888,7 @@ async def test_payment_pairing_checkout_and_subscription_links_exactly(
     checkout = await world.subscription_session()
     outcome = await world.receive(
         _event(
-            "PAYMENT_CONFIRMED",
+            "PAYMENT_RECEIVED",
             id="pay_link_1",
             subscription="sub_linked_by_payment",
             checkoutSession=checkout.external_checkout_id,
@@ -998,7 +1091,7 @@ async def _settled_topup(
         "value": Decimal("100.00"),
     }
     await world.receive(
-        _event("PAYMENT_CONFIRMED", when="2026-10-11 10:00:00", **common)
+        _event("PAYMENT_RECEIVED", when="2026-10-11 10:00:00", **common)
     )
     return common
 
@@ -1022,6 +1115,9 @@ async def test_full_refund_records_one_cumulative_reversal(world: _World) -> Non
     assert (projection.status, projection.reversed_cents) == ("reversed", 10_000)
     (order,) = await world.rows(BillingTopupOrder)
     assert (order.state, order.reversed_cents) == ("reversed", 10_000)
+    facts = await world.rows(BillingOutboxEvent)
+    assert len(facts) == 2
+    assert {fact.payload["paid_at"] for fact in facts} == {"2026-10-11"}
     assert await world.count(Transaction) == 1  # one Transaction per payment
 
 
@@ -1058,7 +1154,43 @@ async def test_partial_refund_is_priced_only_by_exact_readback(world: _World) ->
     assert delivery.status == "processed"
 
 
-async def test_reversal_before_settlement_waits_for_readback(world: _World) -> None:
+@pytest.mark.parametrize(
+    ("event_name", "readback_status", "refunded_cents"),
+    [
+        ("PAYMENT_PARTIALLY_REFUNDED", "RECEIVED", 3_000),
+        ("PAYMENT_CHARGEBACK_REQUESTED", "CHARGEBACK_DISPUTE", 0),
+    ],
+)
+async def test_post_settlement_readback_keeps_paid_at_when_provider_omits_it(
+    world: _World,
+    event_name: str,
+    readback_status: str,
+    refunded_cents: int,
+) -> None:
+    common = await _settled_topup(world)
+    delivery = await world.receive(_event(event_name, **common))
+    world.provider.payments[common["id"]] = _payment_read(
+        common["id"],
+        status=readback_status,
+        value_cents=10_000,
+        refunded_cents=refunded_cents,
+        checkout_id=common["checkoutSession"],
+        payment_date=None,
+    )
+    async with world.sessions() as session:
+        assert (
+            await world.readback(session).readback_payment(
+                common["id"], delivery_id=delivery.delivery_id
+            )
+            == "converged"
+        )
+    (projection,) = await world.rows(BillingPaymentProjection)
+    assert projection.paid_at == date(2026, 10, 11)
+
+
+async def test_refund_before_settlement_is_terminal_and_never_grants(
+    world: _World,
+) -> None:
     checkout, _order = await world.topup_session()
     outcome = await world.receive(
         _event(
@@ -1084,14 +1216,229 @@ async def test_reversal_before_settlement_waits_for_readback(world: _World) -> N
             await world.readback(session).process_delivery(outcome.delivery_id)
             == "converged"
         )
-    effects = sorted(
-        (e.effect_kind, e.source_revision)
-        for e in await world.rows(BillingPaymentEffect)
+    (projection,) = await world.rows(BillingPaymentProjection)
+    assert (projection.status, projection.settled_cents, projection.paid_at) == (
+        "refunded_before_settlement",
+        0,
+        None,
     )
-    assert effects == [
-        ("reversal", "reversed_cents:10000"),
-        ("settlement", "settlement:v1"),
-    ]
+    assert (
+        projection.pre_settlement_refund_cents,
+        projection.pre_settlement_refund_status,
+        projection.pre_settlement_refund_observed_at,
+    ) == (10_000, "REFUNDED", NOW.replace(tzinfo=None))
+    assert await world.count(BillingPaymentEffect) == 0
+    assert await world.count(BillingOutboxEvent) == 0
+    assert await world.count(Transaction) == 0
+
+    # A delayed receipt event triggers another exact read. Even a contradictory
+    # read cannot erase the terminal marker or produce a settlement effect.
+    received = await world.receive(
+        _event(
+            "PAYMENT_RECEIVED",
+            event_id="evt_late_receipt_after_refund",
+            when="2026-10-11 10:30:00",
+            id="pay_early_refund",
+            subscription=None,
+            checkoutSession=checkout.external_checkout_id,
+            value=Decimal("100.00"),
+        )
+    )
+    assert received.outcome == "readback_required"
+    world.provider.payments["pay_early_refund"] = _payment_read(
+        "pay_early_refund",
+        status="RECEIVED",
+        value_cents=10_000,
+        refunded_cents=0,
+        checkout_id=checkout.external_checkout_id,
+    )
+    async with world.sessions() as session:
+        assert (
+            await world.readback(session).process_delivery(received.delivery_id)
+            == "drift"
+        )
+    (projection,) = await world.rows(BillingPaymentProjection)
+    assert (projection.status, projection.settled_cents, projection.paid_at) == (
+        "refunded_before_settlement",
+        0,
+        None,
+    )
+    assert await world.count(BillingPaymentEffect) == 0
+    assert await world.count(BillingOutboxEvent) == 0
+    assert await world.count(Transaction) == 0
+
+
+async def test_refunded_status_without_done_refund_cannot_settle_or_grant(
+    world: _World,
+) -> None:
+    checkout, _order = await world.topup_session()
+    outcome = await world.receive(
+        _event(
+            "PAYMENT_REFUNDED",
+            id="pay_refunded_without_done_refund",
+            subscription=None,
+            checkoutSession=checkout.external_checkout_id,
+            value=Decimal("100.00"),
+        )
+    )
+    world.provider.payments["pay_refunded_without_done_refund"] = _payment_read(
+        "pay_refunded_without_done_refund",
+        status="REFUNDED",
+        value_cents=10_000,
+        refunded_cents=0,
+        checkout_id=checkout.external_checkout_id,
+        payment_date=date(2026, 10, 11),
+    )
+
+    async with world.sessions() as session:
+        assert (
+            await world.readback(session).process_delivery(outcome.delivery_id)
+            == "drift"
+        )
+
+    (projection,) = await world.rows(BillingPaymentProjection)
+    assert (projection.status, projection.settled_cents, projection.paid_at) == (
+        "readback_required",
+        0,
+        None,
+    )
+    assert await world.count(BillingPaymentEffect) == 0
+    assert await world.count(BillingOutboxEvent) == 0
+    assert await world.count(Transaction) == 0
+
+
+async def test_pre_settlement_refund_blocks_delayed_receipt_subscription_activation(
+    world: _World,
+) -> None:
+    subscription = await _linked_subscription(world)
+    (checkout,) = await world.rows(
+        BillingCheckoutSession,
+        BillingCheckoutSession.intent_id == subscription.id,
+    )
+    payment_id = "pay_refund_before_subscription_settlement"
+    common = {
+        "id": payment_id,
+        "subscription": "sub_life_0001",
+        "checkoutSession": checkout.external_checkout_id,
+        "value": Decimal("999.00"),
+    }
+    refunded = await world.receive(
+        _event("PAYMENT_REFUNDED", when="2026-10-11 10:00:00", **common)
+    )
+    world.provider.payments[payment_id] = _payment_read(
+        payment_id,
+        status="PENDING",
+        value_cents=99_900,
+        refunded_cents=1_000,
+        subscription_id="sub_life_0001",
+        checkout_id=checkout.external_checkout_id,
+        payment_date=None,
+    )
+    async with world.sessions() as session:
+        assert (
+            await world.readback(session).process_delivery(refunded.delivery_id)
+            == "converged"
+        )
+
+    received = await world.receive(
+        _event(
+            "PAYMENT_RECEIVED",
+            event_id="evt_late_subscription_receipt_after_refund",
+            when="2026-10-11 10:30:00",
+            **common,
+        )
+    )
+    assert received.outcome == "readback_required"
+    (stored_subscription,) = await world.rows(
+        BillingSubscription, BillingSubscription.id == subscription.id
+    )
+    (projection,) = await world.rows(
+        BillingPaymentProjection,
+        BillingPaymentProjection.payment_id == payment_id,
+    )
+    assert (stored_subscription.status, stored_subscription.is_active) == (
+        "active_linked",
+        True,
+    )
+    assert (projection.status, projection.settled_cents, projection.paid_at) == (
+        "refunded_before_settlement",
+        0,
+        None,
+    )
+    assert await world.count(BillingPaymentEffect) == 0
+    assert await world.count(BillingOutboxEvent) == 0
+    assert await world.count(Transaction) == 0
+
+
+@pytest.mark.parametrize(
+    ("later_status", "later_refunded_cents"),
+    [("PENDING", 4_000), ("CONFIRMED", 3_000)],
+)
+async def test_pre_settlement_refund_evidence_detects_later_contradiction(
+    world: _World, later_status: str, later_refunded_cents: int
+) -> None:
+    checkout, _order = await world.topup_session()
+    delivery = await world.receive(
+        _event(
+            "PAYMENT_REFUNDED",
+            id="pay_early_partial_refund",
+            subscription=None,
+            checkoutSession=checkout.external_checkout_id,
+            value=Decimal("100.00"),
+        )
+    )
+    world.provider.payments["pay_early_partial_refund"] = _payment_read(
+        "pay_early_partial_refund",
+        status="PENDING",
+        value_cents=10_000,
+        refunded_cents=3_000,
+        checkout_id=checkout.external_checkout_id,
+        payment_date=None,
+    )
+    observed_at = NOW + timedelta(hours=4)
+    async with world.sessions() as session:
+        assert (
+            await world.readback(session, clock=lambda: observed_at).process_delivery(
+                delivery.delivery_id
+            )
+            == "converged"
+        )
+    (projection,) = await world.rows(BillingPaymentProjection)
+    assert (
+        projection.status,
+        projection.pre_settlement_refund_cents,
+        projection.pre_settlement_refund_status,
+    ) == ("refunded_before_settlement", 3_000, "PENDING")
+    evidence_date = projection.pre_settlement_refund_observed_at
+    assert evidence_date == observed_at.replace(tzinfo=None)
+    (webhook_delivery,) = await world.rows(
+        BillingWebhookDelivery,
+        BillingWebhookDelivery.id == delivery.delivery_id,
+    )
+    assert evidence_date != webhook_delivery.provider_created_at.replace(tzinfo=None)
+
+    world.provider.payments["pay_early_partial_refund"] = _payment_read(
+        "pay_early_partial_refund",
+        status=later_status,
+        value_cents=10_000,
+        refunded_cents=later_refunded_cents,
+        checkout_id=checkout.external_checkout_id,
+        payment_date=None,
+    )
+    async with world.sessions() as session:
+        assert (
+            await world.readback(session).readback_payment(
+                "pay_early_partial_refund", delivery_id=delivery.delivery_id
+            )
+            == "drift"
+        )
+    (projection,) = await world.rows(BillingPaymentProjection)
+    assert (
+        projection.pre_settlement_refund_cents,
+        projection.pre_settlement_refund_status,
+        projection.pre_settlement_refund_observed_at,
+    ) == (3_000, "PENDING", evidence_date)
+    assert await world.count(BillingPaymentEffect) == 0
 
 
 async def test_restoration_epoch_increments_only_on_readback_proof(
@@ -1366,7 +1713,7 @@ def test_desired_webhook_subscribes_exactly_the_allowlist() -> None:
         ({"send_type": "NON_SEQUENTIALLY"}, "send_type"),
         ({"enabled": False}, "disabled"),
         ({"interrupted": True}, "interrupted"),
-        ({"events": ("PAYMENT_CONFIRMED",)}, "events"),
+        ({"events": ("PAYMENT_RECEIVED",)}, "events"),
         ({"has_auth_token": False}, "token_absent"),
     ],
 )
@@ -1534,7 +1881,7 @@ async def test_late_older_status_never_overwrites_a_newer_one(world: _World) -> 
     assert projection.status == "overdue"
 
     await world.receive(
-        _event("PAYMENT_CONFIRMED", when="2026-10-11 10:00:06", **common)
+        _event("PAYMENT_RECEIVED", when="2026-10-11 10:00:06", **common)
     )
     await world.receive(
         _event("PAYMENT_CHARGEBACK_DISPUTE", when="2026-10-11 10:00:09", **common)
@@ -1584,7 +1931,7 @@ async def test_documented_id_redelivery_deduplicates_and_suffix_distinguishes(
     again = await world.receive(_event("PAYMENT_CREATED", event_id=raw, **common))
     other = await world.receive(
         _event(
-            "PAYMENT_CONFIRMED",
+            "PAYMENT_RECEIVED",
             event_id="evt_05b708f961d739ea7eba7e4db318f621&368604921",
             **common,
         )
@@ -1652,7 +1999,7 @@ def test_failure_classification_is_closed_and_fail_safe(
 async def _topup_confirmed(world: _World) -> WebhookEnvelope:
     checkout, _order = await world.topup_session()
     return _event(
-        "PAYMENT_CONFIRMED",
+        "PAYMENT_RECEIVED",
         id="pay_failure_1",
         subscription=None,
         checkoutSession=checkout.external_checkout_id,
@@ -1768,7 +2115,7 @@ async def test_settlement_without_an_exact_amount_waits_for_readback(
         "subscription": None,
         "checkoutSession": checkout.external_checkout_id,
     }
-    absent = await world.receive(_event("PAYMENT_CONFIRMED", value=None, **common))
+    absent = await world.receive(_event("PAYMENT_RECEIVED", value=None, **common))
     inexact = await world.receive(
         _event("PAYMENT_RECEIVED", value=Decimal("100.001"), **common)
     )
@@ -2117,9 +2464,9 @@ async def test_quarantine_alert_is_counted_once(
 
 
 # ---------------------------------------------------------------------------
-# Fix loop 3 (MEDIUM-E): a deleted, never-settled payment read back live WITH
-# a completed refund is settled and reversed, never "restored" by a negative
-# delta (which the totals CHECK refuses on PostgreSQL).
+# A deleted payment with a current receipt may settle and reverse. A completed
+# refund without an accepted receipt remains terminal and never creates either
+# a settlement or reversal effect.
 # ---------------------------------------------------------------------------
 
 
@@ -2138,24 +2485,18 @@ async def test_quarantine_alert_is_counted_once(
         (
             "PENDING",
             3_000,
-            [
-                ("reversal", "reversed_cents:3000", 3_000),
-                ("settlement", "settlement:v1", 10_000),
-            ],
-            "partially_reversed",
+            [],
+            "refunded_before_settlement",
         ),
         (
             "REFUNDED",
             10_000,
-            [
-                ("reversal", "reversed_cents:10000", 10_000),
-                ("settlement", "settlement:v1", 10_000),
-            ],
-            "reversed",
+            [],
+            "refunded_before_settlement",
         ),
     ],
 )
-async def test_deleted_payment_read_back_with_refunds_settles_then_reverses(
+async def test_deleted_payment_readback_requires_accepted_receipt_before_settlement(
     world: _World, status: str, refunded: int, expected: list[Any], label: str
 ) -> None:
     checkout, _order = await world.topup_session()
@@ -2200,4 +2541,8 @@ async def test_deleted_payment_read_back_with_refunds_settles_then_reverses(
             # contradictory provider data; its replay relabels ``pending``
             # exactly like 417c8ca did — money and effects stay put.)
             assert projection.status == label
-    assert await world.count(Transaction) == 1
+            if status != "RECEIVED":
+                assert projection.pre_settlement_refund_cents == refunded
+                assert projection.pre_settlement_refund_status == (status)
+                assert projection.pre_settlement_refund_observed_at is not None
+    assert await world.count(Transaction) == (1 if status == "RECEIVED" else 0)

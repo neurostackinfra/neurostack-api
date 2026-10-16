@@ -29,6 +29,7 @@ from src.models.user import User, UserRole
 _ROOT = Path(__file__).resolve().parents[2]
 _CHILD_PATTERN = re.compile(r"^neurostack_users_schema_[0-9a-f]{12}$")
 _LOCAL_SOCKET_DIRECTORIES = {"/run/postgresql", "/var/run/postgresql"}
+_LOCAL_POSTGRES_PORTS = {5432, 55432}
 
 
 def _database_identity(url: URL) -> tuple[str, int, str | None]:
@@ -52,14 +53,14 @@ def _validated_admin_url(raw_url: str) -> URL:
             raise ValueError("smoke URL has unsafe connection parameters")
         if str(url.query.get("host", "")) not in _LOCAL_SOCKET_DIRECTORIES:
             raise ValueError("smoke URL must use an allowlisted local socket")
-        if str(url.query.get("port", "5432")) != "5432":
+        if int(str(url.query.get("port", "5432"))) not in _LOCAL_POSTGRES_PORTS:
             raise ValueError("smoke URL must use the local PostgreSQL port")
     else:
         try:
             is_loopback = ipaddress.ip_address(url.host or "").is_loopback
         except ValueError:
             is_loopback = (url.host or "").lower() == "localhost"
-        if not is_loopback or (url.port or 5432) != 5432:
+        if not is_loopback or (url.port or 5432) not in _LOCAL_POSTGRES_PORTS:
             raise ValueError("smoke URL must use local PostgreSQL")
     if _database_identity(url) == _database_identity(make_url(settings.database_url)):
         raise ValueError("smoke URL must not be the application database")

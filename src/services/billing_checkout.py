@@ -63,6 +63,7 @@ _SUBSCRIPTION_OFFERS: Final = frozenset(
 _TOPUP_OFFERS: Final = frozenset(
     offer_id for offer_id, offer in BILLING_CATALOG.items() if offer.cycle == "DETACHED"
 )
+MILLI_CREDITS_PER_CREDIT: Final = 1_000
 _COUPON_CODE_MAX_LENGTH: Final = 50
 
 # Group 3 (M-C) convergence of ambiguous attempts.  The provider Checkout
@@ -312,7 +313,7 @@ def subscription_pricing_snapshot(
         kind="plan",
         quantity=1,
         unit_amount_cents=discounted(offer.amount_cents),
-        credit_grant_mc=offer.credits,
+        credit_grant_mc=offer.credits * MILLI_CREDITS_PER_CREDIT,
     )
     lines: list[dict[str, int | str]] = [plan_line]
     if additional_clinics:
@@ -333,7 +334,7 @@ def subscription_pricing_snapshot(
         "catalog_version_id": CATALOG_VERSION_ID,
         "offer_id": offer.offer_id,
         "amount_cents": net_cents,
-        "credit_grant_mc": offer.credits,
+        "credit_grant_mc": offer.credits * MILLI_CREDITS_PER_CREDIT,
         "included_clinics": offer.included_clinics,
         "additional_clinics": additional_clinics,
         "billing_cycle": "monthly",
@@ -358,7 +359,7 @@ def topup_pricing_snapshot(
         "catalog_version_id": CATALOG_VERSION_ID,
         "offer_id": offer.offer_id,
         "amount_cents": offer.amount_cents,
-        "credit_grant_mc": offer.credits,
+        "credit_grant_mc": offer.credits * MILLI_CREDITS_PER_CREDIT,
         "payment_method": payment_method,
         "lines": [
             _snapshot_line(
@@ -367,7 +368,7 @@ def topup_pricing_snapshot(
                 kind="topup",
                 quantity=1,
                 unit_amount_cents=offer.amount_cents,
-                credit_grant_mc=offer.credits,
+                credit_grant_mc=offer.credits * MILLI_CREDITS_PER_CREDIT,
             )
         ],
     }
@@ -879,7 +880,7 @@ class BillingCheckoutService:
             offer_id=offer.offer_id,
             payment_method=payment_method,
             amount_cents=self._snapshot_amount(snapshot),
-            credit_grant_mc=offer.credits,
+            credit_grant_mc=offer.credits * MILLI_CREDITS_PER_CREDIT,
             pricing_snapshot=snapshot,
             state="pending",
         )

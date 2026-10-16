@@ -1334,6 +1334,9 @@ async def test_ac11_postgres_barrier_matches_sqlite_semantics() -> None:
     """
     assert POSTGRES_SMOKE_DATABASE_URL is not None
     engine = create_async_engine(POSTGRES_SMOKE_DATABASE_URL, future=True)
+    from src.models.builder import Builder
+    from src.models.tenant import Tenant
+
     sessionmaker = async_sessionmaker(
         engine,
         class_=AsyncSession,
@@ -1343,15 +1346,18 @@ async def test_ac11_postgres_barrier_matches_sqlite_semantics() -> None:
     )
     try:
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(
+                lambda sync_conn: Base.metadata.create_all(
+                    sync_conn,
+                    tables=[Builder.__table__, Tenant.__table__, Session.__table__],
+                )
+            )
 
         tenant_id = uuid4()
         now = datetime.now(timezone.utc)
         session_id = uuid4()
 
         async with sessionmaker() as setup_db:
-            from src.models.tenant import Tenant
-
             setup_db.add(
                 Tenant(
                     id=tenant_id,

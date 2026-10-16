@@ -463,7 +463,7 @@ async def test_canary_service_path_survives_pre_egress_failures_then_goes_active
         assert (order.state, order.amount_cents, order.credit_grant_mc) == (
             "pending",
             10_000,
-            500,
+            500_000,
         )
         assert [line["kind"] for line in order.pricing_snapshot["lines"]] == ["topup"]
         assert row.pricing_snapshot == order.pricing_snapshot
@@ -479,8 +479,8 @@ async def test_canary_service_path_survives_pre_egress_failures_then_goes_active
 @pytest.mark.parametrize(
     ("offer_id", "payment_method", "amount_cents", "credits"),
     [
-        ("package_credits_1000_v1", "pix", 20_000, 1_000),
-        ("package_credits_4000_v1", "credit_card", 80_000, 4_000),
+        ("package_credits_1000_v1", "pix", 20_000, 1_000_000),
+        ("package_credits_4000_v1", "credit_card", 80_000, 4_000_000),
     ],
 )
 async def test_general_topup_is_persisted_through_the_service(

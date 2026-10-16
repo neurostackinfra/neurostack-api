@@ -210,7 +210,7 @@ def upgrade() -> None:
             "registered_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.func.now(),
+            server_default=sa.text("CURRENT_TIMESTAMP"),
         ),
         sa.CheckConstraint(
             "length(envelope_digest) = 64 AND envelope_digest ~ '^[0-9a-f]{64}$'",
@@ -326,7 +326,7 @@ def upgrade() -> None:
             "updated_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.func.now(),
+            server_default=sa.text("CURRENT_TIMESTAMP"),
         ),
         sa.CheckConstraint(
             "environment = 'staging'", name="ck_billing_producer_v1_pair_environment"
