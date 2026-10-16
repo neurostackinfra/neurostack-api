@@ -3,6 +3,11 @@ NeuroStack API - Authentication Middleware
 JWT and API Key based authentication for tenant identification.
 """
 
+import asyncio
+import hashlib
+import hmac
+import json
+import time
 from typing import Any, Literal, Optional, cast
 from uuid import UUID
 
@@ -10,16 +15,66 @@ import jwt
 from fastapi import Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from passlib.context import CryptContext
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from src.api.schemas.auth import StagingRehearsalTokenRequest
 from src.config.logging import get_logger
 from src.config.settings import settings
 from src.repositories import TenantRepository, get_db_session
 
 logger = get_logger(__name__)
+
+STAGING_REHEARSAL_TOKEN_PATH = "/v1/auth/staging-rehearsal-token"
+STAGING_REHEARSAL_TOKEN_USE = "asaas_staging_rehearsal"
+STAGING_REHEARSAL_TOKEN_ENVIRONMENT = "staging"
+STAGING_REHEARSAL_TOKEN_SCOPE = "billing.producer.staging.rehearsal"
+STAGING_REHEARSAL_TOKEN_TTL_SECONDS = 600
+STAGING_REHEARSAL_GLOBAL_LIMIT = 30
+STAGING_REHEARSAL_ACCOUNT_LIMIT = 5
+STAGING_REHEARSAL_WINDOW_SECONDS = 900
+STAGING_REHEARSAL_REDIS_TIMEOUT_SECONDS = 0.1
+STAGING_REHEARSAL_READBACK_PATH = "/v1/admin/billing/rollout/readback"
+STAGING_PRODUCER_RECEIPT_PATH = "/v1/admin/billing/producer-receipts"
+_STAGING_REHEARSAL_PURPOSE_CLAIMS = frozenset(
+    {"token_use", "token_environment", "scope"}
+)
+_STAGING_REHEARSAL_CLAIMS = frozenset(
+    {
+        "sub",
+        "tenant_id",
+        "role",
+        "email",
+        "iat",
+        "exp",
+        "jti",
+        "token_use",
+        "token_environment",
+        "scope",
+    }
+)
+_STAGING_REHEARSAL_TARGETS = frozenset(
+    {
+        ("POST", "/v1/admin/billing/producer-grants/assignments"),
+        ("POST", "/v1/admin/billing/producer-grants/authorizations"),
+        ("POST", "/v1/admin/billing/producer-grants/revocations"),
+        ("POST", "/v1/admin/billing/producer-build-attestations"),
+        ("GET", STAGING_REHEARSAL_READBACK_PATH),
+        ("POST", f"{STAGING_PRODUCER_RECEIPT_PATH}/preflight"),
+        ("POST", f"{STAGING_PRODUCER_RECEIPT_PATH}/create"),
+        ("POST", f"{STAGING_PRODUCER_RECEIPT_PATH}/verify"),
+    }
+)
+_STAGING_REHEARSAL_RATE_LIMIT_LUA = """
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return count
+"""
 
 # Password hashing context for API key validation
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -260,7 +315,6 @@ class AuthMiddleware:
         "/openapi.json",
         "/v1/openapi.json",
         "/metrics",
-        "/v1/auth",
         "/v1/auth/login",
     }
 
@@ -274,9 +328,36 @@ class AuthMiddleware:
 
         request = Request(scope, receive, send)
 
+        if (
+            request.method == "POST"
+            and request.url.path == STAGING_REHEARSAL_TOKEN_PATH
+        ):
+            if settings.environment != STAGING_REHEARSAL_TOKEN_ENVIRONMENT:
+                await self._reject_staging_issuer(scope, receive, send, 404)
+                return
+            admitted = await self._admit_staging_issuer(scope, request)
+            if admitted is not None:
+                status_code, error = admitted
+                await self._reject_staging_issuer(
+                    scope, receive, send, status_code, error
+                )
+                return
+            await self.app(scope, receive, self._no_store_send(send))
+            return
+
+        is_rehearsal_target = (request.method, request.url.path) in (
+            _STAGING_REHEARSAL_TARGETS
+        )
+
         # Skip auth for public paths and OPTIONS
         if self._is_public_path(request.url.path) or request.method == "OPTIONS":
             await self.app(scope, receive, send)
+            return
+
+        if is_rehearsal_target and not request.headers.get(
+            "Authorization", ""
+        ).startswith("Bearer "):
+            await self._reject_staging_issuer(scope, receive, send, 401, "unauthorized")
             return
 
         # POST /v1/demo-leads is public (lead capture form)
@@ -297,6 +378,22 @@ class AuthMiddleware:
                     algorithms=["HS256"],
                     options={"require": ["sub", "tenant_id", "exp"]},
                 )
+                has_purpose = bool(
+                    _STAGING_REHEARSAL_PURPOSE_CLAIMS.intersection(payload)
+                )
+                if has_purpose:
+                    if not self._valid_staging_rehearsal_payload(
+                        payload, request.method, request.url.path
+                    ):
+                        await self._reject_staging_issuer(
+                            scope, receive, send, 401, "unauthorized"
+                        )
+                        return
+                elif is_rehearsal_target:
+                    await self._reject_staging_issuer(
+                        scope, receive, send, 401, "unauthorized"
+                    )
+                    return
                 tenant_context = TenantContext(
                     tenant_id=UUID(payload["tenant_id"]),
                     user_id=UUID(payload["sub"]),
@@ -395,6 +492,8 @@ class AuthMiddleware:
 
         # Attach tenant context to request state
         request.state.tenant = tenant_context
+        if is_rehearsal_target:
+            request.state.staging_rehearsal_token = True
         tenant_context.authentication_mode = (
             "jwt" if auth_header.startswith("Bearer ") else "api_key"
         )
@@ -410,6 +509,153 @@ class AuthMiddleware:
         # Continue processing — pure ASGI passthrough
         await self.app(scope, receive, send)
 
+    async def _admit_staging_issuer(
+        self, scope: Scope, request: Request
+    ) -> tuple[int, str] | None:
+        """Reserve both independent fixed-window limits before auth or DB work."""
+        now = int(time.time())
+        global_key, global_ttl = self._fixed_window_key("global", now)
+        global_allowed = await self._reserve_staging_slot(scope, global_key, global_ttl)
+        if global_allowed is None:
+            return status.HTTP_503_SERVICE_UNAVAILABLE, "issuer_unavailable"
+        if not global_allowed:
+            return status.HTTP_429_TOO_MANY_REQUESTS, "rate_limited"
+
+        state = cast(dict[str, Any], scope.get("state", {}))
+        body = state.get("bounded_ingress_body")
+        if not isinstance(body, bytes):
+            return status.HTTP_503_SERVICE_UNAVAILABLE, "issuer_unavailable"
+
+        content_type = request.headers.get("content-type", "")
+        if content_type.split(";", 1)[0].strip().lower() != "application/json":
+            return status.HTTP_400_BAD_REQUEST, "invalid_request"
+
+        try:
+            decoded = json.loads(body, object_pairs_hook=self._reject_duplicate_keys)
+            credentials = StagingRehearsalTokenRequest.model_validate(decoded)
+        except (json.JSONDecodeError, TypeError, ValueError, ValidationError):
+            return status.HTTP_400_BAD_REQUEST, "invalid_request"
+
+        normalized_email = str(credentials.email)
+        account_digest = hmac.new(
+            settings.secret_key.encode("utf-8"),
+            normalized_email.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        account_key, account_ttl = self._fixed_window_key(
+            f"account:{account_digest}", int(time.time())
+        )
+        account_allowed = await self._reserve_staging_slot(
+            scope, account_key, account_ttl
+        )
+        if account_allowed is None:
+            return status.HTTP_503_SERVICE_UNAVAILABLE, "issuer_unavailable"
+        if not account_allowed:
+            return status.HTTP_429_TOO_MANY_REQUESTS, "rate_limited"
+
+        if request.headers.get("Authorization") or request.headers.get(
+            settings.api_key_header
+        ):
+            return status.HTTP_400_BAD_REQUEST, "invalid_request"
+
+        state["staging_rehearsal_issuer_admitted"] = True
+        return None
+
+    @staticmethod
+    def _fixed_window_key(bucket: str, now: int) -> tuple[str, int]:
+        window = STAGING_REHEARSAL_WINDOW_SECONDS
+        bucket_number = now // window
+        ttl = window - (now % window)
+        return f"auth:staging-rehearsal:{bucket}:{bucket_number}", max(ttl, 1)
+
+    @staticmethod
+    async def _reserve_staging_slot(scope: Scope, key: str, ttl: int) -> bool | None:
+        app = scope.get("app")
+        state = getattr(app, "state", None)
+        redis_client = getattr(state, "redis", None)
+        if redis_client is None:
+            return None
+        try:
+            async with asyncio.timeout(STAGING_REHEARSAL_REDIS_TIMEOUT_SECONDS):
+                count = await redis_client.eval(
+                    _STAGING_REHEARSAL_RATE_LIMIT_LUA,
+                    1,
+                    key,
+                    ttl,
+                )
+            limit = (
+                STAGING_REHEARSAL_GLOBAL_LIMIT
+                if ":global:" in key
+                else STAGING_REHEARSAL_ACCOUNT_LIMIT
+            )
+            return int(count) <= limit
+        except Exception:
+            return None
+
+    @staticmethod
+    def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    @staticmethod
+    def _valid_staging_rehearsal_payload(
+        payload: dict[str, Any], method: str, path: str
+    ) -> bool:
+        if set(payload) != _STAGING_REHEARSAL_CLAIMS:
+            return False
+        if (
+            settings.environment != STAGING_REHEARSAL_TOKEN_ENVIRONMENT
+            or (method, path) not in _STAGING_REHEARSAL_TARGETS
+            or payload.get("token_use") != STAGING_REHEARSAL_TOKEN_USE
+            or payload.get("token_environment") != STAGING_REHEARSAL_TOKEN_ENVIRONMENT
+            or payload.get("scope") != STAGING_REHEARSAL_TOKEN_SCOPE
+            or payload.get("role") != "super_admin"
+            or not isinstance(payload.get("email"), str)
+            or not isinstance(payload.get("jti"), str)
+            or not payload.get("jti")
+        ):
+            return False
+        issued_at = payload.get("iat")
+        expires_at = payload.get("exp")
+        if type(issued_at) is not int or type(expires_at) is not int:
+            return False
+        lifetime = expires_at - issued_at
+        return 0 < lifetime <= STAGING_REHEARSAL_TOKEN_TTL_SECONDS
+
+    @staticmethod
+    def _no_store_send(send: Send) -> Send:
+        async def send_no_store(message: Any) -> None:
+            if message.get("type") == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers = [
+                    (name, value)
+                    for name, value in headers
+                    if name.lower() != b"cache-control"
+                ]
+                headers.append((b"cache-control", b"no-store"))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        return send_no_store
+
+    @staticmethod
+    async def _reject_staging_issuer(
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        status_code: int,
+        error: str = "invalid_request",
+    ) -> None:
+        await JSONResponse(
+            status_code=status_code,
+            content={"error": error},
+            headers={"Cache-Control": "no-store"},
+        )(scope, receive, send)
+
     def _is_public_path(self, path: str) -> bool:
         """Check if path is public (no auth required)."""
         if path in self.PUBLIC_PATHS:
@@ -421,6 +667,10 @@ class AuthMiddleware:
         if path.startswith("/v1/webhook/"):
             return True
         if path == "/v1/billing/webhook":
+            return True
+        # ASAAS receiver: exact match only (no prefix, no trailing slash).  It
+        # authenticates its own token at the ingress boundary.
+        if path == "/v1/billing/webhook/asaas":
             return True
         if path.startswith("/privacidade/"):
             return True
@@ -493,6 +743,23 @@ def require_super_admin(request: Request) -> TenantContext:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Super admin access required",
+        )
+    return tenant
+
+
+def require_super_admin_jwt(request: Request) -> TenantContext:
+    """Require a JWT-authenticated super administrator for billing operations.
+
+    API keys must never authorize cross-builder billing migration, rollout, or
+    receipt consumption.  This uses the already verified request context and
+    never re-emits the raw bearer token.
+    """
+
+    tenant = require_super_admin(request)
+    if tenant.authentication_mode != "jwt" or tenant.api_key or tenant.user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "billing_super_admin_jwt_required"},
         )
     return tenant
 

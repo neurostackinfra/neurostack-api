@@ -5,7 +5,14 @@ Contracts for authentication endpoints (/v1/auth).
 
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    ValidationInfo,
+    field_validator,
+)
 
 from src.api.helpers.password_validation import password_mismatch_error
 
@@ -56,6 +63,31 @@ class LoginResponse(BaseModel):
         default=None, description="Clinic UUID if configured"
     )
     role: str = Field(..., description="User role")
+
+
+class StagingRehearsalTokenRequest(BaseModel):
+    """Strict credentials accepted only by the staging rehearsal issuer."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    email: EmailStr = Field(..., max_length=254)
+    password: str = Field(..., min_length=1, max_length=1024, repr=False)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().casefold()
+        return value
+
+
+class StagingRehearsalTokenResponse(BaseModel):
+    """Short-lived JWT response for a staging producer rehearsal."""
+
+    token: str = Field(..., description="Short-lived staging rehearsal JWT")
+    token_type: str = Field(default="Bearer", pattern="^Bearer$")
+    expires_in: int = Field(default=600, ge=1, le=600)
+    token_use: str = Field(default="asaas_staging_rehearsal")
 
 
 class PasswordChangeRequest(BaseModel):

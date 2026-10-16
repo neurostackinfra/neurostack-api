@@ -193,6 +193,29 @@ _ENDPOINT = LabelPolicy(
     normalizer="route_template",
     fallback="/{unmatched}",
 )
+_BILLING_MIGRATION_OPERATION = _enum(
+    "roster_import",
+    "cancel_begin",
+    "cancel_reconcile",
+    "recreate_pending",
+    "recreate_reserve",
+    "recreate_reopen",
+    "checkout_recovery",
+    "provider_flip",
+    "manual_intervention",
+)
+_BILLING_MIGRATION_STATE = _enum(
+    "pending",
+    "in_progress",
+    "legacy_cancel_pending",
+    "legacy_cancelled",
+    "recreate_pending",
+    "migrated",
+    "manual_intervention",
+)
+_BILLING_OPERATION_ROLE = _enum("deployer", "approver", "reviewer", "unknown")
+_BILLING_OPERATION_OUTCOME = _enum("accepted", "rejected", "consumed")
+_BILLING_TOPUP_DIRECTION = _enum("enable", "disable")
 
 
 # Keys are prometheus-client family names (Counter strips the ``_total``
@@ -398,6 +421,85 @@ METRIC_DIMENSION_CONTRACTS: Mapping[str, MetricDimensionContract] = MappingProxy
         "neurostack_llm_generation_attempts": _contract(
             tier=_enum("primary", "multimodal_fallback"),
             outcome=_enum("response", "invalid", "empty", "error"),
+        ),
+        # ASAAS billing webhook/readback (Group 3).  Only closed technical
+        # vocabularies: never builder, payment, subscription or event IDs.
+        "neurostack_billing_webhook_deliveries": _contract(
+            family=_enum("checkout", "subscription", "payment", "unknown"),
+            outcome=_enum(
+                "processed",
+                "duplicate",
+                "unknown_event",
+                "uncorrelated",
+                "readback_required",
+                "quarantined",
+            ),
+        ),
+        "neurostack_billing_webhook_rejections": _contract(
+            reason=_enum(
+                "unauthorized",
+                "unavailable",
+                "unsupported_media_type",
+                "malformed",
+                "too_large",
+                "timeout",
+                "invalid_json",
+                "invalid_event",
+                "processing_unavailable",
+            )
+        ),
+        "neurostack_billing_alerts": _contract(
+            kind=_enum(
+                "unknown_event",
+                "uncorrelated_entity",
+                "drift",
+                "backlog",
+                "readback_failure",
+                "quarantine",
+            )
+        ),
+        "neurostack_billing_webhook_failures": _contract(
+            failure=_enum(
+                "integrity",
+                "data_error",
+                "canary_budget_exceeded",
+                "transition_rejected",
+                "capability_rejected",
+                "state_unavailable",
+                "serialization",
+                "lock_timeout",
+                "database",
+                "timeout",
+                "connection",
+                "unexpected",
+            ),
+            disposition=_enum("quarantined", "already_applied", "retry"),
+        ),
+        "neurostack_billing_readbacks": _contract(
+            resource=_enum("checkout_session", "subscription", "payment", "webhook"),
+            outcome=_enum("converged", "pending", "drift", "failed"),
+        ),
+        "neurostack_billing_readback_backlog": _contract(
+            resource=_enum("delivery", "checkout_session", "subscription", "payment")
+        ),
+        "neurostack_billing_webhook_config_ready": _NONE,
+        # Group 5 migration control plane.  The vocabulary remains closed so
+        # no migration, actor, provider, subscription, receipt or deployment
+        # identity can enter Prometheus.
+        "neurostack_billing_migration_operations": _contract(
+            operation=_BILLING_MIGRATION_OPERATION,
+            outcome=_BILLING_OPERATION_OUTCOME,
+        ),
+        "neurostack_billing_migration_backlog": _contract(
+            state=_BILLING_MIGRATION_STATE
+        ),
+        "neurostack_billing_operation_receipts": _contract(
+            role=_BILLING_OPERATION_ROLE,
+            outcome=_BILLING_OPERATION_OUTCOME,
+        ),
+        "neurostack_billing_topup_capability_transitions": _contract(
+            direction=_BILLING_TOPUP_DIRECTION,
+            outcome=_BILLING_OPERATION_OUTCOME,
         ),
         # neurostack-core opt-in collector
         "neurostack_srm_decisions": _contract(

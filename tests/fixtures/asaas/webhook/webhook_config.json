@@ -1,0 +1,13 @@
+{
+  "id": "0b7e9c3a-1111-4222-8333-944455556666",
+  "name": "neurostack-billing-test",
+  "url": "https://api.example.test/v1/billing/webhook/asaas",
+  "email": "ops@example.test",
+  "enabled": true,
+  "interrupted": false,
+  "apiVersion": 3,
+  "hasAuthToken": true,
+  "sendType": "SEQUENTIALLY",
+  "penalizedRequestsCount": 0,
+  "events": []
+}

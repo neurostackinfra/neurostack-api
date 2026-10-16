@@ -7,9 +7,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from passlib.context import CryptContext
 from sqlalchemy import cast, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.types import String
@@ -20,13 +21,40 @@ from src.api.helpers.health import (
     _compute_health_status,
     _get_time_series,
 )
-from src.api.middleware.auth import TenantContext, require_super_admin
+from src.api.middleware.auth import (
+    TenantContext,
+    require_super_admin,
+    require_super_admin_jwt,
+)
 from src.api.schemas.admin import (
     AdminAlertResponse,
     AdminDashboardResponse,
     AdminDashboardStatsResponse,
     AdminStatsResponse,
     AdminTimeSeriesPoint,
+    BillingCheckoutReservationResponse,
+    BillingMigrationAbsenceReadRequest,
+    BillingMigrationAbsenceReadResponse,
+    BillingMigrationCancelBeginRequest,
+    BillingMigrationCancelReconcileRequest,
+    BillingMigrationProviderFlipRequest,
+    BillingMigrationRecoverCheckoutRequest,
+    BillingMigrationReserveAttemptRequest,
+    BillingMigrationResponse,
+    BillingMigrationRosterRequest,
+    BillingMigrationTransitionRequest,
+    BillingOperationAssignmentRequest,
+    BillingOperationAssignmentResponse,
+    BillingOperationMaterialRequest,
+    BillingOperationReceiptRequest,
+    BillingOperationReceiptResponse,
+    BillingProviderEvidenceRequest,
+    BillingRolloutControlResponse,
+    BillingRolloutReadinessReceiptRequest,
+    BillingRolloutReadinessReceiptResponse,
+    BillingRolloutTransitionRequest,
+    BillingTopupCapabilityDisableRequest,
+    BillingTopupCapabilityEnableRequest,
     BuilderClinicResponse,
     BuilderWithClinicsResponse,
     ClinicSlotResponse,
@@ -38,6 +66,8 @@ from src.api.schemas.admin import (
     UpdateClinicRequest,
 )
 from src.api.schemas.billing import CouponResponse, CreateCouponRequest
+from src.config.settings import settings
+from src.models.billing import BillingMigration, BillingSubscription
 from src.models.builder import Builder
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.coupon import Coupon
@@ -45,7 +75,35 @@ from src.models.event import Event
 from src.models.tenant import Tenant
 from src.models.transaction import Transaction
 from src.models.user import User, UserRole
+from src.observability.metrics import (
+    BILLING_MIGRATION_BACKLOG,
+    BILLING_OPERATION_RECEIPTS_TOTAL,
+)
 from src.repositories import get_db_session_dependency
+from src.repositories.billing import (
+    BillingRepository,
+    BillingRevisionConflict,
+    BillingStateUnavailable,
+    BillingTransitionRejected,
+)
+from src.services.billing_capability import (
+    BillingCapabilityRejected,
+    BillingTopupCapabilityService,
+    TopupCapabilityEvidence,
+)
+from src.services.billing_migration import (
+    BillingMigrationRejected,
+    BillingMigrationService,
+    MigrationTarget,
+    MigrationView,
+    ProviderEvidenceEnvelope,
+)
+from src.services.billing_operations import (
+    BillingOperationAuthority,
+    BillingOperationRejected,
+    OperationMaterial,
+)
+from src.services.billing_rollout import BillingRolloutOperationService
 from src.services.media_assets import (
     MediaOwnerTransition,
     MediaStorageCapacityExceeded,
@@ -1259,3 +1317,826 @@ async def deactivate_coupon(
     coupon.is_active = False
     await session.commit()
     return {"ok": True}
+
+
+# ============================================
+# Billing migration / rollout control plane
+# ============================================
+
+
+def _billing_material(body: BillingOperationMaterialRequest) -> OperationMaterial:
+    return OperationMaterial(
+        scope=body.scope,
+        operation_id=body.operation_id,
+        environment=body.environment,
+        from_state=body.from_state,
+        to_state=body.to_state,
+        budget_digest=body.budget_digest,
+        deployment_digest=body.deployment_digest,
+        expires_at=body.expires_at,
+    )
+
+
+def _billing_signing_key() -> bytes:
+    """Read the configured local receipt key without ever serializing it."""
+
+    return settings.billing_operation_receipt_signing_key.get_secret_value().encode(
+        "utf-8"
+    )
+
+
+def _billing_actor(tenant: TenantContext) -> UUID:
+    # ``require_super_admin_jwt`` establishes this.  Keep a defensive fixed
+    # failure at the route boundary if a nonstandard test/request bypasses it.
+    if tenant.user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="billing_super_admin_jwt_required",
+        )
+    return tenant.user_id
+
+
+def _migration_response(view: MigrationView) -> BillingMigrationResponse:
+    return BillingMigrationResponse(
+        migration_id=view.migration_id,
+        subscription_id=view.subscription_id,
+        state=view.state,
+        attempt_count=view.attempt_count,
+        source_roster_revision=view.source_roster_revision,
+        renewal_date=view.renewal_date,
+        open_by_date=view.open_by_date,
+        cutover_by_date=view.cutover_by_date,
+    )
+
+
+def _rollout_response(control: Any) -> BillingRolloutControlResponse:
+    return BillingRolloutControlResponse(
+        environment=control.environment,
+        state=control.state,
+        rollout_revision=control.rollout_revision,
+        topup_commercial_enabled=control.topup_commercial_enabled,
+        topup_revision=control.topup_revision,
+    )
+
+
+async def _consume_migration_quorum(
+    session: AsyncSession, body: BillingMigrationTransitionRequest
+) -> None:
+    material = _billing_material(body)
+    if material.scope != "migration":
+        raise BillingOperationRejected("billing_migration_receipt_scope_invalid")
+    await BillingOperationAuthority(
+        session, signing_key=_billing_signing_key()
+    ).consume_quorum(material=material)
+
+
+def _billing_http_error(exc: Exception) -> HTTPException:
+    """Map all billing-control failures to fixed, non-sensitive API details."""
+
+    code = getattr(exc, "code", None)
+    if not isinstance(code, str):
+        code = "billing_operation_conflict"
+    if code.startswith("billing_operation_"):
+        BILLING_OPERATION_RECEIPTS_TOTAL.labels(
+            role="unknown", outcome="rejected"
+        ).inc()
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=code)
+
+
+@router.post(
+    "/billing/operations/assignments",
+    response_model=BillingOperationAssignmentResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Assign a billing operation role",
+)
+async def create_billing_operation_assignment(
+    body: BillingOperationAssignmentRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingOperationAssignmentResponse:
+    actor_user_id = _billing_actor(tenant)
+    if body.actor_user_id != actor_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="billing_operation_actor_mismatch",
+        )
+    try:
+        assignment = await BillingOperationAuthority(
+            session, signing_key=_billing_signing_key()
+        ).assign(
+            material=_billing_material(body),
+            role=body.role,
+            actor_user_id=actor_user_id,
+        )
+        await session.commit()
+    except (BillingOperationRejected, IntegrityError) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return BillingOperationAssignmentResponse(
+        assignment_id=assignment.id,
+        operation_id=assignment.operation_id,
+        role=assignment.role,
+        actor_user_id=assignment.actor_user_id,
+        active=assignment.active,
+        expires_at=assignment.expires_at,
+        payload_digest=assignment.payload_digest,
+    )
+
+
+@router.post(
+    "/billing/operations/receipts",
+    response_model=BillingOperationReceiptResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Append a signed single-use billing receipt",
+)
+async def create_billing_operation_receipt(
+    body: BillingOperationReceiptRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingOperationReceiptResponse:
+    actor_user_id = _billing_actor(tenant)
+    try:
+        receipt = await BillingOperationAuthority(
+            session, signing_key=_billing_signing_key()
+        ).record_receipt(
+            assignment_id=body.assignment_id,
+            actor_user_id=actor_user_id,
+            nonce=body.nonce,
+            material=_billing_material(body),
+            signature=body.signature,
+            evidence_type=body.evidence_type,
+            request_id=body.request_id,
+            inbox_high_watermark=body.inbox_high_watermark,
+        )
+        await session.commit()
+    except (BillingOperationRejected, IntegrityError) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return BillingOperationReceiptResponse(
+        receipt_id=receipt.id,
+        operation_id=receipt.operation_id,
+        role=receipt.role,
+        actor_user_id=receipt.actor_user_id,
+        nonce=receipt.nonce,
+        applied=False,
+    )
+
+
+@router.delete(
+    "/billing/operations/assignments/{assignment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke an unused billing operation assignment",
+)
+async def revoke_billing_operation_assignment(
+    assignment_id: UUID,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> None:
+    _billing_actor(tenant)
+    try:
+        await BillingOperationAuthority(
+            session, signing_key=_billing_signing_key()
+        ).revoke_assignment(assignment_id=assignment_id)
+        await session.commit()
+    except (BillingOperationRejected, IntegrityError) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+
+
+@router.post(
+    "/billing/migrations/roster",
+    response_model=BillingMigrationResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Import one legacy subscription from the canonical roster",
+)
+async def import_billing_migration_roster(
+    body: BillingMigrationRosterRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingMigrationResponse:
+    _billing_actor(tenant)
+    try:
+        view = await BillingMigrationService(session).import_roster_entry(
+            builder_id=body.builder_id,
+            subscription_id=body.subscription_id,
+            renewal=body.renewal_date,
+            target=MigrationTarget(
+                catalog_version_id=body.target.catalog_version_id,
+                offer_id=body.target.offer_id,
+                plan=body.target.plan,
+                coupon_code=body.target.coupon_code,
+                amount_cents=body.target.amount_cents,
+                snapshot=body.target.snapshot,
+            ),
+        )
+        await session.commit()
+    except (
+        BillingMigrationRejected,
+        BillingRevisionConflict,
+        BillingStateUnavailable,
+        IntegrityError,
+    ) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return _migration_response(view)
+
+
+@router.get(
+    "/billing/migrations",
+    response_model=list[BillingMigrationResponse],
+    summary="List sanitized migration roster entries",
+)
+async def list_billing_migrations(
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> list[BillingMigrationResponse]:
+    """Return only opaque IDs, state, counter and São Paulo cutoffs for export."""
+
+    _billing_actor(tenant)
+    # Revision equality is not a fence: webhook ingestion may create rows
+    # without advancing it.  Bind the global roster lock, capture IDs, then
+    # re-read the exact rows while the lock is held.
+    await BillingRepository(session).lock_billing_roster()
+    id_result = await session.execute(
+        select(BillingMigration.id).order_by(
+            BillingMigration.created_at, BillingMigration.id
+        )
+    )
+    migration_ids = list(id_result.scalars().all())
+    result = await session.execute(
+        select(BillingMigration)
+        .where(BillingMigration.id.in_(migration_ids))
+        .order_by(BillingMigration.created_at, BillingMigration.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    migrations = list(result.scalars().all())
+    subscription_ids = [migration.subscription_id for migration in migrations]
+    if subscription_ids:
+        await session.execute(
+            select(BillingSubscription.id)
+            .where(BillingSubscription.id.in_(subscription_ids))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    if len(migrations) != len(migration_ids):
+        raise HTTPException(status_code=409, detail="billing_roster_changed")
+    states = (
+        "pending",
+        "in_progress",
+        "legacy_cancel_pending",
+        "legacy_cancelled",
+        "recreate_pending",
+        "migrated",
+        "manual_intervention",
+    )
+    for state in states:
+        BILLING_MIGRATION_BACKLOG.labels(state=state).set(
+            sum(migration.state == state for migration in migrations)
+        )
+    return [
+        _migration_response(BillingMigrationService._view(migration))
+        for migration in migrations
+    ]
+
+
+@router.post(
+    "/billing/migrations/cancel-begin",
+    response_model=BillingMigrationResponse,
+    summary="Begin a legacy cancellation with provider set to unknown",
+)
+async def begin_billing_migration_cancel(
+    body: BillingMigrationCancelBeginRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingMigrationResponse:
+    _billing_actor(tenant)
+    try:
+        await _consume_migration_quorum(session, body)
+        view = await BillingMigrationService(session).begin_legacy_cancel(
+            migration_id=body.migration_id, operation_id=body.operation_id
+        )
+        await session.commit()
+    except (
+        BillingOperationRejected,
+        BillingMigrationRejected,
+        BillingRevisionConflict,
+        BillingStateUnavailable,
+        IntegrityError,
+    ) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return _migration_response(view)
+
+
+@router.post(
+    "/billing/migrations/cancel-reconcile",
+    response_model=BillingMigrationResponse,
+    summary="Reconcile a legacy cancel observation without provider egress",
+)
+async def reconcile_billing_migration_cancel(
+    body: BillingMigrationCancelReconcileRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingMigrationResponse:
+    actor_user_id = _billing_actor(tenant)
+    try:
+        await _consume_migration_quorum(session, body)
+        view = await BillingMigrationService(session).reconcile_legacy_cancel(
+            migration_id=body.migration_id,
+            actor_user_id=actor_user_id,
+            cancelled=body.cancelled,
+            observed_at=body.observed_at,
+        )
+        await session.commit()
+    except (
+        BillingOperationRejected,
+        BillingMigrationRejected,
+        BillingRevisionConflict,
+        BillingStateUnavailable,
+        IntegrityError,
+    ) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return _migration_response(view)
+
+
+@router.post(
+    "/billing/migrations/recreate-pending",
+    response_model=BillingMigrationResponse,
+    summary="Quarantine an unresolved recreation",
+)
+async def mark_billing_migration_recreate_pending(
+    body: BillingMigrationTransitionRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingMigrationResponse:
+    actor_user_id = _billing_actor(tenant)
+    try:
+        await _consume_migration_quorum(session, body)
+        view = await BillingMigrationService(session).mark_recreate_pending(
+            migration_id=body.migration_id, actor_user_id=actor_user_id
+        )
+        await session.commit()
+    except (
+        BillingOperationRejected,
+        BillingMigrationRejected,
+        BillingRevisionConflict,
+        BillingStateUnavailable,
+        IntegrityError,
+    ) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return _migration_response(view)
+
+
+@router.post(
+    "/billing/migrations/recreate-reopen",
+    response_model=BillingMigrationResponse,
+    summary="Reopen recreation only after an absent exact-ID readback",
+)
+async def reopen_billing_migration_recreate(
+    body: BillingMigrationTransitionRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingMigrationResponse:
+    actor_user_id = _billing_actor(tenant)
+    try:
+        await _consume_migration_quorum(session, body)
+        view = await BillingMigrationService(
+            session
+        ).reopen_recreate_after_absent_readback(
+            migration_id=body.migration_id,
+            actor_user_id=actor_user_id,
+            readback_receipt_id=body.readback_receipt_id,
+        )
+        await session.commit()
+    except (
+        BillingOperationRejected,
+        BillingMigrationRejected,
+        BillingRevisionConflict,
+        BillingStateUnavailable,
+        IntegrityError,
+    ) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return _migration_response(view)
+
+
+@router.post(
+    "/billing/migrations/recreate-reserve",
+    response_model=BillingCheckoutReservationResponse,
+    summary="Reserve a numbered recreation attempt without egress",
+)
+async def reserve_billing_migration_recreate(
+    body: BillingMigrationReserveAttemptRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingCheckoutReservationResponse:
+    _billing_actor(tenant)
+    try:
+        await _consume_migration_quorum(session, body)
+        checkout = await BillingMigrationService(session).reserve_recreate_attempt(
+            migration_id=body.migration_id,
+            environment=body.environment,
+            absence_receipt_id=body.absence_receipt_id,
+        )
+        await session.commit()
+    except (
+        BillingOperationRejected,
+        BillingMigrationRejected,
+        BillingRevisionConflict,
+        BillingStateUnavailable,
+        BillingTransitionRejected,
+        IntegrityError,
+    ) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return BillingCheckoutReservationResponse(
+        checkout_session_id=checkout.id,
+        attempt_no=checkout.attempt_no,
+        state=checkout.state,
+        next_due_date=checkout.next_due_date,
+    )
+
+
+@router.post(
+    "/billing/migrations/recover-checkout",
+    response_model=BillingMigrationResponse,
+    summary="Contain a checkout stuck before general rollout",
+)
+async def recover_billing_migration_checkout(
+    body: BillingMigrationRecoverCheckoutRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingMigrationResponse:
+    actor_user_id = _billing_actor(tenant)
+    try:
+        await _consume_migration_quorum(session, body)
+        view = await BillingMigrationService(session).recover_stuck_checkout(
+            migration_id=body.migration_id,
+            checkout_session_id=body.checkout_session_id,
+            environment=body.environment,
+            actor_user_id=actor_user_id,
+        )
+        await session.commit()
+    except (
+        BillingOperationRejected,
+        BillingMigrationRejected,
+        BillingRevisionConflict,
+        BillingStateUnavailable,
+        IntegrityError,
+    ) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return _migration_response(view)
+
+
+@router.post(
+    "/billing/migrations/manual-intervention",
+    response_model=BillingMigrationResponse,
+    summary="Stop a migration in the manual-intervention lane",
+)
+async def manually_intervene_billing_migration(
+    body: BillingMigrationTransitionRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingMigrationResponse:
+    actor_user_id = _billing_actor(tenant)
+    try:
+        await _consume_migration_quorum(session, body)
+        view = await BillingMigrationService(session).mark_manual_intervention(
+            migration_id=body.migration_id, actor_user_id=actor_user_id
+        )
+        await session.commit()
+    except (
+        BillingOperationRejected,
+        BillingMigrationRejected,
+        BillingRevisionConflict,
+        BillingStateUnavailable,
+        IntegrityError,
+    ) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return _migration_response(view)
+
+
+def _provider_evidence(
+    body: BillingProviderEvidenceRequest,
+) -> ProviderEvidenceEnvelope:
+    return ProviderEvidenceEnvelope(
+        external_reference=body.external_reference,
+        provider_event_id=body.provider_event_id,
+        provider_key_id=body.provider_key_id,
+        provider_operation=body.provider_operation,
+        provider_signature=body.provider_signature,
+        provider_observed_at=body.provider_observed_at,
+        provider_expires_at=body.provider_expires_at,
+        provider_snapshot_digest=body.provider_snapshot_digest,
+        provider_evidence_digest=body.provider_evidence_digest,
+    )
+
+
+@router.post(
+    "/billing/migrations/absence-reads",
+    response_model=BillingMigrationAbsenceReadResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Append one provider-signed empty ASAAS read",
+)
+async def record_billing_migration_absence_read(
+    body: BillingMigrationAbsenceReadRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingMigrationAbsenceReadResponse:
+    """Evidence only: authority is the provider signature, the actor the JWT.
+
+    The second valid read also appends the ``recreate_authorized`` receipt;
+    reopen/reserve stay quorum-gated transitions.
+    """
+
+    actor_user_id = _billing_actor(tenant)
+    try:
+        read = await BillingMigrationService(session).record_absence_read(
+            migration_id=body.migration_id,
+            actor_user_id=actor_user_id,
+            evidence=_provider_evidence(body.evidence),
+            observed_at=body.observed_at,
+        )
+        await session.commit()
+    except (
+        BillingMigrationRejected,
+        BillingRevisionConflict,
+        BillingStateUnavailable,
+        IntegrityError,
+    ) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return BillingMigrationAbsenceReadResponse(
+        read_id=read.read_id,
+        read_no=read.read_no,
+        prior_checkout_session_id=read.prior_checkout_session_id,
+        convergence_limit_at=read.convergence_limit_at,
+        authorization_receipt_id=read.authorization_receipt_id,
+    )
+
+
+@router.post(
+    "/billing/migrations/provider-flip",
+    response_model=BillingMigrationResponse,
+    summary="Bind ASAAS only with its verified local receipt",
+)
+async def flip_billing_migration_provider(
+    body: BillingMigrationProviderFlipRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingMigrationResponse:
+    actor_user_id = _billing_actor(tenant)
+    try:
+        await _consume_migration_quorum(session, body)
+        view = await BillingMigrationService(session).record_provider_flip(
+            migration_id=body.migration_id,
+            actor_user_id=actor_user_id,
+            evidence=_provider_evidence(body.evidence),
+            observed_at=body.observed_at,
+        )
+        await session.commit()
+    except (
+        BillingOperationRejected,
+        BillingMigrationRejected,
+        BillingRevisionConflict,
+        BillingStateUnavailable,
+        IntegrityError,
+    ) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return _migration_response(view)
+
+
+@router.post(
+    "/billing/rollout/transitions",
+    response_model=BillingRolloutControlResponse,
+    summary="Apply a signed billing rollout transition",
+)
+async def transition_billing_rollout_control(
+    body: BillingRolloutTransitionRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingRolloutControlResponse:
+    _billing_actor(tenant)
+    try:
+        control = await BillingRolloutOperationService(
+            session, signing_key=_billing_signing_key()
+        ).transition(
+            expected_revision=body.expected_revision,
+            material=_billing_material(body),
+            canary_builder_id=body.canary_builder_id,
+        )
+        await session.commit()
+    except (
+        BillingOperationRejected,
+        BillingRevisionConflict,
+        BillingStateUnavailable,
+        BillingTransitionRejected,
+        IntegrityError,
+    ) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return _rollout_response(control)
+
+
+@router.get(
+    "/billing/rollout/readback",
+    response_model=BillingRolloutControlResponse,
+    summary="Read the persisted staging billing rollout state",
+)
+async def read_staging_billing_rollout(
+    response: Response,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingRolloutControlResponse:
+    """Return only the closed rollout gate snapshot used by the rehearsal."""
+
+    _billing_actor(tenant)
+    if settings.environment != "staging":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="billing_rollout_readback_unavailable",
+        )
+    try:
+        control = await BillingRepository(session).lock_rollout_control(
+            environment="staging"
+        )
+    except BillingStateUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="billing_rollout_readback_unavailable",
+        ) from exc
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return _rollout_response(control)
+
+
+@router.post(
+    "/billing/rollout/receipts",
+    response_model=BillingRolloutReadinessReceiptResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Append authenticated rollout readiness evidence",
+)
+async def create_billing_rollout_readiness_receipt(
+    body: BillingRolloutReadinessReceiptRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingRolloutReadinessReceiptResponse:
+    _billing_actor(tenant)
+    try:
+        receipt = await BillingRolloutOperationService(
+            session, signing_key=_billing_signing_key()
+        ).record_readiness_receipt(
+            environment=body.environment,
+            receipt_kind=body.receipt_kind,
+            rollout_revision=body.rollout_revision,
+            roster_revision=body.roster_revision,
+            status=body.status,
+            content_sha256=body.content_sha256,
+            material=_billing_material(body),
+            operation_receipt_id=body.operation_receipt_id,
+            provider_receipt_id=body.provider_receipt_id,
+            rule_digest=body.rule_digest,
+            bundle_digest=body.bundle_digest,
+            app_digest=body.app_digest,
+            observed_at=body.observed_at,
+            expires_at=body.expires_at,
+        )
+        await session.commit()
+    except (BillingOperationRejected, IntegrityError) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return BillingRolloutReadinessReceiptResponse(
+        **body.model_dump(), receipt_id=receipt.id
+    )
+
+
+@router.post(
+    "/billing/rollout/incident-disable",
+    response_model=BillingRolloutControlResponse,
+    summary="Disable billing rollout for a signed incident",
+)
+async def disable_billing_rollout_for_incident(
+    body: BillingRolloutTransitionRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingRolloutControlResponse:
+    _billing_actor(tenant)
+    try:
+        control = await BillingRolloutOperationService(
+            session, signing_key=_billing_signing_key()
+        ).disable_for_incident(
+            expected_revision=body.expected_revision,
+            material=_billing_material(body),
+        )
+        await session.commit()
+    except (
+        BillingOperationRejected,
+        BillingRevisionConflict,
+        BillingStateUnavailable,
+        BillingTransitionRejected,
+        IntegrityError,
+    ) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return _rollout_response(control)
+
+
+@router.post(
+    "/billing/topup-capability/enable",
+    response_model=BillingRolloutControlResponse,
+    summary="Enable top-up only from complete cross-service capability evidence",
+)
+@router.post(
+    "/billing/topup-capability",
+    response_model=BillingRolloutControlResponse,
+    summary="Enable top-up only from complete cross-service capability evidence",
+)
+async def enable_billing_topup_capability(
+    body: BillingTopupCapabilityEnableRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingRolloutControlResponse:
+    _billing_actor(tenant)
+    evidence = body.evidence
+    try:
+        service = BillingTopupCapabilityService(
+            session, signing_key=_billing_signing_key()
+        )
+        control = await service.enable(
+            expected_revision=body.expected_revision,
+            material=_billing_material(body),
+            evidence=TopupCapabilityEvidence(
+                environment=body.environment,
+                capability_receipt_id=evidence.capability_receipt_id,
+                producer_receipt_id=evidence.producer_receipt_id,
+                credit_receipt_id=evidence.credit_receipt_id,
+                reconciliation_receipt_id=evidence.reconciliation_receipt_id,
+                verification_receipt_id=evidence.verification_receipt_id,
+                producer_digest=evidence.producer_digest,
+                credit_digest=evidence.credit_digest,
+                reconciliation_digest=evidence.reconciliation_digest,
+                verification_digest=evidence.verification_digest,
+                billing_fact_schema_digest=evidence.billing_fact_schema_digest,
+                producer_actor_id=evidence.producer_actor_id,
+                credit_actor_id=evidence.credit_actor_id,
+                reconciliation_actor_id=evidence.reconciliation_actor_id,
+                verification_actor_id=evidence.verification_actor_id,
+                verified_at=evidence.verified_at,
+                operation_id=evidence.operation_id,
+                deployment_digest=evidence.deployment_digest,
+                request_id=evidence.request_id,
+                inbox_high_watermark=evidence.inbox_high_watermark,
+            ),
+        )
+        await session.commit()
+    except (
+        BillingOperationRejected,
+        BillingCapabilityRejected,
+        BillingRevisionConflict,
+        BillingStateUnavailable,
+        BillingTransitionRejected,
+        IntegrityError,
+    ) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return _rollout_response(control)
+
+
+@router.post(
+    "/billing/topup-capability/disable",
+    response_model=BillingRolloutControlResponse,
+    summary="Disable top-up only for health or revocation",
+)
+async def disable_billing_topup_capability(
+    body: BillingTopupCapabilityDisableRequest,
+    tenant: TenantContext = Depends(require_super_admin_jwt),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> BillingRolloutControlResponse:
+    _billing_actor(tenant)
+    try:
+        service = BillingTopupCapabilityService(
+            session, signing_key=_billing_signing_key()
+        )
+        control = await service.disable(
+            expected_revision=body.expected_revision,
+            material=_billing_material(body),
+            reason=body.reason,
+        )
+        await session.commit()
+    except (
+        BillingOperationRejected,
+        BillingCapabilityRejected,
+        BillingRevisionConflict,
+        BillingStateUnavailable,
+        BillingTransitionRejected,
+        IntegrityError,
+    ) as exc:
+        await session.rollback()
+        raise _billing_http_error(exc) from exc
+    return _rollout_response(control)

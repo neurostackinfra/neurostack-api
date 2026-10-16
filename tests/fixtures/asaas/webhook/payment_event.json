@@ -1,0 +1,26 @@
+{
+  "id": "evt_8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a&368604922",
+  "event": "PAYMENT_CONFIRMED",
+  "dateCreated": "2026-10-11 10:00:02",
+  "account": {"id": "acc_fixture", "ownerId": "own_fixture"},
+  "payment": {
+    "object": "payment",
+    "id": "pay_000000000000001",
+    "dateCreated": "2026-10-11",
+    "customer": "cus_fixture_private",
+    "subscription": "sub_000000000000001",
+    "checkoutSession": "chk_000000000000001",
+    "paymentLink": null,
+    "value": 999.00,
+    "netValue": 970.00,
+    "originalValue": null,
+    "billingType": "CREDIT_CARD",
+    "status": "CONFIRMED",
+    "dueDate": "2026-10-11",
+    "invoiceUrl": "https://www.asaas.com/i/fixture",
+    "externalReference": null,
+    "deleted": false,
+    "creditCard": {"creditCardNumber": "4444", "creditCardBrand": "VISA", "creditCardToken": "tok_fixture_private"},
+    "refunds": null
+  }
+}

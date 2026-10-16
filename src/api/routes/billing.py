@@ -1,13 +1,14 @@
 """
 NeuroStack API - Billing Endpoints
-Plan summary, checkout (AbacatePay), webhook handler, and coupon validation.
+Plan summary, hosted ASAAS checkout, legacy webhook handler, and coupon validation.
 """
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import func, select
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.middleware.auth import require_builder
@@ -25,15 +26,37 @@ from src.models.coupon import Coupon
 from src.models.tenant import Tenant
 from src.models.transaction import Transaction
 from src.repositories import get_db_session_dependency
+from src.repositories.billing import billing_roster_advisory_key
+from src.repositories.database import get_db_session
 from src.services.abacatepay import AbacatePayClient
+from src.services.asaas import AsaasClient
+from src.services.billing_checkout import (
+    BillingCheckoutService,
+    CheckoutCouponRejected,
+    CheckoutCreationRejected,
+    CheckoutInputRejected,
+    CheckoutNotEligible,
+    CheckoutNotFound,
+    CheckoutReconciliationRequired,
+    CheckoutUnavailable,
+)
 from src.services.billing_usage_service import (
     PlanUsageLimits,
     get_builder_billing_usage,
 )
-from src.services.egress_policy import (
-    FINANCIAL_EGRESS_DISABLED,
-    EgressDisabledError,
-    require_financial_egress,
+from src.services.billing_webhook import (
+    ASAAS_INGRESS_BODY_STATE,
+    ASAAS_INGRESS_PAYLOAD_STATE,
+    ASAAS_WEBHOOK_READINESS,
+    AsaasWebhookProvisioner,
+    BillingWebhookService,
+    WebhookEnvelopeRejected,
+    WebhookProcessingUnavailable,
+    WebhookReadiness,
+    desired_webhook_settings,
+    parse_envelope,
+    record_rejection,
+    run_delivery_readback,
 )
 
 logger = get_logger(__name__)
@@ -46,11 +69,58 @@ FREE_TIER = 2
 ANNUAL_DISCOUNT_PCT = 15
 
 
-def _get_client() -> AbacatePayClient:
-    return AbacatePayClient(
-        api_key=settings.abacatepay_api_key,
-        env=settings.environment,
+def _asaas_client() -> AsaasClient:
+    """Build the only client permitted on the new hosted-checkout path."""
+
+    return AsaasClient(
+        api_key=settings.asaas_api_key,
+        user_agent=settings.asaas_user_agent,
     )
+
+
+async def _read_back_webhook_readiness() -> WebhookReadiness:
+    """Read-only provider readback of this environment's webhook and token."""
+
+    desired = desired_webhook_settings(
+        environment=settings.environment,
+        url=settings.asaas_webhook_url,
+        email=settings.asaas_webhook_notification_email,
+    )
+    return await AsaasWebhookProvisioner(
+        _asaas_client(), desired, auth_token=settings.asaas_webhook_token
+    ).readback()
+
+
+def _asaas_checkout_client() -> AsaasClient:
+    """Creation client: only built while the webhook reads back ready.
+
+    ``BillingCheckoutService`` calls this among its side-effect-free creation
+    preconditions (after the rollout pre-check and the egress flag, before any
+    reservation), so a missing, drifted or unverified provider webhook/token
+    blocks hosted checkout with zero rows and zero POSTs.  Reconciliation and
+    readback use ``_asaas_client`` and are never gated.
+    """
+
+    ASAAS_WEBHOOK_READINESS.require_ready(_read_back_webhook_readiness)
+    return _asaas_client()
+
+
+# Longest a checkout request waits for a stale verdict's readback.
+WEBHOOK_READBACK_WAIT_SECONDS = 3.0
+
+
+async def _ensure_webhook_ready() -> None:
+    """Creation precondition: refresh a stale verdict, then require ready.
+
+    Runs after the rollout pre-check and the egress flag, before any lock,
+    reservation or POST, with no open transaction.  A failed or slow readback
+    keeps the gate closed (503, zero rows, zero POSTs).
+    """
+
+    await ASAAS_WEBHOOK_READINESS.ensure_fresh(
+        _read_back_webhook_readiness, timeout=WEBHOOK_READBACK_WAIT_SECONDS
+    )
+    ASAAS_WEBHOOK_READINESS.require_ready()
 
 
 async def _count_active_clinics(builder_id: UUID, db: AsyncSession) -> int:
@@ -92,6 +162,91 @@ async def _get_usage(
         _start_plan_usage_limits(),
     )
     return BillingUsageResponse.model_validate(usage)
+
+
+@dataclass(frozen=True)
+class AbacatePayRosterBinding:
+    """Canonical legacy entitlement snapshot owned by billing_subscriptions."""
+
+    builder_id: UUID
+    plan: str
+    billing_cycle: str
+    coupon_code: str | None
+
+
+class AbacatePayRosterUnavailable(RuntimeError):
+    """The canonical legacy roster could not be read safely."""
+
+
+async def _get_abacatepay_roster_binding(
+    external_subscription_id: str,
+    db: AsyncSession,
+) -> AbacatePayRosterBinding | None:
+    """Load the future canonical roster snapshot and deny on read/schema drift."""
+
+    if not external_subscription_id:
+        raise AbacatePayRosterUnavailable
+    try:
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(:roster_lock_key)"),
+            {"roster_lock_key": billing_roster_advisory_key()},
+        )
+        result = await db.execute(
+            text("""
+                SELECT
+                    roster.billing_roster_revision,
+                    subscription.builder_id,
+                    subscription.plan,
+                    subscription.billing_cycle,
+                    subscription.coupon_code,
+                    subscription.roster_revision AS subscription_roster_revision
+                FROM billing_roster_control AS roster
+                LEFT JOIN billing_subscriptions AS subscription
+                  ON subscription.provider = 'abacatepay'
+                 AND subscription.external_subscription_id = :external_subscription_id
+                 AND subscription.is_active = TRUE
+                LIMIT 1
+            """),
+            {"external_subscription_id": external_subscription_id},
+        )
+        row = result.mappings().one_or_none()
+        if row is None:
+            raise ValueError("billing roster control is unavailable")
+        roster_revision = row["billing_roster_revision"]
+        if not isinstance(roster_revision, int) or roster_revision <= 0:
+            raise ValueError("billing roster is not initialized")
+        builder_id = row["builder_id"]
+        if builder_id is None:
+            return None
+        subscription_roster_revision = row["subscription_roster_revision"]
+        if (
+            not isinstance(subscription_roster_revision, int)
+            or subscription_roster_revision <= 0
+            or subscription_roster_revision > roster_revision
+        ):
+            raise ValueError("invalid canonical roster revision")
+        if not isinstance(builder_id, UUID):
+            builder_id = UUID(str(builder_id))
+        plan = row["plan"]
+        billing_cycle = row["billing_cycle"]
+        coupon_code = row["coupon_code"]
+        if (
+            not isinstance(plan, str)
+            or not plan
+            or not isinstance(billing_cycle, str)
+            or not billing_cycle
+            or (coupon_code is not None and not isinstance(coupon_code, str))
+        ):
+            raise ValueError("invalid canonical roster snapshot")
+        return AbacatePayRosterBinding(
+            builder_id=builder_id,
+            plan=plan,
+            billing_cycle=billing_cycle,
+            coupon_code=coupon_code,
+        )
+    except Exception as exc:
+        logger.warning("AbacatePay roster lookup unavailable")
+        raise AbacatePayRosterUnavailable from exc
 
 
 def _calc_pricing(active_clinics: int) -> dict[str, int]:
@@ -149,20 +304,6 @@ async def billing_usage(
     return await _get_usage(builder, db)
 
 
-async def _validate_coupon(code: str, db: AsyncSession) -> Coupon:
-    result = await db.execute(select(Coupon).where(Coupon.code == code.upper()))
-    coupon = result.scalar_one_or_none()
-    if not coupon:
-        raise HTTPException(status_code=404, detail="Cupom não encontrado")
-    if not coupon.is_active:
-        raise HTTPException(status_code=400, detail="Cupom inativo")
-    if coupon.expires_at and coupon.expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=400, detail="Cupom expirado")
-    if coupon.max_uses is not None and coupon.uses_count >= coupon.max_uses:
-        raise HTTPException(status_code=400, detail="Cupom esgotado")
-    return coupon
-
-
 @router.get(
     "/coupon/{code}",
     summary="Validate Coupon",
@@ -198,91 +339,156 @@ async def create_checkout(
     builder_id: UUID = Depends(require_builder),
     db: AsyncSession = Depends(get_db_session_dependency),
 ) -> CheckoutResponse:
-    result = await db.execute(select(Builder).where(Builder.id == builder_id))
-    builder = result.scalar_one_or_none()
-    if not builder:
-        raise HTTPException(status_code=404, detail="Builder not found")
+    """Start a provider-hosted checkout from server-owned commercial state."""
 
-    active_clinics = await _count_active_clinics(builder_id, db)
-    pricing = _calc_pricing(active_clinics)
-
-    if body.cycle == "monthly":
-        amount = pricing["total_monthly"]
-    else:
-        amount = pricing["total_annual"]
-
-    coupon_code_used: str | None = None
-    if body.coupon_code:
-        coupon = await _validate_coupon(body.coupon_code, db)
-        discount_factor = 1 - coupon.discount_percent / 100
-        amount = int(amount * discount_factor)
-        coupon_code_used = coupon.code
-
-    amount_cents = amount * 100
+    service = BillingCheckoutService(
+        db,
+        client_factory=_asaas_checkout_client,
+        creation_precondition=_ensure_webhook_ready,
+    )
     try:
-        await require_financial_egress()
-    except EgressDisabledError as exc:
+        checkout = await service.create_checkout(
+            builder_id=builder_id,
+            offer_id=body.offer_id,
+            payment_method=body.method,
+            coupon_code=body.coupon_code,
+        )
+    except CheckoutInputRejected as exc:
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    except CheckoutNotEligible as exc:
+        # One fixed 409 for every subscription eligibility blocker (legacy or
+        # non-terminal ASAAS subscription, migration, other live plan attempt).
+        raise HTTPException(status_code=409, detail=exc.code) from exc
+    except CheckoutCouponRejected as exc:
+        # One fixed 400 for absent/inactive/expired/exhausted (no enumeration),
+        # matching the legacy coupon route's 400 family.
+        raise HTTPException(status_code=400, detail=exc.code) from exc
+    except CheckoutUnavailable as exc:
         raise HTTPException(
             status_code=503,
-            detail=FINANCIAL_EGRESS_DISABLED,
+            detail=exc.code,
         ) from exc
-    client = _get_client()
-
-    metadata = {
-        "builder_id": str(builder_id),
-        "plan": body.plan,
-        "cycle": body.cycle,
-    }
-    if coupon_code_used:
-        metadata["coupon_code"] = coupon_code_used
-
-    frequency = "MONTHLY" if body.cycle == "monthly" else "YEARLY"
-
-    if body.method == "pix" and body.cycle == "monthly":
-        # PIX gera QR code para o primeiro ciclo; AbacatePay envia cobranças mensais
-        result_pay = client.create_pix_charge(
-            amount_cents=amount_cents,
-            description="NeuroStack Start - Mensal (PIX)",
-            metadata=metadata,
-        )
-        return CheckoutResponse(
-            method="pix",
-            qr_code=result_pay["qr_code"],
-            qr_code_url=result_pay.get("qr_code_url"),
-            subscription_id=result_pay.get("charge_id"),
-        )
-
-    if body.method == "pix" and body.cycle == "annual":
-        result_pay = client.create_pix_charge(
-            amount_cents=amount_cents,
-            description="NeuroStack Start - Anual (PIX)",
-            metadata=metadata,
-        )
-        return CheckoutResponse(
-            method="pix",
-            qr_code=result_pay["qr_code"],
-            qr_code_url=result_pay["qr_code_url"],
-            subscription_id=result_pay.get("charge_id"),
-        )
-
-    max_installments = None
-    if body.cycle == "annual":
-        max_installments = body.installments or 12
-
-    result_pay = client.create_subscription(
-        amount_cents=amount_cents,
-        frequency=frequency,
-        method="CREDIT_CARD",
-        description=f"NeuroStack Start - {'Mensal' if body.cycle == 'monthly' else 'Anual'} (Cartão)",
-        customer={"name": builder.name},
-        metadata=metadata,
-        max_installments=max_installments,
-    )
+    except CheckoutCreationRejected as exc:
+        raise HTTPException(status_code=502, detail=exc.code) from exc
+    except CheckoutReconciliationRequired as exc:
+        raise HTTPException(status_code=202, detail=exc.code) from exc
     return CheckoutResponse(
-        method="card",
-        payment_url=result_pay["subscription_url"],
-        subscription_id=result_pay["subscription_id"],
+        checkout_session_id=str(checkout.checkout_session_id),
+        kind=checkout.kind,
+        state=checkout.state,
+        checkout_url=checkout.checkout_url,
     )
+
+
+@router.get(
+    "/checkout/{checkout_session_id}",
+    summary="Get Hosted Checkout",
+    response_model=CheckoutResponse,
+)
+async def get_checkout(
+    checkout_session_id: UUID,
+    builder_id: UUID = Depends(require_builder),
+    db: AsyncSession = Depends(get_db_session_dependency),
+) -> CheckoutResponse:
+    """Return only the caller's session; foreign IDs are indistinguishable 404s."""
+
+    try:
+        checkout = await BillingCheckoutService(
+            db, client_factory=_asaas_client
+        ).get_checkout(
+            builder_id=builder_id,
+            checkout_session_id=checkout_session_id,
+        )
+    except CheckoutNotFound as exc:
+        raise HTTPException(status_code=404, detail="Checkout not found") from exc
+    return CheckoutResponse(
+        checkout_session_id=str(checkout.checkout_session_id),
+        kind=checkout.kind,
+        state=checkout.state,
+        checkout_url=checkout.checkout_url,
+    )
+
+
+@router.post(
+    "/checkout/{checkout_session_id}/reconcile",
+    summary="Reconcile Hosted Checkout",
+    response_model=CheckoutResponse,
+)
+async def reconcile_checkout(
+    checkout_session_id: UUID,
+    builder_id: UUID = Depends(require_builder),
+    db: AsyncSession = Depends(get_db_session_dependency),
+) -> CheckoutResponse:
+    """Read provider evidence by the session UUID; this endpoint never creates."""
+
+    try:
+        checkout = await BillingCheckoutService(
+            db, client_factory=_asaas_client
+        ).reconcile_checkout(
+            builder_id=builder_id,
+            checkout_session_id=checkout_session_id,
+        )
+    except CheckoutNotFound as exc:
+        raise HTTPException(status_code=404, detail="Checkout not found") from exc
+    except CheckoutReconciliationRequired as exc:
+        raise HTTPException(status_code=202, detail=exc.code) from exc
+    return CheckoutResponse(
+        checkout_session_id=str(checkout.checkout_session_id),
+        kind=checkout.kind,
+        state=checkout.state,
+        checkout_url=checkout.checkout_url,
+    )
+
+
+@router.post(
+    "/webhook/asaas",
+    summary="ASAAS Webhook",
+    response_model=None,
+    status_code=200,
+)
+async def asaas_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db_session_dependency),
+) -> dict[str, bool]:
+    """Persist one authenticated ASAAS delivery; 200 only after commit.
+
+    The ingress boundary has already authenticated ``asaas-access-token`` and
+    bounded/parsed the body; without its state this handler fails closed.
+    Known events apply their deterministic transition in the same commit;
+    readbacks run after the response with their own session.
+    """
+
+    state = request.scope.get("state") or {}
+    body = state.get(ASAAS_INGRESS_BODY_STATE)
+    payload = state.get(ASAAS_INGRESS_PAYLOAD_STATE)
+    if not isinstance(body, bytes) or payload is None:
+        record_rejection("unavailable")
+        raise HTTPException(status_code=503, detail="billing_webhook_unavailable")
+    try:
+        envelope = parse_envelope(body, payload)
+    except WebhookEnvelopeRejected as exc:
+        record_rejection("invalid_event")
+        raise HTTPException(status_code=400, detail="invalid_event") from exc
+    try:
+        outcome = await BillingWebhookService(
+            db, environment=settings.environment
+        ).receive(envelope)
+    except WebhookProcessingUnavailable as exc:
+        record_rejection("processing_unavailable")
+        raise HTTPException(
+            status_code=503, detail="billing_webhook_unavailable"
+        ) from exc
+    if outcome.readback and outcome.delivery_id is not None:
+        background_tasks.add_task(
+            run_delivery_readback,
+            outcome.delivery_id,
+            # Resolved inside the task: a fresh session after the response.
+            session_factory=get_db_session,
+            client_factory=_asaas_client,
+            environment=settings.environment,
+        )
+    return {"ok": True}
 
 
 @router.post(
@@ -295,15 +501,20 @@ async def abacatepay_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db_session_dependency),
 ) -> dict[str, bool]:
-    body = await request.body()
+    webhook_secret = settings.abacatepay_webhook_secret.get_secret_value()
+    if not webhook_secret:
+        raise HTTPException(status_code=503, detail="billing_webhook_unavailable")
 
     signature = request.headers.get("X-Webhook-Signature", "")
-    if settings.abacatepay_webhook_secret:
-        if not AbacatePayClient.verify_webhook_signature(
-            body, signature, settings.abacatepay_webhook_secret
-        ):
-            logger.warning("Webhook signature verification failed")
-            raise HTTPException(status_code=400, detail="Invalid signature")
+    if not signature:
+        logger.warning("Webhook signature verification failed")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    body = await request.body()
+
+    if not AbacatePayClient.verify_webhook_signature(body, signature, webhook_secret):
+        logger.warning("Webhook signature verification failed")
+        raise HTTPException(status_code=400, detail="Invalid signature")
 
     import json
 
@@ -319,32 +530,57 @@ async def abacatepay_webhook(
     if event_type not in ("billing.paid", "checkout.completed"):
         return {"ok": True, "ignored": True}
 
-    builder_id_str = metadata.get("builder_id")
-    if not builder_id_str:
-        logger.warning("Webhook missing builder_id in metadata")
+    subscription = data.get("subscription", {})
+    nested_subscription_id = (
+        subscription.get("id") if isinstance(subscription, dict) else None
+    )
+    external_subscription_id = data.get("subscription_id") or nested_subscription_id
+    if not isinstance(external_subscription_id, str) or not external_subscription_id:
+        logger.warning("AbacatePay webhook subscription is not in canonical roster")
+        return {"ok": True, "ignored": True}
+    try:
+        binding = await _get_abacatepay_roster_binding(external_subscription_id, db)
+    except AbacatePayRosterUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="billing_webhook_unavailable",
+        ) from exc
+    if binding is None:
+        logger.warning("AbacatePay webhook subscription is not in canonical roster")
         return {"ok": True, "ignored": True}
 
-    from uuid import UUID as _UUID
+    builder_id_str = metadata.get("builder_id")
+    if not isinstance(builder_id_str, str):
+        logger.warning("Webhook metadata does not match canonical roster")
+        return {"ok": True, "ignored": True}
 
     try:
-        bid = _UUID(builder_id_str)
-    except ValueError:
-        logger.warning("Webhook invalid builder_id", builder_id=builder_id_str)
+        metadata_builder_id = UUID(builder_id_str)
+    except (ValueError, AttributeError):
+        logger.warning("Webhook metadata does not match canonical roster")
         return {"ok": True, "ignored": True}
 
-    result = await db.execute(select(Builder).where(Builder.id == bid))
+    metadata_coupon = metadata.get("coupon_code")
+    if (
+        metadata_builder_id != binding.builder_id
+        or metadata.get("plan") != binding.plan
+        or metadata.get("cycle") != binding.billing_cycle
+        or metadata_coupon != binding.coupon_code
+    ):
+        logger.warning("Webhook metadata does not match canonical roster")
+        return {"ok": True, "ignored": True}
+
+    result = await db.execute(select(Builder).where(Builder.id == binding.builder_id))
     builder = result.scalar_one_or_none()
     if not builder:
-        logger.warning("Webhook builder not found", builder_id=builder_id_str)
+        logger.warning("Canonical webhook builder not found")
         return {"ok": True, "ignored": True}
 
-    plan = metadata.get("plan", "start")
-    cycle = metadata.get("cycle", "monthly")
-    builder.subscription_plan = plan
+    builder.subscription_plan = binding.plan
     builder.subscription_status = "active"
-    builder.billing_cycle = cycle
+    builder.billing_cycle = binding.billing_cycle
 
-    coupon_code = metadata.get("coupon_code")
+    coupon_code = binding.coupon_code
     if coupon_code:
         coupon_result = await db.execute(
             select(Coupon).where(Coupon.code == coupon_code.upper())
@@ -357,12 +593,12 @@ async def abacatepay_webhook(
 
     # Log transaction record
     tx = Transaction(
-        builder_id=bid,
+        builder_id=binding.builder_id,
         builder_name=builder.name,
         amount_cents=data.get("amount", 0),
         method=data.get("method", "unknown").lower(),
-        cycle=cycle,
-        plan=plan,
+        cycle=binding.billing_cycle,
+        plan=binding.plan,
         coupon_code=coupon_code if coupon_code else None,
         external_id=data.get("id")
         or data.get("charge_id")
@@ -372,5 +608,9 @@ async def abacatepay_webhook(
     db.add(tx)
 
     await db.commit()
-    logger.info("Webhook processed", builder_id=builder_id_str, event_type=event_type)
+    logger.info(
+        "Webhook processed",
+        builder_id=str(binding.builder_id),
+        event_type=event_type,
+    )
     return {"ok": True}

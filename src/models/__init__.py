@@ -6,6 +6,40 @@ This module exports all ORM models for database operations.
 """
 
 from src.models.base import Base, TimestampMixin
+from src.models.billing import (
+    BillingCheckoutSession,
+    BillingFactAck,
+    BillingFactDelivery,
+    BillingFactHandoff,
+    BillingFactReconciliationAlert,
+    BillingMigration,
+    BillingMigrationReceipt,
+    BillingOutboxEvent,
+    BillingPaymentEffect,
+    BillingPaymentProjection,
+    BillingRolloutControl,
+    BillingRolloutReceipt,
+    BillingRosterControl,
+    BillingSubscription,
+    BillingSubscriptionCycle,
+    BillingTopupCapabilityReceipt,
+    BillingTopupOrder,
+    BillingWebhookDelivery,
+)
+from src.models.billing_producer import (
+    BillingProducerActivePair,
+    BillingProducerBuildAttestation,
+    BillingProducerGrant,
+    BillingProducerReceipt,
+)
+from src.models.billing_producer_signed import (
+    BillingProducerV1ActivePair,
+    BillingProducerV1BuildAttestation,
+    BillingProducerV1Grant,
+    BillingProducerV1GrantConsumption,
+    BillingProducerV1GrantRevocation,
+    BillingProducerV1Receipt,
+)
 from src.models.builder import Builder
 from src.models.clinic_config import ClinicConfig
 from src.models.clinic_config_table import ClinicConfigTable
@@ -28,6 +62,35 @@ __all__ = [
     # Base
     "Base",
     "TimestampMixin",
+    # Billing Models
+    "BillingSubscription",
+    "BillingMigration",
+    "BillingCheckoutSession",
+    "BillingSubscriptionCycle",
+    "BillingMigrationReceipt",
+    "BillingWebhookDelivery",
+    "BillingPaymentProjection",
+    "BillingPaymentEffect",
+    "BillingRolloutControl",
+    "BillingRolloutReceipt",
+    "BillingRosterControl",
+    "BillingTopupCapabilityReceipt",
+    "BillingTopupOrder",
+    "BillingOutboxEvent",
+    "BillingFactDelivery",
+    "BillingFactHandoff",
+    "BillingFactAck",
+    "BillingFactReconciliationAlert",
+    "BillingProducerGrant",
+    "BillingProducerBuildAttestation",
+    "BillingProducerReceipt",
+    "BillingProducerActivePair",
+    "BillingProducerV1Grant",
+    "BillingProducerV1GrantConsumption",
+    "BillingProducerV1GrantRevocation",
+    "BillingProducerV1BuildAttestation",
+    "BillingProducerV1Receipt",
+    "BillingProducerV1ActivePair",
     # Core Models
     "Builder",
     "Coupon",

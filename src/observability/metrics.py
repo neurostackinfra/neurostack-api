@@ -241,6 +241,67 @@ LLM_GENERATION_ATTEMPTS_TOTAL = Counter(
     ["tier", "outcome"],
 )
 
+# ASAAS billing webhook and readback (Group 3).  Labels are closed technical
+# vocabularies only; builder, payment, subscription and event identities stay
+# out of Prometheus.  Alert rules (Group 5) fire on ``neurostack_billing_alerts``.
+BILLING_WEBHOOK_DELIVERIES_TOTAL = Counter(
+    "neurostack_billing_webhook_deliveries_total",
+    "Authenticated ASAAS webhook deliveries by event family and outcome",
+    ["family", "outcome"],
+)
+BILLING_WEBHOOK_REJECTIONS_TOTAL = Counter(
+    "neurostack_billing_webhook_rejections_total",
+    "ASAAS webhook requests rejected before any delivery was reserved",
+    ["reason"],
+)
+BILLING_WEBHOOK_FAILURES_TOTAL = Counter(
+    "neurostack_billing_webhook_failures_total",
+    "Webhook transaction failures by bounded class and disposition",
+    ["failure", "disposition"],
+)
+BILLING_ALERTS_TOTAL = Counter(
+    "neurostack_billing_alerts_total",
+    "Billing conditions that require operator attention",
+    ["kind"],
+)
+BILLING_READBACKS_TOTAL = Counter(
+    "neurostack_billing_readbacks_total",
+    "Exact-ID provider readbacks by resource and outcome",
+    ["resource", "outcome"],
+)
+BILLING_READBACK_BACKLOG = Gauge(
+    "neurostack_billing_readback_backlog",
+    "Billing rows awaiting a converged provider readback",
+    ["resource"],
+)
+BILLING_WEBHOOK_CONFIG_READY = Gauge(
+    "neurostack_billing_webhook_config_ready",
+    "1 when the provider webhook configuration and token converged",
+)
+# Group 5 control-plane metrics intentionally expose only bounded state/action
+# names.  Migration, subscription, receipt, actor, provider and deployment
+# identities never enter Prometheus labels.
+BILLING_MIGRATION_OPERATIONS_TOTAL = Counter(
+    "neurostack_billing_migration_operations_total",
+    "Local billing migration actions by bounded operation and outcome",
+    ["operation", "outcome"],
+)
+BILLING_MIGRATION_BACKLOG = Gauge(
+    "neurostack_billing_migration_backlog",
+    "Current billing migration backlog by bounded saga state",
+    ["state"],
+)
+BILLING_OPERATION_RECEIPTS_TOTAL = Counter(
+    "neurostack_billing_operation_receipts_total",
+    "Signed billing operation receipts by role and bounded outcome",
+    ["role", "outcome"],
+)
+BILLING_TOPUP_CAPABILITY_TRANSITIONS_TOTAL = Counter(
+    "neurostack_billing_topup_capability_transitions_total",
+    "Top-up capability gate transitions by bounded direction and outcome",
+    ["direction", "outcome"],
+)
+
 # Deliberately label-free: a telemetry failure must never create tenant,
 # provider, endpoint, model, or secret cardinality in Prometheus.
 API_CREDENTIALS_CHANGE_EMIT_FAILURES_TOTAL = Counter(

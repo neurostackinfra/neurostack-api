@@ -35,6 +35,7 @@ MIGRATION_PATH = (
 _ROOT = Path(__file__).resolve().parents[2]
 _ADMIN_DATABASES = {"postgres"}
 _LOCAL_SOCKET_DIRECTORIES = {"/run/postgresql", "/var/run/postgresql"}
+_LOCAL_POSTGRES_PORTS = {5432, 55432}
 _CHILD_PATTERN = re.compile(r"^neurostack_handoff_sla_smoke_[0-9a-f]{12}$")
 
 
@@ -304,7 +305,7 @@ def _validated_admin_url(raw_url: str, application_url: str) -> URL:
         socket_directory = str(url.query.get("host", ""))
         if socket_directory not in _LOCAL_SOCKET_DIRECTORIES:
             raise ValueError("smoke URL must use an allowlisted local socket")
-        if str(url.query.get("port", "5432")) != "5432":
+        if int(str(url.query.get("port", "5432"))) not in _LOCAL_POSTGRES_PORTS:
             raise ValueError("smoke URL must use the local PostgreSQL port")
     else:
         try:
@@ -313,7 +314,7 @@ def _validated_admin_url(raw_url: str, application_url: str) -> URL:
             is_loopback = (url.host or "").lower() == "localhost"
         if not is_loopback:
             raise ValueError("smoke URL host must be loopback")
-        if (url.port or 5432) != 5432:
+        if (url.port or 5432) not in _LOCAL_POSTGRES_PORTS:
             raise ValueError("smoke URL must use the local PostgreSQL port")
 
     if _database_identity(url) == _database_identity(make_url(application_url)):
@@ -489,6 +490,7 @@ def test_admin_url_rejects_application_database_even_with_different_user() -> No
     [
         "postgresql://localhost/postgres",
         "postgresql:///postgres?host=/run/postgresql&port=5432",
+        "postgresql://127.0.0.1:55432/postgres",
     ],
 )
 def test_admin_url_accepts_allowlisted_local_admin_targets(raw_url: str) -> None:

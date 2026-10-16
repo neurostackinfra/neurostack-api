@@ -1,0 +1,25 @@
+{
+  "id": "evt_1c0e4f3a9b2d47e8a6f5c3b1d0e9f8a7&368604921",
+  "event": "SUBSCRIPTION_CREATED",
+  "dateCreated": "2026-10-11 10:00:01",
+  "account": {"id": "acc_fixture", "ownerId": "own_fixture"},
+  "subscription": {
+    "object": "subscription",
+    "id": "sub_000000000000001",
+    "dateCreated": "2026-10-11",
+    "customer": "cus_fixture_private",
+    "paymentLink": null,
+    "value": 999.00,
+    "nextDueDate": "2026-10-11",
+    "cycle": "MONTHLY",
+    "description": "NeuroStack Plus",
+    "billingType": "CREDIT_CARD",
+    "deleted": false,
+    "status": "ACTIVE",
+    "externalReference": "00000000-0000-4000-8000-000000000001",
+    "sendPaymentByPostalService": false,
+    "discount": {"value": 0, "dueDateLimitDays": 0, "type": "FIXED"},
+    "fine": {"value": 0, "type": "FIXED"},
+    "interest": {"value": 0, "type": "PERCENTAGE"}
+  }
+}

@@ -114,7 +114,9 @@ def test_real_registry_and_core_collector_match_the_closed_contract() -> None:
         for family in registry.collect()
         if family.name.startswith("neurostack_")
     }
-    assert len(METRIC_DIMENSION_CONTRACTS) == 61
+    # 61 pre-existing families + 7 Group 3 billing families + 4 Group 5
+    # migration/control-plane families.
+    assert len(METRIC_DIMENSION_CONTRACTS) == 72
     assert observed == set(METRIC_DIMENSION_CONTRACTS)
 
 

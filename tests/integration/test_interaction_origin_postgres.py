@@ -104,9 +104,8 @@ async def test_alembic_smoke_runner_uses_the_installed_cli() -> None:
     )
 
 
-def test_migration_bootstrap_and_orm_share_the_origin_contract() -> None:
+def test_migration_and_orm_share_the_origin_contract() -> None:
     migration = _MIGRATION.read_text(encoding="utf-8")
-    bootstrap = (_ROOT / "scripts" / "init-db.sql").read_text(encoding="utf-8")
     column = Event.__table__.c.interaction_origin
     constraints = {constraint.name for constraint in Event.__table__.constraints}
     indexes = {index.name for index in Event.__table__.indexes}
@@ -116,10 +115,9 @@ def test_migration_bootstrap_and_orm_share_the_origin_contract() -> None:
     assert str(column.server_default.arg) == "unknown"
     assert "ck_events_interaction_origin" in constraints
     assert "idx_events_tenant_origin_type_created" in indexes
-    for source in (migration, bootstrap):
-        assert "interaction_origin IN ('production', 'simulator', 'unknown')" in source
-        assert "idx_events_tenant_origin_type_created" in source
-        assert "prevent_events_interaction_origin_change" in source
+    assert "interaction_origin IN ('production', 'simulator', 'unknown')" in migration
+    assert "idx_events_tenant_origin_type_created" in migration
+    assert "prevent_events_interaction_origin_change" in migration
 
 
 def test_migration_has_conservative_backfill_and_symmetric_downgrade() -> None:

@@ -1,0 +1,23 @@
+{
+  "id": "evt_05b708f961d739ea7eba7e4db318f621&368604920",
+  "event": "CHECKOUT_PAID",
+  "dateCreated": "2026-10-11 10:00:00",
+  "account": {"id": "acc_fixture", "ownerId": "own_fixture"},
+  "checkout": {
+    "id": "chk_000000000000001",
+    "link": null,
+    "status": "PAID",
+    "minutesToExpire": 60,
+    "billingTypes": ["CREDIT_CARD"],
+    "chargeTypes": ["RECURRENT"],
+    "callback": {
+      "cancelUrl": "https://app.example.test/billing?checkout=cancel",
+      "successUrl": "https://app.example.test/billing?checkout=success",
+      "expiredUrl": "https://app.example.test/billing?checkout=expired"
+    },
+    "items": [{"name": "NeuroStack Plus", "description": "x", "quantity": 1, "value": 999.00}],
+    "subscription": {"cycle": "MONTHLY", "nextDueDate": "2026-10-11", "endDate": null},
+    "customer": "cus_fixture_private",
+    "customerData": {"name": "Fixture Person", "email": "person@example.test", "cpfCnpj": "00000000000"}
+  }
+}

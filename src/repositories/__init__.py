@@ -4,6 +4,15 @@ Provides data access layer abstraction for all models.
 """
 
 from src.repositories.base import BaseRepository
+from src.repositories.billing import (
+    BillingCapabilityRejected,
+    BillingRepository,
+    BillingRevisionConflict,
+    BillingStateUnavailable,
+    BillingTransitionEvidence,
+    BillingTransitionRejected,
+    billing_advisory_key,
+)
 from src.repositories.database import (
     close_database,
     get_db_engine,
@@ -21,6 +30,13 @@ from src.repositories.tenant import TenantRepository
 __all__ = [
     # Base
     "BaseRepository",
+    "BillingRepository",
+    "BillingTransitionEvidence",
+    "BillingStateUnavailable",
+    "BillingRevisionConflict",
+    "BillingTransitionRejected",
+    "BillingCapabilityRejected",
+    "billing_advisory_key",
     # Database
     "get_db_session",
     "get_db_session_dependency",

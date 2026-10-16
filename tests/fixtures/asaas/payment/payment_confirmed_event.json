@@ -1,0 +1,12 @@
+{
+  "event": "PAYMENT_CONFIRMED",
+  "id": "evt_05b708f961d739ea7eba7e4db318f622&368604924",
+  "payment": {
+    "billingType": "CREDIT_CARD",
+    "externalReference": "00000000-0000-4000-8000-000000000001",
+    "id": "pay_000000000000001",
+    "status": "CONFIRMED",
+    "subscription": "sub_000000000000001",
+    "value": 999.0
+  }
+}

@@ -13,6 +13,12 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from src.models.base import Base, TimestampMixin
 
 if TYPE_CHECKING:
+    from src.models.billing import (
+        BillingCheckoutSession,
+        BillingMigration,
+        BillingSubscription,
+        BillingTopupOrder,
+    )
     from src.models.tenant import Tenant
 
 
@@ -69,6 +75,22 @@ class Builder(Base, TimestampMixin):
         "Tenant",
         back_populates="builder",
         lazy="dynamic",
+    )
+    billing_subscriptions: Mapped[list["BillingSubscription"]] = relationship(
+        "BillingSubscription",
+        back_populates="builder",
+    )
+    billing_migrations: Mapped[list["BillingMigration"]] = relationship(
+        "BillingMigration",
+        back_populates="builder",
+    )
+    billing_checkout_sessions: Mapped[list["BillingCheckoutSession"]] = relationship(
+        "BillingCheckoutSession",
+        back_populates="builder",
+    )
+    billing_topup_orders: Mapped[list["BillingTopupOrder"]] = relationship(
+        "BillingTopupOrder",
+        back_populates="builder",
     )
 
     def __repr__(self) -> str:

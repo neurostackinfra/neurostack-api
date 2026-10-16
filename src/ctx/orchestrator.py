@@ -5,7 +5,7 @@ Main orchestrator that assembles the complete context for LLM calls.
 
 import logging
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from uuid import UUID
 
 from src.ctx.compression import HistoryCompressor, get_history_compressor
@@ -22,7 +22,9 @@ from src.ctx.models import (
 from src.ctx.relevance import RelevanceFilter, get_relevance_filter
 from src.observability.metric_dimensions import ContractCounter as Counter
 from src.observability.metric_dimensions import ContractHistogram as Histogram
-from src.services import KnowledgeService, get_knowledge_service
+
+if TYPE_CHECKING:
+    from src.services import KnowledgeService
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +74,7 @@ class ContextOrchestrator:
         builder: Optional[ContextBuilder] = None,
         relevance_filter: Optional[RelevanceFilter] = None,
         compressor: Optional[HistoryCompressor] = None,
-        knowledge_service: Optional[KnowledgeService] = None,
+        knowledge_service: Optional["KnowledgeService"] = None,
     ):
         """
         Initialize the orchestrator.
@@ -86,7 +88,11 @@ class ContextOrchestrator:
         self._builder = builder or get_context_builder()
         self._filter = relevance_filter or get_relevance_filter()
         self._compressor = compressor or get_history_compressor()
-        self._knowledge = knowledge_service or get_knowledge_service()
+        if knowledge_service is None:
+            from src.services import get_knowledge_service
+
+            knowledge_service = get_knowledge_service()
+        self._knowledge = knowledge_service
 
     async def build_context(
         self,

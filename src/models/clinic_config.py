@@ -11,7 +11,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from src.handoff.pause_policy import parse_legacy_cycle_days
+from src.pause_policy import parse_legacy_cycle_days
 
 
 class PricingDisclosureMode(str, Enum):

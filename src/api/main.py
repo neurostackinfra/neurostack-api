@@ -4,9 +4,10 @@ Entry point for the cognitive infrastructure API
 """
 
 # Standard library imports
+import asyncio
 import json
 import re
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, AsyncGenerator, Optional
 
 # Third-party imports
@@ -14,6 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import make_asgi_app
+from redis.asyncio import Redis
 
 from neurostack_core import enable_metrics
 
@@ -42,6 +44,8 @@ from src.api.routes import (
     admin,
     auth,
     billing,
+    billing_producer,
+    billing_producer_setup,
     builder,
     config,
     demo_leads,
@@ -61,6 +65,7 @@ from src.api.routes import (
 from src.config.logging import configure_logging, get_logger
 from src.config.settings import settings
 from src.core.exceptions import ConfigurationError
+from src.services.billing_webhook import ASAAS_WEBHOOK_READINESS
 
 # Configure logging on module load
 configure_logging()
@@ -82,6 +87,22 @@ def _redact_capability_token(path: str) -> str:
     )
 
 
+def _start_webhook_readiness_refresher() -> "asyncio.Task[None] | None":
+    """Keep this worker's ASAAS webhook verdict warm (Group 3, fail-closed).
+
+    Started only when ASAAS is configured and a webhook URL is set; each
+    worker process refreshes its own gate.  Hosted checkout stays blocked
+    whenever this worker's last readback failed or is too old.
+    """
+
+    if not (settings.is_asaas_configuration_compatible and settings.asaas_webhook_url):
+        return None
+    return asyncio.create_task(
+        ASAAS_WEBHOOK_READINESS.run_refresher(billing._read_back_webhook_readiness),
+        name="asaas-webhook-readiness",
+    )
+
+
 def _install_outermost_ingress_body_limit(app: FastAPI) -> None:
     """Keep the ingress cap outside wrappers installed by instrumentation."""
 
@@ -98,6 +119,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan handler for startup and shutdown events."""
     # Startup - Validate configuration
     try:
+        settings.validate_runtime_environment()
         # Settings validation happens during instantiation, but we log it here
         logger.info(
             "Starting NeuroStack API",
@@ -138,9 +160,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from src.repositories import init_database
 
     await init_database()
+    webhook_refresher = _start_webhook_readiness_refresher()
+    redis_client: Redis | None = None
     try:
+        if settings.environment == "staging":
+            redis_client = Redis.from_url(
+                settings.redis_url,
+                max_connections=settings.redis_max_connections,
+                socket_timeout=settings.redis_socket_timeout,
+                decode_responses=True,
+            )
+        app.state.redis = redis_client
         yield
     finally:
+        if webhook_refresher is not None:
+            webhook_refresher.cancel()
+            with suppress(asyncio.CancelledError):
+                await webhook_refresher
         # Shutdown shared services before their database dependency. Each
         # boundary remains eligible for cleanup even when an earlier one fails.
         logger.info("Shutting down NeuroStack API")
@@ -153,7 +189,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             try:
                 await close_handoff_service()
             finally:
-                await close_database()
+                try:
+                    if redis_client is not None:
+                        await redis_client.aclose()
+                finally:
+                    app.state.redis = None
+                    await close_database()
 
 
 def create_app() -> FastAPI:
@@ -564,6 +605,16 @@ def create_app() -> FastAPI:
         admin.router,
         prefix=f"{settings.api_prefix}/admin",
         tags=["Admin"],
+    )
+    app.include_router(
+        billing_producer.router,
+        prefix=f"{settings.api_prefix}/admin/billing/producer-receipts",
+        tags=["Billing Producer"],
+    )
+    app.include_router(
+        billing_producer_setup.router,
+        prefix=f"{settings.api_prefix}/admin/billing",
+        tags=["Billing Producer Setup"],
     )
     app.include_router(
         rlhf.router,

@@ -18,6 +18,28 @@ services:
       QDRANT_HOST: qdrant
       QDRANT_PORT: "6333"
       QDRANT_API_KEY: ${QDRANT_API_KEY:?strong Qdrant API key required}
+      ASAAS_API_KEY: ${ASAAS_API_KEY:?ASAAS production API key required}
+      ASAAS_WEBHOOK_TOKEN: ${ASAAS_WEBHOOK_TOKEN:?ASAAS webhook token required}
+      ASAAS_USER_AGENT: ${ASAAS_USER_AGENT:-NeuroStack/asaas-payment-gateway}
+      ASAAS_PROVIDER_EVIDENCE_KEY_ID: ${ASAAS_PROVIDER_EVIDENCE_KEY_ID:?ASAAS provider evidence key id required}
+      ASAAS_PROVIDER_EVIDENCE_PUBLIC_KEY: ${ASAAS_PROVIDER_EVIDENCE_PUBLIC_KEY:?ASAAS provider evidence public key required}
+      ABACATEPAY_API_KEY: ${ABACATEPAY_API_KEY:-}
+      ABACATEPAY_WEBHOOK_SECRET: ${ABACATEPAY_WEBHOOK_SECRET:?legacy webhook secret required}
+      BILLING_OPERATION_RECEIPT_SIGNING_KEY: ${BILLING_OPERATION_RECEIPT_SIGNING_KEY:?billing receipt signing key required}
+      BILLING_PROMETHEUS_RULES_DIGEST: ${BILLING_PROMETHEUS_RULES_DIGEST:?Prometheus rules digest required}
+      BILLING_PROMETHEUS_RULES_PATH: /etc/neurostack/prometheus_rules.yml
+      BILLING_OBSERVABILITY_SMOKE_DIGEST: ${BILLING_OBSERVABILITY_SMOKE_DIGEST:?observability smoke digest required}
+      BILLING_OBSERVABILITY_SMOKE_TOKEN: ${BILLING_OBSERVABILITY_SMOKE_TOKEN:?observability smoke token required}
+      BILLING_OBSERVABILITY_SMOKE_PATH: /etc/neurostack/billing-observability-smoke.json
+      BILLING_FACT_SCHEMA_DIGEST: ${BILLING_FACT_SCHEMA_DIGEST:?billing fact schema digest required}
+      BILLING_OBSERVABILITY_ACKNOWLEDGEMENT: ${BILLING_OBSERVABILITY_ACKNOWLEDGEMENT:?fresh runtime acknowledgement evidence required}
+      BILLING_OBSERVABILITY_ACKNOWLEDGEMENT_DIGEST: ${BILLING_OBSERVABILITY_ACKNOWLEDGEMENT_DIGEST:?runtime acknowledgement digest required}
+      BILLING_ALERT_RECEIVER_URL: ${BILLING_ALERT_RECEIVER_URL:?non-loopback HTTPS alert receiver required}
+    configs:
+      - source: prometheus_rules
+        target: /etc/neurostack/prometheus_rules.yml
+      - source: billing_observability_smoke
+        target: /etc/neurostack/billing-observability-smoke.json
     depends_on:
       postgres:
         condition: service_healthy
@@ -68,10 +90,64 @@ services:
       - qdrant_data:/qdrant/storage
     networks: [neurostack-production]
 
+  prometheus:
+    image: prom/prometheus@sha256:6573196e5dbe834779ac4d34cb053113cc502a69e9e20ba3be96d37f33e81545
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle=false
+    ports:
+      - "${PROMETHEUS_BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"
+    configs:
+      - source: prometheus_config
+        target: /etc/prometheus/prometheus.yml
+      - source: prometheus_rules
+        target: /etc/prometheus/prometheus_rules.yml
+    volumes:
+      - prometheus_data:/prometheus
+    depends_on:
+      api:
+        condition: service_started
+      alertmanager:
+        condition: service_started
+    networks: [neurostack-production]
+
+  alertmanager:
+    image: prom/alertmanager@sha256:5ba0431d6cb9bda30640de0a8c2c41ecad12bd78847def3e5907e626ed5a49e9
+    restart: unless-stopped
+    environment:
+      BILLING_ALERT_RECEIVER_URL: ${BILLING_ALERT_RECEIVER_URL:?non-loopback HTTPS alert receiver required}
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --config.expand-env=true
+      - --storage.path=/alertmanager
+    ports:
+      - "${ALERTMANAGER_BIND_ADDRESS:-127.0.0.1}:${ALERTMANAGER_PORT:-9093}:9093"
+    configs:
+      - source: alertmanager_config
+        target: /etc/alertmanager/alertmanager.yml
+    volumes:
+      - alertmanager_data:/alertmanager
+    networks: [neurostack-production]
+
 volumes:
   postgres_data:
   redis_data:
   qdrant_data:
+  prometheus_data:
+  alertmanager_data:
+
+configs:
+  prometheus_config:
+    file: ./config/prometheus.yml
+  prometheus_rules:
+    file: ./config/prometheus_rules.yml
+  alertmanager_config:
+    file: ./config/alertmanager/alertmanager.yml
+  billing_observability_smoke:
+    file: ./config/billing-observability-smoke.json
 
 networks:
   neurostack-production:

@@ -1,5 +1,6 @@
 """Contracts for the outermost JSON ingress body cap."""
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -9,18 +10,36 @@ import pytest
 from fastapi import FastAPI
 from fastapi.responses import Response
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from starlette.types import Message, Scope
 
 from src.api.main import app as main_app
 from src.api.main import create_app
 from src.api.middleware.auth import APIKeyStore, TenantContext
 from src.api.middleware.ingress_body_limit import (
+    ABACATEPAY_WEBHOOK_BODY_BYTES,
     MAX_INGRESS_BODY_BYTES,
     IngressBodyLimitMiddleware,
 )
 from src.api.middleware.rate_limit import rate_limit_store
 from src.api.routes import events
 from src.repositories import get_db_session_dependency
+
+
+def _billing_webhook_scope(headers: list[tuple[bytes, bytes]]) -> Scope:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/billing/webhook",
+        "raw_path": b"/v1/billing/webhook",
+        "query_string": b"",
+        "headers": headers,
+        "client": ("test", 1),
+        "server": ("test", 80),
+    }
 
 
 async def _invoke(
@@ -79,6 +98,7 @@ async def test_declared_overflow_rejects_without_reading_or_downstream(
 
     assert replayed == []
     assert sent[0]["status"] == 413
+    assert b"configured limit" in sent[1]["body"]
 
 
 @pytest.mark.asyncio
@@ -137,6 +157,117 @@ async def test_streamed_overflow_rejects_before_downstream(path: str) -> None:
 
     assert replayed == []
     assert sent[0]["status"] == 413
+    assert b"configured limit" in sent[1]["body"]
+
+
+@pytest.mark.asyncio
+async def test_abacatepay_declared_overflow_uses_dedicated_limit_without_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.api.middleware.ingress_body_limit.settings.abacatepay_webhook_secret",
+        SecretStr("legacy-fixture-secret"),
+    )
+    replayed, sent = await _invoke(
+        "/v1/billing/webhook",
+        [{"type": "http.request", "body": b"must-not-be-read", "more_body": False}],
+        headers=[
+            (b"content-length", str(ABACATEPAY_WEBHOOK_BODY_BYTES + 1).encode()),
+            (b"x-webhook-signature", b"fixture-signature"),
+        ],
+    )
+
+    assert replayed == []
+    assert sent[0]["status"] == 413
+    assert b"configured limit" in sent[1]["body"]
+
+
+@pytest.mark.asyncio
+async def test_abacatepay_chunked_overflow_never_reaches_downstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.api.middleware.ingress_body_limit.settings.abacatepay_webhook_secret",
+        SecretStr("legacy-fixture-secret"),
+    )
+    replayed, sent = await _invoke(
+        "/v1/billing/webhook",
+        [
+            {
+                "type": "http.request",
+                "body": b"a" * ABACATEPAY_WEBHOOK_BODY_BYTES,
+                "more_body": True,
+            },
+            {"type": "http.request", "body": b"b", "more_body": False},
+        ],
+        headers=[(b"x-webhook-signature", b"fixture-signature")],
+    )
+
+    assert replayed == []
+    assert sent[0]["status"] == 413
+    assert b"configured limit" in sent[1]["body"]
+
+
+@pytest.mark.asyncio
+async def test_abacatepay_missing_signature_rejects_without_reading_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.api.middleware.ingress_body_limit.settings.abacatepay_webhook_secret",
+        SecretStr("legacy-fixture-secret"),
+    )
+    body_reads: list[bool] = []
+    downstream_calls: list[bool] = []
+    sent: list[Message] = []
+
+    async def receive() -> Message:
+        body_reads.append(True)
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    async def downstream(scope: Scope, receive: Any, send: Any) -> None:
+        downstream_calls.append(True)
+
+    scope = _billing_webhook_scope([])
+    await IngressBodyLimitMiddleware(downstream)(scope, receive, send)
+
+    assert sent[0]["status"] == 400
+    assert body_reads == []
+    assert downstream_calls == []
+
+
+@pytest.mark.asyncio
+async def test_abacatepay_body_timeout_never_reaches_downstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.api.middleware.ingress_body_limit.settings.abacatepay_webhook_secret",
+        SecretStr("legacy-fixture-secret"),
+    )
+    downstream_calls: list[bool] = []
+    sent: list[Message] = []
+    never = asyncio.Event()
+
+    async def receive() -> Message:
+        await never.wait()
+        raise AssertionError("unreachable")
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    async def downstream(scope: Scope, receive: Any, send: Any) -> None:
+        downstream_calls.append(True)
+
+    scope = _billing_webhook_scope([(b"x-webhook-signature", b"fixture-signature")])
+    middleware = IngressBodyLimitMiddleware(
+        downstream, abacatepay_read_timeout_seconds=0.01
+    )
+    await middleware(scope, receive, send)
+
+    assert sent[0]["status"] == 408
+    assert downstream_calls == []
 
 
 @pytest.mark.asyncio
