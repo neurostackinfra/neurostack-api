@@ -23,7 +23,6 @@ def test_release_preflight_emits_required_read_only_check_for_pull_requests() ->
             "branches": ["main"],
             "types": ["opened", "synchronize", "reopened", "ready_for_review"],
         },
-        "workflow_dispatch": {},
     }
     assert workflow["permissions"] == {}
 
