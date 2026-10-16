@@ -38,7 +38,10 @@ def test_release_preflight_emits_required_read_only_check_for_pull_requests() ->
         for step in job["steps"]
         if isinstance(step, dict) and "uses" in step
     ]
-    assert action_refs
+    assert set(action_refs) == {
+        "actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8",
+        "actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c",
+    }
     assert all(re.fullmatch(r"[^@]+@[0-9a-f]{40}", ref) for ref in action_refs)
 
     test_step = job["steps"][-1]
