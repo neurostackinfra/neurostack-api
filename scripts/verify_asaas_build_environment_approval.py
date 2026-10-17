@@ -873,16 +873,14 @@ def _api_get(path: str, token: str) -> dict | list:
         and (parsed.path == API_PREFIX or parsed.path.startswith(API_PREFIX + "/")),
         "github_api_url_invalid",
     )
-    request = Request(
-        url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "Cache-Control": "no-cache",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-        method="GET",
-    )
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Cache-Control": "no-cache",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token and _PREFLIGHT._requires_authenticated_github_read(parsed.path):
+        headers["Authorization"] = f"Bearer {token}"
+    request = Request(url, headers=headers, method="GET")
     try:
         with build_opener(_NoRedirect).open(request, timeout=10) as response:
             status = getattr(response, "status", None)
@@ -1260,6 +1258,7 @@ def _controls_snapshot(
     ruleset = _PREFLIGHT.validate_ruleset(
         rulesets, token, github_get_fn=get_with_headers
     )
+    bypass_api_observation = _PREFLIGHT.ruleset_bypass_api_observation(ruleset)
     environments = {
         name: _PREFLIGHT.validate_environment(
             name,
@@ -1275,12 +1274,14 @@ def _controls_snapshot(
         environments,
         backend_trust_digest,
         backend_trust_origin,
+        bypass_api_observation,
         trust_mode_value=trust_mode_value,
         backend_probe_digest=backend_probe_digest,
     )
     return {
         "repository": repository,
         "ruleset": ruleset,
+        "ruleset_bypass_api_observation": bypass_api_observation,
         "environments": environments,
     }, {"digest": digest}
 
@@ -1344,7 +1345,6 @@ def verify_environment_approval(
             "approval_no_oidc_group2_output_missing",
         )
     token = env.get("GH_TOKEN", "")
-    _require(bool(token), "github_read_token_unavailable")
     run_id = env.get("GITHUB_RUN_ID", "")
     _require(re.fullmatch(r"[1-9][0-9]*", run_id) is not None, "actions_run_id_invalid")
     run_attempt = env.get("GITHUB_RUN_ATTEMPT", "")

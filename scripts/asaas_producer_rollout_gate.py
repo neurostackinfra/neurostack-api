@@ -333,6 +333,7 @@ def validate_repository_protections(
         token,
     )
     ruleset = github_preflight.validate_ruleset(rulesets, token, github_get_fn=get)
+    bypass_api_observation = github_preflight.ruleset_bypass_api_observation(ruleset)
     environment = github_preflight.validate_environment(
         DEPLOY_ENVIRONMENT,
         token,
@@ -353,6 +354,7 @@ def validate_repository_protections(
             "default_branch": repository["default_branch"],
         },
         "ruleset": ruleset,
+        "ruleset_bypass_api_observation": bypass_api_observation,
         "environment": environment,
         "deploy_role_variable": DEPLOY_ROLE_VARIABLE,
         "deploy_role_arn": deploy_role_arn,
@@ -478,6 +480,36 @@ def _validate_ui_approval_comment(
         "checked_at_utc": raw["checked_at_utc"],
         "screenshots": dict(sorted(verified_screenshots.items())),
     }
+
+
+def _require_distinct_ui_approval_screenshots(
+    first: dict[str, Any], second: dict[str, Any]
+) -> None:
+    first_screenshots = first.get("screenshots")
+    second_screenshots = second.get("screenshots")
+    _require(
+        isinstance(first_screenshots, dict) and isinstance(second_screenshots, dict),
+        "ui_approval_screenshots_invalid",
+    )
+    all_screenshots = [*first_screenshots.values(), *second_screenshots.values()]
+    _require(
+        all(
+            isinstance(item, dict)
+            and isinstance(item.get("ref_sha256"), str)
+            and isinstance(item.get("sha256"), str)
+            for item in all_screenshots
+        ),
+        "ui_approval_screenshots_invalid",
+    )
+    first_refs = {item["ref_sha256"] for item in first_screenshots.values()}
+    second_refs = {item["ref_sha256"] for item in second_screenshots.values()}
+    first_hashes = {item["sha256"] for item in first_screenshots.values()}
+    second_hashes = {item["sha256"] for item in second_screenshots.values()}
+    _require(
+        first_refs.isdisjoint(second_refs)
+        and first_hashes.isdisjoint(second_hashes),
+        "ui_approval_screenshots_reused_between_gates",
+    )
 
 
 def validate_environment_approval(
@@ -654,6 +686,7 @@ def validate_environment_approval(
             template_sha256=template_sha256,
             screenshot_fetcher=screenshot_fetcher,
         )
+        _require_distinct_ui_approval_screenshots(first_ui, second_ui)
         _require(
             _time(second_ui["checked_at_utc"], "ui_approval_checked_at")
             > _time(first_ui["checked_at_utc"], "ui_approval_checked_at"),
@@ -1469,7 +1502,6 @@ def main() -> int:
             print("Build trust readback: ready")
             return 0
         token = env.get("GH_TOKEN", "")
-        _require(bool(token), "github_read_token_unavailable")
         protections = validate_repository_protections(token)
         run = validate_current_run(env, token, stage=args.phase)
         history = validate_deployment_history(
@@ -1717,6 +1749,7 @@ def main() -> int:
                     )
                 if args.phase == "deploy":
                     output.write(f"operator_login={operator_login}\n")
+                    output.write(f"ui_checked_at_utc={approval['ui_checked_at_utc']}\n")
                     output.write(
                         f"deployment_job_id={approval['deployment_job_id']}\n"
                     )

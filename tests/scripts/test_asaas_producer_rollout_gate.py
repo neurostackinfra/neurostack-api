@@ -10,10 +10,12 @@ from uuid import uuid4
 import pytest
 
 from scripts import asaas_producer_rollout_gate as rollout_gate
+from scripts.asaas_oidc_ui_freshness import validate_ui_evidence_freshness
 from scripts.asaas_producer_rollout_gate import (
     DEPLOY_ROLE_VARIABLE,
     GateError,
     _validate_ui_approval_comment,
+    _require_distinct_ui_approval_screenshots,
     validate_canonical_registration_comment,
     validate_deploy_role_environment_variable,
     validate_deployment_history,
@@ -104,6 +106,7 @@ def test_repository_protection_readback_hashes_exact_group2_deploy_role(
     assert role_variable_url in seen
     assert protections["deploy_role_variable"] == DEPLOY_ROLE_VARIABLE
     assert protections["deploy_role_arn"] == DEPLOY_ROLE_ARN
+    assert protections["ruleset_bypass_api_observation"] == "omitted"
     assert protections["deploy_role_output_pin"] == {
         "cloudformation_stack": "neurostack-asaas-producer-release",
         "output_key": "DeployRoleArn",
@@ -293,7 +296,65 @@ def test_ui_attestation_hashes_live_pngs_and_binds_fresh_run_review() -> None:
     )
     assert result["checked_at_utc"] == comment["checked_at_utc"]
     assert set(result["screenshots"]) == {"ruleset", "deployment_environment"}
+    assert set(result["screenshots"]["ruleset"]) == {"ref_sha256", "sha256"}
     assert "https://github.com" not in json.dumps(result)
+    with pytest.raises(GateError, match="ui_approval_screenshots_reused_between_gates"):
+        _require_distinct_ui_approval_screenshots(result, result)
+
+
+def test_deployment_approval_phases_reject_reused_screenshot_refs_or_bytes() -> None:
+    first = {
+        "screenshots": {
+            "ruleset": {"ref_sha256": "a" * 64, "sha256": "1" * 64},
+            "environment": {"ref_sha256": "b" * 64, "sha256": "2" * 64},
+        }
+    }
+    distinct = {
+        "screenshots": {
+            "ruleset": {"ref_sha256": "c" * 64, "sha256": "3" * 64},
+            "environment": {"ref_sha256": "d" * 64, "sha256": "4" * 64},
+        }
+    }
+    _require_distinct_ui_approval_screenshots(first, distinct)
+    reused_ref = {
+        "screenshots": {
+            "ruleset": {"ref_sha256": "a" * 64, "sha256": "5" * 64},
+            "environment": {"ref_sha256": "e" * 64, "sha256": "6" * 64},
+        }
+    }
+    with pytest.raises(GateError, match="ui_approval_screenshots_reused_between_gates"):
+        _require_distinct_ui_approval_screenshots(first, reused_ref)
+    reused_bytes = {
+        "screenshots": {
+            "ruleset": {"ref_sha256": "f" * 64, "sha256": "1" * 64},
+            "environment": {"ref_sha256": "g" * 64, "sha256": "7" * 64},
+        }
+    }
+    with pytest.raises(GateError, match="ui_approval_screenshots_reused_between_gates"):
+        _require_distinct_ui_approval_screenshots(first, reused_bytes)
+
+
+@pytest.mark.parametrize(
+    ("checked_at", "expected_error"),
+    [
+        ("", "ui_evidence_checked_at_missing_or_invalid"),
+        ("2026-10-17T10:01:00.000000Z", "ui_evidence_stale_at_oidc_boundary"),
+        ("2026-10-17T10:00:59.000000Z", "ui_evidence_stale_at_oidc_boundary"),
+        ("2026-10-17T09:59:59.000000Z", "ui_evidence_stale_at_oidc_boundary"),
+        ("2026-10-17T10:05:01.000000Z", "ui_evidence_checked_at_in_future"),
+    ],
+)
+def test_oidc_boundary_freshness_rejects_missing_stale_and_future_evidence(
+    checked_at: str, expected_error: str
+) -> None:
+    now = datetime(2026, 10, 17, 10, 5, tzinfo=timezone.utc)
+    with pytest.raises(ValueError, match=expected_error):
+        validate_ui_evidence_freshness(checked_at, now=now)
+
+
+def test_oidc_boundary_freshness_accepts_just_under_four_minutes() -> None:
+    now = datetime(2026, 10, 17, 10, 5, tzinfo=timezone.utc)
+    validate_ui_evidence_freshness("2026-10-17T10:01:01.000000Z", now=now)
 
 
 def test_ui_attestation_rejects_stale_controls_and_unverified_screenshot_bytes() -> (
@@ -342,6 +403,10 @@ def test_ui_attestation_rejects_stale_controls_and_unverified_screenshot_bytes()
     with pytest.raises(GateError, match="ui_approval_comment_mismatch"):
         _validate_ui_approval_comment(json.dumps(comment), **args)
     comment["environment_admin_bypass_disabled"] = True
+    comment["ruleset_bypass_empty"] = False
+    with pytest.raises(GateError, match="ui_approval_comment_mismatch"):
+        _validate_ui_approval_comment(json.dumps(comment), **args)
+    comment["ruleset_bypass_empty"] = True
     args["preflight_observed_at"] = now - timedelta(minutes=10)
     comment["checked_at_utc"] = (
         (now - timedelta(minutes=6)).isoformat().replace("+00:00", "Z")

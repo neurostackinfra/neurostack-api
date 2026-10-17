@@ -720,15 +720,25 @@ def _ruleset() -> dict:
     }
 
 
-def test_ruleset_gate_rejects_omitted_bypass_and_weakened_controls() -> None:
+def test_ruleset_gate_keeps_omitted_bypass_unknown_and_rejects_bad_values() -> None:
     namespace = _gate_namespace()
+    omitted_bypass = _ruleset()
+    omitted_bypass.pop("bypass_actors")
+    namespace["github_get"] = lambda _url, _token: (omitted_bypass, None)
+    validated = namespace["validate_ruleset"](
+        [{"id": 123, "name": "asaas-producer-release-main"}], "masked"
+    )
+    assert "bypass_actors" not in validated
+    assert namespace["ruleset_bypass_api_observation"](validated) == "omitted"
+
     cases = []
-    missing_bypass = _ruleset()
-    missing_bypass.pop("bypass_actors")
-    cases.append((missing_bypass, "ruleset_bypass_not_empty_or_unreadable"))
     allowed_bypass = _ruleset()
     allowed_bypass["bypass_actors"] = [{"actor_id": 1, "actor_type": "Organization"}]
     cases.append((allowed_bypass, "ruleset_bypass_not_empty_or_unreadable"))
+    for invalid_bypass in (None, "empty", {}, [None]):
+        invalid = _ruleset()
+        invalid["bypass_actors"] = invalid_bypass
+        cases.append((invalid, "ruleset_bypass_not_empty_or_unreadable"))
     wrong_ref = _ruleset()
     wrong_ref["conditions"]["ref_name"]["include"].append("refs/heads/release/*")
     cases.append((wrong_ref, "ruleset_ref_scope_mismatch"))
@@ -1141,7 +1151,7 @@ def test_actions_run_gate_binds_current_run_workflow_ref_and_sha() -> None:
         namespace["validate_current_run"]("masked", env)
 
 
-def _approval_gate_fixture(now: datetime):
+def _approval_gate_fixture(now: datetime, *, omit_bypass_api_field: bool = False):
     verifier = _approval_module()
     run_id = "7123456789"
     sha = "a" * 40
@@ -1384,6 +1394,10 @@ def _approval_gate_fixture(now: datetime):
         ),
         "backend_trust_readback": backend_trust_readback,
     }
+    if omit_bypass_api_field:
+        api[
+            "https://api.github.com/repos/neurostackinfra/neurostack-api/rulesets/123"
+        ].pop("bypass_actors")
     env = {
         "GH_TOKEN": "masked",
         "GITHUB_RUN_ID": run_id,
@@ -1829,6 +1843,133 @@ def test_no_oidc_evidence_phase_verifies_first_environment_approval():
     assert evidence["reviewer_login"] == "felps-json"
     assert evidence["approval_sequence"] == "first_no_oidc_gate"
     assert evidence["ui_checked_at_utc"] == "2026-10-16T04:59:34.000000Z"
+
+
+def test_omitted_bypass_api_field_is_unknown_and_fresh_admin_ui_proves_empty():
+    now = datetime(2026, 10, 16, 5, 0, 0, tzinfo=timezone.utc)
+    verifier, env, api, get_json, get_collection, get_evidence, now = (
+        _approval_gate_fixture(now, omit_bypass_api_field=True)
+    )
+    controls, digest_info = verifier._controls_snapshot(
+        "masked",
+        get_json=get_json,
+        get_collection=get_collection,
+        backend_trust_digest=env["ASAAS_PREFLIGHT_BACKEND_TRUST_SHA256"],
+        backend_trust_origin=env["ASAAS_PREFLIGHT_BACKEND_ORIGIN"],
+    )
+    ruleset = controls["ruleset"]
+    assert "bypass_actors" not in ruleset
+    assert controls["ruleset_bypass_api_observation"] == "omitted"
+    assert digest_info["digest"] == env["ASAAS_PREFLIGHT_READBACK_SHA256"]
+    ruleset["bypass_actors"] = []
+    explicit_controls, explicit_digest = verifier._controls_snapshot(
+        "masked",
+        get_json=get_json,
+        get_collection=get_collection,
+        backend_trust_digest=env["ASAAS_PREFLIGHT_BACKEND_TRUST_SHA256"],
+        backend_trust_origin=env["ASAAS_PREFLIGHT_BACKEND_ORIGIN"],
+    )
+    assert explicit_controls["ruleset_bypass_api_observation"] == "empty"
+    assert explicit_digest["digest"] != digest_info["digest"]
+    ruleset.pop("bypass_actors")
+
+    api["phase"] = "evidence"
+    approvals_path = (
+        "https://api.github.com/repos/neurostackinfra/neurostack-api/actions/runs/"
+        "7123456789/approvals"
+    )
+    api[approvals_path] = api[approvals_path][:1]
+    evidence = verifier.verify_environment_approval(
+        env,
+        get_json=get_json,
+        get_collection=get_collection,
+        get_evidence=get_evidence,
+        now=now,
+        phase="evidence",
+    )
+    assert evidence["reviewer_permission"] == "admin"
+    assert evidence["ui_checked_at_utc"] == "2026-10-16T04:59:34.000000Z"
+    assert evidence["screenshots_sha256"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        ("missing", "environment_approval_count_mismatch"),
+        ("incorrect", "ruleset_bypass_not_attested"),
+        ("stale", "evidence_approval_check_stale"),
+    ],
+)
+def test_omitted_bypass_api_field_never_substitutes_for_fresh_ui_evidence(
+    mutation: str, reason: str
+) -> None:
+    now = datetime(2026, 10, 16, 5, 0, 0, tzinfo=timezone.utc)
+    verifier, env, api, get_json, get_collection, get_evidence, now = (
+        _approval_gate_fixture(now, omit_bypass_api_field=True)
+    )
+    api["phase"] = "evidence"
+    approvals_path = (
+        "https://api.github.com/repos/neurostackinfra/neurostack-api/actions/runs/"
+        "7123456789/approvals"
+    )
+    approval = api[approvals_path][0]
+    if mutation == "missing":
+        api[approvals_path] = []
+    elif mutation == "incorrect":
+        approval["comment"] = _update_approval_comment(
+            approval["comment"], ruleset_bypass="present"
+        )
+        api[approvals_path] = [approval]
+    else:
+        _update_package_comment(
+            api,
+            approval,
+            comment_updates={"checked_at_utc": "2026-10-16T04:54:34.000000Z"},
+            manifest_updates={"checked_at_utc": "2026-10-16T04:54:34.000000Z"},
+        )
+        api[approvals_path] = [approval]
+
+    assert "bypass_actors" not in api[
+        "https://api.github.com/repos/neurostackinfra/neurostack-api/rulesets/123"
+    ]
+    with pytest.raises(verifier.ApprovalGateError, match=reason):
+        verifier.verify_environment_approval(
+            env,
+            get_json=get_json,
+            get_collection=get_collection,
+            get_evidence=get_evidence,
+            now=now,
+            phase="evidence",
+        )
+
+
+def test_nonempty_api_bypass_blocks_even_with_valid_admin_ui_claim():
+    now = datetime(2026, 10, 16, 5, 0, 0, tzinfo=timezone.utc)
+    verifier, env, api, get_json, get_collection, get_evidence, now = (
+        _approval_gate_fixture(now)
+    )
+    api["phase"] = "evidence"
+    approvals_path = (
+        "https://api.github.com/repos/neurostackinfra/neurostack-api/actions/runs/"
+        "7123456789/approvals"
+    )
+    api[approvals_path] = api[approvals_path][:1]
+    api[
+        "https://api.github.com/repos/neurostackinfra/neurostack-api/rulesets/123"
+    ]["bypass_actors"] = [{"actor_id": 999, "actor_type": "RepositoryRole"}]
+
+    with pytest.raises(
+        verifier._PREFLIGHT.GateError,
+        match="ruleset_bypass_not_empty_or_unreadable",
+    ):
+        verifier.verify_environment_approval(
+            env,
+            get_json=get_json,
+            get_collection=get_collection,
+            get_evidence=get_evidence,
+            now=now,
+            phase="evidence",
+        )
 
 
 def test_no_oidc_evidence_phase_fails_closed_without_first_approval():
@@ -2630,6 +2771,9 @@ def test_attestation_workflow_gates_oidc_job_after_no_oidc_ui_approval():
     ).read_text(encoding="utf-8")
 
     assert workflow["permissions"] == {}
+    assert set(yaml.load(source, Loader=yaml.BaseLoader)["on"]) == {
+        "workflow_dispatch"
+    }
     assert "run-name: ASAAS producer build ${{ inputs.trust_mode }}" in source
     assert "      trust_mode:" in source
     assert "        default: normal" in source
@@ -2640,9 +2784,12 @@ def test_attestation_workflow_gates_oidc_job_after_no_oidc_ui_approval():
     assert "bootstrap_operation_already_used" in preflight_script
     assert "bootstrap_run_attempt_must_be_first" in preflight_script
     assert set(jobs) == {"preflight", "verify-ui-approval", "build-attestation"}
+    supported_permissions = {"actions", "contents", "id-token"}
+    assert all(
+        set(job["permissions"]) <= supported_permissions for job in jobs.values()
+    )
     assert preflight["permissions"] == {
         "actions": "read",
-        "administration": "read",
         "contents": "read",
     }
     assert "id-token" not in preflight["permissions"]
@@ -2667,7 +2814,6 @@ def test_attestation_workflow_gates_oidc_job_after_no_oidc_ui_approval():
     assert ui_approval["environment"] == "asaas-build"
     assert ui_approval["permissions"] == {
         "actions": "read",
-        "administration": "read",
         "contents": "read",
     }
     assert "id-token" not in ui_approval["permissions"]
@@ -2681,7 +2827,6 @@ def test_attestation_workflow_gates_oidc_job_after_no_oidc_ui_approval():
     assert build["environment"] == "asaas-build"
     assert build["permissions"] == {
         "actions": "read",
-        "administration": "read",
         "contents": "read",
         "id-token": "write",
     }
@@ -2739,6 +2884,12 @@ def test_attestation_workflow_gates_oidc_job_after_no_oidc_ui_approval():
         for index, step in enumerate(steps)
         if step.get("name") == "Validate signer pins before requesting OIDC credentials"
     )
+    freshness = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("name")
+        == "Recheck administrator UI evidence freshness at OIDC boundary"
+    )
     credentials = next(
         index
         for index, step in enumerate(steps)
@@ -2756,6 +2907,7 @@ def test_attestation_workflow_gates_oidc_job_after_no_oidc_ui_approval():
         < clean_source
         < install
         < pins
+        < freshness
         < credentials
         < push
     )
@@ -2792,6 +2944,11 @@ def test_attestation_workflow_gates_oidc_job_after_no_oidc_ui_approval():
         == "${{ needs.preflight.outputs.backend_trust_readback_sha256 }}"
     )
     assert "PIN_BACKEND_BASE_URL" in steps[pins]["env"]
+    assert steps[freshness]["env"]["UI_CHECKED_AT_UTC"] == (
+        "${{ needs.verify-ui-approval.outputs.ui_checked_at_utc }}"
+    )
+    assert "asaas_oidc_ui_freshness.py" in steps[freshness]["run"]
+    assert "--checked-at-utc" in steps[freshness]["run"]
     assert "id-token" not in workflow["jobs"]["preflight"]["permissions"]
     assert "id-token" in build["permissions"]
     assert (
@@ -2916,3 +3073,104 @@ def test_attestation_workflow_is_not_ignored_by_git() -> None:
     )
 
     assert result.returncode == 1, result.stderr
+
+
+@pytest.mark.parametrize("token", ["", "read-only-token"])
+def test_public_preflight_api_reads_omit_authorization(monkeypatch, token: str) -> None:
+    namespace = _gate_namespace()
+    captured = []
+
+    class Response:
+        status = 200
+        headers = {}
+
+        def geturl(self):
+            return "https://api.github.com/repos/neurostackinfra/neurostack-api/rulesets"
+
+        def read(self, _limit):
+            return b"[]"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_urlopen(request, timeout):
+        captured.append(request)
+        return Response()
+
+    monkeypatch.setitem(namespace, "urlopen", fake_urlopen)
+    result, _ = namespace["github_get"](
+        "https://api.github.com/repos/neurostackinfra/neurostack-api/rulesets",
+        token,
+    )
+    assert result == []
+    assert captured[0].get_header("Authorization") is None
+
+
+def test_collaborator_admin_read_retains_token_and_only_that_api_path(monkeypatch) -> None:
+    namespace = _gate_namespace()
+    captured = []
+
+    class Response:
+        status = 200
+        headers = {}
+
+        def geturl(self):
+            return "https://api.github.com/repos/neurostackinfra/neurostack-api/collaborators/felps-json/permission"
+
+        def read(self, _limit):
+            return b'{"permission":"admin"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_urlopen(request, timeout):
+        captured.append(request)
+        return Response()
+
+    monkeypatch.setitem(namespace, "urlopen", fake_urlopen)
+    result, _ = namespace["github_get"](
+        "https://api.github.com/repos/neurostackinfra/neurostack-api/collaborators/felps-json/permission",
+        "read-only-token",
+    )
+    assert result["permission"] == "admin"
+    assert captured[0].get_header("Authorization") == "Bearer read-only-token"
+
+
+def test_build_approval_public_api_read_omits_authorization(monkeypatch) -> None:
+    verifier = _approval_module()
+    captured = []
+
+    class Response:
+        status = 200
+        headers = {}
+
+        def geturl(self):
+            return "https://api.github.com/repos/neurostackinfra/neurostack-api/environments"
+
+        def read(self, _limit):
+            return b"{}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Opener:
+        def open(self, request, timeout):
+            captured.append(request)
+            return Response()
+
+    monkeypatch.setattr(verifier, "build_opener", lambda *_args: Opener())
+    result = verifier._api_get(
+        "https://api.github.com/repos/neurostackinfra/neurostack-api/environments",
+        "",
+    )
+    assert result == {}
+    assert captured[0].get_header("Authorization") is None
