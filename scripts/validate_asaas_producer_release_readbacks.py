@@ -16,7 +16,11 @@ authoritative AWS and GitHub reads. Its exact schema is enforced by this module:
   CloudFormation stack name/status/
   outputs, reused OIDC provider ARN/URL/client IDs, build/deploy/task roles,
   three KMS records, a complete account-wide KMS key-policy/grant inventory,
-  and ECR repository metadata.
+  ECR repository metadata, and `bootstrap_slot_ledger` controls. The ledger
+  record must match the template's versioning, 100-year COMPLIANCE retention,
+  encryption, public-access block, no-lifecycle state, and exact bucket policy.
+  Its separate build/deployment `ListObjectVersions` page chains must terminate
+  and contain no version or delete-marker items before initial bootstrap.
 * Every role record contains `arn`, `assume_role_policy`, page records for
   `ListAttachedRolePolicies` and `ListRolePolicies`, a complete-document flag,
   and the complete `attached_managed_policies` / `inline_policies` values.
@@ -96,7 +100,7 @@ PINNED_DESCRIBE_REGIONS_RESPONSE_SHA256 = (
 
 ACCOUNT_ID = "388460142431"
 REGION = "us-east-1"
-READBACK_SCHEMA_VERSION = "neurostack.asaas_producer_release_readbacks.v3"
+READBACK_SCHEMA_VERSION = "neurostack.asaas_producer_release_readbacks.v4"
 MAX_EVIDENCE_AGE = timedelta(hours=24)
 MAX_FUTURE_SKEW = timedelta(minutes=5)
 MAX_UI_AFTER_GITHUB = timedelta(hours=24)
@@ -170,6 +174,8 @@ KMS_GRANT_OPERATIONS = frozenset(
     }
 )
 EXPECTED_RESOURCES = {
+    "BootstrapSlotLedgerBucket": "AWS::S3::Bucket",
+    "BootstrapSlotLedgerBucketPolicy": "AWS::S3::BucketPolicy",
     "ProducerImageRepository": "AWS::ECR::Repository",
     "BuildAttestationSigningKey": "AWS::KMS::Key",
     "ProducerGrantSigningKey": "AWS::KMS::Key",
@@ -181,6 +187,7 @@ EXPECTED_RESOURCES = {
     "ExistingTaskRoleSigningPermissions": "AWS::IAM::Policy",
 }
 EXPECTED_OUTPUTS = {
+    "BootstrapSlotLedgerBucketName",
     "GitHubOidcProviderArn",
     "ProducerImageRepositoryUri",
     "BuildRoleArn",
@@ -354,6 +361,7 @@ def _release_policy_properties(
 
 def _expected_release_outputs() -> dict[str, Any]:
     return {
+        "BootstrapSlotLedgerBucketName": {"Ref": "BootstrapSlotLedgerBucket"},
         "GitHubOidcProviderArn": OIDC_PROVIDER_ARN,
         "ProducerImageRepositoryUri": {
             "Fn::GetAtt": ["ProducerImageRepository", "RepositoryUri"]
@@ -404,6 +412,8 @@ def _template_static_errors(template: Any) -> list[str]:
             continue
         allowed_fields = {"Type", "Metadata", "Properties"}
         if logical_id in {
+            "BootstrapSlotLedgerBucket",
+            "BootstrapSlotLedgerBucketPolicy",
             "ProducerImageRepository",
             "BuildAttestationSigningKey",
             "ProducerGrantSigningKey",
@@ -419,6 +429,133 @@ def _template_static_errors(template: Any) -> list[str]:
             resource_type,
             f"template.Resources.{logical_id}.Type",
             errors,
+        )
+    ledger_bucket = resources.get("BootstrapSlotLedgerBucket", {})
+    ledger_bucket_properties = _expect_mapping(
+        ledger_bucket.get("Properties") if _is_mapping(ledger_bucket) else None,
+        "template.BootstrapSlotLedgerBucket.Properties",
+        errors,
+    )
+    _expect_equal(
+        ledger_bucket_properties,
+        {
+            "BucketEncryption": {
+                "ServerSideEncryptionConfiguration": [
+                    {"ServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}
+                ]
+            },
+            "ObjectLockEnabled": True,
+            "ObjectLockConfiguration": {
+                "ObjectLockEnabled": "Enabled",
+                "Rule": {"DefaultRetention": {"Mode": "COMPLIANCE", "Years": 100}},
+            },
+            "PublicAccessBlockConfiguration": {
+                "BlockPublicAcls": True,
+                "BlockPublicPolicy": True,
+                "IgnorePublicAcls": True,
+                "RestrictPublicBuckets": True,
+            },
+            "VersioningConfiguration": {"Status": "Enabled"},
+        },
+        "template.BootstrapSlotLedgerBucket.Properties",
+        errors,
+    )
+    if (
+        ledger_bucket.get("DeletionPolicy") != "Retain"
+        or ledger_bucket.get("UpdateReplacePolicy") != "Retain"
+    ):
+        errors.append("template.BootstrapSlotLedgerBucket: retention_policy_mismatch")
+
+    build_claim_arn = {
+        "Fn::Sub": "${BootstrapSlotLedgerBucket.Arn}/slots/build-bootstrap.json"
+    }
+    deployment_claim_arn = {
+        "Fn::Sub": "${BootstrapSlotLedgerBucket.Arn}/slots/deployment-bootstrap.json"
+    }
+    expected_bucket_policy = {
+        "Bucket": {"Ref": "BootstrapSlotLedgerBucket"},
+        "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "DenyInsecureTransport",
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "s3:*",
+                    "Resource": [
+                        {"Fn::GetAtt": ["BootstrapSlotLedgerBucket", "Arn"]},
+                        build_claim_arn,
+                        deployment_claim_arn,
+                    ],
+                    "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+                },
+                {
+                    "Sid": "RequireBuildClaimIfNoneMatchHeader",
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "s3:PutObject",
+                    "Resource": build_claim_arn,
+                    "Condition": {"Null": {"s3:if-none-match": "true"}},
+                },
+                {
+                    "Sid": "RequireExactBuildClaimIfNoneMatchValue",
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "s3:PutObject",
+                    "Resource": build_claim_arn,
+                    "Condition": {"StringNotEquals": {"s3:if-none-match": "*"}},
+                },
+                {
+                    "Sid": "RequireDeploymentClaimIfNoneMatchHeader",
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "s3:PutObject",
+                    "Resource": deployment_claim_arn,
+                    "Condition": {"Null": {"s3:if-none-match": "true"}},
+                },
+                {
+                    "Sid": "RequireExactDeploymentClaimIfNoneMatchValue",
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "s3:PutObject",
+                    "Resource": deployment_claim_arn,
+                    "Condition": {"StringNotEquals": {"s3:if-none-match": "*"}},
+                },
+                {
+                    "Sid": "DenyBuildClaimDeletion",
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+                    "Resource": build_claim_arn,
+                },
+                {
+                    "Sid": "DenyDeploymentClaimDeletion",
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+                    "Resource": deployment_claim_arn,
+                },
+            ],
+        },
+    }
+    bucket_policy = resources.get("BootstrapSlotLedgerBucketPolicy", {})
+    bucket_policy_properties = _expect_mapping(
+        bucket_policy.get("Properties") if _is_mapping(bucket_policy) else None,
+        "template.BootstrapSlotLedgerBucketPolicy.Properties",
+        errors,
+    )
+    _expect_equal(
+        bucket_policy_properties,
+        expected_bucket_policy,
+        "template.BootstrapSlotLedgerBucketPolicy.Properties",
+        errors,
+    )
+    if (
+        bucket_policy.get("DeletionPolicy") != "Retain"
+        or bucket_policy.get("UpdateReplacePolicy") != "Retain"
+    ):
+        errors.append(
+            "template.BootstrapSlotLedgerBucketPolicy: retention_policy_mismatch"
         )
 
     outputs = _expect_mapping(document.get("Outputs"), "template.Outputs", errors)
@@ -582,6 +719,34 @@ def _template_static_errors(template: Any) -> list[str]:
                     "StringEquals": {"kms:SigningAlgorithm": "ECDSA_SHA_256"}
                 },
             },
+            {
+                "Sid": "ReadOnlyTheBuildBootstrapLedgerControls",
+                "Effect": "Allow",
+                "Action": [
+                    "s3:GetBucketVersioning",
+                    "s3:GetBucketObjectLockConfiguration",
+                    "s3:GetEncryptionConfiguration",
+                    "s3:GetBucketPublicAccessBlock",
+                    "s3:GetBucketPolicy",
+                    "s3:GetLifecycleConfiguration",
+                ],
+                "Resource": {"Fn::GetAtt": ["BootstrapSlotLedgerBucket", "Arn"]},
+            },
+            {
+                "Sid": "ListOnlyTheBuildBootstrapSlotVersions",
+                "Effect": "Allow",
+                "Action": "s3:ListBucketVersions",
+                "Resource": {"Fn::GetAtt": ["BootstrapSlotLedgerBucket", "Arn"]},
+                "Condition": {
+                    "StringEquals": {"s3:prefix": "slots/build-bootstrap.json"}
+                },
+            },
+            {
+                "Sid": "CreateOnlyTheBuildBootstrapClaim",
+                "Effect": "Allow",
+                "Action": "s3:PutObject",
+                "Resource": build_claim_arn,
+            },
         ],
     )
     deploy_policy = _release_policy_properties(
@@ -609,6 +774,34 @@ def _template_static_errors(template: Any) -> list[str]:
                 "Condition": {
                     "StringEquals": {"iam:PassedToService": "ecs-tasks.amazonaws.com"}
                 },
+            },
+            {
+                "Sid": "ReadOnlyTheDeploymentBootstrapLedgerControls",
+                "Effect": "Allow",
+                "Action": [
+                    "s3:GetBucketVersioning",
+                    "s3:GetBucketObjectLockConfiguration",
+                    "s3:GetEncryptionConfiguration",
+                    "s3:GetBucketPublicAccessBlock",
+                    "s3:GetBucketPolicy",
+                    "s3:GetLifecycleConfiguration",
+                ],
+                "Resource": {"Fn::GetAtt": ["BootstrapSlotLedgerBucket", "Arn"]},
+            },
+            {
+                "Sid": "ListOnlyTheDeploymentBootstrapSlotVersions",
+                "Effect": "Allow",
+                "Action": "s3:ListBucketVersions",
+                "Resource": {"Fn::GetAtt": ["BootstrapSlotLedgerBucket", "Arn"]},
+                "Condition": {
+                    "StringEquals": {"s3:prefix": "slots/deployment-bootstrap.json"}
+                },
+            },
+            {
+                "Sid": "CreateOnlyTheDeploymentBootstrapClaim",
+                "Effect": "Allow",
+                "Action": "s3:PutObject",
+                "Resource": deployment_claim_arn,
             },
         ],
     )
@@ -694,14 +887,22 @@ def _template_static_errors(template: Any) -> list[str]:
 
 
 def _resolve_template_value(
-    value: Any, arns: dict[str, str], repository_uri: str, stack_name: str
+    value: Any,
+    arns: dict[str, str],
+    repository_uri: str,
+    stack_name: str,
+    bucket_name: str | None = None,
 ) -> Any:
     if isinstance(value, list):
         return [
-            _resolve_template_value(item, arns, repository_uri, stack_name)
+            _resolve_template_value(item, arns, repository_uri, stack_name, bucket_name)
             for item in value
         ]
     if not _is_mapping(value):
+        return value
+    if set(value) == {"Ref"}:
+        if value["Ref"] == "BootstrapSlotLedgerBucket":
+            return bucket_name or "__unresolved_ref_BootstrapSlotLedgerBucket__"
         return value
     if set(value) == {"Fn::GetAtt"}:
         logical_id, attribute = value["Fn::GetAtt"]
@@ -711,9 +912,33 @@ def _resolve_template_value(
             return arns[logical_id]
         return f"__unresolved_getatt_{logical_id}_{attribute}__"
     if set(value) == {"Fn::Sub"}:
-        return value["Fn::Sub"].replace("${AWS::StackName}", stack_name)
+        substitution = value["Fn::Sub"]
+        variables: dict[str, Any] = {}
+        if isinstance(substitution, list) and len(substitution) == 2:
+            substitution, variables = substitution
+        if not isinstance(substitution, str) or not _is_mapping(variables):
+            return "__invalid_substitution__"
+
+        def replace(match: re.Match[str]) -> str:
+            name = match.group(1)
+            if name in variables:
+                resolved = _resolve_template_value(
+                    variables[name], arns, repository_uri, stack_name, bucket_name
+                )
+                return str(resolved)
+            if name == "AWS::StackName":
+                return stack_name
+            if name == "BootstrapSlotLedgerBucket" and bucket_name is not None:
+                return bucket_name
+            if name.endswith(".Arn") and name[:-4] in arns:
+                return arns[name[:-4]]
+            return f"__unresolved_sub_{name}__"
+
+        return re.sub(r"\$\{([^}]+)\}", replace, substitution)
     return {
-        key: _resolve_template_value(item, arns, repository_uri, stack_name)
+        key: _resolve_template_value(
+            item, arns, repository_uri, stack_name, bucket_name
+        )
         for key, item in value.items()
     }
 
@@ -1289,6 +1514,185 @@ def _canonical_record_list(records: list[dict[str, Any]]) -> list[str]:
         json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         for record in records
     )
+
+
+def _validate_bootstrap_slot_ledger(
+    value: Any,
+    template: dict[str, Any],
+    stack_name: str,
+    now_utc: datetime,
+    errors: list[str],
+) -> str:
+    path = "snapshot.aws.bootstrap_slot_ledger"
+    ledger = _exact_keys(
+        value,
+        {
+            "read_at_utc",
+            "bucket_name",
+            "versioning_status",
+            "object_lock_configuration",
+            "bucket_encryption",
+            "public_access_block",
+            "lifecycle_rules",
+            "bucket_policy",
+            "build_slot_versions_pages",
+            "deployment_slot_versions_pages",
+        },
+        path,
+        errors,
+    )
+    _validate_fresh_timestamp(
+        ledger.get("read_at_utc"), f"{path}.read_at_utc", now_utc, errors
+    )
+
+    bucket_name = ledger.get("bucket_name")
+    if (
+        not isinstance(bucket_name, str)
+        or not 3 <= len(bucket_name) <= 63
+        or re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])", bucket_name) is None
+        or ".." in bucket_name
+        or ".-" in bucket_name
+        or "-." in bucket_name
+        or re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", bucket_name) is not None
+    ):
+        errors.append(f"{path}.bucket_name: invalid_bucket_name")
+        bucket_name = "invalid-bootstrap-ledger-bucket"
+
+    resources = _expect_mapping(template.get("Resources"), "template.Resources", errors)
+    bucket = _expect_mapping(
+        resources.get("BootstrapSlotLedgerBucket"),
+        "template.BootstrapSlotLedgerBucket",
+        errors,
+    )
+    properties = _expect_mapping(
+        bucket.get("Properties"),
+        "template.BootstrapSlotLedgerBucket.Properties",
+        errors,
+    )
+    versioning = _expect_mapping(
+        properties.get("VersioningConfiguration"),
+        "template.BootstrapSlotLedgerBucket.Properties.VersioningConfiguration",
+        errors,
+    )
+    _expect_equal(
+        ledger.get("versioning_status"),
+        versioning.get("Status"),
+        f"{path}.versioning_status",
+        errors,
+    )
+    lock_configuration = _expect_mapping(
+        properties.get("ObjectLockConfiguration"),
+        "template.BootstrapSlotLedgerBucket.Properties.ObjectLockConfiguration",
+        errors,
+    )
+    lock_rule = _expect_mapping(
+        lock_configuration.get("Rule"),
+        "template.BootstrapSlotLedgerBucket.Properties.ObjectLockConfiguration.Rule",
+        errors,
+    )
+    default_retention = _expect_mapping(
+        lock_rule.get("DefaultRetention"),
+        "template.BootstrapSlotLedgerBucket.Properties.ObjectLockConfiguration.Rule.DefaultRetention",
+        errors,
+    )
+    _expect_equal(
+        ledger.get("object_lock_configuration"),
+        {
+            "object_lock_enabled": lock_configuration.get("ObjectLockEnabled"),
+            "default_retention_mode": default_retention.get("Mode"),
+            "default_retention_years": default_retention.get("Years"),
+        },
+        f"{path}.object_lock_configuration",
+        errors,
+    )
+    bucket_encryption = _expect_mapping(
+        properties.get("BucketEncryption"),
+        "template.BootstrapSlotLedgerBucket.Properties.BucketEncryption",
+        errors,
+    )
+    encryption = _expect_list(
+        bucket_encryption.get("ServerSideEncryptionConfiguration"),
+        "template.BootstrapSlotLedgerBucket.Properties.BucketEncryption.ServerSideEncryptionConfiguration",
+        errors,
+    )
+    encryption_algorithm = None
+    if len(encryption) == 1 and _is_mapping(encryption[0]):
+        encryption_default = _expect_mapping(
+            encryption[0].get("ServerSideEncryptionByDefault"),
+            "template.BootstrapSlotLedgerBucket.Properties.BucketEncryption.ServerSideEncryptionConfiguration[0].ServerSideEncryptionByDefault",
+            errors,
+        )
+        encryption_algorithm = encryption_default.get("SSEAlgorithm")
+    public_access_block = _expect_mapping(
+        properties.get("PublicAccessBlockConfiguration"),
+        "template.BootstrapSlotLedgerBucket.Properties.PublicAccessBlockConfiguration",
+        errors,
+    )
+    _expect_equal(
+        ledger.get("bucket_encryption"),
+        {"sse_algorithm": encryption_algorithm},
+        f"{path}.bucket_encryption",
+        errors,
+    )
+    _expect_equal(
+        ledger.get("public_access_block"),
+        public_access_block,
+        f"{path}.public_access_block",
+        errors,
+    )
+    _expect_equal(
+        ledger.get("lifecycle_rules"),
+        [],
+        f"{path}.lifecycle_rules",
+        errors,
+    )
+
+    bucket_arn = f"arn:aws:s3:::{bucket_name}"
+    bucket_policy_resource = _expect_mapping(
+        resources.get("BootstrapSlotLedgerBucketPolicy"),
+        "template.BootstrapSlotLedgerBucketPolicy",
+        errors,
+    )
+    bucket_policy_properties = _expect_mapping(
+        bucket_policy_resource.get("Properties"),
+        "template.BootstrapSlotLedgerBucketPolicy.Properties",
+        errors,
+    )
+    expected_bucket_policy = _resolve_template_value(
+        bucket_policy_properties.get("PolicyDocument"),
+        {"BootstrapSlotLedgerBucket": bucket_arn},
+        "",
+        stack_name,
+        bucket_name,
+    )
+    _expect_equal(
+        ledger.get("bucket_policy"),
+        expected_bucket_policy,
+        f"{path}.bucket_policy",
+        errors,
+    )
+
+    for slot_name, key in (
+        ("build", "slots/build-bootstrap.json"),
+        ("deployment", "slots/deployment-bootstrap.json"),
+    ):
+        items = _validate_paged_items(
+            ledger.get(f"{slot_name}_slot_versions_pages"),
+            f"{path}.{slot_name}_slot_versions_pages",
+            {"key", "version_id", "kind"},
+            errors,
+        )
+        for index, item in enumerate(items):
+            item_path = f"{path}.{slot_name}_slot_versions_pages.items[{index}]"
+            if item.get("key") != key:
+                errors.append(f"{item_path}.key: unexpected_prefixed_key")
+            if not _is_nonempty_string(item.get("version_id")):
+                errors.append(f"{item_path}.version_id: invalid_version_id")
+            if item.get("kind") not in ("version", "delete_marker"):
+                errors.append(f"{item_path}.kind: invalid_version_record_kind")
+        if items:
+            errors.append(f"{path}.{slot_name}_slot_versions_pages: slot_not_empty")
+    return bucket_name
 
 
 def _validate_grant_operations(value: Any, path: str, errors: list[str]) -> list[str]:
@@ -2074,6 +2478,7 @@ def validate_snapshot(
             "keys",
             "kms_authorization_inventory",
             "ecr",
+            "bootstrap_slot_ledger",
         },
         "snapshot.aws",
         errors,
@@ -2095,6 +2500,13 @@ def validate_snapshot(
         stack_name = "invalid-stack"
     if stack.get("status") not in ("CREATE_COMPLETE", "UPDATE_COMPLETE"):
         errors.append("snapshot.aws.stack.status: stack_not_complete")
+    bucket_name = _validate_bootstrap_slot_ledger(
+        aws.get("bootstrap_slot_ledger"),
+        template,
+        str(stack_name),
+        now_utc,
+        errors,
+    )
 
     provider = _exact_keys(
         aws.get("oidc_provider"),
@@ -2315,12 +2727,17 @@ def validate_snapshot(
         "ExistingTaskRole": TASK_ROLE_ARN,
         **key_arns,
         "ProducerImageRepository": expected_ecr_arn,
+        "BootstrapSlotLedgerBucket": f"arn:aws:s3:::{bucket_name}",
     }
     try:
         expected_outputs: dict[str, Any] = {}
         for output_name, output in template.get("Outputs", {}).items():
             expected_outputs[output_name] = _resolve_template_value(
-                output["Value"], arns, str(repository_uri), str(stack_name)
+                output["Value"],
+                arns,
+                str(repository_uri),
+                str(stack_name),
+                bucket_name,
             )
     except (KeyError, TypeError, ValueError):
         errors.append("template.Outputs: cannot_resolve_output_contract")

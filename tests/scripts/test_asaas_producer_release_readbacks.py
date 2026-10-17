@@ -27,6 +27,7 @@ DEPLOY_ROLE_ARN = f"arn:aws:iam::388460142431:role/{STACK_NAME}-DeployRole-E5F6A
 ECR_NAME = "asaas-producer"
 ECR_ARN = f"arn:aws:ecr:us-east-1:388460142431:repository/{ECR_NAME}"
 ECR_URI = f"388460142431.dkr.ecr.us-east-1.amazonaws.com/{ECR_NAME}"
+BOOTSTRAP_LEDGER_BUCKET = "asaas-producer-release-bootstrap-ledger"
 KEY_ARNS = {
     "BuildAttestationSigningKey": "arn:aws:kms:us-east-1:388460142431:key/11111111-1111-4111-8111-111111111111",
     "ProducerGrantSigningKey": "arn:aws:kms:us-east-1:388460142431:key/22222222-2222-4222-8222-222222222222",
@@ -131,6 +132,7 @@ def synthetic_snapshot(evidence_root: Path) -> dict[str, Any]:
         "ExistingTaskRole": TASK_ROLE_ARN,
         **KEY_ARNS,
         "ProducerImageRepository": ECR_ARN,
+        "BootstrapSlotLedgerBucket": f"arn:aws:s3:::{BOOTSTRAP_LEDGER_BUCKET}",
     }
 
     def policy_document(logical_id: str) -> dict[str, Any]:
@@ -183,10 +185,19 @@ def synthetic_snapshot(evidence_root: Path) -> dict[str, Any]:
     }
     stack_outputs = {
         output_name: validator._resolve_template_value(
-            output["Value"], arns, ECR_URI, STACK_NAME
+            output["Value"], arns, ECR_URI, STACK_NAME, BOOTSTRAP_LEDGER_BUCKET
         )
         for output_name, output in template["Outputs"].items()
     }
+    bootstrap_bucket_policy = validator._resolve_template_value(
+        template["Resources"]["BootstrapSlotLedgerBucketPolicy"]["Properties"][
+            "PolicyDocument"
+        ],
+        arns,
+        ECR_URI,
+        STACK_NAME,
+        BOOTSTRAP_LEDGER_BUCKET,
+    )
     inventory = [
         {
             "arn": KEY_ARNS[logical_id],
@@ -555,6 +566,27 @@ def synthetic_snapshot(evidence_root: Path) -> dict[str, Any]:
                 "image_tag_mutability": "IMMUTABLE",
                 "encryption_type": "AES256",
                 "scan_on_push": True,
+            },
+            "bootstrap_slot_ledger": {
+                "read_at_utc": collected,
+                "bucket_name": BOOTSTRAP_LEDGER_BUCKET,
+                "versioning_status": "Enabled",
+                "object_lock_configuration": {
+                    "object_lock_enabled": "Enabled",
+                    "default_retention_mode": "COMPLIANCE",
+                    "default_retention_years": 100,
+                },
+                "bucket_encryption": {"sse_algorithm": "AES256"},
+                "public_access_block": {
+                    "BlockPublicAcls": True,
+                    "BlockPublicPolicy": True,
+                    "IgnorePublicAcls": True,
+                    "RestrictPublicBuckets": True,
+                },
+                "lifecycle_rules": [],
+                "bucket_policy": bootstrap_bucket_policy,
+                "build_slot_versions_pages": [_page([])],
+                "deployment_slot_versions_pages": [_page([])],
             },
         },
         "github": github,
@@ -1289,6 +1321,77 @@ def test_snapshot_rejects_missing_and_extra_fields(tmp_path: Path) -> None:
     assert all("sentinel-secret-do-not-print" not in error for error in errors)
 
 
+@pytest.mark.parametrize("kind", ["version", "delete_marker"])
+def test_bootstrap_slot_ledger_rejects_any_prior_version_or_delete_marker(
+    kind: str, tmp_path: Path
+) -> None:
+    snapshot = synthetic_snapshot(tmp_path)
+    page = snapshot["aws"]["bootstrap_slot_ledger"]["build_slot_versions_pages"][0]
+    page["items"].append(
+        {"key": "slots/build-bootstrap.json", "version_id": "v1", "kind": kind}
+    )
+    page["item_count"] = len(page["items"])
+    _refresh_attestation_digests(snapshot, tmp_path)
+    errors = validator.validate_snapshot(snapshot, evidence_root=tmp_path)
+    assert any("build_slot_versions_pages: slot_not_empty" in error for error in errors)
+
+
+def test_bootstrap_slot_ledger_requires_terminal_version_history_page(
+    tmp_path: Path,
+) -> None:
+    snapshot = synthetic_snapshot(tmp_path)
+    page = snapshot["aws"]["bootstrap_slot_ledger"]["deployment_slot_versions_pages"][0]
+    page["truncated"] = True
+    page["next_marker_sha256"] = "a" * 64
+    _refresh_attestation_digests(snapshot, tmp_path)
+    errors = validator.validate_snapshot(snapshot, evidence_root=tmp_path)
+    assert any(
+        "deployment_slot_versions_pages[0]: page_missing_after_next_marker" in error
+        for error in errors
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("versioning_status", "Suspended", "versioning_status: mismatch"),
+        (
+            "object_lock_configuration",
+            {
+                "object_lock_enabled": "Enabled",
+                "default_retention_mode": "GOVERNANCE",
+                "default_retention_years": 100,
+            },
+            "object_lock_configuration: mismatch",
+        ),
+        (
+            "bucket_encryption",
+            {"sse_algorithm": "aws:kms"},
+            "bucket_encryption: mismatch",
+        ),
+        (
+            "public_access_block",
+            {
+                "BlockPublicAcls": True,
+                "BlockPublicPolicy": True,
+                "IgnorePublicAcls": True,
+                "RestrictPublicBuckets": False,
+            },
+            "public_access_block: mismatch",
+        ),
+        ("lifecycle_rules", [{"expiration_days": 365}], "lifecycle_rules: mismatch"),
+    ],
+)
+def test_bootstrap_slot_ledger_controls_fail_closed(
+    field: str, value: Any, reason: str, tmp_path: Path
+) -> None:
+    snapshot = synthetic_snapshot(tmp_path)
+    snapshot["aws"]["bootstrap_slot_ledger"][field] = value
+    _refresh_attestation_digests(snapshot, tmp_path)
+    errors = validator.validate_snapshot(snapshot, evidence_root=tmp_path)
+    assert any(reason in error for error in errors)
+
+
 def test_role_policy_lists_require_complete_paged_evidence(tmp_path: Path) -> None:
     snapshot = synthetic_snapshot(tmp_path)
     snapshot["aws"]["roles"]["ExistingTaskRole"]["inline_policy_pages"] = []
@@ -1908,10 +2011,88 @@ def test_template_check_rejects_trust_mutation(
         lambda template: template["Resources"]["ExistingTaskRoleSigningPermissions"][
             "Properties"
         ]["PolicyDocument"]["Statement"][0].update(Action="kms:*"),
+        lambda template: template["Resources"]["BuildRolePermissions"]["Properties"][
+            "PolicyDocument"
+        ]["Statement"][4].update(Resource="*"),
+        lambda template: template["Resources"]["BuildRolePermissions"]["Properties"][
+            "PolicyDocument"
+        ]["Statement"][4].update(Condition={"StringLike": {"s3:prefix": "slots/*"}}),
+        lambda template: template["Resources"]["BuildRolePermissions"]["Properties"][
+            "PolicyDocument"
+        ]["Statement"][4].update(Condition={"StringEquals": {"s3:prefix": "slots/"}}),
+        lambda template: template["Resources"]["BuildRolePermissions"]["Properties"][
+            "PolicyDocument"
+        ]["Statement"][5].update(
+            Resource={
+                "Fn::Sub": "${BootstrapSlotLedgerBucket.Arn}/slots/deployment-bootstrap.json"
+            }
+        ),
+        lambda template: template["Resources"]["DeployRolePermissions"]["Properties"][
+            "PolicyDocument"
+        ]["Statement"][5].update(
+            Resource={
+                "Fn::Sub": "${BootstrapSlotLedgerBucket.Arn}/slots/build-bootstrap.json"
+            }
+        ),
+        lambda template: template["Resources"]["DeployRolePermissions"]["Properties"][
+            "PolicyDocument"
+        ]["Statement"][5].update(
+            Resource={"Fn::Sub": "${BootstrapSlotLedgerBucket.Arn}/*"}
+        ),
+        lambda template: template["Resources"]["BootstrapSlotLedgerBucket"][
+            "Properties"
+        ]["ObjectLockConfiguration"]["Rule"]["DefaultRetention"].update(Years=30),
+        lambda template: template["Resources"]["BootstrapSlotLedgerBucket"][
+            "Properties"
+        ].update(ObjectLockEnabled=False),
+        lambda template: template["Resources"]["BootstrapSlotLedgerBucket"][
+            "Properties"
+        ].pop("ObjectLockConfiguration"),
+        lambda template: template["Resources"]["BootstrapSlotLedgerBucket"][
+            "Properties"
+        ].update(VersioningConfiguration={"Status": "Suspended"}),
+        lambda template: template["Resources"]["BootstrapSlotLedgerBucket"][
+            "Properties"
+        ]["PublicAccessBlockConfiguration"].update(RestrictPublicBuckets=False),
+        lambda template: template["Resources"]["BootstrapSlotLedgerBucket"][
+            "Properties"
+        ]["BucketEncryption"]["ServerSideEncryptionConfiguration"][0][
+            "ServerSideEncryptionByDefault"
+        ].update(
+            SSEAlgorithm="aws:kms"
+        ),
+        lambda template: template["Resources"]["BootstrapSlotLedgerBucket"][
+            "Properties"
+        ].update(LifecycleConfiguration={"Rules": [{"Status": "Enabled"}]}),
+        lambda template: template["Resources"]["BootstrapSlotLedgerBucketPolicy"][
+            "Properties"
+        ]["PolicyDocument"]["Statement"].pop(1),
+        lambda template: template["Resources"]["BootstrapSlotLedgerBucketPolicy"][
+            "Properties"
+        ]["PolicyDocument"]["Statement"][0].update(Condition={}),
+        lambda template: template["Resources"]["BootstrapSlotLedgerBucketPolicy"][
+            "Properties"
+        ]["PolicyDocument"]["Statement"][5].update(Action="s3:DeleteObject"),
+        lambda template: template["Resources"]["BootstrapSlotLedgerBucket"].update(
+            DeletionPolicy="Delete"
+        ),
+        lambda template: template["Resources"]["BootstrapSlotLedgerBucket"].update(
+            UpdateReplacePolicy="Delete"
+        ),
+        lambda template: template["Resources"][
+            "BootstrapSlotLedgerBucketPolicy"
+        ].update(DeletionPolicy="Delete"),
+        lambda template: template["Resources"][
+            "BootstrapSlotLedgerBucketPolicy"
+        ].update(UpdateReplacePolicy="Delete"),
+        lambda template: template["Resources"].update(
+            UnexpectedLedger="AWS::S3::Bucket"
+        ),
         lambda template: template["Resources"]["ProducerReceiptSigningKey"][
             "Properties"
         ].update(Enabled=False),
         lambda template: template["Outputs"].pop("ProducerGrantSigningKeyArn"),
+        lambda template: template["Outputs"].update(UnexpectedOutput={"Value": "x"}),
         lambda template: template["Resources"]["DeployRole"].update(
             Condition="SkipDeployRole"
         ),
@@ -1924,8 +2105,30 @@ def test_template_check_rejects_trust_mutation(
         "pass-role-service-condition-required",
         "task-role-signs-only-grant-and-receipt",
         "task-role-no-kms-action-wildcard",
+        "build-list-no-broad-resource",
+        "build-list-no-stringlike-prefix",
+        "build-list-exact-build-prefix",
+        "build-write-cannot-cross-role-key",
+        "deploy-write-cannot-cross-role-key",
+        "deploy-write-cannot-be-broad",
+        "ledger-lock-100-year-retention",
+        "ledger-object-lock-enabled",
+        "ledger-object-lock-configuration-required",
+        "ledger-versioning-enabled",
+        "ledger-public-access-block",
+        "ledger-encrypted-at-rest",
+        "ledger-no-expiration-lifecycle",
+        "ledger-conditional-put-required",
+        "ledger-tls-only-policy",
+        "ledger-delete-and-delete-version-denied",
+        "ledger-bucket-retained",
+        "ledger-bucket-replacement-retained",
+        "ledger-policy-retained",
+        "ledger-policy-replacement-retained",
+        "unexpected-resource-rejected",
         "key-must-remain-enabled",
         "all-key-arns-output",
+        "unexpected-output-rejected",
         "roles-cannot-be-conditionally-omitted",
         "transform-rejected",
         "unknown-top-level-field-rejected",
