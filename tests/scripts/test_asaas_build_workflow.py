@@ -70,6 +70,28 @@ _BUILD_SCREENSHOT_URLS = {
 }
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    def construct_mapping(self, node, deep=False):
+        self.flatten_mapping(node)
+        mapping = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in mapping:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+            mapping[key] = self.construct_object(value_node, deep=deep)
+        return mapping
+
+
+def test_build_workflow_has_no_duplicate_yaml_keys() -> None:
+    parsed = yaml.load(_WORKFLOW.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)
+    assert isinstance(parsed, dict)
+
+
 def _canonical_test_json(value):
     return json.dumps(
         value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")

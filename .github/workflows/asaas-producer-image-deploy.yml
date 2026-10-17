@@ -475,7 +475,43 @@ jobs:
       - name: Deploy exact attested image, verify post-readback, register, or roll back
         shell: bash
         env:
-          <<: *protected_gate_env
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          GITHUB_REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_OPERATION_ID: ${{ inputs.operation_id }}
+          INPUT_BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          INPUT_ATTESTATION_ID: ${{ inputs.attestation_id }}
+          INPUT_APP_IMAGE_DIGEST: ${{ inputs.app_image_digest }}
+          INPUT_ENVELOPE_SHA256: ${{ inputs.envelope_sha256 }}
+          INPUT_EVIDENCE_ISSUE_NUMBER: ${{ inputs.evidence_issue_number }}
+          INPUT_REGISTRATION_ATTESTATION_ID: ${{ inputs.registration_attestation_id }}
+          INPUT_REGISTRATION_DIGEST: ${{ inputs.registration_digest }}
+          INPUT_REGISTERED_AT_UTC: ${{ inputs.registered_at_utc }}
+          ASAAS_PREFLIGHT_PROTECTION_SHA256: ${{ needs.preflight.outputs.protection_sha256 }}
+          ASAAS_PREFLIGHT_OBSERVED_AT: ${{ needs.preflight.outputs.preflight_observed_at }}
+          ASAAS_PRODUCER_TASK_DEFINITION_TEMPLATE_JSON: ${{ secrets.ASAAS_PRODUCER_TASK_DEFINITION_TEMPLATE_JSON }}
+          ASAAS_PRODUCER_TASK_DEFINITION_TEMPLATE_SHA256: ${{ secrets.ASAAS_PRODUCER_TASK_DEFINITION_TEMPLATE_SHA256 }}
+          ASAAS_PRODUCER_PREDEPLOY_READBACK_JSON: ${{ secrets.ASAAS_PRODUCER_PREDEPLOY_READBACK_JSON }}
+          BILLING_PRODUCER_GRANT_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_GRANT_KMS_KEY_ARN }}
+          BILLING_PRODUCER_GRANT_PUBLIC_KEY_PEM: ${{ vars.BILLING_PRODUCER_GRANT_PUBLIC_KEY_PEM }}
+          BILLING_PRODUCER_BUILD_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_BUILD_KMS_KEY_ARN }}
+          BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM: ${{ vars.BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM }}
+          BILLING_PRODUCER_RECEIPT_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_RECEIPT_KMS_KEY_ARN }}
+          BILLING_PRODUCER_RECEIPT_PUBLIC_KEY_PEM: ${{ vars.BILLING_PRODUCER_RECEIPT_PUBLIC_KEY_PEM }}
+          BILLING_PRODUCER_BUILD_ISSUER: ${{ vars.BILLING_PRODUCER_BUILD_ISSUER }}
+          BILLING_PRODUCER_BUILD_AUDIENCE: ${{ vars.BILLING_PRODUCER_BUILD_AUDIENCE }}
+          BILLING_PRODUCER_BUILD_OIDC_SUBJECT: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_SUBJECT }}
+          BILLING_PRODUCER_ECR_REPOSITORY_URI: ${{ vars.BILLING_PRODUCER_ECR_REPOSITORY_URI }}
+          BILLING_PRODUCER_DEPLOY_ROLE_ARN: ${{ vars.BILLING_PRODUCER_DEPLOY_ROLE_ARN }}
+          ASAAS_SIGNED_ENVELOPE_PATH: ${{ runner.temp }}/asaas-build-attestation/asaas-build-attestation.json
           # The cohort confirmation stays on this runner and is hash-bound to
           # the approval gate before AWS credentials are requested.
           ASAAS_PRE_OIDC_COHORT_PATH: ${{ runner.temp }}/asaas-producer-pre-oidc-cohort.json

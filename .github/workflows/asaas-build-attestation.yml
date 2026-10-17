@@ -372,7 +372,6 @@ jobs:
           GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
           ASAAS_BUILD_TRUST_MODE: ${{ inputs.trust_mode }}
           ASAAS_PREFLIGHT_BUILD_TRUST_MODE: ${{ needs.preflight.outputs.build_trust_mode }}
-          ASAAS_PREFLIGHT_BACKEND_TRUST_PROBE_SHA256: ${{ needs.preflight.outputs.backend_trust_probe_sha256 }}
           GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail

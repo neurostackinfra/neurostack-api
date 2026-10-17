@@ -24,6 +24,30 @@ def _workflow() -> dict[str, object]:
     return parsed
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    def construct_mapping(self, node, deep=False):
+        self.flatten_mapping(node)
+        mapping = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in mapping:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+            mapping[key] = self.construct_object(value_node, deep=deep)
+        return mapping
+
+
+def test_deploy_workflow_has_no_duplicate_keys_or_unsupported_merge_mapping() -> None:
+    source = WORKFLOW.read_text(encoding="utf-8")
+    parsed = yaml.load(source, Loader=_UniqueKeyLoader)
+    assert isinstance(parsed, dict)
+    assert "<<:" not in source
+
+
 def _walk(value: object):
     if isinstance(value, dict):
         yield value
@@ -137,6 +161,20 @@ def test_only_deploy_job_can_request_oidc_and_it_is_after_all_no_oidc_gates() ->
     )
     assert "asaas_oidc_ui_freshness.py" in deploy_steps[freshness_steps[0]]["run"]
     assert "--checked-at-utc" in deploy_steps[freshness_steps[0]]["run"]
+    predeploy_environment = next(
+        node["env"]
+        for node in _walk(jobs["verify-predeploy-evidence"])
+        if isinstance(node, dict)
+        and node.get("name")
+        == "Re-read controls, human UI evidence, database readiness, and private baseline"
+    )
+    deploy_executor_environment = deploy_steps[-1]["env"]
+    assert all(
+        deploy_executor_environment.get(key) == value
+        for key, value in predeploy_environment.items()
+    )
+    assert "ASAAS_PRE_OIDC_COHORT_PATH" in deploy_executor_environment
+    assert "ASAAS_PRE_OIDC_COHORT_SHA256" in deploy_executor_environment
     assert all(
         not step.get("uses", "").startswith("aws-actions/")
         for step in deploy_steps[: aws_steps[0]]
