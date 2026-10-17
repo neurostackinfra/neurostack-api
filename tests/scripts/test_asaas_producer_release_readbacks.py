@@ -230,14 +230,36 @@ def synthetic_snapshot(evidence_root: Path) -> dict[str, Any]:
         {"region_name": "us-east-2", "opt_in_status": "opted-in"},
         {"region_name": "ap-south-1", "opt_in_status": "not-opted-in"},
     ]
+    raw_regions = [
+        {
+            "RegionName": row["region_name"],
+            "OptInStatus": row["opt_in_status"],
+            "Endpoint": f"ec2.{row['region_name']}.amazonaws.com",
+            "Geography": [{"Name": "Synthetic"}],
+        }
+        for row in enabled_region_rows
+    ]
+    raw_response = {"Regions": raw_regions}
     region_document = {
-        "operation": "ec2:DescribeRegions",
-        "all_regions": True,
-        "http_status": 200,
-        "request_id": "synthetic-request-0123456789",
+        "schema_version": "neurostack.aws_ec2_describe_regions_readback.v1",
+        "source": "aws_mcp__run_script.call_boto3",
+        "service_name": "ec2",
+        "operation_name": "DescribeRegions",
+        "region_name": "us-east-1",
+        "request_params": {"AllRegions": True},
+        "api_calls": [
+            {
+                "service": "ec2",
+                "operation": "DescribeRegions",
+                "status": "success",
+                "n_items": {"Regions": len(raw_regions)},
+            }
+        ],
         "read_at_utc": collected,
-        "region_count": len(enabled_region_rows),
-        "regions": enabled_region_rows,
+        "response": raw_response,
+        "response_sha256": hashlib.sha256(
+            json.dumps(raw_response, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
     }
     region_bytes = json.dumps(region_document, sort_keys=True).encode("utf-8")
     region_artifact_path = evidence_root / "aws" / "describe-regions.json"
@@ -1386,13 +1408,43 @@ def test_describe_regions_artifact_timestamp_and_count_are_checked(
     _rewrite_region_document(
         snapshot,
         tmp_path,
-        lambda document: document.update(region_count=document["region_count"] + 1),
+        lambda document: document["api_calls"][0]["n_items"].update(Regions=99),
     )
     errors = validator.validate_snapshot(snapshot, evidence_root=tmp_path, now_utc=now)
     assert any(
-        "describe_regions_artifact.document.region_count: returned_count_mismatch"
-        in error
+        "describe_regions_artifact.document.api_calls[0].n_items: mismatch" in error
         for error in errors
+    )
+
+
+@pytest.mark.parametrize("parameters", [{}, {"AllRegions": False}])
+def test_describe_regions_requires_explicit_all_regions_request(
+    tmp_path: Path, parameters: dict[str, Any]
+) -> None:
+    snapshot = synthetic_snapshot(tmp_path)
+    _rewrite_region_document(
+        snapshot,
+        tmp_path,
+        lambda document: document.update(request_params=parameters),
+    )
+    errors = validator.validate_snapshot(snapshot, evidence_root=tmp_path)
+    assert (
+        "snapshot.aws.kms_authorization_inventory.describe_regions_artifact.document.request_params: mismatch"
+        in errors
+    )
+
+
+def test_describe_regions_raw_response_digest_must_match(tmp_path: Path) -> None:
+    snapshot = synthetic_snapshot(tmp_path)
+    _rewrite_region_document(
+        snapshot,
+        tmp_path,
+        lambda document: document.update(response_sha256="0" * 64),
+    )
+    errors = validator.validate_snapshot(snapshot, evidence_root=tmp_path)
+    assert (
+        "snapshot.aws.kms_authorization_inventory.describe_regions_artifact.document.response_sha256: mismatch"
+        in errors
     )
 
 
@@ -1405,20 +1457,100 @@ def test_describe_regions_omission_breaks_exact_scan_coverage(tmp_path: Path) ->
         in errors
     )
 
+
+def test_paired_describe_regions_omission_fails_against_independent_response_pin(
+    tmp_path: Path,
+) -> None:
+    """Recomputed local hashes cannot override the independently pinned source."""
     snapshot = synthetic_snapshot(tmp_path)
-    _rewrite_region_document(
-        snapshot,
-        tmp_path,
-        lambda document: (
-            document["regions"].pop(1),
-            document.update(region_count=document["region_count"] - 1),
-        ),
+    source_path = (
+        tmp_path
+        / snapshot["aws"]["kms_authorization_inventory"]["describe_regions_artifact"][
+            "path"
+        ]
     )
+    pinned_response_sha256 = json.loads(source_path.read_text())["response_sha256"]
+
+    def remove_region(document: dict[str, Any]) -> None:
+        document["response"]["Regions"].pop(1)
+        document["api_calls"][0]["n_items"]["Regions"] -= 1
+        document["response_sha256"] = hashlib.sha256(
+            json.dumps(
+                document["response"], sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+
+    _rewrite_region_document(snapshot, tmp_path, remove_region)
+    snapshot["aws"]["kms_authorization_inventory"]["regional_scans"].pop("us-east-2")
+    snapshot["aws"]["kms_authorization_inventory"]["keys"] = [
+        key
+        for key in snapshot["aws"]["kms_authorization_inventory"]["keys"]
+        if ":us-east-2:" not in key["arn"]
+    ]
+    snapshot["aws"]["kms_authorization_inventory"]["inspected_key_count"] -= 1
+    _refresh_attestation_digests(snapshot, tmp_path)
+
+    errors = validator.validate_snapshot(
+        snapshot,
+        evidence_root=tmp_path,
+        expected_describe_regions_response_sha256=pinned_response_sha256,
+    )
+    assert (
+        "snapshot.aws.kms_authorization_inventory.describe_regions_artifact.document.response_sha256_pinned: mismatch"
+        in errors
+    )
+
+    snapshot = synthetic_snapshot(tmp_path)
+    _rewrite_region_document(snapshot, tmp_path, remove_region)
     errors = validator.validate_snapshot(snapshot, evidence_root=tmp_path)
     assert (
         "snapshot.aws.kms_authorization_inventory.regional_scans: enabled_region_coverage_mismatch"
         in errors
     )
+
+
+def test_evidence_cli_rejects_rehashed_paired_region_omission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert (
+        validator.PINNED_DESCRIBE_REGIONS_RESPONSE_SHA256
+        == "f4e52f7420e339d831af2555ef035e75316cc01351296330ed68da7f119a6e00"
+    )
+    snapshot = synthetic_snapshot(tmp_path)
+    source_path = (
+        tmp_path
+        / snapshot["aws"]["kms_authorization_inventory"]["describe_regions_artifact"][
+            "path"
+        ]
+    )
+    fixture_pin = json.loads(source_path.read_text())["response_sha256"]
+    monkeypatch.setattr(
+        validator, "PINNED_DESCRIBE_REGIONS_RESPONSE_SHA256", fixture_pin
+    )
+
+    def remove_region(document: dict[str, Any]) -> None:
+        document["response"]["Regions"].pop(1)
+        document["api_calls"][0]["n_items"]["Regions"] -= 1
+        document["response_sha256"] = hashlib.sha256(
+            json.dumps(
+                document["response"], sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+
+    _rewrite_region_document(snapshot, tmp_path, remove_region)
+    inventory = snapshot["aws"]["kms_authorization_inventory"]
+    inventory["regional_scans"].pop("us-east-2")
+    inventory["keys"] = [
+        key for key in inventory["keys"] if ":us-east-2:" not in key["arn"]
+    ]
+    inventory["inspected_key_count"] -= 1
+    _refresh_attestation_digests(snapshot, tmp_path)
+    evidence_path = tmp_path / "snapshot.json"
+    evidence_path.write_text(json.dumps(snapshot, sort_keys=True))
+    evidence_path.chmod(0o600)
+
+    assert validator.main(["--evidence", str(evidence_path)]) == 1
+    assert "response_sha256_pinned: mismatch" in capsys.readouterr().err
 
 
 def test_attestation_time_is_compared_with_github_readback(tmp_path: Path) -> None:
@@ -1652,10 +1784,21 @@ def test_grant_operation_enum_is_case_sensitive_and_complete() -> None:
 
 
 def test_readback_cli_validates_snapshot_and_never_prints_values(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     evidence = tmp_path / "snapshot.json"
     snapshot = synthetic_snapshot(tmp_path)
+    artifact_ref = snapshot["aws"]["kms_authorization_inventory"][
+        "describe_regions_artifact"
+    ]
+    source = json.loads((tmp_path / artifact_ref["path"]).read_text())
+    monkeypatch.setattr(
+        validator,
+        "PINNED_DESCRIBE_REGIONS_RESPONSE_SHA256",
+        source["response_sha256"],
+    )
     evidence.write_text(json.dumps(snapshot), encoding="utf-8")
     evidence.chmod(0o600)
     assert validator.main(["--evidence", str(evidence)]) == 0

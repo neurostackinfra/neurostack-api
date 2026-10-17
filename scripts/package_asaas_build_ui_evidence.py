@@ -201,14 +201,16 @@ def _copy_png(contents: bytes, destination: Path) -> str:
     return hashlib.sha256(contents).hexdigest()
 
 
-def _private_run_directory(run_id: str, attempt: str) -> Path:
+def _private_run_directory(
+    run_id: str, attempt: str, approval_gate: str = "evidence"
+) -> Path:
     home = Path.home().resolve()
     repository = _repository_root()
     root = (
         home
         / ".local/share/neurostack/asaas-build-ui-evidence/neurostackinfra-neurostack-api"
     )
-    destination = root / f"run-{run_id}-attempt-{attempt}"
+    destination = root / f"run-{run_id}-attempt-{attempt}-gate-{approval_gate}"
     if root == repository or repository in root.parents or root in repository.parents:
         raise ValueError("private evidence directory must be outside the repository")
     current = home
@@ -246,6 +248,23 @@ def package(args: argparse.Namespace) -> tuple[dict[str, object], Path]:
         raise ValueError("run attempt must be a positive decimal integer")
     if not re.fullmatch(r"[0-9a-f]{40}", args.sha):
         raise ValueError("SHA must be 40 lowercase hexadecimal characters")
+    preflight_sha256 = getattr(args, "preflight_sha256", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", preflight_sha256):
+        raise ValueError(
+            "preflight SHA-256 must be 64 lowercase hexadecimal characters"
+        )
+    approval_gate = getattr(args, "approval_gate", "evidence")
+    if approval_gate not in {"evidence", "build"}:
+        raise ValueError("approval gate must be evidence or build")
+    group2_bundle_ref = getattr(args, "group2_bundle_ref", "")
+    group2_bundle_sha256 = getattr(args, "group2_bundle_sha256", "")
+    if not re.fullmatch(
+        r"https://github\.com/user-attachments/files/[1-9][0-9]*/[A-Za-z0-9][A-Za-z0-9_-]{0,80}\.zip",
+        group2_bundle_ref,
+    ):
+        raise ValueError("Group 2 bundle must use the exact GitHub zip attachment URL")
+    if not re.fullmatch(r"[0-9a-f]{64}", group2_bundle_sha256):
+        raise ValueError("Group 2 bundle SHA-256 must be lowercase hexadecimal")
     evidence_label = getattr(args, "evidence_label", "ruleset")
     if evidence_label not in SCREENSHOTS:
         raise ValueError("evidence label must name a packaged screenshot")
@@ -270,7 +289,7 @@ def package(args: argparse.Namespace) -> tuple[dict[str, object], Path]:
     }
     if len(set(source_digests.values())) != len(SCREENSHOTS):
         raise ValueError("each UI screenshot must have a distinct SHA-256 digest")
-    output = _private_run_directory(args.run_id, args.run_attempt)
+    output = _private_run_directory(args.run_id, args.run_attempt, approval_gate)
     screenshot_digests = {
         label: _copy_png(source_bytes[label], output / filename)
         for label, filename in SCREENSHOTS.items()
@@ -282,9 +301,13 @@ def package(args: argparse.Namespace) -> tuple[dict[str, object], Path]:
         "run_attempt": args.run_attempt,
         "workflow_path": ".github/workflows/asaas-build-attestation.yml",
         "sha": args.sha,
+        "preflight_sha256": preflight_sha256,
         "ref": "refs/heads/main",
         "environment": "asaas-build",
+        "approval_gate": approval_gate,
         "checked_at_utc": checked_at,
+        "group2_bundle_ref": group2_bundle_ref,
+        "group2_bundle_sha256": group2_bundle_sha256,
     }
     checks = {
         "ruleset_bypass_empty": True,
@@ -294,7 +317,7 @@ def package(args: argparse.Namespace) -> tuple[dict[str, object], Path]:
         "asaas_production_branch_only_main": True,
     }
     manifest = {
-        "schema_version": "neurostack.asaas_build_ui_evidence_manifest.v2",
+        "schema_version": "neurostack.asaas_build_ui_evidence_manifest.v4",
         **metadata,
         "checks": checks,
         "screenshots_sha256": screenshot_digests,
@@ -309,11 +332,11 @@ def package(args: argparse.Namespace) -> tuple[dict[str, object], Path]:
     os.chmod(manifest_path, 0o600)
 
     comment = {
-        "schema_version": "neurostack.asaas_build_ui_attestation.v4",
+        "schema_version": "neurostack.asaas_build_ui_attestation.v6",
         **metadata,
         "reviewer_id": "<github-user-id>",
         "reviewer_login": "<github-login>",
-        "preflight_sha256": "<64-lowercase-hex>",
+        "preflight_sha256": preflight_sha256,
         "ruleset_bypass": "empty",
         "environment_admin_bypass": "disabled",
         "branch_policy": "main-only",
@@ -340,7 +363,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--run-attempt", required=True)
+    parser.add_argument(
+        "--approval-gate", choices=("evidence", "build"), default="evidence"
+    )
     parser.add_argument("--sha", required=True)
+    parser.add_argument("--preflight-sha256", required=True)
+    parser.add_argument("--group2-bundle-ref", required=True)
+    parser.add_argument("--group2-bundle-sha256", required=True)
     parser.add_argument(
         "--evidence-label", choices=tuple(SCREENSHOTS), default="ruleset"
     )

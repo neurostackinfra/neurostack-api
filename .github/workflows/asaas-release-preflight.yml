@@ -39,4 +39,8 @@ jobs:
           poetry run pytest -q -p no:cacheprovider \
             tests/scripts/test_asaas_producer_release_readbacks.py \
             tests/scripts/test_asaas_build_workflow.py \
-            tests/scripts/test_asaas_release_preflight_workflow.py
+            tests/scripts/test_asaas_release_preflight_workflow.py \
+            tests/scripts/test_package_asaas_build_ui_evidence.py \
+            tests/scripts/test_sign_asaas_build_attestation.py \
+            tests/api/test_billing_producer_build_trust.py \
+            tests/scripts/test_production_infra.py

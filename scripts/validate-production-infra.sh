@@ -20,4 +20,6 @@ python_bin="${PYTHON:-python3}"
   tests/scripts/test_asaas_producer_deploy_executor.py \
   tests/scripts/test_asaas_database_secret_reference.py \
   tests/scripts/test_asaas_registration_database_readiness_sql.py \
-  tests/scripts/test_verify_asaas_producer_image_rollout.py
+  tests/scripts/test_verify_asaas_producer_image_rollout.py \
+  tests/scripts/test_package_asaas_build_ui_evidence.py \
+  tests/api/test_billing_producer_build_trust.py

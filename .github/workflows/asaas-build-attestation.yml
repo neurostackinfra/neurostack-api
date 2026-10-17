@@ -111,6 +111,8 @@ jobs:
     outputs:
       approval_evidence_sha256: ${{ steps.verify.outputs.approval_evidence_sha256 }}
       ui_checked_at_utc: ${{ steps.verify.outputs.ui_checked_at_utc }}
+      group2_bundle_sha256: ${{ steps.verify.outputs.group2_bundle_sha256 }}
+      group2_snapshot_sha256: ${{ steps.verify.outputs.group2_snapshot_sha256 }}
     steps:
       - name: Checkout selected protected ref
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -121,6 +123,13 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.12"
+
+      - name: Install locked readback validator dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check "poetry==2.4.1"
+          poetry install --with dev --no-root
 
       - name: Verify first asaas-build approval and run-bound UI evidence
         id: verify
@@ -155,7 +164,7 @@ jobs:
           PIN_OIDC_SUBJECT: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_SUBJECT }}
           BUILD_PUBLIC_KEY: ${{ vars.BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM }}
         run: >-
-          python3 scripts/verify_asaas_build_environment_approval.py
+          poetry run python scripts/verify_asaas_build_environment_approval.py
           --phase evidence
           --evidence-output
           "$RUNNER_TEMP/asaas-admin-ui-approval.json"
@@ -186,6 +195,13 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.12"
+
+      - name: Install locked readback validator dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check "poetry==2.4.1"
+          poetry install --with dev --no-root
 
       - name: Verify second approval and unchanged run-bound evidence before OIDC
         shell: bash
@@ -220,11 +236,13 @@ jobs:
           BUILD_PUBLIC_KEY: ${{ vars.BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM }}
           EXPECTED_APPROVAL_EVIDENCE_SHA256: ${{ needs.verify-ui-approval.outputs.approval_evidence_sha256 }}
           EXPECTED_UI_CHECKED_AT_UTC: ${{ needs.verify-ui-approval.outputs.ui_checked_at_utc }}
+          EXPECTED_GROUP2_BUNDLE_SHA256: ${{ needs.verify-ui-approval.outputs.group2_bundle_sha256 }}
         run: >-
-          python3 scripts/verify_asaas_build_environment_approval.py
+          poetry run python scripts/verify_asaas_build_environment_approval.py
           --phase build
           --expected-evidence-sha256 "$EXPECTED_APPROVAL_EVIDENCE_SHA256"
           --expected-checked-at-utc "$EXPECTED_UI_CHECKED_AT_UTC"
+          --expected-group2-bundle-sha256 "$EXPECTED_GROUP2_BUNDLE_SHA256"
           --evidence-output
           "$RUNNER_TEMP/asaas-admin-ui-approval.json"
           --github-output "$GITHUB_OUTPUT"

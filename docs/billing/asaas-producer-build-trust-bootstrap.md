@@ -81,6 +81,46 @@ or ambiguous responses, and every other status fail closed.
    workflow-run history check reject reuse. A failed or retried build attempt
    consumes that operation UUID. The protected `asaas-build` environment
    still requires approval for the exact run.
+   Before either approval, make a private ZIP containing `snapshot.json` at the
+   archive root and every artifact referenced by it at the same relative paths.
+   Do not include symlinks. Keep the bundle within the verifier's 64 MiB
+   download and 128 MiB unpacked limits. Upload that ZIP as a GitHub user
+   attachment and record its exact URL and SHA-256; the protected approval
+   comment binds that digest to the reviewer, run, ref, SHA, workflow,
+   environment, and preflight readback. The no-OIDC verifier downloads the
+   attachment, checks its digest and ZIP paths, extracts into a private
+   temporary directory, and runs the full Group 2 snapshot/artifact validator.
+   The build job downloads and validates the same bundle again before requesting
+   OIDC. A locally rehashed snapshot alone is not evidence of origin. The
+   standalone evidence validator and the approval verifier pin the canonical
+   separate read-only AWS MCP observation. Removing a region from the raw
+   response and matching scans still fails even if all local hashes or both
+   recomputed. If AWS changes the region catalog or opt-in statuses, the gate
+   remains closed until a fresh independent response is collected and its
+   digest is updated through reviewed code. The repository and its user
+   attachments are public: sanitize the
+   bundle and screenshots and exclude credentials, tokens, customer data, and
+   other secrets before uploading.
+   The `asaas-build` environment has two distinct approvals. For the first,
+   inspect and capture the ruleset and both environment settings, then package
+   the three screenshots with `--approval-gate evidence`, the run identity, and
+   the preflight SHA, the Group 2 bundle URL, and the bundle SHA-256. Attach that
+   manifest and all three PNGs, and put its
+   compact JSON in the first environment approval comment. The no-OIDC verifier
+   requires this package timestamp to fall between preflight and five minutes
+   before the no-OIDC job starts.
+   After that job completes successfully, repeat the UI inspection and capture
+   all three screenshots; the verifier checks the second timestamp is at or
+   after the no-OIDC job's recorded completion time. The second screenshots
+   must have new bytes, even if a new timestamp or attachment URL is supplied.
+   Run the packer again with `--approval-gate build`; this creates
+   a separate private package and requires a distinct timestamp and attachment
+   URLs. Reuse the same Group 2 URL and digest. Attach the new manifest and PNGs and use its compact JSON in the second
+   environment approval comment. The build verifier requires exactly one
+   `evidence` and one `build` package, verifies both complete chains, checks the
+   first against the no-OIDC outputs, and requires the second timestamp to be no
+   more than five minutes before the build job starts. Do not reuse the first
+   comment, timestamp, manifest, or attachment URLs for the second approval.
 3. Before OIDC, bootstrap preflight probes only the committed HTTPS backend
    origin and both exact public readback paths. The probe does not infer
    authentication from the `/admin` prefix: both exact paths are public. The

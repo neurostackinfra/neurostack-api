@@ -6,12 +6,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
 import struct
 import sys
+import stat
+import tempfile
 import zlib
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -37,12 +41,21 @@ OWNER_ID = _PREFLIGHT.OWNER_ID
 RELEASE_REF = _PREFLIGHT.RELEASE_REF
 WORKFLOW_PATH = _PREFLIGHT.WORKFLOW_PATH
 ENVIRONMENT = "asaas-build"
-COMMENT_SCHEMA = "neurostack.asaas_build_ui_attestation.v4"
+COMMENT_SCHEMA = "neurostack.asaas_build_ui_attestation.v6"
 UI_APPROVAL_JOB_NAME = "Verify run-bound admin UI evidence before OIDC (no token)"
 BUILD_JOB_NAME = "Build and sign after second asaas-build approval"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_EVIDENCE_BYTES = 20 * 1024 * 1024
 MAX_MANIFEST_BYTES = 256 * 1024
+MAX_GROUP2_BUNDLE_BYTES = 64 * 1024 * 1024
+MAX_GROUP2_UNPACKED_BYTES = 128 * 1024 * 1024
+# Independent AWS MCP DescribeRegions response pinned from the separately
+# collected read-only Group 2 source artifact. A changed region catalog or
+# opt-in status requires a fresh independent observation and reviewed pin.
+PINNED_GROUP2_REGIONS_RESPONSE_SHA256 = (
+    "f4e52f7420e339d831af2555ef035e75316cc01351296330ed68da7f119a6e00"
+)
+MAX_GROUP2_FILES = 2048
 MAX_APPROVAL_COMMENT_BYTES = 2048
 MAX_BUILD_JOB_AGE = timedelta(minutes=2)
 MAX_UI_CHECK_AGE = timedelta(minutes=5)
@@ -54,6 +67,9 @@ _ATTACHMENT_PATH = re.compile(
 )
 _MANIFEST_ATTACHMENT_PATH = re.compile(
     r"/user-attachments/files/[1-9][0-9]*/[A-Za-z0-9][A-Za-z0-9_-]{0,80}\.json"
+)
+_BUNDLE_ATTACHMENT_PATH = re.compile(
+    r"/user-attachments/files/[1-9][0-9]*/[A-Za-z0-9][A-Za-z0-9_-]{0,80}\.zip"
 )
 
 
@@ -119,6 +135,7 @@ def _is_allowed_attachment_redirect(url: str) -> bool:
         return (
             _ATTACHMENT_PATH.fullmatch(parsed.path) is not None
             or _MANIFEST_ATTACHMENT_PATH.fullmatch(parsed.path) is not None
+            or _BUNDLE_ATTACHMENT_PATH.fullmatch(parsed.path) is not None
         )
     return hostname == "githubusercontent.com" or hostname.endswith(
         ".githubusercontent.com"
@@ -152,6 +169,21 @@ def _validate_manifest_ref(url: str) -> None:
         and not parsed.query
         and not parsed.fragment,
         "approval_manifest_ref_invalid",
+    )
+
+
+def _validate_group2_bundle_ref(url: str) -> None:
+    parsed = urlsplit(url)
+    _require(
+        parsed.scheme == "https"
+        and parsed.hostname == "github.com"
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.port is None
+        and _BUNDLE_ATTACHMENT_PATH.fullmatch(parsed.path) is not None
+        and not parsed.query
+        and not parsed.fragment,
+        "approval_group2_bundle_ref_invalid",
     )
 
 
@@ -675,6 +707,163 @@ def _fetch_github_manifest(url: str) -> bytes:
         raise ApprovalGateError("approval_manifest_download_failed") from None
 
 
+def _fetch_group2_bundle(url: str) -> bytes:
+    _validate_group2_bundle_ref(url)
+    request = Request(
+        url,
+        headers={"Accept": "application/zip", "Cache-Control": "no-cache"},
+        method="GET",
+    )
+    try:
+        with build_opener(_GitHubAttachmentRedirect()).open(
+            request, timeout=30
+        ) as response:
+            status = getattr(response, "status", None)
+            if status is None:
+                status = response.getcode()
+            _require(status == 200, "approval_group2_bundle_download_failed")
+            _require(
+                _is_allowed_attachment_redirect(response.geturl()),
+                "approval_group2_bundle_ref_invalid",
+            )
+            _require(
+                response.headers.get_content_type()
+                in {"application/zip", "application/octet-stream"},
+                "approval_group2_bundle_media_type_invalid",
+            )
+            raw = response.read(MAX_GROUP2_BUNDLE_BYTES + 1)
+            _require(
+                len(raw) <= MAX_GROUP2_BUNDLE_BYTES,
+                "approval_group2_bundle_too_large",
+            )
+            return raw
+    except ApprovalGateError:
+        raise
+    except (HTTPError, URLError, OSError):
+        raise ApprovalGateError("approval_group2_bundle_download_failed") from None
+
+
+def _validate_group2_bundle(raw: bytes, expected_sha256: str) -> dict[str, str]:
+    _require(
+        isinstance(raw, bytes) and 1 <= len(raw) <= MAX_GROUP2_BUNDLE_BYTES,
+        "approval_group2_bundle_invalid",
+    )
+    actual_sha256 = hashlib.sha256(raw).hexdigest()
+    _require(
+        actual_sha256 == expected_sha256,
+        "approval_group2_bundle_digest_mismatch",
+    )
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(raw))
+    except (OSError, zipfile.BadZipFile):
+        raise ApprovalGateError("approval_group2_bundle_invalid") from None
+    with archive:
+        infos = archive.infolist()
+        _require(0 < len(infos) <= MAX_GROUP2_FILES, "approval_group2_bundle_invalid")
+        names: set[str] = set()
+        total_size = 0
+        snapshot_names = 0
+        for info in infos:
+            name = info.filename
+            _require(
+                isinstance(name, str)
+                and name
+                and "\\" not in name
+                and not name.startswith("/")
+                and not (len(name) >= 2 and name[1] == ":"),
+                "approval_group2_bundle_path_invalid",
+            )
+            parts = name.rstrip("/").split("/")
+            _require(
+                all(part not in {"", ".", ".."} for part in parts),
+                "approval_group2_bundle_path_invalid",
+            )
+            normalized = "/".join(parts)
+            _require(
+                normalized not in names,
+                "approval_group2_bundle_duplicate_path",
+            )
+            names.add(normalized)
+            _require(not info.flag_bits & 0x1, "approval_group2_bundle_encrypted")
+            mode = (info.external_attr >> 16) & 0xFFFF
+            _require(not stat.S_ISLNK(mode), "approval_group2_bundle_symlink_invalid")
+            if info.is_dir():
+                continue
+            total_size += info.file_size
+            _require(
+                total_size <= MAX_GROUP2_UNPACKED_BYTES,
+                "approval_group2_bundle_unpacked_too_large",
+            )
+            if normalized == "snapshot.json":
+                snapshot_names += 1
+        _require(snapshot_names == 1, "approval_group2_bundle_snapshot_missing")
+
+        validator_path = _SCRIPT_DIR / "validate_asaas_producer_release_readbacks.py"
+        validator_spec = importlib.util.spec_from_file_location(
+            "asaas_group2_readback_validator", validator_path
+        )
+        if validator_spec is None or validator_spec.loader is None:
+            raise ApprovalGateError("approval_group2_validator_unavailable") from None
+        validator = importlib.util.module_from_spec(validator_spec)
+        try:
+            validator_spec.loader.exec_module(validator)
+        except ImportError:
+            raise ApprovalGateError("approval_group2_validator_unavailable") from None
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="asaas-group2-") as temporary_root:
+                root = Path(temporary_root)
+                root.chmod(0o700)
+                for info in infos:
+                    if info.is_dir():
+                        target = root.joinpath(*info.filename.rstrip("/").split("/"))
+                        target.mkdir(parents=True, exist_ok=True, mode=0o700)
+                        target.chmod(0o700)
+                        continue
+                    target = root.joinpath(*info.filename.split("/"))
+                    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    target.parent.chmod(0o700)
+                    contents = archive.read(info)
+                    _require(
+                        len(contents) == info.file_size,
+                        "approval_group2_bundle_invalid",
+                    )
+                    with target.open("xb") as handle:
+                        handle.write(contents)
+                    target.chmod(0o600)
+                snapshot_path = root / "snapshot.json"
+                snapshot = _loads_strict_json(
+                    snapshot_path.read_bytes(),
+                    reason="approval_group2_snapshot_invalid",
+                )
+                errors = validator.validate_snapshot(
+                    snapshot,
+                    evidence_root=root,
+                    expected_describe_regions_response_sha256=(
+                        PINNED_GROUP2_REGIONS_RESPONSE_SHA256
+                    ),
+                )
+                _require(
+                    not any(
+                        error.endswith(
+                            "describe_regions_artifact.document.response_sha256_pinned: mismatch"
+                        )
+                        for error in errors
+                    ),
+                    "approval_group2_regions_source_unpinned",
+                )
+                _require(not errors, "approval_group2_snapshot_invalid")
+                snapshot_sha256 = validator.canonical_snapshot_readback_sha256(snapshot)
+        except ApprovalGateError:
+            raise
+        except (OSError, RuntimeError, ValueError, zipfile.BadZipFile):
+            raise ApprovalGateError("approval_group2_bundle_invalid") from None
+    return {
+        "bundle_sha256": actual_sha256,
+        "snapshot_sha256": snapshot_sha256,
+    }
+
+
 def _api_get(path: str, token: str) -> dict | list:
     url = path if path.startswith("https://") else API_ROOT + path
     parsed = urlsplit(url)
@@ -794,6 +983,7 @@ def _parse_approval_comment(
         "ref",
         "workflow_path",
         "environment",
+        "approval_gate",
         "checked_at_utc",
         "reviewer_id",
         "reviewer_login",
@@ -804,6 +994,8 @@ def _parse_approval_comment(
         "checks",
         "manifest_ref",
         "manifest_sha256",
+        "group2_bundle_ref",
+        "group2_bundle_sha256",
         "screenshots",
         "evidence_ref",
         "evidence_label",
@@ -827,6 +1019,7 @@ def _parse_approval_comment(
         "approval_preflight_digest_invalid",
     )
     _validate_manifest_ref(values["manifest_ref"])
+    _validate_group2_bundle_ref(values["group2_bundle_ref"])
     _validate_attachment_ref(values["evidence_ref"])
     screenshots = values["screenshots"]
     labels = {"ruleset", "asaas-build", "asaas-production-deployment"}
@@ -852,7 +1045,7 @@ def _parse_approval_comment(
         len(refs) == len(labels) and len(screenshot_digests) == len(labels),
         "approval_comment_screenshots_invalid",
     )
-    for key in ("manifest_sha256", "evidence_sha256"):
+    for key in ("manifest_sha256", "evidence_sha256", "group2_bundle_sha256"):
         _require(
             isinstance(values[key], str)
             and re.fullmatch(r"[0-9a-f]{64}", values[key]) is not None,
@@ -885,15 +1078,19 @@ def _validate_ui_manifest(
         "run_attempt",
         "workflow_path",
         "sha",
+        "preflight_sha256",
         "ref",
         "environment",
+        "approval_gate",
         "checked_at_utc",
+        "group2_bundle_ref",
+        "group2_bundle_sha256",
         "checks",
         "screenshots_sha256",
     }
     _require(set(manifest) == required, "approval_manifest_fields_invalid")
     _require(
-        manifest["schema_version"] == "neurostack.asaas_build_ui_evidence_manifest.v2",
+        manifest["schema_version"] == "neurostack.asaas_build_ui_evidence_manifest.v4",
         "approval_manifest_schema_invalid",
     )
     for key in (
@@ -901,9 +1098,13 @@ def _validate_ui_manifest(
         "run_attempt",
         "workflow_path",
         "sha",
+        "preflight_sha256",
         "ref",
         "environment",
+        "approval_gate",
         "checked_at_utc",
+        "group2_bundle_ref",
+        "group2_bundle_sha256",
     ):
         _require(
             manifest[key] == comment[key],
@@ -955,6 +1156,73 @@ def _validate_ui_manifest(
         "approval_evidence_label_digest_mismatch",
     )
     return manifest
+
+
+def _verify_approval_package(
+    comment: str,
+    *,
+    expected: dict[str, str],
+    approval_gate: str,
+    preflight_at: datetime,
+    job_started_at: datetime,
+    fetch_manifest,
+    fetch_evidence,
+    fetch_group2_bundle,
+    expected_sha256: str = "",
+    expected_checked_at_utc: str = "",
+) -> dict[str, object]:
+    fields = _parse_approval_comment(comment, expected=expected)
+    _require(fields["approval_gate"] == approval_gate, "approval_gate_mismatch")
+    checked_at = _canonical_timestamp(fields["checked_at_utc"])
+    _require(
+        checked_at <= job_started_at,
+        f"{approval_gate}_approval_check_after_job_start",
+    )
+    _require(
+        job_started_at - checked_at <= MAX_UI_CHECK_AGE,
+        f"{approval_gate}_approval_check_stale",
+    )
+    _require(checked_at >= preflight_at, "approval_ui_check_before_preflight")
+    if expected_checked_at_utc:
+        _require(
+            checked_at == _canonical_timestamp(expected_checked_at_utc),
+            "approval_checked_at_changed_after_no_oidc_gate",
+        )
+    manifest_bytes = fetch_manifest(fields["manifest_ref"])
+    manifest = _validate_ui_manifest(
+        manifest_bytes,
+        expected_sha256=fields["manifest_sha256"],
+        comment=fields,
+    )
+    verified: dict[str, bytes] = {}
+    for label, screenshot in fields["screenshots"].items():
+        screenshot_bytes = fetch_evidence(screenshot["ref"])
+        _validate_png(screenshot_bytes)
+        _require(
+            hashlib.sha256(screenshot_bytes).hexdigest() == screenshot["sha256"],
+            "approval_evidence_digest_mismatch",
+        )
+        verified[label] = screenshot_bytes
+    group2_bytes = fetch_group2_bundle(fields["group2_bundle_ref"])
+    group2 = _validate_group2_bundle(group2_bytes, fields["group2_bundle_sha256"])
+    selected = verified[fields["evidence_label"]]
+    selected_sha256 = hashlib.sha256(selected).hexdigest()
+    if expected_sha256:
+        _require(
+            re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is not None,
+            "approval_expected_evidence_digest_invalid",
+        )
+        _require(
+            selected_sha256 == expected_sha256,
+            "approval_evidence_changed_after_no_oidc_gate",
+        )
+    return {
+        "fields": fields,
+        "manifest": manifest,
+        "selected": selected,
+        "selected_sha256": selected_sha256,
+        "group2": group2,
+    }
 
 
 def _controls_snapshot(
@@ -1034,10 +1302,12 @@ def verify_environment_approval(
     get_collection=None,
     get_evidence=None,
     get_manifest=None,
+    get_group2_bundle=None,
     now: datetime | None = None,
     phase: str = "build",
     expected_evidence_sha256: str = "",
     expected_checked_at_utc: str = "",
+    expected_group2_bundle_sha256: str = "",
 ) -> dict[str, str]:
     get = _api_get if get_json is None else get_json
     collect = _PREFLIGHT.github_collection if get_collection is None else get_collection
@@ -1047,7 +1317,32 @@ def verify_environment_approval(
         if get_manifest is None and get_evidence is None
         else get_evidence if get_manifest is None else get_manifest
     )
+    fetch_group2_bundle = (
+        (_fetch_group2_bundle if get_evidence is None else get_evidence)
+        if get_group2_bundle is None
+        else get_group2_bundle
+    )
     _require(phase in {"evidence", "build"}, "approval_phase_invalid")
+    if phase == "build":
+        expected_evidence_sha256 = expected_evidence_sha256 or env.get(
+            "EXPECTED_APPROVAL_EVIDENCE_SHA256", ""
+        )
+        expected_checked_at_utc = expected_checked_at_utc or env.get(
+            "EXPECTED_UI_CHECKED_AT_UTC", ""
+        )
+        expected_group2_bundle_sha256 = expected_group2_bundle_sha256 or env.get(
+            "EXPECTED_GROUP2_BUNDLE_SHA256", ""
+        )
+    if phase == "build":
+        _require(
+            re.fullmatch(r"[0-9a-f]{64}", expected_evidence_sha256) is not None
+            and bool(expected_checked_at_utc),
+            "approval_no_oidc_outputs_missing",
+        )
+        _require(
+            re.fullmatch(r"[0-9a-f]{64}", expected_group2_bundle_sha256) is not None,
+            "approval_no_oidc_group2_output_missing",
+        )
     token = env.get("GH_TOKEN", "")
     _require(bool(token), "github_read_token_unavailable")
     run_id = env.get("GITHUB_RUN_ID", "")
@@ -1264,8 +1559,20 @@ def verify_environment_approval(
             ui_approval_jobs[0].get("started_at"),
             field="actions_ui_evidence_job_timestamp",
         )
+        ui_job_completed_at = _api_timestamp(
+            ui_approval_jobs[0].get("completed_at"),
+            field="actions_ui_evidence_job_timestamp",
+        )
+        _require(
+            ui_job_started_at <= ui_job_completed_at,
+            "actions_ui_evidence_job_timestamp_invalid",
+        )
         gate_job_started_at = _api_timestamp(
             build_jobs[0].get("started_at"), field="actions_build_job_timestamp"
+        )
+        _require(
+            ui_job_completed_at <= gate_job_started_at,
+            "actions_build_job_started_before_ui_evidence_completion",
         )
     _require(
         preflight_at <= gate_job_started_at <= current_time + timedelta(seconds=30),
@@ -1356,8 +1663,9 @@ def verify_environment_approval(
         if isinstance(entry.get("comment"), str) and entry.get("comment")
     ]
     _require(
-        len(approval_comments) >= 1 and len(set(approval_comments)) == 1,
-        "approval_evidence_comment_missing_or_mismatched",
+        len(approval_comments) == expected_approval_count
+        and len(set(approval_comments)) == expected_approval_count,
+        "approval_phase_comments_missing_reused_or_mismatched",
     )
     comment_expected = {
         "run_id": run_id,
@@ -1370,52 +1678,92 @@ def verify_environment_approval(
         "reviewer_login": user["login"],
         "preflight_sha256": preflight_digest,
     }
-    comment_fields = _parse_approval_comment(
-        approval_comments[0],
-        expected=comment_expected,
-    )
-    checked_at = _canonical_timestamp(comment_fields["checked_at_utc"])
+    comments_by_gate: dict[str, str] = {}
+    for approval_comment in approval_comments:
+        parsed = _parse_approval_comment(approval_comment, expected=comment_expected)
+        approval_gate = parsed["approval_gate"]
+        _require(
+            approval_gate in {"evidence", "build"}
+            and approval_gate not in comments_by_gate,
+            "approval_phase_comments_missing_reused_or_mismatched",
+        )
+        comments_by_gate[approval_gate] = approval_comment
+    required_gates = {"evidence"} if phase == "evidence" else {"evidence", "build"}
     _require(
-        checked_at <= ui_job_started_at,
-        "approval_ui_check_after_evidence_job_start",
+        set(comments_by_gate) == required_gates,
+        "approval_phase_comments_missing_reused_or_mismatched",
     )
-    _require(
-        ui_job_started_at - checked_at <= MAX_UI_CHECK_AGE,
-        "approval_ui_check_stale",
+    package_evidence = _verify_approval_package(
+        comments_by_gate["evidence"],
+        expected={**comment_expected, "approval_gate": "evidence"},
+        approval_gate="evidence",
+        preflight_at=preflight_at,
+        job_started_at=ui_job_started_at,
+        fetch_manifest=fetch_manifest,
+        fetch_evidence=fetch_evidence,
+        fetch_group2_bundle=fetch_group2_bundle,
+        expected_sha256=expected_evidence_sha256 if phase == "build" else "",
+        expected_checked_at_utc=expected_checked_at_utc if phase == "build" else "",
     )
-    _require(checked_at >= preflight_at, "approval_ui_check_before_preflight")
-    if expected_checked_at_utc:
+    if phase == "build":
         _require(
-            _canonical_timestamp(expected_checked_at_utc) == checked_at,
-            "approval_checked_at_changed_after_no_oidc_gate",
+            package_evidence["group2"]["bundle_sha256"]
+            == expected_group2_bundle_sha256,
+            "approval_group2_bundle_changed_after_no_oidc_gate",
         )
-    manifest_bytes = fetch_manifest(comment_fields["manifest_ref"])
-    manifest = _validate_ui_manifest(
-        manifest_bytes,
-        expected_sha256=comment_fields["manifest_sha256"],
-        comment=comment_fields,
-    )
-    verified_screenshots: dict[str, bytes] = {}
-    for label, screenshot in comment_fields["screenshots"].items():
-        screenshot_bytes = fetch_evidence(screenshot["ref"])
-        _validate_png(screenshot_bytes)
-        actual_digest = hashlib.sha256(screenshot_bytes).hexdigest()
+    packages = {"evidence": package_evidence}
+    if phase == "build":
+        package_build = _verify_approval_package(
+            comments_by_gate["build"],
+            expected={**comment_expected, "approval_gate": "build"},
+            approval_gate="build",
+            preflight_at=preflight_at,
+            job_started_at=gate_job_started_at,
+            fetch_manifest=fetch_manifest,
+            fetch_evidence=fetch_evidence,
+            fetch_group2_bundle=fetch_group2_bundle,
+        )
+        evidence_fields = package_evidence["fields"]
+        build_fields = package_build["fields"]
         _require(
-            actual_digest == screenshot["sha256"],
-            "approval_evidence_digest_mismatch",
+            evidence_fields["checked_at_utc"] != build_fields["checked_at_utc"]
+            and evidence_fields["manifest_sha256"] != build_fields["manifest_sha256"]
+            and evidence_fields["manifest_ref"] != build_fields["manifest_ref"]
+            and {
+                item["ref"] for item in evidence_fields["screenshots"].values()
+            }.isdisjoint(
+                {item["ref"] for item in build_fields["screenshots"].values()}
+            ),
+            "approval_package_reused_between_gates",
         )
-        verified_screenshots[label] = screenshot_bytes
-    evidence_bytes = verified_screenshots[comment_fields["evidence_label"]]
-    actual_evidence_sha256 = hashlib.sha256(evidence_bytes).hexdigest()
-    if expected_evidence_sha256:
         _require(
-            re.fullmatch(r"[0-9a-f]{64}", expected_evidence_sha256) is not None,
-            "approval_expected_evidence_digest_invalid",
+            _canonical_timestamp(build_fields["checked_at_utc"]) >= ui_job_completed_at,
+            "build_approval_ui_check_before_evidence_job_completed",
         )
         _require(
-            actual_evidence_sha256 == expected_evidence_sha256,
-            "approval_evidence_changed_after_no_oidc_gate",
+            {
+                item["sha256"] for item in evidence_fields["screenshots"].values()
+            }.isdisjoint(
+                {item["sha256"] for item in build_fields["screenshots"].values()}
+            ),
+            "approval_screenshot_bytes_reused_between_gates",
         )
+        _require(
+            package_evidence["group2"] == package_build["group2"]
+            and evidence_fields["group2_bundle_ref"]
+            == build_fields["group2_bundle_ref"],
+            "approval_group2_bundle_changed_between_gates",
+        )
+        _require(
+            ui_job_started_at < gate_job_started_at,
+            "actions_build_job_must_start_after_evidence_job",
+        )
+        packages["build"] = package_build
+    selected_package = packages[phase]
+    comment_fields = selected_package["fields"]
+    manifest = selected_package["manifest"]
+    evidence_bytes = selected_package["selected"]
+    actual_evidence_sha256 = selected_package["selected_sha256"]
     observed_backend_trust_digest = ""
     observed_backend_probe_digest = ""
     try:
@@ -1458,6 +1806,9 @@ def verify_environment_approval(
         "evidence_size_bytes": str(len(evidence_bytes)),
         "manifest_ref": comment_fields["manifest_ref"],
         "manifest_sha256": comment_fields["manifest_sha256"],
+        "group2_bundle_ref": comment_fields["group2_bundle_ref"],
+        "group2_bundle_sha256": selected_package["group2"]["bundle_sha256"],
+        "group2_snapshot_sha256": selected_package["group2"]["snapshot_sha256"],
         "screenshots_sha256": json.dumps(
             manifest["screenshots_sha256"], sort_keys=True, separators=(",", ":")
         ),
@@ -1508,6 +1859,7 @@ def main() -> int:
     parser.add_argument("--phase", choices=("evidence", "build"), default="build")
     parser.add_argument("--expected-evidence-sha256", default="")
     parser.add_argument("--expected-checked-at-utc", default="")
+    parser.add_argument("--expected-group2-bundle-sha256", default="")
     parser.add_argument("--github-output", type=Path)
     args = parser.parse_args()
     try:
@@ -1516,6 +1868,7 @@ def main() -> int:
             phase=args.phase,
             expected_evidence_sha256=args.expected_evidence_sha256,
             expected_checked_at_utc=args.expected_checked_at_utc,
+            expected_group2_bundle_sha256=args.expected_group2_bundle_sha256,
         )
         _write_evidence(args.evidence_output, evidence)
         if args.github_output is not None:
@@ -1524,6 +1877,12 @@ def main() -> int:
                     f"approval_evidence_sha256={evidence['evidence_sha256']}\n"
                 )
                 output.write(f"ui_checked_at_utc={evidence['ui_checked_at_utc']}\n")
+                output.write(
+                    f"group2_bundle_sha256={evidence['group2_bundle_sha256']}\n"
+                )
+                output.write(
+                    f"group2_snapshot_sha256={evidence['group2_snapshot_sha256']}\n"
+                )
     except ApprovalGateError as exc:
         print(f"blocked: {exc}", file=sys.stderr)
         return 1
@@ -1549,6 +1908,8 @@ def main() -> int:
             f"- Evidence: `{evidence['evidence_ref']}`\n"
             f"- Evidence SHA-256: `{evidence['evidence_sha256']}`\n"
             f"- Manifest SHA-256: `{evidence['manifest_sha256']}`\n"
+            f"- Group 2 bundle SHA-256: `{evidence['group2_bundle_sha256']}`\n"
+            f"- Group 2 snapshot SHA-256: `{evidence['group2_snapshot_sha256']}`\n"
             f"- Screenshot SHA-256 values: `{evidence['screenshots_sha256']}`\n"
             f"- Evidence PNG verified: `{evidence['evidence_verified']}` ({evidence['evidence_size_bytes']} bytes)\n"
             f"- Approval gate: `{evidence['approval_gate']}`\n"

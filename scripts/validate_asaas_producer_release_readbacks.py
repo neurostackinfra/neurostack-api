@@ -31,11 +31,13 @@ authoritative AWS and GitHub reads. Its exact schema is enforced by this module:
   `public_key_der_base64`, canonical PEM, and `sha256:<hex>` fingerprint of the
   DER SubjectPublicKeyInfo bytes. Private key material must never be included.
 * `kms_authorization_inventory` references a private local artifact containing
-  the full `ec2:DescribeRegions(AllRegions=true)` response normalized to all
-  region names and opt-in statuses. The validator derives enabled regions from
-  those rows and requires exactly one completed key/grant pagination record
-  per enabled region. It also contains the inspected key count and all returned
-  keys. Each key has `arn`, complete
+  the AWS MCP `DescribeRegions` envelope (`service_name`, `operation_name`,
+  `region_name`, `request_params`, successful `api_calls`, the complete raw
+  `response`, its canonical response SHA-256, and `read_at_utc`). The validator
+  requires `AllRegions=true`, checks the response digest and API call count,
+  derives enabled regions from the raw `Regions` records, and requires exactly
+  one completed key/grant pagination record per enabled region. It also
+  contains the inspected key count and all returned keys. Each key has `arn`, complete
   `key_policy`, and all grants with `grantee_principal` and `operations`. This
   lets the validator detect task-role signing paths outside the two approved
   runtime keys.
@@ -88,6 +90,9 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TEMPLATE = ROOT / "infra/production/asaas-producer-release.yaml"
+PINNED_DESCRIBE_REGIONS_RESPONSE_SHA256 = (
+    "f4e52f7420e339d831af2555ef035e75316cc01351296330ed68da7f119a6e00"
+)
 
 ACCOUNT_ID = "388460142431"
 REGION = "us-east-1"
@@ -1044,6 +1049,7 @@ def _validate_describe_regions_artifact(
     evidence_root: Path | None,
     now_utc: datetime,
     errors: list[str],
+    expected_response_sha256: str | None = None,
 ) -> set[str]:
     content = _read_verified_artifact(
         value, path, evidence_root, errors, read_contents=True
@@ -1058,50 +1064,124 @@ def _validate_describe_regions_artifact(
     record = _exact_keys(
         artifact,
         {
-            "operation",
-            "all_regions",
-            "http_status",
-            "request_id",
+            "schema_version",
+            "source",
+            "service_name",
+            "operation_name",
+            "region_name",
+            "request_params",
+            "api_calls",
             "read_at_utc",
-            "region_count",
-            "regions",
+            "response",
+            "response_sha256",
         },
         f"{path}.document",
         errors,
     )
     _expect_equal(
-        record.get("operation"),
-        "ec2:DescribeRegions",
-        f"{path}.document.operation",
+        record.get("schema_version"),
+        "neurostack.aws_ec2_describe_regions_readback.v1",
+        f"{path}.document.schema_version",
         errors,
     )
     _expect_equal(
-        record.get("all_regions"), True, f"{path}.document.all_regions", errors
+        record.get("source"),
+        "aws_mcp__run_script.call_boto3",
+        f"{path}.document.source",
+        errors,
     )
     _expect_equal(
-        record.get("http_status"), 200, f"{path}.document.http_status", errors
+        record.get("service_name"), "ec2", f"{path}.document.service_name", errors
     )
-    if not _is_nonempty_string(record.get("request_id")):
-        errors.append(f"{path}.document.request_id: missing_request_id")
+    _expect_equal(
+        record.get("operation_name"),
+        "DescribeRegions",
+        f"{path}.document.operation_name",
+        errors,
+    )
+    _expect_equal(
+        record.get("region_name"),
+        "us-east-1",
+        f"{path}.document.region_name",
+        errors,
+    )
+    _expect_equal(
+        record.get("request_params"),
+        {"AllRegions": True},
+        f"{path}.document.request_params",
+        errors,
+    )
+    calls = _expect_list(record.get("api_calls"), f"{path}.document.api_calls", errors)
+    _expect_equal(len(calls), 1, f"{path}.document.api_calls.count", errors)
+    api_call = _expect_mapping(
+        calls[0] if calls else {}, f"{path}.document.api_calls[0]", errors
+    )
+    _expect_equal(
+        api_call.get("service"), "ec2", f"{path}.document.api_calls[0].service", errors
+    )
+    _expect_equal(
+        api_call.get("operation"),
+        "DescribeRegions",
+        f"{path}.document.api_calls[0].operation",
+        errors,
+    )
+    _expect_equal(
+        api_call.get("status"),
+        "success",
+        f"{path}.document.api_calls[0].status",
+        errors,
+    )
+    n_items = _expect_mapping(
+        api_call.get("n_items"), f"{path}.document.api_calls[0].n_items", errors
+    )
+    response = _exact_keys(
+        record.get("response"), {"Regions"}, f"{path}.document.response", errors
+    )
+    response_bytes = json.dumps(
+        response, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    _expect_equal(
+        record.get("response_sha256"),
+        hashlib.sha256(response_bytes).hexdigest(),
+        f"{path}.document.response_sha256",
+        errors,
+    )
+    if expected_response_sha256 is not None:
+        _expect_equal(
+            record.get("response_sha256"),
+            expected_response_sha256,
+            f"{path}.document.response_sha256_pinned",
+            errors,
+        )
     _validate_fresh_timestamp(
         record.get("read_at_utc"), f"{path}.document.read_at_utc", now_utc, errors
     )
-    rows = _expect_list(record.get("regions"), f"{path}.document.regions", errors)
-    region_count = record.get("region_count")
-    if (
-        isinstance(region_count, bool)
-        or not isinstance(region_count, int)
-        or region_count != len(rows)
-        or region_count <= 0
-    ):
-        errors.append(f"{path}.document.region_count: returned_count_mismatch")
+    raw_rows = _expect_list(
+        response.get("Regions"), f"{path}.document.response.Regions", errors
+    )
+    _expect_equal(
+        n_items,
+        {"Regions": len(raw_rows)},
+        f"{path}.document.api_calls[0].n_items",
+        errors,
+    )
+    for index, raw_value in enumerate(raw_rows):
+        raw_path = f"{path}.document.response.Regions[{index}]"
+        raw_row = _expect_mapping(raw_value, raw_path, errors)
+        name = raw_row.get("RegionName")
+        status = raw_row.get("OptInStatus")
+        if not isinstance(name, str) or not isinstance(status, str):
+            errors.append(f"{raw_path}: missing_region_fields")
+            continue
+    if not raw_rows:
+        errors.append(f"{path}.document.response.Regions: empty_response")
     all_regions: set[str] = set()
     enabled_regions: set[str] = set()
-    for index, row_value in enumerate(rows):
+    for index, row_value in enumerate(raw_rows):
         row_path = f"{path}.document.regions[{index}]"
-        row = _exact_keys(row_value, {"region_name", "opt_in_status"}, row_path, errors)
-        name = row.get("region_name")
-        status = row.get("opt_in_status")
+        row = _expect_mapping(row_value, row_path, errors)
+        name = row.get("RegionName")
+        status = row.get("OptInStatus")
         if (
             not isinstance(name, str)
             or re.fullmatch(r"[a-z]{2}(?:-gov)?-[a-z]+-\d", name) is None
@@ -1116,7 +1196,7 @@ def _validate_describe_regions_artifact(
         elif status in ("opt-in-not-required", "opted-in"):
             enabled_regions.add(name)
     if not enabled_regions:
-        errors.append(f"{path}.document.regions: no_enabled_regions")
+        errors.append(f"{path}.document.response.Regions: no_enabled_regions")
     return enabled_regions
 
 
@@ -1958,6 +2038,7 @@ def validate_snapshot(
     template_path: Path = DEFAULT_TEMPLATE,
     evidence_root: Path | None = None,
     now_utc: datetime | None = None,
+    expected_describe_regions_response_sha256: str | None = None,
 ) -> list[str]:
     """Return safe path-only failures; an empty list means every gate passed."""
     errors: list[str] = []
@@ -2377,6 +2458,7 @@ def validate_snapshot(
         evidence_root,
         now_utc,
         errors,
+        expected_describe_regions_response_sha256,
     )
     regional_scans = _expect_mapping(
         inventory.get("regional_scans"), f"{inventory_path}.regional_scans", errors
@@ -2914,7 +2996,14 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        errors = validate_snapshot(snapshot, args.template, evidence_path.parent)
+        errors = validate_snapshot(
+            snapshot,
+            args.template,
+            evidence_path.parent,
+            expected_describe_regions_response_sha256=(
+                PINNED_DESCRIBE_REGIONS_RESPONSE_SHA256
+            ),
+        )
     if errors:
         print("readback validation failed:", file=sys.stderr)
         for error in errors:

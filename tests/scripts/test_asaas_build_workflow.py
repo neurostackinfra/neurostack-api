@@ -9,7 +9,9 @@ import json
 import re
 import struct
 import subprocess
+import tempfile
 import zlib
+import zipfile
 from datetime import datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
@@ -52,10 +54,19 @@ _EVIDENCE_URL = (
     "https://github.com/user-attachments/assets/" "12345678-1234-4abc-8def-0123456789ab"
 )
 _MANIFEST_URL = "https://github.com/user-attachments/files/1234567890/manifest.json"
+_BUILD_MANIFEST_URL = (
+    "https://github.com/user-attachments/files/1234567891/manifest.json"
+)
+_GROUP2_BUNDLE_URL = "https://github.com/user-attachments/files/1234567892/group2.zip"
 _SCREENSHOT_URLS = {
     "ruleset": _EVIDENCE_URL,
     "asaas-build": "https://github.com/user-attachments/assets/22345678-1234-4abc-8def-0123456789ab",
     "asaas-production-deployment": "https://github.com/user-attachments/assets/32345678-1234-4abc-8def-0123456789ab",
+}
+_BUILD_SCREENSHOT_URLS = {
+    "ruleset": "https://github.com/user-attachments/assets/42345678-1234-4abc-8def-0123456789ab",
+    "asaas-build": "https://github.com/user-attachments/assets/52345678-1234-4abc-8def-0123456789ab",
+    "asaas-production-deployment": "https://github.com/user-attachments/assets/62345678-1234-4abc-8def-0123456789ab",
 }
 
 
@@ -65,10 +76,104 @@ def _canonical_test_json(value):
     ).encode("ascii")
 
 
+_GROUP2_BUNDLE_BYTES = None
+
+
+def _group2_bundle_bytes():
+    global _GROUP2_BUNDLE_BYTES
+    if _GROUP2_BUNDLE_BYTES is not None:
+        return _GROUP2_BUNDLE_BYTES
+    fixture_script = (
+        Path(__file__).resolve().parent / "test_asaas_producer_release_readbacks.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "asaas_release_readback_fixture", fixture_script
+    )
+    assert spec is not None and spec.loader is not None
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    with tempfile.TemporaryDirectory(prefix="asaas-group2-test-") as temporary:
+        root = Path(temporary)
+        snapshot = fixture.synthetic_snapshot(root)
+        snapshot_path = root / "snapshot.json"
+        snapshot_path.write_bytes(_canonical_test_json(snapshot))
+        snapshot_path.chmod(0o600)
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in sorted(root.rglob("*")):
+                if path.is_file():
+                    archive.write(path, path.relative_to(root).as_posix())
+        _GROUP2_BUNDLE_BYTES = buffer.getvalue()
+    return _GROUP2_BUNDLE_BYTES
+
+
+def _paired_omission_group2_bundle_bytes():
+    fixture_script = (
+        Path(__file__).resolve().parent / "test_asaas_producer_release_readbacks.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "asaas_release_omission_fixture", fixture_script
+    )
+    assert spec is not None and spec.loader is not None
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    with tempfile.TemporaryDirectory(prefix="asaas-group2-omission-test-") as temporary:
+        root = Path(temporary)
+        snapshot = fixture.synthetic_snapshot(root)
+        artifact = root / "aws/describe-regions.json"
+        document = json.loads(artifact.read_text(encoding="utf-8"))
+        response_regions = document["response"]["Regions"]
+        omitted = next(
+            region for region in response_regions if region["RegionName"] == "us-east-2"
+        )
+        response_regions.remove(omitted)
+        document["api_calls"][0]["n_items"]["Regions"] -= 1
+        document["response_sha256"] = hashlib.sha256(
+            _canonical_test_json(document["response"])
+        ).hexdigest()
+        artifact.write_bytes(_canonical_test_json(document))
+        artifact.chmod(0o600)
+        inventory = snapshot["aws"]["kms_authorization_inventory"]
+        inventory["describe_regions_artifact"]["sha256"] = hashlib.sha256(
+            artifact.read_bytes()
+        ).hexdigest()
+        inventory["regional_scans"].pop("us-east-2")
+        inventory["keys"] = [
+            key for key in inventory["keys"] if ":us-east-2:" not in key["arn"]
+        ]
+        inventory["inspected_key_count"] -= 1
+        fixture._refresh_attestation_digests(snapshot, root)
+        snapshot_path = root / "snapshot.json"
+        snapshot_path.write_bytes(_canonical_test_json(snapshot))
+        snapshot_path.chmod(0o600)
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in sorted(root.rglob("*")):
+                if path.is_file():
+                    archive.write(path, path.relative_to(root).as_posix())
+        return buffer.getvalue()
+
+
 def _update_approval_comment(comment, **updates):
     value = json.loads(comment)
     value.update(updates)
     return _canonical_test_json(value).decode("ascii")
+
+
+def _update_package_comment(
+    api, approval, *, comment_updates=None, manifest_updates=None
+):
+    payload = json.loads(approval["comment"])
+    manifest_url = payload["manifest_ref"]
+    manifest = json.loads(api["manifest_by_url"][manifest_url])
+    manifest.update(manifest_updates or {})
+    manifest_bytes = _canonical_test_json(manifest)
+    api["manifest_by_url"][manifest_url] = manifest_bytes
+    if manifest_url == _MANIFEST_URL:
+        api["manifest_bytes"] = manifest_bytes
+    payload["manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
+    payload.update(comment_updates or {})
+    approval["comment"] = _canonical_test_json(payload).decode("ascii")
 
 
 def _workflow() -> tuple[str, dict]:
@@ -124,13 +229,23 @@ def _indexed_png(sample_byte: int, palette_entries: int = 2) -> bytes:
     )
 
 
-def _approval_module():
+def _approval_module(*, fixture_regions_pin=True):
     spec = importlib.util.spec_from_file_location(
         "asaas_build_approval_test", _APPROVAL_SCRIPT
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # The workflow verifier pins the independently collected DescribeRegions
+    # response. Approval fixtures use their own complete synthetic source.
+    if fixture_regions_pin:
+        with zipfile.ZipFile(io.BytesIO(_group2_bundle_bytes())) as archive:
+            snapshot = json.loads(archive.read("snapshot.json"))
+            artifact_ref = snapshot["aws"]["kms_authorization_inventory"][
+                "describe_regions_artifact"
+            ]
+            source = json.loads(archive.read(artifact_ref["path"]))
+        module.PINNED_GROUP2_REGIONS_RESPONSE_SHA256 = source["response_sha256"]
     return module
 
 
@@ -759,7 +874,8 @@ def test_preflight_writes_run_bound_admin_approval_instructions(
     assert f"API readback SHA-256: `{'c' * 64}`" in text
     assert f"Backend build-trust readback SHA-256: `{'d' * 64}`" in text
     assert "Backend origin: `https://staging.api.neurostack.global`" in text
-    assert "neurostack.asaas_build_ui_attestation.v4" in text
+    assert "neurostack.asaas_build_ui_attestation.v6" in text
+    assert '"approval_gate": "evidence"' in text
     assert '"manifest_sha256": "<64-lowercase-hex>"' in text
     assert '"checks": {' in text
     assert (
@@ -942,7 +1058,7 @@ def test_preflight_emits_readback_digest_before_environment_approval(
     assert (
         "Independent administrator UI review required before approval" in summary_text
     )
-    assert "neurostack.asaas_build_ui_attestation.v4" in summary_text
+    assert "neurostack.asaas_build_ui_attestation.v6" in summary_text
     assert '"manifest_ref"' in summary_text and '"checks"' in summary_text
 
 
@@ -1096,12 +1212,12 @@ def _approval_gate_fixture(now: datetime):
             _png_chunk(b"tEXt", b"deployment\0reviewed")
         ),
     }
-    screenshot_hashes = {
-        label: hashlib.sha256(contents).hexdigest()
-        for label, contents in screenshot_bytes.items()
+    build_screenshot_bytes = {
+        label: _png_before_idat(
+            _png_chunk(b"tEXt", b"new build gate\0" + label.encode())
+        )
+        for label in screenshot_bytes
     }
-    evidence_digest = screenshot_hashes["ruleset"]
-    checked_at = "2026-10-16T04:59:34.000000Z"
     checks = {
         "ruleset_bypass_empty": True,
         "asaas_build_admin_bypass_disabled": True,
@@ -1109,48 +1225,98 @@ def _approval_gate_fixture(now: datetime):
         "asaas_production_admin_bypass_disabled": True,
         "asaas_production_branch_only_main": True,
     }
-    manifest = {
-        "schema_version": "neurostack.asaas_build_ui_evidence_manifest.v2",
-        "run_id": run_id,
-        "run_attempt": "2",
-        "workflow_path": ".github/workflows/asaas-build-attestation.yml",
-        "sha": sha,
-        "ref": "refs/heads/main",
-        "environment": "asaas-build",
-        "checked_at_utc": checked_at,
-        "checks": checks,
-        "screenshots_sha256": screenshot_hashes,
-    }
-    manifest_bytes = _canonical_test_json(manifest)
-    manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
-    api = {"manifest_bytes": manifest_bytes}
-    comment_payload = {
-        "schema_version": "neurostack.asaas_build_ui_attestation.v4",
-        "run_id": run_id,
-        "run_attempt": "2",
-        "sha": sha,
-        "ref": "refs/heads/main",
-        "workflow_path": ".github/workflows/asaas-build-attestation.yml",
-        "environment": "asaas-build",
-        "checked_at_utc": checked_at,
-        "reviewer_id": "42",
-        "reviewer_login": "felps-json",
-        "preflight_sha256": preflight_digest,
-        "ruleset_bypass": "empty",
-        "environment_admin_bypass": "disabled",
-        "branch_policy": "main-only",
-        "checks": checks,
-        "manifest_ref": _MANIFEST_URL,
-        "manifest_sha256": manifest_digest,
-        "screenshots": {
-            label: {"ref": _SCREENSHOT_URLS[label], "sha256": screenshot_hashes[label]}
-            for label in screenshot_hashes
+
+    def make_package(gate, checked_at, images, manifest_url, screenshot_urls):
+        screenshot_hashes = {
+            label: hashlib.sha256(contents).hexdigest()
+            for label, contents in images.items()
+        }
+        manifest = {
+            "schema_version": "neurostack.asaas_build_ui_evidence_manifest.v4",
+            "run_id": run_id,
+            "run_attempt": "2",
+            "workflow_path": ".github/workflows/asaas-build-attestation.yml",
+            "sha": sha,
+            "preflight_sha256": preflight_digest,
+            "ref": "refs/heads/main",
+            "environment": "asaas-build",
+            "approval_gate": gate,
+            "checked_at_utc": checked_at,
+            "group2_bundle_ref": _GROUP2_BUNDLE_URL,
+            "group2_bundle_sha256": hashlib.sha256(_group2_bundle_bytes()).hexdigest(),
+            "checks": checks,
+            "screenshots_sha256": screenshot_hashes,
+        }
+        manifest_bytes = _canonical_test_json(manifest)
+        comment_payload = {
+            "schema_version": "neurostack.asaas_build_ui_attestation.v6",
+            "run_id": run_id,
+            "run_attempt": "2",
+            "sha": sha,
+            "ref": "refs/heads/main",
+            "workflow_path": ".github/workflows/asaas-build-attestation.yml",
+            "environment": "asaas-build",
+            "approval_gate": gate,
+            "checked_at_utc": checked_at,
+            "reviewer_id": "42",
+            "reviewer_login": "felps-json",
+            "preflight_sha256": preflight_digest,
+            "ruleset_bypass": "empty",
+            "environment_admin_bypass": "disabled",
+            "branch_policy": "main-only",
+            "checks": checks,
+            "manifest_ref": manifest_url,
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "group2_bundle_ref": _GROUP2_BUNDLE_URL,
+            "group2_bundle_sha256": hashlib.sha256(_group2_bundle_bytes()).hexdigest(),
+            "screenshots": {
+                label: {
+                    "ref": screenshot_urls[label],
+                    "sha256": screenshot_hashes[label],
+                }
+                for label in screenshot_hashes
+            },
+            "evidence_ref": screenshot_urls["ruleset"],
+            "evidence_label": "ruleset",
+            "evidence_sha256": screenshot_hashes["ruleset"],
+        }
+        return _canonical_test_json(comment_payload).decode("ascii"), manifest_bytes
+
+    comment, manifest_bytes = make_package(
+        "evidence",
+        "2026-10-16T04:59:34.000000Z",
+        screenshot_bytes,
+        _MANIFEST_URL,
+        _SCREENSHOT_URLS,
+    )
+    build_comment, build_manifest_bytes = make_package(
+        "build",
+        "2026-10-16T04:59:43.000000Z",
+        build_screenshot_bytes,
+        _BUILD_MANIFEST_URL,
+        _BUILD_SCREENSHOT_URLS,
+    )
+    api = {
+        "manifest_bytes": manifest_bytes,
+        "manifest_by_url": {
+            _MANIFEST_URL: manifest_bytes,
+            _BUILD_MANIFEST_URL: build_manifest_bytes,
         },
-        "evidence_ref": _EVIDENCE_URL,
-        "evidence_label": "ruleset",
-        "evidence_sha256": evidence_digest,
+        "screenshots_by_url": {
+            **{
+                _SCREENSHOT_URLS[label]: value
+                for label, value in screenshot_bytes.items()
+            },
+            **{
+                _BUILD_SCREENSHOT_URLS[label]: value
+                for label, value in build_screenshot_bytes.items()
+            },
+        },
+        "group2_bundle_by_url": {
+            _GROUP2_BUNDLE_URL: _group2_bundle_bytes(),
+        },
     }
-    comment = _canonical_test_json(comment_payload).decode("ascii")
+    package_artifacts = api
     repository = {
         "full_name": "neurostackinfra/neurostack-api",
         "id": 1152335815,
@@ -1186,6 +1352,9 @@ def _approval_gate_fixture(now: datetime):
     }
     api = {
         "manifest_bytes": manifest_bytes,
+        "manifest_by_url": package_artifacts["manifest_by_url"],
+        "screenshots_by_url": package_artifacts["screenshots_by_url"],
+        "group2_bundle_by_url": package_artifacts["group2_bundle_by_url"],
         "https://api.github.com/repos/neurostackinfra/neurostack-api": repository,
         f"https://api.github.com/repos/neurostackinfra/neurostack-api/actions/runs/{run_id}": run,
         "https://api.github.com/repos/neurostackinfra/neurostack-api/git/ref/heads/main": {
@@ -1196,7 +1365,7 @@ def _approval_gate_fixture(now: datetime):
             approval,
             {
                 **copy.deepcopy(approval),
-                "comment": "",
+                "comment": build_comment,
                 "environments": [
                     {
                         "name": "asaas-build",
@@ -1237,6 +1406,10 @@ def _approval_gate_fixture(now: datetime):
         "ASAAS_PREFLIGHT_OBSERVED_AT": (now - timedelta(minutes=2))
         .isoformat(timespec="microseconds")
         .replace("+00:00", "Z"),
+        "EXPECTED_APPROVAL_EVIDENCE_SHA256": json.loads(comment)["evidence_sha256"],
+        "EXPECTED_UI_CHECKED_AT_UTC": json.loads(comment)["checked_at_utc"],
+        "EXPECTED_GROUP2_BUNDLE_SHA256": json.loads(comment)["group2_bundle_sha256"],
+        "EXPECTED_GROUP2_BUNDLE_SHA256": json.loads(comment)["group2_bundle_sha256"],
         **backend_trust_env,
     }
 
@@ -1266,18 +1439,20 @@ def _approval_gate_fixture(now: datetime):
             "status": "completed",
             "conclusion": "success",
             "started_at": "2026-10-16T04:59:35Z",
+            "completed_at": api.get("ui_completed_at", "2026-10-16T04:59:42Z"),
         }
         build_job = {
             "name": "Build and sign after second asaas-build approval",
             "head_sha": sha,
             "status": "in_progress",
-            "started_at": "2026-10-16T04:59:45Z",
+            "started_at": api.get("build_started_at", "2026-10-16T04:59:45Z"),
         }
         if api["phase"] == "evidence":
             ui_job.update(
                 {
                     "status": "in_progress",
                     "started_at": "2026-10-16T04:59:35Z",
+                    "completed_at": None,
                 }
             )
             build_job.update({"status": "queued", "started_at": None})
@@ -1293,11 +1468,12 @@ def _approval_gate_fixture(now: datetime):
         ]
 
     def get_evidence(url: str) -> bytes:
-        if url == _MANIFEST_URL:
-            return api["manifest_bytes"]
-        for label, reference in _SCREENSHOT_URLS.items():
-            if reference == url:
-                return screenshot_bytes[label]
+        if url in api["manifest_by_url"]:
+            return api["manifest_by_url"][url]
+        if url in api["screenshots_by_url"]:
+            return api["screenshots_by_url"][url]
+        if url in api["group2_bundle_by_url"]:
+            return api["group2_bundle_by_url"][url]
         raise AssertionError(f"unexpected evidence URL: {url}")
 
     def fetch_backend_trust(environment, *, expected_digest=None):
@@ -1322,11 +1498,16 @@ def _approval_gate_fixture(now: datetime):
         backend_trust_origin=backend_origin,
     )
     preflight_digest = digest_info["digest"]
-    api[
+    approvals = api[
         f"https://api.github.com/repos/neurostackinfra/neurostack-api/actions/runs/{run_id}/approvals"
-    ][0]["comment"] = _update_approval_comment(
-        comment, preflight_sha256=preflight_digest
-    )
+    ]
+    for approval_entry in approvals:
+        _update_package_comment(
+            api,
+            approval_entry,
+            comment_updates={"preflight_sha256": preflight_digest},
+            manifest_updates={"preflight_sha256": preflight_digest},
+        )
     env["ASAAS_PREFLIGHT_READBACK_SHA256"] = preflight_digest
 
     return verifier, env, api, get_json, get_collection, get_evidence, now
@@ -1377,18 +1558,18 @@ def _bootstrap_approval_gate_fixture(now: datetime):
     env["ASAAS_PREFLIGHT_READBACK_SHA256"] = digest_info["digest"]
     approvals_path = run_path + "/approvals"
     for approval in api[approvals_path]:
-        if not approval["comment"]:
-            continue
-        approval["comment"] = _update_approval_comment(
-            approval["comment"], preflight_sha256=digest_info["digest"]
+        _update_package_comment(
+            api,
+            approval,
+            comment_updates={
+                "preflight_sha256": digest_info["digest"],
+                "run_attempt": "1",
+            },
+            manifest_updates={
+                "preflight_sha256": digest_info["digest"],
+                "run_attempt": "1",
+            },
         )
-        payload = json.loads(approval["comment"])
-        payload.update(run_attempt="1")
-        manifest = json.loads(api["manifest_bytes"])
-        manifest["run_attempt"] = "1"
-        api["manifest_bytes"] = _canonical_test_json(manifest)
-        payload["manifest_sha256"] = hashlib.sha256(api["manifest_bytes"]).hexdigest()
-        approval["comment"] = _canonical_test_json(payload).decode("ascii")
     api[run_path]["run_attempt"] = 1
     return (
         verifier,
@@ -1403,7 +1584,7 @@ def _bootstrap_approval_gate_fixture(now: datetime):
 
 def test_environment_approval_requires_run_bound_independent_admin_and_readback():
     now = datetime(2026, 10, 16, 5, 0, 0, tzinfo=timezone.utc)
-    verifier, env, _api, get_json, get_collection, get_evidence, now = (
+    verifier, env, api, get_json, get_collection, get_evidence, now = (
         _approval_gate_fixture(now)
     )
 
@@ -1414,6 +1595,12 @@ def test_environment_approval_requires_run_bound_independent_admin_and_readback(
         get_evidence=get_evidence,
         now=now,
     )
+    approvals = api[
+        "https://api.github.com/repos/neurostackinfra/neurostack-api/actions/runs/7123456789/approvals"
+    ]
+    build_comment = json.loads(approvals[1]["comment"])
+    build_manifest = api["manifest_by_url"][build_comment["manifest_ref"]]
+    build_manifest_value = json.loads(build_manifest)
 
     assert evidence == {
         "schema": "asaas_admin_ui_approval.v2",
@@ -1430,32 +1617,101 @@ def test_environment_approval_requires_run_bound_independent_admin_and_readback(
         "backend_trust_readback_sha256": env["ASAAS_PREFLIGHT_BACKEND_TRUST_SHA256"],
         "backend_trust_probe_sha256": "",
         "backend_trust_origin": env["ASAAS_PREFLIGHT_BACKEND_ORIGIN"],
-        "evidence_ref": _EVIDENCE_URL,
-        "evidence_sha256": hashlib.sha256(_VALID_EVIDENCE_PNG).hexdigest(),
+        "evidence_ref": build_comment["evidence_ref"],
+        "evidence_sha256": build_comment["evidence_sha256"],
         "evidence_verified": "true",
-        "evidence_size_bytes": str(len(_VALID_EVIDENCE_PNG)),
-        "manifest_ref": _MANIFEST_URL,
-        "manifest_sha256": hashlib.sha256(_api["manifest_bytes"]).hexdigest(),
+        "evidence_size_bytes": str(
+            len(api["screenshots_by_url"][build_comment["evidence_ref"]])
+        ),
+        "manifest_ref": build_comment["manifest_ref"],
+        "manifest_sha256": hashlib.sha256(build_manifest).hexdigest(),
+        "group2_bundle_ref": build_comment["group2_bundle_ref"],
+        "group2_bundle_sha256": build_comment["group2_bundle_sha256"],
+        "group2_bundle_ref": build_comment["group2_bundle_ref"],
+        "group2_bundle_sha256": build_comment["group2_bundle_sha256"],
+        "group2_snapshot_sha256": verifier._validate_group2_bundle(
+            api["group2_bundle_by_url"][build_comment["group2_bundle_ref"]],
+            build_comment["group2_bundle_sha256"],
+        )["snapshot_sha256"],
         "screenshots_sha256": json.dumps(
-            json.loads(_api["manifest_bytes"])["screenshots_sha256"],
+            build_manifest_value["screenshots_sha256"],
             sort_keys=True,
             separators=(",", ":"),
         ),
         "screenshots_refs": json.dumps(
-            _SCREENSHOT_URLS, sort_keys=True, separators=(",", ":")
+            {
+                label: value["ref"]
+                for label, value in build_comment["screenshots"].items()
+            },
+            sort_keys=True,
+            separators=(",", ":"),
         ),
         "approval_gate": "github_environment_required_reviewer_approved",
         "approval_sequence": "second_oidc_gate",
-        "ui_checked_at_utc": "2026-10-16T04:59:34.000000Z",
+        "ui_checked_at_utc": "2026-10-16T04:59:43.000000Z",
         "approval_observed_at_utc": "2026-10-16T05:00:00Z",
         "approval_observation_source": (
             "verifier clock when GitHub Actions returned the approved state; "
             "this is not the reviewer click time"
         ),
     }
-    assert _api["backend_trust_fetch_calls"] == [
+    assert api["backend_trust_fetch_calls"] == [
         env["ASAAS_PREFLIGHT_BACKEND_TRUST_SHA256"]
     ]
+
+
+def test_build_approval_package_must_be_fresh_for_build_job_start():
+    now = datetime(2026, 10, 16, 5, 5, 30, tzinfo=timezone.utc)
+    verifier, env, api, get_json, get_collection, get_evidence, now = (
+        _approval_gate_fixture(now)
+    )
+    env["ASAAS_PREFLIGHT_OBSERVED_AT"] = "2026-10-16T04:58:00.000000Z"
+    api["build_started_at"] = "2026-10-16T05:05:00Z"
+
+    with pytest.raises(verifier.ApprovalGateError, match="build_approval_check_stale"):
+        verifier.verify_environment_approval(
+            env,
+            get_json=get_json,
+            get_collection=get_collection,
+            get_evidence=get_evidence,
+            now=now,
+        )
+
+
+@pytest.mark.parametrize("comment_mode", ["missing", "reused", "wrong_phase"])
+def test_build_requires_a_distinct_build_phase_approval_comment(comment_mode):
+    now = datetime(2026, 10, 16, 5, 0, 0, tzinfo=timezone.utc)
+    verifier, env, api, get_json, get_collection, get_evidence, now = (
+        _approval_gate_fixture(now)
+    )
+    approvals_path = (
+        "https://api.github.com/repos/neurostackinfra/neurostack-api/actions/runs/"
+        "7123456789/approvals"
+    )
+    evidence_approval, build_approval = api[approvals_path]
+    if comment_mode == "missing":
+        build_approval["comment"] = ""
+    elif comment_mode == "reused":
+        build_approval["comment"] = evidence_approval["comment"]
+    else:
+        _update_package_comment(
+            api,
+            build_approval,
+            comment_updates={"approval_gate": "evidence"},
+            manifest_updates={"approval_gate": "evidence"},
+        )
+
+    with pytest.raises(
+        verifier.ApprovalGateError,
+        match="approval_phase_comments_missing_reused_or_mismatched",
+    ):
+        verifier.verify_environment_approval(
+            env,
+            get_json=get_json,
+            get_collection=get_collection,
+            get_evidence=get_evidence,
+            now=now,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1478,33 +1734,38 @@ def test_approval_manifest_provenance_is_bound_to_comment_and_selected_png(
         "https://api.github.com/repos/neurostackinfra/neurostack-api/actions/runs/"
         "7123456789/approvals"
     )
-    manifest = json.loads(api["manifest_bytes"])
+    evidence_comment = json.loads(api[approvals_path][0]["comment"])
+    manifest_url = evidence_comment["manifest_ref"]
+    manifest_bytes = api["manifest_by_url"][manifest_url]
+    manifest = json.loads(manifest_bytes)
     if mutation == "digest":
-        api["manifest_bytes"] += b" "
+        manifest_bytes += b" "
     elif mutation == "timestamp":
         manifest["checked_at_utc"] = "2026-10-16T04:59:33.000000Z"
-        api["manifest_bytes"] = _canonical_test_json(manifest)
+        manifest_bytes = _canonical_test_json(manifest)
         api[approvals_path][0]["comment"] = _update_approval_comment(
             api[approvals_path][0]["comment"],
-            manifest_sha256=hashlib.sha256(api["manifest_bytes"]).hexdigest(),
+            manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
         )
     elif mutation == "label":
         manifest["screenshots_sha256"]["ruleset"] = "e" * 64
-        api["manifest_bytes"] = _canonical_test_json(manifest)
+        manifest_bytes = _canonical_test_json(manifest)
         api[approvals_path][0]["comment"] = _update_approval_comment(
             api[approvals_path][0]["comment"],
-            manifest_sha256=hashlib.sha256(api["manifest_bytes"]).hexdigest(),
+            manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
         )
     else:
-        raw = api["manifest_bytes"].decode("ascii")
+        raw = manifest_bytes.decode("ascii")
         sha_field = f'"sha":"{"a" * 40}"'
-        api["manifest_bytes"] = raw.replace(
-            sha_field, f"{sha_field},{sha_field}", 1
-        ).encode("ascii")
+        manifest_bytes = raw.replace(sha_field, f"{sha_field},{sha_field}", 1).encode(
+            "ascii"
+        )
         api[approvals_path][0]["comment"] = _update_approval_comment(
             api[approvals_path][0]["comment"],
-            manifest_sha256=hashlib.sha256(api["manifest_bytes"]).hexdigest(),
+            manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
         )
+    api["manifest_by_url"][manifest_url] = manifest_bytes
+    api["manifest_bytes"] = manifest_bytes
 
     with pytest.raises(verifier.ApprovalGateError, match=reason):
         verifier.verify_environment_approval(
@@ -1599,10 +1860,10 @@ def test_no_oidc_evidence_phase_fails_closed_without_first_approval():
     ("checked_at", "reason"),
     [
         (None, "approval_checked_at_missing"),
-        ("2026-10-16T04:54:34.000000Z", "approval_ui_check_stale"),
+        ("2026-10-16T04:54:34.000000Z", "evidence_approval_check_stale"),
         (
             "2026-10-16T04:59:36.000000Z",
-            "approval_ui_check_after_evidence_job_start",
+            "evidence_approval_check_after_job_start",
         ),
     ],
 )
@@ -1624,8 +1885,11 @@ def test_no_oidc_evidence_phase_rejects_missing_stale_or_future_check_time(
         comment.pop("checked_at_utc")
         approval["comment"] = _canonical_test_json(comment).decode("ascii")
     else:
-        approval["comment"] = _update_approval_comment(
-            approval["comment"], checked_at_utc=checked_at
+        _update_package_comment(
+            api,
+            approval,
+            comment_updates={"checked_at_utc": checked_at},
+            manifest_updates={"checked_at_utc": checked_at},
         )
     api[approvals_path] = [approval]
 
@@ -1662,6 +1926,72 @@ def test_build_phase_requires_same_human_checked_at_as_no_oidc_phase():
         )
 
 
+def test_build_ui_evidence_must_be_checked_after_no_oidc_job_completed():
+    now = datetime(2026, 10, 16, 5, 0, 0, tzinfo=timezone.utc)
+    verifier, env, api, get_json, get_collection, get_evidence, now = (
+        _approval_gate_fixture(now)
+    )
+    api["ui_completed_at"] = "2026-10-16T04:59:44Z"
+
+    with pytest.raises(
+        verifier.ApprovalGateError,
+        match="build_approval_ui_check_before_evidence_job_completed",
+    ):
+        verifier.verify_environment_approval(
+            env,
+            get_json=get_json,
+            get_collection=get_collection,
+            get_evidence=get_evidence,
+            now=now,
+            phase="build",
+        )
+
+
+def test_build_ui_evidence_rejects_reused_screenshot_bytes_with_new_manifest_time():
+    now = datetime(2026, 10, 16, 5, 0, 0, tzinfo=timezone.utc)
+    verifier, env, api, get_json, get_collection, get_evidence, now = (
+        _approval_gate_fixture(now)
+    )
+    approvals_path = (
+        "https://api.github.com/repos/neurostackinfra/neurostack-api/actions/runs/"
+        "7123456789/approvals"
+    )
+    approvals = api[approvals_path]
+    evidence_comment = json.loads(approvals[0]["comment"])
+    build_comment = json.loads(approvals[1]["comment"])
+    reused_label = "asaas-build"
+    reused_bytes = api["screenshots_by_url"][
+        evidence_comment["screenshots"][reused_label]["ref"]
+    ]
+    build_ref = build_comment["screenshots"][reused_label]["ref"]
+    api["screenshots_by_url"][build_ref] = reused_bytes
+    reused_digest = hashlib.sha256(reused_bytes).hexdigest()
+    changed_screenshots = copy.deepcopy(build_comment["screenshots"])
+    changed_screenshots[reused_label]["sha256"] = reused_digest
+    build_manifest = json.loads(api["manifest_by_url"][build_comment["manifest_ref"]])
+    changed_hashes = dict(build_manifest["screenshots_sha256"])
+    changed_hashes[reused_label] = reused_digest
+    _update_package_comment(
+        api,
+        approvals[1],
+        comment_updates={"screenshots": changed_screenshots},
+        manifest_updates={"screenshots_sha256": changed_hashes},
+    )
+
+    with pytest.raises(
+        verifier.ApprovalGateError,
+        match="approval_screenshot_bytes_reused_between_gates",
+    ):
+        verifier.verify_environment_approval(
+            env,
+            get_json=get_json,
+            get_collection=get_collection,
+            get_evidence=get_evidence,
+            now=now,
+            phase="build",
+        )
+
+
 def test_approval_comment_checked_at_is_not_replaced_by_api_update_time():
     now = datetime(2026, 10, 16, 5, 0, 0, tzinfo=timezone.utc)
     verifier, env, api, get_json, get_collection, get_evidence, now = (
@@ -1681,7 +2011,7 @@ def test_approval_comment_checked_at_is_not_replaced_by_api_update_time():
         now=now,
         phase="build",
     )
-    assert evidence["ui_checked_at_utc"] == "2026-10-16T04:59:34.000000Z"
+    assert evidence["ui_checked_at_utc"] == "2026-10-16T04:59:43.000000Z"
 
 
 def test_approval_observation_is_named_separately_from_human_check_time():
@@ -1704,7 +2034,7 @@ def test_approval_observation_is_named_separately_from_human_check_time():
 
     assert evidence["approval_observed_at_utc"] == "2026-10-16T05:00:00Z"
     assert "not the reviewer click time" in evidence["approval_observation_source"]
-    assert evidence["ui_checked_at_utc"] == "2026-10-16T04:59:34.000000Z"
+    assert evidence["ui_checked_at_utc"] == "2026-10-16T04:59:43.000000Z"
 
 
 def test_bootstrap_approval_blocks_when_readback_becomes_available():
@@ -1881,6 +2211,165 @@ def test_manifest_attachment_ref_requires_exact_github_json_file_path():
             verifier.ApprovalGateError, match="approval_manifest_ref_invalid"
         ):
             verifier._validate_manifest_ref(invalid)
+
+
+def test_group2_bundle_url_is_exact_github_zip_attachment():
+    verifier = _approval_module()
+    verifier._validate_group2_bundle_ref(_GROUP2_BUNDLE_URL)
+    for ref in (
+        "https://attacker.example/user-attachments/files/123/group2.zip",
+        "http://github.com/user-attachments/files/123/group2.zip",
+        "https://github.com/user-attachments/files/123/../group2.zip",
+        "https://github.com/user-attachments/files/123/group2.zip?download=1",
+    ):
+        with pytest.raises(verifier.ApprovalGateError):
+            verifier._validate_group2_bundle_ref(ref)
+
+
+def test_group2_bundle_attachment_fetch_checks_media_type_and_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verifier = _approval_module()
+    bundle = _group2_bundle_bytes()
+
+    class Headers:
+        @staticmethod
+        def get_content_type() -> str:
+            return "application/zip"
+
+    class Response:
+        status = 200
+        headers = Headers()
+
+        @staticmethod
+        def geturl() -> str:
+            return "https://private-user-images.githubusercontent.com/files/group2.zip"
+
+        @staticmethod
+        def read(limit: int) -> bytes:
+            assert limit == verifier.MAX_GROUP2_BUNDLE_BYTES + 1
+            return bundle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+    class Opener:
+        @staticmethod
+        def open(request, *, timeout: int):
+            assert request.full_url == _GROUP2_BUNDLE_URL
+            assert timeout == 30
+            return Response()
+
+    monkeypatch.setattr(verifier, "build_opener", lambda _handler: Opener())
+    assert verifier._fetch_group2_bundle(_GROUP2_BUNDLE_URL) == bundle
+
+
+def test_group2_verifier_pins_independent_describe_regions_source_digest():
+    verifier = _approval_module(fixture_regions_pin=False)
+    assert (
+        verifier.PINNED_GROUP2_REGIONS_RESPONSE_SHA256
+        == "f4e52f7420e339d831af2555ef035e75316cc01351296330ed68da7f119a6e00"
+    )
+    bundle = _group2_bundle_bytes()
+    with pytest.raises(
+        verifier.ApprovalGateError, match="approval_group2_regions_source_unpinned"
+    ):
+        verifier._validate_group2_bundle(bundle, hashlib.sha256(bundle).hexdigest())
+
+
+def test_group2_bundle_checks_exact_digest_and_validates_full_snapshot():
+    verifier = _approval_module()
+    raw = _group2_bundle_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    result = verifier._validate_group2_bundle(raw, digest)
+    assert result["bundle_sha256"] == digest
+    assert re.fullmatch(r"[0-9a-f]{64}", result["snapshot_sha256"])
+    with pytest.raises(
+        verifier.ApprovalGateError, match="approval_group2_bundle_digest_mismatch"
+    ):
+        verifier._validate_group2_bundle(raw, "0" * 64)
+
+
+def test_group2_bundle_rejects_stale_snapshot_even_with_new_approved_digest():
+    verifier = _approval_module()
+    original = _group2_bundle_bytes()
+    with zipfile.ZipFile(io.BytesIO(original)) as source:
+        entries = {info.filename: source.read(info) for info in source.infolist()}
+    snapshot = json.loads(entries["snapshot.json"])
+    stale = datetime.now(timezone.utc) - timedelta(hours=25)
+    snapshot["collected_at_utc"] = stale.isoformat().replace("+00:00", "Z")
+    entries["snapshot.json"] = _canonical_test_json(snapshot)
+    changed = io.BytesIO()
+    with zipfile.ZipFile(changed, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, contents in sorted(entries.items()):
+            archive.writestr(name, contents)
+    raw = changed.getvalue()
+    # A new approval digest cannot make expired Group 2 evidence current.
+    with pytest.raises(
+        verifier.ApprovalGateError, match="approval_group2_snapshot_invalid"
+    ):
+        verifier._validate_group2_bundle(raw, hashlib.sha256(raw).hexdigest())
+
+
+def test_group2_bundle_rejects_zip_traversal():
+    verifier = _approval_module()
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("snapshot.json", b"{}")
+        archive.writestr("../outside.json", b"{}")
+    raw = buffer.getvalue()
+    with pytest.raises(
+        verifier.ApprovalGateError, match="approval_group2_bundle_path_invalid"
+    ):
+        verifier._validate_group2_bundle(raw, hashlib.sha256(raw).hexdigest())
+
+
+def test_paired_region_omission_fails_even_after_both_admin_approvals_are_recomputed():
+    now = datetime(2026, 10, 16, 5, 0, tzinfo=timezone.utc)
+    verifier, env, api, get_json, get_collection, get_evidence, _ = (
+        _approval_gate_fixture(now)
+    )
+    original = json.loads(
+        api[
+            "https://api.github.com/repos/neurostackinfra/neurostack-api/actions/"
+            f"runs/{env['GITHUB_RUN_ID']}/approvals"
+        ][0]["comment"]
+    )
+    changed_bundle = _paired_omission_group2_bundle_bytes()
+    changed_digest = hashlib.sha256(changed_bundle).hexdigest()
+    with pytest.raises(
+        verifier.ApprovalGateError, match="approval_group2_regions_source_unpinned"
+    ):
+        verifier._validate_group2_bundle(changed_bundle, changed_digest)
+
+    approvals = api[
+        "https://api.github.com/repos/neurostackinfra/neurostack-api/actions/"
+        f"runs/{env['GITHUB_RUN_ID']}/approvals"
+    ]
+    api["group2_bundle_by_url"][original["group2_bundle_ref"]] = changed_bundle
+    for approval in approvals:
+        _update_package_comment(
+            api,
+            approval,
+            comment_updates={"group2_bundle_sha256": changed_digest},
+            manifest_updates={"group2_bundle_sha256": changed_digest},
+        )
+    env["EXPECTED_GROUP2_BUNDLE_SHA256"] = changed_digest
+
+    with pytest.raises(
+        verifier.ApprovalGateError, match="approval_group2_regions_source_unpinned"
+    ):
+        verifier.verify_environment_approval(
+            env,
+            get_json=get_json,
+            get_collection=get_collection,
+            get_evidence=get_evidence,
+            now=now,
+            phase="build",
+        )
 
     handler = verifier._GitHubAttachmentRedirect()
     with pytest.raises(
@@ -2184,6 +2673,8 @@ def test_attestation_workflow_gates_oidc_job_after_no_oidc_ui_approval():
     assert "id-token" not in ui_approval["permissions"]
     assert "approval_evidence_sha256" in ui_approval["outputs"]
     assert "ui_checked_at_utc" in ui_approval["outputs"]
+    assert "group2_bundle_sha256" in ui_approval["outputs"]
+    assert "group2_snapshot_sha256" in ui_approval["outputs"]
     assert build["needs"] == ["preflight", "verify-ui-approval"]
     assert "needs.preflight.outputs.rollout_scope == 'validated'" in build["if"]
     assert "needs.verify-ui-approval.result == 'success'" in build["if"]
@@ -2206,6 +2697,13 @@ def test_attestation_workflow_gates_oidc_job_after_no_oidc_ui_approval():
     ui_verify = next(
         index for index, step in enumerate(ui_steps) if step.get("id") == "verify"
     )
+    ui_install = next(
+        index
+        for index, step in enumerate(ui_steps)
+        if step.get("name") == "Install locked readback validator dependencies"
+    )
+    assert ui_install < ui_verify
+    assert "poetry install --with dev --no-root" in ui_steps[ui_install]["run"]
     assert "--phase evidence" in ui_steps[ui_verify]["run"]
     assert "--github-output" in ui_steps[ui_verify]["run"]
 
@@ -2214,6 +2712,11 @@ def test_attestation_workflow_gates_oidc_job_after_no_oidc_ui_approval():
         index
         for index, step in enumerate(steps)
         if step.get("name") == "Set up pinned CPython 3.12"
+    )
+    install_validator = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("name") == "Install locked readback validator dependencies"
     )
     verify_approval = next(
         index
@@ -2248,6 +2751,7 @@ def test_attestation_workflow_gates_oidc_job_after_no_oidc_ui_approval():
     )
     assert (
         setup_python
+        < install_validator
         < verify_approval
         < clean_source
         < install
@@ -2270,6 +2774,7 @@ def test_attestation_workflow_gates_oidc_job_after_no_oidc_ui_approval():
     assert "--phase build" in steps[verify_approval]["run"]
     assert "--expected-evidence-sha256" in steps[verify_approval]["run"]
     assert "--expected-checked-at-utc" in steps[verify_approval]["run"]
+    assert "--expected-group2-bundle-sha256" in steps[verify_approval]["run"]
     assert (
         steps[verify_approval]["env"]["EXPECTED_APPROVAL_EVIDENCE_SHA256"]
         == "${{ needs.verify-ui-approval.outputs.approval_evidence_sha256 }}"
@@ -2277,6 +2782,10 @@ def test_attestation_workflow_gates_oidc_job_after_no_oidc_ui_approval():
     assert (
         steps[verify_approval]["env"]["EXPECTED_UI_CHECKED_AT_UTC"]
         == "${{ needs.verify-ui-approval.outputs.ui_checked_at_utc }}"
+    )
+    assert (
+        steps[verify_approval]["env"]["EXPECTED_GROUP2_BUNDLE_SHA256"]
+        == "${{ needs.verify-ui-approval.outputs.group2_bundle_sha256 }}"
     )
     assert (
         steps[pins]["env"]["ASAAS_PREFLIGHT_BACKEND_TRUST_SHA256"]

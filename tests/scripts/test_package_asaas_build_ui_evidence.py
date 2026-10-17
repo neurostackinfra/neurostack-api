@@ -88,6 +88,11 @@ def _args(tmp_path: Path) -> Namespace:
         run_id="7123456789",
         run_attempt="2",
         sha="a" * 40,
+        preflight_sha256="c" * 64,
+        group2_bundle_ref=(
+            "https://github.com/user-attachments/files/1234567892/group2.zip"
+        ),
+        group2_bundle_sha256="d" * 64,
         **files,
     )
 
@@ -113,7 +118,7 @@ def test_packer_creates_private_run_manifest_and_approval_json(monkeypatch, tmp_
 
     expected = (
         home / ".local/share/neurostack/asaas-build-ui-evidence/"
-        "neurostackinfra-neurostack-api/run-7123456789-attempt-2"
+        "neurostackinfra-neurostack-api/run-7123456789-attempt-2-gate-evidence"
     )
     assert output == expected
     assert repository not in output.parents
@@ -123,13 +128,17 @@ def test_packer_creates_private_run_manifest_and_approval_json(monkeypatch, tmp_
     manifest = json.loads(manifest_path.read_text())
     assert len(packer._canonical_json(comment)) <= 2048
     assert (
-        manifest["schema_version"] == "neurostack.asaas_build_ui_evidence_manifest.v2"
+        manifest["schema_version"] == "neurostack.asaas_build_ui_evidence_manifest.v4"
     )
     assert (
         packer.hashlib.sha256(manifest_path.read_bytes()).hexdigest()
         == comment["manifest_sha256"]
     )
     assert "approval_comment" not in manifest
+    assert manifest["approval_gate"] == comment["approval_gate"] == "evidence"
+    assert manifest["group2_bundle_ref"] == comment["group2_bundle_ref"]
+    assert manifest["group2_bundle_sha256"] == comment["group2_bundle_sha256"]
+    assert manifest["preflight_sha256"] == comment["preflight_sha256"] == "c" * 64
     checked_at = datetime.fromisoformat(
         comment["checked_at_utc"].replace("Z", "+00:00")
     )
@@ -177,6 +186,44 @@ def test_packaged_timestamp_is_accepted_by_approval_verifier(monkeypatch, tmp_pa
     assert verifier._canonical_timestamp(checked_at).tzinfo == timezone.utc
     assert checked_at.endswith("Z")
     assert len(checked_at.rsplit(".", 1)[1]) == 7
+
+
+def test_package_supports_distinct_build_gate_artifact(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    args = _args(tmp_path)
+    args.approval_gate = "build"
+
+    comment, output = packer.package(args)
+    manifest = json.loads((output / "manifest.json").read_bytes())
+
+    assert output.name.endswith("-gate-build")
+    assert comment["approval_gate"] == manifest["approval_gate"] == "build"
+    assert (
+        comment["manifest_sha256"]
+        == packer.hashlib.sha256((output / "manifest.json").read_bytes()).hexdigest()
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("group2_bundle_ref", "https://attacker.example/group2.zip"),
+        (
+            "group2_bundle_ref",
+            "https://github.com/user-attachments/files/123/group2.zip?x=1",
+        ),
+        ("group2_bundle_sha256", "not-a-digest"),
+    ],
+)
+def test_package_rejects_invalid_group2_bundle_reference_or_digest(
+    tmp_path, field, value
+):
+    args = _args(tmp_path)
+    setattr(args, field, value)
+    with pytest.raises(ValueError, match="Group 2 bundle"):
+        packer.package(args)
 
 
 def test_package_and_verifier_share_per_png_size_limit():
@@ -255,7 +302,7 @@ def test_packer_rejects_invalid_or_empty_png_before_creating_run_directory(
 
     assert not (
         home / ".local/share/neurostack/asaas-build-ui-evidence/"
-        "neurostackinfra-neurostack-api/run-7123456789-attempt-2"
+        "neurostackinfra-neurostack-api/run-7123456789-attempt-2-gate-evidence"
     ).exists()
 
 
@@ -292,7 +339,7 @@ def test_packer_requires_three_distinct_screenshot_digests(monkeypatch, tmp_path
 
     assert not (
         home / ".local/share/neurostack/asaas-build-ui-evidence/"
-        "neurostackinfra-neurostack-api/run-7123456789-attempt-2"
+        "neurostackinfra-neurostack-api/run-7123456789-attempt-2-gate-evidence"
     ).exists()
 
 

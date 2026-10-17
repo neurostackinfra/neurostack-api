@@ -1033,9 +1033,13 @@ def write_admin_ui_approval_instructions(
             "for approval; this stores the "
             "image outside repository history. Include this run ID, SHA, ref, "
             "and environment in that comment. Copy `checked_at_utc` exactly from "
-            "the evidence package's approval-comment JSON; the no-OIDC evidence "
-            "job requires it after preflight and within five minutes before that "
-            "job starts. The protected job downloads the "
+            "the `--approval-gate evidence` package's approval JSON; the no-OIDC "
+            "job requires its timestamp within five minutes before that job starts. "
+            "After that job succeeds and while the build job waits for its second "
+            "approval, inspect and capture all three settings again, then create a "
+            "new `--approval-gate build` package with a distinct timestamp and "
+            "fresh attachment URLs. The build verifier requires this second "
+            "package within five minutes before the build job starts. It downloads the "
             "PNG and verifies its SHA-256 before requesting OIDC.\n\n"
             f"- Run ID: `{run_context['run_id']}`\n"
             f"- Workflow: `{run_context['workflow_path']}`\n"
@@ -1051,25 +1055,38 @@ def write_admin_ui_approval_instructions(
             )
             + f"- Backend origin: `{backend_trust_origin}`\n"
             f"- API readback time: `{observed_at}`\n\n"
-            "Run the private evidence packer for this run, upload its manifest "
+            "Attach the complete Group 2 evidence bundle (snapshot.json plus every "
+            "referenced artifact) as a ZIP user attachment, then verify its SHA-256. "
+            "This repository is public: the ZIP, screenshots, and comment will be "
+            "publicly visible, so include only sanitized non-secret readbacks/screens. "
+            "Run the private evidence packer with `--approval-gate evidence`, "
+            "`--group2-bundle-ref` set to that attachment URL, and "
+            "`--group2-bundle-sha256` set to its digest, plus "
+            "the displayed preflight SHA-256; upload its manifest "
             "and all three PNGs as GitHub user attachments, then paste the compact "
             "JSON approval object it emits below after replacing only the four "
             "attachment URLs, "
             "reviewer fields, and preflight digest. Keep the manifest hash and "
-            "metadata unchanged. The "
+            "metadata unchanged. After the no-OIDC approval job succeeds, repeat "
+            "the UI inspection and capture, run the packer with `--approval-gate "
+            "build`, then attach its new manifest and three PNGs for the second "
+            "approval. Reuse the same Group 2 ZIP and digest, but use the new "
+            "build package's compact JSON and screenshot/manifest URLs; do not "
+            "reuse the evidence package. The "
             "protected environment approval is the authoritative gate; GitHub's "
             "approval-history API does not expose the human click timestamp. The "
             "checked time binds the earlier human UI check; the verifier's later "
             "observation time records when GitHub returned approved:\n\n"
             "```json\n"
             "{\n"
-            '  "schema_version": "neurostack.asaas_build_ui_attestation.v4",\n'
+            '  "schema_version": "neurostack.asaas_build_ui_attestation.v6",\n'
             f'  "run_id": "{run_context["run_id"]}",\n'
             f'  "run_attempt": "{run_context["run_attempt"]}",\n'
             f'  "workflow_path": "{run_context["workflow_path"]}",\n'
             f'  "sha": "{run_context["sha"]}",\n'
             f'  "ref": "{run_context["ref"]}",\n'
             f'  "environment": "{environment_name}",\n'
+            '  "approval_gate": "evidence",\n'
             '  "checked_at_utc": "<YYYY-MM-DDTHH:MM:SS.ffffffZ>",\n'
             '  "reviewer_id": "<github-user-id>",\n'
             '  "reviewer_login": "<github-login>",\n'
@@ -1080,6 +1097,8 @@ def write_admin_ui_approval_instructions(
             '  "checks": {"asaas_build_admin_bypass_disabled":true,"asaas_build_branch_only_main":true,"asaas_production_admin_bypass_disabled":true,"asaas_production_branch_only_main":true,"ruleset_bypass_empty":true},\n'
             '  "manifest_ref": "https://github.com/user-attachments/files/<id>/manifest.json",\n'
             '  "manifest_sha256": "<64-lowercase-hex>",\n'
+            '  "group2_bundle_ref": "https://github.com/user-attachments/files/<id>/group2.zip",\n'
+            '  "group2_bundle_sha256": "<64-lowercase-hex>",\n'
             '  "screenshots": {"ruleset":{"ref":"https://github.com/user-attachments/assets/<uuid>","sha256":"<64-lowercase-hex>"},"asaas-build":{"ref":"https://github.com/user-attachments/assets/<uuid>","sha256":"<64-lowercase-hex>"},"asaas-production-deployment":{"ref":"https://github.com/user-attachments/assets/<uuid>","sha256":"<64-lowercase-hex>"}},\n'
             '  "evidence_ref": "https://github.com/user-attachments/assets/<uuid>",\n'
             '  "evidence_label": "<ruleset|asaas-build|asaas-production-deployment>",\n'
