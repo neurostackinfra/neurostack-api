@@ -314,6 +314,7 @@ jobs:
           BILLING_PRODUCER_BUILD_AUDIENCE: ${{ vars.BILLING_PRODUCER_BUILD_AUDIENCE }}
           BILLING_PRODUCER_BUILD_OIDC_SUBJECT: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_SUBJECT }}
           BILLING_PRODUCER_ECR_REPOSITORY_URI: ${{ vars.BILLING_PRODUCER_ECR_REPOSITORY_URI }}
+          BILLING_PRODUCER_DEPLOY_ROLE_ARN: ${{ vars.BILLING_PRODUCER_DEPLOY_ROLE_ARN }}
           ASAAS_SIGNED_ENVELOPE_PATH: ${{ runner.temp }}/asaas-build-attestation/asaas-build-attestation.json
         run: python3 scripts/asaas_producer_rollout_gate.py --phase predeploy --output "$RUNNER_TEMP/asaas-predeploy-private.json"
 
@@ -375,6 +376,7 @@ jobs:
           path: ${{ runner.temp }}/asaas-build-attestation
 
       - name: Verify current approval, environment secrets, artifact and readbacks before OIDC
+        id: pre_oidc_gate
         env: *protected_gate_env
         shell: bash
         run: |
@@ -407,7 +409,7 @@ jobs:
           python3 scripts/verify_asaas_producer_image_rollout.py "${args[@]}"
           python3 scripts/asaas_producer_rollout_gate.py --phase deploy --output "$RUNNER_TEMP/asaas-deploy-private.json"
 
-      - name: Generate one-run encrypted readback key before OIDC
+      - name: Generate one-run key and publish pre-OIDC cohort instructions
         shell: bash
         run: |
           set -euo pipefail
@@ -416,26 +418,64 @@ jobs:
             --public-output "$RUNNER_TEMP/asaas-producer-post-readback-public.pem"
           python3 - "$GITHUB_STEP_SUMMARY" "$RUNNER_TEMP/asaas-producer-post-readback-public.pem" <<'PY'
           import sys
+          import os
           from pathlib import Path
           summary = Path(sys.argv[1])
           public_key = Path(sys.argv[2]).read_text(encoding="ascii")
           with summary.open("a", encoding="utf-8") as output:
-              output.write("## One-run post-readback encryption key\n\n")
-              output.write("Use this public key only for the encrypted run-bound operator snapshot.\n\n```pem\n")
+              output.write("## One-run encrypted cohort confirmation\n\n")
+              output.write("After this deploy job is approved, capture a fresh authenticated ECS service/task readback, database SQL readiness, per-task `/ready`, ALB target health, and secret version metadata. Encrypt the sanitized snapshot with this one-run key and post only the encrypted marker to the configured evidence issue. The gate waits here before requesting AWS credentials.\n\n")
+              output.write("Run context (all fields are required by the encrypt command):\n\n")
+              output.write(f"- run_id: `{os.environ['GITHUB_RUN_ID']}`\n")
+              output.write(f"- run_attempt: `{os.environ['GITHUB_RUN_ATTEMPT']}`\n")
+              output.write(f"- operation_id: `{os.environ['INPUT_OPERATION_ID']}`\n")
+              output.write(f"- artifact_sha256: `{os.environ['INPUT_ENVELOPE_SHA256']}`\n")
+              output.write(f"- ref: `{os.environ['GITHUB_REF']}`\n")
+              output.write(f"- sha: `{os.environ['GITHUB_SHA']}`\n")
+              output.write(f"- job_id: `{os.environ['DEPLOYMENT_JOB_ID']}`\n")
+              output.write(f"- job_started_at: `{os.environ['DEPLOYMENT_JOB_STARTED_AT']}`\n\n")
+              output.write(f"- evidence_issue_number: `{os.environ['INPUT_EVIDENCE_ISSUE_NUMBER']}`\n\n")
+              output.write("Encrypt the sanitized `phase=cohort` snapshot with:\n\n```bash\n")
+              output.write("python3 scripts/asaas_producer_rollout_evidence.py encrypt-post-readback \\\n")
+              output.write("  --phase cohort --public-key /private/path/run-public.pem \\\n")
+              output.write("  --snapshot /private/path/cohort-readback.json --output /private/path/cohort-encrypted.json \\\n")
+              output.write(f"  --run-id {os.environ['GITHUB_RUN_ID']} --run-attempt {os.environ['GITHUB_RUN_ATTEMPT']} \\\n")
+              output.write(f"  --operation-id {os.environ['INPUT_OPERATION_ID']} --artifact-sha256 {os.environ['INPUT_ENVELOPE_SHA256']} \\\n")
+              output.write(f"  --ref {os.environ['GITHUB_REF']} --sha {os.environ['GITHUB_SHA']} \\\n")
+              output.write(f"  --job-id {os.environ['DEPLOYMENT_JOB_ID']} --job-started-at {os.environ['DEPLOYMENT_JOB_STARTED_AT']}\n``\n\n")
+              output.write(f"Post only `/private/path/cohort-encrypted.json` to issue {os.environ['INPUT_EVIDENCE_ISSUE_NUMBER']} under marker `<!-- asaas-producer-encrypted-readback.v2` and closing `-->`.\n\n")
+              output.write("Public key for this run:\n\n```pem\n")
               output.write(public_key)
               output.write("```\n")
           PY
+        env:
+          INPUT_OPERATION_ID: ${{ inputs.operation_id }}
+          INPUT_ENVELOPE_SHA256: ${{ inputs.envelope_sha256 }}
+          INPUT_EVIDENCE_ISSUE_NUMBER: ${{ inputs.evidence_issue_number }}
+          DEPLOYMENT_JOB_ID: ${{ steps.pre_oidc_gate.outputs.deployment_job_id }}
+          DEPLOYMENT_JOB_STARTED_AT: ${{ steps.pre_oidc_gate.outputs.deployment_job_started_at }}
+
+      - name: Validate fresh run-bound cohort confirmation before OIDC
+        id: cohort_confirmation
+        env: *protected_gate_env
+        shell: bash
+        run: python3 scripts/asaas_producer_rollout_gate.py --phase pre-oidc-cohort --output "$RUNNER_TEMP/asaas-producer-pre-oidc-cohort.json"
 
       # This is the only OIDC step. The no-OIDC job and this job's gate have
       # already re-read current protections, approvals, artifacts, and secrets.
       - name: Request the exact protected deployment role through OIDC
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
         with:
-          role-to-assume: ${{ vars.BILLING_PRODUCER_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ env.BILLING_PRODUCER_DEPLOY_ROLE_ARN }}
           aws-region: us-east-1
           role-session-name: asaas-producer-${{ github.run_id }}
 
       - name: Deploy exact attested image, verify post-readback, register, or roll back
         shell: bash
-        env: *protected_gate_env
+        env:
+          <<: *protected_gate_env
+          # The cohort confirmation stays on this runner and is hash-bound to
+          # the approval gate before AWS credentials are requested.
+          ASAAS_PRE_OIDC_COHORT_PATH: ${{ runner.temp }}/asaas-producer-pre-oidc-cohort.json
+          ASAAS_PRE_OIDC_COHORT_SHA256: ${{ steps.cohort_confirmation.outputs.cohort_evidence_sha256 }}
         run: python3 scripts/asaas_producer_deploy_executor.py

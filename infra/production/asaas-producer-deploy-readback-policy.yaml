@@ -7,7 +7,7 @@ Metadata:
   com.aws.cloudformation.Context:
     arch: action-scoped readback permissions attached to the existing protected deploy identity
     must:
-      - Limit service, task, ECR repository, and Secrets Manager reads to the fixed release target.
+      - Limit service, ECR repository, and Secrets Manager reads to the fixed release target.
       - Do not broaden the Group 2 Resource '*' allowlist for readback APIs.
       - Never grant secretsmanager:GetSecretValue or any additional mutating action.
 Parameters:
@@ -35,7 +35,7 @@ Resources:
         must:
           - Preserve the existing DeployRole write policy exactly.
           - Keep all secret access metadata-only.
-          - Keep ECS read scope at the fixed cluster/service/task family.
+          - Keep ECS read scope at the fixed service.
     Properties:
       PolicyName: asaas-producer-image-rollout-readback
       Roles:
@@ -49,15 +49,6 @@ Resources:
               - ecs:DescribeServices
             Resource:
               - arn:aws:ecs:us-east-1:388460142431:service/neurostack-staging/neurostack-staging-app
-            Condition:
-              StringEquals:
-                ecs:cluster: arn:aws:ecs:us-east-1:388460142431:cluster/neurostack-staging
-          - Sid: DescribeOnlyTasksInTheProductionServingCluster
-            Effect: Allow
-            Action:
-              - ecs:DescribeTasks
-            Resource:
-              - arn:aws:ecs:us-east-1:388460142431:task/neurostack-staging/*
             Condition:
               StringEquals:
                 ecs:cluster: arn:aws:ecs:us-east-1:388460142431:cluster/neurostack-staging

@@ -49,7 +49,21 @@ TASK_ROLE_ARN = "arn:aws:iam::388460142431:role/neurostack-staging-ecs-task"
 EXECUTION_ROLE_ARN = "arn:aws:iam::388460142431:role/neurostack-staging-ecs-execution"
 TASK_DEFINITION_TEMPLATE_SCHEMA = "asaas_producer_task_definition_template.v1"
 READBACK_SCHEMA = "asaas_producer_run_bound_readback.v1"
-POST_COMMENT_SCHEMA = "asaas_producer_post_readback_encrypted.v1"
+POST_COMMENT_SCHEMA = "asaas_producer_encrypted_readback.v2"
+ENCRYPTED_READBACK_MARKER = "asaas-producer-encrypted-readback.v2"
+_ENCRYPTION_CONTEXT_FIELDS = frozenset(
+    {
+        "run_id",
+        "run_attempt",
+        "operation_id",
+        "phase",
+        "artifact_sha256",
+        "ref",
+        "sha",
+        "job_id",
+        "job_started_at",
+    }
+)
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _UUID = re.compile(
@@ -723,6 +737,52 @@ def _task_readiness_check(
     }
 
 
+def _validate_database_task_ip_binding(
+    readiness: dict[str, Any], snapshot_tasks: list[Any]
+) -> None:
+    count = readiness.get("task_ip_count")
+    matched_count = readiness.get("matched_task_ip_count")
+    sql_task_ips = readiness.get("task_ips")
+    _require(
+        type(count) is int
+        and count > 0
+        and type(matched_count) is int
+        and matched_count == count
+        and isinstance(sql_task_ips, list)
+        and len(sql_task_ips) == count
+        and all(isinstance(value, str) for value in sql_task_ips)
+        and len(set(sql_task_ips)) == count,
+        "database_task_ip_binding_failed",
+    )
+    _require(
+        bool(snapshot_tasks)
+        and all(isinstance(task, dict) for task in snapshot_tasks),
+        "operator_snapshot_tasks_invalid",
+    )
+    snapshot_ips = [task.get("privateIp") for task in snapshot_tasks]
+    try:
+        sql_addresses = [ipaddress.ip_address(value) for value in sql_task_ips]
+        snapshot_addresses = [ipaddress.ip_address(value) for value in snapshot_ips]
+    except (TypeError, ValueError):
+        raise EvidenceError("database_task_ip_cohort_mismatch") from None
+    _require(
+        all(address.version == 4 for address in sql_addresses)
+        and all(address.version == 4 for address in snapshot_addresses)
+        and all(
+            str(address) == value
+            for address, value in zip(sql_addresses, sql_task_ips)
+        )
+        and all(
+            str(address) == value
+            for address, value in zip(snapshot_addresses, snapshot_ips)
+        )
+        and len(snapshot_addresses) == count
+        and len(set(snapshot_addresses)) == count
+        and set(sql_addresses) == set(snapshot_addresses),
+        "database_task_ip_cohort_mismatch",
+    )
+
+
 def validate_operator_readback(
     raw: Any,
     *,
@@ -777,7 +837,10 @@ def validate_operator_readback(
     _require(
         raw.get("schema_version") == READBACK_SCHEMA, "operator_readback_schema_invalid"
     )
-    _require(raw.get("phase") == phase, "operator_readback_phase_mismatch")
+    _require(
+        phase in {"before", "cohort", "after"} and raw.get("phase") == phase,
+        "operator_readback_phase_mismatch",
+    )
     _require(
         raw.get("run_id") == expected_run_id
         and re.fullmatch(r"[1-9][0-9]*", expected_run_id),
@@ -835,6 +898,7 @@ def validate_operator_readback(
     readiness = raw.get("database_readiness")
     readiness_fields = {
         "schema",
+        "task_ips",
         "task_ip_count",
         "matched_task_ip_count",
         "runtime_role_count",
@@ -852,13 +916,6 @@ def validate_operator_readback(
     _require(
         readiness.get("schema") == "asaas_registration_database_readiness.v1",
         "database_readiness_schema_invalid",
-    )
-    count = readiness.get("task_ip_count")
-    _require(
-        type(count) is int
-        and count > 0
-        and readiness.get("matched_task_ip_count") == count,
-        "database_task_ip_binding_failed",
     )
     _require(
         readiness.get("runtime_role_count") == 1
@@ -897,9 +954,8 @@ def validate_operator_readback(
     )
     snapshot_tasks = snapshot.get("tasks")
     _require(isinstance(snapshot_tasks, list), "operator_snapshot_tasks_invalid")
-    private_ips = [
-        task.get("privateIp") for task in snapshot_tasks if isinstance(task, dict)
-    ]
+    _validate_database_task_ip_binding(readiness, snapshot_tasks)
+    private_ips = [task.get("privateIp") for task in snapshot_tasks]
     target = _target_group_check(
         raw.get("target_group"),
         desired_count=service.get("desiredCount", -1),
@@ -918,7 +974,9 @@ def validate_operator_readback(
         latest_allowed_at=latest_allowed_at,
     )
     expected_digest = (
-        "current" if phase == "before" else artifact_tuple["app_image_digest"]
+        "current"
+        if phase in {"before", "cohort"}
+        else artifact_tuple["app_image_digest"]
     )
     try:
         checked_snapshot = validate_deployment_snapshot(
@@ -932,7 +990,7 @@ def validate_operator_readback(
             expected_secret_version_id=expected_secret_version_id,
             expected_task_environment=expected_environment,
             expected_base_environment_sha256=expected_base_environment_sha256,
-            phase="before" if phase == "before" else "after",
+            phase="before" if phase in {"before", "cohort"} else "after",
             external_readiness_verified=True,
         )
     except (RolloutError, ReferenceError) as exc:
@@ -958,6 +1016,106 @@ def validate_operator_readback(
     }
 
 
+def validate_pre_oidc_cohort_confirmation(
+    before: dict[str, Any], cohort: dict[str, Any]
+) -> dict[str, Any]:
+    """Bind a fresh post-approval cohort readback to the approved baseline.
+
+    Task ARNs, timestamps, private ENIs, and the primary deployment ID may
+    change between predeploy approval and deployment-job approval. The new
+    snapshot is accepted only after its own SQL readiness, per-task /ready,
+    target-group health, digest, task-definition, and secret-version checks.
+    """
+
+    _require(
+        before.get("phase") == "before" and cohort.get("phase") == "cohort",
+        "cohort_confirmation_phase_invalid",
+    )
+    _require(
+        before.get("operator_login") == cohort.get("operator_login")
+        and before.get("operator_permission") == "admin"
+        and cohort.get("operator_permission") == "admin",
+        "cohort_confirmation_operator_mismatch",
+    )
+    _require(
+        before.get("template_sha256") == cohort.get("template_sha256")
+        and before.get("base_environment_sha256")
+        == cohort.get("base_environment_sha256"),
+        "cohort_confirmation_template_mismatch",
+    )
+    _require(
+        before.get("database_runtime_role") == cohort.get("database_runtime_role"),
+        "cohort_confirmation_database_runtime_role_mismatch",
+    )
+    _require(
+        before.get("target_group", {}).get("target_group_arn")
+        == cohort.get("target_group", {}).get("target_group_arn")
+        and before.get("target_group", {}).get("health_check_path")
+        == cohort.get("target_group", {}).get("health_check_path"),
+        "cohort_confirmation_target_group_changed",
+    )
+    _require(
+        cohort.get("readiness") == "ready"
+        and cohort.get("readiness_probe", {}).get("path") == "/ready"
+        and cohort.get("readiness_probe", {}).get("ready_count")
+        == cohort.get("snapshot", {}).get("task_count")
+        and cohort.get("target_group", {}).get("healthy_count")
+        == cohort.get("snapshot", {}).get("task_count"),
+        "cohort_confirmation_readiness_failed",
+    )
+    before_snapshot = before.get("snapshot")
+    cohort_snapshot = cohort.get("snapshot")
+    _require(
+        isinstance(before_snapshot, dict) and isinstance(cohort_snapshot, dict),
+        "cohort_confirmation_snapshot_invalid",
+    )
+    for field in (
+        "schema",
+        "cluster_arn",
+        "service_arn",
+        "task_definition_arn",
+        "task_count",
+        "runtime_fingerprint_sha256",
+        "base_environment_sha256",
+        "app_image_digest",
+        "task_role_arn",
+        "execution_role_arn",
+        "database_secret_arn",
+        "database_secret_json_key",
+        "database_secret_version_id",
+        "readiness",
+        "commercial_gates",
+        "trust_pins",
+    ):
+        _require(
+            before_snapshot.get(field) == cohort_snapshot.get(field),
+            f"cohort_confirmation_{field}_mismatch",
+        )
+    cohort_changed = any(
+        before_snapshot.get(field) != cohort_snapshot.get(field)
+        for field in (
+            "task_arns",
+            "task_private_ips",
+            "task_timestamps",
+            "primary_deployment_id",
+        )
+    )
+    return {
+        "schema": "asaas_producer_pre_oidc_cohort_verification.v1",
+        "cohort_changed_since_predeploy": cohort_changed,
+        "before_snapshot_sha256": before.get("snapshot_sha256"),
+        "cohort_snapshot_sha256": cohort.get("snapshot_sha256"),
+        "primary_deployment_id": cohort_snapshot.get("primary_deployment_id"),
+        "task_count": cohort_snapshot.get("task_count"),
+        "task_definition_arn": cohort_snapshot.get("task_definition_arn"),
+        "app_image_digest": cohort_snapshot.get("app_image_digest"),
+        "database_secret_version_id": cohort_snapshot.get(
+            "database_secret_version_id"
+        ),
+        "readiness": cohort.get("readiness"),
+    }
+
+
 def validate_before_after(
     before: dict[str, Any], after: dict[str, Any], *, expected_digest: str
 ) -> dict[str, Any]:
@@ -966,10 +1124,9 @@ def validate_before_after(
         "operator_readback_order_invalid",
     )
     _require(
-        before.get("operator_login")
-        == after.get("operator_login")
-        == before.get("operator_permission")
-        == after.get("operator_permission"),
+        before.get("operator_login") == after.get("operator_login")
+        and before.get("operator_permission") == "admin"
+        and after.get("operator_permission") == "admin",
         "operator_readback_admin_mismatch",
     )
     _require(
@@ -1051,15 +1208,27 @@ def generate_post_readback_key() -> tuple[bytes, bytes]:
 def encrypt_operator_snapshot(
     snapshot: Any, public_pem: bytes, context: dict[str, str]
 ) -> dict[str, str]:
-    """Encrypt a post-readback JSON for a public, run-bound GitHub comment."""
+    """Encrypt a run-bound cohort or post-deployment readback for GitHub."""
 
     _reject_sensitive_value_fields(snapshot)
     _require(
-        set(context)
-        == {"run_id", "run_attempt", "operation_id", "phase", "artifact_sha256"},
+        set(context) == _ENCRYPTION_CONTEXT_FIELDS,
         "encryption_context_invalid",
     )
-    _require(context.get("phase") == "after", "post_snapshot_phase_invalid")
+    _require(context.get("phase") in {"cohort", "after"}, "post_snapshot_phase_invalid")
+    _require(
+        re.fullmatch(r"[1-9][0-9]*", context.get("run_id", "")) is not None
+        and context.get("run_attempt") == "1"
+        and re.fullmatch(r"[0-9a-f]{40}", context.get("sha", "")) is not None
+        and context.get("ref") == RELEASE_REF
+        and re.fullmatch(r"[1-9][0-9]*", context.get("job_id", "")) is not None
+        and re.fullmatch(r"[0-9a-f]{64}", context.get("artifact_sha256", ""))
+        is not None,
+        "encryption_context_invalid",
+    )
+    _canonical_uuid(context.get("operation_id"), "encryption_context_invalid")
+    job_started_at = _timestamp(context.get("job_started_at"), "job_started_at")
+    _require(job_started_at.isoformat().endswith("+00:00"), "job_started_at_invalid")
     try:
         public_key = serialization.load_pem_public_key(public_pem)
     except (ValueError, TypeError):
@@ -1074,7 +1243,8 @@ def encrypt_operator_snapshot(
     payload = _canonical(snapshot)
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-    associated_data = _canonical(context)
+    snapshot_sha256 = canonical_sha256(snapshot)
+    associated_data = _canonical({**context, "snapshot_sha256": snapshot_sha256})
     ciphertext = AESGCM(symmetric_key).encrypt(nonce, payload, associated_data)
     wrapped_key = public_key.encrypt(
         symmetric_key,
@@ -1087,6 +1257,7 @@ def encrypt_operator_snapshot(
     return {
         "schema_version": POST_COMMENT_SCHEMA,
         **context,
+        "snapshot_sha256": snapshot_sha256,
         "recipient_public_key_sha256": public_fingerprint,
         "wrapped_key_b64": base64.b64encode(wrapped_key).decode("ascii"),
         "nonce_b64": base64.b64encode(nonce).decode("ascii"),
@@ -1099,11 +1270,8 @@ def decrypt_operator_snapshot(
 ) -> Any:
     expected_fields = {
         "schema_version",
-        "run_id",
-        "run_attempt",
-        "operation_id",
-        "phase",
-        "artifact_sha256",
+        *_ENCRYPTION_CONTEXT_FIELDS,
+        "snapshot_sha256",
         "recipient_public_key_sha256",
         "wrapped_key_b64",
         "nonce_b64",
@@ -1117,17 +1285,13 @@ def decrypt_operator_snapshot(
         envelope.get("schema_version") == POST_COMMENT_SCHEMA,
         "post_snapshot_envelope_schema_invalid",
     )
-    context = {
-        field: envelope[field]
-        for field in (
-            "run_id",
-            "run_attempt",
-            "operation_id",
-            "phase",
-            "artifact_sha256",
-        )
-    }
+    context = {field: envelope[field] for field in _ENCRYPTION_CONTEXT_FIELDS}
     _require(context == expected_context, "post_snapshot_envelope_context_mismatch")
+    snapshot_sha256 = envelope.get("snapshot_sha256")
+    _require(
+        isinstance(snapshot_sha256, str) and _HEX64.fullmatch(snapshot_sha256),
+        "post_snapshot_hash_invalid",
+    )
     try:
         private_key = serialization.load_pem_private_key(private_pem, password=None)
     except (ValueError, TypeError):
@@ -1160,12 +1324,18 @@ def decrypt_operator_snapshot(
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
         plaintext = AESGCM(symmetric_key).decrypt(
-            nonce, ciphertext, _canonical(context)
+            nonce,
+            ciphertext,
+            _canonical({**context, "snapshot_sha256": snapshot_sha256}),
         )
     except (InvalidTag, ValueError, TypeError):
         raise EvidenceError("post_snapshot_decryption_failed") from None
     value = _strict_loads(plaintext, max_bytes=1_000_000)
     _reject_sensitive_value_fields(value)
+    _require(
+        canonical_sha256(value) == snapshot_sha256,
+        "post_snapshot_hash_mismatch",
+    )
     return value
 
 
@@ -1188,7 +1358,7 @@ def parse_post_readback_comment(
         isinstance(body, str) and len(body.encode("utf-8")) <= 64_000,
         "post_readback_comment_invalid",
     )
-    marker_start = "<!-- asaas-producer-post-readback.v1\n"
+    marker_start = f"<!-- {ENCRYPTED_READBACK_MARKER}\n"
     marker_end = "\n-->"
     _require(
         body.startswith(marker_start) and body.endswith(marker_end),
@@ -1248,7 +1418,12 @@ def main(argv: list[str] | None = None) -> int:
     encrypt.add_argument("--run-id", required=True)
     encrypt.add_argument("--run-attempt", required=True)
     encrypt.add_argument("--operation-id", required=True)
+    encrypt.add_argument("--phase", choices=("cohort", "after"), required=True)
     encrypt.add_argument("--artifact-sha256", required=True)
+    encrypt.add_argument("--ref", required=True)
+    encrypt.add_argument("--sha", required=True)
+    encrypt.add_argument("--job-id", required=True)
+    encrypt.add_argument("--job-started-at", required=True)
     args = parser.parse_args(argv)
     try:
         template = None
@@ -1292,8 +1467,12 @@ def main(argv: list[str] | None = None) -> int:
                 "operation_id": _canonical_uuid(
                     args.operation_id, "operation_id_invalid"
                 ),
-                "phase": "after",
+                "phase": args.phase,
                 "artifact_sha256": args.artifact_sha256,
+                "ref": args.ref,
+                "sha": args.sha,
+                "job_id": args.job_id,
+                "job_started_at": args.job_started_at,
             }
             _require(
                 _HEX64.fullmatch(args.artifact_sha256) is not None,

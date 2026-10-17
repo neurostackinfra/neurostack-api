@@ -9,6 +9,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/asaas-producer-image-deploy.yml"
+RUNBOOK = ROOT / "docs/runbooks/asaas-producer-image-rollout-group5.md"
 ENVIRONMENT = "asaas-production-deployment"
 _SENSITIVE_NAMES = {
     "ASAAS_PRODUCER_TASK_DEFINITION_TEMPLATE_JSON",
@@ -59,16 +60,30 @@ def test_workflow_has_exact_manual_inputs_and_serialized_execution() -> None:
 
 
 def test_only_deploy_job_can_request_oidc_and_it_is_after_all_no_oidc_gates() -> None:
-    jobs = _workflow()["jobs"]
-    oidc_jobs = [
-        name
+    workflow = _workflow()
+    jobs = workflow["jobs"]
+    oidc_permissions = [
+        (name, job.get("permissions", {}).get("id-token"))
         for name, job in jobs.items()
-        if job.get("permissions", {}).get("id-token") == "write"
+        if "id-token" in job.get("permissions", {})
     ]
-    assert oidc_jobs == ["deploy"]
+    assert oidc_permissions == [("deploy", "write")]
+    assert workflow["permissions"] == {}
     assert jobs["preflight"].get("environment") is None
     assert jobs["verify-predeploy-evidence"]["environment"] == ENVIRONMENT
     assert jobs["deploy"]["environment"] == ENVIRONMENT
+    assert jobs["deploy"]["needs"] == ["preflight", "verify-predeploy-evidence"]
+    assert jobs["deploy"]["if"] == (
+        "needs.preflight.result == 'success' && "
+        "needs.verify-predeploy-evidence.result == 'success'"
+    )
+    assert "id-token" not in jobs["preflight"].get("permissions", {})
+    assert "id-token" not in jobs["verify-predeploy-evidence"].get("permissions", {})
+    assert not any(
+        "BILLING_PRODUCER_DEPLOY_ROLE_ARN" in node.get("env", {})
+        for node in _walk(jobs["preflight"])
+        if isinstance(node, dict)
+    )
 
     deploy_steps = jobs["deploy"]["steps"]
     aws_steps = [
@@ -85,14 +100,50 @@ def test_only_deploy_job_can_request_oidc_and_it_is_after_all_no_oidc_gates() ->
     key_steps = [
         index
         for index, step in enumerate(deploy_steps)
-        if step.get("name") == "Generate one-run encrypted readback key before OIDC"
+        if step.get("name")
+        == "Generate one-run key and publish pre-OIDC cohort instructions"
     ]
-    assert len(aws_steps) == len(gate_steps) == len(key_steps) == 1
-    assert gate_steps[0] < key_steps[0] < aws_steps[0]
+    cohort_steps = [
+        index
+        for index, step in enumerate(deploy_steps)
+        if step.get("name") == "Validate fresh run-bound cohort confirmation before OIDC"
+    ]
+    assert len(aws_steps) == len(gate_steps) == len(key_steps) == len(cohort_steps) == 1
+    assert gate_steps[0] < key_steps[0] < cohort_steps[0] < aws_steps[0]
+    assert deploy_steps[aws_steps[0]]["with"]["role-to-assume"] == (
+        "${{ env.BILLING_PRODUCER_DEPLOY_ROLE_ARN }}"
+    )
+    assert "BILLING_PRODUCER_DEPLOY_ROLE_ARN" in jobs["deploy"]["env"]
+    assert "BILLING_PRODUCER_DEPLOY_ROLE_ARN" in deploy_steps[gate_steps[0]]["env"]
+    assert "ASAAS_PRE_OIDC_COHORT_PATH" in deploy_steps[-1]["env"]
+    assert "ASAAS_PRE_OIDC_COHORT_SHA256" in deploy_steps[-1]["env"]
+    assert deploy_steps[cohort_steps[0]]["id"] == "cohort_confirmation"
+    assert "--phase pre-oidc-cohort" in deploy_steps[cohort_steps[0]]["run"]
     assert all(
         not step.get("uses", "").startswith("aws-actions/")
         for step in deploy_steps[: aws_steps[0]]
     )
+    assert (
+        sum(
+            1
+            for node in _walk(workflow)
+            if isinstance(node, dict)
+            and node.get("uses", "").startswith(
+                "aws-actions/configure-aws-credentials@"
+            )
+        )
+        == 1
+    )
+
+    serialized = WORKFLOW.read_text(encoding="utf-8")
+    assert serialized.count("id-token: write") == 1
+    runbook = RUNBOOK.read_text(encoding="utf-8").lower()
+    assert "job-scoped, not step-scoped" in runbook
+    assert (
+        "approved group 2 output readback for stack "
+        "`neurostack-asaas-producer-release` records `deployrolearn=" in runbook
+    )
+    assert "neurostack-asaas-producer-release-deployrole-cu6auecqci9i" in runbook
 
 
 def test_private_secrets_are_scoped_to_protected_environment_steps_only() -> None:

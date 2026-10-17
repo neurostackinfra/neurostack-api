@@ -12,7 +12,9 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 
 from scripts.asaas_producer_rollout_evidence import (
+    ENCRYPTED_READBACK_MARKER,
     EvidenceError,
+    _validate_database_task_ip_binding,
     _task_readiness_check,
     build_replacement_task_definition,
     decrypt_operator_snapshot,
@@ -20,8 +22,13 @@ from scripts.asaas_producer_rollout_evidence import (
     generate_post_readback_key,
     parse_post_readback_comment,
     validate_operator_readback,
+    validate_before_after,
+    validate_pre_oidc_cohort_confirmation,
     validate_registered_task_definition,
     validate_task_definition_template,
+)
+from scripts.validate_asaas_registration_database_readiness import (
+    main as validate_database_readiness_cli,
 )
 from scripts.verify_asaas_producer_image_rollout import (
     SERVICE_ARN,
@@ -195,6 +202,7 @@ def _snapshot() -> dict[str, object]:
             ],
             "deployments": [
                 {
+                    "id": "ecs-svc/1234567890123456789",
                     "status": "PRIMARY",
                     "taskDefinition": task_definition_arn,
                     "rolloutState": "COMPLETED",
@@ -286,7 +294,14 @@ def _validate_snapshot(raw: dict[str, object]) -> dict[str, object]:
     )
 
 
-def _operator_readback(*, phase: str = "before") -> dict[str, object]:
+def _operator_readback(
+    *,
+    phase: str = "before",
+    database_task_ips: list[str] | None = None,
+    database_readiness: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if database_task_ips is None:
+        database_task_ips = ["10.0.1.7"]
     snapshot = _snapshot()
     old_digest = "sha256:" + "b" * 64
     if phase == "before":
@@ -339,18 +354,23 @@ def _operator_readback(*, phase: str = "before") -> dict[str, object]:
         "template_sha256": "d" * 64,
         "producer_environment_sha256": "e" * 64,
         "artifact": artifact,
-        "database_readiness": {
-            "schema": "asaas_registration_database_readiness.v1",
-            "task_ip_count": 1,
-            "matched_task_ip_count": 1,
-            "runtime_role_count": 1,
-            "api_runtime_role": "neurostack_api_runtime",
-            "required_columns_present": True,
-            "required_constraints_present": True,
-            "required_privileges_present": True,
-            "row_lock_privilege_present": True,
-            "readiness_ok": True,
-        },
+        "database_readiness": (
+            database_readiness
+            if database_readiness is not None
+            else {
+                "schema": "asaas_registration_database_readiness.v1",
+                "task_ips": database_task_ips,
+                "task_ip_count": len(database_task_ips),
+                "matched_task_ip_count": len(database_task_ips),
+                "runtime_role_count": 1,
+                "api_runtime_role": "neurostack_api_runtime",
+                "required_columns_present": True,
+                "required_constraints_present": True,
+                "required_privileges_present": True,
+                "row_lock_privilege_present": True,
+                "readiness_ok": True,
+            }
+        ),
         "target_group": {
             "target_group_arn": snapshot["service"]["loadBalancers"][0][
                 "targetGroupArn"
@@ -512,6 +532,68 @@ def test_operator_alb_readiness_accepts_unknown_ecs_health_only_for_exact_live_i
         _operator_readback_with_raw(raw)
 
 
+def test_readiness_cli_output_can_be_embedded_unchanged_in_readback_gate(
+    tmp_path: Path,
+) -> None:
+    sql_row = {
+        "task_ips": ["10.0.1.7"],
+        "task_ip_count": 1,
+        "matched_task_ip_count": 1,
+        "runtime_role_count": 1,
+        "api_runtime_role": "neurostack_api_runtime",
+        "required_columns_present": True,
+        "required_constraints_present": True,
+        "required_privileges_present": True,
+        "row_lock_privilege_present": True,
+        "readiness_ok": True,
+    }
+    input_path = tmp_path / "readiness-row.json"
+    output_path = tmp_path / "readiness-validated.json"
+    input_path.write_text(json.dumps(sql_row), encoding="utf-8")
+
+    assert validate_database_readiness_cli(
+        ["--input", str(input_path), "--output", str(output_path)]
+    ) == 0
+    validated_readiness = json.loads(output_path.read_text(encoding="utf-8"))
+    assert validated_readiness["task_ips"] == ["10.0.1.7"]
+    assert validated_readiness["readiness_ok"] is True
+    assert "readiness" not in validated_readiness
+
+    checked = _operator_readback(database_readiness=validated_readiness)["checked"]
+    assert checked["database_runtime_role"] == "neurostack_api_runtime"
+
+
+@pytest.mark.parametrize(
+    "sql_task_ips",
+    [["10.0.1.8"], ["10.0.1.7", "10.0.1.8"]],
+)
+def test_database_readiness_must_bind_exactly_to_every_snapshot_task_ip(
+    sql_task_ips: list[str],
+) -> None:
+    with pytest.raises(EvidenceError, match="database_task_ip_cohort_mismatch"):
+        _operator_readback(database_task_ips=sql_task_ips)
+
+
+@pytest.mark.parametrize(
+    ("sql_task_ips", "task_ips"),
+    [
+        (["10.0.1.7"], ["10.0.1.7", "10.0.1.8"]),
+        (["10.0.1.7", "10.0.1.8", "10.0.1.9"], ["10.0.1.7", "10.0.1.8"]),
+    ],
+)
+def test_database_readiness_rejects_omitted_or_extra_cohort_ips(
+    sql_task_ips: list[str], task_ips: list[str]
+) -> None:
+    readiness = {
+        "task_ips": sql_task_ips,
+        "task_ip_count": len(sql_task_ips),
+        "matched_task_ip_count": len(sql_task_ips),
+    }
+    snapshot_tasks = [{"privateIp": address} for address in task_ips]
+    with pytest.raises(EvidenceError, match="database_task_ip_cohort_mismatch"):
+        _validate_database_task_ip_binding(readiness, snapshot_tasks)
+
+
 @pytest.mark.parametrize(
     ("mutate", "reason"),
     [
@@ -653,11 +735,159 @@ def test_before_and_after_readbacks_preserve_count_role_secret_and_trust_pins() 
     result = compare_rollout_readbacks(before, after, expected_digest=DIGEST)
     assert result["previous_image_digest"] == old_digest
     assert result["active_image_digest"] == DIGEST
+    assert result["active_primary_deployment_id"] == "ecs-svc/1234567890123456789"
     after["database_secret_version_id"] = "different-version"
     with pytest.raises(
         RolloutError, match="readback_database_secret_version_id_changed"
     ):
         compare_rollout_readbacks(before, after, expected_digest=DIGEST)
+
+
+def test_snapshot_requires_primary_deployment_id_for_live_binding() -> None:
+    raw = _snapshot()
+    del raw["service"]["deployments"][0]["id"]
+    with pytest.raises(RolloutError, match="service_primary_deployment_mismatch"):
+        _validate_snapshot(raw)
+
+
+def _cohort_summary(
+    *, phase: str, task_suffix: str, primary_deployment_id: str
+) -> dict[str, object]:
+    snapshot = {
+        "schema": "asaas_producer_image_rollout_readback.v1",
+        "cluster_arn": "arn:aws:ecs:us-east-1:388460142431:cluster/neurostack-staging",
+        "service_arn": SERVICE_ARN,
+        "task_definition_arn": "arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:8",
+        "primary_deployment_id": primary_deployment_id,
+        "task_count": 2,
+        "task_arns": [f"task-{task_suffix}-1", f"task-{task_suffix}-2"],
+        "task_private_ips": ["10.0.1.7", "10.0.1.8"],
+        "task_timestamps": [
+            {"task_arn": f"task-{task_suffix}-1", "created_at": "2026-10-16T10:00:00Z", "started_at": "2026-10-16T10:00:05Z"},
+            {"task_arn": f"task-{task_suffix}-2", "created_at": "2026-10-16T10:00:01Z", "started_at": "2026-10-16T10:00:06Z"},
+        ],
+        "runtime_fingerprint_sha256": "b" * 64,
+        "base_environment_sha256": {"HOST": "c" * 64},
+        "app_image_digest": "sha256:" + "d" * 64,
+        "task_role_arn": TASK_ROLE,
+        "execution_role_arn": EXECUTION_ROLE,
+        "database_secret_arn": SECRET_ARN,
+        "database_secret_json_key": "database_url",
+        "database_secret_version_id": VERSION_ID,
+        "readiness": "healthy",
+        "commercial_gates": "disabled",
+        "trust_pins": {"BILLING_PRODUCER_BUILD_KID": "key"},
+    }
+    return {
+        "phase": phase,
+        "operator_login": "operator-admin",
+        "operator_permission": "admin",
+        "template_sha256": "e" * 64,
+        "base_environment_sha256": {"HOST": "c" * 64},
+        "readiness": "ready",
+        "readiness_probe": {"path": "/ready", "ready_count": 2},
+        "target_group": {"healthy_count": 2},
+        "snapshot": snapshot,
+        "snapshot_sha256": "f" * 64,
+    }
+
+
+def test_pre_oidc_cohort_allows_changed_tasks_only_with_fresh_readiness_contract() -> None:
+    before = _cohort_summary(
+        phase="before", task_suffix="old", primary_deployment_id="deploy-old"
+    )
+    cohort = _cohort_summary(
+        phase="cohort", task_suffix="fresh", primary_deployment_id="deploy-fresh"
+    )
+    result = validate_pre_oidc_cohort_confirmation(before, cohort)
+    assert result["cohort_changed_since_predeploy"] is True
+    assert result["primary_deployment_id"] == "deploy-fresh"
+
+    cohort["readiness_probe"] = {"ready_count": 1}
+    with pytest.raises(EvidenceError, match="cohort_confirmation_readiness_failed"):
+        validate_pre_oidc_cohort_confirmation(before, cohort)
+
+
+def test_pre_oidc_cohort_accepts_matching_normal_admin_login() -> None:
+    before = _cohort_summary(
+        phase="before", task_suffix="old", primary_deployment_id="deploy-old"
+    )
+    cohort = _cohort_summary(
+        phase="cohort", task_suffix="fresh", primary_deployment_id="deploy-fresh"
+    )
+    before["operator_login"] = "lorenzo"
+    cohort["operator_login"] = "lorenzo"
+    before["operator_permission"] = "admin"
+    cohort["operator_permission"] = "admin"
+
+    result = validate_pre_oidc_cohort_confirmation(before, cohort)
+    assert result["cohort_changed_since_predeploy"] is True
+
+
+@pytest.mark.parametrize(
+    ("before_login", "cohort_login", "before_permission", "cohort_permission"),
+    [
+        ("lorenzo", "lorenzo", "write", "admin"),
+        ("lorenzo", "lorenzo", "admin", "write"),
+        ("lorenzo", "another-admin", "admin", "admin"),
+    ],
+)
+def test_pre_oidc_cohort_rejects_permission_or_login_mismatch(
+    before_login: str,
+    cohort_login: str,
+    before_permission: str,
+    cohort_permission: str,
+) -> None:
+    before = _cohort_summary(
+        phase="before", task_suffix="old", primary_deployment_id="deploy-old"
+    )
+    cohort = _cohort_summary(
+        phase="cohort", task_suffix="fresh", primary_deployment_id="deploy-fresh"
+    )
+    before["operator_login"] = before_login
+    cohort["operator_login"] = cohort_login
+    before["operator_permission"] = before_permission
+    cohort["operator_permission"] = cohort_permission
+
+    with pytest.raises(EvidenceError, match="cohort_confirmation_operator_mismatch"):
+        validate_pre_oidc_cohort_confirmation(before, cohort)
+
+
+def test_postdeploy_readback_accepts_matching_normal_admin_login() -> None:
+    before = _operator_readback(phase="before")["checked"]
+    after = _operator_readback(phase="after")["checked"]
+    before["operator_login"] = "lorenzo"
+    after["operator_login"] = "lorenzo"
+
+    result = validate_before_after(before, after, expected_digest=DIGEST)
+    assert result["verified"] is True
+
+
+@pytest.mark.parametrize("phase", ["before", "after"])
+def test_postdeploy_readback_rejects_non_admin_operator_permission(
+    phase: str,
+) -> None:
+    before = _operator_readback(phase="before")["checked"]
+    after = _operator_readback(phase="after")["checked"]
+    (before if phase == "before" else after)["operator_permission"] = "write"
+
+    with pytest.raises(EvidenceError, match="operator_readback_admin_mismatch"):
+        validate_before_after(before, after, expected_digest=DIGEST)
+
+
+def test_pre_oidc_cohort_rejects_secret_or_task_definition_drift() -> None:
+    before = _cohort_summary(
+        phase="before", task_suffix="same", primary_deployment_id="deploy-1"
+    )
+    cohort = _cohort_summary(
+        phase="cohort", task_suffix="same", primary_deployment_id="deploy-1"
+    )
+    cohort["snapshot"]["database_secret_version_id"] = "different-version"
+    with pytest.raises(
+        EvidenceError,
+        match="cohort_confirmation_database_secret_version_id_mismatch",
+    ):
+        validate_pre_oidc_cohort_confirmation(before, cohort)
 
 
 @pytest.mark.parametrize(
@@ -921,14 +1151,21 @@ def test_registered_task_definition_summary_never_contains_environment_or_secret
     assert "private" not in encoded
 
 
-def test_post_readback_encryption_comment_binds_context_and_admin_identity() -> None:
+@pytest.mark.parametrize("phase", ["cohort", "after"])
+def test_encrypted_readback_comment_binds_full_context_and_admin_identity(
+    phase: str,
+) -> None:
     private_pem, public_pem = generate_post_readback_key()
     context = {
         "run_id": "8123456789",
         "run_attempt": "1",
         "operation_id": str(uuid4()),
-        "phase": "after",
+        "phase": phase,
         "artifact_sha256": "a" * 64,
+        "ref": "refs/heads/main",
+        "sha": "c" * 40,
+        "job_id": "9212345678",
+        "job_started_at": "2026-10-16T10:00:00.000Z",
     }
     snapshot = {
         "task_definition_arn": "arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:9",
@@ -943,7 +1180,8 @@ def test_post_readback_encryption_comment_binds_context_and_admin_identity() -> 
         envelope, private_pem, expected_context=context
     )
     assert restored == snapshot
-    comment = "<!-- asaas-producer-post-readback.v1\n" + serialized + "\n-->"
+    assert envelope["snapshot_sha256"]
+    comment = f"<!-- {ENCRYPTED_READBACK_MARKER}\n" + serialized + "\n-->"
     parsed = parse_post_readback_comment(
         comment,
         author_login="operator-admin",
@@ -961,6 +1199,11 @@ def test_post_readback_encryption_comment_binds_context_and_admin_identity() -> 
             expected_operator_login="operator-admin",
             private_pem=private_pem,
             expected_context=context,
+        )
+    wrong_job_context = {**context, "job_id": "9212345679"}
+    with pytest.raises(EvidenceError, match="post_snapshot_envelope_context_mismatch"):
+        decrypt_operator_snapshot(
+            envelope, private_pem, expected_context=wrong_job_context
         )
     tampered = copy.deepcopy(envelope)
     tampered["ciphertext_b64"] = tampered["ciphertext_b64"][:-2] + "AA"

@@ -16,6 +16,13 @@ EXPECTED_TESTS = (
     "tests/scripts/test_asaas_build_workflow.py",
     "tests/scripts/test_sign_asaas_build_attestation.py",
     "tests/scripts/test_asaas_release_preflight_workflow.py",
+    "tests/scripts/test_asaas_producer_deploy_readback_policy.py",
+    "tests/scripts/test_asaas_producer_deploy_workflow.py",
+    "tests/scripts/test_asaas_producer_rollout_gate.py",
+    "tests/scripts/test_asaas_producer_deploy_executor.py",
+    "tests/scripts/test_asaas_database_secret_reference.py",
+    "tests/scripts/test_asaas_registration_database_readiness_sql.py",
+    "tests/scripts/test_verify_asaas_producer_image_rollout.py",
 )
 
 
@@ -44,8 +51,13 @@ def test_production_infra_gate_is_asaas_only_and_runs_static_template_first() ->
         "scripts/validate_asaas_producer_release_readbacks.py",
         "--check-template",
     ]
-    assert commands[1][:3] == ["$python_bin", "-m", "pytest"]
-    assert commands[1][3:] == ["-q", *EXPECTED_TESTS]
+    assert commands[1] == [
+        "$python_bin",
+        "scripts/validate_asaas_producer_deploy_readback_policy.py",
+        "--check-template",
+    ]
+    assert commands[2][:3] == ["$python_bin", "-m", "pytest"]
+    assert commands[2][3:] == ["-q", *EXPECTED_TESTS]
 
 
 def test_template_and_static_validator_enforce_asaas_trust_policy() -> None:

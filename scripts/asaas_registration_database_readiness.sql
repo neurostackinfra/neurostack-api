@@ -2,9 +2,10 @@
 Read-only predeployment check for POST /v1/admin/billing/producer-build-attestations.
 
 Replace the reserved 192.0.2.10 address below with every current task ENI IPv4
-address from ECS DescribeTasks. Run in the already-authenticated PostgreSQL
-console connected to the API database. Do not add application selects or query
-text fields. A query error or any false result blocks the rollout.
+address from the operator-authenticated ECS task readback. Run in the already-
+authenticated PostgreSQL console connected to the API database. Do not add
+application selects or query text fields. A query error or any false result
+blocks the rollout.
 */
 WITH supplied_task_ips AS (
     SELECT ARRAY[INET '192.0.2.10'] AS task_ips
@@ -20,6 +21,11 @@ matched_sessions AS (
 ),
 task_binding AS (
     SELECT
+        ARRAY(
+            SELECT host(task_ip.address)
+            FROM UNNEST(supplied.task_ips) AS task_ip(address)
+            ORDER BY host(task_ip.address)
+        ) AS task_ips,
         CARDINALITY(supplied.task_ips) AS task_ip_count,
         COUNT(DISTINCT matched.client_addr) AS matched_task_ip_count,
         COUNT(DISTINCT matched.usename) AS runtime_role_count,
@@ -76,12 +82,12 @@ column_status AS (
 required_constraints AS (
     SELECT *
     FROM (VALUES
-        ('billing_producer_v1_build_attestations', 'billing_producer_v1_build_attestations_pkey', 'p'),
-        ('billing_producer_v1_build_attestations', 'ck_billing_producer_v1_attestation_envelope_digest', 'c'),
-        ('billing_producer_v1_build_attestations', 'ck_billing_producer_v1_attestation_payload_digest', 'c'),
-        ('billing_producer_v1_build_attestations', 'uq_billing_producer_v1_attestation_digest', 'u'),
-        ('billing_producer_v1_build_attestations', 'billing_producer_v1_build_attestations_registered_by_user_id_fkey', 'f')
-    ) AS expected(table_name, constraint_name, constraint_type)
+        ('billing_producer_v1_build_attestations', 'billing_producer_v1_build_attestations_pkey', 'p', ARRAY['id']::text[], NULL, NULL, NULL, NULL, NULL),
+        ('billing_producer_v1_build_attestations', 'ck_billing_producer_v1_attestation_envelope_digest', 'c', ARRAY['envelope_digest']::text[], 'lengthenvelope_digest=64andenvelope_digest~''^[0-9a-f]{64}$''', NULL, NULL, NULL, NULL),
+        ('billing_producer_v1_build_attestations', 'ck_billing_producer_v1_attestation_payload_digest', 'c', ARRAY['payload_digest']::text[], 'lengthpayload_digest=64andpayload_digest~''^[0-9a-f]{64}$''', NULL, NULL, NULL, NULL),
+        ('billing_producer_v1_build_attestations', 'uq_billing_producer_v1_attestation_digest', 'u', ARRAY['id', 'envelope_digest']::text[], NULL, NULL, NULL, NULL, NULL),
+        ('billing_producer_v1_build_attestations', 'billing_producer_v1_build_attestations_registered_by_user_id_fkey', 'f', ARRAY['registered_by_user_id']::text[], NULL, 'public', 'users', ARRAY['id']::text[], 'r')
+    ) AS expected(table_name, constraint_name, constraint_type, key_columns, check_expression, referenced_schema, referenced_table, referenced_columns, delete_action)
 ),
 constraint_status AS (
     SELECT BOOL_AND(
@@ -97,6 +103,55 @@ constraint_status AS (
               AND constraint_row.conname = expected.constraint_name
               AND constraint_row.contype = expected.constraint_type
               AND constraint_row.convalidated
+              AND CASE
+                    WHEN expected.constraint_type = 'c' THEN
+                        lower(regexp_replace(
+                            regexp_replace(
+                                pg_catalog.pg_get_expr(
+                                    constraint_row.conbin,
+                                    constraint_row.conrelid,
+                                    true
+                                ),
+                                '::text',
+                                '',
+                                'g'
+                            ),
+                            '[[:space:]()]',
+                            '',
+                            'g'
+                        )) = expected.check_expression
+                    ELSE ARRAY(
+                        SELECT attribute.attname::text
+                        FROM unnest(constraint_row.conkey)
+                             WITH ORDINALITY AS key_column(attnum, ordinal)
+                        JOIN pg_catalog.pg_attribute AS attribute
+                          ON attribute.attrelid = constraint_row.conrelid
+                         AND attribute.attnum = key_column.attnum
+                        ORDER BY key_column.ordinal
+                    )::text[] = expected.key_columns
+                  END
+              AND (
+                    expected.constraint_type <> 'f'
+                    OR (
+                        constraint_row.confrelid = pg_catalog.to_regclass(
+                            pg_catalog.format(
+                                '%I.%I',
+                                expected.referenced_schema,
+                                expected.referenced_table
+                            )
+                        )
+                        AND ARRAY(
+                            SELECT referenced_attribute.attname::text
+                            FROM unnest(constraint_row.confkey)
+                                 WITH ORDINALITY AS referenced_key(attnum, ordinal)
+                            JOIN pg_catalog.pg_attribute AS referenced_attribute
+                              ON referenced_attribute.attrelid = constraint_row.confrelid
+                             AND referenced_attribute.attnum = referenced_key.attnum
+                            ORDER BY referenced_key.ordinal
+                        )::text[] = expected.referenced_columns
+                        AND constraint_row.confdeltype = expected.delete_action
+                    )
+              )
         )
     ) AS required_constraints_present
     FROM required_constraints AS expected
@@ -132,6 +187,7 @@ privilege_status AS (
     FROM task_binding AS binding
 )
 SELECT
+    to_json(binding.task_ips) AS task_ips,
     binding.task_ip_count,
     binding.matched_task_ip_count,
     binding.runtime_role_count,

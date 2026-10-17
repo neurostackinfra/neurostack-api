@@ -9,15 +9,115 @@ from uuid import uuid4
 
 import pytest
 
+from scripts import asaas_producer_rollout_gate as rollout_gate
 from scripts.asaas_producer_rollout_gate import (
+    DEPLOY_ROLE_VARIABLE,
     GateError,
     _validate_ui_approval_comment,
     validate_canonical_registration_comment,
+    validate_deploy_role_environment_variable,
     validate_deployment_history,
+    validate_repository_protections,
+    validate_runtime_deploy_role_variable,
 )
 
 REPOSITORY = "neurostackinfra/neurostack-api"
 WORKFLOW = ".github/workflows/asaas-producer-image-deploy.yml"
+DEPLOY_ROLE_ARN = (
+    rollout_gate.PINNED_DEPLOY_ROLE_ARN
+)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"name": "OTHER_ROLE", "value": DEPLOY_ROLE_ARN},
+        {"name": DEPLOY_ROLE_VARIABLE, "value": "arn:aws:iam::388460142431:role/other"},
+        {
+            "name": DEPLOY_ROLE_VARIABLE,
+            "value": "arn:aws:iam::388460142431:role/neurostack-asaas-producer-release-DeployRole-AbCd1234",
+        },
+        {"name": DEPLOY_ROLE_VARIABLE, "value": ""},
+        None,
+    ],
+)
+def test_deploy_role_readback_rejects_wrong_name_or_unpinned_arn(value) -> None:
+    with pytest.raises(GateError, match="protected_deploy_role_readback_invalid"):
+        validate_deploy_role_environment_variable(value)
+
+
+def test_runtime_deploy_role_must_equal_hashed_protected_value() -> None:
+    assert (
+        validate_runtime_deploy_role_variable(DEPLOY_ROLE_ARN, DEPLOY_ROLE_ARN)
+        == DEPLOY_ROLE_ARN
+    )
+    with pytest.raises(GateError, match="protected_deploy_role_variable_mismatch"):
+        validate_runtime_deploy_role_variable(
+            "arn:aws:iam::388460142431:role/arbitrary", DEPLOY_ROLE_ARN
+        )
+
+
+def test_repository_protection_readback_hashes_exact_group2_deploy_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    role_variable_url = (
+        "https://api.github.com/repos/neurostackinfra/neurostack-api/"
+        "environments/asaas-production-deployment/variables/"
+        "BILLING_PRODUCER_DEPLOY_ROLE_ARN"
+    )
+    seen: list[str] = []
+
+    def get(url: str, token: str):
+        seen.append(url)
+        if url.endswith("/repos/neurostackinfra/neurostack-api"):
+            return (
+                {
+                    "full_name": REPOSITORY,
+                    "id": rollout_gate.REPOSITORY_ID,
+                    "owner": {"id": rollout_gate.OWNER_ID},
+                    "default_branch": "main",
+                },
+                None,
+            )
+        if url == role_variable_url:
+            return (
+                {"name": DEPLOY_ROLE_VARIABLE, "value": DEPLOY_ROLE_ARN},
+                None,
+            )
+        raise AssertionError("unexpected GitHub readback endpoint")
+
+    monkeypatch.setattr(
+        rollout_gate.github_preflight,
+        "validate_ruleset",
+        lambda *args, **kwargs: {"ruleset_id": 42},
+    )
+    monkeypatch.setattr(
+        rollout_gate.github_preflight,
+        "validate_environment",
+        lambda name, *args, **kwargs: {"environment": name},
+    )
+    protections = validate_repository_protections(
+        "read-only-token",
+        github_get=get,
+        github_collection=lambda *args, **kwargs: [],
+    )
+    assert role_variable_url in seen
+    assert protections["deploy_role_variable"] == DEPLOY_ROLE_VARIABLE
+    assert protections["deploy_role_arn"] == DEPLOY_ROLE_ARN
+    assert protections["deploy_role_output_pin"] == {
+        "cloudformation_stack": "neurostack-asaas-producer-release",
+        "output_key": "DeployRoleArn",
+        "read_at_utc": "2026-10-16T23:02:35.755467Z",
+        "readback_sha256": "765b3174d6a1b28205f0185f535fc6cdf2fa8b369c8af6e7583524aa437d7fb9",
+    }
+
+    changed = {
+        **protections,
+        "deploy_role_arn": DEPLOY_ROLE_ARN + "x",
+    }
+    original_hash = hashlib.sha256(rollout_gate._canonical(protections)).digest()
+    changed_hash = hashlib.sha256(rollout_gate._canonical(changed)).digest()
+    assert original_hash != changed_hash
 
 
 def _png(rgba: bytes) -> bytes:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -16,8 +17,42 @@ class ReadinessError(ValueError):
     """The readiness SQL result is missing or failed a required check."""
 
 
+_REQUIRED_SQL_FRAGMENTS = (
+    "('billing_producer_v1_build_attestations','billing_producer_v1_build_attestations_pkey','p',array['id']::text[],null,null,null,null,null)",
+    "('billing_producer_v1_build_attestations','ck_billing_producer_v1_attestation_envelope_digest','c',array['envelope_digest']::text[],'lengthenvelope_digest=64andenvelope_digest~''^[0-9a-f]{64}$''',null,null,null,null)",
+    "('billing_producer_v1_build_attestations','ck_billing_producer_v1_attestation_payload_digest','c',array['payload_digest']::text[],'lengthpayload_digest=64andpayload_digest~''^[0-9a-f]{64}$''',null,null,null,null)",
+    "('billing_producer_v1_build_attestations','uq_billing_producer_v1_attestation_digest','u',array['id','envelope_digest']::text[],null,null,null,null,null)",
+    "('billing_producer_v1_build_attestations','billing_producer_v1_build_attestations_registered_by_user_id_fkey','f',array['registered_by_user_id']::text[],null,'public','users',array['id']::text[],'r')",
+)
+_REQUIRED_SQL_SEMANTICS = (
+    "array(selecthost(task_ip.address)fromunnest(supplied.task_ips)astask_ip(address)orderbyhost(task_ip.address))astask_ips",
+    "to_json(binding.task_ips)astask_ips",
+    "pg_catalog.pg_get_expr(constraint_row.conbin,constraint_row.conrelid,true)",
+    "=expected.check_expression",
+    "=expected.key_columns",
+    "constraint_row.confrelid=pg_catalog.to_regclass(",
+    "=expected.referenced_columns",
+    "constraint_row.confdeltype=expected.delete_action",
+    "constraint_row.convalidated",
+)
+
+
+def validate_readiness_sql_contract(sql_text: str) -> None:
+    """Check that the operator-facing SQL still measures migration semantics."""
+
+    if not isinstance(sql_text, str):
+        raise ReadinessError("readiness_sql_contract_invalid")
+    uncommented = re.sub(r"/\*.*?\*/|--[^\n]*", "", sql_text, flags=re.DOTALL)
+    normalized = re.sub(r"\s+", "", uncommented).lower()
+    if not all(fragment in normalized for fragment in _REQUIRED_SQL_FRAGMENTS):
+        raise ReadinessError("readiness_sql_constraint_contract_invalid")
+    if not all(fragment in normalized for fragment in _REQUIRED_SQL_SEMANTICS):
+        raise ReadinessError("readiness_sql_semantic_check_missing")
+
+
 _ROLE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,62}$")
 _FIELDS = {
+    "task_ips",
     "task_ip_count",
     "matched_task_ip_count",
     "runtime_role_count",
@@ -33,6 +68,19 @@ _FIELDS = {
 def validate_readiness_row(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict) or set(raw) != _FIELDS:
         raise ReadinessError("readiness_result_shape_invalid")
+    task_ips = raw["task_ips"]
+    if not isinstance(task_ips, list) or not task_ips:
+        raise ReadinessError("readiness_result_task_ips_invalid")
+    try:
+        parsed_task_ips = [ipaddress.ip_address(value) for value in task_ips]
+    except (TypeError, ValueError):
+        raise ReadinessError("readiness_result_task_ips_invalid") from None
+    if (
+        any(address.version != 4 for address in parsed_task_ips)
+        or any(str(address) != value for address, value in zip(parsed_task_ips, task_ips))
+        or len(set(parsed_task_ips)) != len(parsed_task_ips)
+    ):
+        raise ReadinessError("readiness_result_task_ips_invalid")
     counts = (
         raw["task_ip_count"],
         raw["matched_task_ip_count"],
@@ -44,6 +92,7 @@ def validate_readiness_row(raw: Any) -> dict[str, Any]:
     role = raw["api_runtime_role"]
     if not (
         task_count > 0
+        and len(task_ips) == task_count
         and matched_count == task_count
         and role_count == 1
         and isinstance(role, str)
@@ -63,6 +112,7 @@ def validate_readiness_row(raw: Any) -> dict[str, Any]:
             raise ReadinessError(f"{field}_failed")
     return {
         "schema": "asaas_registration_database_readiness.v1",
+        "task_ips": task_ips,
         "task_ip_count": task_count,
         "matched_task_ip_count": matched_count,
         "runtime_role_count": role_count,
@@ -71,7 +121,7 @@ def validate_readiness_row(raw: Any) -> dict[str, Any]:
         "required_constraints_present": True,
         "required_privileges_present": True,
         "row_lock_privilege_present": True,
-        "readiness": "ready",
+        "readiness_ok": True,
     }
 
 

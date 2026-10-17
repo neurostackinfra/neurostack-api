@@ -8,9 +8,9 @@ printed or uploaded in raw form. The script never calls GetSecretValue.
 
 from __future__ import annotations
 
-import ipaddress
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -25,12 +25,15 @@ from scripts.asaas_database_secret_reference import (
     resolve_active_database_secret,
 )
 from scripts.asaas_producer_rollout_evidence import (
+    ENCRYPTED_READBACK_MARKER,
     EvidenceError,
     _canonical,
     _strict_loads,
     build_replacement_task_definition,
+    canonical_sha256,
     parse_post_readback_comment,
     validate_before_after,
+    validate_pre_oidc_cohort_confirmation,
     validate_operator_readback,
     validate_registered_task_definition,
     validate_task_definition_template,
@@ -38,6 +41,8 @@ from scripts.asaas_producer_rollout_evidence import (
 from scripts.asaas_producer_rollout_gate import (
     API_PREFIX,
     API_ROOT,
+    DEPLOY_ROLE_VARIABLE,
+    PINNED_DEPLOY_ROLE_ARN,
     DEPLOY_WORKFLOW_PATH,
     EXECUTION_ROLE_ARN,
     REPOSITORY,
@@ -49,12 +54,12 @@ from scripts.asaas_producer_rollout_gate import (
     validate_deployment_history,
     validate_private_before_readback,
     validate_repository_protections,
+    validate_runtime_deploy_role_variable,
 )
 from scripts.verify_asaas_producer_image_rollout import (
     CLUSTER_ARN,
     SERVICE_ARN,
     SERVICE_NAME,
-    TASK_FAMILY,
     RolloutError,
     validate_signed_attestation,
 )
@@ -192,7 +197,7 @@ def _live_service() -> dict[str, Any]:
             "--services",
             SERVICE_ARN,
             "--query",
-            "{services:services[].{serviceArn:serviceArn,serviceName:serviceName,status:status,desiredCount:desiredCount,runningCount:runningCount,taskDefinition:taskDefinition,deployments:deployments[].{status:status,taskDefinition:taskDefinition,rolloutState:rolloutState},loadBalancers:loadBalancers[].{targetGroupArn:targetGroupArn,containerName:containerName,containerPort:containerPort}},failures:failures}",
+            "{services:services[].{serviceArn:serviceArn,serviceName:serviceName,status:status,desiredCount:desiredCount,runningCount:runningCount,taskDefinition:taskDefinition,deployments:deployments[].{id:id,status:status,taskDefinition:taskDefinition,rolloutState:rolloutState},loadBalancers:loadBalancers[].{targetGroupArn:targetGroupArn,containerName:containerName,containerPort:containerPort}},failures:failures}",
         ]
     )
     _require(
@@ -213,138 +218,48 @@ def _live_service() -> dict[str, Any]:
     return service
 
 
-def _live_tasks(task_arns: list[str]) -> list[dict[str, Any]]:
-    _require(
-        task_arns and len(task_arns) <= 100 and len(task_arns) == len(set(task_arns)),
-        "ecs_task_arn_list_invalid",
-    )
-    for arn in task_arns:
-        _require(
-            isinstance(arn, str)
-            and re.fullmatch(
-                r"arn:aws:ecs:us-east-1:388460142431:task/neurostack-staging/[A-Za-z0-9-]+",
-                arn,
-            ),
-            "ecs_task_arn_invalid",
-        )
-    raw = _aws_json(
-        [
-            "ecs",
-            "describe-tasks",
-            "--cluster",
-            CLUSTER_ARN,
-            "--tasks",
-            *task_arns,
-            "--query",
-            "{tasks:tasks[].{taskArn:taskArn,taskDefinitionArn:taskDefinitionArn,lastStatus:lastStatus,desiredStatus:desiredStatus,createdAt:createdAt,startedAt:startedAt,privateIpDetails:attachments[].details[?name=='privateIPv4Address'].value,containers:containers[].{name:name,lastStatus:lastStatus,healthStatus:healthStatus,imageDigest:imageDigest}},failures:failures}",
-        ]
-    )
-    _require(
-        isinstance(raw, dict) and raw.get("failures") == [], "ecs_task_readback_failed"
-    )
-    tasks = raw.get("tasks")
-    _require(
-        isinstance(tasks, list) and len(tasks) == len(task_arns),
-        "ecs_task_cohort_readback_mismatch",
-    )
-    projected: list[dict[str, Any]] = []
-    for task in tasks:
-        values = task.get("privateIpDetails")
-        pending = list(values) if isinstance(values, list) else []
-        ips: list[str] = []
-        while pending:
-            value = pending.pop()
-            if isinstance(value, list):
-                pending.extend(value)
-            elif isinstance(value, str):
-                ips.append(value)
-        _require(len(ips) == 1, "ecs_task_private_ip_readback_invalid")
-        try:
-            address = ipaddress.ip_address(ips[0])
-        except ValueError:
-            raise DeployError("ecs_task_private_ip_invalid") from None
-        _require(
-            address.version == 4 and address.is_private, "ecs_task_private_ip_invalid"
-        )
-        projected.append(
-            {key: value for key, value in task.items() if key != "privateIpDetails"}
-            | {"privateIp": ips[0]}
-        )
-    return projected
-
-
-def _validate_predeployment_live_cohort(
-    snapshot: dict[str, Any],
-    live_tasks: list[dict[str, Any]],
-    *,
-    task_definition_arn: str,
-    app_image_digest: str,
+def _validate_live_service_snapshot(
+    service: dict[str, Any], snapshot: dict[str, Any]
 ) -> None:
-    """Bind authenticated task metadata to the exact operator-attested cohort."""
+    """Bind live DescribeServices metadata to the authenticated operator snapshot."""
 
-    expected_arns = snapshot.get("task_arns")
-    timestamps = snapshot.get("task_timestamps")
+    expected_count = snapshot.get("task_count")
+    expected_task_definition = snapshot.get("task_definition_arn")
+    expected_service = snapshot.get("service")
     _require(
-        isinstance(expected_arns, list)
-        and expected_arns
-        and all(isinstance(arn, str) for arn in expected_arns)
-        and len(expected_arns) == len(set(expected_arns)),
-        "predeploy_task_arn_snapshot_invalid",
+        type(expected_count) is int
+        and expected_count > 0
+        and isinstance(expected_task_definition, str)
+        and isinstance(expected_service, dict),
+        "operator_service_snapshot_invalid",
+    )
+    _require(service.get("status") == "ACTIVE", "live_service_not_active")
+    _require(
+        service.get("taskDefinition") == expected_task_definition,
+        "live_service_task_definition_mismatch",
     )
     _require(
-        isinstance(timestamps, list)
-        and len(timestamps) == len(expected_arns)
-        and all(
-            isinstance(row, dict)
-            and set(row) == {"task_arn", "created_at", "started_at"}
-            and isinstance(row.get("task_arn"), str)
-            and isinstance(row.get("created_at"), str)
-            and isinstance(row.get("started_at"), str)
-            for row in timestamps
-        ),
-        "predeploy_task_timestamps_missing_or_invalid",
+        service.get("desiredCount") == expected_count
+        and service.get("runningCount") == expected_count,
+        "live_service_cohort_count_mismatch",
     )
     _require(
-        len(live_tasks) == len(expected_arns)
-        and {task.get("taskArn") for task in live_tasks} == set(expected_arns),
-        "active_task_cohort_changed_after_preflight",
+        service.get("loadBalancers") == expected_service.get("loadBalancers"),
+        "live_service_load_balancer_mismatch",
     )
-    expected_timestamps = {row["task_arn"]: row for row in timestamps}
+    deployments = service.get("deployments")
+    primary = [
+        item
+        for item in deployments or []
+        if isinstance(item, dict) and item.get("status") == "PRIMARY"
+    ]
     _require(
-        len(expected_timestamps) == len(timestamps),
-        "predeploy_task_timestamp_arn_duplicate",
+        len(primary) == 1
+        and primary[0].get("id") == snapshot.get("primary_deployment_id")
+        and primary[0].get("taskDefinition") == expected_task_definition
+        and primary[0].get("rolloutState") == "COMPLETED",
+        "live_service_rollout_not_complete",
     )
-    expected_ips = snapshot.get("task_private_ips")
-    _require(
-        isinstance(expected_ips, list) and len(expected_ips) == len(expected_arns),
-        "predeploy_task_ip_snapshot_invalid",
-    )
-    _require(
-        {task.get("privateIp") for task in live_tasks} == set(expected_ips),
-        "active_task_target_cohort_changed_after_preflight",
-    )
-    for task in live_tasks:
-        task_arn = task["taskArn"]
-        expected = expected_timestamps[task_arn]
-        _require(
-            task.get("taskDefinitionArn") == task_definition_arn,
-            "active_task_definition_changed_after_preflight",
-        )
-        _require(
-            task.get("createdAt") == expected["created_at"]
-            and task.get("startedAt") == expected["started_at"],
-            "active_task_timestamps_changed_after_preflight",
-        )
-        containers = [
-            row
-            for row in task.get("containers", [])
-            if isinstance(row, dict) and row.get("name") == "app"
-        ]
-        _require(
-            len(containers) == 1
-            and containers[0].get("imageDigest") == app_image_digest,
-            "active_task_digest_changed_after_preflight",
-        )
 
 
 def _secret_metadata(secret_arn: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -409,7 +324,9 @@ def _ecr_metadata(digest: str, repository_uri: str) -> dict[str, Any]:
     return raw
 
 
-def _assert_caller_account() -> None:
+def _assert_caller_account(expected_role_arn: str, run_id: str) -> None:
+    _require(expected_role_arn == PINNED_DEPLOY_ROLE_ARN, "expected_deploy_role_arn_invalid")
+    _require(re.fullmatch(r"[1-9][0-9]*", run_id) is not None, "actions_run_id_invalid")
     identity = _aws_json(
         ["sts", "get-caller-identity", "--query", "{Account:Account,Arn:Arn}"]
     )
@@ -418,37 +335,79 @@ def _assert_caller_account() -> None:
         "aws_caller_account_mismatch",
     )
     arn = identity.get("Arn")
+    role_name = expected_role_arn.split("/", maxsplit=1)[1]
+    expected_session_arn = (
+        f"arn:aws:sts::388460142431:assumed-role/"
+        f"{role_name}/asaas-producer-{run_id}"
+    )
     _require(
-        isinstance(arn, str) and ":assumed-role/" in arn and "asaas" in arn.lower(),
+        arn == expected_session_arn,
         "aws_caller_role_mismatch",
     )
 
 
-def _service_for_snapshot(service: dict[str, Any]) -> dict[str, Any]:
-    return service
-
-
-def _live_snapshot(
-    operator_snapshot: dict[str, Any],
+def _resolve_operator_snapshot_secret_version(
+    source_snapshot: dict[str, Any],
+    secret_metadata: dict[str, Any],
+    secret_versions: dict[str, Any],
     *,
-    task_definition: dict[str, Any],
+    expected_secret_arn: str,
+    expected_version_id: str,
+) -> dict[str, Any]:
+    service = source_snapshot.get("service")
+    tasks = source_snapshot.get("tasks")
+    task_definition = source_snapshot.get("task_definition")
+    _require(
+        isinstance(service, dict)
+        and isinstance(tasks, list)
+        and isinstance(task_definition, dict),
+        "operator_task_readback_missing",
+    )
+    try:
+        resolved = resolve_active_database_secret(
+            {
+                "desired_count": service.get("desiredCount"),
+                "active_tasks": tasks,
+                "task_definitions": [task_definition],
+                "secret_description": secret_metadata,
+                "secret_versions": secret_versions,
+            }
+        )
+    except ReferenceError as exc:
+        raise DeployError(f"database_secret_{exc}") from None
+    _require(
+        resolved["database_secret_arn"] == expected_secret_arn
+        and resolved["resolved_version_id"] == expected_version_id,
+        "database_secret_live_metadata_mismatch",
+    )
+    return resolved
+
+
+def _validate_live_deployment_metadata(
+    validated_snapshot: dict[str, Any],
+    source_snapshot: dict[str, Any],
+    *,
     expected_digest: str,
     image_uri: str,
     secret_arn: str,
-) -> dict[str, Any]:
+) -> None:
     service = _live_service()
-    task_arns = [item["taskArn"] for item in operator_snapshot["tasks"]]
-    tasks = _live_tasks(task_arns)
-    secret, versions = _secret_metadata(secret_arn)
+    _validate_live_service_snapshot(service, validated_snapshot)
     ecr = _ecr_metadata(expected_digest, image_uri)
-    return {
-        "service": _service_for_snapshot(service),
-        "tasks": tasks,
-        "task_definition": task_definition,
-        "ecr": ecr,
-        "secret_description": secret,
-        "secret_versions": versions,
-    }
+    image_rows = [
+        row
+        for row in ecr["imageDetails"]
+        if isinstance(row, dict) and row.get("imageDigest") == expected_digest
+    ]
+    _require(len(image_rows) == 1, "ecr_digest_not_found_or_ambiguous")
+    secret, versions = _secret_metadata(secret_arn)
+    _resolve_operator_snapshot_secret_version(
+        source_snapshot,
+        secret,
+        versions,
+        expected_secret_arn=secret_arn,
+        expected_version_id=validated_snapshot["database_secret_version_id"],
+    )
 
 
 def _canonical_registration_comment(
@@ -589,7 +548,7 @@ def _collect_comments(issue_number: str, token: str) -> list[Any]:
     )
 
 
-def _deployment_job_started_at(run_id: str, token: str) -> datetime:
+def _deployment_job_context(run_id: str, token: str) -> dict[str, str]:
     jobs = github_preflight.github_collection(
         f"{API_ROOT}{API_PREFIX}/actions/runs/{run_id}/jobs?per_page=100&page=1",
         token,
@@ -599,10 +558,22 @@ def _deployment_job_started_at(run_id: str, token: str) -> datetime:
         row for row in jobs if isinstance(row, dict) and row.get("name") == "deploy"
     ]
     _require(
-        len(matches) == 1 and isinstance(matches[0].get("started_at"), str),
+        len(matches) == 1
+        and type(matches[0].get("id")) is int
+        and matches[0]["id"] > 0
+        and matches[0].get("status") == "in_progress"
+        and isinstance(matches[0].get("started_at"), str),
         "deployment_job_start_unreadable",
     )
-    return _time(matches[0]["started_at"], "deployment_job_started_at")
+    return {
+        "job_id": str(matches[0]["id"]),
+        "job_started_at": matches[0]["started_at"],
+    }
+
+
+def _deployment_job_started_at(run_id: str, token: str) -> datetime:
+    context = _deployment_job_context(run_id, token)
+    return _time(context["job_started_at"], "deployment_job_started_at")
 
 
 def _wait_for_encrypted_post_readback(
@@ -616,12 +587,21 @@ def _wait_for_encrypted_post_readback(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     token = env.get("GH_TOKEN", "")
     _require(bool(token), "github_read_token_unavailable")
+    job = _deployment_job_context(env["GITHUB_RUN_ID"], token)
+    _require(
+        _time(job["job_started_at"], "deployment_job_started_at")
+        == deploy_started_at,
+        "deployment_job_context_changed",
+    )
     context = {
         "run_id": env["GITHUB_RUN_ID"],
         "run_attempt": env["GITHUB_RUN_ATTEMPT"],
         "operation_id": env["INPUT_OPERATION_ID"],
         "phase": "after",
         "artifact_sha256": env["INPUT_ENVELOPE_SHA256"],
+        "ref": env["GITHUB_REF"],
+        "sha": env["GITHUB_SHA"],
+        **job,
     }
     deadline = time.monotonic() + MAX_POST_READBACK_WAIT_SECONDS
     comments: list[Any] = []
@@ -632,7 +612,7 @@ def _wait_for_encrypted_post_readback(
         for row in comments:
             if not isinstance(row, dict) or not isinstance(row.get("body"), str):
                 continue
-            marker = "<!-- asaas-producer-post-readback.v1\n"
+            marker = f"<!-- {ENCRYPTED_READBACK_MARKER}\n"
             body = row["body"]
             if not body.startswith(marker) or not body.endswith("\n-->"):
                 continue
@@ -655,7 +635,7 @@ def _wait_for_encrypted_post_readback(
         isinstance(author, dict) and isinstance(author.get("login"), str),
         "post_readback_author_invalid",
     )
-    after_operator = parse_post_readback_comment(
+    after_snapshot_source = parse_post_readback_comment(
         matching[0]["body"],
         author_login=author["login"],
         author_permission=_admin_permission(author["login"], token),
@@ -665,7 +645,7 @@ def _wait_for_encrypted_post_readback(
     )
     artifact_tuple = _artifact_tuple(env)
     after_operator = validate_operator_readback(
-        after_operator,
+        after_snapshot_source,
         phase="after",
         expected_run_id=env["GITHUB_RUN_ID"],
         expected_run_attempt=env["GITHUB_RUN_ATTEMPT"],
@@ -692,6 +672,13 @@ def _wait_for_encrypted_post_readback(
     )
     now = datetime.now(timezone.utc)
     checked_at = _time(after_operator["checked_at_utc"], "post_readback_checked_at")
+    comment_created_at = _time(
+        matching[0].get("created_at"), "post_readback_comment_created_at"
+    )
+    _require(
+        comment_created_at >= checked_at and comment_created_at >= deploy_started_at,
+        "post_readback_comment_time_invalid",
+    )
     _require(now - checked_at <= timedelta(minutes=15), "post_readback_snapshot_stale")
     verified = validate_before_after(
         {
@@ -709,62 +696,14 @@ def _wait_for_encrypted_post_readback(
         expected_digest=verified_attestation["app_image_digest"],
     )
     after_snapshot = after_operator["snapshot"]
-    task_definition = _readback_task_definition_from_template(env)
-    task_definition["taskDefinitionArn"] = after_snapshot["task_definition_arn"]
-    task_definition["family"] = TASK_FAMILY
-    task_definition["status"] = "ACTIVE"
-    live = _live_snapshot(
+    _validate_live_deployment_metadata(
         after_snapshot,
-        task_definition=task_definition,
+        after_snapshot_source["snapshot"],
         expected_digest=verified_attestation["app_image_digest"],
         image_uri=env["BILLING_PRODUCER_ECR_REPOSITORY_URI"],
         secret_arn=after_snapshot["database_secret_arn"],
     )
-    # Runner-authenticated service and task metadata independently binds the
-    # operator attestation to this target without ListTasks/DescribeTaskDefinition.
-    _require(
-        live["service"]["taskDefinition"] == after_snapshot["task_definition_arn"],
-        "live_service_task_definition_mismatch",
-    )
-    _require(
-        live["service"]["desiredCount"] == after_snapshot["task_count"],
-        "live_service_desired_count_mismatch",
-    )
-    _require(
-        all(
-            task.get("taskDefinitionArn") == after_snapshot["task_definition_arn"]
-            for task in live["tasks"]
-        ),
-        "live_task_definition_mismatch",
-    )
-    _require(
-        {task.get("privateIp") for task in live["tasks"]}
-        == set(after_snapshot.get("task_private_ips", [])),
-        "live_task_target_cohort_mismatch",
-    )
-    _require(
-        all(
-            container.get("imageDigest") == verified_attestation["app_image_digest"]
-            for task in live["tasks"]
-            for container in task.get("containers", [])
-            if container.get("name") == "app"
-        ),
-        "live_task_digest_mismatch",
-    )
     return after_operator, {**verified, "live_readback": "verified"}
-
-
-def _readback_task_definition_from_template(env: dict[str, str]) -> dict[str, Any]:
-    template = _strict_loads(
-        env.get("ASAAS_PRODUCER_TASK_DEFINITION_TEMPLATE_JSON", "")
-    )
-    definition = dict(template["task_definition"])
-    # The registered request is separately validated and returned as a safe
-    # summary; this local projection adds response identity only.
-    definition["containerDefinitions"] = [
-        dict(row) for row in definition["containerDefinitions"]
-    ]
-    return definition
 
 
 def _wait_for_service(task_definition_arn: str, desired_count: int) -> dict[str, Any]:
@@ -843,6 +782,144 @@ def _register_task_definition(
     return summary["task_definition_arn"], summary
 
 
+def _validate_pre_oidc_cohort_evidence(
+    env: dict[str, str],
+    run: dict[str, Any],
+    before: dict[str, Any],
+    template_data: dict[str, Any],
+) -> dict[str, Any]:
+    runner_temp = Path(env["RUNNER_TEMP"])
+    path = runner_temp / "asaas-producer-pre-oidc-cohort.json"
+    try:
+        mode = stat.S_IMODE(path.lstat().st_mode)
+        _require(stat.S_ISREG(path.lstat().st_mode) and mode & 0o077 == 0, "cohort_evidence_file_permissions_invalid")
+        evidence = _strict_loads(path.read_bytes(), max_bytes=1_500_000)
+    except (OSError, EvidenceError):
+        raise DeployError("cohort_evidence_file_unreadable") from None
+    fields = {
+        "schema",
+        "run_id",
+        "run_attempt",
+        "ref",
+        "sha",
+        "operation_id",
+        "artifact_sha256",
+        "deployment_job_id",
+        "deployment_job_started_at",
+        "comment_created_at",
+        "checked_at_utc",
+        "operator_login",
+        "encrypted_snapshot_sha256",
+        "operator_readback",
+        "validated_cohort",
+        "verification",
+        "evidence_sha256",
+    }
+    _require(
+        isinstance(evidence, dict) and set(evidence) == fields,
+        "cohort_evidence_shape_invalid",
+    )
+    evidence_digest = evidence["evidence_sha256"]
+    payload = {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+    actual_digest = __import__("hashlib").sha256(_canonical(payload)).hexdigest()
+    _require(
+        isinstance(evidence_digest, str)
+        and evidence_digest == actual_digest
+        and evidence_digest == env.get("ASAAS_PRE_OIDC_COHORT_SHA256"),
+        "cohort_evidence_hash_mismatch",
+    )
+    expected_values = {
+        "schema": "asaas_producer_pre_oidc_cohort_confirmation.v1",
+        "run_id": run["run_id"],
+        "run_attempt": run["run_attempt"],
+        "ref": run["ref"],
+        "sha": run["sha"],
+        "operation_id": env["INPUT_OPERATION_ID"],
+        "artifact_sha256": env["INPUT_ENVELOPE_SHA256"],
+        "operator_login": before["operator_login"],
+    }
+    _require(
+        all(evidence.get(key) == value for key, value in expected_values.items()),
+        "cohort_evidence_run_binding_mismatch",
+    )
+    job_context = _deployment_job_context(run["run_id"], env["GH_TOKEN"])
+    _require(
+        evidence.get("deployment_job_id") == job_context["job_id"]
+        and evidence.get("deployment_job_started_at")
+        == job_context["job_started_at"],
+        "cohort_evidence_job_binding_mismatch",
+    )
+    job_started_at = _time(
+        job_context["job_started_at"], "deployment_job_started_at"
+    )
+    now = datetime.now(timezone.utc)
+    checked_at = _time(evidence.get("checked_at_utc"), "cohort_checked_at")
+    comment_created_at = _time(
+        evidence.get("comment_created_at"), "cohort_comment_created_at"
+    )
+    _require(
+        job_started_at <= checked_at <= comment_created_at <= now
+        and now - checked_at <= timedelta(minutes=5),
+        "cohort_evidence_stale_or_out_of_order",
+    )
+    raw = evidence.get("operator_readback")
+    _require(isinstance(raw, dict), "cohort_operator_readback_invalid")
+    _require(
+        canonical_sha256(raw) == evidence.get("encrypted_snapshot_sha256"),
+        "cohort_encrypted_snapshot_hash_mismatch",
+    )
+    _require(
+        raw.get("operator_login") == before["operator_login"],
+        "cohort_operator_mismatch",
+    )
+    permission = _admin_permission(before["operator_login"], env["GH_TOKEN"])
+    try:
+        cohort = validate_operator_readback(
+            raw,
+            phase="cohort",
+            expected_run_id=run["run_id"],
+            expected_run_attempt=run["run_attempt"],
+            expected_sha=run["sha"],
+            expected_operation_id=env["INPUT_OPERATION_ID"],
+            mode=env["INPUT_MODE"],
+            artifact_tuple=_artifact_tuple(env),
+            template_sha256=before["template_sha256"],
+            producer_environment_sha256=before["producer_environment_sha256"],
+            expected_base_environment_sha256=template_data[
+                "base_environment_sha256"
+            ],
+            expected_operator_login=before["operator_login"],
+            operator_permission=permission,
+            expected_environment=_task_env(env),
+            expected_task_role_arn=TASK_ROLE_ARN,
+            expected_execution_role_arn=EXECUTION_ROLE_ARN,
+            expected_image_uri=env["BILLING_PRODUCER_ECR_REPOSITORY_URI"],
+            expected_secret_arn=before["validated_snapshot"][
+                "database_secret_arn"
+            ],
+            expected_secret_json_key=before["validated_snapshot"][
+                "database_secret_json_key"
+            ],
+            expected_secret_version_id=before["database_secret_version_id"],
+            earliest_allowed_at=job_started_at,
+            latest_allowed_at=now,
+        )
+        verification = validate_pre_oidc_cohort_confirmation(before, cohort)
+    except (EvidenceError, RolloutError, ReferenceError) as exc:
+        raise DeployError(str(exc)) from None
+    _require(
+        cohort == evidence["validated_cohort"]
+        and verification == evidence["verification"],
+        "cohort_evidence_validation_changed",
+    )
+    return {
+        **evidence,
+        "operator_readback": raw,
+        "validated_cohort": cohort,
+        "verification": verification,
+    }
+
+
 def _private_template_and_before(
     env: dict[str, str], run: dict[str, Any]
 ) -> dict[str, Any]:
@@ -864,6 +941,9 @@ def _private_template_and_before(
     _require(
         protection_digest == env.get("ASAAS_PREFLIGHT_PROTECTION_SHA256"),
         "github_controls_changed_after_preflight",
+    )
+    validate_runtime_deploy_role_variable(
+        env.get(DEPLOY_ROLE_VARIABLE), protections["deploy_role_arn"]
     )
     history = validate_deployment_history(
         token,
@@ -899,7 +979,19 @@ def _private_template_and_before(
         == env.get("ASAAS_PREDEPLOY_PRODUCER_ENVIRONMENT_SHA256"),
         "producer_environment_changed_after_approval",
     )
-    return {**readback, "template": template, "template_data": template_data}
+    cohort = _validate_pre_oidc_cohort_evidence(
+        env,
+        run,
+        readback,
+        validate_task_definition_template(template),
+    )
+    return {
+        **readback,
+        "template": template,
+        "template_data": template_data,
+        "deploy_role_arn": protections["deploy_role_arn"],
+        "cohort": cohort,
+    }
 
 
 def execute_rollout(env: dict[str, str]) -> dict[str, Any]:
@@ -924,27 +1016,20 @@ def execute_rollout(env: dict[str, str]) -> dict[str, Any]:
         verified_attestation["app_image_digest"] == env["INPUT_APP_IMAGE_DIGEST"],
         "app_image_digest_mismatch",
     )
-    _assert_caller_account()
-    before_snapshot = private_before["validated_snapshot"]
-    previous_task_definition_arn = before_snapshot["task_definition_arn"]
-    desired_count = before_snapshot["task_count"]
+    _assert_caller_account(private_before["deploy_role_arn"], run["run_id"])
+    cohort_evidence = private_before["cohort"]
+    cohort = cohort_evidence["validated_cohort"]
+    cohort_snapshot = cohort["snapshot"]
+    source_before = cohort_evidence["operator_readback"]
+    _require(
+        isinstance(source_before, dict)
+        and isinstance(source_before.get("snapshot"), dict),
+        "operator_task_readback_missing",
+    )
+    previous_task_definition_arn = cohort_snapshot["task_definition_arn"]
+    desired_count = cohort_snapshot["task_count"]
     current_service = _live_service()
-    _require(
-        current_service.get("taskDefinition") == previous_task_definition_arn,
-        "active_task_definition_changed_after_preflight",
-    )
-    _require(
-        current_service.get("desiredCount") == desired_count
-        and current_service.get("runningCount") == desired_count,
-        "active_service_cohort_changed_after_preflight",
-    )
-    pre_live_tasks = _live_tasks(before_snapshot["task_arns"])
-    _validate_predeployment_live_cohort(
-        before_snapshot,
-        pre_live_tasks,
-        task_definition_arn=previous_task_definition_arn,
-        app_image_digest=before_snapshot["app_image_digest"],
-    )
+    _validate_live_service_snapshot(current_service, cohort_snapshot)
     template_definition = private_before["template"]["task_definition"]
     db_source = next(
         row["valueFrom"]
@@ -953,35 +1038,25 @@ def execute_rollout(env: dict[str, str]) -> dict[str, Any]:
         if row.get("name") == "DATABASE_URL"
     )
     secret_metadata, secret_versions = _secret_metadata(
-        before_snapshot["database_secret_arn"]
+        cohort_snapshot["database_secret_arn"]
     )
-    try:
-        database_binding = resolve_active_database_secret(
-            {
-                "desired_count": desired_count,
-                "active_tasks": pre_live_tasks,
-                "task_definitions": [
-                    {
-                        "taskDefinitionArn": private_before["template"][
-                            "source_task_definition_arn"
-                        ],
-                        **template_definition,
-                    }
-                ],
-                "secret_description": secret_metadata,
-                "secret_versions": secret_versions,
-            }
-        )
-    except ReferenceError as exc:
-        raise DeployError(f"database_secret_{exc}") from None
+    database_binding = _resolve_operator_snapshot_secret_version(
+        source_before["snapshot"],
+        secret_metadata,
+        secret_versions,
+        expected_secret_arn=cohort_snapshot["database_secret_arn"],
+        expected_version_id=cohort_snapshot["database_secret_version_id"],
+    )
+    source_parts = db_source.split(":")
+    source_arn = ":".join(source_parts[:7])
+    source_json_key = source_parts[7] if len(source_parts) == 10 else ""
     _require(
-        db_source == before_snapshot["database_secret_arn"],
+        source_arn == database_binding["database_secret_arn"]
+        and source_json_key == database_binding["database_secret_json_key"]
+        and database_binding["active_task_count"] == cohort_snapshot["task_count"]
+        and database_binding["active_task_definition_arn"]
+        == cohort_snapshot["task_definition_arn"],
         "database_secret_reference_mismatch",
-    )
-    _require(
-        database_binding["resolved_version_id"]
-        == before_snapshot["database_secret_version_id"],
-        "database_secret_version_changed_after_preflight",
     )
     _ecr_metadata(
         verified_attestation["app_image_digest"],
@@ -1006,17 +1081,31 @@ def execute_rollout(env: dict[str, str]) -> dict[str, Any]:
         _update_service(new_task_definition_arn)
         _wait_for_service(new_task_definition_arn, desired_count)
         deploy_started_at = _deployment_job_started_at(run["run_id"], token)
+        rollout_before = {
+            **private_before,
+            "phase": "before",
+            "operator_login": cohort["operator_login"],
+            "operator_permission": cohort["operator_permission"],
+            "base_environment_sha256": cohort["base_environment_sha256"],
+            "target_group": cohort["target_group"],
+            "readiness_probe": cohort["readiness_probe"],
+            "before_snapshot_sha256": cohort["snapshot_sha256"],
+            "validated_snapshot": cohort_snapshot,
+            "database_secret_version_id": cohort_snapshot[
+                "database_secret_version_id"
+            ],
+        }
         private_key_path = (
             Path(env["RUNNER_TEMP"]) / "asaas-producer-post-readback-private.pem"
         )
-        # The preapproval job already validated the base task spec. The key is
-        # generated only after OIDC role assumption and stays on this runner.
+        # The one-run private key was created before OIDC and remains on this
+        # runner for the later post-deployment confirmation.
         if not private_key_path.exists():
             raise DeployError("post_readback_private_key_missing")
         after_operator, accepted = _wait_for_encrypted_post_readback(
             env=env,
             private_key_path=private_key_path,
-            before=private_before,
+            before=rollout_before,
             verified_attestation=verified_attestation,
             deploy_started_at=deploy_started_at,
             expected_protection_hash=env["ASAAS_PREFLIGHT_PROTECTION_SHA256"],

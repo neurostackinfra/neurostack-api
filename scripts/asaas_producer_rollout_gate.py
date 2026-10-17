@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -20,11 +21,14 @@ from scripts.asaas_database_secret_reference import (
     resolve_active_database_secret,
 )
 from scripts.asaas_producer_rollout_evidence import (
+    ENCRYPTED_READBACK_MARKER,
     EvidenceError,
     _canonical,
     _strict_loads,
+    canonical_sha256,
     parse_post_readback_comment,
     validate_before_after,
+    validate_pre_oidc_cohort_confirmation,
     validate_operator_readback,
     validate_task_definition_template,
 )
@@ -48,6 +52,18 @@ API_ROOT = "https://api.github.com"
 API_PREFIX = f"/repos/{REPOSITORY}"
 DEPLOY_ENVIRONMENT = "asaas-production-deployment"
 DEPLOY_WORKFLOW_PATH = ".github/workflows/asaas-producer-image-deploy.yml"
+DEPLOY_ROLE_VARIABLE = "BILLING_PRODUCER_DEPLOY_ROLE_ARN"
+# This exact value was read from the approved Group 2 CloudFormation output
+# DeployRoleArn and roles.DeployRole.arn on 2026-10-16. A stack recreation must
+# update this reviewed pin from a new authenticated Group 2 output readback.
+PINNED_DEPLOY_ROLE_ARN = (
+    "arn:aws:iam::388460142431:role/"
+    "neurostack-asaas-producer-release-DeployRole-CU6AueCQCi9i"
+)
+DEPLOY_ROLE_OUTPUT_READ_AT_UTC = "2026-10-16T23:02:35.755467Z"
+DEPLOY_ROLE_OUTPUT_READBACK_SHA256 = (
+    "765b3174d6a1b28205f0185f535fc6cdf2fa8b369c8af6e7583524aa437d7fb9"
+)
 TASK_ROLE_ARN = "arn:aws:iam::388460142431:role/neurostack-staging-ecs-task"
 EXECUTION_ROLE_ARN = "arn:aws:iam::388460142431:role/neurostack-staging-ecs-execution"
 HISTORY_RUN_NAME = re.compile(
@@ -61,11 +77,40 @@ HISTORY_RUN_NAME = re.compile(
 MAX_RUN_AGE = timedelta(hours=1)
 MAX_BEFORE_READBACK_AGE = timedelta(minutes=5)
 MAX_AFTER_READBACK_AGE = timedelta(minutes=15)
+MAX_PRE_OIDC_COHORT_WAIT_SECONDS = 900
+MAX_COHORT_READBACK_AGE = timedelta(minutes=5)
 UI_COMMENT_SCHEMA = "asaas_producer_deployment_ui_attestation.v1"
 
 
 class GateError(ValueError):
     """A workflow, environment, or rollout artifact did not meet its contract."""
+
+
+def validate_deploy_role_environment_variable(raw: Any) -> str:
+    """Accept only the exact role ARN in the reviewed Group 2 output readback."""
+
+    _require(
+        isinstance(raw, dict)
+        and raw.get("name") == DEPLOY_ROLE_VARIABLE
+        and raw.get("value") == PINNED_DEPLOY_ROLE_ARN,
+        "protected_deploy_role_readback_invalid",
+    )
+    return raw["value"]
+
+
+def validate_runtime_deploy_role_variable(
+    environment_value: Any, protected_role_arn: Any
+) -> str:
+    """Require the job's protected vars value to equal the hashed API readback."""
+
+    expected = validate_deploy_role_environment_variable(
+        {"name": DEPLOY_ROLE_VARIABLE, "value": protected_role_arn}
+    )
+    _require(
+        isinstance(environment_value, str) and environment_value == expected,
+        "protected_deploy_role_variable_mismatch",
+    )
+    return expected
 
 
 def _require(condition: bool, reason: str) -> None:
@@ -215,7 +260,10 @@ def validate_current_run(
         token,
         list_field="jobs",
     )
-    _require(stage in {"preflight", "predeploy", "deploy"}, "workflow_stage_invalid")
+    _require(
+        stage in {"preflight", "predeploy", "deploy", "pre-oidc-cohort"},
+        "workflow_stage_invalid",
+    )
     jobs_by_name: dict[str, list[dict[str, Any]]] = {}
     for job in jobs:
         if isinstance(job, dict) and isinstance(job.get("name"), str):
@@ -226,7 +274,7 @@ def validate_current_run(
         expected_jobs["verify-predeploy-evidence"] = (
             "in_progress" if stage == "predeploy" else "completed_success"
         )
-    if stage == "deploy":
+    if stage in {"deploy", "pre-oidc-cohort"}:
         expected_jobs["deploy"] = "in_progress"
     for job_name, expected_state in expected_jobs.items():
         rows = jobs_by_name.get(job_name, [])
@@ -291,6 +339,12 @@ def validate_repository_protections(
         github_get_fn=get,
         github_collection_fn=collect,
     )
+    role_readback, _ = get(
+        f"{API_ROOT}{API_PREFIX}/environments/"
+        f"{quote(DEPLOY_ENVIRONMENT, safe='')}/variables/{DEPLOY_ROLE_VARIABLE}",
+        token,
+    )
+    deploy_role_arn = validate_deploy_role_environment_variable(role_readback)
     return {
         "repository": {
             "full_name": repository["full_name"],
@@ -300,6 +354,14 @@ def validate_repository_protections(
         },
         "ruleset": ruleset,
         "environment": environment,
+        "deploy_role_variable": DEPLOY_ROLE_VARIABLE,
+        "deploy_role_arn": deploy_role_arn,
+        "deploy_role_output_pin": {
+            "cloudformation_stack": "neurostack-asaas-producer-release",
+            "output_key": "DeployRoleArn",
+            "read_at_utc": DEPLOY_ROLE_OUTPUT_READ_AT_UTC,
+            "readback_sha256": DEPLOY_ROLE_OUTPUT_READBACK_SHA256,
+        },
     }
 
 
@@ -502,6 +564,7 @@ def validate_environment_approval(
         _require(len(rows) == 1, "environment_approval_job_start_missing")
         return rows[0]
 
+    deploy_job_metadata: dict[str, str] | None = None
     if phase == "predeploy":
         target_job = exactly_one_job("verify-predeploy-evidence")
         _require(
@@ -538,6 +601,14 @@ def validate_environment_approval(
             predeploy_job["completed_at"], "predeploy_job_completed_at"
         )
         deploy_started = _time(deploy_job["started_at"], "deploy_job_started_at")
+        _require(
+            type(deploy_job.get("id")) is int and deploy_job["id"] > 0,
+            "deployment_job_id_unreadable",
+        )
+        deploy_job_metadata = {
+            "deployment_job_id": str(deploy_job["id"]),
+            "deployment_job_started_at": deploy_job["started_at"],
+        }
         _require(
             predeploy_completed <= deploy_started, "environment_approval_order_invalid"
         )
@@ -603,6 +674,7 @@ def validate_environment_approval(
             {"checked_at_utc": checked, "screenshots": captured}
             for checked, captured in zip(checked_times, screenshots)
         ],
+        **(deploy_job_metadata or {}),
     }
 
 
@@ -946,6 +1018,7 @@ def validate_private_before_readback(
     except (EvidenceError, RolloutError) as exc:
         raise GateError(str(exc)) from None
     return {
+        "phase": "before",
         "template_sha256": template_result["template_sha256"],
         "producer_environment_sha256": template_result["producer_environment_sha256"],
         "base_environment_sha256": template_result["base_environment_sha256"],
@@ -988,7 +1061,7 @@ def validate_post_readback_comment(
         for row in comments
         if isinstance(row, dict)
         and isinstance(row.get("body"), str)
-        and row["body"].startswith("<!-- asaas-producer-post-readback.v1\n")
+        and row["body"].startswith(f"<!-- {ENCRYPTED_READBACK_MARKER}\n")
     ]
     _require(len(candidates) == 1, "post_readback_comment_count_invalid")
     comment = candidates[0]
@@ -1114,9 +1187,11 @@ def _readback_call_fields(
     database_secret_arn: str,
     database_secret_json_key: str,
     database_secret_version_id: str,
+    *,
+    phase: str = "before",
 ) -> dict[str, Any]:
     return {
-        "phase": "before",
+        "phase": phase,
         "expected_run_id": expected_run["run_id"],
         "expected_run_attempt": expected_run["run_attempt"],
         "expected_sha": expected_run["sha"],
@@ -1138,6 +1213,176 @@ def _readback_call_fields(
         "earliest_allowed_at": earliest,
         "latest_allowed_at": latest,
     }
+
+
+def _deployment_job_context(token: str, run_id: str) -> dict[str, str]:
+    jobs = github_preflight.github_collection(
+        f"{API_ROOT}{API_PREFIX}/actions/runs/{run_id}/jobs?per_page=100&page=1",
+        token,
+        list_field="jobs",
+    )
+    matches = [
+        row for row in jobs if isinstance(row, dict) and row.get("name") == "deploy"
+    ]
+    _require(
+        len(matches) == 1
+        and type(matches[0].get("id")) is int
+        and matches[0]["id"] > 0
+        and matches[0].get("status") == "in_progress"
+        and isinstance(matches[0].get("started_at"), str),
+        "deployment_job_context_unavailable",
+    )
+    started_at = matches[0]["started_at"]
+    _time(started_at, "deployment_job_started_at")
+    return {"job_id": str(matches[0]["id"]), "job_started_at": started_at}
+
+
+def _pre_oidc_cohort_context(
+    env: dict[str, str], run: dict[str, Any], job: dict[str, str]
+) -> dict[str, str]:
+    return {
+        "run_id": run["run_id"],
+        "run_attempt": run["run_attempt"],
+        "operation_id": env["INPUT_OPERATION_ID"],
+        "phase": "cohort",
+        "artifact_sha256": env["INPUT_ENVELOPE_SHA256"],
+        "ref": run["ref"],
+        "sha": run["sha"],
+        **job,
+    }
+
+
+def wait_for_pre_oidc_cohort_confirmation(
+    *,
+    env: dict[str, str],
+    token: str,
+    run: dict[str, Any],
+    artifact_tuple: dict[str, str],
+    template_result: dict[str, Any],
+    expected_environment: dict[str, str],
+    operator_login: str,
+    operator_permission: str,
+    before: dict[str, Any],
+    private_key_path: Path,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Wait for a fresh encrypted operator snapshot after deploy approval."""
+
+    _require(private_key_path.is_file(), "cohort_confirmation_private_key_missing")
+    job = _deployment_job_context(token, run["run_id"])
+    context = _pre_oidc_cohort_context(env, run, job)
+    deadline = time.monotonic() + MAX_PRE_OIDC_COHORT_WAIT_SECONDS
+    marker = f"<!-- {ENCRYPTED_READBACK_MARKER}\n"
+    matching: list[dict[str, Any]] = []
+    while time.monotonic() < deadline:
+        comments = github_preflight.github_collection(
+            f"{API_ROOT}{API_PREFIX}/issues/{env.get('INPUT_EVIDENCE_ISSUE_NUMBER', '')}/comments?per_page=100&page=1",
+            token,
+        )
+        matching = []
+        for row in comments:
+            if not isinstance(row, dict) or not isinstance(row.get("body"), str):
+                continue
+            body = row["body"]
+            if not body.startswith(marker) or not body.endswith("\n-->"):
+                continue
+            try:
+                envelope = _strict_loads(body[len(marker) : -4], max_bytes=48_000)
+            except EvidenceError:
+                continue
+            if isinstance(envelope, dict) and all(
+                envelope.get(key) == value for key, value in context.items()
+            ):
+                matching.append(row)
+        if matching:
+            break
+        time.sleep(10)
+    _require(bool(matching), "pre_oidc_cohort_confirmation_timeout")
+    _require(len(matching) == 1, "pre_oidc_cohort_confirmation_ambiguous")
+    comment = matching[0]
+    author = comment.get("user")
+    _require(
+        isinstance(author, dict) and isinstance(author.get("login"), str),
+        "cohort_confirmation_author_invalid",
+    )
+    permission, _ = github_preflight.github_get(
+        f"{API_ROOT}{API_PREFIX}/collaborators/{quote(author['login'], safe='')}/permission",
+        token,
+    )
+    _require(
+        isinstance(permission, dict) and permission.get("permission") == "admin",
+        "cohort_confirmation_author_not_admin",
+    )
+    try:
+        raw = parse_post_readback_comment(
+            comment["body"],
+            author_login=author["login"],
+            author_permission=permission["permission"],
+            expected_operator_login=operator_login,
+            private_pem=private_key_path.read_bytes(),
+            expected_context=context,
+        )
+    except (EvidenceError, OSError) as exc:
+        if isinstance(exc, OSError):
+            raise GateError("cohort_confirmation_private_key_unreadable") from None
+        raise GateError(str(exc)) from None
+    _require(
+        isinstance(raw, dict), "cohort_confirmation_payload_invalid"
+    )
+    job_started_at = _time(job["job_started_at"], "deployment_job_started_at")
+    observed = datetime.now(timezone.utc) if now is None else now.astimezone(timezone.utc)
+    created_at = _time(comment.get("created_at"), "cohort_confirmation_comment_time")
+    _require(
+        created_at >= job_started_at and created_at >= _time(
+            raw.get("checked_at_utc"), "cohort_confirmation_checked_at"
+        ),
+        "cohort_confirmation_comment_time_invalid",
+    )
+    checked_at = _time(raw.get("checked_at_utc"), "cohort_confirmation_checked_at")
+    _require(
+        observed - checked_at <= MAX_COHORT_READBACK_AGE,
+        "cohort_confirmation_snapshot_stale",
+    )
+    fields = _readback_call_fields(
+        env,
+        run,
+        artifact_tuple,
+        template_result,
+        expected_environment,
+        operator_login,
+        permission["permission"],
+        job_started_at,
+        observed,
+        before["validated_snapshot"]["database_secret_arn"],
+        before["validated_snapshot"]["database_secret_json_key"],
+        before["database_secret_version_id"],
+        phase="cohort",
+    )
+    try:
+        cohort = validate_operator_readback(raw, **fields)
+        verification = validate_pre_oidc_cohort_confirmation(before, cohort)
+    except (EvidenceError, RolloutError, ReferenceError) as exc:
+        raise GateError(str(exc)) from None
+    evidence = {
+        "schema": "asaas_producer_pre_oidc_cohort_confirmation.v1",
+        "run_id": run["run_id"],
+        "run_attempt": run["run_attempt"],
+        "ref": run["ref"],
+        "sha": run["sha"],
+        "operation_id": env["INPUT_OPERATION_ID"],
+        "artifact_sha256": env["INPUT_ENVELOPE_SHA256"],
+        "deployment_job_id": job["job_id"],
+        "deployment_job_started_at": job["job_started_at"],
+        "comment_created_at": comment["created_at"],
+        "checked_at_utc": raw["checked_at_utc"],
+        "operator_login": operator_login,
+        "encrypted_snapshot_sha256": canonical_sha256(raw),
+        "operator_readback": raw,
+        "validated_cohort": cohort,
+        "verification": verification,
+    }
+    evidence["evidence_sha256"] = hashlib.sha256(_canonical(evidence)).hexdigest()
+    return evidence
 
 
 def write_private_json(path: Path, value: Any) -> None:
@@ -1206,7 +1451,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--phase",
-        choices=("prepare-trust", "preflight", "predeploy", "deploy"),
+        choices=(
+            "prepare-trust",
+            "preflight",
+            "predeploy",
+            "deploy",
+            "pre-oidc-cohort",
+        ),
         default="preflight",
     )
     parser.add_argument("--output", type=Path)
@@ -1229,6 +1480,9 @@ def main() -> int:
         )
         protection_hash = hashlib.sha256(_canonical(protections)).hexdigest()
         if args.phase != "preflight":
+            validate_runtime_deploy_role_variable(
+                env.get(DEPLOY_ROLE_VARIABLE), protections["deploy_role_arn"]
+            )
             expected_protection_hash = env.get("ASAAS_PREFLIGHT_PROTECTION_SHA256", "")
             _require(
                 re.fullmatch(r"[0-9a-f]{64}", expected_protection_hash) is not None
@@ -1331,7 +1585,7 @@ def main() -> int:
                 operator_login=operator_login,
                 operator_permission=permission["permission"],
             )
-            if args.phase == "deploy":
+            if args.phase in {"deploy", "pre-oidc-cohort"}:
                 _require(
                     before["before_snapshot_sha256"]
                     == env.get("ASAAS_PREDEPLOY_READBACK_SHA256"),
@@ -1342,20 +1596,87 @@ def main() -> int:
                     == env.get("ASAAS_PREDEPLOY_PRODUCER_ENVIRONMENT_SHA256"),
                     "producer_environment_changed_after_approval",
                 )
-            if args.output is not None:
-                write_private_json(
-                    args.output,
-                    (
-                        before
-                        if args.phase == "predeploy"
-                        else {
-                            **before,
-                            "approval_observed_at_utc": approval[
-                                "approval_observed_at_utc"
-                            ],
-                        }
+            cohort_evidence = None
+            if args.phase == "pre-oidc-cohort":
+                _require(args.output is not None, "cohort_confirmation_output_required")
+                cohort_evidence = wait_for_pre_oidc_cohort_confirmation(
+                    env=env,
+                    token=token,
+                    run=run,
+                    artifact_tuple=artifact_tuple,
+                    template_result=template_result,
+                    expected_environment=_expected_task_environment(env),
+                    operator_login=operator_login,
+                    operator_permission=permission["permission"],
+                    before=before,
+                    private_key_path=(
+                        Path(env["RUNNER_TEMP"])
+                        / "asaas-producer-post-readback-private.pem"
                     ),
                 )
+                latest_protections = validate_repository_protections(token)
+                latest_protection_hash = hashlib.sha256(
+                    _canonical(latest_protections)
+                ).hexdigest()
+                _require(
+                    latest_protection_hash
+                    == env.get("ASAAS_PREFLIGHT_PROTECTION_SHA256"),
+                    "github_controls_changed_during_cohort_confirmation",
+                )
+                validate_runtime_deploy_role_variable(
+                    env.get(DEPLOY_ROLE_VARIABLE),
+                    latest_protections["deploy_role_arn"],
+                )
+                latest_run = validate_current_run(
+                    env, token, stage="pre-oidc-cohort"
+                )
+                _require(
+                    latest_run == run,
+                    "actions_run_changed_during_cohort_confirmation",
+                )
+                validate_deployment_history(
+                    token,
+                    current_run_id=run["run_id"],
+                    operation_id=env["INPUT_OPERATION_ID"],
+                    mode=env["INPUT_MODE"],
+                )
+                validate_environment_approval(
+                    token=token,
+                    run=run,
+                    phase="deploy",
+                    expected_reviewer_login=operator_login,
+                    actor_id=run["actor_id"],
+                    template_sha256=template_result["template_sha256"],
+                    preflight_observed_at=_time(
+                        env.get("ASAAS_PREFLIGHT_OBSERVED_AT"),
+                        "preflight_observed_at",
+                    ),
+                )
+                current_job = _deployment_job_context(token, run["run_id"])
+                _require(
+                    current_job["job_id"]
+                    == cohort_evidence["deployment_job_id"]
+                    and current_job["job_started_at"]
+                    == cohort_evidence["deployment_job_started_at"],
+                    "deployment_job_changed_during_cohort_confirmation",
+                )
+            if args.output is not None:
+                if args.phase == "pre-oidc-cohort":
+                    write_private_json(args.output, cohort_evidence)
+                else:
+                    write_private_json(
+                        args.output,
+                        (
+                            before
+                            if args.phase == "predeploy"
+                            else {
+                                **before,
+                                "approval_observed_at_utc": approval[
+                                    "approval_observed_at_utc"
+                                ],
+                            }
+                        ),
+                    )
         else:
             preflight_observed_at = datetime.now(timezone.utc)
             if args.output is not None:
@@ -1373,6 +1694,8 @@ def main() -> int:
         print("GitHub rollout protections and run history: ready")
         if args.phase == "predeploy":
             print("Protected task definition and database readiness: ready")
+        if args.phase == "pre-oidc-cohort":
+            print("Fresh pre-OIDC task cohort and readiness confirmation: ready")
         if os.environ.get("GITHUB_OUTPUT"):
             with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
                 output.write(f"run_id={run['run_id']}\n")
@@ -1394,7 +1717,22 @@ def main() -> int:
                     )
                 if args.phase == "deploy":
                     output.write(f"operator_login={operator_login}\n")
-                if args.output is not None:
+                    output.write(
+                        f"deployment_job_id={approval['deployment_job_id']}\n"
+                    )
+                    output.write(
+                        "deployment_job_started_at="
+                        f"{approval['deployment_job_started_at']}\n"
+                    )
+                if args.phase == "pre-oidc-cohort":
+                    output.write(
+                        f"cohort_evidence_path={args.output}\n"
+                    )
+                    output.write(
+                        "cohort_evidence_sha256="
+                        f"{cohort_evidence['evidence_sha256']}\n"
+                    )
+                if args.output is not None and args.phase != "pre-oidc-cohort":
                     output.write(f"predeploy_readback_path={args.output}\n")
         return 0
     except (

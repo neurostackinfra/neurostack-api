@@ -565,7 +565,10 @@ def sanitize_aws_readbacks(raw: Any) -> dict[str, Any]:
     deployments = service.get("deployments")
     _require(isinstance(deployments, list), "service_deployments_unreadable")
     safe_service["deployments"] = [
-        {key: row.get(key) for key in ("status", "taskDefinition", "rolloutState")}
+        {
+            key: row.get(key)
+            for key in ("id", "status", "taskDefinition", "rolloutState")
+        }
         for row in deployments
         if isinstance(row, dict)
     ]
@@ -863,6 +866,8 @@ def validate_deployment_snapshot(
     ]
     _require(
         len(primary) == 1
+        and isinstance(primary[0].get("id"), str)
+        and primary[0]["id"]
         and primary[0].get("taskDefinition") == service_task_definition,
         "service_primary_deployment_mismatch",
     )
@@ -1093,6 +1098,7 @@ def validate_deployment_snapshot(
         "cluster_arn": CLUSTER_ARN,
         "service_arn": SERVICE_ARN,
         "task_definition_arn": service_task_definition,
+        "primary_deployment_id": primary[0]["id"],
         "task_count": desired,
         "task_arns": sorted(task_arns),
         "task_private_ips": sorted(task.get("privateIp") for task in tasks),
@@ -1149,6 +1155,7 @@ def compare_rollout_readbacks(
         "cluster_arn",
         "service_arn",
         "task_definition_arn",
+        "primary_deployment_id",
         "task_count",
         "task_arns",
         "app_image_digest",
@@ -1176,6 +1183,14 @@ def compare_rollout_readbacks(
     _require(
         before.get("phase") == "before" and after.get("phase") == "after",
         "readback_phase_order_invalid",
+    )
+    _require(
+        all(
+            isinstance(row.get("primary_deployment_id"), str)
+            and row["primary_deployment_id"]
+            for row in (before, after)
+        ),
+        "readback_primary_deployment_id_invalid",
     )
     _require(
         before.get("schema")
@@ -1211,6 +1226,8 @@ def compare_rollout_readbacks(
         "service_arn": after["service_arn"],
         "previous_task_definition_arn": before["task_definition_arn"],
         "active_task_definition_arn": after["task_definition_arn"],
+        "previous_primary_deployment_id": before["primary_deployment_id"],
+        "active_primary_deployment_id": after["primary_deployment_id"],
         "task_definition_runtime_sha256": after["runtime_fingerprint_sha256"],
         "base_environment_sha256": after["base_environment_sha256"],
         "previous_image_digest": before["app_image_digest"],
