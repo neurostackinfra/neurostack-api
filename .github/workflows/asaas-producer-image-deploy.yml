@@ -58,9 +58,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       actions: read
-      administration: read
       contents: read
-      issues: read
     outputs:
       protection_sha256: ${{ steps.gate.outputs.protection_sha256 }}
       preflight_observed_at: ${{ steps.gate.outputs.preflight_observed_at }}
@@ -177,9 +175,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       actions: read
-      administration: read
       contents: read
-      issues: read
     outputs:
       task_definition_template_sha256: ${{ steps.gate.outputs.task_definition_template_sha256 }}
       predeploy_readback_sha256: ${{ steps.gate.outputs.predeploy_readback_sha256 }}
@@ -326,9 +322,7 @@ jobs:
     timeout-minutes: 60
     permissions:
       actions: read
-      administration: read
       contents: read
-      issues: read
       id-token: write
     env:
       ASAAS_PREFLIGHT_PROTECTION_SHA256: ${{ needs.preflight.outputs.protection_sha256 }}
@@ -460,6 +454,14 @@ jobs:
         env: *protected_gate_env
         shell: bash
         run: python3 scripts/asaas_producer_rollout_gate.py --phase pre-oidc-cohort --output "$RUNNER_TEMP/asaas-producer-pre-oidc-cohort.json"
+
+      - name: Recheck administrator UI evidence freshness at OIDC boundary
+        shell: bash
+        env:
+          UI_CHECKED_AT_UTC: ${{ steps.pre_oidc_gate.outputs.ui_checked_at_utc }}
+        run: >-
+          python3 scripts/asaas_oidc_ui_freshness.py
+          --checked-at-utc "$UI_CHECKED_AT_UTC"
 
       # This is the only OIDC step. The no-OIDC job and this job's gate have
       # already re-read current protections, approvals, artifacts, and secrets.

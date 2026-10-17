@@ -57,6 +57,7 @@ def test_workflow_has_exact_manual_inputs_and_serialized_execution() -> None:
         "task" in key or "secret" in key or "snapshot" in key for key in inputs
     )
     assert workflow["permissions"] == {}
+    assert set(workflow["on"]) == {"workflow_dispatch"}
 
 
 def test_only_deploy_job_can_request_oidc_and_it_is_after_all_no_oidc_gates() -> None:
@@ -69,6 +70,12 @@ def test_only_deploy_job_can_request_oidc_and_it_is_after_all_no_oidc_gates() ->
     ]
     assert oidc_permissions == [("deploy", "write")]
     assert workflow["permissions"] == {}
+    allowed = {"actions", "contents", "id-token"}
+    assert all(
+        set(job.get("permissions", {})) <= allowed
+        for job in jobs.values()
+    )
+    assert all("issues" not in job.get("permissions", {}) for job in jobs.values())
     assert jobs["preflight"].get("environment") is None
     assert jobs["verify-predeploy-evidence"]["environment"] == ENVIRONMENT
     assert jobs["deploy"]["environment"] == ENVIRONMENT
@@ -108,8 +115,14 @@ def test_only_deploy_job_can_request_oidc_and_it_is_after_all_no_oidc_gates() ->
         for index, step in enumerate(deploy_steps)
         if step.get("name") == "Validate fresh run-bound cohort confirmation before OIDC"
     ]
-    assert len(aws_steps) == len(gate_steps) == len(key_steps) == len(cohort_steps) == 1
-    assert gate_steps[0] < key_steps[0] < cohort_steps[0] < aws_steps[0]
+    freshness_steps = [
+        index
+        for index, step in enumerate(deploy_steps)
+        if step.get("name")
+        == "Recheck administrator UI evidence freshness at OIDC boundary"
+    ]
+    assert len(aws_steps) == len(gate_steps) == len(key_steps) == len(cohort_steps) == len(freshness_steps) == 1
+    assert gate_steps[0] < key_steps[0] < cohort_steps[0] < freshness_steps[0] < aws_steps[0]
     assert deploy_steps[aws_steps[0]]["with"]["role-to-assume"] == (
         "${{ env.BILLING_PRODUCER_DEPLOY_ROLE_ARN }}"
     )
@@ -119,6 +132,11 @@ def test_only_deploy_job_can_request_oidc_and_it_is_after_all_no_oidc_gates() ->
     assert "ASAAS_PRE_OIDC_COHORT_SHA256" in deploy_steps[-1]["env"]
     assert deploy_steps[cohort_steps[0]]["id"] == "cohort_confirmation"
     assert "--phase pre-oidc-cohort" in deploy_steps[cohort_steps[0]]["run"]
+    assert deploy_steps[freshness_steps[0]]["env"]["UI_CHECKED_AT_UTC"] == (
+        "${{ steps.pre_oidc_gate.outputs.ui_checked_at_utc }}"
+    )
+    assert "asaas_oidc_ui_freshness.py" in deploy_steps[freshness_steps[0]]["run"]
+    assert "--checked-at-utc" in deploy_steps[freshness_steps[0]]["run"]
     assert all(
         not step.get("uses", "").startswith("aws-actions/")
         for step in deploy_steps[: aws_steps[0]]

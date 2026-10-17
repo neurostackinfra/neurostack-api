@@ -562,16 +562,18 @@ def github_get(url, token):
         parsed.path == API_PREFIX or parsed.path.startswith(API_PREFIX + "/"),
         "github_api_path_invalid",
     )
-    request = Request(
-        url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "Cache-Control": "no-cache",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-        method="GET",
-    )
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Cache-Control": "no-cache",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    # Public control/readback endpoints are intentionally anonymous: a
+    # GITHUB_TOKEN with least-privilege scopes cannot read repository settings.
+    # The collaborator permission endpoint is private and remains authenticated
+    # so the admin-role checks below fail closed if the token cannot read it.
+    if token and _requires_authenticated_github_read(parsed.path):
+        headers["Authorization"] = f"Bearer {token}"
+    request = Request(url, headers=headers, method="GET")
     try:
         with urlopen(request, timeout=10) as response:
             status = getattr(response, "status", None)
@@ -593,6 +595,12 @@ def github_get(url, token):
         raise
     except (HTTPError, URLError, OSError, json.JSONDecodeError):
         raise GateError("github_api_readback_failed") from None
+
+
+def _requires_authenticated_github_read(path):
+    return re.fullmatch(
+        re.escape(API_PREFIX) + r"/collaborators/[^/]+/permission", path
+    ) is not None
 
 
 def github_collection(url, token, *, list_field=None):
@@ -653,9 +661,12 @@ def validate_ruleset(rulesets, token, *, github_get_fn=None):
         and ref_name.get("exclude") == [],
         "ruleset_ref_scope_mismatch",
     )
-    require(
-        ruleset.get("bypass_actors") == [], "ruleset_bypass_not_empty_or_unreadable"
-    )
+    if "bypass_actors" in ruleset:
+        require(
+            isinstance(ruleset["bypass_actors"], list)
+            and ruleset["bypass_actors"] == [],
+            "ruleset_bypass_not_empty_or_unreadable",
+        )
     rows = ruleset.get("rules")
     require(isinstance(rows, list), "ruleset_rules_missing")
     by_type = {}
@@ -708,6 +719,20 @@ def validate_ruleset(rulesets, token, *, github_get_fn=None):
         check_names.append(check["context"])
     require(len(check_names) == len(set(check_names)), "ruleset_named_check_duplicate")
     return ruleset
+
+
+def ruleset_bypass_api_observation(ruleset):
+    """Distinguish a hidden public-API field from an explicitly empty list."""
+
+    require(isinstance(ruleset, dict), "ruleset_readback_invalid")
+    if "bypass_actors" not in ruleset:
+        return "omitted"
+    require(
+        isinstance(ruleset["bypass_actors"], list)
+        and ruleset["bypass_actors"] == [],
+        "ruleset_bypass_not_empty_or_unreadable",
+    )
+    return "empty"
 
 
 def validate_environment(name, token, *, github_get_fn=None, github_collection_fn=None):
@@ -1114,10 +1139,15 @@ def controls_digest(
     environments,
     backend_trust_digest,
     backend_trust_origin,
+    ruleset_bypass_api_observation,
     *,
     trust_mode_value="normal",
     backend_probe_digest="",
 ):
+    require(
+        ruleset_bypass_api_observation in {"omitted", "empty"},
+        "ruleset_bypass_observation_invalid",
+    )
     owner = repository.get("owner")
     snapshot = {
         "repository": {
@@ -1127,6 +1157,7 @@ def controls_digest(
             "default_branch": repository.get("default_branch"),
         },
         "ruleset": ruleset,
+        "ruleset_bypass_api_observation": ruleset_bypass_api_observation,
         "environments": environments,
         "backend_build_trust_readback_sha256": backend_trust_digest,
         "backend_build_trust_mode": trust_mode_value,
@@ -1149,7 +1180,6 @@ def main():
         backend_probe_digest = probe_backend_trust_readback_unavailable(env)
     backend_origin = backend_trust_origin(env)
     token = env.get("GH_TOKEN", "")
-    require(bool(token), "github_read_token_unavailable")
     repository, _ = github_get(f"{API_ROOT}{API_PREFIX}", token)
     require(
         isinstance(repository, dict)
@@ -1170,6 +1200,7 @@ def main():
         token,
     )
     ruleset = validate_ruleset(rulesets, token)
+    bypass_api_observation = ruleset_bypass_api_observation(ruleset)
     environment_readbacks = {}
     for environment_name in ENVIRONMENTS:
         environment_readbacks[environment_name] = validate_environment(
@@ -1193,6 +1224,7 @@ def main():
         environment_readbacks,
         backend_trust_digest,
         backend_origin,
+        bypass_api_observation,
         trust_mode_value=mode,
         backend_probe_digest=backend_probe_digest,
     )

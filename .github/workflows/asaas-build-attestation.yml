@@ -44,7 +44,6 @@ jobs:
     timeout-minutes: 10
     permissions:
       actions: read
-      administration: read
       contents: read
     outputs:
       rollout_scope: ${{ steps.gate.outputs.rollout_scope }}
@@ -106,7 +105,6 @@ jobs:
     timeout-minutes: 10
     permissions:
       actions: read
-      administration: read
       contents: read
     outputs:
       approval_evidence_sha256: ${{ steps.verify.outputs.approval_evidence_sha256 }}
@@ -182,7 +180,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       actions: read
-      administration: read
       contents: read
       id-token: write
     steps:
@@ -306,6 +303,14 @@ jobs:
           test "$BILLING_PRODUCER_BUILD_OIDC_AUDIENCE" = "sts.amazonaws.com"
           "$RUNNER_TEMP/attestation-venv/bin/python" \
             scripts/sign_asaas_build_attestation.py --validate-pins
+
+      - name: Recheck administrator UI evidence freshness at OIDC boundary
+        shell: bash
+        env:
+          UI_CHECKED_AT_UTC: ${{ needs.verify-ui-approval.outputs.ui_checked_at_utc }}
+        run: >-
+          python3 scripts/asaas_oidc_ui_freshness.py
+          --checked-at-utc "$UI_CHECKED_AT_UTC"
 
       - name: Assume the administrator-pinned CI role
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
