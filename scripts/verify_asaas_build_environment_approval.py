@@ -37,15 +37,23 @@ OWNER_ID = _PREFLIGHT.OWNER_ID
 RELEASE_REF = _PREFLIGHT.RELEASE_REF
 WORKFLOW_PATH = _PREFLIGHT.WORKFLOW_PATH
 ENVIRONMENT = "asaas-build"
-COMMENT_PREFIX = "ASAAS-ADMIN-UI-ATTESTATION/2"
+COMMENT_SCHEMA = "neurostack.asaas_build_ui_attestation.v4"
+UI_APPROVAL_JOB_NAME = "Verify run-bound admin UI evidence before OIDC (no token)"
+BUILD_JOB_NAME = "Build and sign after second asaas-build approval"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-MAX_EVIDENCE_BYTES = 5 * 1024 * 1024
+MAX_EVIDENCE_BYTES = 20 * 1024 * 1024
+MAX_MANIFEST_BYTES = 256 * 1024
+MAX_APPROVAL_COMMENT_BYTES = 2048
 MAX_BUILD_JOB_AGE = timedelta(minutes=2)
+MAX_UI_CHECK_AGE = timedelta(minutes=5)
 MAX_DECODED_EVIDENCE_BYTES = 128 * 1024 * 1024
 MAX_DECODED_PNG_TEXT_BYTES = 4 * 1024 * 1024
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _ATTACHMENT_PATH = re.compile(
     r"/user-attachments/assets/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+)
+_MANIFEST_ATTACHMENT_PATH = re.compile(
+    r"/user-attachments/files/[1-9][0-9]*/[A-Za-z0-9][A-Za-z0-9_-]{0,80}\.json"
 )
 
 
@@ -108,7 +116,10 @@ def _is_allowed_attachment_redirect(url: str) -> bool:
     ):
         return False
     if hostname == "github.com":
-        return _ATTACHMENT_PATH.fullmatch(parsed.path) is not None
+        return (
+            _ATTACHMENT_PATH.fullmatch(parsed.path) is not None
+            or _MANIFEST_ATTACHMENT_PATH.fullmatch(parsed.path) is not None
+        )
     return hostname == "githubusercontent.com" or hostname.endswith(
         ".githubusercontent.com"
     )
@@ -126,6 +137,21 @@ def _validate_attachment_ref(url: str) -> None:
         and not parsed.query
         and not parsed.fragment,
         "approval_evidence_ref_invalid",
+    )
+
+
+def _validate_manifest_ref(url: str) -> None:
+    parsed = urlsplit(url)
+    _require(
+        parsed.scheme == "https"
+        and parsed.hostname == "github.com"
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.port is None
+        and _MANIFEST_ATTACHMENT_PATH.fullmatch(parsed.path) is not None
+        and not parsed.query
+        and not parsed.fragment,
+        "approval_manifest_ref_invalid",
     )
 
 
@@ -614,6 +640,41 @@ def _fetch_github_attachment(url: str) -> bytes:
         raise ApprovalGateError("approval_evidence_download_failed") from None
 
 
+def _fetch_github_manifest(url: str) -> bytes:
+    _validate_manifest_ref(url)
+    request = Request(
+        url,
+        headers={"Accept": "application/json", "Cache-Control": "no-cache"},
+        method="GET",
+    )
+    try:
+        with build_opener(_GitHubAttachmentRedirect()).open(
+            request, timeout=15
+        ) as response:
+            status = getattr(response, "status", None)
+            if status is None:
+                status = response.getcode()
+            _require(status == 200, "approval_manifest_download_failed")
+            _require(
+                _is_allowed_attachment_redirect(response.geturl()),
+                "approval_manifest_ref_invalid",
+            )
+            _require(
+                response.headers.get_content_type() == "application/json",
+                "approval_manifest_media_type_invalid",
+            )
+            raw = response.read(MAX_MANIFEST_BYTES + 1)
+            _require(
+                len(raw) <= MAX_MANIFEST_BYTES,
+                "approval_manifest_too_large",
+            )
+            return raw
+    except ApprovalGateError:
+        raise
+    except (HTTPError, URLError, OSError):
+        raise ApprovalGateError("approval_manifest_download_failed") from None
+
+
 def _api_get(path: str, token: str) -> dict | list:
     url = path if path.startswith("https://") else API_ROOT + path
     parsed = urlsplit(url)
@@ -661,58 +722,100 @@ def _canonical_timestamp(value: str) -> datetime:
     _require(
         isinstance(value, str)
         and re.fullmatch(
-            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z",
+            value,
         )
         is not None,
         "approval_timestamp_invalid",
     )
     try:
-        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
             tzinfo=timezone.utc
         )
     except ValueError:
         raise ApprovalGateError("approval_timestamp_invalid") from None
+    _require(
+        parsed.strftime("%Y-%m-%dT%H:%M:%S.%fZ") == value,
+        "approval_timestamp_invalid",
+    )
     return parsed
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        _require(key not in value, "approval_comment_duplicate_json_key")
+        value[key] = item
+    return value
+
+
+def _loads_strict_json(raw: bytes, *, reason: str) -> object:
+    try:
+        return json.loads(raw, object_pairs_hook=_reject_duplicate_json_keys)
+    except ApprovalGateError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise ApprovalGateError(reason) from None
+
+
+def _canonical_json(value: object) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    except (TypeError, ValueError):
+        raise ApprovalGateError("approval_manifest_invalid") from None
 
 
 def _parse_approval_comment(
     comment: str,
     *,
     expected: dict[str, str],
-) -> dict[str, str]:
+) -> dict[str, object]:
     _require(
-        isinstance(comment, str) and 1 <= len(comment) <= 2048 and "\n" not in comment,
+        isinstance(comment, str)
+        and 1 <= len(comment.encode("utf-8")) <= MAX_APPROVAL_COMMENT_BYTES,
         "approval_comment_invalid",
     )
-    parts = comment.split(" ")
-    _require(
-        parts[0] == COMMENT_PREFIX and all(parts) and " ".join(parts) == comment,
-        "approval_comment_invalid",
-    )
-    values: dict[str, str] = {}
-    for item in parts[1:]:
-        _require("=" in item, "approval_comment_invalid")
-        key, value = item.split("=", 1)
-        _require(key and value and key not in values, "approval_comment_invalid")
-        values[key] = value
+    raw = comment.encode("utf-8")
+    values = _loads_strict_json(raw, reason="approval_comment_invalid")
+    _require(isinstance(values, dict), "approval_comment_invalid")
+    _require(_canonical_json(values) == raw, "approval_comment_noncanonical")
+    _require("checked_at_utc" in values, "approval_checked_at_missing")
     required = {
+        "schema_version",
         "run_id",
+        "run_attempt",
         "sha",
         "ref",
         "workflow_path",
         "environment",
+        "checked_at_utc",
         "reviewer_id",
         "reviewer_login",
         "preflight_sha256",
         "ruleset_bypass",
         "environment_admin_bypass",
         "branch_policy",
+        "checks",
+        "manifest_ref",
+        "manifest_sha256",
+        "screenshots",
         "evidence_ref",
+        "evidence_label",
         "evidence_sha256",
     }
     _require(set(values) == required, "approval_comment_fields_invalid")
+    _require(
+        values["schema_version"] == COMMENT_SCHEMA, "approval_comment_schema_invalid"
+    )
     for key, expected_value in expected.items():
         _require(values.get(key) == expected_value, f"approval_{key}_mismatch")
+    _canonical_timestamp(values["checked_at_utc"])
     _require(values["ruleset_bypass"] == "empty", "ruleset_bypass_not_attested")
     _require(
         values["environment_admin_bypass"] == "disabled",
@@ -723,13 +826,135 @@ def _parse_approval_comment(
         re.fullmatch(r"[0-9a-f]{64}", values["preflight_sha256"]) is not None,
         "approval_preflight_digest_invalid",
     )
-    _require(isinstance(values["evidence_ref"], str), "approval_evidence_ref_invalid")
+    _validate_manifest_ref(values["manifest_ref"])
     _validate_attachment_ref(values["evidence_ref"])
+    screenshots = values["screenshots"]
+    labels = {"ruleset", "asaas-build", "asaas-production-deployment"}
     _require(
-        re.fullmatch(r"[0-9a-f]{64}", values["evidence_sha256"]) is not None,
-        "approval_evidence_digest_invalid",
+        isinstance(screenshots, dict) and set(screenshots) == labels,
+        "approval_comment_screenshots_invalid",
+    )
+    refs, screenshot_digests = set(), set()
+    for screenshot in screenshots.values():
+        _require(
+            isinstance(screenshot, dict) and set(screenshot) == {"ref", "sha256"},
+            "approval_comment_screenshots_invalid",
+        )
+        _validate_attachment_ref(screenshot["ref"])
+        _require(
+            isinstance(screenshot["sha256"], str)
+            and re.fullmatch(r"[0-9a-f]{64}", screenshot["sha256"]) is not None,
+            "approval_comment_screenshots_invalid",
+        )
+        refs.add(screenshot["ref"])
+        screenshot_digests.add(screenshot["sha256"])
+    _require(
+        len(refs) == len(labels) and len(screenshot_digests) == len(labels),
+        "approval_comment_screenshots_invalid",
+    )
+    for key in ("manifest_sha256", "evidence_sha256"):
+        _require(
+            isinstance(values[key], str)
+            and re.fullmatch(r"[0-9a-f]{64}", values[key]) is not None,
+            f"approval_{key}_invalid",
+        )
+    _require(
+        values["evidence_label"]
+        in {"ruleset", "asaas-build", "asaas-production-deployment"},
+        "approval_evidence_label_invalid",
     )
     return values
+
+
+def _validate_ui_manifest(
+    raw: bytes,
+    *,
+    expected_sha256: str,
+    comment: dict[str, object],
+) -> dict[str, object]:
+    _require(
+        hashlib.sha256(raw).hexdigest() == expected_sha256,
+        "approval_manifest_digest_mismatch",
+    )
+    manifest = _loads_strict_json(raw, reason="approval_manifest_json_invalid")
+    _require(isinstance(manifest, dict), "approval_manifest_invalid")
+    _require(_canonical_json(manifest) == raw, "approval_manifest_noncanonical")
+    required = {
+        "schema_version",
+        "run_id",
+        "run_attempt",
+        "workflow_path",
+        "sha",
+        "ref",
+        "environment",
+        "checked_at_utc",
+        "checks",
+        "screenshots_sha256",
+    }
+    _require(set(manifest) == required, "approval_manifest_fields_invalid")
+    _require(
+        manifest["schema_version"] == "neurostack.asaas_build_ui_evidence_manifest.v2",
+        "approval_manifest_schema_invalid",
+    )
+    for key in (
+        "run_id",
+        "run_attempt",
+        "workflow_path",
+        "sha",
+        "ref",
+        "environment",
+        "checked_at_utc",
+    ):
+        _require(
+            manifest[key] == comment[key],
+            f"approval_manifest_{key}_mismatch",
+        )
+    expected_checks = {
+        "ruleset_bypass_empty": True,
+        "asaas_build_admin_bypass_disabled": True,
+        "asaas_build_branch_only_main": True,
+        "asaas_production_admin_bypass_disabled": True,
+        "asaas_production_branch_only_main": True,
+    }
+    _require(manifest["checks"] == expected_checks, "approval_manifest_checks_invalid")
+    _require(comment["checks"] == expected_checks, "approval_comment_checks_invalid")
+    screenshot_hashes = manifest["screenshots_sha256"]
+    labels = {"ruleset", "asaas-build", "asaas-production-deployment"}
+    _require(
+        isinstance(screenshot_hashes, dict) and set(screenshot_hashes) == labels,
+        "approval_manifest_screenshots_invalid",
+    )
+    hashes = list(screenshot_hashes.values())
+    _require(
+        all(
+            isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+            for value in hashes
+        )
+        and len(set(hashes)) == len(labels),
+        "approval_manifest_screenshots_invalid",
+    )
+    label = comment["evidence_label"]
+    _require(
+        screenshot_hashes[label] == comment["evidence_sha256"],
+        "approval_evidence_label_digest_mismatch",
+    )
+    _require(
+        {
+            name: {
+                "sha256": screenshot_hashes[name],
+                "ref": comment["screenshots"][name]["ref"],
+            }
+            for name in labels
+        }
+        == comment["screenshots"],
+        "approval_manifest_screenshots_mismatch",
+    )
+    _require(
+        comment["screenshots"][label]["ref"] == comment["evidence_ref"]
+        and comment["screenshots"][label]["sha256"] == comment["evidence_sha256"],
+        "approval_evidence_label_digest_mismatch",
+    )
+    return manifest
 
 
 def _controls_snapshot(
@@ -792,13 +1017,13 @@ def _controls_snapshot(
     }, {"digest": digest}
 
 
-def _api_timestamp(value: str) -> datetime:
-    _require(isinstance(value, str), "actions_build_job_timestamp_missing")
+def _api_timestamp(value: str, *, field: str) -> datetime:
+    _require(isinstance(value, str), f"{field}_missing")
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
-        raise ApprovalGateError("actions_build_job_timestamp_invalid") from None
-    _require(parsed.tzinfo is not None, "actions_build_job_timestamp_invalid")
+        raise ApprovalGateError(f"{field}_invalid") from None
+    _require(parsed.tzinfo is not None, f"{field}_invalid")
     return parsed.astimezone(timezone.utc)
 
 
@@ -808,15 +1033,30 @@ def verify_environment_approval(
     get_json=None,
     get_collection=None,
     get_evidence=None,
+    get_manifest=None,
     now: datetime | None = None,
+    phase: str = "build",
+    expected_evidence_sha256: str = "",
+    expected_checked_at_utc: str = "",
 ) -> dict[str, str]:
     get = _api_get if get_json is None else get_json
     collect = _PREFLIGHT.github_collection if get_collection is None else get_collection
     fetch_evidence = _fetch_github_attachment if get_evidence is None else get_evidence
+    fetch_manifest = (
+        _fetch_github_manifest
+        if get_manifest is None and get_evidence is None
+        else get_evidence if get_manifest is None else get_manifest
+    )
+    _require(phase in {"evidence", "build"}, "approval_phase_invalid")
     token = env.get("GH_TOKEN", "")
     _require(bool(token), "github_read_token_unavailable")
     run_id = env.get("GITHUB_RUN_ID", "")
     _require(re.fullmatch(r"[1-9][0-9]*", run_id) is not None, "actions_run_id_invalid")
+    run_attempt = env.get("GITHUB_RUN_ATTEMPT", "")
+    _require(
+        re.fullmatch(r"[1-9][0-9]*", run_attempt) is not None,
+        "actions_run_attempt_invalid",
+    )
     sha = env.get("GITHUB_SHA", "")
     _require(re.fullmatch(r"[0-9a-f]{40}", sha) is not None, "actions_run_sha_invalid")
     _require(env.get("GITHUB_REPOSITORY") == REPOSITORY, "repository_name_mismatch")
@@ -883,10 +1123,21 @@ def verify_environment_approval(
     _require(
         run.get("event") == "workflow_dispatch"
         and run.get("status") == "in_progress"
+        and run.get("run_attempt") == int(run_attempt)
         and run.get("head_branch") == "main"
         and run.get("head_sha") == sha
         and run.get("path") == f"{WORKFLOW_PATH}@{RELEASE_REF}",
         "actions_run_context_mismatch",
+    )
+    exact_ref = get(f"{API_ROOT}{API_PREFIX}/git/ref/heads/main", token)
+    exact_ref_object = exact_ref.get("object") if isinstance(exact_ref, dict) else None
+    _require(
+        isinstance(exact_ref, dict)
+        and exact_ref.get("ref") == RELEASE_REF
+        and isinstance(exact_ref_object, dict)
+        and exact_ref_object.get("type") == "commit"
+        and exact_ref_object.get("sha") == run.get("head_sha"),
+        "actions_run_exact_ref_readback_mismatch",
     )
     if mode == "bootstrap":
         expected_title = (
@@ -942,6 +1193,17 @@ def verify_environment_approval(
         and job.get("name") == "preflight"
         and job.get("head_sha") == sha
     ]
+    ui_approval_jobs = [
+        job
+        for job in jobs
+        if isinstance(job, dict)
+        and job.get("head_sha") == sha
+        and job.get("name")
+        in {
+            UI_APPROVAL_JOB_NAME,
+            f"verify-ui-approval / {UI_APPROVAL_JOB_NAME}",
+        }
+    ]
     build_jobs = [
         job
         for job in jobs
@@ -949,8 +1211,8 @@ def verify_environment_approval(
         and job.get("head_sha") == sha
         and job.get("name")
         in {
-            "Build and sign after live protections and environment approval",
-            "build-attestation / Build and sign after live protections and environment approval",
+            BUILD_JOB_NAME,
+            f"build-attestation / {BUILD_JOB_NAME}",
         }
     ]
     _require(
@@ -969,19 +1231,49 @@ def verify_environment_approval(
             )
         except _PREFLIGHT.GateError as exc:
             raise ApprovalGateError(str(exc)) from None
-    _require(
-        len(build_jobs) == 1 and build_jobs[0].get("status") == "in_progress",
-        "actions_build_job_not_current",
-    )
     current_time = datetime.now(timezone.utc) if now is None else now
-    build_job_started_at = _api_timestamp(build_jobs[0].get("started_at"))
+    if phase == "evidence":
+        _require(
+            len(ui_approval_jobs) == 1
+            and ui_approval_jobs[0].get("status") == "in_progress",
+            "actions_ui_evidence_job_not_current",
+        )
+        _require(
+            len(build_jobs) == 1
+            and build_jobs[0].get("status") in {"queued", "waiting"}
+            and not build_jobs[0].get("started_at"),
+            "actions_build_job_started_before_ui_evidence_gate",
+        )
+        ui_job_started_at = _api_timestamp(
+            ui_approval_jobs[0].get("started_at"),
+            field="actions_ui_evidence_job_timestamp",
+        )
+        gate_job_started_at = ui_job_started_at
+    else:
+        _require(
+            len(ui_approval_jobs) == 1
+            and ui_approval_jobs[0].get("status") == "completed"
+            and ui_approval_jobs[0].get("conclusion") == "success",
+            "actions_ui_evidence_job_not_successful",
+        )
+        _require(
+            len(build_jobs) == 1 and build_jobs[0].get("status") == "in_progress",
+            "actions_build_job_not_current",
+        )
+        ui_job_started_at = _api_timestamp(
+            ui_approval_jobs[0].get("started_at"),
+            field="actions_ui_evidence_job_timestamp",
+        )
+        gate_job_started_at = _api_timestamp(
+            build_jobs[0].get("started_at"), field="actions_build_job_timestamp"
+        )
     _require(
-        preflight_at <= build_job_started_at <= current_time + timedelta(seconds=30),
-        "actions_build_job_timestamp_invalid",
+        preflight_at <= gate_job_started_at <= current_time + timedelta(seconds=30),
+        "actions_gate_job_timestamp_invalid",
     )
     _require(
-        current_time - build_job_started_at <= MAX_BUILD_JOB_AGE,
-        "actions_build_job_not_current",
+        current_time - gate_job_started_at <= MAX_BUILD_JOB_AGE,
+        "actions_gate_job_not_current",
     )
 
     # Re-read every API-visible control after the environment approval. The
@@ -1011,6 +1303,7 @@ def verify_environment_approval(
     required_reviewer = reviewers[0]
 
     approvals = get(f"{API_ROOT}{run_path}/approvals", token)
+    approval_observed_at = datetime.now(timezone.utc) if now is None else now
     _require(isinstance(approvals, list), "actions_approval_history_invalid")
     matching = [
         entry
@@ -1022,19 +1315,34 @@ def verify_environment_approval(
             for item in entry["environments"]
         )
     ]
-    _require(len(matching) == 1, "environment_approval_count_mismatch")
-    approval = matching[0]
-    _require(approval.get("state") == "approved", "environment_approval_not_approved")
-    user = approval.get("user")
+    expected_approval_count = 1 if phase == "evidence" else 2
     _require(
-        isinstance(user, dict)
-        and type(user.get("id")) is int
-        and user.get("id") == required_reviewer.get("id")
-        and isinstance(user.get("login"), str)
-        and user.get("login") == required_reviewer.get("login"),
+        len(matching) == expected_approval_count,
+        "environment_approval_count_mismatch",
+    )
+    _require(
+        all(entry.get("state") == "approved" for entry in matching),
+        "environment_approval_not_approved",
+    )
+    required_reviewer = build_environment["reviewers"][0]
+    users = [entry.get("user") for entry in matching]
+    _require(
+        all(
+            isinstance(user, dict)
+            and type(user.get("id")) is int
+            and user.get("id") == required_reviewer.get("id")
+            and isinstance(user.get("login"), str)
+            and user.get("login") == required_reviewer.get("login")
+            for user in users
+        ),
         "environment_approval_reviewer_mismatch",
     )
-    _require(user["id"] not in actor_ids, "environment_approval_not_independent")
+    user = users[0]
+    assert isinstance(user, dict)
+    _require(
+        all(candidate["id"] not in actor_ids for candidate in users),
+        "environment_approval_not_independent",
+    )
     permission = get(
         f"{API_ROOT}{API_PREFIX}/collaborators/{user['login']}/permission", token
     )
@@ -1042,8 +1350,18 @@ def verify_environment_approval(
         isinstance(permission, dict) and permission.get("permission") == "admin",
         "environment_reviewer_is_not_repository_admin",
     )
+    approval_comments = [
+        entry.get("comment")
+        for entry in matching
+        if isinstance(entry.get("comment"), str) and entry.get("comment")
+    ]
+    _require(
+        len(approval_comments) >= 1 and len(set(approval_comments)) == 1,
+        "approval_evidence_comment_missing_or_mismatched",
+    )
     comment_expected = {
         "run_id": run_id,
+        "run_attempt": run_attempt,
         "sha": sha,
         "ref": RELEASE_REF,
         "workflow_path": WORKFLOW_PATH,
@@ -1053,16 +1371,51 @@ def verify_environment_approval(
         "preflight_sha256": preflight_digest,
     }
     comment_fields = _parse_approval_comment(
-        approval.get("comment"),
+        approval_comments[0],
         expected=comment_expected,
     )
-    evidence_bytes = fetch_evidence(comment_fields["evidence_ref"])
-    _validate_png(evidence_bytes)
-    actual_evidence_sha256 = hashlib.sha256(evidence_bytes).hexdigest()
+    checked_at = _canonical_timestamp(comment_fields["checked_at_utc"])
     _require(
-        actual_evidence_sha256 == comment_fields["evidence_sha256"],
-        "approval_evidence_digest_mismatch",
+        checked_at <= ui_job_started_at,
+        "approval_ui_check_after_evidence_job_start",
     )
+    _require(
+        ui_job_started_at - checked_at <= MAX_UI_CHECK_AGE,
+        "approval_ui_check_stale",
+    )
+    _require(checked_at >= preflight_at, "approval_ui_check_before_preflight")
+    if expected_checked_at_utc:
+        _require(
+            _canonical_timestamp(expected_checked_at_utc) == checked_at,
+            "approval_checked_at_changed_after_no_oidc_gate",
+        )
+    manifest_bytes = fetch_manifest(comment_fields["manifest_ref"])
+    manifest = _validate_ui_manifest(
+        manifest_bytes,
+        expected_sha256=comment_fields["manifest_sha256"],
+        comment=comment_fields,
+    )
+    verified_screenshots: dict[str, bytes] = {}
+    for label, screenshot in comment_fields["screenshots"].items():
+        screenshot_bytes = fetch_evidence(screenshot["ref"])
+        _validate_png(screenshot_bytes)
+        actual_digest = hashlib.sha256(screenshot_bytes).hexdigest()
+        _require(
+            actual_digest == screenshot["sha256"],
+            "approval_evidence_digest_mismatch",
+        )
+        verified_screenshots[label] = screenshot_bytes
+    evidence_bytes = verified_screenshots[comment_fields["evidence_label"]]
+    actual_evidence_sha256 = hashlib.sha256(evidence_bytes).hexdigest()
+    if expected_evidence_sha256:
+        _require(
+            re.fullmatch(r"[0-9a-f]{64}", expected_evidence_sha256) is not None,
+            "approval_expected_evidence_digest_invalid",
+        )
+        _require(
+            actual_evidence_sha256 == expected_evidence_sha256,
+            "approval_evidence_changed_after_no_oidc_gate",
+        )
     observed_backend_trust_digest = ""
     observed_backend_probe_digest = ""
     try:
@@ -1077,13 +1430,15 @@ def verify_environment_approval(
                 "backend_trust_changed_after_preflight",
             )
         else:
-            observed_backend_probe_digest = _PREFLIGHT.probe_backend_trust_absent(
-                env, expected_digest=backend_probe_preflight_digest
+            observed_backend_probe_digest = (
+                _PREFLIGHT.probe_backend_trust_readback_unavailable(
+                    env, expected_digest=backend_probe_preflight_digest
+                )
             )
     except _PREFLIGHT.GateError as exc:
         raise ApprovalGateError(str(exc)) from None
     return {
-        "schema": "asaas_admin_ui_approval.v1",
+        "schema": "asaas_admin_ui_approval.v2",
         "run_id": run_id,
         "workflow_path": WORKFLOW_PATH,
         "sha": sha,
@@ -1101,13 +1456,31 @@ def verify_environment_approval(
         "evidence_sha256": actual_evidence_sha256,
         "evidence_verified": "true",
         "evidence_size_bytes": str(len(evidence_bytes)),
+        "manifest_ref": comment_fields["manifest_ref"],
+        "manifest_sha256": comment_fields["manifest_sha256"],
+        "screenshots_sha256": json.dumps(
+            manifest["screenshots_sha256"], sort_keys=True, separators=(",", ":")
+        ),
+        "screenshots_refs": json.dumps(
+            {
+                label: value["ref"]
+                for label, value in comment_fields["screenshots"].items()
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
         "approval_gate": "github_environment_required_reviewer_approved",
-        "approval_gate_satisfied_at_utc": build_job_started_at.replace(microsecond=0)
+        "approval_sequence": (
+            "first_no_oidc_gate" if phase == "evidence" else "second_oidc_gate"
+        ),
+        "ui_checked_at_utc": comment_fields["checked_at_utc"],
+        "approval_observed_at_utc": approval_observed_at.replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z"),
-        "approval_observed_at_utc": current_time.replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z"),
+        "approval_observation_source": (
+            "verifier clock when GitHub Actions returned the approved state; "
+            "this is not the reviewer click time"
+        ),
     }
 
 
@@ -1132,16 +1505,38 @@ def _write_evidence(path: Path, evidence: dict[str, str]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--evidence-output", type=Path, required=True)
+    parser.add_argument("--phase", choices=("evidence", "build"), default="build")
+    parser.add_argument("--expected-evidence-sha256", default="")
+    parser.add_argument("--expected-checked-at-utc", default="")
+    parser.add_argument("--github-output", type=Path)
     args = parser.parse_args()
     try:
-        evidence = verify_environment_approval(dict(os.environ))
+        evidence = verify_environment_approval(
+            dict(os.environ),
+            phase=args.phase,
+            expected_evidence_sha256=args.expected_evidence_sha256,
+            expected_checked_at_utc=args.expected_checked_at_utc,
+        )
         _write_evidence(args.evidence_output, evidence)
+        if args.github_output is not None:
+            with args.github_output.open("a", encoding="utf-8") as output:
+                output.write(
+                    f"approval_evidence_sha256={evidence['evidence_sha256']}\n"
+                )
+                output.write(f"ui_checked_at_utc={evidence['ui_checked_at_utc']}\n")
     except ApprovalGateError as exc:
         print(f"blocked: {exc}", file=sys.stderr)
         return 1
     except (OSError, TypeError, ValueError):
         print("blocked: administrator approval could not be verified", file=sys.stderr)
         return 1
+    phase_summary = (
+        "This protected verification job has no OIDC permission. The build job needs "
+        "a second approval for the same environment and validates it before requesting OIDC."
+        if args.phase == "evidence"
+        else "The second required approval for this environment and run-bound evidence "
+        "were verified before the first OIDC request."
+    )
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
         summary.write(
             "## Administrator UI approval verified\n\n"
@@ -1153,11 +1548,15 @@ def main() -> int:
             f"- Backend origin: `{evidence['backend_trust_origin']}`\n"
             f"- Evidence: `{evidence['evidence_ref']}`\n"
             f"- Evidence SHA-256: `{evidence['evidence_sha256']}`\n"
+            f"- Manifest SHA-256: `{evidence['manifest_sha256']}`\n"
+            f"- Screenshot SHA-256 values: `{evidence['screenshots_sha256']}`\n"
             f"- Evidence PNG verified: `{evidence['evidence_verified']}` ({evidence['evidence_size_bytes']} bytes)\n"
             f"- Approval gate: `{evidence['approval_gate']}`\n"
-            f"- Approval gate satisfied: `{evidence['approval_gate_satisfied_at_utc']}`\n"
+            f"- UI attestation checked at: `{evidence['ui_checked_at_utc']}`\n"
             f"- Approval record observed: `{evidence['approval_observed_at_utc']}`\n"
-            "The remaining steps may request OIDC only after this verification.\n"
+            f"- Observation source: `{evidence['approval_observation_source']}`\n"
+            "The human checked time is run-bound evidence, not a GitHub click time.\n"
+            f"{phase_summary}\n"
         )
     print("Run-bound independent administrator UI approval verified")
     return 0

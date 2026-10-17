@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-
 import pytest
 from cryptography.hazmat.primitives import serialization
 from fastapi import FastAPI, HTTPException
@@ -119,12 +118,62 @@ async def test_build_trust_readback_fails_closed_for_missing_or_invalid_key(
     assert getattr(invalid.value, "status_code", None) == 503
 
 
+@pytest.mark.asyncio
+async def test_public_build_trust_readback_is_separate_and_uses_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pem = _configured_build_key(monkeypatch)
+    response = Response()
+
+    result = await billing_producer_setup.read_public_producer_build_trust(response)
+
+    assert result["schema"] == "billing_producer_build_trust_readback.v1"
+    assert (
+        result["public_key_fingerprint_sha256"]
+        == hashlib.sha256(
+            serialization.load_pem_public_key(pem.encode("ascii")).public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        ).hexdigest()
+    )
+    assert "read_at_utc" in result
+    assert "public_key_pem" not in result
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+
+
+def test_admin_build_trust_http_contract_remains_public_and_unchanged(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pem = _configured_build_key(monkeypatch)
+    response = client.get("/v1/admin/billing/producer-build-trust")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["schema"] == "billing_producer_build_trust_readback.v1"
+    assert (
+        body["public_key_fingerprint_sha256"]
+        == hashlib.sha256(
+            serialization.load_pem_public_key(pem.encode("ascii")).public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        ).hexdigest()
+    )
+    assert "read_at_utc" not in body
+    assert "public_key_pem" not in body
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+
+
 def test_build_trust_route_is_exact_get_without_route_auth_dependency() -> None:
     app = FastAPI()
     app.include_router(billing_producer_setup.router, prefix="/v1/admin/billing")
+    app.include_router(billing_producer_setup.public_router, prefix="/v1/billing")
     paths = app.openapi()["paths"]
     path = "/v1/admin/billing/producer-build-trust"
     assert set(paths[path]) == {"get"}
+    assert set(paths["/v1/billing/producer-build-trust"]) == {"get"}
     route = next(
         route
         for route in billing_producer_setup.router.routes
@@ -150,7 +199,7 @@ def _http_scope(path: str, *, method: str = "GET") -> Scope:
     }
 
 
-def test_auth_middleware_allows_only_exact_build_trust_get_without_jwt() -> None:
+def test_auth_middleware_exempts_both_exact_trust_paths_only() -> None:
     async def exercise(path: str):
         started: list[Message] = []
 
@@ -167,18 +216,34 @@ def test_auth_middleware_allows_only_exact_build_trust_get_without_jwt() -> None
         await AuthMiddleware(downstream)(_http_scope(path), receive, send)
         return started
 
-    messages = asyncio.run(exercise("/v1/admin/billing/producer-build-trust"))
+    messages = asyncio.run(exercise("/v1/billing/producer-build-trust"))
     response_start = next(
         message for message in messages if message["type"] == "http.response.start"
     )
     assert response_start["status"] == 200
-    assert (b"cache-control", b"no-store") in response_start["headers"]
 
-    adjacent = asyncio.run(exercise("/v1/admin/billing/producer-build-trust/other"))
+    admin = asyncio.run(exercise("/v1/admin/billing/producer-build-trust"))
+    admin_start = next(
+        message for message in admin if message["type"] == "http.response.start"
+    )
+    assert admin_start["status"] == 200
+    assert (b"cache-control", b"no-store") in admin_start["headers"]
+
+    adjacent = asyncio.run(exercise("/v1/billing/producer-build-trust/other"))
     adjacent_start = next(
         message for message in adjacent if message["type"] == "http.response.start"
     )
     assert adjacent_start["status"] == 401
+
+    admin_adjacent = asyncio.run(
+        exercise("/v1/admin/billing/producer-build-trust/other")
+    )
+    admin_adjacent_start = next(
+        message
+        for message in admin_adjacent
+        if message["type"] == "http.response.start"
+    )
+    assert admin_adjacent_start["status"] == 401
 
 
 def test_build_trust_schema_version_matches_signed_envelope_protocol() -> None:

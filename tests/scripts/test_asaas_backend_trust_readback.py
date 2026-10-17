@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -67,6 +68,9 @@ def _environment() -> tuple[dict[str, str], dict[str, str]]:
         "workflow_ref": env["PIN_WORKFLOW_REF"],
         "oidc_issuer": env["PIN_OIDC_ISSUER"],
         "oidc_subject": env["PIN_OIDC_SUBJECT"],
+        "read_at_utc": datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
     }
     return env, readback
 
@@ -128,7 +132,7 @@ def test_backend_trust_readback_digest_is_canonical_and_detects_preflight_drift(
         digest
         == hashlib.sha256(
             json.dumps(
-                readback,
+                {key: value for key, value in readback.items() if key != "read_at_utc"},
                 ensure_ascii=True,
                 allow_nan=False,
                 sort_keys=True,
@@ -142,10 +146,24 @@ def test_backend_trust_readback_digest_is_canonical_and_detects_preflight_drift(
         )
 
 
+@pytest.mark.parametrize(
+    ("timestamp", "reason"),
+    [
+        ("not-a-timestamp", "timestamp_invalid"),
+        ("2020-01-01T00:00:00Z", "stale"),
+    ],
+)
+def test_backend_trust_readback_requires_fresh_timestamp(timestamp, reason) -> None:
+    env, readback = _environment()
+    readback["read_at_utc"] = timestamp
+    with pytest.raises(preflight.GateError, match=reason):
+        preflight.validate_backend_trust_readback(env, readback)
+
+
 def test_backend_url_must_be_a_pinned_https_origin() -> None:
     env, _ = _environment()
     assert preflight.backend_trust_url(env) == (
-        "https://staging-api.example.test/v1/admin/billing/producer-build-trust"
+        "https://staging-api.example.test/v1/billing/producer-build-trust"
     )
     for invalid in (
         "",

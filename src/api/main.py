@@ -617,6 +617,11 @@ def create_app() -> FastAPI:
         tags=["Billing Producer Setup"],
     )
     app.include_router(
+        billing_producer_setup.public_router,
+        prefix=f"{settings.api_prefix}/billing",
+        tags=["Billing Producer Trust"],
+    )
+    app.include_router(
         rlhf.router,
         prefix=f"{settings.api_prefix}/rlhf",
         tags=["RLHF"],

@@ -45,5 +45,10 @@ def test_release_preflight_emits_required_read_only_check_for_pull_requests() ->
     assert all(re.fullmatch(r"[^@]+@[0-9a-f]{40}", ref) for ref in action_refs)
 
     test_step = job["steps"][-1]
+    assert (
+        "scripts/validate_asaas_producer_release_readbacks.py --check-template"
+        in test_step["run"]
+    )
+    assert "tests/scripts/test_asaas_producer_release_readbacks.py" in test_step["run"]
     assert "test_asaas_build_workflow.py" in test_step["run"]
     assert "test_asaas_release_preflight_workflow.py" in test_step["run"]

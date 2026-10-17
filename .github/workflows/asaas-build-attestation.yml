@@ -94,18 +94,23 @@ jobs:
           BUILD_PUBLIC_KEY: ${{ vars.BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM }}
         run: python3 scripts/asaas_build_release_preflight.py
 
-  build-attestation:
-    name: Build and sign after live protections and environment approval
+  # Both jobs intentionally use the same protected environment: the no-OIDC job
+  # validates the first approval and screenshot; the OIDC job needs a second
+  # approval and revalidates it before requesting credentials.
+  verify-ui-approval:
+    name: Verify run-bound admin UI evidence before OIDC (no token)
     needs: preflight
     if: needs.preflight.result == 'success' && needs.preflight.outputs.rollout_scope == 'validated'
     runs-on: ubuntu-24.04
     environment: asaas-build
-    timeout-minutes: 30
+    timeout-minutes: 10
     permissions:
       actions: read
       administration: read
       contents: read
-      id-token: write
+    outputs:
+      approval_evidence_sha256: ${{ steps.verify.outputs.approval_evidence_sha256 }}
+      ui_checked_at_utc: ${{ steps.verify.outputs.ui_checked_at_utc }}
     steps:
       - name: Checkout selected protected ref
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -117,7 +122,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Verify run-bound administrator UI approval before OIDC
+      - name: Verify first asaas-build approval and run-bound UI evidence
+        id: verify
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -150,8 +156,78 @@ jobs:
           BUILD_PUBLIC_KEY: ${{ vars.BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM }}
         run: >-
           python3 scripts/verify_asaas_build_environment_approval.py
+          --phase evidence
           --evidence-output
           "$RUNNER_TEMP/asaas-admin-ui-approval.json"
+          --github-output "$GITHUB_OUTPUT"
+
+  build-attestation:
+    name: Build and sign after second asaas-build approval
+    needs: [preflight, verify-ui-approval]
+    if: >-
+      needs.preflight.result == 'success' &&
+      needs.preflight.outputs.rollout_scope == 'validated' &&
+      needs.verify-ui-approval.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: asaas-build
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      administration: read
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout selected protected ref
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Set up pinned CPython 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Verify second approval and unchanged run-bound evidence before OIDC
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          GITHUB_REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          INPUT_OPERATION_ID: ${{ inputs.operation_id }}
+          ASAAS_BUILD_TRUST_MODE: ${{ inputs.trust_mode }}
+          ASAAS_PREFLIGHT_READBACK_SHA256: ${{ needs.preflight.outputs.preflight_readback_sha256 }}
+          ASAAS_PREFLIGHT_BUILD_TRUST_MODE: ${{ needs.preflight.outputs.build_trust_mode }}
+          ASAAS_PREFLIGHT_BACKEND_TRUST_SHA256: ${{ needs.preflight.outputs.backend_trust_readback_sha256 }}
+          ASAAS_PREFLIGHT_BACKEND_TRUST_PROBE_SHA256: ${{ needs.preflight.outputs.backend_trust_probe_sha256 }}
+          ASAAS_PREFLIGHT_BACKEND_ORIGIN: ${{ needs.preflight.outputs.backend_trust_origin }}
+          ASAAS_PREFLIGHT_OBSERVED_AT: ${{ needs.preflight.outputs.preflight_observed_at }}
+          PIN_BACKEND_BASE_URL: ${{ vars.BILLING_PRODUCER_BUILD_BACKEND_BASE_URL }}
+          PIN_REPOSITORY_ID: ${{ vars.BILLING_PRODUCER_BUILD_REPOSITORY_ID }}
+          PIN_REPOSITORY_NAME: ${{ vars.BILLING_PRODUCER_BUILD_REPOSITORY_NAME }}
+          PIN_WORKFLOW_PATH: ${{ vars.BILLING_PRODUCER_BUILD_WORKFLOW_PATH }}
+          PIN_WORKFLOW_REF: ${{ vars.BILLING_PRODUCER_BUILD_WORKFLOW_REF }}
+          PIN_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_BUILD_KMS_KEY_ARN }}
+          PIN_BUILD_AUDIENCE: ${{ vars.BILLING_PRODUCER_BUILD_AUDIENCE }}
+          PIN_ISSUER: ${{ vars.BILLING_PRODUCER_BUILD_ISSUER }}
+          PIN_OIDC_ISSUER: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_ISSUER }}
+          PIN_OIDC_SUBJECT: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_SUBJECT }}
+          BUILD_PUBLIC_KEY: ${{ vars.BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM }}
+          EXPECTED_APPROVAL_EVIDENCE_SHA256: ${{ needs.verify-ui-approval.outputs.approval_evidence_sha256 }}
+          EXPECTED_UI_CHECKED_AT_UTC: ${{ needs.verify-ui-approval.outputs.ui_checked_at_utc }}
+        run: >-
+          python3 scripts/verify_asaas_build_environment_approval.py
+          --phase build
+          --expected-evidence-sha256 "$EXPECTED_APPROVAL_EVIDENCE_SHA256"
+          --expected-checked-at-utc "$EXPECTED_UI_CHECKED_AT_UTC"
+          --evidence-output
+          "$RUNNER_TEMP/asaas-admin-ui-approval.json"
+          --github-output "$GITHUB_OUTPUT"
 
       - name: Verify clean protected source and hash the build bundle
         shell: bash

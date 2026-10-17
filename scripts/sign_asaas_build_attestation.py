@@ -369,7 +369,7 @@ def _active_backend_trust(
         environment, "ASAAS_PREFLIGHT_BACKEND_TRUST_PROBE_SHA256"
     )
     try:
-        digest = _PREFLIGHT.probe_backend_trust_absent(
+        digest = _PREFLIGHT.probe_backend_trust_readback_unavailable(
             trust_environment, expected_digest=expected_probe
         )
     except _PREFLIGHT.GateError as exc:

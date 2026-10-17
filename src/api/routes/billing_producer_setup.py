@@ -53,6 +53,7 @@ from src.services.billing_signed_envelope import (
 )
 
 router = APIRouter()
+public_router = APIRouter()
 
 
 class BuildAttestationRegistrationRequest(BaseModel):
@@ -257,6 +258,47 @@ async def read_producer_build_trust(response: Response) -> dict[str, str]:
         "workflow_ref": entry.workflow_ref or "",
         "oidc_issuer": entry.oidc_issuer or "",
         "oidc_subject": entry.oidc_subject or "",
+    }
+
+
+@public_router.get(
+    "/producer-build-trust",
+    summary="Read public trust pins for the protected ASAAS build workflow",
+)
+async def read_public_producer_build_trust(response: Response) -> dict[str, str]:
+    """Expose only non-secret verifier pins to the protected build workflow."""
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    if settings.environment != ENVIRONMENT:
+        raise HTTPException(status_code=404, detail="build_trust_unavailable")
+    try:
+        entry = _build_attestation_entry()
+        fingerprint = _build_attestation_public_key_fingerprint(entry)
+    except (SignedEnvelopeRejected, ValueError):
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "producer_build_trust_unavailable"},
+        ) from None
+    return {
+        "schema": "billing_producer_build_trust_readback.v1",
+        "schema_version": entry.schema_version,
+        "environment": entry.environment,
+        "type": entry.type,
+        "purpose": entry.purpose,
+        "algorithm": entry.algorithm,
+        "issuer": entry.issuer,
+        "kid": entry.kid,
+        "audience": entry.audience,
+        "public_key_fingerprint_sha256": fingerprint,
+        "repository_id": entry.repository_id or "",
+        "repository_name": entry.repository_name or "",
+        "workflow_path": entry.workflow_path or "",
+        "workflow_ref": entry.workflow_ref or "",
+        "oidc_issuer": entry.oidc_issuer or "",
+        "oidc_subject": entry.oidc_subject or "",
+        "read_at_utc": datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
     }
 
 

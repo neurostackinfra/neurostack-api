@@ -1,0 +1,341 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Establishes isolated ASAAS image publication, signing, and deployment roles
+  with immutable artifact storage and separately scoped signing keys.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    arch: separate OIDC build/deploy roles; three purpose-specific P-256 signing keys; immutable ECR
+    must:
+      - Never request AWS credentials until GitHub ruleset, environment, and customized immutable OIDC subject readbacks pass.
+      - Build role may publish only to this repository and sign only the build-attestation key.
+      - Existing ECS task role may sign only with grant and producer-receipt keys.
+      - Deploy role may update only the fixed ECS service and pass only its exact task roles to ecs-tasks.amazonaws.com.
+      - KMS key policy Resource '*' denotes only its attached key; IAM wildcard scopes are limited to ECR authorization and the exact task-definition family revision.
+    ref:
+      - at: .genie/wishes/asaas-producer-image-rollout/WISH.md
+        has: Group 2 trust and authorization scope
+        scope: acceptance contract
+Rules:
+  ReleaseAccountRegionBoundary:
+    Assertions:
+      - Assert: !Equals [!Ref AWS::AccountId, '388460142431']
+        AssertDescription: Release resources belong only to the verified AWS account.
+      - Assert: !Equals [!Ref AWS::Region, us-east-1]
+        AssertDescription: Release resources belong only to the verified AWS region.
+Resources:
+  ProducerImageRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: stores only digested build output; AWS-generated name avoids an unverified repository URI assumption
+        must:
+          - Image tags are immutable and artifacts are encrypted at rest.
+          - Build permissions target only this repository ARN.
+        mutable: change-with-constraints
+        mutability:
+          ImageTagMutability: must-never-change
+    Properties:
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: IMMUTABLE
+
+  BuildAttestationSigningKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: dedicated P-256 key signs only billing_build_attestation.v1 envelopes from the exact protected workflow
+        must:
+          - KeySpec remains ECC_NIST_P256 and KeyUsage remains SIGN_VERIFY.
+          - Only account root administers this key and only BuildRole may sign with ECDSA_SHA_256.
+        mutable: must-never-change
+    Properties:
+      Description: ASAAS producer build-attestation signing key
+      Enabled: true
+      KeySpec: ECC_NIST_P256
+      KeyUsage: SIGN_VERIFY
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountRootKeyAdministration
+            Effect: Allow
+            Principal:
+              AWS: arn:aws:iam::388460142431:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: BuildRoleAttestationSigning
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt BuildRole.Arn
+            Action: kms:Sign
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:SigningAlgorithm: ECDSA_SHA_256
+
+  ProducerGrantSigningKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: dedicated P-256 key signs producer grants; it is separated from build and receipt keys
+        must:
+          - KeySpec remains ECC_NIST_P256 and KeyUsage remains SIGN_VERIFY.
+          - Only account root administers this key and only the fixed ECS task role may sign with ECDSA_SHA_256.
+        mutable: must-never-change
+    Properties:
+      Description: ASAAS producer grant signing key
+      Enabled: true
+      KeySpec: ECC_NIST_P256
+      KeyUsage: SIGN_VERIFY
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountRootKeyAdministration
+            Effect: Allow
+            Principal:
+              AWS: arn:aws:iam::388460142431:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: ProducerTaskRoleGrantSigning
+            Effect: Allow
+            Principal:
+              AWS: arn:aws:iam::388460142431:role/neurostack-staging-ecs-task
+            Action: kms:Sign
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:SigningAlgorithm: ECDSA_SHA_256
+
+  ProducerReceiptSigningKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: dedicated P-256 key signs producer receipts; it is separated from grant and build keys
+        must:
+          - KeySpec remains ECC_NIST_P256 and KeyUsage remains SIGN_VERIFY.
+          - Only account root administers this key and only the fixed ECS task role may sign with ECDSA_SHA_256.
+        mutable: must-never-change
+    Properties:
+      Description: ASAAS producer receipt signing key
+      Enabled: true
+      KeySpec: ECC_NIST_P256
+      KeyUsage: SIGN_VERIFY
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountRootKeyAdministration
+            Effect: Allow
+            Principal:
+              AWS: arn:aws:iam::388460142431:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: ProducerTaskRoleReceiptSigning
+            Effect: Allow
+            Principal:
+              AWS: arn:aws:iam::388460142431:role/neurostack-staging-ecs-task
+            Action: kms:Sign
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:SigningAlgorithm: ECDSA_SHA_256
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: OIDC identity for one protected build workflow; repository identity, environment, ref, and workflow are pinned in one exact subject
+        must:
+          - Trust only the existing GitHub OIDC provider, STS audience, and immutable customized subject for the main build environment/workflow.
+          - Grant no ECS or task-role-passing actions.
+          - Build signing permission is separately bounded by BuildAttestationSigningKey and its exact key ARN policy.
+        mutable: must-never-change
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ExactProtectedBuildWorkflow
+            Effect: Allow
+            Principal:
+              Federated: arn:aws:iam::388460142431:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: repo:neurostackinfra@340698182/neurostack-api@1152335815:environment:asaas-build:ref:refs/heads/main:workflow_ref:neurostackinfra/neurostack-api/.github/workflows/asaas-build-attestation.yml@refs/heads/main
+      MaxSessionDuration: 3600
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: OIDC identity for the separately approved production-serving deployment workflow; it has no image publication or KMS signing authority
+        must:
+          - Trust only the existing GitHub OIDC provider, STS audience, and immutable customized subject for the main deployment environment/workflow.
+          - Update only the verified ECS service and register only the fixed task-definition family.
+          - Pass only the existing ECS task and execution roles to ecs-tasks.amazonaws.com.
+        mutable: must-never-change
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ExactProtectedDeploymentWorkflow
+            Effect: Allow
+            Principal:
+              Federated: arn:aws:iam::388460142431:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: repo:neurostackinfra@340698182/neurostack-api@1152335815:environment:asaas-production-deployment:ref:refs/heads/main:workflow_ref:neurostackinfra/neurostack-api/.github/workflows/asaas-producer-image-deploy.yml@refs/heads/main
+      MaxSessionDuration: 3600
+
+  BuildRolePermissions:
+    Type: AWS::IAM::Policy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: grants the build role only the ECR token, this repository's push/read operations, and the dedicated build key signature
+        must:
+          - The only IAM Resource '*' is the ECR GetAuthorizationToken operation that has no resource type.
+          - Every publish/read/sign operation uses the exact ECR repository or build key ARN.
+          - Never grant ECS, PassRole, or grant/receipt key actions to BuildRole.
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-build'
+      Roles:
+        - !Ref BuildRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EcrAuthorization
+            Effect: Allow
+            Action: ecr:GetAuthorizationToken
+            Resource: '*'
+          - Sid: PublishAndReadOnlyTheProducerRepository
+            Effect: Allow
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:CompleteLayerUpload
+              - ecr:DescribeImages
+              - ecr:InitiateLayerUpload
+              - ecr:PutImage
+              - ecr:UploadLayerPart
+            Resource: !GetAtt ProducerImageRepository.Arn
+          - Sid: SignOnlyTheBuildAttestationKey
+            Effect: Allow
+            Action: kms:Sign
+            Resource: !GetAtt BuildAttestationSigningKey.Arn
+            Condition:
+              StringEquals:
+                kms:SigningAlgorithm: ECDSA_SHA_256
+
+  DeployRolePermissions:
+    Type: AWS::IAM::Policy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: deploys one immutable digest by registering only the verified task family and updating only its production-serving ECS service
+        must:
+          - The only variable ARN segment is the revision of the exact task-definition family.
+          - UpdateService targets only the exact cluster/service pair.
+          - PassRole is limited to the verified task/execution role ARNs and ecs-tasks.amazonaws.com.
+          - Never grant ECR publication, KMS signing, or additional role passing to DeployRole.
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-deploy'
+      Roles:
+        - !Ref DeployRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RegisterOnlyTheStagingTaskFamily
+            Effect: Allow
+            Action: ecs:RegisterTaskDefinition
+            Resource: arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:*
+          - Sid: UpdateOnlyTheStagingService
+            Effect: Allow
+            Action: ecs:UpdateService
+            Resource: arn:aws:ecs:us-east-1:388460142431:service/neurostack-staging/neurostack-staging-app
+            Condition:
+              StringEquals:
+                ecs:cluster: arn:aws:ecs:us-east-1:388460142431:cluster/neurostack-staging
+          - Sid: PassOnlyTheExistingEcsTaskRoles
+            Effect: Allow
+            Action: iam:PassRole
+            Resource:
+              - arn:aws:iam::388460142431:role/neurostack-staging-ecs-task
+              - arn:aws:iam::388460142431:role/neurostack-staging-ecs-execution
+            Condition:
+              StringEquals:
+                iam:PassedToService: ecs-tasks.amazonaws.com
+
+  ExistingTaskRoleSigningPermissions:
+    Type: AWS::IAM::Policy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: grants the already-existing staging task role only the two runtime signing keys required for grants and producer receipts
+        must:
+          - Attach to the verified existing task role name only.
+          - Grant kms:Sign on the grant and receipt key ARNs and no other KMS action or key.
+          - Never grant the task role image publication, ECS control, or iam:PassRole actions.
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-task-signing'
+      Roles:
+        - neurostack-staging-ecs-task
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: SignOnlyGrantAndReceiptKeys
+            Effect: Allow
+            Action: kms:Sign
+            Resource:
+              - !GetAtt ProducerGrantSigningKey.Arn
+              - !GetAtt ProducerReceiptSigningKey.Arn
+            Condition:
+              StringEquals:
+                kms:SigningAlgorithm: ECDSA_SHA_256
+
+Outputs:
+  GitHubOidcProviderArn:
+    Description: Exact existing Terraform-managed GitHub OIDC provider reused by both trust policies.
+    Value: arn:aws:iam::388460142431:oidc-provider/token.actions.githubusercontent.com
+  ProducerImageRepositoryUri:
+    Description: AWS-generated immutable ECR repository URI for the protected build workflow.
+    Value: !GetAtt ProducerImageRepository.RepositoryUri
+  BuildRoleArn:
+    Description: Exact role ARN to configure in the protected build environment.
+    Value: !GetAtt BuildRole.Arn
+  DeployRoleArn:
+    Description: Exact role ARN to configure in the protected deployment environment.
+    Value: !GetAtt DeployRole.Arn
+  BuildAttestationSigningKeyArn:
+    Description: P-256 key ARN used only for build-attestation signatures.
+    Value: !GetAtt BuildAttestationSigningKey.Arn
+  ProducerGrantSigningKeyArn:
+    Description: P-256 key ARN used only for grant signatures.
+    Value: !GetAtt ProducerGrantSigningKey.Arn
+  ProducerReceiptSigningKeyArn:
+    Description: P-256 key ARN used only for producer-receipt signatures.
+    Value: !GetAtt ProducerReceiptSigningKey.Arn
+  BuildOidcSubject:
+    Description: Exact customized immutable GitHub OIDC subject required by BuildRole.
+    Value: repo:neurostackinfra@340698182/neurostack-api@1152335815:environment:asaas-build:ref:refs/heads/main:workflow_ref:neurostackinfra/neurostack-api/.github/workflows/asaas-build-attestation.yml@refs/heads/main
+  DeployOidcSubject:
+    Description: Exact customized immutable GitHub OIDC subject required by DeployRole.
+    Value: repo:neurostackinfra@340698182/neurostack-api@1152335815:environment:asaas-production-deployment:ref:refs/heads/main:workflow_ref:neurostackinfra/neurostack-api/.github/workflows/asaas-producer-image-deploy.yml@refs/heads/main
+  OidcSubjectClaimKeys:
+    Description: Exact ordered claim keys for repository OIDC subject customization.
+    Value: repo,context,ref,workflow_ref
+  OidcImmutableSubjectRequired:
+    Description: Repository OIDC subject customization must retain immutable IDs.
+    Value: 'true'
