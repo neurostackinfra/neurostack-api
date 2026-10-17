@@ -1,22 +1,28 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
-  Establishes isolated ASAAS image publication, signing, and deployment roles
-  with immutable artifact storage and separately scoped signing keys.
+  Establishes isolated ASAAS image publication, signing, deployment, and
+  one-time bootstrap claims with a retained ledger that release roles cannot reset.
 Metadata:
   AWSToolsMetrics:
     AWSAgentToolkit: aws-cloudformation@3
   com.aws.cloudformation.Context:
-    arch: separate OIDC build/deploy roles; three purpose-specific P-256 signing keys; immutable ECR
+    arch: separate OIDC build/deploy roles; three purpose-specific P-256 signing keys; immutable ECR; retained S3 ledger with one fixed key per bootstrap slot
     must:
       - Never request AWS credentials until GitHub ruleset, environment, and customized immutable OIDC subject readbacks pass.
       - Build role may publish only to this repository and sign only the build-attestation key.
       - Existing ECS task role may sign only with grant and producer-receipt keys.
       - Deploy role may update only the fixed ECS service and pass only its exact task roles to ecs-tasks.amazonaws.com.
       - KMS key policy Resource '*' denotes only its attached key; IAM wildcard scopes are limited to ECR authorization and the exact task-definition family revision.
+      - Bootstrap claims use only slots/build-bootstrap.json and slots/deployment-bootstrap.json; release roles cannot delete claims or mutate bucket controls.
+      - 'Claims require If-None-Match: *; every version and delete marker must be checked before a claim because conditional writes only inspect the current version.'
+      - Retain the ledger bucket and its policy; do not configure lifecycle expiration.
     ref:
       - at: .genie/wishes/asaas-producer-image-rollout/WISH.md
         has: Group 2 trust and authorization scope
         scope: acceptance contract
+      - at: docs/billing/asaas-bootstrap-slot-ledger.md
+        has: ledger controls, role scopes, readback, and retry rules
+        scope: operations
 Rules:
   ReleaseAccountRegionBoundary:
     Assertions:
@@ -25,6 +31,116 @@ Rules:
       - Assert: !Equals [!Ref AWS::Region, us-east-1]
         AssertDescription: Release resources belong only to the verified AWS region.
 Resources:
+  BootstrapSlotLedgerBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: durable single-use claims outlive GitHub Actions history; version history remains the consumption authority after a run's logs expire
+        must:
+          - Keep versioning enabled and Object Lock default retention at 100 years in COMPLIANCE mode.
+          - Keep all four public-access-block settings enabled and server-side encryption enabled.
+          - Do not configure lifecycle expiration; retain this bucket on stack deletion or replacement.
+          - Only the two fixed slot keys are valid; every version and delete marker makes that slot consumed.
+          - Release roles may inspect controls and versions and conditionally create a claim, but may not delete versions or mutate bucket controls.
+        mutable: must-never-change
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: COMPLIANCE
+            Years: 100
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  BootstrapSlotLedgerBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: prevents claim overwrite, delete-marker creation, version deletion, and insecure transport on the two permanent bootstrap slots
+        must:
+          - 'Require If-None-Match: * for PutObject to each exact claim key.'
+          - Deny DeleteObject and DeleteObjectVersion on both exact claim keys.
+          - Deny non-TLS requests to this bucket and its two claim objects.
+          - Retain this policy with the bucket so stack deletion does not remove ledger controls.
+        mutable: must-never-change
+    Properties:
+      Bucket: !Ref BootstrapSlotLedgerBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt BootstrapSlotLedgerBucket.Arn
+              - !Sub '${BootstrapSlotLedgerBucket.Arn}/slots/build-bootstrap.json'
+              - !Sub '${BootstrapSlotLedgerBucket.Arn}/slots/deployment-bootstrap.json'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Sid: RequireBuildClaimIfNoneMatchHeader
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub '${BootstrapSlotLedgerBucket.Arn}/slots/build-bootstrap.json'
+            Condition:
+              'Null':
+                s3:if-none-match: 'true'
+          - Sid: RequireExactBuildClaimIfNoneMatchValue
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub '${BootstrapSlotLedgerBucket.Arn}/slots/build-bootstrap.json'
+            Condition:
+              StringNotEquals:
+                s3:if-none-match: '*'
+          - Sid: RequireDeploymentClaimIfNoneMatchHeader
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub '${BootstrapSlotLedgerBucket.Arn}/slots/deployment-bootstrap.json'
+            Condition:
+              'Null':
+                s3:if-none-match: 'true'
+          - Sid: RequireExactDeploymentClaimIfNoneMatchValue
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub '${BootstrapSlotLedgerBucket.Arn}/slots/deployment-bootstrap.json'
+            Condition:
+              StringNotEquals:
+                s3:if-none-match: '*'
+          - Sid: DenyBuildClaimDeletion
+            Effect: Deny
+            Principal: '*'
+            Action:
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+            Resource: !Sub '${BootstrapSlotLedgerBucket.Arn}/slots/build-bootstrap.json'
+          - Sid: DenyDeploymentClaimDeletion
+            Effect: Deny
+            Principal: '*'
+            Action:
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+            Resource: !Sub '${BootstrapSlotLedgerBucket.Arn}/slots/deployment-bootstrap.json'
+
   ProducerImageRepository:
     Type: AWS::ECR::Repository
     DeletionPolicy: Retain
@@ -207,11 +323,12 @@ Resources:
     Type: AWS::IAM::Policy
     Metadata:
       com.aws.cloudformation.Context:
-        why: grants the build role only the ECR token, this repository's push/read operations, and the dedicated build key signature
+        why: grants the build role only its ECR publication, build-key signature, and read/claim access to the build bootstrap slot
         must:
           - The only IAM Resource '*' is the ECR GetAuthorizationToken operation that has no resource type.
           - Every publish/read/sign operation uses the exact ECR repository or build key ARN.
-          - Never grant ECS, PassRole, or grant/receipt key actions to BuildRole.
+          - Ledger version listing uses the exact build key as s3:prefix; PutObject names only that object ARN.
+          - Never grant ECS, PassRole, grant/receipt key actions, object deletion, or bucket-control mutation to BuildRole.
     Properties:
       PolicyName: !Sub '${AWS::StackName}-build'
       Roles:
@@ -240,17 +357,39 @@ Resources:
             Condition:
               StringEquals:
                 kms:SigningAlgorithm: ECDSA_SHA_256
+          - Sid: ReadOnlyTheBuildBootstrapLedgerControls
+            Effect: Allow
+            Action:
+              - s3:GetBucketVersioning
+              - s3:GetBucketObjectLockConfiguration
+              - s3:GetEncryptionConfiguration
+              - s3:GetBucketPublicAccessBlock
+              - s3:GetBucketPolicy
+              - s3:GetLifecycleConfiguration
+            Resource: !GetAtt BootstrapSlotLedgerBucket.Arn
+          - Sid: ListOnlyTheBuildBootstrapSlotVersions
+            Effect: Allow
+            Action: s3:ListBucketVersions
+            Resource: !GetAtt BootstrapSlotLedgerBucket.Arn
+            Condition:
+              StringEquals:
+                s3:prefix: slots/build-bootstrap.json
+          - Sid: CreateOnlyTheBuildBootstrapClaim
+            Effect: Allow
+            Action: s3:PutObject
+            Resource: !Sub '${BootstrapSlotLedgerBucket.Arn}/slots/build-bootstrap.json'
 
   DeployRolePermissions:
     Type: AWS::IAM::Policy
     Metadata:
       com.aws.cloudformation.Context:
-        why: deploys one immutable digest by registering only the verified task family and updating only its production-serving ECS service
+        why: deploys one immutable digest by registering only the verified task family, updating its service, and claiming the deployment bootstrap slot once
         must:
           - The only variable ARN segment is the revision of the exact task-definition family.
           - UpdateService targets only the exact cluster/service pair.
           - PassRole is limited to the verified task/execution role ARNs and ecs-tasks.amazonaws.com.
-          - Never grant ECR publication, KMS signing, or additional role passing to DeployRole.
+          - Ledger version listing uses the exact deployment key as s3:prefix; PutObject names only that object ARN.
+          - Never grant ECR publication, KMS signing, additional role passing, object deletion, or bucket-control mutation to DeployRole.
     Properties:
       PolicyName: !Sub '${AWS::StackName}-deploy'
       Roles:
@@ -278,6 +417,27 @@ Resources:
             Condition:
               StringEquals:
                 iam:PassedToService: ecs-tasks.amazonaws.com
+          - Sid: ReadOnlyTheDeploymentBootstrapLedgerControls
+            Effect: Allow
+            Action:
+              - s3:GetBucketVersioning
+              - s3:GetBucketObjectLockConfiguration
+              - s3:GetEncryptionConfiguration
+              - s3:GetBucketPublicAccessBlock
+              - s3:GetBucketPolicy
+              - s3:GetLifecycleConfiguration
+            Resource: !GetAtt BootstrapSlotLedgerBucket.Arn
+          - Sid: ListOnlyTheDeploymentBootstrapSlotVersions
+            Effect: Allow
+            Action: s3:ListBucketVersions
+            Resource: !GetAtt BootstrapSlotLedgerBucket.Arn
+            Condition:
+              StringEquals:
+                s3:prefix: slots/deployment-bootstrap.json
+          - Sid: CreateOnlyTheDeploymentBootstrapClaim
+            Effect: Allow
+            Action: s3:PutObject
+            Resource: !Sub '${BootstrapSlotLedgerBucket.Arn}/slots/deployment-bootstrap.json'
 
   ExistingTaskRoleSigningPermissions:
     Type: AWS::IAM::Policy
@@ -306,6 +466,9 @@ Resources:
                 kms:SigningAlgorithm: ECDSA_SHA_256
 
 Outputs:
+  BootstrapSlotLedgerBucketName:
+    Description: Retained S3 bucket that owns the two single-use bootstrap claims.
+    Value: !Ref BootstrapSlotLedgerBucket
   GitHubOidcProviderArn:
     Description: Exact existing Terraform-managed GitHub OIDC provider reused by both trust policies.
     Value: arn:aws:iam::388460142431:oidc-provider/token.actions.githubusercontent.com
