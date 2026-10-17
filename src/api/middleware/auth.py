@@ -39,6 +39,7 @@ STAGING_REHEARSAL_WINDOW_SECONDS = 900
 STAGING_REHEARSAL_REDIS_TIMEOUT_SECONDS = 0.1
 STAGING_REHEARSAL_READBACK_PATH = "/v1/admin/billing/rollout/readback"
 STAGING_PRODUCER_RECEIPT_PATH = "/v1/admin/billing/producer-receipts"
+PUBLIC_PRODUCER_BUILD_TRUST_PATH = "/v1/billing/producer-build-trust"
 PRODUCER_BUILD_TRUST_READBACK_PATH = "/v1/admin/billing/producer-build-trust"
 _STAGING_REHEARSAL_PURPOSE_CLAIMS = frozenset(
     {"token_use", "token_environment", "scope"}
@@ -317,7 +318,6 @@ class AuthMiddleware:
         "/v1/openapi.json",
         "/metrics",
         "/v1/auth/login",
-        "/v1/billing/producer-build-trust",
     }
 
     def __init__(self, app: ASGIApp) -> None:
@@ -347,12 +347,12 @@ class AuthMiddleware:
             await self.app(scope, receive, self._no_store_send(send))
             return
 
-        # Existing exact-path CI trust readback. Preserve its public contract;
-        # neighboring admin routes continue through normal authentication.
-        if (
-            request.method == "GET"
-            and request.url.path == PRODUCER_BUILD_TRUST_READBACK_PATH
-        ):
+        # Exact GET-only trust readbacks are public; other methods and adjacent
+        # paths continue through normal authentication.
+        if request.method == "GET" and request.url.path in {
+            PUBLIC_PRODUCER_BUILD_TRUST_PATH,
+            PRODUCER_BUILD_TRUST_READBACK_PATH,
+        }:
             await self.app(scope, receive, self._no_store_send(send))
             return
 

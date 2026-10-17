@@ -33,7 +33,7 @@ on:
           - bootstrap
 
 concurrency:
-  group: asaas-producer-operation-${{ inputs.operation_id }}
+  group: asaas-producer-build
   cancel-in-progress: false
 
 permissions: {}

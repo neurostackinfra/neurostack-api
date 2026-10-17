@@ -33,8 +33,8 @@ from scripts.asaas_producer_rollout_evidence import (
     canonical_sha256,
     parse_post_readback_comment,
     validate_before_after,
-    validate_pre_oidc_cohort_confirmation,
     validate_operator_readback,
+    validate_pre_oidc_cohort_confirmation,
     validate_registered_task_definition,
     validate_task_definition_template,
 )
@@ -42,9 +42,9 @@ from scripts.asaas_producer_rollout_gate import (
     API_PREFIX,
     API_ROOT,
     DEPLOY_ROLE_VARIABLE,
-    PINNED_DEPLOY_ROLE_ARN,
     DEPLOY_WORKFLOW_PATH,
     EXECUTION_ROLE_ARN,
+    PINNED_DEPLOY_ROLE_ARN,
     REPOSITORY,
     TASK_ROLE_ARN,
     GateError,
@@ -57,7 +57,10 @@ from scripts.asaas_producer_rollout_gate import (
     validate_runtime_deploy_role_variable,
 )
 from scripts.verify_asaas_producer_image_rollout import (
+    BUILD_WORKFLOW_PATH,
+    BUILD_WORKFLOW_REF,
     CLUSTER_ARN,
+    REPOSITORY_ID,
     SERVICE_ARN,
     SERVICE_NAME,
     RolloutError,
@@ -153,6 +156,66 @@ def _build_trust_env(env: dict[str, str]) -> dict[str, str]:
         ),
         "INPUT_OPERATION_ID": env.get("INPUT_OPERATION_ID", ""),
     }
+
+
+def _fetch_runtime_build_trust(
+    env: dict[str, str], *, opener=None
+) -> tuple[dict[str, str], str, str]:
+    """Read and validate the trust served by the deployed public API."""
+    from scripts.asaas_build_release_preflight import (
+        BOOTSTRAP_BACKEND_ORIGIN,
+        fetch_backend_trust_readback,
+    )
+
+    trust_env = _build_trust_env(env)
+    pins = {
+        "PIN_BACKEND_BASE_URL": BOOTSTRAP_BACKEND_ORIGIN,
+        "ASAAS_PREFLIGHT_BACKEND_ORIGIN": BOOTSTRAP_BACKEND_ORIGIN,
+        "PIN_REPOSITORY_ID": REPOSITORY_ID,
+        "PIN_REPOSITORY_NAME": REPOSITORY,
+        "PIN_WORKFLOW_PATH": BUILD_WORKFLOW_PATH,
+        "PIN_WORKFLOW_REF": BUILD_WORKFLOW_REF,
+        "PIN_KMS_KEY_ARN": trust_env["BILLING_PRODUCER_BUILD_KMS_KEY_ARN"],
+        "PIN_BUILD_AUDIENCE": trust_env["BILLING_PRODUCER_BUILD_AUDIENCE"],
+        "PIN_ISSUER": trust_env["BILLING_PRODUCER_BUILD_ISSUER"],
+        "PIN_OIDC_ISSUER": "https://token.actions.githubusercontent.com",
+        "PIN_OIDC_SUBJECT": trust_env["BILLING_PRODUCER_BUILD_OIDC_SUBJECT"],
+        "BUILD_PUBLIC_KEY": trust_env["BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM"],
+    }
+    try:
+        readback, digest = fetch_backend_trust_readback(
+            pins,
+            opener=opener,
+        )
+    except (GateError, github_preflight.GateError) as exc:
+        # The preflight fetcher raises its own GateError class, distinct from the
+        # rollout gate's; translate both so the sanitized reason is preserved.
+        raise DeployError(str(exc)) from None
+    # Timestamp freshness is validated by the fetcher; omit it from the trust
+    # entry consumed by the signature verifier, which checks the exact pin tuple.
+    trust = {key: value for key, value in readback.items() if key != "read_at_utc"}
+    _require(
+        set(readback) == set(trust) | {"read_at_utc"},
+        "runtime_build_trust_shape_invalid",
+    )
+    return trust, digest, readback["read_at_utc"]
+
+
+def _verify_runtime_build_trust(
+    env: dict[str, str],
+    signed_envelope: Any,
+    expected_verified: dict[str, str],
+    *,
+    opener=None,
+) -> tuple[str, str]:
+    trust, digest, read_at = _fetch_runtime_build_trust(env, opener=opener)
+    verified = validate_artifact_before_aws(env, signed_envelope, trust)
+    _require(
+        verified == expected_verified
+        and verified["app_image_digest"] == env["INPUT_APP_IMAGE_DIGEST"],
+        "runtime_build_trust_attestation_mismatch",
+    )
+    return digest, read_at
 
 
 def validate_artifact_before_aws(
@@ -325,7 +388,9 @@ def _ecr_metadata(digest: str, repository_uri: str) -> dict[str, Any]:
 
 
 def _assert_caller_account(expected_role_arn: str, run_id: str) -> None:
-    _require(expected_role_arn == PINNED_DEPLOY_ROLE_ARN, "expected_deploy_role_arn_invalid")
+    _require(
+        expected_role_arn == PINNED_DEPLOY_ROLE_ARN, "expected_deploy_role_arn_invalid"
+    )
     _require(re.fullmatch(r"[1-9][0-9]*", run_id) is not None, "actions_run_id_invalid")
     identity = _aws_json(
         ["sts", "get-caller-identity", "--query", "{Account:Account,Arn:Arn}"]
@@ -589,8 +654,7 @@ def _wait_for_encrypted_post_readback(
     _require(bool(token), "github_read_token_unavailable")
     job = _deployment_job_context(env["GITHUB_RUN_ID"], token)
     _require(
-        _time(job["job_started_at"], "deployment_job_started_at")
-        == deploy_started_at,
+        _time(job["job_started_at"], "deployment_job_started_at") == deploy_started_at,
         "deployment_job_context_changed",
     )
     context = {
@@ -792,7 +856,10 @@ def _validate_pre_oidc_cohort_evidence(
     path = runner_temp / "asaas-producer-pre-oidc-cohort.json"
     try:
         mode = stat.S_IMODE(path.lstat().st_mode)
-        _require(stat.S_ISREG(path.lstat().st_mode) and mode & 0o077 == 0, "cohort_evidence_file_permissions_invalid")
+        _require(
+            stat.S_ISREG(path.lstat().st_mode) and mode & 0o077 == 0,
+            "cohort_evidence_file_permissions_invalid",
+        )
         evidence = _strict_loads(path.read_bytes(), max_bytes=1_500_000)
     except (OSError, EvidenceError):
         raise DeployError("cohort_evidence_file_unreadable") from None
@@ -820,7 +887,9 @@ def _validate_pre_oidc_cohort_evidence(
         "cohort_evidence_shape_invalid",
     )
     evidence_digest = evidence["evidence_sha256"]
-    payload = {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+    payload = {
+        key: value for key, value in evidence.items() if key != "evidence_sha256"
+    }
     actual_digest = __import__("hashlib").sha256(_canonical(payload)).hexdigest()
     _require(
         isinstance(evidence_digest, str)
@@ -845,13 +914,10 @@ def _validate_pre_oidc_cohort_evidence(
     job_context = _deployment_job_context(run["run_id"], env["GH_TOKEN"])
     _require(
         evidence.get("deployment_job_id") == job_context["job_id"]
-        and evidence.get("deployment_job_started_at")
-        == job_context["job_started_at"],
+        and evidence.get("deployment_job_started_at") == job_context["job_started_at"],
         "cohort_evidence_job_binding_mismatch",
     )
-    job_started_at = _time(
-        job_context["job_started_at"], "deployment_job_started_at"
-    )
+    job_started_at = _time(job_context["job_started_at"], "deployment_job_started_at")
     now = datetime.now(timezone.utc)
     checked_at = _time(evidence.get("checked_at_utc"), "cohort_checked_at")
     comment_created_at = _time(
@@ -885,18 +951,14 @@ def _validate_pre_oidc_cohort_evidence(
             artifact_tuple=_artifact_tuple(env),
             template_sha256=before["template_sha256"],
             producer_environment_sha256=before["producer_environment_sha256"],
-            expected_base_environment_sha256=template_data[
-                "base_environment_sha256"
-            ],
+            expected_base_environment_sha256=template_data["base_environment_sha256"],
             expected_operator_login=before["operator_login"],
             operator_permission=permission,
             expected_environment=_task_env(env),
             expected_task_role_arn=TASK_ROLE_ARN,
             expected_execution_role_arn=EXECUTION_ROLE_ARN,
             expected_image_uri=env["BILLING_PRODUCER_ECR_REPOSITORY_URI"],
-            expected_secret_arn=before["validated_snapshot"][
-                "database_secret_arn"
-            ],
+            expected_secret_arn=before["validated_snapshot"]["database_secret_arn"],
             expected_secret_json_key=before["validated_snapshot"][
                 "database_secret_json_key"
             ],
@@ -1007,9 +1069,12 @@ def execute_rollout(env: dict[str, str]) -> dict[str, Any]:
     _require(run["run_id"] == env["GITHUB_RUN_ID"], "actions_run_id_mismatch")
 
     private_before = _private_template_and_before(env, run)
+    signed_envelope = _strict_loads(
+        Path(env["ASAAS_SIGNED_ENVELOPE_PATH"]).read_bytes()
+    )
     verified_attestation = validate_artifact_before_aws(
         env,
-        _strict_loads(Path(env["ASAAS_SIGNED_ENVELOPE_PATH"]).read_bytes()),
+        signed_envelope,
         _strict_loads(env.get("ASAAS_PRODUCER_BUILD_TRUST_READBACK_JSON", "")),
     )
     _require(
@@ -1091,9 +1156,7 @@ def execute_rollout(env: dict[str, str]) -> dict[str, Any]:
             "readiness_probe": cohort["readiness_probe"],
             "before_snapshot_sha256": cohort["snapshot_sha256"],
             "validated_snapshot": cohort_snapshot,
-            "database_secret_version_id": cohort_snapshot[
-                "database_secret_version_id"
-            ],
+            "database_secret_version_id": cohort_snapshot["database_secret_version_id"],
         }
         private_key_path = (
             Path(env["RUNNER_TEMP"]) / "asaas-producer-post-readback-private.pem"
@@ -1109,6 +1172,9 @@ def execute_rollout(env: dict[str, str]) -> dict[str, Any]:
             verified_attestation=verified_attestation,
             deploy_started_at=deploy_started_at,
             expected_protection_hash=env["ASAAS_PREFLIGHT_PROTECTION_SHA256"],
+        )
+        runtime_trust_sha256, runtime_trust_read_at = _verify_runtime_build_trust(
+            env, signed_envelope, verified_attestation
         )
         if env.get("INPUT_MODE") == "bootstrap":
             registration = _wait_for_canonical_registration(
@@ -1137,6 +1203,8 @@ def execute_rollout(env: dict[str, str]) -> dict[str, Any]:
             "registration": accepted.get(
                 "registration", "canonical_response_supplied_by_operator"
             ),
+            "runtime_build_trust_sha256": runtime_trust_sha256,
+            "runtime_build_trust_read_at_utc": runtime_trust_read_at,
             "rollback": "not_required",
         }
     except (
@@ -1149,15 +1217,29 @@ def execute_rollout(env: dict[str, str]) -> dict[str, Any]:
         ValueError,
         KeyError,
     ) as exc:
+        coded = isinstance(
+            exc,
+            (
+                DeployError,
+                GateError,
+                github_preflight.GateError,
+                EvidenceError,
+                RolloutError,
+                ReferenceError,
+            ),
+        )
         if update_attempted:
+            # Keep the sanitized failure code that triggered rollback visible;
+            # uncoded exceptions may carry paths or values, so they stay generic.
+            reason = str(exc) if coded else "rollout_post_mutation_failed"
             try:
                 _rollback(previous_task_definition_arn, desired_count)
             except (DeployError, OSError, ValueError):
-                raise DeployError("rollout_failed_and_rollback_failed") from None
-            raise DeployError("rollout_failed_rolled_back") from None
-        if isinstance(
-            exc, (DeployError, GateError, EvidenceError, RolloutError, ReferenceError)
-        ):
+                raise DeployError(
+                    f"rollout_failed_and_rollback_failed:{reason}"
+                ) from None
+            raise DeployError(f"rollout_failed_rolled_back:{reason}") from None
+        if coded:
             raise DeployError(str(exc)) from None
         raise DeployError("rollout_pre_mutation_failed") from None
 
@@ -1173,6 +1255,12 @@ def main() -> int:
             summary.write(f"- Operation: `{result['operation_id']}`\n")
             summary.write(f"- Attestation: `{result['attestation_id']}`\n")
             summary.write(f"- Image digest: `{result['app_image_digest']}`\n")
+            summary.write(
+                f"- Runtime trust readback SHA-256: `{result['runtime_build_trust_sha256']}`\n"
+            )
+            summary.write(
+                f"- Runtime trust readback time: `{result['runtime_build_trust_read_at_utc']}`\n"
+            )
             summary.write("- Cohort/readiness: healthy\n")
             summary.write("- Commercial gates: disabled\n")
             summary.write("- Registration: canonical response verified\n")

@@ -166,6 +166,23 @@ def test_admin_build_trust_http_contract_remains_public_and_unchanged(
     assert response.headers["pragma"] == "no-cache"
 
 
+def test_public_build_trust_unavailable_http_contract(client, monkeypatch) -> None:
+    _configured_build_key(monkeypatch)
+    monkeypatch.setattr(settings, "billing_producer_build_public_key", "")
+
+    response = client.get("/v1/billing/producer-build-trust")
+
+    assert response.status_code == 503
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json() == {"detail": {"error": "producer_build_trust_unavailable"}}
+    # The bootstrap probe compares these exact bytes; bind both sides.
+    from scripts.asaas_build_release_preflight import BOOTSTRAP_UNAVAILABLE_RESPONSE
+
+    assert response.content == BOOTSTRAP_UNAVAILABLE_RESPONSE
+    # The exact GET exception wraps error responses with no-store as well.
+    assert response.headers["cache-control"] == "no-store"
+
+
 def test_build_trust_route_is_exact_get_without_route_auth_dependency() -> None:
     app = FastAPI()
     app.include_router(billing_producer_setup.router, prefix="/v1/admin/billing")
@@ -181,6 +198,33 @@ def test_build_trust_route_is_exact_get_without_route_auth_dependency() -> None:
     )
     assert route.methods == {"GET"}
     assert route.dependant.dependencies == []
+
+
+def test_public_build_trust_openapi_omits_api_key_but_protected_billing_keeps_it() -> (
+    None
+):
+    from src.api.main import create_app
+
+    schema = create_app().openapi()
+    paths = schema["paths"]
+    public_operation = paths[f"{settings.api_prefix}/billing/producer-build-trust"][
+        "get"
+    ]
+    protected_operation = paths[f"{settings.api_prefix}/billing/summary"]["get"]
+
+    assert not any(
+        parameter.get("in") == "header" and parameter.get("name") == "X-API-Key"
+        for parameter in public_operation.get("parameters", [])
+    )
+    assert public_operation["security"] == []
+    assert protected_operation.get("security", schema["security"]) == [
+        {"ApiKeyAuth": []},
+        {"BearerAuth": []},
+    ]
+    assert any(
+        parameter.get("in") == "header" and parameter.get("name") == "X-API-Key"
+        for parameter in protected_operation.get("parameters", [])
+    )
 
 
 def _http_scope(path: str, *, method: str = "GET") -> Scope:
@@ -199,8 +243,8 @@ def _http_scope(path: str, *, method: str = "GET") -> Scope:
     }
 
 
-def test_auth_middleware_exempts_both_exact_trust_paths_only() -> None:
-    async def exercise(path: str):
+def test_auth_middleware_exempts_only_exact_trust_get_paths() -> None:
+    async def exercise(path: str, *, method: str = "GET"):
         started: list[Message] = []
 
         async def downstream(scope, receive, send):
@@ -213,7 +257,9 @@ def test_auth_middleware_exempts_both_exact_trust_paths_only() -> None:
         async def send(message):
             started.append(message)
 
-        await AuthMiddleware(downstream)(_http_scope(path), receive, send)
+        await AuthMiddleware(downstream)(
+            _http_scope(path, method=method), receive, send
+        )
         return started
 
     messages = asyncio.run(exercise("/v1/billing/producer-build-trust"))
@@ -244,6 +290,20 @@ def test_auth_middleware_exempts_both_exact_trust_paths_only() -> None:
         if message["type"] == "http.response.start"
     )
     assert admin_adjacent_start["status"] == 401
+
+    public_put = asyncio.run(exercise("/v1/billing/producer-build-trust", method="PUT"))
+    public_put_start = next(
+        message for message in public_put if message["type"] == "http.response.start"
+    )
+    assert public_put_start["status"] == 401
+
+    admin_put = asyncio.run(
+        exercise("/v1/admin/billing/producer-build-trust", method="PUT")
+    )
+    admin_put_start = next(
+        message for message in admin_put if message["type"] == "http.response.start"
+    )
+    assert admin_put_start["status"] == 401
 
 
 def test_build_trust_schema_version_matches_signed_envelope_protocol() -> None:
