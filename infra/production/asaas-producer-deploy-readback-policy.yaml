@@ -1,0 +1,76 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Adds only metadata readback permissions required by the protected ASAAS producer
+  deployment workflow to its existing deploy role. This policy cannot publish
+  images, sign artifacts, read secret values, or change ECS resources.
+Metadata:
+  com.aws.cloudformation.Context:
+    arch: action-scoped readback permissions attached to the existing protected deploy identity
+    must:
+      - Limit service, task, ECR repository, and Secrets Manager reads to the fixed release target.
+      - Do not broaden the Group 2 Resource '*' allowlist for readback APIs.
+      - Never grant secretsmanager:GetSecretValue or any additional mutating action.
+Parameters:
+  DeployRoleName:
+    Type: String
+    Description: Physical name read back from the approved release CloudFormation stack.
+    AllowedPattern: '^neurostack-asaas-producer-release-DeployRole-[A-Za-z0-9]+$'
+    ConstraintDescription: Must be the verified physical DeployRole name from the release stack.
+  EcrRepositoryArn:
+    Type: String
+    Description: Exact immutable ECR repository ARN returned by the approved release stack.
+    AllowedPattern: '^arn:aws:ecr:us-east-1:388460142431:repository/[A-Za-z0-9._/-]+$'
+    ConstraintDescription: Must be the exact producer release repository ARN.
+  DatabaseSecretArn:
+    Type: String
+    Description: Exact DATABASE_URL secret ARN observed in the active task definition.
+    AllowedPattern: '^arn:aws:secretsmanager:us-east-1:388460142431:secret:[A-Za-z0-9/_+=.@-]+$'
+    ConstraintDescription: Must be the exact existing DATABASE_URL secret ARN.
+Resources:
+  ProducerDeploymentReadbackPolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: the deploy workflow must independently validate its before/after state without retrieving database credentials
+        must:
+          - Preserve the existing DeployRole write policy exactly.
+          - Keep all secret access metadata-only.
+          - Keep ECS read scope at the fixed cluster/service/task family.
+    Properties:
+      PolicyName: asaas-producer-image-rollout-readback
+      Roles:
+        - Ref: DeployRoleName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DescribeOnlyTheProductionServingService
+            Effect: Allow
+            Action:
+              - ecs:DescribeServices
+            Resource:
+              - arn:aws:ecs:us-east-1:388460142431:service/neurostack-staging/neurostack-staging-app
+            Condition:
+              StringEquals:
+                ecs:cluster: arn:aws:ecs:us-east-1:388460142431:cluster/neurostack-staging
+          - Sid: DescribeOnlyTasksInTheProductionServingCluster
+            Effect: Allow
+            Action:
+              - ecs:DescribeTasks
+            Resource:
+              - arn:aws:ecs:us-east-1:388460142431:task/neurostack-staging/*
+            Condition:
+              StringEquals:
+                ecs:cluster: arn:aws:ecs:us-east-1:388460142431:cluster/neurostack-staging
+          - Sid: ReadImageDigestMetadataForOnlyTheProducerRepository
+            Effect: Allow
+            Action:
+              - ecr:DescribeImages
+            Resource:
+              - Ref: EcrRepositoryArn
+          - Sid: ReadOnlyDatabaseSecretVersionMetadata
+            Effect: Allow
+            Action:
+              - secretsmanager:DescribeSecret
+              - secretsmanager:ListSecretVersionIds
+            Resource:
+              - Ref: DatabaseSecretArn
