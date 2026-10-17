@@ -10,7 +10,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urljoin, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from uuid import UUID
 
 REPOSITORY = "neurostackinfra/neurostack-api"
@@ -34,14 +34,13 @@ API_ROOT = "https://api.github.com"
 API_PREFIX = f"/repos/{REPOSITORY}"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 BACKEND_TRUST_PATH = "/v1/billing/producer-build-trust"
-BACKEND_TRUST_PROBE_PATHS = (
-    BACKEND_TRUST_PATH,
-    "/v1/admin/billing/producer-build-trust",
-)
-BACKEND_TRUST_PROBE_PATH = BACKEND_TRUST_PROBE_PATHS[1]
 BACKEND_TRUST_SCHEMA = "billing_producer_build_trust_readback.v1"
-BACKEND_TRUST_PROBE_SCHEMA = "billing_producer_build_trust_bootstrap_probe.v2"
+BACKEND_TRUST_PROBE_SCHEMA = "billing_producer_build_trust_bootstrap_probe.v3"
 BUILD_TRUST_MODES = frozenset({"normal", "bootstrap"})
+BUILD_SIGN_JOB_NAME = "Build and sign after second asaas-build approval"
+# Terminal conclusions GitHub reports for a job that never started because its
+# run was cancelled or an upstream gate failed; both also require a null start.
+NEVER_STARTED_JOB_CONCLUSIONS = frozenset({"cancelled", "skipped"})
 BOOTSTRAP_BUILD_ROLE_ARN = (
     "arn:aws:iam::388460142431:role/"
     "neurostack-asaas-producer-release-BuildRole-ptpxs3j9NIZM"
@@ -59,10 +58,9 @@ BOOTSTRAP_BACKEND_ORIGIN = "https://staging.api.neurostack.global"
 BOOTSTRAP_PUBLIC_KEY_FINGERPRINT_SHA256 = (
     "86d440d5c7f2248499bd6fefc37064ec4b5eae2fae0b3aebb30c43819bbd384b"
 )
-BOOTSTRAP_OLD_AUTH_RESPONSE = {
-    "error": "unauthorized",
-    "documentation_url": "https://docs.neurostack.ai/auth",
-}
+BOOTSTRAP_UNAVAILABLE_RESPONSE = (
+    b'{"detail":{"error":"producer_build_trust_unavailable"}}'
+)
 BACKEND_TRUST_FIELDS = frozenset(
     {
         "schema",
@@ -199,31 +197,7 @@ def _bootstrap_pins(env):
 
 
 def _expected_bootstrap_readback_unavailable_response(raw):
-    def reject_duplicate_keys(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("duplicate JSON key")
-            result[key] = value
-        return result
-
-    try:
-        value = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
-    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
-        return False
-    return (
-        isinstance(value, dict)
-        and set(value) == set(BOOTSTRAP_OLD_AUTH_RESPONSE) | {"message"}
-        and value.get("error") == BOOTSTRAP_OLD_AUTH_RESPONSE["error"]
-        and value.get("documentation_url")
-        == BOOTSTRAP_OLD_AUTH_RESPONSE["documentation_url"]
-        and isinstance(value.get("message"), str)
-        and re.fullmatch(
-            r"Missing Authorization or [A-Za-z0-9_-]+ header",
-            value["message"],
-        )
-        is not None
-    )
+    return raw == BOOTSTRAP_UNAVAILABLE_RESPONSE
 
 
 class _NoBackendTrustRedirect(HTTPRedirectHandler):
@@ -359,7 +333,7 @@ def fetch_backend_trust_readback(env, *, opener=None, expected_digest=None):
 
 
 def probe_backend_trust_readback_unavailable(env, *, opener=None, expected_digest=None):
-    """Accept only the known 401 response from both public readback paths."""
+    """Accept only the exact unavailable response from the pinned public route."""
     origin = backend_trust_origin(env)
     require(
         origin == BOOTSTRAP_BACKEND_ORIGIN,
@@ -374,70 +348,62 @@ def probe_backend_trust_readback_unavailable(env, *, opener=None, expected_diges
     open_url = (
         build_opener(_NoBackendTrustRedirect()).open if opener is None else opener
     )
-    observed = []
-    for path in BACKEND_TRUST_PROBE_PATHS:
-        url = origin + path
-        request = Request(url, headers={"Accept": "application/json"}, method="GET")
-        status = None
-        final_url = url
-        headers = None
-        raw = b""
-        try:
-            with open_url(request, timeout=5) as response:
-                status = response.status
-                final_url = response.geturl()
-                headers = response.headers
-                raw = response.read(64 * 1024 + 1)
-        except HTTPError as exc:
-            if 300 <= exc.code < 400:
-                raise GateError("backend_trust_readback_redirect_rejected") from None
-            if exc.code != 401:
-                raise GateError("backend_trust_readback_unavailable") from None
-            status = exc.code
-            final_url = exc.geturl()
-            headers = exc.headers
-            try:
-                raw = exc.read(64 * 1024 + 1)
-            except OSError:
-                raise GateError("backend_trust_readback_unavailable") from None
-            finally:
-                try:
-                    exc.close()
-                except OSError:
-                    pass
-        except (OSError, TimeoutError, ValueError):
+    path = BACKEND_TRUST_PATH
+    url = origin + path
+    request = Request(url, headers={"Accept": "application/json"}, method="GET")
+    status = None
+    final_url = url
+    headers = None
+    raw = b""
+    try:
+        with open_url(request, timeout=5) as response:
+            status = response.status
+            final_url = response.geturl()
+            headers = response.headers
+            raw = response.read(64 * 1024 + 1)
+    except HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise GateError("backend_trust_readback_redirect_rejected") from None
+        if exc.code == 200:
+            raise GateError("bootstrap_readback_active") from None
+        if exc.code != 503:
             raise GateError("backend_trust_readback_unavailable") from None
+        status = exc.code
+        final_url = exc.geturl()
+        headers = exc.headers
+        try:
+            raw = exc.read(64 * 1024 + 1)
+        except OSError:
+            raise GateError("backend_trust_readback_unavailable") from None
+        finally:
+            try:
+                exc.close()
+            except OSError:
+                pass
+    except (OSError, TimeoutError, ValueError):
+        raise GateError("backend_trust_readback_unavailable") from None
 
-        require(final_url == url, "backend_trust_readback_redirect_rejected")
-        require(status != 200, "bootstrap_readback_active")
-        require(status == 401, "backend_trust_readback_unavailable")
-        require(len(raw) <= 64 * 1024, "backend_trust_readback_unavailable")
-        content_type = headers.get("Content-Type", "") if headers is not None else ""
-        require(
-            content_type.split(";", 1)[0].strip().lower() == "application/json",
-            "backend_trust_readback_unavailable",
-        )
-        require(
-            _expected_bootstrap_readback_unavailable_response(raw),
-            "backend_trust_readback_unavailable",
-        )
-        observed.append({"path": path, "status": status, "body": raw})
-
+    require(final_url == url, "backend_trust_readback_redirect_rejected")
+    require(status != 200, "bootstrap_readback_active")
+    require(status == 503, "backend_trust_readback_unavailable")
+    require(len(raw) <= 64 * 1024, "backend_trust_readback_unavailable")
+    content_type = headers.get("Content-Type", "") if headers is not None else ""
     require(
-        observed[0]["body"] == observed[1]["body"],
+        content_type.split(";", 1)[0].strip().lower() == "application/json",
+        "backend_trust_readback_unavailable",
+    )
+    require(
+        _expected_bootstrap_readback_unavailable_response(raw),
         "backend_trust_readback_unavailable",
     )
     probe = {
         "schema": BACKEND_TRUST_PROBE_SCHEMA,
         "origin": origin,
-        "readbacks": [
-            {
-                "path": row["path"],
-                "status": row["status"],
-                "body_sha256": hashlib.sha256(row["body"]).hexdigest(),
-            }
-            for row in observed
-        ],
+        "readback": {
+            "path": path,
+            "status": status,
+            "body_sha256": hashlib.sha256(raw).hexdigest(),
+        },
     }
     digest = hashlib.sha256(_canonical_json(probe)).hexdigest()
     if expected_digest is not None:
@@ -569,9 +535,9 @@ def github_get(url, token):
     }
     # Public control/readback endpoints are intentionally anonymous: a
     # GITHUB_TOKEN with least-privilege scopes cannot read repository settings.
-    # The collaborator permission endpoint is private and remains authenticated
-    # so the admin-role checks below fail closed if the token cannot read it.
-    if token and _requires_authenticated_github_read(parsed.path):
+    # Actions history and collaborator permissions require authenticated reads.
+    if _requires_authenticated_github_read(parsed.path):
+        require(bool(token and token.strip()), "github_api_token_required")
         headers["Authorization"] = f"Bearer {token}"
     request = Request(url, headers=headers, method="GET")
     try:
@@ -598,9 +564,13 @@ def github_get(url, token):
 
 
 def _requires_authenticated_github_read(path):
-    return re.fullmatch(
-        re.escape(API_PREFIX) + r"/collaborators/[^/]+/permission", path
-    ) is not None
+    return (
+        path.startswith(API_PREFIX + "/actions/")
+        or re.fullmatch(
+            re.escape(API_PREFIX) + r"/collaborators/[^/]+/permission", path
+        )
+        is not None
+    )
 
 
 def github_collection(url, token, *, list_field=None):
@@ -728,8 +698,7 @@ def ruleset_bypass_api_observation(ruleset):
     if "bypass_actors" not in ruleset:
         return "omitted"
     require(
-        isinstance(ruleset["bypass_actors"], list)
-        and ruleset["bypass_actors"] == [],
+        isinstance(ruleset["bypass_actors"], list) and ruleset["bypass_actors"] == [],
         "ruleset_bypass_not_empty_or_unreadable",
     )
     return "empty"
@@ -946,7 +915,13 @@ def validate_current_run(token, env, *, github_get_fn=None, github_collection_fn
 
 
 def validate_bootstrap_operation_unused(
-    token, operation_id, current_run_id, *, github_collection_fn=None
+    token,
+    operation_id,
+    current_run_id,
+    *,
+    mode="bootstrap",
+    github_collection_fn=None,
+    github_jobs_collection_fn=None,
 ):
     collect = (
         github_collection if github_collection_fn is None else github_collection_fn
@@ -954,6 +929,11 @@ def validate_bootstrap_operation_unused(
     url = (
         f"{API_ROOT}{API_PREFIX}/actions/workflows/asaas-build-attestation.yml/runs"
         "?event=workflow_dispatch&per_page=100&page=1"
+    )
+    collect_jobs = (
+        github_collection
+        if github_jobs_collection_fn is None
+        else github_jobs_collection_fn
     )
     runs = collect(url, token, list_field="workflow_runs")
     for run in runs:
@@ -974,7 +954,16 @@ def validate_bootstrap_operation_unused(
         )
         require(match is not None, "bootstrap_run_history_unattributable")
         historical_operation_id = match.group(1)
+        historical_mode = re.fullmatch(
+            r"ASAAS producer build (normal|bootstrap) "
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            title,
+        ).group(1)
         if str(run_id) == current_run_id:
+            require(
+                historical_mode == mode,
+                "bootstrap_current_run_mode_mismatch",
+            )
             require(
                 historical_operation_id == operation_id,
                 "bootstrap_current_run_operation_mismatch",
@@ -984,6 +973,54 @@ def validate_bootstrap_operation_unused(
             historical_operation_id != operation_id,
             "bootstrap_operation_already_used",
         )
+        if mode != "bootstrap" or historical_mode != "bootstrap":
+            continue
+
+        # Until the durable S3 claim is wired (t_mvcn8tm75222ec86), this retained
+        # history is the only enforced bootstrap consumption guard; afterwards it
+        # remains an audit/identity check. History may treat an earlier
+        # bootstrap run as non-conflicting only when that run is terminal and
+        # every attempt's build/sign job is terminal with an explicit null
+        # ``started_at``. Any non-null start blocks regardless of conclusion.
+        require(run.get("status") == "completed", "bootstrap_run_history_ambiguous")
+        attempts = run.get("run_attempt")
+        require(
+            type(attempts) is int and attempts > 0,
+            "bootstrap_run_history_invalid",
+        )
+        for attempt in range(1, attempts + 1):
+            jobs_url = (
+                f"{API_ROOT}{API_PREFIX}/actions/runs/{run_id}/attempts/{attempt}/jobs"
+                "?per_page=100&page=1"
+            )
+            jobs = collect_jobs(jobs_url, token, list_field="jobs")
+            build_jobs = 0
+            for job in jobs:
+                require(
+                    isinstance(job, dict)
+                    and type(job.get("id")) is int
+                    and job["id"] > 0
+                    and isinstance(job.get("name"), str)
+                    and isinstance(job.get("status"), str),
+                    "bootstrap_job_history_invalid",
+                )
+                if job["name"] != BUILD_SIGN_JOB_NAME:
+                    continue
+                build_jobs += 1
+                require("started_at" in job, "bootstrap_job_history_ambiguous")
+                started_at = job["started_at"]
+                if started_at is not None:
+                    require(
+                        isinstance(started_at, str) and bool(started_at.strip()),
+                        "bootstrap_job_history_ambiguous",
+                    )
+                    raise GateError("bootstrap_attempt_already_consumed")
+                require(
+                    job["status"] == "completed"
+                    and job.get("conclusion") in NEVER_STARTED_JOB_CONCLUSIONS,
+                    "bootstrap_job_history_ambiguous",
+                )
+            require(build_jobs == 1, "bootstrap_job_history_incomplete")
 
 
 def write_admin_ui_approval_instructions(
@@ -1207,12 +1244,12 @@ def main():
             environment_name, token
         )
     run_context = validate_current_run(token, env)
-    if mode == "bootstrap":
-        validate_bootstrap_operation_unused(
-            token,
-            env["INPUT_OPERATION_ID"],
-            run_context["run_id"],
-        )
+    validate_bootstrap_operation_unused(
+        token,
+        env["INPUT_OPERATION_ID"],
+        run_context["run_id"],
+        mode=mode,
+    )
     observed_at = (
         datetime.now(timezone.utc)
         .isoformat(timespec="microseconds")

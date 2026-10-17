@@ -10,8 +10,8 @@ import re
 import struct
 import subprocess
 import tempfile
-import zlib
 import zipfile
+import zlib
 from datetime import datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
@@ -404,13 +404,10 @@ def test_bootstrap_scope_requires_first_group_four_run_and_committed_kms_fingerp
             namespace["validate_scope"](invalid)
 
 
-def test_bootstrap_probe_accepts_only_known_readback_unavailability_and_binds_digest():
+def test_bootstrap_probe_accepts_exact_public_503_and_binds_digest():
     namespace = _gate_namespace()
     env = _valid_bootstrap_scope(namespace)
-    body = (
-        b'{"error":"unauthorized","message":"Missing Authorization or '
-        b'X-API-Key header","documentation_url":"https://docs.neurostack.ai/auth"}'
-    )
+    body = b'{"detail":{"error":"producer_build_trust_unavailable"}}'
     headers = Message()
     headers["Content-Type"] = "application/json"
     paths = []
@@ -421,11 +418,10 @@ def test_bootstrap_probe_accepts_only_known_readback_unavailability_and_binds_di
         paths.append(request.full_url)
         response_body = io.BytesIO(body)
         bodies.append(response_body)
-        raise HTTPError(request.full_url, 401, "Unauthorized", headers, response_body)
+        raise HTTPError(request.full_url, 503, "Unavailable", headers, response_body)
 
     expected_paths = [
-        "https://staging.api.neurostack.global/v1/billing/producer-build-trust",
-        "https://staging.api.neurostack.global/v1/admin/billing/producer-build-trust",
+        "https://staging.api.neurostack.global/v1/billing/producer-build-trust"
     ]
     digest = namespace["probe_backend_trust_readback_unavailable"](env, opener=opener)
     assert paths == expected_paths
@@ -440,157 +436,141 @@ def test_bootstrap_probe_accepts_only_known_readback_unavailability_and_binds_di
     assert paths == expected_paths
     assert all(response_body.closed for response_body in bodies)
 
-    duplicate_key_body = (
-        b'{"error":"unauthorized","error":"ok","message":"Missing '
-        b'Authorization or X-API-Key header",'
-        b'"documentation_url":"https://docs.neurostack.ai/auth"}'
-    )
-
-    def duplicate_key_opener(request, *, timeout):
-        raise HTTPError(
-            request.full_url,
-            401,
-            "Unauthorized",
-            headers,
-            io.BytesIO(duplicate_key_body),
-        )
-
     with pytest.raises(
-        namespace["GateError"], match="backend_trust_readback_unavailable"
+        namespace["GateError"], match="bootstrap_readback_unavailable_changed"
     ):
         namespace["probe_backend_trust_readback_unavailable"](
-            env, opener=duplicate_key_opener
-        )
-
-    changed_body = body.replace(b"X-API-Key", b"X-Other-Key")
-
-    def changed_opener(request, *, timeout):
-        response_body = body if "/v1/billing/" in request.full_url else changed_body
-        raise HTTPError(
-            request.full_url,
-            401,
-            "Unauthorized",
-            headers,
-            io.BytesIO(response_body),
-        )
-
-    with pytest.raises(
-        namespace["GateError"], match="backend_trust_readback_unavailable"
-    ):
-        namespace["probe_backend_trust_readback_unavailable"](
-            env, opener=changed_opener, expected_digest=digest
+            env, opener=opener, expected_digest="0" * 64
         )
 
 
-@pytest.mark.parametrize(
-    ("status", "reason"),
-    [
-        (200, "bootstrap_readback_active"),
-        (302, "backend_trust_readback_redirect_rejected"),
-        (404, "backend_trust_readback_unavailable"),
-        (503, "backend_trust_readback_unavailable"),
-    ],
-)
-def test_bootstrap_probe_fails_closed_for_active_redirect_missing_and_unavailable(
-    status: int, reason: str
-) -> None:
+def test_bootstrap_probe_requests_only_public_route_and_blocks_active_trust():
     namespace = _gate_namespace()
     env = _valid_bootstrap_scope(namespace)
     url = "https://staging.api.neurostack.global/v1/billing/producer-build-trust"
     headers = Message()
     headers["Content-Type"] = "application/json"
+    requests = []
 
     def opener(request, *, timeout):
-        if status == 200:
+        requests.append(request.full_url)
 
-            class ActiveResponse:
-                def __init__(self):
-                    self.status = 200
-                    self.headers = headers
+        class ActiveResponse:
+            status = 200
 
-                def __enter__(self):
-                    return self
+            def __init__(self):
+                self.headers = headers
 
-                def __exit__(self, *_args):
-                    return False
+            def __enter__(self):
+                return self
 
-                def geturl(self):
-                    return request.full_url
+            def __exit__(self, *_args):
+                return False
 
-                def read(self, _limit):
-                    return b"{}"
+            def geturl(self):
+                return request.full_url
 
-            return ActiveResponse()
-        raise HTTPError(
-            request.full_url, status, "HTTP result", headers, io.BytesIO(b"{}")
-        )
+            def read(self, _limit):
+                return b'{"schema":"billing_producer_build_trust_readback.v1"}'
 
-    with pytest.raises(namespace["GateError"], match=reason):
-        namespace["probe_backend_trust_readback_unavailable"](env, opener=opener)
-
-
-def test_bootstrap_probe_rejects_active_admin_route_and_divergent_401_responses() -> (
-    None
-):
-    namespace = _gate_namespace()
-    env = _valid_bootstrap_scope(namespace)
-    base = "https://staging.api.neurostack.global"
-    body = (
-        b'{"error":"unauthorized","message":"Missing Authorization or '
-        b'X-API-Key header","documentation_url":"https://docs.neurostack.ai/auth"}'
-    )
-    headers = Message()
-    headers["Content-Type"] = "application/json"
-
-    def admin_active_opener(request, *, timeout):
-        if request.full_url.endswith("/v1/admin/billing/producer-build-trust"):
-
-            class ActiveResponse:
-                status = 200
-
-                def __init__(self):
-                    self.headers = headers
-
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, *_args):
-                    return False
-
-                def geturl(self):
-                    return request.full_url
-
-                def read(self, _limit):
-                    return b"{}"
-
-            return ActiveResponse()
-        raise HTTPError(
-            request.full_url, 401, "Unauthorized", headers, io.BytesIO(body)
-        )
+        return ActiveResponse()
 
     with pytest.raises(namespace["GateError"], match="bootstrap_readback_active"):
-        namespace["probe_backend_trust_readback_unavailable"](
-            env, opener=admin_active_opener
-        )
+        namespace["probe_backend_trust_readback_unavailable"](env, opener=opener)
+    assert requests == [url]
 
-    def divergent_opener(request, *, timeout):
-        response_body = body
-        if request.full_url == base + "/v1/admin/billing/producer-build-trust":
-            response_body = body.replace(b"X-API-Key", b"Other-Key")
-        raise HTTPError(
-            request.full_url,
+
+@pytest.mark.parametrize(
+    ("status", "content_type", "body", "final_url"),
+    [
+        (
             401,
-            "Unauthorized",
-            headers,
-            io.BytesIO(response_body),
-        )
+            "application/json",
+            b'{"detail":{"error":"producer_build_trust_unavailable"}}',
+            None,
+        ),
+        (
+            404,
+            "application/json",
+            b'{"detail":{"error":"producer_build_trust_unavailable"}}',
+            None,
+        ),
+        (
+            500,
+            "application/json",
+            b'{"detail":{"error":"producer_build_trust_unavailable"}}',
+            None,
+        ),
+        (
+            302,
+            "application/json",
+            b'{"detail":{"error":"producer_build_trust_unavailable"}}',
+            "https://elsewhere.invalid/",
+        ),
+        (
+            503,
+            "text/plain",
+            b'{"detail":{"error":"producer_build_trust_unavailable"}}',
+            None,
+        ),
+        (503, "application/json", b'{"detail":{"error":"other"}}', None),
+        (
+            503,
+            "application/json",
+            b'{"detail":{"error":"producer_build_trust_unavailable","extra":true}}',
+            None,
+        ),
+        (
+            503,
+            "application/json",
+            b'{"detail":{"error":"producer_build_trust_unavailable"},"detail":{}}',
+            None,
+        ),
+        (
+            503,
+            "application/json",
+            b'{"detail":{"error":"producer_build_trust_unavailable"}}',
+            "https://elsewhere.invalid/",
+        ),
+    ],
+)
+def test_bootstrap_probe_rejects_wrong_status_body_content_type_and_redirect(
+    status: int, content_type: str, body: bytes, final_url: str | None
+) -> None:
+    namespace = _gate_namespace()
+    env = _valid_bootstrap_scope(namespace)
+    headers = Message()
+    headers["Content-Type"] = content_type
+    url = "https://staging.api.neurostack.global/v1/billing/producer-build-trust"
+    error = (
+        "backend_trust_readback_redirect_rejected"
+        if final_url
+        else "backend_trust_readback_unavailable"
+    )
 
-    with pytest.raises(
-        namespace["GateError"], match="backend_trust_readback_unavailable"
-    ):
-        namespace["probe_backend_trust_readback_unavailable"](
-            env, opener=divergent_opener
-        )
+    class Response:
+        def __init__(self):
+            self.status = status
+            self.headers = headers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def geturl(self):
+            return final_url or url
+
+        def read(self, _limit):
+            return body
+
+    def opener(request, *, timeout):
+        assert request.full_url == url
+        return Response()
+
+    with pytest.raises(namespace["GateError"], match=error):
+        namespace["probe_backend_trust_readback_unavailable"](env, opener=opener)
 
 
 def test_bootstrap_operation_history_rejects_prior_run_for_same_operation():
@@ -601,6 +581,7 @@ def test_bootstrap_operation_history_rejects_prior_run_for_same_operation():
             "id": 7123456789,
             "event": "workflow_dispatch",
             "display_title": f"ASAAS producer build bootstrap {operation}",
+            "run_attempt": 1,
         },
         {
             "id": 7123456788,
@@ -608,19 +589,26 @@ def test_bootstrap_operation_history_rejects_prior_run_for_same_operation():
             "display_title": (
                 "ASAAS producer build normal " "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
             ),
+            "run_attempt": 1,
         },
     ]
+
+    def jobs(*_args, **_kwargs):
+        return []
+
     namespace["validate_bootstrap_operation_unused"](
         "masked",
         operation,
         "7123456789",
         github_collection_fn=lambda *_args, **_kwargs: runs,
+        github_jobs_collection_fn=jobs,
     )
     runs.append(
         {
             "id": 7123456787,
             "event": "workflow_dispatch",
             "display_title": f"ASAAS producer build normal {operation}",
+            "run_attempt": 1,
         }
     )
     with pytest.raises(
@@ -648,8 +636,41 @@ def test_bootstrap_operation_history_fails_closed_on_unattributable_legacy_title
                     "id": 7123456788,
                     "event": "workflow_dispatch",
                     "display_title": "ASAAS producer build attestation",
+                    "run_attempt": 1,
                 }
             ],
+        )
+
+
+@pytest.mark.parametrize(
+    ("title_mode", "requested_mode"),
+    [("normal", "bootstrap"), ("bootstrap", "normal")],
+)
+def test_bootstrap_operation_history_rejects_current_run_with_other_mode(
+    title_mode, requested_mode
+):
+    # The current run's retained title must name the requested trust mode; a
+    # matching operation UUID alone does not attribute the run to this mode.
+    namespace = _gate_namespace()
+    operation = "89bf1556-9f6d-4f39-b5c8-8dcb041877da"
+    runs = [
+        {
+            "id": 7123456789,
+            "event": "workflow_dispatch",
+            "display_title": f"ASAAS producer build {title_mode} {operation}",
+            "run_attempt": 1,
+        }
+    ]
+    with pytest.raises(
+        namespace["GateError"], match="^bootstrap_current_run_mode_mismatch$"
+    ):
+        namespace["validate_bootstrap_operation_unused"](
+            "masked",
+            operation,
+            "7123456789",
+            mode=requested_mode,
+            github_collection_fn=lambda *_args, **_kwargs: runs,
+            github_jobs_collection_fn=lambda *_args, **_kwargs: [],
         )
 
 
@@ -677,6 +698,7 @@ def test_bootstrap_operation_history_cannot_skip_legacy_run_on_later_page():
                                 "ASAAS producer build normal "
                                 "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
                             ),
+                            "run_attempt": 1,
                         }
                     ],
                 },
@@ -691,6 +713,7 @@ def test_bootstrap_operation_history_cannot_skip_legacy_run_on_later_page():
                             "id": 7123456787,
                             "event": "workflow_dispatch",
                             "display_title": "ASAAS producer build attestation",
+                            "run_attempt": 1,
                         }
                     ],
                 },
@@ -708,6 +731,358 @@ def test_bootstrap_operation_history_cannot_skip_legacy_run_on_later_page():
             "7123456789",
         )
     assert seen == [start_url, second_url]
+
+
+_BUILD_SIGN_JOB_NAME = "Build and sign after second asaas-build approval"
+_CURRENT_BOOTSTRAP_OPERATION = "89bf1556-9f6d-4f39-b5c8-8dcb041877da"
+_EARLIER_BOOTSTRAP_OPERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+
+def _bootstrap_history_runs(*, attempts: int = 1, **prior_run: object) -> list[dict]:
+    """Return the current run plus one retained earlier bootstrap run."""
+    earlier = {
+        "id": 7123456788,
+        "event": "workflow_dispatch",
+        "display_title": (
+            f"ASAAS producer build bootstrap {_EARLIER_BOOTSTRAP_OPERATION}"
+        ),
+        "run_attempt": attempts,
+        "status": "completed",
+        "conclusion": "cancelled",
+    }
+    earlier.update(prior_run)
+    return [
+        {
+            "id": 7123456789,
+            "event": "workflow_dispatch",
+            "display_title": (
+                f"ASAAS producer build bootstrap {_CURRENT_BOOTSTRAP_OPERATION}"
+            ),
+            "run_attempt": 1,
+            "status": "in_progress",
+            "conclusion": None,
+        },
+        earlier,
+    ]
+
+
+def _never_started_build_job(**overrides: object) -> dict:
+    """GitHub's job record for a build/sign job that was cancelled pre-start."""
+    job = {
+        "id": 88,
+        "name": _BUILD_SIGN_JOB_NAME,
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": None,
+    }
+    job.update(overrides)
+    return job
+
+
+def _validate_bootstrap_history(
+    namespace: dict, runs: list[dict], jobs_by_attempt: dict[int, list[dict]]
+) -> list[int]:
+    seen: list[int] = []
+
+    def jobs(url, _token, *, list_field=None):
+        assert list_field == "jobs"
+        assert "/actions/runs/7123456788/attempts/" in url
+        attempt = int(url.split("/attempts/")[1].split("/")[0])
+        seen.append(attempt)
+        return jobs_by_attempt[attempt]
+
+    namespace["validate_bootstrap_operation_unused"](
+        "masked",
+        _CURRENT_BOOTSTRAP_OPERATION,
+        "7123456789",
+        github_collection_fn=lambda *_args, **_kwargs: runs,
+        github_jobs_collection_fn=jobs,
+    )
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("run_conclusion", "job_conclusion"),
+    [
+        # The exact review gap: the run was cancelled before the OIDC-capable
+        # build/sign job started, so GitHub reports an explicit null start.
+        ("cancelled", "cancelled"),
+        ("cancelled", "skipped"),
+        # Preflight or first-approval rejection skips the build/sign job.
+        ("failure", "skipped"),
+        ("success", "skipped"),
+    ],
+)
+def test_bootstrap_history_never_started_build_job_does_not_consume_slot(
+    run_conclusion: str, job_conclusion: str
+) -> None:
+    namespace = _gate_namespace()
+    _, workflow = _workflow()
+    assert (
+        workflow["jobs"]["build-attestation"]["name"]
+        == namespace["BUILD_SIGN_JOB_NAME"]
+        == _BUILD_SIGN_JOB_NAME
+    )
+    runs = _bootstrap_history_runs(conclusion=run_conclusion)
+
+    seen = _validate_bootstrap_history(
+        namespace, runs, {1: [_never_started_build_job(conclusion=job_conclusion)]}
+    )
+
+    assert seen == [1]
+
+
+def test_bootstrap_history_never_started_requires_every_attempt_to_be_unstarted():
+    namespace = _gate_namespace()
+    runs = _bootstrap_history_runs(attempts=2)
+
+    seen = _validate_bootstrap_history(
+        namespace,
+        runs,
+        {
+            1: [_never_started_build_job(conclusion="skipped")],
+            2: [_never_started_build_job()],
+        },
+    )
+
+    assert seen == [1, 2]
+
+
+@pytest.mark.parametrize(
+    ("job", "error"),
+    [
+        # The start field must be present; omission is not proof of no start.
+        (
+            {
+                key: value
+                for key, value in _never_started_build_job().items()
+                if key != "started_at"
+            },
+            "bootstrap_job_history_ambiguous",
+        ),
+        (_never_started_build_job(started_at=""), "bootstrap_job_history_ambiguous"),
+        (_never_started_build_job(started_at="  "), "bootstrap_job_history_ambiguous"),
+        (_never_started_build_job(started_at=0), "bootstrap_job_history_ambiguous"),
+        # A non-terminal job may still start, so it cannot be treated as unused.
+        (
+            _never_started_build_job(status="queued", conclusion=None),
+            "bootstrap_job_history_ambiguous",
+        ),
+        (
+            _never_started_build_job(status="waiting", conclusion=None),
+            "bootstrap_job_history_ambiguous",
+        ),
+        (
+            _never_started_build_job(status="in_progress", conclusion=None),
+            "bootstrap_job_history_ambiguous",
+        ),
+        # A terminal job that claims to have run but has no start is contradictory.
+        (
+            _never_started_build_job(conclusion=None),
+            "bootstrap_job_history_ambiguous",
+        ),
+        (
+            _never_started_build_job(conclusion="success"),
+            "bootstrap_job_history_ambiguous",
+        ),
+        (
+            _never_started_build_job(conclusion="failure"),
+            "bootstrap_job_history_ambiguous",
+        ),
+        (
+            _never_started_build_job(conclusion="timed_out"),
+            "bootstrap_job_history_ambiguous",
+        ),
+        (
+            _never_started_build_job(conclusion="Cancelled"),
+            "bootstrap_job_history_ambiguous",
+        ),
+        (
+            {
+                key: value
+                for key, value in _never_started_build_job().items()
+                if key != "status"
+            },
+            "bootstrap_job_history_invalid",
+        ),
+    ],
+)
+def test_bootstrap_history_ambiguous_build_job_shapes_fail_closed(
+    job: dict, error: str
+) -> None:
+    namespace = _gate_namespace()
+
+    with pytest.raises(namespace["GateError"], match=f"^{error}$"):
+        _validate_bootstrap_history(namespace, _bootstrap_history_runs(), {1: [job]})
+
+
+@pytest.mark.parametrize(
+    "prior_run",
+    [
+        {"status": "in_progress", "conclusion": None},
+        {"status": "queued", "conclusion": None},
+        {"status": "waiting", "conclusion": None},
+        {"status": None},
+    ],
+)
+def test_bootstrap_history_non_terminal_prior_run_fails_closed(
+    prior_run: dict,
+) -> None:
+    namespace = _gate_namespace()
+    runs = _bootstrap_history_runs(**prior_run)
+
+    with pytest.raises(
+        namespace["GateError"], match="^bootstrap_run_history_ambiguous$"
+    ):
+        _validate_bootstrap_history(namespace, runs, {1: [_never_started_build_job()]})
+
+
+def test_bootstrap_history_omitted_prior_run_status_fails_closed() -> None:
+    namespace = _gate_namespace()
+    runs = _bootstrap_history_runs()
+    del runs[1]["status"]
+
+    with pytest.raises(
+        namespace["GateError"], match="^bootstrap_run_history_ambiguous$"
+    ):
+        _validate_bootstrap_history(namespace, runs, {1: [_never_started_build_job()]})
+
+
+@pytest.mark.parametrize(
+    "jobs_by_attempt",
+    [
+        # A cancelled run with no build/sign job record cannot prove no start.
+        {1: []},
+        {1: [{"id": 87, "name": "preflight", "status": "completed"}]},
+        # Every attempt must show its own never-started build/sign job.
+        {1: [_never_started_build_job(conclusion="skipped")], 2: []},
+        # Duplicate records for one attempt are ambiguous.
+        {1: [_never_started_build_job(), _never_started_build_job(id=89)]},
+    ],
+)
+def test_bootstrap_history_incomplete_attempt_records_fail_closed(
+    jobs_by_attempt: dict[int, list[dict]],
+) -> None:
+    namespace = _gate_namespace()
+    runs = _bootstrap_history_runs(attempts=len(jobs_by_attempt))
+
+    with pytest.raises(
+        namespace["GateError"], match="^bootstrap_job_history_incomplete$"
+    ):
+        _validate_bootstrap_history(namespace, runs, jobs_by_attempt)
+
+
+@pytest.mark.parametrize("run_attempt", [0, None, "1", True])
+def test_bootstrap_history_invalid_run_attempt_fails_closed(run_attempt) -> None:
+    namespace = _gate_namespace()
+    runs = _bootstrap_history_runs(run_attempt=run_attempt)
+
+    with pytest.raises(namespace["GateError"], match="^bootstrap_run_history_invalid$"):
+        _validate_bootstrap_history(namespace, runs, {1: [_never_started_build_job()]})
+
+
+@pytest.mark.parametrize(
+    ("status", "conclusion"),
+    [
+        ("completed", "failure"),
+        ("completed", "cancelled"),
+        ("completed", "skipped"),
+        ("completed", "success"),
+        ("completed", None),
+        ("in_progress", None),
+        ("queued", None),
+    ],
+)
+def test_bootstrap_global_slot_consumed_when_prior_signing_job_started(
+    status: str, conclusion: str | None
+) -> None:
+    namespace = _gate_namespace()
+    started_build = _never_started_build_job(
+        status=status, conclusion=conclusion, started_at="2026-10-17T12:00:00Z"
+    )
+
+    with pytest.raises(
+        namespace["GateError"], match="^bootstrap_attempt_already_consumed$"
+    ):
+        _validate_bootstrap_history(
+            namespace, _bootstrap_history_runs(), {1: [started_build]}
+        )
+
+
+def test_bootstrap_global_slot_checks_every_attempt_of_a_prior_run():
+    namespace = _gate_namespace()
+    started = _never_started_build_job(started_at="2026-10-17T12:00:00Z")
+    jobs_by_attempt = {
+        1: [_never_started_build_job(conclusion="skipped")],
+        2: [started],
+    }
+    seen: list[int] = []
+
+    def jobs(url, _token, *, list_field=None):
+        assert list_field == "jobs"
+        attempt = int(url.split("/attempts/")[1].split("/")[0])
+        seen.append(attempt)
+        return jobs_by_attempt[attempt]
+
+    with pytest.raises(
+        namespace["GateError"], match="^bootstrap_attempt_already_consumed$"
+    ):
+        namespace["validate_bootstrap_operation_unused"](
+            "masked",
+            _CURRENT_BOOTSTRAP_OPERATION,
+            "7123456789",
+            github_collection_fn=lambda *_args, **_kwargs: _bootstrap_history_runs(
+                attempts=2
+            ),
+            github_jobs_collection_fn=jobs,
+        )
+    assert seen == [1, 2]
+
+
+def test_bootstrap_history_jobs_pagination_must_be_complete() -> None:
+    namespace = _gate_namespace()
+    runs_url = (
+        "https://api.github.com/repos/neurostackinfra/neurostack-api/actions/"
+        "workflows/asaas-build-attestation.yml/runs"
+        "?event=workflow_dispatch&per_page=100&page=1"
+    )
+    jobs_url = (
+        "https://api.github.com/repos/neurostackinfra/neurostack-api/actions/"
+        "runs/7123456788/attempts/1/jobs?per_page=100&page=1"
+    )
+    seen: list[str] = []
+
+    def github_get(url, token):
+        assert token == "read-only-token"
+        seen.append(url)
+        if url == runs_url:
+            runs = _bootstrap_history_runs()
+            return {"total_count": len(runs), "workflow_runs": runs}, None
+        if url == jobs_url:
+            # GitHub reports two jobs but returns one without a next page.
+            return {"total_count": 2, "jobs": [_never_started_build_job()]}, None
+        raise AssertionError("unexpected Actions history URL")
+
+    namespace["github_get"] = github_get
+    with pytest.raises(
+        namespace["GateError"], match="^github_api_pagination_incomplete$"
+    ):
+        namespace["validate_bootstrap_operation_unused"](
+            "read-only-token", _CURRENT_BOOTSTRAP_OPERATION, "7123456789"
+        )
+    assert seen == [runs_url, jobs_url]
+
+
+def test_bootstrap_history_unauthenticated_read_fails_before_any_request() -> None:
+    namespace = _gate_namespace()
+    captured = []
+    namespace["urlopen"] = lambda request, timeout: captured.append(request)
+
+    with pytest.raises(namespace["GateError"], match="^github_api_token_required$"):
+        namespace["validate_bootstrap_operation_unused"](
+            "", _CURRENT_BOOTSTRAP_OPERATION, "7123456789"
+        )
+    assert captured == []
 
 
 def _ruleset() -> dict:
@@ -1005,8 +1380,9 @@ def test_preflight_writes_run_bound_admin_approval_instructions(
         )
 
 
+@pytest.mark.parametrize("reuse_operation", [False, True])
 def test_preflight_emits_readback_digest_before_environment_approval(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reuse_operation: bool
 ) -> None:
     namespace = _gate_namespace()
     now = datetime.now(timezone.utc)
@@ -1059,6 +1435,23 @@ def test_preflight_emits_readback_digest_before_environment_approval(
                     "type": "branch",
                 }
             ]
+        if list_field == "workflow_runs":
+            operation = _valid_scope()["INPUT_OPERATION_ID"]
+            prior_operation = (
+                operation if reuse_operation else "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            )
+            return [
+                {
+                    "id": int(run_id),
+                    "event": "workflow_dispatch",
+                    "display_title": f"ASAAS producer build normal {operation}",
+                },
+                {
+                    "id": int(run_id) - 1,
+                    "event": "workflow_dispatch",
+                    "display_title": f"ASAAS producer build normal {prior_operation}",
+                },
+            ]
         assert list_field == "jobs"
         return [{"name": "preflight", "head_sha": sha, "status": "in_progress"}]
 
@@ -1076,6 +1469,12 @@ def test_preflight_emits_readback_digest_before_environment_approval(
     monkeypatch.setenv("GITHUB_OUTPUT", str(output))
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
 
+    if reuse_operation:
+        with pytest.raises(
+            namespace["GateError"], match="bootstrap_operation_already_used"
+        ):
+            namespace["main"]()
+        return
     namespace["main"]()
 
     output_text = output.read_text(encoding="utf-8")
@@ -1951,9 +2350,12 @@ def test_omitted_bypass_api_field_never_substitutes_for_fresh_ui_evidence(
         )
         api[approvals_path] = [approval]
 
-    assert "bypass_actors" not in api[
-        "https://api.github.com/repos/neurostackinfra/neurostack-api/rulesets/123"
-    ]
+    assert (
+        "bypass_actors"
+        not in api[
+            "https://api.github.com/repos/neurostackinfra/neurostack-api/rulesets/123"
+        ]
+    )
     with pytest.raises(verifier.ApprovalGateError, match=reason):
         verifier.verify_environment_approval(
             env,
@@ -1976,9 +2378,9 @@ def test_nonempty_api_bypass_blocks_even_with_valid_admin_ui_claim():
         "7123456789/approvals"
     )
     api[approvals_path] = api[approvals_path][:1]
-    api[
-        "https://api.github.com/repos/neurostackinfra/neurostack-api/rulesets/123"
-    ]["bypass_actors"] = [{"actor_id": 999, "actor_type": "RepositoryRole"}]
+    api["https://api.github.com/repos/neurostackinfra/neurostack-api/rulesets/123"][
+        "bypass_actors"
+    ] = [{"actor_id": 999, "actor_type": "RepositoryRole"}]
 
     with pytest.raises(
         verifier._PREFLIGHT.GateError,
@@ -2793,15 +3195,17 @@ def test_attestation_workflow_gates_oidc_job_after_no_oidc_ui_approval():
     ).read_text(encoding="utf-8")
 
     assert workflow["permissions"] == {}
-    assert set(yaml.load(source, Loader=yaml.BaseLoader)["on"]) == {
-        "workflow_dispatch"
-    }
+    assert set(yaml.load(source, Loader=yaml.BaseLoader)["on"]) == {"workflow_dispatch"}
     assert "run-name: ASAAS producer build ${{ inputs.trust_mode }}" in source
     assert "      trust_mode:" in source
     assert "        default: normal" in source
     assert "          - bootstrap" in source
     assert "cancel-in-progress: false" in source
-    assert "group: asaas-producer-operation-${{ inputs.operation_id }}" in source
+    assert workflow["concurrency"] == {
+        "group": "asaas-producer-build",
+        "cancel-in-progress": False,
+    }
+    assert "group: asaas-producer-operation-${{ inputs.operation_id }}" not in source
     assert "bootstrap_backend_origin_pin_mismatch" in preflight_script
     assert "bootstrap_operation_already_used" in preflight_script
     assert "bootstrap_run_attempt_must_be_first" in preflight_script
@@ -3004,11 +3408,18 @@ def test_build_trust_bootstrap_runbook_matches_approved_group_sequence_and_contr
         / "asaas-producer-build-trust-bootstrap.md"
     ).read_text(encoding="utf-8")
     normalized = " ".join(runbook.split())
+    assert "Group 3/4" not in runbook
+    assert "## Group 4 build bootstrap" in runbook
     group4 = runbook.index("Group 4 publishes and signs only")
     group5 = runbook.index("## Group 5 one-time deployment bootstrap")
     later = runbook.index("## Later deployments")
 
-    assert "eb217bef741981537e6b6277242e0fb7fccd05b3e8b5e216768d7c7926d8ccb8" in runbook
+    # The runbook defers review status to the WISH record instead of pinning a
+    # WISH digest that later amendments make stale.
+    assert (
+        "see `asaas-producer-image-rollout/WISH.md` for the current review record"
+        in normalized
+    )
     assert "It never deploys or registers the attestation" in normalized
     assert group4 < group5 < later
     assert "exactly one protected deployment" in normalized
@@ -3036,20 +3447,75 @@ def test_build_trust_bootstrap_runbook_matches_approved_group_sequence_and_contr
         "This operation ID is deployment metadata; it is not added to the signed envelope"
         in normalized
     )
+    # The durable S3 claim, not job start, consumes either bootstrap slot.
+    assert "S3 claim success, not job start, is the durable slot" in normalized
     assert (
-        "Pending or rejected-before-start environment records do not consume the slot"
+        "A successful claim consumes the slot even if later build or signing steps "
+        "fail or are cancelled" in normalized
+    )
+    assert "A failure after claim consumes the slot permanently" in normalized
+    assert "Any prior S3 claim blocks regardless of history" in normalized
+    assert "once the protected job starts" not in normalized
+    assert (
+        "Never re-run a bootstrap run. Today the deploy gate blocks a later "
+        "bootstrap deployment only when the latest attempt of an earlier bootstrap "
+        "deployment run has a started deploy job (it does not yet read earlier "
+        "attempts; after the S3 claim is implemented, a successful claim consumes "
+        "the slot). Treat a failed bootstrap deployment as having used the one-time "
+        "slot; another unregistered deployment requires a separately revised and "
+        "explicitly approved WISH." in normalized
+    )
+    assert "a failed run does not reopen the one-time slot" not in normalized
+    assert "workflow-wide concurrency group serializes" in normalized
+    assert "complete, paginated run and job-history check" in normalized
+    assert "job list of every run attempt" in normalized
+    # The durable S3 claim is not wired yet; both the build section and the
+    # Group 5 deployment step must say so and forbid bootstrap dispatch until it is.
+    implementation_status = (
+        "Implementation status: neither `asaas-build-attestation.yml` nor "
+        "`scripts/asaas_producer_deploy_executor.py` performs the S3 claim yet "
+        "(task t_mvcn8tm75222ec86). Until it does, do not dispatch "
+        "`trust_mode=bootstrap` or deploy `bootstrap` mode; the only enforced guard "
+        "is retained Actions history: the build preflight blocks when any attempt "
+        "of an earlier bootstrap build run has a started build/sign job, and the "
+        "deploy gate blocks when the latest attempt of an earlier bootstrap "
+        "deployment run has a started deploy job (it does not yet read earlier "
+        "attempts). Never re-run a bootstrap run."
+    )
+    status_positions = [
+        match.start()
+        for match in re.finditer(re.escape(implementation_status), normalized)
+    ]
+    normalized_group5 = normalized.index("## Group 5 one-time deployment bootstrap")
+    normalized_later = normalized.index("## Later deployments")
+    assert len(status_positions) == 2
+    assert status_positions[0] < normalized.index(
+        "S3 claim success, not job start, is the durable slot"
+    )
+    assert normalized_group5 < status_positions[1] < normalized_later
+    assert "but does not consume or reset the slot" not in normalized
+    # The explicit null-start shape is not proven against live GitHub.
+    assert "is UNVERIFIED against live GitHub" in normalized
+    assert (
+        "treat a bootstrap run that created any build/sign job as having consumed "
+        "the slot" in normalized
+    )
+    assert "Examples are a preflight or review run" not in normalized
+    assert "a run cancelled before that job started" in normalized
+    assert "an explicit `started_at: null`" in normalized
+    assert "Any non-null `started_at` blocks regardless of conclusion" in normalized
+    assert (
+        "A non-terminal run or job, an omitted `started_at`, a missing or duplicate "
+        "build/sign record, or any other conclusion is ambiguous and blocks"
         in normalized
     )
-    assert (
-        "once the protected job starts, any failure or cancellation consumes it"
-        in normalized
-    )
-    assert "No retry or second unregistered bootstrap is allowed" in normalized
+    assert "rollout_failed_rolled_back:<original reason>" in normalized
     assert "no user JWT" in normalized
-    assert "both exact public readback paths" in normalized
+    assert "only `GET /v1/billing/producer-build-trust`" in normalized
     assert "`readback_unavailable`" in normalized
-    assert "does not prove that trust is absent" in normalized
-    assert "differing responses" in normalized
+    assert "does not prove that backend trust is absent" in normalized
+    assert "`503`, JSON content" in normalized
+    assert '`{"detail":{"error":"producer_build_trust_unavailable"}}`' in normalized
     assert "PostgreSQL console/session" in normalized
     assert (
         "If either is absent, withhold approval; do not substitute ad hoc SQL"
@@ -3107,7 +3573,9 @@ def test_public_preflight_api_reads_omit_authorization(monkeypatch, token: str) 
         headers = {}
 
         def geturl(self):
-            return "https://api.github.com/repos/neurostackinfra/neurostack-api/rulesets"
+            return (
+                "https://api.github.com/repos/neurostackinfra/neurostack-api/rulesets"
+            )
 
         def read(self, _limit):
             return b"[]"
@@ -3131,7 +3599,9 @@ def test_public_preflight_api_reads_omit_authorization(monkeypatch, token: str) 
     assert captured[0].get_header("Authorization") is None
 
 
-def test_collaborator_admin_read_retains_token_and_only_that_api_path(monkeypatch) -> None:
+def test_collaborator_admin_read_retains_token_and_only_that_api_path(
+    monkeypatch,
+) -> None:
     namespace = _gate_namespace()
     captured = []
 
@@ -3196,3 +3666,89 @@ def test_build_approval_public_api_read_omits_authorization(monkeypatch) -> None
     )
     assert result == {}
     assert captured[0].get_header("Authorization") is None
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/actions/workflows/asaas-build-attestation.yml/runs",
+        "/actions/runs/7123456789/attempts/1/jobs",
+    ],
+)
+@pytest.mark.parametrize("token", ["", "read-only-token"])
+def test_actions_history_requires_authenticated_read(monkeypatch, path, token):
+    namespace = _gate_namespace()
+    url = f"{namespace['API_ROOT']}{namespace['API_PREFIX']}{path}"
+    captured = []
+
+    class Response:
+        status = 200
+        headers = {}
+
+        def geturl(self):
+            return url
+
+        def read(self, _limit):
+            return b"{}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_urlopen(request, timeout):
+        captured.append(request)
+        return Response()
+
+    monkeypatch.setitem(namespace, "urlopen", fake_urlopen)
+    if not token:
+        with pytest.raises(namespace["GateError"], match="github_api_token_required"):
+            namespace["github_get"](url, token)
+        assert captured == []
+    else:
+        namespace["github_get"](url, token)
+        assert captured[0].get_header("Authorization") == f"Bearer {token}"
+
+
+def test_github_get_uses_the_imported_urllib_urlopen(monkeypatch) -> None:
+    # Namespace-injected fakes above cannot detect a missing module binding;
+    # exercise the importable module so production name resolution is covered.
+    from urllib import request as urllib_request
+
+    from scripts import asaas_build_release_preflight as preflight
+
+    assert preflight.urlopen is urllib_request.urlopen
+    url = (
+        "https://api.github.com/repos/neurostackinfra/neurostack-api/actions/"
+        "runs/7123456789/attempts/1/jobs?per_page=100&page=1"
+    )
+    captured = []
+
+    class Response:
+        status = 200
+        headers = {}
+
+        def geturl(self):
+            return url
+
+        def read(self, _limit):
+            return b'{"total_count":0,"jobs":[]}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_urlopen(request, timeout):
+        captured.append((request, timeout))
+        return Response()
+
+    monkeypatch.setattr(preflight, "urlopen", fake_urlopen)
+    value, link = preflight.github_get(url, "read-only-token")
+
+    assert value == {"total_count": 0, "jobs": []}
+    assert link is None
+    assert captured[0][0].get_header("Authorization") == "Bearer read-only-token"
+    assert captured[0][1] == 10

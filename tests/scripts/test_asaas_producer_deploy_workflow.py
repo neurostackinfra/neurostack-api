@@ -95,10 +95,7 @@ def test_only_deploy_job_can_request_oidc_and_it_is_after_all_no_oidc_gates() ->
     assert oidc_permissions == [("deploy", "write")]
     assert workflow["permissions"] == {}
     allowed = {"actions", "contents", "id-token"}
-    assert all(
-        set(job.get("permissions", {})) <= allowed
-        for job in jobs.values()
-    )
+    assert all(set(job.get("permissions", {})) <= allowed for job in jobs.values())
     assert all("issues" not in job.get("permissions", {}) for job in jobs.values())
     assert jobs["preflight"].get("environment") is None
     assert jobs["verify-predeploy-evidence"]["environment"] == ENVIRONMENT
@@ -137,7 +134,8 @@ def test_only_deploy_job_can_request_oidc_and_it_is_after_all_no_oidc_gates() ->
     cohort_steps = [
         index
         for index, step in enumerate(deploy_steps)
-        if step.get("name") == "Validate fresh run-bound cohort confirmation before OIDC"
+        if step.get("name")
+        == "Validate fresh run-bound cohort confirmation before OIDC"
     ]
     freshness_steps = [
         index
@@ -145,8 +143,21 @@ def test_only_deploy_job_can_request_oidc_and_it_is_after_all_no_oidc_gates() ->
         if step.get("name")
         == "Recheck administrator UI evidence freshness at OIDC boundary"
     ]
-    assert len(aws_steps) == len(gate_steps) == len(key_steps) == len(cohort_steps) == len(freshness_steps) == 1
-    assert gate_steps[0] < key_steps[0] < cohort_steps[0] < freshness_steps[0] < aws_steps[0]
+    assert (
+        len(aws_steps)
+        == len(gate_steps)
+        == len(key_steps)
+        == len(cohort_steps)
+        == len(freshness_steps)
+        == 1
+    )
+    assert (
+        gate_steps[0]
+        < key_steps[0]
+        < cohort_steps[0]
+        < freshness_steps[0]
+        < aws_steps[0]
+    )
     assert deploy_steps[aws_steps[0]]["with"]["role-to-assume"] == (
         "${{ env.BILLING_PRODUCER_DEPLOY_ROLE_ARN }}"
     )

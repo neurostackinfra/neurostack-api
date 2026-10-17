@@ -1,17 +1,23 @@
 # ASAAS producer build trust bootstrap
 
-This runbook documents the one-time build-trust bootstrap for Group 3/4. The
+This runbook documents the one-time build-trust bootstrap for Group 4. The
 `asaas-build-attestation.yml` workflow may validate trust readiness, build and
 publish one immutable image digest, sign its canonical
 `billing_build_attestation.v1` envelope, and upload that artifact. It never
 deploys or registers the attestation. Group 5 uses a separate protected deploy
 workflow and role.
 
-This sequence follows the SHIP-approved plan review recorded in WISH SHA
-`eb217bef741981537e6b6277242e0fb7fccd05b3e8b5e216768d7c7926d8ccb8`.
+This sequence follows the current WISH and DESIGN. Their review status changes
+as amendments land; see `asaas-producer-image-rollout/WISH.md` for the current
+review record.
 
-The build bootstrap is not the deployment bootstrap. Group 5 permits exactly one
-protected deployment of the exact Group 4 signed digest before backend
+The build bootstrap is not the deployment bootstrap. Group 2 owns the durable
+S3 slot ledger design and its exact role scopes, claim ordering, and
+failure/retry readbacks; see `docs/billing/asaas-bootstrap-slot-ledger.md`.
+The release template defines the ledger bucket and
+`scripts/asaas_bootstrap_slot.py` implements the claim, but no workflow invokes
+it yet (see Implementation status below). Group 5 permits
+exactly one protected deployment of the exact Group 4 signed digest before backend
 registration, followed immediately by human registration of that identical
 envelope. Every later deployment requires canonical registration before its
 protected deployment approval.
@@ -41,26 +47,27 @@ the build workflow does not call `GetPublicKey`, ECS, Secrets Manager, or
 payment services.
 
 Normal mode reads the active public trust tuple from
-`GET /v1/billing/producer-build-trust`. The exact GET paths
-`/v1/billing/producer-build-trust` and
-`/v1/admin/billing/producer-build-trust` are both public middleware exceptions
-and require no JWT. Each returns only non-secret verification pins and uses
-`no-store` cache headers; the public path returns the verifier PEM and fresh
-read timestamp, while the legacy administrative path preserves its
+`GET /v1/billing/producer-build-trust`. That exact GET is the unauthenticated
+readback and returns non-secret verification pins, including the public-key
+fingerprint and fresh read timestamp, with `no-store` headers; it does not
+return the PEM. The separate exact `GET /v1/admin/billing/producer-build-trust`
+also currently has a no-JWT readback exception and preserves its
 fingerprint-only schema and staging-only response. Do not infer authentication
-from the `/admin` prefix. Adjacent paths, methods, or suffixes remain protected
-by authentication middleware.
+from the `/admin` prefix. Adjacent paths and suffixes remain protected. Other
+methods on these readback paths are not public operations; global OPTIONS
+preflight handling remains unchanged.
 
-Bootstrap mode probes both exact public readback paths without a JWT and
-accepts only when both return the known legacy `401` body with no redirect. This
-is named `readback_unavailable`: it shows only that neither path exposes the
-readback on this request. It does not establish whether trust exists elsewhere
-in the backend or infer the route code from the image digest. This response is
-only the one-time bootstrap exception, and the probe must not be relaxed. A
-`200` from either path, differing responses, `404`, `503`, redirects, malformed
-or ambiguous responses, and every other status fail closed.
+Bootstrap mode probes only the pinned public endpoint
+`GET /v1/billing/producer-build-trust`, without a JWT. It accepts only HTTP
+`503`, `Content-Type: application/json`, and the exact body
+`{"detail":{"error":"producer_build_trust_unavailable"}}`, with no redirect.
+This is named `readback_unavailable`: it shows only that the trust readback was
+unavailable on this request. It does not establish whether backend trust exists
+or is absent. A `200`, `401`, `404`, any other status, changed URL, timeout,
+malformed or ambiguous body, and every redirect fail closed. This is only the
+one-time bootstrap exception, and the probe must not be relaxed.
 
-## Group 3/4 build bootstrap
+## Group 4 build bootstrap
 
 1. Merge the reviewed commit through the protected `main` ruleset. Before any
    OIDC-enabled job runs, the no-OIDC preflight re-reads the active source-ref
@@ -74,13 +81,46 @@ or ambiguous responses, and every other status fail closed.
    current protected-environment reviewer required by live settings. Lorenzo
    performs final PR approval and merge. Add no other reviewers or approvers,
    and do not change settings to bypass last-push review.
-2. Use `trust_mode=bootstrap` only for Group 3/4 trust/build readiness, with a
+2. Use `trust_mode=bootstrap` only for Group 4 trust/build readiness, with a
    newly allocated operation UUID and the explicit operational authorization
    at `asaas-producer-image-rollout/WISH.md#2026-10-15-separate-build-and-rollout-plan-approved`.
-   The run title binds the UUID; concurrency and a complete, paginated
-   workflow-run history check reject reuse. A failed or retried build attempt
-   consumes that operation UUID. The protected `asaas-build` environment
-   still requires approval for the exact run.
+   The run title binds the UUID; a workflow-wide concurrency group serializes
+   every build run even when operation UUIDs differ. A complete, paginated run
+   and job-history check uses authenticated Actions reads and checks exact run
+   identity. It rejects UUID reuse in both normal and bootstrap modes and fails
+   closed on conflicting or ambiguous retained history, incomplete pagination,
+   or unreadable history. For bootstrap, it reads the job list of every run
+   attempt of each earlier bootstrap run. An earlier bootstrap run is
+   non-conflicting only when the run is `completed` and, in every attempt, its
+   single build/sign job record is `completed` with conclusion `cancelled` or
+   `skipped` and an explicit `started_at: null`. Whether GitHub ever reports
+   that explicit `started_at: null` shape (for example for a skipped
+   build/sign job, or a run cancelled before that job started) is UNVERIFIED
+   against live GitHub. Until it is verified, treat a bootstrap run that
+   created any build/sign job as having consumed the slot. Any non-null
+   `started_at` blocks regardless of conclusion. A non-terminal run or job, an
+   omitted `started_at`, a missing or duplicate build/sign record, or any
+   other conclusion is ambiguous and blocks.
+   Implementation status: neither `asaas-build-attestation.yml` nor
+   `scripts/asaas_producer_deploy_executor.py` performs the S3 claim yet (task
+   t_mvcn8tm75222ec86). Until it does, do not dispatch `trust_mode=bootstrap`
+   or deploy `bootstrap` mode; the only enforced guard is retained Actions
+   history: the build preflight blocks when any attempt of an earlier
+   bootstrap build run has a started build/sign job, and the deploy gate
+   blocks when the latest attempt of an earlier bootstrap deployment run has a
+   started deploy job (it does not yet read earlier attempts). Never re-run a
+   bootstrap run. The rest of this paragraph is the target design, not current
+   behavior. In the target design, S3 claim success, not job start, is the
+   durable slot consumption event. A successful claim consumes the slot even
+   if later build or signing steps fail or are cancelled. A fresh UUID retry
+   may proceed after a pre-claim failure only when complete
+   version/delete-marker pagination proves the fixed key is empty under
+   verified bucket controls and claim is guaranteed to be the first
+   release-side AWS write, even if an older pre-claim Actions record expired
+   or was deleted. Any prior S3 claim blocks regardless of history. Retained
+   authenticated Actions history is an additional audit/identity check and
+   cannot reset the claim. The protected `asaas-build` environment still
+   requires approval for the exact run.
    Before either approval, make a private ZIP containing `snapshot.json` at the
    archive root and every artifact referenced by it at the same relative paths.
    Do not include symlinks. Keep the bundle within the verifier's 64 MiB
@@ -121,15 +161,15 @@ or ambiguous responses, and every other status fail closed.
    first against the no-OIDC outputs, and requires the second timestamp to be no
    more than five minutes before the build job starts. Do not reuse the first
    comment, timestamp, manifest, or attachment URLs for the second approval.
-3. Before OIDC, bootstrap preflight probes only the committed HTTPS backend
-   origin and both exact public readback paths. The probe does not infer
-   authentication from the `/admin` prefix: both exact paths are public. The
-   one-time bootstrap exception requires the known legacy `401` body from both
-   paths, without redirects or divergent responses. This reports only
-   `readback_unavailable`; it does not prove that trust is absent or infer
-   route code from the serving image digest. A `200` from either path, `404`,
-   `503`, redirect, malformed or ambiguous response, timeout, or any other
-   status blocks bootstrap.
+3. Before OIDC, bootstrap preflight probes only
+   `GET /v1/billing/producer-build-trust` at the committed HTTPS backend
+   origin. The one-time bootstrap exception requires HTTP `503`, JSON content
+   type, and the exact body
+   `{"detail":{"error":"producer_build_trust_unavailable"}}`, without any
+   redirect. This reports only that readback is unavailable on this request;
+   it does not prove that backend trust is absent. A `200`, `401`, `404`, any
+   other status, changed URL, malformed or ambiguous body, timeout, or any
+   redirect blocks bootstrap.
    The canonical probe digest is included in evidence. After environment
    approval and before `configure-aws-credentials`, the verifier repeats the
    probe and requires the same digest.
@@ -189,16 +229,32 @@ cannot publish images or sign attestations.
    explicit VersionId, prove that exact version exists. Pin the replacement
    task definition to the same secret ARN, JSON key, and proven immutable
    VersionId. Record no secret value or database URL.
-4. Bootstrap mode is available for exactly one started protected deployment
-   job. A distinct preallocated deployment operation UUID binds the run to the
-   exact Group 4 artifact tuple: attestation ID, immutable image digest, build
-   run ID, and signed-envelope SHA-256. This operation ID is deployment
-   metadata; it is not added to the signed envelope. A serialized, paginated
-   history check fails closed if any earlier bootstrap deployment job started
-   or if identity/history is ambiguous. Pending or rejected-before-start
-   environment records do not consume the slot; once the protected job starts,
-   any failure or cancellation consumes it. No retry or second unregistered
-   bootstrap is allowed.
+4. Implementation status: neither `asaas-build-attestation.yml` nor
+   `scripts/asaas_producer_deploy_executor.py` performs the S3 claim yet (task
+   t_mvcn8tm75222ec86). Until it does, do not dispatch `trust_mode=bootstrap`
+   or deploy `bootstrap` mode; the only enforced guard is retained Actions
+   history: the build preflight blocks when any attempt of an earlier
+   bootstrap build run has a started build/sign job, and the deploy gate
+   blocks when the latest attempt of an earlier bootstrap deployment run has a
+   started deploy job (it does not yet read earlier attempts). Never re-run a
+   bootstrap run. The rest of this step is the target design, not current
+   behavior. A distinct preallocated deployment operation UUID binds the run
+   to the exact Group 4 artifact tuple: attestation ID, immutable image
+   digest, build run ID, and signed-envelope SHA-256. This operation ID is
+   deployment metadata; it is not added to the signed envelope. In the target
+   design, bootstrap mode permits one successful durable S3 deployment claim;
+   retained authenticated paginated history checks exact identity and blocks
+   conflicting or ambiguous records, and once the claim is enforced it no
+   longer serves as the consumption record or resets the slot. After
+   read-only checks, the deploy role will fully read versions and delete
+   markers and conditionally write its claim as the first release-side AWS
+   write, before ECS mutation. A fresh UUID
+   retry may proceed if complete version/delete-marker pagination proves the
+   key empty under verified controls and claim is the first release-side AWS
+   write, even if an older pre-claim Actions record expired or was deleted.
+   Conflicting or ambiguous retained history, incomplete readback/pagination,
+   or changed controls blocks; any prior claim blocks regardless of history.
+   A failure after claim consumes the slot permanently.
 5. After the deployment environment approval, independently verify the exact
    signed envelope, trust claims, build run/ref, ECR digest, and configured
    public-key pin before requesting deploy-role OIDC. Change only the pinned
@@ -207,7 +263,22 @@ cannot publish images or sign attestations.
    trust settings and the proven active secret version. Read back the entire
    running task cohort, readiness, immutable digest, task role, trust settings,
    target, desired count, and disabled financial/commercial gates.
-6. Immediately after successful healthy readbacks, a human staging
+6. Immediately after successful healthy readbacks and before accepting any
+   canonical registration, the deploy job makes a bounded unauthenticated GET
+   to the pinned
+   `https://staging.api.neurostack.global/v1/billing/producer-build-trust`
+   endpoint. It rejects redirects, non-200 responses, invalid content types,
+   oversized, duplicate-key, malformed, stale, or incomplete JSON, and compares
+   the complete trust tuple and public-key fingerprint with the configured
+   pins. It then verifies the byte-identical signed envelope and exact image
+   digest again using that runtime-returned trust. Only the sanitized trust
+   tuple SHA-256 and read timestamp are retained. If the endpoint is unavailable,
+   any pin differs, or signature/digest verification fails, the existing
+   post-update exception path rolls back to the recorded prior task definition
+   and exits non-zero with `rollout_failed_rolled_back:<original reason>`; it
+   must not wait for or accept human registration.
+7. Register only while the deploy job is still running; if it has failed with
+   `rollout_failed_rolled_back:…`, do not register. A human staging
    `super_admin` registers the exact Group 4 envelope through
    `POST /v1/admin/billing/producer-build-attestations`. Confirm that the
    backend returns the same canonical attestation ID, envelope digest, and
@@ -216,11 +287,15 @@ cannot publish images or sign attestations.
    only the byte-identical envelope may be resubmitted for its idempotent
    result. Do not use a different envelope, direct database writes, or delayed
    registration.
-7. Any signature, trust, digest, health, cohort, secret-version, or registration
-   mismatch stops acceptance and rolls back to the recorded prior task
-   definition using the pre-approved rollback path. Keep payment and commercial
-   gates disabled through rollback and recovery. Once this bootstrap has
-   started, a failed run does not reopen the one-time slot; another unregistered
+8. Any runtime trust, signature, digest, health, cohort, secret-version, or
+   registration mismatch stops acceptance and rolls back to the recorded prior
+   task definition using the pre-approved rollback path. Keep payment and
+   commercial gates disabled through rollback and recovery. Never re-run a
+   bootstrap run. Today the deploy gate blocks a later bootstrap deployment
+   only when the latest attempt of an earlier bootstrap deployment run has a
+   started deploy job (it does not yet read earlier attempts; after the S3
+   claim is implemented, a successful claim consumes the slot). Treat a failed
+   bootstrap deployment as having used the one-time slot; another unregistered
    deployment requires a separately revised and explicitly approved WISH.
 
 ## Later deployments

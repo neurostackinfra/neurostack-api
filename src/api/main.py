@@ -234,6 +234,7 @@ def create_app() -> FastAPI:
             "/redoc",
             "/openapi.json",
             f"{settings.api_prefix}/openapi.json",
+            f"{settings.api_prefix}/billing/producer-build-trust",
             "/metrics",
         ]
         return path in public_paths or any(
@@ -329,6 +330,14 @@ def create_app() -> FastAPI:
         }
         for path, path_item in schema.get("paths", {}).items():
             if _is_public_path(path):
+                if path == f"{settings.api_prefix}/billing/producer-build-trust":
+                    operation = (
+                        path_item.get("get") if isinstance(path_item, dict) else None
+                    )
+                    if isinstance(operation, dict):
+                        # OpenAPI's global security otherwise makes this no-auth
+                        # runtime route appear authenticated to generated clients.
+                        operation["security"] = []
                 continue
 
             if not isinstance(path_item, dict):

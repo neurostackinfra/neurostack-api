@@ -1,5 +1,7 @@
 # ASAAS bootstrap slot ledger
 
+Implementation status: the claim described here is the target design and is not yet invoked by any workflow (task t_mvcn8tm75222ec86).
+
 The S3 ledger is the durable authority for whether the one-time build and deployment bootstrap slots have been consumed. GitHub Actions run history is an additional identity and audit check; it is not the consumption record and cannot clear an S3 claim. A completed or failed attempt that successfully writes its claim consumes that slot permanently.
 
 The release stack exposes the retained bucket name as `BootstrapSlotLedgerBucketName`. The bucket has versioning enabled, default Object Lock retention of 100 years in COMPLIANCE mode, SSE-S3 encryption, all four S3 Block Public Access controls enabled, and no lifecycle rules. The bucket and its bucket policy use `DeletionPolicy: Retain` and `UpdateReplacePolicy: Retain`.
