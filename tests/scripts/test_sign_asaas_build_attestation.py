@@ -122,6 +122,9 @@ def _backend_readback(pins: dict[str, str]) -> dict[str, str]:
         "workflow_ref": pins["BILLING_PRODUCER_BUILD_WORKFLOW_REF"],
         "oidc_issuer": pins["BILLING_PRODUCER_BUILD_OIDC_ISSUER"],
         "oidc_subject": pins["BILLING_PRODUCER_BUILD_OIDC_SUBJECT"],
+        "read_at_utc": datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
     }
 
 
@@ -296,7 +299,9 @@ def test_bootstrap_signer_uses_committed_fingerprint_checked_public_key_pins(
         observed.append((trust_environment, expected_digest))
         return expected_digest
 
-    monkeypatch.setattr(cli._PREFLIGHT, "probe_backend_trust_absent", probe)
+    monkeypatch.setattr(
+        cli._PREFLIGHT, "probe_backend_trust_readback_unavailable", probe
+    )
     entry, digest = cli._active_backend_trust(pins, environment)
 
     assert digest == "a" * 64

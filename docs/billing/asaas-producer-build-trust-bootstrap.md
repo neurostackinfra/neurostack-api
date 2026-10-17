@@ -40,6 +40,26 @@ The build role remains restricted to ECR publication/readback and `kms:Sign`;
 the build workflow does not call `GetPublicKey`, ECS, Secrets Manager, or
 payment services.
 
+Normal mode reads the active public trust tuple from
+`GET /v1/billing/producer-build-trust`. The exact GET paths
+`/v1/billing/producer-build-trust` and
+`/v1/admin/billing/producer-build-trust` are both public middleware exceptions
+and require no JWT. Each returns only non-secret verification pins and uses
+`no-store` cache headers; the public path returns the verifier PEM and fresh
+read timestamp, while the legacy administrative path preserves its
+fingerprint-only schema and staging-only response. Do not infer authentication
+from the `/admin` prefix. Adjacent paths, methods, or suffixes remain protected
+by authentication middleware.
+
+Bootstrap mode probes both exact public readback paths without a JWT and
+accepts only when both return the known legacy `401` body with no redirect. This
+is named `readback_unavailable`: it shows only that neither path exposes the
+readback on this request. It does not establish whether trust exists elsewhere
+in the backend or infer the route code from the image digest. This response is
+only the one-time bootstrap exception, and the probe must not be relaxed. A
+`200` from either path, differing responses, `404`, `503`, redirects, malformed
+or ambiguous responses, and every other status fail closed.
+
 ## Group 3/4 build bootstrap
 
 1. Merge the reviewed commit through the protected `main` ruleset. Before any
@@ -61,10 +81,55 @@ payment services.
    workflow-run history check reject reuse. A failed or retried build attempt
    consumes that operation UUID. The protected `asaas-build` environment
    still requires approval for the exact run.
-3. Before OIDC, preflight probes only the committed HTTPS backend origin and
-   exact trust path. It accepts only the known unauthenticated `401` response
-   shape as evidence that the trust route is not yet active. A `200`, `404`,
-   redirect, malformed response, timeout, or other status blocks bootstrap.
+   Before either approval, make a private ZIP containing `snapshot.json` at the
+   archive root and every artifact referenced by it at the same relative paths.
+   Do not include symlinks. Keep the bundle within the verifier's 64 MiB
+   download and 128 MiB unpacked limits. Upload that ZIP as a GitHub user
+   attachment and record its exact URL and SHA-256; the protected approval
+   comment binds that digest to the reviewer, run, ref, SHA, workflow,
+   environment, and preflight readback. The no-OIDC verifier downloads the
+   attachment, checks its digest and ZIP paths, extracts into a private
+   temporary directory, and runs the full Group 2 snapshot/artifact validator.
+   The build job downloads and validates the same bundle again before requesting
+   OIDC. A locally rehashed snapshot alone is not evidence of origin. The
+   standalone evidence validator and the approval verifier pin the canonical
+   separate read-only AWS MCP observation. Removing a region from the raw
+   response and matching scans still fails even if all local hashes or both
+   recomputed. If AWS changes the region catalog or opt-in statuses, the gate
+   remains closed until a fresh independent response is collected and its
+   digest is updated through reviewed code. The repository and its user
+   attachments are public: sanitize the
+   bundle and screenshots and exclude credentials, tokens, customer data, and
+   other secrets before uploading.
+   The `asaas-build` environment has two distinct approvals. For the first,
+   inspect and capture the ruleset and both environment settings, then package
+   the three screenshots with `--approval-gate evidence`, the run identity, and
+   the preflight SHA, the Group 2 bundle URL, and the bundle SHA-256. Attach that
+   manifest and all three PNGs, and put its
+   compact JSON in the first environment approval comment. The no-OIDC verifier
+   requires this package timestamp to fall between preflight and five minutes
+   before the no-OIDC job starts.
+   After that job completes successfully, repeat the UI inspection and capture
+   all three screenshots; the verifier checks the second timestamp is at or
+   after the no-OIDC job's recorded completion time. The second screenshots
+   must have new bytes, even if a new timestamp or attachment URL is supplied.
+   Run the packer again with `--approval-gate build`; this creates
+   a separate private package and requires a distinct timestamp and attachment
+   URLs. Reuse the same Group 2 URL and digest. Attach the new manifest and PNGs and use its compact JSON in the second
+   environment approval comment. The build verifier requires exactly one
+   `evidence` and one `build` package, verifies both complete chains, checks the
+   first against the no-OIDC outputs, and requires the second timestamp to be no
+   more than five minutes before the build job starts. Do not reuse the first
+   comment, timestamp, manifest, or attachment URLs for the second approval.
+3. Before OIDC, bootstrap preflight probes only the committed HTTPS backend
+   origin and both exact public readback paths. The probe does not infer
+   authentication from the `/admin` prefix: both exact paths are public. The
+   one-time bootstrap exception requires the known legacy `401` body from both
+   paths, without redirects or divergent responses. This reports only
+   `readback_unavailable`; it does not prove that trust is absent or infer
+   route code from the serving image digest. A `200` from either path, `404`,
+   `503`, redirect, malformed or ambiguous response, timeout, or any other
+   status blocks bootstrap.
    The canonical probe digest is included in evidence. After environment
    approval and before `configure-aws-credentials`, the verifier repeats the
    probe and requires the same digest.

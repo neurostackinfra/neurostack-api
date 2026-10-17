@@ -317,6 +317,7 @@ class AuthMiddleware:
         "/v1/openapi.json",
         "/metrics",
         "/v1/auth/login",
+        "/v1/billing/producer-build-trust",
     }
 
     def __init__(self, app: ASGIApp) -> None:
@@ -346,8 +347,8 @@ class AuthMiddleware:
             await self.app(scope, receive, self._no_store_send(send))
             return
 
-        # CI may read only the active public build-trust tuple. Keep this
-        # method-and-path exception exact; neighboring admin routes stay gated.
+        # Existing exact-path CI trust readback. Preserve its public contract;
+        # neighboring admin routes continue through normal authentication.
         if (
             request.method == "GET"
             and request.url.path == PRODUCER_BUILD_TRUST_READBACK_PATH

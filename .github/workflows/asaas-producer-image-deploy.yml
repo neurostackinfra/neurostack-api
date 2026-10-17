@@ -1,0 +1,481 @@
+name: ASAAS producer image protected deployment
+run-name: ASAAS producer image ${{ inputs.mode }} operation=${{ inputs.operation_id }} build_run=${{ inputs.build_run_id }} attestation=${{ inputs.attestation_id }} digest=${{ inputs.app_image_digest }} envelope=${{ inputs.envelope_sha256 }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Use the one-time bootstrap or a pre-registered attestation
+        required: true
+        type: choice
+        options: [bootstrap, registered]
+      operation_id:
+        description: Preallocated deployment operation UUID (distinct from signed envelope operation_id)
+        required: true
+        type: string
+      build_run_id:
+        description: Exact successful Group 4 build run ID
+        required: true
+        type: string
+      attestation_id:
+        description: Canonical attestation UUID in the signed envelope
+        required: true
+        type: string
+      app_image_digest:
+        description: Immutable sha256 digest in the signed envelope
+        required: true
+        type: string
+      envelope_sha256:
+        description: SHA-256 of the canonical signed envelope bytes
+        required: true
+        type: string
+      evidence_issue_number:
+        description: Public issue number used only for sanitized human evidence comments
+        required: true
+        type: string
+      registration_attestation_id:
+        description: Canonical registration attestation UUID (registered mode only)
+        required: false
+        type: string
+      registration_digest:
+        description: Canonical registration digest (registered mode only)
+        required: false
+        type: string
+      registered_at_utc:
+        description: Canonical registration timestamp (registered mode only)
+        required: false
+        type: string
+
+concurrency:
+  group: asaas-producer-deployment
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      administration: read
+      contents: read
+      issues: read
+    outputs:
+      protection_sha256: ${{ steps.gate.outputs.protection_sha256 }}
+      preflight_observed_at: ${{ steps.gate.outputs.preflight_observed_at }}
+    steps:
+      - name: Checkout the exact protected deployment workflow commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up pinned CPython 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Install the pinned envelope verifier dependency
+        shell: bash
+        run: python -m pip install --disable-pip-version-check cryptography==50.0.2
+
+      - name: Prepare public Group 2 trust readback
+        shell: bash
+        env: &trust_pins
+          BILLING_PRODUCER_BUILD_ISSUER: ${{ vars.BILLING_PRODUCER_BUILD_ISSUER }}
+          BILLING_PRODUCER_BUILD_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_BUILD_KMS_KEY_ARN }}
+          BILLING_PRODUCER_BUILD_AUDIENCE: ${{ vars.BILLING_PRODUCER_BUILD_AUDIENCE }}
+          BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM: ${{ vars.BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM }}
+          BILLING_PRODUCER_BUILD_OIDC_SUBJECT: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_SUBJECT }}
+          BILLING_PRODUCER_ECR_REPOSITORY_URI: ${{ vars.BILLING_PRODUCER_ECR_REPOSITORY_URI }}
+        run: python3 scripts/asaas_producer_rollout_gate.py --phase prepare-trust
+
+      - name: Download the exact Group 4 signed build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: asaas-build-attestation-${{ inputs.build_run_id }}-1
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/asaas-build-attestation
+
+      - name: Verify signed envelope, exact tuple, and optional canonical registration
+        shell: bash
+        env:
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_OPERATION_ID: ${{ inputs.operation_id }}
+          INPUT_BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          INPUT_ATTESTATION_ID: ${{ inputs.attestation_id }}
+          INPUT_APP_IMAGE_DIGEST: ${{ inputs.app_image_digest }}
+          INPUT_ENVELOPE_SHA256: ${{ inputs.envelope_sha256 }}
+          INPUT_REGISTRATION_ATTESTATION_ID: ${{ inputs.registration_attestation_id }}
+          INPUT_REGISTRATION_DIGEST: ${{ inputs.registration_digest }}
+          INPUT_REGISTERED_AT_UTC: ${{ inputs.registered_at_utc }}
+          BILLING_PRODUCER_BUILD_ISSUER: ${{ vars.BILLING_PRODUCER_BUILD_ISSUER }}
+          BILLING_PRODUCER_BUILD_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_BUILD_KMS_KEY_ARN }}
+          BILLING_PRODUCER_BUILD_AUDIENCE: ${{ vars.BILLING_PRODUCER_BUILD_AUDIENCE }}
+          BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM: ${{ vars.BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM }}
+          BILLING_PRODUCER_BUILD_OIDC_SUBJECT: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_SUBJECT }}
+          BILLING_PRODUCER_ECR_REPOSITORY_URI: ${{ vars.BILLING_PRODUCER_ECR_REPOSITORY_URI }}
+          ASAAS_SIGNED_ENVELOPE_PATH: ${{ runner.temp }}/asaas-build-attestation/asaas-build-attestation.json
+        run: |
+          set -euo pipefail
+          args=(validate-attestation \
+            --envelope "$ASAAS_SIGNED_ENVELOPE_PATH" \
+            --trust "$RUNNER_TEMP/asaas-producer-build-trust.json" \
+            --output "$RUNNER_TEMP/asaas-producer-attestation-summary.json" \
+            --build-run-id "$INPUT_BUILD_RUN_ID" \
+            --attestation-id "$INPUT_ATTESTATION_ID" \
+            --app-digest "$INPUT_APP_IMAGE_DIGEST" \
+            --envelope-sha256 "$INPUT_ENVELOPE_SHA256" \
+            --mode "$INPUT_MODE")
+          if [[ "$INPUT_MODE" == "registered" ]]; then
+            python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path(os.environ["RUNNER_TEMP"]) / "asaas-producer-registration-input.json"
+          value = {
+              "attestation_id": os.environ["INPUT_REGISTRATION_ATTESTATION_ID"],
+              "attestation_digest": os.environ["INPUT_REGISTRATION_DIGEST"],
+              "registered_at": os.environ["INPUT_REGISTERED_AT_UTC"],
+          }
+          descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+              json.dump(value, output, sort_keys=True, separators=(",", ":"))
+          PY
+            args+=(--registration "$RUNNER_TEMP/asaas-producer-registration-input.json")
+          fi
+          python3 scripts/verify_asaas_producer_image_rollout.py "${args[@]}"
+
+      - name: Re-read repository protections, exact run, and bootstrap history without OIDC
+        id: gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          GITHUB_REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_OPERATION_ID: ${{ inputs.operation_id }}
+          INPUT_BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          INPUT_ATTESTATION_ID: ${{ inputs.attestation_id }}
+          INPUT_APP_IMAGE_DIGEST: ${{ inputs.app_image_digest }}
+          INPUT_ENVELOPE_SHA256: ${{ inputs.envelope_sha256 }}
+        run: python3 scripts/asaas_producer_rollout_gate.py --phase preflight --output "$RUNNER_TEMP/asaas-preflight-private.json"
+
+  verify-predeploy-evidence:
+    needs: preflight
+    if: needs.preflight.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: asaas-production-deployment
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      administration: read
+      contents: read
+      issues: read
+    outputs:
+      task_definition_template_sha256: ${{ steps.gate.outputs.task_definition_template_sha256 }}
+      predeploy_readback_sha256: ${{ steps.gate.outputs.predeploy_readback_sha256 }}
+      predeploy_producer_environment_sha256: ${{ steps.gate.outputs.predeploy_producer_environment_sha256 }}
+      operator_login: ${{ steps.gate.outputs.operator_login }}
+    env:
+      ASAAS_PREFLIGHT_PROTECTION_SHA256: ${{ needs.preflight.outputs.protection_sha256 }}
+      ASAAS_PREFLIGHT_OBSERVED_AT: ${{ needs.preflight.outputs.preflight_observed_at }}
+      BILLING_PRODUCER_GRANT_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_GRANT_KMS_KEY_ARN }}
+      BILLING_PRODUCER_GRANT_PUBLIC_KEY_PEM: ${{ vars.BILLING_PRODUCER_GRANT_PUBLIC_KEY_PEM }}
+      BILLING_PRODUCER_BUILD_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_BUILD_KMS_KEY_ARN }}
+      BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM: ${{ vars.BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM }}
+      BILLING_PRODUCER_RECEIPT_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_RECEIPT_KMS_KEY_ARN }}
+      BILLING_PRODUCER_RECEIPT_PUBLIC_KEY_PEM: ${{ vars.BILLING_PRODUCER_RECEIPT_PUBLIC_KEY_PEM }}
+      BILLING_PRODUCER_BUILD_ISSUER: ${{ vars.BILLING_PRODUCER_BUILD_ISSUER }}
+      BILLING_PRODUCER_BUILD_AUDIENCE: ${{ vars.BILLING_PRODUCER_BUILD_AUDIENCE }}
+      BILLING_PRODUCER_BUILD_OIDC_SUBJECT: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_SUBJECT }}
+      BILLING_PRODUCER_ECR_REPOSITORY_URI: ${{ vars.BILLING_PRODUCER_ECR_REPOSITORY_URI }}
+    steps:
+      - name: Checkout protected deployment code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up pinned CPython 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Install the pinned envelope verifier dependency
+        shell: bash
+        run: python -m pip install --disable-pip-version-check cryptography==50.0.2
+
+      - name: Prepare public Group 2 trust readback
+        shell: bash
+        env: *trust_pins
+        run: python3 scripts/asaas_producer_rollout_gate.py --phase prepare-trust
+
+      - name: Download the exact Group 4 signed build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: asaas-build-attestation-${{ inputs.build_run_id }}-1
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/asaas-build-attestation
+
+      - name: Validate build artifact before approving the no-OIDC job
+        shell: bash
+        env:
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_OPERATION_ID: ${{ inputs.operation_id }}
+          INPUT_BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          INPUT_ATTESTATION_ID: ${{ inputs.attestation_id }}
+          INPUT_APP_IMAGE_DIGEST: ${{ inputs.app_image_digest }}
+          INPUT_ENVELOPE_SHA256: ${{ inputs.envelope_sha256 }}
+          INPUT_REGISTRATION_ATTESTATION_ID: ${{ inputs.registration_attestation_id }}
+          INPUT_REGISTRATION_DIGEST: ${{ inputs.registration_digest }}
+          INPUT_REGISTERED_AT_UTC: ${{ inputs.registered_at_utc }}
+          BILLING_PRODUCER_BUILD_ISSUER: ${{ vars.BILLING_PRODUCER_BUILD_ISSUER }}
+          BILLING_PRODUCER_BUILD_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_BUILD_KMS_KEY_ARN }}
+          BILLING_PRODUCER_BUILD_AUDIENCE: ${{ vars.BILLING_PRODUCER_BUILD_AUDIENCE }}
+          BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM: ${{ vars.BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM }}
+          BILLING_PRODUCER_BUILD_OIDC_SUBJECT: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_SUBJECT }}
+          BILLING_PRODUCER_ECR_REPOSITORY_URI: ${{ vars.BILLING_PRODUCER_ECR_REPOSITORY_URI }}
+          ASAAS_SIGNED_ENVELOPE_PATH: ${{ runner.temp }}/asaas-build-attestation/asaas-build-attestation.json
+        run: |
+          set -euo pipefail
+          args=(validate-attestation \
+            --envelope "$ASAAS_SIGNED_ENVELOPE_PATH" \
+            --trust "$RUNNER_TEMP/asaas-producer-build-trust.json" \
+            --output "$RUNNER_TEMP/asaas-producer-attestation-summary.json" \
+            --build-run-id "$INPUT_BUILD_RUN_ID" \
+            --attestation-id "$INPUT_ATTESTATION_ID" \
+            --app-digest "$INPUT_APP_IMAGE_DIGEST" \
+            --envelope-sha256 "$INPUT_ENVELOPE_SHA256" \
+            --mode "$INPUT_MODE")
+          if [[ "$INPUT_MODE" == "registered" ]]; then
+            python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path(os.environ["RUNNER_TEMP"]) / "asaas-producer-registration-input.json"
+          value = {
+              "attestation_id": os.environ["INPUT_REGISTRATION_ATTESTATION_ID"],
+              "attestation_digest": os.environ["INPUT_REGISTRATION_DIGEST"],
+              "registered_at": os.environ["INPUT_REGISTERED_AT_UTC"],
+          }
+          descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+              json.dump(value, output, sort_keys=True, separators=(",", ":"))
+          PY
+            args+=(--registration "$RUNNER_TEMP/asaas-producer-registration-input.json")
+          fi
+          python3 scripts/verify_asaas_producer_image_rollout.py "${args[@]}"
+
+      - name: Re-read controls, human UI evidence, database readiness, and private baseline
+        id: gate
+        shell: bash
+        env: &protected_gate_env
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          GITHUB_REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_OPERATION_ID: ${{ inputs.operation_id }}
+          INPUT_BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          INPUT_ATTESTATION_ID: ${{ inputs.attestation_id }}
+          INPUT_APP_IMAGE_DIGEST: ${{ inputs.app_image_digest }}
+          INPUT_ENVELOPE_SHA256: ${{ inputs.envelope_sha256 }}
+          INPUT_EVIDENCE_ISSUE_NUMBER: ${{ inputs.evidence_issue_number }}
+          INPUT_REGISTRATION_ATTESTATION_ID: ${{ inputs.registration_attestation_id }}
+          INPUT_REGISTRATION_DIGEST: ${{ inputs.registration_digest }}
+          INPUT_REGISTERED_AT_UTC: ${{ inputs.registered_at_utc }}
+          ASAAS_PREFLIGHT_PROTECTION_SHA256: ${{ needs.preflight.outputs.protection_sha256 }}
+          ASAAS_PREFLIGHT_OBSERVED_AT: ${{ needs.preflight.outputs.preflight_observed_at }}
+          ASAAS_PRODUCER_TASK_DEFINITION_TEMPLATE_JSON: ${{ secrets.ASAAS_PRODUCER_TASK_DEFINITION_TEMPLATE_JSON }}
+          ASAAS_PRODUCER_TASK_DEFINITION_TEMPLATE_SHA256: ${{ secrets.ASAAS_PRODUCER_TASK_DEFINITION_TEMPLATE_SHA256 }}
+          ASAAS_PRODUCER_PREDEPLOY_READBACK_JSON: ${{ secrets.ASAAS_PRODUCER_PREDEPLOY_READBACK_JSON }}
+          BILLING_PRODUCER_GRANT_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_GRANT_KMS_KEY_ARN }}
+          BILLING_PRODUCER_GRANT_PUBLIC_KEY_PEM: ${{ vars.BILLING_PRODUCER_GRANT_PUBLIC_KEY_PEM }}
+          BILLING_PRODUCER_BUILD_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_BUILD_KMS_KEY_ARN }}
+          BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM: ${{ vars.BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM }}
+          BILLING_PRODUCER_RECEIPT_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_RECEIPT_KMS_KEY_ARN }}
+          BILLING_PRODUCER_RECEIPT_PUBLIC_KEY_PEM: ${{ vars.BILLING_PRODUCER_RECEIPT_PUBLIC_KEY_PEM }}
+          BILLING_PRODUCER_BUILD_ISSUER: ${{ vars.BILLING_PRODUCER_BUILD_ISSUER }}
+          BILLING_PRODUCER_BUILD_AUDIENCE: ${{ vars.BILLING_PRODUCER_BUILD_AUDIENCE }}
+          BILLING_PRODUCER_BUILD_OIDC_SUBJECT: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_SUBJECT }}
+          BILLING_PRODUCER_ECR_REPOSITORY_URI: ${{ vars.BILLING_PRODUCER_ECR_REPOSITORY_URI }}
+          BILLING_PRODUCER_DEPLOY_ROLE_ARN: ${{ vars.BILLING_PRODUCER_DEPLOY_ROLE_ARN }}
+          ASAAS_SIGNED_ENVELOPE_PATH: ${{ runner.temp }}/asaas-build-attestation/asaas-build-attestation.json
+        run: python3 scripts/asaas_producer_rollout_gate.py --phase predeploy --output "$RUNNER_TEMP/asaas-predeploy-private.json"
+
+  deploy:
+    needs: [preflight, verify-predeploy-evidence]
+    if: needs.preflight.result == 'success' && needs.verify-predeploy-evidence.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: asaas-production-deployment
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      administration: read
+      contents: read
+      issues: read
+      id-token: write
+    env:
+      ASAAS_PREFLIGHT_PROTECTION_SHA256: ${{ needs.preflight.outputs.protection_sha256 }}
+      ASAAS_PREFLIGHT_OBSERVED_AT: ${{ needs.preflight.outputs.preflight_observed_at }}
+      ASAAS_PREDEPLOY_READBACK_SHA256: ${{ needs.verify-predeploy-evidence.outputs.predeploy_readback_sha256 }}
+      ASAAS_PREDEPLOY_PRODUCER_ENVIRONMENT_SHA256: ${{ needs.verify-predeploy-evidence.outputs.predeploy_producer_environment_sha256 }}
+      BILLING_PRODUCER_GRANT_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_GRANT_KMS_KEY_ARN }}
+      BILLING_PRODUCER_GRANT_PUBLIC_KEY_PEM: ${{ vars.BILLING_PRODUCER_GRANT_PUBLIC_KEY_PEM }}
+      BILLING_PRODUCER_BUILD_ISSUER: ${{ vars.BILLING_PRODUCER_BUILD_ISSUER }}
+      BILLING_PRODUCER_BUILD_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_BUILD_KMS_KEY_ARN }}
+      BILLING_PRODUCER_BUILD_AUDIENCE: ${{ vars.BILLING_PRODUCER_BUILD_AUDIENCE }}
+      BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM: ${{ vars.BILLING_PRODUCER_BUILD_PUBLIC_KEY_PEM }}
+      BILLING_PRODUCER_BUILD_OIDC_SUBJECT: ${{ vars.BILLING_PRODUCER_BUILD_OIDC_SUBJECT }}
+      BILLING_PRODUCER_RECEIPT_KMS_KEY_ARN: ${{ vars.BILLING_PRODUCER_RECEIPT_KMS_KEY_ARN }}
+      BILLING_PRODUCER_RECEIPT_PUBLIC_KEY_PEM: ${{ vars.BILLING_PRODUCER_RECEIPT_PUBLIC_KEY_PEM }}
+      BILLING_PRODUCER_ECR_REPOSITORY_URI: ${{ vars.BILLING_PRODUCER_ECR_REPOSITORY_URI }}
+      BILLING_PRODUCER_DEPLOY_ROLE_ARN: ${{ vars.BILLING_PRODUCER_DEPLOY_ROLE_ARN }}
+    steps:
+      - name: Checkout protected deployment code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up pinned CPython 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned deployment verification dependency
+        shell: bash
+        run: python -m pip install --disable-pip-version-check cryptography==50.0.2
+
+      - name: Prepare public Group 2 trust readback
+        shell: bash
+        env: *trust_pins
+        run: python3 scripts/asaas_producer_rollout_gate.py --phase prepare-trust
+
+      - name: Download the exact Group 4 signed build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: asaas-build-attestation-${{ inputs.build_run_id }}-1
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/asaas-build-attestation
+
+      - name: Verify current approval, environment secrets, artifact and readbacks before OIDC
+        id: pre_oidc_gate
+        env: *protected_gate_env
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(validate-attestation \
+            --envelope "$ASAAS_SIGNED_ENVELOPE_PATH" \
+            --trust "$RUNNER_TEMP/asaas-producer-build-trust.json" \
+            --output "$RUNNER_TEMP/asaas-producer-attestation-summary.json" \
+            --build-run-id "$INPUT_BUILD_RUN_ID" \
+            --attestation-id "$INPUT_ATTESTATION_ID" \
+            --app-digest "$INPUT_APP_IMAGE_DIGEST" \
+            --envelope-sha256 "$INPUT_ENVELOPE_SHA256" \
+            --mode "$INPUT_MODE")
+          if [[ "$INPUT_MODE" == "registered" ]]; then
+            python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path(os.environ["RUNNER_TEMP"]) / "asaas-producer-registration-input.json"
+          value = {
+              "attestation_id": os.environ["INPUT_REGISTRATION_ATTESTATION_ID"],
+              "attestation_digest": os.environ["INPUT_REGISTRATION_DIGEST"],
+              "registered_at": os.environ["INPUT_REGISTERED_AT_UTC"],
+          }
+          descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+              json.dump(value, output, sort_keys=True, separators=(",", ":"))
+          PY
+            args+=(--registration "$RUNNER_TEMP/asaas-producer-registration-input.json")
+          fi
+          python3 scripts/verify_asaas_producer_image_rollout.py "${args[@]}"
+          python3 scripts/asaas_producer_rollout_gate.py --phase deploy --output "$RUNNER_TEMP/asaas-deploy-private.json"
+
+      - name: Generate one-run key and publish pre-OIDC cohort instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/asaas_producer_rollout_evidence.py new-post-readback-key \
+            --private-output "$RUNNER_TEMP/asaas-producer-post-readback-private.pem" \
+            --public-output "$RUNNER_TEMP/asaas-producer-post-readback-public.pem"
+          python3 - "$GITHUB_STEP_SUMMARY" "$RUNNER_TEMP/asaas-producer-post-readback-public.pem" <<'PY'
+          import sys
+          import os
+          from pathlib import Path
+          summary = Path(sys.argv[1])
+          public_key = Path(sys.argv[2]).read_text(encoding="ascii")
+          with summary.open("a", encoding="utf-8") as output:
+              output.write("## One-run encrypted cohort confirmation\n\n")
+              output.write("After this deploy job is approved, capture a fresh authenticated ECS service/task readback, database SQL readiness, per-task `/ready`, ALB target health, and secret version metadata. Encrypt the sanitized snapshot with this one-run key and post only the encrypted marker to the configured evidence issue. The gate waits here before requesting AWS credentials.\n\n")
+              output.write("Run context (all fields are required by the encrypt command):\n\n")
+              output.write(f"- run_id: `{os.environ['GITHUB_RUN_ID']}`\n")
+              output.write(f"- run_attempt: `{os.environ['GITHUB_RUN_ATTEMPT']}`\n")
+              output.write(f"- operation_id: `{os.environ['INPUT_OPERATION_ID']}`\n")
+              output.write(f"- artifact_sha256: `{os.environ['INPUT_ENVELOPE_SHA256']}`\n")
+              output.write(f"- ref: `{os.environ['GITHUB_REF']}`\n")
+              output.write(f"- sha: `{os.environ['GITHUB_SHA']}`\n")
+              output.write(f"- job_id: `{os.environ['DEPLOYMENT_JOB_ID']}`\n")
+              output.write(f"- job_started_at: `{os.environ['DEPLOYMENT_JOB_STARTED_AT']}`\n\n")
+              output.write(f"- evidence_issue_number: `{os.environ['INPUT_EVIDENCE_ISSUE_NUMBER']}`\n\n")
+              output.write("Encrypt the sanitized `phase=cohort` snapshot with:\n\n```bash\n")
+              output.write("python3 scripts/asaas_producer_rollout_evidence.py encrypt-post-readback \\\n")
+              output.write("  --phase cohort --public-key /private/path/run-public.pem \\\n")
+              output.write("  --snapshot /private/path/cohort-readback.json --output /private/path/cohort-encrypted.json \\\n")
+              output.write(f"  --run-id {os.environ['GITHUB_RUN_ID']} --run-attempt {os.environ['GITHUB_RUN_ATTEMPT']} \\\n")
+              output.write(f"  --operation-id {os.environ['INPUT_OPERATION_ID']} --artifact-sha256 {os.environ['INPUT_ENVELOPE_SHA256']} \\\n")
+              output.write(f"  --ref {os.environ['GITHUB_REF']} --sha {os.environ['GITHUB_SHA']} \\\n")
+              output.write(f"  --job-id {os.environ['DEPLOYMENT_JOB_ID']} --job-started-at {os.environ['DEPLOYMENT_JOB_STARTED_AT']}\n``\n\n")
+              output.write(f"Post only `/private/path/cohort-encrypted.json` to issue {os.environ['INPUT_EVIDENCE_ISSUE_NUMBER']} under marker `<!-- asaas-producer-encrypted-readback.v2` and closing `-->`.\n\n")
+              output.write("Public key for this run:\n\n```pem\n")
+              output.write(public_key)
+              output.write("```\n")
+          PY
+        env:
+          INPUT_OPERATION_ID: ${{ inputs.operation_id }}
+          INPUT_ENVELOPE_SHA256: ${{ inputs.envelope_sha256 }}
+          INPUT_EVIDENCE_ISSUE_NUMBER: ${{ inputs.evidence_issue_number }}
+          DEPLOYMENT_JOB_ID: ${{ steps.pre_oidc_gate.outputs.deployment_job_id }}
+          DEPLOYMENT_JOB_STARTED_AT: ${{ steps.pre_oidc_gate.outputs.deployment_job_started_at }}
+
+      - name: Validate fresh run-bound cohort confirmation before OIDC
+        id: cohort_confirmation
+        env: *protected_gate_env
+        shell: bash
+        run: python3 scripts/asaas_producer_rollout_gate.py --phase pre-oidc-cohort --output "$RUNNER_TEMP/asaas-producer-pre-oidc-cohort.json"
+
+      # This is the only OIDC step. The no-OIDC job and this job's gate have
+      # already re-read current protections, approvals, artifacts, and secrets.
+      - name: Request the exact protected deployment role through OIDC
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
+        with:
+          role-to-assume: ${{ env.BILLING_PRODUCER_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: asaas-producer-${{ github.run_id }}
+
+      - name: Deploy exact attested image, verify post-readback, register, or roll back
+        shell: bash
+        env:
+          <<: *protected_gate_env
+          # The cohort confirmation stays on this runner and is hash-bound to
+          # the approval gate before AWS credentials are requested.
+          ASAAS_PRE_OIDC_COHORT_PATH: ${{ runner.temp }}/asaas-producer-pre-oidc-cohort.json
+          ASAAS_PRE_OIDC_COHORT_SHA256: ${{ steps.cohort_confirmation.outputs.cohort_evidence_sha256 }}
+        run: python3 scripts/asaas_producer_deploy_executor.py

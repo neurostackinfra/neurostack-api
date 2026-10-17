@@ -33,9 +33,14 @@ EXPECTED_BUILD_SUBJECT = (
 API_ROOT = "https://api.github.com"
 API_PREFIX = f"/repos/{REPOSITORY}"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-BACKEND_TRUST_PATH = "/v1/admin/billing/producer-build-trust"
+BACKEND_TRUST_PATH = "/v1/billing/producer-build-trust"
+BACKEND_TRUST_PROBE_PATHS = (
+    BACKEND_TRUST_PATH,
+    "/v1/admin/billing/producer-build-trust",
+)
+BACKEND_TRUST_PROBE_PATH = BACKEND_TRUST_PROBE_PATHS[1]
 BACKEND_TRUST_SCHEMA = "billing_producer_build_trust_readback.v1"
-BACKEND_TRUST_PROBE_SCHEMA = "billing_producer_build_trust_bootstrap_probe.v1"
+BACKEND_TRUST_PROBE_SCHEMA = "billing_producer_build_trust_bootstrap_probe.v2"
 BUILD_TRUST_MODES = frozenset({"normal", "bootstrap"})
 BOOTSTRAP_BUILD_ROLE_ARN = (
     "arn:aws:iam::388460142431:role/"
@@ -76,6 +81,7 @@ BACKEND_TRUST_FIELDS = frozenset(
         "workflow_ref",
         "oidc_issuer",
         "oidc_subject",
+        "read_at_utc",
     }
 )
 
@@ -192,7 +198,7 @@ def _bootstrap_pins(env):
     )
 
 
-def _expected_bootstrap_absence_response(raw):
+def _expected_bootstrap_readback_unavailable_response(raw):
     def reject_duplicate_keys(pairs):
         result = {}
         for key, value in pairs:
@@ -276,7 +282,21 @@ def validate_backend_trust_readback(env, readback, *, expected_digest=None):
         is not None,
         "backend_trust_fingerprint_invalid",
     )
-    digest = hashlib.sha256(_canonical_json(readback)).hexdigest()
+    try:
+        read_at = datetime.fromisoformat(readback["read_at_utc"].replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        raise GateError("backend_trust_readback_timestamp_invalid") from None
+    now = datetime.now(timezone.utc)
+    require(
+        read_at.tzinfo is not None
+        and read_at <= now + timedelta(minutes=5)
+        and now - read_at <= timedelta(minutes=5),
+        "backend_trust_readback_stale",
+    )
+    digest_fields = {
+        key: value for key, value in readback.items() if key != "read_at_utc"
+    }
+    digest = hashlib.sha256(_canonical_json(digest_fields)).hexdigest()
     if expected_digest is not None:
         require(
             re.fullmatch(r"[0-9a-f]{64}", expected_digest) is not None,
@@ -338,8 +358,8 @@ def fetch_backend_trust_readback(env, *, opener=None, expected_digest=None):
     )
 
 
-def probe_backend_trust_absent(env, *, opener=None, expected_digest=None):
-    """Accept only the known pre-route 401 response for explicit bootstrap."""
+def probe_backend_trust_readback_unavailable(env, *, opener=None, expected_digest=None):
+    """Accept only the known 401 response from both public readback paths."""
     origin = backend_trust_origin(env)
     require(
         origin == BOOTSTRAP_BACKEND_ORIGIN,
@@ -351,67 +371,81 @@ def probe_backend_trust_absent(env, *, opener=None, expected_digest=None):
             expected_origin == origin,
             "backend_trust_origin_changed_after_preflight",
         )
-    url = backend_trust_url(env)
-    request = Request(url, headers={"Accept": "application/json"}, method="GET")
     open_url = (
         build_opener(_NoBackendTrustRedirect()).open if opener is None else opener
     )
-    status = None
-    final_url = url
-    headers = None
-    raw = b""
-    try:
-        with open_url(request, timeout=5) as response:
-            status = response.status
-            final_url = response.geturl()
-            headers = response.headers
-            raw = response.read(64 * 1024 + 1)
-    except HTTPError as exc:
-        if 300 <= exc.code < 400:
-            raise GateError("backend_trust_readback_redirect_rejected") from None
-        if exc.code != 401:
-            raise GateError("bootstrap_trust_absence_unconfirmed") from None
-        status = exc.code
-        final_url = exc.geturl()
-        headers = exc.headers
+    observed = []
+    for path in BACKEND_TRUST_PROBE_PATHS:
+        url = origin + path
+        request = Request(url, headers={"Accept": "application/json"}, method="GET")
+        status = None
+        final_url = url
+        headers = None
+        raw = b""
         try:
-            raw = exc.read(64 * 1024 + 1)
-        except OSError:
-            raise GateError("bootstrap_trust_absence_unconfirmed") from None
-        finally:
+            with open_url(request, timeout=5) as response:
+                status = response.status
+                final_url = response.geturl()
+                headers = response.headers
+                raw = response.read(64 * 1024 + 1)
+        except HTTPError as exc:
+            if 300 <= exc.code < 400:
+                raise GateError("backend_trust_readback_redirect_rejected") from None
+            if exc.code != 401:
+                raise GateError("backend_trust_readback_unavailable") from None
+            status = exc.code
+            final_url = exc.geturl()
+            headers = exc.headers
             try:
-                exc.close()
+                raw = exc.read(64 * 1024 + 1)
             except OSError:
-                pass
-    except (OSError, TimeoutError, ValueError):
-        raise GateError("bootstrap_trust_absence_unconfirmed") from None
+                raise GateError("backend_trust_readback_unavailable") from None
+            finally:
+                try:
+                    exc.close()
+                except OSError:
+                    pass
+        except (OSError, TimeoutError, ValueError):
+            raise GateError("backend_trust_readback_unavailable") from None
 
-    require(final_url == url, "backend_trust_readback_redirect_rejected")
-    require(status == 401, "bootstrap_trust_already_active")
-    require(len(raw) <= 64 * 1024, "bootstrap_trust_probe_too_large")
-    content_type = headers.get("Content-Type", "") if headers is not None else ""
+        require(final_url == url, "backend_trust_readback_redirect_rejected")
+        require(status != 200, "bootstrap_readback_active")
+        require(status == 401, "backend_trust_readback_unavailable")
+        require(len(raw) <= 64 * 1024, "backend_trust_readback_unavailable")
+        content_type = headers.get("Content-Type", "") if headers is not None else ""
+        require(
+            content_type.split(";", 1)[0].strip().lower() == "application/json",
+            "backend_trust_readback_unavailable",
+        )
+        require(
+            _expected_bootstrap_readback_unavailable_response(raw),
+            "backend_trust_readback_unavailable",
+        )
+        observed.append({"path": path, "status": status, "body": raw})
+
     require(
-        content_type.split(";", 1)[0].strip().lower() == "application/json",
-        "bootstrap_trust_absence_unconfirmed",
-    )
-    require(
-        _expected_bootstrap_absence_response(raw),
-        "bootstrap_trust_absence_unconfirmed",
+        observed[0]["body"] == observed[1]["body"],
+        "backend_trust_readback_unavailable",
     )
     probe = {
         "schema": BACKEND_TRUST_PROBE_SCHEMA,
         "origin": origin,
-        "path": BACKEND_TRUST_PATH,
-        "status": status,
-        "body_sha256": hashlib.sha256(raw).hexdigest(),
+        "readbacks": [
+            {
+                "path": row["path"],
+                "status": row["status"],
+                "body_sha256": hashlib.sha256(row["body"]).hexdigest(),
+            }
+            for row in observed
+        ],
     }
     digest = hashlib.sha256(_canonical_json(probe)).hexdigest()
     if expected_digest is not None:
         require(
             re.fullmatch(r"[0-9a-f]{64}", expected_digest) is not None,
-            "bootstrap_trust_probe_digest_invalid",
+            "bootstrap_readback_unavailable_digest_invalid",
         )
-        require(digest == expected_digest, "bootstrap_trust_probe_changed")
+        require(digest == expected_digest, "bootstrap_readback_unavailable_changed")
     return digest
 
 
@@ -788,6 +822,11 @@ def validate_current_run(token, env, *, github_get_fn=None, github_collection_fn
     )
     run_id = env.get("GITHUB_RUN_ID", "")
     require(bool(re.fullmatch(r"[1-9][0-9]*", run_id)), "actions_run_id_invalid")
+    run_attempt = env.get("GITHUB_RUN_ATTEMPT", "")
+    require(
+        bool(re.fullmatch(r"[1-9][0-9]*", run_attempt)),
+        "actions_run_attempt_invalid",
+    )
     run, _ = get(f"{API_ROOT}{API_PREFIX}/actions/runs/{run_id}", token)
     require(isinstance(run, dict), "actions_run_readback_invalid")
     require(
@@ -799,6 +838,10 @@ def validate_current_run(token, env, *, github_get_fn=None, github_collection_fn
         "actions_run_not_current_dispatch",
     )
     require(
+        type(run.get("run_attempt")) is int and run["run_attempt"] == int(run_attempt),
+        "actions_run_attempt_mismatch",
+    )
+    require(
         run.get("head_sha") == env.get("GITHUB_SHA")
         and run.get("head_branch") == "main",
         "actions_run_commit_or_ref_mismatch",
@@ -806,6 +849,16 @@ def validate_current_run(token, env, *, github_get_fn=None, github_collection_fn
     require(
         bool(re.fullmatch(r"[0-9a-f]{40}", run.get("head_sha", ""))),
         "actions_run_commit_or_ref_mismatch",
+    )
+    exact_ref, _ = get(f"{API_ROOT}{API_PREFIX}/git/ref/heads/main", token)
+    exact_ref_object = exact_ref.get("object") if isinstance(exact_ref, dict) else None
+    require(
+        isinstance(exact_ref, dict)
+        and exact_ref.get("ref") == RELEASE_REF
+        and isinstance(exact_ref_object, dict)
+        and exact_ref_object.get("type") == "commit"
+        and exact_ref_object.get("sha") == run.get("head_sha"),
+        "actions_run_exact_ref_readback_mismatch",
     )
     expected_path = f"{WORKFLOW_PATH}@{RELEASE_REF}"
     require(run.get("path") == expected_path, "actions_run_workflow_path_mismatch")
@@ -860,6 +913,7 @@ def validate_current_run(token, env, *, github_get_fn=None, github_collection_fn
     )
     return {
         "run_id": run_id,
+        "run_attempt": run_attempt,
         "workflow_path": WORKFLOW_PATH,
         "sha": run["head_sha"],
         "ref": RELEASE_REF,
@@ -969,14 +1023,23 @@ def write_admin_ui_approval_instructions(
     with open(summary_path, "a", encoding="utf-8") as summary:
         summary.write(
             "## Independent administrator UI review required before approval\n\n"
-            "Inspect the exact source-ref ruleset and `asaas-build` environment "
-            "in GitHub settings immediately before approving the protected job. "
+            "Inspect the exact source-ref ruleset plus `asaas-build` and "
+            "`asaas-production-deployment` environments in GitHub settings "
+            "immediately before approving the protected job. "
             "Confirm the ruleset bypass list is empty, administrator bypass is "
             "disabled, and the environment allows only the `main` branch with "
-            "no tag policy. Capture a sanitized PNG, then attach it to a PR or "
-            "issue comment while this run waits for approval; this stores the "
+            "no tag policy. Capture three sanitized PNGs, then attach all three "
+            "and the JSON manifest to a PR or issue comment while this run waits "
+            "for approval; this stores the "
             "image outside repository history. Include this run ID, SHA, ref, "
-            "and environment in that comment. The protected job downloads the "
+            "and environment in that comment. Copy `checked_at_utc` exactly from "
+            "the `--approval-gate evidence` package's approval JSON; the no-OIDC "
+            "job requires its timestamp within five minutes before that job starts. "
+            "After that job succeeds and while the build job waits for its second "
+            "approval, inspect and capture all three settings again, then create a "
+            "new `--approval-gate build` package with a distinct timestamp and "
+            "fresh attachment URLs. The build verifier requires this second "
+            "package within five minutes before the build job starts. It downloads the "
             "PNG and verifies its SHA-256 before requesting OIDC.\n\n"
             f"- Run ID: `{run_context['run_id']}`\n"
             f"- Workflow: `{run_context['workflow_path']}`\n"
@@ -988,27 +1051,59 @@ def write_admin_ui_approval_instructions(
             + (
                 f"- Backend build-trust readback SHA-256: `{backend_trust_digest}`\n"
                 if trust_mode_value == "normal"
-                else f"- Bootstrap absence probe SHA-256: `{backend_probe_digest}`\n"
+                else f"- Bootstrap readback-unavailable probe SHA-256: `{backend_probe_digest}`\n"
             )
             + f"- Backend origin: `{backend_trust_origin}`\n"
             f"- API readback time: `{observed_at}`\n\n"
-            "Use this exact shape as the environment approval comment, replacing "
-            "the reviewer, attachment URL, and digest with the actual values. The "
+            "Attach the complete Group 2 evidence bundle (snapshot.json plus every "
+            "referenced artifact) as a ZIP user attachment, then verify its SHA-256. "
+            "This repository is public: the ZIP, screenshots, and comment will be "
+            "publicly visible, so include only sanitized non-secret readbacks/screens. "
+            "Run the private evidence packer with `--approval-gate evidence`, "
+            "`--group2-bundle-ref` set to that attachment URL, and "
+            "`--group2-bundle-sha256` set to its digest, plus "
+            "the displayed preflight SHA-256; upload its manifest "
+            "and all three PNGs as GitHub user attachments, then paste the compact "
+            "JSON approval object it emits below after replacing only the four "
+            "attachment URLs, "
+            "reviewer fields, and preflight digest. Keep the manifest hash and "
+            "metadata unchanged. After the no-OIDC approval job succeeds, repeat "
+            "the UI inspection and capture, run the packer with `--approval-gate "
+            "build`, then attach its new manifest and three PNGs for the second "
+            "approval. Reuse the same Group 2 ZIP and digest, but use the new "
+            "build package's compact JSON and screenshot/manifest URLs; do not "
+            "reuse the evidence package. The "
             "protected environment approval is the authoritative gate; GitHub's "
-            "approval-history API does not expose the human click timestamp:\n\n"
-            "```text\n"
-            "ASAAS-ADMIN-UI-ATTESTATION/2 "
-            f"run_id={run_context['run_id']} "
-            f"sha={run_context['sha']} "
-            f"ref={run_context['ref']} "
-            f"workflow_path={run_context['workflow_path']} "
-            f"environment={environment_name} reviewer_id=<github-user-id> "
-            "reviewer_login=<github-login> "
-            f"preflight_sha256={readback_digest} "
-            "ruleset_bypass=empty environment_admin_bypass=disabled "
-            "branch_policy=main-only "
-            "evidence_ref=https://github.com/user-attachments/assets/<uuid> "
-            "evidence_sha256=<64-lowercase-hex>\n"
+            "approval-history API does not expose the human click timestamp. The "
+            "checked time binds the earlier human UI check; the verifier's later "
+            "observation time records when GitHub returned approved:\n\n"
+            "```json\n"
+            "{\n"
+            '  "schema_version": "neurostack.asaas_build_ui_attestation.v6",\n'
+            f'  "run_id": "{run_context["run_id"]}",\n'
+            f'  "run_attempt": "{run_context["run_attempt"]}",\n'
+            f'  "workflow_path": "{run_context["workflow_path"]}",\n'
+            f'  "sha": "{run_context["sha"]}",\n'
+            f'  "ref": "{run_context["ref"]}",\n'
+            f'  "environment": "{environment_name}",\n'
+            '  "approval_gate": "evidence",\n'
+            '  "checked_at_utc": "<YYYY-MM-DDTHH:MM:SS.ffffffZ>",\n'
+            '  "reviewer_id": "<github-user-id>",\n'
+            '  "reviewer_login": "<github-login>",\n'
+            f'  "preflight_sha256": "{readback_digest}",\n'
+            '  "ruleset_bypass": "empty",\n'
+            '  "environment_admin_bypass": "disabled",\n'
+            '  "branch_policy": "main-only",\n'
+            '  "checks": {"asaas_build_admin_bypass_disabled":true,"asaas_build_branch_only_main":true,"asaas_production_admin_bypass_disabled":true,"asaas_production_branch_only_main":true,"ruleset_bypass_empty":true},\n'
+            '  "manifest_ref": "https://github.com/user-attachments/files/<id>/manifest.json",\n'
+            '  "manifest_sha256": "<64-lowercase-hex>",\n'
+            '  "group2_bundle_ref": "https://github.com/user-attachments/files/<id>/group2.zip",\n'
+            '  "group2_bundle_sha256": "<64-lowercase-hex>",\n'
+            '  "screenshots": {"ruleset":{"ref":"https://github.com/user-attachments/assets/<uuid>","sha256":"<64-lowercase-hex>"},"asaas-build":{"ref":"https://github.com/user-attachments/assets/<uuid>","sha256":"<64-lowercase-hex>"},"asaas-production-deployment":{"ref":"https://github.com/user-attachments/assets/<uuid>","sha256":"<64-lowercase-hex>"}},\n'
+            '  "evidence_ref": "https://github.com/user-attachments/assets/<uuid>",\n'
+            '  "evidence_label": "<ruleset|asaas-build|asaas-production-deployment>",\n'
+            '  "evidence_sha256": "<64-lowercase-hex>"\n'
+            "}\n"
             "```\n"
         )
 
@@ -1051,7 +1146,7 @@ def main():
     if mode == "normal":
         _backend_trust, backend_trust_digest = fetch_backend_trust_readback(env)
     else:
-        backend_probe_digest = probe_backend_trust_absent(env)
+        backend_probe_digest = probe_backend_trust_readback_unavailable(env)
     backend_origin = backend_trust_origin(env)
     token = env.get("GH_TOKEN", "")
     require(bool(token), "github_read_token_unavailable")
@@ -1089,8 +1184,7 @@ def main():
         )
     observed_at = (
         datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
+        .isoformat(timespec="microseconds")
         .replace("+00:00", "Z")
     )
     readback_digest = controls_digest(
