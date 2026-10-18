@@ -284,15 +284,39 @@ Falha fechada: se algum caminho cair sob um prefixo reservado (`/v1`, `/api/`,
 testados contra a tabela de rotas; para `/traces/<id>` qualquer rota ou mount
 sob `/traces/`, qualquer rota com parâmetro que possa cobrir `/traces/` (por
 exemplo `/{x}` ou `/{x}/stats`), um mount na raiz, uma rota sem caminho
-analisável (`Host`) ou uma classe de rota com `matches` próprio conta como
-colisão; rotas de routers incluídos são avaliadas pelo caminho efetivo (com
-prefixo) que o FastAPI realmente despacha. Em todos esses casos a API sobe
-normalmente (`/health` continua verde) e o frontend fica desligado: o sinal é o
-log `spa_not_installed`. Diretórios, arquivos que não são regulares, symlinks,
-dotfiles, nomes fora de `[A-Za-z0-9._-]`, source maps, HTML além do
-`index.html` e extensões desconhecidas são ignorados e listados uma vez em
-`spa_build_entries_skipped`. Nada depende de `ENVIRONMENT` (o service que
-atende produção roda com `ENVIRONMENT=staging`).
+analisável (`Host`) ou uma rota com `matches` próprio (na classe ou atribuído
+na instância) conta como colisão; rotas de routers incluídos são avaliadas pelo
+caminho efetivo (com prefixo) que o FastAPI realmente despacha. Em todos esses
+casos a API sobe normalmente (`/health` continua verde) e o frontend fica
+desligado: o sinal é o log `spa_not_installed`. Diretórios, arquivos que não
+são regulares, symlinks, dotfiles, nomes fora de `[A-Za-z0-9._-]`, source maps,
+HTML além do `index.html` e extensões desconhecidas são ignorados e listados
+uma vez em `spa_build_entries_skipped`. Nada depende de `ENVIRONMENT` (o
+service que atende produção roda com `ENVIRONMENT=staging`).
+
+A mesma verificação roda de novo no fim do startup, depois de todo o lifespan
+(o da aplicação, os dos routers incluídos e os handlers `on_startup`) e antes
+de o servidor receber `lifespan.startup.complete`. O frontend é desligado ali
+mesmo se algum hook tiver acrescentado ou inserido uma rota que colida (por
+exemplo `/traces/{x}` num router incluído, ou qualquer rota num caminho exato
+do SPA), se a própria verificação falhar (`recheck_failed:<erro>`) ou se o
+lifespan tiver sido trocado depois de `install_spa` (um `include_router`
+posterior mescla o lifespan do router, cujos hooks rodariam depois da
+verificação: `lifespan_replaced_after_install`). Por isso `install_spa` tem de
+ser a última coisa em `create_app` a mexer em rotas e lifespan. Desligado,
+nenhum caminho do SPA fica público nem é servido: GET anônimo recebe o 401 de
+sempre, exceto `/`, que continua público para o middleware de autenticação e
+responde 404 (como com o SPA desligado); a requisição autenticada a um caminho
+do SPA recebe 404, a menos que a rota que colidiu esteja à frente da do SPA na
+tabela (router incluído ou rota inserida no topo), caso em que é essa rota que
+responde. Um único log `spa_conflict_after_startup` (nível error) lista os
+conflitos e a API continua no ar.
+
+Sem lifespan não há reverificação: com `uvicorn --lifespan off`, com o
+`TestClient` usado fora de `with` ou com `httpx.ASGITransport` nenhum hook
+roda, e uma rota acrescentada depois de `install_spa` fora de qualquer hook
+(por exemplo `app.router.routes.insert(0, ...)` direto no código) não é
+verificada por ninguém.
 
 Cabeçalhos só nas respostas do frontend (nunca em `/v1`, `/docs`, `/redoc`):
 `index.html` sai da memória com `Cache-Control: no-cache`, ETag forte e 304;

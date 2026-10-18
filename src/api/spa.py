@@ -25,8 +25,14 @@ Security contract (wish asaas-payment-gateway, Group 6c):
   exact probes for the exact paths and, for ``/traces/<id>``, a structural
   check of every effective route in the table, included routers resolved to
   the route FastAPI dispatches (see ``_effective_route`` and
-  ``_shadows_trace_detail``); a route class with its own ``matches`` cannot
-  be analyzed and always counts as a collision.
+  ``_shadows_trace_detail``); a route with its own ``matches`` (a subclass
+  override or one set on the instance) cannot be analyzed and always counts
+  as a collision.
+* The route table is checked again once every startup hook has run (the
+  installed lifespan is wrapped, see ``_recheck_after_startup``): a hook that
+  adds or inserts a route that collides turns the SPA off in place
+  (``SpaRegistry.revoke``), so the auth bypass and every SPA endpoint stop
+  together, with one ``spa_conflict_after_startup`` error.
 * SPA responses alone carry the cache and security headers below; ``/v1``,
   ``/docs`` and ``/redoc`` responses are untouched.
 """
@@ -38,11 +44,12 @@ import hashlib
 import os
 import re
 import stat
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 from fastapi import FastAPI
 from fastapi.routing import (
@@ -104,7 +111,8 @@ _TRACE_DETAIL_PREFIX: Final = TRACE_DETAIL_ROUTE.split(":", 1)[0]
 _TRACE_DETAIL_SAMPLE: Final = _TRACE_DETAIL_PREFIX + "0"
 # The structural check reads ``path``; it is only sound for route classes
 # whose matching is the stock, path-derived one.  Any other ``matches`` (a
-# subclass overriding it) is unanalyzable and counts as a collision.
+# subclass overriding it, or one assigned on the instance) is unanalyzable
+# and counts as a collision.
 _STOCK_MATCHES: Final = frozenset(
     cls.matches
     for cls in (Route, Mount, Host, WebSocketRoute, APIRoute, APIWebSocketRoute)
@@ -281,6 +289,16 @@ class SpaRegistry:
     def is_public(self, path: str) -> bool:
         """True only for an exact registered path (the auth bypass)."""
         return self.lookup(path) is not None
+
+    def revoke(self) -> None:
+        """Turn this registry off in place: nothing is public or served.
+
+        In place because the auth hook (through ``app.state.spa``), the page
+        endpoint and the assets app all hold this same object.
+        """
+        self._index = None
+        self._pages = frozenset()
+        self._files = {}
 
 
 def router_path(scope: Scope) -> str:
@@ -614,16 +632,27 @@ def _shadows_trace_detail(path: object, is_mount: bool) -> bool:
     return is_mount and _TRACE_DETAIL_PREFIX.startswith(path + "/")
 
 
+def _has_custom_matches(route: BaseRoute) -> bool:
+    """A ``matches`` other than the stock, path-derived one of its class."""
+    return type(route).matches not in _STOCK_MATCHES or "matches" in getattr(
+        route, "__dict__", {}
+    )
+
+
 def find_conflicts(app: FastAPI, registry: SpaRegistry) -> list[str]:
     """Reserved-prefix hits and collisions with routes already registered."""
+    return _find_conflicts(list(app.router.routes), registry)
+
+
+def _find_conflicts(routes: list[BaseRoute], registry: SpaRegistry) -> list[str]:
     probes = sorted({*registry.pages, *registry.files})
     conflicts = [f"reserved:{path}" for path in probes if _is_reserved(path)]
-    for context in iter_route_contexts(app.router.routes):
+    for context in iter_route_contexts(routes):
         path, route = _effective_route(context)
         custom = [
             candidate
             for candidate in (context.original_route, route)
-            if type(candidate).matches not in _STOCK_MATCHES
+            if _has_custom_matches(candidate)
         ]
         if custom:
             name = type(custom[0]).__name__
@@ -645,12 +674,85 @@ def find_conflicts(app: FastAPI, registry: SpaRegistry) -> list[str]:
                 "headers": [],
                 "query_string": b"",
             }
-            for route in list(app.router.routes):
+            for route in routes:
                 match, _ = route.matches(scope)
                 if match is not Match.NONE:
                     owner = getattr(route, "path", None) or type(route).__name__
                     conflicts.append(f"collision:{method} {path} -> {owner}")
     return sorted(set(conflicts))
+
+
+LIFESPAN_REPLACED: Final = "lifespan_replaced_after_install"
+
+
+def _revoke_on_late_conflict(
+    app: FastAPI,
+    registry: SpaRegistry,
+    own_routes: tuple[BaseRoute, ...],
+    *,
+    lifespan_replaced: bool,
+) -> None:
+    """Re-run the install-time check; on any conflict turn the SPA off.
+
+    The SPA's own routes are left out by identity (they would collide with
+    themselves); every other route counts wherever it sits, even one on an
+    exact SPA path.  A check that cannot run is a conflict too, and so is a
+    lifespan replaced after ``install_spa`` (``include_router`` merges one):
+    its hooks start after this check and could still add a colliding route.
+    """
+    if not registry.enabled:
+        return
+    routes = [
+        route
+        for route in app.router.routes
+        if not any(route is own for own in own_routes)
+    ]
+    try:
+        conflicts = _find_conflicts(routes, registry)
+    except Exception as error:  # noqa: BLE001 - fail closed on any failure
+        conflicts = [f"recheck_failed:{type(error).__name__}"]
+    if lifespan_replaced:
+        conflicts = [LIFESPAN_REPLACED, *conflicts]
+    if not conflicts:
+        return
+    registry.revoke()
+    logger.error(
+        "spa_conflict_after_startup",
+        reason="route table changed during startup; SPA turned off",
+        conflicts=conflicts,
+    )
+
+
+def _recheck_after_startup(
+    app: FastAPI, registry: SpaRegistry, own_routes: tuple[BaseRoute, ...]
+) -> None:
+    """Wrap the lifespan so the route table is checked after every hook.
+
+    ``app.router.lifespan_context`` at install time already holds the app's
+    lifespan merged with every included router's (or the ``on_startup``
+    runner); the check runs once all of them have entered, before the
+    server is told startup completed.  Both the ASGI ``lifespan`` protocol
+    and direct ``lifespan_context`` callers go through this wrapper.  If the
+    app's lifespan is no longer this wrapper when the check runs (a router
+    included after ``install_spa``), the SPA is turned off: hooks merged
+    later start after the check.  Exceptions from the inner lifespan or the
+    body pass through unchanged.
+    """
+    startup = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def spa_checked_lifespan(lifespan_app: Any) -> AsyncIterator[Any]:
+        async with startup(lifespan_app) as state:
+            _revoke_on_late_conflict(
+                app,
+                registry,
+                own_routes,
+                lifespan_replaced=app.router.lifespan_context
+                is not spa_checked_lifespan,
+            )
+            yield state
+
+    app.router.lifespan_context = spa_checked_lifespan
 
 
 def install_spa(app: FastAPI) -> SpaRegistry:
@@ -678,6 +780,7 @@ def install_spa(app: FastAPI) -> SpaRegistry:
         )
         return disabled
 
+    routes_before = len(app.router.routes)
     serve = _page_endpoint(registry)
     exact_paths = sorted(registry.pages) + sorted(
         path for path in registry.files if not path.startswith(ASSETS_PREFIX + "/")
@@ -692,6 +795,7 @@ def install_spa(app: FastAPI) -> SpaRegistry:
     )
     if any(path.startswith(ASSETS_PREFIX + "/") for path in registry.files):
         app.mount(ASSETS_PREFIX, _AssetsApp(registry))
+    _recheck_after_startup(app, registry, tuple(app.router.routes[routes_before:]))
     app.state.spa = registry
     logger.info(
         "spa_installed",
