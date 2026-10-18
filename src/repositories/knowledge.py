@@ -22,14 +22,68 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
 
     Provides methods for:
     - CRUD operations (inherited from BaseRepository)
+    - Tenant-scoped lookup and delete by document ID
     - Finding documents by tenant
     - Finding indexed documents
     - Finding documents by category
     - Finding documents by tags
+
+    The inherited ``get_by_id``/``delete`` are not tenant-scoped; request
+    handlers must use ``get_by_id_and_tenant``/``delete_by_id_and_tenant`` with
+    the authorized tenant so another tenant's document is never reachable.
     """
 
     def __init__(self, session: AsyncSession):
         super().__init__(session, KnowledgeDocument)
+
+    async def get_by_id_and_tenant(
+        self,
+        document_id: UUID,
+        tenant_id: UUID,
+    ) -> Optional[KnowledgeDocument]:
+        """
+        Get a document by ID only if it belongs to ``tenant_id``.
+
+        Another tenant's document and a missing document both return None, so
+        callers cannot tell them apart.
+
+        Args:
+            document_id: Document ID
+            tenant_id: Authorized tenant ID
+
+        Returns:
+            Document instance or None
+        """
+        stmt = select(KnowledgeDocument).where(
+            KnowledgeDocument.id == document_id,
+            KnowledgeDocument.tenant_id == tenant_id,
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def delete_by_id_and_tenant(
+        self,
+        document_id: UUID,
+        tenant_id: UUID,
+    ) -> bool:
+        """
+        Delete a document by ID only if it belongs to ``tenant_id``.
+
+        Args:
+            document_id: Document ID
+            tenant_id: Authorized tenant ID
+
+        Returns:
+            True if deleted, False if missing or owned by another tenant
+        """
+        instance = await self.get_by_id_and_tenant(document_id, tenant_id)
+        if instance is None:
+            return False
+
+        await self.session.delete(instance)
+        await self.session.flush()
+        logger.debug("Deleted KnowledgeDocument", id=str(document_id))
+        return True
 
     async def find_by_tenant(
         self,

@@ -36,7 +36,14 @@ class DocumentUploadRequest(BaseModel):
         }
     }
 
-    tenant_id: UUID = Field(..., description="Tenant that owns this document")
+    tenant_id: Optional[UUID] = Field(
+        default=None,
+        description=(
+            "Tenant that will own the document. Defaults to the caller's "
+            "tenant; another tenant is allowed only for a builder that owns "
+            "the clinic or a super admin."
+        ),
+    )
     content: str = Field(
         ...,
         min_length=10,
@@ -87,7 +94,14 @@ class SearchRequest(BaseModel):
         }
     }
 
-    tenant_id: UUID = Field(..., description="Tenant to search in")
+    tenant_id: Optional[UUID] = Field(
+        default=None,
+        description=(
+            "Tenant to search in. Defaults to the caller's tenant; another "
+            "tenant is allowed only for a builder that owns the clinic or a "
+            "super admin."
+        ),
+    )
     query: str = Field(
         ...,
         min_length=3,
