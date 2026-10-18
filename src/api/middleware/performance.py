@@ -303,6 +303,11 @@ class CachingMiddleware(BaseHTTPMiddleware):
     - Tenant ID header
 
     Only caches successful GET requests.
+
+    A cache HIT is answered here, before the route runs, and the key does not
+    include the authenticated caller (the tenant header is client-supplied).
+    Only tenant-agnostic paths may therefore be cacheable; tenant-scoped
+    routes that authorize per request belong in ``NEVER_CACHE``.
     """
 
     # Paths that should be cached
@@ -310,13 +315,13 @@ class CachingMiddleware(BaseHTTPMiddleware):
         "/health": 10.0,  # 10 seconds
         "/ready": 5.0,  # 5 seconds
         "/live": 1.0,  # 1 second
-        "/v1/policies": 60.0,  # 1 minute
     }
 
     # Paths that should never be cached
     NEVER_CACHE = {
         "/v1/events",  # Always dynamic
         "/v1/sessions",  # State changes
+        "/v1/policies",  # Tenant-authorized per request; HITs would bypass it
         "/metrics",  # Real-time metrics
     }
 
