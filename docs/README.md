@@ -28,6 +28,10 @@
 | [Schema do banco e índices](./database-schema.md) | Tabelas, relacionamentos, índices compostos e triggers | Engenheiros / DBA |
 | [Observabilidade](./observability.md) | Métricas, logs, alertas e dashboards | DevOps/SRE |
 | [Rollout operacional de providers](./api-provider-settings-rollout.md) | Build imutável, smoke, receipt assinado e deploy por digest | Produção / DevOps/SRE |
+| [Deploy ASAAS](./runbooks/asaas-deployment.md) | Pré-condições, estados de rollout e build da UI | Operações / SRE |
+| [Rollback ASAAS](./runbooks/asaas-rollback.md) | Contenção em `disabled` e rollback application-only | Operações / SRE |
+| [Incidente de billing ASAAS](./runbooks/asaas-billing-incident.md) | Contenção e rollout `disabled` | Operações / SRE |
+| [Rotação de segredo ASAAS](./runbooks/asaas-secret-rotation.md) | Prova next→current sem expor segredo | Operações / SRE |
 
 ---
 
