@@ -1,0 +1,21 @@
+# Reviewed, non-secret parameters for the Group 9 D3 production wiring
+# (infra/production/asaas-production-wiring.yaml). All three values were
+# confirmed by the product owner on 2026-10-18. Secrets never belong here:
+# the task definition references them by ARN only.
+#
+# scripts/asaas_production_wiring.py --params <this file> fails the plan when a
+# required value is missing, empty or invalid. Each URL is validated with the
+# application's own settings validators and must use a host the ALB serves.
+schema_version: asaas_production_wiring_parameters.v1
+parameters:
+  # Hosted-checkout browser return page: the published /billing route.
+  ASAAS_CHECKOUT_RETURN_URL: https://payments.staging.api.neurostack.global/billing
+  # Public receiver registered at ASAAS; the path must be exactly
+  # /v1/billing/webhook/asaas.
+  ASAAS_WEBHOOK_URL: https://staging.api.neurostack.global/v1/billing/webhook/asaas
+  # Operator address ASAAS notifies about webhook queue problems.
+  ASAAS_WEBHOOK_NOTIFICATION_EMAIL: neurostack.infra@gmail.com
+  # null keeps the live app image reference exactly. A value must be an
+  # immutable <account ECR repository URI>@sha256:<digest> that exists in ECR;
+  # building and attesting that image is a separate gate.
+  app_image_override: null
