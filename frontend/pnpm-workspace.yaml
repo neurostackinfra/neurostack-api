@@ -67,12 +67,6 @@ catalog:
 
 autoInstallPeers: false
 
-onlyBuiltDependencies:
-  - '@swc/core'
-  - esbuild
-  - msw
-  - unrs-resolver
-
 overrides:
   # Removed Replit linux-x64-only platform exclusions for local macOS ARM development.
   # The original overrides excluded all darwin-arm64 binaries which breaks on Apple Silicon.
@@ -80,5 +74,10 @@ overrides:
   "@esbuild-kit/esm-loader": "npm:tsx@^4.21.0"
   esbuild: "0.27.3"
 
+# pnpm 11 build-script policy (replaces the removed `onlyBuiltDependencies`).
+# esbuild's postinstall only validates/optimizes the platform binary, which it
+# already resolves through its optional @esbuild/<platform> dependency, so it
+# is explicitly denied. Any new dependency with install scripts fails the
+# install (strictDepBuilds) until it is listed here.
 allowBuilds:
-  esbuild: set this to true or false
+  esbuild: false

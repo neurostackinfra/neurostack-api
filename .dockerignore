@@ -55,6 +55,18 @@ Dockerfile*
 .docker/
 **/node_modules/
 
+# Frontend: only the sources the frontend-build stage copies belong in the
+# context. Docker patterns are anchored at the context root, so nested
+# directories need an explicit prefix or `**/`.
+frontend/artifacts/neurostack/tests
+**/playwright-report
+**/test-results
+frontend/**/dist
+**/*.tsbuildinfo
+# Compiled output next to the TypeScript sources: Vite resolves .js before .ts.
+frontend/lib/**/*.js
+frontend/attached_assets/*.txt
+
 # Local development
 .env
 .env.local
