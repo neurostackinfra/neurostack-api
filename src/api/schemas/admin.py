@@ -227,9 +227,15 @@ class BillingOperationAssignmentResponse(BaseModel):
 
 
 class BillingOperationReceiptRequest(BillingOperationMaterialRequest):
+    """Ask the backend to sign one receipt; no client signature is accepted.
+
+    Closed: an extra field (such as the retired ``signature``) is a 422.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     assignment_id: UUID
     nonce: UUID
-    signature: str = Field(pattern=r"^[0-9a-f]{64}$")
     evidence_type: Optional[
         Literal["producer", "credit", "reconciliation", "verification"]
     ] = None

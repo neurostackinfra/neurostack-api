@@ -891,12 +891,9 @@ async def _signed_receipt(
     request_id: UUID | None = None,
     inbox_high_watermark: int | None = None,
 ) -> Any:
-    """Assignment + receipt through the production operation authority."""
+    """Assignment + backend-signed receipt through the operation authority."""
 
-    from src.services.billing_operations import (
-        BillingOperationAuthority,
-        sign_operation_payload,
-    )
+    from src.services.billing_operations import BillingOperationAuthority
 
     authority = BillingOperationAuthority(session, signing_key=_CAPABILITY_SIGNING_KEY)
     actor_id = uuid4()
@@ -908,9 +905,6 @@ async def _signed_receipt(
         actor_user_id=actor_id,
         nonce=uuid4(),
         material=material,
-        signature=sign_operation_payload(
-            material.payload_digest, _CAPABILITY_SIGNING_KEY
-        ),
         evidence_type=evidence_type,
         request_id=request_id,
         inbox_high_watermark=inbox_high_watermark,

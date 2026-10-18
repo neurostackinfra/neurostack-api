@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from passlib.context import CryptContext
 from sqlalchemy import cast, func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.types import String
@@ -1391,9 +1391,14 @@ async def _consume_migration_quorum(
 
 
 def _billing_http_error(exc: Exception) -> HTTPException:
-    """Map all billing-control failures to fixed, non-sensitive API details."""
+    """Map all billing-control failures to fixed, non-sensitive API details.
 
-    code = getattr(exc, "code", None)
+    Only domain exceptions carry a client code.  SQLAlchemy errors expose
+    ``.code`` too (a library documentation key such as ``gkpj``), so a
+    constraint or trigger violation is reported as the generic conflict.
+    """
+
+    code = None if isinstance(exc, SQLAlchemyError) else getattr(exc, "code", None)
     if not isinstance(code, str):
         code = "billing_operation_conflict"
     if code.startswith("billing_operation_"):
@@ -1447,13 +1452,15 @@ async def create_billing_operation_assignment(
     "/billing/operations/receipts",
     response_model=BillingOperationReceiptResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Append a signed single-use billing receipt",
+    summary="Append a backend-signed single-use billing receipt",
 )
 async def create_billing_operation_receipt(
     body: BillingOperationReceiptRequest,
     tenant: TenantContext = Depends(require_super_admin_jwt),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> BillingOperationReceiptResponse:
+    """The JWT subject's own assignment; the backend signs, never the caller."""
+
     actor_user_id = _billing_actor(tenant)
     try:
         receipt = await BillingOperationAuthority(
@@ -1463,7 +1470,6 @@ async def create_billing_operation_receipt(
             actor_user_id=actor_user_id,
             nonce=body.nonce,
             material=_billing_material(body),
-            signature=body.signature,
             evidence_type=body.evidence_type,
             request_id=body.request_id,
             inbox_high_watermark=body.inbox_high_watermark,
@@ -1987,7 +1993,9 @@ async def create_billing_rollout_readiness_receipt(
     tenant: TenantContext = Depends(require_super_admin_jwt),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> BillingRolloutReadinessReceiptResponse:
-    _billing_actor(tenant)
+    """Recorded only by the bound deployer/reviewer duty that owns the kind."""
+
+    recorder_user_id = _billing_actor(tenant)
     try:
         receipt = await BillingRolloutOperationService(
             session, signing_key=_billing_signing_key()
@@ -2006,6 +2014,7 @@ async def create_billing_rollout_readiness_receipt(
             app_digest=body.app_digest,
             observed_at=body.observed_at,
             expires_at=body.expires_at,
+            recorder_user_id=recorder_user_id,
         )
         await session.commit()
     except (BillingOperationRejected, IntegrityError) as exc:

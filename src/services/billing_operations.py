@@ -1,9 +1,21 @@
-"""Typed, signed operator evidence for billing control-plane actions.
+"""Typed, backend-signed operator evidence for billing control-plane actions.
 
 The payment provider is deliberately absent from this module.  These values
 are the local, auditable boundary that must be satisfied before a caller can
 change a persisted billing state.  Keeping the signing payload closed avoids
 accidentally turning an operator receipt into a PII or secret transport.
+
+The server signs ("o servidor assina").  An operator never holds
+``BILLING_OPERATION_RECEIPT_SIGNING_KEY`` and never sends or receives a
+signature.  Once the route has authenticated the ``super_admin`` JWT that
+supplies the actor, :meth:`BillingOperationAuthority.record_receipt` checks
+the actor's own active assignment and the nonce, then stores the HMAC-SHA256
+of :func:`operation_receipt_message` (operation material, rollout revision,
+role, actor, assignment and nonce of that one receipt) in
+``signature_sha256``.  Every quorum read (:meth:`~BillingOperationAuthority.
+verified_quorum`, :meth:`~BillingOperationAuthority.consume_quorum`)
+recomputes it from the stored row, so one receipt's signature never
+authenticates another role, actor, assignment, nonce or revision.
 """
 
 from __future__ import annotations
@@ -12,14 +24,19 @@ import hashlib
 import hmac
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Callable, Final, Literal, Sequence, cast
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Final, Iterable, Literal, Sequence, cast
 from uuid import UUID
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.models.billing import BillingOperationAssignment, BillingOperationReceipt
+from src.config.settings import settings
+from src.models.billing import (
+    BillingOperationAssignment,
+    BillingOperationReceipt,
+    BillingRolloutControl,
+)
 from src.observability.metrics import BILLING_OPERATION_RECEIPTS_TOTAL
 from src.repositories.billing import billing_advisory_key
 
@@ -63,6 +80,21 @@ def require_aware_future(value: datetime, *, now: datetime | None = None) -> Non
         raise BillingOperationRejected("billing_operation_expired")
 
 
+def require_receipt_lifetime(expires_at: datetime, *, now: datetime) -> None:
+    """Also cap the lifetime: ``expires_at - now`` <= the configured maximum.
+
+    *now* is the creation instant of the assignment or receipt.  The cap is
+    ``BILLING_OPERATION_RECEIPT_MAX_TTL_SECONDS`` (default 24 h, at most
+    7 days); exactly the cap is accepted.  Readiness rows inherit it because
+    they may not outlive the receipts they name.
+    """
+
+    require_aware_future(expires_at, now=now)
+    cap = timedelta(seconds=settings.billing_operation_receipt_max_ttl_seconds)
+    if expires_at - now > cap:
+        raise BillingOperationRejected("billing_operation_expiry_too_long")
+
+
 def operation_payload_digest(
     *,
     scope: OperationScope,
@@ -102,25 +134,153 @@ def operation_payload_digest(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def sign_operation_payload(payload_digest: str, signing_key: bytes) -> str:
-    """Create an HMAC proof; callers must not log either input."""
+def _uuid_text(value: object) -> str:
+    return str(value if isinstance(value, UUID) else UUID(str(value)))
 
-    if not is_sha256_digest(payload_digest) or not signing_key:
-        raise BillingOperationRejected("billing_operation_signature_invalid")
-    return hmac.new(
-        signing_key, payload_digest.encode("ascii"), hashlib.sha256
+
+# The fixed canary budget (``ck_billing_rollout_control_canary_budget``).
+CANARY_CHECKOUT_LIMIT: Final = 2
+CANARY_SETTLEMENT_LIMIT: Final = 2
+CANARY_AMOUNT_LIMIT_CENTS: Final = 109900
+
+
+def canary_budget_digest(*, environment: str, canary_builder_id: UUID) -> str:
+    """The ``budget_digest`` of every ``disabled -> canary_allowlist`` receipt.
+
+    One helper for both sides: the operator tool computes the material's
+    ``budget_digest`` with it, and the canary transition refuses any other
+    value for the builder it is asked to open.  Every signer of the quorum
+    thus signs the builder, and nobody holding the quorum can choose another.
+
+    Canonical encoding (the exact bytes hashed): SHA-256, lowercase hex, of
+    the ASCII JSON object with keys sorted, separators ``,`` and ``:`` and no
+    whitespace, the builder as lowercase hyphenated UUID text::
+
+        {"canary_amount_limit_cents":109900,"canary_builder_id":"<uuid>",
+         "canary_checkout_limit":2,"canary_settlement_limit":2,
+         "environment":"<environment>"}
+
+    (shown wrapped; the hashed bytes are one line).
+    """
+
+    canonical = {
+        "canary_amount_limit_cents": CANARY_AMOUNT_LIMIT_CENTS,
+        "canary_builder_id": _uuid_text(canary_builder_id),
+        "canary_checkout_limit": CANARY_CHECKOUT_LIMIT,
+        "canary_settlement_limit": CANARY_SETTLEMENT_LIMIT,
+        "environment": environment,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
     ).hexdigest()
 
 
-def verify_operation_signature(
-    *, payload_digest: str, signature: str, signing_key: bytes
-) -> None:
-    """Fail closed when a receipt cannot be authenticated."""
+# Domain separation and version of the receipt MAC.  The retired scheme (a
+# client-computed HMAC over the bare payload digest, no context) counts as
+# version 1 and never verifies here.
+OPERATION_RECEIPT_SIGNATURE_CONTEXT: Final = "neurostack.billing.operation_receipt.v2"
 
-    if not is_sha256_digest(signature):
-        raise BillingOperationRejected("billing_operation_signature_invalid")
-    expected = sign_operation_payload(payload_digest, signing_key)
-    if not hmac.compare_digest(expected, signature):
+
+def signs_rollout_revision(*, scope: str, to_state: str) -> bool:
+    """Whether a receipt is bound to the rollout revision it was signed at.
+
+    Opening rollout moves (``-> canary_allowlist`` / ``-> general``) sign the
+    environment's ``rollout_revision`` read when the receipt is recorded: the
+    transition's expected (``from``) revision.  Verification uses the stored
+    revision at consumption, so a quorum is only valid while the state it was
+    signed for still exists and can never be queued across a state change.
+    Everything else signs ``null``: a move to ``disabled`` (rollback or
+    incident) only reduces exposure and deliberately keeps an older unspent
+    quorum usable, and migration/top-up operations do not spend a rollout
+    revision (they are fenced by their own state and ``topup_revision``).
+    """
+
+    return scope == "rollout" and to_state != "disabled"
+
+
+def operation_receipt_message(
+    receipt: BillingOperationReceipt, *, rollout_revision: int | None
+) -> bytes:
+    """The exact bytes the backend MACs for one stored receipt.
+
+    Encoding: one JSON object, keys sorted, separators ``,`` and ``:`` (no
+    whitespace), ASCII only; UUIDs as lowercase hyphenated text;
+    ``expires_at`` as ``datetime.isoformat()`` of the UTC instant (for example
+    ``2026-10-17T12:00:00+00:00``); absent values as ``null``.  Keys:
+
+    * ``context``: :data:`OPERATION_RECEIPT_SIGNATURE_CONTEXT`;
+    * the shared operation material: ``scope``, ``operation_id``,
+      ``environment``, ``from_state``, ``to_state``, ``budget_digest``,
+      ``deployment_digest``, ``expires_at``;
+    * ``rollout_revision``: see :func:`signs_rollout_revision`;
+    * this receipt's identity: ``role``, ``actor_user_id``,
+      ``assignment_id``, ``nonce``;
+    * the typed-evidence columns: ``evidence_type``, ``request_id``,
+      ``inbox_high_watermark``, ``billing_fact_schema_digest``.
+    """
+
+    expires_at = receipt.expires_at
+    if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+        raise BillingOperationRejected("billing_operation_expiry_invalid")
+    canonical = {
+        "actor_user_id": _uuid_text(receipt.actor_user_id),
+        "assignment_id": _uuid_text(receipt.assignment_id),
+        "billing_fact_schema_digest": receipt.billing_fact_schema_digest,
+        "budget_digest": receipt.budget_digest,
+        "context": OPERATION_RECEIPT_SIGNATURE_CONTEXT,
+        "deployment_digest": receipt.deployment_digest,
+        "environment": receipt.environment,
+        "evidence_type": receipt.evidence_type,
+        "expires_at": expires_at.astimezone(timezone.utc).isoformat(),
+        "from_state": receipt.from_state,
+        "inbox_high_watermark": receipt.inbox_high_watermark,
+        "nonce": _uuid_text(receipt.nonce),
+        "operation_id": _uuid_text(receipt.operation_id),
+        "request_id": (
+            None if receipt.request_id is None else _uuid_text(receipt.request_id)
+        ),
+        "role": receipt.role,
+        "rollout_revision": rollout_revision,
+        "scope": receipt.scope,
+        "to_state": receipt.to_state,
+    }
+    return json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+
+
+def operation_receipt_signature(
+    receipt: BillingOperationReceipt,
+    *,
+    rollout_revision: int | None,
+    signing_key: bytes,
+) -> str:
+    """Backend-only HMAC-SHA256; no caller-supplied signature is ever used."""
+
+    if not signing_key:
+        raise BillingOperationRejected("billing_operation_signing_unavailable")
+    return hmac.new(
+        signing_key,
+        operation_receipt_message(receipt, rollout_revision=rollout_revision),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def verify_operation_receipt_signature(
+    receipt: BillingOperationReceipt,
+    *,
+    rollout_revision: int | None,
+    signing_key: bytes,
+) -> None:
+    """Recompute the stored row's signature; constant-time, fail closed."""
+
+    expected = operation_receipt_signature(
+        receipt, rollout_revision=rollout_revision, signing_key=signing_key
+    )
+    stored = receipt.signature_sha256
+    if not is_sha256_digest(stored) or not hmac.compare_digest(expected, stored):
         raise BillingOperationRejected("billing_operation_signature_invalid")
 
 
@@ -143,6 +303,28 @@ class OperatorReceipt:
     to_state: str
     expires_at: datetime
     applied_at: datetime | None = None
+
+
+def operator_receipt(row: BillingOperationReceipt) -> OperatorReceipt:
+    """Project one persisted receipt onto the pure quorum-check shape."""
+
+    return OperatorReceipt(
+        id=row.id,
+        assignment_id=row.assignment_id,
+        operation_id=row.operation_id,
+        scope=cast(OperationScope, row.scope),
+        role=cast(OperatorRole, row.role),
+        actor_user_id=row.actor_user_id,
+        environment=row.environment,
+        nonce=row.nonce,
+        payload_digest=row.payload_digest,
+        deployment_digest=row.deployment_digest,
+        budget_digest=row.budget_digest,
+        from_state=row.from_state,
+        to_state=row.to_state,
+        expires_at=row.expires_at,
+        applied_at=row.applied_at,
+    )
 
 
 def require_operator_quorum(
@@ -196,6 +378,26 @@ def require_operator_quorum(
             raise BillingOperationRejected("billing_operation_receipt_invalid")
 
 
+def require_quorum_after(
+    receipts: Iterable[BillingOperationReceipt], anchor_created_at: datetime
+) -> None:
+    """Refuse a quorum any of whose receipts is not strictly newer than *anchor*.
+
+    *anchor_created_at* is the ``created_at`` of the rollout receipt of the
+    current state.  Both timestamps are PostgreSQL ``now()``, which is the
+    START of the inserting transaction, on one clock: fresh means the
+    receipt's transaction started after the anchor's transaction started (not
+    after it committed), and equal is stale.  A receipt that started in that
+    window but read the previous state is caught by its signed rollout
+    revision instead (:func:`signs_rollout_revision`).  This is the single
+    freshness rule; it runs inside :meth:`BillingOperationAuthority.
+    verified_quorum` over exactly the rows that are then validated and spent.
+    """
+
+    if any(receipt.created_at <= anchor_created_at for receipt in receipts):
+        raise BillingOperationRejected("billing_rollout_quorum_stale")
+
+
 @dataclass(frozen=True, slots=True)
 class OperationMaterial:
     """The common, closed values that every operator signs for one action."""
@@ -224,11 +426,12 @@ class OperationMaterial:
 
 
 class BillingOperationAuthority:
-    """Persist and consume signed operator evidence without committing.
+    """Persist, sign and consume operator evidence without committing.
 
     Every caller owns its transaction.  A rollout/capability service invokes
     ``consume_quorum`` while holding this environment lock, then performs its
-    protected state transition under the same PostgreSQL advisory lock.
+    protected state transition under the same PostgreSQL advisory lock.  The
+    signing key is held only here and never serialized.
     """
 
     def __init__(
@@ -253,7 +456,7 @@ class BillingOperationAuthority:
 
         if role not in OPERATOR_ROLES:
             raise BillingOperationRejected("billing_operation_role_invalid")
-        require_aware_future(material.expires_at, now=self._clock())
+        require_receipt_lifetime(material.expires_at, now=self._clock())
         assignment = BillingOperationAssignment(
             operation_id=material.operation_id,
             environment=material.environment,
@@ -268,6 +471,22 @@ class BillingOperationAuthority:
         await self._session.flush()
         return assignment
 
+    async def _signed_rollout_revision(
+        self, *, scope: str, environment: str, to_state: str
+    ) -> int | None:
+        """The stored rollout revision a receipt is (to be) signed at, if any."""
+
+        if not signs_rollout_revision(scope=scope, to_state=to_state):
+            return None
+        revision = await self._session.scalar(
+            select(BillingRolloutControl.rollout_revision).where(
+                BillingRolloutControl.environment == environment
+            )
+        )
+        if revision is None:
+            raise BillingOperationRejected("billing_operation_rollout_unavailable")
+        return int(revision)
+
     async def record_receipt(
         self,
         *,
@@ -275,12 +494,17 @@ class BillingOperationAuthority:
         actor_user_id: UUID,
         nonce: UUID,
         material: OperationMaterial,
-        signature: str,
         evidence_type: str | None = None,
         request_id: UUID | None = None,
         inbox_high_watermark: int | None = None,
     ) -> BillingOperationReceipt:
-        """Verify and append one single-use receipt for its assigned actor."""
+        """Append one single-use receipt, signed here, for its assigned actor.
+
+        ``actor_user_id`` is the authenticated JWT subject.  The receipt is
+        refused unless it is that actor's own active, unconsumed assignment
+        for exactly this material and the nonce was never used; only then
+        does the backend compute and store the signature.
+        """
 
         if not self._signing_key:
             raise BillingOperationRejected("billing_operation_signing_unavailable")
@@ -311,7 +535,7 @@ class BillingOperationAuthority:
                 raise BillingOperationRejected(
                     "billing_operation_fact_schema_unavailable"
                 ) from exc
-        require_aware_future(material.expires_at, now=self._clock())
+        require_receipt_lifetime(material.expires_at, now=self._clock())
         result = await self._session.execute(
             select(BillingOperationAssignment)
             .where(BillingOperationAssignment.id == assignment_id)
@@ -331,10 +555,19 @@ class BillingOperationAuthority:
             or assignment.expires_at != material.expires_at
         ):
             raise BillingOperationRejected("billing_operation_assignment_invalid")
-        verify_operation_signature(
-            payload_digest=material.payload_digest,
-            signature=signature,
-            signing_key=self._signing_key,
+        # The unique constraint stays the race-proof backstop; this gives the
+        # ordinary reuse a typed refusal before anything is signed.
+        nonce_used = await self._session.scalar(
+            select(BillingOperationReceipt.id)
+            .where(BillingOperationReceipt.nonce == nonce)
+            .limit(1)
+        )
+        if nonce_used is not None:
+            raise BillingOperationRejected("billing_operation_nonce_conflict")
+        rollout_revision = await self._signed_rollout_revision(
+            scope=material.scope,
+            environment=material.environment,
+            to_state=material.to_state,
         )
         receipt = BillingOperationReceipt(
             assignment_id=assignment.id,
@@ -354,7 +587,9 @@ class BillingOperationAuthority:
             inbox_high_watermark=inbox_high_watermark,
             billing_fact_schema_digest=fact_schema_digest,
             expires_at=material.expires_at,
-            signature_sha256=signature,
+        )
+        receipt.signature_sha256 = operation_receipt_signature(
+            receipt, rollout_revision=rollout_revision, signing_key=self._signing_key
         )
         self._session.add(receipt)
         await self._session.flush()
@@ -379,19 +614,25 @@ class BillingOperationAuthority:
         assignment.active = False
         await self._session.flush()
 
-    async def consume_quorum(
-        self, *, material: OperationMaterial
-    ) -> tuple[OperatorReceipt, OperatorReceipt, OperatorReceipt]:
-        """Lock, validate, and consume the exact three receipts once."""
+    async def verified_quorum(
+        self,
+        *,
+        material: OperationMaterial,
+        fresh_after: datetime | None = None,
+    ) -> Sequence[BillingOperationReceipt]:
+        """Lock and authenticate the exact quorum rows of *material*; no spend.
 
-        if self._session.get_bind().dialect.name == "postgresql":
-            await self._session.execute(
-                select(
-                    func.pg_advisory_xact_lock(
-                        billing_advisory_key(material.environment)
-                    )
-                )
-            )
+        The one loader behind readiness (which must not spend the quorum) and
+        :meth:`consume_quorum`, so both judge the same rows.  Order:
+        freshness against *fresh_after* when given (:func:`require_quorum_after`),
+        then the pure quorum shape, then every stored backend signature
+        recomputed from its row and the rollout revision it must have been
+        signed at.  A caller whose material signs the rollout revision holds
+        the rollout control row lock, so that revision cannot move here.
+        """
+
+        if not self._signing_key:
+            raise BillingOperationRejected("billing_operation_signing_unavailable")
         result = await self._session.execute(
             select(BillingOperationReceipt)
             .where(
@@ -408,28 +649,10 @@ class BillingOperationAuthority:
             .execution_options(populate_existing=True)
         )
         rows = result.scalars().all()
-        receipts = tuple(
-            OperatorReceipt(
-                id=row.id,
-                assignment_id=row.assignment_id,
-                operation_id=row.operation_id,
-                scope=cast(OperationScope, row.scope),
-                role=cast(OperatorRole, row.role),
-                actor_user_id=row.actor_user_id,
-                environment=row.environment,
-                nonce=row.nonce,
-                payload_digest=row.payload_digest,
-                deployment_digest=row.deployment_digest,
-                budget_digest=row.budget_digest,
-                from_state=row.from_state,
-                to_state=row.to_state,
-                expires_at=row.expires_at,
-                applied_at=row.applied_at,
-            )
-            for row in rows
-        )
+        if fresh_after is not None:
+            require_quorum_after(rows, fresh_after)
         require_operator_quorum(
-            receipts,
+            tuple(operator_receipt(row) for row in rows),
             scope=material.scope,
             operation_id=material.operation_id,
             environment=material.environment,
@@ -437,6 +660,35 @@ class BillingOperationAuthority:
             material=material,
             now=self._clock(),
         )
+        rollout_revision = await self._signed_rollout_revision(
+            scope=material.scope,
+            environment=material.environment,
+            to_state=material.to_state,
+        )
+        for row in rows:
+            verify_operation_receipt_signature(
+                row, rollout_revision=rollout_revision, signing_key=self._signing_key
+            )
+        return rows
+
+    async def consume_quorum(
+        self,
+        *,
+        material: OperationMaterial,
+        fresh_after: datetime | None = None,
+    ) -> tuple[OperatorReceipt, OperatorReceipt, OperatorReceipt]:
+        """Lock, authenticate, and consume the exact three receipts once."""
+
+        if self._session.get_bind().dialect.name == "postgresql":
+            await self._session.execute(
+                select(
+                    func.pg_advisory_xact_lock(
+                        billing_advisory_key(material.environment)
+                    )
+                )
+            )
+        rows = await self.verified_quorum(material=material, fresh_after=fresh_after)
+        receipts = tuple(operator_receipt(row) for row in rows)
         applied_at = self._clock()
         for row in rows:
             row.applied_at = applied_at

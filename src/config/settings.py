@@ -397,9 +397,27 @@ class Settings(BaseSettings):
     # that ASAAS copies a Checkout's externalReference to the subscription and
     # payments it creates.  Off keeps such sessions blocking (operator action).
     asaas_auto_abandon_enabled: bool = False
-    # Local control-plane authentication.  It signs only closed receipt
-    # digests, never provider payloads, customer data, or API credentials.
+    # Local control-plane authentication.  Only the backend holds it: it
+    # signs each operator receipt it records (operators never send or see a
+    # signature), never provider payloads, customer data, or API credentials.
     billing_operation_receipt_signing_key: SecretStr = SecretStr("")
+    # Longest lifetime of an operator assignment/receipt, measured from its
+    # creation (``expires_at - now``; exactly the cap is accepted).  Readiness
+    # rows cannot outlive the receipts they name, so they inherit it.
+    billing_operation_receipt_max_ttl_seconds: int = Field(
+        default=86400, gt=0, le=604800
+    )
+
+    @field_validator("billing_operation_receipt_max_ttl_seconds", mode="before")
+    @classmethod
+    def validate_receipt_ttl_integer(cls, value: object) -> object:
+        """Accept a base-10 integer only (no bool, float, sign or blank)."""
+        if type(value) is int:
+            return value
+        if isinstance(value, str) and value and value.isascii() and value.isdecimal():
+            return value
+        raise ValueError("must be an unsigned base-10 integer of seconds")
+
     # Group 7b canonical producer signing and verification configuration.
     billing_receipt_signing_key: SecretStr = SecretStr("")
     billing_receipt_verification_public_key: str = ""
