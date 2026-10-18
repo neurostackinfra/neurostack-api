@@ -212,13 +212,14 @@ steps:
   - id: migrations_033_035
     scope: separate_approval
     approval: separate owner approval required; not performed by this manifest
-    why: the image built from main needs Alembic head 035; production was read at 032 on 2026-10-17
+    why: the image built from main needs the schema at Alembic revision 035; production was read at 032 on 2026-10-17
     preconditions:
-      - Read back the exact Alembic head first; continue only if it is 032.
+      - Read back the exact revision first; continue only if alembic_version == 032.
       - Expand-only window; the running image keeps working on the expanded schema.
-    change: one-off neurostack-staging-migrations task (alembic upgrade head) on the same image as the deployment
+      - Revisions 036 and 037 are outside this window; each needs its own explicit owner instruction, 036 before 037, after a fresh SELECT showing zero legacy rows.
+    change: one-off neurostack-staging-migrations task on the same image as the deployment, with the container command overridden to the exact revision `alembic upgrade 035` (never the head)
     verification:
-      - Alembic head reads 035.
+      - read back alembic_version == 035 (exact; 036 and 037 not applied).
     rollback: none; never downgrade the schema as part of a rollback
 
   - id: service_deployment

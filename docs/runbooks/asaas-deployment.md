@@ -98,8 +98,8 @@ These are prerequisites to check, not steps to execute now:
    `financial_egress_enabled` stays closed: no AppConfig profile exists, and
    opening it needs the follow-up F2 below.
 3. Schema changes are expand-only and applied in a separately approved
-   window; read back the exact head before deploying the image digest, and
-   verify `/ready` on every task before any external effect.
+   window; read back the exact `alembic_version` before deploying the image
+   digest, and verify `/ready` on every task before any external effect.
 4. Evidence records only opaque IDs, statuses, timestamps and SHA-256
    digests. Never record tokens, provider payloads, customer details or card
    data.
@@ -297,10 +297,16 @@ own explicit owner approval and is never performed from the manifest.
    the build network access listed under
    [Frontend build and deployment](#frontend-build-and-deployment).
 5. **Gate: migrations 033-035 (separate approval).** In an expand-only
-   window, read back the exact Alembic head first (it was `032` on
+   window, read back the exact `alembic_version` first (it was `032` on
    2026-10-17), continue only if it is still `032`, then run the
    `neurostack-staging-migrations` one-off task on the same image as the
-   deployment. **Verify:** the head reads `035`. Never downgrade.
+   deployment with the container command overridden to the exact revision
+   `alembic upgrade 035`. Never upgrade to the head: once migrations `036`
+   and `037` (decouple and drop the legacy objects) are on main, the image
+   carries them and the head would apply them in the same run. Each of them
+   needs its own explicit owner instruction, 036 before 037, after a fresh
+   SELECT showing zero legacy rows. **Verify:** read back `alembic_version`
+   == `035`. Never downgrade.
 6. **Gate: service deployment (separate approval).** Two paths (see F1
    below):
    - **Path A (cheapest).** If the owner approves, deploy the registered D3
