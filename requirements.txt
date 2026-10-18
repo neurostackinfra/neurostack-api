@@ -19,7 +19,6 @@ alembic>=1.13.1
 
 # HTTP Client
 httpx>=0.26.0
-requests>=2.31.0  # sync HTTP client used by src/services/abacatepay.py
 
 # Authentication & Security
 PyJWT>=2.15.0

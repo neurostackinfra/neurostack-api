@@ -220,9 +220,6 @@ async def readiness_check(
         "database": database_ok,
         "redis": redis_ok,
         "qdrant": qdrant_ok,
-        # Production must be able to authenticate legacy Abacate deliveries.
-        "abacatepay_webhook": not settings.is_production
-        or bool(settings.abacatepay_webhook_secret.get_secret_value().strip()),
         # A production payment rollout is not ready when alert delivery could
         # loop locally or when its rule/smoke digests are absent or malformed.
         "billing_observability": not settings.is_production

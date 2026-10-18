@@ -1,14 +1,13 @@
 """
 NeuroStack API - Billing Endpoints
-Plan summary, hosted ASAAS checkout, legacy webhook handler, and coupon validation.
+Plan summary, hosted ASAAS checkout, ASAAS webhook receiver, and coupon validation.
 """
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.middleware.auth import require_builder
@@ -24,11 +23,8 @@ from src.config.settings import settings
 from src.models.builder import Builder
 from src.models.coupon import Coupon
 from src.models.tenant import Tenant
-from src.models.transaction import Transaction
 from src.repositories import get_db_session_dependency
-from src.repositories.billing import billing_roster_advisory_key
 from src.repositories.database import get_db_session
-from src.services.abacatepay import AbacatePayClient
 from src.services.asaas import AsaasClient
 from src.services.billing_checkout import (
     BillingCheckoutService,
@@ -162,91 +158,6 @@ async def _get_usage(
         _start_plan_usage_limits(),
     )
     return BillingUsageResponse.model_validate(usage)
-
-
-@dataclass(frozen=True)
-class AbacatePayRosterBinding:
-    """Canonical legacy entitlement snapshot owned by billing_subscriptions."""
-
-    builder_id: UUID
-    plan: str
-    billing_cycle: str
-    coupon_code: str | None
-
-
-class AbacatePayRosterUnavailable(RuntimeError):
-    """The canonical legacy roster could not be read safely."""
-
-
-async def _get_abacatepay_roster_binding(
-    external_subscription_id: str,
-    db: AsyncSession,
-) -> AbacatePayRosterBinding | None:
-    """Load the future canonical roster snapshot and deny on read/schema drift."""
-
-    if not external_subscription_id:
-        raise AbacatePayRosterUnavailable
-    try:
-        await db.execute(
-            text("SELECT pg_advisory_xact_lock(:roster_lock_key)"),
-            {"roster_lock_key": billing_roster_advisory_key()},
-        )
-        result = await db.execute(
-            text("""
-                SELECT
-                    roster.billing_roster_revision,
-                    subscription.builder_id,
-                    subscription.plan,
-                    subscription.billing_cycle,
-                    subscription.coupon_code,
-                    subscription.roster_revision AS subscription_roster_revision
-                FROM billing_roster_control AS roster
-                LEFT JOIN billing_subscriptions AS subscription
-                  ON subscription.provider = 'abacatepay'
-                 AND subscription.external_subscription_id = :external_subscription_id
-                 AND subscription.is_active = TRUE
-                LIMIT 1
-            """),
-            {"external_subscription_id": external_subscription_id},
-        )
-        row = result.mappings().one_or_none()
-        if row is None:
-            raise ValueError("billing roster control is unavailable")
-        roster_revision = row["billing_roster_revision"]
-        if not isinstance(roster_revision, int) or roster_revision <= 0:
-            raise ValueError("billing roster is not initialized")
-        builder_id = row["builder_id"]
-        if builder_id is None:
-            return None
-        subscription_roster_revision = row["subscription_roster_revision"]
-        if (
-            not isinstance(subscription_roster_revision, int)
-            or subscription_roster_revision <= 0
-            or subscription_roster_revision > roster_revision
-        ):
-            raise ValueError("invalid canonical roster revision")
-        if not isinstance(builder_id, UUID):
-            builder_id = UUID(str(builder_id))
-        plan = row["plan"]
-        billing_cycle = row["billing_cycle"]
-        coupon_code = row["coupon_code"]
-        if (
-            not isinstance(plan, str)
-            or not plan
-            or not isinstance(billing_cycle, str)
-            or not billing_cycle
-            or (coupon_code is not None and not isinstance(coupon_code, str))
-        ):
-            raise ValueError("invalid canonical roster snapshot")
-        return AbacatePayRosterBinding(
-            builder_id=builder_id,
-            plan=plan,
-            billing_cycle=billing_cycle,
-            coupon_code=coupon_code,
-        )
-    except Exception as exc:
-        logger.warning("AbacatePay roster lookup unavailable")
-        raise AbacatePayRosterUnavailable from exc
 
 
 def _calc_pricing(active_clinics: int) -> dict[str, int]:
@@ -488,129 +399,4 @@ async def asaas_webhook(
             client_factory=_asaas_client,
             environment=settings.environment,
         )
-    return {"ok": True}
-
-
-@router.post(
-    "/webhook",
-    summary="AbacatePay Webhook",
-    response_model=None,
-    status_code=200,
-)
-async def abacatepay_webhook(
-    request: Request,
-    db: AsyncSession = Depends(get_db_session_dependency),
-) -> dict[str, bool]:
-    webhook_secret = settings.abacatepay_webhook_secret.get_secret_value()
-    if not webhook_secret:
-        raise HTTPException(status_code=503, detail="billing_webhook_unavailable")
-
-    signature = request.headers.get("X-Webhook-Signature", "")
-    if not signature:
-        logger.warning("Webhook signature verification failed")
-        raise HTTPException(status_code=400, detail="Invalid signature")
-
-    body = await request.body()
-
-    if not AbacatePayClient.verify_webhook_signature(body, signature, webhook_secret):
-        logger.warning("Webhook signature verification failed")
-        raise HTTPException(status_code=400, detail="Invalid signature")
-
-    import json
-
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    event_type = payload.get("event", "")
-    data = payload.get("data", {})
-    metadata = data.get("metadata", {})
-
-    if event_type not in ("billing.paid", "checkout.completed"):
-        return {"ok": True, "ignored": True}
-
-    subscription = data.get("subscription", {})
-    nested_subscription_id = (
-        subscription.get("id") if isinstance(subscription, dict) else None
-    )
-    external_subscription_id = data.get("subscription_id") or nested_subscription_id
-    if not isinstance(external_subscription_id, str) or not external_subscription_id:
-        logger.warning("AbacatePay webhook subscription is not in canonical roster")
-        return {"ok": True, "ignored": True}
-    try:
-        binding = await _get_abacatepay_roster_binding(external_subscription_id, db)
-    except AbacatePayRosterUnavailable as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="billing_webhook_unavailable",
-        ) from exc
-    if binding is None:
-        logger.warning("AbacatePay webhook subscription is not in canonical roster")
-        return {"ok": True, "ignored": True}
-
-    builder_id_str = metadata.get("builder_id")
-    if not isinstance(builder_id_str, str):
-        logger.warning("Webhook metadata does not match canonical roster")
-        return {"ok": True, "ignored": True}
-
-    try:
-        metadata_builder_id = UUID(builder_id_str)
-    except (ValueError, AttributeError):
-        logger.warning("Webhook metadata does not match canonical roster")
-        return {"ok": True, "ignored": True}
-
-    metadata_coupon = metadata.get("coupon_code")
-    if (
-        metadata_builder_id != binding.builder_id
-        or metadata.get("plan") != binding.plan
-        or metadata.get("cycle") != binding.billing_cycle
-        or metadata_coupon != binding.coupon_code
-    ):
-        logger.warning("Webhook metadata does not match canonical roster")
-        return {"ok": True, "ignored": True}
-
-    result = await db.execute(select(Builder).where(Builder.id == binding.builder_id))
-    builder = result.scalar_one_or_none()
-    if not builder:
-        logger.warning("Canonical webhook builder not found")
-        return {"ok": True, "ignored": True}
-
-    builder.subscription_plan = binding.plan
-    builder.subscription_status = "active"
-    builder.billing_cycle = binding.billing_cycle
-
-    coupon_code = binding.coupon_code
-    if coupon_code:
-        coupon_result = await db.execute(
-            select(Coupon).where(Coupon.code == coupon_code.upper())
-        )
-        coupon = coupon_result.scalar_one_or_none()
-        if coupon:
-            coupon.uses_count += 1
-            if coupon.max_uses is not None and coupon.uses_count >= coupon.max_uses:
-                coupon.is_active = False
-
-    # Log transaction record
-    tx = Transaction(
-        builder_id=binding.builder_id,
-        builder_name=builder.name,
-        amount_cents=data.get("amount", 0),
-        method=data.get("method", "unknown").lower(),
-        cycle=binding.billing_cycle,
-        plan=binding.plan,
-        coupon_code=coupon_code if coupon_code else None,
-        external_id=data.get("id")
-        or data.get("charge_id")
-        or data.get("subscription_id"),
-        event_type=event_type,
-    )
-    db.add(tx)
-
-    await db.commit()
-    logger.info(
-        "Webhook processed",
-        builder_id=str(binding.builder_id),
-        event_type=event_type,
-    )
     return {"ok": True}

@@ -26,7 +26,6 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import NullPool
 
-from src.api.routes import billing as billing_route
 from src.config.settings import settings
 from src.models.base import Base
 from src.repositories.billing import (
@@ -36,6 +35,7 @@ from src.repositories.billing import (
     BillingRevisionConflict,
     BillingTransitionEvidence,
     BillingTransitionRejected,
+    billing_roster_advisory_key,
 )
 from src.services.billing_outbox import billing_fact_schema_digest
 
@@ -971,15 +971,9 @@ async def test_bootstrap_is_fail_closed_for_every_environment(
     ]
 
 
-async def test_group_zero_binding_fences_uninitialized_roster_and_keeps_annual(
+async def test_group_zero_roster_keeps_annual_and_fences_unapproved_legacy_flip(
     postgres_harness: _Harness,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(billing_route.settings, "environment", "test")
-    async with postgres_harness.session() as session:
-        with pytest.raises(billing_route.AbacatePayRosterUnavailable):
-            await billing_route._get_abacatepay_roster_binding("sub-annual", session)
-
     async with postgres_harness.session() as session:
         async with session.begin():
             await session.execute(text("""
@@ -987,12 +981,6 @@ async def test_group_zero_binding_fences_uninitialized_roster_and_keeps_annual(
                     SET billing_roster_revision = 1, updated_at = now()
                     WHERE singleton = true
                 """))
-        assert (
-            await billing_route._get_abacatepay_roster_binding(
-                "sub-not-present", session
-            )
-            is None
-        )
 
     subscription_id = uuid4()
     async with postgres_harness.session() as session:
@@ -1010,17 +998,18 @@ async def test_group_zero_binding_fences_uninitialized_roster_and_keeps_annual(
                 """),
                 {"id": subscription_id, "builder_id": postgres_harness.builder_id},
             )
-        binding = await billing_route._get_abacatepay_roster_binding(
-            "sub-annual", session
-        )
-        assert binding == billing_route.AbacatePayRosterBinding(
-            builder_id=postgres_harness.builder_id,
-            plan="start",
-            billing_cycle="annual",
-            coupon_code="LEGACY10",
-        )
+        stored = (
+            await session.execute(
+                text("""
+                    SELECT plan, billing_cycle, coupon_code, roster_revision
+                    FROM billing_subscriptions WHERE id = :id
+                """),
+                {"id": subscription_id},
+            )
+        ).one()
+        assert tuple(stored) == ("start", "annual", "LEGACY10", 1)
         await session.commit()
-        with pytest.raises(DBAPIError):
+        with pytest.raises(DBAPIError, match="legacy cancellation migration required"):
             async with session.begin_nested():
                 await session.execute(
                     text("""
@@ -1033,11 +1022,24 @@ async def test_group_zero_binding_fences_uninitialized_roster_and_keeps_annual(
                 )
 
 
-async def test_legacy_receiver_and_roster_writer_serialize_in_both_orders(
+async def test_roster_lock_holder_and_roster_writer_serialize_in_both_orders(
     postgres_harness: _Harness,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(billing_route.settings, "environment", "test")
+    # The retired legacy receiver used to be the lock holder here; the roster
+    # writer's own serialization on the roster advisory lock is still owed.
+    async def hold_roster_lock(session: AsyncSession) -> None:
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(:roster_lock_key)"),
+            {"roster_lock_key": billing_roster_advisory_key()},
+        )
+
+    async def is_active(session: AsyncSession, subscription_id: UUID) -> bool:
+        return bool(
+            await session.scalar(
+                text("SELECT is_active FROM billing_subscriptions WHERE id = :id"),
+                {"id": subscription_id},
+            )
+        )
 
     async def seed_legacy(session: AsyncSession, revision: int) -> tuple[UUID, str]:
         subscription_id = uuid4()
@@ -1109,16 +1111,15 @@ async def test_legacy_receiver_and_roster_writer_serialize_in_both_orders(
                 text("SELECT billing_roster_revision FROM billing_roster_control")
             )
             assert revision is not None
-            first_id, first_external = await seed_legacy(setup, revision)
+            first_id, _first_external = await seed_legacy(setup, revision)
 
     receiver = postgres_harness.session()
     writer = postgres_harness.session()
     await receiver.begin()
     await writer.begin()
     try:
-        assert await billing_route._get_abacatepay_roster_binding(
-            first_external, receiver
-        )
+        await hold_roster_lock(receiver)
+        assert await is_active(receiver, first_id)
 
         async def cancel_first() -> None:
             await writer.execute(
@@ -1148,7 +1149,7 @@ async def test_legacy_receiver_and_roster_writer_serialize_in_both_orders(
 
     async with postgres_harness.session() as setup:
         async with setup.begin():
-            second_id, second_external = await seed_legacy(setup, revision + 1)
+            second_id, _second_external = await seed_legacy(setup, revision + 1)
 
     writer = postgres_harness.session()
     receiver = postgres_harness.session()
@@ -1165,16 +1166,15 @@ async def test_legacy_receiver_and_roster_writer_serialize_in_both_orders(
             {"id": second_id, "revision": revision + 2},
         )
 
-        async def receive_after_writer() -> object:
-            return await billing_route._get_abacatepay_roster_binding(
-                second_external, receiver
-            )
+        async def receive_after_writer() -> bool:
+            await hold_roster_lock(receiver)
+            return await is_active(receiver, second_id)
 
         contender = asyncio.create_task(receive_after_writer())
         done, _ = await asyncio.wait({contender}, timeout=0.15)
         assert not done
         await writer.commit()
-        assert await contender is None
+        assert await contender is False
         await receiver.commit()
     finally:
         if writer.in_transaction():

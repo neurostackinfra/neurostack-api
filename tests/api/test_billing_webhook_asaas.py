@@ -2,8 +2,8 @@
 
 Every rejection here must happen before any downstream code (so before any
 delivery is reserved or persisted) and must never echo the token, headers or
-body.  The Abacate boundary is asserted unchanged and unable to govern (or be
-governed by) the new path.  No network: provider calls are fakes.
+body.  The retired legacy webhook path is asserted unrouted, non-public and
+outside this boundary.  No network: provider calls are fakes.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from fastapi.testclient import TestClient
 from prometheus_client import REGISTRY
@@ -64,9 +64,6 @@ def _metric(name: str, **labels: str) -> float:
 @pytest.fixture(autouse=True)
 def _configured(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "asaas_webhook_token", SecretStr(TOKEN))
-    monkeypatch.setattr(
-        settings, "abacatepay_webhook_secret", SecretStr("legacy-fixture-secret")
-    )
 
 
 def _scope(
@@ -169,7 +166,7 @@ def _payload_bytes() -> bytes:
         _headers(extra=[(b"asaas-access-token", TOKEN.encode())]),  # repeated
         _headers(token=None, extra=[(b"x-webhook-signature", b"abc")]),
     ],
-    ids=["missing", "wrong", "empty", "case", "repeated", "abacate-signature-only"],
+    ids=["missing", "wrong", "empty", "case", "repeated", "legacy-signature-only"],
 )
 async def test_invalid_auth_rejects_before_reading_any_body(
     headers: list[tuple[bytes, bytes]],
@@ -328,28 +325,53 @@ async def test_accepted_body_is_replayed_and_strictly_parsed() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The two webhook boundaries never govern each other.
+# The retired legacy webhook path is gone: unrouted, non-public, unbounded.
 # ---------------------------------------------------------------------------
 
+LEGACY_WEBHOOK_PATH = "/v1/billing/webhook"
 
-async def test_abacate_settings_never_govern_the_asaas_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "abacatepay_webhook_secret", SecretStr(""))
+
+async def test_legacy_webhook_path_is_not_a_bounded_ingress_path() -> None:
     reached, sent, _ = await _invoke(
-        [{"type": "http.request", "body": b"{}", "more_body": False}], _headers()
-    )
-    assert len(reached) == 1 and _status(sent) == 204
-
-
-async def test_asaas_token_never_satisfies_the_abacate_rule() -> None:
-    reached, sent, receives = await _invoke(
         [{"type": "http.request", "body": b"{}", "more_body": False}],
-        _headers(),
-        path="/v1/billing/webhook",
+        _headers(extra=[(b"x-webhook-signature", b"legacy-signature")]),
+        path=LEGACY_WEBHOOK_PATH,
     )
-    assert (reached, receives, _status(sent)) == ([], [], 400)
-    assert json.loads(_response_text(sent)) == {"detail": "Invalid signature"}
+    # Passed through untouched to the app (and auth); no ingress state.
+    assert len(reached) == 1 and _status(sent) == 204
+    assert "state" not in reached[0]
+
+
+def test_legacy_webhook_path_is_neither_routed_nor_public() -> None:
+    documented = set(main_app.openapi()["paths"])
+    assert ASAAS_WEBHOOK_PATH in documented
+    assert LEGACY_WEBHOOK_PATH not in documented
+    billing_paths = {getattr(route, "path", None) for route in billing.router.routes}
+    assert "/webhook/asaas" in billing_paths and "/webhook" not in billing_paths
+    assert not hasattr(billing, "abacatepay_webhook")
+    assert AuthMiddleware(MagicMock())._is_public_path(LEGACY_WEBHOOK_PATH) is False
+
+    # Router alone (no auth in front): the legacy path has no handler at all.
+    bare = FastAPI()
+    bare.include_router(billing.router, prefix="/v1/billing")
+    with TestClient(bare) as client:
+        unrouted = client.post(LEGACY_WEBHOOK_PATH, content=b"{}")
+    assert unrouted.status_code == 404
+
+    with TestClient(main_app) as client:
+        legacy = client.post(
+            LEGACY_WEBHOOK_PATH,
+            content=b'{"event":"billing.paid","data":{}}',
+            headers={
+                "X-Webhook-Signature": "legacy-signature",
+                "asaas-access-token": TOKEN,
+                "Content-Type": "application/json",
+            },
+        )
+
+    # Auth answers before the router: the path is an ordinary protected path.
+    assert legacy.status_code == 401
+    assert TOKEN not in legacy.text
 
 
 @pytest.mark.parametrize(
@@ -374,7 +396,7 @@ async def test_near_miss_paths_are_neither_public_nor_bounded_here(path: str) ->
 def test_exact_asaas_path_is_the_only_new_public_exception() -> None:
     auth = AuthMiddleware(MagicMock())
     assert auth._is_public_path(ASAAS_WEBHOOK_PATH) is True
-    assert auth._is_public_path("/v1/billing/webhook") is True
+    assert auth._is_public_path("/v1/billing/webhook") is False
     assert auth._is_public_path("/v1/billing/checkout") is False
     assert auth._is_public_path("/v1/billing/summary") is False
 

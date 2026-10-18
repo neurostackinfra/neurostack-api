@@ -23,8 +23,6 @@ services:
       ASAAS_USER_AGENT: ${ASAAS_USER_AGENT:-NeuroStack/asaas-payment-gateway}
       ASAAS_PROVIDER_EVIDENCE_KEY_ID: ${ASAAS_PROVIDER_EVIDENCE_KEY_ID:?ASAAS provider evidence key id required}
       ASAAS_PROVIDER_EVIDENCE_PUBLIC_KEY: ${ASAAS_PROVIDER_EVIDENCE_PUBLIC_KEY:?ASAAS provider evidence public key required}
-      ABACATEPAY_API_KEY: ${ABACATEPAY_API_KEY:-}
-      ABACATEPAY_WEBHOOK_SECRET: ${ABACATEPAY_WEBHOOK_SECRET:?legacy webhook secret required}
       BILLING_OPERATION_RECEIPT_SIGNING_KEY: ${BILLING_OPERATION_RECEIPT_SIGNING_KEY:?billing receipt signing key required}
       BILLING_PROMETHEUS_RULES_DIGEST: ${BILLING_PROMETHEUS_RULES_DIGEST:?Prometheus rules digest required}
       BILLING_PROMETHEUS_RULES_PATH: /etc/neurostack/prometheus_rules.yml

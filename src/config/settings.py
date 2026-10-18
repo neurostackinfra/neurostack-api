@@ -357,15 +357,6 @@ class Settings(BaseSettings):
     public_base_url: str = ""
 
     # ============================================
-    # AbacatePay (Payment Gateway)
-    # ============================================
-    abacatepay_api_key: SecretStr = SecretStr("")
-    # ABACATEPAY_WEBHOOK_SECRET: string gerada pela AbacatePay ao cadastrar o endpoint
-    # webhook em app.abacatepay.com → Webhooks → Criar endpoint → copiar o "Secret"
-    # NÃO colocar a URL do webhook aqui — apenas o token/secret HMAC.
-    abacatepay_webhook_secret: SecretStr = SecretStr("")
-
-    # ============================================
     # ASAAS (Payment Gateway)
     # ============================================
     # The production API origin and authentication header are code constants;
@@ -670,11 +661,6 @@ class Settings(BaseSettings):
                 errors.append(
                     "ALLOWED_ORIGINS should not contain '*' in production for security"
                 )
-
-            # The legacy Abacate receiver must be able to authenticate every
-            # delivery; production never starts without its HMAC secret.
-            if not self.abacatepay_webhook_secret.get_secret_value().strip():
-                errors.append("ABACATEPAY_WEBHOOK_SECRET is required in production")
 
             if not self.is_billing_observability_compatible:
                 errors.append(

@@ -1,4 +1,4 @@
-"""Protected ASAAS and legacy-webhook configuration tests."""
+"""Protected ASAAS and production billing configuration tests."""
 
 from __future__ import annotations
 
@@ -111,12 +111,10 @@ def test_non_production_namespace_key_is_rejected_without_disclosure(
 def test_secrets_are_masked_from_settings_repr_and_dump() -> None:
     api_key = "$aact_prod_fixture-never-render"
     webhook_token = "webhook-fixture-never-render"
-    legacy_api_key = "legacy-api-key-never-render"
     configured = Settings(
         _env_file=None,
         asaas_api_key=api_key,
         asaas_webhook_token=webhook_token,
-        abacatepay_api_key=legacy_api_key,
     )
 
     rendered = repr(configured)
@@ -125,10 +123,7 @@ def test_secrets_are_masked_from_settings_repr_and_dump() -> None:
     assert api_key not in dumped
     assert webhook_token not in rendered
     assert webhook_token not in dumped
-    assert legacy_api_key not in rendered
-    assert legacy_api_key not in dumped
     assert isinstance(configured.asaas_api_key, SecretStr)
-    assert isinstance(configured.abacatepay_api_key, SecretStr)
 
 
 def test_absent_or_incomplete_asaas_configuration_is_incompatible() -> None:
@@ -142,46 +137,46 @@ def test_absent_or_incomplete_asaas_configuration_is_incompatible() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [{}, {"abacatepay_webhook_secret": " \t "}],
-    ids=["absent", "whitespace-only"],
-)
-def test_production_startup_rejects_missing_legacy_webhook_secret(
-    overrides: dict[str, object],
+def test_settings_expose_no_retired_legacy_gateway_fields() -> None:
+    legacy_fields = {
+        name for name in Settings.model_fields if "abacate" in name.lower()
+    }
+
+    assert legacy_fields == set()
+
+
+def test_production_startup_accepts_complete_asaas_billing_configuration() -> None:
+    configured = _production_settings()
+
+    assert configured.is_production is True
+    assert configured.is_billing_observability_compatible is True
+
+
+def test_production_startup_ignores_stale_legacy_gateway_environment(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A task definition that still injects the retired variables must neither
+    # block startup nor surface their values anywhere in the settings object.
+    monkeypatch.setenv("ABACATEPAY_API_KEY", "stale-legacy-api-key")
+    monkeypatch.setenv("ABACATEPAY_WEBHOOK_SECRET", "stale-legacy-secret")
+
+    configured = _production_settings()
+
+    assert configured.is_production is True
+    rendered = repr(configured) + repr(configured.model_dump())
+    assert "stale-legacy-api-key" not in rendered
+    assert "stale-legacy-secret" not in rendered
+
+
+def test_production_startup_error_never_mentions_retired_legacy_gateway() -> None:
     with pytest.raises(ConfigurationError) as exc_info:
-        _production_settings(**overrides)
-
-    message = str(exc_info.value)
-    assert "ABACATEPAY_WEBHOOK_SECRET is required in production" in message
-    assert "production-secret-key-at-least-32-characters" not in message
-    assert "password" not in message
-
-
-def test_production_startup_error_never_echoes_legacy_webhook_secret() -> None:
-    with pytest.raises(ConfigurationError) as exc_info:
-        _production_settings(
-            abacatepay_webhook_secret="legacy-fixture-secret",
-            debug=True,
-        )
+        _production_settings(debug=True)
 
     message = str(exc_info.value)
     assert "DEBUG must be False in production" in message
-    assert "ABACATEPAY_WEBHOOK_SECRET" not in message
-    assert "legacy-fixture-secret" not in message
-
-
-def test_production_startup_accepts_injected_legacy_webhook_secret() -> None:
-    configured = _production_settings(abacatepay_webhook_secret="legacy-fixture-secret")
-
-    assert configured.is_production is True
-    assert isinstance(configured.abacatepay_webhook_secret, SecretStr)
-    assert (
-        configured.abacatepay_webhook_secret.get_secret_value()
-        == "legacy-fixture-secret"
-    )
-    assert "legacy-fixture-secret" not in repr(configured)
+    assert "ABACATEPAY" not in message.upper()
+    assert "production-secret-key-at-least-32-characters" not in message
+    assert "password" not in message
 
 
 @pytest.mark.parametrize(
@@ -197,9 +192,7 @@ def test_production_billing_observability_fails_closed(
     overrides: dict[str, object],
 ) -> None:
     with pytest.raises((ConfigurationError, ValidationError)):
-        _production_settings(
-            abacatepay_webhook_secret="legacy-fixture-secret", **overrides
-        )
+        _production_settings(**overrides)
 
 
 @pytest.mark.parametrize(
