@@ -349,6 +349,7 @@ def test_release_gate_passes_clean_conventional_candidate(tmp_path: Path) -> Non
     assert "baseline secret/PII findings (review required)" in result.stdout
     assert "tests/legacy_fixture.py" in result.stdout
     assert "tests/integration/test_billing_producer_handoff_postgres.py" in calls
+    assert "tests/integration/test_asaas_subscription_triggers_postgres.py" in calls
     assert "conventional commits: 1 checked" in result.stdout
 
 

@@ -626,6 +626,7 @@ asaas_release_candidate_gate() (
         tests/integration/test_asaas_billing_postgres.py \
         tests/integration/test_asaas_checkout_service_postgres.py \
         tests/integration/test_asaas_webhook_postgres.py \
+        tests/integration/test_asaas_subscription_triggers_postgres.py \
         tests/integration/test_billing_producer_handoff_postgres.py -v || {
         echo "release-candidate PostgreSQL suites failed" >&2
         return 1
