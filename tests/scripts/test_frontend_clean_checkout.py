@@ -40,6 +40,11 @@ STATIC_PATH = re.compile(
     r"""^(?:"([^"\\]*)"|'([^'\\]*)'"""
     r"""|\{\s*(?:"([^"\\]*)"|'([^'\\]*)'|`([^`\\$]*)`)\s*\})$"""
 )
+# The path syntax both route lists can express (allow-list): "/" or segments
+# that are literals or a single `:param`. Wildcards (`/billing/*`, `:rest*`),
+# optional params (`:id?`) and regexps match more than the list would serve.
+ROUTE_PATH = re.compile(r"^/$|^(?:/(?:[A-Za-z0-9._~-]+|:[A-Za-z_][A-Za-z0-9_]*))+$")
+WOUTER_IMPORT = re.compile(r"""\bimport\s+([^;]*?)\s*\bfrom\s*["']wouter["']\s*;?""")
 
 
 @cache
@@ -253,7 +258,20 @@ def _braced_end(text: str, index: int) -> int:
                 index += 1
             elif char == quote:
                 quote = ""
+            elif char == "\n" and quote != "`":
+                # JSX text such as <p>Isn't</p> is not a string: reading it as
+                # one would swallow the rest of the tag (and its path).
+                raise AssertionError(
+                    f"string literal crosses a line break in a <Route> value "
+                    f"(JSX text apostrophe?): {text[index - 40 : index]!r}"
+                )
         elif char in "\"'`":
+            previous = text[index - 1 : index]
+            if char != "`" and (previous.isalnum() or previous in {"_", "$"}):
+                raise AssertionError(
+                    f"quote after an identifier in a <Route> value "
+                    f"(JSX text apostrophe?): {text[index - 40 : index + 1]!r}"
+                )
             quote = char
         elif char == "{":
             depth += 1
@@ -317,10 +335,69 @@ def _routes_in(text: str) -> set[str]:
     for attributes in _route_tags(text):
         # wouter `nest` makes every inner path relative: the list would lie.
         assert "nest" not in attributes, f"nested <Route>: {attributes}"
+        assert "base" not in attributes, f"base attribute on <Route>: {attributes}"
         # A pathless <Route component={X} /> is the catch-all: no SPA route.
         if "path" in attributes:
-            routes.add(_static_path(attributes["path"]))
+            path = _static_path(attributes["path"])
+            assert ROUTE_PATH.match(path), (
+                f"unsupported route path syntax {path!r} (wildcard, optional "
+                f"param or regexp): the SPA route list cannot express it"
+            )
+            routes.add(path)
     return routes
+
+
+def _wouter_imports(text: str) -> list[tuple[str, str]]:
+    """(imported, local) for every binding imported from wouter."""
+
+    bindings: list[tuple[str, str]] = []
+    for clause in WOUTER_IMPORT.findall(text):
+        clause = clause.strip()
+        if clause.startswith("type "):
+            continue
+        named = clause.startswith("{") and clause.endswith("}")
+        assert named, f"non-named wouter import (default or namespace): {clause!r}"
+        for spec in clause[1:-1].split(","):
+            words = spec.split()
+            if not words or words[0] == "type":
+                continue
+            assert len(words) in {1, 3} and words[1:2] in ([], ["as"]), spec
+            bindings.append((words[0], words[-1]))
+    return bindings
+
+
+def _assert_jsx_only_references(text: str, name: str) -> None:
+    """Every reference to ``name`` outside the wouter import is a JSX tag."""
+
+    body = WOUTER_IMPORT.sub("", text)
+    for match in re.finditer(rf"(?<![\w$.]){re.escape(name)}(?![\w$])", body):
+        before = body[max(0, match.start() - 2) : match.start()]
+        assert before.endswith("<") or before == "</", (
+            f"{name} used other than as a <{name}> tag (createElement, "
+            f"aliasing, `< {name}`): {body[match.start() - 30 : match.end() + 30]!r}"
+        )
+
+
+def _assert_route_bindings(text: str) -> None:
+    """wouter's Route is only rendered as a literal <Route> tag (no alias,
+    createElement/jsx call or rebinding), and its Router (which takes `base`,
+    making every inner path relative) only once."""
+
+    bindings = _wouter_imports(text)
+    routes = [local for imported, local in bindings if imported == "Route"]
+    assert routes == ["Route"], f"Route imported as {routes} (aliased Route import)"
+    _assert_jsx_only_references(text, "Route")
+    routers = [local for imported, local in bindings if imported == "Router"]
+    assert len(routers) <= 1, f"Router imported as {routers}"
+    for local in routers:
+        _assert_jsx_only_references(text, local)
+        count = len(re.findall(rf"<{re.escape(local)}(?![\w$])", text))
+        assert count == 1, f"nested <Router> (<{local}> rendered {count} times)"
+
+
+def _declared_routes(text: str) -> set[str]:
+    _assert_route_bindings(text)
+    return _routes_in(text)
 
 
 def test_route_parser_ignores_attribute_order_and_line_breaks() -> None:
@@ -369,6 +446,28 @@ def test_route_parser_reads_braced_and_template_literal_paths() -> None:
         ("<Route {...props} />", "spread attribute"),
         ('<Route path="/a" nest>{() => <A />}</Route>', "nested <Route>"),
         ('<Route path="/a" component={() => {}', "unbalanced"),
+        ('<Route path="/billing/*" component={A} />', "unsupported route path"),
+        ('<Route path="/admin/:rest*" component={A} />', "unsupported route path"),
+        ('<Route path="/t/:id?" component={A} />', "unsupported route path"),
+        ('<Route path="*" component={A} />', "unsupported route path"),
+        ('<Route path="/a" base="/b" component={A} />', "base attribute"),
+        (
+            # T08: the apostrophe opened a "string" that closed in a later,
+            # non-Route tag; the /x route was silently read as pathless.
+            '<Route component={() => <p>Isn\'t ready</p>} path="/x" />\n'
+            "<Toaster label={<span>Don't</span>} />",
+            "quote after an identifier",
+        ),
+        (
+            '<Route component={() => <p>Say \'hi</p>} path="/x" />\n'
+            "<Toaster label={<span>bye'</span>} />",
+            "crosses a line break",
+        ),
+        (
+            "<Route\n  component={() => {\n    // it's lazy\n    return <L />;\n"
+            '  }}\n  path="/lazy"\n/>',
+            "quote after an identifier",
+        ),
     ],
 )
 def test_route_parser_fails_loudly_on_paths_it_cannot_derive(
@@ -378,11 +477,110 @@ def test_route_parser_fails_loudly_on_paths_it_cannot_derive(
         _routes_in(snippet)
 
 
+WOUTER_IMPORT_LINE = 'import { Switch, Route, Router as WouterRouter } from "wouter";\n'
+APP_ROUTER = '<WouterRouter base="/">{children}</WouterRouter>\n'
+
+
+def test_route_bindings_accept_the_app_tsx_shape() -> None:
+    snippet = WOUTER_IMPORT_LINE + APP_ROUTER + '<Route path="/a" component={A} />'
+    assert _declared_routes(snippet) == {"/a"}
+
+
+@pytest.mark.parametrize(
+    ("snippet", "message"),
+    [
+        (
+            # T07: an aliased Route is invisible to the <Route scan.
+            WOUTER_IMPORT_LINE.replace("Route,", "Route, Route as Page,")
+            + APP_ROUTER
+            + '<Page path="/aliased" component={A} />',
+            "aliased Route import",
+        ),
+        (
+            WOUTER_IMPORT_LINE.replace("Route,", "Route as Page,")
+            + APP_ROUTER
+            + '<Page path="/aliased" component={A} />',
+            "aliased Route import",
+        ),
+        (
+            # T15
+            WOUTER_IMPORT_LINE
+            + APP_ROUTER
+            + '{React.createElement(Route, { path: "/ce", component: A })}',
+            "used other than as a <Route> tag",
+        ),
+        (
+            WOUTER_IMPORT_LINE + APP_ROUTER + '{jsx(Route, { path: "/j" })}',
+            "used other than as a <Route> tag",
+        ),
+        (
+            WOUTER_IMPORT_LINE + APP_ROUTER + "const Page = Route;",
+            "used other than as a <Route> tag",
+        ),
+        (
+            WOUTER_IMPORT_LINE + APP_ROUTER + '< Route path="/spaced" />',
+            "used other than as a <Route> tag",
+        ),
+        (
+            # T12: a nested Router makes every inner path relative to `base`.
+            WOUTER_IMPORT_LINE
+            + APP_ROUTER
+            + '<Route path="/admin/x">{() => <WouterRouter base="/admin">'
+            '<Route path="/users" component={U} /></WouterRouter>}</Route>',
+            "nested <Router>",
+        ),
+        (
+            WOUTER_IMPORT_LINE + "<WouterRouter>{children}</WouterRouter>\n"
+            "{createElement(WouterRouter, { base: '/admin' })}",
+            "used other than as a <WouterRouter> tag",
+        ),
+        (
+            'import * as wouter from "wouter";\n<wouter.Route path="/ns" />',
+            "non-named wouter import",
+        ),
+        (
+            'import { Switch } from "wouter";\n<Route path="/a" />',
+            "Route imported as []",
+        ),
+    ],
+    ids=[
+        "alias-plus-route",
+        "alias-only",
+        "create-element",
+        "jsx-runtime-call",
+        "rebinding",
+        "space-after-angle",
+        "nested-router-base",
+        "router-create-element",
+        "namespace-import",
+        "route-not-imported",
+    ],
+)
+def test_route_bindings_fail_loudly_on_routes_outside_literal_tags(
+    snippet: str, message: str
+) -> None:
+    with pytest.raises(AssertionError, match=re.escape(message)):
+        _declared_routes(snippet)
+
+
+def _declares_routes(text: str) -> bool:
+    if ROUTE_OPEN.search(text):
+        return True
+    # An aliased or namespaced wouter Route declares routes without a literal
+    # <Route tag. A bare Router (tests wrap pages in a memory-location Router)
+    # adds no route by itself.
+    try:
+        bindings = _wouter_imports(text)
+    except AssertionError:
+        return True
+    return any(imported == "Route" for imported, _ in bindings)
+
+
 def _route_declarers(sources: dict[str, str]) -> list[str]:
     return sorted(
         path
         for path, text in sources.items()
-        if path != APP_TSX.relative_to(ROOT).as_posix() and ROUTE_OPEN.search(text)
+        if path != APP_TSX.relative_to(ROOT).as_posix() and _declares_routes(text)
     )
 
 
@@ -391,8 +589,20 @@ def test_route_declarer_scan_flags_routes_outside_app_tsx() -> None:
         f"{ARTIFACT}/src/App.tsx": '<Route path="/a" component={A} />',
         f"{ARTIFACT}/src/pages/nested.tsx": '<Route path="/a/b" component={B} />',
         f"{ARTIFACT}/src/pages/other.tsx": "<Router hook={hook}><Routes /></Router>",
+        f"{ARTIFACT}/src/pages/links.tsx": 'import { Link, useLocation } from "wouter";',
+        f"{ARTIFACT}/src/pages/aliased.tsx": (
+            'import { Route as Page } from "wouter";\n<Page path="/p" />'
+        ),
+        f"{ARTIFACT}/src/pages/router.tsx": (
+            'import { Router as R } from "wouter";\n<R base="/x">{c}</R>'
+        ),
+        f"{ARTIFACT}/src/pages/namespace.tsx": 'import * as w from "wouter";',
     }
-    assert _route_declarers(sources) == [f"{ARTIFACT}/src/pages/nested.tsx"]
+    assert _route_declarers(sources) == [
+        f"{ARTIFACT}/src/pages/aliased.tsx",
+        f"{ARTIFACT}/src/pages/namespace.tsx",
+        f"{ARTIFACT}/src/pages/nested.tsx",
+    ]
 
 
 def test_no_source_file_other_than_app_tsx_declares_a_route() -> None:
@@ -409,7 +619,7 @@ def test_no_source_file_other_than_app_tsx_declares_a_route() -> None:
 
 
 def _app_routes() -> set[str]:
-    return _routes_in(APP_TSX.read_text(encoding="utf-8"))
+    return _declared_routes(APP_TSX.read_text(encoding="utf-8"))
 
 
 def test_spa_route_list_matches_app_tsx_routes() -> None:
@@ -423,7 +633,7 @@ def test_spa_route_list_matches_app_tsx_routes() -> None:
     assert len(static) == len(set(static))
     assert not set(static) & set(dynamic)
     assert set(static) | set(dynamic) == app_routes - excluded
-    assert all(":" not in route for route in static)
+    assert all(":" not in route and "*" not in route for route in static)
 
 
 def test_spa_dynamic_patterns_match_only_their_route_shape() -> None:
