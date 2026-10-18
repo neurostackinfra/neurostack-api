@@ -29,6 +29,7 @@ from src.models.billing import (
 )
 from src.models.coupon import Coupon
 from src.models.transaction import Transaction
+from src.services.billing_catalog import BILLING_CATALOG, CATALOG_VERSION_ID
 from src.services.billing_outbox import authoritative_billing_fact_schema_digest
 
 _ENVIRONMENTS: Final = frozenset({"development", "staging", "production", "test"})
@@ -47,6 +48,9 @@ _LIVE_CHECKOUT_STATES: Final = (
     "terminal_pending_readback",
 )
 _TERMINAL_SUBSCRIPTION_STATUSES: Final = ("inactive", "cancelled")
+# Public read-contract aliases (Group 6b); the tuples above stay the source.
+LIVE_CHECKOUT_STATES: Final = _LIVE_CHECKOUT_STATES
+TERMINAL_SUBSCRIPTION_STATUSES: Final = _TERMINAL_SUBSCRIPTION_STATUSES
 
 
 class BillingStateUnavailable(RuntimeError):
@@ -449,16 +453,20 @@ class BillingRepository:
         capability: BillingTopupCapabilityReceipt,
         environment: str,
         now: datetime,
+        for_update: bool = True,
     ) -> bool:
-        """Revalidate the immutable capability evidence at every active gate."""
+        """Revalidate the immutable capability evidence at every active gate.
 
+        ``for_update=False`` is the lock-free advisory read (Group 6b summary);
+        every gate that authorizes a reservation keeps the row locks.
+        """
+
+        binding_query = select(BillingTopupCapabilityBinding).where(
+            BillingTopupCapabilityBinding.environment == environment,
+            BillingTopupCapabilityBinding.capability_receipt_id == capability.id,
+        )
         binding = await self.session.scalar(
-            select(BillingTopupCapabilityBinding)
-            .where(
-                BillingTopupCapabilityBinding.environment == environment,
-                BillingTopupCapabilityBinding.capability_receipt_id == capability.id,
-            )
-            .with_for_update()
+            binding_query.with_for_update() if for_update else binding_query
         )
         if binding is None or capability.operation_id is None:
             return False
@@ -468,26 +476,24 @@ class BillingRepository:
             binding.reconciliation_receipt_id,
             binding.verification_receipt_id,
         )
+        receipts_query = select(BillingOperationReceipt).where(
+            BillingOperationReceipt.environment == environment,
+            BillingOperationReceipt.operation_id == capability.operation_id,
+            BillingOperationReceipt.id.in_(receipt_ids),
+            BillingOperationReceipt.scope == "topup_capability",
+            BillingOperationReceipt.applied_at.is_(None),
+            BillingOperationReceipt.request_id == capability.request_id,
+            BillingOperationReceipt.inbox_high_watermark
+            == capability.inbox_high_watermark,
+            BillingOperationReceipt.deployment_digest == capability.deployment_digest,
+            BillingOperationReceipt.billing_fact_schema_digest
+            == capability.billing_fact_schema_digest,
+            BillingOperationReceipt.expires_at > now,
+        )
         rows = list(
             (
                 await self.session.execute(
-                    select(BillingOperationReceipt)
-                    .where(
-                        BillingOperationReceipt.environment == environment,
-                        BillingOperationReceipt.operation_id == capability.operation_id,
-                        BillingOperationReceipt.id.in_(receipt_ids),
-                        BillingOperationReceipt.scope == "topup_capability",
-                        BillingOperationReceipt.applied_at.is_(None),
-                        BillingOperationReceipt.request_id == capability.request_id,
-                        BillingOperationReceipt.inbox_high_watermark
-                        == capability.inbox_high_watermark,
-                        BillingOperationReceipt.deployment_digest
-                        == capability.deployment_digest,
-                        BillingOperationReceipt.billing_fact_schema_digest
-                        == capability.billing_fact_schema_digest,
-                        BillingOperationReceipt.expires_at > now,
-                    )
-                    .with_for_update()
+                    receipts_query.with_for_update() if for_update else receipts_query
                 )
             ).scalars()
         )
@@ -518,6 +524,96 @@ class BillingRepository:
             == (row.evidence_type, row.payload_digest, row.actor_user_id)
             for row in rows
         )
+
+    async def active_topup_capability_is_current(
+        self,
+        *,
+        control: BillingRolloutControl,
+        environment: str,
+        now: datetime,
+        for_update: bool,
+    ) -> bool:
+        """Whether the control row's active top-up capability is valid now.
+
+        The single capability check of the ``general`` top-up reservation,
+        shared with the lock-free Group 6b summary read: the receipt must
+        exist in ``environment``, pass ``_capability_is_valid`` and keep its
+        typed operation-receipt binding current.  ``for_update=True`` (every
+        authorizing gate) row-locks the receipt, binding and receipts;
+        ``for_update=False`` takes no lock and is advisory only.
+        """
+
+        if control.active_topup_capability_id is None:
+            return False
+        capability_query = select(BillingTopupCapabilityReceipt).where(
+            BillingTopupCapabilityReceipt.environment == environment,
+            BillingTopupCapabilityReceipt.id == control.active_topup_capability_id,
+        )
+        capability = (
+            await self.session.execute(
+                capability_query.with_for_update() if for_update else capability_query
+            )
+        ).scalar_one_or_none()
+        return bool(
+            capability is not None
+            and _capability_is_valid(capability, environment=environment, now=now)
+            and await self._topup_capability_binding_is_current(
+                capability=capability,
+                environment=environment,
+                now=now,
+                for_update=for_update,
+            )
+        )
+
+    async def read_rollout_control(
+        self, *, environment: str
+    ) -> BillingRolloutControl | None:
+        """Lock-free read of the persisted rollout row (advisory readers only).
+
+        Takes neither the advisory lock nor a row lock, so it never blocks a
+        transition or a reservation; a decision that authorizes egress must
+        use ``lock_rollout_control`` instead.
+        """
+
+        return cast(
+            BillingRolloutControl | None,
+            await self.session.scalar(
+                select(BillingRolloutControl)
+                .where(BillingRolloutControl.environment == environment)
+                .execution_options(populate_existing=True)
+            ),
+        )
+
+    @staticmethod
+    def canary_reservation_admits(
+        control: BillingRolloutControl, *, builder_id: UUID, offer_id: str
+    ) -> bool:
+        """Whether a canary reservation would accept a new no-coupon attempt.
+
+        Mirrors ``reserve_canary_subscription_checkout`` (the active canary for
+        this builder, the exact Plus offer and a free subscription slot; the
+        service rejects any coupon) and the canary branch of
+        ``authorize_and_reserve_topup_checkout`` (the exact 500-credit offer of
+        the canary catalog and a free top-up slot).  Advisory only.
+        """
+
+        if (
+            control.state != "canary_allowlist"
+            or control.canary_builder_id != builder_id
+        ):
+            return False
+        if offer_id == _CANARY_SUBSCRIPTION_OFFER:
+            return control.canary_subscription_checkout_id is None
+        if offer_id == _CANARY_TOPUP_OFFER:
+            offer = BILLING_CATALOG.get(offer_id)
+            return bool(
+                offer is not None
+                and CATALOG_VERSION_ID == _CANARY_CATALOG
+                and offer.amount_cents == _CANARY_TOPUP_AMOUNT_CENTS
+                and offer.credits * 1_000 == _CANARY_TOPUP_CREDIT_GRANT_MC
+                and control.canary_topup_checkout_id is None
+            )
+        return False
 
     async def authorize_and_reserve_topup_checkout(
         self,
@@ -581,28 +677,11 @@ class BillingRepository:
                 or control.active_topup_capability_id is None
             ):
                 raise BillingCapabilityRejected("topup capability is required")
-            capability_result = await self.session.execute(
-                select(BillingTopupCapabilityReceipt)
-                .where(
-                    BillingTopupCapabilityReceipt.environment == environment,
-                    BillingTopupCapabilityReceipt.id
-                    == control.active_topup_capability_id,
-                )
-                .with_for_update()
-            )
-            capability = capability_result.scalar_one_or_none()
-            if (
-                capability is None
-                or not _capability_is_valid(
-                    capability,
-                    environment=environment,
-                    now=datetime.now(timezone.utc),
-                )
-                or not await self._topup_capability_binding_is_current(
-                    capability=capability,
-                    environment=environment,
-                    now=datetime.now(timezone.utc),
-                )
+            if not await self.active_topup_capability_is_current(
+                control=control,
+                environment=environment,
+                now=datetime.now(timezone.utc),
+                for_update=True,
             ):
                 raise BillingCapabilityRejected("topup capability is not valid")
         else:

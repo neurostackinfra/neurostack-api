@@ -19,6 +19,7 @@
    - [Policies](#policies)
    - [Knowledge](#knowledge)
    - [Health](#health)
+   - [Billing do builder (leitura)](#billing-do-builder-leitura)
 6. [Schemas](#schemas)
 7. [Exemplos de Integração](#exemplos-de-integração)
 
@@ -531,6 +532,171 @@ Rotaciona (regenera) a API key do tenant.
 
 Retorna estatísticas do tenant.
 
+### Billing do builder (leitura)
+
+Rotas para a tela de pagamentos. Exigem login de **builder** (JWT com claim
+`builder_id`; outros papéis recebem `403`, sem token `401`). O builder vem
+sempre do JWT: `builder_id`/`tenant_id` enviados pelo cliente são ignorados.
+As leituras não alteram nenhuma linha, não reservam nada e não tomam lock de
+linha nem advisory lock (somente `SELECT` simples). Valores monetários são
+inteiros em centavos de BRL; o cliente nunca calcula preço.
+
+#### GET /v1/billing/catalog
+
+Catálogo imutável da versão `catalog_version_id` (uma mudança comercial
+publica uma nova versão). Resposta igual para todo builder.
+
+**Response (200):**
+
+```json
+{
+  "catalog_version_id": "payment-2026-10-03",
+  "offers": [
+    {
+      "offer_id": "plan_plus_monthly_v1",
+      "kind": "subscription",
+      "currency": "BRL",
+      "amount_cents": 99900,
+      "credits": 5000,
+      "included_clinics": 1,
+      "additional_clinic_amount_cents": 20000
+    },
+    {
+      "offer_id": "package_credits_500_v1",
+      "kind": "topup",
+      "currency": "BRL",
+      "amount_cents": 10000,
+      "credits": 500,
+      "included_clinics": 0,
+      "additional_clinic_amount_cents": 0
+    }
+  ]
+}
+```
+
+`offers` traz as sete ofertas na ordem canônica (Plus, Pro, Max e os pacotes
+de 500/1000/2000/4000 créditos). `kind` é `subscription` (mensal) ou `topup`
+(avulso); `additional_clinic_amount_cents` é o preço por clínica adicional/mês.
+
+#### GET /v1/billing/summary
+
+Mantém byte a byte todos os campos legados (`plan`, `active_clinics`,
+`free_tier`, `extra_clinics`, `base_price`, `extra_price`, `total_monthly`,
+`total_annual`, `discount_pct`, `subscription_status`, `billing_cycle`,
+`usage`) e acrescenta, depois de `usage`:
+
+```json
+{
+  "subscription": {
+    "offer_id": "plan_pro_monthly_v1",
+    "catalog_version_id": "payment-2026-10-03",
+    "status": "active",
+    "amount_cents": 265000,
+    "current_period_end": "2026-11-11"
+  },
+  "checkout": {
+    "available_offer_ids": ["package_credits_500_v1"],
+    "live_session": {
+      "checkout_session_id": "5b0c8f7e-0000-4000-8000-000000000000",
+      "kind": "topup",
+      "state": "active"
+    },
+    "available": true
+  },
+  "topup_commercial_enabled": true
+}
+```
+
+- `subscription`: a assinatura ASAAS atual (não terminal) ou `null`.
+  `status` é o estado financeiro do registro de assinatura (`active_linked`
+  até a primeira liquidação, `active` depois dela, `readback_required` ou
+  `non_billable_pending_readback` enquanto há evidência do provedor
+  pendente), **não** o flag legado `subscription_status`. `amount_cents` é o
+  valor mensal contratado (snapshot do checkout). `status` continua `active`
+  durante uma renovação vencida e depois de um estorno: ele não é prova de
+  período pago; para isso use `current_period_end`.
+- `subscription.current_period_end`: o maior `cycle_end` entre os ciclos da
+  assinatura **integralmente pagos, líquidos de estornos**, isto é,
+  `state IN ('settled', 'restored') AND reversed_cents = restored_cents`.
+  Ciclos estornados (`reversed`), parcialmente restaurados, `pending` ou
+  `quarantined` são ignorados: um ciclo atual estornado faz o valor voltar ao
+  fim do último ciclo integralmente pago, e `null` significa que nenhum ciclo
+  está integralmente pago líquido de estornos: nenhum jamais foi pago, ou
+  todos estão estornados, parcialmente restaurados (`reversed_cents` maior
+  que `restored_cents`), `pending` ou `quarantined`. Um ciclo com estorno parcial
+  **não** conta (padrão conservador; é uma decisão de política do dono do
+  produto e pode mudar). É uma **data de calendário** (`YYYY-MM-DD`, o
+  vencimento do ASAAS, sem fuso), não um instante UTC: o cliente deve exibi-la
+  como data local sem conversão. Em JavaScript, `new Date("2026-11-11")` é
+  meia-noite UTC e aparece como 10/11 em `America/Sao_Paulo`; separe
+  ano/mês/dia (ou use `new Date(2026, 10, 11)`) em vez disso.
+- Assinaturas legadas (não ASAAS, por exemplo Abacate ainda não migrada) e
+  encerradas (`inactive`/`cancelled`) resultam em `subscription: null`,
+  mesmo que os campos legados (`plan`, `subscription_status`) digam `active`.
+  Ao encerrar, a data de período pago também deixa de ser informada (o objeto
+  inteiro vira `null`).
+- `checkout.available_offer_ids`: em ordem de catálogo, as ofertas que um
+  `POST /v1/billing/checkout` sem cupom aceitaria agora (rollout persistido,
+  builder do canário, restrição Plus/500 créditos e sem cupom do canário,
+  elegibilidade de assinatura, gate de recarga). Uma oferta com tentativa
+  viva do próprio builder aparece porque o `POST` devolve essa tentativa. É
+  **consultivo**: o `POST` continua sendo a autoridade, e a resposta nunca
+  informa por que uma oferta está ausente. A lista **não** reflete o kill
+  switch de egress financeiro, a prontidão do webhook nem o método de
+  pagamento: o `POST` pode responder `503` (ou `422` para um método não
+  permitido) para uma oferta listada.
+- `checkout.live_session`: a tentativa viva mais recente do builder
+  (`creating`, `active`, `paid_pending_subscription`,
+  `reconciliation_required`, `terminal_pending_readback`) ou `null`; a URL
+  do provedor é obtida em `GET /v1/billing/checkout/{checkout_session_id}`.
+  Não traz `offer_id`: a oferta da tentativa é lida nesse `GET`.
+- `checkout.available`: `true` quando a leitura consultiva funcionou (mesmo
+  com rollout fechado e lista vazia: "nada à venda"). A mesma resposta
+  `available: true` com lista vazia também ocorre quando a configuração
+  ASAAS é incompatível, quando não existe a linha de rollout do ambiente ou
+  quando o builder não é o canário em `canary_allowlist` (casos em que o
+  `POST` também recusa com `503`). `false` somente quando
+  a própria leitura falhou: então `available_offer_ids` é `[]`,
+  `live_session` é `null` e `topup_commercial_enabled` é `false` (fechado
+  para compra), e a tela deve mostrar "indisponível", não "nada à venda". A
+  falha incrementa `neurostack_billing_summary_checkout_unavailable_total` e
+  registra o aviso estruturado `billing summary checkout availability
+  unavailable` (apenas `error_type`). É por requisição: nada é guardado nem
+  compartilhado, então a falha de um builder não afeta outro. Os campos
+  legados, `subscription` e o status `200` não mudam.
+- `topup_commercial_enabled`: `true` somente se o flag armazenado é
+  verdadeiro, o rollout está em `general`, a capability de recarga está
+  válida agora (inclusive o vínculo dos recibos de operação) e a
+  configuração ASAAS é compatível; `false` por padrão e em qualquer falha de
+  leitura. O critério de aceite falava em "três condições", mas o flag também
+  exige a configuração ASAAS compatível (quatro). Em `canary_allowlist` a
+  recarga de 500 créditos do canário pode aparecer em `available_offer_ids`
+  com `topup_commercial_enabled=false`: a tela habilita "Recarregar" pelo
+  flag, não pela lista.
+
+Se o estado financeiro (assinatura ou tentativa viva) não puder ser lido sem
+adivinhar, a rota responde `503 {"detail": "billing_summary_unavailable"}` em
+vez de informar "sem assinatura".
+
+#### POST /v1/billing/checkout — `202`
+
+O contrato `200` e os demais status não mudam. Quando o resultado no
+provedor é incerto (timeout, resposta inválida), a reserva já estava
+persistida e a resposta `202` passa a incluir o seu identificador (todo
+caminho de criação atual persiste a reserva antes do egress; sem reserva, o
+corpo continua sendo só `{"detail": ...}`):
+
+```json
+{
+  "detail": "billing_checkout_reconciliation_required",
+  "checkout_session_id": "5b0c8f7e-0000-4000-8000-000000000000"
+}
+```
+
+Use o identificador em `GET /v1/billing/checkout/{checkout_session_id}` ou
+`POST /v1/billing/checkout/{checkout_session_id}/reconcile`; nunca repita o
+`POST` às cegas.
+
 ---
 
 ## Schemas
@@ -975,14 +1141,17 @@ existente em vez de criar outra.
 | Status | `detail` | Significado |
 |--------|----------|-------------|
 | 200 | — | Sessão criada ou sessão viva existente. |
-| 202 | `billing_checkout_reconciliation_required` | Resultado do provedor incerto; nenhum ID é devolvido. O usuário não deve pagar de novo: para retomar a sessão existente, envia o mesmo plano outra vez (o servidor devolve a sessão viva em vez de criar outra) ou aguarda e atualiza a página. |
+| 202 | `billing_checkout_reconciliation_required` | Resultado do provedor incerto; o corpo traz também o `checkout_session_id` da reserva persistida (ver "POST /v1/billing/checkout — `202`" acima). O usuário não deve pagar de novo: para retomar a sessão existente, envia o mesmo plano outra vez (o servidor devolve a sessão viva em vez de criar outra) ou aguarda e atualiza a página. |
 | 400 | `billing_checkout_coupon_invalid` / `billing_checkout_coupon_not_eligible` | Cupom inexistente, inativo, expirado, esgotado, ou não utilizável nesta oferta/estado. |
 | 409 | `billing_checkout_not_eligible` | Código único para todo bloqueio de elegibilidade (assinatura não terminal, outro checkout vivo etc.). |
 | 422 | `billing_checkout_input_rejected` ou erro de schema | Oferta/método/cupom inválidos. |
 | 502 | `billing_checkout_creation_rejected` | O provedor recusou a criação; nada foi cobrado. |
 | 503 | `billing_checkout_unavailable` | Rollout fechado, egress financeiro desligado, webhook não pronto ou configuração ausente; nenhum POST ao provedor. |
 
-Atenção: o 202 é um status "ok" do HTTP, mas não traz `checkout_session_id`.
+Atenção: o 202 é um status "ok" do HTTP, mas não é uma sessão criada: traz
+`detail` e `checkout_session_id`, sem `ok`, `state` nem `checkout_url`. A
+página atual lê apenas `detail` do 202 (e continua funcionando); o ID permite
+reler ou reconciliar exatamente essa reserva.
 Um 403 nestas rotas significa que o usuário autenticado não é builder (não é
 sessão expirada, que é 401).
 

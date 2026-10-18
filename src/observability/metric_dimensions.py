@@ -483,6 +483,7 @@ METRIC_DIMENSION_CONTRACTS: Mapping[str, MetricDimensionContract] = MappingProxy
             resource=_enum("delivery", "checkout_session", "subscription", "payment")
         ),
         "neurostack_billing_webhook_config_ready": _NONE,
+        "neurostack_billing_summary_checkout_unavailable": _NONE,
         # Group 5 migration control plane.  The vocabulary remains closed so
         # no migration, actor, provider, subscription, receipt or deployment
         # identity can enter Prometheus.

@@ -278,6 +278,13 @@ BILLING_WEBHOOK_CONFIG_READY = Gauge(
     "neurostack_billing_webhook_config_ready",
     "1 when the provider webhook configuration and token converged",
 )
+# Group 6b builder summary: the advisory checkout-availability read failed and
+# the summary answered ``checkout.available = false``.  Label-free on purpose:
+# builder identities stay in structured logs, never in Prometheus.
+BILLING_SUMMARY_CHECKOUT_UNAVAILABLE_TOTAL = Counter(
+    "neurostack_billing_summary_checkout_unavailable_total",
+    "Billing summaries whose advisory checkout availability read failed",
+)
 # Group 5 control-plane metrics intentionally expose only bounded state/action
 # names.  Migration, subscription, receipt, actor, provider and deployment
 # identities never enter Prometheus labels.
