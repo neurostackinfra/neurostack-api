@@ -8,19 +8,23 @@ Every retry reuses the immutable outbox row and therefore its event id.
 
 from __future__ import annotations
 
+import asyncio
 import calendar
+import copy
 import hashlib
 import json
 import os
+from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Final, cast
+from typing import Final, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from sqlalchemy import select
+from sqlalchemy import DateTime, Select, case, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import BindParameter, ColumnElement
 
 from src.models.billing import (
     BillingCheckoutSession,
@@ -110,6 +114,117 @@ _FORBIDDEN_KEYS: Final = frozenset(
 _DEFAULT_DEPLOYMENT_DIGEST: Final = hashlib.sha256(
     b"billing.fact.v1:deployment-unverified"
 ).hexdigest()
+# Delivery states a publisher may still present.  ``acknowledged`` and
+# ``blocked`` are terminal for presentation; neither ever deletes the fact.
+_PRESENTABLE: Final = ("pending", "awaiting_ack")
+# Fixed, sanitized ``backlog`` alert details (stored only as SHA-256).  They
+# reuse the existing alert vocabulary, so no schema change is required.
+ACK_MISSING_DETAIL: Final = "ack missing"
+ACK_OVERDUE_DETAIL: Final = "ack overdue"
+RETRY_EXHAUSTED_DETAIL: Final = "retry cap exhausted"
+
+# Presenting a fact to a real consumer is NOT safe yet.  Three binding
+# preconditions must all be met before this may become ``False``:
+#
+# 1. The attempt is counted in a committed lease BEFORE the fact is presented.
+#    Today ``attempt_count``/``last_attempt_at`` are written only after the
+#    transport returns, in the same transaction, so a crash or lost commit
+#    after a consumer-visible send leaves the delivery ``pending`` with no
+#    attempt counted: it is presented again at once, unbounded by the backoff
+#    and by ``max_attempts``.
+# 2. ``blocked`` deliveries have an operator requeue path (today only a late
+#    valid ack or manual SQL leaves ``blocked``).
+# 3. The runbook ``docs/runbooks/asaas-billing-reconciliation.md`` covers the
+#    real transport.
+#
+# While it is ``True`` every presenting entry point raises and production
+# wires ``transport=None``; only tests waive it, explicitly, per test.
+PRESENTATION_PRECONDITIONS_OPEN: Final = True
+
+
+class PresentationPreconditionsOpen(RuntimeError):
+    """A consumer transport was used before presentation is crash-safe."""
+
+
+def require_presentation_allowed() -> None:
+    """Raise unless the presentation preconditions above are all closed."""
+
+    if PRESENTATION_PRECONDITIONS_OPEN:
+        raise PresentationPreconditionsOpen(
+            "billing fact presentation preconditions are open: no consumer "
+            "transport may be wired (see PRESENTATION_PRECONDITIONS_OPEN)"
+        )
+
+
+def _detail_digest(detail: str) -> str:
+    return hashlib.sha256(detail.encode("utf-8")).hexdigest()
+
+
+def _valid_ack_exists() -> ColumnElement[bool]:
+    """``EXISTS`` a consumer ack the reconciler would accept for the delivery.
+
+    Mirrors :meth:`BillingFactReconciler._reconcile_fact`: same schema, same
+    event id, ``accepted``, and fact/bundle/deployment digests equal to the
+    outbox row and its handoff.  A mismatching ack does not count, so the
+    fact keeps alerting until the reconciler moves it to ``blocked``.
+    """
+
+    return (
+        select(BillingFactAck.id)
+        .join(
+            BillingOutboxEvent, BillingOutboxEvent.id == BillingFactAck.outbox_event_id
+        )
+        .join(
+            BillingFactHandoff,
+            BillingFactHandoff.outbox_event_id == BillingFactAck.outbox_event_id,
+        )
+        .where(
+            BillingFactAck.outbox_event_id == BillingFactDelivery.outbox_event_id,
+            BillingFactAck.schema_version == ACK_SCHEMA_VERSION,
+            BillingFactAck.event_id == BillingFactDelivery.event_id,
+            BillingFactAck.outcome != "rejected",
+            BillingFactAck.fact_sha256 == BillingOutboxEvent.payload_sha256,
+            BillingFactAck.bundle_digest == BillingFactHandoff.bundle_digest,
+            BillingFactAck.deployment_digest == BillingFactHandoff.deployment_digest,
+        )
+        .correlate(BillingFactDelivery)
+        .exists()
+    )
+
+
+async def _append_alert_row(
+    db: AsyncSession,
+    *,
+    kind: str,
+    outbox_event_id: UUID | None,
+    detail: str,
+    observed_at: datetime,
+) -> None:
+    """Append one sanitized alert unless the same (fact, kind, detail) exists.
+
+    Check-then-insert with no unique constraint: de-duplication rests on the
+    callers being serialized (the maintenance advisory lock, or the delivery
+    row lock for the retry-cap alert), not on the schema.
+    """
+
+    digest = _detail_digest(detail)
+    existing = await db.scalar(
+        select(BillingFactReconciliationAlert.id).where(
+            BillingFactReconciliationAlert.outbox_event_id == outbox_event_id,
+            BillingFactReconciliationAlert.kind == kind,
+            BillingFactReconciliationAlert.detail_sha256 == digest,
+        )
+    )
+    if existing is None:
+        db.add(
+            BillingFactReconciliationAlert(
+                id=uuid4(),
+                outbox_event_id=outbox_event_id,
+                kind=kind,
+                detail_sha256=digest,
+                observed_at=observed_at,
+            )
+        )
 
 
 class BillingFactViolation(ValueError):
@@ -133,6 +248,56 @@ class PublishedFact:
     payload: dict[str, object]
 
 
+PublishOutcome = Literal["presented", "failed", "exhausted", "skipped"]
+
+
+@dataclass(frozen=True, slots=True)
+class FactRetryPolicy:
+    """Bounded re-presentation: exponential backoff, then a terminal block.
+
+    ``max_attempts`` counts presentations without an append-only ack.  After
+    the last one the consumer still gets ``backoff(max_attempts)`` to ack
+    before the delivery becomes ``blocked``; the fact itself is never deleted.
+    """
+
+    max_attempts: int
+    base_backoff: timedelta = timedelta(seconds=60)
+    max_backoff: timedelta = timedelta(hours=1)
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
+        if self.base_backoff <= timedelta(0) or self.max_backoff < self.base_backoff:
+            raise ValueError("retry backoff must be positive and ordered")
+
+    def backoff(self, attempts: int) -> timedelta:
+        """Wait after the ``attempts``-th presentation before the next claim."""
+
+        if attempts <= 0:
+            return timedelta(0)
+        exponent = min(attempts, self.max_attempts, 32) - 1
+        return min(self.base_backoff * (1 << exponent), self.max_backoff)
+
+
+@dataclass(frozen=True, slots=True)
+class PublishAttempt:
+    """Outcome of one claimed delivery; ``failure`` is an exception class only."""
+
+    event_id: UUID
+    outcome: PublishOutcome
+    attempt_count: int
+    failure: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FactBacklog:
+    """Global delivery backlog read by every worker loop (never per process)."""
+
+    unacked: int
+    stale: int
+    blocked: int
+
+
 @dataclass(frozen=True, slots=True)
 class ReconciliationResult:
     """Current producer/consumer proof state; any issue blocks rollout."""
@@ -154,6 +319,18 @@ class ReconciliationResult:
                 self.digest_mismatches,
             )
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationPage:
+    """One bounded reconciliation pass and the keyset cursor for the next one.
+
+    ``next_after`` is ``None`` when the open set was exhausted, so the next
+    page wraps to the beginning and every open fact is revisited each cycle.
+    """
+
+    result: ReconciliationResult
+    next_after: UUID | None
 
 
 def canonical_json_bytes(value: Mapping[str, object]) -> bytes:
@@ -1163,24 +1340,13 @@ class BillingFactProducer:
     async def _append_alert(
         self, *, kind: str, outbox_event_id: UUID | None, detail: str
     ) -> None:
-        digest = hashlib.sha256(detail.encode("utf-8")).hexdigest()
-        existing = await self._db.scalar(
-            select(BillingFactReconciliationAlert.id).where(
-                BillingFactReconciliationAlert.outbox_event_id == outbox_event_id,
-                BillingFactReconciliationAlert.kind == kind,
-                BillingFactReconciliationAlert.detail_sha256 == digest,
-            )
+        await _append_alert_row(
+            self._db,
+            kind=kind,
+            outbox_event_id=outbox_event_id,
+            detail=detail,
+            observed_at=_utc(self._now()),
         )
-        if existing is None:
-            self._db.add(
-                BillingFactReconciliationAlert(
-                    id=uuid4(),
-                    outbox_event_id=outbox_event_id,
-                    kind=kind,
-                    detail_sha256=digest,
-                    observed_at=_utc(self._now()),
-                )
-            )
 
 
 class BillingFactPublisher:
@@ -1191,6 +1357,9 @@ class BillingFactPublisher:
         self._now = now or (lambda: datetime.now(timezone.utc))
 
     async def pending(self, *, limit: int = 100) -> tuple[PublishedFact, ...]:
+        """Legacy unbounded read of presentable rows; see :meth:`publish_pending`."""
+
+        require_presentation_allowed()
         if limit <= 0:
             raise ValueError("limit must be positive")
         rows = await self._db.execute(
@@ -1218,8 +1387,15 @@ class BillingFactPublisher:
         *,
         limit: int = 100,
     ) -> tuple[PublishedFact, ...]:
-        """Send rows without inventing new event ids; caller owns commit policy."""
+        """Legacy bulk send; caller owns commit policy.  NOT a delivery path.
 
+        Warning: this bypasses everything :meth:`publish_next` enforces: no
+        ``SKIP LOCKED`` claim, no backoff, no ``max_attempts`` cap, no ack
+        re-read and no transport timeout.  It has no production caller and
+        raises while ``PRESENTATION_PRECONDITIONS_OPEN`` is true.
+        """
+
+        require_presentation_allowed()
         published: list[PublishedFact] = []
         for item in await self.pending(limit=limit):
             try:
@@ -1230,6 +1406,136 @@ class BillingFactPublisher:
                 await self._record_attempt(item.event_id, delivered=True)
                 published.append(item)
         return tuple(published)
+
+    async def publish_next(
+        self,
+        transport: Callable[[dict[str, object]], Awaitable[None]],
+        *,
+        policy: FactRetryPolicy,
+        timeout: float,
+    ) -> PublishAttempt | None:
+        """Claim, present and record at most one due fact; caller commits.
+
+        The claim is ``FOR UPDATE OF billing_fact_deliveries SKIP LOCKED`` and
+        the row stays locked until the caller commits the recorded attempt, so
+        concurrent workers never present the same fact at the same time and
+        the next claim by any worker re-reads ``last_attempt_at`` and honours
+        the backoff.  A fact whose ack was committed before the post-lock
+        re-read below is not presented again (the reconciler converges it);
+        an ack committed after that re-read cannot stop the presentation in
+        flight.  When ``policy`` is spent the delivery becomes ``blocked``
+        with alert evidence and no presentation; the fact is retained and a
+        later valid ack still converges it.  ``None`` means nothing is due.
+
+        The attempt is counted only after the transport returns, in the
+        caller's transaction: a crash or lost commit after a consumer-visible
+        send is not counted and bypasses the backoff and the cap.  That is
+        why this raises while ``PRESENTATION_PRECONDITIONS_OPEN`` is true.
+        """
+
+        require_presentation_allowed()
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        row = (
+            await self._db.execute(self._due_claim(policy, _utc(self._now())))
+        ).first()
+        if row is None:
+            return None
+        delivery, outbox = row
+        # Fresh statement, fresh READ COMMITTED snapshot: an ack committed
+        # after the claim query started still prevents a re-presentation.
+        if (
+            await self._db.scalar(
+                select(BillingFactAck.id).where(
+                    BillingFactAck.outbox_event_id == outbox.id
+                )
+            )
+            is not None
+        ):
+            return PublishAttempt(
+                delivery.event_id, "skipped", int(delivery.attempt_count)
+            )
+        if delivery.attempt_count >= policy.max_attempts:
+            delivery.state = "blocked"
+            await _append_alert_row(
+                self._db,
+                kind="backlog",
+                outbox_event_id=outbox.id,
+                detail=RETRY_EXHAUSTED_DETAIL,
+                observed_at=_utc(self._now()),
+            )
+            await self._db.flush()
+            return PublishAttempt(
+                delivery.event_id, "exhausted", int(delivery.attempt_count)
+            )
+        failure: str | None = None
+        try:
+            # A deep copy: a consumer can never alias the persisted payload.
+            await asyncio.wait_for(transport(copy.deepcopy(outbox.payload)), timeout)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise  # a real cancellation of this task: roll back, retriable
+            # A stray CancelledError raised by the consumer code itself is a
+            # failed presentation, so the backoff and the cap still apply.
+            failure = "CancelledError"
+        except Exception as exc:
+            failure = type(exc).__name__
+        await self._record_attempt(delivery.event_id, delivered=failure is None)
+        return PublishAttempt(
+            delivery.event_id,
+            "presented" if failure is None else "failed",
+            int(delivery.attempt_count),
+            failure,
+        )
+
+    @staticmethod
+    def _due_claim(
+        policy: FactRetryPolicy, now: datetime
+    ) -> Select[tuple[BillingFactDelivery, BillingOutboxEvent]]:
+        """One oldest presentable, un-acked, due delivery, locked SKIP LOCKED.
+
+        Backoff is a closed ``CASE`` over ``attempt_count`` with bound cutoffs,
+        so PostgreSQL re-checks it against the latest row version when a
+        concurrent worker committed an attempt between snapshot and lock.
+        """
+
+        def cutoff(attempts: int) -> BindParameter[datetime]:
+            return literal(now - policy.backoff(attempts), DateTime(timezone=True))
+
+        due_before = case(
+            {
+                attempts: cutoff(attempts)
+                for attempts in range(1, policy.max_attempts + 1)
+            },
+            value=BillingFactDelivery.attempt_count,
+            else_=cutoff(policy.max_attempts),
+        )
+        return (
+            select(BillingFactDelivery, BillingOutboxEvent)
+            .join(
+                BillingOutboxEvent,
+                BillingOutboxEvent.id == BillingFactDelivery.outbox_event_id,
+            )
+            .where(
+                BillingFactDelivery.state.in_(_PRESENTABLE),
+                ~select(BillingFactAck.id)
+                .where(
+                    BillingFactAck.outbox_event_id
+                    == BillingFactDelivery.outbox_event_id
+                )
+                .exists(),
+                or_(
+                    BillingFactDelivery.attempt_count == 0,
+                    BillingFactDelivery.last_attempt_at.is_(None),
+                    BillingFactDelivery.last_attempt_at <= due_before,
+                ),
+            )
+            .order_by(BillingOutboxEvent.created_at, BillingOutboxEvent.id)
+            .limit(1)
+            .with_for_update(of=BillingFactDelivery, skip_locked=True)
+            .execution_options(populate_existing=True)
+        )
 
     async def _record_attempt(self, event_id: UUID, *, delivered: bool) -> None:
         delivery = await self._db.scalar(
@@ -1254,23 +1560,10 @@ class BillingFactReconciler:
         self._now = now or (lambda: datetime.now(timezone.utc))
 
     async def reconcile(self) -> ReconciliationResult:
-        backlog = gaps = collisions = schema_mismatches = digest_mismatches = 0
-        missing_effect_rows = await self._db.execute(
-            select(BillingPaymentEffect.id)
-            .outerjoin(
-                BillingOutboxEvent,
-                BillingOutboxEvent.payment_effect_id == BillingPaymentEffect.id,
-            )
-            .where(
-                BillingPaymentEffect.provider == "asaas",
-                BillingOutboxEvent.id.is_(None),
-            )
-        )
-        for (effect_id,) in missing_effect_rows:
-            gaps += 1
-            await self._alert(
-                kind="gap", outbox_event_id=None, detail=f"effect:{effect_id}"
-            )
+        """Verify every fact ever produced (full proof pass, unbounded)."""
+
+        tally: Counter[str] = Counter()
+        await self._alert_missing_facts(tally, limit=None)
         outboxes = list(
             (
                 await self._db.execute(
@@ -1287,86 +1580,254 @@ class BillingFactReconciler:
                 .with_for_update()
                 .execution_options(populate_existing=True)
             )
-            handoff = await self._db.scalar(
-                select(BillingFactHandoff)
-                .where(BillingFactHandoff.outbox_event_id == outbox.id)
-                .execution_options(populate_existing=True)
-            )
-            if delivery is None or handoff is None or outbox.payment_effect_id is None:
-                gaps += 1
-                await self._alert(
-                    kind="gap", outbox_event_id=outbox.id, detail="missing lineage"
-                )
-                continue
-            ack = await self._db.scalar(
-                select(BillingFactAck)
-                .where(BillingFactAck.outbox_event_id == outbox.id)
-                .execution_options(populate_existing=True)
-            )
-            if ack is None:
-                backlog += 1
-                await self._alert(
-                    kind="backlog", outbox_event_id=outbox.id, detail="ack missing"
-                )
-                continue
-            if ack.schema_version != ACK_SCHEMA_VERSION:
-                schema_mismatches += 1
-                delivery.state = "blocked"
-                await self._alert(
-                    kind="schema_mismatch",
-                    outbox_event_id=outbox.id,
-                    detail="ack schema",
-                )
-                continue
-            if ack.event_id != delivery.event_id or ack.outcome == "rejected":
-                collisions += 1
-                delivery.state = "blocked"
-                await self._alert(
-                    kind="collision", outbox_event_id=outbox.id, detail="ack collision"
-                )
-                continue
-            if (
-                ack.fact_sha256 != outbox.payload_sha256
-                or ack.bundle_digest != handoff.bundle_digest
-                or ack.deployment_digest != handoff.deployment_digest
-            ):
-                digest_mismatches += 1
-                delivery.state = "blocked"
-                await self._alert(
-                    kind="digest_mismatch",
-                    outbox_event_id=outbox.id,
-                    detail="ack digest",
-                )
-                continue
-            delivery.state = "acknowledged"
-            delivery.acknowledged_at = ack.acknowledged_at
+            tally[await self._reconcile_fact(outbox, delivery)] += 1
         await self._db.flush()
+        return self._result(tally)
+
+    async def reconcile_open(
+        self, *, limit: int, after: UUID | None = None
+    ) -> ReconciliationPage:
+        """Verify one bounded page of the open (non-``acknowledged``) facts.
+
+        ``acknowledged`` is terminal and its inputs (outbox, handoff, ack) are
+        immutable in PostgreSQL, so only open facts can still change.  Pages
+        are keyed by outbox id and wrap; a delivery a publisher is presenting
+        right now is skipped (``SKIP LOCKED``) and revisited next cycle.
+        """
+
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        tally: Counter[str] = Counter()
+        await self._alert_missing_facts(tally, limit=limit)
+        orphaned = await self._db.execute(
+            select(BillingOutboxEvent)
+            .outerjoin(
+                BillingFactDelivery,
+                BillingFactDelivery.outbox_event_id == BillingOutboxEvent.id,
+            )
+            .where(BillingFactDelivery.id.is_(None))
+            .order_by(BillingOutboxEvent.id)
+            .limit(limit)
+        )
+        for outbox in list(orphaned.scalars()):
+            tally[await self._reconcile_fact(outbox, None)] += 1
+        page_query = (
+            select(BillingFactDelivery.id, BillingOutboxEvent.id)
+            .join(
+                BillingOutboxEvent,
+                BillingOutboxEvent.id == BillingFactDelivery.outbox_event_id,
+            )
+            .where(BillingFactDelivery.state != "acknowledged")
+        )
+        if after is not None:
+            page_query = page_query.where(BillingOutboxEvent.id > after)
+        page = list(
+            (
+                await self._db.execute(
+                    page_query.order_by(BillingOutboxEvent.id).limit(limit)
+                )
+            ).all()
+        )
+        for delivery_id, outbox_id in page:
+            delivery = await self._db.scalar(
+                select(BillingFactDelivery)
+                .where(
+                    BillingFactDelivery.id == delivery_id,
+                    BillingFactDelivery.state != "acknowledged",
+                )
+                .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
+            )
+            fact = await self._db.get(
+                BillingOutboxEvent, outbox_id, populate_existing=True
+            )
+            if delivery is None or fact is None:
+                continue
+            tally[await self._reconcile_fact(fact, delivery)] += 1
+        await self._db.flush()
+        return ReconciliationPage(
+            result=self._result(tally),
+            next_after=page[-1][1] if len(page) == limit else None,
+        )
+
+    async def escalate_overdue(self, *, stale_before: datetime, limit: int) -> int:
+        """Append one durable ``ack overdue`` alert per fact unacked too long.
+
+        Only facts without that alert are selected, so a bounded page always
+        progresses through the whole overdue set; replays add nothing.  A
+        fact that already has a valid ack is not overdue even before the
+        reconciler's page reaches it and marks it ``acknowledged``.
+        """
+
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        overdue_digest = _detail_digest(ACK_OVERDUE_DETAIL)
+        rows = await self._db.execute(
+            select(BillingFactDelivery.outbox_event_id)
+            .where(
+                BillingFactDelivery.state.in_(_PRESENTABLE),
+                BillingFactDelivery.created_at <= stale_before,
+                ~_valid_ack_exists(),
+                ~select(BillingFactReconciliationAlert.id)
+                .where(
+                    BillingFactReconciliationAlert.outbox_event_id
+                    == BillingFactDelivery.outbox_event_id,
+                    BillingFactReconciliationAlert.kind == "backlog",
+                    BillingFactReconciliationAlert.detail_sha256 == overdue_digest,
+                )
+                .exists(),
+            )
+            .order_by(
+                BillingFactDelivery.created_at, BillingFactDelivery.outbox_event_id
+            )
+            .limit(limit)
+        )
+        overdue = [outbox_event_id for (outbox_event_id,) in rows]
+        for outbox_event_id in overdue:
+            await self._alert(
+                kind="backlog",
+                outbox_event_id=outbox_event_id,
+                detail=ACK_OVERDUE_DETAIL,
+            )
+        await self._db.flush()
+        return len(overdue)
+
+    async def backlog(self, *, stale_before: datetime) -> FactBacklog:
+        """Read-only global counts; safe for every worker loop to compute.
+
+        ``unacked``/``stale`` exclude open rows that already carry a valid ack
+        (converged on the reconciler's next page), so an acknowledged fact
+        never raises the stale alert.
+        """
+
+        open_state = BillingFactDelivery.state.in_(_PRESENTABLE) & ~_valid_ack_exists()
+        unacked, stale, blocked = (
+            await self._db.execute(
+                select(
+                    func.coalesce(func.sum(case((open_state, 1), else_=0)), 0),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (
+                                    open_state
+                                    & (BillingFactDelivery.created_at <= stale_before),
+                                    1,
+                                ),
+                                else_=0,
+                            )
+                        ),
+                        0,
+                    ),
+                    func.coalesce(
+                        func.sum(
+                            case((BillingFactDelivery.state == "blocked", 1), else_=0)
+                        ),
+                        0,
+                    ),
+                )
+            )
+        ).one()
+        return FactBacklog(unacked=int(unacked), stale=int(stale), blocked=int(blocked))
+
+    async def _alert_missing_facts(
+        self, tally: Counter[str], *, limit: int | None
+    ) -> None:
+        query = (
+            select(BillingPaymentEffect.id)
+            .outerjoin(
+                BillingOutboxEvent,
+                BillingOutboxEvent.payment_effect_id == BillingPaymentEffect.id,
+            )
+            .where(
+                BillingPaymentEffect.provider == "asaas",
+                BillingOutboxEvent.id.is_(None),
+            )
+        )
+        if limit is not None:
+            # Known limit: a gap stays a gap until repaired, so a bounded run
+            # re-alerts the same first page and gaps beyond it are not
+            # alerted until earlier ones are resolved (the full ``reconcile``
+            # pass sees all of them).  The orphan page below has the same
+            # limit.  See docs/runbooks/asaas-billing-reconciliation.md.
+            query = query.order_by(BillingPaymentEffect.id).limit(limit)
+        for (effect_id,) in await self._db.execute(query):
+            tally["gap"] += 1
+            await self._alert(
+                kind="gap", outbox_event_id=None, detail=f"effect:{effect_id}"
+            )
+
+    async def _reconcile_fact(
+        self, outbox: BillingOutboxEvent, delivery: BillingFactDelivery | None
+    ) -> str:
+        """Verify one fact against its lineage and ack; return the tally key."""
+
+        handoff = await self._db.scalar(
+            select(BillingFactHandoff)
+            .where(BillingFactHandoff.outbox_event_id == outbox.id)
+            .execution_options(populate_existing=True)
+        )
+        if delivery is None or handoff is None or outbox.payment_effect_id is None:
+            await self._alert(
+                kind="gap", outbox_event_id=outbox.id, detail="missing lineage"
+            )
+            return "gap"
+        ack = await self._db.scalar(
+            select(BillingFactAck)
+            .where(BillingFactAck.outbox_event_id == outbox.id)
+            .execution_options(populate_existing=True)
+        )
+        if ack is None:
+            await self._alert(
+                kind="backlog", outbox_event_id=outbox.id, detail=ACK_MISSING_DETAIL
+            )
+            return "backlog"
+        if ack.schema_version != ACK_SCHEMA_VERSION:
+            delivery.state = "blocked"
+            await self._alert(
+                kind="schema_mismatch",
+                outbox_event_id=outbox.id,
+                detail="ack schema",
+            )
+            return "schema_mismatch"
+        if ack.event_id != delivery.event_id or ack.outcome == "rejected":
+            delivery.state = "blocked"
+            await self._alert(
+                kind="collision", outbox_event_id=outbox.id, detail="ack collision"
+            )
+            return "collision"
+        if (
+            ack.fact_sha256 != outbox.payload_sha256
+            or ack.bundle_digest != handoff.bundle_digest
+            or ack.deployment_digest != handoff.deployment_digest
+        ):
+            delivery.state = "blocked"
+            await self._alert(
+                kind="digest_mismatch",
+                outbox_event_id=outbox.id,
+                detail="ack digest",
+            )
+            return "digest_mismatch"
+        delivery.state = "acknowledged"
+        delivery.acknowledged_at = ack.acknowledged_at
+        return "acknowledged"
+
+    @staticmethod
+    def _result(tally: Counter[str]) -> ReconciliationResult:
         return ReconciliationResult(
-            backlog=backlog,
-            gaps=gaps,
-            collisions=collisions,
-            schema_mismatches=schema_mismatches,
-            digest_mismatches=digest_mismatches,
+            backlog=tally["backlog"],
+            gaps=tally["gap"],
+            collisions=tally["collision"],
+            schema_mismatches=tally["schema_mismatch"],
+            digest_mismatches=tally["digest_mismatch"],
         )
 
     async def _alert(
         self, *, kind: str, outbox_event_id: UUID | None, detail: str
     ) -> None:
-        digest = hashlib.sha256(detail.encode("utf-8")).hexdigest()
-        existing = await self._db.scalar(
-            select(BillingFactReconciliationAlert.id).where(
-                BillingFactReconciliationAlert.outbox_event_id == outbox_event_id,
-                BillingFactReconciliationAlert.kind == kind,
-                BillingFactReconciliationAlert.detail_sha256 == digest,
-            )
+        await _append_alert_row(
+            self._db,
+            kind=kind,
+            outbox_event_id=outbox_event_id,
+            detail=detail,
+            observed_at=_utc(self._now()),
         )
-        if existing is None:
-            self._db.add(
-                BillingFactReconciliationAlert(
-                    id=uuid4(),
-                    outbox_event_id=outbox_event_id,
-                    kind=kind,
-                    detail_sha256=digest,
-                    observed_at=_utc(self._now()),
-                )
-            )

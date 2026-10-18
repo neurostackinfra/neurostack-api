@@ -295,3 +295,42 @@ groups:
           summary: "Top-up capability was disabled"
           description: "Investigate health or revocation before any re-enable"
           runbook_url: "https://docs.neurostack.io/runbooks/asaas-billing-incident"
+
+  # billing.fact.v1 outbox (Group 9).  The backlog gauge is recomputed from
+  # the database by every worker loop, so max() across scraped processes is
+  # the global state; only bounded delivery conditions are labels.
+  - name: neurostack_billing_facts
+    interval: 30s
+    rules:
+      - alert: BillingFactDeliveryStale
+        expr: max(neurostack_billing_fact_backlog{condition="stale"}) > 0
+        for: 1m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "Billing fact unacknowledged beyond the stale threshold"
+          description: "A billing.fact.v1 fact is still pending or awaiting its consumer acknowledgement"
+          runbook_url: "https://docs.neurostack.io/runbooks/asaas-billing-reconciliation"
+
+      - alert: BillingFactDeliveryBlocked
+        expr: max(neurostack_billing_fact_backlog{condition="blocked"}) > 0
+        for: 1m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "Billing fact delivery reached the terminal blocked state"
+          description: "Retry cap exhausted or acknowledgement mismatch; the fact is retained for reconciliation"
+          runbook_url: "https://docs.neurostack.io/runbooks/asaas-billing-reconciliation"
+
+      - alert: BillingFactWorkerStalled
+        expr: max(neurostack_billing_fact_worker_last_tick_timestamp_seconds) > 0 and (time() - max(neurostack_billing_fact_worker_last_tick_timestamp_seconds)) > 600
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Billing fact worker stopped ticking"
+          description: "An enabled billing fact worker has not completed a tick for over 10 minutes"
+          runbook_url: "https://docs.neurostack.io/runbooks/asaas-billing-reconciliation"

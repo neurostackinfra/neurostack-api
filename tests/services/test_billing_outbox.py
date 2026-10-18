@@ -26,6 +26,7 @@ from src.models.billing import (
 )
 from src.models.builder import Builder
 from src.repositories.database import _patch_jsonb_for_sqlite
+from src.services import billing_outbox
 from src.services.billing_catalog import BILLING_CATALOG
 from src.services.billing_checkout import (
     subscription_pricing_snapshot,
@@ -315,7 +316,10 @@ async def test_subscription_fact_creates_current_cycle_with_xor_target(
 
 async def test_lost_ack_republishes_same_event_then_reconciles_read_only_ack(
     session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Explicit test-only waiver: the legacy sender raises in production.
+    monkeypatch.setattr(billing_outbox, "PRESENTATION_PRECONDITIONS_OPEN", False)
     async with session_factory() as session:
         effect, projection, _order = await _settled_topup(session)
         outbox = await BillingFactProducer(session).record_effect(effect, projection)

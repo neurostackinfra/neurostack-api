@@ -501,6 +501,18 @@ METRIC_DIMENSION_CONTRACTS: Mapping[str, MetricDimensionContract] = MappingProxy
             direction=_BILLING_TOPUP_DIRECTION,
             outcome=_BILLING_OPERATION_OUTCOME,
         ),
+        # Group 9 billing.fact.v1 outbox worker: delivery conditions and
+        # outcomes only; event, builder and aggregate identities stay out.
+        "neurostack_billing_fact_backlog": _contract(
+            condition=_enum("unacked", "stale", "blocked")
+        ),
+        "neurostack_billing_fact_publish_attempts": _contract(
+            outcome=_enum("presented", "failed", "exhausted")
+        ),
+        "neurostack_billing_fact_worker_ticks": _contract(
+            outcome=_enum("completed", "deadline", "stopped", "failed")
+        ),
+        "neurostack_billing_fact_worker_last_tick_timestamp_seconds": _NONE,
         # neurostack-core opt-in collector
         "neurostack_srm_decisions": _contract(
             intent_category=_INTENT, funnel_stage=_FUNNEL_STAGE, mode=_FLOW_MODE

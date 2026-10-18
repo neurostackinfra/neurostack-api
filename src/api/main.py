@@ -65,6 +65,10 @@ from src.api.routes import (
 from src.config.logging import configure_logging, get_logger
 from src.config.settings import settings
 from src.core.exceptions import ConfigurationError
+from src.services.billing_fact_worker import (
+    BillingFactWorker,
+    start_billing_fact_worker,
+)
 from src.services.billing_webhook import ASAAS_WEBHOOK_READINESS
 
 # Configure logging on module load
@@ -101,6 +105,19 @@ def _start_webhook_readiness_refresher() -> "asyncio.Task[None] | None":
         ASAAS_WEBHOOK_READINESS.run_refresher(billing._read_back_webhook_readiness),
         name="asaas-webhook-readiness",
     )
+
+
+def _start_billing_fact_worker() -> BillingFactWorker | None:
+    """Deliver and escalate ``billing.fact.v1`` rows (Group 9), off by default.
+
+    ``BILLING_FACT_WORKER_ENABLED=false`` returns before touching the pool.
+    No credit consumer exists yet, so no transport is wired: facts stay
+    pending/retriable and the stale alert fires instead of a presentation.
+    """
+
+    from src.repositories.database import get_db_session_factory
+
+    return start_billing_fact_worker(settings, get_db_session_factory, transport=None)
 
 
 def _install_outermost_ingress_body_limit(app: FastAPI) -> None:
@@ -161,8 +178,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     await init_database()
     webhook_refresher = _start_webhook_readiness_refresher()
+    fact_worker: BillingFactWorker | None = None
     redis_client: Redis | None = None
     try:
+        fact_worker = _start_billing_fact_worker()
         if settings.environment == "staging":
             redis_client = Redis.from_url(
                 settings.redis_url,
@@ -177,6 +196,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             webhook_refresher.cancel()
             with suppress(asyncio.CancelledError):
                 await webhook_refresher
+        if fact_worker is not None:
+            # Before the pool closes: the in-flight fact commits or rolls back.
+            await fact_worker.stop()
         # Shutdown shared services before their database dependency. Each
         # boundary remains eligible for cleanup even when an earlier one fails.
         logger.info("Shutting down NeuroStack API")

@@ -301,6 +301,28 @@ BILLING_TOPUP_CAPABILITY_TRANSITIONS_TOTAL = Counter(
     "Top-up capability gate transitions by bounded direction and outcome",
     ["direction", "outcome"],
 )
+# Group 9 billing.fact.v1 outbox worker.  The backlog gauge is recomputed from
+# the database by every worker loop, so whichever process a scrape reaches
+# reports the global state; alert rules use it, never per-process counters.
+BILLING_FACT_BACKLOG = Gauge(
+    "neurostack_billing_fact_backlog",
+    "Unacknowledged billing facts by bounded delivery condition",
+    ["condition"],
+)
+BILLING_FACT_PUBLISH_ATTEMPTS_TOTAL = Counter(
+    "neurostack_billing_fact_publish_attempts_total",
+    "Billing fact presentations by bounded outcome",
+    ["outcome"],
+)
+BILLING_FACT_WORKER_TICKS_TOTAL = Counter(
+    "neurostack_billing_fact_worker_ticks_total",
+    "Billing fact worker ticks by bounded outcome",
+    ["outcome"],
+)
+BILLING_FACT_WORKER_LAST_TICK = Gauge(
+    "neurostack_billing_fact_worker_last_tick_timestamp_seconds",
+    "Unix time of this process's last completed billing fact worker tick or loop start",
+)
 
 # Deliberately label-free: a telemetry failure must never create tenant,
 # provider, endpoint, model, or secret cardinality in Prometheus.
