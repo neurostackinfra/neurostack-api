@@ -1,0 +1,299 @@
+# Group 9 D3/D4 production wiring for asaas-payment-gateway.
+#
+# Declarative and inert: no code in this repository applies it. The operator
+# applies the d3_apply steps by hand after an independent review and the
+# owner's approval; every separate_approval step needs its own explicit owner
+# instruction and is never performed from this file.
+#
+# scripts/asaas_production_wiring.py reads it:
+#   check-manifest   static validation of this file, the parameters file and
+#                    the CloudFormation template (no AWS access)
+#   plan             read-only AWS readback compared with this manifest
+#   render-taskdef   the proposed task definition (secrets as references only)
+#   check            the existing evidence validators against that rendering
+schema_version: asaas_production_wiring_manifest.v1
+context:
+  arch: additive IAM grant and one new secret through a reviewed CloudFormation stack, then one task definition revision derived from the live rollback target; financial egress stays closed by the absence of any AppConfig configuration
+  must:
+    - Read AWS only through Describe*, Get* and List* calls; never call GetSecretValue and never print a secret value.
+    - Resolve every secret ARN, random suffix included, from DescribeSecret at plan time.
+    - Derive the new revision from the live rollback target revision; change only the names listed under task_definition.
+    - Keep exactly the containers app and otel; otel keeps an empty environment and no secrets.
+    - Never introduce a name listed under task_definition.forbidden_name_prefixes or forbidden_names.
+    - Keep financial_egress_enabled closed; opening it is a separate, unwritten follow-up.
+    - Steps with scope separate_approval are never performed from this manifest.
+  ref:
+    - at: .genie/wishes/asaas-payment-gateway/WISH.md
+      has: Group 9 deliverables 3 and 4; Review Results 2026-10-18 hosts and D3 apply approval
+      scope: acceptance contract
+    - at: docs/runbooks/asaas-deployment.md
+      has: ordered procedure, gates, verification and build network needs
+      scope: operations
+    - at: docs/runbooks/asaas-rollback.md
+      has: service rollback to the rollback target and circuit breaker behaviour
+      scope: operations
+
+target:
+  account_id: '388460142431'
+  region: us-east-1
+  cluster: neurostack-staging
+  service: neurostack-staging-app
+  task_family: neurostack-staging-app
+  rollback_task_definition_revision: 8
+  execution_role_name: neurostack-staging-ecs-execution
+  task_role_name: neurostack-staging-ecs-task
+  # The service serves production traffic with ENVIRONMENT=staging. Never gate
+  # anything on settings.is_production for this target.
+  application_environment: staging
+  operational_role: production-serving
+  load_balancer_name: neurostack-staging-alb
+  hosted_zone_name: api.neurostack.global
+  # Builder users reach both hosts, clinic users only the first, super_admin both.
+  served_hosts:
+    - staging.api.neurostack.global
+    - payments.staging.api.neurostack.global
+
+secrets:
+  kms_key_arn: arn:aws:kms:us-east-1:388460142431:key/90eff49a-c2bf-4836-834f-d5666294d956
+  stack_name: neurostack-asaas-production-wiring
+  template: infra/production/asaas-production-wiring-secret-access.yaml
+  execution_role_policy_name: asaas-production-wiring-secret-read
+  # Terraform owns this inline policy; the wiring never edits it.
+  terraform_execution_policy_name: segredos-e-logs
+  references:
+    - environment_name: ASAAS_API_KEY
+      secret_name: neurostack/staging/asaas-api-key
+      source: existing
+      stack_parameter: AsaasApiKeySecretArn
+    - environment_name: ASAAS_WEBHOOK_TOKEN
+      secret_name: neurostack/staging/asaas-webhook-token
+      source: existing
+      stack_parameter: AsaasWebhookTokenSecretArn
+    - environment_name: BILLING_OBSERVABILITY_SMOKE_TOKEN
+      secret_name: neurostack/staging/billing-observability-smoke-token
+      source: created_by_stack
+      stack_parameter: null
+
+parameters:
+  file: infra/production/asaas-production-wiring.params.yaml
+  required:
+    ASAAS_CHECKOUT_RETURN_URL:
+      validator: Settings.validate_asaas_checkout_return_url
+      path: /billing
+    ASAAS_WEBHOOK_URL:
+      validator: Settings.validate_asaas_webhook_url
+      path: /v1/billing/webhook/asaas
+    ASAAS_WEBHOOK_NOTIFICATION_EMAIL:
+      validator: operator_email
+      path: null
+  optional:
+    app_image_override:
+      validator: ecr_image_digest_reference
+      path: null
+
+task_definition:
+  source_revision: 8
+  app_secrets_added:
+    - ASAAS_API_KEY
+    - ASAAS_WEBHOOK_TOKEN
+    - BILLING_OBSERVABILITY_SMOKE_TOKEN
+  app_environment_added:
+    ASAAS_WEBHOOK_URL:
+      parameter: ASAAS_WEBHOOK_URL
+    ASAAS_CHECKOUT_RETURN_URL:
+      parameter: ASAAS_CHECKOUT_RETURN_URL
+    ASAAS_WEBHOOK_NOTIFICATION_EMAIL:
+      parameter: ASAAS_WEBHOOK_NOTIFICATION_EMAIL
+    BILLING_FACT_WORKER_ENABLED:
+      value: 'false'
+  forbidden_name_prefixes:
+    - ABACATEPAY_
+    - APPCONFIG_
+  # The production image sets SPA_DIST_DIR=/app/spa itself and SPA_ENABLED
+  # defaults to true; the task definition never carries them (step spa_serving).
+  forbidden_names:
+    - SPA_DIST_DIR
+    - SPA_ENABLED
+  image: preserve_live_unless_override
+
+financial_egress:
+  flag: financial_egress_enabled
+  initial_state: closed
+  mechanism: closed_by_absence
+  why: >-
+    The app reads the flag only through the AppConfig Agent at a loopback
+    origin and only when APPCONFIG_ENABLED is true
+    (src/infrastructure/appconfig.py, _request_url). With no APPCONFIG_* name
+    in the task definition every read returns false before any I/O, so
+    checkout creation fails with financial_egress_disabled before any provider
+    POST. No AppConfig application exists in the account (read back
+    2026-10-18). A third Agent container would break the evidence validators,
+    which require exactly app and otel.
+
+steps:
+  - id: secret_access_stack
+    scope: d3_apply
+    approval: owner approved applying the D3 wiring on 2026-10-18, after an independent review of this manifest
+    why: the execution role cannot read the ASAAS secrets today, so a revision that references them would fail to start tasks
+    preconditions:
+      - Execution role exists with exactly the inline policies segredos-e-logs (and, after apply, asaas-production-wiring-secret-read) and the attached AmazonECSTaskExecutionRolePolicy.
+      - segredos-e-logs already grants kms:Decrypt on the manifest KMS key.
+      - asaas-api-key and asaas-webhook-token exist, are not scheduled for deletion, use the manifest KMS key and have an AWSCURRENT version.
+      - billing-observability-smoke-token does not exist outside the stack.
+    change: >-
+      Create the CloudFormation stack from the template with CAPABILITY_IAM and
+      the two resolved ARN parameters printed by plan, through a change set
+      that is described and reviewed before it is executed. Executing it with
+      RetainExceptOnCreate is REQUIRED: a failed create then deletes what it
+      created instead of leaving an orphaned smoke token secret behind.
+    verification:
+      - plan reports secret_access_stack compliant, including stack_resources_exact, stack_template_matches_reviewed_template and applied_record_matches_live_state.
+      - DescribeSecret on the smoke token shows the manifest KMS key and an AWSCURRENT version.
+      - GetRolePolicy shows exactly one statement with GetSecretValue on the three ARNs.
+      - terraform_policy_sha256 is unchanged from the pre-apply plan.
+    rollback: >-
+      Not required for a service rollback: the grant is additive and may stay.
+      Keep the stack while any revision the service runs, or could roll back
+      to, references any of the three secrets. Only then may it be deleted;
+      the smoke token secret is retained by policy and is deleted separately.
+    applied:
+      date: '2026-10-18'
+      stack_name: neurostack-asaas-production-wiring
+      change_set_name: d3-wiring-review
+      execution_options: RetainExceptOnCreate
+      smoke_token_secret_arn: arn:aws:secretsmanager:us-east-1:388460142431:secret:neurostack/staging/billing-observability-smoke-token-mSR8Ux
+      terraform_policy_unchanged: true
+
+  - id: task_definition_revision
+    scope: d3_apply
+    approval: owner approved applying the D3 wiring on 2026-10-18, after an independent review of this manifest
+    why: the running revision carries no ASAAS secret or URL, so hosted checkout can never become available
+    preconditions:
+      - The service runs the rollback target revision (or already runs the rendered revision), with one PRIMARY deployment COMPLETED.
+      - The source revision passes the existing Group 5 template validator and has none of the added names.
+      - secret_access_stack is compliant, so the smoke token ARN can be read back.
+      - Every required parameter is present and valid; both hosts resolve to the ALB and are covered by its certificate.
+      - plan runs immediately before rendering, exits 0 and reports no block; render-taskdef refuses otherwise.
+    change: >-
+      Register one new revision of the family with the request printed by
+      render-taskdef. Registering does not change the service.
+    verification:
+      - plan reports task_definition_revision compliant (registered, not yet deployed).
+      - check passes the structural evidence validators.
+    rollback: >-
+      None needed: the service keeps running the rollback target until the
+      separately approved service_deployment step. The extra revision may be
+      deregistered.
+
+  - id: financial_egress_closed
+    scope: d3_apply
+    approval: no AWS change
+    why: financial egress must stay closed until a separate owner instruction opens it
+    preconditions:
+      - No APPCONFIG_* name in the source or the rendered revision.
+    change: none
+    verification:
+      - plan reports financial_egress_closed compliant.
+    rollback: none
+
+  - id: signed_image_build_and_attestation
+    scope: separate_approval
+    approval: separate owner approval required; not performed by this manifest
+    why: the running image predates the SPA and the latest billing code; production images are built, signed and attested only by the protected workflows
+    preconditions:
+      - The release-candidate gate passed for the candidate commit.
+      - The build runner can reach the network hosts listed in docs/runbooks/asaas-deployment.md.
+      - The protected deploy path accepts the serving revision (follow-up F1); today it rejects it even without D3, because the live image is outside the producer repository.
+    change: protected build workflow, then attestation registration
+    verification:
+      - The attestation readback names the exact image digest.
+    rollback: none (an unused image digest is inert)
+
+  - id: migrations_033_035
+    scope: separate_approval
+    approval: separate owner approval required; not performed by this manifest
+    why: the image built from main needs Alembic head 035; production was read at 032 on 2026-10-17
+    preconditions:
+      - Read back the exact Alembic head first; continue only if it is 032.
+      - Expand-only window; the running image keeps working on the expanded schema.
+    change: one-off neurostack-staging-migrations task (alembic upgrade head) on the same image as the deployment
+    verification:
+      - Alembic head reads 035.
+    rollback: none; never downgrade the schema as part of a rollback
+
+  - id: service_deployment
+    scope: separate_approval
+    approval: separate owner approval required; not performed by this manifest
+    why: registering a revision changes nothing until the service runs it
+    preconditions:
+      - Deployment circuit breaker enabled with rollback; minimum healthy 100, maximum 200.
+      - The ASAAS key secret holds a production-namespace key and the webhook token is 32 to 255 printable ASCII characters (checked by the owner without printing).
+    change: >-
+      Path A (cheapest): update the service to the registered D3 revision with
+      the current tooling, outside the protected path, if the owner approves.
+      Path B (one protected deployment carrying image and wiring) also needs a
+      reviewed exception to the runtime fingerprint equality check.
+    verification:
+      - All tasks RUNNING on the new revision, target group healthy, GET /ready 200 on every task.
+      - The webhook readiness gauge neurostack_billing_webhook_config_ready is 0 until registration (expected).
+    rollback: update the service back to the rollback target revision; the circuit breaker does this automatically when tasks fail to become healthy
+
+  - id: spa_serving
+    scope: separate_approval
+    approval: separate owner approval required (it arrives with the signed image); not performed by this manifest
+    why: the SPA files exist only in images built with the frontend-build stage, which sets SPA_DIST_DIR=/app/spa itself
+    preconditions:
+      - The deployed image was built from a commit with the frontend-build stage.
+    change: none in the task definition
+    verification:
+      - GET / and GET /billing on both hosts return the SPA with the enforced CSP.
+      - Builder browser check after checkout returns from the other host (session is per origin).
+    rollback: service rollback; SPA_ENABLED=false would be a new reviewed revision, not part of this manifest
+
+  - id: webhook_exposure_and_registration
+    scope: separate_approval
+    approval: separate owner approval required for the provider call; not performed by this manifest
+    why: ASAAS must deliver to the public receiver, and checkout stays unavailable until the provider webhook reads back converged
+    preconditions:
+      - ALB 443 forwards every path to the service target group; no listener rule shadows the receiver path.
+      - AuthMiddleware makes /v1/billing/webhook/asaas public by exact match only; every other non-public path still requires a JWT.
+      - The WAF web ACL counts but blocks nothing.
+      - An operator entry point that runs AsaasWebhookProvisioner.readback (dry run) and reconcile exists (follow-up F3; it does not exist today).
+    change: run the readback dry run, then reconcile once, from a one-off task on the deployed revision
+    verification:
+      - Readback verdict ready with no reasons; the gauge neurostack_billing_webhook_config_ready reads 1 on every worker.
+    rollback: disable or delete the provider webhook at ASAAS (manual provider operation with its own approval)
+
+  - id: rollout_transitions
+    scope: separate_approval
+    approval: separate owner approval required; not planned until the credit system exists
+    why: canary_allowlist is a real-money state and general opens only after credits
+    preconditions:
+      - See docs/runbooks/asaas-deployment.md, Preconditions before any future transition request.
+    change: none from this manifest
+    verification:
+      - GET /v1/admin/billing/rollout/readback shows the expected state.
+    rollback: docs/runbooks/asaas-rollback.md
+
+known_blocks:
+  - id: F1_group5_deploy_validator_allowlist
+    blocks: signed_image_build_and_attestation
+    reason: >-
+      The protected deploy path rejects the live service today and would
+      reject the D3 wiring. (1) validate_task_definition_template and
+      validate_deployment_snapshot pin the app environment and secret names to
+      the revision 8 sets. (2) build_replacement_task_definition and
+      validate_deployment_snapshot require the template image to start with
+      the producer repository, while revision 8 runs a neurostack-staging
+      image: this blocks the path even without D3. (3) compare_rollout_readbacks
+      requires equal before and after runtime fingerprints, and the
+      fingerprint hashes every secret reference, so one deploy from revision 8
+      to image plus wiring fails with readback_runtime_fingerprint_sha256_changed.
+      (4) The fingerprint hashes only the six base environment values, so D3
+      values such as ASAAS_WEBHOOK_URL are invisible to it. The deploy-path
+      code is not changed here.
+  - id: F3_webhook_registration_entry_point
+    blocks: webhook_exposure_and_registration
+    reason: >-
+      AsaasWebhookProvisioner.reconcile and readback have no operator entry
+      point; only the in-process readiness refresher calls readback.

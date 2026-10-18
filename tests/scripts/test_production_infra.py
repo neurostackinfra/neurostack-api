@@ -25,6 +25,7 @@ EXPECTED_TESTS = (
     "tests/scripts/test_asaas_registration_database_readiness_sql.py",
     "tests/scripts/test_verify_asaas_producer_image_rollout.py",
     "tests/scripts/test_package_asaas_build_ui_evidence.py",
+    "tests/scripts/test_asaas_production_wiring.py",
     "tests/api/test_billing_producer_build_trust.py",
 )
 
@@ -59,8 +60,15 @@ def test_production_infra_gate_is_asaas_only_and_runs_static_template_first() ->
         "scripts/validate_asaas_producer_deploy_readback_policy.py",
         "--check-template",
     ]
-    assert commands[2][:3] == ["$python_bin", "-m", "pytest"]
-    assert commands[2][3:] == ["-q", *EXPECTED_TESTS]
+    assert commands[2] == [
+        "$python_bin",
+        "scripts/asaas_production_wiring.py",
+        "check-manifest",
+        "--params",
+        "infra/production/asaas-production-wiring.params.yaml",
+    ]
+    assert commands[3][:3] == ["$python_bin", "-m", "pytest"]
+    assert commands[3][3:] == ["-q", *EXPECTED_TESTS]
 
 
 def test_template_and_static_validator_enforce_asaas_trust_policy() -> None:
