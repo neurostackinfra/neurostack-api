@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
+from src.api.routing_paths import decision_path
 from src.config.logging import get_logger
 from src.config.settings import settings
 
@@ -178,8 +179,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     ) -> Response:
         """Process request through rate limiting."""
 
+        # Decisions use the path the router matches (routing_paths); the log
+        # line below keeps request.url.path.
+        path = decision_path(request.scope)
+
         # Skip rate limiting for exempt paths
-        if self._is_exempt_path(request.url.path):
+        if self._is_exempt_path(path):
             return await call_next(request)
 
         # Skip rate limiting for OPTIONS (CORS preflight)
@@ -204,7 +209,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # Preserve the established tenant+channel bucket while moving its
         # consumption ahead of FastAPI route dependencies.
         bucket_key = tenant_id
-        if request.method == "POST" and request.url.path == "/v1/webhook/meta":
+        if request.method == "POST" and path == "/v1/webhook/meta":
             bucket_key = f"webhook:{tenant_id}:meta"
 
         # Get or create token bucket for tenant

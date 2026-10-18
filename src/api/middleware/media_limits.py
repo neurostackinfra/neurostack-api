@@ -8,6 +8,8 @@ from typing import Final
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from src.api.routing_paths import decision_path
+
 MEDIA_MULTIPART_MAX_BYTES: Final = 51_000_000
 
 
@@ -114,7 +116,8 @@ class MediaUploadLimitsMiddleware:
         if (
             scope["type"] != "http"
             or scope.get("method") != "POST"
-            or scope.get("path") != self.upload_path
+            # the router's path: "%0a" still routes to the upload endpoint
+            or decision_path(scope) != self.upload_path
         ):
             await self.app(scope, receive, send)
             return

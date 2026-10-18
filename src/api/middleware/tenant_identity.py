@@ -12,6 +12,7 @@ from sqlalchemy import select
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from src.api.middleware.auth import TenantContext
+from src.api.routing_paths import decision_path
 from src.config.logging import get_logger
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.tenant import Tenant
@@ -72,7 +73,9 @@ class TenantIdentityMiddleware:
             await self.app(scope, receive, send)
             return
 
-        path = scope.get("path")
+        # The router's path (routing_paths): "/v1/webhook/meta%0a" still
+        # routes to the Meta receiver and must not skip its HMAC guard.
+        path = decision_path(scope)
         if path == "/v1/events":
             await self._guard_event(scope, receive, send)
             return

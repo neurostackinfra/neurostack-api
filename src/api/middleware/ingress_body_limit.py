@@ -11,6 +11,7 @@ from typing import Any
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from src.api.routing_paths import decision_path
 from src.config.settings import settings
 from src.services.billing_webhook import (
     ASAAS_INGRESS_BODY_STATE,
@@ -55,10 +56,13 @@ class IngressBodyLimitMiddleware:
         self.asaas_read_timeout_seconds = asaas_read_timeout_seconds
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Paths are judged as the router matches them (routing_paths): a
+        # trailing "%0a" still routes to the exact endpoint, so it must not
+        # skip the token check or the body bound here.
         is_staging_rehearsal_token = (
             scope.get("type") == "http"
             and scope.get("method") == "POST"
-            and scope.get("path") == _STAGING_REHEARSAL_TOKEN_PATH
+            and decision_path(scope) == _STAGING_REHEARSAL_TOKEN_PATH
         )
         if is_staging_rehearsal_token:
             send = self._no_store_send(send)
@@ -127,7 +131,7 @@ class IngressBodyLimitMiddleware:
         return (
             scope["type"] == "http"
             and scope.get("method") == "POST"
-            and scope.get("path") == ASAAS_WEBHOOK_PATH
+            and decision_path(scope) == ASAAS_WEBHOOK_PATH
         )
 
     async def _asaas_webhook(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -242,15 +246,10 @@ class IngressBodyLimitMiddleware:
 
     @staticmethod
     def _is_limited_request(scope: Scope) -> bool:
-        path = scope.get("path", "")
-        return (
-            scope["type"] == "http"
-            and scope.get("method") == "POST"
-            and (
-                path in _FIXED_LIMITED_ENDPOINTS
-                or path == _STAGING_REHEARSAL_TOKEN_PATH
-            )
-        )
+        if scope["type"] != "http" or scope.get("method") != "POST":
+            return False
+        path = decision_path(scope)
+        return path in _FIXED_LIMITED_ENDPOINTS or path == _STAGING_REHEARSAL_TOKEN_PATH
 
     @staticmethod
     def _no_store_send(send: Send) -> Send:
