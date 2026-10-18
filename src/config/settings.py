@@ -440,6 +440,17 @@ class Settings(BaseSettings):
     billing_observability_challenge_nonce: str = ""
     billing_observability_challenge_digest: str = ""
     billing_observability_acknowledgement_public_key: str = ""
+    # billing.fact.v1 outbox worker (Group 9).  Off by default: when false no
+    # loop, task or database work is started.  When true every API worker
+    # process runs one loop; rows are claimed FOR UPDATE SKIP LOCKED and the
+    # reconcile/escalation phase is serialized by a PostgreSQL advisory lock.
+    billing_fact_worker_enabled: bool = False
+    billing_fact_worker_interval_seconds: int = Field(default=30, ge=5, le=300)
+    billing_fact_worker_batch_size: int = Field(default=50, ge=1, le=500)
+    # Presentations without an ack before the delivery becomes ``blocked``.
+    billing_fact_worker_max_attempts: int = Field(default=10, ge=1, le=50)
+    # A pending/awaiting_ack fact older than this raises the stale alert.
+    billing_fact_worker_stale_after_seconds: int = Field(default=900, ge=60, le=86_400)
 
     @field_validator("asaas_webhook_url")
     @classmethod

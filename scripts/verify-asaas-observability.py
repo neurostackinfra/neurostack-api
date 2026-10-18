@@ -27,12 +27,17 @@ REQUIRED_ALERTS = {
     "BillingMigrationReadbackBacklog",
     "BillingOperationReceiptRejected",
     "BillingTopupCapabilityRevoked",
+    "BillingFactDeliveryStale",
+    "BillingFactDeliveryBlocked",
+    "BillingFactWorkerStalled",
 }
 REQUIRED_METRICS = {
     "neurostack_billing_migration_operations_total",
     "neurostack_billing_migration_backlog",
     "neurostack_billing_operation_receipts_total",
     "neurostack_billing_topup_capability_transitions_total",
+    "neurostack_billing_fact_backlog",
+    "neurostack_billing_fact_worker_last_tick_timestamp_seconds",
 }
 FORBIDDEN_LABEL_WORDS = {
     "actor",

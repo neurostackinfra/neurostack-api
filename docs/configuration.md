@@ -45,6 +45,105 @@ O manifesto `config/database-connection-budgets.json` registra as topologias apr
 
 No VPS, o deploy confere separadamente o comando de workers do Dockerfile, a propagação das três variáveis pelo Compose, os valores do `.env` e `max_connections=100` antes de `docker pull` ou `docker compose up`. O perfil `ecs-poc` mantém um orçamento separado e versionado para o deploy ECS.
 
+## Worker do outbox `billing.fact.v1`
+
+O worker periódico que reconcilia, escalona e (quando houver consumidor)
+apresenta os fatos `billing.fact.v1` é **desligado por padrão**.
+`BILLING_FACT_WORKER_ENABLED=false` não cria task, loop nem acesso ao banco, e
+nenhuma métrica do worker recebe valor capaz de disparar alerta. O merge, porém,
+não é neutro: ele altera `config/prometheus_rules.yml` e, portanto, o digest de
+regras vinculado ao release (ver "Release" abaixo).
+
+O worker **não tem transporte e não entrega nada hoje**: nenhum consumidor de
+créditos existe, a produção passa `transport=None` e a apresentação está
+bloqueada por uma guarda de código (ver "Apresentação bloqueada" abaixo).
+
+| Variável | Padrão | Limites | Efeito |
+|---|---:|---|---|
+| `BILLING_FACT_WORKER_ENABLED` | `false` | booleano | Liga um loop por processo da API (no ECS: 2 tasks × 4 workers = 8 loops). |
+| `BILLING_FACT_WORKER_INTERVAL_SECONDS` | `30` | 5–300 | Intervalo entre ticks e orçamento de tempo de cada tick: depois dele nenhuma nova claim é feita. |
+| `BILLING_FACT_WORKER_BATCH_SIZE` | `50` | 1–500 | Máximo de fatos apresentados por tick e tamanho de cada página de reconciliação/escalonamento. |
+| `BILLING_FACT_WORKER_MAX_ATTEMPTS` | `10` | 1–50 | Apresentações sem ack antes do estado terminal `blocked`. |
+| `BILLING_FACT_WORKER_STALE_AFTER_SECONDS` | `900` | 60–86400 | Idade a partir da qual um fato `pending`/`awaiting_ack` dispara o alerta de atraso (padrão 15 min). |
+
+Garantias com vários processos, todas no PostgreSQL:
+
+- **Claim sem dupla apresentação:** cada fato é reivindicado numa transação
+  curta própria com `FOR UPDATE OF billing_fact_deliveries SKIP LOCKED`, e a
+  linha fica travada até o commit da tentativa. Outro processo pula a linha em
+  vez de esperar, e o backoff persistido (`last_attempt_at`, exponencial de
+  60 s até 1 h) adia a próxima apresentação **de uma tentativa já
+  commitada**. Ele não cobre uma queda entre o envio e o commit (ver
+  "Apresentação bloqueada"). Um fato cujo ack foi commitado antes da releitura
+  feita logo após o lock não é reapresentado; um ack commitado depois dessa
+  releitura não interrompe a apresentação já em curso (ela acontece uma vez
+  mais e o reconciliador converge o fato em seguida).
+- **Manutenção serializada:** a reconciliação (página limitada dos fatos não
+  `acknowledged`, com cursor que dá a volta) e o escalonamento rodam sob
+  `pg_try_advisory_xact_lock`; quem não obtém o lock pula a fase sem esperar.
+- **Retry limitado sem migration:** usa `attempt_count`, `last_attempt_at` e o
+  estado existente `blocked`. Esgotado o limite, a entrega vira `blocked` e é
+  gravado um alerta `backlog` (detalhe `retry cap exhausted`) em
+  `billing_fact_reconciliation_alerts`. O fato nunca é apagado nem marcado
+  `acknowledged` sem ack válido; um ack válido que chegue depois ainda o
+  converge para `acknowledged`.
+- **Apresentação bloqueada:** a tentativa só é contada depois que o transporte
+  retorna, na mesma transação. Se o processo cair, ou o commit se perder,
+  depois de um envio já visível ao consumidor, a entrega continua `pending`
+  com `attempt_count` inalterado e é reapresentada no tick seguinte: a cada
+  nova queda isso se repete **sem limite**, ignorando o backoff e
+  `BILLING_FACT_WORKER_MAX_ATTEMPTS`. Por isso
+  `PRESENTATION_PRECONDITIONS_OPEN = True` em `src/services/billing_outbox.py`
+  faz `BillingFactWorker(transport=...)`, `publish_next`, e os caminhos legados
+  `publish_pending`/`pending` levantarem `PresentationPreconditionsOpen`. A
+  constante só pode virar `False` quando as três pré-condições forem cumpridas:
+  (1) contar a tentativa num lease commitado **antes** de apresentar;
+  (2) existir um caminho de requeue para entregas `blocked`;
+  (3) o runbook cobrir o transporte real.
+- **Ack válido:** o backlog (`unacked`/`stale`) e o escalonamento `ack overdue`
+  ignoram fatos que já têm um ack válido (mesmo schema, mesmo `event_id`,
+  `accepted` e digests iguais aos do outbox/handoff), mesmo antes de a página de
+  reconciliação marcá-los `acknowledged`. Um ack divergente continua contando
+  até o reconciliador mover o fato para `blocked`.
+- **Sem consumidor:** hoje nenhum consumidor de créditos existe, então nenhum
+  transporte é ligado. Os fatos ficam `pending`, sem tentativas consumidas e
+  reapresentáveis quando o consumidor existir; após o limiar, cada fato recebe
+  um alerta `backlog` (detalhe `ack overdue`) e o gauge
+  `neurostack_billing_fact_backlog{condition="stale"}` dispara
+  `BillingFactDeliveryStale`. O worker nunca chama ledger ou lógica de crédito.
+- **Shutdown:** o lifespan para o loop antes de fechar o pool; o fato em voo
+  termina (timeout de apresentação de 10 s, espera de até 15 s) e nenhum novo é
+  reivindicado. Se for preciso cancelar, a transação faz rollback e o fato
+  mantém o estado anterior. Um `CancelledError` que não foi dirigido à task do
+  loop (por exemplo, levantado pelo código do consumidor ou do driver) é
+  registrado em ERROR e contado como tick/tentativa falha, e o loop continua;
+  um cancelamento real (shutdown) nunca é engolido.
+
+Alertas em `config/prometheus_rules.yml` (grupo `neurostack_billing_facts`):
+`BillingFactDeliveryStale`, `BillingFactDeliveryBlocked` e
+`BillingFactWorkerStalled` (nenhum tick completo há mais de 10 min com o worker
+ligado). O gauge de backlog é recalculado a partir do banco por todo loop, então
+qualquer processo raspado reporta o estado global. Detalhes e primeiros passos:
+`docs/runbooks/asaas-billing-reconciliation.md`.
+
+Liveness: ao ligar, `start()` grava o horário de início em
+`neurostack_billing_fact_worker_last_tick_timestamp_seconds`, e cada tick
+completo o atualiza. Um worker que falha todos os ticks desde o boot (sem
+nenhuma amostra de backlog) ainda envelhece esse timestamp e dispara
+`BillingFactWorkerStalled` após 10 min; com a flag desligada o gauge fica em
+`0`, que a regra ignora. Não há regra sobre a taxa de
+`neurostack_billing_fact_worker_ticks_total{outcome="failed"}`: o `/metrics` não
+usa o modo multiprocess do `prometheus_client` e a imagem roda 4 workers
+uvicorn, então cada scrape lê o contador de um processo diferente e `rate()`
+veria resets falsos. O contador serve para diagnóstico, não para alerta.
+
+Release: este grupo muda o digest de `config/prometheus_rules.yml` (e do
+espelho byte-idêntico `src/config/prometheus_rules.yml`) de `5ff2ae8d…` para
+`e3714701…`. Implantar um build com essas regras exige reemitir
+`BILLING_PROMETHEUS_RULES_DIGEST` e o acknowledgement do receiver. A limpeza de
+alertas do Group 10 vai rotacionar o digest de novo, então os dois devem sair
+no mesmo deploy, com uma única reemissão.
+
 ## Primeiro acesso: bootstrap do super_admin
 
 Um banco novo, depois de `alembic upgrade head`, não tem nenhum usuário. O
