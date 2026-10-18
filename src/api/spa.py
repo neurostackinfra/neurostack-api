@@ -51,7 +51,6 @@ from fastapi.routing import (
     RouteContext,
     iter_route_contexts,
 )
-from starlette._utils import get_route_path
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import Response
@@ -59,6 +58,7 @@ from starlette.routing import BaseRoute, Host, Match, Mount, Route, WebSocketRou
 from starlette.types import Receive, Scope, Send
 from starlette.websockets import WebSocketClose
 
+from src.api.routing_paths import route_path
 from src.config.logging import get_logger
 from src.config.settings import settings
 
@@ -284,8 +284,12 @@ class SpaRegistry:
 
 
 def router_path(scope: Scope) -> str:
-    """The exact path string Starlette's router matches for ``scope``."""
-    return get_route_path(scope)
+    """The exact path string Starlette's router matches for ``scope``.
+
+    Exact on purpose (``routing_paths.route_path``, not ``decision_path``):
+    the SPA endpoints re-check this same string against the registry.
+    """
+    return route_path(scope)
 
 
 def is_public_spa_path(scope: Scope) -> bool:
@@ -351,7 +355,7 @@ class _AssetsApp:
         if not root_path.endswith(ASSETS_PREFIX):
             raise HTTPException(status_code=404)
         parent_root = root_path[: -len(ASSETS_PREFIX)]
-        path = get_route_path({"path": scope["path"], "root_path": parent_root})
+        path = route_path({"path": scope["path"], "root_path": parent_root})
         file = self._registry.lookup(path)
         if file is None or not path.startswith(ASSETS_PREFIX + "/"):
             raise HTTPException(status_code=404)

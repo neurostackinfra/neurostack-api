@@ -23,6 +23,7 @@ from typing import Optional, Protocol, cast
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
+from src.api.routing_paths import decision_path, route_path
 from src.config.logging import get_logger
 from src.observability.metric_dimensions import ContractCounter as Counter
 from src.observability.metric_dimensions import ContractGauge as Gauge
@@ -329,7 +330,9 @@ class CachingMiddleware(BaseHTTPMiddleware):
         if request.method != "GET":
             return await call_next(request)
 
-        path = request.url.path
+        # TTL/never-cache rules judge the path the router matches
+        # (routing_paths); the key below uses its exact string.
+        path = decision_path(request.scope)
 
         # Check if path should never be cached
         for never_cache_path in self.NEVER_CACHE:
@@ -388,9 +391,11 @@ class CachingMiddleware(BaseHTTPMiddleware):
 
     def _generate_cache_key(self, request: Request) -> str:
         """Generate cache key from request."""
-        # Include path, query, and tenant
+        # Include path, query, and tenant.  The exact router path: every
+        # string the router can tell apart (route parameters included) keeps
+        # its own entry, and nothing it does not dispatch here shares one.
         parts = [
-            request.url.path,
+            route_path(request.scope),
             str(sorted(request.query_params.items())),
             request.headers.get("X-Tenant-ID", ""),
         ]

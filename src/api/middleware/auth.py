@@ -21,6 +21,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from src.api.routing_paths import decision_path
 from src.api.schemas.auth import StagingRehearsalTokenRequest
 from src.api.spa import is_public_spa_path
 from src.config.logging import get_logger
@@ -42,6 +43,14 @@ STAGING_REHEARSAL_READBACK_PATH = "/v1/admin/billing/rollout/readback"
 STAGING_PRODUCER_RECEIPT_PATH = "/v1/admin/billing/producer-receipts"
 PUBLIC_PRODUCER_BUILD_TRUST_PATH = "/v1/billing/producer-build-trust"
 PRODUCER_BUILD_TRUST_READBACK_PATH = "/v1/admin/billing/producer-build-trust"
+# Exact GET-only public trust readbacks (served with Cache-Control: no-store).
+PUBLIC_TRUST_READBACK_PATHS = frozenset(
+    {PUBLIC_PRODUCER_BUILD_TRUST_PATH, PRODUCER_BUILD_TRUST_READBACK_PATH}
+)
+# Exact POST-only public lead-capture form.
+PUBLIC_DEMO_LEADS_PATH = "/v1/demo-leads"
+# ASAAS receiver: public here because the ingress boundary authenticates it.
+PUBLIC_ASAAS_WEBHOOK_PATH = "/v1/billing/webhook/asaas"
 _STAGING_REHEARSAL_PURPOSE_CLAIMS = frozenset(
     {"token_use", "token_environment", "scope"}
 )
@@ -71,6 +80,8 @@ _STAGING_REHEARSAL_TARGETS = frozenset(
         ("POST", f"{STAGING_PRODUCER_RECEIPT_PATH}/verify"),
     }
 )
+# Exported for the route-table invariant tests (single source).
+STAGING_REHEARSAL_TARGETS = _STAGING_REHEARSAL_TARGETS
 _STAGING_REHEARSAL_RATE_LIMIT_LUA = """
 local count = redis.call('INCR', KEYS[1])
 if count == 1 then
@@ -320,6 +331,15 @@ class AuthMiddleware:
         "/metrics",
         "/v1/auth/login",
     }
+    # Every path starting with one of these is public (plain ``startswith``).
+    PUBLIC_PATH_PREFIXES: tuple[str, ...] = (
+        "/docs",
+        "/redoc",
+        "/metrics",
+        "/v1/webhook/",
+        "/privacidade/",
+        "/api/public/privacidade/",
+    )
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -330,11 +350,13 @@ class AuthMiddleware:
             return
 
         request = Request(scope, receive, send)
+        # Every path decision below is taken on the path the router matches
+        # (src/api/routing_paths.py), never on request.url.path, which drops
+        # tab/CR/LF, cuts at a decoded "?"/"#" and keeps root_path.  Logs
+        # keep request.url.path.
+        path = decision_path(scope)
 
-        if (
-            request.method == "POST"
-            and request.url.path == STAGING_REHEARSAL_TOKEN_PATH
-        ):
+        if request.method == "POST" and path == STAGING_REHEARSAL_TOKEN_PATH:
             if settings.environment != STAGING_REHEARSAL_TOKEN_ENVIRONMENT:
                 await self._reject_staging_issuer(scope, receive, send, 404)
                 return
@@ -350,10 +372,7 @@ class AuthMiddleware:
 
         # Exact GET-only trust readbacks are public; other methods and adjacent
         # paths continue through normal authentication.
-        if request.method == "GET" and request.url.path in {
-            PUBLIC_PRODUCER_BUILD_TRUST_PATH,
-            PRODUCER_BUILD_TRUST_READBACK_PATH,
-        }:
+        if request.method == "GET" and path in PUBLIC_TRUST_READBACK_PATHS:
             await self.app(scope, receive, self._no_store_send(send))
             return
 
@@ -363,12 +382,10 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        is_rehearsal_target = (request.method, request.url.path) in (
-            _STAGING_REHEARSAL_TARGETS
-        )
+        is_rehearsal_target = (request.method, path) in _STAGING_REHEARSAL_TARGETS
 
         # Skip auth for public paths and OPTIONS
-        if self._is_public_path(request.url.path) or request.method == "OPTIONS":
+        if self._is_public_path(path) or request.method == "OPTIONS":
             await self.app(scope, receive, send)
             return
 
@@ -379,7 +396,7 @@ class AuthMiddleware:
             return
 
         # POST /v1/demo-leads is public (lead capture form)
-        if request.url.path == "/v1/demo-leads" and request.method == "POST":
+        if path == PUBLIC_DEMO_LEADS_PATH and request.method == "POST":
             await self.app(scope, receive, send)
             return
 
@@ -401,7 +418,7 @@ class AuthMiddleware:
                 )
                 if has_purpose:
                     if not self._valid_staging_rehearsal_payload(
-                        payload, request.method, request.url.path
+                        payload, request.method, path
                     ):
                         await self._reject_staging_issuer(
                             scope, receive, send, 401, "unauthorized"
@@ -678,21 +695,11 @@ class AuthMiddleware:
         """Check if path is public (no auth required)."""
         if path in self.PUBLIC_PATHS:
             return True
-        if path.startswith("/docs") or path.startswith("/redoc"):
-            return True
-        if path.startswith("/metrics"):
-            return True
-        if path.startswith("/v1/webhook/"):
+        if path.startswith(self.PUBLIC_PATH_PREFIXES):
             return True
         # ASAAS receiver: exact match only (no prefix, no trailing slash).  It
         # authenticates its own token at the ingress boundary.
-        if path == "/v1/billing/webhook/asaas":
-            return True
-        if path.startswith("/privacidade/"):
-            return True
-        if path.startswith("/api/public/privacidade/"):
-            return True
-        return False
+        return path == PUBLIC_ASAAS_WEBHOOK_PATH
 
     def _get_client_ip(self, request: Request) -> str:
         """Extract client IP from request, handling proxies."""
