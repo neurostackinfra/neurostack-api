@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from src.api.schemas.auth import StagingRehearsalTokenRequest
+from src.api.spa import is_public_spa_path
 from src.config.logging import get_logger
 from src.config.settings import settings
 from src.repositories import TenantRepository, get_db_session
@@ -354,6 +355,12 @@ class AuthMiddleware:
             PRODUCER_BUILD_TRUST_READBACK_PATH,
         }:
             await self.app(scope, receive, self._no_store_send(send))
+            return
+
+        # Exact GET/HEAD-only frontend paths, decided on the router's own path
+        # string (src/api/spa.py); everything else keeps normal authentication.
+        if request.method in ("GET", "HEAD") and is_public_spa_path(scope):
+            await self.app(scope, receive, send)
             return
 
         is_rehearsal_target = (request.method, request.url.path) in (

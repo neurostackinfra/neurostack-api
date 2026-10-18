@@ -260,6 +260,48 @@ e nunca ficam em fila entre mudanças de estado: qualquer transição no meio
 torna a quorum inútil (`billing_rollout_quorum_stale` ou
 `billing_operation_signature_invalid`) e ela precisa ser assinada de novo.
 
+## Frontend servido pela API (`SPA_*`)
+
+A API serve o build do frontend (`frontend/artifacts/neurostack`, saída
+`dist/public` do Vite) em caminhos **exatos**, calculados uma vez na
+inicialização por `src/api/spa.py`: as rotas do `App.tsx` (e o gêmeo com barra
+final, exceto `/` e `/traces/`), `/traces/<id>` com `id` de 1 a 128 caracteres
+`[A-Za-z0-9_-]`, cada arquivo regular de `assets/` como `/assets/<nome>` e os
+arquivos do topo (`/favicon.png`, `/favicon.svg`, `/opengraph.jpg`). Só GET e
+HEAD desses caminhos dispensam autenticação; qualquer variante (barra dupla,
+caixa, codificação, `..`, outro método) continua recebendo o 401 de hoje.
+`/privacidade/:clinicId` continua sendo a página renderizada pela API.
+
+| Variável | Padrão | Regra |
+|---|---|---|
+| `SPA_ENABLED` | `true` | `false` desliga o frontend sem mexer na imagem |
+| `SPA_DIST_DIR` | vazio | diretório do build (a imagem define `/app/spa`); vazio, inexistente, sem `index.html` regular, com `index.html` fora de UTF-8, com `assets/` ilegível (permissão, symlink, não diretório) ou com `index.html` referenciando um `/assets/...` que não foi carregado não registra nada (um warning `spa_not_installed`); a ausência de `assets/` só é aceita se o `index.html` não referenciar nenhum `/assets/...` |
+
+Falha fechada: se algum caminho cair sob um prefixo reservado (`/v1`, `/api/`,
+`/docs`, `/redoc`, `/openapi.json`, `/metrics`, `/health`, `/ready`, `/live`,
+`/privacidade/`) ou colidir com uma rota já registrada, nada é servido e o log
+`spa_not_installed` (nível error) lista os conflitos. Os caminhos exatos são
+testados contra a tabela de rotas; para `/traces/<id>` qualquer rota ou mount
+sob `/traces/`, qualquer rota com parâmetro que possa cobrir `/traces/` (por
+exemplo `/{x}` ou `/{x}/stats`), um mount na raiz, uma rota sem caminho
+analisável (`Host`) ou uma classe de rota com `matches` próprio conta como
+colisão; rotas de routers incluídos são avaliadas pelo caminho efetivo (com
+prefixo) que o FastAPI realmente despacha. Em todos esses casos a API sobe
+normalmente (`/health` continua verde) e o frontend fica desligado: o sinal é o
+log `spa_not_installed`. Diretórios, arquivos que não são regulares, symlinks,
+dotfiles, nomes fora de `[A-Za-z0-9._-]`, source maps, HTML além do
+`index.html` e extensões desconhecidas são ignorados e listados uma vez em
+`spa_build_entries_skipped`. Nada depende de `ENVIRONMENT` (o service que
+atende produção roda com `ENVIRONMENT=staging`).
+
+Cabeçalhos só nas respostas do frontend (nunca em `/v1`, `/docs`, `/redoc`):
+`index.html` sai da memória com `Cache-Control: no-cache`, ETag forte e 304;
+`/assets/*` com `public, max-age=31536000, immutable`; os arquivos do topo com
+`public, max-age=86400`; todos com `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: strict-origin-when-cross-origin`, `X-Frame-Options: DENY` e a
+`Content-Security-Policy` aplicada (não report-only) definida e comentada em
+`src/api/spa.py`.
+
 ---
 
 ## Índice
