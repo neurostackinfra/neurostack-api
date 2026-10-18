@@ -1597,7 +1597,7 @@ class _FinancialState:
     ) -> None:
         """Mirror the legacy paid-event commercial effect with ASAAS identity.
 
-        Legacy Abacate: activate the builder plan, consume the coupon, log a
+        Legacy effect: activate the builder plan, consume the coupon, log a
         ``Transaction``.  Here every value comes from persisted rows: the
         Group 1 four-tuple links the Transaction to this effect, amounts are
         the snapshot's, and the coupon is consumed once per checkout session by

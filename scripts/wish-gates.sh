@@ -587,11 +587,10 @@ _asaas_baseline_scan() {
 #   BASE_REF=origin/main POSTGRES_SMOKE_DATABASE_URL=... \
 #     bash -c 'source scripts/wish-gates.sh && asaas_release_candidate_gate'
 #
-# Known legacy references, removed by asaas-payment-gateway Group 10 and not by
-# this gate: docker-compose.production.yml still requires
-# ABACATEPAY_WEBHOOK_SECRET (hence its synthetic value), and
-# tests/integration/test_asaas_billing_postgres.py still carries the legacy
-# migration cases.
+# Known legacy references, removed by later phases of asaas-payment-gateway
+# Group 10 and not by this gate: tests/integration/test_asaas_billing_postgres.py
+# still carries the legacy migration cases. (docker-compose.production.yml no
+# longer requires ABACATEPAY_WEBHOOK_SECRET since Group 10 phase 1.)
 asaas_release_candidate_gate() (
     set -euo pipefail
     local root="$_WISH_GATES_ROOT"

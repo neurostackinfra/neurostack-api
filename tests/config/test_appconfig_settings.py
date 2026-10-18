@@ -22,7 +22,6 @@ def _production_settings(**overrides: Any) -> Settings:
         "database_url": "postgresql+asyncpg://runtime-user:runtime-pass@database/api",
         "allowed_origins": ["https://app.neurostack.example"],
         "allowed_hosts": ["api.neurostack.example"],
-        "abacatepay_webhook_secret": "legacy-fixture-secret",
     }
     values.update(overrides)
     return complete_production_settings(**values)

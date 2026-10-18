@@ -104,7 +104,6 @@ def _vps_files(tmp_path: Path) -> tuple[Path, Path, Path]:
         "QDRANT_API_KEY=test_qdrant\n"
         "ASAAS_API_KEY=test_asaas_api_key\n"
         "ASAAS_WEBHOOK_TOKEN=test_asaas_webhook_token\n"
-        "ABACATEPAY_WEBHOOK_SECRET=test_abacatepay_webhook_secret\n"
         # Group 5 production requirements (``${VAR:?...}`` in the production
         # Compose file): provider evidence key, receipt signing key, mounted
         # rule/smoke/schema digests, runtime acknowledgement and receiver.

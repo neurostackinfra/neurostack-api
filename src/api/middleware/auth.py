@@ -677,8 +677,6 @@ class AuthMiddleware:
             return True
         if path.startswith("/v1/webhook/"):
             return True
-        if path == "/v1/billing/webhook":
-            return True
         # ASAAS receiver: exact match only (no prefix, no trailing slash).  It
         # authenticates its own token at the ingress boundary.
         if path == "/v1/billing/webhook/asaas":

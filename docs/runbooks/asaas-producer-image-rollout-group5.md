@@ -10,7 +10,7 @@ The live target group `neurostack-staging-app` currently checks `/health`. That 
 
 Before approval and after deployment, an administrator also probes **every exact running task private IPv4 address** with `GET http://<task-ip>:8000/ready` from a VPC-connected host whose network policy already allows access. Record only the private target IP, HTTP status code, and `ready` boolean; discard response bodies. Every task must return HTTP 200 with `ready=true`. The evidence is a fresh, human-authenticated operator attestation bound to the Actions run; the runner does not independently make the HTTP or ELB readback. If no already-authorized VPC host can reach every task IP, stop before approval or acceptance. Do not use `/health`, an ALB request that may hit only one target, ECS Exec, or a security-group change as a substitute.
 
-`GET /ready` checks the production DB session, Redis, Qdrant, AbacatePay webhook configuration, and billing-observability compatibility. The checked-in SQL query separately proves the database registration schema and the active task-to-runtime-role mapping.
+`GET /ready` checks the production DB session, Redis, Qdrant, and billing-observability compatibility. The checked-in SQL query separately proves the database registration schema and the active task-to-runtime-role mapping.
 
 ## Required prerequisites
 

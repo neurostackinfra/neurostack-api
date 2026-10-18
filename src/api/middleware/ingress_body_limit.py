@@ -23,12 +23,9 @@ from src.services.billing_webhook import (
 )
 
 MAX_INGRESS_BODY_BYTES = 1024 * 1024
-ABACATEPAY_WEBHOOK_BODY_BYTES = 262_144
-ABACATEPAY_WEBHOOK_READ_TIMEOUT_SECONDS = 5.0
 STAGING_REHEARSAL_TOKEN_BODY_BYTES = 2 * 1024
 STAGING_REHEARSAL_TOKEN_READ_TIMEOUT_SECONDS = 2.0
 _STAGING_REHEARSAL_TOKEN_PATH = "/v1/auth/staging-rehearsal-token"
-_ABACATEPAY_WEBHOOK_PATH = "/v1/billing/webhook"
 _FIXED_LIMITED_ENDPOINTS = frozenset(
     {
         "/v1/events",
@@ -51,12 +48,10 @@ class IngressBodyLimitMiddleware:
         app: ASGIApp,
         *,
         max_body_bytes: int = MAX_INGRESS_BODY_BYTES,
-        abacatepay_read_timeout_seconds: float = ABACATEPAY_WEBHOOK_READ_TIMEOUT_SECONDS,
         asaas_read_timeout_seconds: float = ASAAS_WEBHOOK_READ_TIMEOUT_SECONDS,
     ) -> None:
         self.app = app
         self.max_body_bytes = max_body_bytes
-        self.abacatepay_read_timeout_seconds = abacatepay_read_timeout_seconds
         self.asaas_read_timeout_seconds = asaas_read_timeout_seconds
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -68,30 +63,18 @@ class IngressBodyLimitMiddleware:
         if is_staging_rehearsal_token:
             send = self._no_store_send(send)
         if self._is_asaas_webhook(scope):
-            # Separate, exact-path boundary: the Abacate rule and the generic
-            # 1 MiB cap below never see this path, and this branch never sees
-            # theirs.
+            # Separate, exact-path boundary: the generic 1 MiB cap below never
+            # sees this path, and this branch never sees the generic paths.
             await self._asaas_webhook(scope, receive, send)
             return
         if not self._is_limited_request(scope):
             await self.app(scope, receive, send)
             return
 
-        is_abacatepay = scope.get("path") == _ABACATEPAY_WEBHOOK_PATH
-        if is_abacatepay:
-            if not settings.abacatepay_webhook_secret.get_secret_value():
-                await self._reject_unavailable_billing_webhook(scope, receive, send)
-                return
-            if not self._has_header(scope, b"x-webhook-signature"):
-                await self._reject_missing_billing_signature(scope, receive, send)
-                return
-
         body_limit = (
             STAGING_REHEARSAL_TOKEN_BODY_BYTES
             if is_staging_rehearsal_token
-            else (
-                ABACATEPAY_WEBHOOK_BODY_BYTES if is_abacatepay else self.max_body_bytes
-            )
+            else self.max_body_bytes
         )
 
         declared_length, valid_length = self._content_length(scope)
@@ -107,13 +90,9 @@ class IngressBodyLimitMiddleware:
         received = 0
         try:
             async with asyncio.timeout(
-                (
-                    STAGING_REHEARSAL_TOKEN_READ_TIMEOUT_SECONDS
-                    if is_staging_rehearsal_token
-                    else (
-                        self.abacatepay_read_timeout_seconds if is_abacatepay else None
-                    )
-                )
+                STAGING_REHEARSAL_TOKEN_READ_TIMEOUT_SECONDS
+                if is_staging_rehearsal_token
+                else None
             ):
                 while True:
                     message = await receive()
@@ -269,7 +248,6 @@ class IngressBodyLimitMiddleware:
             and scope.get("method") == "POST"
             and (
                 path in _FIXED_LIMITED_ENDPOINTS
-                or path == _ABACATEPAY_WEBHOOK_PATH
                 or path == _STAGING_REHEARSAL_TOKEN_PATH
             )
         )
@@ -314,13 +292,6 @@ class IngressBodyLimitMiddleware:
         names = [name.lower() for name, _value in scope.get("headers", [])]
         return b"content-length" in names and b"transfer-encoding" in names
 
-    @staticmethod
-    def _has_header(scope: Scope, expected_name: bytes) -> bool:
-        return any(
-            name.lower() == expected_name and bool(value)
-            for name, value in scope.get("headers", [])
-        )
-
     async def _reject(self, scope: Scope, receive: Receive, send: Send) -> None:
         response = JSONResponse(
             status_code=413,
@@ -348,25 +319,6 @@ class IngressBodyLimitMiddleware:
         response = JSONResponse(
             status_code=408,
             content={"error": "request_body_timeout"},
-        )
-        await response(scope, receive, send)
-
-    @staticmethod
-    async def _reject_missing_billing_signature(
-        scope: Scope, receive: Receive, send: Send
-    ) -> None:
-        response = JSONResponse(
-            status_code=400, content={"detail": "Invalid signature"}
-        )
-        await response(scope, receive, send)
-
-    @staticmethod
-    async def _reject_unavailable_billing_webhook(
-        scope: Scope, receive: Receive, send: Send
-    ) -> None:
-        response = JSONResponse(
-            status_code=503,
-            content={"detail": "billing_webhook_unavailable"},
         )
         await response(scope, receive, send)
 
