@@ -21,6 +21,7 @@ from src.api import spa
 from src.api.main import create_app
 from src.api.spa import (
     SPA_CLIENT_ROUTES,
+    TRACE_DETAIL_PATTERN,
     SpaRegistry,
     SpaUnavailable,
     install_spa,
@@ -132,18 +133,22 @@ def test_client_routes_are_rederived_from_app_tsx() -> None:
     assert [route for route in SPA_CLIENT_ROUTES if ":" in route] == ["/traces/:id"]
 
 
-def test_client_routes_match_shared_fixture_when_present() -> None:
-    if not ROUTES_FIXTURE.exists():
-        pytest.skip(
-            "tests/fixtures/spa_client_routes.json is created by the Group 6c "
-            "build/hygiene branch; until it merges App.tsx is the oracle"
-        )
+def test_client_routes_match_shared_fixture() -> None:
     loaded = json.loads(ROUTES_FIXTURE.read_text(encoding="utf-8"))
-    if isinstance(loaded, dict):
-        lists = [value for value in loaded.values() if isinstance(value, list)]
-        assert len(lists) == 1, f"unexpected fixture shape: {sorted(loaded)}"
-        loaded = lists[0]
-    assert set(loaded) - {"/privacidade/:clinicId"} == set(SPA_CLIENT_ROUTES)
+    assert sorted(loaded) == ["description", "dynamic", "excluded", "static"]
+
+    dynamic = loaded["dynamic"]
+    assert [entry["route"] for entry in dynamic] == ["/traces/:id"]
+    assert dynamic[0]["pattern"] == TRACE_DETAIL_PATTERN.pattern
+
+    declared = [*loaded["static"], *(entry["route"] for entry in dynamic)]
+    assert len(declared) == len(set(declared))
+    assert set(declared) == set(SPA_CLIENT_ROUTES)
+    assert len(declared) == len(SPA_CLIENT_ROUTES)
+
+    # Routes the API serves itself must never become SPA routes.
+    assert loaded["excluded"] == ["/privacidade/:clinicId"]
+    assert not set(loaded["excluded"]) & set(SPA_CLIENT_ROUTES)
 
 
 def test_registry_is_exactly_the_client_routes_twins_and_clean_build_files(
