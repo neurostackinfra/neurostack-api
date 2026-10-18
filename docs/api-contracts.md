@@ -910,3 +910,105 @@ Os limites são configuráveis por tenant no momento da criação da API Key.
 ---
 
 *Documentação gerada automaticamente. Última atualização: Fevereiro 2026*
+
+## Billing ASAAS (assinatura mensal no cartão)
+
+As rotas abaixo exigem o JWT de builder (`require_builder`). Catálogo, preço,
+clínicas adicionais, cupom, ciclo e vencimento são resolvidos no servidor; o
+navegador escolhe somente a oferta e o método permitido. Fonte:
+`src/api/routes/billing.py` e `src/api/schemas/billing.py`.
+
+### GET `/v1/billing/summary` e GET `/v1/billing/usage`
+
+`summary` retorna `plan`, `subscription_status`, `billing_cycle`,
+`active_clinics` e `usage` (o mesmo objeto de `/usage`: período, traces,
+armazenamento RAG/mídia e `credits.purchase_enabled`/`coming_soon`). Os campos
+`free_tier`, `base_price`, `extra_price`, `total_monthly`, `total_annual` e
+`discount_pct` são legados e não descrevem o preço das ofertas ASAAS.
+`subscription_status` é uma marca de mão única: a liquidação do webhook ASAAS
+(e a rota legada) só a escreve como `active`, e nada a limpa em estorno,
+chargeback ou cancelamento. A página usa esse valor para duas coisas: bloquear
+um novo checkout e exibir o selo "Assinatura Ativa" (com os botões
+"Gerenciar Assinatura" desabilitados no lugar de "Assinar"). O selo apenas
+mostra essa marca de mão única: não é prova de direito vigente e continua
+aparecendo depois de um estorno, chargeback ou cancelamento. O estado financeiro
+confirmado vem do estado da sessão de checkout relida do servidor
+(`GET /v1/billing/checkout/{id}`); o navegador nunca escreve nenhum dos dois.
+
+### POST `/v1/billing/checkout`
+
+Request fechado (`extra="forbid"`):
+
+```json
+{
+  "offer_id": "plan_pro_monthly_v1",
+  "method": "credit_card",
+  "coupon_code": "OPCIONAL"
+}
+```
+
+- Ofertas de assinatura (`cycle=MONTHLY`): `plan_plus_monthly_v1`,
+  `plan_pro_monthly_v1`, `plan_max_monthly_v1`. Para elas `method` é sempre
+  `credit_card`; `pix` é rejeitado no schema (422).
+- `coupon_code` é opcional e aceito somente para assinatura; é apenas um
+  seletor normalizado (`strip().upper()`) e resolvido pelo servidor.
+- Ofertas `DETACHED` (pacotes de créditos) pertencem ao contrato de recarga,
+  que continua fechado: a recarga comercial está adiada e a UI não a expõe.
+
+Resposta 200 (`CheckoutResponse`):
+
+```json
+{
+  "ok": true,
+  "checkout_session_id": "<uuid>",
+  "kind": "subscription",
+  "state": "active",
+  "checkout_url": "https://asaas.com/checkoutSession/show?id=<id>"
+}
+```
+
+`checkout_url` só é preenchido quando `state=active`; a URL é construída pelo
+backend a partir de uma origem fixa. A página navega para ela no mesmo
+separador. Um novo POST para a mesma oferta e método devolve a sessão viva
+existente em vez de criar outra.
+
+| Status | `detail` | Significado |
+|--------|----------|-------------|
+| 200 | — | Sessão criada ou sessão viva existente. |
+| 202 | `billing_checkout_reconciliation_required` | Resultado do provedor incerto; nenhum ID é devolvido. O usuário não deve pagar de novo: para retomar a sessão existente, envia o mesmo plano outra vez (o servidor devolve a sessão viva em vez de criar outra) ou aguarda e atualiza a página. |
+| 400 | `billing_checkout_coupon_invalid` / `billing_checkout_coupon_not_eligible` | Cupom inexistente, inativo, expirado, esgotado, ou não utilizável nesta oferta/estado. |
+| 409 | `billing_checkout_not_eligible` | Código único para todo bloqueio de elegibilidade (assinatura não terminal, outro checkout vivo etc.). |
+| 422 | `billing_checkout_input_rejected` ou erro de schema | Oferta/método/cupom inválidos. |
+| 502 | `billing_checkout_creation_rejected` | O provedor recusou a criação; nada foi cobrado. |
+| 503 | `billing_checkout_unavailable` | Rollout fechado, egress financeiro desligado, webhook não pronto ou configuração ausente; nenhum POST ao provedor. |
+
+Atenção: o 202 é um status "ok" do HTTP, mas não traz `checkout_session_id`.
+Um 403 nestas rotas significa que o usuário autenticado não é builder (não é
+sessão expirada, que é 401).
+
+### GET `/v1/billing/checkout/{checkout_session_id}`
+
+Relê a sessão do próprio builder, sem lock nem egress. IDs alheios ou
+inexistentes retornam o mesmo 404. Estados possíveis: `creating`, `active`,
+`paid_pending_subscription`, `reconciliation_required`,
+`terminal_pending_readback` (vivos) e `completed`, `abandoned`, `cancelled`,
+`expired`, `failed` (terminais).
+
+### POST `/v1/billing/checkout/{checkout_session_id}/reconcile`
+
+Reconciliação somente leitura por referência exata; nunca cria um novo
+Checkout. Só age sobre `reconciliation_required` ou `creating` órfão; falha de
+leitura do provedor retorna 202 `billing_checkout_reconciliation_required`: a
+sessão continua em verificação pelo servidor (não é falha de leitura da
+sessão), e a página informa isso sem liberar um novo checkout.
+
+### Retorno do checkout hospedado
+
+O backend deriva de `ASAAS_CHECKOUT_RETURN_URL` três URLs de navegação:
+`?checkout=success`, `?checkout=cancel` e `?checkout=expired`. Esses valores
+não são resultado financeiro. A página remove o marcador, relê
+`/v1/billing/summary` e, se guardou o `checkout_session_id` em
+`sessionStorage` antes do redirect, relê `GET /v1/billing/checkout/{id}` uma
+vez. Não há polling: novas leituras são acionadas pelo usuário. Enquanto um ID
+guardado não puder ser lido (erro diferente de 404), a página mostra o erro,
+oferece nova leitura e mantém os botões de assinatura bloqueados.

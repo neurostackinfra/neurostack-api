@@ -5,6 +5,28 @@
 
 Este documento descreve onde e como as informações de configuração do tenant e da clínica (ClinicConfig) são armazenadas, a estrutura dos dados e um exemplo completo em JSON.
 
+## Billing ASAAS: variáveis e gates
+
+`ASAAS_API_KEY`, `ASAAS_WEBHOOK_TOKEN`, `ASAAS_CHECKOUT_RETURN_URL`,
+`ASAAS_WEBHOOK_URL` e `ASAAS_WEBHOOK_NOTIFICATION_EMAIL` são apenas nomes
+documentados em `.env.example`: os valores reais vêm do secret manager ou da
+configuração protegida do ambiente e nunca entram no repositório.
+
+- `ASAAS_CHECKOUT_RETURN_URL` deve ser uma URL HTTPS absoluta, sem userinfo,
+  query ou fragmento (`src/config/settings.py`). O backend acrescenta
+  `?checkout=success|cancel|expired`; aponte-a para a rota `/billing` da UI
+  publicada. Sem ela, a criação de checkout retorna 503.
+- A assinatura usa somente checkout hospedado mensal no cartão.
+- Não há variável de ambiente que abra vendas ou recargas. O estado de rollout
+  (`disabled`, `canary_allowlist`, `general`) e `topup_commercial_enabled`
+  são controles persistidos e auditados no banco; ambos nascem fechados. A
+  recarga comercial está adiada e permanece fechada.
+- O flag `financial_egress_enabled` do AppConfig (seção seguinte) e a
+  prontidão do webhook também bloqueiam a criação quando ausentes.
+
+Em exemplos e evidências locais use valores vazios ou placeholders, não faça
+egress financeiro e não copie tokens, payloads, dados de cartão ou PII.
+
 ## Flags de egress pelo AWS AppConfig Agent
 
 A aplicação consulta o cache HTTP local do AWS AppConfig Agent imediatamente

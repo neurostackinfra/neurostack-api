@@ -15,3 +15,23 @@ Published catalog versions are append-only contracts. A commercial change
 must introduce a new `catalog_version_id`; it must never edit a previously
 published version retroactively. Additional-clinic charges always grant zero
 credits.
+
+## Release UI contract (checkout wiring)
+
+This section covers only how the builder page wires the hosted checkout. The
+page layout, plan comparison, credits area and state matrix belong to the
+separate `tela-pagamentos` wish.
+
+- The page offers the three `MONTHLY` offers (`plan_plus_monthly_v1`,
+  `plan_pro_monthly_v1`, `plan_max_monthly_v1`) and sends only
+  `{offer_id, method: "credit_card"}`, plus an optional server-validated
+  `coupon_code`. It never sends price, cycle, quantity, installments or
+  payment details, and never offers annual billing or PIX for a subscription.
+- It navigates to the `checkout_url` the API returns, which is built by the
+  backend only for an `active` session.
+- A return from the hosted checkout is navigation only. Status is read back
+  from `GET /v1/billing/summary` and `GET /v1/billing/checkout/{id}`; the
+  query string never activates a plan and the page does not poll.
+- Credit packages (`DETACHED` offers) are not purchasable from the page. A
+  disabled browser control is not the security boundary: top-up creation is
+  gated server-side and the commercial top-up is deferred.
