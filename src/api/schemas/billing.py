@@ -3,12 +3,16 @@ NeuroStack API - Billing Schemas
 Pydantic models for billing endpoints.
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from src.services.billing_catalog import BILLING_CATALOG
+from src.services.billing_read_contract import (
+    LiveCheckoutState,
+    SubscriptionFinancialStatus,
+)
 
 
 class UsagePeriodResponse(BaseModel):
@@ -57,6 +61,58 @@ class BillingUsageResponse(BaseModel):
     credits: CreditAvailabilityResponse
 
 
+class BillingSubscriptionSummaryResponse(BaseModel):
+    """The builder's current ASAAS subscription (Group 6b read contract).
+
+    ``status`` is the confirmed financial state of the subscription record,
+    never the legacy one-way ``subscription_status`` flag.
+    ``current_period_end`` is the latest ``cycle_end`` among the cycles that
+    are fully paid net of reversals (``settled``, or ``restored`` with
+    ``restored_cents = reversed_cents``); reversed, partially restored,
+    pending and quarantined cycles are skipped, so it falls back to the
+    previous fully paid cycle and is ``null`` only if none ever was.  A
+    partially reversed cycle does not count (conservative owner-policy
+    default).  It is a calendar date (the ASAAS due date, ``YYYY-MM-DD``,
+    no time zone), not a UTC instant.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    offer_id: str = Field(..., min_length=1, max_length=100)
+    catalog_version_id: str = Field(..., min_length=1, max_length=80)
+    status: SubscriptionFinancialStatus
+    amount_cents: int = Field(..., ge=0)
+    current_period_end: Optional[date]
+
+
+class BillingLiveCheckoutResponse(BaseModel):
+    """The builder's newest live checkout attempt; no provider URL."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    checkout_session_id: str
+    kind: Literal["subscription", "topup"]
+    state: LiveCheckoutState
+
+
+class BillingCheckoutSummaryResponse(BaseModel):
+    """Advisory checkout availability; ``POST /checkout`` stays the authority.
+
+    ``available_offer_ids`` lists, in catalog order, the offers a no-coupon
+    checkout would accept now; it never states why an offer is absent.
+    ``available`` is ``false`` only when this advisory read failed: then
+    ``available_offer_ids`` is ``[]``, ``live_session`` is ``null`` and
+    ``topup_commercial_enabled`` is ``false`` (closed for buying), which a
+    client must show as "unavailable", not as "nothing for sale".
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    available_offer_ids: list[str]
+    live_session: Optional[BillingLiveCheckoutResponse]
+    available: bool
+
+
 class BillingSummaryResponse(BaseModel):
     plan: Optional[str] = None
     active_clinics: int = 0
@@ -70,6 +126,33 @@ class BillingSummaryResponse(BaseModel):
     subscription_status: str = "trial"
     billing_cycle: str = "monthly"
     usage: BillingUsageResponse
+    # Group 6b additions; every field above is the legacy contract, unchanged.
+    subscription: Optional[BillingSubscriptionSummaryResponse]
+    checkout: BillingCheckoutSummaryResponse
+    topup_commercial_enabled: bool
+
+
+class BillingCatalogOfferResponse(BaseModel):
+    """One immutable offer of the backend-owned catalog, in integer units."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    offer_id: str
+    kind: Literal["subscription", "topup"]
+    currency: Literal["BRL"]
+    amount_cents: int = Field(..., gt=0)
+    credits: int = Field(..., gt=0)
+    included_clinics: int = Field(..., ge=0)
+    additional_clinic_amount_cents: int = Field(..., ge=0)
+
+
+class BillingCatalogResponse(BaseModel):
+    """The complete catalog of one immutable ``catalog_version_id``."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    catalog_version_id: str
+    offers: list[BillingCatalogOfferResponse]
 
 
 class CheckoutRequest(BaseModel):
@@ -109,6 +192,20 @@ class CheckoutResponse(BaseModel):
     kind: Literal["subscription", "topup"]
     state: str
     checkout_url: Optional[str] = None
+
+
+class CheckoutReconciliationResponse(BaseModel):
+    """``202`` of ``POST /checkout``: the outcome is uncertain.
+
+    The reservation was committed before the provider request, so its id is
+    the handle to read (``GET /checkout/{id}``) or reconcile it; never retry
+    the ``POST`` blindly.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    detail: Literal["billing_checkout_reconciliation_required"]
+    checkout_session_id: str
 
 
 class CouponValidationResponse(BaseModel):

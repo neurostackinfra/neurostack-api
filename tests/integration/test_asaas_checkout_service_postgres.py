@@ -21,7 +21,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -1113,3 +1113,103 @@ async def test_capability_service_enables_and_disables_the_gate_on_a_production_
             )
             assert disabled_control.topup_commercial_enabled is False
     assert await gate() == (False, enabled[1] + 1, None)
+
+
+# ---------------------------------------------------------------------------
+# Group 6b review: the general top-up reservation keeps its capability row
+# locks and its binding check (the summary read path takes neither lock).
+# ---------------------------------------------------------------------------
+
+_CAPABILITY_TABLES = (
+    "billing_topup_capability_receipts",
+    "billing_topup_capability_bindings",
+    "billing_operation_receipts",
+)
+
+
+async def test_general_topup_reservation_locks_and_rebinds_the_capability(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = "development"
+    await _general(harness, environment)
+    _configure(monkeypatch, environment, _Flag())
+    provider = _Provider(harness)
+
+    reserving = False
+    locked: list[str] = []
+    refusals: list[BaseException] = []
+
+    def record(conn: Any, cursor: Any, statement: str, *args: Any) -> None:
+        if reserving and "FOR UPDATE" in statement:
+            locked.append(statement)
+
+    original = BillingRepository.authorize_and_reserve_topup_checkout
+
+    async def reservation(self: BillingRepository, **kwargs: Any) -> Any:
+        nonlocal reserving
+        reserving = True
+        try:
+            return await original(self, **kwargs)
+        except BaseException as exc:
+            refusals.append(exc)
+            raise
+        finally:
+            reserving = False
+
+    monkeypatch.setattr(
+        BillingRepository, "authorize_and_reserve_topup_checkout", reservation
+    )
+    event.listen(harness.engine.sync_engine, "before_cursor_execute", record)
+    try:
+        builder_id = await _builder(harness, "G6b reservation locks")
+        view = await _create(
+            harness, provider.client, builder_id, "package_credits_500_v1", "pix"
+        )
+        assert view.state == "active"
+        # Every capability table is read FOR UPDATE inside the reservation.
+        for table in _CAPABILITY_TABLES:
+            assert any(f"FROM {table}" in sql for sql in locked), table
+
+        # The capability itself stays valid; one bound operation receipt is
+        # consumed, so the typed binding is no longer current.
+        async with harness.session() as session:
+            async with session.begin():
+                await session.execute(
+                    text("""
+                        UPDATE billing_operation_receipts SET applied_at = now()
+                        WHERE id = (
+                            SELECT b.verification_receipt_id
+                            FROM billing_topup_capability_bindings b
+                            JOIN billing_rollout_control c
+                              ON c.active_topup_capability_id
+                                 = b.capability_receipt_id
+                            WHERE c.environment = :env AND b.environment = :env
+                        )
+                    """),
+                    {"env": environment},
+                )
+        posts = len(provider.posts)
+        refused = await _builder(harness, "G6b reservation unbound")
+        with pytest.raises(CheckoutUnavailable):
+            await _create(
+                harness, provider.client, refused, "package_credits_500_v1", "pix"
+            )
+        assert len(provider.posts) == posts
+        assert [str(exc) for exc in refusals] == ["topup capability is not valid"]
+        assert isinstance(refusals[0], BillingCapabilityRejected)
+    finally:
+        event.remove(harness.engine.sync_engine, "before_cursor_execute", record)
+        # Leave the shared environment's gate open for the other tests.
+        async with harness.session() as session:
+            async with session.begin():
+                repository = BillingRepository(session)
+                control = await repository.lock_rollout_control(environment=environment)
+                if control.topup_commercial_enabled:
+                    await repository.set_topup_commercial_enabled(
+                        environment=environment,
+                        expected_revision=control.topup_revision,
+                        enabled=False,
+                        evidence=_evidence(),
+                        disable_reason="health",
+                    )
+        await _open_topup_gate(harness, environment)

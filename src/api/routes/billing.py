@@ -4,16 +4,24 @@ Plan summary, hosted ASAAS checkout, ASAAS webhook receiver, and coupon validati
 """
 
 from datetime import datetime, timezone
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.middleware.auth import require_builder
 from src.api.schemas.billing import (
+    BillingCatalogOfferResponse,
+    BillingCatalogResponse,
+    BillingCheckoutSummaryResponse,
+    BillingLiveCheckoutResponse,
+    BillingSubscriptionSummaryResponse,
     BillingSummaryResponse,
     BillingUsageResponse,
+    CheckoutReconciliationResponse,
     CheckoutRequest,
     CheckoutResponse,
     CouponValidationResponse,
@@ -26,6 +34,7 @@ from src.models.tenant import Tenant
 from src.repositories import get_db_session_dependency
 from src.repositories.database import get_db_session
 from src.services.asaas import AsaasClient
+from src.services.billing_catalog import catalog_snapshot
 from src.services.billing_checkout import (
     BillingCheckoutService,
     CheckoutCouponRejected,
@@ -35,6 +44,12 @@ from src.services.billing_checkout import (
     CheckoutNotFound,
     CheckoutReconciliationRequired,
     CheckoutUnavailable,
+)
+from src.services.billing_read_contract import (
+    BillingReadUnavailable,
+    read_commercial_availability,
+    read_current_subscription,
+    read_live_checkout,
 )
 from src.services.billing_usage_service import (
     PlanUsageLimits,
@@ -191,13 +206,115 @@ async def billing_summary(
     active_clinics = await _count_active_clinics(builder_id, db)
     pricing = _calc_pricing(active_clinics)
     usage = await _get_usage(builder, db)
+    # Legacy values are captured before the Group 6b reads run.
+    plan = builder.subscription_plan
+    subscription_status = builder.subscription_status
+    billing_cycle = builder.billing_cycle
+    subscription, checkout, topup_enabled = await _summary_read_contract(builder_id, db)
 
     return BillingSummaryResponse(
-        plan=builder.subscription_plan,
-        subscription_status=builder.subscription_status,
-        billing_cycle=builder.billing_cycle,
+        plan=plan,
+        subscription_status=subscription_status,
+        billing_cycle=billing_cycle,
         usage=usage,
         **pricing,
+        subscription=subscription,
+        checkout=checkout,
+        topup_commercial_enabled=topup_enabled,
+    )
+
+
+async def _summary_read_contract(builder_id: UUID, db: AsyncSession) -> tuple[
+    BillingSubscriptionSummaryResponse | None,
+    BillingCheckoutSummaryResponse,
+    bool,
+]:
+    """Group 6b summary fields: read-only, lock-free, scoped to the JWT builder.
+
+    The financial reads (subscription record, live attempt) fail the request
+    closed (503) rather than reporting "no subscription"; the advisory
+    availability read answers closed by itself (``checkout.available`` false,
+    no offer, no live session, top-up false) and runs last, so a failed
+    statement there cannot poison the reads above.
+    """
+
+    try:
+        subscription = await read_current_subscription(db, builder_id=builder_id)
+        live = await read_live_checkout(db, builder_id=builder_id)
+    except BillingReadUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.code) from exc
+    except Exception as exc:
+        logger.warning("Billing summary financial read unavailable")
+        raise HTTPException(
+            status_code=503, detail=BillingReadUnavailable.code
+        ) from exc
+    commercial = await read_commercial_availability(db, builder_id=builder_id)
+    return (
+        (
+            None
+            if subscription is None
+            else BillingSubscriptionSummaryResponse(
+                offer_id=subscription.offer_id,
+                catalog_version_id=subscription.catalog_version_id,
+                status=subscription.status,
+                amount_cents=subscription.amount_cents,
+                current_period_end=subscription.current_period_end,
+            )
+        ),
+        BillingCheckoutSummaryResponse(
+            available_offer_ids=list(commercial.available_offer_ids),
+            # A failed advisory read closes the whole block for buying.
+            live_session=(
+                None
+                if live is None or not commercial.available
+                else BillingLiveCheckoutResponse(
+                    checkout_session_id=str(live.checkout_session_id),
+                    kind=live.kind,
+                    state=live.state,
+                )
+            ),
+            available=commercial.available,
+        ),
+        commercial.topup_commercial_enabled,
+    )
+
+
+_CATALOG_KINDS: dict[str, Literal["subscription", "topup"]] = {
+    "MONTHLY": "subscription",
+    "DETACHED": "topup",
+}
+
+
+@router.get(
+    "/catalog",
+    summary="Billing Catalog",
+    response_model=BillingCatalogResponse,
+)
+async def billing_catalog(
+    builder_id: UUID = Depends(require_builder),
+) -> BillingCatalogResponse:
+    """Return the immutable backend-owned catalog; prices are never computed
+    by the client.  Builder login is required; the response is identical for
+    every builder of a deployment."""
+
+    del builder_id
+    snapshot = catalog_snapshot()
+    offers = snapshot["offers"]
+    assert isinstance(offers, list)
+    return BillingCatalogResponse(
+        catalog_version_id=str(snapshot["catalog_version_id"]),
+        offers=[
+            BillingCatalogOfferResponse(
+                offer_id=offer["offer_id"],
+                kind=_CATALOG_KINDS[offer["cycle"]],
+                currency="BRL",
+                amount_cents=offer["amount_cents"],
+                credits=offer["credits"],
+                included_clinics=offer["included_clinics"],
+                additional_clinic_amount_cents=offer["additional_clinic_amount_cents"],
+            )
+            for offer in offers
+        ],
     )
 
 
@@ -244,12 +361,18 @@ async def validate_coupon(
     "/checkout",
     summary="Create Checkout",
     response_model=CheckoutResponse,
+    responses={
+        202: {
+            "model": CheckoutReconciliationResponse,
+            "description": "Outcome uncertain: reconcile by checkout_session_id.",
+        }
+    },
 )
 async def create_checkout(
     body: CheckoutRequest,
     builder_id: UUID = Depends(require_builder),
     db: AsyncSession = Depends(get_db_session_dependency),
-) -> CheckoutResponse:
+) -> CheckoutResponse | JSONResponse:
     """Start a provider-hosted checkout from server-owned commercial state."""
 
     service = BillingCheckoutService(
@@ -282,7 +405,19 @@ async def create_checkout(
     except CheckoutCreationRejected as exc:
         raise HTTPException(status_code=502, detail=exc.code) from exc
     except CheckoutReconciliationRequired as exc:
-        raise HTTPException(status_code=202, detail=exc.code) from exc
+        if exc.checkout_session_id is None:
+            raise HTTPException(status_code=202, detail=exc.code) from exc
+        # Group 6b: the legacy ``{"detail": code}`` body plus the stored
+        # reservation id (the builder's own session UUID).
+        return JSONResponse(
+            status_code=202,
+            content=CheckoutReconciliationResponse.model_validate(
+                {
+                    "detail": exc.code,
+                    "checkout_session_id": str(exc.checkout_session_id),
+                }
+            ).model_dump(),
+        )
     return CheckoutResponse(
         checkout_session_id=str(checkout.checkout_session_id),
         kind=checkout.kind,

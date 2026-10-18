@@ -121,7 +121,20 @@ class CheckoutCreationRejected(BillingCheckoutError):
 
 
 class CheckoutReconciliationRequired(BillingCheckoutError):
+    """The provider outcome is uncertain; reconcile by the stored session id.
+
+    ``checkout_session_id`` is set whenever the reservation was committed (the
+    creation path always commits before egress); it is the caller's own
+    session UUID, never provider data.
+    """
+
     code = "billing_checkout_reconciliation_required"
+
+    def __init__(
+        self, code: str | None = None, *, checkout_session_id: UUID | None = None
+    ) -> None:
+        super().__init__(code)
+        self.checkout_session_id = checkout_session_id
 
 
 class CheckoutNotEligible(BillingCheckoutError):
@@ -934,13 +947,17 @@ class BillingCheckoutService:
             # The client reaches this path for read/write timeouts and malformed
             # success payloads.  It must never create a second Checkout here.
             await self._set_reconciliation_required(checkout)
-            raise CheckoutReconciliationRequired() from exc
+            raise CheckoutReconciliationRequired(
+                checkout_session_id=checkout_session_id
+            ) from exc
         except Exception as exc:
             # A custom transport/client failure occurs after the sealed permit
             # was handed to the egress boundary, so the safe classification is
             # also ambiguous.
             await self._set_reconciliation_required(checkout)
-            raise CheckoutReconciliationRequired() from exc
+            raise CheckoutReconciliationRequired(
+                checkout_session_id=checkout_session_id
+            ) from exc
 
         try:
             current = await BillingRepository(self._db).lock_checkout_session(
@@ -948,7 +965,9 @@ class BillingCheckoutService:
                 checkout_session_id=checkout_session_id,
             )
             if current is None or current.state != "creating":
-                raise CheckoutReconciliationRequired()
+                raise CheckoutReconciliationRequired(
+                    checkout_session_id=checkout_session_id
+                )
             current.external_checkout_id = created.checkout_id
             current.state = "active"
             await self._db.commit()
@@ -956,7 +975,9 @@ class BillingCheckoutService:
             await self._rollback()
             # The provider identity was observed but is not safely persisted;
             # force exact-ID reconciliation rather than returning a URL.
-            raise CheckoutReconciliationRequired() from exc
+            raise CheckoutReconciliationRequired(
+                checkout_session_id=checkout_session_id
+            ) from exc
         return self._view(current)
 
     async def _reauthorize_before_post(
