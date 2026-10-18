@@ -76,8 +76,13 @@ CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--re
 # Node is pinned by tag AND by the multi-arch index digest; pnpm is pinned by
 # version AND by the sha512 of its registry tarball (corepack format, hex),
 # equal to "packageManager" in frontend/package.json. Only dist/public leaves
-# this stage: no node_modules, sources, sourcemaps (neither .map files nor
-# inline sourceMappingURL data URLs) or Node runtime reach the production image.
+# this stage: no node_modules, sources, sourcemaps (neither .map files, inline
+# sourceMappingURL data URLs nor renamed maps carrying sourcesContent), no
+# TypeScript file and no Node runtime reach the production image. The guarded
+# build RUN MUST stay the last instruction of this stage (the guards only vouch
+# for what they inspected), and every WORKDIR/COPY/RUN here is pinned by
+# tests/scripts/test_production_dockerfile_frontend.py: nothing else may write
+# into the workspace (Vite copies artifacts/neurostack/public verbatim).
 FROM node:22.22.3-bookworm-slim@sha256:e21fc383b50d5347dc7a9f1cae45b8f4e2f0d39f7ade28e4eef7d2934522b752 AS frontend-build
 ARG PNPM_PIN=11.1.2+sha512.415a1cc25974731e75455c1468371be74c5aa5fb7621b50d4056d222451609f11412f23fd602e6169f1e060466641f798597e1be961a10688836a67b16569499
 ARG FRONTEND_PORT=3000
@@ -102,7 +107,9 @@ COPY frontend/artifacts/neurostack ./artifacts/neurostack
 RUN PORT="${FRONTEND_PORT}" BASE_PATH="${FRONTEND_BASE_PATH}" NODE_ENV=production pnpm --filter @workspace/neurostack run build \
     && test -s artifacts/neurostack/dist/public/index.html \
     && test -z "$(find artifacts/neurostack/dist/public -name '*.map' -print -quit)" \
-    && ! grep -rqs sourceMappingURL artifacts/neurostack/dist/public
+    && ! grep -rqs sourceMappingURL artifacts/neurostack/dist/public \
+    && ! grep -rqs sourcesContent artifacts/neurostack/dist/public \
+    && test -z "$(find artifacts/neurostack/dist/public \( -name '*.ts' -o -name '*.tsx' -o -name '*.mts' \) -print -quit)"
 
 # ============================================
 # Stage 5: Production image
