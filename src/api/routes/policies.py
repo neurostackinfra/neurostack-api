@@ -7,13 +7,24 @@ Policies define the rules that govern agent behavior, including:
 - Tone and communication guidelines
 - Scope limitations (what topics to avoid)
 - Compliance requirements
+
+Tenant authorization: every route resolves exactly one authorized tenant with
+the canonical ``resolve_effective_tenant`` before it reads or mutates the
+policy store. A client-supplied ``tenant_id`` is an override request, never an
+authorization: API keys and clinic administrators stay in their own tenant,
+builders may select only clinics they own, super administrators may select any
+tenant, and other JWT roles are denied. The shared global policy stays visible
+to every authorized caller. Policy responses are never cached: the response
+cache excludes ``/v1/policies`` and every successful response carries
+``Cache-Control: no-store``.
 """
 
 from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from neurostack_core.policy import PolicyCreate, PolicyDefinition, PolicyRuleCreate
 from neurostack_core.policy import PolicyType as DomainPolicyType
@@ -27,7 +38,11 @@ from neurostack_core.policy import (
     get_policy_merger,
     get_policy_store,
 )
-from src.api.middleware.auth import TenantContext, get_tenant_context
+from src.api.middleware.auth import (
+    TenantContext,
+    get_tenant_context,
+    resolve_effective_tenant,
+)
 from src.api.schemas.base import ErrorResponse
 from src.api.schemas.policies import (
     EffectivePolicyResponse,
@@ -41,10 +56,32 @@ from src.api.schemas.policies import (
     RuleSeverity,
 )
 from src.config.logging import get_logger
+from src.repositories import get_db_session_dependency
 
 logger = get_logger(__name__)
 
-router = APIRouter()
+
+def _no_store(response: Response) -> None:
+    """Forbid browsers and shared caches from storing tenant policy data."""
+    response.headers["Cache-Control"] = "no-store"
+
+
+router = APIRouter(dependencies=[Depends(_no_store)])
+
+_TENANT_OVERRIDE_DESCRIPTION = (
+    "Tenant to act on. Defaults to the caller's tenant; another tenant is "
+    "allowed only for a builder that owns the clinic or a super admin."
+)
+_TENANT_FORBIDDEN_RESPONSE: dict[int | str, dict[str, Any]] = {
+    403: {
+        "description": (
+            "Caller may not act on the requested tenant "
+            "(tenant_override_forbidden) or its role is not allowed "
+            "(caller_role_forbidden)"
+        ),
+        "model": ErrorResponse,
+    },
+}
 
 
 # ============================================
@@ -129,6 +166,11 @@ When processing events, policies are merged in priority order:
 - Define clinic-specific tone guidelines
 - Set up scope limitations (e.g., don't discuss pricing)
 - Configure compliance rules for specific regions
+
+## Tenant
+
+`tenant_id` in the body defaults to the caller's tenant. Another tenant is
+accepted only for a builder that owns the clinic or a super admin.
     """,
     responses={
         201: {
@@ -140,7 +182,10 @@ When processing events, policies are merged in priority order:
             "model": ErrorResponse,
         },
         403: {
-            "description": "Not authorized to create global policies",
+            "description": (
+                "Not authorized to create global policies, to act on the "
+                "requested tenant, or with the caller's role"
+            ),
             "model": ErrorResponse,
         },
     },
@@ -148,7 +193,9 @@ When processing events, policies are merged in priority order:
 )
 async def create_policy(
     request: PolicyCreateRequest,
+    http_request: Request,
     tenant: TenantContext = Depends(get_tenant_context),
+    db: AsyncSession = Depends(get_db_session_dependency),
 ) -> PolicyResponse:
     """
     Create a new policy.
@@ -157,11 +204,13 @@ async def create_policy(
     - Tenant policies apply only to specific tenant
     - Policies are merged and applied in priority order
     """
-    # Determine effective tenant_id: prefer request payload, fallback to authenticated tenant
-    effective_tenant_id = request.tenant_id or tenant.tenant_id
+    # The payload tenant is an override request; authorize it before use.
+    effective_tenant_id = await resolve_effective_tenant(
+        http_request, tenant, request.tenant_id, db
+    )
 
     # Global policies cannot be created via API
-    if effective_tenant_id is None or request.policy_type == PolicyType.GLOBAL:
+    if request.policy_type == PolicyType.GLOBAL:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Global policies can only be managed by system administrators",
@@ -206,13 +255,16 @@ async def create_policy(
     description="""
 Retrieve a policy by ID.
 
-Returns the complete policy configuration including all rules.
+Returns the complete policy configuration including all rules. The global
+policy is readable by every authorized caller; a tenant policy is returned
+only inside the authorized tenant (another tenant's policy is a 404).
     """,
     responses={
         200: {
             "description": "Policy retrieved successfully",
             "model": PolicyResponse,
         },
+        **_TENANT_FORBIDDEN_RESPONSE,
         404: {
             "description": "Policy not found",
             "model": ErrorResponse,
@@ -228,18 +280,28 @@ Returns the complete policy configuration including all rules.
     },
     tags=["Policies"],
 )
-async def get_policy(policy_id: UUID) -> PolicyResponse:
+async def get_policy(
+    policy_id: UUID,
+    request: Request,
+    tenant_id: Optional[UUID] = Query(
+        default=None, description=_TENANT_OVERRIDE_DESCRIPTION
+    ),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: AsyncSession = Depends(get_db_session_dependency),
+) -> PolicyResponse:
     """
     Retrieve a policy by ID.
     """
+    effective_tenant_id = await resolve_effective_tenant(request, tenant, tenant_id, db)
+
     # Check if it's the global policy
     global_policy = get_global_policy()
     if policy_id == global_policy.id:
         return get_global_policy_response()
 
-    # Try to get from store
+    # Only the authorized tenant's policies are visible.
     store = get_policy_store()
-    policy = await store.get_policy_or_none(policy_id)
+    policy = await store.get_policy_or_none(policy_id, effective_tenant_id)
 
     if not policy:
         raise HTTPException(
@@ -255,11 +317,12 @@ async def get_policy(policy_id: UUID) -> PolicyResponse:
     response_model=PolicyListResponse,
     summary="List Policies",
     description="""
-List policies with optional tenant filter.
+List the authorized tenant's policies plus the shared global policy.
 
 ## Filtering
 
-- **tenant_id**: Filter by specific tenant
+- **tenant_id**: Tenant to list (default: the caller's tenant; another tenant
+  only for a builder that owns the clinic or a super admin)
 - **include_global**: Include global policies (default: true)
 - **active_only**: Only return active policies (default: true)
 - **policy_type**: Filter by policy type
@@ -271,45 +334,55 @@ Results are ordered by priority (highest first).
             "description": "Policies listed successfully",
             "model": PolicyListResponse,
         },
+        **_TENANT_FORBIDDEN_RESPONSE,
     },
     tags=["Policies"],
 )
 async def list_policies(
-    tenant_id: Optional[UUID] = Query(default=None, description="Filter by tenant ID"),
+    request: Request,
+    tenant_id: Optional[UUID] = Query(
+        default=None, description=_TENANT_OVERRIDE_DESCRIPTION
+    ),
     include_global: bool = Query(default=True, description="Include global policies"),
     active_only: bool = Query(default=True, description="Only return active policies"),
     policy_type: Optional[PolicyType] = Query(
         default=None, description="Filter by policy type"
     ),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: AsyncSession = Depends(get_db_session_dependency),
 ) -> PolicyListResponse:
     """
     List policies.
 
-    - If tenant_id is provided, returns tenant + global policies
+    - Returns the authorized tenant's policies (default: the caller's tenant)
     - If include_global is True (default), includes global policies
     - If active_only is True (default), only returns active policies
     """
+    effective_tenant_id = await resolve_effective_tenant(request, tenant, tenant_id, db)
     policies = []
 
     # Add global policy if requested
     if include_global:
         policies.append(get_global_policy_response())
 
-    # Add tenant policies if tenant_id provided
-    if tenant_id:
-        store = get_policy_store()
-        tenant_policies = await store.list_policies(tenant_id, active_only=active_only)
-        policies.extend([convert_to_response(p) for p in tenant_policies])
+    # Add the authorized tenant's policies
+    store = get_policy_store()
+    tenant_policies = await store.list_policies(
+        effective_tenant_id, active_only=active_only
+    )
+    policies.extend([convert_to_response(p) for p in tenant_policies])
 
     # Filter by policy type if specified
     if policy_type:
         policies = [p for p in policies if p.policy_type == policy_type]
 
+    # Count by scope over the filtered list, never by request flags.
+    global_count = sum(1 for p in policies if p.tenant_id is None)
     return PolicyListResponse(
         policies=policies,
         total=len(policies),
-        global_count=1 if include_global else 0,
-        tenant_count=len(policies) - (1 if include_global else 0),
+        global_count=global_count,
+        tenant_count=len(policies) - global_count,
     )
 
 
@@ -331,11 +404,14 @@ is automatically incremented.
             "model": PolicyResponse,
         },
         404: {
-            "description": "Policy not found",
+            "description": "Policy not found in the authorized tenant",
             "model": ErrorResponse,
         },
         403: {
-            "description": "Cannot modify global policies",
+            "description": (
+                "Cannot modify global policies, act on the requested tenant, "
+                "or act with the caller's role"
+            ),
             "model": ErrorResponse,
         },
     },
@@ -344,11 +420,24 @@ is automatically incremented.
 async def update_policy(
     policy_id: UUID,
     request: PolicyUpdateRequest,
-    tenant_id: UUID = Query(..., description="Tenant ID for authorization"),
+    http_request: Request,
+    tenant_id: UUID = Query(
+        ...,
+        description=(
+            "Tenant that owns the policy: the caller's tenant, a clinic the "
+            "builder owns, or any tenant for a super admin"
+        ),
+    ),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: AsyncSession = Depends(get_db_session_dependency),
 ) -> PolicyResponse:
     """
     Update an existing policy.
     """
+    effective_tenant_id = await resolve_effective_tenant(
+        http_request, tenant, tenant_id, db
+    )
+
     # Check if it's a global policy
     global_policy = get_global_policy()
     if policy_id == global_policy.id:
@@ -358,6 +447,12 @@ async def update_policy(
         )
 
     store = get_policy_store()
+    # Another tenant's policy is indistinguishable from a missing one.
+    if await store.get_policy_or_none(policy_id, effective_tenant_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Policy {policy_id} not found",
+        )
 
     # Convert rules if provided
     rules = None
@@ -386,27 +481,29 @@ async def update_policy(
     )
 
     try:
-        policy = await store.update_policy(policy_id, tenant_id, policy_update)
+        policy = await store.update_policy(
+            policy_id, effective_tenant_id, policy_update
+        )
         return convert_to_response(policy)
-    except ValueError as e:
+    # Store exception text may name other tenants or policy content, so it
+    # never reaches the response body or the logs; only the type is logged.
+    except ValueError:
         # Policy not found
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Policy {policy_id} not found: {str(e)}",
-        )
+            detail=f"Policy {policy_id} not found",
+        ) from None
     except Exception as e:
         logger.error(
             "Unexpected error updating policy",
             policy_id=str(policy_id),
-            tenant_id=str(tenant_id),
-            error=str(e),
+            tenant_id=str(effective_tenant_id),
             error_type=type(e).__name__,
-            exc_info=True,
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update policy: {str(e)}",
-        )
+            detail="Failed to update policy",
+        ) from None
 
 
 @router.delete(
@@ -426,11 +523,14 @@ Note: Global safety policies cannot be deleted.
             "description": "Policy deleted successfully",
         },
         403: {
-            "description": "Cannot delete global policies",
+            "description": (
+                "Cannot delete global policies, act on the requested tenant, "
+                "or act with the caller's role"
+            ),
             "model": ErrorResponse,
         },
         404: {
-            "description": "Policy not found",
+            "description": "Policy not found in the authorized tenant",
             "model": ErrorResponse,
         },
     },
@@ -438,11 +538,22 @@ Note: Global safety policies cannot be deleted.
 )
 async def delete_policy(
     policy_id: UUID,
-    tenant_id: UUID = Query(..., description="Tenant ID for authorization"),
+    request: Request,
+    tenant_id: UUID = Query(
+        ...,
+        description=(
+            "Tenant that owns the policy: the caller's tenant, a clinic the "
+            "builder owns, or any tenant for a super admin"
+        ),
+    ),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: AsyncSession = Depends(get_db_session_dependency),
 ) -> None:
     """
     Delete a policy (soft delete).
     """
+    effective_tenant_id = await resolve_effective_tenant(request, tenant, tenant_id, db)
+
     # Check if it's a global policy
     global_policy = get_global_policy()
     if policy_id == global_policy.id:
@@ -452,7 +563,7 @@ async def delete_policy(
         )
 
     store = get_policy_store()
-    deleted = await store.delete_policy(policy_id, tenant_id)
+    deleted = await store.delete_policy(policy_id, effective_tenant_id)
 
     if not deleted:
         raise HTTPException(
@@ -478,12 +589,18 @@ applied during event processing.
 2. Sort by priority (descending)
 3. Merge rules, with higher-priority rules taking precedence
 4. Return the final effective rule set
+
+## Tenant
+
+`tenant_id` must be the caller's tenant, a clinic the builder owns, or any
+tenant for a super admin.
     """,
     responses={
         200: {
             "description": "Effective policies retrieved successfully",
             "model": EffectivePolicyResponse,
         },
+        **_TENANT_FORBIDDEN_RESPONSE,
         404: {
             "description": "Tenant not found",
             "model": ErrorResponse,
@@ -491,17 +608,23 @@ applied during event processing.
     },
     tags=["Policies"],
 )
-async def get_effective_policies(tenant_id: UUID) -> EffectivePolicyResponse:
+async def get_effective_policies(
+    tenant_id: UUID,
+    request: Request,
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: AsyncSession = Depends(get_db_session_dependency),
+) -> EffectivePolicyResponse:
     """
     Get the effective (merged) policies for a tenant.
 
     This returns global + tenant policies merged by priority.
     """
+    effective_tenant_id = await resolve_effective_tenant(request, tenant, tenant_id, db)
     merger = get_policy_merger()
 
     # Get merged policies
-    policies = await merger.get_merged_policies(tenant_id)
-    rules = await merger.get_merged_rules(tenant_id)
+    policies = await merger.get_merged_policies(effective_tenant_id)
+    rules = await merger.get_merged_rules(effective_tenant_id)
 
     # Convert to effective rules format
     effective_rules = []
@@ -535,7 +658,7 @@ async def get_effective_policies(tenant_id: UUID) -> EffectivePolicyResponse:
     ]
 
     return EffectivePolicyResponse(
-        tenant_id=tenant_id,
+        tenant_id=effective_tenant_id,
         effective_rules=effective_rules,
         source_policies=source_policies,
         computed_at=datetime.utcnow().isoformat(),
@@ -549,25 +672,38 @@ async def get_effective_policies(tenant_id: UUID) -> EffectivePolicyResponse:
 Evaluate a message against all applicable policies.
 
 This is useful for testing policy configurations before deployment.
+`tenant_id` must be the caller's tenant, a clinic the builder owns, or any
+tenant for a super admin.
     """,
     responses={
         200: {
             "description": "Evaluation completed",
         },
+        **_TENANT_FORBIDDEN_RESPONSE,
     },
     tags=["Policies"],
 )
 async def evaluate_message(
-    tenant_id: UUID = Query(..., description="Tenant ID"),
+    request: Request,
+    tenant_id: UUID = Query(
+        ...,
+        description=(
+            "Tenant whose policies apply: the caller's tenant, a clinic the "
+            "builder owns, or any tenant for a super admin"
+        ),
+    ),
     session_id: UUID = Query(..., description="Session ID"),
     message: str = Query(..., description="Message to evaluate"),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: AsyncSession = Depends(get_db_session_dependency),
 ) -> dict[str, Any]:
     """
     Evaluate a message against policies.
     """
+    effective_tenant_id = await resolve_effective_tenant(request, tenant, tenant_id, db)
     engine = get_policy_engine()
     result = await engine.evaluate_pre_srm(
-        tenant_id=tenant_id,
+        tenant_id=effective_tenant_id,
         session_id=session_id,
         message=message,
     )

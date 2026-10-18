@@ -595,11 +595,21 @@ POST /v1/policies
 }
 ```
 
+### Autorização por Tenant
+
+`tenant_id` nunca autoriza sozinho: API keys e `clinic_admin` só acessam o
+próprio tenant, `builder` só clínicas que possui, `super_admin` pode escolher
+qualquer tenant, e outros papéis JWT recebem `403`. Tenant alheio responde
+`403` (`tenant_override_forbidden`). Detalhes em
+[api-contracts.md](api-contracts.md#policies).
+
 ### Listar Políticas
 
 ```bash
 GET /v1/policies?tenant_id={uuid}&include_global=true
 ```
+
+Sem `tenant_id`, lista o tenant do chamador mais a política global.
 
 ### Ver Política Específica
 
@@ -610,13 +620,13 @@ GET /v1/policies/{policy_id}
 ### Atualizar Política
 
 ```bash
-PUT /v1/policies/{policy_id}
+PATCH /v1/policies/{policy_id}?tenant_id={uuid}
 ```
 
 ### Deletar Política
 
 ```bash
-DELETE /v1/policies/{policy_id}
+DELETE /v1/policies/{policy_id}?tenant_id={uuid}
 ```
 
 ### Ver Políticas Efetivas (Merged)
