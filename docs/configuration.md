@@ -217,6 +217,27 @@ admin que apaga um tenant (só um `super_admin` pode chamá-la) remove também o
 usuários dele; a próxima execução só volta a criar a conta se não sobrar nenhum
 `super_admin` em outro tenant.
 
+## Receipts de operação do billing (control plane)
+
+O backend assina os receipts de operação (`POST /v1/admin/billing/operations/receipts`).
+O operador envia só o material da operação, o `assignment_id` e o `nonce`; um
+campo `signature` no corpo é recusado com 422. Depois de validar o JWT
+`super_admin`, o assignment ativo do próprio ator e o nonce, o backend calcula
+o HMAC-SHA256 sobre o material, a revisão de rollout (só nas aberturas
+`-> canary_allowlist` e `-> general`), o papel, o ator, o assignment e o nonce,
+e o grava. Cada consumo da quorum recalcula a assinatura a partir da linha
+gravada.
+
+| Variável | Origem | Regra |
+|---|---|---|
+| `BILLING_OPERATION_RECEIPT_SIGNING_KEY` | secret do service | só o backend a conhece; nunca vai para operador, ferramenta ou ticket; em produção tem pelo menos 32 bytes |
+| `BILLING_OPERATION_RECEIPT_MAX_TTL_SECONDS` | env, opcional | inteiro de 1 a 604800 (7 dias), padrão `86400` (24 h); `expires_at` de um assignment ou receipt pode ficar no máximo esse tempo depois da criação (o limite exato é aceito); acima disso a resposta é `409 billing_operation_expiry_too_long`. Receipts de prontidão não podem durar mais que os receipts que citam, então herdam o teto |
+
+Quorums de abertura de rollout se assinam **depois** de o estado atual existir
+e nunca ficam em fila entre mudanças de estado: qualquer transição no meio
+torna a quorum inútil (`billing_rollout_quorum_stale` ou
+`billing_operation_signature_invalid`) e ela precisa ser assinada de novo.
+
 ---
 
 ## Índice

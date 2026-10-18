@@ -27,11 +27,14 @@ recreate.
 ## Local preparation
 
 1. Obtain three active, distinct JWT `super_admin` assignments: deployer,
-   approver, reviewer. All must sign the same operation ID, environment,
-   from/to state, deployment digest, budget digest, and expiry.
-2. Append each signed receipt through `/v1/admin/billing/operations/receipts`.
-   A nonce and assignment are both single-use. Never place a JWT, HMAC, or
-   provider response in the receipt payload or ticket.
+   approver, reviewer. All must submit the same operation ID, environment,
+   from/to state, deployment digest, budget digest, and expiry (at most
+   `BILLING_OPERATION_RECEIPT_MAX_TTL_SECONDS`, 24 h by default, ahead).
+2. Each operator appends their own receipt through
+   `/v1/admin/billing/operations/receipts` with the material, their
+   `assignment_id` and a fresh `nonce`; the backend signs it (a `signature`
+   field is refused). A nonce and assignment are both single-use. Never place
+   a JWT, key, or provider response in the receipt payload or ticket.
 3. Import only an existing canonical legacy roster entry through
    `/v1/admin/billing/migrations/roster`. The API rejects non-roster entries
    and new builder checkout remains blocked while a migration exists.

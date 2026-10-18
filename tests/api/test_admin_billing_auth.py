@@ -153,3 +153,44 @@ def test_provider_flip_takes_the_asaas_id_only_from_the_signed_envelope() -> Non
                 "asaas_subscription_id": "sub_caller_asserted",
             }
         )
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    [
+        "uq_billing_operation_assignments_actor",
+        "uq_billing_rollout_readiness_revision",
+    ],
+)
+def test_billing_integrity_errors_map_to_the_domain_conflict_code(
+    constraint: str,
+) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    from src.api.routes.admin import _billing_http_error
+
+    exc = IntegrityError(
+        "INSERT INTO billing_table ...",
+        {},
+        Exception(f'duplicate key value violates unique constraint "{constraint}"'),
+    )
+    # SQLAlchemy's own documentation key; it must never become the detail.
+    assert isinstance(exc.code, str) and not exc.code.startswith("billing_")
+
+    error = _billing_http_error(exc)
+
+    assert (error.status_code, error.detail) == (409, "billing_operation_conflict")
+
+
+def test_billing_domain_rejection_codes_pass_through_unchanged() -> None:
+    from src.api.routes.admin import _billing_http_error
+    from src.services.billing_operations import BillingOperationRejected
+
+    error = _billing_http_error(
+        BillingOperationRejected("billing_rollout_from_state_mismatch")
+    )
+
+    assert (error.status_code, error.detail) == (
+        409,
+        "billing_rollout_from_state_mismatch",
+    )

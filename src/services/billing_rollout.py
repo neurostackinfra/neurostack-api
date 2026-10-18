@@ -1,4 +1,32 @@
-"""Fail-closed persisted rollout guard for billing checkout creation."""
+"""Fail-closed persisted rollout guard and signed rollout control plane.
+
+Operator invariants of the control plane (``docs/runbooks`` has no
+deployment/rollback runbook in this tree; the Group 6 port owns it, and this
+docstring is the reference until then):
+
+* Opening quorums (``disabled -> canary_allowlist`` and
+  ``canary_allowlist -> general``) are signed only AFTER the state they leave
+  exists, and are never prepared ahead or queued across a state change.  Each
+  such receipt signs the rollout revision current when it is recorded and
+  must come from a transaction that started after the one that wrote the
+  current state's rollout receipt.  Any transition in between (an
+  incident-disable, a rollback, a re-canary) makes the whole quorum unusable
+  (``billing_rollout_quorum_stale``); sign it again.  Only a move to
+  ``disabled`` may spend an older quorum.
+* A canary quorum signs its builder: ``budget_digest`` must equal
+  ``canary_budget_digest(environment, builder)`` of the builder the
+  transition opens.
+* Every assignment and receipt expires at most
+  ``BILLING_OPERATION_RECEIPT_MAX_TTL_SECONDS`` (default 24 h, at most 7 days)
+  after it is created; readiness rows cannot outlive the receipts they name.
+* Readiness rows are recorded by the bound duty: ``readiness`` by the
+  deployer, ``backlog``/``provisioning``/``smoke`` by the reviewer.
+* NOT IMPLEMENTED: ``deployment_digest`` (and readiness ``app_digest``) is
+  compared only with what the operators signed, never with the build that is
+  actually running.  Binding it to the running build needs deploy-time
+  injection; it is a production precondition owned by the Group 9 D3 wiring.
+  Until then a quorum can attest a digest that the process does not run.
+"""
 
 from __future__ import annotations
 
@@ -6,10 +34,10 @@ import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Final, Sequence
 from uuid import UUID
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.settings import settings
@@ -18,6 +46,7 @@ from src.models.billing import (
     BillingOperationReceipt,
     BillingRolloutControl,
     BillingRolloutReadinessReceipt,
+    BillingRolloutReceipt,
     BillingRosterControl,
 )
 from src.repositories.billing import (
@@ -29,10 +58,26 @@ from src.services.billing_operations import (
     BillingOperationAuthority,
     BillingOperationRejected,
     OperationMaterial,
+    canary_budget_digest,
 )
 from src.services.billing_outbox import billing_fact_bundle_digest
 
 BILLING_CHECKOUT_UNAVAILABLE = "billing_checkout_unavailable"
+
+# Which duty records each readiness kind (the JWT subject must be that
+# receipt's actor).  A row names the deployer's operation receipt
+# (``operation_receipt_id``) and the reviewer's (``provider_receipt_id``):
+# the deployer attests the deployed application's own readiness; the
+# reviewer attests the three provider-side checks, i.e. the ASAAS webhook
+# provisioning readback and smoke (``AsaasWebhookProvisioner.readback`` /
+# ``.smoke``) and the delivery backlog (``reconcile_backlog``).  An approver
+# or an actor outside the quorum records nothing.
+_READINESS_RECORDER_ROLE: Final = {
+    "readiness": "deployer",
+    "backlog": "reviewer",
+    "provisioning": "reviewer",
+    "smoke": "reviewer",
+}
 
 
 def _is_digest(value: object) -> bool:
@@ -124,8 +169,10 @@ def _readiness_evidence_is_bound(
         and provider.scope == "rollout"
         and deployer.role == "deployer"
         and provider.role == "reviewer"
-        and deployer.applied_at is not None
-        and provider.applied_at is not None
+        # Readiness references the quorum the ``general`` transition is about
+        # to spend; spent evidence was already used by a transition.
+        and deployer.applied_at is None
+        and provider.applied_at is None
         and row.observed_at <= now < row.expires_at
         and deployer.created_at <= row.observed_at
         and provider.created_at <= row.observed_at
@@ -147,6 +194,35 @@ def _readiness_evidence_is_bound(
             app_digest=row.app_digest,
         )
     )
+
+
+async def _current_state_anchor(
+    session: AsyncSession, control: BillingRolloutControl
+) -> datetime | None:
+    """``created_at`` of the rollout receipt that produced the current state.
+
+    An approval is for the next transition of the state that exists when it is
+    signed.  Without a freshness anchor, a quorum signed before an
+    incident-disable (and a re-canary) would still promote afterwards.  Both
+    readiness and every opening transition pass this anchor to
+    :meth:`BillingOperationAuthority.verified_quorum`, whose
+    :func:`require_quorum_after` judges exactly the rows it validates (and
+    ``consume_quorum`` spends): each must come from a transaction that started
+    strictly after the anchor's transaction started.  A never-transitioned
+    environment has no current receipt and nothing to compare against
+    (``None``); a dangling pointer is refused as stale.
+    """
+
+    if control.rollout_receipt_id is None:
+        return None
+    anchor = await session.scalar(
+        select(BillingRolloutReceipt.created_at).where(
+            BillingRolloutReceipt.id == control.rollout_receipt_id
+        )
+    )
+    if anchor is None:
+        raise BillingOperationRejected("billing_rollout_quorum_stale")
+    return anchor
 
 
 class BillingCheckoutUnavailable(RuntimeError):
@@ -321,13 +397,22 @@ class BillingRolloutOperationService:
         app_digest: str,
         observed_at: datetime,
         expires_at: datetime,
+        recorder_user_id: UUID,
     ) -> BillingRolloutReadinessReceipt:
-        """Append readiness only after binding it to a consumed operation quorum.
+        """Append readiness bound to the unspent quorum ``general`` will spend.
 
         The HTTP body is a request for evidence, not evidence itself.  The
         service checks the current rollout row, the exact on-disk rule and
-        fact-bundle digests, and two typed receipts from one active operation
-        before it writes the append-only readiness row.
+        fact-bundle digests, and the deployer/reviewer receipts of one
+        complete, unspent ``canary_allowlist -> general`` quorum before it
+        writes the append-only readiness row.  Recording does not consume the
+        quorum: the ``general`` transition spends it exactly once.  Every row
+        of one rollout revision must name the same receipt pair, and a pair
+        used at another revision is refused, so no row can be appended that
+        the transition could not use.  *recorder_user_id* (the JWT subject)
+        must be the actor of the bound receipt whose duty owns the kind
+        (``_READINESS_RECORDER_ROLE``); the table has no recorder column, so
+        this is enforced here, at insert.
         """
 
         now = self._authority._clock()
@@ -338,6 +423,10 @@ class BillingRolloutOperationService:
             or receipt_kind not in {"readiness", "backlog", "provisioning", "smoke"}
         ):
             raise BillingOperationRejected("billing_rollout_readiness_invalid")
+        if material.from_state != "canary_allowlist" or material.to_state != "general":
+            raise BillingOperationRejected(
+                "billing_rollout_readiness_transition_invalid"
+            )
         if observed_at.tzinfo is None or expires_at.tzinfo is None:
             raise BillingOperationRejected("billing_rollout_readiness_invalid")
         if observed_at > now or expires_at <= observed_at or expires_at <= now:
@@ -373,22 +462,17 @@ class BillingRolloutOperationService:
         )
         if control is None or control.rollout_revision != rollout_revision:
             raise BillingOperationRejected("billing_rollout_readiness_revision_invalid")
+        if control.state != material.from_state:
+            raise BillingOperationRejected("billing_rollout_from_state_mismatch")
         if operation_receipt_id == provider_receipt_id:
             raise BillingOperationRejected("billing_rollout_readiness_receipt_invalid")
-        result = await self._repository.session.execute(
-            select(BillingOperationReceipt)
-            .where(
-                BillingOperationReceipt.id.in_(
-                    (operation_receipt_id, provider_receipt_id)
-                ),
-                BillingOperationReceipt.operation_id == material.operation_id,
-                BillingOperationReceipt.environment == environment,
-                BillingOperationReceipt.scope == "rollout",
-                BillingOperationReceipt.applied_at.is_(None),
-            )
-            .with_for_update()
+        # The exact rows ``consume_quorum`` will spend for this material,
+        # judged by the same loader: fresh, a complete quorum, backend-signed.
+        quorum_rows = await self._authority.verified_quorum(
+            material=material,
+            fresh_after=await _current_state_anchor(self._repository.session, control),
         )
-        operation_rows = {row.id: row for row in result.scalars()}
+        operation_rows = {row.id: row for row in quorum_rows}
         deployer = operation_rows.get(operation_receipt_id)
         provider = operation_rows.get(provider_receipt_id)
         if (
@@ -415,6 +499,13 @@ class BillingRolloutOperationService:
             or expires_at > provider.expires_at
         ):
             raise BillingOperationRejected("billing_rollout_readiness_receipt_invalid")
+        recorder = (
+            deployer
+            if _READINESS_RECORDER_ROLE[receipt_kind] == "deployer"
+            else provider
+        )
+        if recorder.actor_user_id != recorder_user_id:
+            raise BillingOperationRejected("billing_rollout_readiness_recorder_invalid")
         expected_content = _readiness_content_digest(
             environment=environment,
             receipt_kind=receipt_kind,
@@ -429,7 +520,34 @@ class BillingRolloutOperationService:
         )
         if content_sha256 != expected_content:
             raise BillingOperationRejected("billing_rollout_readiness_digest_invalid")
-        await self._authority.consume_quorum(material=material)
+        # Recovery: these refusals are fail-closed and can leave a revision
+        # with no completable readiness set (one pair per revision; a pair
+        # whose quorum gained a receipt or whose rows expired cannot finish,
+        # and no other pair is accepted).  Recover by rolling back to
+        # ``disabled``, re-opening the canary (a new revision) and signing a
+        # fresh ``canary_allowlist -> general`` quorum.
+        pair = (operation_receipt_id, provider_receipt_id)
+        recorded = await self._repository.session.execute(
+            select(BillingRolloutReadinessReceipt).where(
+                BillingRolloutReadinessReceipt.environment == environment,
+                or_(
+                    BillingRolloutReadinessReceipt.rollout_revision == rollout_revision,
+                    BillingRolloutReadinessReceipt.operation_receipt_id.in_(pair),
+                    BillingRolloutReadinessReceipt.provider_receipt_id.in_(pair),
+                ),
+            )
+        )
+        for row in recorded.scalars():
+            if row.rollout_revision != rollout_revision:
+                raise BillingOperationRejected(
+                    "billing_rollout_readiness_receipt_reused"
+                )
+            if (row.operation_receipt_id, row.provider_receipt_id) != pair:
+                raise BillingOperationRejected(
+                    "billing_rollout_readiness_operation_conflict"
+                )
+            if row.receipt_kind == receipt_kind:
+                raise BillingOperationRejected("billing_rollout_readiness_duplicate")
         receipt = BillingRolloutReadinessReceipt(
             environment=environment,
             receipt_kind=receipt_kind,
@@ -457,7 +575,11 @@ class BillingRolloutOperationService:
         material: OperationMaterial,
         canary_builder_id: UUID | None = None,
     ) -> BillingRolloutControl:
-        """Transition disabled/canary/general only from a quorum receipt."""
+        """Transition disabled/canary/general only from a quorum receipt.
+
+        The signed ``from_state`` must be the persisted state.  ``general``
+        additionally spends exactly the quorum its four readiness rows name.
+        """
 
         if material.scope != "rollout" or material.to_state not in {
             "disabled",
@@ -465,6 +587,17 @@ class BillingRolloutOperationService:
             "general",
         }:
             raise BillingOperationRejected("billing_rollout_transition_invalid")
+        if material.to_state == "canary_allowlist" and (
+            canary_builder_id is None
+            or material.budget_digest
+            != canary_budget_digest(
+                environment=material.environment, canary_builder_id=canary_builder_id
+            )
+        ):
+            # Every signer signed this builder (see ``canary_budget_digest``);
+            # a caller holding the quorum cannot open another one's canary.
+            raise BillingOperationRejected("billing_rollout_canary_budget_unbound")
+        readiness_rows: Sequence[BillingRolloutReadinessReceipt] = ()
         if material.to_state == "general":
             now = self._authority._clock()
             kinds = {"readiness", "backlog", "provisioning", "smoke"}
@@ -529,8 +662,30 @@ class BillingRolloutOperationService:
                 for row in readiness_rows
             ):
                 raise BillingOperationRejected("billing_rollout_readiness_unbound")
-        receipts = await self._authority.consume_quorum(material=material)
+        # After the roster lock (lock order), before anything is consumed.
+        control = await self._repository.lock_rollout_control(
+            environment=material.environment
+        )
+        if control.state != material.from_state:
+            raise BillingOperationRejected("billing_rollout_from_state_mismatch")
+        # Moving to ``disabled`` only reduces exposure, so an older unspent
+        # rollback quorum stays usable; every opening move must be fresh.
+        fresh_after = (
+            None
+            if material.to_state == "disabled"
+            else await _current_state_anchor(self._repository.session, control)
+        )
+        receipts = await self._authority.consume_quorum(
+            material=material, fresh_after=fresh_after
+        )
         deployer = next(receipt for receipt in receipts if receipt.role == "deployer")
+        reviewer = next(receipt for receipt in receipts if receipt.role == "reviewer")
+        if any(
+            (row.operation_receipt_id, row.provider_receipt_id)
+            != (deployer.id, reviewer.id)
+            for row in readiness_rows
+        ):
+            raise BillingOperationRejected("billing_rollout_readiness_unbound")
         return await self._repository.transition_rollout(
             environment=material.environment,
             expected_revision=expected_revision,
