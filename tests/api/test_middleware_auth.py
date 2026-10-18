@@ -272,6 +272,46 @@ def test_tenant_resolver_requires_builder_ownership() -> None:
     db.execute.assert_awaited_once()
 
 
+def test_tenant_resolver_denies_builder_without_builder_claim_before_db() -> None:
+    """A builder token without ``builder_id`` never reaches the ownership query.
+
+    That query compares ``Tenant.builder_id`` with the claim; with no claim it
+    compiles to ``IS NULL`` and matches every clinic that has no builder. The
+    mocked query answers like that, so only the claim guard can deny.
+    """
+    own_tenant = uuid4()
+    builderless_clinic = uuid4()
+    tenant = TenantContext(
+        tenant_id=own_tenant,
+        user_id=uuid4(),
+        role="builder",
+        builder_id=None,
+    )
+    db = AsyncMock()
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = builderless_clinic
+    db.execute.return_value = result
+
+    assert (
+        asyncio.run(
+            resolve_effective_tenant(
+                _request_with_tenant(tenant), tenant, own_tenant, db
+            )
+        )
+        == own_tenant
+    )
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(
+            resolve_effective_tenant(
+                _request_with_tenant(tenant), tenant, builderless_clinic, db
+            )
+        )
+
+    assert error.value.status_code == 403
+    assert cast(Any, error.value.detail) == {"code": "tenant_override_forbidden"}
+    db.execute.assert_not_awaited()
+
+
 def test_api_key_store_skips_malformed_database_hash_locally() -> None:
     """Malformed tenant hashes are a per-row miss, not an auth-wide failure."""
     tenant = MagicMock(

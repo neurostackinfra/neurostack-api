@@ -428,9 +428,47 @@ conforme a tabela acima.
 
 ### Knowledge
 
+**Autorização por tenant.** Todas as rotas de knowledge resolvem um único
+tenant autorizado com a regra canônica `resolve_effective_tenant` antes de
+ler, criar ou remover qualquer documento, e o repositório só é consultado com
+esse tenant. O `tenant_id` enviado pelo cliente (query ou body) é um pedido de
+override, nunca uma autorização:
+
+| Chamador | Sem `tenant_id` | `tenant_id` = próprio tenant | `tenant_id` de outro tenant |
+|----------|-----------------|------------------------------|-----------------------------|
+| API key | próprio tenant | permitido | `403` `tenant_override_forbidden` |
+| JWT `clinic_admin` | próprio tenant | permitido | `403` `tenant_override_forbidden` |
+| JWT `builder` | tenant do token | permitido | permitido só para clínica cujo `builder_id` é o do token; senão `403` `tenant_override_forbidden` |
+| JWT `super_admin` | tenant do token | permitido | permitido (qualquer tenant, sem checar existência) |
+| Outros papéis JWT (`investor`, desconhecidos) | `403` `caller_role_forbidden` | `403` `caller_role_forbidden` | `403` `caller_role_forbidden` |
+
+De onde vem o tenant em cada rota (os outros lugares são ignorados; o header
+`X-Tenant-ID` nunca seleciona tenant):
+
+| Rota | Fonte do `tenant_id` |
+|------|----------------------|
+| `POST /v1/knowledge/documents` | body (opcional) |
+| `POST /v1/knowledge/search` | body (opcional) |
+| `GET /v1/knowledge/documents` | query (opcional) |
+| `GET /v1/knowledge/documents/{document_id}` | query (opcional) |
+| `DELETE /v1/knowledge/documents/{document_id}` | query (opcional) |
+
+O corpo do `403` é `{"detail": {"code": "<código>"}}` e não traz dados do
+tenant pedido. Sem credencial, ou com token inválido/expirado ou API key
+desconhecida, a resposta é `401`. Em `GET`/`DELETE`
+`/v1/knowledge/documents/{document_id}` o documento é buscado por ID **e**
+tenant autorizado juntos: um documento de outro tenant responde `404`
+`{"detail": "Document <document_id> not found"}`, idêntico a um ID
+inexistente, então a resposta não revela se o ID existe. Para o `super_admin`
+(e o `builder`) sem `tenant_id`, o escopo é o tenant do token: para ler ou
+remover o documento de uma clínica é preciso passar `tenant_id` da clínica.
+Respostas de `/v1/knowledge*` não entram no cache de respostas, e as
+respostas de sucesso trazem `Cache-Control: no-store`.
+
 #### POST /v1/knowledge/documents
 
-Upload e indexação de documento.
+Upload e indexação de documento. `tenant_id` no body é opcional (padrão:
+tenant do chamador) e segue a tabela acima.
 
 **Request:**
 
@@ -448,7 +486,9 @@ Upload e indexação de documento.
 
 #### POST /v1/knowledge/search
 
-Busca semântica na base de conhecimento.
+Busca semântica na base de conhecimento. `tenant_id` no body é opcional
+(padrão: tenant do chamador) e segue a tabela acima. A busca ainda é um stub
+que devolve `results: []`; a autorização já é aplicada.
 
 **Request:**
 
@@ -463,6 +503,31 @@ Busca semântica na base de conhecimento.
   "min_score": 0.5
 }
 ```
+
+#### GET /v1/knowledge/documents
+
+Lista os documentos do tenant autorizado.
+
+**Query Parameters:**
+
+| Parâmetro | Tipo | Default | Descrição |
+|-----------|------|---------|-----------|
+| `tenant_id` | UUID | null | Tenant a listar; omitido = tenant do chamador (override conforme a tabela acima) |
+| `page` | int | 1 | Número da página |
+| `page_size` | int | 20 | Itens por página (max 100) |
+| `category` | string | null | Filtrar por categoria |
+
+#### GET /v1/knowledge/documents/{document_id}
+
+Retorna um documento (metadados, sem o conteúdo). `tenant_id` (query,
+opcional, padrão: tenant do chamador) define o escopo; documento de outro
+tenant responde `404`, igual a um inexistente.
+
+#### DELETE /v1/knowledge/documents/{document_id}
+
+Remove um documento (`204`). `tenant_id` (query, opcional, padrão: tenant do
+chamador) define o escopo; documento de outro tenant responde `404`, igual a
+um inexistente.
 
 ---
 

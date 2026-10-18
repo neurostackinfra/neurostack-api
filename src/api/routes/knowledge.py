@@ -6,15 +6,32 @@ Provides endpoints for:
 - Document upload and indexing
 - Semantic search/retrieval
 - Knowledge base management
+
+Tenant authorization: every route resolves exactly one authorized tenant with
+the canonical ``resolve_effective_tenant`` before it reads or mutates the
+knowledge base, and the repository is called only with that tenant. A
+client-supplied ``tenant_id`` (query or body) is an override request, never an
+authorization: API keys and clinic administrators stay in their own tenant,
+builders may select only clinics they own, super administrators may select any
+tenant, and other JWT roles are denied. A document requested by ID is looked up
+by ID and authorized tenant together, so another tenant's document is a 404
+identical to a missing one. Knowledge responses are not cacheable by the
+response cache, and every successful response carries ``Cache-Control:
+no-store``.
 """
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.middleware.auth import (
+    TenantContext,
+    get_tenant_context,
+    resolve_effective_tenant,
+)
 from src.api.schemas.base import ErrorResponse
 from src.api.schemas.knowledge import (
     DocumentListResponse,
@@ -26,7 +43,45 @@ from src.api.schemas.knowledge import (
 )
 from src.repositories import KnowledgeDocumentRepository, get_db_session_dependency
 
-router = APIRouter()
+
+def _no_store(response: Response) -> None:
+    """Forbid browsers and shared caches from storing tenant knowledge data."""
+    response.headers["Cache-Control"] = "no-store"
+
+
+router = APIRouter(dependencies=[Depends(_no_store)])
+
+_TENANT_OVERRIDE_DESCRIPTION = (
+    "Tenant to act on. Defaults to the caller's tenant; another tenant is "
+    "allowed only for a builder that owns the clinic or a super admin."
+)
+_TENANT_FORBIDDEN_RESPONSE: dict[int | str, dict[str, Any]] = {
+    403: {
+        "description": (
+            "Caller may not act on the requested tenant "
+            "(tenant_override_forbidden) or its role is not allowed "
+            "(caller_role_forbidden)"
+        ),
+        "model": ErrorResponse,
+    },
+}
+_DOCUMENT_NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
+    404: {
+        "description": (
+            "Document not found in the authorized tenant (another tenant's "
+            "document is indistinguishable from a missing one)"
+        ),
+        "model": ErrorResponse,
+    },
+}
+
+
+def _document_not_found(document_id: UUID) -> HTTPException:
+    """Same body for a missing document and another tenant's document."""
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Document {document_id} not found",
+    )
 
 
 # ============================================
@@ -55,6 +110,11 @@ vector database for semantic retrieval.
 
 Documents are split into chunks of ~500 tokens with overlap for
 context preservation. Each chunk is individually embedded and indexed.
+
+## Tenant
+
+`tenant_id` in the body defaults to the caller's tenant. Another tenant is
+accepted only for a builder that owns the clinic or a super admin.
     """,
     responses={
         201: {
@@ -65,21 +125,28 @@ context preservation. Each chunk is individually embedded and indexed.
             "description": "Invalid document content",
             "model": ErrorResponse,
         },
+        **_TENANT_FORBIDDEN_RESPONSE,
     },
     tags=["Knowledge"],
 )
 async def upload_document(
     request: DocumentUploadRequest,
+    http_request: Request,
+    tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> DocumentResponse:
     """
     Upload and index a document.
     """
+    # The payload tenant is an override request; authorize it before use.
+    effective_tenant_id = await resolve_effective_tenant(
+        http_request, tenant, request.tenant_id, session
+    )
     repo = KnowledgeDocumentRepository(session)
 
     # Create document
     document = await repo.create(
-        tenant_id=request.tenant_id,
+        tenant_id=effective_tenant_id,
         title=request.metadata.title or "Untitled Document",
         content=request.content,
         content_type="text",
@@ -130,22 +197,37 @@ Apply metadata filters to narrow down results:
 - `category`: Filter by document category
 - `tags`: Filter by tags (any match)
 - Custom metadata fields
+
+## Tenant
+
+`tenant_id` in the body defaults to the caller's tenant. Another tenant is
+accepted only for a builder that owns the clinic or a super admin.
     """,
     responses={
         200: {
             "description": "Search completed successfully",
             "model": SearchResponse,
         },
+        **_TENANT_FORBIDDEN_RESPONSE,
     },
     tags=["Knowledge"],
 )
-async def search_knowledge(request: SearchRequest) -> SearchResponse:
+async def search_knowledge(
+    request: SearchRequest,
+    http_request: Request,
+    tenant: TenantContext = Depends(get_tenant_context),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> SearchResponse:
     """
     Perform semantic search in the knowledge base.
     """
     start_time = datetime.utcnow()
 
-    # TODO: Implement semantic search (Task 19.0)
+    # Authorize before searching: retrieval may only ever use this tenant,
+    # never request.tenant_id.
+    await resolve_effective_tenant(http_request, tenant, request.tenant_id, session)
+
+    # TODO: Implement semantic search (Task 19.0) scoped to the resolved tenant
     end_time = datetime.utcnow()
     processing_time_ms = int((end_time - start_time).total_seconds() * 1000)
 
@@ -162,46 +244,59 @@ async def search_knowledge(request: SearchRequest) -> SearchResponse:
     response_model=DocumentListResponse,
     summary="List Documents",
     description="""
-List all documents in the knowledge base for a tenant.
+List the documents of the authorized tenant.
 
 Supports pagination and filtering by metadata.
+
+## Tenant
+
+- **tenant_id**: Tenant to list (default: the caller's tenant; another tenant
+  only for a builder that owns the clinic or a super admin)
     """,
     responses={
         200: {
             "description": "Documents listed successfully",
             "model": DocumentListResponse,
         },
+        **_TENANT_FORBIDDEN_RESPONSE,
     },
     tags=["Knowledge"],
 )
 async def list_documents(
-    tenant_id: UUID = Query(..., description="Tenant ID"),
+    request: Request,
+    tenant_id: Optional[UUID] = Query(
+        default=None, description=_TENANT_OVERRIDE_DESCRIPTION
+    ),
     page: int = Query(default=1, ge=1, description="Page number"),
     page_size: int = Query(default=20, ge=1, le=100, description="Items per page"),
     category: Optional[str] = Query(default=None, description="Filter by category"),
+    tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> DocumentListResponse:
     """
-    List documents for a tenant.
+    List documents for the authorized tenant (default: the caller's tenant).
     """
+    effective_tenant_id = await resolve_effective_tenant(
+        request, tenant, tenant_id, session
+    )
     repo = KnowledgeDocumentRepository(session)
     skip = (page - 1) * page_size
 
     if category:
         documents_list = await repo.find_by_category(
-            tenant_id=tenant_id,
+            tenant_id=effective_tenant_id,
             category=category,
             skip=skip,
             limit=page_size,
         )
     else:
         documents_list = await repo.find_by_tenant(
-            tenant_id=tenant_id,
+            tenant_id=effective_tenant_id,
             skip=skip,
             limit=page_size,
         )
 
-    total = await repo.count_by_tenant(tenant_id)
+    total = await repo.count_by_tenant(effective_tenant_id)
 
     document_responses = [
         DocumentResponse(
@@ -253,34 +348,44 @@ async def list_documents(
     "/documents/{document_id}",
     response_model=DocumentResponse,
     summary="Get Document",
-    description="Retrieve a document by ID.",
+    description="""
+Retrieve a document by ID.
+
+The document is returned only inside the authorized tenant (`tenant_id`,
+default: the caller's tenant); another tenant's document is a 404, identical
+to a missing one.
+    """,
     responses={
         200: {
             "description": "Document retrieved successfully",
             "model": DocumentResponse,
         },
-        404: {
-            "description": "Document not found",
-            "model": ErrorResponse,
-        },
+        **_TENANT_FORBIDDEN_RESPONSE,
+        **_DOCUMENT_NOT_FOUND_RESPONSE,
     },
     tags=["Knowledge"],
 )
 async def get_document(
     document_id: UUID,
+    request: Request,
+    tenant_id: Optional[UUID] = Query(
+        default=None, description=_TENANT_OVERRIDE_DESCRIPTION
+    ),
+    tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> DocumentResponse:
     """
     Retrieve a document by ID.
     """
+    effective_tenant_id = await resolve_effective_tenant(
+        request, tenant, tenant_id, session
+    )
     repo = KnowledgeDocumentRepository(session)
-    document = await repo.get_by_id(document_id)
+    # Only the authorized tenant's documents are visible.
+    document = await repo.get_by_id_and_tenant(document_id, effective_tenant_id)
 
     if not document:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Document {document_id} not found",
-        )
+        raise _document_not_found(document_id)
 
     return DocumentResponse(
         id=str(document.id),
@@ -327,32 +432,40 @@ Delete a document from the knowledge base.
 
 This removes the document and all its indexed chunks from the
 vector database.
+
+Only a document of the authorized tenant (`tenant_id`, default: the caller's
+tenant) can be deleted; another tenant's document is a 404, identical to a
+missing one.
     """,
     responses={
         204: {
             "description": "Document deleted successfully",
         },
-        404: {
-            "description": "Document not found",
-            "model": ErrorResponse,
-        },
+        **_TENANT_FORBIDDEN_RESPONSE,
+        **_DOCUMENT_NOT_FOUND_RESPONSE,
     },
     tags=["Knowledge"],
 )
 async def delete_document(
     document_id: UUID,
+    request: Request,
+    tenant_id: Optional[UUID] = Query(
+        default=None, description=_TENANT_OVERRIDE_DESCRIPTION
+    ),
+    tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> None:
     """
     Delete a document.
     """
+    effective_tenant_id = await resolve_effective_tenant(
+        request, tenant, tenant_id, session
+    )
     repo = KnowledgeDocumentRepository(session)
-    deleted = await repo.delete(document_id)
+    # Another tenant's document is indistinguishable from a missing one.
+    deleted = await repo.delete_by_id_and_tenant(document_id, effective_tenant_id)
 
     if not deleted:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Document {document_id} not found",
-        )
+        raise _document_not_found(document_id)
 
     # TODO: Delete from vector database (Task 19.0)

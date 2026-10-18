@@ -101,6 +101,8 @@ async with get_db_session() as session:
 ### KnowledgeDocumentRepository
 
 **Métodos adicionais:**
+- `get_by_id_and_tenant(document_id, tenant_id)` - Buscar por ID dentro do tenant (outro tenant = `None`)
+- `delete_by_id_and_tenant(document_id, tenant_id)` - Remover por ID dentro do tenant (outro tenant = `False`)
 - `find_by_tenant(tenant_id, indexed_only, skip, limit)` - Buscar por tenant
 - `find_indexed(tenant_id, skip, limit)` - Buscar indexados
 - `find_not_indexed(tenant_id, skip, limit)` - Buscar não indexados

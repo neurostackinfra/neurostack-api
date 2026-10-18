@@ -25,8 +25,12 @@ Este documento resume as integrações dos repositories realizadas no código.
 ### 3. **Knowledge Routes** (`src/api/routes/knowledge.py`)
 - ✅ `upload_document` - Usa `KnowledgeDocumentRepository.create()`
 - ✅ `list_documents` - Usa `KnowledgeDocumentRepository.find_by_tenant()` e `find_by_category()`
-- ✅ `get_document` - Usa `KnowledgeDocumentRepository.get_by_id()`
-- ✅ `delete_document` - Usa `KnowledgeDocumentRepository.delete()`
+- ✅ `get_document` - Usa `KnowledgeDocumentRepository.get_by_id_and_tenant()`
+- ✅ `delete_document` - Usa `KnowledgeDocumentRepository.delete_by_id_and_tenant()`
+
+Todas as rotas resolvem o tenant com `resolve_effective_tenant` e passam só
+esse tenant ao repository; `get_by_id()`/`delete()` herdados não são
+escopados por tenant e não devem ser usados por rotas.
 
 **Nota:** O endpoint `search_knowledge` ainda não está implementado (requer integração com Qdrant).
 
