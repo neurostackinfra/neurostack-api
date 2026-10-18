@@ -39,6 +39,16 @@ NO_SOURCEMAPS = (
 # An inline map (`--sourcemap inline`) is a data: URL inside a JS chunk, not a
 # .map file: only the sourceMappingURL comment gives it away.
 NO_INLINE_SOURCEMAPS = "! grep -rqs sourceMappingURL artifacts/neurostack/dist/public"
+# A map under another name (`sourcemap: "hidden"` plus `sourcemapFileNames`
+# renaming it to .json/.txt) is neither a .map file nor referenced by a
+# sourceMappingURL comment: its raw sourcesContent key still gives it away.
+NO_EMBEDDED_SOURCEMAPS = "! grep -rqs sourcesContent artifacts/neurostack/dist/public"
+# Vite copies public/ into dist/public verbatim: a TypeScript source landing
+# there (or anywhere in the output) ships as-is, with no map to give it away.
+NO_TYPESCRIPT_SOURCES = (
+    'test -z "$(find artifacts/neurostack/dist/public'
+    " \\( -name '*.ts' -o -name '*.tsx' -o -name '*.mts' \\) -print -quit)\""
+)
 # The whole build RUN, step by step: any extra flag (`-- --sourcemap inline`)
 # or masking operator (`|| true`, `;`) changes it and fails the contract.
 BUILD_RUN_STEPS = [
@@ -47,6 +57,8 @@ BUILD_RUN_STEPS = [
     "test -s artifacts/neurostack/dist/public/index.html",
     NO_SOURCEMAPS,
     NO_INLINE_SOURCEMAPS,
+    NO_EMBEDDED_SOURCEMAPS,
+    NO_TYPESCRIPT_SOURCES,
 ]
 NEUROSTACK_BUILD_SCRIPT = "vite build --config vite.config.ts"
 # Instructions the production lineage may use. Anything else (ONBUILD, or a
@@ -62,6 +74,48 @@ PRODUCTION_KEYWORDS = {
     "HEALTHCHECK",
     "CMD",
 }
+# Instructions the frontend-build stage may use (FROM opens the stage and is
+# pinned by EXPECTED_STAGES). SHELL could mask every exit status, ADD could
+# fetch remote files, ONBUILD/heredocs hide instructions: all fail.
+FRONTEND_BUILD_KEYWORDS = {"ARG", "ENV", "WORKDIR", "COPY", "RUN"}
+# Every WORKDIR, COPY (shlex tokens: flags, sources, destination) and RUN
+# (&&-separated steps) of frontend-build, in order. Nothing else may write
+# into the workspace, so nothing reaches artifacts/neurostack/public (copied
+# verbatim into dist/public) or dist/ except through the guarded build.
+FRONTEND_BUILD_SEQUENCE = [
+    ("RUN", "corepack enable", 'corepack prepare "pnpm@${PNPM_PIN}" --activate'),
+    ("WORKDIR", "/frontend"),
+    (
+        "COPY",
+        "frontend/package.json",
+        "frontend/pnpm-lock.yaml",
+        "frontend/pnpm-workspace.yaml",
+        "frontend/.npmrc",
+        "./",
+    ),
+    ("COPY", "frontend/lib/api-client-react/package.json", "lib/api-client-react/"),
+    ("COPY", "frontend/scripts/package.json", "scripts/"),
+    (
+        "COPY",
+        "frontend/artifacts/mockup-sandbox/package.json",
+        "artifacts/mockup-sandbox/",
+    ),
+    ("COPY", "frontend/artifacts/neurostack/package.json", "artifacts/neurostack/"),
+    (
+        "RUN",
+        "pnpm install --frozen-lockfile --ignore-scripts"
+        ' --filter "@workspace/neurostack..."',
+    ),
+    ("COPY", "frontend/tsconfig.base.json", "frontend/tsconfig.json", "./"),
+    ("COPY", "frontend/lib", "./lib"),
+    (
+        "COPY",
+        "frontend/attached_assets/logo_png_1775411054369.png",
+        "./attached_assets/",
+    ),
+    ("COPY", "frontend/artifacts/neurostack", "./artifacts/neurostack"),
+    ("RUN", *BUILD_RUN_STEPS),
+]
 # Everything the production lineage may copy, per source stage (None = the
 # build context). Anything else (e.g. `COPY . .`) fails the contract.
 PRODUCTION_COPY_SOURCES = {
@@ -115,10 +169,9 @@ def _instructions(text: str) -> list[Instruction]:
     return result
 
 
-@cache
-def _stages() -> tuple[Stage, ...]:
+def _parse_stages(text: str) -> tuple[Stage, ...]:
     stages: list[Stage] = []
-    for instruction in _instructions(DOCKERFILE.read_text(encoding="utf-8")):
+    for instruction in _instructions(text):
         if instruction.keyword == "FROM":
             tokens = instruction.args.split()
             platform = any(token.startswith("--platform") for token in tokens)
@@ -131,15 +184,22 @@ def _stages() -> tuple[Stage, ...]:
     return tuple(stages)
 
 
-def _stage(alias: str) -> Stage:
-    return next(stage for stage in _stages() if stage.alias == alias)
+@cache
+def _stages() -> tuple[Stage, ...]:
+    return _parse_stages(DOCKERFILE.read_text(encoding="utf-8"))
 
 
-def _lineage(alias: str) -> list[Stage]:
-    aliases = {stage.alias for stage in _stages()}
-    chain = [_stage(alias)]
+def _stage(alias: str, stages: tuple[Stage, ...] | None = None) -> Stage:
+    stages = _stages() if stages is None else stages
+    return next(stage for stage in stages if stage.alias == alias)
+
+
+def _lineage(alias: str, stages: tuple[Stage, ...] | None = None) -> list[Stage]:
+    stages = _stages() if stages is None else stages
+    aliases = {stage.alias for stage in stages}
+    chain = [_stage(alias, stages)]
     while chain[-1].parent in aliases:
-        chain.append(_stage(chain[-1].parent))
+        chain.append(_stage(chain[-1].parent, stages))
     return chain
 
 
@@ -342,8 +402,8 @@ def test_node_env_production_is_never_set_before_install() -> None:
             assert "NODE_ENV" not in instruction.args, instruction
 
 
-def _build_run() -> str:
-    frontend = _stage("frontend-build")
+def _build_run(stages: tuple[Stage, ...] | None = None) -> str:
+    frontend = _stage("frontend-build", stages)
     builds = [
         instruction.args
         for instruction in frontend.instructions[_install_index(frontend) + 1 :]
@@ -363,6 +423,11 @@ def test_build_uses_root_base_path_and_checks_index_html() -> None:
     # neither as a file nor inlined as a data: URL in a chunk.
     assert NO_SOURCEMAPS in build
     assert NO_INLINE_SOURCEMAPS in build
+    assert NO_EMBEDDED_SOURCEMAPS in build
+
+
+def _build_steps(build: str) -> list[str]:
+    return [step.strip() for step in re.split(r"\s*&&\s*", build)]
 
 
 def test_build_run_guards_cannot_be_masked_or_bypassed() -> None:
@@ -370,11 +435,196 @@ def test_build_run_guards_cannot_be_masked_or_bypassed() -> None:
     assert "--sourcemap" not in build, f"build RUN enables sourcemaps: {build}"
     # Every step must gate the layer: `|| true`, `;`, `&` or a pipe would let a
     # failing guard pass silently.
-    steps = [step.strip() for step in re.split(r"\s*&&\s*", build)]
+    steps = _build_steps(build)
     for step in steps:
         for operator in ("||", ";", "&", "|", "`"):
             assert operator not in step, f"{operator!r} masks a guard in: {step}"
     assert steps == BUILD_RUN_STEPS
+
+
+def test_index_html_check_precedes_every_grep_guard() -> None:
+    # `! grep -rqs` also succeeds when dist/public is missing (grep rc=2 is
+    # negated to success): only the earlier `test -s .../index.html` step
+    # stops a build that wrote nothing from passing the guards vacuously.
+    steps = _build_steps(_build_run())
+    index_check = steps.index("test -s artifacts/neurostack/dist/public/index.html")
+    greps = [i for i, step in enumerate(steps) if "grep" in step]
+    assert greps and index_check < min(greps), steps
+    assert index_check == 1, steps
+
+
+def _assert_frontend_build_is_sealed_by_the_guarded_build(
+    stages: tuple[Stage, ...],
+) -> None:
+    frontend = _stage("frontend-build", stages)
+    for instruction in frontend.instructions:
+        allowed = instruction.keyword in FRONTEND_BUILD_KEYWORDS
+        assert allowed, f"instruction not allowed in frontend-build: {instruction}"
+        assert "<<" not in instruction.args, f"heredoc in frontend-build: {instruction}"
+    # The guards only prove what dist/public held when they ran: anything
+    # after them (a second `vite build --sourcemap inline`, a COPY into
+    # dist/public, even ENV/LABEL) would reach /app/spa unchecked.
+    last = frontend.instructions[-1]
+    sealed = last.keyword == "RUN" and last.args == _build_run(stages)
+    assert sealed, f"guarded build RUN is not the last instruction: {last}"
+    assert _build_steps(last.args) == BUILD_RUN_STEPS
+    sequence = _workspace_writes(frontend)
+    assert sequence == FRONTEND_BUILD_SEQUENCE, (
+        "frontend-build WORKDIR/COPY/RUN sequence differs from the allow-list: "
+        f"{[step for step in sequence if step not in FRONTEND_BUILD_SEQUENCE]}"
+    )
+
+
+def _workspace_writes(stage: Stage) -> list[tuple[str, ...]]:
+    sequence: list[tuple[str, ...]] = []
+    for instruction in stage.instructions:
+        if instruction.keyword == "RUN":
+            sequence.append(("RUN", *_build_steps(instruction.args)))
+        elif instruction.keyword == "COPY":
+            sequence.append(("COPY", *shlex.split(instruction.args)))
+        elif instruction.keyword == "WORKDIR":
+            sequence.append(("WORKDIR", instruction.args))
+    return sequence
+
+
+def test_guarded_build_run_is_the_last_instruction_of_frontend_build() -> None:
+    _assert_frontend_build_is_sealed_by_the_guarded_build(_stages())
+
+
+_GUARD_TAIL = BUILD_RUN_STEPS[-1] + "\n"
+_SOURCE_COPY = "COPY frontend/artifacts/neurostack ./artifacts/neurostack\n"
+_SEQUENCE = "sequence differs from the allow-list"
+_BUILD_HEAD = 'RUN PORT="${FRONTEND_PORT}"'
+
+
+@pytest.mark.parametrize(
+    ("anchor", "replacement", "message"),
+    [
+        (
+            _GUARD_TAIL,
+            _GUARD_TAIL + "RUN PORT=3000 BASE_PATH=/ pnpm --filter "
+            "@workspace/neurostack exec vite build --config vite.config.ts "
+            "--sourcemap inline\n",
+            "not the last instruction",
+        ),
+        (
+            _GUARD_TAIL,
+            _GUARD_TAIL + "COPY frontend/artifacts/neurostack/src "
+            "artifacts/neurostack/dist/public/src\n",
+            "not the last instruction",
+        ),
+        (_GUARD_TAIL, _GUARD_TAIL + "ENV NODE_OPTIONS=\n", "not the last instruction"),
+        (
+            _BUILD_HEAD,
+            'SHELL ["/bin/sh", "-c", "eval \\"$0\\"; true"]\n' + _BUILD_HEAD,
+            "not allowed in frontend-build",
+        ),
+        (_GUARD_TAIL, _GUARD_TAIL + 'LABEL x="y"\n', "not allowed in frontend-build"),
+        (_BUILD_HEAD, "ONBUILD RUN true\n" + _BUILD_HEAD, "not allowed"),
+        (_BUILD_HEAD, "ADD https://x.invalid/a.js ./\n" + _BUILD_HEAD, "not allowed"),
+        (_BUILD_HEAD, "RUN <<EOF\ntrue\nEOF\n" + _BUILD_HEAD, "heredoc"),
+        (
+            _BUILD_HEAD,
+            "COPY frontend/artifacts/neurostack/src "
+            "artifacts/neurostack/public/src\n" + _BUILD_HEAD,
+            _SEQUENCE,
+        ),
+        (
+            _BUILD_HEAD,
+            "COPY frontend/lib/api-client-react/src ./artifacts/neurostack/public/\n"
+            + _BUILD_HEAD,
+            _SEQUENCE,
+        ),
+        (
+            _SOURCE_COPY,
+            _SOURCE_COPY.replace("COPY ", "COPY --link "),
+            _SEQUENCE,
+        ),
+        (
+            _BUILD_HEAD,
+            "ADD frontend/artifacts/neurostack/src artifacts/neurostack/public/\n"
+            + _BUILD_HEAD,
+            "not allowed in frontend-build",
+        ),
+        (
+            _BUILD_HEAD,
+            "RUN cp -r artifacts/neurostack/src artifacts/neurostack/public/\n"
+            + _BUILD_HEAD,
+            _SEQUENCE,
+        ),
+        (
+            _BUILD_HEAD,
+            "WORKDIR /frontend/artifacts/neurostack/public\n"
+            "COPY frontend/artifacts/neurostack/src ./\n"
+            "WORKDIR /frontend\n" + _BUILD_HEAD,
+            _SEQUENCE,
+        ),
+        (
+            _SOURCE_COPY,
+            _SOURCE_COPY.replace("./artifacts/neurostack", "./artifacts/neurostack/"),
+            _SEQUENCE,
+        ),
+    ],
+    ids=[
+        "rebuild-with-inline-maps",
+        "copy-sources-into-dist",
+        "env-after-guard",
+        "shell-masks-exit-status",
+        "label-after-guard",
+        "onbuild",
+        "add-remote",
+        "heredoc-run",
+        "copy-sources-into-vite-public",
+        "copy-into-vite-public-other-destination",
+        "copy-link-flag",
+        "add-into-vite-public",
+        "run-cp-into-vite-public",
+        "workdir-redirect",
+        "destination-spelling",
+    ],
+)
+def test_frontend_build_seal_rejects_instructions_around_the_guard(
+    anchor: str, replacement: str, message: str
+) -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert text.count(anchor) == 1, anchor
+    stages = _parse_stages(text.replace(anchor, replacement))
+    with pytest.raises(AssertionError, match=re.escape(message)):
+        _assert_frontend_build_is_sealed_by_the_guarded_build(stages)
+
+
+def _typescript_in_vite_public(paths: frozenset[str] | set[str]) -> list[str]:
+    public = f"{NEUROSTACK.relative_to(ROOT).as_posix()}/public/"
+    return sorted(
+        path
+        for path in paths
+        if path.startswith(public) and path.endswith((".ts", ".tsx", ".mts"))
+    )
+
+
+def test_typescript_in_vite_public_detector_flags_sources() -> None:
+    artifact = NEUROSTACK.relative_to(ROOT).as_posix()
+    paths = {
+        f"{artifact}/public/favicon.svg",
+        f"{artifact}/public/a.ts",
+        f"{artifact}/public/x/b.tsx",
+        f"{artifact}/public/c.mts",
+        f"{artifact}/src/d.ts",
+    }
+    assert _typescript_in_vite_public(paths) == [
+        f"{artifact}/public/a.ts",
+        f"{artifact}/public/c.mts",
+        f"{artifact}/public/x/b.tsx",
+    ]
+
+
+def test_vite_public_dir_holds_no_typescript_sources() -> None:
+    public = f"{NEUROSTACK.relative_to(ROOT).as_posix()}/public/"
+    assert any(
+        path.startswith(public) for path in _tracked_files()
+    ), "vite public/ dir vanished: update this contract"
+    sources = _typescript_in_vite_public(_tracked_files())
+    assert not sources, sources
 
 
 def test_neurostack_build_script_is_pinned() -> None:
@@ -455,17 +705,39 @@ def test_production_lineage_has_no_node_runtime_or_modules() -> None:
     assert copied == PRODUCTION_COPY_SOURCES
 
 
+def _assert_production_lineage_imports_only_through_copies(
+    stages: tuple[Stage, ...],
+) -> None:
+    for stage in _lineage("production", stages):
+        for instruction in stage.instructions:
+            allowed = instruction.keyword in PRODUCTION_KEYWORDS
+            assert allowed, f"instruction not allowed in {stage.alias}: {instruction}"
+            assert "<<" not in instruction.args, (stage.alias, instruction)
+            assert "--mount" not in instruction.args, (stage.alias, instruction)
+
+
 def test_production_lineage_imports_files_only_through_the_copy_allowlist() -> None:
     # `RUN --mount=type=bind,from=frontend-build,... cp -r ...` (or a bind of
     # the build context) would import files without a COPY.
-    for stage in _lineage("production"):
-        for instruction in stage.instructions:
-            assert instruction.keyword in PRODUCTION_KEYWORDS, (
-                stage.alias,
-                instruction,
-            )
-            assert "<<" not in instruction.args, (stage.alias, instruction)
-            assert "--mount" not in instruction.args, (stage.alias, instruction)
+    _assert_production_lineage_imports_only_through_copies(_stages())
+
+
+@pytest.mark.parametrize(
+    ("anchor", "stage"),
+    [
+        ("# Create non-root user for security\n", "base"),
+        ("ENV SPA_DIST_DIR=/app/spa\n", "production"),
+    ],
+)
+def test_production_lineage_rejects_shell_that_masks_exit_statuses(
+    anchor: str, stage: str
+) -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert text.count(anchor) == 1, anchor
+    shell = 'SHELL ["/bin/sh", "-c", "eval \\"$0\\"; true"]\n'
+    stages = _parse_stages(text.replace(anchor, shell + anchor))
+    with pytest.raises(AssertionError, match=f"not allowed in {stage}"):
+        _assert_production_lineage_imports_only_through_copies(stages)
 
 
 # --- Build context ---------------------------------------------------------
