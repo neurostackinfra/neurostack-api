@@ -7,18 +7,24 @@ import json
 import os
 import re
 import shutil
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from html.parser import HTMLParser
 from pathlib import Path
+from types import MethodType
 from typing import Any
 
 import pytest
 from fastapi import APIRouter, FastAPI, WebSocket
+from fastapi.routing import APIRoute
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 from starlette.routing import Host, Match, Mount, Route, Router
 
+from src.api import main as main_module
 from src.api import spa
 from src.api.main import create_app
+from src.api.routes import health
 from src.api.spa import (
     SPA_CLIENT_ROUTES,
     TRACE_DETAIL_PATTERN,
@@ -40,6 +46,7 @@ from tests.api._spa_support import (
     INDEX_HTML,
     TOP_LEVEL_FILES,
     AsgiResponse,
+    asgi_lifespan,
     asgi_request,
     bearer_header,
     build_dist,
@@ -980,6 +987,441 @@ def test_install_on_clean_app_appends_only_spa_routes(
     for route in added[:-1]:
         assert set(getattr(route, "methods", ())) == {"GET", "HEAD"}
         assert getattr(route, "include_in_schema", True) is False
+
+
+def _selective_matches(self: Any, scope: Any) -> tuple[Match, dict[str, Any]]:
+    """An instance-level ``matches`` that ``path`` does not describe."""
+
+    if scope["type"] == "http" and scope["path"] == "/traces/stats":
+        return Match.FULL, {"endpoint": self.endpoint, "path_params": {}}
+    return Match.NONE, {}
+
+
+def _instance_matches_top_level(app: FastAPI) -> None:
+    @app.get("/lying")
+    async def lying() -> dict[str, str]:
+        return {"ok": "yes"}
+
+    route = app.router.routes[-1]
+    assert isinstance(route, APIRoute)
+    route.matches = MethodType(_selective_matches, route)  # type: ignore[method-assign]
+
+
+def _instance_matches_included(app: FastAPI) -> None:
+    router = APIRouter()
+
+    @router.get("/lying")
+    async def lying() -> dict[str, str]:
+        return {"ok": "yes"}
+
+    route = router.routes[-1]
+    assert isinstance(route, APIRoute)
+    route.matches = MethodType(_selective_matches, route)  # type: ignore[method-assign]
+    app.include_router(router)
+
+
+@pytest.mark.parametrize(
+    "setup", [_instance_matches_top_level, _instance_matches_included]
+)
+def test_instance_level_matches_override_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    spa_log: _Recorder,
+    setup: Any,
+) -> None:
+    """``type(route).matches`` is stock here; only ``vars(route)`` shows it."""
+
+    configure_spa(monkeypatch, build_dist(tmp_path, hostile=False))
+
+    registry = install_spa(_bare_app_with(setup))
+
+    assert registry.enabled is False
+    conflicts = spa_log.levels("error")[0][1]["conflicts"]
+    assert conflicts == ["collision:/traces/:id -> custom matches APIRoute"]
+
+
+async def test_utf8_index_with_non_ascii_text_is_served_byte_identical(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dist = build_dist(tmp_path, hostile=False)
+    index = INDEX_HTML.replace(
+        b"<head>", "<head><title>Clínica São João</title>".encode("utf-8")
+    )
+    assert not index.isascii()
+    (dist / "index.html").write_bytes(index)
+    configure_spa(monkeypatch, dist)
+
+    application = create_app()
+    response = await asgi_request(application, "GET", "/billing")
+
+    assert application.state.spa.enabled
+    assert response.status == 200
+    assert response.body == index
+    assert response.header("content-type") == "text/html; charset=utf-8"
+    assert response.header("etag") == etag_of(index)
+
+
+# --------------------------------------------------------------------------
+# Route table re-checked once every startup hook has run
+# --------------------------------------------------------------------------
+
+_LATE_PATH = "/traces/{late_id}"
+
+
+@pytest.fixture
+def restore_health_routes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``health.router`` is module-global: give it a copy of its route list."""
+
+    monkeypatch.setattr(health.router, "routes", list(health.router.routes))
+
+
+def _late_route_on_included_router(app: FastAPI) -> None:
+    # health.router is included without a prefix, before install_spa.
+    health.router.add_api_route(_LATE_PATH, _plain, methods=["GET"])
+
+
+def _late_route_at_the_top_of_the_table(app: FastAPI) -> None:
+    app.router.routes.insert(0, APIRoute(_LATE_PATH, _plain, methods=["GET"]))
+
+
+@pytest.mark.usefixtures("restore_health_routes")
+@pytest.mark.parametrize(
+    "add_late_route",
+    [_late_route_on_included_router, _late_route_at_the_top_of_the_table],
+)
+async def test_route_added_during_startup_turns_the_spa_off(
+    monkeypatch: pytest.MonkeyPatch,
+    spa_log: _Recorder,
+    spa_app: FastAPI,
+    add_late_route: Any,
+) -> None:
+    registry: SpaRegistry = spa_app.state.spa
+
+    def startup_hook() -> None:
+        # Stands in for any startup work inside the real lifespan.
+        add_late_route(spa_app)
+
+    monkeypatch.setattr(main_module, "_start_billing_fact_worker", startup_hook)
+    assert registry.is_public("/traces/abc")
+
+    async with asgi_lifespan(spa_app):
+        assert spa_app.state.spa is registry
+        assert registry.enabled is False
+        assert (registry.pages, registry.files) == (frozenset(), {})
+        assert not registry.is_public("/billing")
+        for method, path in [
+            ("GET", "/traces/abc"),
+            ("GET", "/billing"),
+            ("HEAD", "/billing"),
+            ("GET", "/assets/index-AbC123.js"),
+            ("GET", "/favicon.svg"),
+        ]:
+            anonymous = await asgi_request(spa_app, method, path)
+            assert anonymous.status == 401, (method, path)
+            assert anonymous.header("content-security-policy") is None
+        # "/" stays in AuthMiddleware.PUBLIC_PATHS, as with the SPA off.
+        root = await asgi_request(spa_app, "GET", "/")
+        assert (root.status, root.body) == (404, b'{"detail":"Not Found"}')
+        late = await asgi_request(
+            spa_app, "GET", "/traces/abc", headers=[bearer_header()]
+        )
+        assert (late.status, late.body) == (200, b"api handler")
+        for path in ("/billing", "/assets/index-AbC123.js", "/favicon.svg"):
+            served = await asgi_request(spa_app, "GET", path, headers=[bearer_header()])
+            assert served.status == 404, path
+            assert served.header("content-security-policy") is None
+
+    errors = spa_log.levels("error")
+    assert [event for event, _ in errors] == ["spa_conflict_after_startup"]
+    assert f"collision:/traces/:id -> {_LATE_PATH}" in errors[0][1]["conflicts"]
+
+
+def _bare_app_with_late_route(hook: str) -> FastAPI:
+    """An included router that adds a /traces route from its own startup hook."""
+
+    @asynccontextmanager
+    async def router_lifespan(_: Any) -> AsyncIterator[None]:
+        router.add_api_route(_LATE_PATH, _plain, methods=["GET"])
+        yield
+
+    def on_startup() -> None:
+        router.add_api_route(_LATE_PATH, _plain, methods=["GET"])
+
+    if hook == "router-lifespan":
+        router = APIRouter(lifespan=router_lifespan)
+    else:
+        router = APIRouter(on_startup=[on_startup])
+    application = FastAPI()
+    application.include_router(router)
+    return application
+
+
+@pytest.mark.parametrize("hook", ["router-lifespan", "on-startup"])
+@pytest.mark.parametrize("driver", ["asgi", "lifespan-context"])
+async def test_recheck_runs_after_every_startup_hook(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    spa_log: _Recorder,
+    hook: str,
+    driver: str,
+) -> None:
+    """Nested router lifespans and on_startup handlers run before the check."""
+
+    configure_spa(monkeypatch, build_dist(tmp_path, hostile=False))
+    application = _bare_app_with_late_route(hook)
+    registry = install_spa(application)
+    assert registry.enabled
+
+    for _ in range(2):  # a second startup logs nothing new
+        lifespan = (
+            asgi_lifespan(application)
+            if driver == "asgi"
+            else application.router.lifespan_context(application)
+        )
+        async with lifespan:
+            assert registry.enabled is False
+            late = await asgi_request(application, "GET", "/traces/abc")
+            assert (late.status, late.body) == (200, b"api handler")
+            assert (await asgi_request(application, "GET", "/billing")).status == 404
+
+    errors = spa_log.levels("error")
+    assert [event for event, _ in errors] == ["spa_conflict_after_startup"]
+    assert f"collision:/traces/:id -> {_LATE_PATH}" in errors[0][1]["conflicts"]
+
+
+async def test_clean_startup_keeps_the_spa_and_logs_nothing_new(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, spa_log: _Recorder
+) -> None:
+    started: list[bool] = []
+
+    @asynccontextmanager
+    async def app_lifespan(_: Any) -> AsyncIterator[dict[str, str]]:
+        yield {"from_app": "kept"}
+
+    @asynccontextmanager
+    async def router_lifespan(_: Any) -> AsyncIterator[None]:
+        started.append(True)
+        yield
+
+    configure_spa(monkeypatch, build_dist(tmp_path, hostile=False))
+    application = FastAPI(lifespan=app_lifespan)
+    application.include_router(APIRouter(lifespan=router_lifespan))
+    registry = install_spa(application)
+    calls_after_install = list(spa_log.calls)
+
+    async with asgi_lifespan(application) as state:
+        # The wrapper passes the inner lifespan state through unchanged.
+        assert state == {"from_app": "kept"}
+        assert started == [True]
+        assert registry.enabled
+        page = await asgi_request(application, "GET", "/traces/abc")
+        assert (page.status, page.body) == (200, INDEX_HTML)
+
+    assert spa_log.calls == calls_after_install
+
+
+async def test_real_app_still_serves_the_spa_after_its_lifespan(
+    spa_log: _Recorder, spa_app: FastAPI
+) -> None:
+    calls_after_install = list(spa_log.calls)
+
+    async with asgi_lifespan(spa_app):
+        assert spa_app.state.spa.enabled
+        for path in ("/billing", "/traces/abc", "/"):
+            page = await asgi_request(spa_app, "GET", path)
+            assert (page.status, page.body) == (200, INDEX_HTML), path
+        asset = await asgi_request(spa_app, "GET", "/assets/index-AbC123.js")
+        assert asset.status == 200
+
+    assert spa_log.calls == calls_after_install
+
+
+async def test_failing_recheck_turns_the_spa_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, spa_log: _Recorder
+) -> None:
+    configure_spa(monkeypatch, build_dist(tmp_path, hostile=False))
+    application = FastAPI()
+    registry = install_spa(application)
+
+    def broken(*args: Any, **kwargs: Any) -> list[str]:
+        raise RuntimeError("route table unreadable")
+
+    monkeypatch.setattr(spa, "_find_conflicts", broken)
+
+    async with asgi_lifespan(application):
+        assert registry.enabled is False
+        assert (await asgi_request(application, "GET", "/billing")).status == 404
+
+    errors = spa_log.levels("error")
+    assert [event for event, _ in errors] == ["spa_conflict_after_startup"]
+    assert errors[0][1]["conflicts"] == ["recheck_failed:RuntimeError"]
+
+
+def test_create_app_leaves_the_spa_lifespan_outermost(spa_app: FastAPI) -> None:
+    """Nothing after install_spa in create_app may replace its lifespan."""
+
+    lifespan = spa_app.router.lifespan_context
+    assert getattr(lifespan, "__name__", None) == "spa_checked_lifespan"
+
+
+def _router_inserting_a_late_route() -> APIRouter:
+    @asynccontextmanager
+    async def router_lifespan(app: Any) -> AsyncIterator[None]:
+        # Runs after the SPA check: the merged lifespan enters it last.
+        app.router.routes.insert(0, APIRoute(_LATE_PATH, _plain, methods=["GET"]))
+        yield
+
+    return APIRouter(lifespan=router_lifespan)
+
+
+@pytest.mark.parametrize(
+    "make_router", [_router_inserting_a_late_route, APIRouter], ids=["hook", "plain"]
+)
+async def test_router_included_after_install_spa_turns_the_spa_off(
+    spa_log: _Recorder, spa_app: FastAPI, make_router: Any
+) -> None:
+    registry: SpaRegistry = spa_app.state.spa
+    spa_app.include_router(make_router())
+    assert registry.is_public("/traces/abc")
+
+    async with asgi_lifespan(spa_app):
+        assert registry.enabled is False
+        assert not registry.is_public("/traces/abc")
+        anonymous = await asgi_request(spa_app, "GET", "/traces/abc")
+        assert anonymous.status == 401
+        page = await asgi_request(spa_app, "GET", "/billing", headers=[bearer_header()])
+        assert page.status == 404
+
+    errors = spa_log.levels("error")
+    assert [event for event, _ in errors] == ["spa_conflict_after_startup"]
+    assert errors[0][1]["conflicts"] == [spa.LIFESPAN_REPLACED]
+
+
+def _app_whose_lifespan_adds(path: str, *, first: bool) -> FastAPI:
+    @asynccontextmanager
+    async def app_lifespan(app: Any) -> AsyncIterator[None]:
+        route = APIRoute(path, _plain, methods=["GET"])
+        if first:
+            app.router.routes.insert(0, route)
+        else:
+            app.router.routes.append(route)
+        yield
+
+    return FastAPI(lifespan=app_lifespan)
+
+
+@pytest.mark.parametrize("first", [True, False], ids=["insert-0", "append"])
+@pytest.mark.parametrize(
+    "path", ["/billing", "/favicon.svg", "/assets/index-AbC123.js"]
+)
+async def test_late_route_on_an_exact_spa_path_turns_the_spa_off(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    spa_log: _Recorder,
+    path: str,
+    first: bool,
+) -> None:
+    """Only the SPA's own route objects are skipped, not their paths."""
+
+    configure_spa(monkeypatch, build_dist(tmp_path, hostile=False))
+    application = _app_whose_lifespan_adds(path, first=first)
+    registry = install_spa(application)
+    assert registry.is_public(path)
+
+    async with asgi_lifespan(application):
+        assert registry.enabled is False
+        assert not registry.is_public(path)
+
+    errors = spa_log.levels("error")
+    assert [event for event, _ in errors] == ["spa_conflict_after_startup"]
+    assert f"collision:GET {path} -> {path}" in errors[0][1]["conflicts"]
+
+
+async def test_late_route_is_caught_for_a_build_without_assets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, spa_log: _Recorder
+) -> None:
+    dist = build_dist(tmp_path, hostile=False)
+    shutil.rmtree(dist / "assets")
+    (dist / "index.html").write_bytes(
+        b'<!DOCTYPE html><html><head></head><body><div id="root"></div></body></html>'
+    )
+    configure_spa(monkeypatch, dist)
+    application = _app_whose_lifespan_adds(_LATE_PATH, first=True)
+    registry = install_spa(application)
+    assert registry.enabled
+    assert not any(path.startswith("/assets/") for path in registry.files)
+
+    async with asgi_lifespan(application):
+        assert registry.enabled is False
+
+    errors = spa_log.levels("error")
+    assert [event for event, _ in errors] == ["spa_conflict_after_startup"]
+    assert f"collision:/traces/:id -> {_LATE_PATH}" in errors[0][1]["conflicts"]
+
+
+class _Boom(Exception):
+    pass
+
+
+def _app_whose_lifespan_fails(stage: str, seen: list[BaseException]) -> FastAPI:
+    @asynccontextmanager
+    async def app_lifespan(_: Any) -> AsyncIterator[None]:
+        if stage == "startup":
+            raise _Boom("startup boom")
+        try:
+            yield
+        except BaseException as error:
+            seen.append(error)
+            raise
+        if stage == "teardown":
+            raise _Boom("teardown boom")
+
+    return FastAPI(lifespan=app_lifespan)
+
+
+@pytest.mark.parametrize("stage", ["startup", "teardown"])
+@pytest.mark.parametrize("driver", ["asgi", "lifespan-context"])
+async def test_inner_lifespan_errors_surface_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    spa_log: _Recorder,
+    stage: str,
+    driver: str,
+) -> None:
+    configure_spa(monkeypatch, build_dist(tmp_path, hostile=False))
+    application = _app_whose_lifespan_fails(stage, [])
+    registry = install_spa(application)
+    calls_after_install = list(spa_log.calls)
+    lifespan = (
+        asgi_lifespan(application)
+        if driver == "asgi"
+        else application.router.lifespan_context(application)
+    )
+
+    with pytest.raises(_Boom, match=f"^{stage} boom$"):
+        async with lifespan:
+            pass
+
+    if stage == "teardown":
+        assert registry.enabled
+    assert spa_log.calls == calls_after_install
+
+
+async def test_body_error_reaches_the_inner_lifespan_and_the_caller(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``lifespan_context`` called directly (tests/conftest.py does) keeps errors."""
+
+    configure_spa(monkeypatch, build_dist(tmp_path, hostile=False))
+    seen: list[BaseException] = []
+    application = _app_whose_lifespan_fails("body", seen)
+    install_spa(application)
+
+    with pytest.raises(_Boom, match="^body boom$"):
+        async with application.router.lifespan_context(application):
+            raise _Boom("body boom")
+
+    assert [str(error) for error in seen] == ["body boom"]
 
 
 # --------------------------------------------------------------------------
