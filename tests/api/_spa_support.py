@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -222,6 +225,48 @@ async def asgi_request(
 
     await app(scope, receive, send)
     return response
+
+
+async def _keep_loop_responsive() -> None:
+    while True:
+        await asyncio.sleep(0.01)
+
+
+@asynccontextmanager
+async def asgi_lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
+    """Run the ASGI lifespan protocol the way a server (uvicorn) does.
+
+    Yields the lifespan ``state`` dict the server would copy into requests.
+    """
+
+    to_app: asyncio.Queue[Message] = asyncio.Queue()
+    from_app: asyncio.Queue[Message] = asyncio.Queue()
+    state: dict[str, Any] = {}
+    scope: Scope = {
+        "type": "lifespan",
+        "asgi": {"version": "3.0", "spec_version": "2.0"},
+        "state": state,
+    }
+    # aiosqlite wakes the loop from a thread; keep it ticking (tests/conftest.py).
+    heartbeat = asyncio.create_task(_keep_loop_responsive())
+    task = asyncio.create_task(app(scope, to_app.get, from_app.put))
+    try:
+        await to_app.put({"type": "lifespan.startup"})
+        started = await from_app.get()
+        if started["type"] != "lifespan.startup.complete":
+            await task  # surfaces the startup error
+            raise AssertionError(started)
+        try:
+            yield state
+        finally:
+            await to_app.put({"type": "lifespan.shutdown"})
+            stopped = await from_app.get()
+            await task
+            assert stopped["type"] == "lifespan.shutdown.complete", stopped
+    finally:
+        heartbeat.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat
 
 
 def route_signature(route: Any) -> tuple[Any, ...]:

@@ -335,9 +335,34 @@ Recupera eventos de uma sessão.
 
 ### Policies
 
+**Autorização por tenant.** Todas as rotas de políticas resolvem um único
+tenant autorizado com a regra canônica `resolve_effective_tenant` antes de
+ler ou alterar qualquer política. O `tenant_id` enviado pelo cliente (query,
+path ou body) é um pedido de override, nunca uma autorização:
+
+| Chamador | Sem `tenant_id` | `tenant_id` = próprio tenant | `tenant_id` de outro tenant |
+|----------|-----------------|------------------------------|-----------------------------|
+| API key | próprio tenant | permitido | `403` `tenant_override_forbidden` |
+| JWT `clinic_admin` | próprio tenant | permitido | `403` `tenant_override_forbidden` |
+| JWT `builder` | tenant do token | permitido | permitido só para clínica cujo `builder_id` é o do token; senão `403` `tenant_override_forbidden` |
+| JWT `super_admin` | tenant do token | permitido | permitido (qualquer tenant, sem checar existência) |
+| Outros papéis JWT (`investor`, desconhecidos) | `403` `caller_role_forbidden` | `403` `caller_role_forbidden` | `403` `caller_role_forbidden` |
+
+O corpo do `403` é `{"detail": {"code": "<código>"}}`. Sem credencial, ou com
+token inválido/expirado, a resposta é `401`. Uma política de outro tenant
+pedida por ID dentro do próprio escopo (`GET`/`PATCH`/`DELETE`
+`/v1/policies/{policy_id}`) responde `404`, igual a uma política inexistente.
+A política global (`tenant_id: null`) continua visível para todo chamador
+autorizado e continua imutável (`PATCH`/`DELETE` → `403`). Respostas de
+`/v1/policies*` nunca são servidas do cache de respostas (a autorização roda
+em toda requisição), e as respostas de sucesso trazem `Cache-Control:
+no-store`. Em `GET /v1/policies`, `global_count` e `tenant_count` contam as
+políticas devolvidas depois dos filtros (por escopo), e `total` é a soma.
+
 #### POST /v1/policies
 
-Cria uma nova política.
+Cria uma nova política. `tenant_id` no body é opcional (padrão: tenant do
+chamador) e segue a tabela acima.
 
 **Request:**
 
@@ -361,20 +386,43 @@ Cria uma nova política.
 
 #### GET /v1/policies
 
-Lista políticas com filtros.
+Lista as políticas do tenant autorizado mais a política global.
 
 **Query Parameters:**
 
 | Parâmetro | Tipo | Default | Descrição |
 |-----------|------|---------|-----------|
-| `tenant_id` | UUID | null | Filtrar por tenant |
+| `tenant_id` | UUID | null | Tenant a listar; omitido = tenant do chamador (override conforme a tabela acima) |
 | `include_global` | bool | true | Incluir políticas globais |
 | `active_only` | bool | true | Apenas políticas ativas |
 | `policy_type` | string | null | Filtrar por tipo |
 
+#### GET /v1/policies/{policy_id}
+
+Retorna uma política. `tenant_id` (query, opcional, padrão: tenant do
+chamador) define o escopo; a política global é retornada para qualquer
+chamador autorizado.
+
+#### PATCH /v1/policies/{policy_id}
+
+Atualiza uma política. `tenant_id` (query) é obrigatório e precisa ser
+autorizado conforme a tabela acima.
+
+#### DELETE /v1/policies/{policy_id}
+
+Remove uma política. `tenant_id` (query) é obrigatório e precisa ser
+autorizado conforme a tabela acima.
+
 #### GET /v1/policies/tenant/{tenant_id}/effective
 
-Retorna as políticas efetivas (merged) para um tenant.
+Retorna as políticas efetivas (merged) para um tenant. O `tenant_id` do path
+precisa ser autorizado conforme a tabela acima.
+
+#### POST /v1/policies/evaluate
+
+Avalia uma mensagem (`tenant_id`, `session_id`, `message` na query) contra as
+políticas do tenant. `tenant_id` é obrigatório e precisa ser autorizado
+conforme a tabela acima.
 
 ---
 

@@ -692,8 +692,12 @@ def create_app() -> FastAPI:
             media_type="application/json",
         )
 
-    # Built frontend at exact paths. Must stay after every API route: its
-    # startup collision check only sees routes registered before it.
+    # Built frontend at exact paths. Must stay after every API route and
+    # include_router: its collision check only sees routes registered before
+    # it, and it wraps the lifespan merged so far to re-check the route table
+    # once every startup hook has run. A router included later would start
+    # after that re-check, so a lifespan replaced after this call turns the
+    # SPA off at startup (pinned by test_spa_static).
     install_spa(app)
 
     # Global exception handler
