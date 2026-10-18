@@ -1985,6 +1985,107 @@ def test_manifest_applied_record_is_pinned(
 
 
 # ---------------------------------------------------------------------------
+# Migrations window 033-035: exact revision, never ``upgrade head``
+# ---------------------------------------------------------------------------
+
+UPGRADE_HEAD = re.compile(r"upgrade\s+heads?\b", re.IGNORECASE)
+
+
+def _migrations_step(manifest: dict[str, Any]) -> dict[str, Any]:
+    return next(row for row in manifest["steps"] if row["id"] == "migrations_033_035")
+
+
+def test_migrations_window_constants_pin_revision_035() -> None:
+    assert wiring.MIGRATIONS_SOURCE_REVISION == "032"
+    assert wiring.MIGRATIONS_TARGET_REVISION == "035"
+    assert wiring.MIGRATIONS_COMMAND == ("alembic", "upgrade", "035")
+    assert wiring.MIGRATIONS_VERIFICATION == "read back alembic_version == 035"
+
+
+def test_manifest_migrations_step_upgrades_to_exactly_035() -> None:
+    manifest = wiring.validate_manifest(wiring.load_yaml(MANIFEST))
+    step = _migrations_step(manifest)
+    assert "`alembic upgrade 035`" in step["change"]
+    assert any("alembic_version == 032" in row for row in step["preconditions"])
+    assert any("alembic_version == 035" in row for row in step["verification"])
+    assert UPGRADE_HEAD.search(json.dumps(manifest)) is None
+    assert UPGRADE_HEAD.search(MANIFEST.read_text(encoding="utf-8")) is None
+
+
+def _set_change(text: str) -> Callable[[dict[str, Any]], None]:
+    return lambda m: _migrations_step(m).__setitem__("change", text)
+
+
+def _set_verification(rows: list[str]) -> Callable[[dict[str, Any]], None]:
+    return lambda m: _migrations_step(m).__setitem__("verification", rows)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _set_change("one-off migrations task (alembic upgrade head)"),
+        _set_change("one-off migrations task (`alembic upgrade heads`)"),
+        _set_change("one-off migrations task (`alembic upgrade +3`)"),
+        _set_change("one-off migrations task (`alembic upgrade 036`)"),
+        _set_change("one-off migrations task (`alembic upgrade 0350`)"),
+        _set_change("one-off task `alembic upgrade 035`, then `alembic upgrade 037`"),
+        _set_change("one-off migrations task (alembic upgrade 035 without backticks)"),
+        _set_verification(["read back alembic_version == 0350"]),
+        _set_verification(
+            ["read back alembic_version == 035", "then alembic_version == 037"]
+        ),
+        _set_change(
+            "one-off migrations task (`alembic upgrade 035`), then alembic upgrade head"
+        ),
+        _set_verification(["Alembic head reads 035."]),
+        _set_verification(["read back alembic_version == 037"]),
+        lambda m: _migrations_step(m).__setitem__(
+            "preconditions", ["Expand-only window."]
+        ),
+        lambda m: m["steps"][5].__setitem__(
+            "change", m["steps"][5]["change"] + " Then run alembic upgrade head."
+        ),
+        lambda m: m["context"]["must"].append("alembic  upgrade   HEAD after deploy"),
+        lambda m: m["context"]["must"].append("then run `upgrade head` in the task"),
+        lambda m: m["steps"][5].__setitem__(
+            "change", m["steps"][5]["change"] + " Then run `alembic upgrade 037`."
+        ),
+        _set_verification(["alembic_version == 035 eventually"]),
+    ],
+)
+def test_manifest_validator_rejects_an_unpinned_migrations_window(
+    mutate: Callable[[dict[str, Any]], None],
+) -> None:
+    manifest = wiring.load_yaml(MANIFEST)
+    mutate(manifest)
+    with pytest.raises(wiring.WiringError, match="manifest_migrations_window"):
+        wiring.validate_manifest(manifest)
+
+
+def test_plan_prints_the_pinned_migrations_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    snapshot = FakeAws(applied=True).snapshot(tmp_path / "readback.json")
+    code, out, err = _run(
+        ["plan", "--params", str(PARAMS), "--readback-file", str(snapshot)], capsys
+    )
+    assert code == 0, err
+    info = _step(json.loads(out), "migrations_033_035")["info"]
+    assert info["command"] == "alembic upgrade 035"
+    assert info["target_revision"] == "035"
+    assert info["required_current_revision"] == "032"
+    assert info["verification"] == "read back alembic_version == 035"
+    assert "036" in info["excluded_revisions"]
+    assert "037" in info["excluded_revisions"]
+    assert UPGRADE_HEAD.search(out) is None
+    assert "alembic upgrade 035" in out
+
+
+def test_planner_source_never_says_upgrade_head() -> None:
+    assert UPGRADE_HEAD.search(SCRIPT.read_text(encoding="utf-8")) is None
+
+
+# ---------------------------------------------------------------------------
 # Fix loop 1: the reviewer's surviving mutants
 # ---------------------------------------------------------------------------
 

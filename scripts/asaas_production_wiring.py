@@ -151,6 +151,21 @@ STEPS: tuple[tuple[str, str], ...] = (
     ("webhook_exposure_and_registration", "separate_approval"),
     ("rollout_transitions", "separate_approval"),
 )
+# The 033-035 window applies exactly revision 035. Migrations 036 and 037 each
+# need their own explicit owner instruction (036 before 037, after a fresh
+# SELECT showing zero legacy rows), so the window never upgrades to the head.
+MIGRATIONS_STEP = "migrations_033_035"
+MIGRATIONS_SOURCE_REVISION = "032"
+MIGRATIONS_TARGET_REVISION = "035"
+MIGRATIONS_COMMAND = ("alembic", "upgrade", MIGRATIONS_TARGET_REVISION)
+MIGRATIONS_VERIFICATION = f"read back alembic_version == {MIGRATIONS_TARGET_REVISION}"
+MIGRATIONS_EXCLUDED = (
+    "036 and 037: each needs its own explicit owner instruction, 036 before "
+    "037, after a fresh SELECT showing zero legacy rows"
+)
+_UNPINNED_UPGRADE = re.compile(r"upgrade\s+(?:heads?\b|[+-])", re.IGNORECASE)
+_ALEMBIC_UPGRADE = re.compile(r"alembic\s+upgrade\s+([^\s`'\"),.;]+)", re.IGNORECASE)
+_ALEMBIC_VERSION = re.compile(r"alembic_version\s*==\s*(\w+)")
 KNOWN_BLOCKS = {
     "F1_group5_deploy_validator_allowlist": "signed_image_build_and_attestation",
     "F3_webhook_registration_entry_point": "webhook_exposure_and_registration",
@@ -686,7 +701,29 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
     _require(
         serialized.count("ABACATEPAY") == 1, "manifest_abacatepay_outside_forbidden"
     )
+    _validate_migrations_window(document, serialized)
     return document
+
+
+def _validate_migrations_window(document: dict[str, Any], serialized: str) -> None:
+    """The 033-035 window names exactly ``alembic upgrade 035``, nothing wider."""
+
+    step = next(row for row in document["steps"] if row["id"] == MIGRATIONS_STEP)
+    command = "`" + " ".join(MIGRATIONS_COMMAND) + "`"
+    _require(
+        _UNPINNED_UPGRADE.search(serialized) is None
+        and _ALEMBIC_UPGRADE.findall(serialized) == [MIGRATIONS_TARGET_REVISION]
+        and command in step["change"],
+        "manifest_migrations_window_not_pinned_to_035",
+    )
+    preconditions = "\n".join(step["preconditions"])
+    verification = "\n".join(step["verification"])
+    _require(
+        _ALEMBIC_VERSION.findall(preconditions) == [MIGRATIONS_SOURCE_REVISION]
+        and MIGRATIONS_VERIFICATION in verification
+        and _ALEMBIC_VERSION.findall(verification) == [MIGRATIONS_TARGET_REVISION],
+        "manifest_migrations_window_readback_not_pinned",
+    )
 
 
 def validate_parameters(raw: Any) -> dict[str, Any]:
@@ -2146,9 +2183,18 @@ def _plan_gates(
     else:
         image_gate.blocks.append("F1_group5_deploy_validator_allowlist:not_evaluated")
 
-    steps["migrations_033_035"].info["alembic_head"] = (
-        "not readable through AWS APIs; read it back with the migrations one-off "
-        "task before the window"
+    steps[MIGRATIONS_STEP].info.update(
+        {
+            "alembic_version": (
+                "not readable through AWS APIs; read it back with the migrations "
+                "one-off task before the window"
+            ),
+            "required_current_revision": MIGRATIONS_SOURCE_REVISION,
+            "command": " ".join(MIGRATIONS_COMMAND),
+            "target_revision": MIGRATIONS_TARGET_REVISION,
+            "verification": MIGRATIONS_VERIFICATION,
+            "excluded_revisions": MIGRATIONS_EXCLUDED,
+        }
     )
 
     deployment = steps["service_deployment"]

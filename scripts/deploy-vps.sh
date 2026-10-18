@@ -155,6 +155,11 @@ main() {
 
     /usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" pull api
     /usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d
+    # Guard: this migrates the VPS compose-local Postgres only, never the AWS
+    # production database, whose window (033-035) is pinned to an exact revision
+    # in docs/runbooks/asaas-deployment.md. It applies every migration in the
+    # approved image, so an image carrying 036 or 037 needs the same owner
+    # instruction per migration before it is deployed here.
     /usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" exec -T api alembic upgrade head
     /usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" ps
 }

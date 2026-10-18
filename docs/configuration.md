@@ -168,7 +168,7 @@ no mesmo deploy, com uma única reemissão.
 
 ## Primeiro acesso: bootstrap do super_admin
 
-Um banco novo, depois de `alembic upgrade head`, não tem nenhum usuário. O
+Um banco novo, depois das migrations, não tem nenhum usuário. O
 primeiro acesso ao painel vem de `scripts/bootstrap_admin.py`, o único arquivo de
 `scripts/` incluído na imagem `production`. Numa transação, ele cria o tenant da
 plataforma (slug `neurostack-admin`, `plan_type=admin`, UUID aleatório, API key
@@ -182,6 +182,12 @@ para a mesma tag. O service pode já estar no ar; nenhum login funciona até o
 bootstrap rodar. A role da aplicação precisa de DML nas tabelas criadas pelas
 migrations (por exemplo, `ALTER DEFAULT PRIVILEGES` do dono do schema); sem
 isso o bootstrap sai com `database error` sem escrever nada.
+
+No banco de produção existente, a task de migrations roda sempre uma revisão
+exata aprovada, nunca `upgrade` até o head: a janela 033-035 usa
+`alembic upgrade 035` e as migrations 036 e 037 exigem, cada uma, instrução
+própria do owner (ver o gate de migrations em
+`docs/runbooks/asaas-deployment.md`).
 
 ```bash
 python -m scripts.bootstrap_admin
