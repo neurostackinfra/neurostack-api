@@ -1,0 +1,35 @@
+{
+  "description": "Client routes of frontend/artifacts/neurostack/src/App.tsx that the API serves as the SPA shell (index.html). Test fixture only: tests/ is not copied into the image, so the API (src/api/spa.py) must hard-code its own route list and never read this file at runtime. tests/scripts/test_frontend_clean_checkout.py pins this file against App.tsx. Trailing-slash twins are derived by the server, not listed here. Routes in 'excluded' are served by the API itself and must never be registered as SPA routes.",
+  "static": [
+    "/",
+    "/dashboard",
+    "/traces",
+    "/config",
+    "/agents",
+    "/crm",
+    "/knowledge-base",
+    "/master-admin",
+    "/rlhf-audit",
+    "/builder",
+    "/onboarding",
+    "/seguranca",
+    "/slm-cortex",
+    "/consultoria",
+    "/midias",
+    "/billing",
+    "/voice-ai",
+    "/suporte",
+    "/portal-parceiros",
+    "/handoff-queue",
+    "/inactive-queue"
+  ],
+  "dynamic": [
+    {
+      "route": "/traces/:id",
+      "pattern": "/traces/[A-Za-z0-9_-]{1,128}"
+    }
+  ],
+  "excluded": [
+    "/privacidade/:clinicId"
+  ]
+}
