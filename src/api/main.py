@@ -62,6 +62,7 @@ from src.api.routes import (
     traces,
     webhook,
 )
+from src.api.spa import install_spa
 from src.config.logging import configure_logging, get_logger
 from src.config.settings import settings
 from src.core.exceptions import ConfigurationError
@@ -690,6 +691,10 @@ def create_app() -> FastAPI:
             content=json.dumps(schema, indent=2),
             media_type="application/json",
         )
+
+    # Built frontend at exact paths. Must stay after every API route: its
+    # startup collision check only sees routes registered before it.
+    install_spa(app)
 
     # Global exception handler
     @app.exception_handler(Exception)

@@ -206,6 +206,10 @@ class Settings(BaseSettings):
     api_prefix: str = "/v1"
     docs_enabled: bool = True
     redoc_js_url: str = "https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"
+    # Built frontend served by the API at exact paths (src/api/spa.py). An
+    # empty/absent directory or one without index.html serves nothing.
+    spa_enabled: bool = True
+    spa_dist_dir: str = ""
 
     # ============================================
     # Server
