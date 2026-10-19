@@ -589,8 +589,12 @@ _asaas_baseline_scan() {
 #
 # Known legacy references, removed by later phases of asaas-payment-gateway
 # Group 10 and not by this gate: tests/integration/test_asaas_billing_postgres.py
-# still carries the legacy migration cases. (docker-compose.production.yml no
-# longer requires ABACATEPAY_WEBHOOK_SECRET since Group 10 phase 1.)
+# and tests/integration/test_asaas_subscription_triggers_postgres.py still
+# exercise the legacy migration tables and roster triggers with raw SQL until
+# those database objects are dropped. The migration saga service, its admin
+# routes and operator client were removed in Group 10 phase E2;
+# docker-compose.production.yml no longer requires ABACATEPAY_WEBHOOK_SECRET
+# (phase 1) nor ASAAS_PROVIDER_EVIDENCE_* (phase E2).
 asaas_release_candidate_gate() (
     set -euo pipefail
     local root="$_WISH_GATES_ROOT"

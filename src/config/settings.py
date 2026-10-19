@@ -381,11 +381,6 @@ class Settings(BaseSettings):
     # because the webhook can never read back as ready.
     asaas_webhook_url: str = ""
     asaas_webhook_notification_email: str = ""
-    # Provider evidence is verified locally with this public key.  The private
-    # key belongs to the provider fixture/authority and is never configured in
-    # the migration service.
-    asaas_provider_evidence_key_id: str = ""
-    asaas_provider_evidence_public_key: str = ""
     # Protected switch for automatic ``abandoned`` of ambiguous checkouts.
     # Default off: the evidence (empty reads by our session UUID as ASAAS
     # ``externalReference``) is only sound once Group 8 proves by readback
