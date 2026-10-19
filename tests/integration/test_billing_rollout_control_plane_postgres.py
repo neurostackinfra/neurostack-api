@@ -53,8 +53,10 @@ import asyncio
 import hashlib
 import json
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, AsyncIterator, Iterator
 from uuid import UUID, uuid4
 
@@ -76,13 +78,15 @@ from sqlalchemy.pool import NullPool
 from src.api.middleware.auth import TenantContext, require_super_admin_jwt
 from src.api.routes import admin as admin_route
 from src.config.settings import settings
-from src.models.billing import BillingOperationReceipt, BillingRolloutReadinessReceipt
-from src.repositories.billing import (
-    BillingRepository,
-    billing_advisory_key,
-    billing_roster_advisory_key,
+from src.models.billing import (
+    BillingCheckoutSession,
+    BillingOperationReceipt,
+    BillingRolloutReadinessReceipt,
 )
+from src.repositories.billing import BillingRepository, billing_advisory_key
 from src.repositories.database import get_db_session_dependency
+from src.services.billing_catalog import BILLING_CATALOG, CATALOG_VERSION_ID
+from src.services.billing_checkout import subscription_pricing_snapshot
 from src.services.billing_operations import (
     BillingOperationAuthority,
     BillingOperationRejected,
@@ -98,6 +102,7 @@ from src.services.billing_rollout import (
     BillingRolloutOperationService,
     _readiness_content_digest,
 )
+from src.services.billing_webhook import BillingWebhookService
 from tests.integration.test_asaas_billing_postgres import (
     _ROOT,
     _create_child,
@@ -106,6 +111,7 @@ from tests.integration.test_asaas_billing_postgres import (
     _run_alembic,
     _validated_admin_url,
 )
+from tests.integration.test_asaas_webhook_postgres import _brl, _envelope, _payload
 
 pytestmark = pytest.mark.integration
 
@@ -268,6 +274,23 @@ def _legacy_content_digest(
     return _sha256_canonical({**payload, "roster_revision": roster_revision})
 
 
+# Clock seam.  Operation and rollout receipts are stamped by the database
+# (``created_at`` is the inserting transaction's ``now()``), readiness
+# ``observed_at`` by this process, and the service judges both against its own
+# wall clock: a quorum must be newer than the rollout receipt of the current
+# state, and ``created_at <= observed_at <= now``.  CLOCK_REALTIME is not
+# monotonic: on the WSL2 hosts these suites run on it steps BACK by ~70-90 ms
+# every 30 s (time sync; measured on 2026-10-19).  Evidence produced within
+# that window after the row it must follow then predates it and is refused
+# (``billing_rollout_readiness_receipt_invalid``,
+# ``billing_rollout_readiness_expired``, ``billing_rollout_quorum_stale``):
+# an intermittent 409 that passes alone.  The harness therefore waits until
+# its wall clock is a margin past the database stamp before it signs a
+# receipt or observes readiness, and observes 1 us after the receipts it
+# names, so a later step cannot reorder them.
+_CLOCK_STEP_MARGIN = timedelta(milliseconds=250)
+
+
 @dataclass
 class _ControlPlane:
     """Drive the admin billing routes as named super-admin principals."""
@@ -278,6 +301,28 @@ class _ControlPlane:
 
     def actor(self, principal: str) -> UUID:
         return self.actors.setdefault(principal, uuid4())
+
+    async def clock_past(self, sql: str, **params: Any) -> datetime | None:
+        """Wait until this process's wall clock is ``_CLOCK_STEP_MARGIN`` past
+        the database stamp *sql* selects (if any); return that stamp."""
+
+        stamp = await self.scalar(sql, **params)
+        if stamp is not None:
+            while datetime.now(timezone.utc) <= stamp + _CLOCK_STEP_MARGIN:
+                await asyncio.sleep(0.01)
+        return stamp
+
+    async def observed_after(self, *receipt_ids: str) -> datetime:
+        """A readiness ``observed_at`` 1 us after the named receipts."""
+
+        stamp = await self.clock_past(
+            "SELECT max(created_at) FROM billing_operation_receipts "
+            "WHERE id::text = ANY(CAST(:ids AS text[]))",
+            ids=list(receipt_ids),
+        )
+        if stamp is None:  # receipts that do not exist: nothing to follow
+            return datetime.now(timezone.utc)
+        return stamp + timedelta(microseconds=1)
 
     async def post(self, principal: str, path: str, body: dict[str, Any]) -> Any:
         self.actor(principal)
@@ -307,6 +352,12 @@ class _ControlPlane:
     ) -> httpx.Response:
         """Ask the backend to sign one receipt; the client sends no signature."""
 
+        # Newer than the rollout receipt of the current state (clock seam).
+        await self.clock_past(
+            "SELECT max(created_at) FROM billing_rollout_receipts "
+            "WHERE environment = :env",
+            env=material.get("environment", _ENVIRONMENT),
+        )
         body: dict[str, Any] = {
             **material,
             "assignment_id": assignment_id,
@@ -403,7 +454,9 @@ class _ControlPlane:
             "rule_digest": _rule_digest(),
             "bundle_digest": billing_fact_bundle_digest(),
             "app_digest": material["deployment_digest"],
-            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "observed_at": (
+                await self.observed_after(deployer_receipt_id, reviewer_receipt_id)
+            ).isoformat(),
             **(extra or {}),
         }
         return await self.post(principal or _RECORDER[kind], "/rollout/receipts", body)
@@ -1285,7 +1338,9 @@ async def test_d1_receipt_expiry_bounds_readiness_service_clock(
                 rule_digest=_rule_digest(),
                 bundle_digest=billing_fact_bundle_digest(),
                 app_digest=material["deployment_digest"],
-                observed_at=datetime.now(timezone.utc),
+                observed_at=await plane.observed_after(
+                    quorum["deployer"], quorum["reviewer"]
+                ),
                 expires_at=operation.expires_at + timedelta(minutes=1),
                 recorder_user_id=plane.actor("deployer"),
             )
@@ -1824,6 +1879,7 @@ async def _insert_readiness_past_the_service(
     036); *legacy_roster_revision* computes the pre-E3 digest instead.
     """
 
+    observed_at = await plane.observed_after(quorum["deployer"], quorum["reviewer"])
     async with plane.sessions() as session:
         async with session.begin():
             for kind in _KINDS:
@@ -1859,7 +1915,7 @@ async def _insert_readiness_past_the_service(
                         rule_digest=_rule_digest(),
                         bundle_digest=billing_fact_bundle_digest(),
                         app_digest=material["deployment_digest"],
-                        observed_at=datetime.now(timezone.utc),
+                        observed_at=observed_at,
                         expires_at=_operation(material).expires_at,
                     )
                 )
@@ -2435,7 +2491,62 @@ async def test_l5_readiness_conflicts_do_not_cross_environments(
 # E3 (Group 10): readiness and ``general`` no longer bind the legacy roster
 # --------------------------------------------------------------------------
 
-_ROSTER_KEY = billing_roster_advisory_key()
+# Inventory for Group 10 E5/E6, same convention as the characterization
+# module (tests/integration/test_asaas_subscription_triggers_postgres.py):
+# pytest node names, checked by test_break_inventory_names_only_collected_tests
+# below.  A test may appear in both lists when it breaks for both reasons.
+#
+# 036 drops billing_rollout_readiness_receipts.roster_revision (and its model
+# field).  These tests write or read it, directly or through
+# _insert_readiness_past_the_service / _assert_general_quorum_stale; dropping
+# the roster_revision argument in that helper repairs the indirect ones.
+TESTS_THAT_BREAK_AFTER_036: tuple[str, ...] = (
+    "test_d1_general_spends_exactly_the_receipts_its_rows_name_bypass_row",
+    "test_d3_integrity_violations_surface_as_billing_operation_conflict",
+    "test_h1_pre_incident_general_quorum_is_stale_after_recanary",
+    "test_h1_quorum_created_at_equal_to_the_rollout_receipt_is_stale",
+    "test_hd_general_quorum_with_two_stale_and_one_fresh_receipt_is_stale",
+    "test_hd_general_quorum_with_only_the_approver_stale_is_stale",
+    "test_hd_freshness_is_judged_against_the_current_rollout_receipt",
+    "test_e3_readiness_ignores_the_roster_stores_zero_and_promotes",
+    "test_e3_a_digest_that_hashes_roster_revision_never_verifies",
+    "test_e3_a_stored_roster_revision_is_inert_until_migration_036",
+    "test_e3_readiness_locks_rollout_first_and_never_the_roster_fence"
+    "[SUBSCRIPTION_CREATED]",
+    "test_e3_readiness_locks_rollout_first_and_never_the_roster_fence"
+    "[SUBSCRIPTION_DELETED]",
+)
+# 037 drops billing_roster_control: _advance_roster_revision updates it and
+# _assert_roster_fence_free locks it.
+TESTS_THAT_BREAK_AFTER_037: tuple[str, ...] = (
+    "test_e3_readiness_ignores_the_roster_stores_zero_and_promotes",
+    "test_e3_readiness_locks_rollout_first_and_never_the_roster_fence"
+    "[SUBSCRIPTION_CREATED]",
+    "test_e3_readiness_locks_rollout_first_and_never_the_roster_fence"
+    "[SUBSCRIPTION_DELETED]",
+    "test_e3_general_locks_rollout_first_and_never_the_roster_fence"
+    "[SUBSCRIPTION_CREATED]",
+    "test_e3_general_locks_rollout_first_and_never_the_roster_fence"
+    "[SUBSCRIPTION_DELETED]",
+)
+
+
+async def test_break_inventory_names_only_collected_tests(
+    request: pytest.FixtureRequest,
+) -> None:
+    """Every inventory entry is a real node name of this module (not stale)."""
+
+    module = request.node.parent
+    assert isinstance(module, pytest.Module)
+    collected = {item.name for item in module.collect()}
+    for listed in (TESTS_THAT_BREAK_AFTER_036, TESTS_THAT_BREAK_AFTER_037):
+        assert len(set(listed)) == len(listed)
+        assert sorted(set(listed) - collected) == []
+
+
+# The global roster key the migration 026 triggers take (the Python mirror
+# was removed in Group 10 E4; migration 036 removes the triggers).
+_ROSTER_KEY = 3486705124568449331
 _HELD_ADVISORY = (
     "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted "
     "AND pid = pg_backend_pid() AND objsubid = 1 "
@@ -2542,6 +2653,172 @@ async def _assert_roster_fence_free(plane: _ControlPlane) -> None:
         ).all()
         assert len(rows) == 1
         await probe.rollback()
+
+
+# The webhook side of the lock-order proofs below is a REAL delivery through
+# ``BillingWebhookService.receive`` (Group 10 E4), paused right after its
+# ``lock_rollout_control`` and then let run to its commit.  A handoff
+# (SUBSCRIPTION_CREATED) locks the checkout row and inserts the subscription;
+# a deletion locks the subscription row and UPDATEs it, which still takes the
+# database's roster statement fence until migration 036 drops that trigger.
+# The webhook itself takes no roster fence.
+_E4_DUE = date(2026, 10, 11)
+_E4_SUBSCRIPTION = "sub_e4_lock_order"
+_FENCE_TRIGGER = (
+    "SELECT count(*) FROM pg_trigger "
+    "WHERE tgname = 'trg_billing_subscriptions_roster_fence' AND NOT tgisinternal"
+)
+
+
+def _subscription_event(event: str, checkout_id: UUID, amount_cents: int) -> Any:
+    return _payload(
+        event,
+        {
+            "object": "subscription",
+            "id": _E4_SUBSCRIPTION,
+            "value": Decimal(_brl(amount_cents)),
+            "cycle": "MONTHLY",
+            "nextDueDate": _E4_DUE.isoformat(),
+            "status": "ACTIVE" if event == "SUBSCRIPTION_CREATED" else "INACTIVE",
+            "deleted": event == "SUBSCRIPTION_DELETED",
+            "externalReference": str(checkout_id),
+        },
+    )
+
+
+async def _webhook_payload(plane: _ControlPlane, event: str) -> dict[str, Any]:
+    """Seed what *event* needs and return its payload.
+
+    A live non-canary subscription checkout of a fresh builder, as Group 2
+    reserves it; for ``SUBSCRIPTION_DELETED`` its subscription is first
+    handed off by a committed SUBSCRIPTION_CREATED delivery.
+    """
+
+    builder_id = uuid4()
+    snapshot = subscription_pricing_snapshot(
+        BILLING_CATALOG["plan_plus_monthly_v1"], active_clinics=1
+    )
+    amount = int(snapshot["amount_cents"])  # type: ignore[call-overload]
+    checkout = BillingCheckoutSession(
+        id=uuid4(),
+        builder_id=builder_id,
+        intent_kind="subscription",
+        intent_id=uuid4(),
+        topup_order_id=None,
+        attempt_no=1,
+        provider="asaas",
+        external_checkout_id=f"chk_e4_{uuid4().hex[:16]}",
+        state="active",
+        catalog_version_id=CATALOG_VERSION_ID,
+        offer_id="plan_plus_monthly_v1",
+        amount_cents=amount,
+        pricing_snapshot=snapshot,
+        next_due_date=_E4_DUE,
+    )
+    async with plane.sessions() as session:
+        async with session.begin():
+            await session.execute(
+                text("INSERT INTO builders (id, name) VALUES (:id, 'E4 webhook')"),
+                {"id": builder_id},
+            )
+            session.add(checkout)
+    if event == "SUBSCRIPTION_DELETED":
+        async with plane.sessions() as session:
+            created = await BillingWebhookService(
+                session, environment=_ENVIRONMENT
+            ).receive(
+                _envelope(
+                    _subscription_event("SUBSCRIPTION_CREATED", checkout.id, amount)
+                )
+            )
+        assert created.outcome == "processed"
+    return _subscription_event(event, checkout.id, amount)
+
+
+@dataclass
+class _PausedWebhook:
+    pid: int
+    task: asyncio.Task[Any]
+    resume: asyncio.Event
+    # Advisory keys the delivery's own backend held right before its commit.
+    held_at_commit: list[set[int]]
+
+
+@asynccontextmanager
+async def _webhook_paused_after_rollout(
+    plane: _ControlPlane, payload: dict[str, Any]
+) -> AsyncIterator[_PausedWebhook]:
+    """Run one real delivery; pause it once it holds the rollout lock."""
+
+    async with plane.sessions() as session:
+        # One transaction from here to the delivery's commit: the backend pid
+        # stays the delivery's, and a lock wait fails instead of hanging.
+        pid = int(await session.scalar(text("SELECT pg_backend_pid()")))
+        await session.execute(text("SET LOCAL lock_timeout = '10s'"))
+        service = BillingWebhookService(session, environment=_ENVIRONMENT)
+        repository = service._repo
+        lock_rollout = repository.lock_rollout_control
+        commit = session.commit
+        holding = asyncio.Event()
+        resume = asyncio.Event()
+        held_at_commit: list[set[int]] = []
+
+        async def paused_lock_rollout(*, environment: str) -> Any:
+            control = await lock_rollout(environment=environment)
+            holding.set()
+            await resume.wait()
+            return control
+
+        async def recording_commit() -> None:
+            rows = await session.execute(
+                text(
+                    "SELECT classid::bigint, objid::bigint FROM pg_locks "
+                    "WHERE pid = pg_backend_pid() AND locktype = 'advisory' "
+                    "AND granted AND objsubid = 1"
+                )
+            )
+            held_at_commit.append({_signed_key(high, low) for high, low in rows})
+            await commit()
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(repository, "lock_rollout_control", paused_lock_rollout)
+            patch.setattr(session, "commit", recording_commit)
+            task = asyncio.create_task(service.receive(_envelope(payload)))
+            try:
+                waiter = asyncio.ensure_future(holding.wait())
+                await asyncio.wait(
+                    {task, waiter}, timeout=20, return_when=asyncio.FIRST_COMPLETED
+                )
+                waiter.cancel()
+                if task.done():
+                    task.result()
+                    raise AssertionError("the delivery never paused on its lock")
+                assert holding.is_set(), "the delivery never took the rollout lock"
+                yield _PausedWebhook(
+                    pid=pid, task=task, resume=resume, held_at_commit=held_at_commit
+                )
+            finally:
+                resume.set()
+                await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 30)
+
+
+async def _finish_webhook(
+    plane: _ControlPlane, webhook: _PausedWebhook, event: str
+) -> None:
+    """Let the paused delivery run its whole path; it must not wait on the
+    worker queued behind its rollout lock."""
+
+    webhook.resume.set()
+    outcome = await asyncio.wait_for(webhook.task, 30)
+    assert outcome.outcome == (
+        "processed" if event == "SUBSCRIPTION_CREATED" else "readback_required"
+    ), outcome
+    (held,) = webhook.held_at_commit
+    assert billing_advisory_key(_ENVIRONMENT) in held
+    # Its only roster fence is the database trigger's, on the deletion's
+    # UPDATE, and only while that trigger exists (migration 036 drops it).
+    fence_trigger = int(await plane.scalar(_FENCE_TRIGGER)) == 1
+    assert (_ROSTER_KEY in held) == (event == "SUBSCRIPTION_DELETED" and fence_trigger)
 
 
 async def test_e3_readiness_request_with_roster_revision_is_422_before_anything(
@@ -2769,13 +3046,20 @@ async def test_e3_a_stored_roster_revision_is_inert_until_migration_036(
     assert await plane.applied(material) == 3
 
 
+_WEBHOOK_EVENTS = pytest.mark.parametrize(
+    "event", ["SUBSCRIPTION_CREATED", "SUBSCRIPTION_DELETED"]
+)
+
+
+@_WEBHOOK_EVENTS
 async def test_e3_readiness_locks_rollout_first_and_never_the_roster_fence(
-    plane: _ControlPlane,
+    plane: _ControlPlane, event: str
 ) -> None:
     """Readiness takes ``lock_rollout_control`` before anything else and the
-    roster fence never.  A holder in the webhook's order (rollout control,
-    then the roster fence) completes while readiness waits behind it; the
-    old order (roster fence, then rollout) deadlocked against it."""
+    roster fence never.  A real webhook delivery that holds the rollout lock
+    completes its whole path (row locks; for a deletion also the database's
+    roster statement fence) while readiness waits behind it; the old
+    readiness order (roster fence, then rollout) deadlocked against it."""
 
     revision = await _open_canary(plane)
     material = _material(from_state="canary_allowlist", to_state="general")
@@ -2784,10 +3068,12 @@ async def test_e3_readiness_locks_rollout_first_and_never_the_roster_fence(
         material, quorum, rollout_revision=revision, kinds=_KINDS[:3]
     )
     operation = _operation(material)
+    payload = await _webhook_payload(plane, event)
 
-    async with plane.sessions() as holder, plane.sessions() as worker:
-        await holder.execute(text("SET LOCAL lock_timeout = '10s'"))
-        await BillingRepository(holder).lock_rollout_control(environment=_ENVIRONMENT)
+    async with (
+        _webhook_paused_after_rollout(plane, payload) as webhook,
+        plane.sessions() as worker,
+    ):
         pid = int(await worker.scalar(text("SELECT pg_backend_pid()")))
         service = BillingRolloutOperationService(
             worker, signing_key=_SIGNING_KEY.encode()
@@ -2811,7 +3097,9 @@ async def test_e3_readiness_locks_rollout_first_and_never_the_roster_fence(
                 rule_digest=_rule_digest(),
                 bundle_digest=billing_fact_bundle_digest(),
                 app_digest=material["deployment_digest"],
-                observed_at=datetime.now(timezone.utc),
+                observed_at=await plane.observed_after(
+                    quorum["deployer"], quorum["reviewer"]
+                ),
                 expires_at=operation.expires_at,
                 recorder_user_id=plane.actor("reviewer"),
             )
@@ -2830,9 +3118,9 @@ async def test_e3_readiness_locks_rollout_first_and_never_the_roster_fence(
                 op=material["operation_id"],
             )
             await _assert_roster_fence_free(plane)
-            assert await BillingRepository(holder).lock_billing_roster() == 0
+            await _finish_webhook(plane, webhook, event)
         finally:
-            await holder.rollback()
+            webhook.resume.set()
             (outcome,) = await asyncio.wait_for(
                 asyncio.gather(task, return_exceptions=True), 30
             )
@@ -2850,23 +3138,27 @@ async def test_e3_readiness_locks_rollout_first_and_never_the_roster_fence(
     assert response.json()["state"] == "general"
 
 
+@_WEBHOOK_EVENTS
 async def test_e3_general_locks_rollout_first_and_never_the_roster_fence(
-    plane: _ControlPlane,
+    plane: _ControlPlane, event: str
 ) -> None:
     """Lock order of ``general``: rollout control (advisory + row), then the
-    readiness rows, then the quorum receipts; the roster fence never.  A
-    holder in the webhook's order completes while ``general`` waits; the old
-    order (roster fence, readiness rows, rollout) deadlocked against it."""
+    readiness rows, then the quorum receipts; the roster fence never.  A real
+    webhook delivery that holds the rollout lock completes while ``general``
+    waits; the old order (roster fence, readiness rows, rollout) deadlocked
+    against it."""
 
     revision = await _open_canary(plane)
     material = _material(from_state="canary_allowlist", to_state="general")
     quorum = await plane.quorum(material)
     await plane.record_kinds(material, quorum, rollout_revision=revision)
     operation = _operation(material)
+    payload = await _webhook_payload(plane, event)
 
-    async with plane.sessions() as holder, plane.sessions() as worker:
-        await holder.execute(text("SET LOCAL lock_timeout = '10s'"))
-        await BillingRepository(holder).lock_rollout_control(environment=_ENVIRONMENT)
+    async with (
+        _webhook_paused_after_rollout(plane, payload) as webhook,
+        plane.sessions() as worker,
+    ):
         pid = int(await worker.scalar(text("SELECT pg_backend_pid()")))
         service = BillingRolloutOperationService(
             worker, signing_key=_SIGNING_KEY.encode()
@@ -2896,9 +3188,9 @@ async def test_e3_general_locks_rollout_first_and_never_the_roster_fence(
                 op=material["operation_id"],
             )
             await _assert_roster_fence_free(plane)
-            assert await BillingRepository(holder).lock_billing_roster() == 0
+            await _finish_webhook(plane, webhook, event)
         finally:
-            await holder.rollback()
+            webhook.resume.set()
             (outcome,) = await asyncio.wait_for(
                 asyncio.gather(task, return_exceptions=True), 30
             )

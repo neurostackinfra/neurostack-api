@@ -19,7 +19,6 @@ from src.models.billing import (
     BillingPaymentProjection,
     BillingRolloutControl,
     BillingRolloutReceipt,
-    BillingRosterControl,
     BillingSubscription,
     BillingTopupCapabilityBinding,
     BillingTopupCapabilityReceipt,
@@ -90,13 +89,6 @@ def billing_advisory_key(environment: str) -> int:
     digest = hashlib.sha256(
         f"neurostack:billing-control:{environment}".encode("ascii")
     ).digest()
-    return int.from_bytes(digest[:8], byteorder="big", signed=True)
-
-
-def billing_roster_advisory_key() -> int:
-    """Return the one global roster lock key used by every environment."""
-
-    digest = hashlib.sha256(b"neurostack:billing-roster-control:global").digest()
     return int.from_bytes(digest[:8], byteorder="big", signed=True)
 
 
@@ -1257,29 +1249,6 @@ class BillingRepository:
             .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
-
-    async def lock_billing_roster(self) -> int:
-        """Take the global roster fence and return the current revision.
-
-        Same advisory key and row lock as every roster writer and the
-        statement-level roster trigger, so a subscription row created here is
-        serialized against roster imports, legacy cancellation and flips.
-        """
-
-        if self._dialect_name() == "postgresql":
-            await self.session.execute(
-                select(func.pg_advisory_xact_lock(billing_roster_advisory_key()))
-            )
-        result = await self.session.execute(
-            select(BillingRosterControl)
-            .where(BillingRosterControl.singleton.is_(True))
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-        control = result.scalar_one_or_none()
-        if control is None:
-            raise BillingStateUnavailable("billing roster control is unavailable")
-        return int(control.billing_roster_revision)
 
     async def lock_subscription(
         self, *, builder_id: UUID, subscription_id: UUID

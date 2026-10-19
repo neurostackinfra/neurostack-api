@@ -416,11 +416,16 @@ async def world(
     sessions = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     builder_id = uuid4()
     async with sessions() as session:
+        # No billing_roster_control row (Group 10 E4): the application code
+        # no longer reads it, and every test here proves that.  SQLite has no
+        # triggers: on PostgreSQL the 026 statement trigger still needs the
+        # row for every UPDATE of billing_subscriptions (settlement
+        # activation, SUBSCRIPTION_UPDATED/DELETED, a readback that changes
+        # the status) until migration 036 drops it.
         session.add_all(
             [
                 Builder(id=builder_id, name="Fixture Builder"),
                 BillingRolloutControl(environment=ENVIRONMENT, state="disabled"),
-                BillingRosterControl(singleton=True, billing_roster_revision=0),
             ]
         )
         await session.commit()
@@ -940,6 +945,67 @@ async def test_provider_amount_drift_blocks_settlement(world: _World) -> None:
 # ---------------------------------------------------------------------------
 # Subscription handoff, settlement, coupon.
 # ---------------------------------------------------------------------------
+
+# Inventory for Group 10 E5/E6, same convention as the characterization
+# module (tests/integration/test_asaas_subscription_triggers_postgres.py):
+# pytest node names, checked by test_break_inventory_names_only_collected_tests
+# below.  A test may appear in both lists when it breaks for both reasons.
+#
+# 036 drops BillingSubscription.roster_revision (these tests set or read it).
+# The _World.topup_session/subscription_session helpers also pass
+# ``migration_id=None``, a column 036 drops: E5 removes that argument there,
+# after which no other test of this module breaks for that reason.
+TESTS_THAT_BREAK_AFTER_036: tuple[str, ...] = (
+    "test_handoff_ignores_the_legacy_roster_and_writes_the_constant",
+    "test_subscription_created_hands_off_and_settlement_activates_once",
+    "test_second_recurring_subscription_is_never_bound",
+)
+# 037 drops BillingRosterControl: this test writes it, and the module-level
+# import of the model must go too (or the whole module fails to import).
+TESTS_THAT_BREAK_AFTER_037: tuple[str, ...] = (
+    "test_handoff_ignores_the_legacy_roster_and_writes_the_constant",
+)
+
+
+def test_break_inventory_names_only_collected_tests(
+    request: pytest.FixtureRequest,
+) -> None:
+    """Every inventory entry is a real node name of this module (not stale)."""
+
+    module = request.node.parent
+    assert isinstance(module, pytest.Module)
+    collected = {item.name for item in module.collect()}
+    for listed in (TESTS_THAT_BREAK_AFTER_036, TESTS_THAT_BREAK_AFTER_037):
+        assert len(set(listed)) == len(listed)
+        assert sorted(set(listed) - collected) == []
+
+
+async def test_handoff_ignores_the_legacy_roster_and_writes_the_constant(
+    world: _World,
+) -> None:
+    """Group 10 E4: a stray roster row at revision 7 is neither read nor
+    locked; the new row records the constant 1 that the CHECK (> 0) needs
+    until migration 036 drops ``roster_revision``."""
+
+    await world.add(BillingRosterControl(singleton=True, billing_roster_revision=7))
+    checkout = await world.subscription_session()
+    created = await world.receive(
+        _event(
+            "SUBSCRIPTION_CREATED",
+            id="sub_roster_constant",
+            externalReference=str(checkout.id),
+            value=Decimal(checkout.amount_cents).scaleb(-2),
+        )
+    )
+    assert created.outcome == "processed"
+    (row,) = await world.rows(BillingSubscription)
+    assert (row.id, row.status, row.roster_revision) == (
+        checkout.intent_id,
+        "active_linked",
+        1,
+    )
+    (control,) = await world.rows(BillingRosterControl)
+    assert control.billing_roster_revision == 7
 
 
 async def test_subscription_created_hands_off_and_settlement_activates_once(

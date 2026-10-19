@@ -15,10 +15,11 @@ import asyncio
 import itertools
 import json
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 from uuid import UUID, uuid4
 
 import httpx
@@ -30,7 +31,7 @@ from sqlalchemy.pool import NullPool
 
 from src.config.settings import settings
 from src.models.coupon import Coupon
-from src.repositories.billing import BillingRepository
+from src.repositories.billing import BillingRepository, billing_advisory_key
 from src.services.asaas import (
     PaymentReadback,
     ProviderRecord,
@@ -55,6 +56,7 @@ from src.services.billing_webhook import (
 from tests.integration.test_asaas_billing_postgres import (
     _create_child,
     _drop_child,
+    _evidence,
     _run_alembic,
     _validated_admin_url,
 )
@@ -2522,3 +2524,756 @@ async def test_deleted_payment_with_refunds_settles_and_reverses_on_postgres(
         "SELECT count(*) FROM transactions WHERE builder_id = :b",
         b=builder_id,
     ) == (1 if status == "RECEIVED" else 0)
+
+
+# ---------------------------------------------------------------------------
+# Group 10 E4: no webhook or readback path takes the legacy roster fence.
+#
+# The four former call sites -- the handoff, the target rows of a payment of
+# a subscription, an event on an existing subscription and the subscription
+# readback -- took the global roster advisory key and the
+# billing_roster_control row right after the environment rollout lock.  Each
+# runs under that rollout lock, which already serializes them within one
+# environment.  The global fence also serialized handoffs ACROSS environments;
+# without it one environment per database is a requirement (two environments
+# sharing a database could leave a builder with two active subscriptions; see
+# the billing_webhook module docstring and the deployment runbook).  What is
+# left of the fence is the database's statement trigger on UPDATE/DELETE of
+# billing_subscriptions (migration 026), which migration 036 (E5) removes.
+# ---------------------------------------------------------------------------
+
+# Inventory for Group 10 E5/E6, same convention as the characterization
+# module (tests/integration/test_asaas_subscription_triggers_postgres.py):
+# pytest node names, checked by test_break_inventory_names_only_collected_tests
+# below.  A test may appear in both lists when it breaks for both reasons.
+#
+# 036 drops billing_subscriptions.roster_revision (these tests select it) and
+# the roster statement trigger.  From 036 on the held-fence test only runs its
+# "no trigger" branch; its trigger branch becomes unreachable.
+TESTS_THAT_BREAK_AFTER_036: tuple[str, ...] = (
+    "test_handoff_holds_the_rollout_lock_against_eligibility",
+    "test_e4_former_roster_call_sites_commit_without_the_fence",
+    "test_e4_a_held_roster_fence_blocks_only_a_subscription_update",
+    "test_e4_creation_payment_cancellation_and_transition_queue_on_rollout",
+)
+# 037 drops billing_roster_control, which the held-fence test locks.
+TESTS_THAT_BREAK_AFTER_037: tuple[str, ...] = (
+    "test_e4_a_held_roster_fence_blocks_only_a_subscription_update",
+)
+
+
+async def test_break_inventory_names_only_collected_tests(
+    request: pytest.FixtureRequest,
+) -> None:
+    """Every inventory entry is a real node name of this module (not stale)."""
+
+    module = request.node.parent
+    assert isinstance(module, pytest.Module)
+    collected = {item.name for item in module.collect()}
+    for listed in (TESTS_THAT_BREAK_AFTER_036, TESTS_THAT_BREAK_AFTER_037):
+        assert len(set(listed)) == len(listed)
+        assert sorted(set(listed) - collected) == []
+
+
+# The key the 026 triggers take; it has no Python mirror any more.
+_LEGACY_ROSTER_FENCE_KEY = 3486705124568449331
+_FENCE_TRIGGER = (
+    "SELECT count(*) FROM pg_trigger "
+    "WHERE tgname = 'trg_billing_subscriptions_roster_fence' AND NOT tgisinternal"
+)
+# Long enough for any lock-free path on a slow runner; a path that waits on
+# the held fence (the pre-E4 code) fails here instead of hanging.
+_FENCE_FREE_SECONDS = 15.0
+
+
+@dataclass(frozen=True)
+class _Lock:
+    locktype: str
+    relation: str | None
+    advisory: int | None
+    granted: bool
+
+
+def _bigint_key(high: int, low: int) -> int:
+    """The bigint advisory key that pg_locks splits into classid/objid."""
+
+    key = (high << 32) | low
+    return key - 2**64 if key >= 2**63 else key
+
+
+async def _locks_of(session: AsyncSession, pid: int | None = None) -> list[_Lock]:
+    """The locks of backend *pid* (default: *session*'s own backend)."""
+
+    rows = (
+        await session.execute(
+            text(
+                "SELECT locktype, CASE WHEN locktype = 'relation' "
+                "THEN relation::regclass::text END, classid::bigint, "
+                "objid::bigint, objsubid, granted FROM pg_locks "
+                "WHERE pid = COALESCE(CAST(:pid AS integer), pg_backend_pid())"
+            ),
+            {"pid": pid},
+        )
+    ).all()
+    return [
+        _Lock(
+            locktype=str(locktype),
+            relation=relation,
+            advisory=(
+                _bigint_key(int(high), int(low))
+                if locktype == "advisory" and subid == 1
+                else None
+            ),
+            granted=bool(granted),
+        )
+        for locktype, relation, high, low, subid, granted in rows
+    ]
+
+
+def _roster_locks(locks: list[_Lock]) -> list[_Lock]:
+    return [
+        lock
+        for lock in locks
+        if lock.advisory == _LEGACY_ROSTER_FENCE_KEY
+        or (lock.relation or "").startswith("billing_roster_control")
+    ]
+
+
+@asynccontextmanager
+async def _locks_at_commit(session: AsyncSession) -> AsyncIterator[list[list[_Lock]]]:
+    """Record *session*'s own locks right before each of its commits."""
+
+    snapshots: list[list[_Lock]] = []
+    commit = session.commit
+
+    async def recording_commit() -> None:
+        snapshots.append(await _locks_of(session))
+        await commit()
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(session, "commit", recording_commit)
+        yield snapshots
+
+
+def _assert_rollout_without_roster(locks: list[_Lock], environment: str) -> None:
+    # Recorded inside the path's transaction: the rollout lock is held ...
+    assert billing_advisory_key(environment) in {
+        lock.advisory for lock in locks if lock.granted
+    }
+    assert "billing_rollout_control" in {lock.relation for lock in locks}
+    # ... and nothing of the roster: neither its key nor its control row.
+    assert _roster_locks(locks) == []
+
+
+async def _waiting(harness: _Harness, pid: int) -> list[_Lock]:
+    """Poll until backend *pid* waits on a lock; return all of its locks."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 30
+    while True:
+        async with harness.session() as probe:
+            locks = await _locks_of(probe, pid)
+        if any(not lock.granted for lock in locks):
+            return locks
+        assert loop.time() < deadline, f"backend {pid} never waited on a lock"
+        await asyncio.sleep(0.02)
+
+
+def _awaited(locks: list[_Lock]) -> list[tuple[str, int | None]]:
+    return [(lock.locktype, lock.advisory) for lock in locks if not lock.granted]
+
+
+async def test_e4_former_roster_call_sites_commit_without_the_fence(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each former call site, through every public entry point that reaches
+    it (deliveries and the subscription, payment and checkout readbacks),
+    commits holding the rollout lock and nothing of the roster.  Before E4
+    each one held the roster key and the roster row lock at this point."""
+
+    builder_id, session_id, checkout_id, cents = await _subscription(
+        harness, monkeypatch, "E4 no roster fence"
+    )
+    external = "sub_pg_e4_no_fence"
+
+    async def deliver(payload: dict[str, Any]) -> tuple[Any, list[_Lock]]:
+        async with harness.session() as session:
+            async with _locks_at_commit(session) as snapshots:
+                outcome = await BillingWebhookService(
+                    session, environment="test"
+                ).receive(_envelope(payload))
+        (locks,) = snapshots
+        return outcome, locks
+
+    # 1. The handoff creates the subscription row (former first call site).
+    created, locks = await deliver(_subscription_created(session_id, external, cents))
+    assert created.outcome == "processed"
+    _assert_rollout_without_roster(locks, "test")
+    # 2. A payment of that subscription locks its target rows (second site).
+    pending, locks = await deliver(
+        _payment(
+            "PAYMENT_CREATED",
+            "pay_pg_e4_no_fence",
+            checkout=checkout_id,
+            subscription=external,
+            value=_brl(cents),
+        )
+    )
+    assert pending.outcome == "processed"
+    _assert_rollout_without_roster(locks, "test")
+    # 3. An event on the existing subscription row (third site).
+    again, locks = await deliver(_subscription_created(session_id, external, cents))
+    assert again.outcome == "processed"
+    _assert_rollout_without_roster(locks, "test")
+    # 4. The subscription readback (fourth site), converged with no write.
+    subscription_id, next_due = tuple(
+        (
+            await _all(
+                harness,
+                "SELECT s.id, c.next_due_date FROM billing_subscriptions s "
+                "JOIN billing_checkout_sessions c ON c.intent_id = s.id "
+                "WHERE s.builder_id = :b",
+                b=builder_id,
+            )
+        )[0]
+    )
+    reads = _Reads(
+        subscriptions={
+            external: SubscriptionReadback(
+                external, "ACTIVE", False, "MONTHLY", cents, next_due, str(session_id)
+            )
+        }
+    )
+    async with harness.session() as session:
+        async with _locks_at_commit(session) as snapshots:
+            converged = await BillingReadbackService(
+                session, client_factory=reads, environment="test"
+            ).readback_subscription(subscription_id)
+    assert converged == "converged"
+    (locks,) = snapshots
+    _assert_rollout_without_roster(locks, "test")
+    # 5. The payment readback reaches the second site under its own lock.
+    reads.payments["pay_pg_e4_no_fence"] = _read("pay_pg_e4_no_fence", "PENDING", cents)
+    async with harness.session() as session:
+        async with _locks_at_commit(session) as snapshots:
+            await BillingReadbackService(
+                session, client_factory=reads, environment="test"
+            ).readback_payment("pay_pg_e4_no_fence", delivery_id=pending.delivery_id)
+    (locks,) = snapshots
+    _assert_rollout_without_roster(locks, "test")
+
+    (row,) = await _all(
+        harness,
+        "SELECT status, is_active, roster_revision, "
+        "(SELECT count(*) FROM billing_payment_projections WHERE builder_id = :b) "
+        "FROM billing_subscriptions WHERE builder_id = :b",
+        b=builder_id,
+    )
+    # The legacy column holds the constant the CHECK (> 0) needs until 036.
+    assert tuple(row) == ("active_linked", True, 1, 1)
+
+    # 6. The checkout readback reaches the first site (a readback handoff).
+    other_builder, other_session, other_checkout, _cents = await _subscription(
+        harness, monkeypatch, "E4 no roster fence, readback handoff"
+    )
+    paid = await _deliver(
+        harness, _payload("CHECKOUT_PAID", {"id": other_checkout}), "test"
+    )
+    assert paid.outcome == "processed"
+    handoff_reads = _Reads(
+        by_reference={
+            other_session: (
+                ProviderRecord(
+                    "sub_pg_e4_no_fence_rb", str(other_session), "ACTIVE", False
+                ),
+            )
+        }
+    )
+    async with harness.session() as session:
+        async with _locks_at_commit(session) as snapshots:
+            linked = await BillingReadbackService(
+                session, client_factory=handoff_reads, environment="test"
+            ).readback_checkout(other_session)
+    assert linked == "converged"
+    (locks,) = snapshots
+    _assert_rollout_without_roster(locks, "test")
+    assert (
+        await _scalar(
+            harness,
+            "SELECT roster_revision FROM billing_subscriptions WHERE builder_id = :b",
+            b=other_builder,
+        )
+        == 1
+    )
+
+
+async def test_e4_a_held_roster_fence_blocks_only_a_subscription_update(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transaction holding the roster fence exactly as the 026 triggers take
+    it (the global key, then the control row) no longer blocks the handoff, a
+    payment of the subscription, a redelivered event or the readback; before
+    E4 each of them waited on it.  A deletion UPDATEs billing_subscriptions,
+    so it still meets the database's statement fence until migration 036 --
+    only after its rollout lock and its subscription row lock -- and applies
+    once the holder ends."""
+
+    builder_id, session_id, checkout_id, cents = await _subscription(
+        harness, monkeypatch, "E4 fence held"
+    )
+    external = "sub_pg_e4_fence_held"
+    fence_trigger = int(await _scalar(harness, _FENCE_TRIGGER)) == 1
+    holder = harness.session()
+    writer = harness.session()
+    try:
+        await holder.execute(
+            text("SELECT pg_advisory_xact_lock(:key)"),
+            {"key": _LEGACY_ROSTER_FENCE_KEY},
+        )
+        await holder.execute(
+            text(
+                "SELECT 1 FROM billing_roster_control WHERE singleton = true "
+                "FOR UPDATE"
+            )
+        )
+
+        async def unblocked(call: Awaitable[Any]) -> Any:
+            return await asyncio.wait_for(call, timeout=_FENCE_FREE_SECONDS)
+
+        created = await unblocked(
+            _deliver(
+                harness, _subscription_created(session_id, external, cents), "test"
+            )
+        )
+        assert created.outcome == "processed"
+        pending = await unblocked(
+            _deliver(
+                harness,
+                _payment(
+                    "PAYMENT_CREATED",
+                    "pay_pg_e4_fence_held",
+                    checkout=checkout_id,
+                    subscription=external,
+                    value=_brl(cents),
+                ),
+                "test",
+            )
+        )
+        assert pending.outcome == "processed"
+        again = await unblocked(
+            _deliver(
+                harness, _subscription_created(session_id, external, cents), "test"
+            )
+        )
+        assert again.outcome == "processed"
+        subscription_id, next_due = tuple(
+            (
+                await _all(
+                    harness,
+                    "SELECT s.id, c.next_due_date FROM billing_subscriptions s "
+                    "JOIN billing_checkout_sessions c ON c.intent_id = s.id "
+                    "WHERE s.builder_id = :b",
+                    b=builder_id,
+                )
+            )[0]
+        )
+        reads = _Reads(
+            subscriptions={
+                external: SubscriptionReadback(
+                    external,
+                    "ACTIVE",
+                    False,
+                    "MONTHLY",
+                    cents,
+                    next_due,
+                    str(session_id),
+                )
+            }
+        )
+
+        async def readback() -> str:
+            async with harness.session() as session:
+                return await BillingReadbackService(
+                    session, client_factory=reads, environment="test"
+                ).readback_subscription(subscription_id)
+
+        assert await unblocked(readback()) == "converged"
+
+        pid = await _pid(writer)
+        deletion = asyncio.create_task(
+            BillingWebhookService(writer, environment="test").receive(
+                _envelope(
+                    _payload("SUBSCRIPTION_DELETED", {"id": external, "deleted": True})
+                )
+            )
+        )
+        if fence_trigger:
+            locks = await _waiting(harness, pid)
+            # It waits on the trigger's key alone, already holding the
+            # rollout lock and the subscription it is updating.
+            assert _awaited(locks) == [("advisory", _LEGACY_ROSTER_FENCE_KEY)]
+            assert billing_advisory_key("test") in {
+                lock.advisory for lock in locks if lock.granted
+            }
+            assert {"billing_rollout_control", "billing_subscriptions"} <= {
+                lock.relation for lock in locks if lock.granted
+            }
+            assert not deletion.done()
+        else:
+            assert (await unblocked(deletion)).outcome == "readback_required"
+        await holder.rollback()
+        deleted = await asyncio.wait_for(deletion, timeout=30)
+    finally:
+        await holder.close()
+        await writer.close()
+    assert deleted.outcome == "readback_required"
+    (row,) = await _all(
+        harness,
+        "SELECT status, is_active, roster_revision FROM billing_subscriptions "
+        "WHERE builder_id = :b",
+        b=builder_id,
+    )
+    assert tuple(row) == ("non_billable_pending_readback", False, 1)
+
+
+async def test_e4_creation_payment_cancellation_and_transition_queue_on_rollout(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the environment's rollout lock held, a handoff, a settling payment
+    of the same subscription, its cancellation and a rollout transition each
+    queue on exactly the rollout advisory key, holding no checkout or
+    subscription row and no roster fence.  Released, they apply one at a time
+    in arrival order (the cancellation sees the settled row) and the end
+    state is consistent: no deadlock, no lost update."""
+
+    environment = "staging"
+    builder_id, session_id, checkout_id, cents = await _subscription(
+        harness, monkeypatch, "E4 race", environment=environment
+    )
+    external = "sub_pg_e4_race"
+    payment_id = "pay_pg_e4_race"
+    pids: dict[str, int] = {}
+
+    def delivery(name: str, payload: dict[str, Any]) -> Callable[[], Awaitable[Any]]:
+        async def run() -> Any:
+            async with harness.session() as session:
+                # Same transaction as the delivery: the pid stays its backend.
+                pids[name] = await _pid(session)
+                return await BillingWebhookService(
+                    session, environment=environment
+                ).receive(_envelope(payload))
+
+        return run
+
+    async def transition() -> str:
+        async with harness.session() as session:
+            pids["transition"] = await _pid(session)
+            repository = BillingRepository(session)
+            control = await repository.lock_rollout_control(environment=environment)
+            control = await repository.transition_rollout(
+                environment=environment,
+                expected_revision=control.rollout_revision,
+                to_state="disabled",
+                evidence=_evidence(),
+            )
+            state = str(control.state)
+            await session.commit()
+            return state
+
+    contenders: list[tuple[str, Callable[[], Awaitable[Any]]]] = [
+        (
+            "handoff",
+            delivery("handoff", _subscription_created(session_id, external, cents)),
+        ),
+        (
+            "payment",
+            delivery(
+                "payment",
+                _payment(
+                    "PAYMENT_CONFIRMED",
+                    payment_id,
+                    checkout=checkout_id,
+                    subscription=external,
+                    value=_brl(cents),
+                ),
+            ),
+        ),
+        (
+            "cancellation",
+            delivery(
+                "cancellation",
+                _payload("SUBSCRIPTION_DELETED", {"id": external, "deleted": True}),
+            ),
+        ),
+        ("transition", transition),
+    ]
+    rollout_key = billing_advisory_key(environment)
+    tasks: list[asyncio.Task[Any]] = []
+    holder = harness.session()
+    try:
+        await BillingRepository(holder).lock_rollout_control(environment=environment)
+        for name, run in contenders:
+            tasks.append(asyncio.create_task(run()))
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 30
+            while name not in pids:
+                assert loop.time() < deadline, f"{name} never started"
+                await asyncio.sleep(0.01)
+            locks = await _waiting(harness, pids[name])
+            # Queued on the rollout key alone, in arrival order, holding no
+            # roster fence (only its own delivery row, if any).
+            assert _awaited(locks) == [("advisory", rollout_key)], name
+            assert _roster_locks(locks) == [], name
+            assert not tasks[-1].done(), name
+        # None of them holds the checkout row its path will lock.
+        async with harness.session() as probe:
+            rows = (
+                await probe.execute(
+                    text(
+                        "SELECT id FROM billing_checkout_sessions WHERE id = :id "
+                        "FOR UPDATE NOWAIT"
+                    ),
+                    {"id": session_id},
+                )
+            ).all()
+            assert len(rows) == 1
+            await probe.rollback()
+        await holder.rollback()
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), timeout=60
+        )
+    finally:
+        await holder.close()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        # This test leaves the environment disabled for the rest of the module.
+        _READY.discard((id(harness), environment))
+    for (name, _run), result in zip(contenders, results, strict=True):
+        assert not isinstance(result, BaseException), (name, result)
+    handoff, payment, cancellation, state = results
+    assert (handoff.outcome, payment.outcome, cancellation.outcome, state) == (
+        "processed",
+        "processed",
+        "readback_required",
+        "disabled",
+    )
+    (row,) = await _all(
+        harness,
+        "SELECT (SELECT count(*) FROM billing_subscriptions WHERE builder_id = :b), "
+        "s.status, s.is_active, s.roster_revision, c.state, p.status, "
+        "p.settled_cents, "
+        "(SELECT count(*) FROM billing_payment_effects WHERE builder_id = :b), "
+        "(SELECT count(*) FROM transactions WHERE builder_id = :b) "
+        "FROM billing_subscriptions s "
+        "JOIN billing_checkout_sessions c ON c.id = :s "
+        "JOIN billing_payment_projections p ON p.subscription_id = s.id "
+        "WHERE s.builder_id = :b",
+        b=builder_id,
+        s=session_id,
+    )
+    assert tuple(row) == (
+        1,
+        "non_billable_pending_readback",
+        False,
+        1,
+        "completed",
+        "settled",
+        cents,
+        1,
+        1,
+    )
+
+
+async def test_e4_identical_subscription_deliveries_hand_off_once(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two deliveries of one SUBSCRIPTION_CREATED: the second waits on the
+    first's idempotency key (the unique delivery index), before any rollout
+    or roster lock, and is a duplicate once the first commits."""
+
+    builder_id, session_id, _checkout, cents = await _subscription(
+        harness, monkeypatch, "E4 duplicate handoff"
+    )
+    envelope = _envelope(_subscription_created(session_id, "sub_pg_e4_dup", cents))
+    first = harness.session()
+    second = harness.session()
+    try:
+        held = await BillingWebhookService(first, environment="test")._receive(envelope)
+        pid = await _pid(second)
+        task = asyncio.create_task(
+            BillingWebhookService(second, environment="test").receive(envelope)
+        )
+        locks = await _waiting(harness, pid)
+        assert _awaited(locks) == [("transactionid", None)]
+        assert {lock.advisory for lock in locks} == {None}
+        assert not task.done()
+        await first.commit()
+        late = await asyncio.wait_for(task, timeout=30)
+    finally:
+        await first.close()
+        await second.close()
+    assert (held.outcome, late.outcome) == ("processed", "duplicate")
+    (row,) = await _all(
+        harness,
+        "SELECT (SELECT count(*) FROM billing_webhook_deliveries WHERE event_id = :e), "
+        "(SELECT count(*) FROM billing_subscriptions WHERE builder_id = :b), "
+        "(SELECT state FROM billing_checkout_sessions WHERE id = :s)",
+        e=envelope.event_id,
+        b=builder_id,
+        s=session_id,
+    )
+    assert tuple(row) == (1, 1, "completed")
+
+
+async def _rollout_waiter(
+    harness: _Harness, holder_pid: int, environment: str
+) -> tuple[int, list[_Lock]]:
+    """Poll until another backend waits on *environment*'s rollout key.
+
+    A readback runs several transactions and, under NullPool, each may get a
+    new backend, so the waiter is found by the lock it waits on; returns its
+    pid and all of its locks.
+    """
+
+    key = billing_advisory_key(environment)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 30
+    while True:
+        async with harness.session() as probe:
+            pid = await probe.scalar(
+                text(
+                    "SELECT lock.pid FROM pg_locks AS lock "
+                    "JOIN pg_database AS db ON db.oid = lock.database "
+                    "WHERE db.datname = current_database() "
+                    "AND lock.locktype = 'advisory' AND NOT lock.granted "
+                    "AND lock.objsubid = 1 AND lock.classid::bigint = :high "
+                    "AND lock.objid::bigint = :low AND lock.pid <> :holder"
+                ),
+                {
+                    "high": (key >> 32) & 0xFFFFFFFF,
+                    "low": key & 0xFFFFFFFF,
+                    "holder": holder_pid,
+                },
+            )
+            if pid is not None:
+                return int(pid), await _locks_of(probe, int(pid))
+        assert loop.time() < deadline, "no backend queued on the rollout lock"
+        await asyncio.sleep(0.02)
+
+
+async def _assert_rows_unlocked(harness: _Harness, rows: dict[str, Any]) -> None:
+    """Every named row is free: ``FOR UPDATE NOWAIT`` would raise otherwise."""
+
+    for table, row_id in rows.items():
+        async with harness.session() as probe:
+            found = (
+                await probe.execute(
+                    text(f"SELECT id FROM {table} WHERE id = :id FOR UPDATE NOWAIT"),
+                    {"id": row_id},
+                )
+            ).all()
+            assert len(found) == 1, table
+            await probe.rollback()
+
+
+@pytest.mark.parametrize("readback", ["subscription", "payment", "checkout"])
+async def test_e4_readbacks_take_the_rollout_lock_before_any_billing_row(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, readback: str
+) -> None:
+    """Each readback's locked transaction takes the environment rollout lock
+    before any billing row.  With the lock held elsewhere it waits on exactly
+    the rollout key while holding no builder, checkout, subscription or
+    projection row and nothing of the roster (the payment readback holds only
+    its own delivery row, locked first by design); released, it converges."""
+
+    builder_id, session_id, checkout_id, cents = await _subscription(
+        harness, monkeypatch, f"E4 readback order {readback}"
+    )
+    external = f"sub_pg_e4_order_{readback}"
+    payment_id = f"pay_pg_e4_order_{readback}"
+    reads = _Reads()
+    rows: dict[str, Any] = {
+        "builders": builder_id,
+        "billing_checkout_sessions": session_id,
+    }
+    if readback == "checkout":
+        paid = await _deliver(
+            harness, _payload("CHECKOUT_PAID", {"id": checkout_id}), "test"
+        )
+        assert paid.outcome == "processed"
+        reads.by_reference[session_id] = (
+            ProviderRecord(external, str(session_id), "ACTIVE", False),
+        )
+    else:
+        created = await _deliver(
+            harness, _subscription_created(session_id, external, cents), "test"
+        )
+        assert created.outcome == "processed"
+        subscription_id, next_due = tuple(
+            (
+                await _all(
+                    harness,
+                    "SELECT s.id, c.next_due_date FROM billing_subscriptions s "
+                    "JOIN billing_checkout_sessions c ON c.intent_id = s.id "
+                    "WHERE s.builder_id = :b",
+                    b=builder_id,
+                )
+            )[0]
+        )
+        rows["billing_subscriptions"] = subscription_id
+        reads.subscriptions[external] = SubscriptionReadback(
+            external, "ACTIVE", False, "MONTHLY", cents, next_due, str(session_id)
+        )
+        pending = await _deliver(
+            harness,
+            _payment(
+                "PAYMENT_CREATED",
+                payment_id,
+                checkout=checkout_id,
+                subscription=external,
+                value=_brl(cents),
+            ),
+            "test",
+        )
+        assert pending.outcome == "processed"
+        rows["billing_payment_projections"] = await _scalar(
+            harness,
+            "SELECT id FROM billing_payment_projections WHERE payment_id = :p",
+            p=payment_id,
+        )
+        reads.payments[payment_id] = _read(payment_id, "PENDING", cents)
+
+    async def run() -> str:
+        async with harness.session() as session:
+            service = BillingReadbackService(
+                session, client_factory=reads, environment="test"
+            )
+            if readback == "subscription":
+                return await service.readback_subscription(
+                    rows["billing_subscriptions"]
+                )
+            if readback == "payment":
+                return await service.readback_payment(
+                    payment_id, delivery_id=pending.delivery_id
+                )
+            return await service.readback_checkout(session_id)
+
+    holder = harness.session()
+    task: asyncio.Task[str] | None = None
+    try:
+        holder_pid = await _pid(holder)
+        await BillingRepository(holder).lock_rollout_control(environment="test")
+        task = asyncio.create_task(run())
+        _pid_waiting, locks = await _rollout_waiter(harness, holder_pid, "test")
+        assert _awaited(locks) == [("advisory", billing_advisory_key("test"))]
+        assert _roster_locks(locks) == []
+        await _assert_rows_unlocked(harness, rows)
+        assert not task.done()
+        await holder.rollback()
+        outcome = await asyncio.wait_for(task, timeout=30)
+    finally:
+        await holder.close()
+        if task is not None and not task.done():
+            task.cancel()
+    assert outcome == "converged"
