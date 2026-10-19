@@ -811,8 +811,8 @@ def test_release_gate_fails_when_a_scan_cannot_run(
 
 
 # ── secret/PII scan waivers (owner decision 2026-10-18) ─────────────────────
-# The release gate waives a closed list of exact synthetic lines in the two
-# sandbox card capture files only, and audits those files as a whole. These
+# The release gate waives a closed list of exact synthetic lines in the
+# sandbox card capture tool's files only, and audits them as a whole. These
 # tests drive the mechanism through a test-owned table injected by
 # redefining `_asaas_scan_waivers`; the real table is checked structurally
 # below and against the tool's bytes by the gate itself. Rule literals are
@@ -822,35 +822,43 @@ _CARD_FIELD = "credit" + "Card"
 _KEY_HMLG = "$" + "aact_hmlg_"
 _KEY_PROD = "$" + "aact_prod_"
 _CVV_TERM = "c" + "vv"
+_CCV_TERM = "c" + "cv"
 _ACCESS_HEADER = "asaas-access-" + "token: abc"
 _CAPTURE_TOOL = "scripts/asaas_sandbox_card_capture.py"
 _CAPTURE_TESTS = "tests/scripts/test_asaas_sandbox_card_capture.py"
+_CAPTURE_RUNBOOK = "docs/runbooks/asaas-sandbox-card-capture.md"
 _DECISION = "owner decision 2026-10-18, wish asaas-payment-gateway"
 _WAIVED = f"waived ({_DECISION}): "
 _FAKE_KEY_TAIL = "FAKEcapture-test-key-0001"
 _REAL_LOOKING_TAIL = "Zx9Qm2LwPb7RtY4uVk8NcJ3hGs6FdA1eXo5iTyMn"
 _OTHER_PAN = "5162306219378829"
 _MALFORMED = "malformed scan rules or waiver table"
-# (line, rule) fixture lines; rule None marks a pinned (never waived) line.
-_TOOL_LINES = [
-    (f'        "{_CPF_FIELD}": identity.cpf,', "forbidden_cpf_field"),
-    (f'        "{_CARD_FIELD}": {{', "forbidden_card_field"),
-    ('            "number": TEST_CARD_NUMBER,', None),
-    ('            "ccv": TEST_CARD_CCV,', None),
-    (f'        "{_CARD_FIELD}HolderInfo": {{', "forbidden_card_field"),
-    ('TEST_CARD_NUMBER = "4444444444444444"', None),
-    ('TEST_CARD_CCV = "123"', None),
+# (line, rules) fixture lines: the rules each line hits, all of them waived;
+# () marks a pinned line that hits no rule.
+_TOOL_LINES: list[tuple[str, tuple[str, ...]]] = [
+    (f'        "{_CPF_FIELD}": identity.cpf,', ("forbidden_cpf_field",)),
+    (f'        "{_CARD_FIELD}": {{', ("forbidden_card_field",)),
+    ('            "number": TEST_CARD_NUMBER,', ()),
+    (f'            "{_CCV_TERM}": TEST_CARD_CCV,', ("payment_security_term",)),
+    (f'        "{_CARD_FIELD}HolderInfo": {{', ("forbidden_card_field",)),
+    ('TEST_CARD_NUMBER = "4444444444444444"', ()),
+    ('TEST_CARD_CCV = "123"', ()),
 ]
-_TEST_LINES = [
-    (f'SANDBOX_KEY = "{_KEY_HMLG}{_FAKE_KEY_TAIL}"', "asaas_api_key"),
-    (f'PROD_KEY = "{_KEY_PROD}{_FAKE_KEY_TAIL}"', "asaas_api_key"),
+_TEST_LINES: list[tuple[str, tuple[str, ...]]] = [
+    (f'SANDBOX_KEY = "{_KEY_HMLG}{_FAKE_KEY_TAIL}"', ("asaas_api_key",)),
+    (f'PROD_KEY = "{_KEY_PROD}{_FAKE_KEY_TAIL}"', ("asaas_api_key",)),
     (
         f'    assert payload["{_CARD_FIELD}"]["number"] == "4444444444444444"',
-        "forbidden_card_field",
+        ("forbidden_card_field",),
     ),
-    (f'    assert payload["{_CARD_FIELD}"]["ccv"] == "123"', "forbidden_card_field"),
+    (
+        f'    assert payload["{_CARD_FIELD}"]["{_CCV_TERM}"] == "123"',
+        ("forbidden_card_field", "payment_security_term"),
+    ),
 ]
-_WAIVED_COUNT = sum(1 for _, rule in _TOOL_LINES + _TEST_LINES if rule)
+_RUNBOOK_PIN = "  `4444 4444 4444 4444`, with any future expiry and CCV `123`"
+_RUNBOOK_LINES: list[tuple[str, tuple[str, ...]]] = [(_RUNBOOK_PIN, ())]
+_WAIVED_COUNT = sum(len(rules) for _, rules in _TOOL_LINES + _TEST_LINES)
 _TEST_TABLE = [
     (
         _CAPTURE_TOOL,
@@ -860,7 +868,7 @@ _TEST_TABLE = [
     ),
     (_CAPTURE_TOOL, "forbidden_card_field", 1, '[[:space:]]*"credit[C]ard": [{]'),
     (_CAPTURE_TOOL, "pinned_line", 1, '[[:space:]]*"number": TEST_CARD_NUMBER,'),
-    (_CAPTURE_TOOL, "pinned_line", 1, '[[:space:]]*"ccv": TEST_CARD_CCV,'),
+    (_CAPTURE_TOOL, "pinned_line", 1, '[[:space:]]*"c[c]v": TEST_CARD_CCV,'),
     (
         _CAPTURE_TOOL,
         "forbidden_card_field",
@@ -891,13 +899,34 @@ _TEST_TABLE = [
         _CAPTURE_TESTS,
         "forbidden_card_field",
         1,
-        '[[:space:]]*assert payload[[]"credit[C]ard"[]][[]"ccv"[]] == "123"',
+        '[[:space:]]*assert payload[[]"credit[C]ard"[]][[]"c[c]v"[]] == "123"',
+    ),
+    # The security-code rule on lines already pinned or waived for another rule.
+    (
+        _CAPTURE_TOOL,
+        "payment_security_term",
+        1,
+        '[[:space:]]*"c[c]v": TEST_CARD_CCV,',
+    ),
+    (
+        _CAPTURE_TESTS,
+        "payment_security_term",
+        1,
+        '[[:space:]]*assert payload[[]"credit[C]ard"[]][[]"c[c]v"[]] == "123"',
+    ),
+    (
+        _CAPTURE_RUNBOOK,
+        "pinned_line",
+        1,
+        "[[:space:]]*`4444 4444 4444 4444`, with any future expiry and CCV `123`",
     ),
 ]
 # Entry numbers in _TEST_TABLE (1-based) for targeted assertions.
 _ENTRY_TOOL_CARD_OPENER = 2
 _ENTRY_TOOL_CCV_PIN = 7
 _ENTRY_TESTS_PROD_KEY = 9
+_ENTRY_TOOL_CCV_TERM = 12
+_ENTRY_RUNBOOK_PIN = 14
 
 
 def _table_override(rows: list[tuple[str, str, int, str]]) -> str:
@@ -934,7 +963,7 @@ def _write_lines(
 
 
 def _capture_lines(
-    fixture: list[tuple[str, str | None]], replace: dict[str, str]
+    fixture: list[tuple[str, tuple[str, ...]]], replace: dict[str, str]
 ) -> list[str]:
     lines = [replace.get(line, line) for line, _ in fixture]
     assert all(old in [line for line, _ in fixture] for old in replace), replace
@@ -946,17 +975,25 @@ def _write_capture_files(
     *,
     tool_path: str = _CAPTURE_TOOL,
     test_path: str = _CAPTURE_TESTS,
+    runbook_path: str | None = _CAPTURE_RUNBOOK,
     extra_tool: tuple[str, ...] = (),
     extra_test: tuple[str, ...] = (),
+    extra_runbook: tuple[str, ...] = (),
     replace: dict[str, str] | None = None,
     newline: str = "\n",
 ) -> None:
     replace = replace or {}
     tool_replace = {k: v for k, v in replace.items() if k in dict(_TOOL_LINES)}
     test_replace = {k: v for k, v in replace.items() if k in dict(_TEST_LINES)}
-    assert len(tool_replace) + len(test_replace) == len(replace), replace
+    book_replace = {k: v for k, v in replace.items() if k in dict(_RUNBOOK_LINES)}
+    assert len(tool_replace) + len(test_replace) + len(book_replace) == len(
+        replace
+    ), replace
     tool = _capture_lines(_TOOL_LINES, tool_replace) + list(extra_tool)
     tests = _capture_lines(_TEST_LINES, test_replace) + list(extra_test)
+    if runbook_path is not None:
+        book = _capture_lines(_RUNBOOK_LINES, book_replace) + list(extra_runbook)
+        _write_lines(repo, runbook_path, book, newline)
     if tool_path == test_path:
         _write_lines(repo, tool_path, tool + tests, newline)
         return
@@ -984,13 +1021,13 @@ def _stale_lines(stderr: str) -> list[str]:
 def _expected_waived() -> list[str]:
     expected = [
         f"{_CAPTURE_TOOL}:{n} rule={rule}"
-        for n, (_, rule) in enumerate(_TOOL_LINES, 2)
-        if rule
+        for n, (_, rules) in enumerate(_TOOL_LINES, 2)
+        for rule in rules
     ]
     expected += [
         f"{_CAPTURE_TESTS}:{n} rule={rule}"
-        for n, (_, rule) in enumerate(_TEST_LINES, 2)
-        if rule
+        for n, (_, rules) in enumerate(_TEST_LINES, 2)
+        for rule in rules
     ]
     return expected
 
@@ -1047,8 +1084,8 @@ def test_waived_lines_fail_in_any_other_path(
     output = result.stdout + result.stderr
     assert result.returncode == 1, output
     assert "secret/PII pattern found in added lines" in result.stderr
-    for number, (_, rule) in enumerate(_TOOL_LINES + _TEST_LINES, 2):
-        if rule:
+    for number, (_, rules) in enumerate(_TOOL_LINES + _TEST_LINES, 2):
+        for rule in rules:
             assert f"\n{other_path}:{number}: {rule}\n" in result.stdout, rule
     assert not [line for line in _waived_lines(output) if other_path in line]
 
@@ -1063,7 +1100,7 @@ _OTHER_VALUES = [
     # A different security code.
     (
         _CAPTURE_TESTS,
-        f'    assert payload["{_CARD_FIELD}"]["ccv"] == "987"',
+        f'    assert payload["{_CARD_FIELD}"]["{_CCV_TERM}"] == "987"',
         "forbidden_card_field",
     ),
     # A key without the synthetic tail.
@@ -1111,6 +1148,11 @@ _OTHER_VALUES = [
     (_CAPTURE_TESTS, f"AUTH = '{_PLANTED_BEARER}'", "bearer_token"),
     (_CAPTURE_TOOL, f"HEADER = '{_ACCESS_HEADER}'", "asaas_access_token_header"),
     (_CAPTURE_TOOL, f"TERM = '{_CVV_TERM}'", "payment_security_term"),
+    # The provider's security-code field on a line that is not pinned.
+    (_CAPTURE_TOOL, f'            "{_CCV_TERM}": "987",', "payment_security_term"),
+    (_CAPTURE_TESTS, f'CARD = {{"{_CCV_TERM}": "987"}}', "payment_security_term"),
+    (_CAPTURE_RUNBOOK, f'Send `"{_CCV_TERM}": "987"` instead', "payment_security_term"),
+    (_CAPTURE_RUNBOOK, f"AUTH = '{_PLANTED_BEARER}'", "bearer_token"),
 ]
 
 
@@ -1127,6 +1169,9 @@ def test_waiver_does_not_cover_other_values_in_waived_paths(
     if relative == _CAPTURE_TOOL:
         _write_capture_files(repo, extra_tool=(offending,))
         number = len(_TOOL_LINES) + 2
+    elif relative == _CAPTURE_RUNBOOK:
+        _write_capture_files(repo, extra_runbook=(offending,))
+        number = len(_RUNBOOK_LINES) + 2
     else:
         _write_capture_files(repo, extra_test=(offending,))
         number = len(_TEST_LINES) + 2
@@ -1150,7 +1195,7 @@ def test_waiver_does_not_cover_other_values_in_waived_paths(
 _TOOL_NUMBER_PIN = 'TEST_CARD_NUMBER = "4444444444444444"'
 _TOOL_CCV_PIN = 'TEST_CARD_CCV = "123"'
 _PAYLOAD_NUMBER = '            "number": TEST_CARD_NUMBER,'
-_PAYLOAD_CCV = '            "ccv": TEST_CARD_CCV,'
+_PAYLOAD_CCV = f'            "{_CCV_TERM}": TEST_CARD_CCV,'
 _SPACED_PAN = "5162 3062 1937 8829"
 _DASHED_PAN = "5162-3062-1937-8829"
 _UNDERSCORED_PAN = "5162_3062_1937_8829"
@@ -1163,7 +1208,7 @@ _CARD_CHANGES = [
         [f"\n{_CAPTURE_TOOL}:7: card_number_guard\n", "pinned line entry 6 matches 0"],
     ),
     (
-        "ccv-constant",
+        "security-code-constant",
         {"replace": {_TOOL_CCV_PIN: 'TEST_CARD_CCV = "999"'}},
         ["pinned line entry 7 matches 0 lines, expected 1"],
     ),
@@ -1173,8 +1218,8 @@ _CARD_CHANGES = [
         [f"\n{_CAPTURE_TOOL}:4: card_number_guard\n", "pinned line entry 3 matches 0"],
     ),
     (
-        "payload-ccv",
-        {"replace": {_PAYLOAD_CCV: '            "ccv": "999",'}},
+        "payload-security-code",
+        {"replace": {_PAYLOAD_CCV: f'            "{_CCV_TERM}": "999",'}},
         ["pinned line entry 4 matches 0 lines, expected 1"],
     ),
     (
@@ -1245,6 +1290,31 @@ _CARD_CHANGES = [
         [
             f"{_CAPTURE_TOOL}: waiver entry {_ENTRY_TOOL_CARD_OPENER} "
             "rule=forbidden_card_field matches 2 lines, more than the 1 recorded"
+        ],
+    ),
+    # The tool's runbook is audited like the tool.
+    (
+        "runbook-card-number",
+        {"extra_runbook": (f"Use `{_SPACED_PAN}` for declines",)},
+        [f"\n{_CAPTURE_RUNBOOK}:3: card_number_guard\n"],
+    ),
+    (
+        "runbook-pin-changed",
+        {"replace": {_RUNBOOK_PIN: _RUNBOOK_PIN.replace("`123`", "`999`")}},
+        [f"pinned line entry {_ENTRY_RUNBOOK_PIN} matches 0 lines, expected 1"],
+    ),
+    (
+        "runbook-pin-copied",
+        {"extra_runbook": (_RUNBOOK_PIN,)},
+        [f"pinned line entry {_ENTRY_RUNBOOK_PIN} matches 2 lines, expected 1"],
+    ),
+    # A copied security-code payload line is over its recorded count.
+    (
+        "security-code-line-copied",
+        {"extra_tool": (_PAYLOAD_CCV,)},
+        [
+            f"{_CAPTURE_TOOL}: waiver entry {_ENTRY_TOOL_CCV_TERM} "
+            "rule=payment_security_term matches 2 lines, more than the 1 recorded"
         ],
     ),
 ]
@@ -1341,26 +1411,27 @@ def test_card_guard_covers_waived_paths_only(tmp_path: Path) -> None:
         ("symlink", "waived path is not a regular file and cannot be audited"),
     ],
 )
+@pytest.mark.parametrize("relative", [_CAPTURE_TESTS, _CAPTURE_RUNBOOK])
 def test_waived_path_that_cannot_be_audited_fails(
-    tmp_path: Path, kind: str, message: str
+    tmp_path: Path, kind: str, message: str, relative: str
 ) -> None:
     repo, log = _candidate_repo(tmp_path)
     _commit_clean_change(repo)
     _write_capture_files(repo)
-    target = repo / _CAPTURE_TESTS
+    target = repo / relative
     if kind == "binary":
         with target.open("ab") as handle:
             handle.write(b"\x00binary\n")
     else:
-        moved = repo / "tests" / "elsewhere.py"
+        moved = target.parent / f"elsewhere{target.suffix}"
         target.rename(moved)
-        target.symlink_to("../elsewhere.py")
+        target.symlink_to(moved.name)
     _commit_all(repo)
 
     result = _run_waiver_gate(repo, log)
 
     assert result.returncode == 1, result.stdout + result.stderr
-    assert f"{message}: {_CAPTURE_TESTS}" in result.stdout
+    assert f"{message}: {relative}" in result.stdout
     assert "secret/PII waiver audit failed" in result.stderr
 
 
@@ -1437,7 +1508,10 @@ def test_stale_waiver_entries_warn_without_failing(tmp_path: Path) -> None:
         if "entry 5 " in x
         and f"{_CAPTURE_TOOL} rule=forbidden_card_field matches 0 of 1" in x
     ]
-    assert len([x for x in stale if f"{_CAPTURE_TESTS} rule=" in x]) == 4
+    tests_entries = [row for row in _TEST_TABLE if row[0] == _CAPTURE_TESTS]
+    assert len([x for x in stale if f"{_CAPTURE_TESTS} rule=" in x]) == len(
+        tests_entries
+    )
     assert not [x for x in stale if f"{_CAPTURE_TOOL} rule=forbidden_cpf_field" in x]
     assert (
         f"waived path is not in the tree; its entries are stale: {_CAPTURE_TESTS}"
@@ -1576,11 +1650,12 @@ def test_waiver_table_is_closed_and_recorded() -> None:
         assert len(entry) == 5, entry
         decision, path, rule, count, pattern = entry
         assert decision == _DECISION
-        assert path in {_CAPTURE_TOOL, _CAPTURE_TESTS}
+        assert path in {_CAPTURE_TOOL, _CAPTURE_TESTS, _CAPTURE_RUNBOOK}
         assert rule in {
             "asaas_api_key",
             "forbidden_cpf_field",
             "forbidden_card_field",
+            "payment_security_term",
             "pinned_line",
         }
         assert count.isdigit() and int(count) >= 1, entry
@@ -1590,6 +1665,17 @@ def test_waiver_table_is_closed_and_recorded() -> None:
     pins = {e[4] for e in table if e[1] == _CAPTURE_TOOL and e[2] == "pinned_line"}
     assert 'TEST_CARD_NUMBER = "4444444444444444"' in pins
     assert 'TEST_CARD_CCV = "123"' in pins
+    # The runbook holds only its pinned test-card line.
+    assert [e[2] for e in table if e[1] == _CAPTURE_RUNBOOK] == ["pinned_line"]
+    # The security-code rule is waived only on lines that are also pinned or
+    # waived for the card field.
+    security = [e[4] for e in table if e[2] == "payment_security_term"]
+    others = {e[4] for e in table if e[2] != "payment_security_term"}
+    assert security and all(pattern in others for pattern in security)
+    assert {e[1] for e in table if e[2] == "payment_security_term"} == {
+        _CAPTURE_TOOL,
+        _CAPTURE_TESTS,
+    }
 
 
 def test_real_waiver_table_passes_the_gate_validation(tmp_path: Path) -> None:
@@ -1762,17 +1848,21 @@ def test_waived_hit_prints_its_own_entry_decision(tmp_path: Path) -> None:
     _write_capture_files(repo)
     _commit_all(repo)
     other = "owner decision 2099-01-01, wish test-only"
-    override = _raw_table_override(
-        [f"{_DECISION}\t{p}\t{r}\t{c}\t{e}" for p, r, c, e in _TEST_TABLE[:-1]]
-        + ["\t".join([other, *map(str, _TEST_TABLE[-1])])]
-    )
+    # Relabel only the card-field entry of the tests file's security-code line.
+    relabel = 10
+    rows = [
+        "\t".join([other if index == relabel else _DECISION, *map(str, row)])
+        for index, row in enumerate(_TEST_TABLE)
+    ]
 
-    result = _run_waiver_gate(repo, log, override=override)
+    result = _run_waiver_gate(repo, log, override=_raw_table_override(rows))
 
     assert result.returncode == 0, result.stdout + result.stderr
-    last = f"{_CAPTURE_TESTS}:{len(_TEST_LINES) + 1} rule=forbidden_card_field"
-    assert f"\nwaived ({other}): {last}\n" in result.stdout
-    assert f"{_WAIVED}{last}" not in result.stdout
+    assert _TEST_TABLE[relabel][1] == "forbidden_card_field"
+    last = f"{_CAPTURE_TESTS}:{len(_TEST_LINES) + 1}"
+    assert f"\nwaived ({other}): {last} rule=forbidden_card_field\n" in result.stdout
+    assert f"{_WAIVED}{last} rule=forbidden_card_field" not in result.stdout
+    assert f"\n{_WAIVED}{last} rule=payment_security_term\n" in result.stdout
     assert f"\n{_WAIVED}{_CAPTURE_TOOL}:2 rule=forbidden_cpf_field\n" in result.stdout
 
 
@@ -1799,7 +1889,7 @@ def test_pinned_line_counts_whole_lines_only(tmp_path: Path) -> None:
         repo,
         extra_tool=(
             f"# was: {_TOOL_CCV_PIN} (kept for history)",
-            f"x = {{{_PAYLOAD_CCV}}}",
+            f"x = {{{_PAYLOAD_NUMBER}}}",
         ),
     )
     _commit_all(repo)
@@ -1826,3 +1916,136 @@ def test_pinned_line_never_waives_a_rule_on_its_line(tmp_path: Path) -> None:
     assert not _waived_lines(output)
     assert "pinned line entry" not in result.stdout
     assert "abc.def.ghi" not in output
+
+
+@pytest.mark.parametrize(
+    "term", [_CCV_TERM, _CVV_TERM], ids=["provider-field", "generic-term"]
+)
+@pytest.mark.parametrize("committed", [True, False], ids=["committed", "untracked"])
+def test_security_code_term_fails_outside_the_tool(
+    tmp_path: Path, term: str, committed: bool
+) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    _write_capture_files(repo)
+    # The exact pinned payload line, but in another file.
+    (repo / "src" / "checkout.py").write_text(
+        f'payload = {{\n    "{term}": TEST_CARD_CCV,\n}}\n'
+    )
+    if committed:
+        _commit_all(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert "\nsrc/checkout.py:2: payment_security_term\n" in result.stdout
+    assert "src/checkout.py:2 rule=" not in output
+
+
+def test_security_code_rule_is_waived_only_on_its_pinned_lines(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    _write_capture_files(repo)
+    _commit_all(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    # Added-line scan output only (the baseline repeats it, indented).
+    waived = [x for x in result.stdout.splitlines() if x.startswith(_WAIVED)]
+    security = [line for line in waived if "rule=payment_security_term" in line]
+    assert security == [
+        f"{_WAIVED}{_CAPTURE_TOOL}:5 rule=payment_security_term",
+        f"{_WAIVED}{_CAPTURE_TESTS}:5 rule=payment_security_term",
+    ]
+    # The test line is waived for both rules it hits, each by its own entry.
+    assert f"{_WAIVED}{_CAPTURE_TESTS}:5 rule=forbidden_card_field" in waived
+    assert not [line for line in waived if _CAPTURE_RUNBOOK in line]
+
+
+def test_pinned_line_alone_does_not_waive_the_security_code_rule(
+    tmp_path: Path,
+) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    _write_capture_files(repo)
+    _commit_all(repo)
+    rows = [row for row in _TEST_TABLE if row[1] != "payment_security_term"]
+
+    result = _run_waiver_gate(repo, log, rows)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert f"\n{_CAPTURE_TOOL}:5: payment_security_term\n" in result.stdout
+    assert f"\n{_CAPTURE_TESTS}:5: payment_security_term\n" in result.stdout
+    assert f"{_WAIVED}{_CAPTURE_TESTS}:5 rule=forbidden_card_field" in result.stdout
+
+
+def test_runbook_pinned_line_passes_and_is_audited(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    _write_capture_files(repo, extra_runbook=("Any future expiry works.",))
+    _commit_all(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "waived-path audit: no findings" in result.stdout
+    assert not [x for x in _stale_lines(result.stderr) if _CAPTURE_RUNBOOK in x]
+
+
+def test_real_table_matches_the_real_tool_files(tmp_path: Path) -> None:
+    """The committed table against the committed tool: every scan and the audit."""
+    repo, log = _candidate_repo(tmp_path)
+    for relative in (_CAPTURE_TOOL, _CAPTURE_TESTS, _CAPTURE_RUNBOOK):
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((ROOT / relative).read_bytes())
+    _commit_all(repo)
+    # The security-code hits, found by text so line drift does not matter.
+    term = f'"{_CCV_TERM}"'
+    tool_code_lines = [
+        n
+        for n, line in enumerate((ROOT / _CAPTURE_TOOL).read_text().splitlines(), 1)
+        if f"{term}: TEST_CARD_CCV," in line
+    ]
+    tests_code_lines = [
+        n
+        for n, line in enumerate((ROOT / _CAPTURE_TESTS).read_text().splitlines(), 1)
+        if f'["{_CARD_FIELD}"][{term}] == "123"' in line
+    ]
+    table = _waiver_table()
+
+    result = _run_release_gate(repo, log, **_GATE_INPUTS)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "waived-path audit: no findings" in result.stdout
+    assert "added-line secret/PII scan: no findings" in result.stdout
+    assert not _stale_lines(result.stderr)
+    lines = result.stdout.splitlines()
+    added = [x for x in lines if x.startswith(_WAIVED)]
+    baseline = [x[2:] for x in lines if x.startswith(f"  {_WAIVED}")]
+    assert sorted(added) == sorted(baseline)
+    per_file = {
+        path: len([x for x in added if f"): {path}:" in x])
+        for path in (_CAPTURE_TOOL, _CAPTURE_TESTS, _CAPTURE_RUNBOOK)
+    }
+    assert per_file == {_CAPTURE_TOOL: 5, _CAPTURE_TESTS: 21, _CAPTURE_RUNBOOK: 0}
+    assert len(added) == 26
+    assert "added-line secret/PII waived: 26\n" in result.stdout
+    assert "baseline secret/PII waived: 26\n" in result.stdout
+    security = sorted(x for x in added if x.endswith("rule=payment_security_term"))
+    assert len(tool_code_lines) == 1 and len(tests_code_lines) == 1
+    assert security == sorted(
+        [
+            f"{_WAIVED}{_CAPTURE_TOOL}:{tool_code_lines[0]} rule=payment_security_term",
+            f"{_WAIVED}{_CAPTURE_TESTS}:{tests_code_lines[0]} rule=payment_security_term",
+        ]
+    )
+    # Four card pins in the tool plus the runbook's test-card pin; a passing
+    # audit means each matched exactly its recorded count.
+    pins = [(e[1], e[3]) for e in table if e[2] == "pinned_line"]
+    assert sorted(pins) == sorted(
+        [(_CAPTURE_TOOL, "1")] * 4 + [(_CAPTURE_RUNBOOK, "1")]
+    )
