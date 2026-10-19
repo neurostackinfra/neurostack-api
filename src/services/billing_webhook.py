@@ -29,6 +29,20 @@ projection row locks.  Effects are unique on ``(provider, payment_id,
 effect_kind, source_revision)``; ``PAYMENT_CONFIRMED`` and
 ``PAYMENT_RECEIVED`` share ``settlement:v1``.
 
+Settlement (owner decision 2026-10-18).  A card capture (``CONFIRMED``) is
+commercially paid: the first accepted settle-class evidence (``CONFIRMED`` or
+``RECEIVED``, event or exact read) creates the only settlement effect, cycle,
+fact revision, activation and Transaction; a later one is normally an inert
+confirmation (``RECEIVED`` is "funds available", ~D+32 for a card).  It is
+not always inert: a terminal pre-settlement refund marker, a disputed or
+reversal label (H-1/L-3), a stale capture against a newer refusal or
+refund-first row (M2/L-2), or a canary capture while a refund/chargeback
+delivery of that payment is still open (M-2) needs a read instead.
+``paid_at`` is write-once: the first strict ``YYYY-MM-DD`` of
+``confirmedDate``, ``clientPaymentDate``, ``paymentDate`` that is not later
+than the São Paulo day of the observation (``resolve_paid_at``); nothing is
+inferred from a timestamp, and no usable date fails closed.
+
 Network.  No provider call is made while a database lock is held.  Readbacks
 run after the delivery commit (in a background task and from the backlog
 sweep) and apply their result in a fresh locked transaction.
@@ -138,7 +152,8 @@ PAYMENT_EVENT_STATUSES: Final[Mapping[str, str]] = MappingProxyType(
         "PAYMENT_REPROVED_BY_RISK_ANALYSIS": "failed",
         "PAYMENT_CREDIT_CARD_CAPTURE_REFUSED": "failed",
         "PAYMENT_OVERDUE": "overdue",
-        "PAYMENT_CONFIRMED": "pending",
+        # Card capture: commercially paid (funds arrive ~D+32 as RECEIVED).
+        "PAYMENT_CONFIRMED": "settled",
         "PAYMENT_RECEIVED": "settled",
         "PAYMENT_REFUND_IN_PROGRESS": "reversal_pending",
         "PAYMENT_PARTIALLY_REFUNDED": "partially_reversed",
@@ -173,8 +188,9 @@ _READBACK_PAYMENT_STATUSES: Final[Mapping[str, str]] = MappingProxyType(
         "PENDING": "pending",
         "AWAITING_RISK_ANALYSIS": "pending",
         "OVERDUE": "overdue",
-        "CONFIRMED": "pending",
+        "CONFIRMED": "settled",
         "RECEIVED": "settled",
+        # Cash received outside ASAAS is never a NeuroStack settlement.
         "RECEIVED_IN_CASH": "pending",
         "REFUND_REQUESTED": "reversal_pending",
         "REFUND_IN_PROGRESS": "reversal_pending",
@@ -221,6 +237,40 @@ _MONEY_SETTLED_STATUSES: Final = frozenset(
 )
 _NON_FINANCIAL_STATUSES: Final = frozenset({"pending", "failed", "overdue"})
 _LIVE_PROVIDER_STATUSES: Final = frozenset({"pending", "overdue", "settled"})
+# Newer settle-class evidence on these labels is never inert: a won chargeback
+# ends in CONFIRMED/RECEIVED (H-1), and a capture or receipt after a refund
+# contradicts the reversal (L-3).  Only an exact read relabels them; never a
+# second effect and never an alert.
+_SETTLE_EVIDENCE_NEEDS_READ: Final = frozenset(
+    {
+        "restoration_pending",
+        "chargeback_requested",
+        "chargeback_dispute",
+        "reversal_pending",
+        "partially_reversed",
+        "reversed",
+    }
+)
+# M-2: deliveries that, while not ``processed``, keep a canary payment's
+# first write from settling from an event (the DB cannot store the canary
+# refund marker).  Derived from the closed allowlist, never hand-listed.
+_REVERSAL_CLASS_EVENTS: Final = frozenset(
+    name
+    for name, status in PAYMENT_EVENT_STATUSES.items()
+    if status
+    in {
+        "reversal_pending",
+        "partially_reversed",
+        "reversed",
+        "chargeback_requested",
+        "chargeback_dispute",
+        "restoration_pending",
+    }
+)
+# H-2: a newer "unpaid" event on settled money contradicts the settlement.
+_UNPAID_STATUSES: Final = frozenset({"failed", "overdue"})
+# The event whose envelope time anchors the ``paid_at`` bound.
+_CAPTURE_EVENT: Final = "PAYMENT_CONFIRMED"
 
 _LIVE_CHECKOUT_STATES: Final = (
     "creating",
@@ -481,6 +531,8 @@ class PaymentFacts:
     billing_type: str | None
     due_date: date | None = None
     payment_date: date | None = None
+    confirmed_date: date | None = None
+    client_payment_date: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -631,6 +683,8 @@ def parse_envelope(body: bytes, payload: object) -> WebhookEnvelope:
             billing_type=_billing_type(data.get("billingType")),
             due_date=_date(data.get("dueDate")),
             payment_date=_date(data.get("paymentDate")),
+            confirmed_date=_date(data.get("confirmedDate")),
+            client_payment_date=_date(data.get("clientPaymentDate")),
         ),
         **common,
     )
@@ -646,6 +700,54 @@ def _payment_facts_from_readback(readback: PaymentReadback) -> PaymentFacts:
         billing_type=_billing_type(readback.billing_type),
         due_date=readback.due_date,
         payment_date=readback.payment_date,
+        confirmed_date=readback.confirmed_date,
+        client_payment_date=readback.client_payment_date,
+    )
+
+
+def _sao_paulo_day(instant: datetime) -> date:
+    """The civil date of an instant in ``America/Sao_Paulo`` (never UTC)."""
+
+    return _aware(instant).astimezone(_BRAZIL).date()
+
+
+def resolve_paid_at(facts: PaymentFacts, *, bound: date) -> date | None:
+    """The civil date on which the payment first became commercially paid.
+
+    The first of ``confirmedDate``, ``clientPaymentDate``, ``paymentDate``
+    (each already a strict ``YYYY-MM-DD``) that is not later than ``bound``,
+    the São Paulo day of the observation.  ``clientPaymentDate`` is the
+    capture day on the sandbox evidence, while ``paymentDate`` is ASAAS's
+    "data de liquidação" (the card funds day, ~D+32), so it comes last.  A
+    later candidate is skipped, never clamped.  ``None`` means no settlement
+    (fail closed): ``paid_at`` is never inferred from an event, payment or
+    readback timestamp.
+    """
+
+    for candidate in (
+        facts.confirmed_date,
+        facts.client_payment_date,
+        facts.payment_date,
+    ):
+        if candidate is not None and candidate <= bound:
+            return candidate
+    return None
+
+
+def _readback_evidence_usable(
+    readback: PaymentReadback, normalized: str, amount_cents: int
+) -> bool:
+    """An exact read whose status, refund list and amounts can be trusted."""
+
+    refunded = readback.refunded_cents
+    return not (
+        normalized == "unknown"
+        or readback.status not in _READBACK_PAYMENT_STATUSES
+        or refunded is None
+        or refunded > amount_cents
+        # A REFUNDED label without any exact DONE refund value is
+        # contradictory provider evidence; a date alone proves nothing.
+        or (readback.status == "REFUNDED" and refunded == 0)
     )
 
 
@@ -1139,19 +1241,47 @@ class _FinancialState:
                     event_id=event_id,
                 )
                 return "readback_required"
-        terminal_pre_settlement_refund = bool(
-            existing is not None and existing.status == REFUNDED_BEFORE_SETTLEMENT
-        )
-        has_prior_settlement = bool(existing is not None and existing.settled_cents > 0)
-        should_activate_subscription = (
-            normalized == "settled" and not terminal_pre_settlement_refund
-        ) or (
-            readback is not None
-            and has_prior_settlement
-            and normalized in _MONEY_SETTLED_STATUSES
-        )
-        if should_activate_subscription:
-            await self._activate_subscription_before_projection(subscription, canary)
+        paid_at: date | None = None
+        if normalized == "settled" or readback is not None:
+            # Events: the envelope time; readbacks: the read clock.  Both are
+            # superseded by the earliest capture delivery of this payment.
+            paid_at = resolve_paid_at(
+                facts,
+                bound=await self._paid_at_bound(
+                    builder_id=target.builder_id,
+                    payment_id=payment_id,
+                    observed_at=provider_created_at,
+                ),
+            )
+        pre_activated = False
+        if (
+            existing is None
+            and canary
+            and (subscription is None or subscription.status != "active")
+        ):
+            # The DB pins every canary projection write to an ``active`` Plus
+            # row, and activation belongs to the settling branch only (Q-C):
+            # decide whether this first write settles before writing at all.
+            if not self._first_write_settles(
+                normalized=normalized,
+                readback=readback,
+                amount_cents=target.amount_cents,
+                paid_at=paid_at,
+            ):
+                if readback is not None:
+                    self.alerts.append("drift")
+                return "readback_required"
+            if readback is None and await self._has_open_reversal_delivery(
+                builder_id=target.builder_id, payment_id=payment_id
+            ):
+                # M-2: a refund/chargeback event of this payment is still
+                # unresolved, and the canary refund marker cannot be stored
+                # (the DB refuses the row until the Plus row is active).  A
+                # capture event must not grant and spend the slot on stale
+                # evidence; only an exact read may settle it.
+                return "readback_required"
+            await self._activate_subscription_before_projection(subscription)
+            pre_activated = True
         projection = existing or await self.ensure_projection(
             target,
             payment_id=payment_id,
@@ -1162,7 +1292,7 @@ class _FinancialState:
             event_id=event_id,
         )
         if readback is not None:
-            return await self._apply_readback(
+            result = await self._apply_readback(
                 projection,
                 target=target,
                 readback=readback,
@@ -1175,27 +1305,103 @@ class _FinancialState:
                 session=session,
                 facts=facts,
                 observed_at=provider_created_at,
+                paid_at=paid_at,
             )
-        return await self._apply_event(
-            projection,
-            target=target,
-            normalized=normalized,
-            key=key,
-            event_id=event_id,
-            event_name=event_name,
-            delivery=delivery,
-            subscription=subscription,
-            order=order,
-            session=session,
-            facts=facts,
+        else:
+            result = await self._apply_event(
+                projection,
+                target=target,
+                normalized=normalized,
+                key=key,
+                event_id=event_id,
+                event_name=event_name,
+                delivery=delivery,
+                subscription=subscription,
+                order=order,
+                session=session,
+                facts=facts,
+                paid_at=paid_at,
+            )
+        if pre_activated and projection.settled_cents <= 0:
+            # Activation without the settlement it was decided for is never
+            # committed: refuse the whole transaction (quarantine/retry).
+            raise BillingTransitionRejected("canary activation without settlement")
+        return result
+
+    async def _paid_at_bound(
+        self, *, builder_id: UUID, payment_id: str, observed_at: datetime
+    ) -> date:
+        """São Paulo day that no ``paid_at`` candidate may exceed (+0 days).
+
+        Anchored on the envelope ``dateCreated`` of the earliest
+        ``PAYMENT_CONFIRMED`` delivery bound to this payment (any status), so
+        a later receipt or read can never admit the card funds day; without
+        one, the observation itself (envelope time, or the read clock).  The
+        payment's own ``dateCreated`` is never read.
+        """
+
+        anchor = await self._db.scalar(
+            select(func.min(BillingWebhookDelivery.provider_created_at)).where(
+                BillingWebhookDelivery.builder_id == builder_id,
+                BillingWebhookDelivery.provider == PROVIDER,
+                BillingWebhookDelivery.resource_kind == "payment",
+                BillingWebhookDelivery.resource_id == payment_id,
+                BillingWebhookDelivery.event_name == _CAPTURE_EVENT,
+            )
         )
+        return _sao_paulo_day(anchor if anchor is not None else observed_at)
+
+    async def _has_open_reversal_delivery(
+        self, *, builder_id: UUID, payment_id: str
+    ) -> bool:
+        """Whether a refund/chargeback delivery of this payment is unresolved."""
+
+        found = await self._db.scalar(
+            select(BillingWebhookDelivery.id)
+            .where(
+                BillingWebhookDelivery.builder_id == builder_id,
+                BillingWebhookDelivery.provider == PROVIDER,
+                BillingWebhookDelivery.resource_kind == "payment",
+                BillingWebhookDelivery.resource_id == payment_id,
+                BillingWebhookDelivery.event_name.in_(sorted(_REVERSAL_CLASS_EVENTS)),
+                BillingWebhookDelivery.status != "processed",
+            )
+            .limit(1)
+        )
+        return found is not None
+
+    @staticmethod
+    def _first_write_settles(
+        *,
+        normalized: str,
+        readback: PaymentReadback | None,
+        amount_cents: int,
+        paid_at: date | None,
+    ) -> bool:
+        """Whether applying this evidence to a brand-new projection settles.
+
+        Mirrors ``_apply_event``/``_apply_readback`` on a fresh ``pending``
+        row (no money, no marker, not deleted, never stale-vs-failed).
+        """
+
+        if paid_at is None:
+            return False
+        if readback is None:
+            return normalized == "settled"
+        if not _readback_evidence_usable(readback, normalized, amount_cents):
+            return False
+        refunded = int(readback.refunded_cents or 0)
+        if refunded > 0 and normalized != "settled":
+            return False  # the pre-settlement refund marker, not a settlement
+        return normalized in _MONEY_SETTLED_STATUSES or refunded > 0
 
     async def _activate_subscription_before_projection(
-        self, subscription: BillingSubscription | None, canary: bool
+        self, subscription: BillingSubscription | None
     ) -> None:
-        # ``active_linked`` -> ``active`` on the first settlement, before the
-        # projection is written (the Group 1 canary trigger requires an
-        # ``active`` Plus row for every canary projection write).
+        # ``active_linked`` -> ``active`` only on the branch that settles
+        # (owner decision Q-C), before the settled projection is written (the
+        # Group 1 canary trigger requires an ``active`` Plus row for every
+        # canary projection write).
         if subscription is not None and subscription.status == "active_linked":
             subscription.status = "active"
             await self._db.flush()
@@ -1214,6 +1420,7 @@ class _FinancialState:
         order: BillingTopupOrder | None,
         session: BillingCheckoutSession | None,
         facts: PaymentFacts,
+        paid_at: date | None,
     ) -> str:
         stale = key <= projection.ordering_key
         if projection.status == REFUNDED_BEFORE_SETTLEMENT:
@@ -1226,16 +1433,26 @@ class _FinancialState:
             # 035 cannot backfill historical settlement dates. Require an
             # exact provider read before a later event can emit a fact.
             return "readback_required"
-        if (
-            normalized == "settled"
-            and projection.settled_cents > 0
-            and (projection.paid_at is None or facts.payment_date != projection.paid_at)
-        ):
-            return "readback_required"
         if normalized == "settled":
             if projection.settled_cents > 0:
-                return "processed"  # second settlement event: same settlement:v1
-            if facts.payment_date is None:
+                if not stale and projection.status in _SETTLE_EVIDENCE_NEEDS_READ:
+                    # H-1/L-3: a won dispute, or capture evidence after a
+                    # refund: only an exact read may relabel the row.
+                    return "readback_required"
+                if paid_at != projection.paid_at:
+                    # ``paid_at`` is write-once: the funds receipt (or any
+                    # later capture evidence) never moves it.
+                    logger.info("billing settlement evidence date ignored")
+                # The second settle-class event: same settlement:v1, inert.
+                return "processed"
+            if stale and projection.status in ("failed", "readback_required"):
+                # M2/L-2: an older capture never overrides a newer refusal,
+                # nor the newer refund/chargeback/deletion/restoration event
+                # that projected this row (the only way a row is created
+                # ``readback_required``); only the provider's current word
+                # (a read) may settle it.
+                return "readback_required"
+            if paid_at is None:
                 return "readback_required"
             if projection.status not in (*_NON_FINANCIAL_STATUSES, "readback_required"):
                 return "readback_required"
@@ -1251,7 +1468,7 @@ class _FinancialState:
                 session=session,
                 billing_type=facts.billing_type,
                 cycle_start=facts.due_date,
-                paid_at=facts.payment_date,
+                paid_at=paid_at,
             )
             return "processed"
         # Monetary transitions are monotone in their cumulative key, so their
@@ -1276,6 +1493,12 @@ class _FinancialState:
             return "readback_required"
         if stale:
             return "processed"  # an old event never regresses the projection
+        if normalized in _UNPAID_STATUSES and projection.settled_cents > 0:
+            # H-2: a newer refusal/overdue on settled money contradicts the
+            # settlement (e.g. a capture later reproved).  Money never
+            # un-settles here; an exact read (or an operator) must decide.
+            self.alerts.append("drift")
+            return "readback_required"
         if normalized in _NON_FINANCIAL_STATUSES:
             if event_name == "PAYMENT_UPDATED" and projection.status != "pending":
                 return "readback_required"
@@ -1334,27 +1557,14 @@ class _FinancialState:
         session: BillingCheckoutSession | None,
         facts: PaymentFacts,
         observed_at: datetime,
+        paid_at: date | None,
     ) -> str:
         """Converge the projection to one exact provider read."""
 
-        if (
-            normalized == "unknown"
-            or readback.status not in _READBACK_PAYMENT_STATUSES
-            or readback.refunded_cents is None
-        ):
+        if not _readback_evidence_usable(readback, normalized, projection.amount_cents):
             self.alerts.append("drift")
             return "readback_required"
-        amount = projection.amount_cents
-        target_reversed = readback.refunded_cents
-        if target_reversed > amount:
-            self.alerts.append("drift")
-            return "readback_required"
-        if readback.status == "REFUNDED" and target_reversed == 0:
-            # A REFUNDED label without any exact DONE refund value is
-            # contradictory provider evidence. paymentDate alone cannot
-            # prove settlement or authorize a grant.
-            self.alerts.append("drift")
-            return "readback_required"
+        target_reversed = int(readback.refunded_cents or 0)
         if projection.status == REFUNDED_BEFORE_SETTLEMENT:
             # The marker is terminal for automatic financial projection.  A
             # provider read that continues to show a completed refund is
@@ -1374,9 +1584,10 @@ class _FinancialState:
             and target_reversed > 0
             and normalized != "settled"
         ):
-            # ASAAS can complete a refund before we have accepted a PAYMENT_
-            # RECEIVED / RECEIVED read.  Preserve that history as a terminal
-            # marker and never manufacture a temporary grant/reversal pair.
+            # A completed refund read while nothing is settled here and the
+            # provider status is not itself a receipt (CONFIRMED/RECEIVED
+            # settle, then reverse: owner decision Q-A).  Preserve that
+            # history as a terminal marker; never manufacture a grant.
             self._touch(
                 projection,
                 status=REFUNDED_BEFORE_SETTLEMENT,
@@ -1392,17 +1603,14 @@ class _FinancialState:
         money_settled = normalized in _MONEY_SETTLED_STATUSES or target_reversed > 0
         if projection.settled_cents > 0:
             if projection.paid_at is None:
-                if facts.payment_date is None:
+                # Legacy (pre-035) settlement: repair from the same chain.
+                if paid_at is None:
                     self.alerts.append("drift")
                     return "readback_required"
-                projection.paid_at = facts.payment_date
-            elif (
-                facts.payment_date is not None
-                and facts.payment_date != projection.paid_at
-            ):
-                self.alerts.append("drift")
-                return "readback_required"
-        elif money_settled and facts.payment_date is None:
+                projection.paid_at = paid_at
+            # Otherwise ``paid_at`` is write-once and never compared: a later
+            # read (CONFIRMED, RECEIVED with the funds day, a refund) keeps it.
+        elif money_settled and paid_at is None:
             self.alerts.append("drift")
             return "readback_required"
         net_reversed = projection.reversed_cents - projection.restored_cents
@@ -1451,7 +1659,7 @@ class _FinancialState:
                 session=session,
                 billing_type=facts.billing_type,
                 cycle_start=facts.due_date,
-                paid_at=facts.payment_date,
+                paid_at=paid_at,
             )
         elif not money_settled and projection.settled_cents > 0:
             self.alerts.append("drift")  # money can never un-settle
@@ -1549,9 +1757,11 @@ class _FinancialState:
         paid_at: date | None,
     ) -> None:
         if paid_at is None:
-            raise RuntimeError("ASAAS settlement is missing paymentDate")
+            raise RuntimeError("ASAAS settlement is missing paid_at")
         if projection.paid_at is not None and projection.paid_at != paid_at:
-            raise RuntimeError("ASAAS paymentDate changed after settlement")
+            raise RuntimeError("ASAAS paid_at changed after settlement")
+        # Q-C: the only place a subscription is activated by a payment.
+        await self._activate_subscription_before_projection(subscription)
         projection.paid_at = paid_at
         amount = projection.amount_cents
         self._touch(projection, status="settled", key=key, event_id=event_id)

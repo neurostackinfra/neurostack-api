@@ -750,6 +750,10 @@ Mantém byte a byte todos os campos legados (`plan`, `active_clinics`,
 - `subscription.current_period_end`: o maior `cycle_end` entre os ciclos da
   assinatura **integralmente pagos, líquidos de estornos**, isto é,
   `state IN ('settled', 'restored') AND reversed_cents = restored_cents`.
+  `settled` significa pago comercialmente: capturado no cartão
+  (`PAYMENT_CONFIRMED`) ou recebido (`PAYMENT_RECEIVED`), o que chegar
+  primeiro, e não fundos disponíveis no ASAAS (no cartão eles só ficam
+  disponíveis cerca de 32 dias depois da captura).
   Ciclos estornados (`reversed`), parcialmente restaurados, `pending` ou
   `quarantined` são ignorados: um ciclo atual estornado faz o valor voltar ao
   fim do último ciclo integralmente pago, e `null` significa que nenhum ciclo
