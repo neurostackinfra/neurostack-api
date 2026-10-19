@@ -166,7 +166,9 @@ def _payment(
     when: str | None = None,
     event_id: str | None = None,
     payment_date: str | None = None,
+    capture_dates: bool = True,
 ) -> dict[str, Any]:
+    when = when or _when()
     if payment_date is None and event == "PAYMENT_RECEIVED":
         payment_date = "2026-10-11"
     resource = {
@@ -181,6 +183,12 @@ def _payment(
     }
     if payment_date is not None:
         resource["paymentDate"] = payment_date
+    if event == "PAYMENT_CONFIRMED" and capture_dates:
+        # ASAAS sandbox 2026-10-18: a card capture carries confirmedDate =
+        # clientPaymentDate = the capture day and paymentDate = null.
+        resource.update(
+            confirmedDate=when[:10], clientPaymentDate=when[:10], paymentDate=None
+        )
     return _payload(
         event,
         resource,
@@ -250,7 +258,12 @@ def _read(
     *,
     omit_payment_date: bool = False,
     include_payment_date: bool = False,
+    capture_date: date | None = None,
 ) -> PaymentReadback:
+    capture: dict[str, Any] = {}
+    if capture_date is not None:
+        # Sandbox-shaped card read: capture dates set (paymentDate as given).
+        capture = {"confirmed_date": capture_date, "client_payment_date": capture_date}
     return PaymentReadback(
         payment_id,
         status,
@@ -270,6 +283,7 @@ def _read(
             )
             else None
         ),
+        **capture,
     )
 
 
@@ -624,7 +638,9 @@ async def test_concurrent_confirmed_and_received_share_one_settlement(
     first = harness.session()
     second = harness.session()
     try:
-        await BillingWebhookService(first, environment="test")._receive(confirmed)
+        held = await BillingWebhookService(first, environment="test")._receive(
+            confirmed
+        )
         pid = await _pid(second)
         task = asyncio.create_task(
             BillingWebhookService(second, environment="test").receive(received)
@@ -635,13 +651,21 @@ async def test_concurrent_confirmed_and_received_share_one_settlement(
     finally:
         await first.close()
         await second.close()
-    assert late.outcome == "processed"
+    assert (held.outcome, late.outcome) == ("processed", "processed")
+    # The capture settled; the receipt that waited on it is inert.
     rows = await _all(
         harness,
-        "SELECT effect_kind, source_revision FROM billing_payment_effects WHERE builder_id = :b",
+        "SELECT effect_kind, source_revision, delivery_id FROM billing_payment_effects "
+        "WHERE builder_id = :b",
         b=builder_id,
     )
-    assert [tuple(r) for r in rows] == [("settlement", "settlement:v1")]
+    assert [tuple(r) for r in rows] == [
+        ("settlement", "settlement:v1", held.delivery_id)
+    ]
+    assert await _scalar(
+        harness,
+        "SELECT paid_at FROM billing_payment_projections WHERE payment_id = 'pay_pg_pair'",
+    ) == date(2026, 10, 11)
     assert (
         await _scalar(
             harness,
@@ -691,6 +715,40 @@ async def test_out_of_order_events_never_regress_on_postgres(
         )
         == 1
     )
+
+
+async def test_capture_first_then_late_receipt_never_regresses_on_postgres(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reverse order: CONFIRMED settles, then a RECEIVED at D+32 with the
+    funds day as ``paymentDate`` is inert and keeps the capture day."""
+
+    builder_id, _session, checkout_id = await _topup(
+        harness, monkeypatch, "ordering reverse"
+    )
+    payment = "pay_pg_order_reverse"
+    for event, when, extra in (
+        ("PAYMENT_CREATED", "2026-10-11 11:00:00", None),
+        ("PAYMENT_CONFIRMED", "2026-10-11 11:00:05", None),
+        ("PAYMENT_RECEIVED", "2026-11-12 08:00:00", "2026-11-12"),
+    ):
+        outcome = await _deliver(
+            harness,
+            _payment(
+                event, payment, checkout=checkout_id, when=when, payment_date=extra
+            ),
+            "test",
+        )
+        assert outcome.outcome == "processed", event
+    (row,) = await _all(
+        harness,
+        "SELECT status, paid_at, (SELECT count(*) FROM billing_payment_effects "
+        "WHERE builder_id = :b), (SELECT count(*) FROM billing_outbox "
+        "WHERE builder_id = :b) FROM billing_payment_projections WHERE payment_id = :p",
+        b=builder_id,
+        p=payment,
+    )
+    assert tuple(row) == ("settled", date(2026, 10, 11), 1, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -934,7 +992,7 @@ async def test_canary_subscription_settles_into_its_slot_and_quarantines_refusal
         == 0
     )
     for event in ("PAYMENT_CONFIRMED", "PAYMENT_RECEIVED"):
-        await _deliver(
+        outcome = await _deliver(
             harness,
             _payment(
                 event,
@@ -945,6 +1003,17 @@ async def test_canary_subscription_settles_into_its_slot_and_quarantines_refusal
             ),
             environment,
         )
+        assert outcome.outcome == "processed", event
+        # The capture consumes the lifetime slot; the receipt changes nothing.
+        assert (
+            await _scalar(
+                harness,
+                "SELECT canary_settlement_count FROM billing_rollout_control "
+                "WHERE environment = :env",
+                env=environment,
+            )
+            == 1
+        ), event
     (control,) = await _all(
         harness,
         "SELECT c.canary_settlement_count, c.canary_subscription_effect_id = e.id, "
@@ -1695,13 +1764,15 @@ async def test_subscription_readback_converges_back_to_active(
             ).readback_subscription(subscription_id)
             == "converged"
         )
+    # The card capture settled the first charge, so the converged row is
+    # ``active`` (before 2026-10-18 a CONFIRMED left it ``active_linked``).
     assert (
         await _scalar(
             harness,
             "SELECT status FROM billing_subscriptions WHERE id = :i",
             i=subscription_id,
         )
-        == "active_linked"
+        == "active"
     )
 
 

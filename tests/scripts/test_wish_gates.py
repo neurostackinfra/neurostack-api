@@ -808,3 +808,1021 @@ def test_release_gate_fails_when_a_scan_cannot_run(
         assert message in result.stderr
         assert "GATE-PASSED" not in result.stdout
         assert "conventional commits" not in result.stdout
+
+
+# ── secret/PII scan waivers (owner decision 2026-10-18) ─────────────────────
+# The release gate waives a closed list of exact synthetic lines in the two
+# sandbox card capture files only, and audits those files as a whole. These
+# tests drive the mechanism through a test-owned table injected by
+# redefining `_asaas_scan_waivers`; the real table is checked structurally
+# below and against the tool's bytes by the gate itself. Rule literals are
+# assembled at runtime so this module never matches the scan itself.
+_CPF_FIELD = "cpf" + "Cnpj"
+_CARD_FIELD = "credit" + "Card"
+_KEY_HMLG = "$" + "aact_hmlg_"
+_KEY_PROD = "$" + "aact_prod_"
+_CVV_TERM = "c" + "vv"
+_ACCESS_HEADER = "asaas-access-" + "token: abc"
+_CAPTURE_TOOL = "scripts/asaas_sandbox_card_capture.py"
+_CAPTURE_TESTS = "tests/scripts/test_asaas_sandbox_card_capture.py"
+_DECISION = "owner decision 2026-10-18, wish asaas-payment-gateway"
+_WAIVED = f"waived ({_DECISION}): "
+_FAKE_KEY_TAIL = "FAKEcapture-test-key-0001"
+_REAL_LOOKING_TAIL = "Zx9Qm2LwPb7RtY4uVk8NcJ3hGs6FdA1eXo5iTyMn"
+_OTHER_PAN = "5162306219378829"
+_MALFORMED = "malformed scan rules or waiver table"
+# (line, rule) fixture lines; rule None marks a pinned (never waived) line.
+_TOOL_LINES = [
+    (f'        "{_CPF_FIELD}": identity.cpf,', "forbidden_cpf_field"),
+    (f'        "{_CARD_FIELD}": {{', "forbidden_card_field"),
+    ('            "number": TEST_CARD_NUMBER,', None),
+    ('            "ccv": TEST_CARD_CCV,', None),
+    (f'        "{_CARD_FIELD}HolderInfo": {{', "forbidden_card_field"),
+    ('TEST_CARD_NUMBER = "4444444444444444"', None),
+    ('TEST_CARD_CCV = "123"', None),
+]
+_TEST_LINES = [
+    (f'SANDBOX_KEY = "{_KEY_HMLG}{_FAKE_KEY_TAIL}"', "asaas_api_key"),
+    (f'PROD_KEY = "{_KEY_PROD}{_FAKE_KEY_TAIL}"', "asaas_api_key"),
+    (
+        f'    assert payload["{_CARD_FIELD}"]["number"] == "4444444444444444"',
+        "forbidden_card_field",
+    ),
+    (f'    assert payload["{_CARD_FIELD}"]["ccv"] == "123"', "forbidden_card_field"),
+]
+_WAIVED_COUNT = sum(1 for _, rule in _TOOL_LINES + _TEST_LINES if rule)
+_TEST_TABLE = [
+    (
+        _CAPTURE_TOOL,
+        "forbidden_cpf_field",
+        1,
+        '[[:space:]]*"cpf[C]npj": identity[.]cpf,',
+    ),
+    (_CAPTURE_TOOL, "forbidden_card_field", 1, '[[:space:]]*"credit[C]ard": [{]'),
+    (_CAPTURE_TOOL, "pinned_line", 1, '[[:space:]]*"number": TEST_CARD_NUMBER,'),
+    (_CAPTURE_TOOL, "pinned_line", 1, '[[:space:]]*"ccv": TEST_CARD_CCV,'),
+    (
+        _CAPTURE_TOOL,
+        "forbidden_card_field",
+        1,
+        '[[:space:]]*"credit[C]ardHolderInfo": [{]',
+    ),
+    (_CAPTURE_TOOL, "pinned_line", 1, 'TEST_CARD_NUMBER = "4444444444444444"'),
+    (_CAPTURE_TOOL, "pinned_line", 1, 'TEST_CARD_CCV = "123"'),
+    (
+        _CAPTURE_TESTS,
+        "asaas_api_key",
+        1,
+        'SANDBOX_KEY = "[$]aact_hmlg_FAKEcapture-test-key-0001"',
+    ),
+    (
+        _CAPTURE_TESTS,
+        "asaas_api_key",
+        1,
+        'PROD_KEY = "[$]aact_prod_FAKEcapture-test-key-0001"',
+    ),
+    (
+        _CAPTURE_TESTS,
+        "forbidden_card_field",
+        1,
+        '[[:space:]]*assert payload[[]"credit[C]ard"[]][[]"number"[]] == "4444444444444444"',
+    ),
+    (
+        _CAPTURE_TESTS,
+        "forbidden_card_field",
+        1,
+        '[[:space:]]*assert payload[[]"credit[C]ard"[]][[]"ccv"[]] == "123"',
+    ),
+]
+# Entry numbers in _TEST_TABLE (1-based) for targeted assertions.
+_ENTRY_TOOL_CARD_OPENER = 2
+_ENTRY_TOOL_CCV_PIN = 7
+_ENTRY_TESTS_PROD_KEY = 9
+
+
+def _table_override(rows: list[tuple[str, str, int, str]]) -> str:
+    body = "".join(f"{_DECISION}\t{p}\t{r}\t{c}\t{e}\n" for p, r, c, e in rows)
+    return f"_asaas_scan_waivers() {{\ncat <<'TABLE'\n{body}TABLE\n}}\n"
+
+
+def _raw_table_override(lines: list[str]) -> str:
+    body = "".join(f"{line}\n" for line in lines)
+    return f"_asaas_scan_waivers() {{\ncat <<'TABLE'\n{body}TABLE\n}}\n"
+
+
+def _run_waiver_gate(
+    repo: Path,
+    log: Path,
+    rows: list[tuple[str, str, int, str]] | None = None,
+    *,
+    override: str | None = None,
+    **env: str,
+) -> subprocess.CompletedProcess[str]:
+    table = override if override is not None else _table_override(rows or _TEST_TABLE)
+    command = f"source scripts/wish-gates.sh\n{table}asaas_release_candidate_gate"
+    return _run_release_gate(repo, log, command=command, **_GATE_INPUTS, **env)
+
+
+def _write_lines(
+    repo: Path, relative: str, lines: list[str], newline: str = "\n"
+) -> None:
+    target = repo / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Line 1 is filler so reported numbers start at 2.
+    text = "# synthetic\n" + "".join(f"{line}{newline}" for line in lines)
+    target.write_bytes(text.encode())
+
+
+def _capture_lines(
+    fixture: list[tuple[str, str | None]], replace: dict[str, str]
+) -> list[str]:
+    lines = [replace.get(line, line) for line, _ in fixture]
+    assert all(old in [line for line, _ in fixture] for old in replace), replace
+    return lines
+
+
+def _write_capture_files(
+    repo: Path,
+    *,
+    tool_path: str = _CAPTURE_TOOL,
+    test_path: str = _CAPTURE_TESTS,
+    extra_tool: tuple[str, ...] = (),
+    extra_test: tuple[str, ...] = (),
+    replace: dict[str, str] | None = None,
+    newline: str = "\n",
+) -> None:
+    replace = replace or {}
+    tool_replace = {k: v for k, v in replace.items() if k in dict(_TOOL_LINES)}
+    test_replace = {k: v for k, v in replace.items() if k in dict(_TEST_LINES)}
+    assert len(tool_replace) + len(test_replace) == len(replace), replace
+    tool = _capture_lines(_TOOL_LINES, tool_replace) + list(extra_tool)
+    tests = _capture_lines(_TEST_LINES, test_replace) + list(extra_test)
+    if tool_path == test_path:
+        _write_lines(repo, tool_path, tool + tests, newline)
+        return
+    _write_lines(repo, tool_path, tool, newline)
+    _write_lines(repo, test_path, tests, newline)
+
+
+def _commit_all(repo: Path, message: str = "test(billing): add capture tool") -> None:
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", message)
+
+
+def _waived_lines(output: str) -> list[str]:
+    return [line for line in output.splitlines() if _WAIVED in line]
+
+
+def _stale_lines(stderr: str) -> list[str]:
+    return [
+        line
+        for line in stderr.splitlines()
+        if line.startswith("warning: stale secret/PII waiver")
+    ]
+
+
+def _expected_waived() -> list[str]:
+    expected = [
+        f"{_CAPTURE_TOOL}:{n} rule={rule}"
+        for n, (_, rule) in enumerate(_TOOL_LINES, 2)
+        if rule
+    ]
+    expected += [
+        f"{_CAPTURE_TESTS}:{n} rule={rule}"
+        for n, (_, rule) in enumerate(_TEST_LINES, 2)
+        if rule
+    ]
+    return expected
+
+
+@pytest.mark.parametrize("committed", [True, False], ids=["committed", "untracked"])
+def test_waiver_passes_and_prints_exact_synthetic_lines(
+    tmp_path: Path, committed: bool
+) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    _write_capture_files(repo)
+    if committed:
+        _commit_all(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "added-line secret/PII scan: no findings" in result.stdout
+    assert "waived-path audit: no findings" in result.stdout
+    for item in _expected_waived():
+        assert f"\n{_WAIVED}{item}\n" in result.stdout, item
+    assert f"added-line secret/PII waived: {_WAIVED_COUNT}\n" in result.stdout
+    assert not _stale_lines(result.stderr)
+    # The matched text and line content are never printed.
+    assert "4444444444444444" not in output
+    assert _FAKE_KEY_TAIL not in output
+    assert "identity.cpf" not in output
+
+
+@pytest.mark.parametrize(
+    "other_path",
+    [
+        "scripts/asaas_sandbox_card_capture_v2.py",  # copy / rename target
+        "scripts/asaas_sandbox_card_capture.py.orig",  # prefix of a waived path
+        "tests/scripts/asaas_sandbox_card_capture.py",  # waived path as suffix
+        "src/tests/scripts/test_asaas_sandbox_card_capture.py",  # as suffix
+        "scripts/ASAAS_sandbox_card_capture.py",  # case variant
+        "scripts/asaas_sandbox_card_captureXpy",  # `.` read as a regex
+        "docs/asaas-sandbox-card-capture.md",
+    ],
+)
+@pytest.mark.parametrize("committed", [True, False], ids=["committed", "untracked"])
+def test_waived_lines_fail_in_any_other_path(
+    tmp_path: Path, other_path: str, committed: bool
+) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _write_capture_files(repo, tool_path=other_path, test_path=other_path)
+    if committed:
+        _commit_all(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert "secret/PII pattern found in added lines" in result.stderr
+    for number, (_, rule) in enumerate(_TOOL_LINES + _TEST_LINES, 2):
+        if rule:
+            assert f"\n{other_path}:{number}: {rule}\n" in result.stdout, rule
+    assert not [line for line in _waived_lines(output) if other_path in line]
+
+
+_OTHER_VALUES = [
+    # A different card number on an otherwise waived line shape.
+    (
+        _CAPTURE_TESTS,
+        f'    assert payload["{_CARD_FIELD}"]["number"] == "{_OTHER_PAN}"',
+        "forbidden_card_field",
+    ),
+    # A different security code.
+    (
+        _CAPTURE_TESTS,
+        f'    assert payload["{_CARD_FIELD}"]["ccv"] == "987"',
+        "forbidden_card_field",
+    ),
+    # A key without the synthetic tail.
+    (_CAPTURE_TESTS, f'PROD_KEY = "{_KEY_PROD}{_REAL_LOOKING_TAIL}"', "asaas_api_key"),
+    # A real-looking tail appended to the synthetic key.
+    (
+        _CAPTURE_TESTS,
+        f'PROD_KEY = "{_KEY_PROD}{_FAKE_KEY_TAIL}{_REAL_LOOKING_TAIL}"',
+        "asaas_api_key",
+    ),
+    # A carriage return inside the pinned text is not the pinned line.
+    (
+        _CAPTURE_TESTS,
+        f'PROD_KEY = "{_KEY_PROD}FAKE\rcapture-test-key-0001"',
+        "asaas_api_key",
+    ),
+    # A live key prepended to, or appended after, a waived line.
+    (
+        _CAPTURE_TESTS,
+        f'LIVE = "{_KEY_PROD}{_REAL_LOOKING_TAIL}"; '
+        f'PROD_KEY = "{_KEY_PROD}{_FAKE_KEY_TAIL}"',
+        "asaas_api_key",
+    ),
+    (
+        _CAPTURE_TESTS,
+        f'PROD_KEY = "{_KEY_PROD}{_FAKE_KEY_TAIL}"; '
+        f'LIVE = "{_KEY_PROD}{_REAL_LOOKING_TAIL}"',
+        "asaas_api_key",
+    ),
+    # An email riding on a waived field line.
+    (
+        _CAPTURE_TOOL,
+        f'        "{_CPF_FIELD}": identity.cpf, "email": "maria.silva@gmail.com",',
+        "forbidden_cpf_field",
+    ),
+    # A CPF-looking value that is not the generated identity.
+    (_CAPTURE_TOOL, f'        "{_CPF_FIELD}": "39053344705",', "forbidden_cpf_field"),
+    # A private key block on a waived rule's line.
+    (
+        _CAPTURE_TOOL,
+        f'        "{_CARD_FIELD}": "-----BEGIN PRIVATE KEY-----MIIEvQIBADANBgkq",',
+        "forbidden_card_field",
+    ),
+    # Rules with no waiver at all still run on the waived paths.
+    (_CAPTURE_TESTS, f"AUTH = '{_PLANTED_BEARER}'", "bearer_token"),
+    (_CAPTURE_TOOL, f"HEADER = '{_ACCESS_HEADER}'", "asaas_access_token_header"),
+    (_CAPTURE_TOOL, f"TERM = '{_CVV_TERM}'", "payment_security_term"),
+]
+
+
+@pytest.mark.parametrize(
+    ("relative", "offending", "rule"),
+    _OTHER_VALUES,
+    ids=[f"{rule}-{index}" for index, (_, _, rule) in enumerate(_OTHER_VALUES)],
+)
+@pytest.mark.parametrize("committed", [True, False], ids=["committed", "untracked"])
+def test_waiver_does_not_cover_other_values_in_waived_paths(
+    tmp_path: Path, relative: str, offending: str, rule: str, committed: bool
+) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    if relative == _CAPTURE_TOOL:
+        _write_capture_files(repo, extra_tool=(offending,))
+        number = len(_TOOL_LINES) + 2
+    else:
+        _write_capture_files(repo, extra_test=(offending,))
+        number = len(_TEST_LINES) + 2
+    if committed:
+        _commit_all(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert "secret/PII pattern found in added lines" in result.stderr
+    assert f"\n{relative}:{number}: {rule}\n" in result.stdout
+    assert f"{relative}:{number} rule=" not in output
+    # The genuine synthetic lines are still waived, and still printed.
+    assert f"added-line secret/PII waived: {_WAIVED_COUNT}\n" in result.stdout
+    assert _REAL_LOOKING_TAIL not in output
+    assert _OTHER_PAN not in output
+    assert "maria.silva" not in output
+
+
+_TOOL_NUMBER_PIN = 'TEST_CARD_NUMBER = "4444444444444444"'
+_TOOL_CCV_PIN = 'TEST_CARD_CCV = "123"'
+_PAYLOAD_NUMBER = '            "number": TEST_CARD_NUMBER,'
+_PAYLOAD_CCV = '            "ccv": TEST_CARD_CCV,'
+_SPACED_PAN = "5162 3062 1937 8829"
+_DASHED_PAN = "5162-3062-1937-8829"
+_UNDERSCORED_PAN = "5162_3062_1937_8829"
+_DOTTED_PAN = "5162.3062.1937.8829"
+# (id, file edits, expected stdout fragments) for the waived-path audit.
+_CARD_CHANGES = [
+    (
+        "number-constant",
+        {"replace": {_TOOL_NUMBER_PIN: f'TEST_CARD_NUMBER = "{_OTHER_PAN}"'}},
+        [f"\n{_CAPTURE_TOOL}:7: card_number_guard\n", "pinned line entry 6 matches 0"],
+    ),
+    (
+        "ccv-constant",
+        {"replace": {_TOOL_CCV_PIN: 'TEST_CARD_CCV = "999"'}},
+        ["pinned line entry 7 matches 0 lines, expected 1"],
+    ),
+    (
+        "payload-number",
+        {"replace": {_PAYLOAD_NUMBER: f'            "number": "{_SPACED_PAN}",'}},
+        [f"\n{_CAPTURE_TOOL}:4: card_number_guard\n", "pinned line entry 3 matches 0"],
+    ),
+    (
+        "payload-ccv",
+        {"replace": {_PAYLOAD_CCV: '            "ccv": "999",'}},
+        ["pinned line entry 4 matches 0 lines, expected 1"],
+    ),
+    (
+        "copied-opener-block",
+        {
+            "extra_tool": (
+                f'        "{_CARD_FIELD}": {{',
+                f'            "number": "{_OTHER_PAN}",',
+                "        },",
+            )
+        },
+        [
+            f"{_CAPTURE_TOOL}: waiver entry {_ENTRY_TOOL_CARD_OPENER} "
+            "rule=forbidden_card_field matches 2 lines, more than the 1 recorded",
+            f"\n{_CAPTURE_TOOL}:10: card_number_guard\n",
+        ],
+    ),
+    (
+        "copied-pin",
+        {"extra_tool": (_PAYLOAD_CCV,)},
+        ["pinned line entry 4 matches 2 lines, expected 1"],
+    ),
+    (
+        "bare-number-in-tests",
+        {"extra_test": (f'CARD = "{_DASHED_PAN}"',)},
+        [f"\n{_CAPTURE_TESTS}:6: card_number_guard\n"],
+    ),
+    (
+        "thirteen-digits-in-tests",
+        {"extra_test": ("VALUE = 1000000000000",)},
+        [f"\n{_CAPTURE_TESTS}:6: card_number_guard\n"],
+    ),
+    (
+        "longer-run-in-tests",
+        {"extra_test": ("VALUE = 44444444444444441",)},
+        [f"\n{_CAPTURE_TESTS}:6: card_number_guard\n"],
+    ),
+    (
+        "underscored-number-in-tests",
+        {"extra_test": (f"CARD = {_UNDERSCORED_PAN}",)},
+        [f"\n{_CAPTURE_TESTS}:6: card_number_guard\n"],
+    ),
+    (
+        "dotted-number-in-tests",
+        {"extra_test": (f'CARD = "{_DOTTED_PAN}"',)},
+        [f"\n{_CAPTURE_TESTS}:6: card_number_guard\n"],
+    ),
+    # The second digit run on a line is checked too ("2" comes first here).
+    (
+        "second-run-on-line",
+        {"extra_test": (f'CARD_V2 = "{_OTHER_PAN}"',)},
+        [f"\n{_CAPTURE_TESTS}:6: card_number_guard\n"],
+    ),
+    (
+        "seventeen-fours-in-tests",
+        {"extra_test": ("VALUE = 44444444444444444",)},
+        [f"\n{_CAPTURE_TESTS}:6: card_number_guard\n"],
+    ),
+    (
+        "thirteen-fours-in-tests",
+        {"extra_test": ("VALUE = 4444444444444",)},
+        [f"\n{_CAPTURE_TESTS}:6: card_number_guard\n"],
+    ),
+    # N27: a copied waived line on its own, with no card number on it.
+    (
+        "copied-opener-only",
+        {"extra_tool": (f'        "{_CARD_FIELD}": {{',)},
+        [
+            f"{_CAPTURE_TOOL}: waiver entry {_ENTRY_TOOL_CARD_OPENER} "
+            "rule=forbidden_card_field matches 2 lines, more than the 1 recorded"
+        ],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("edits", "expected"),
+    [(edits, expected) for _, edits, expected in _CARD_CHANGES],
+    ids=[name for name, _, _ in _CARD_CHANGES],
+)
+@pytest.mark.parametrize("committed", [True, False], ids=["committed", "untracked"])
+def test_waived_path_audit_rejects_any_other_card_data(
+    tmp_path: Path, edits: dict, expected: list[str], committed: bool
+) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    _write_capture_files(repo, **edits)
+    if committed:
+        _commit_all(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert "secret/PII waiver audit failed" in result.stderr
+    for fragment in expected:
+        assert fragment in output, fragment
+    for digits in (
+        _OTHER_PAN,
+        _SPACED_PAN,
+        _DASHED_PAN,
+        _UNDERSCORED_PAN,
+        _DOTTED_PAN,
+        "1000000000000",
+        "3062",
+    ):
+        assert digits not in output
+    assert "conventional commits" not in result.stdout
+
+
+def test_waived_path_audit_runs_even_when_the_files_predate_base(
+    tmp_path: Path,
+) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _write_capture_files(repo, extra_test=(f'CARD = "{_OTHER_PAN}"',))
+    _commit_all(repo)
+    _git(repo, "tag", "-f", "base")
+    _commit_clean_change(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert f"\n{_CAPTURE_TESTS}:6: card_number_guard\n" in result.stdout
+    assert "added-line secret/PII scan: no findings" in result.stdout
+
+
+def test_waived_path_audit_allows_the_public_test_card_forms(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    _write_capture_files(
+        repo,
+        extra_tool=(
+            "# card 4444 4444 4444 4444 or 4444-4444-4444-4444",
+            "# also 4444_4444_4444_4444 and 4444.4444.4444.4444",
+            "VERSION = 1.2.3, HOST = 198.51.100.7, RATE = 0.125",
+        ),
+        extra_test=('PHONE = "4738010919"', 'CPF = "52998224725"'),
+    )
+    _commit_all(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "card_number_guard" not in result.stdout
+
+
+def test_card_guard_covers_waived_paths_only(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    _write_capture_files(repo)
+    (repo / "src" / "orders.py").write_text(f'REF = "{_OTHER_PAN}"\n')
+    _commit_all(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "card_number_guard" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    [
+        ("binary", "waived path contains a NUL byte and cannot be audited"),
+        ("symlink", "waived path is not a regular file and cannot be audited"),
+    ],
+)
+def test_waived_path_that_cannot_be_audited_fails(
+    tmp_path: Path, kind: str, message: str
+) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    _write_capture_files(repo)
+    target = repo / _CAPTURE_TESTS
+    if kind == "binary":
+        with target.open("ab") as handle:
+            handle.write(b"\x00binary\n")
+    else:
+        moved = repo / "tests" / "elsewhere.py"
+        target.rename(moved)
+        target.symlink_to("../elsewhere.py")
+    _commit_all(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert f"{message}: {_CAPTURE_TESTS}" in result.stdout
+    assert "secret/PII waiver audit failed" in result.stderr
+
+
+@pytest.mark.parametrize("awk", ["gawk", "mawk"])
+def test_waiver_never_matches_across_an_embedded_nul(tmp_path: Path, awk: str) -> None:
+    found = shutil.which(awk)
+    if found is None:
+        pytest.skip(f"{awk} is not installed")
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    # Past git's 8000-byte binary probe the file is diffed as text, so the
+    # line with the NUL reaches the scanner.
+    filler = tuple(f"# filler line {index:04d} " + "x" * 60 for index in range(150))
+    planted = f'PROD_KEY = "{_KEY_PROD}{_FAKE_KEY_TAIL}"\0; LIVE = "{_KEY_PROD}{_REAL_LOOKING_TAIL}"'
+    _write_capture_files(repo, extra_test=filler + (planted,))
+    _commit_all(repo)
+    awk_dir = tmp_path / "awk-bin"
+    awk_dir.mkdir()
+    (awk_dir / "awk").symlink_to(found)
+
+    result = _run_waiver_gate(
+        repo, log, PATH=f"{awk_dir}:{log.parent / 'bin'}:{os.environ['PATH']}"
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    number = len(_TEST_LINES) + len(filler) + 2
+    assert f"\n{_CAPTURE_TESTS}:{number}: asaas_api_key\n" in result.stdout
+    assert f"{_CAPTURE_TESTS}:{number} rule=" not in output
+    assert _REAL_LOOKING_TAIL not in output
+
+
+def test_waiver_does_not_follow_a_rename(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    filler = [f"VALUE_{index} = {index}" for index in range(30)]
+    _write_capture_files(repo, extra_tool=tuple(filler))
+    _commit_all(repo)
+    _git(repo, "tag", "-f", "base")
+    moved = "scripts/asaas_card_capture_moved.py"
+    _git(repo, "mv", _CAPTURE_TOOL, moved)
+    with (repo / moved).open("a") as handle:
+        handle.write(f"{_TOOL_LINES[0][0]}\n")
+    _commit_all(repo, "refactor: move capture tool")
+
+    result = _run_waiver_gate(repo, log)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    number = len(_TOOL_LINES) + len(filler) + 2
+    assert f"\n{moved}:{number}: forbidden_cpf_field\n" in result.stdout
+    # Only the added line is new; the moved lines stay review-only.
+    assert f"\n{moved}:2: forbidden_cpf_field\n" not in result.stdout
+
+
+def test_stale_waiver_entries_warn_without_failing(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    # The tool lost its holder-info line; the tests file is gone entirely.
+    _write_lines(
+        repo,
+        _CAPTURE_TOOL,
+        [line for line, _ in _TOOL_LINES[:4]] + [_TOOL_NUMBER_PIN, _TOOL_CCV_PIN],
+    )
+    _commit_all(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    stale = _stale_lines(result.stderr)
+    assert all(_DECISION in line for line in stale)
+    assert [
+        x
+        for x in stale
+        if "entry 5 " in x
+        and f"{_CAPTURE_TOOL} rule=forbidden_card_field matches 0 of 1" in x
+    ]
+    assert len([x for x in stale if f"{_CAPTURE_TESTS} rule=" in x]) == 4
+    assert not [x for x in stale if f"{_CAPTURE_TOOL} rule=forbidden_cpf_field" in x]
+    assert (
+        f"waived path is not in the tree; its entries are stale: {_CAPTURE_TESTS}"
+        in result.stdout
+    )
+    assert f"{_WAIVED}{_CAPTURE_TOOL}:2 rule=forbidden_cpf_field" in result.stdout
+
+
+def test_partially_stale_entry_warns(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    _write_capture_files(repo)
+    _commit_all(repo)
+    rows = list(_TEST_TABLE)
+    path, rule, _, pattern = rows[0]
+    rows[0] = (path, rule, 2, pattern)
+
+    result = _run_waiver_gate(repo, log, rows)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    stale = _stale_lines(result.stderr)
+    assert len(stale) == 1
+    assert (
+        f"entry 1 ({_DECISION}): {_CAPTURE_TOOL} rule=forbidden_cpf_field matches 1 of 2"
+        in stale[0]
+    )
+
+
+def test_missing_waived_path_only_warns_for_its_pins(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(_stale_lines(result.stderr)) == len(_TEST_TABLE)
+    assert "waived-path audit: no findings" in result.stdout
+
+
+def test_baseline_scan_prints_and_counts_waived_lines(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    offending = f'    assert payload["{_CARD_FIELD}"]["number"] == "1234"'
+    _write_capture_files(repo, extra_test=(offending,))
+    _commit_all(repo)
+    # The files predate BASE_REF: only the review-only baseline sees them.
+    _git(repo, "tag", "-f", "base")
+    _commit_clean_change(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "baseline secret/PII findings (review required)" in result.stdout
+    for item in _expected_waived():
+        assert f"\n  {_WAIVED}{item}\n" in result.stdout, item
+        path, rest = item.split(":", 1)
+        number = rest.split(" ", 1)[0]
+        assert f"  {path}:{number}: " not in result.stdout
+    number = len(_TEST_LINES) + 2
+    assert f"\n  {_CAPTURE_TESTS}:{number}: forbidden_card_field\n" in result.stdout
+    assert "\n  tests/legacy_fixture.py:1: forbidden_cpf_field\n" in result.stdout
+    assert f"baseline secret/PII waived: {_WAIVED_COUNT}\n" in result.stdout
+    assert "added-line secret/PII waived: 0\n" in result.stdout
+    assert "added-line secret/PII scan: no findings" in result.stdout
+
+
+def test_baseline_scan_reports_waived_only_tree(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    (repo / "tests" / "legacy_fixture.py").unlink()
+    _write_capture_files(repo)
+    _commit_all(repo)
+    _git(repo, "tag", "-f", "base")
+    _commit_clean_change(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "baseline secret/PII scan: no findings" in result.stdout
+    assert f"\n  {_WAIVED}{_CAPTURE_TOOL}:2 rule=forbidden_cpf_field\n" in result.stdout
+    assert f"baseline secret/PII waived: {_WAIVED_COUNT}\n" in result.stdout
+
+
+@pytest.mark.parametrize("committed", [True, False], ids=["committed", "untracked"])
+def test_waiver_matches_crlf_lines(tmp_path: Path, committed: bool) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _write_capture_files(
+        repo,
+        extra_test=(f'PROD_KEY = "{_KEY_PROD}{_REAL_LOOKING_TAIL}"',),
+        newline="\r\n",
+    )
+    if committed:
+        _commit_all(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert f"added-line secret/PII waived: {_WAIVED_COUNT}\n" in result.stdout
+    number = len(_TEST_LINES) + 2
+    assert f"\n{_CAPTURE_TESTS}:{number}: asaas_api_key\n" in result.stdout
+    assert "waived-path audit: no findings" in result.stdout
+    assert "scan failed" not in result.stderr
+
+
+def test_waiver_rejects_a_very_long_line(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    long_line = f'PROD_KEY = "{_KEY_PROD}{_FAKE_KEY_TAIL}"' + " " * 200_000 + "#"
+    _write_capture_files(repo, extra_test=(long_line,))
+    _commit_all(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert "scan failed" not in result.stderr
+    number = len(_TEST_LINES) + 2
+    assert f"\n{_CAPTURE_TESTS}:{number}: asaas_api_key\n" in result.stdout
+    assert f"added-line secret/PII waived: {_WAIVED_COUNT}\n" in result.stdout
+
+
+def _waiver_table() -> list[list[str]]:
+    result = subprocess.run(
+        ["bash", "-c", f'source "{GATES}" && _asaas_scan_waivers'],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return [line.split("\t") for line in result.stdout.splitlines() if line]
+
+
+def test_waiver_table_is_closed_and_recorded() -> None:
+    table = _waiver_table()
+
+    assert table
+    for entry in table:
+        assert len(entry) == 5, entry
+        decision, path, rule, count, pattern = entry
+        assert decision == _DECISION
+        assert path in {_CAPTURE_TOOL, _CAPTURE_TESTS}
+        assert rule in {
+            "asaas_api_key",
+            "forbidden_cpf_field",
+            "forbidden_card_field",
+            "pinned_line",
+        }
+        assert count.isdigit() and int(count) >= 1, entry
+        # The gate anchors every pattern to the whole line itself.
+        assert not pattern.startswith("^") and not pattern.endswith("$"), pattern
+    assert len({(e[1], e[2], e[4]) for e in table}) == len(table)
+    pins = {e[4] for e in table if e[1] == _CAPTURE_TOOL and e[2] == "pinned_line"}
+    assert 'TEST_CARD_NUMBER = "4444444444444444"' in pins
+    assert 'TEST_CARD_CCV = "123"' in pins
+
+
+def test_real_waiver_table_passes_the_gate_validation(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+
+    result = _run_release_gate(repo, log, **_GATE_INPUTS)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _MALFORMED not in result.stderr
+
+
+_TOOL = _CAPTURE_TOOL
+_BAD_ENTRIES = [
+    ("unknown-rule", f"{_DECISION}\t{_TOOL}\tno_such_rule\t1\tx"),
+    ("missing-pattern", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1"),
+    ("empty-pattern", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\t"),
+    ("missing-decision", f"\t{_TOOL}\tforbidden_cpf_field\t1\tx"),
+    ("four-fields", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\tx"),
+    ("six-fields", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\tx\ty"),
+    ("zero-count", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t0\tx"),
+    ("text-count", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\tone\tx"),
+    ("alternation-escape", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\tx)|(.+"),
+    ("alternation", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\ta|b"),
+    ("group", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\t(x)"),
+    ("dot", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\tidentity.cpf"),
+    ("star", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\tx*"),
+    ("bracket-star", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\ta[x]*"),
+    ("plus", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\t[a-z]+"),
+    ("question", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\tx?"),
+    ("interval", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\t[0-9]{{16}}"),
+    ("range-class", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\t[a-z]"),
+    ("negated-class", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\t[^x]"),
+    ("print-class", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\t[[:print:]]*x"),
+    (
+        "space-class-inside",
+        f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\tx[[:space:]]*y",
+    ),
+    (
+        "only-space-prefix",
+        f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\t[[:space:]]*",
+    ),
+    ("backslash-escape", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\tx\\.y"),
+    ("backreference", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\t(a)\\1"),
+    ("bare-backreference", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\ta\\1"),
+    ("word-boundary-escape", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\tx\\y"),
+    ("negated-bracket-tokens", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\t[^][]]"),
+    ("caret", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\t^x"),
+    ("dollar", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\tx$"),
+    ("unterminated-bracket", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\tx[y"),
+    ("brace", f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\tx{{"),
+    (
+        "duplicate",
+        f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\tx\n"
+        f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t2\tx",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "entry", [entry for _, entry in _BAD_ENTRIES], ids=[n for n, _ in _BAD_ENTRIES]
+)
+def test_malformed_waiver_table_fails_closed(tmp_path: Path, entry: str) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+
+    result = _run_waiver_gate(repo, log, override=_raw_table_override([entry]))
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert f"secret/PII scan failed: {_MALFORMED}" in result.stderr
+    assert "conventional commits" not in result.stdout
+
+
+def test_literal_waiver_shapes_are_accepted(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    rows = [
+        (_TOOL, "forbidden_cpf_field", 1, "[[:space:]]*a[.]b[[][]][\\\\][$][(][)]á-x"),
+        (_TOOL, "pinned_line", 1, "y"),
+    ]
+
+    result = _run_waiver_gate(repo, log, rows)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(_stale_lines(result.stderr)) == 2
+
+
+def test_malformed_waiver_table_fails_even_when_nothing_is_scanned(
+    tmp_path: Path,
+) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    (repo / "tests" / "legacy_fixture.py").unlink()
+    _commit_all(repo, "test: drop legacy fixture")
+    _git(repo, "tag", "-f", "base")
+    # A change outside every scan root: no file reaches the scanner.
+    (repo / "NOTES.txt").write_text("outside the scan roots\n")
+    _commit_all(repo, "docs: add notes")
+    entry = f"{_DECISION}\t{_TOOL}\tforbidden_cpf_field\t1\tidentity.cpf"
+
+    result = _run_waiver_gate(repo, log, override=_raw_table_override([entry]))
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert _MALFORMED in result.stderr
+    assert "conventional commits" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("line", "waived_rule", "pattern", "other_rule"),
+    [
+        # Waived rule sorts after the other one.
+        (
+            f"FIELD = '{_CPF_FIELD}' + '{_PLANTED_BEARER}'",
+            "forbidden_cpf_field",
+            "FIELD = 'cpf[C]npj' [+] 'Bear[e]r abc[.]def[.]ghi'",
+            "bearer_token",
+        ),
+        # Waived rule sorts before the other one.
+        (
+            f"KEY = '{_KEY_PROD}{_FAKE_KEY_TAIL}' + '{_CVV_TERM}'",
+            "asaas_api_key",
+            "KEY = '[$]aact_prod_FAKEcapture-test-key-0001' [+] 'c[v]v'",
+            "payment_security_term",
+        ),
+    ],
+    ids=["waived-rule-last", "waived-rule-first"],
+)
+def test_waiver_for_one_rule_never_waives_another_rule_on_the_line(
+    tmp_path: Path, line: str, waived_rule: str, pattern: str, other_rule: str
+) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    _write_lines(repo, _CAPTURE_TOOL, [line])
+    _commit_all(repo)
+
+    result = _run_waiver_gate(repo, log, [(_CAPTURE_TOOL, waived_rule, 1, pattern)])
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert f"{_WAIVED}{_CAPTURE_TOOL}:2 rule={waived_rule}" in result.stdout
+    assert f"\n{_CAPTURE_TOOL}:2: {other_rule}\n" in result.stdout
+    assert "abc.def.ghi" not in output
+
+
+def test_baseline_hit_the_rules_cannot_reproduce_fails(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    real_git = shutil.which("git")
+    assert real_git
+    wrapper = log.parent / "bin" / "git"
+    # git grep reports a hit on a line no scan rule matches.
+    wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        'case " $* " in *" grep --untracked "*)\n'
+        "  printf '%s\\0%s\\0%s\\n' docs/README.txt 1 'clean line'; exit 0 ;;\n"
+        "esac\n"
+        f'exec "{real_git}" "$@"\n'
+    )
+    wrapper.chmod(0o755)
+
+    result = _run_release_gate(repo, log, **_GATE_INPUTS)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "baseline hit not reproduced by the scan rules" in result.stderr
+    assert "baseline secret/PII scan failed" in result.stderr
+
+
+def test_waived_hit_prints_its_own_entry_decision(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    _write_capture_files(repo)
+    _commit_all(repo)
+    other = "owner decision 2099-01-01, wish test-only"
+    override = _raw_table_override(
+        [f"{_DECISION}\t{p}\t{r}\t{c}\t{e}" for p, r, c, e in _TEST_TABLE[:-1]]
+        + ["\t".join([other, *map(str, _TEST_TABLE[-1])])]
+    )
+
+    result = _run_waiver_gate(repo, log, override=override)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    last = f"{_CAPTURE_TESTS}:{len(_TEST_LINES) + 1} rule=forbidden_card_field"
+    assert f"\nwaived ({other}): {last}\n" in result.stdout
+    assert f"{_WAIVED}{last}" not in result.stdout
+    assert f"\n{_WAIVED}{_CAPTURE_TOOL}:2 rule=forbidden_cpf_field\n" in result.stdout
+
+
+def test_entry_whose_rule_never_matches_its_line_is_stale(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    _write_lines(repo, _CAPTURE_TOOL, ["plain line"])
+    _commit_all(repo)
+
+    result = _run_waiver_gate(
+        repo, log, [(_CAPTURE_TOOL, "forbidden_cpf_field", 1, "plain line")]
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    stale = _stale_lines(result.stderr)
+    assert len(stale) == 1
+    assert "rule=forbidden_cpf_field matches 0 of 1" in stale[0]
+
+
+def test_pinned_line_counts_whole_lines_only(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    _write_capture_files(
+        repo,
+        extra_tool=(
+            f"# was: {_TOOL_CCV_PIN} (kept for history)",
+            f"x = {{{_PAYLOAD_CCV}}}",
+        ),
+    )
+    _commit_all(repo)
+
+    result = _run_waiver_gate(repo, log)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "pinned line entry" not in result.stdout
+
+
+def test_pinned_line_never_waives_a_rule_on_its_line(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    _commit_clean_change(repo)
+    line = f'TEST_CARD_CCV = "123"  # {_PLANTED_BEARER}'
+    _write_lines(repo, _CAPTURE_TOOL, [line])
+    _commit_all(repo)
+    pin = 'TEST_CARD_CCV = "123"  # Bear[e]r abc[.]def[.]ghi'
+
+    result = _run_waiver_gate(repo, log, [(_CAPTURE_TOOL, "pinned_line", 1, pin)])
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert f"\n{_CAPTURE_TOOL}:2: bearer_token\n" in result.stdout
+    assert not _waived_lines(output)
+    assert "pinned line entry" not in result.stdout
+    assert "abc.def.ghi" not in output

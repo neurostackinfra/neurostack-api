@@ -345,7 +345,7 @@ path ou body) é um pedido de override, nunca uma autorização:
 | API key | próprio tenant | permitido | `403` `tenant_override_forbidden` |
 | JWT `clinic_admin` | próprio tenant | permitido | `403` `tenant_override_forbidden` |
 | JWT `builder` | tenant do token | permitido | permitido só para clínica cujo `builder_id` é o do token; senão `403` `tenant_override_forbidden` |
-| JWT `super_admin` | tenant do token | permitido | permitido (qualquer tenant, sem checar existência) |
+| JWT `super_admin` | tenant do token | permitido | permitido (qualquer tenant; a autorização não checa existência, e o upload de knowledge a checa depois, ver [Knowledge](#knowledge)) |
 | Outros papéis JWT (`investor`, desconhecidos) | `403` `caller_role_forbidden` | `403` `caller_role_forbidden` | `403` `caller_role_forbidden` |
 
 O corpo do `403` é `{"detail": {"code": "<código>"}}`. Sem credencial, ou com
@@ -439,7 +439,7 @@ override, nunca uma autorização:
 | API key | próprio tenant | permitido | `403` `tenant_override_forbidden` |
 | JWT `clinic_admin` | próprio tenant | permitido | `403` `tenant_override_forbidden` |
 | JWT `builder` | tenant do token | permitido | permitido só para clínica cujo `builder_id` é o do token; senão `403` `tenant_override_forbidden` |
-| JWT `super_admin` | tenant do token | permitido | permitido (qualquer tenant, sem checar existência) |
+| JWT `super_admin` | tenant do token | permitido | permitido (qualquer tenant; a autorização não checa existência, mas o upload checa em seguida e responde `404` `Tenant not found` se o tenant não tem registro) |
 | Outros papéis JWT (`investor`, desconhecidos) | `403` `caller_role_forbidden` | `403` `caller_role_forbidden` | `403` `caller_role_forbidden` |
 
 De onde vem o tenant em cada rota (os outros lugares são ignorados; o header
@@ -468,7 +468,81 @@ respostas de sucesso trazem `Cache-Control: no-store`.
 #### POST /v1/knowledge/documents
 
 Upload e indexação de documento. `tenant_id` no body é opcional (padrão:
-tenant do chamador) e segue a tabela acima.
+tenant do chamador) e segue a tabela acima. O `201` só é respondido depois do
+commit: o documento fica legível pelo mesmo tenant (e só por ele) nas rotas
+abaixo. Se o tenant autorizado não tem registro, a resposta é `404`
+`{"detail": "Tenant not found"}`, igual para todo chamador e sem ecoar o
+`tenant_id` (o `builder` continua recebendo antes o `403` da checagem de
+posse, então não descobre se uma clínica alheia existe). Uma falha antes do
+commit (por exemplo depois do insert, ao montar a resposta) não deixa
+documento gravado. Uma falha depois do commit (serialização da resposta,
+middleware externo, confirmação do `COMMIT` perdida na conexão) pode responder
+`500` com o documento já gravado: o cliente que recebe `500` deve listar ou
+buscar antes de reenviar, porque o upload não é idempotente.
+
+A resposta `201` é montada a partir da linha gravada (não do request): é
+exatamente o que `GET /v1/knowledge/documents/{document_id}` e a listagem
+devolvem depois, campo por campo.
+
+**Limites de entrada.** O schema recusa com `422`, antes de tocar o banco, o
+que o PostgreSQL não consegue gravar e o que passa dos limites abaixo (antes
+disso essas entradas respondiam `500` com traceback do driver). Comprimentos
+contam caracteres (code points), não bytes. Um corpo que o próprio FastAPI não
+consegue decodificar (aninhamento JSON acima de ~9.900 níveis, inteiro com mais
+de 4.300 dígitos ou UTF-8 inválido) não chega ao schema: responde `400`
+`{"detail": "There was an error parsing the body"}`, sem `Cache-Control:
+no-store`, sem ecoar o corpo e nunca `500`.
+
+| Campo | Limite | Origem | `type` do erro |
+|-------|--------|--------|----------------|
+| `content` | 10 a 100.000 caracteres | limite já existente (coluna `TEXT`) | `string_too_short` / `string_too_long` |
+| `metadata.title` | até 500 caracteres | coluna `knowledge_documents.title VARCHAR(500)` | `string_too_long` |
+| `metadata.source` | até 2.048 caracteres | JSONB `metadata` (sem limite próprio) | `string_too_long` |
+| `metadata.category` | até 100 caracteres | JSONB `metadata` | `string_too_long` |
+| `metadata.tags` | até 50 tags, cada uma até 100 caracteres | JSONB `metadata` | `too_long` / `string_too_long` |
+| `metadata.custom` | até 5 níveis de aninhamento (o próprio `custom` é o nível 1) | JSONB `metadata` | `metadata_too_deep` |
+| `metadata.custom` | até 100 chaves no total, somando objetos aninhados | JSONB `metadata` | `metadata_too_many_keys` |
+| `metadata.custom` | até 10.000 bytes como JSON UTF-8 compacto | JSONB `metadata` | `metadata_too_large` |
+| `metadata.custom` | só números finitos (`NaN`, `Infinity`, `1e400` são recusados) | JSONB não aceita | `non_finite_number` |
+| todo texto (`content`, `title`, `source`, `category`, cada tag, chaves e strings de `custom` em qualquer nível) | sem o caractere NUL (U+0000, inclusive escrito `\u0000` no JSON) | `text`/`jsonb` não aceitam | `nul_character` |
+| idem | sem surrogate UTF-16 desemparelhado (`\ud800`...`\udfff` sozinho) | UTF-8 inválido | `string_unicode` (campos de texto) / `unpaired_surrogate` (`custom`) |
+| `?category=` da listagem | até 100 caracteres, sem NUL (inclusive `%00`) | mesmo limite do upload | `string_too_long` / `nul_character` |
+
+Strings vazias continuam aceitas e gravadas como enviadas (`title` vazio ou
+ausente grava a coluna `title` como `Untitled Document`, e os metadados
+guardam o valor enviado). Documentos gravados antes desses limites continuam
+legíveis: os limites valem só para a entrada.
+
+**Chaves reservadas de `metadata.custom`.** `custom` é gravado ao lado de
+`title`, `source`, `category` e `tags` no mesmo objeto JSONB, então essas
+quatro chaves (comparação exata, com maiúsculas e minúsculas) são reservadas:
+um `custom` que use qualquer uma delas responde `422`
+`reserved_metadata_key`, com a mensagem listando os **nomes** das chaves
+reservadas usadas (nunca os valores), e nada é gravado. Chaves parecidas
+(`Title`, `tag`, `_source`) são chaves comuns de `custom`.
+
+**Formato do `422` (rotas de documentos).** Em `POST`/`GET`
+`/v1/knowledge/documents` e `GET`/`DELETE`
+`/v1/knowledge/documents/{document_id}` o `422` traz, por problema, só
+`type`, `loc` e `msg`: os campos `input` e `ctx` do FastAPI são removidos,
+então nenhum texto livre enviado (conteúdo, metadados, filtro) volta na
+resposta, e a resposta traz `Cache-Control: no-store`. A `msg` padrão do
+Pydantic para UUID inválido (`tenant_id`, `document_id`) cita um único
+caractere da entrada (por exemplo ``found `S` at 1``):
+
+```json
+{
+  "detail": [
+    {
+      "type": "nul_character",
+      "loc": ["body", "metadata", "title"],
+      "msg": "Text must not contain the NUL character (U+0000)"
+    }
+  ]
+}
+```
+
+`POST /v1/knowledge/search` (ainda um stub) mantém o `422` padrão do FastAPI.
 
 **Request:**
 
@@ -515,7 +589,13 @@ Lista os documentos do tenant autorizado.
 | `tenant_id` | UUID | null | Tenant a listar; omitido = tenant do chamador (override conforme a tabela acima) |
 | `page` | int | 1 | Número da página |
 | `page_size` | int | 20 | Itens por página (max 100) |
-| `category` | string | null | Filtrar por categoria |
+| `category` | string | null | Filtrar por categoria (até 100 caracteres, sem NUL; senão `422`) |
+
+`total` conta o mesmo conjunto filtrado da página (tenant autorizado e, quando
+informada, a `category`), não todos os documentos do tenant. `category` vazia
+(`?category=`) não filtra: página e `total` cobrem todos os documentos do
+tenant. Um tenant sem documentos, ou sem registro, responde `200` com
+`documents: []` e `total: 0`.
 
 #### GET /v1/knowledge/documents/{document_id}
 
@@ -525,9 +605,12 @@ tenant responde `404`, igual a um inexistente.
 
 #### DELETE /v1/knowledge/documents/{document_id}
 
-Remove um documento (`204`). `tenant_id` (query, opcional, padrão: tenant do
+Remove um documento (`204`, após o commit). Se outra transação segura a linha,
+a remoção espera: se ela desfaz (rollback), a remoção responde `204`; se ela
+remove e confirma, `404`. `tenant_id` (query, opcional, padrão: tenant do
 chamador) define o escopo; documento de outro tenant responde `404`, igual a
-um inexistente.
+um inexistente. Remover de novo responde `404`, e de
+duas remoções simultâneas do mesmo documento exatamente uma responde `204`.
 
 ---
 
@@ -731,6 +814,10 @@ Mantém byte a byte todos os campos legados (`plan`, `active_clinics`,
 - `subscription.current_period_end`: o maior `cycle_end` entre os ciclos da
   assinatura **integralmente pagos, líquidos de estornos**, isto é,
   `state IN ('settled', 'restored') AND reversed_cents = restored_cents`.
+  `settled` significa pago comercialmente: capturado no cartão
+  (`PAYMENT_CONFIRMED`) ou recebido (`PAYMENT_RECEIVED`), o que chegar
+  primeiro, e não fundos disponíveis no ASAAS (no cartão eles só ficam
+  disponíveis cerca de 32 dias depois da captura).
   Ciclos estornados (`reversed`), parcialmente restaurados, `pending` ou
   `quarantined` são ignorados: um ciclo atual estornado faz o valor voltar ao
   fim do último ciclo integralmente pago, e `null` significa que nenhum ciclo

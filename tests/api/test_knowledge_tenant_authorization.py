@@ -8,10 +8,14 @@ clinic explicitly, and every other JWT role is denied.  A document requested by
 ID is looked up by ID *and* authorized tenant together, so another tenant's
 document is indistinguishable from a missing one.
 
-The shipped request session never commits, which hides cross-tenant writes
-behind a rollback.  This module therefore replaces the session dependency with
-one that commits every successful request: a cross-tenant create or delete
-that slipped past the tenant scoping would persist here and fail the test.
+The knowledge routes commit their own successful writes, but a write that
+skipped that commit would hide a cross-tenant effect behind a rollback.  This
+module therefore replaces the session dependency with one that commits every
+successful request: a cross-tenant create or delete that slipped past the
+tenant scoping would persist here and fail the test whether or not the route
+committed.  (Persistence through the real, non-committing dependency is pinned
+by ``tests/api/test_knowledge_persistence.py`` and, on PostgreSQL, by
+``tests/integration/test_knowledge_persistence_postgres.py``.)
 A denied request still rolls back, and SQLite does not enforce foreign keys,
 so a write issued *before* the tenant check would leave no trace in the table;
 ``write_spy`` therefore observes the write attempt itself.
@@ -260,12 +264,28 @@ def _seed_tenants(
 
 
 def _seed_document(client: LifespanTestClient, tenant_id: UUID) -> str:
-    """Persist one document for ``tenant_id`` outside the routes under test."""
+    """Persist one document for ``tenant_id`` outside the routes under test.
+
+    The tenant row is created when missing, as PostgreSQL's foreign key
+    requires: an upload into a tenant without a row is a 404 by contract, so a
+    successful upload needs the row even where SQLite would not enforce it.
+    """
     document_id = uuid4()
 
     async def _run() -> None:
         db = get_db_session()
         try:
+            if await db.get(Tenant, tenant_id) is None:
+                db.add(
+                    Tenant(
+                        id=tenant_id,
+                        name=f"Clinic {tenant_id}",
+                        slug=f"clinic-{tenant_id}",
+                        api_key_hash=f"hash-{tenant_id}",
+                        config={},
+                    )
+                )
+                await db.flush()
             db.add(
                 KnowledgeDocument(
                     id=document_id,
@@ -703,6 +723,8 @@ class TestPrivilegedTenantSelection:
     ) -> None:
         clinic, admin_tenant = uuid4(), uuid4()
         document_id = _seed_document(client, clinic)
+        # The caller's own tenant needs a row for its upload to succeed.
+        _seed_tenants(client, tenants=[(admin_tenant, None)])
 
         response = _call(
             client,
@@ -1200,6 +1222,8 @@ class TestTenantSourceMismatch:
     ) -> None:
         tenant_a, tenant_b = uuid4(), uuid4()
         document_id = _seed_document(client, tenant_a)
+        # The caller's own tenant needs a row for its upload to succeed.
+        _seed_tenants(client, tenants=[(tenant_b, None)])
 
         response = client.post(
             "/v1/knowledge/documents",
@@ -1237,6 +1261,8 @@ class TestTenantSourceMismatch:
     ) -> None:
         tenant_a, tenant_b = uuid4(), uuid4()
         document_id = _seed_document(client, tenant_a)
+        # The caller's own tenant needs a row for its upload to succeed.
+        _seed_tenants(client, tenants=[(tenant_b, None)])
         headers = {**_clinic_admin(tenant_b), "X-Tenant-ID": str(tenant_a)}
 
         response = _call(

@@ -402,6 +402,9 @@ class PaymentReadback:
 
     ``refunded_cents`` is the exact sum of ``DONE`` refunds, or ``None`` when
     the refund list cannot be read exactly (the caller must not guess).
+    ``confirmed_date``/``payment_date``/``client_payment_date`` are the
+    provider's civil dates that may become ``paid_at``; the funds dates
+    (``creditDate``/``estimatedCreditDate``) are deliberately not read.
     """
 
     payment_id: str
@@ -415,6 +418,8 @@ class PaymentReadback:
     refunded_cents: int | None
     due_date: date | None = None
     payment_date: date | None = None
+    confirmed_date: date | None = None
+    client_payment_date: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,6 +548,8 @@ def _payment_readback(payload: Mapping[str, Any]) -> PaymentReadback:
         refunded_cents=_refunded_cents(payload.get("refunds")),
         due_date=_optional_date(payload.get("dueDate")),
         payment_date=_optional_date(payload.get("paymentDate")),
+        confirmed_date=_optional_date(payload.get("confirmedDate")),
+        client_payment_date=_optional_date(payload.get("clientPaymentDate")),
     )
 
 
