@@ -1,0 +1,19 @@
+{
+  "billingType": "CREDIT_CARD",
+  "clientPaymentDate": "2026-10-11",
+  "confirmedDate": "2026-10-11",
+  "creditDate": "2026-11-12",
+  "dateCreated": "2026-10-11",
+  "dueDate": "2026-10-11",
+  "estimatedCreditDate": "2026-11-12",
+  "externalReference": "00000000-0000-4000-8000-000000000001",
+  "id": "pay_000000000000001",
+  "originalDueDate": "2026-10-11",
+  "paymentDate": null,
+  "refunds": [
+    {"status": "DONE", "value": 999.00, "dateCreated": "2026-10-11 18:06:07"}
+  ],
+  "status": "REFUNDED",
+  "subscription": "sub_000000000000001",
+  "value": 999.0
+}

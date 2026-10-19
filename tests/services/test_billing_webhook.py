@@ -122,10 +122,32 @@ def _event(
         # chosen explicitly by each test (a foreign one is a conflict).
         payload[family]["externalReference"] = None
         if family == "payment":
-            payload[family]["paymentDate"] = "2026-10-11"
+            payload[family].update(_provider_dates(name, when[:10]))
         for key, value in resource.items():
             payload[family][key] = value
     return parse_envelope(_body(payload), payload)
+
+
+def _provider_dates(name: str, day: str) -> dict[str, str | None]:
+    """The provider date fields of one payment event, by event name.
+
+    ASAAS sandbox, 2026-10-18 (real API): a card ``CONFIRMED`` carries
+    ``confirmedDate = clientPaymentDate =`` the capture day and
+    ``paymentDate = null``.  A (Pix) ``RECEIVED`` carries ``paymentDate``.
+    No other payment event carries any of the three.  ``day`` is the São
+    Paulo civil date of the envelope; any test may override each key.
+    """
+
+    dates: dict[str, str | None] = {
+        "confirmedDate": None,
+        "paymentDate": None,
+        "clientPaymentDate": None,
+    }
+    if name == "PAYMENT_CONFIRMED":
+        dates.update(confirmedDate=day, clientPaymentDate=day)
+    elif name == "PAYMENT_RECEIVED":
+        dates.update(paymentDate=day)
+    return dates
 
 
 def _documented_id() -> str:
@@ -210,7 +232,17 @@ def _payment_read(
     subscription_id: str | None = None,
     checkout_id: str | None = None,
     payment_date: date | None = date(2026, 10, 11),
+    confirmed_date: date | None = None,
+    client_payment_date: date | None = None,
+    billing_type: str = "PIX",
 ) -> PaymentReadback:
+    dates: dict[str, Any] = {"payment_date": payment_date}
+    # Only the new provider fields that a test sets are passed, so a read
+    # built without them stays constructible on the pre-change dataclass.
+    if confirmed_date is not None:
+        dates["confirmed_date"] = confirmed_date
+    if client_payment_date is not None:
+        dates["client_payment_date"] = client_payment_date
     return PaymentReadback(
         payment_id=payment_id,
         status=status,
@@ -219,9 +251,35 @@ def _payment_read(
         subscription_id=subscription_id,
         checkout_id=checkout_id,
         external_reference=None,
-        billing_type="PIX",
+        billing_type=billing_type,
         refunded_cents=refunded_cents,
-        payment_date=payment_date,
+        **dates,
+    )
+
+
+def _card_read(
+    payment_id: str,
+    *,
+    status: str = "CONFIRMED",
+    value_cents: int = 99_900,
+    refunded_cents: int | None = 0,
+    subscription_id: str | None = "sub_life_0001",
+    checkout_id: str | None = None,
+    capture_day: date = date(2026, 10, 11),
+) -> PaymentReadback:
+    """Sandbox-shaped card read: capture dates set, ``paymentDate`` null."""
+
+    return _payment_read(
+        payment_id,
+        status=status,
+        value_cents=value_cents,
+        refunded_cents=refunded_cents,
+        subscription_id=subscription_id,
+        checkout_id=checkout_id,
+        payment_date=None,
+        confirmed_date=capture_day,
+        client_payment_date=capture_day,
+        billing_type="CREDIT_CARD",
     )
 
 
@@ -392,7 +450,8 @@ def test_allowlist_is_the_design_set_plus_the_boleto_only_readback_event() -> No
         "SUBSCRIPTION_INACTIVATED": "non_billable_pending_readback",
         "SUBSCRIPTION_DELETED": "non_billable_pending_readback",
     }
-    assert PAYMENT_EVENT_STATUSES["PAYMENT_CONFIRMED"] == "pending"
+    # Owner decision (2026-10-18): card capture is commercially paid.
+    assert PAYMENT_EVENT_STATUSES["PAYMENT_CONFIRMED"] == "settled"
     assert PAYMENT_EVENT_STATUSES["PAYMENT_RECEIVED"] == "settled"
     assert PAYMENT_EVENT_STATUSES["PAYMENT_RESTORED"] == "readback_required"
     assert PAYMENT_EVENT_STATUSES["PAYMENT_AWAITING_CHARGEBACK_REVERSAL"] == (
@@ -680,40 +739,69 @@ async def test_topup_settlement_uses_snapshot_and_runs_once(world: _World) -> No
     assert builder.subscription_status == "trial"  # top-up never changes the plan
 
 
-async def test_payment_confirmed_does_not_settle_or_grant(world: _World) -> None:
+async def test_payment_confirmed_settles_a_card_topup_once(world: _World) -> None:
+    """A card capture (``PAYMENT_CONFIRMED``) is the settlement; the later
+    ``PAYMENT_RECEIVED`` (funds available) is an inert confirmation."""
+
     checkout, _order = await world.topup_session()
-    outcome = await world.receive(
-        _event(
-            "PAYMENT_CONFIRMED",
-            id="pay_confirmed_not_received",
-            subscription=None,
-            checkoutSession=checkout.external_checkout_id,
-            value=Decimal("100.00"),
-        )
-    )
+    common = {
+        "id": "pay_confirmed_card_topup",
+        "subscription": None,
+        "checkoutSession": checkout.external_checkout_id,
+        "value": Decimal("100.00"),
+    }
+    outcome = await world.receive(_event("PAYMENT_CONFIRMED", **common))
 
     assert outcome.outcome == "processed"
     (projection,) = await world.rows(BillingPaymentProjection)
-    assert projection.status == "pending"
-    assert projection.settled_cents == 0
-    assert projection.paid_at is None
-    assert await world.count(BillingPaymentEffect) == 0
-    assert await world.count(BillingOutboxEvent) == 0
-    assert await world.count(Transaction) == 0
+    assert (projection.status, projection.settled_cents) == ("settled", 10_000)
+    assert projection.paid_at == date(2026, 10, 11)
+    (effect,) = await world.rows(BillingPaymentEffect)
+    assert (effect.effect_kind, effect.source_revision) == (
+        "settlement",
+        "settlement:v1",
+    )
+    (outbox,) = await world.rows(BillingOutboxEvent)
+    assert outbox.payload["paid_at"] == "2026-10-11"
+    (transaction,) = await world.rows(Transaction)
+    assert transaction.event_type == "PAYMENT_CONFIRMED"
+    (order,) = await world.rows(BillingTopupOrder)
+    assert (order.state, order.settled_cents) == ("settled", 10_000)
+
+    received = await world.receive(
+        _event(
+            "PAYMENT_RECEIVED",
+            when="2026-11-12 08:00:00",
+            confirmedDate="2026-10-11",
+            **common,
+        )
+    )
+    assert received.outcome == "processed"
+    assert await world.count(BillingPaymentEffect) == 1
+    assert await world.count(BillingOutboxEvent) == 1
+    assert await world.count(Transaction) == 1
+    (projection,) = await world.rows(BillingPaymentProjection)
+    assert projection.paid_at == date(2026, 10, 11)
 
 
-async def test_received_without_provider_payment_date_is_quarantined(
-    world: _World,
+@pytest.mark.parametrize("event_name", ["PAYMENT_RECEIVED", "PAYMENT_CONFIRMED"])
+async def test_settlement_event_without_a_usable_date_is_quarantined(
+    world: _World, event_name: str
 ) -> None:
+    """No ``confirmedDate``/``paymentDate``/``clientPaymentDate``: nothing
+    is inferred from the event or payment timestamps (fail closed)."""
+
     checkout, _order = await world.topup_session()
     outcome = await world.receive(
         _event(
-            "PAYMENT_RECEIVED",
-            id="pay_received_missing_date",
+            event_name,
+            id="pay_settlement_missing_date",
             subscription=None,
             checkoutSession=checkout.external_checkout_id,
             value=Decimal("100.00"),
             paymentDate=None,
+            confirmedDate=None,
+            clientPaymentDate=None,
         )
     )
 
@@ -741,7 +829,45 @@ def test_provider_payment_date_is_parsed_as_a_strict_civil_date() -> None:
     assert noncanonical.payment_date is None
 
 
-def test_only_completed_refunds_are_counted_and_confirmed_is_not_settlement() -> None:
+@pytest.mark.parametrize(
+    ("key", "attribute"),
+    [
+        ("paymentDate", "payment_date"),
+        ("confirmedDate", "confirmed_date"),
+        ("clientPaymentDate", "client_payment_date"),
+    ],
+)
+def test_every_paid_at_source_is_a_strict_civil_date_in_reads_and_events(
+    key: str, attribute: str
+) -> None:
+    from src.services.asaas import _payment_readback
+
+    base = {"id": "pay_dates", "status": "CONFIRMED", "value": "100.00"}
+    for raw, expected in (
+        ("2026-04-30", date(2026, 4, 30)),
+        ("2026-02-30", None),
+        ("2026-4-3", None),
+        ("2026-04-30 10:00:00", None),
+        (20260430, None),
+        # Ten characters that date.fromisoformat accepts (ISO week date):
+        # only the canonical round-trip rejects it.
+        ("2026-W41-7", None),
+    ):
+        read = _payment_readback({**base, key: raw})
+        assert getattr(read, attribute) == expected, (key, raw)
+        envelope = _event("PAYMENT_CONFIRMED", **{key: raw})
+        assert envelope.payment is not None
+        assert getattr(envelope.payment, attribute) == expected, (key, raw)
+    # The funds dates are deliberately never extracted (owner decision).
+    full = _payment_readback(
+        {**base, "creditDate": "2026-05-30", "estimatedCreditDate": "2026-05-30"}
+    )
+    for absent in ("credit_date", "estimated_credit_date"):
+        assert not hasattr(full, absent)
+        assert not hasattr(envelope.payment, absent)
+
+
+def test_only_completed_refunds_are_counted_and_confirmed_is_settlement() -> None:
     from src.services.asaas import _payment_readback
     from src.services.billing_webhook import _READBACK_PAYMENT_STATUSES
 
@@ -762,8 +888,11 @@ def test_only_completed_refunds_are_counted_and_confirmed_is_not_settlement() ->
     assert pending.refunded_cents == 0
     assert cancelled.refunded_cents == 0
     assert done.refunded_cents == 1_000
-    assert PAYMENT_EVENT_STATUSES["PAYMENT_CONFIRMED"] == "pending"
-    assert _READBACK_PAYMENT_STATUSES["CONFIRMED"] == "pending"
+    assert PAYMENT_EVENT_STATUSES["PAYMENT_CONFIRMED"] == "settled"
+    assert _READBACK_PAYMENT_STATUSES["CONFIRMED"] == "settled"
+    assert _READBACK_PAYMENT_STATUSES["RECEIVED"] == "settled"
+    # Cash receipt outside ASAAS is never a NeuroStack settlement.
+    assert _READBACK_PAYMENT_STATUSES["RECEIVED_IN_CASH"] == "pending"
 
 
 async def test_old_event_never_regresses_the_projection(world: _World) -> None:
@@ -1372,6 +1501,9 @@ async def test_pre_settlement_refund_blocks_delayed_receipt_subscription_activat
 
 @pytest.mark.parametrize(
     ("later_status", "later_refunded_cents"),
+    # PENDING with a different refund total contradicts the evidence; a
+    # CONFIRMED read is a receipt (settled since 2026-10-18), which the
+    # terminal marker always quarantines.
     [("PENDING", 4_000), ("CONFIRMED", 3_000)],
 )
 async def test_pre_settlement_refund_evidence_detects_later_contradiction(
@@ -2483,6 +2615,17 @@ async def test_quarantine_alert_is_counted_once(
             "partially_reversed",
         ),
         (
+            # Owner decision Q-A: a CONFIRMED read with DONE refunds is a
+            # receipt exactly like RECEIVED: settle, then reverse.
+            "CONFIRMED",
+            3_000,
+            [
+                ("reversal", "reversed_cents:3000", 3_000),
+                ("settlement", "settlement:v1", 10_000),
+            ],
+            "partially_reversed",
+        ),
+        (
             "PENDING",
             3_000,
             [],
@@ -2541,8 +2684,11 @@ async def test_deleted_payment_readback_requires_accepted_receipt_before_settlem
             # contradictory provider data; its replay relabels ``pending``
             # exactly like 417c8ca did — money and effects stay put.)
             assert projection.status == label
-            if status != "RECEIVED":
+            if status not in ("RECEIVED", "CONFIRMED"):
                 assert projection.pre_settlement_refund_cents == refunded
                 assert projection.pre_settlement_refund_status == (status)
                 assert projection.pre_settlement_refund_observed_at is not None
-    assert await world.count(Transaction) == (1 if status == "RECEIVED" else 0)
+            else:
+                assert projection.pre_settlement_refund_cents is None
+    receipt = status in ("RECEIVED", "CONFIRMED")
+    assert await world.count(Transaction) == (1 if receipt else 0)
