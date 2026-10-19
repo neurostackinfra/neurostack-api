@@ -8,6 +8,7 @@ repository SQL runs on SQLite so every blocker condition and the
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from pathlib import Path
 from typing import AsyncIterator
@@ -190,24 +191,55 @@ async def test_legacy_row_flipped_to_asaas_blocks_while_asaas_is_billable(
     assert await _blocker(sessions, builder_id) is None
 
 
-async def test_any_canonical_migration_fails_closed_until_group_five(
+# The migration saga was removed (Group 10 phase E2) and production holds no
+# billing_migrations rows; the table goes in a later phase.  Every saga state
+# (migration 026) is paired with the subscription row that state leaves
+# behind: each of those still fails closed, now through the subscription rule.
+SAGA_LIVE_SUBSCRIPTION: dict[str, tuple[str | None, str, bool, str]] = {
+    "pending": ("abacatepay", "active", True, "abacatepay_subscription"),
+    "in_progress": (None, "legacy_cancel_pending", False, "unresolved_subscription"),
+    "legacy_cancel_pending": (
+        None,
+        "legacy_cancel_pending",
+        False,
+        "unresolved_subscription",
+    ),
+    "legacy_cancelled": (None, "legacy_cancelled", False, "unresolved_subscription"),
+    "recreate_pending": (None, "legacy_cancelled", False, "unresolved_subscription"),
+    "migrated": ("asaas", "active", True, "asaas_subscription"),
+    "manual_intervention": (
+        None,
+        "manual_intervention",
+        False,
+        "unresolved_subscription",
+    ),
+}
+ENDED_SUBSCRIPTIONS = (("abacatepay", "inactive"), ("asaas", "cancelled"))
+
+
+async def _saga_builder(
     sessions: async_sessionmaker[AsyncSession],
-) -> None:
+    *,
+    state: str,
+    provider: str | None,
+    status: str,
+    is_active: bool,
+) -> UUID:
     builder_id = uuid4()
     async with sessions() as session:
         subscription_id = await _subscription(
             session,
             builder_id,
-            provider="abacatepay",
-            status="inactive",
-            is_active=False,
+            provider=provider,
+            status=status,
+            is_active=is_active,
         )
         session.add(
             BillingMigration(
                 id=uuid4(),
                 builder_id=builder_id,
                 subscription_id=subscription_id,
-                state="migrated",
+                state=state,
                 renewal_date=date(2026, 11, 10),
                 open_by_date=date(2026, 11, 3),
                 cutover_by_date=date(2026, 11, 8),
@@ -223,8 +255,48 @@ async def test_any_canonical_migration_fails_closed_until_group_five(
             )
         )
         await session.commit()
+    return builder_id
 
-    assert await _blocker(sessions, builder_id) == "migration"
+
+def test_the_saga_matrix_covers_every_persisted_saga_state() -> None:
+    from sqlalchemy import CheckConstraint
+
+    (check,) = [
+        str(constraint.sqltext)
+        for constraint in BillingMigration.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+        and constraint.name == "ck_billing_migrations_state"
+    ]
+    persisted = set(re.findall(r"'([a-z_]+)'", check))
+
+    assert persisted == set(SAGA_LIVE_SUBSCRIPTION)
+
+
+@pytest.mark.parametrize("state", sorted(SAGA_LIVE_SUBSCRIPTION))
+async def test_every_live_saga_state_still_blocks_through_its_subscription(
+    sessions: async_sessionmaker[AsyncSession], state: str
+) -> None:
+    provider, status, is_active, expected = SAGA_LIVE_SUBSCRIPTION[state]
+    builder_id = await _saga_builder(
+        sessions, state=state, provider=provider, status=status, is_active=is_active
+    )
+
+    assert await _blocker(sessions, builder_id) == expected
+
+
+@pytest.mark.parametrize(("provider", "status"), ENDED_SUBSCRIPTIONS)
+@pytest.mark.parametrize("state", sorted(SAGA_LIVE_SUBSCRIPTION))
+async def test_a_leftover_saga_row_with_an_ended_subscription_does_not_block(
+    sessions: async_sessionmaker[AsyncSession],
+    state: str,
+    provider: str,
+    status: str,
+) -> None:
+    builder_id = await _saga_builder(
+        sessions, state=state, provider=provider, status=status, is_active=False
+    )
+
+    assert await _blocker(sessions, builder_id) is None
 
 
 @pytest.mark.parametrize(

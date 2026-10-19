@@ -1145,7 +1145,6 @@ async def test_ambiguous_attempts_converge_to_abandoned_after_two_empty_reads(
             environment="test",
             builder_id=builder_id,
             intent_id=uuid4(),
-            migration_id=None,
             checkout_session_id=session_id,
             attempt_no=1,
             catalog_version_id="payment-2026-10-03",

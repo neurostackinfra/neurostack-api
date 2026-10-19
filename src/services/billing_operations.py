@@ -40,12 +40,14 @@ from src.models.billing import (
 from src.observability.metrics import BILLING_OPERATION_RECEIPTS_TOTAL
 from src.repositories.billing import billing_advisory_key
 
-OperationScope = Literal["migration", "rollout", "topup_capability", "incident"]
+# The database CHECK (migration 028) still admits the retired ``migration``
+# scope; the code no longer issues or accepts it (Group 10 phase E2).
+OperationScope = Literal["rollout", "topup_capability", "incident"]
 OperatorRole = Literal["deployer", "approver", "reviewer"]
 
 OPERATOR_ROLES: Final[frozenset[str]] = frozenset({"deployer", "approver", "reviewer"})
 OPERATION_SCOPES: Final[frozenset[str]] = frozenset(
-    {"migration", "rollout", "topup_capability", "incident"}
+    {"rollout", "topup_capability", "incident"}
 )
 _SHA256_HEX: Final = frozenset("0123456789abcdef")
 
@@ -193,8 +195,8 @@ def signs_rollout_revision(*, scope: str, to_state: str) -> bool:
     signed for still exists and can never be queued across a state change.
     Everything else signs ``null``: a move to ``disabled`` (rollback or
     incident) only reduces exposure and deliberately keeps an older unspent
-    quorum usable, and migration/top-up operations do not spend a rollout
-    revision (they are fenced by their own state and ``topup_revision``).
+    quorum usable, and top-up operations do not spend a rollout revision
+    (they are fenced by ``topup_revision``).
     """
 
     return scope == "rollout" and to_state != "disabled"

@@ -345,7 +345,7 @@ path ou body) é um pedido de override, nunca uma autorização:
 | API key | próprio tenant | permitido | `403` `tenant_override_forbidden` |
 | JWT `clinic_admin` | próprio tenant | permitido | `403` `tenant_override_forbidden` |
 | JWT `builder` | tenant do token | permitido | permitido só para clínica cujo `builder_id` é o do token; senão `403` `tenant_override_forbidden` |
-| JWT `super_admin` | tenant do token | permitido | permitido (qualquer tenant, sem checar existência) |
+| JWT `super_admin` | tenant do token | permitido | permitido (qualquer tenant; a autorização não checa existência, e o upload de knowledge a checa depois, ver [Knowledge](#knowledge)) |
 | Outros papéis JWT (`investor`, desconhecidos) | `403` `caller_role_forbidden` | `403` `caller_role_forbidden` | `403` `caller_role_forbidden` |
 
 O corpo do `403` é `{"detail": {"code": "<código>"}}`. Sem credencial, ou com
@@ -439,7 +439,7 @@ override, nunca uma autorização:
 | API key | próprio tenant | permitido | `403` `tenant_override_forbidden` |
 | JWT `clinic_admin` | próprio tenant | permitido | `403` `tenant_override_forbidden` |
 | JWT `builder` | tenant do token | permitido | permitido só para clínica cujo `builder_id` é o do token; senão `403` `tenant_override_forbidden` |
-| JWT `super_admin` | tenant do token | permitido | permitido (qualquer tenant, sem checar existência) |
+| JWT `super_admin` | tenant do token | permitido | permitido (qualquer tenant; a autorização não checa existência, mas o upload checa em seguida e responde `404` `Tenant not found` se o tenant não tem registro) |
 | Outros papéis JWT (`investor`, desconhecidos) | `403` `caller_role_forbidden` | `403` `caller_role_forbidden` | `403` `caller_role_forbidden` |
 
 De onde vem o tenant em cada rota (os outros lugares são ignorados; o header
@@ -468,7 +468,17 @@ respostas de sucesso trazem `Cache-Control: no-store`.
 #### POST /v1/knowledge/documents
 
 Upload e indexação de documento. `tenant_id` no body é opcional (padrão:
-tenant do chamador) e segue a tabela acima.
+tenant do chamador) e segue a tabela acima. O `201` só é respondido depois do
+commit: o documento fica legível pelo mesmo tenant (e só por ele) nas rotas
+abaixo. Se o tenant autorizado não tem registro, a resposta é `404`
+`{"detail": "Tenant not found"}`, igual para todo chamador e sem ecoar o
+`tenant_id` (o `builder` continua recebendo antes o `403` da checagem de
+posse, então não descobre se uma clínica alheia existe). Uma falha antes do
+commit (por exemplo depois do insert, ao montar a resposta) não deixa
+documento gravado. Uma falha depois do commit (serialização da resposta,
+middleware externo, confirmação do `COMMIT` perdida na conexão) pode responder
+`500` com o documento já gravado: o cliente que recebe `500` deve listar ou
+buscar antes de reenviar, porque o upload não é idempotente.
 
 **Request:**
 
@@ -517,6 +527,12 @@ Lista os documentos do tenant autorizado.
 | `page_size` | int | 20 | Itens por página (max 100) |
 | `category` | string | null | Filtrar por categoria |
 
+`total` conta o mesmo conjunto filtrado da página (tenant autorizado e, quando
+informada, a `category`), não todos os documentos do tenant. `category` vazia
+(`?category=`) não filtra: página e `total` cobrem todos os documentos do
+tenant. Um tenant sem documentos, ou sem registro, responde `200` com
+`documents: []` e `total: 0`.
+
 #### GET /v1/knowledge/documents/{document_id}
 
 Retorna um documento (metadados, sem o conteúdo). `tenant_id` (query,
@@ -525,9 +541,12 @@ tenant responde `404`, igual a um inexistente.
 
 #### DELETE /v1/knowledge/documents/{document_id}
 
-Remove um documento (`204`). `tenant_id` (query, opcional, padrão: tenant do
+Remove um documento (`204`, após o commit). Se outra transação segura a linha,
+a remoção espera: se ela desfaz (rollback), a remoção responde `204`; se ela
+remove e confirma, `404`. `tenant_id` (query, opcional, padrão: tenant do
 chamador) define o escopo; documento de outro tenant responde `404`, igual a
-um inexistente.
+um inexistente. Remover de novo responde `404`, e de
+duas remoções simultâneas do mesmo documento exatamente uma responde `204`.
 
 ---
 
@@ -747,7 +766,7 @@ Mantém byte a byte todos os campos legados (`plan`, `active_clinics`,
   como data local sem conversão. Em JavaScript, `new Date("2026-11-11")` é
   meia-noite UTC e aparece como 10/11 em `America/Sao_Paulo`; separe
   ano/mês/dia (ou use `new Date(2026, 10, 11)`) em vez disso.
-- Assinaturas legadas (não ASAAS, por exemplo Abacate ainda não migrada) e
+- Assinaturas legadas (de um provedor que não é o ASAAS) e
   encerradas (`inactive`/`cancelled`) resultam em `subscription: null`,
   mesmo que os campos legados (`plan`, `subscription_status`) digam `active`.
   Ao encerrar, a data de período pago também deixa de ser informada (o objeto
