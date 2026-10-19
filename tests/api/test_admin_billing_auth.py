@@ -170,3 +170,153 @@ def test_billing_domain_rejection_codes_pass_through_unchanged() -> None:
         409,
         "billing_rollout_from_state_mismatch",
     )
+
+
+# ---------------------------------------------------------------------------
+# Group 10 E3: readiness request/response lose ``roster_revision`` (closed)
+# ---------------------------------------------------------------------------
+
+
+def _readiness_body() -> dict[str, object]:
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    return {
+        "scope": "rollout",
+        "operation_id": str(uuid4()),
+        "environment": "test",
+        "from_state": "canary_allowlist",
+        "to_state": "general",
+        "budget_digest": "a" * 64,
+        "deployment_digest": "b" * 64,
+        "expires_at": expires_at.isoformat(),
+        "receipt_kind": "readiness",
+        "rollout_revision": 3,
+        "status": "passed",
+        "content_sha256": "c" * 64,
+        "operation_receipt_id": str(uuid4()),
+        "provider_receipt_id": str(uuid4()),
+        "rule_digest": "d" * 64,
+        "bundle_digest": "e" * 64,
+        "app_digest": "b" * 64,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def test_readiness_request_and_response_are_closed_without_roster_revision() -> None:
+    from pydantic import ValidationError
+
+    from src.api.schemas.admin import (
+        BillingRolloutReadinessReceiptRequest,
+        BillingRolloutReadinessReceiptResponse,
+    )
+
+    for model in (
+        BillingRolloutReadinessReceiptRequest,
+        BillingRolloutReadinessReceiptResponse,
+    ):
+        assert "roster_revision" not in model.model_fields
+        assert model.model_config.get("extra") == "forbid"
+    body = BillingRolloutReadinessReceiptRequest.model_validate(_readiness_body())
+    response = BillingRolloutReadinessReceiptResponse(
+        **body.model_dump(), receipt_id=uuid4()
+    )
+    assert "roster_revision" not in response.model_dump()
+
+    for extra in ({"roster_revision": 0}, {"roster_revision": 7}, {"unknown": 1}):
+        with pytest.raises(ValidationError) as captured:
+            BillingRolloutReadinessReceiptRequest.model_validate(
+                {**_readiness_body(), **extra}
+            )
+        assert [(e["loc"], e["type"]) for e in captured.value.errors()] == [
+            ((next(iter(extra)),), "extra_forbidden")
+        ]
+
+
+async def test_readiness_route_refuses_roster_revision_and_never_forwards_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+    from typing import AsyncIterator
+
+    import httpx
+    from fastapi import FastAPI
+    from pydantic import SecretStr
+
+    from src.api.routes import admin as admin_route
+    from src.config.settings import settings
+    from src.repositories.database import get_db_session_dependency
+
+    calls: list[dict[str, object]] = []
+    receipt_id = uuid4()
+    actor = uuid4()
+
+    class _RecordingService:
+        def __init__(self, session: object, *, signing_key: bytes) -> None:
+            del session, signing_key
+
+        async def record_readiness_receipt(self, **kwargs: object) -> object:
+            calls.append(kwargs)
+            return SimpleNamespace(id=receipt_id)
+
+    class _Session:
+        async def commit(self) -> None:
+            return None
+
+        async def rollback(self) -> None:
+            return None
+
+    async def _session() -> AsyncIterator[object]:
+        yield _Session()
+
+    monkeypatch.setattr(
+        admin_route, "BillingRolloutOperationService", _RecordingService
+    )
+    monkeypatch.setattr(
+        settings, "billing_operation_receipt_signing_key", SecretStr("k" * 32)
+    )
+    app = FastAPI()
+    app.include_router(admin_route.router, prefix="/v1/admin")
+    app.dependency_overrides[require_super_admin_jwt] = lambda: TenantContext(
+        tenant_id=uuid4(),
+        user_id=actor,
+        role="super_admin",
+        authentication_mode="jwt",
+    )
+    app.dependency_overrides[get_db_session_dependency] = _session
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://admin.test"
+    ) as client:
+        for value in (0, 1):
+            refused = await client.post(
+                "/v1/admin/billing/rollout/receipts",
+                json={**_readiness_body(), "roster_revision": value},
+            )
+            assert refused.status_code == 422, refused.text
+            assert [
+                (error["loc"], error["type"]) for error in refused.json()["detail"]
+            ] == [(["body", "roster_revision"], "extra_forbidden")]
+        assert calls == []
+
+        accepted = await client.post(
+            "/v1/admin/billing/rollout/receipts", json=_readiness_body()
+        )
+    assert accepted.status_code == 201, accepted.text
+    assert "roster_revision" not in accepted.json()
+    assert accepted.json()["receipt_id"] == str(receipt_id)
+    assert len(calls) == 1
+    assert set(calls[0]) == {
+        "environment",
+        "receipt_kind",
+        "rollout_revision",
+        "status",
+        "content_sha256",
+        "material",
+        "operation_receipt_id",
+        "provider_receipt_id",
+        "rule_digest",
+        "bundle_digest",
+        "app_digest",
+        "observed_at",
+        "expires_at",
+        "recorder_user_id",
+    }
+    assert calls[0]["recorder_user_id"] == actor
