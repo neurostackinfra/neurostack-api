@@ -105,10 +105,8 @@ def _vps_files(tmp_path: Path) -> tuple[Path, Path, Path]:
         "ASAAS_API_KEY=test_asaas_api_key\n"
         "ASAAS_WEBHOOK_TOKEN=test_asaas_webhook_token\n"
         # Group 5 production requirements (``${VAR:?...}`` in the production
-        # Compose file): provider evidence key, receipt signing key, mounted
-        # rule/smoke/schema digests, runtime acknowledgement and receiver.
-        "ASAAS_PROVIDER_EVIDENCE_KEY_ID=test-provider-key\n"
-        "ASAAS_PROVIDER_EVIDENCE_PUBLIC_KEY=" + "b" * 64 + "\n"
+        # Compose file): receipt signing key, mounted rule/smoke/schema
+        # digests, runtime acknowledgement and receiver.
         "BILLING_OPERATION_RECEIPT_SIGNING_KEY=" + "k" * 32 + "\n"
         "BILLING_PROMETHEUS_RULES_DIGEST=" + "c" * 64 + "\n"
         "BILLING_OBSERVABILITY_SMOKE_DIGEST=" + "d" * 64 + "\n"

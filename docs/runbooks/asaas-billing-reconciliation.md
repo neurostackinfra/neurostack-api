@@ -95,6 +95,261 @@ binding precondition before a transport may be wired.
    above before you change anything. A mismatch is a consumer contract bug. Cap
    exhaustion needs the consumer to be healthy before any reviewed manual reset.
 
+## Card captures, funds receipts and payment drift
+
+`BillingMigrationReadbackBacklog` (`sum(neurostack_billing_readback_backlog) > 0`)
+also routes here: an exact-ID payment readback that does not converge.
+
+**Rule since 2026-10-18 (owner decision).** A card `PAYMENT_CONFIRMED`
+(capture) is the settlement: it creates the only settlement effect,
+`billing.fact.v1` revision, subscription cycle, activation and Transaction.
+The `PAYMENT_RECEIVED` that follows about 32 days later (funds available) is
+an inert confirmation: the delivery is `processed` and nothing else changes.
+Pix has no capture, so its `PAYMENT_RECEIVED` settles. `paid_at` is the
+capture day, written once: the first of `confirmedDate`, `clientPaymentDate`,
+`paymentDate` (ASAAS's "data de liquidação", the card funds day, comes last)
+that is not later than the São Paulo day of the earliest `PAYMENT_CONFIRMED`
+envelope for that payment (else of the event, or of the readback clock).
+Nothing is inferred from a timestamp: a capture without a usable date waits
+for a readback. No new metric, alert kind or label exists for any of this:
+every case below surfaces as the delivery status `readback_required` and the
+readback backlog, and the contradictory ones also raise `kind=drift`.
+
+Verified once in the ASAAS sandbox (2026-10-18, capture at 21:45 BRT, which
+was already 00:45 UTC of the next day): `dateCreated`, `confirmedDate` and
+`clientPaymentDate` carry the São Paulo date; `paymentDate` stays null while
+`CONFIRMED`; `creditDate`/`estimatedCreditDate` are the capture day + 32 in
+São Paulo time; refund entry timestamps are São Paulo wall-clock time without
+an offset.
+
+### A capture date later than its anchor day (bound dead end)
+
+If ASAAS ever returns a `confirmedDate`/`clientPaymentDate` later than the
+São Paulo day of the payment's earliest `PAYMENT_CONFIRMED` envelope, no date
+is usable: the payment stays `readback_required` (an event, or `kind=drift`
+on every read) and nothing is granted. Forcing more reads does not help,
+because every read uses the same anchor. Compare the panel's dates with the
+anchor:
+
+```sql
+SELECT min(provider_created_at) AT TIME ZONE 'America/Sao_Paulo' AS anchor_sp
+FROM billing_webhook_deliveries
+WHERE provider = 'asaas' AND resource_kind = 'payment'
+  AND resource_id = :payment_id AND event_name = 'PAYMENT_CONFIRMED';
+```
+
+No repair path exists in code today. Do not edit or delete that delivery,
+`paid_at` or any other billing row: the anchor is evidence, and moving it
+would admit any later date, including the funds day. The only reviewed hand
+edit, the forced-read `UPDATE` of one delivery's status below, does not help
+here. The operator path is:
+
+1. Record a reconciliation entry in the incident log: payment id, the
+   panel's dates, the anchor day, the decision, and two named people.
+2. If the charge should not stand, refund it in the ASAAS panel. The next
+   read shows `REFUNDED` with a `DONE` refund and converges as the
+   pre-settlement refund marker (no grant, no fact). For a canary payment,
+   see the canary note below.
+3. If the customer must keep the purchase, escalate to the owner: settling
+   such a payment needs a code change (an approved `paid_at` path does not
+   exist). Until then it stays open, ungranted and alerting.
+
+### A card receipt seen before its capture (accepted funds-day `paid_at`)
+
+**What happens.** The payment settles from the first settle-class evidence,
+and `paid_at` is the first date of the chain that exists. A card
+`PAYMENT_RECEIVED` that arrives first and carries only `paymentDate` (no
+`confirmedDate`, no `clientPaymentDate`) settles with the funds day as
+`paid_at`, roughly the capture day + 32. Everything anchored on `paid_at`
+then runs about 32 days later than if the capture had been seen first: a
+top-up's expiry (`paid_at` + 6 months) is about 32 days longer. The
+subscription cycle is not affected, because it starts at `dueDate`. A later
+`PAYMENT_CONFIRMED` is inert and never moves `paid_at`.
+
+**Why it is accepted.** Owner decision 2026-10-18: do not refuse it. The
+funds day is a date the provider sent, not an inferred one.
+
+**When it can happen.** The `PAYMENT_CONFIRMED` event was lost, or delayed
+until after the `PAYMENT_RECEIVED`, and that `RECEIVED` payload lacks
+`confirmedDate` and `clientPaymentDate`. Not observed so far: the sandbox
+never produced a card `RECEIVED`.
+
+**How to detect it.** Read-only. It lists settled card payments whose
+`paid_at` is more than 20 days after the São Paulo day of the earliest
+`PAYMENT_CONFIRMED` delivery (the case itself), and settled card payments
+with no `PAYMENT_CONFIRMED` delivery at all (candidates: compare `paid_at`
+with the capture day shown in the ASAAS panel):
+
+```sql
+SELECT p.payment_id, p.status, p.paid_at, c.capture_day
+FROM billing_payment_projections p
+JOIN billing_payment_effects e
+  ON e.projection_id = p.id AND e.effect_kind = 'settlement'
+JOIN transactions t ON t.billing_payment_effect_id = e.id
+LEFT JOIN LATERAL (
+  SELECT (min(d.provider_created_at) AT TIME ZONE 'America/Sao_Paulo')::date
+           AS capture_day
+  FROM billing_webhook_deliveries d
+  WHERE d.provider = p.provider AND d.resource_kind = 'payment'
+    AND d.resource_id = p.payment_id AND d.event_name = 'PAYMENT_CONFIRMED'
+) c ON true
+WHERE p.provider = 'asaas' AND p.settled_cents > 0
+  AND t.method = 'credit_card'
+  AND (c.capture_day IS NULL OR p.paid_at > c.capture_day + 20)
+ORDER BY p.paid_at;
+```
+
+**What to do.** Nothing in the database. `paid_at` is write-once. No billing
+row is edited by hand; the only reviewed exception is the forced-read
+`UPDATE` on one delivery below. If the shifted expiry matters, record a
+reconciliation entry in the incident log (payment id, panel capture day,
+`paid_at`, decision, two named people) and handle any credit adjustment
+through the credit system's own process.
+
+### Capture without a funds receipt after ~40 days
+
+Expected: none. A capture that is not refunded should reach `RECEIVED`
+about 32 days later.
+
+```sql
+SELECT p.payment_id, p.status, p.paid_at,
+       min(c.provider_created_at) AS captured_at
+FROM billing_payment_projections p
+JOIN billing_webhook_deliveries c
+  ON c.provider = p.provider AND c.resource_kind = 'payment'
+ AND c.resource_id = p.payment_id AND c.event_name = 'PAYMENT_CONFIRMED'
+WHERE p.provider = 'asaas' AND p.settled_cents > 0 AND p.reversed_cents = 0
+  AND NOT EXISTS (
+    SELECT 1 FROM billing_webhook_deliveries r
+    WHERE r.provider = p.provider AND r.resource_kind = 'payment'
+      AND r.resource_id = p.payment_id AND r.event_name = 'PAYMENT_RECEIVED')
+GROUP BY p.payment_id, p.status, p.paid_at
+HAVING min(c.provider_created_at) < now() - interval '40 days'
+ORDER BY captured_at;
+```
+
+For each row, read the payment in the ASAAS panel. `RECEIVED` there means
+the event was lost: nothing to repair, because the capture already settled.
+A chargeback or refund there that we never received is the real risk: get a
+readback for one of that payment's deliveries (see "Forcing one exact read"
+below). The capture's access and credits stay granted until that read
+reverses them. A different receivable plan (anticipation) only changes the
+timing, so record it and close the row.
+
+### A capture blocked by drift (intended fail closed)
+
+A `PAYMENT_CONFIRMED` whose `value` differs from the checkout snapshot
+(`billing_checkout_sessions.amount_cents`), or has no usable date, does not
+settle: `kind=drift` (for a value mismatch), the delivery is
+`readback_required`, and the builder gets no access or credits. The backlog
+sweep settles it only when the exact read reports the snapshot amount and a
+usable capture date. If ASAAS really charged a different amount, do not force
+anything: refund or cancel through the provider's own approval, and the read
+then converges.
+
+### A settled capture later reported unpaid (H-2)
+
+A newer `PAYMENT_REPROVED_BY_RISK_ANALYSIS`,
+`PAYMENT_CREDIT_CARD_CAPTURE_REFUSED` or `PAYMENT_OVERDUE` on settled money
+is `readback_required` with `kind=drift`. If the read still shows
+`PENDING`/`AWAITING_RISK_ANALYSIS`/`OVERDUE` (or a status outside the
+mapping), it drifts again on every sweep, because settled money never
+un-settles. Whether this alert fires depends on arrival order: the same
+refusal arriving before the capture is stale or ordinary and raises nothing,
+arriving after it raises `kind=drift`. The final money after the reads is
+the same either way. The named operator path:
+
+1. Find the payment from the delivery
+   (`billing_webhook_deliveries.resource_id`) and read it in the ASAAS panel.
+2. `CONFIRMED` or `RECEIVED` there: the next read converges. Nothing to do.
+3. The charge will not be honored: refund it at ASAAS (a manual provider
+   operation with its own approval). The read then shows `REFUNDED` with a
+   `DONE` refund and converges as a normal reversal: a new fact revision, the
+   cycle `reversed`, and `current_period_end` falls back.
+4. ASAAS keeps reporting an unpaid status for a charge that cannot be
+   refunded: escalate to ASAAS support and the owner. The grant and the alert
+   stay. No automated un-settle path exists. No billing row is edited by
+   hand; the only reviewed exception is the forced-read `UPDATE` on one
+   delivery below.
+
+Related cases need a read but are not drift. A newer settle-class event on
+a `chargeback_requested`/`chargeback_dispute`/`restoration_pending` row (a
+won dispute ends in `CONFIRMED`/`RECEIVED`, H-1) or on a
+`reversal_pending`/`partially_reversed`/`reversed` row (a capture or receipt
+after a refund, L-3). An older capture that arrives after a newer refusal
+(M2), or after the newer refund, chargeback or deletion event that created a
+`readback_required` row (L-2). The read relabels or settles them; no second
+settlement effect is ever created.
+
+**Canary payment refunded before any settlement.** The pre-settlement refund
+marker cannot be stored for a canary payment: the database refuses any canary
+projection row until the Plus subscription is active. The guard (M-2) stops
+only the event-driven first write: while one of the payment's refund or
+chargeback deliveries is open, a later `PAYMENT_CONFIRMED`/`PAYMENT_RECEIVED`
+event waits for a read instead of granting.
+
+- When every read shows the completed refund, those deliveries stay
+  `readback_required`, with `kind=drift` on every sweep. Nothing is granted
+  and the canary slot is not spent.
+- An exact read that shows the capture without a completed refund still
+  settles. A read of a `PAYMENT_REFUND_IN_PROGRESS` delivery taken while the
+  refund is still in progress settles too: the subscription becomes active,
+  Plus is granted, the slot is spent and a Transaction is recorded with
+  `event_type = PAYMENT_REFUND_IN_PROGRESS`. It stays that way until the read
+  of the `REFUNDED` delivery reverses it.
+
+This is expected. Do not close those deliveries by hand: an open one is what
+stops a stale capture from granting. Record the case and close the canary
+run through [`asaas-rollback.md`](./asaas-rollback.md).
+
+### Forcing one exact read
+
+The backlog sweep reads only deliveries in `readback_required`/`unknown`. To
+re-read a payment whose deliveries are all `processed`, use reviewed manual
+SQL, checked by a second person, that sets **one** of its deliveries back to
+`readback_required`, then let the sweep run:
+
+```sql
+UPDATE billing_webhook_deliveries SET status = 'readback_required'
+WHERE id = :delivery_id AND provider = 'asaas' AND resource_kind = 'payment'
+  AND status = 'processed';
+```
+
+Change nothing else. Projections, effects, cycles, the outbox, Transactions
+and `paid_at` are written only by the services.
+
+### Preflight gate for this change
+
+Run this before the image with this rule serves webhooks. Expected: `0`.
+Nothing was live, and no production ASAAS billing data existed on
+2026-10-17.
+
+```sql
+SELECT count(DISTINCT p.payment_id)
+FROM billing_payment_projections p
+JOIN billing_webhook_deliveries d
+  ON d.provider = p.provider AND d.resource_kind = 'payment'
+ AND d.resource_id = p.payment_id
+WHERE p.provider = 'asaas' AND p.status = 'pending'
+  AND d.event_name = 'PAYMENT_CONFIRMED' AND d.status = 'processed';
+```
+
+Each counted payment is a capture the previous code accepted without
+granting. If the count is not zero, force one exact read per payment (above)
+after the deploy. A `CONFIRMED` read then settles it once, with the capture
+day as `paid_at`.
+
+### Rollback is a forward fix
+
+An image from before this change treats a capture's later `RECEIVED` (funds
+day `paymentDate` differs from the stored `paid_at`) as a date mismatch. That
+means `readback_required`, `kind=drift` and a growing readback backlog about
+32 days after every capture. The old image also stops granting new captures.
+Its rollback is financially safe, because no effect is undone or doubled, but
+it splits semantics. Fix forward instead. If an application rollback is
+unavoidable (see `asaas-rollback.md`), expect these drift alerts on captured
+payments. Do not clear them by editing `paid_at`.
+
 ## Known, accepted limits
 
 - Alert de-duplication is check-then-insert, with no unique constraint. It
@@ -104,3 +359,7 @@ binding precondition before a transport may be wired.
   is not counted. It is re-presented without limit, bypassing the backoff and
   the cap, until the attempt is leased before presentation (see
   `PRESENTATION_PRECONDITIONS_OPEN`).
+- Label only, money is right: a fully reversed payment whose read reports
+  `CONFIRMED`/`RECEIVED` with the full `DONE` refund (an unrealistic provider
+  state, which would say `REFUNDED`) is relabelled `partially_reversed`. The
+  cumulative cents stay fully reversed, and no effect or fact changes.

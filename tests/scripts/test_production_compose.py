@@ -100,8 +100,13 @@ def test_compose_uses_only_approved_app_digest_and_named_volumes() -> None:
         in api_env["BILLING_OBSERVABILITY_SMOKE_TOKEN"]
     )
     assert "BILLING_ALERT_RECEIVER_URL:?" in api_env["BILLING_ALERT_RECEIVER_URL"]
-    # ASAAS is the only gateway: the retired legacy secrets are not required.
+    # ASAAS is the only gateway: the retired legacy secrets are not required,
+    # nor the provider-evidence key of the removed migration saga.
     assert not [name for name in api_env if name.startswith("ABACATEPAY_")]
+    assert not [name for name in api_env if name.startswith("ASAAS_PROVIDER_EVIDENCE_")]
+    assert not [
+        name for name in _synthetic_env() if name.startswith("ASAAS_PROVIDER_EVIDENCE_")
+    ]
     assert "command" not in services["api"]
     assert "entrypoint" not in services["api"]
     assert services["postgres"]["command"] == [

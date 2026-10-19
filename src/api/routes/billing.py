@@ -390,8 +390,8 @@ async def create_checkout(
     except CheckoutInputRejected as exc:
         raise HTTPException(status_code=422, detail=exc.code) from exc
     except CheckoutNotEligible as exc:
-        # One fixed 409 for every subscription eligibility blocker (legacy or
-        # non-terminal ASAAS subscription, migration, other live plan attempt).
+        # One fixed 409 for every subscription eligibility blocker (unresolved,
+        # legacy or non-terminal ASAAS subscription, other live plan attempt).
         raise HTTPException(status_code=409, detail=exc.code) from exc
     except CheckoutCouponRejected as exc:
         # One fixed 400 for absent/inactive/expired/exhausted (no enumeration),

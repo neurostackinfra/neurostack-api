@@ -69,6 +69,11 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
         """
         Delete a document by ID only if it belongs to ``tenant_id``.
 
+        After the scoped lookup the row is locked (``FOR UPDATE``) and checked
+        again, so concurrent deletes of one document serialise: the one that
+        waited finds the row gone and returns False instead of reporting a
+        delete that matched nothing. The caller commits.
+
         Args:
             document_id: Document ID
             tenant_id: Authorized tenant ID
@@ -78,6 +83,17 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
         """
         instance = await self.get_by_id_and_tenant(document_id, tenant_id)
         if instance is None:
+            return False
+
+        locked = await self.session.execute(
+            select(KnowledgeDocument.id)
+            .where(
+                KnowledgeDocument.id == document_id,
+                KnowledgeDocument.tenant_id == tenant_id,
+            )
+            .with_for_update()
+        )
+        if locked.scalar_one_or_none() is None:
             return False
 
         await self.session.delete(instance)
@@ -230,6 +246,42 @@ class KnowledgeDocumentRepository(BaseRepository[KnowledgeDocument]):
             select(func.count())
             .select_from(KnowledgeDocument)
             .where(KnowledgeDocument.tenant_id == tenant_id)
+        )
+        if indexed_only:
+            stmt = stmt.where(KnowledgeDocument.is_indexed.is_(True))
+
+        result = await self.session.execute(stmt)
+        return result.scalar() or 0
+
+    async def count_by_category(
+        self,
+        tenant_id: UUID,
+        category: str,
+        indexed_only: bool = False,
+    ) -> int:
+        """
+        Count a tenant's documents in ``category``.
+
+        Uses the same filter as ``find_by_category``, so it is the total of the
+        set that method pages through.
+
+        Args:
+            tenant_id: Tenant ID
+            category: Category name
+            indexed_only: Only count indexed documents
+
+        Returns:
+            Number of documents
+        """
+        stmt = (
+            select(func.count())
+            .select_from(KnowledgeDocument)
+            .where(
+                and_(
+                    KnowledgeDocument.tenant_id == tenant_id,
+                    KnowledgeDocument.document_metadata["category"].astext == category,
+                )
+            )
         )
         if indexed_only:
             stmt = stmt.where(KnowledgeDocument.is_indexed.is_(True))

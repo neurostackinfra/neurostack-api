@@ -904,17 +904,12 @@ _asaas_waived_path_audit() {
 #
 # Known legacy references, removed by later phases of asaas-payment-gateway
 # Group 10 and not by this gate: tests/integration/test_asaas_billing_postgres.py
-# still carries the legacy migration cases. (docker-compose.production.yml no
-# longer requires ABACATEPAY_WEBHOOK_SECRET since Group 10 phase 1.)
-#
-# Recorded scan exception (owner decision 2026-10-18, wish
-# asaas-payment-gateway): `_asaas_scan_waivers` waives a closed list of exact
-# synthetic lines in scripts/asaas_sandbox_card_capture.py and
-# tests/scripts/test_asaas_sandbox_card_capture.py, for named rules only, and
-# audits both files whole on every run (card numbers other than the public
-# test card, copied waived lines, changed card constants). Every waived hit is
-# printed and counted, and stale entries are warned about; see the table for
-# what is waived and how to remove it.
+# and tests/integration/test_asaas_subscription_triggers_postgres.py still
+# exercise the legacy migration tables and roster triggers with raw SQL until
+# those database objects are dropped. The migration saga service, its admin
+# routes and operator client were removed in Group 10 phase E2;
+# docker-compose.production.yml no longer requires ABACATEPAY_WEBHOOK_SECRET
+# (phase 1) nor ASAAS_PROVIDER_EVIDENCE_* (phase E2).
 asaas_release_candidate_gate() (
     set -euo pipefail
     local root="$_WISH_GATES_ROOT"
