@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -76,7 +77,11 @@ from src.api.middleware.auth import TenantContext, require_super_admin_jwt
 from src.api.routes import admin as admin_route
 from src.config.settings import settings
 from src.models.billing import BillingOperationReceipt, BillingRolloutReadinessReceipt
-from src.repositories.billing import BillingRepository
+from src.repositories.billing import (
+    BillingRepository,
+    billing_advisory_key,
+    billing_roster_advisory_key,
+)
 from src.repositories.database import get_db_session_dependency
 from src.services.billing_operations import (
     BillingOperationAuthority,
@@ -199,13 +204,11 @@ def _content_digest(
     rollout_revision: int,
     deployer_receipt_id: str,
     reviewer_receipt_id: str,
-    roster_revision: int = 0,
 ) -> str:
     return _readiness_content_digest(
         environment=material["environment"],
         receipt_kind=kind,
         rollout_revision=rollout_revision,
-        roster_revision=roster_revision,
         operation_id=UUID(material["operation_id"]),
         operation_receipt_id=UUID(deployer_receipt_id),
         provider_receipt_id=UUID(reviewer_receipt_id),
@@ -213,6 +216,56 @@ def _content_digest(
         bundle_digest=billing_fact_bundle_digest(),
         app_digest=material["deployment_digest"],
     )
+
+
+def _documented_payload(
+    material: dict[str, Any],
+    *,
+    kind: str,
+    rollout_revision: int,
+    deployer_receipt_id: str,
+    reviewer_receipt_id: str,
+) -> dict[str, Any]:
+    """The documented field list (``docs/runbooks/asaas-deployment.md``)."""
+
+    return {
+        "app_digest": material["deployment_digest"],
+        "bundle_digest": billing_fact_bundle_digest(),
+        "environment": material["environment"],
+        "operation_id": str(UUID(material["operation_id"])),
+        "operation_receipt_id": str(UUID(deployer_receipt_id)),
+        "provider_receipt_id": str(UUID(reviewer_receipt_id)),
+        "receipt_kind": kind,
+        "rollout_revision": rollout_revision,
+        "rule_digest": _rule_digest(),
+    }
+
+
+def _sha256_canonical(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+
+
+def _legacy_content_digest(
+    material: dict[str, Any],
+    *,
+    kind: str,
+    rollout_revision: int,
+    deployer_receipt_id: str,
+    reviewer_receipt_id: str,
+    roster_revision: int,
+) -> str:
+    """The pre-E3 digest: the documented fields plus ``roster_revision``."""
+
+    payload = _documented_payload(
+        material,
+        kind=kind,
+        rollout_revision=rollout_revision,
+        deployer_receipt_id=deployer_receipt_id,
+        reviewer_receipt_id=reviewer_receipt_id,
+    )
+    return _sha256_canonical({**payload, "roster_revision": roster_revision})
 
 
 @dataclass
@@ -324,8 +377,9 @@ class _ControlPlane:
         rollout_revision: int,
         deployer_receipt_id: str,
         reviewer_receipt_id: str,
-        roster_revision: int = 0,
         principal: str | None = None,
+        content_sha256: str | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> httpx.Response:
         """Record one readiness row; by default as the duty that owns *kind*."""
 
@@ -335,15 +389,14 @@ class _ControlPlane:
             **material,
             "receipt_kind": kind,
             "rollout_revision": rollout_revision,
-            "roster_revision": roster_revision,
             "status": "passed",
-            "content_sha256": _content_digest(
+            "content_sha256": content_sha256
+            or _content_digest(
                 material,
                 kind=kind,
                 rollout_revision=rollout_revision,
                 deployer_receipt_id=deployer_receipt_id,
                 reviewer_receipt_id=reviewer_receipt_id,
-                roster_revision=roster_revision,
             ),
             "operation_receipt_id": deployer_receipt_id,
             "provider_receipt_id": reviewer_receipt_id,
@@ -351,6 +404,7 @@ class _ControlPlane:
             "bundle_digest": billing_fact_bundle_digest(),
             "app_digest": material["deployment_digest"],
             "observed_at": datetime.now(timezone.utc).isoformat(),
+            **(extra or {}),
         }
         return await self.post(principal or _RECORDER[kind], "/rollout/receipts", body)
 
@@ -1217,7 +1271,6 @@ async def test_d1_receipt_expiry_bounds_readiness_service_clock(
                 environment=_ENVIRONMENT,
                 receipt_kind="readiness",
                 rollout_revision=revision,
-                roster_revision=0,
                 status="passed",
                 content_sha256=_content_digest(
                     material,
@@ -1762,29 +1815,47 @@ async def _insert_readiness_past_the_service(
     quorum: dict[str, str],
     *,
     rollout_revision: int,
+    stored_roster_revision: int = 0,
+    legacy_roster_revision: int | None = None,
 ) -> None:
-    """Write all four readiness rows directly (no service checks)."""
+    """Write all four readiness rows directly (no service checks).
+
+    *stored_roster_revision* fills the legacy column (kept until migration
+    036); *legacy_roster_revision* computes the pre-E3 digest instead.
+    """
 
     async with plane.sessions() as session:
         async with session.begin():
             for kind in _KINDS:
+                content = (
+                    _content_digest(
+                        material,
+                        kind=kind,
+                        rollout_revision=rollout_revision,
+                        deployer_receipt_id=quorum["deployer"],
+                        reviewer_receipt_id=quorum["reviewer"],
+                    )
+                    if legacy_roster_revision is None
+                    else _legacy_content_digest(
+                        material,
+                        kind=kind,
+                        rollout_revision=rollout_revision,
+                        deployer_receipt_id=quorum["deployer"],
+                        reviewer_receipt_id=quorum["reviewer"],
+                        roster_revision=legacy_roster_revision,
+                    )
+                )
                 session.add(
                     BillingRolloutReadinessReceipt(
                         environment=material["environment"],
                         receipt_kind=kind,
                         rollout_revision=rollout_revision,
                         status="passed",
-                        content_sha256=_content_digest(
-                            material,
-                            kind=kind,
-                            rollout_revision=rollout_revision,
-                            deployer_receipt_id=quorum["deployer"],
-                            reviewer_receipt_id=quorum["reviewer"],
-                        ),
+                        content_sha256=content,
                         operation_id=UUID(material["operation_id"]),
                         operation_receipt_id=UUID(quorum["deployer"]),
                         provider_receipt_id=UUID(quorum["reviewer"]),
-                        roster_revision=0,
+                        roster_revision=stored_roster_revision,
                         rule_digest=_rule_digest(),
                         bundle_digest=billing_fact_bundle_digest(),
                         app_digest=material["deployment_digest"],
@@ -2298,7 +2369,6 @@ async def test_characterization_expired_readiness_strands_the_revision(
                 environment=_ENVIRONMENT,
                 receipt_kind="readiness",
                 rollout_revision=revision,
-                roster_revision=0,
                 status="passed",
                 content_sha256=_content_digest(
                     second,
@@ -2359,3 +2429,587 @@ async def test_l5_readiness_conflicts_do_not_cross_environments(
     response = await plane.transition(staging, expected_revision=staging_revision)
     assert response.status_code == 200, response.text
     assert response.json()["state"] == "general"
+
+
+# --------------------------------------------------------------------------
+# E3 (Group 10): readiness and ``general`` no longer bind the legacy roster
+# --------------------------------------------------------------------------
+
+_ROSTER_KEY = billing_roster_advisory_key()
+_HELD_ADVISORY = (
+    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted "
+    "AND pid = pg_backend_pid() AND objsubid = 1 "
+    "AND classid::bigint = ((CAST(:key AS bigint) >> 32) & 4294967295) "
+    "AND objid::bigint = (CAST(:key AS bigint) & 4294967295)"
+)
+
+
+async def _advance_roster_revision(plane: _ControlPlane) -> int:
+    """Move the global roster revision 0 -> 1 (the one step the database
+    allows outside the saga), so readiness bound to the roster would differ."""
+
+    async with plane.sessions() as session:
+        async with session.begin():
+            result = await session.execute(
+                text(
+                    "UPDATE billing_roster_control SET billing_roster_revision = 1 "
+                    "WHERE singleton = true AND billing_roster_revision = 0"
+                )
+            )
+            assert result.rowcount == 1
+    return int(
+        await plane.scalar("SELECT billing_roster_revision FROM billing_roster_control")
+    )
+
+
+async def _held_advisory(session: AsyncSession, key: int) -> int:
+    """Advisory locks on *key* that *session*'s own backend holds now."""
+
+    return int(await session.scalar(text(_HELD_ADVISORY), {"key": key}))
+
+
+def _signed_key(high: int, low: int) -> int:
+    """The bigint advisory key pg_locks splits into ``classid``/``objid``."""
+
+    key = (high << 32) | low
+    return key - 2**64 if key >= 2**63 else key
+
+
+async def _wait_until_waiting(
+    plane: _ControlPlane, pid: int, task: asyncio.Task[Any]
+) -> list[tuple[str, int | None]]:
+    """Wait until backend *pid* blocks; return its ungranted locks as
+    ``(locktype, advisory key or None)``."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 20
+    while True:
+        async with plane.sessions() as probe:
+            rows = (
+                await probe.execute(
+                    text(
+                        "SELECT locktype, classid::bigint AS high, "
+                        "objid::bigint AS low, objsubid "
+                        "FROM pg_locks WHERE pid = :pid AND NOT granted"
+                    ),
+                    {"pid": pid},
+                )
+            ).all()
+        if rows:
+            return [
+                (
+                    row.locktype,
+                    (
+                        _signed_key(int(row.high), int(row.low))
+                        if row.locktype == "advisory" and row.objsubid == 1
+                        else None
+                    ),
+                )
+                for row in rows
+            ]
+        if task.done():
+            task.result()
+            raise AssertionError("finished without waiting on the rollout lock")
+        assert loop.time() < deadline, "never waited on the held rollout lock"
+        await asyncio.sleep(0.05)
+
+
+async def _assert_lockable(
+    plane: _ControlPlane, sql: str, expected: int, **params: Any
+) -> None:
+    """Nobody holds a row lock on *sql*'s rows (``NOWAIT`` would raise)."""
+
+    async with plane.sessions() as probe:
+        rows = (await probe.execute(text(f"{sql} FOR UPDATE NOWAIT"), params)).all()
+        assert len(rows) == expected
+        await probe.rollback()
+
+
+async def _assert_roster_fence_free(plane: _ControlPlane) -> None:
+    """Neither the roster advisory key nor the roster row is held."""
+
+    async with plane.sessions() as probe:
+        assert (
+            await probe.scalar(
+                text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": _ROSTER_KEY}
+            )
+            is True
+        )
+        rows = (
+            await probe.execute(
+                text("SELECT singleton FROM billing_roster_control FOR UPDATE NOWAIT")
+            )
+        ).all()
+        assert len(rows) == 1
+        await probe.rollback()
+
+
+async def test_e3_readiness_request_with_roster_revision_is_422_before_anything(
+    plane: _ControlPlane,
+) -> None:
+    revision = await _open_canary(plane)
+    material = _material(from_state="canary_allowlist", to_state="general")
+    quorum = await plane.quorum(material)
+
+    for value in (0, 1):
+        response = await plane.readiness(
+            material,
+            kind="readiness",
+            rollout_revision=revision,
+            deployer_receipt_id=quorum["deployer"],
+            reviewer_receipt_id=quorum["reviewer"],
+            extra={"roster_revision": value},
+        )
+        assert response.status_code == 422, response.text
+        assert [
+            (error["loc"], error["type"]) for error in response.json()["detail"]
+        ] == [(["body", "roster_revision"], "extra_forbidden")]
+    assert await plane.readiness_rows(revision) == 0
+
+    response = await plane.readiness(
+        material,
+        kind="readiness",
+        rollout_revision=revision,
+        deployer_receipt_id=quorum["deployer"],
+        reviewer_receipt_id=quorum["reviewer"],
+    )
+    assert response.status_code == 201, response.text
+    assert "roster_revision" not in response.json()
+    assert await plane.readiness_rows(revision) == 1
+
+
+async def test_e3_readiness_ignores_the_roster_stores_zero_and_promotes(
+    plane: _ControlPlane,
+) -> None:
+    """The global roster revision moved (1): readiness neither checks nor
+    copies it; the legacy column holds the constant 0 and the stored digest
+    is the documented one, re-derived here from the field list."""
+
+    assert await _advance_roster_revision(plane) == 1
+    revision = await _open_canary(plane)
+    material = _material(from_state="canary_allowlist", to_state="general")
+    quorum = await plane.quorum(material)
+    await plane.record_kinds(material, quorum, rollout_revision=revision)
+
+    async with plane.sessions() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(BillingRolloutReadinessReceipt).where(
+                        BillingRolloutReadinessReceipt.environment == _ENVIRONMENT,
+                        BillingRolloutReadinessReceipt.rollout_revision == revision,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert sorted(row.receipt_kind for row in rows) == sorted(_KINDS)
+    assert {row.roster_revision for row in rows} == {0}
+    for row in rows:
+        assert row.content_sha256 == _sha256_canonical(
+            _documented_payload(
+                material,
+                kind=row.receipt_kind,
+                rollout_revision=revision,
+                deployer_receipt_id=quorum["deployer"],
+                reviewer_receipt_id=quorum["reviewer"],
+            )
+        )
+
+    # Replaying any recorded row is still refused and changes nothing.
+    for kind in _KINDS:
+        _assert_rejected(
+            await plane.readiness(
+                material,
+                kind=kind,
+                rollout_revision=revision,
+                deployer_receipt_id=quorum["deployer"],
+                reviewer_receipt_id=quorum["reviewer"],
+            ),
+            "billing_rollout_readiness_duplicate",
+        )
+    assert await plane.readiness_rows(revision) == 4
+
+    response = await plane.transition(material, expected_revision=revision)
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "general"
+    assert await plane.applied(material) == 3
+    assert (
+        await plane.scalar("SELECT billing_roster_revision FROM billing_roster_control")
+        == 1
+    )
+
+
+async def test_e3_a_digest_that_hashes_roster_revision_never_verifies(
+    plane: _ControlPlane,
+) -> None:
+    """Receipts issued before E3 hashed ``roster_revision``; none verifies."""
+
+    revision = await _open_canary(plane)
+    material = _material(from_state="canary_allowlist", to_state="general")
+    quorum = await plane.quorum(material)
+
+    for roster_revision in (0, 1):
+        _assert_rejected(
+            await plane.readiness(
+                material,
+                kind="readiness",
+                rollout_revision=revision,
+                deployer_receipt_id=quorum["deployer"],
+                reviewer_receipt_id=quorum["reviewer"],
+                content_sha256=_legacy_content_digest(
+                    material,
+                    kind="readiness",
+                    rollout_revision=revision,
+                    deployer_receipt_id=quorum["deployer"],
+                    reviewer_receipt_id=quorum["reviewer"],
+                    roster_revision=roster_revision,
+                ),
+            ),
+            "billing_rollout_readiness_digest_invalid",
+        )
+    assert await plane.readiness_rows(revision) == 0
+
+    # A full pre-E3 set, stored as the old code stored it (column 0, legacy
+    # digest), is refused by the transition before anything is spent.
+    await _insert_readiness_past_the_service(
+        plane, material, quorum, rollout_revision=revision, legacy_roster_revision=0
+    )
+    _assert_rejected(
+        await plane.transition(material, expected_revision=revision),
+        "billing_rollout_readiness_unbound",
+    )
+    assert await plane.applied(material) == 0
+    assert (await plane.readback())["state"] == "canary_allowlist"
+
+    # The revision cannot be completed again: every kind is taken by that
+    # pair (unique environment, kind, revision; one pair per revision).
+    _assert_rejected(
+        await plane.readiness(
+            material,
+            kind="readiness",
+            rollout_revision=revision,
+            deployer_receipt_id=quorum["deployer"],
+            reviewer_receipt_id=quorum["reviewer"],
+        ),
+        "billing_rollout_readiness_duplicate",
+    )
+    assert await plane.readiness_rows(revision) == 4
+
+    # The recovery the runbook documents: disable, re-open the canary (a new
+    # revision), then a fresh general quorum and all four kinds again.
+    rollback = _material(from_state="canary_allowlist", to_state="disabled")
+    await plane.quorum(rollback)
+    response = await plane.transition(rollback, expected_revision=revision)
+    assert response.status_code == 200, response.text
+    builder_id = await _canary_builder(plane)
+    reopen = _material(
+        from_state="disabled", to_state="canary_allowlist", canary_builder_id=builder_id
+    )
+    await plane.quorum(reopen)
+    response = await plane.transition(
+        reopen, expected_revision=revision + 1, canary_builder_id=builder_id
+    )
+    assert response.status_code == 200, response.text
+    assert await _promote_general(plane, revision + 2) == revision + 3
+    assert await plane.applied(material) == 0
+
+
+async def test_e3_a_stored_roster_revision_is_inert_until_migration_036(
+    plane: _ControlPlane,
+) -> None:
+    """Decided behaviour: the column is not evidence.  A row whose stored
+    ``roster_revision`` is non-zero (only writable past the service) binds
+    exactly like one holding 0, because the transition neither hashes nor
+    compares it; the column and its CHECK (``>= 0``) stay until 036."""
+
+    revision = await _open_canary(plane)
+    material = _material(from_state="canary_allowlist", to_state="general")
+    quorum = await plane.quorum(material)
+
+    # Intentional server-log ERROR: ... ck_billing_rollout_readiness_roster_revision.
+    async with plane.sessions() as session:
+        session.add(
+            BillingRolloutReadinessReceipt(
+                environment=_ENVIRONMENT,
+                receipt_kind="readiness",
+                rollout_revision=revision,
+                status="passed",
+                content_sha256=_content_digest(
+                    material,
+                    kind="readiness",
+                    rollout_revision=revision,
+                    deployer_receipt_id=quorum["deployer"],
+                    reviewer_receipt_id=quorum["reviewer"],
+                ),
+                operation_id=UUID(material["operation_id"]),
+                operation_receipt_id=UUID(quorum["deployer"]),
+                provider_receipt_id=UUID(quorum["reviewer"]),
+                roster_revision=-1,
+                rule_digest=_rule_digest(),
+                bundle_digest=billing_fact_bundle_digest(),
+                app_digest=material["deployment_digest"],
+                observed_at=datetime.now(timezone.utc),
+                expires_at=_operation(material).expires_at,
+            )
+        )
+        with pytest.raises(
+            IntegrityError, match="ck_billing_rollout_readiness_roster_revision"
+        ):
+            await session.flush()
+        await session.rollback()
+
+    await _insert_readiness_past_the_service(
+        plane, material, quorum, rollout_revision=revision, stored_roster_revision=7
+    )
+    response = await plane.transition(material, expected_revision=revision)
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "general"
+    assert await plane.applied(material) == 3
+
+
+async def test_e3_readiness_locks_rollout_first_and_never_the_roster_fence(
+    plane: _ControlPlane,
+) -> None:
+    """Readiness takes ``lock_rollout_control`` before anything else and the
+    roster fence never.  A holder in the webhook's order (rollout control,
+    then the roster fence) completes while readiness waits behind it; the
+    old order (roster fence, then rollout) deadlocked against it."""
+
+    revision = await _open_canary(plane)
+    material = _material(from_state="canary_allowlist", to_state="general")
+    quorum = await plane.quorum(material)
+    await plane.record_kinds(
+        material, quorum, rollout_revision=revision, kinds=_KINDS[:3]
+    )
+    operation = _operation(material)
+
+    async with plane.sessions() as holder, plane.sessions() as worker:
+        await holder.execute(text("SET LOCAL lock_timeout = '10s'"))
+        await BillingRepository(holder).lock_rollout_control(environment=_ENVIRONMENT)
+        pid = int(await worker.scalar(text("SELECT pg_backend_pid()")))
+        service = BillingRolloutOperationService(
+            worker, signing_key=_SIGNING_KEY.encode()
+        )
+        task = asyncio.create_task(
+            service.record_readiness_receipt(
+                environment=_ENVIRONMENT,
+                receipt_kind="smoke",
+                rollout_revision=revision,
+                status="passed",
+                content_sha256=_content_digest(
+                    material,
+                    kind="smoke",
+                    rollout_revision=revision,
+                    deployer_receipt_id=quorum["deployer"],
+                    reviewer_receipt_id=quorum["reviewer"],
+                ),
+                material=operation,
+                operation_receipt_id=UUID(quorum["deployer"]),
+                provider_receipt_id=UUID(quorum["reviewer"]),
+                rule_digest=_rule_digest(),
+                bundle_digest=billing_fact_bundle_digest(),
+                app_digest=material["deployment_digest"],
+                observed_at=datetime.now(timezone.utc),
+                expires_at=operation.expires_at,
+                recorder_user_id=plane.actor("reviewer"),
+            )
+        )
+        try:
+            # It waits on the per-environment advisory key, the first step of
+            # ``lock_rollout_control``: not even the control row came first.
+            assert await _wait_until_waiting(plane, pid, task) == [
+                ("advisory", billing_advisory_key(_ENVIRONMENT))
+            ]
+            # Waiting on the rollout lock, it holds nothing it locks later.
+            await _assert_lockable(
+                plane,
+                "SELECT id FROM billing_operation_receipts WHERE operation_id = :op",
+                3,
+                op=material["operation_id"],
+            )
+            await _assert_roster_fence_free(plane)
+            assert await BillingRepository(holder).lock_billing_roster() == 0
+        finally:
+            await holder.rollback()
+            (outcome,) = await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True), 30
+            )
+        if isinstance(outcome, BaseException):
+            raise outcome
+        assert outcome.roster_revision == 0
+        assert await _held_advisory(worker, billing_advisory_key(_ENVIRONMENT)) == 1
+        assert await _held_advisory(worker, _ROSTER_KEY) == 0
+        await _assert_roster_fence_free(plane)
+        await worker.commit()
+
+    assert await plane.readiness_rows(revision) == 4
+    response = await plane.transition(material, expected_revision=revision)
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "general"
+
+
+async def test_e3_general_locks_rollout_first_and_never_the_roster_fence(
+    plane: _ControlPlane,
+) -> None:
+    """Lock order of ``general``: rollout control (advisory + row), then the
+    readiness rows, then the quorum receipts; the roster fence never.  A
+    holder in the webhook's order completes while ``general`` waits; the old
+    order (roster fence, readiness rows, rollout) deadlocked against it."""
+
+    revision = await _open_canary(plane)
+    material = _material(from_state="canary_allowlist", to_state="general")
+    quorum = await plane.quorum(material)
+    await plane.record_kinds(material, quorum, rollout_revision=revision)
+    operation = _operation(material)
+
+    async with plane.sessions() as holder, plane.sessions() as worker:
+        await holder.execute(text("SET LOCAL lock_timeout = '10s'"))
+        await BillingRepository(holder).lock_rollout_control(environment=_ENVIRONMENT)
+        pid = int(await worker.scalar(text("SELECT pg_backend_pid()")))
+        service = BillingRolloutOperationService(
+            worker, signing_key=_SIGNING_KEY.encode()
+        )
+        task = asyncio.create_task(
+            service.transition(expected_revision=revision, material=operation)
+        )
+        try:
+            # The advisory key first, as the webhook takes it: a control-row
+            # lock taken before it deadlocks against a webhook that holds the
+            # advisory key and then asks for the row.
+            assert await _wait_until_waiting(plane, pid, task) == [
+                ("advisory", billing_advisory_key(_ENVIRONMENT))
+            ]
+            await _assert_lockable(
+                plane,
+                "SELECT id FROM billing_rollout_readiness_receipts "
+                "WHERE environment = :env AND rollout_revision = :rev",
+                4,
+                env=_ENVIRONMENT,
+                rev=revision,
+            )
+            await _assert_lockable(
+                plane,
+                "SELECT id FROM billing_operation_receipts WHERE operation_id = :op",
+                3,
+                op=material["operation_id"],
+            )
+            await _assert_roster_fence_free(plane)
+            assert await BillingRepository(holder).lock_billing_roster() == 0
+        finally:
+            await holder.rollback()
+            (outcome,) = await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True), 30
+            )
+        if isinstance(outcome, BaseException):
+            raise outcome
+        assert outcome.state == "general"
+        assert await _held_advisory(worker, billing_advisory_key(_ENVIRONMENT)) == 1
+        assert await _held_advisory(worker, _ROSTER_KEY) == 0
+        await _assert_roster_fence_free(plane)
+        await worker.commit()
+
+    assert (await plane.readback())["state"] == "general"
+    assert await plane.applied(material) == 3
+
+
+async def test_e3_readiness_without_a_control_row_keeps_its_typed_refusal(
+    plane: _ControlPlane,
+) -> None:
+    """Readiness now locks through ``lock_rollout_control``, which raises
+    ``BillingStateUnavailable`` for a missing row; the route keeps the typed
+    409 readiness answered before E3, never a 500.  (Row deleted past the
+    history trigger.)"""
+
+    async with plane.sessions() as session:
+        async with session.begin():
+            await session.execute(text("SET LOCAL session_replication_role = replica"))
+            result = await session.execute(
+                text("DELETE FROM billing_rollout_control WHERE environment = 'test'")
+            )
+            assert result.rowcount == 1
+    material = _material(
+        from_state="canary_allowlist", to_state="general", environment="test"
+    )
+    _assert_rejected(
+        await plane.readiness(
+            material,
+            kind="readiness",
+            rollout_revision=0,
+            deployer_receipt_id=str(uuid4()),
+            reviewer_receipt_id=str(uuid4()),
+        ),
+        "billing_rollout_readiness_revision_invalid",
+    )
+    assert await plane.readiness_rows(0, environment="test") == 0
+
+
+async def test_e3_general_without_a_control_row_is_a_conflict_before_any_read(
+    plane: _ControlPlane,
+) -> None:
+    """The rollout lock is the first step of every transition, so ``general``
+    with a missing control row stops there with the route's generic 409 for
+    ``BillingStateUnavailable`` (before E3 the readiness read came first and
+    answered ``billing_rollout_readiness_incomplete``).  (Row deleted past the
+    history trigger.)"""
+
+    async with plane.sessions() as session:
+        async with session.begin():
+            await session.execute(text("SET LOCAL session_replication_role = replica"))
+            result = await session.execute(
+                text("DELETE FROM billing_rollout_control WHERE environment = 'test'")
+            )
+            assert result.rowcount == 1
+    material = _material(
+        from_state="canary_allowlist", to_state="general", environment="test"
+    )
+    _assert_rejected(await plane.transition(material, expected_revision=0), _CONFLICT)
+    assert await plane.applied(material) == 0
+
+
+async def test_e3_general_reads_its_clock_only_after_the_rollout_lock(
+    plane: _ControlPlane,
+) -> None:
+    """``now`` (readiness freshness) is read once the rollout lock is held, so
+    a transition that waited judges readiness at the time it can act.  The
+    injected clock records whether the holder had already let go."""
+
+    revision = await _open_canary(plane)
+    material = _material(from_state="canary_allowlist", to_state="general")
+    quorum = await plane.quorum(material)
+    await plane.record_kinds(material, quorum, rollout_revision=revision)
+    released = {"value": False}
+    reads: list[bool] = []
+
+    def clock() -> datetime:
+        reads.append(released["value"])
+        return datetime.now(timezone.utc)
+
+    async with plane.sessions() as holder, plane.sessions() as worker:
+        await BillingRepository(holder).lock_rollout_control(environment=_ENVIRONMENT)
+        pid = int(await worker.scalar(text("SELECT pg_backend_pid()")))
+        service = BillingRolloutOperationService(
+            worker, signing_key=_SIGNING_KEY.encode(), clock=clock
+        )
+        task = asyncio.create_task(
+            service.transition(
+                expected_revision=revision, material=_operation(material)
+            )
+        )
+        try:
+            assert await _wait_until_waiting(plane, pid, task) == [
+                ("advisory", billing_advisory_key(_ENVIRONMENT))
+            ]
+            assert reads == []
+        finally:
+            released["value"] = True
+            await holder.rollback()
+            (outcome,) = await asyncio.wait_for(
+                asyncio.gather(task, return_exceptions=True), 30
+            )
+        if isinstance(outcome, BaseException):
+            raise outcome
+        assert outcome.state == "general"
+        assert reads and all(reads)
+        await worker.commit()

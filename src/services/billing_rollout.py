@@ -21,6 +21,10 @@ docstring is the reference until then):
   after it is created; readiness rows cannot outlive the receipts they name.
 * Readiness rows are recorded by the bound duty: ``readiness`` by the
   deployer, ``backlog``/``provisioning``/``smoke`` by the reviewer.
+* Readiness does not bind the legacy billing roster (Group 10 E3): its
+  content digest covers the nine fields documented in
+  ``docs/runbooks/asaas-deployment.md``, and readiness and every transition
+  take ``lock_rollout_control`` first and never the roster fence.
 * NOT IMPLEMENTED: ``deployment_digest`` (and readiness ``app_digest``) is
   compared only with what the operators signed, never with the build that is
   actually running.  Binding it to the running build needs deploy-time
@@ -37,7 +41,7 @@ from pathlib import Path
 from typing import Callable, Final, Sequence
 from uuid import UUID
 
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.settings import settings
@@ -47,12 +51,11 @@ from src.models.billing import (
     BillingRolloutControl,
     BillingRolloutReadinessReceipt,
     BillingRolloutReceipt,
-    BillingRosterControl,
 )
 from src.repositories.billing import (
     BillingRepository,
+    BillingStateUnavailable,
     BillingTransitionEvidence,
-    billing_roster_advisory_key,
 )
 from src.services.billing_operations import (
     BillingOperationAuthority,
@@ -105,7 +108,6 @@ def _readiness_content_digest(
     environment: str,
     receipt_kind: str,
     rollout_revision: int,
-    roster_revision: int,
     operation_id: UUID,
     operation_receipt_id: UUID,
     provider_receipt_id: UUID,
@@ -113,6 +115,13 @@ def _readiness_content_digest(
     bundle_digest: str,
     app_digest: str,
 ) -> str:
+    """SHA-256 of the canonical readiness content (nine documented fields).
+
+    The field list is documented in ``docs/runbooks/asaas-deployment.md``
+    ("Readiness receipt content digest").  Group 10 E3 removed the legacy
+    ``roster_revision``, so a digest computed before E3 no longer verifies.
+    """
+
     payload = {
         "app_digest": app_digest,
         "bundle_digest": bundle_digest,
@@ -122,7 +131,6 @@ def _readiness_content_digest(
         "provider_receipt_id": str(provider_receipt_id),
         "receipt_kind": receipt_kind,
         "rollout_revision": rollout_revision,
-        "roster_revision": roster_revision,
         "rule_digest": rule_digest,
     }
     return hashlib.sha256(
@@ -140,8 +148,9 @@ def _readiness_evidence_is_bound(
     rule_digest: str,
     bundle_digest: str,
     now: datetime,
-    current_roster_revision: int | None = None,
 ) -> bool:
+    # ``row.roster_revision`` is deliberately absent: the legacy column is
+    # neither hashed nor compared (Group 10 E3), so its value is not evidence.
     deployer = evidence_by_id.get(row.operation_receipt_id)
     provider = evidence_by_id.get(row.provider_receipt_id)
     return bool(
@@ -150,10 +159,6 @@ def _readiness_evidence_is_bound(
         and row.rule_digest == rule_digest
         and row.bundle_digest == bundle_digest
         and row.app_digest == deployment_digest
-        and (
-            current_roster_revision is None
-            or row.roster_revision == current_roster_revision
-        )
         and deployer.deployment_digest == deployment_digest
         and provider.deployment_digest == deployment_digest
         and row.operation_id == operation_id
@@ -185,7 +190,6 @@ def _readiness_evidence_is_bound(
             environment=row.environment,
             receipt_kind=row.receipt_kind,
             rollout_revision=row.rollout_revision,
-            roster_revision=row.roster_revision,
             operation_id=row.operation_id,
             operation_receipt_id=row.operation_receipt_id,
             provider_receipt_id=row.provider_receipt_id,
@@ -372,7 +376,6 @@ class BillingRolloutOperationService:
         environment: str,
         receipt_kind: str,
         rollout_revision: int,
-        roster_revision: int,
         status: str,
         content_sha256: str,
         material: OperationMaterial,
@@ -399,6 +402,11 @@ class BillingRolloutOperationService:
         must be the actor of the bound receipt whose duty owns the kind
         (``_READINESS_RECORDER_ROLE``); the table has no recorder column, so
         this is enforced here, at insert.
+
+        Lock order: :meth:`BillingRepository.lock_rollout_control` (the
+        per-environment advisory lock, then the control row) before anything
+        else, the same first lock as the webhook, checkout and transition
+        paths.  The legacy roster fence is not taken (Group 10 E3).
         """
 
         now = self._authority._clock()
@@ -432,21 +440,15 @@ class BillingRolloutOperationService:
             or app_digest != material.deployment_digest
         ):
             raise BillingOperationRejected("billing_rollout_readiness_evidence_invalid")
-        if self._repository.session.get_bind().dialect.name == "postgresql":
-            await self._repository.session.execute(
-                select(func.pg_advisory_xact_lock(billing_roster_advisory_key()))
+        try:
+            control = await self._repository.lock_rollout_control(
+                environment=environment
             )
-        roster = await self._repository.session.scalar(
-            select(BillingRosterControl).with_for_update()
-        )
-        if roster is None or roster.billing_roster_revision != roster_revision:
-            raise BillingOperationRejected("billing_rollout_readiness_roster_invalid")
-        control = await self._repository.session.scalar(
-            select(BillingRolloutControl)
-            .where(BillingRolloutControl.environment == environment)
-            .with_for_update()
-        )
-        if control is None or control.rollout_revision != rollout_revision:
+        except BillingStateUnavailable as exc:
+            raise BillingOperationRejected(
+                "billing_rollout_readiness_revision_invalid"
+            ) from exc
+        if control.rollout_revision != rollout_revision:
             raise BillingOperationRejected("billing_rollout_readiness_revision_invalid")
         if control.state != material.from_state:
             raise BillingOperationRejected("billing_rollout_from_state_mismatch")
@@ -496,7 +498,6 @@ class BillingRolloutOperationService:
             environment=environment,
             receipt_kind=receipt_kind,
             rollout_revision=rollout_revision,
-            roster_revision=roster_revision,
             operation_id=material.operation_id,
             operation_receipt_id=operation_receipt_id,
             provider_receipt_id=provider_receipt_id,
@@ -543,7 +544,9 @@ class BillingRolloutOperationService:
             operation_id=material.operation_id,
             operation_receipt_id=operation_receipt_id,
             provider_receipt_id=provider_receipt_id,
-            roster_revision=roster_revision,
+            # Legacy column, kept with its CHECK (>= 0) until migration 036
+            # (Group 10 E5) drops it.  Constant: not hashed, never read.
+            roster_revision=0,
             rule_digest=rule_digest,
             bundle_digest=bundle_digest,
             app_digest=app_digest,
@@ -565,6 +568,12 @@ class BillingRolloutOperationService:
 
         The signed ``from_state`` must be the persisted state.  ``general``
         additionally spends exactly the quorum its four readiness rows name.
+
+        Lock order: :meth:`BillingRepository.lock_rollout_control` first,
+        then (``general``) the readiness rows, then the quorum receipts in
+        ``consume_quorum``.  The legacy roster fence is not taken (Group 10
+        E3), so this path and the webhook (rollout, then roster fence) can no
+        longer wait on each other in opposite orders.
         """
 
         if material.scope != "rollout" or material.to_state not in {
@@ -583,21 +592,14 @@ class BillingRolloutOperationService:
             # Every signer signed this builder (see ``canary_budget_digest``);
             # a caller holding the quorum cannot open another one's canary.
             raise BillingOperationRejected("billing_rollout_canary_budget_unbound")
+        # First lock of every transition, before anything is read or consumed.
+        control = await self._repository.lock_rollout_control(
+            environment=material.environment
+        )
         readiness_rows: Sequence[BillingRolloutReadinessReceipt] = ()
         if material.to_state == "general":
             now = self._authority._clock()
             kinds = {"readiness", "backlog", "provisioning", "smoke"}
-            if self._repository.session.get_bind().dialect.name == "postgresql":
-                await self._repository.session.execute(
-                    select(func.pg_advisory_xact_lock(billing_roster_advisory_key()))
-                )
-            roster = await self._repository.session.scalar(
-                select(BillingRosterControl).with_for_update()
-            )
-            if roster is None:
-                raise BillingOperationRejected(
-                    "billing_rollout_readiness_roster_invalid"
-                )
             result = await self._repository.session.execute(
                 select(BillingRolloutReadinessReceipt)
                 .where(
@@ -643,15 +645,10 @@ class BillingRolloutOperationService:
                     rule_digest=exact_rule_digest,
                     bundle_digest=exact_bundle_digest,
                     now=now,
-                    current_roster_revision=roster.billing_roster_revision,
                 )
                 for row in readiness_rows
             ):
                 raise BillingOperationRejected("billing_rollout_readiness_unbound")
-        # After the roster lock (lock order), before anything is consumed.
-        control = await self._repository.lock_rollout_control(
-            environment=material.environment
-        )
         if control.state != material.from_state:
             raise BillingOperationRejected("billing_rollout_from_state_mismatch")
         # Moving to ``disabled`` only reduces exposure, so an older unspent

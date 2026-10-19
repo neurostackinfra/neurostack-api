@@ -59,6 +59,61 @@ transition quorum. In `general` any eligible builder can create a Checkout
 for Plus, Pro or Max, with coupon. `general` does not open
 `topup_commercial_enabled`.
 
+### Readiness receipt content digest
+
+Each readiness row is recorded through `POST /v1/admin/billing/rollout/receipts`
+by the duty its kind belongs to (`readiness` by the deployer, `backlog`,
+`provisioning` and `smoke` by the reviewer) and carries `content_sha256`. The
+backend recomputes it at insert and again at the `general` transition. It is
+the lowercase hex SHA-256 of the ASCII bytes of one JSON object with exactly
+these nine keys, sorted by key, with no whitespace (separators `,` and `:`):
+
+| Key | Value |
+|-----|-------|
+| `app_digest` | the deployment digest the quorum signed (64 lowercase hex) |
+| `bundle_digest` | the billing fact bundle digest (`billing_fact_bundle_digest()`) |
+| `environment` | `development`, `staging`, `production` or `test` |
+| `operation_id` | the `canary_allowlist -> general` operation id, as a lowercase hyphenated UUID string |
+| `operation_receipt_id` | the deployer's operation receipt id, as a lowercase hyphenated UUID string |
+| `provider_receipt_id` | the reviewer's operation receipt id, as a lowercase hyphenated UUID string |
+| `receipt_kind` | `readiness`, `backlog`, `provisioning` or `smoke` |
+| `rollout_revision` | the current rollout revision, as a JSON integer |
+| `rule_digest` | the SHA-256 of `config/prometheus_rules.yml` as deployed |
+
+Shape of the hashed bytes (placeholders in angle brackets):
+`{"app_digest":"<hex>","bundle_digest":"<hex>","environment":"staging","operation_id":"<uuid>","operation_receipt_id":"<uuid>","provider_receipt_id":"<uuid>","receipt_kind":"smoke","rollout_revision":3,"rule_digest":"<hex>"}`.
+
+Group 10 phase E3 (2026-10-19) removed `roster_revision` from this list and
+from the readiness request and response. A request that still sends it is
+refused with 422, and a receipt whose digest included it (every receipt
+issued before E3) no longer verifies. Production holds no readiness receipts
+of consequence.
+
+A rollout revision whose readiness rows were recorded before E3 cannot be
+completed. The `general` transition refuses them
+(`billing_rollout_readiness_unbound`, nothing is spent, the state stays
+`canary_allowlist`), and they cannot be recorded again at that revision: each
+kind is unique per environment and revision, and a revision accepts one
+deployer/reviewer pair, so re-recording is refused
+(`billing_rollout_readiness_duplicate` for a kind that pair already holds,
+`billing_rollout_readiness_operation_conflict` for another pair). Recover
+with a new revision, each step its own approved operation:
+
+1. Move `canary_allowlist -> disabled` with a fresh rollback quorum.
+2. Re-open the canary (`disabled -> canary_allowlist`, a new rollout
+   revision) with a fresh canary quorum for the builder.
+3. Sign a fresh `canary_allowlist -> general` quorum, record all four
+   readiness kinds again at the new revision, then request `general`.
+
+The table column
+`billing_rollout_readiness_receipts.roster_revision` and its
+`CHECK (roster_revision >= 0)` stay until migration 036 (phase E5, not yet
+written) drops them. Until then the backend writes the constant `0` and never
+reads the column, so a stored value is not evidence. By the owner's plan,
+migration 036 will refuse to run while any unexpired readiness receipt
+exists. Readiness and every rollout transition take the per-environment
+rollout control lock first and no longer take the legacy roster fence.
+
 ## Work in progress that changes these steps
 
 - **Receipt signing is moving server-side.** Today the operation-receipt
