@@ -3,8 +3,8 @@ NeuroStack API - Admin Schemas
 Pydantic models for super-admin endpoints (clinics + builders management).
 """
 
-from datetime import date, datetime
-from typing import Any, Literal, Optional
+from datetime import datetime
+from typing import Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
@@ -194,14 +194,14 @@ class AdminDashboardResponse(BaseModel):
 
 
 # ============================================
-# Billing migration and control-plane schemas
+# Billing control-plane schemas
 # ============================================
 
 
 class BillingOperationMaterialRequest(BaseModel):
     """Closed material signed by each billing-operation participant."""
 
-    scope: Literal["migration", "rollout", "topup_capability", "incident"]
+    scope: Literal["rollout", "topup_capability", "incident"]
     operation_id: UUID
     environment: Literal["development", "staging", "production", "test"]
     from_state: str = Field(min_length=1, max_length=40)
@@ -250,109 +250,6 @@ class BillingOperationReceiptResponse(BaseModel):
     actor_user_id: UUID
     nonce: UUID
     applied: bool
-
-
-class BillingMigrationTargetRequest(BaseModel):
-    catalog_version_id: str = Field(min_length=1, max_length=80)
-    offer_id: str = Field(min_length=1, max_length=100)
-    plan: str = Field(min_length=1, max_length=100)
-    coupon_code: Optional[str] = Field(default=None, max_length=50)
-    amount_cents: int = Field(ge=0)
-    snapshot: dict[str, Any]
-
-
-class BillingMigrationRosterRequest(BaseModel):
-    builder_id: UUID
-    subscription_id: UUID
-    renewal_date: date
-    target: BillingMigrationTargetRequest
-
-
-class BillingMigrationTransitionRequest(BillingOperationMaterialRequest):
-    migration_id: UUID
-    readback_receipt_id: Optional[UUID] = None
-
-
-class BillingMigrationCancelBeginRequest(BillingMigrationTransitionRequest):
-    pass
-
-
-class BillingMigrationCancelReconcileRequest(BillingMigrationTransitionRequest):
-    """A fresh panel observation; the backend persists it as the receipt."""
-
-    cancelled: bool
-    observed_at: Optional[datetime] = None
-
-
-class BillingMigrationRecoverCheckoutRequest(BillingMigrationTransitionRequest):
-    checkout_session_id: UUID
-    environment: Literal["development", "staging", "production", "test"]
-
-
-class BillingMigrationReserveAttemptRequest(BillingMigrationTransitionRequest):
-    environment: Literal["development", "staging", "production", "test"]
-    absence_receipt_id: UUID
-
-
-class BillingProviderEvidenceRequest(BaseModel):
-    """One provider-signed ASAAS observation, verbatim from the authority."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    external_reference: str = Field(pattern=r"^[A-Za-z0-9._:-]{1,160}$")
-    provider_event_id: str = Field(pattern=r"^[A-Za-z0-9._:-]{1,160}$")
-    provider_key_id: str = Field(pattern=r"^[A-Za-z0-9._:-]{1,80}$")
-    provider_operation: Literal[
-        "subscription.migration.provider_flip", "subscription.migration.absence"
-    ]
-    provider_signature: str = Field(pattern=r"^[0-9a-f]{128}$")
-    provider_observed_at: datetime
-    provider_expires_at: datetime
-    provider_snapshot_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
-    provider_evidence_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
-
-
-class BillingMigrationProviderFlipRequest(BillingMigrationTransitionRequest):
-    """The ASAAS ID is ``evidence.external_reference``, covered by the signature."""
-
-    evidence: BillingProviderEvidenceRequest
-    observed_at: Optional[datetime] = None
-
-
-class BillingMigrationAbsenceReadRequest(BaseModel):
-    """Record one provider-signed empty ASAAS read for a recreate decision."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    migration_id: UUID
-    evidence: BillingProviderEvidenceRequest
-    observed_at: Optional[datetime] = None
-
-
-class BillingMigrationAbsenceReadResponse(BaseModel):
-    read_id: UUID
-    read_no: int
-    prior_checkout_session_id: Optional[UUID] = None
-    convergence_limit_at: datetime
-    authorization_receipt_id: Optional[UUID] = None
-
-
-class BillingMigrationResponse(BaseModel):
-    migration_id: UUID
-    subscription_id: UUID
-    state: str
-    attempt_count: int
-    source_roster_revision: int
-    renewal_date: date
-    open_by_date: date
-    cutover_by_date: date
-
-
-class BillingCheckoutReservationResponse(BaseModel):
-    checkout_session_id: UUID
-    attempt_no: int
-    state: str
-    next_due_date: Optional[date] = None
 
 
 class BillingRolloutTransitionRequest(BillingOperationMaterialRequest):

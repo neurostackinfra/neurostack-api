@@ -121,6 +121,7 @@ def _install_general_reservation(
         async def reserve_general_subscription_checkout(
             self, **kwargs: object
         ) -> BillingCheckoutSession:
+            assert "migration_id" not in kwargs  # the saga was removed (G10 E2)
             # Mirror the repository: the persisted attempt is the planned one.
             checkout.id = kwargs["checkout_session_id"]  # type: ignore[assignment]
             checkout.next_due_date = kwargs["next_due_date"]  # type: ignore[assignment]

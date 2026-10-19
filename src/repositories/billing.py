@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.billing import (
     BillingCheckoutSession,
-    BillingMigration,
     BillingOperationReceipt,
     BillingOutboxEvent,
     BillingPaymentEffect,
@@ -406,47 +405,6 @@ class BillingRepository:
         await self.session.flush()
         return control
 
-    async def rebase_legacy_migration(
-        self,
-        *,
-        migration_id: UUID,
-        expected_source_revision: int,
-    ) -> int:
-        """Rebase one cancelled legacy saga; provider flip owns advancement."""
-        await self.session.execute(
-            select(func.pg_advisory_xact_lock(billing_roster_advisory_key()))
-        )
-        roster_result = await self.session.execute(
-            select(BillingRosterControl).with_for_update()
-        )
-        control = roster_result.scalar_one_or_none()
-        if control is None:
-            raise BillingStateUnavailable("billing roster control is unavailable")
-        migration_result = await self.session.execute(
-            select(BillingMigration)
-            .where(BillingMigration.id == migration_id)
-            .with_for_update()
-        )
-        migration = migration_result.scalar_one_or_none()
-        if migration is None or migration.state != "legacy_cancelled":
-            raise BillingStateUnavailable("legacy migration is unavailable")
-        if migration.source_roster_revision != expected_source_revision:
-            raise BillingRevisionConflict("migration source revision changed")
-        subscription_result = await self.session.execute(
-            select(BillingSubscription)
-            .where(BillingSubscription.id == migration.subscription_id)
-            .with_for_update()
-        )
-        subscription = subscription_result.scalar_one_or_none()
-        if (
-            subscription is None
-            or subscription.roster_revision != expected_source_revision
-        ):
-            raise BillingRevisionConflict("subscription source revision changed")
-        subscription.roster_revision = control.billing_roster_revision
-        await self.session.flush()
-        return subscription.roster_revision
-
     async def _topup_capability_binding_is_current(
         self,
         *,
@@ -692,7 +650,6 @@ class BillingRepository:
             builder_id=builder_id,
             intent_kind="topup",
             intent_id=order.id,
-            migration_id=None,
             topup_order_id=order.id,
             attempt_no=attempt_no,
             provider="asaas",
@@ -755,7 +712,6 @@ class BillingRepository:
             builder_id=builder_id,
             intent_kind="subscription",
             intent_id=intent_id,
-            migration_id=None,
             topup_order_id=None,
             attempt_no=1,
             provider="asaas",
@@ -923,7 +879,6 @@ class BillingRepository:
         environment: str,
         builder_id: UUID,
         intent_id: UUID,
-        migration_id: UUID | None,
         checkout_session_id: UUID,
         attempt_no: int,
         catalog_version_id: str,
@@ -944,14 +899,11 @@ class BillingRepository:
             raise BillingTransitionRejected(
                 "subscription checkout requires general rollout"
             )
-        if migration_id is not None and intent_id != migration_id:
-            raise BillingTransitionRejected("migration attempt must reuse its intent")
         checkout = BillingCheckoutSession(
             id=checkout_session_id,
             builder_id=builder_id,
             intent_kind="subscription",
             intent_id=intent_id,
-            migration_id=migration_id,
             topup_order_id=None,
             attempt_no=attempt_no,
             provider="asaas",
@@ -999,11 +951,9 @@ class BillingRepository:
 
         Blockers, in order: an unresolved provider row (``provider IS NULL``:
         legacy cancel/unknown/manual states), an active or otherwise
-        non-terminal AbacatePay or ASAAS row (any status except
-        ``inactive``/``cancelled``, or ``is_active``), any
-        ``billing_migrations`` row (adoption of ``pending``/
-        ``recreate_pending`` arrives in Group 5, so every migration state
-        fails closed here), and any live subscription checkout attempt.
+        non-terminal subscription row of any provider (any status except
+        ``inactive``/``cancelled``, or ``is_active``), and any live
+        subscription checkout attempt.
         """
 
         subscription = (
@@ -1026,13 +976,6 @@ class BillingRepository:
         if subscription is not None:
             provider = subscription[1]
             return f"{provider}_subscription" if provider else "unresolved_subscription"
-        migration = await self.session.scalar(
-            select(BillingMigration.id)
-            .where(BillingMigration.builder_id == builder_id)
-            .limit(1)
-        )
-        if migration is not None:
-            return "migration"
         live = await self.session.scalar(
             select(BillingCheckoutSession.id)
             .where(

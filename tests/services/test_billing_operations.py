@@ -217,7 +217,6 @@ def test_receipt_signature_is_keyed_and_not_the_old_payload_hmac() -> None:
         ("rollout", "general", True),
         ("rollout", "disabled", False),
         ("incident", "disabled", False),
-        ("migration", "in_progress", False),
         ("topup_capability", "topup_enabled", False),
     ],
 )
