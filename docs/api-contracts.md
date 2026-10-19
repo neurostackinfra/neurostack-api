@@ -480,6 +480,70 @@ middleware externo, confirmação do `COMMIT` perdida na conexão) pode responde
 `500` com o documento já gravado: o cliente que recebe `500` deve listar ou
 buscar antes de reenviar, porque o upload não é idempotente.
 
+A resposta `201` é montada a partir da linha gravada (não do request): é
+exatamente o que `GET /v1/knowledge/documents/{document_id}` e a listagem
+devolvem depois, campo por campo.
+
+**Limites de entrada.** O schema recusa com `422`, antes de tocar o banco, o
+que o PostgreSQL não consegue gravar e o que passa dos limites abaixo (antes
+disso essas entradas respondiam `500` com traceback do driver). Comprimentos
+contam caracteres (code points), não bytes. Um corpo que o próprio FastAPI não
+consegue decodificar (aninhamento JSON acima de ~9.900 níveis, inteiro com mais
+de 4.300 dígitos ou UTF-8 inválido) não chega ao schema: responde `400`
+`{"detail": "There was an error parsing the body"}`, sem `Cache-Control:
+no-store`, sem ecoar o corpo e nunca `500`.
+
+| Campo | Limite | Origem | `type` do erro |
+|-------|--------|--------|----------------|
+| `content` | 10 a 100.000 caracteres | limite já existente (coluna `TEXT`) | `string_too_short` / `string_too_long` |
+| `metadata.title` | até 500 caracteres | coluna `knowledge_documents.title VARCHAR(500)` | `string_too_long` |
+| `metadata.source` | até 2.048 caracteres | JSONB `metadata` (sem limite próprio) | `string_too_long` |
+| `metadata.category` | até 100 caracteres | JSONB `metadata` | `string_too_long` |
+| `metadata.tags` | até 50 tags, cada uma até 100 caracteres | JSONB `metadata` | `too_long` / `string_too_long` |
+| `metadata.custom` | até 5 níveis de aninhamento (o próprio `custom` é o nível 1) | JSONB `metadata` | `metadata_too_deep` |
+| `metadata.custom` | até 100 chaves no total, somando objetos aninhados | JSONB `metadata` | `metadata_too_many_keys` |
+| `metadata.custom` | até 10.000 bytes como JSON UTF-8 compacto | JSONB `metadata` | `metadata_too_large` |
+| `metadata.custom` | só números finitos (`NaN`, `Infinity`, `1e400` são recusados) | JSONB não aceita | `non_finite_number` |
+| todo texto (`content`, `title`, `source`, `category`, cada tag, chaves e strings de `custom` em qualquer nível) | sem o caractere NUL (U+0000, inclusive escrito `\u0000` no JSON) | `text`/`jsonb` não aceitam | `nul_character` |
+| idem | sem surrogate UTF-16 desemparelhado (`\ud800`...`\udfff` sozinho) | UTF-8 inválido | `string_unicode` (campos de texto) / `unpaired_surrogate` (`custom`) |
+| `?category=` da listagem | até 100 caracteres, sem NUL (inclusive `%00`) | mesmo limite do upload | `string_too_long` / `nul_character` |
+
+Strings vazias continuam aceitas e gravadas como enviadas (`title` vazio ou
+ausente grava a coluna `title` como `Untitled Document`, e os metadados
+guardam o valor enviado). Documentos gravados antes desses limites continuam
+legíveis: os limites valem só para a entrada.
+
+**Chaves reservadas de `metadata.custom`.** `custom` é gravado ao lado de
+`title`, `source`, `category` e `tags` no mesmo objeto JSONB, então essas
+quatro chaves (comparação exata, com maiúsculas e minúsculas) são reservadas:
+um `custom` que use qualquer uma delas responde `422`
+`reserved_metadata_key`, com a mensagem listando os **nomes** das chaves
+reservadas usadas (nunca os valores), e nada é gravado. Chaves parecidas
+(`Title`, `tag`, `_source`) são chaves comuns de `custom`.
+
+**Formato do `422` (rotas de documentos).** Em `POST`/`GET`
+`/v1/knowledge/documents` e `GET`/`DELETE`
+`/v1/knowledge/documents/{document_id}` o `422` traz, por problema, só
+`type`, `loc` e `msg`: os campos `input` e `ctx` do FastAPI são removidos,
+então nenhum texto livre enviado (conteúdo, metadados, filtro) volta na
+resposta, e a resposta traz `Cache-Control: no-store`. A `msg` padrão do
+Pydantic para UUID inválido (`tenant_id`, `document_id`) cita um único
+caractere da entrada (por exemplo ``found `S` at 1``):
+
+```json
+{
+  "detail": [
+    {
+      "type": "nul_character",
+      "loc": ["body", "metadata", "title"],
+      "msg": "Text must not contain the NUL character (U+0000)"
+    }
+  ]
+}
+```
+
+`POST /v1/knowledge/search` (ainda um stub) mantém o `422` padrão do FastAPI.
+
 **Request:**
 
 ```json
@@ -525,7 +589,7 @@ Lista os documentos do tenant autorizado.
 | `tenant_id` | UUID | null | Tenant a listar; omitido = tenant do chamador (override conforme a tabela acima) |
 | `page` | int | 1 | Número da página |
 | `page_size` | int | 20 | Itens por página (max 100) |
-| `category` | string | null | Filtrar por categoria |
+| `category` | string | null | Filtrar por categoria (até 100 caracteres, sem NUL; senão `422`) |
 
 `total` conta o mesmo conjunto filtrado da página (tenant autorizado e, quando
 informada, a `category`), não todos os documentos do tenant. `category` vazia
