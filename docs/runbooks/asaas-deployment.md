@@ -147,40 +147,46 @@ These are prerequisites to check, not steps to execute now:
 
    **Recorded secret/PII scan exception (owner decision 2026-10-18).** The
    product owner decided to commit the sandbox card capture tool
-   (`scripts/asaas_sandbox_card_capture.py` and
-   `tests/scripts/test_asaas_sandbox_card_capture.py`) with a scoped
-   exception, instead of splitting its literals or excluding its files from
-   the scan. The tool must send the provider's CPF/CNPJ and card field names
-   and the public sandbox test card (sixteen 4s, CCV 123), and its tests use
-   fixed synthetic API keys. `_asaas_scan_waivers` in `scripts/wish-gates.sh`
-   lists each waived line as exact path, one rule, the number of lines it may
-   match, and a literal pattern that must match the whole line. Every other
-   rule still runs on those files, any other value on a pinned line fails,
-   and copies or renames of these lines to another path get no waiver (a
-   file renamed into a waived path is audited like the tool). On every run
-   the gate also reads both files whole and fails on a card number written as
-   a digit run (optionally grouped with single spaces, dashes, dots or
-   underscores) of 13 or more digits other than the sixteen 4s, on a waived
-   line that appears more often than recorded, and when a pinned card line
+   (`scripts/asaas_sandbox_card_capture.py`,
+   `tests/scripts/test_asaas_sandbox_card_capture.py` and
+   `docs/runbooks/asaas-sandbox-card-capture.md`) with a scoped exception,
+   instead of splitting its literals or excluding its files from the scan.
+   The tool must send the provider's CPF/CNPJ, card and security-code field
+   names and the public sandbox test card (sixteen 4s, CCV 123), its tests
+   use fixed synthetic API keys, and its runbook names the test card.
+   `_asaas_scan_waivers` in `scripts/wish-gates.sh` lists each waived line
+   as exact path, one rule, the number of lines it may match, and a literal
+   pattern that must match the whole line. Every other rule still runs on
+   those files, any other value on a pinned line fails, and copies or
+   renames of these lines to another path get no waiver (a file renamed into
+   a waived path is audited like the tool). On every run the gate also reads
+   all three files whole and fails on a card number written as a digit run
+   (optionally grouped with single spaces, dashes, dots or underscores) of
+   13 or more digits other than the sixteen 4s, on a waived line that
+   appears more often than recorded, and when a pinned card line
    (`TEST_CARD_NUMBER`, `TEST_CARD_CCV` and the payload lines that use them)
    is missing or appears a different number of times. Pinned lines are
-   checked for existence and exact count only, not for being overridden by
-   a later assignment elsewhere in the file. Other spellings of a card number
+   checked for existence and exact count only, not for being overridden by a
+   later assignment elsewhere in the file. Other spellings of a card number
    (string concatenation, several-line splits, double spaces or tabs between
    groups, non-ASCII digits, encodings) are NOT detected. A waived line
    matching fewer times than recorded only warns; raising a count needs a
-   table edit, which is visible in review. The tool's own runbook
-   (`docs/runbooks/asaas-sandbox-card-capture.md`) is outside the audit by
-   design: it holds no waived line. Each waived hit prints as
-   `waived (owner decision 2026-10-18, wish asaas-payment-gateway):
-   <path>:<line> rule=<rule>`, both scans print a waived count, and an entry
-   that no longer matches is reported as a stale warning. Residual exposure:
-   this gate detects no CCV values, emails, CPF digits or private-key blocks
-   anywhere (unless they change a pinned line), and no card numbers outside
-   those two files; its security-code rule term is `c[v]v`, which never
-   matches the provider's `ccv` field (whether to add such rules is an open
-   owner decision). To remove the exception, delete the table's entries;
-   any new entry needs a new recorded owner decision.
+   table edit, which is visible in review. The tool's runbook is part of the
+   whole-file audit because its test-card line is pinned: the card-number
+   check is what fails on any other card number there, and every rule keeps
+   running on it. Each waived hit prints as `waived (owner decision
+   2026-10-18, wish asaas-payment-gateway): <path>:<line> rule=<rule>`, both
+   scans print a waived count, and an entry that no longer matches is
+   reported as a stale warning. The security-code rule matches both
+   spellings of the three-letter term, the generic C-V-V and the provider's
+   field name C-C-V (spelled with hyphens here because this runbook is
+   itself scanned), in lowercase, anywhere on a line (owner decision
+   2026-10-19); the tool's payload line and test assertion carry an explicit
+   waiver for it, and the term anywhere else fails the gate in added lines.
+   Residual exposure: this gate detects no CCV values, emails, CPF digits or
+   private-key blocks anywhere (unless they change a pinned line), and no
+   card numbers outside those three files. To remove the exception, delete
+   the table's entries; any new entry needs a new recorded owner decision.
 2. Runtime configuration was applied and read back as described in
    [Production wiring (Group 9 D3/D4)](#production-wiring-group-9-d3d4):
    ASAAS secrets in the task definition, `ASAAS_WEBHOOK_URL`,
