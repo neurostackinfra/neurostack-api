@@ -21,13 +21,21 @@ webhook body can block an effect (amount drift) but can never price one.
 
 Serialization.  Every authenticated, allowlisted event takes, in order: the
 delivery idempotency key (``ON CONFLICT DO NOTHING``), the environment rollout
-lock (``lock_rollout_control`` — the same lock Group 2 eligibility holds, so
-a session→subscription handoff can never interleave with a checkout
-eligibility decision), the global roster fence when a subscription row or a
-builder entitlement may change, then the session, subscription/order and
-projection row locks.  Effects are unique on ``(provider, payment_id,
-effect_kind, source_revision)``; ``PAYMENT_CONFIRMED`` and
-``PAYMENT_RECEIVED`` share ``settlement:v1``.
+lock (``lock_rollout_control`` — the same lock Group 2 eligibility, readiness
+and every rollout transition take first, so a session→subscription handoff
+can never interleave with a checkout eligibility decision and the deliveries
+and readbacks of one environment apply one at a time), then the session,
+subscription/order and projection row locks.  No path here takes the legacy
+billing roster fence (Group 10 E4); until migration 036 (Group 10 E5) drops
+it, only the database's statement trigger on ``billing_subscriptions`` still
+takes that fence, on an UPDATE, so always after the rollout lock.  The
+rollout lock is per environment, so one environment per database is a
+requirement: the global fence used to serialize handoffs of different
+environments too, and without it two environments sharing a database could
+both pass the "second recurring subscription" check and leave one builder
+with two active subscriptions.  Effects
+are unique on ``(provider, payment_id, effect_kind, source_revision)``;
+``PAYMENT_CONFIRMED`` and ``PAYMENT_RECEIVED`` share ``settlement:v1``.
 
 Settlement (owner decision 2026-10-18).  A card capture (``CONFIRMED``) is
 commercially paid: the first accepted settle-class evidence (``CONFIRMED`` or
@@ -981,12 +989,12 @@ class _FinancialState:
         """Turn one live subscription checkout into its canonical row.
 
         Must run under ``lock_rollout_control``: Group 2 eligibility reads
-        subscriptions, migrations and live sessions as three statements under
-        the same lock, so this commit can never land between them.
+        subscriptions and live sessions as two statements under the same
+        lock, so this commit can never land between them.
         """
 
-        # Lock order: rollout (caller) -> roster fence -> session row.
-        roster_revision = await self._repo.lock_billing_roster()
+        # Lock order: rollout (caller) -> session row.  The rollout lock is
+        # what serializes handoffs; no roster fence is taken (Group 10 E4).
         session = await self._repo.lock_checkout_session(
             builder_id=builder_id, checkout_session_id=session_id
         )
@@ -999,7 +1007,7 @@ class _FinancialState:
             return existing
         plan = OFFER_PLANS.get(session.offer_id)
         if (
-            session.migration_id is not None  # adoption belongs to Group 5
+            session.migration_id is not None  # legacy saga link (036 drops it)
             or session.state not in _LIVE_CHECKOUT_STATES
             or session.resulting_external_subscription_id
             not in (
@@ -1010,6 +1018,9 @@ class _FinancialState:
             or session.next_due_date is None
         ):
             raise _Uncorrelated()
+        # Check-then-insert, serialized only by the per-environment rollout
+        # lock: correct only with one environment per database (see the
+        # module docstring; Group 10 E4 removed the global roster fence).
         other = await self._db.scalar(
             select(BillingSubscription.id)
             .where(
@@ -1054,9 +1065,9 @@ class _FinancialState:
             offer_id=session.offer_id,
             amount_cents=int(session.amount_cents),
             status=status,
-            # billing_roster_revision is saga-owned (DB trigger); a new ASAAS
-            # row records the fence it was created under (>0 by CHECK).
-            roster_revision=max(roster_revision, 1),
+            # Legacy column, NOT NULL with CHECK (> 0) until migration 036
+            # (Group 10 E5) drops it.  Constant: write-once, never read.
+            roster_revision=1,
         )
         self._db.add(subscription)
         await self._db.flush()
@@ -1097,8 +1108,7 @@ class _FinancialState:
         BillingTopupOrder | None,
         BillingCheckoutSession | None,
     ]:
-        if target.aggregate_kind == "subscription":
-            await self._repo.lock_billing_roster()
+        # Caller holds the rollout lock; rows follow in this fixed order.
         session = None
         if target.session_id is not None:
             session = await self._repo.lock_checkout_session(
@@ -2294,7 +2304,6 @@ class BillingWebhookService:
             origin = await state.originating_session(row)
             if origin is not None and origin.id != facts.external_reference:
                 raise _Uncorrelated()
-        await self._repo.lock_billing_roster()
         locked = await self._repo.lock_subscription(
             builder_id=row.builder_id, subscription_id=row.id
         )
@@ -2566,7 +2575,6 @@ class BillingReadbackService:
         non_billable = remote.deleted or remote.status in ("INACTIVE", "EXPIRED")
         try:
             await self._repo.lock_rollout_control(environment=self._environment)
-            await self._repo.lock_billing_roster()
             locked = await self._repo.lock_subscription(
                 builder_id=builder_id, subscription_id=subscription_id
             )
