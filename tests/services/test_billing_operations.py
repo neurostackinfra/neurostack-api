@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import inspect
+import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -439,7 +442,7 @@ def _readiness_fixture(
     now: datetime,
     operation_expires_at: datetime,
     app_digest: str = "d" * 64,
-    roster_revision: int = 7,
+    stored_roster_revision: int = 0,
 ) -> tuple[BillingRolloutReadinessReceipt, dict[UUID, BillingOperationReceipt]]:
     operation_id = uuid4()
     deployer_id = uuid4()
@@ -480,7 +483,8 @@ def _readiness_fixture(
         environment="test",
         receipt_kind="readiness",
         rollout_revision=0,
-        roster_revision=roster_revision,
+        # Legacy column (dropped by migration 036): stored, never evidence.
+        roster_revision=stored_roster_revision,
         status="passed",
         operation_id=operation_id,
         operation_receipt_id=deployer_id,
@@ -494,7 +498,6 @@ def _readiness_fixture(
             environment="test",
             receipt_kind="readiness",
             rollout_revision=0,
-            roster_revision=roster_revision,
             operation_id=operation_id,
             operation_receipt_id=deployer_id,
             provider_receipt_id=reviewer_id,
@@ -521,7 +524,6 @@ def _is_bound(
         rule_digest="r" * 64,
         bundle_digest="s" * 64,
         now=now,
-        current_roster_revision=row.roster_revision,
     )
 
 
@@ -599,7 +601,7 @@ def test_readiness_rejects_fresh_row_with_mismatched_deployment_evidence() -> No
     )
 
 
-def test_readiness_rejects_receipt_from_another_operation_or_roster() -> None:
+def test_readiness_rejects_receipt_from_another_operation_or_payload() -> None:
     now = datetime.now(timezone.utc)
     row, evidence = _readiness_fixture(
         now=now, operation_expires_at=now + timedelta(minutes=10)
@@ -623,20 +625,6 @@ def test_readiness_rejects_receipt_from_another_operation_or_roster() -> None:
             row,
             evidence,
             operation_id=row.operation_id,
-            payload_digest="a" * 64,
-            deployment_digest="d" * 64,
-            rule_digest="r" * 64,
-            bundle_digest="s" * 64,
-            now=now,
-            current_roster_revision=row.roster_revision + 1,
-        )
-        is False
-    )
-    assert (
-        _readiness_evidence_is_bound(
-            row,
-            evidence,
-            operation_id=row.operation_id,
             payload_digest="f" * 64,
             deployment_digest="d" * 64,
             rule_digest="r" * 64,
@@ -645,3 +633,206 @@ def test_readiness_rejects_receipt_from_another_operation_or_roster() -> None:
         )
         is False
     )
+
+
+# ---------------------------------------------------------------------------
+# Group 10 E3: the readiness content digest no longer binds the legacy roster
+# ---------------------------------------------------------------------------
+
+_RUNBOOK = Path(__file__).resolve().parents[2] / "docs/runbooks/asaas-deployment.md"
+_DIGEST_SECTION = "### Readiness receipt content digest"
+# The documented field list, in its canonical (sorted) order.
+_DOCUMENTED_READINESS_FIELDS = (
+    "app_digest",
+    "bundle_digest",
+    "environment",
+    "operation_id",
+    "operation_receipt_id",
+    "provider_receipt_id",
+    "receipt_kind",
+    "rollout_revision",
+    "rule_digest",
+)
+_INTEGER_FIELDS = frozenset({"rollout_revision", "roster_revision"})
+
+
+def _hand_canonical_json(values: dict[str, object]) -> str:
+    """Serialize by hand, without ``json``: sorted keys, no whitespace."""
+
+    members = []
+    for name in sorted(values):
+        value = values[name]
+        rendered = str(value) if name in _INTEGER_FIELDS else f'"{value}"'
+        members.append(f'"{name}":{rendered}')
+    return "{" + ",".join(members) + "}"
+
+
+def _hand_digest(values: dict[str, object]) -> str:
+    return hashlib.sha256(_hand_canonical_json(values).encode("ascii")).hexdigest()
+
+
+def _row_values(row: BillingRolloutReadinessReceipt) -> dict[str, object]:
+    return {
+        "app_digest": row.app_digest,
+        "bundle_digest": row.bundle_digest,
+        "environment": row.environment,
+        "operation_id": str(row.operation_id),
+        "operation_receipt_id": str(row.operation_receipt_id),
+        "provider_receipt_id": str(row.provider_receipt_id),
+        "receipt_kind": row.receipt_kind,
+        "rollout_revision": row.rollout_revision,
+        "rule_digest": row.rule_digest,
+    }
+
+
+def test_runbook_documents_exactly_the_readiness_digest_field_list() -> None:
+    text = _RUNBOOK.read_text(encoding="utf-8")
+    start = text.index(_DIGEST_SECTION)
+    end = re.compile(r"^#", re.M).search(text, start + len(_DIGEST_SECTION))
+    section = text[start : end.start() if end else len(text)]
+    documented = tuple(re.findall(r"^\| `([a-z_]+)` \|", section, re.M))
+
+    assert documented == _DOCUMENTED_READINESS_FIELDS
+    assert "roster_revision" not in documented
+
+
+def test_readiness_content_digest_is_rederived_by_hand_from_the_documented_list() -> (
+    None
+):
+    values: dict[str, object] = {
+        "app_digest": "0123456789abcdef" * 4,
+        "bundle_digest": "fedcba9876543210" * 4,
+        "environment": "staging",
+        "operation_id": "00000000-0000-4000-8000-00000000000a",
+        "operation_receipt_id": "00000000-0000-4000-8000-00000000000b",
+        "provider_receipt_id": "00000000-0000-4000-8000-00000000000c",
+        "receipt_kind": "provisioning",
+        "rollout_revision": 12,
+        "rule_digest": "e37147012adaf5e847f6f6171e15443d268f8e51acde261ae728c1265f447dad",
+    }
+    assert tuple(values) == _DOCUMENTED_READINESS_FIELDS
+    # The exact bytes, written out once so a serializer change cannot hide.
+    assert _hand_canonical_json(values) == (
+        '{"app_digest":"' + "0123456789abcdef" * 4 + '",'
+        '"bundle_digest":"' + "fedcba9876543210" * 4 + '",'
+        '"environment":"staging",'
+        '"operation_id":"00000000-0000-4000-8000-00000000000a",'
+        '"operation_receipt_id":"00000000-0000-4000-8000-00000000000b",'
+        '"provider_receipt_id":"00000000-0000-4000-8000-00000000000c",'
+        '"receipt_kind":"provisioning",'
+        '"rollout_revision":12,'
+        '"rule_digest":"e37147012adaf5e847f6f6171e15443d268f8e51acde261ae728c1265f447dad"}'
+    )
+
+    assert _readiness_content_digest(
+        environment="staging",
+        receipt_kind="provisioning",
+        rollout_revision=12,
+        operation_id=UUID("00000000-0000-4000-8000-00000000000a"),
+        operation_receipt_id=UUID("00000000-0000-4000-8000-00000000000b"),
+        provider_receipt_id=UUID("00000000-0000-4000-8000-00000000000c"),
+        rule_digest="e37147012adaf5e847f6f6171e15443d268f8e51acde261ae728c1265f447dad",
+        bundle_digest="fedcba9876543210" * 4,
+        app_digest="0123456789abcdef" * 4,
+    ) == _hand_digest(values)
+
+
+def test_readiness_digest_and_binding_take_no_roster_parameter() -> None:
+    digest_parameters = inspect.signature(_readiness_content_digest).parameters
+    assert set(digest_parameters) == {
+        "environment",
+        "receipt_kind",
+        "rollout_revision",
+        "operation_id",
+        "operation_receipt_id",
+        "provider_receipt_id",
+        "rule_digest",
+        "bundle_digest",
+        "app_digest",
+    }
+    assert not any(
+        "roster" in name
+        for name in inspect.signature(_readiness_evidence_is_bound).parameters
+    )
+
+
+def test_readiness_fixture_digest_is_the_hand_derived_one() -> None:
+    now = datetime.now(timezone.utc)
+    row, _ = _readiness_fixture(
+        now=now, operation_expires_at=now + timedelta(minutes=10)
+    )
+
+    assert row.content_sha256 == _hand_digest(_row_values(row))
+
+
+@pytest.mark.parametrize("roster_revision", [0, 7])
+def test_readiness_digest_computed_with_roster_revision_never_verifies(
+    roster_revision: int,
+) -> None:
+    """A receipt issued before E3 hashed ``roster_revision`` too: unbound."""
+
+    now = datetime.now(timezone.utc)
+    row, evidence = _readiness_fixture(
+        now=now,
+        operation_expires_at=now + timedelta(minutes=10),
+        stored_roster_revision=roster_revision,
+    )
+    legacy = {**_row_values(row), "roster_revision": roster_revision}
+    row.content_sha256 = _hand_digest(legacy)
+
+    assert row.content_sha256 != _hand_digest(_row_values(row))
+    assert _is_bound(row, evidence, now=now) is False
+
+
+@pytest.mark.parametrize("stored_roster_revision", [0, 1, 7, 2**62])
+def test_readiness_stored_roster_revision_is_not_evidence(
+    stored_roster_revision: int,
+) -> None:
+    """The column stays until migration 036; its value is neither hashed nor
+    compared, so any value the CHECK allows (``>= 0``) binds alike."""
+
+    now = datetime.now(timezone.utc)
+    row, evidence = _readiness_fixture(
+        now=now,
+        operation_expires_at=now + timedelta(minutes=10),
+        stored_roster_revision=stored_roster_revision,
+    )
+
+    assert _is_bound(row, evidence, now=now) is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("receipt_kind", "smoke"),
+        ("rollout_revision", 1),
+        ("content_sha256", "0" * 64),
+    ],
+)
+def test_readiness_tampered_row_is_unbound(field: str, value: object) -> None:
+    """Kind and revision are bound only through the digest."""
+
+    now = datetime.now(timezone.utc)
+    row, evidence = _readiness_fixture(
+        now=now, operation_expires_at=now + timedelta(minutes=10)
+    )
+    setattr(row, field, value)
+
+    assert _is_bound(row, evidence, now=now) is False
+
+
+@pytest.mark.parametrize("bound", ["observed_in_future", "expired_now"])
+def test_readiness_row_outside_its_own_window_is_unbound(bound: str) -> None:
+    """The pure check bounds the row by itself (the transition query also
+    filters it); everything else about the row stays bound."""
+
+    now = datetime.now(timezone.utc)
+    row, evidence = _readiness_fixture(
+        now=now, operation_expires_at=now + timedelta(minutes=10)
+    )
+    if bound == "observed_in_future":
+        row.observed_at = now + timedelta(seconds=1)
+    else:
+        row.expires_at = now
+
+    assert _is_bound(row, evidence, now=now) is False

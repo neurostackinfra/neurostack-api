@@ -258,10 +258,17 @@ class BillingRolloutTransitionRequest(BillingOperationMaterialRequest):
 
 
 class BillingRolloutReadinessReceiptRequest(BillingOperationMaterialRequest):
+    """One readiness receipt for the ``canary_allowlist -> general`` quorum.
+
+    The response repeats the accepted request with its ``receipt_id``.  The
+    request is closed: a field not declared here is refused with 422.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     environment: Literal["development", "staging", "production", "test"]
     receipt_kind: Literal["readiness", "backlog", "provisioning", "smoke"]
     rollout_revision: int = Field(ge=0)
-    roster_revision: int = Field(ge=0)
     status: Literal["passed"]
     content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     operation_receipt_id: UUID

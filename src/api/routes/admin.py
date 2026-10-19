@@ -1547,7 +1547,6 @@ async def create_billing_rollout_readiness_receipt(
             environment=body.environment,
             receipt_kind=body.receipt_kind,
             rollout_revision=body.rollout_revision,
-            roster_revision=body.roster_revision,
             status=body.status,
             content_sha256=body.content_sha256,
             material=_billing_material(body),
