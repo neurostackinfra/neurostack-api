@@ -814,6 +814,10 @@ Mantém byte a byte todos os campos legados (`plan`, `active_clinics`,
 - `subscription.current_period_end`: o maior `cycle_end` entre os ciclos da
   assinatura **integralmente pagos, líquidos de estornos**, isto é,
   `state IN ('settled', 'restored') AND reversed_cents = restored_cents`.
+  `settled` significa pago comercialmente: capturado no cartão
+  (`PAYMENT_CONFIRMED`) ou recebido (`PAYMENT_RECEIVED`), o que chegar
+  primeiro, e não fundos disponíveis no ASAAS (no cartão eles só ficam
+  disponíveis cerca de 32 dias depois da captura).
   Ciclos estornados (`reversed`), parcialmente restaurados, `pending` ou
   `quarantined` são ignorados: um ciclo atual estornado faz o valor voltar ao
   fim do último ciclo integralmente pago, e `null` significa que nenhum ciclo
@@ -826,7 +830,7 @@ Mantém byte a byte todos os campos legados (`plan`, `active_clinics`,
   como data local sem conversão. Em JavaScript, `new Date("2026-11-11")` é
   meia-noite UTC e aparece como 10/11 em `America/Sao_Paulo`; separe
   ano/mês/dia (ou use `new Date(2026, 10, 11)`) em vez disso.
-- Assinaturas legadas (não ASAAS, por exemplo Abacate ainda não migrada) e
+- Assinaturas legadas (de um provedor que não é o ASAAS) e
   encerradas (`inactive`/`cancelled`) resultam em `subscription: null`,
   mesmo que os campos legados (`plan`, `subscription_status`) digam `active`.
   Ao encerrar, a data de período pago também deixa de ser informada (o objeto

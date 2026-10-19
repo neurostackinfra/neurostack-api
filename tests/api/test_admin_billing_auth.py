@@ -80,11 +80,11 @@ def test_billing_admin_accepts_super_admin_jwt_context() -> None:
 def test_assignment_actor_must_match_the_authenticated_jwt_subject() -> None:
     actor = uuid4()
     body = BillingOperationAssignmentRequest(
-        scope="migration",
+        scope="rollout",
         operation_id=uuid4(),
         environment="test",
-        from_state="pending",
-        to_state="in_progress",
+        from_state="disabled",
+        to_state="canary_allowlist",
         budget_digest="a" * 64,
         deployment_digest="b" * 64,
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
@@ -108,7 +108,7 @@ def test_assignment_actor_must_match_the_authenticated_jwt_subject() -> None:
         )
 
 
-def test_every_billing_admin_route_including_absence_reads_requires_jwt() -> None:
+def test_every_billing_admin_route_requires_jwt() -> None:
     from src.api.routes.admin import router
 
     billing_routes = {
@@ -116,43 +116,19 @@ def test_every_billing_admin_route_including_absence_reads_requires_jwt() -> Non
         for route in router.routes
         if getattr(route, "path", "").startswith(("/admin/billing/", "/billing/"))
     }
-    assert any(
-        path.endswith("/billing/migrations/absence-reads") for path in billing_routes
-    )
+    # Non-vacuous: the signed control plane is enumerated.
+    assert {
+        "/billing/operations/assignments",
+        "/billing/operations/receipts",
+        "/billing/rollout/transitions",
+        "/billing/rollout/receipts",
+        "/billing/topup-capability/enable",
+    } <= set(billing_routes)
     for path, route in billing_routes.items():
         dependencies = {
             dependency.call for dependency in route.dependant.dependencies  # type: ignore[attr-defined]
         }
         assert require_super_admin_jwt in dependencies, path
-
-
-def test_provider_flip_takes_the_asaas_id_only_from_the_signed_envelope() -> None:
-    from pydantic import ValidationError
-
-    from src.api.schemas.admin import (
-        BillingMigrationProviderFlipRequest,
-        BillingProviderEvidenceRequest,
-    )
-
-    assert (
-        "asaas_subscription_id" not in BillingMigrationProviderFlipRequest.model_fields
-    )
-    assert BillingMigrationProviderFlipRequest.model_fields["evidence"].is_required()
-    with pytest.raises(ValidationError):
-        BillingProviderEvidenceRequest.model_validate(
-            {
-                "external_reference": "sub_1",
-                "provider_event_id": "evt_1",
-                "provider_key_id": "key-1",
-                "provider_operation": "subscription.migration.provider_flip",
-                "provider_signature": "a" * 128,
-                "provider_observed_at": "2026-10-12T20:00:00+00:00",
-                "provider_expires_at": "2026-10-12T20:15:00+00:00",
-                "provider_snapshot_digest": "b" * 64,
-                "provider_evidence_digest": "c" * 64,
-                "asaas_subscription_id": "sub_caller_asserted",
-            }
-        )
 
 
 @pytest.mark.parametrize(

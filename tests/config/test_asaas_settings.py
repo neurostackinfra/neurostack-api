@@ -168,6 +168,63 @@ def test_production_startup_ignores_stale_legacy_gateway_environment(
     assert "stale-legacy-secret" not in rendered
 
 
+def test_settings_expose_no_retired_provider_evidence_fields() -> None:
+    # Read only by the removed migration saga (Group 10 phase E2).
+    retired = {
+        name for name in Settings.model_fields if "provider_evidence" in name.lower()
+    }
+
+    assert retired == set()
+
+
+def test_settings_ignore_stale_provider_evidence_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A deployment that still injects the retired variables must neither block
+    # startup nor surface their values anywhere in the settings object.
+    monkeypatch.setenv("ASAAS_PROVIDER_EVIDENCE_KEY_ID", "stale-evidence-key-id")
+    monkeypatch.setenv(
+        "ASAAS_PROVIDER_EVIDENCE_PUBLIC_KEY", "stale-evidence-public-key"
+    )
+
+    configured = _production_settings()
+    local = Settings(_env_file=None)
+
+    assert configured.is_production is True
+    assert configured.is_billing_observability_compatible is True
+    for loaded in (configured, local):
+        rendered = repr(loaded) + repr(loaded.model_dump())
+        assert "stale-evidence-key-id" not in rendered
+        assert "stale-evidence-public-key" not in rendered
+        assert not hasattr(loaded, "asaas_provider_evidence_key_id")
+        assert not hasattr(loaded, "asaas_provider_evidence_public_key")
+
+
+def test_settings_ignore_stale_provider_evidence_in_a_dotenv_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A .env still carrying the retired keys must load: unknown dotenv keys
+    # are ignored (``extra="ignore"``), never rejected or exposed.
+    monkeypatch.delenv("ASAAS_USER_AGENT", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "ASAAS_PROVIDER_EVIDENCE_KEY_ID=stale-dotenv-key-id\n"
+        "ASAAS_PROVIDER_EVIDENCE_PUBLIC_KEY=stale-dotenv-public-key\n"
+        "ASAAS_USER_AGENT=NeuroStack/dotenv-probe\n",
+        encoding="utf-8",
+    )
+
+    loaded = Settings(_env_file=env_file)  # type: ignore[call-arg]
+
+    # Non-vacuous: the file itself was read.
+    assert loaded.asaas_user_agent == "NeuroStack/dotenv-probe"
+    rendered = repr(loaded) + repr(loaded.model_dump())
+    assert "stale-dotenv-key-id" not in rendered
+    assert "stale-dotenv-public-key" not in rendered
+    assert not hasattr(loaded, "asaas_provider_evidence_key_id")
+    assert not hasattr(loaded, "asaas_provider_evidence_public_key")
+
+
 def test_production_startup_error_never_mentions_retired_legacy_gateway() -> None:
     with pytest.raises(ConfigurationError) as exc_info:
         _production_settings(debug=True)

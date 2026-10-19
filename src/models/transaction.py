@@ -1,6 +1,6 @@
 """
 NeuroStack - Transaction Model
-Records confirmed payments received via AbacatePay webhooks.
+Records confirmed payments projected from settled billing payment effects.
 """
 
 from typing import TYPE_CHECKING, Optional
@@ -23,7 +23,11 @@ if TYPE_CHECKING:
 
 
 class Transaction(Base, TimestampMixin):
-    """Payment transaction logged from AbacatePay webhook events."""
+    """Payment transaction logged once per settled ASAAS payment effect.
+
+    The provider CHECK still admits the retired legacy provider value so old
+    rows stay representable; the application writes only ASAAS rows.
+    """
 
     __tablename__ = "transactions"
     __table_args__ = (

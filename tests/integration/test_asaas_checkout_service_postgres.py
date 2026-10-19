@@ -42,6 +42,7 @@ from src.services.billing_checkout import (
     CheckoutView,
 )
 from src.services.billing_outbox import billing_fact_schema_digest
+from src.services.billing_read_contract import read_commercial_availability
 from src.services.egress_policy import EgressPolicy
 from tests.integration.test_asaas_billing_postgres import (
     _create_child,
@@ -648,28 +649,11 @@ async def test_concurrent_different_plan_creation_is_rejected_with_stable_code(
     ]
 
 
-_MIGRATION_SNAPSHOT = """
-    jsonb_build_object(
-      'catalog_version_id','payment-2026-10-03',
-      'offer_id','plan_plus_monthly_v1','plan','plus',
-      'billing_cycle','monthly','coupon_code',NULL,
-      'amount_cents',99900,'credit_grant_mc',5000,
-      'included_clinics',1,'additional_clinics',0,
-      'lines',jsonb_build_array(jsonb_build_object(
-        'line_id','plan','offer_id','plan_plus_monthly_v1',
-        'kind','plan','quantity',1,'unit_amount_cents',99900,
-        'line_amount_cents',99900,'credit_grant_mc',5000,
-        'settled_cents',0,'reversed_cents',0,'restored_cents',0,
-        'line_financial_state','pending')))
-"""
-
-
 async def _seed_blocker(harness: _Harness, builder_id: UUID, condition: str) -> None:
     subscription_id = uuid4()
     provider, status, active = {
         "legacy_active": ("abacatepay", "active", True),
         "asaas_non_terminal": ("asaas", "readback_required", True),
-        "migration": ("abacatepay", "inactive", False),
     }.get(condition, (None, None, None))
     async with harness.session() as session:
         async with session.begin():
@@ -694,35 +678,11 @@ async def _seed_blocker(harness: _Harness, builder_id: UUID, condition: str) -> 
                         "status": status,
                     },
                 )
-            if condition == "migration":
-                await session.execute(
-                    text(f"""
-                        INSERT INTO billing_migrations (
-                            id, builder_id, subscription_id, state,
-                            renewal_date, open_by_date, cutover_by_date,
-                            target_catalog_version_id, target_offer_id,
-                            target_plan, target_billing_cycle,
-                            target_amount_cents, target_snapshot,
-                            source_roster_revision
-                        ) VALUES (
-                            :id, :builder_id, :subscription_id, 'pending',
-                            DATE '2026-12-10', DATE '2026-12-03',
-                            DATE '2026-12-08', 'payment-2026-10-03',
-                            'plan_plus_monthly_v1', 'plus', 'monthly', 99900,
-                            {_MIGRATION_SNAPSHOT}, 1
-                        )
-                    """),
-                    {
-                        "id": uuid4(),
-                        "builder_id": builder_id,
-                        "subscription_id": subscription_id,
-                    },
-                )
 
 
 @pytest.mark.parametrize(
     "condition",
-    ["legacy_active", "asaas_non_terminal", "migration", "live_other_plan"],
+    ["legacy_active", "asaas_non_terminal", "live_other_plan"],
 )
 async def test_ineligible_builder_gets_stable_rejection_without_rows_or_post(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch, condition: str
@@ -752,6 +712,192 @@ async def test_ineligible_builder_gets_stable_rejection_without_rows_or_post(
         harness, provider.client, builder_id, "package_credits_1000_v1", "pix"
     )
     assert topup.state == "active"
+
+
+# ---------------------------------------------------------------------------
+# Group 10 phase E2: the migration saga is removed and a billing_migrations row
+# no longer blocks by itself.  Every live saga state still fails closed through
+# the subscription row it leaves behind; a row left over after its
+# subscription ended does not.  The advisory read contract (6b) and the POST
+# must agree in both directions.
+# ---------------------------------------------------------------------------
+
+_SAGA_SNAPSHOT = """
+    jsonb_build_object(
+      'catalog_version_id','payment-2026-10-03',
+      'offer_id','plan_plus_monthly_v1','plan','plus',
+      'billing_cycle','monthly','coupon_code',NULL,
+      'amount_cents',99900,'credit_grant_mc',5000,
+      'included_clinics',1,'additional_clinics',0,
+      'lines',jsonb_build_array(jsonb_build_object(
+        'line_id','plan','offer_id','plan_plus_monthly_v1',
+        'kind','plan','quantity',1,'unit_amount_cents',99900,
+        'line_amount_cents',99900,'credit_grant_mc',5000,
+        'settled_cents',0,'reversed_cents',0,'restored_cents',0,
+        'line_financial_state','pending')))
+"""
+
+
+async def _seed_saga(
+    harness: _Harness,
+    builder_id: UUID,
+    *,
+    state: str,
+    provider: str | None,
+    status: str,
+    is_active: bool,
+) -> None:
+    subscription_id = uuid4()
+    async with harness.session() as session:
+        async with session.begin():
+            await session.execute(
+                text("""
+                    INSERT INTO billing_subscriptions (
+                        id, builder_id, provider, external_subscription_id,
+                        is_active, plan, billing_cycle, status, roster_revision
+                    ) VALUES (
+                        :id, :builder_id, :provider, :external_id, :active,
+                        'plus', 'monthly', :status, 1
+                    )
+                """),
+                {
+                    "id": subscription_id,
+                    "builder_id": builder_id,
+                    "provider": provider,
+                    "external_id": f"sub-{subscription_id.hex}",
+                    "active": is_active,
+                    "status": status,
+                },
+            )
+            await session.execute(
+                text(f"""
+                    INSERT INTO billing_migrations (
+                        id, builder_id, subscription_id, state,
+                        renewal_date, open_by_date, cutover_by_date,
+                        target_catalog_version_id, target_offer_id,
+                        target_plan, target_billing_cycle,
+                        target_amount_cents, target_snapshot,
+                        source_roster_revision
+                    ) VALUES (
+                        :id, :builder_id, :subscription_id, :state,
+                        DATE '2026-12-10', DATE '2026-12-03',
+                        DATE '2026-12-08', 'payment-2026-10-03',
+                        'plan_plus_monthly_v1', 'plus', 'monthly', 99900,
+                        {_SAGA_SNAPSHOT}, 1
+                    )
+                """),
+                {
+                    "id": uuid4(),
+                    "builder_id": builder_id,
+                    "subscription_id": subscription_id,
+                    "state": state,
+                },
+            )
+
+
+async def _listed_offers(harness: _Harness, builder_id: UUID) -> tuple[str, ...]:
+    async with harness.session() as session:
+        readback = await read_commercial_availability(
+            session, builder_id=builder_id, clock=lambda: _CLOCK
+        )
+    assert readback.available is True
+    return readback.available_offer_ids
+
+
+@pytest.mark.parametrize(
+    ("state", "provider", "status", "is_active"),
+    [
+        ("pending", "abacatepay", "active", True),
+        ("in_progress", None, "legacy_cancel_pending", False),
+        ("legacy_cancel_pending", None, "legacy_cancel_pending", False),
+        ("legacy_cancelled", None, "legacy_cancelled", False),
+        ("recreate_pending", None, "legacy_cancelled", False),
+        ("migrated", "asaas", "active", True),
+        ("manual_intervention", None, "manual_intervention", False),
+    ],
+)
+async def test_live_saga_pairings_still_reject_without_rows_or_post(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    provider: str | None,
+    status: str,
+    is_active: bool,
+) -> None:
+    await _general(harness, "development")
+    builder_id = await _builder(harness, f"E2 live saga {state}")
+    _configure(monkeypatch, "development", _Flag())
+    fake = _Provider(harness)
+    await _seed_saga(
+        harness,
+        builder_id,
+        state=state,
+        provider=provider,
+        status=status,
+        is_active=is_active,
+    )
+    before = await _rows(harness, builder_id)
+
+    # The read contract does not advertise what the POST refuses.
+    listed = await _listed_offers(harness, builder_id)
+    assert "plan_pro_monthly_v1" not in listed
+    assert "plan_plus_monthly_v1" not in listed
+    with pytest.raises(CheckoutNotEligible, match="^billing_checkout_not_eligible$"):
+        await _create(
+            harness, fake.client, builder_id, "plan_pro_monthly_v1", "credit_card"
+        )
+
+    assert await _rows(harness, builder_id) == before
+    assert fake.posts == []
+
+
+@pytest.mark.parametrize(
+    ("state", "provider", "status"),
+    [
+        ("pending", "abacatepay", "inactive"),
+        ("in_progress", "asaas", "cancelled"),
+        ("legacy_cancel_pending", "abacatepay", "cancelled"),
+        ("legacy_cancelled", "asaas", "inactive"),
+        ("recreate_pending", "abacatepay", "inactive"),
+        ("migrated", "asaas", "cancelled"),
+        ("manual_intervention", "abacatepay", "cancelled"),
+    ],
+)
+async def test_leftover_saga_row_with_an_ended_subscription_checks_out(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    provider: str,
+    status: str,
+) -> None:
+    await _general(harness, "development")
+    builder_id = await _builder(harness, f"E2 leftover saga {state}")
+    _configure(monkeypatch, "development", _Flag())
+    fake = _Provider(harness)
+    await _seed_saga(
+        harness,
+        builder_id,
+        state=state,
+        provider=provider,
+        status=status,
+        is_active=False,
+    )
+
+    # Read contract and POST agree: listed, then exactly one provider POST.
+    assert "plan_pro_monthly_v1" in await _listed_offers(harness, builder_id)
+    view = await _create(
+        harness, fake.client, builder_id, "plan_pro_monthly_v1", "credit_card"
+    )
+
+    assert view.state == "active"
+    assert len(fake.posts) == 1
+    sessions, orders = await _rows(harness, builder_id)
+    assert [(row.intent_kind, row.state, row.offer_id) for row in sessions] == [
+        ("subscription", "active", "plan_pro_monthly_v1")
+    ]
+    assert orders == []
+    # The live attempt stays listed (the POST would return it unchanged).
+    assert "plan_pro_monthly_v1" in await _listed_offers(harness, builder_id)
 
 
 async def test_locked_reads_refresh_references_held_across_a_foreign_commit(
