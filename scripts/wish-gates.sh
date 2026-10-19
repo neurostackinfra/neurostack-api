@@ -409,11 +409,14 @@ _production_compose_render() (
 # means the same to `git grep -E` and to awk. Split literals keep this scanner
 # from matching its own source. Findings are printed as `path:line: rule`
 # only: the matched text and the line content are never printed, because
-# gate transcripts are captured as evidence.
+# gate transcripts are captured as evidence. `payment_security_term` matches
+# both spellings of a card security code, the generic three-letter term and
+# the provider's own field name (`c[c]v`), case-sensitively and anywhere on a
+# line, as the generic term always did.
 _asaas_scan_rules() {
     local forbidden_cpf='cpf'"Cnpj"
     local forbidden_card='credit'"Card"
-    local payment_security_term='c'"vv"
+    local payment_security_term='c[cv]'"v"
     printf '%s\t%s\n' \
         asaas_api_key '[$]aact_(prod|hmlg)_[A-Za-z0-9]+' \
         asaas_access_token_header 'asaas-access-token[[:space:]]*[:=][[:space:]]*[^$<{]' \
@@ -427,10 +430,11 @@ _asaas_scan_rules() {
 # `decision<TAB>path<TAB>rule<TAB>count<TAB>pattern` per line. OWNER DECISION
 # 2026-10-18 (wish asaas-payment-gateway): the sandbox card capture tool is
 # committed with a scoped exception instead of splitting its literals or
-# skipping its files. It must send the provider's CPF/CNPJ and card field
-# names and the public sandbox test card (sixteen 4s, CCV 123), and its tests
-# use fixed synthetic API keys. A card number other than the public test card
-# in those files still fails the gate.
+# skipping its files. It must send the provider's CPF/CNPJ, card and
+# security-code field names and the public sandbox test card (sixteen 4s,
+# CCV 123), its tests use fixed synthetic API keys, and its runbook
+# (docs/runbooks/asaas-sandbox-card-capture.md) names the test card. A card
+# number other than the public test card in those files still fails the gate.
 #
 # How narrow it is:
 #   * `path` is compared byte for byte with the repo-relative path being
@@ -450,7 +454,8 @@ _asaas_scan_rules() {
 #     match a constant string. Rule literals are written as bracket
 #     expressions so this table never matches the scan.
 #   * `count` is the exact number of lines the entry may match in the file.
-#     `_asaas_waived_path_audit` reads both files whole on every run: more
+#     `_asaas_waived_path_audit` reads every path the table names (the tool,
+#     its tests and its runbook) whole on every run: more
 #     matches than recorded (a copied line) fails, a pinned line that does not
 #     match exactly `count` times fails, and a card number written as a digit
 #     run (optionally grouped with single spaces, dashes, dots or underscores)
@@ -462,21 +467,25 @@ _asaas_scan_rules() {
 #
 # A waived hit is never silent: each one prints `waived (<decision>):
 # <path>:<line> rule=<rule>`, both scans print a waived count, and the audit
-# warns about stale entries. The rule set is unchanged: the security-code
-# rule term is `c[v]v`, which never matches the provider's `ccv` field; only
-# the pinned lines protect the CCV value. To remove the exception, delete
+# warns about stale entries. The security-code rule matches the provider's
+# field name (`c[c]v`) too, so the tool's payload line and its test assertion
+# carry an explicit `payment_security_term` entry next to their pin or card
+# entry; the pinned lines alone waive nothing. To remove the exception, delete
 # these entries; the gate then fails on the tool's lines again. Expanding it
 # needs a new recorded owner decision. See docs/runbooks/asaas-deployment.md.
 _asaas_scan_waivers() {
     local decision='owner decision 2026-10-18, wish asaas-payment-gateway'
     local tool='scripts/asaas_sandbox_card_capture.py'
     local tests='tests/scripts/test_asaas_sandbox_card_capture.py'
+    local runbook='docs/runbooks/asaas-sandbox-card-capture.md'
     local entry
     while IFS= read -r entry; do
         printf '%s\t%s\n' "$decision" "$entry"
     done < <(printf '%s\t%s\t%s\t%s\n' \
+        "$runbook" pinned_line 1 \
+        '[[:space:]]*`4444 4444 4444 4444`, with any future expiry and CCV `123`' \
         "$tool" pinned_line 1 \
-        '[[:space:]]*"ccv": TEST_CARD_CCV,' \
+        '[[:space:]]*"c[c]v": TEST_CARD_CCV,' \
         "$tool" pinned_line 1 \
         '[[:space:]]*"number": TEST_CARD_NUMBER,' \
         "$tool" pinned_line 1 \
@@ -487,6 +496,8 @@ _asaas_scan_waivers() {
         '[[:space:]]*"cpf[C]npj": identity[.]cpf,' \
         "$tool" forbidden_card_field 1 \
         '[[:space:]]*"credit[C]ard": [{]' \
+        "$tool" payment_security_term 1 \
+        '[[:space:]]*"c[c]v": TEST_CARD_CCV,' \
         "$tool" forbidden_card_field 1 \
         '[[:space:]]*"credit[C]ardHolderInfo": [{]' \
         "$tests" asaas_api_key 1 \
@@ -506,7 +517,9 @@ _asaas_scan_waivers() {
         "$tests" forbidden_card_field 1 \
         '[[:space:]]*assert payload[[]"credit[C]ard"[]][[]"number"[]] == "4444444444444444"' \
         "$tests" forbidden_card_field 1 \
-        '[[:space:]]*assert payload[[]"credit[C]ard"[]][[]"ccv"[]] == "123"' \
+        '[[:space:]]*assert payload[[]"credit[C]ard"[]][[]"c[c]v"[]] == "123"' \
+        "$tests" payment_security_term 1 \
+        '[[:space:]]*assert payload[[]"credit[C]ard"[]][[]"c[c]v"[]] == "123"' \
         "$tests" forbidden_card_field 1 \
         '[[:space:]]*assert int[(]payload[[]"credit[C]ard"[]][[]"expiryYear"[]][)] > TODAY[.]year' \
         "$tests" forbidden_card_field 1 \
@@ -910,6 +923,14 @@ _asaas_waived_path_audit() {
 # routes and operator client were removed in Group 10 phase E2;
 # docker-compose.production.yml no longer requires ABACATEPAY_WEBHOOK_SECRET
 # (phase 1) nor ASAAS_PROVIDER_EVIDENCE_* (phase E2).
+#
+# Recorded scan exception (owner decision 2026-10-18, wish
+# asaas-payment-gateway): `_asaas_scan_waivers` waives a closed list of exact
+# synthetic lines of the sandbox card capture tool, its tests and its
+# runbook, for named rules only, and `_asaas_waived_path_audit` reads those
+# files whole on every run (card numbers other than the public test card,
+# copied waived lines, changed card constants). Every waived hit is printed
+# and counted; see the table for what is waived and how to remove it.
 asaas_release_candidate_gate() (
     set -euo pipefail
     local root="$_WISH_GATES_ROOT"
