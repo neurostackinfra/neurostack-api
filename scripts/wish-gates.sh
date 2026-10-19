@@ -423,14 +423,153 @@ _asaas_scan_rules() {
         payment_security_term "$payment_security_term"
 }
 
+# Recorded secret/PII scan waivers, one
+# `decision<TAB>path<TAB>rule<TAB>count<TAB>pattern` per line. OWNER DECISION
+# 2026-10-18 (wish asaas-payment-gateway): the sandbox card capture tool is
+# committed with a scoped exception instead of splitting its literals or
+# skipping its files. It must send the provider's CPF/CNPJ and card field
+# names and the public sandbox test card (sixteen 4s, CCV 123), and its tests
+# use fixed synthetic API keys. A card number other than the public test card
+# in those files still fails the gate.
+#
+# How narrow it is:
+#   * `path` is compared byte for byte with the repo-relative path being
+#     scanned: no prefix, glob, regex or case folding, so a copy or rename of
+#     these lines to another path gets no waiver.
+#   * `rule` is the only rule waived for that entry; every other rule still
+#     runs on every line of the file. `pinned_line` waives nothing: it marks a
+#     line the file must contain exactly `count` times (the card constants and
+#     the payload lines that use them).
+#   * `pattern` must match the WHOLE line (the scanner wraps it in `^(...)$`;
+#     one trailing CR is ignored) and may hold only literal text: plain
+#     characters, one-character bracket expressions such as `[.]`, `[$]`,
+#     `[C]`, `[\\]` for a backslash, and one optional leading `[[:space:]]*`.
+#     Anything else (`.`, `*`, `+`, `?`, `{}`, `()`, `|`, classes, ranges,
+#     escapes) fails the gate up front, as do duplicate entries. Pinning the
+#     line, not just the matched text, matters because the field-name rules
+#     match a constant string. Rule literals are written as bracket
+#     expressions so this table never matches the scan.
+#   * `count` is the exact number of lines the entry may match in the file.
+#     `_asaas_waived_path_audit` reads both files whole on every run: more
+#     matches than recorded (a copied line) fails, a pinned line that does not
+#     match exactly `count` times fails, and a card number written as a digit
+#     run (optionally grouped with single spaces, dashes, dots or underscores)
+#     of 13 or more digits, other than the sixteen 4s, fails as
+#     `card_number_guard`. Other spellings (string concatenation, several-line
+#     splits, double spaces or tabs, non-ASCII digits, encodings) are NOT
+#     detected. Fewer matches of a waiver entry is a stale warning, never a
+#     failure.
+#
+# A waived hit is never silent: each one prints `waived (<decision>):
+# <path>:<line> rule=<rule>`, both scans print a waived count, and the audit
+# warns about stale entries. The rule set is unchanged: the security-code
+# rule term is `c[v]v`, which never matches the provider's `ccv` field; only
+# the pinned lines protect the CCV value. To remove the exception, delete
+# these entries; the gate then fails on the tool's lines again. Expanding it
+# needs a new recorded owner decision. See docs/runbooks/asaas-deployment.md.
+_asaas_scan_waivers() {
+    local decision='owner decision 2026-10-18, wish asaas-payment-gateway'
+    local tool='scripts/asaas_sandbox_card_capture.py'
+    local tests='tests/scripts/test_asaas_sandbox_card_capture.py'
+    local entry
+    while IFS= read -r entry; do
+        printf '%s\t%s\n' "$decision" "$entry"
+    done < <(printf '%s\t%s\t%s\t%s\n' \
+        "$tool" pinned_line 1 \
+        '[[:space:]]*"ccv": TEST_CARD_CCV,' \
+        "$tool" pinned_line 1 \
+        '[[:space:]]*"number": TEST_CARD_NUMBER,' \
+        "$tool" pinned_line 1 \
+        'TEST_CARD_CCV = "123"' \
+        "$tool" pinned_line 1 \
+        'TEST_CARD_NUMBER = "4444444444444444"' \
+        "$tool" forbidden_cpf_field 2 \
+        '[[:space:]]*"cpf[C]npj": identity[.]cpf,' \
+        "$tool" forbidden_card_field 1 \
+        '[[:space:]]*"credit[C]ard": [{]' \
+        "$tool" forbidden_card_field 1 \
+        '[[:space:]]*"credit[C]ardHolderInfo": [{]' \
+        "$tests" asaas_api_key 1 \
+        'SANDBOX_KEY = "[$]aact_hmlg_100000000000capture-test-key-0001"' \
+        "$tests" asaas_api_key 1 \
+        'PROD_KEY = "[$]aact_prod_100000000000capture-test-key-0001"' \
+        "$tests" forbidden_cpf_field 2 \
+        '[[:space:]]*"cpf[C]npj": "52998224725",' \
+        "$tests" forbidden_card_field 1 \
+        '[[:space:]]*"credit[C]ard": [{]"credit[C]ardNumber": "4444", "credit[C]ardToken": "tok"[}],' \
+        "$tests" asaas_api_key 1 \
+        '[[:space:]]*[(]"[$]aact_hmlg_xxxxxxxxxxxxxxxxxxxxaact_prod", "sandbox_key_is_production"[)],' \
+        "$tests" asaas_api_key 1 \
+        '[[:space:]]*[(]"[$]aact_hmlg_abc", "sandbox_key_malformed"[)],' \
+        "$tests" asaas_api_key 1 \
+        '[[:space:]]*[(]"[$]aact_hmlg_xxxxxxxxxxxxxxxxxxxx space", "sandbox_key_malformed"[)],' \
+        "$tests" forbidden_card_field 1 \
+        '[[:space:]]*assert payload[[]"credit[C]ard"[]][[]"number"[]] == "4444444444444444"' \
+        "$tests" forbidden_card_field 1 \
+        '[[:space:]]*assert payload[[]"credit[C]ard"[]][[]"ccv"[]] == "123"' \
+        "$tests" forbidden_card_field 1 \
+        '[[:space:]]*assert int[(]payload[[]"credit[C]ard"[]][[]"expiryYear"[]][)] > TODAY[.]year' \
+        "$tests" forbidden_card_field 1 \
+        '[[:space:]]*"credit[C]ard": [{]"credit[C]ardNumber": "4444", "credit[C]ardToken": "secret-token"[}],' \
+        "$tests" forbidden_card_field 1 \
+        '[[:space:]]*"credit[C]ardHolderInfo": [{]"name": "x"[}],' \
+        "$tests" forbidden_card_field 1 \
+        '[[:space:]]*assert clean[[]"_other_fields"[]][[]"credit[C]ard"[]] == "object"' \
+        "$tests" forbidden_cpf_field 1 \
+        '[[:space:]]*[{]"code": "invalid_cpf[C]npj", "description": "CPF 52998224725 inválido"[}],' \
+        "$tests" forbidden_cpf_field 1 \
+        '[[:space:]]*[{]"code": "invalid_cpf[C]npj", "reason": "unmapped"[}],' \
+        "$tests" forbidden_cpf_field 1 \
+        '[[:space:]]*assert sent_customer[[]"cpf[C]npj"[]] == identity[.]cpf  # the scrubbed value was real' \
+        "$tests" asaas_api_key 1 \
+        'UPPER_KEY = "[$]aact_hmlg_ABCDEFGHIJKLMNOPQRSTUVWXYZ"' \
+        "$tests" asaas_api_key 1 \
+        '[[:space:]]*key = "[$]aact_hmlg_abc4738010919XYZsecretTAIL"' \
+        "$tests" asaas_api_key 1 \
+        '[[:space:]]*broken[.]write_bytes[(]b"ASAAS_SANDBOX_API_KEY=[$]aact_hmlg_abc[\\]xff[\\]xfedefghijkl[\\]n"[)]')
+}
+
 # Reads stdin and prints `path:line: rule` per hit; exits 3 when anything
-# matched. ASAAS_SCAN_MODE=file numbers the input lines; ASAAS_SCAN_MODE=diff
+# not waived matched. ASAAS_SCAN_MODE=file numbers the input lines;
+# ASAAS_SCAN_MODE=line scans one line numbered ASAAS_SCAN_LINE (a `git grep`
+# hit) and fails if no rule reproduces it; ASAAS_SCAN_MODE=diff
 # reads a single-file `git diff --unified=0` and scans only `+` lines inside
 # hunks, numbered from each `@@ ... +start` header. With --unified=0 every body
 # line starts with `+`, `-` or `\`, so the header block before the first `@@`
 # is the only place a `+++ ` header can appear: an added line whose text starts
-# with `++ ` is content, never a file switch.
+# with `++ ` is content, never a file switch. ASAAS_SCAN_MODE=audit reads one
+# waived path's whole content (see `_asaas_waived_path_audit`).
+#
+# ASAAS_SCAN_WAIVERS holds the `_asaas_scan_waivers` table, validated and
+# compiled in BEGIN whatever the mode, so a malformed entry fails even when no
+# file is scanned. A hit is waived only when an entry's path and rule are
+# equal (as strings) to this hit's and the entry's pattern, wrapped as
+# `^(...)$`, matches the whole line. The parentheses are load-bearing: mawk
+# lets a bare `^...$` match at an embedded NUL byte. A waived hit is printed,
+# and its entry number is appended to ASAAS_WAIVER_LOG for the counts.
 _ASAAS_SCAN_AWK='
+function fail(message) { print message > "/dev/stderr"; failed = 1; exit 2 }
+# Only literal text: plain characters, one-character bracket expressions
+# (`[.]`, `[$]`, `[]]`, `[[]`, `[\\]` for a backslash) and one optional
+# leading `[[:space:]]*`. No `.`, `*`, `+`, `?`, `{}`, `()`, `|`, `^`, `$`,
+# ranges, classes, negations or backslash escapes.
+function literal_pattern(re,    c) {
+    if (substr(re, 1, 12) == "[[:space:]]*") re = substr(re, 13)
+    if (re == "") return 0
+    while (re != "") {
+        if (substr(re, 1, 4) == "[\\\\]") { re = substr(re, 5); continue }
+        c = substr(re, 1, 1)
+        if (c == "[") {
+            c = substr(re, 2, 1)
+            if (substr(re, 3, 1) != "]" || c == "" || c == "^" || c == "\\") return 0
+            re = substr(re, 4)
+            continue
+        }
+        if (index("\\.[]()*+?{}|^$", c)) return 0
+        re = substr(re, 2)
+    }
+    return 1
+}
 BEGIN {
     count = split(ENVIRON["ASAAS_SCAN_RULES"], specs, "\n")
     for (i = 1; i <= count; i++) {
@@ -439,21 +578,129 @@ BEGIN {
         rules++
         rule_name[rules] = substr(specs[i], 1, tab - 1)
         rule_re[rules] = substr(specs[i], tab + 1)
+        rule_index[rule_name[rules]] = rules
+        if ("" ~ rule_re[rules]) fail("scan rule matches an empty line: " rule_name[rules])
     }
-    if (rules == 0) { print "no scan rules" > "/dev/stderr"; exit 2 }
+    if (rules == 0) fail("no scan rules")
+    count = split(ENVIRON["ASAAS_SCAN_WAIVERS"], specs, "\n")
+    for (i = 1; i <= count; i++) {
+        if (specs[i] == "") continue
+        n = waivers + 1
+        if (split(specs[i], field, "\t") != 5 || field[1] == "" || field[2] == "" ||
+            !((field[3] in rule_index) || field[3] == "pinned_line") ||
+            field[4] !~ /^[1-9][0-9]*$/ || !literal_pattern(field[5])) {
+            fail("malformed scan waiver entry " n)
+        }
+        key = field[2] "\t" field[3] "\t" field[5]
+        if (key in seen) fail("duplicate scan waiver entry " n)
+        seen[key] = 1
+        waivers = n
+        waiver_decision[n] = field[1]
+        waiver_path[n] = field[2]
+        waiver_rule[n] = field[3]
+        waiver_count[n] = field[4] + 0
+        waiver_re[n] = "^(" field[5] ")$"
+        # Compiles the pattern now; a literal line is never empty.
+        if ("" ~ waiver_re[n]) fail("scan waiver entry matches an empty line: " n)
+    }
+    waiver_log = ENVIRON["ASAAS_WAIVER_LOG"]
+    if (waiver_log == "") fail("no waiver log")
     path = ENVIRON["ASAAS_SCAN_PATH"]
+    prefix = ENVIRON["ASAAS_SCAN_PREFIX"]
+    missing = ENVIRON["ASAAS_AUDIT_MISSING"] == "1"
     mode = ENVIRON["ASAAS_SCAN_MODE"]
-    if (mode != "file" && mode != "diff") { print "bad scan mode" > "/dev/stderr"; exit 2 }
-}
-function check(text, number,    j) {
-    for (j = 1; j <= rules; j++) {
-        if (text ~ rule_re[j]) { print path ":" number ": " rule_name[j]; hits++ }
+    if (mode != "file" && mode != "diff" && mode != "line" && mode != "audit") {
+        fail("bad scan mode")
     }
+}
+function waiver_for(j, line,    k) {
+    for (k = 1; k <= waivers; k++) {
+        if ((waiver_path[k] "") == (path "") && (waiver_rule[k] "") == (rule_name[j] "") &&
+            line ~ waiver_re[k]) return k
+    }
+    return 0
+}
+function check(text, number,    j, k, line, matched) {
+    line = text
+    sub(/\r$/, "", line)
+    for (j = 1; j <= rules; j++) {
+        if (text !~ rule_re[j]) continue
+        matched++
+        k = waiver_for(j, line)
+        if (k) {
+            print prefix "waived (" waiver_decision[k] "): " path ":" number " rule=" rule_name[j]
+            print k >> waiver_log
+        } else {
+            print prefix path ":" number ": " rule_name[j]
+            hits++
+        }
+    }
+    return matched
+}
+# A card number written as a digit run (optionally grouped with single
+# spaces, dashes, dots or underscores) of 13 or more digits, other than the
+# sixteen 4s of the public sandbox test card. Every run on the line is
+# checked; the digits are never printed. Other spellings are NOT detected:
+# string concatenation, a number split over several lines, double spaces or
+# tabs between groups, non-ASCII digits, or any encoding.
+function card_guard(text, number,    rest, run) {
+    rest = text
+    while (match(rest, /[0-9]([ ._-]?[0-9])*/)) {
+        run = substr(rest, RSTART, RLENGTH)
+        rest = substr(rest, RSTART + RLENGTH)
+        gsub(/[ ._-]/, "", run)
+        if (length(run) >= 13 && run != "4444444444444444") {
+            print path ":" number ": card_number_guard"
+            hits++
+            return
+        }
+    }
+}
+function audit_line(text, number,    k, line) {
+    line = text
+    sub(/\r$/, "", line)
+    card_guard(text, number)
+    for (k = 1; k <= waivers; k++) {
+        if ((waiver_path[k] "") != (path "") || line !~ waiver_re[k]) continue
+        if (waiver_rule[k] == "pinned_line" || text ~ rule_re[rule_index[waiver_rule[k]]]) {
+            found[k]++
+        }
+    }
+}
+# More matches than recorded fails (a copied line); a pinned line must match
+# exactly its count; fewer matches of a waiver entry is a stale warning.
+function audit_end(    k, n) {
+    for (k = 1; k <= waivers; k++) {
+        if ((waiver_path[k] "") != (path "")) continue
+        n = found[k] + 0
+        if (n > waiver_count[k] && waiver_rule[k] == "pinned_line") {
+            print path ": pinned line entry " k " matches " n " lines, expected " waiver_count[k]
+            hits++
+        } else if (n > waiver_count[k]) {
+            print path ": waiver entry " k " rule=" waiver_rule[k] " matches " n \
+                " lines, more than the " waiver_count[k] " recorded"
+            hits++
+        } else if (n < waiver_count[k] && waiver_rule[k] == "pinned_line" && !missing) {
+            print path ": pinned line entry " k " matches " n " lines, expected " waiver_count[k]
+            hits++
+        } else if (n < waiver_count[k]) {
+            print "warning: stale secret/PII waiver entry " k " (" waiver_decision[k] "): " \
+                path " rule=" waiver_rule[k] " matches " n " of " waiver_count[k] \
+                " recorded lines" > "/dev/stderr"
+        }
+    }
+}
+mode == "audit" { audit_line($0, NR); next }
+mode == "line" {
+    if (!check($0, ENVIRON["ASAAS_SCAN_LINE"])) {
+        fail("baseline hit not reproduced by the scan rules")
+    }
+    next
 }
 mode == "file" { check($0, NR); next }
 /^@@ / {
     header = $0
-    if (!sub(/^@@ -[0-9]+(,[0-9]+)? \+/, "", header)) { print "bad hunk header" > "/dev/stderr"; exit 2 }
+    if (!sub(/^@@ -[0-9]+(,[0-9]+)? \+/, "", header)) fail("bad hunk header")
     number = header + 0
     in_hunk = 1
     next
@@ -461,7 +708,11 @@ mode == "file" { check($0, NR); next }
 !in_hunk { next }
 /^\+/ { check(substr($0, 2), number); number++; next }
 /^ / { number++; next }
-END { if (hits > 0) exit 3 }
+END {
+    if (failed) exit 2
+    if (mode == "audit") audit_end()
+    if (hits > 0) exit 3
+}
 '
 
 # Fatal scan: lines added since BASE_REF in tracked files (committed, staged or
@@ -475,10 +726,13 @@ END { if (hits > 0) exit 3 }
 # binary (a NUL byte, or a `binary`/`-diff` attribute) are listed by path and
 # not scanned. Untracked symlinks and other non-regular entries are listed by
 # path and never followed, so nothing outside the repository is read.
+# Waivers apply to the path as it is now (the new side of a rename), never to
+# the path a file was moved or copied from; each waived hit's entry number is
+# appended to `$work/waived-added`.
 # Returns 0 clean, 1 on a finding, 2 when the scan itself failed.
 _asaas_added_line_scan() {
-    local base_ref="$1" work="$2" rules="$3"
-    shift 3
+    local base_ref="$1" work="$2" rules="$3" waivers="$4"
+    shift 4
     local record added rest path old_path rc status=0
     local -a git_diff=(
         git -c diff.noprefix=false -c diff.mnemonicPrefix=false -c core.quotepath=false
@@ -513,8 +767,9 @@ _asaas_added_line_scan() {
             return 2
         }
         rc=0
-        ASAAS_SCAN_RULES="$rules" ASAAS_SCAN_MODE=diff ASAAS_SCAN_PATH="$path" \
-            LC_ALL=C awk "$_ASAAS_SCAN_AWK" <"$work/patch" || rc=$?
+        ASAAS_SCAN_RULES="$rules" ASAAS_SCAN_WAIVERS="$waivers" \
+            ASAAS_WAIVER_LOG="$work/waived-added" ASAAS_SCAN_MODE=diff \
+            ASAAS_SCAN_PATH="$path" LC_ALL=C awk "$_ASAAS_SCAN_AWK" <"$work/patch" || rc=$?
         case "$rc" in
             0) ;;
             3) status=1 ;;
@@ -536,8 +791,9 @@ _asaas_added_line_scan() {
             continue
         fi
         rc=0
-        ASAAS_SCAN_RULES="$rules" ASAAS_SCAN_MODE=file ASAAS_SCAN_PATH="$path" \
-            LC_ALL=C awk "$_ASAAS_SCAN_AWK" <"$path" || rc=$?
+        ASAAS_SCAN_RULES="$rules" ASAAS_SCAN_WAIVERS="$waivers" \
+            ASAAS_WAIVER_LOG="$work/waived-added" ASAAS_SCAN_MODE=file \
+            ASAAS_SCAN_PATH="$path" LC_ALL=C awk "$_ASAAS_SCAN_AWK" <"$path" || rc=$?
         case "$rc" in
             0) ;;
             3) status=1 ;;
@@ -549,28 +805,87 @@ _asaas_added_line_scan() {
 
 # Review-only scan of the whole tree under the roots, through `git grep
 # --untracked`: tracked files plus untracked, non-ignored ones. Ignored files
-# are never read, symlinks are not followed and binary files are skipped.
-# Returns 0 with findings, 1 without, 2 when git grep failed.
+# are never read, symlinks are not followed and binary files are skipped. Each
+# hit line goes through the same awk rules and waivers as the fatal scan, so a
+# waived hit prints as waived here too; each waived hit's entry number is
+# appended to `$work/waived-baseline`, which is how stale entries are found.
+# Returns 0 with findings, 1 without, 2 when the scan failed.
 _asaas_baseline_scan() {
-    local work="$1" rules="$2"
-    shift 2
-    local name expression path line _content rc found=1
+    local work="$1" rules="$2" waivers="$3"
+    shift 3
+    local name expression path line content rc found=1
+    local -a patterns=()
     while IFS=$'\t' read -r name expression; do
-        [ -n "$name" ] || continue
-        rc=0
-        LC_ALL=C git grep --untracked -I -n -z -E -e "$expression" -- "$@" \
-            >"$work/grep" || rc=$?
-        case "$rc" in
-            0) found=0 ;;
-            1) continue ;;
-            *) echo "baseline git grep failed with exit $rc" >&2; return 2 ;;
-        esac
-        while IFS= read -r -d '' path && IFS= read -r -d '' line &&
-            IFS= read -r _content; do
-            echo "  $path:$line: $name"
-        done <"$work/grep"
+        [ -n "$name" ] && patterns+=(-e "$expression")
     done <<<"$rules"
+    rc=0
+    LC_ALL=C git grep --untracked -I -n -z -E "${patterns[@]}" -- "$@" \
+        >"$work/grep" || rc=$?
+    case "$rc" in
+        0) ;;
+        1) return 1 ;;
+        *) echo "baseline git grep failed with exit $rc" >&2; return 2 ;;
+    esac
+    while IFS= read -r -d '' path && IFS= read -r -d '' line &&
+        IFS= read -r content; do
+        rc=0
+        printf '%s\n' "$content" |
+            ASAAS_SCAN_RULES="$rules" ASAAS_SCAN_WAIVERS="$waivers" \
+                ASAAS_WAIVER_LOG="$work/waived-baseline" ASAAS_SCAN_MODE=line \
+                ASAAS_SCAN_LINE="$line" ASAAS_SCAN_PATH="$path" ASAAS_SCAN_PREFIX='  ' \
+                LC_ALL=C awk "$_ASAAS_SCAN_AWK" || rc=$?
+        case "$rc" in
+            0) ;;
+            3) found=0 ;;
+            *) echo "baseline scan failed with exit $rc" >&2; return 2 ;;
+        esac
+    done <"$work/grep"
     return "$found"
+}
+
+# Fatal audit of every path the waiver table names, over the path's whole
+# current content (tracked or untracked, never an ignored file), whether or
+# not it changed since BASE_REF: card numbers (`card_number_guard`), copied
+# waived lines and missing or changed pinned lines fail; stale entries only
+# warn. A waived path that is a symlink or holds a NUL byte cannot be read as
+# text, so it fails instead of being skipped. A path absent from the tree
+# makes its entries stale. Returns 0 clean, 1 on a finding, 2 when the audit
+# itself failed.
+_asaas_waived_path_audit() {
+    local rules="$1" waivers="$2"
+    local path listed input missing rc status=0
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        listed="$(git ls-files --cached --others --exclude-standard -- ":(literal)$path")" || {
+            echo "git ls-files failed for a waived path" >&2
+            return 2
+        }
+        input="$path"
+        missing=0
+        if [ -z "$listed" ] || { [ ! -e "$path" ] && [ ! -L "$path" ]; }; then
+            echo "waived path is not in the tree; its entries are stale: $path"
+            input=/dev/null
+            missing=1
+        elif [ -L "$path" ] || [ ! -f "$path" ]; then
+            echo "waived path is not a regular file and cannot be audited: $path"
+            status=1
+            continue
+        elif [ "$(LC_ALL=C tr -dc '\000' <"$path" | wc -c)" -ne 0 ]; then
+            echo "waived path contains a NUL byte and cannot be audited: $path"
+            status=1
+            continue
+        fi
+        rc=0
+        ASAAS_SCAN_RULES="$rules" ASAAS_SCAN_WAIVERS="$waivers" ASAAS_WAIVER_LOG=/dev/null \
+            ASAAS_SCAN_MODE=audit ASAAS_SCAN_PATH="$path" ASAAS_AUDIT_MISSING="$missing" \
+            LC_ALL=C awk "$_ASAAS_SCAN_AWK" <"$input" || rc=$?
+        case "$rc" in
+            0) ;;
+            3) status=1 ;;
+            *) echo "waived-path audit failed with exit $rc" >&2; return 2 ;;
+        esac
+    done < <(printf '%s\n' "$waivers" | cut -f2 | sort -u)
+    return "$status"
 }
 
 # ASAAS release-candidate aggregate (asaas-payment-gateway Group 6). Local
@@ -591,12 +906,21 @@ _asaas_baseline_scan() {
 # Group 10 and not by this gate: tests/integration/test_asaas_billing_postgres.py
 # still carries the legacy migration cases. (docker-compose.production.yml no
 # longer requires ABACATEPAY_WEBHOOK_SECRET since Group 10 phase 1.)
+#
+# Recorded scan exception (owner decision 2026-10-18, wish
+# asaas-payment-gateway): `_asaas_scan_waivers` waives a closed list of exact
+# synthetic lines in scripts/asaas_sandbox_card_capture.py and
+# tests/scripts/test_asaas_sandbox_card_capture.py, for named rules only, and
+# audits both files whole on every run (card numbers other than the public
+# test card, copied waived lines, changed card constants). Every waived hit is
+# printed and counted, and stale entries are warned about; see the table for
+# what is waived and how to remove it.
 asaas_release_candidate_gate() (
     set -euo pipefail
     local root="$_WISH_GATES_ROOT"
     local base_ref="${BASE_REF:?set BASE_REF to the branch point, e.g. origin/main}"
     : "${POSTGRES_SMOKE_DATABASE_URL:?set POSTGRES_SMOKE_DATABASE_URL to a disposable loopback PostgreSQL}"
-    local rules work scan_status
+    local rules waivers work scan_status audit_status
     # The same git pathspecs for the review-only full-tree scan and for the
     # fatal added-lines scan; the glob is quoted so git, not bash, expands it.
     local -a scan_roots=(
@@ -634,34 +958,60 @@ asaas_release_candidate_gate() (
     _production_compose_render || return 1
 
     rules="$(_asaas_scan_rules)" || return 1
+    waivers="$(_asaas_scan_waivers)" || return 1
     work="$(mktemp -d /tmp/neurostack-asaas-scan.XXXXXX)" || return 1
     [ -n "$work" ] || return 1
     # shellcheck disable=SC2064 # expand now: $work is local to this subshell
     trap "case '$work' in /tmp/neurostack-asaas-scan.*) rm -rf -- '$work' ;; esac" EXIT
+    : >"$work/waived-baseline"
+    : >"$work/waived-added"
+    # Parse the rules and the waiver table once up front, so a malformed
+    # entry fails the gate even when no file reaches the scanner.
+    ASAAS_SCAN_RULES="$rules" ASAAS_SCAN_WAIVERS="$waivers" ASAAS_WAIVER_LOG=/dev/null \
+        ASAAS_SCAN_MODE=file ASAAS_SCAN_PATH=- LC_ALL=C awk "$_ASAAS_SCAN_AWK" </dev/null || {
+        echo "secret/PII scan failed: malformed scan rules or waiver table" >&2
+        return 1
+    }
 
     echo "secret/PII scan: rules $(printf '%s' "$rules" | cut -f1 | paste -sd, -);" \
         "findings print path:line: rule, never the matched text;" \
-        "files git treats as binary (a NUL byte) are not scanned"
+        "files git treats as binary (a NUL byte) are not scanned;" \
+        "$(printf '%s\n' "$waivers" | grep -c .) recorded waiver entries" \
+        "(_asaas_scan_waivers), each waived hit printed as waived"
 
     # Pre-existing findings stay visible so maintainers can tell fixtures that
     # predate this candidate from new ones. They never fail the gate: only the
     # added-lines scan below does.
     scan_status=0
-    _asaas_baseline_scan "$work" "$rules" "${scan_roots[@]}" \
+    _asaas_baseline_scan "$work" "$rules" "$waivers" "${scan_roots[@]}" \
         >"$work/baseline" || scan_status=$?
     case "$scan_status" in
         0) echo "baseline secret/PII findings (review required):"; cat -- "$work/baseline" ;;
-        1) echo "baseline secret/PII scan: no findings" ;;
+        1) echo "baseline secret/PII scan: no findings"; cat -- "$work/baseline" ;;
         *) echo "baseline secret/PII scan failed" >&2; return 1 ;;
+    esac
+    echo "baseline secret/PII waived: $(grep -c . "$work/waived-baseline" || true)"
+
+    # The waived files are audited whole on every run; a finding fails the
+    # gate after the added-line scan has reported too.
+    audit_status=0
+    _asaas_waived_path_audit "$rules" "$waivers" || audit_status=$?
+    case "$audit_status" in
+        0) echo "waived-path audit: no findings" ;;
+        1) echo "secret/PII waiver audit failed: a waived path breaks its recorded exception" >&2 ;;
+        *) echo "waived-path audit could not run" >&2; return 1 ;;
     esac
 
     scan_status=0
-    _asaas_added_line_scan "$base_ref" "$work" "$rules" "${scan_roots[@]}" || scan_status=$?
+    _asaas_added_line_scan "$base_ref" "$work" "$rules" "$waivers" "${scan_roots[@]}" ||
+        scan_status=$?
+    echo "added-line secret/PII waived: $(grep -c . "$work/waived-added" || true)"
     case "$scan_status" in
         0) echo "added-line secret/PII scan: no findings" ;;
         1) echo "secret/PII pattern found in added lines" >&2; return 1 ;;
         *) echo "added-line secret/PII scan failed" >&2; return 1 ;;
     esac
+    [ "$audit_status" -eq 0 ] || return 1
 
     poetry run python scripts/validate-conventional-commits.py \
         --range "${base_ref}..HEAD" || return 1
