@@ -18,6 +18,12 @@ by ID and authorized tenant together, so another tenant's document is a 404
 identical to a missing one. Knowledge responses are not cacheable by the
 response cache, and every successful response carries ``Cache-Control:
 no-store``.
+
+Persistence: the request session only closes, so each mutating route commits
+explicitly, once, after the authorization check, the write and the response
+are complete. Any failure before that commit leaves nothing behind. An upload
+into a tenant without a row is a 404 ``Tenant not found`` (identical for every
+caller allowed to name that tenant); a builder still gets the ownership 403.
 """
 
 from datetime import datetime
@@ -25,6 +31,8 @@ from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.middleware.auth import (
@@ -41,6 +49,7 @@ from src.api.schemas.knowledge import (
     SearchRequest,
     SearchResponse,
 )
+from src.models.tenant import Tenant
 from src.repositories import KnowledgeDocumentRepository, get_db_session_dependency
 
 
@@ -74,6 +83,49 @@ _DOCUMENT_NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
         "model": ErrorResponse,
     },
 }
+
+
+_TENANT_NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
+    404: {
+        "description": "The authorized tenant has no tenant record",
+        "model": ErrorResponse,
+    },
+}
+_TENANT_NOT_FOUND_DETAIL = "Tenant not found"
+# PostgreSQL foreign_key_violation and the knowledge_documents -> tenants key.
+_FOREIGN_KEY_VIOLATION = "23503"
+_TENANT_FOREIGN_KEY = "knowledge_documents_tenant_id_fkey"
+
+
+def _tenant_not_found() -> HTTPException:
+    """Same body for every caller; never names the requested tenant."""
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=_TENANT_NOT_FOUND_DETAIL,
+    )
+
+
+async def _require_tenant_row(session: AsyncSession, tenant_id: UUID) -> None:
+    """Refuse a write into a tenant that has no row, before the insert."""
+    found = await session.execute(select(Tenant.id).where(Tenant.id == tenant_id))
+    if found.scalar_one_or_none() is None:
+        raise _tenant_not_found()
+
+
+def _is_missing_tenant_violation(error: IntegrityError) -> bool:
+    """True only for the knowledge_documents.tenant_id foreign-key violation.
+
+    This is the race where the tenant row disappears between
+    ``_require_tenant_row`` and the insert; every other integrity error
+    (another constraint, another SQLSTATE) is not a missing tenant.
+    """
+    driver_error = error.orig
+    candidates = (driver_error, getattr(driver_error, "__cause__", None))
+    sqlstates = {getattr(candidate, "sqlstate", None) for candidate in candidates}
+    constraints = {
+        getattr(candidate, "constraint_name", None) for candidate in candidates
+    }
+    return _FOREIGN_KEY_VIOLATION in sqlstates and _TENANT_FOREIGN_KEY in constraints
 
 
 def _document_not_found(document_id: UUID) -> HTTPException:
@@ -126,6 +178,7 @@ accepted only for a builder that owns the clinic or a super admin.
             "model": ErrorResponse,
         },
         **_TENANT_FORBIDDEN_RESPONSE,
+        **_TENANT_NOT_FOUND_RESPONSE,
     },
     tags=["Knowledge"],
 )
@@ -142,30 +195,37 @@ async def upload_document(
     effective_tenant_id = await resolve_effective_tenant(
         http_request, tenant, request.tenant_id, session
     )
+    await _require_tenant_row(session, effective_tenant_id)
     repo = KnowledgeDocumentRepository(session)
 
     # Create document
-    document = await repo.create(
-        tenant_id=effective_tenant_id,
-        title=request.metadata.title or "Untitled Document",
-        content=request.content,
-        content_type="text",
-        document_metadata={
-            "title": request.metadata.title,
-            "source": request.metadata.source,
-            "category": request.metadata.category,
-            "tags": request.metadata.tags,
-            **request.metadata.custom,
-        },
-        is_indexed=False,
-        chunk_count=0,
-        size_bytes=len(request.content.encode("utf-8")),
-    )
+    try:
+        document = await repo.create(
+            tenant_id=effective_tenant_id,
+            title=request.metadata.title or "Untitled Document",
+            content=request.content,
+            content_type="text",
+            document_metadata={
+                "title": request.metadata.title,
+                "source": request.metadata.source,
+                "category": request.metadata.category,
+                "tags": request.metadata.tags,
+                **request.metadata.custom,
+            },
+            is_indexed=False,
+            chunk_count=0,
+            size_bytes=len(request.content.encode("utf-8")),
+        )
+    except IntegrityError as error:
+        await session.rollback()
+        if _is_missing_tenant_violation(error):
+            raise _tenant_not_found() from None
+        raise
 
     # TODO: Trigger indexing job (Task 19.0)
     # For now, mark as pending
 
-    return DocumentResponse(
+    response = DocumentResponse(
         id=str(document.id),
         tenant_id=document.tenant_id,
         status="pending",
@@ -179,6 +239,9 @@ async def upload_document(
         chunk_count=0,
         created_at=document.created_at.isoformat(),
     )
+    # Commit only once the write and its response are complete.
+    await session.commit()
+    return response
 
 
 @router.post(
@@ -282,6 +345,8 @@ async def list_documents(
     repo = KnowledgeDocumentRepository(session)
     skip = (page - 1) * page_size
 
+    # One branch picks the filter for both the page and its total, so they
+    # always describe the same set. An empty ``?category=`` does not filter.
     if category:
         documents_list = await repo.find_by_category(
             tenant_id=effective_tenant_id,
@@ -289,14 +354,16 @@ async def list_documents(
             skip=skip,
             limit=page_size,
         )
+        total = await repo.count_by_category(
+            tenant_id=effective_tenant_id, category=category
+        )
     else:
         documents_list = await repo.find_by_tenant(
             tenant_id=effective_tenant_id,
             skip=skip,
             limit=page_size,
         )
-
-    total = await repo.count_by_tenant(effective_tenant_id)
+        total = await repo.count_by_tenant(effective_tenant_id)
 
     document_responses = [
         DocumentResponse(
@@ -468,4 +535,8 @@ async def delete_document(
     if not deleted:
         raise _document_not_found(document_id)
 
-    # TODO: Delete from vector database (Task 19.0)
+    await session.commit()
+    # TODO: Delete from vector database (Task 19.0). It must run only after the
+    # commit above, never while the row lock taken by delete_by_id_and_tenant
+    # is held (a slow external call would block every writer of this row) nor
+    # before the commit (a rollback would leave the vectors already deleted).

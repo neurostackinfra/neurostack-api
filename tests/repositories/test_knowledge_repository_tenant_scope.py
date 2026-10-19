@@ -11,6 +11,7 @@ from contextlib import suppress
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import src.models as orm_models
@@ -127,3 +128,62 @@ async def test_unscoped_lookups_keep_their_existing_behaviour(
     assert found.tenant_id == owner
     assert [d.id for d in await repo.find_by_tenant(owner)] == [document_id]
     assert await repo.count_by_tenant(owner) == 1
+
+
+@pytest.mark.asyncio
+async def test_count_by_category_counts_only_the_tenants_category(
+    knowledge_db: AsyncSession,
+) -> None:
+    owner, other, _document_id = await _seed(knowledge_db)
+    for tenant_id, category in (
+        (owner, "protocolo"),
+        (owner, "protocolo"),
+        (owner, "faq"),
+        (other, "protocolo"),
+    ):
+        knowledge_db.add(
+            KnowledgeDocument(
+                tenant_id=tenant_id,
+                title=f"{category} document",
+                content="Categorised content",
+                document_metadata={"category": category},
+            )
+        )
+    await knowledge_db.commit()
+    repo = KnowledgeDocumentRepository(knowledge_db)
+
+    assert await repo.count_by_category(owner, "protocolo") == 2
+    assert await repo.count_by_category(owner, "faq") == 1
+    assert await repo.count_by_category(other, "protocolo") == 1
+    assert await repo.count_by_category(owner, "missing") == 0
+    assert await repo.count_by_category(owner, "protocolo", indexed_only=True) == 0
+    assert len(await repo.find_by_category(owner, "protocolo")) == 2
+
+
+@pytest.mark.asyncio
+async def test_delete_by_id_and_tenant_rechecks_a_row_gone_after_the_lookup(
+    knowledge_db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent delete that won the race is reported, not repeated."""
+    owner, _other, document_id = await _seed(knowledge_db)
+    repo = KnowledgeDocumentRepository(knowledge_db)
+    stale = await repo.get_by_id_and_tenant(document_id, owner)
+    assert stale is not None
+    # Another transaction deleted the row after this request's lookup.
+    await knowledge_db.execute(
+        delete(KnowledgeDocument)
+        .where(KnowledgeDocument.id == document_id)
+        .execution_options(synchronize_session=False)
+    )
+
+    async def stale_lookup(
+        _self: KnowledgeDocumentRepository, _document_id: UUID, _tenant_id: UUID
+    ) -> KnowledgeDocument:
+        return stale
+
+    monkeypatch.setattr(
+        KnowledgeDocumentRepository, "get_by_id_and_tenant", stale_lookup
+    )
+
+    assert await repo.delete_by_id_and_tenant(document_id, owner) is False
+    assert stale not in knowledge_db.deleted
