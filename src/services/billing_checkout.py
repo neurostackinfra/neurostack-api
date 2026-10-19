@@ -853,7 +853,6 @@ class BillingCheckoutService:
             environment=settings.environment,
             builder_id=builder_id,
             intent_id=uuid4(),
-            migration_id=None,
             checkout_session_id=checkout_session_id,
             attempt_no=1,
             catalog_version_id=CATALOG_VERSION_ID,

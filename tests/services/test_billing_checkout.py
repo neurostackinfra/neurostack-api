@@ -170,6 +170,7 @@ class _Repository:
     async def reserve_general_subscription_checkout(
         self, **kwargs: object
     ) -> BillingCheckoutSession:
+        assert "migration_id" not in kwargs  # the saga was removed (G10 E2)
         assert isinstance(kwargs["amount_cents"], int)
         assert kwargs["amount_cents"] > 0
         assert kwargs["pricing_snapshot"]
@@ -435,6 +436,7 @@ def _install_world(monkeypatch: pytest.MonkeyPatch, world: _World) -> None:
         async def reserve_general_subscription_checkout(  # type: ignore[override]
             self, **kwargs: object
         ) -> BillingCheckoutSession:
+            assert "migration_id" not in kwargs  # the saga was removed (G10 E2)
             world.reservations.append(kwargs)
             world.checkout.id = kwargs["checkout_session_id"]  # type: ignore[assignment]
             world.checkout.next_due_date = kwargs["next_due_date"]  # type: ignore[assignment]
@@ -1128,7 +1130,6 @@ def _canary_world(builder_id: UUID) -> _World:
         "abacatepay_subscription",
         "asaas_subscription",
         "unresolved_subscription",
-        "migration",
         "live_subscription_checkout",
     ],
 )

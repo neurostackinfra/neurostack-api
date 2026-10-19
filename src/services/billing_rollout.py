@@ -346,20 +346,6 @@ async def set_billing_topup_gate(
     )
 
 
-async def rebase_legacy_billing_migration(
-    db: AsyncSession,
-    *,
-    migration_id: UUID,
-    expected_source_revision: int,
-) -> int:
-    """Refresh a cancelled saga to the current global roster revision."""
-
-    return await BillingRepository(db).rebase_legacy_migration(
-        migration_id=migration_id,
-        expected_source_revision=expected_source_revision,
-    )
-
-
 class BillingRolloutOperationService:
     """Signed administrative rollout and incident transitions.
 

@@ -743,7 +743,7 @@ Mantém byte a byte todos os campos legados (`plan`, `active_clinics`,
   como data local sem conversão. Em JavaScript, `new Date("2026-11-11")` é
   meia-noite UTC e aparece como 10/11 em `America/Sao_Paulo`; separe
   ano/mês/dia (ou use `new Date(2026, 10, 11)`) em vez disso.
-- Assinaturas legadas (não ASAAS, por exemplo Abacate ainda não migrada) e
+- Assinaturas legadas (de um provedor que não é o ASAAS) e
   encerradas (`inactive`/`cancelled`) resultam em `subscription: null`,
   mesmo que os campos legados (`plan`, `subscription_status`) digam `active`.
   Ao encerrar, a data de período pago também deixa de ser informada (o objeto
