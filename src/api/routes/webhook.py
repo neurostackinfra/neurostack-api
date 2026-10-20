@@ -3663,6 +3663,39 @@ async def meta_webhook(
             meta_token = (creds.get("meta_permanent_token") or "").strip()
             agent_lang = _get_agent_language(clinic_config)
 
+            # LGPD privacy notice for a new session. Called by the text/audio
+            # path right before the pipeline and by the file path right before
+            # the fixed ack, so a patient whose first message is an attachment
+            # still receives it on that first (and only ``is_new``) turn.
+            async def _send_meta_privacy_notice() -> None:
+                if not (is_new and meta_pnid and meta_token):
+                    return
+                lgpd_cfg = (clinic_config or {}).get("lgpd") or {}
+
+                async def _send_meta_privacy(msg: str) -> dict[str, Any]:
+                    return await send_meta_cloud_text(
+                        meta_pnid,
+                        meta_token,
+                        from_phone,
+                        msg,
+                    )
+
+                # Meta wraps the outbound id inside ``messages[0].id`` — use
+                # ``extract_meta_message_id`` here instead of the default
+                # top-level ``messageid`` lookup used by the other channels.
+                await _send_privacy_notice(
+                    channel_label="Meta",
+                    is_new=is_new,
+                    lgpd_cfg=lgpd_cfg,
+                    clinic_config=clinic_config,
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    to_phone=from_phone,
+                    db=db,
+                    send=_send_meta_privacy,
+                    id_extractor=lambda r: extract_meta_message_id(r) or "",
+                )
+
             # ── dispatch by message type ──
             #
             # Group 4 adds two paths on top of the Group 2 text flow:
@@ -3869,6 +3902,10 @@ async def meta_webhook(
                     )
                     return {"ok": True, "replied": False, "reason": "no_credentials"}
 
+                # The file path returns before the shared notice below, so a
+                # file-first session sends its LGPD notice here, ahead of the ack.
+                await _send_meta_privacy_notice()
+
                 try:
                     send_result = await send_meta_cloud_text(
                         meta_pnid,
@@ -3911,32 +3948,7 @@ async def meta_webhook(
                 return {"ok": True, "skipped": "non-text"}
 
             # ── send LGPD privacy notice on new sessions ──
-            if is_new and meta_pnid and meta_token:
-                lgpd_cfg = (clinic_config or {}).get("lgpd") or {}
-
-                async def _send_meta_privacy(msg: str) -> dict[str, Any]:
-                    return await send_meta_cloud_text(
-                        meta_pnid,
-                        meta_token,
-                        from_phone,
-                        msg,
-                    )
-
-                # Meta wraps the outbound id inside ``messages[0].id`` — use
-                # ``extract_meta_message_id`` here instead of the default
-                # top-level ``messageid`` lookup used by the other channels.
-                await _send_privacy_notice(
-                    channel_label="Meta",
-                    is_new=is_new,
-                    lgpd_cfg=lgpd_cfg,
-                    clinic_config=clinic_config,
-                    tenant_id=tenant_id,
-                    session_id=session_id,
-                    to_phone=from_phone,
-                    db=db,
-                    send=_send_meta_privacy,
-                    id_extractor=lambda r: extract_meta_message_id(r) or "",
-                )
+            await _send_meta_privacy_notice()
 
             # ── pipeline ──
             event_request = CanonicalEventRequest(
