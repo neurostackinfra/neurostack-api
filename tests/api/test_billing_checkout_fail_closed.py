@@ -75,7 +75,6 @@ def _checkout(builder_id: UUID) -> BillingCheckoutSession:
         builder_id=builder_id,
         intent_kind="subscription",
         intent_id=uuid4(),
-        migration_id=None,
         topup_order_id=None,
         attempt_no=1,
         provider="asaas",

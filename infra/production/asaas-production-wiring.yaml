@@ -11,13 +11,20 @@
 #   plan             read-only AWS readback compared with this manifest
 #   render-taskdef   the proposed task definition (secrets as references only)
 #   check            the existing evidence validators against that rendering
+#   render-migrations-taskdef
+#                    a new one-off migrations revision with the pinned command
+#
+# scripts/asaas_deploy_hook.py (pure, readback files only) plans, renders and
+# verifies the post-deploy webhook registration task (step
+# webhook_exposure_and_registration).
 schema_version: asaas_production_wiring_manifest.v1
 context:
-  arch: additive IAM grant and one new secret through a reviewed CloudFormation stack, then one task definition revision derived from the live rollback target; financial egress stays closed by the absence of any AppConfig configuration
+  arch: additive IAM grant and one new secret through a reviewed CloudFormation stack, then one task definition revision derived from the D3 source revision and one migrations revision baking the pinned upgrade; the post-deploy hook (scripts/asaas_deploy_hook.py) renders the webhook registration task; the rollback target is the field rollback_target; financial egress stays closed by the absence of any AppConfig configuration
   must:
     - Read AWS only through Describe*, Get* and List* calls; never call GetSecretValue and never print a secret value.
     - Resolve every secret ARN, random suffix included, from DescribeSecret at plan time.
-    - Derive the new revision from the live rollback target revision; change only the names listed under task_definition.
+    - Derive the new revision from the D3 source revision (task_definition.source_revision); change only the names listed under task_definition, the otel image (task_definition.otel_image, a digest) and the tags in task_definition.tag_overrides.
+    - The service rollback target is the field rollback_target; code paths read it from here and it moves only through its documented re-pin.
     - Keep exactly the containers app and otel; otel keeps an empty environment and no secrets.
     - Never introduce a name listed under task_definition.forbidden_name_prefixes or forbidden_names.
     - Keep financial_egress_enabled closed; opening it is a separate, unwritten follow-up.
@@ -39,7 +46,6 @@ target:
   cluster: neurostack-staging
   service: neurostack-staging-app
   task_family: neurostack-staging-app
-  rollback_task_definition_revision: 8
   execution_role_name: neurostack-staging-ecs-execution
   task_role_name: neurostack-staging-ecs-task
   # The service serves production traffic with ENVIRONMENT=staging. Never gate
@@ -52,6 +58,25 @@ target:
   served_hosts:
     - staging.api.neurostack.global
     - payments.staging.api.neurostack.global
+
+# Where a failed service deployment goes back to. Code reads this field (never
+# a constant). Revision 8 stays the target while the bridge revision 9 is under
+# observation; revision 8 runs code that reads columns migration 036 drops, so
+# the re-pin below is a reviewed edit of this field made after revision 9 has
+# served and its observation period closed, and before migration 036 runs.
+rollback_target:
+  revision: 8
+  effective_after: initial_d3_planning_2026_10_18
+  repin:
+    revision: 9
+    effective_after: bridge_revision_9_serving_verified_and_observation_closed
+    before: migration_036
+    why: >-
+      Revision 8 (image of 2026-10-14) reads legacy columns that migration 036
+      drops, so after 036 a rollback to it would fail at runtime. Revision 9,
+      the D3 rendering on the bridge image pinned by digest, is the first
+      revision safe after 036. Re-pinning earlier would leave no safe way back
+      while revision 9 is still under observation.
 
 secrets:
   kms_key_arn: arn:aws:kms:us-east-1:388460142431:key/90eff49a-c2bf-4836-834f-d5666294d956
@@ -115,6 +140,31 @@ task_definition:
     - SPA_DIST_DIR
     - SPA_ENABLED
   image: preserve_live_unless_override
+  # The otel collector by digest, never by tag: a deliberate pin of what the
+  # :latest tag resolved to on 2026-10-19 (no behaviour change). Moving it is a
+  # reviewed edit of this field.
+  otel_image: public.ecr.aws/aws-observability/aws-otel-collector@sha256:7968fb60db6a2390a47ba6a2df029745638486e285c9b2487da1b722d0855a3e
+  # PENDING OWNER CONFIRMATION. Owner approval A4 (2026-10-19) moved the two
+  # ECS IAM roles to ManagedBy=manual; tagging the new task-definition
+  # revisions the same way is the engineer's inference (truthful: no code
+  # manages them; reversible). Confirm or change it before registering.
+  tag_overrides:
+    ManagedBy: manual
+
+# The one-off migrations family. Revision 3 bakes an unpinned upgrade, so it is
+# only read (roles, the DATABASE_URL secret, sizing, logs) and never run.
+# render-migrations-taskdef registers a new revision whose command is exactly
+# the planner constant MIGRATIONS_COMMAND, on the reviewed bridge image
+# (parameters.app_image_override).
+migrations_task_definition:
+  family: neurostack-staging-migrations
+  source_revision: 3
+  database_secret_name: neurostack/staging/database-url-migrations
+  image: app_image_override
+  command: MIGRATIONS_COMMAND
+  # PENDING OWNER CONFIRMATION (see task_definition.tag_overrides).
+  tag_overrides:
+    ManagedBy: manual
 
 financial_egress:
   flag: financial_egress_enabled
@@ -203,7 +253,8 @@ steps:
     preconditions:
       - The release-candidate gate passed for the candidate commit.
       - The build runner can reach the network hosts listed in docs/runbooks/asaas-deployment.md.
-      - The protected deploy path accepts the serving revision (follow-up F1); today it rejects it even without D3, because the live image is outside the producer repository.
+      - The serving revision runs an image pinned by digest (revision 9 rendered with app_image_override). Since F1 path A (T3) the protected deploy path accepts the D3 names and a digest-pinned bridge image; revision 8 is rejected only because it runs a mutable tag.
+      - F1 residual 5 (DATABASE_URL runtime fingerprint) is fixed and reviewed before the first protected deploy (known block below).
     change: protected build workflow, then attestation registration
     verification:
       - The attestation readback names the exact image digest.
@@ -217,7 +268,7 @@ steps:
       - Read back the exact revision first; continue only if alembic_version == 032.
       - Expand-only window; the running image keeps working on the expanded schema.
       - Revisions 036 and 037 are outside this window; each needs its own explicit owner instruction, 036 before 037, after a fresh SELECT showing zero legacy rows.
-    change: one-off neurostack-staging-migrations task on the same image as the deployment, with the container command overridden to the exact revision `alembic upgrade 035` (never the head)
+    change: register a new neurostack-staging-migrations revision with render-migrations-taskdef (the bridge image digest, the command baked to exactly `alembic upgrade 035`, the roles and database-url-migrations secret of revision 3, ManagedBy=manual) and run that revision once as a one-off task with no command override; revision 3 is never run (never the head)
     verification:
       - read back alembic_version == 035 (exact; 036 and 037 not applied).
     rollback: none; never downgrade the schema as part of a rollback
@@ -230,14 +281,17 @@ steps:
       - Deployment circuit breaker enabled with rollback; minimum healthy 100, maximum 200.
       - The ASAAS key secret holds a production-namespace key and the webhook token is 32 to 255 printable ASCII characters (checked by the owner without printing).
     change: >-
-      Path A (cheapest): update the service to the registered D3 revision with
-      the current tooling, outside the protected path, if the owner approves.
-      Path B (one protected deployment carrying image and wiring) also needs a
-      reviewed exception to the runtime fingerprint equality check.
+      Path A (owner approval A1, 2026-10-19): update the service to the
+      registered D3 revision 9 (bridge image pinned by digest) with the current
+      tooling, outside the protected path. After the deployment is COMPLETED
+      the deploy hook registers the webhook (step
+      webhook_exposure_and_registration). Path B (one protected deployment
+      carrying image and wiring) was not chosen; it would also need a reviewed
+      exception to the runtime fingerprint equality check.
     verification:
       - All tasks RUNNING on the new revision, target group healthy, GET /ready 200 on every task.
       - The webhook readiness gauge neurostack_billing_webhook_config_ready is 0 until registration (expected).
-    rollback: update the service back to the rollback target revision; the circuit breaker does this automatically when tasks fail to become healthy
+    rollback: update the service back to the rollback_target revision; the circuit breaker does this automatically when tasks fail to become healthy. A failed webhook registration is never a reason to roll back.
 
   - id: spa_serving
     scope: separate_approval
@@ -253,17 +307,27 @@ steps:
 
   - id: webhook_exposure_and_registration
     scope: separate_approval
-    approval: separate owner approval required for the provider call; not performed by this manifest
+    approval: separate owner approval required for each deployment it follows; owner decision A2 (2026-10-19) made the registration automatic at deploy, run by the deploy hook and never from this manifest
     why: ASAAS must deliver to the public receiver, and checkout stays unavailable until the provider webhook reads back converged
     preconditions:
       - ALB 443 forwards every path to the service target group; no listener rule shadows the receiver path.
       - AuthMiddleware makes /v1/billing/webhook/asaas public by exact match only; every other non-public path still requires a JWT.
       - The WAF web ACL counts but blocks nothing.
-      - An operator entry point that runs AsaasWebhookProvisioner.readback (dry run) and reconcile exists (follow-up F3; it does not exist today).
-    change: run the readback dry run, then reconcile once, from a one-off task on the deployed revision
+      - The operator entry point python -m src.ops.asaas_webhook (src/ops/asaas_webhook.py, PR #120) is in the tree and in the deployed image; plan checks the file at plan time and reports F3_webhook_registration_entry_point:missing while it is absent.
+    change: >-
+      After the service deployment is COMPLETED, scripts/asaas_deploy_hook.py
+      plans (single flight by startedBy), renders one ecs:RunTask of
+      python -m src.ops.asaas_webhook reconcile on the deployed revision
+      (private subnets, no public IP, count 1) and verifies the stopped task:
+      exit 0 with verdict ready is registered; anything else is the alert
+      DEPLOYED_WEBHOOK_PENDING.
     verification:
-      - Readback verdict ready with no reasons; the gauge neurostack_billing_webhook_config_ready reads 1 on every worker.
-    rollback: disable or delete the provider webhook at ASAAS (manual provider operation with its own approval)
+      - verify-result outcome registered (app exit code 0, verdict ready, one result line, no forbidden material in the log stream).
+      - The gauge neurostack_billing_webhook_config_ready reads 1 on every worker within one refresher period.
+    rollback: >-
+      None from the hook: DEPLOYED_WEBHOOK_PENDING is an alert, never a service
+      rollback and never a service update. Disabling or deleting the provider
+      webhook at ASAAS is a manual provider operation with its own approval.
 
   - id: rollout_transitions
     scope: separate_approval
@@ -277,24 +341,30 @@ steps:
     rollback: docs/runbooks/asaas-rollback.md
 
 known_blocks:
-  - id: F1_group5_deploy_validator_allowlist
+  - id: F1_residual_5_database_url_fingerprint
     blocks: signed_image_build_and_attestation
     reason: >-
-      The protected deploy path rejects the live service today and would
-      reject the D3 wiring. (1) validate_task_definition_template and
-      validate_deployment_snapshot pin the app environment and secret names to
-      the revision 8 sets. (2) build_replacement_task_definition and
-      validate_deployment_snapshot require the template image to start with
-      the producer repository, while revision 8 runs a neurostack-staging
-      image: this blocks the path even without D3. (3) compare_rollout_readbacks
-      requires equal before and after runtime fingerprints, and the
-      fingerprint hashes every secret reference, so one deploy from revision 8
-      to image plus wiring fails with readback_runtime_fingerprint_sha256_changed.
-      (4) The fingerprint hashes only the six base environment values, so D3
-      values such as ASAAS_WEBHOOK_URL are invisible to it. The deploy-path
-      code is not changed here.
+      F1 path A is implemented (owner approval A1, T3 2026-10-19): the
+      protected deploy path accepts the revision 8 names or those plus exactly
+      the D3 names, accepts a serving image in neurostack-staging pinned by
+      digest (exact repository match, no prefix match), and fingerprints the
+      four D3 environment values with the base ones. Revision 8 is now
+      rejected only because it runs a mutable tag; render revision 9 with
+      app_image_override. Still true: compare_rollout_readbacks requires equal
+      before and after runtime fingerprints and the fingerprint hashes every
+      secret reference, so Path B (revision 8 to image plus wiring in one
+      protected deploy) fails with readback_runtime_fingerprint_sha256_changed.
+      Open, residual 5: the template carries the plain DATABASE_URL ARN, the
+      replacement pins it to <ARN>:::<VersionId>, and the runtime fingerprint
+      normalizes the two forms differently, so the first PROTECTED deploy
+      (Track B) would update the service, fail compare_rollout_readbacks and
+      roll back. The hand-registered bridge path (Path A, update-service
+      outside the protected path) is not affected. plan evaluates it with the
+      real replacement builder and fingerprint and reports this id only while
+      the two fingerprints differ; PR #118 fixes the normalization.
   - id: F3_webhook_registration_entry_point
     blocks: webhook_exposure_and_registration
     reason: >-
-      AsaasWebhookProvisioner.reconcile and readback have no operator entry
-      point; only the in-process readiness refresher calls readback.
+      Reported by plan only while src/ops/asaas_webhook.py (the operator entry
+      point python -m src.ops.asaas_webhook, PR #120) is absent from the tree
+      it runs from; a fact checked at plan time, not a pinned state.

@@ -1284,7 +1284,6 @@ async def test_d1_general_spends_exactly_the_receipts_its_rows_name_bypass_row(
                     operation_id=UUID(material["operation_id"]),
                     operation_receipt_id=UUID(typed_deployer),
                     provider_receipt_id=UUID(typed_reviewer),
-                    roster_revision=0,
                     rule_digest=_rule_digest(),
                     bundle_digest=billing_fact_bundle_digest(),
                     app_digest=material["deployment_digest"],
@@ -1449,7 +1448,6 @@ async def test_d3_integrity_violations_surface_as_billing_operation_conflict(
                 operation_id=UUID(material["operation_id"]),
                 operation_receipt_id=UUID(quorum["deployer"]),
                 provider_receipt_id=UUID(quorum["reviewer"]),
-                roster_revision=0,
                 rule_digest=_rule_digest(),
                 bundle_digest=billing_fact_bundle_digest(),
                 app_digest=material["deployment_digest"],
@@ -1870,13 +1868,12 @@ async def _insert_readiness_past_the_service(
     quorum: dict[str, str],
     *,
     rollout_revision: int,
-    stored_roster_revision: int = 0,
     legacy_roster_revision: int | None = None,
 ) -> None:
     """Write all four readiness rows directly (no service checks).
 
-    *stored_roster_revision* fills the legacy column (kept until migration
-    036); *legacy_roster_revision* computes the pre-E3 digest instead.
+    *legacy_roster_revision* computes the pre-E3 digest instead (the column
+    itself left with migration 036).
     """
 
     observed_at = await plane.observed_after(quorum["deployer"], quorum["reviewer"])
@@ -1911,7 +1908,6 @@ async def _insert_readiness_past_the_service(
                         operation_id=UUID(material["operation_id"]),
                         operation_receipt_id=UUID(quorum["deployer"]),
                         provider_receipt_id=UUID(quorum["reviewer"]),
-                        roster_revision=stored_roster_revision,
                         rule_digest=_rule_digest(),
                         bundle_digest=billing_fact_bundle_digest(),
                         app_digest=material["deployment_digest"],
@@ -2496,30 +2492,15 @@ async def test_l5_readiness_conflicts_do_not_cross_environments(
 # pytest node names, checked by test_break_inventory_names_only_collected_tests
 # below.  A test may appear in both lists when it breaks for both reasons.
 #
-# 036 drops billing_rollout_readiness_receipts.roster_revision (and its model
-# field).  These tests write or read it, directly or through
-# _insert_readiness_past_the_service / _assert_general_quorum_stale; dropping
-# the roster_revision argument in that helper repairs the indirect ones.
-TESTS_THAT_BREAK_AFTER_036: tuple[str, ...] = (
-    "test_d1_general_spends_exactly_the_receipts_its_rows_name_bypass_row",
-    "test_d3_integrity_violations_surface_as_billing_operation_conflict",
-    "test_h1_pre_incident_general_quorum_is_stale_after_recanary",
-    "test_h1_quorum_created_at_equal_to_the_rollout_receipt_is_stale",
-    "test_hd_general_quorum_with_two_stale_and_one_fresh_receipt_is_stale",
-    "test_hd_general_quorum_with_only_the_approver_stale_is_stale",
-    "test_hd_freshness_is_judged_against_the_current_rollout_receipt",
-    "test_e3_readiness_ignores_the_roster_stores_zero_and_promotes",
-    "test_e3_a_digest_that_hashes_roster_revision_never_verifies",
-    "test_e3_a_stored_roster_revision_is_inert_until_migration_036",
-    "test_e3_readiness_locks_rollout_first_and_never_the_roster_fence"
-    "[SUBSCRIPTION_CREATED]",
-    "test_e3_readiness_locks_rollout_first_and_never_the_roster_fence"
-    "[SUBSCRIPTION_DELETED]",
-)
+# 036 is applied: E5 removed billing_rollout_readiness_receipts.roster_revision
+# (and its model field) from the twelve tests it listed, directly or through
+# _insert_readiness_past_the_service, and moved the "stored value is inert"
+# test to "the column is gone".
+TESTS_THAT_BREAK_AFTER_036: tuple[str, ...] = ()
 # 037 drops billing_roster_control: _advance_roster_revision updates it and
 # _assert_roster_fence_free locks it.
 TESTS_THAT_BREAK_AFTER_037: tuple[str, ...] = (
-    "test_e3_readiness_ignores_the_roster_stores_zero_and_promotes",
+    "test_e3_readiness_ignores_the_roster_and_promotes",
     "test_e3_readiness_locks_rollout_first_and_never_the_roster_fence"
     "[SUBSCRIPTION_CREATED]",
     "test_e3_readiness_locks_rollout_first_and_never_the_roster_fence"
@@ -2545,7 +2526,8 @@ async def test_break_inventory_names_only_collected_tests(
 
 
 # The global roster key the migration 026 triggers take (the Python mirror
-# was removed in Group 10 E4; migration 036 removes the triggers).
+# was removed in Group 10 E4; migration 036 removed the trigger on
+# billing_subscriptions, the legacy tables keep theirs until 037).
 _ROSTER_KEY = 3486705124568449331
 _HELD_ADVISORY = (
     "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted "
@@ -2659,9 +2641,9 @@ async def _assert_roster_fence_free(plane: _ControlPlane) -> None:
 # ``BillingWebhookService.receive`` (Group 10 E4), paused right after its
 # ``lock_rollout_control`` and then let run to its commit.  A handoff
 # (SUBSCRIPTION_CREATED) locks the checkout row and inserts the subscription;
-# a deletion locks the subscription row and UPDATEs it, which still takes the
-# database's roster statement fence until migration 036 drops that trigger.
-# The webhook itself takes no roster fence.
+# a deletion locks the subscription row and UPDATEs it, which took the
+# database's roster statement fence until migration 036 dropped that trigger.
+# Neither the webhook nor (since 036) the database takes the roster fence.
 _E4_DUE = date(2026, 10, 11)
 _E4_SUBSCRIPTION = "sub_e4_lock_order"
 _FENCE_TRIGGER = (
@@ -2815,10 +2797,10 @@ async def _finish_webhook(
     ), outcome
     (held,) = webhook.held_at_commit
     assert billing_advisory_key(_ENVIRONMENT) in held
-    # Its only roster fence is the database trigger's, on the deletion's
-    # UPDATE, and only while that trigger exists (migration 036 drops it).
-    fence_trigger = int(await plane.scalar(_FENCE_TRIGGER)) == 1
-    assert (_ROSTER_KEY in held) == (event == "SUBSCRIPTION_DELETED" and fence_trigger)
+    # 035's statement trigger took the roster key on the deletion's UPDATE;
+    # migration 036 dropped it, so no event holds the key any more.
+    assert int(await plane.scalar(_FENCE_TRIGGER)) == 0
+    assert _ROSTER_KEY not in held
 
 
 async def test_e3_readiness_request_with_roster_revision_is_422_before_anything(
@@ -2855,12 +2837,12 @@ async def test_e3_readiness_request_with_roster_revision_is_422_before_anything(
     assert await plane.readiness_rows(revision) == 1
 
 
-async def test_e3_readiness_ignores_the_roster_stores_zero_and_promotes(
+async def test_e3_readiness_ignores_the_roster_and_promotes(
     plane: _ControlPlane,
 ) -> None:
     """The global roster revision moved (1): readiness neither checks nor
-    copies it; the legacy column holds the constant 0 and the stored digest
-    is the documented one, re-derived here from the field list."""
+    copies it (since migration 036 the row has no roster column at all) and
+    the stored digest is the documented one, re-derived from the field list."""
 
     assert await _advance_roster_revision(plane) == 1
     revision = await _open_canary(plane)
@@ -2882,7 +2864,6 @@ async def test_e3_readiness_ignores_the_roster_stores_zero_and_promotes(
             .all()
         )
     assert sorted(row.receipt_kind for row in rows) == sorted(_KINDS)
-    assert {row.roster_revision for row in rows} == {0}
     for row in rows:
         assert row.content_sha256 == _sha256_canonical(
             _documented_payload(
@@ -2948,8 +2929,8 @@ async def test_e3_a_digest_that_hashes_roster_revision_never_verifies(
         )
     assert await plane.readiness_rows(revision) == 0
 
-    # A full pre-E3 set, stored as the old code stored it (column 0, legacy
-    # digest), is refused by the transition before anything is spent.
+    # A full pre-E3 set, stored with the old (legacy) digest, is refused by
+    # the transition before anything is spent.
     await _insert_readiness_past_the_service(
         plane, material, quorum, rollout_revision=revision, legacy_roster_revision=0
     )
@@ -2993,52 +2974,36 @@ async def test_e3_a_digest_that_hashes_roster_revision_never_verifies(
     assert await plane.applied(material) == 0
 
 
-async def test_e3_a_stored_roster_revision_is_inert_until_migration_036(
+async def test_e3_readiness_rows_carry_no_roster_revision_since_036(
     plane: _ControlPlane,
 ) -> None:
-    """Decided behaviour: the column is not evidence.  A row whose stored
-    ``roster_revision`` is non-zero (only writable past the service) binds
-    exactly like one holding 0, because the transition neither hashes nor
-    compares it; the column and its CHECK (``>= 0``) stay until 036."""
+    """Decided behaviour (E3): the roster revision is not readiness evidence.
+    E3 kept the column (constant 0, never read) until migration 036, which
+    dropped it with its CHECK (``>= 0``); rows written past the service bind
+    on the documented fields alone."""
+
+    assert (
+        await plane.scalar(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_name = 'billing_rollout_readiness_receipts' "
+            "AND column_name = 'roster_revision'"
+        )
+        == 0
+    )
+    assert (
+        await plane.scalar(
+            "SELECT count(*) FROM pg_constraint "
+            "WHERE conname = 'ck_billing_rollout_readiness_roster_revision'"
+        )
+        == 0
+    )
+    assert "roster_revision" not in BillingRolloutReadinessReceipt.__table__.columns
 
     revision = await _open_canary(plane)
     material = _material(from_state="canary_allowlist", to_state="general")
     quorum = await plane.quorum(material)
-
-    # Intentional server-log ERROR: ... ck_billing_rollout_readiness_roster_revision.
-    async with plane.sessions() as session:
-        session.add(
-            BillingRolloutReadinessReceipt(
-                environment=_ENVIRONMENT,
-                receipt_kind="readiness",
-                rollout_revision=revision,
-                status="passed",
-                content_sha256=_content_digest(
-                    material,
-                    kind="readiness",
-                    rollout_revision=revision,
-                    deployer_receipt_id=quorum["deployer"],
-                    reviewer_receipt_id=quorum["reviewer"],
-                ),
-                operation_id=UUID(material["operation_id"]),
-                operation_receipt_id=UUID(quorum["deployer"]),
-                provider_receipt_id=UUID(quorum["reviewer"]),
-                roster_revision=-1,
-                rule_digest=_rule_digest(),
-                bundle_digest=billing_fact_bundle_digest(),
-                app_digest=material["deployment_digest"],
-                observed_at=datetime.now(timezone.utc),
-                expires_at=_operation(material).expires_at,
-            )
-        )
-        with pytest.raises(
-            IntegrityError, match="ck_billing_rollout_readiness_roster_revision"
-        ):
-            await session.flush()
-        await session.rollback()
-
     await _insert_readiness_past_the_service(
-        plane, material, quorum, rollout_revision=revision, stored_roster_revision=7
+        plane, material, quorum, rollout_revision=revision
     )
     response = await plane.transition(material, expected_revision=revision)
     assert response.status_code == 200, response.text
@@ -3057,9 +3022,10 @@ async def test_e3_readiness_locks_rollout_first_and_never_the_roster_fence(
 ) -> None:
     """Readiness takes ``lock_rollout_control`` before anything else and the
     roster fence never.  A real webhook delivery that holds the rollout lock
-    completes its whole path (row locks; for a deletion also the database's
-    roster statement fence) while readiness waits behind it; the old
-    readiness order (roster fence, then rollout) deadlocked against it."""
+    completes its whole path (row locks; until migration 036, for a deletion,
+    also the database's roster statement fence) while readiness waits behind
+    it; the old readiness order (roster fence, then rollout) deadlocked
+    against it."""
 
     revision = await _open_canary(plane)
     material = _material(from_state="canary_allowlist", to_state="general")
@@ -3126,7 +3092,7 @@ async def test_e3_readiness_locks_rollout_first_and_never_the_roster_fence(
             )
         if isinstance(outcome, BaseException):
             raise outcome
-        assert outcome.roster_revision == 0
+        assert outcome.receipt_kind == "smoke"
         assert await _held_advisory(worker, billing_advisory_key(_ENVIRONMENT)) == 1
         assert await _held_advisory(worker, _ROSTER_KEY) == 0
         await _assert_roster_fence_free(plane)

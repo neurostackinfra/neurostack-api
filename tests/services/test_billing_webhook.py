@@ -348,7 +348,6 @@ class _World:
             builder_id=owner,
             intent_kind="topup",
             intent_id=order.id,
-            migration_id=None,
             topup_order_id=order.id,
             attempt_no=1,
             provider="asaas",
@@ -383,7 +382,6 @@ class _World:
             builder_id=builder_id or self.builder_id,
             intent_kind="subscription",
             intent_id=uuid4(),
-            migration_id=None,
             topup_order_id=None,
             attempt_no=1,
             provider="asaas",
@@ -417,11 +415,10 @@ async def world(
     builder_id = uuid4()
     async with sessions() as session:
         # No billing_roster_control row (Group 10 E4): the application code
-        # no longer reads it, and every test here proves that.  SQLite has no
-        # triggers: on PostgreSQL the 026 statement trigger still needs the
-        # row for every UPDATE of billing_subscriptions (settlement
-        # activation, SUBSCRIPTION_UPDATED/DELETED, a readback that changes
-        # the status) until migration 036 drops it.
+        # no longer reads it, and every test here proves that.  Since
+        # migration 036 the database does not need it either: the 026
+        # statement trigger that took it on every UPDATE of
+        # billing_subscriptions is gone.
         session.add_all(
             [
                 Builder(id=builder_id, name="Fixture Builder"),
@@ -951,19 +948,14 @@ async def test_provider_amount_drift_blocks_settlement(world: _World) -> None:
 # pytest node names, checked by test_break_inventory_names_only_collected_tests
 # below.  A test may appear in both lists when it breaks for both reasons.
 #
-# 036 drops BillingSubscription.roster_revision (these tests set or read it).
-# The _World.topup_session/subscription_session helpers also pass
-# ``migration_id=None``, a column 036 drops: E5 removes that argument there,
-# after which no other test of this module breaks for that reason.
-TESTS_THAT_BREAK_AFTER_036: tuple[str, ...] = (
-    "test_handoff_ignores_the_legacy_roster_and_writes_the_constant",
-    "test_subscription_created_hands_off_and_settlement_activates_once",
-    "test_second_recurring_subscription_is_never_bound",
-)
+# 036 is applied: E5 removed BillingSubscription.roster_revision and
+# BillingCheckoutSession.migration_id from the model and from the three tests
+# (and the two _World helpers) that set or read them.
+TESTS_THAT_BREAK_AFTER_036: tuple[str, ...] = ()
 # 037 drops BillingRosterControl: this test writes it, and the module-level
 # import of the model must go too (or the whole module fails to import).
 TESTS_THAT_BREAK_AFTER_037: tuple[str, ...] = (
-    "test_handoff_ignores_the_legacy_roster_and_writes_the_constant",
+    "test_handoff_ignores_the_legacy_roster_row",
 )
 
 
@@ -980,12 +972,10 @@ def test_break_inventory_names_only_collected_tests(
         assert sorted(set(listed) - collected) == []
 
 
-async def test_handoff_ignores_the_legacy_roster_and_writes_the_constant(
-    world: _World,
-) -> None:
+async def test_handoff_ignores_the_legacy_roster_row(world: _World) -> None:
     """Group 10 E4: a stray roster row at revision 7 is neither read nor
-    locked; the new row records the constant 1 that the CHECK (> 0) needs
-    until migration 036 drops ``roster_revision``."""
+    locked.  Since migration 036 the new row carries no roster revision at
+    all (E4 wrote the constant 1 the dropped CHECK needed)."""
 
     await world.add(BillingRosterControl(singleton=True, billing_roster_revision=7))
     checkout = await world.subscription_session()
@@ -999,11 +989,8 @@ async def test_handoff_ignores_the_legacy_roster_and_writes_the_constant(
     )
     assert created.outcome == "processed"
     (row,) = await world.rows(BillingSubscription)
-    assert (row.id, row.status, row.roster_revision) == (
-        checkout.intent_id,
-        "active_linked",
-        1,
-    )
+    assert (row.id, row.status) == (checkout.intent_id, "active_linked")
+    assert "roster_revision" not in BillingSubscription.__table__.columns
     (control,) = await world.rows(BillingRosterControl)
     assert control.billing_roster_revision == 7
 
@@ -1029,7 +1016,6 @@ async def test_subscription_created_hands_off_and_settlement_activates_once(
     assert (row.status, row.is_active, row.plan) == ("active_linked", True, "plus")
     assert row.coupon_code == "WELCOME10"
     assert row.amount_cents == amount
-    assert row.roster_revision == 1
     (session_row,) = await world.rows(BillingCheckoutSession)
     assert session_row.state == "completed"
     assert session_row.resulting_external_subscription_id == "sub_handoff_01"
@@ -1129,7 +1115,6 @@ async def test_second_recurring_subscription_is_never_bound(world: _World) -> No
             plan="start",
             billing_cycle="monthly",
             status="active",
-            roster_revision=1,
         )
     )
     checkout = await world.subscription_session()

@@ -662,11 +662,10 @@ async def _seed_blocker(harness: _Harness, builder_id: UUID, condition: str) -> 
                     text("""
                         INSERT INTO billing_subscriptions (
                             id, builder_id, provider, external_subscription_id,
-                            is_active, plan, billing_cycle, status,
-                            roster_revision
+                            is_active, plan, billing_cycle, status
                         ) VALUES (
                             :id, :builder_id, :provider, :external_id, :active,
-                            'plus', 'monthly', :status, 1
+                            'plus', 'monthly', :status
                         )
                     """),
                     {
@@ -754,10 +753,10 @@ async def _seed_saga(
                 text("""
                     INSERT INTO billing_subscriptions (
                         id, builder_id, provider, external_subscription_id,
-                        is_active, plan, billing_cycle, status, roster_revision
+                        is_active, plan, billing_cycle, status
                     ) VALUES (
                         :id, :builder_id, :provider, :external_id, :active,
-                        'plus', 'monthly', :status, 1
+                        'plus', 'monthly', :status
                     )
                 """),
                 {

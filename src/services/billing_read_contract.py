@@ -12,17 +12,26 @@ the live-session reuse, ``subscription_checkout_blocker``, the canary slot and
 the top-up capability gate), evaluated without the rollout lock, so a
 concurrent transition can make it stale; the ``POST`` stays the authority.  It
 never says *why* an offer is absent.
+
+``payment_state`` (owner decision A1) is derived here, never by the client,
+from the subscription status, its newest cycle and the paid-through date
+against the São Paulo calendar date of an injectable clock
+(``derive_payment_state``).  A subscription the provider deleted
+(``cancelled``) stays visible while its paid period runs (owner decision A2);
+that window is display only and changes no checkout eligibility.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Callable, Final, Literal, cast
+from typing import Callable, Final, Literal, TypeVar, cast
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import InstrumentedAttribute
+from sqlalchemy.sql.selectable import ScalarSelect
 
 from src.config.logging import get_logger
 from src.config.settings import settings
@@ -38,12 +47,15 @@ from src.repositories.billing import (
     BillingRepository,
 )
 from src.services.billing_catalog import BILLING_CATALOG
+from src.services.billing_checkout import CheckoutUnavailable, billing_local_date
 from src.services.billing_rollout import (
     BillingCheckoutUnavailable,
     require_billing_checkout_rollout,
 )
 
 logger = get_logger(__name__)
+
+_T = TypeVar("_T")
 
 BILLING_SUMMARY_UNAVAILABLE: Final = "billing_summary_unavailable"
 
@@ -56,6 +68,19 @@ SubscriptionFinancialStatus = Literal[
     "readback_required",
     "non_billable_pending_readback",
 ]
+# What the summary reports: a current status, or ``cancelled`` (the provider
+# deleted the subscription) while its paid period still runs (owner A2).
+SubscriptionSummaryStatus = Literal[
+    "active",
+    "active_linked",
+    "readback_required",
+    "non_billable_pending_readback",
+    "cancelled",
+]
+# Owner A1: derived server side so the page never infers it from dates.
+PaymentState = Literal["paid", "overdue", "reversed", "pending"]
+# The newest cycle, classified by ``latest_cycle_kind``.
+LatestCycleKind = Literal["pending", "paid", "reversed", "quarantined"]
 LiveCheckoutState = Literal[
     "creating",
     "active",
@@ -72,10 +97,20 @@ _SUBSCRIPTION_STATUSES: Final = frozenset(
         "non_billable_pending_readback",
     )
 )
+_CANCELLED: Final = "cancelled"
+_SUMMARY_STATUSES: Final = _SUBSCRIPTION_STATUSES | {_CANCELLED}
 _KINDS: Final = frozenset(("subscription", "topup"))
 # Cycle states that can be fully paid; ``current_period_end`` additionally
 # requires ``reversed_cents = restored_cents`` (nothing net reversed).
 _PAID_CYCLE_STATES: Final = ("settled", "restored")
+# ``ck_billing_subscription_cycles_state``; anything else fails closed.
+_CYCLE_STATES: Final = frozenset(
+    ("pending", "settled", "reversed", "restored", "quarantined")
+)
+# Provider evidence is still pending: no payment state is claimed from cycles.
+_EVIDENCE_PENDING_STATUSES: Final = frozenset(
+    ("readback_required", "non_billable_pending_readback")
+)
 
 
 class BillingReadUnavailable(RuntimeError):
@@ -89,13 +124,15 @@ class BillingReadUnavailable(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class SubscriptionReadback:
-    """The builder's current (non-terminal) ASAAS subscription record."""
+    """The builder's current ASAAS subscription record, or the cancelled one
+    whose paid period still runs."""
 
     offer_id: str
     catalog_version_id: str
-    status: SubscriptionFinancialStatus
+    status: SubscriptionSummaryStatus
     amount_cents: int
     current_period_end: date | None
+    payment_state: PaymentState
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +142,7 @@ class LiveCheckoutReadback:
     checkout_session_id: UUID
     kind: CheckoutKind
     state: LiveCheckoutState
+    offer_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,10 +172,87 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def billing_today(now: datetime) -> date:
+    """The São Paulo calendar date of an aware instant (the commercial
+    calendar of ``billing_local_date``); a naive instant fails closed."""
+
+    try:
+        return billing_local_date(now)
+    except CheckoutUnavailable:
+        raise BillingReadUnavailable() from None
+
+
+def latest_cycle_kind(
+    state: object, reversed_cents: object, restored_cents: object
+) -> LatestCycleKind:
+    """Classify a cycle row; an unknown state or a non-integer total fails
+    closed.
+
+    ``paid`` is the F1 rule (``settled``/``restored`` with
+    ``reversed_cents = restored_cents``).  Every other settled-then-reversed
+    shape (``reversed``, partially restored, a ``settled`` row carrying a net
+    reversal) is ``reversed``: a partial reversal does not count as paid
+    (owner decision B).
+    """
+
+    if (
+        not isinstance(state, str)
+        or state not in _CYCLE_STATES
+        or type(reversed_cents) is not int
+        or type(restored_cents) is not int
+    ):
+        raise BillingReadUnavailable()
+    if state == "pending":
+        return "pending"
+    if state == "quarantined":
+        return "quarantined"
+    if state in _PAID_CYCLE_STATES and reversed_cents == restored_cents:
+        return "paid"
+    return "reversed"
+
+
+def derive_payment_state(
+    *,
+    status: SubscriptionSummaryStatus,
+    latest: LatestCycleKind | None,
+    paid_through: date | None,
+    today: date,
+) -> PaymentState:
+    """The closed payment state of one subscription on ``today``.
+
+    In order: pending provider evidence (``readback_required``,
+    ``non_billable_pending_readback``), no cycle at all, or a quarantined
+    newest cycle is ``pending``; a reversed or partially restored newest
+    cycle is ``reversed`` (even while an older paid cycle still covers
+    today); otherwise ``paid`` while ``paid_through >= today`` (the São Paulo
+    date; the last paid day is still paid), ``overdue`` after it, and
+    ``pending`` when no cycle was ever fully paid.  The full matrix is
+    documented in ``docs/api-contracts.md``.
+    """
+
+    if status in _EVIDENCE_PENDING_STATUSES:
+        return "pending"
+    if latest is None:
+        return "pending"
+    if latest == "quarantined":
+        return "pending"
+    if latest == "reversed":
+        return "reversed"
+    if paid_through is None:
+        return "pending"
+    if paid_through >= today:
+        return "paid"
+    return "overdue"
+
+
 async def read_current_subscription(
-    db: AsyncSession, *, builder_id: UUID
+    db: AsyncSession,
+    *,
+    builder_id: UUID,
+    clock: Callable[[], datetime] | None = None,
 ) -> SubscriptionReadback | None:
-    """Return the builder's non-terminal ASAAS subscription, else ``None``.
+    """Return the builder's current ASAAS subscription, else the cancelled one
+    still inside its paid period, else ``None``.
 
     ``status`` is ``billing_subscriptions.status``, the financial state the
     webhook/readback owns (``active_linked`` until the first settlement,
@@ -149,71 +264,145 @@ async def read_current_subscription(
     ``reversed_cents = restored_cents``); a reversed, partially restored,
     pending or quarantined cycle is skipped, so a currently reversed cycle
     falls back to the previous fully paid one, and ``None`` means no cycle
-    ever was.  A partially reversed cycle does not count (conservative owner
-    policy default).  Legacy (non-ASAAS) and terminal rows
-    are not a current ASAAS subscription.  An unexpected shape (two current
-    rows, a missing snapshot column, an unknown status) fails closed.
+    ever was.  A partially reversed cycle does not count (owner decision B).
+
+    Owner decision A2: with no current (non-terminal) row, a ``cancelled``
+    row (the provider read back ``deleted: true``) is returned while its
+    ``current_period_end`` is on or after today's São Paulo date (``clock``,
+    default the UTC wall clock, read once); among several, the longest paid
+    period, then the newest.  ``inactive`` (provider ``INACTIVE``/``EXPIRED``),
+    legacy (non-ASAAS) and every other ended row are not returned.
+
+    One statement (one snapshot) reads the row, its paid-through date and its
+    newest cycle (by ``cycle_start``), from which ``payment_state`` is
+    derived.  An unexpected shape (two current rows, a missing snapshot
+    column, an unknown status or cycle state, a paid-through value that is
+    not exactly a ``date``, a naive clock) fails closed.
     """
 
+    today = billing_today(clock() if clock is not None else _utc_now())
+    cycle = BillingSubscriptionCycle
+    own_cycles = and_(
+        cycle.builder_id == builder_id,
+        cycle.subscription_id == BillingSubscription.id,
+    )
+    paid_through = (
+        select(func.max(cycle.cycle_end))
+        .where(
+            own_cycles,
+            # Fully paid net of reversals: settled, or restored in full.
+            cycle.state.in_(_PAID_CYCLE_STATES),
+            cycle.reversed_cents == cycle.restored_cents,
+        )
+        .correlate(BillingSubscription)
+        .scalar_subquery()
+    )
+
+    def newest(column: InstrumentedAttribute[_T]) -> ScalarSelect[_T]:
+        return (
+            select(column)
+            .where(own_cycles)
+            .order_by(cycle.cycle_start.desc(), cycle.created_at.desc(), cycle.id)
+            .limit(1)
+            .correlate(BillingSubscription)
+            .scalar_subquery()
+        )
+
+    current = BillingSubscription.status.not_in(TERMINAL_SUBSCRIPTION_STATUSES)
     rows = (
         await db.execute(
             select(
-                BillingSubscription.id,
                 BillingSubscription.offer_id,
                 BillingSubscription.catalog_version_id,
                 BillingSubscription.status,
                 BillingSubscription.amount_cents,
+                paid_through.label("paid_through"),
+                newest(cycle.state).label("newest_state"),
+                newest(cycle.reversed_cents).label("newest_reversed_cents"),
+                newest(cycle.restored_cents).label("newest_restored_cents"),
             )
             .where(
                 BillingSubscription.builder_id == builder_id,
                 BillingSubscription.provider == "asaas",
-                BillingSubscription.status.not_in(TERMINAL_SUBSCRIPTION_STATUSES),
+                or_(
+                    current,
+                    and_(
+                        BillingSubscription.status == _CANCELLED,
+                        paid_through >= today,
+                    ),
+                ),
             )
-            .order_by(BillingSubscription.created_at.desc(), BillingSubscription.id)
+            # Current rows first; then the longest paid period, the newest.
+            .order_by(
+                case((current, 0), else_=1),
+                paid_through.desc(),
+                BillingSubscription.created_at.desc(),
+                BillingSubscription.id,
+            )
             .limit(2)
         )
     ).all()
     if not rows:
         return None
-    if len(rows) != 1:
-        # A second recurring subscription is a drift state, not a choice.
+    if len(rows) > 1 and rows[1].status != _CANCELLED:
+        # Current rows sort first, so this is a second current recurring
+        # subscription: a drift state, not a choice.
         raise BillingReadUnavailable()
-    subscription_id, offer_id, catalog_version_id, status, amount_cents = rows[0]
+    (
+        offer_id,
+        catalog_version_id,
+        status,
+        amount_cents,
+        period_end,
+        newest_state,
+        newest_reversed_cents,
+        newest_restored_cents,
+    ) = rows[0]
     if (
         not isinstance(offer_id, str)
         or not offer_id
         or not isinstance(catalog_version_id, str)
         or not catalog_version_id
-        or status not in _SUBSCRIPTION_STATUSES
+        or status not in _SUMMARY_STATUSES
         or type(amount_cents) is not int
         or amount_cents < 0
     ):
         raise BillingReadUnavailable()
-    period_end = await db.scalar(
-        select(func.max(BillingSubscriptionCycle.cycle_end)).where(
-            BillingSubscriptionCycle.builder_id == builder_id,
-            BillingSubscriptionCycle.subscription_id == subscription_id,
-            # Fully paid net of reversals: settled, or restored in full.
-            BillingSubscriptionCycle.state.in_(_PAID_CYCLE_STATES),
-            BillingSubscriptionCycle.reversed_cents
-            == BillingSubscriptionCycle.restored_cents,
+    if period_end is not None and type(period_end) is not date:
+        # Owner A4: a calendar date only.  ``datetime`` subclasses ``date``,
+        # so an instant (with or without a zone) must not pass for one.
+        raise BillingReadUnavailable()
+    latest = (
+        None
+        if newest_state is None
+        else latest_cycle_kind(
+            newest_state, newest_reversed_cents, newest_restored_cents
         )
     )
-    if period_end is not None and not isinstance(period_end, date):
-        raise BillingReadUnavailable()
+    summary_status = cast(SubscriptionSummaryStatus, status)
     return SubscriptionReadback(
         offer_id=offer_id,
         catalog_version_id=catalog_version_id,
-        status=cast(SubscriptionFinancialStatus, status),
+        status=summary_status,
         amount_cents=amount_cents,
         current_period_end=period_end,
+        payment_state=derive_payment_state(
+            status=summary_status,
+            latest=latest,
+            paid_through=period_end,
+            today=today,
+        ),
     )
 
 
 async def read_live_checkout(
     db: AsyncSession, *, builder_id: UUID
 ) -> LiveCheckoutReadback | None:
-    """Return the builder's newest live checkout attempt, else ``None``."""
+    """Return the builder's newest live checkout attempt, else ``None``.
+
+    ``offer_id`` is that attempt's own catalog offer (its session row, owner
+    decision A3), never inferred from the catalog or the subscription.
+    """
 
     row = (
         await db.execute(
@@ -221,6 +410,7 @@ async def read_live_checkout(
                 BillingCheckoutSession.id,
                 BillingCheckoutSession.intent_kind,
                 BillingCheckoutSession.state,
+                BillingCheckoutSession.offer_id,
             )
             .where(
                 BillingCheckoutSession.builder_id == builder_id,
@@ -235,8 +425,13 @@ async def read_live_checkout(
     ).first()
     if row is None:
         return None
-    checkout_session_id, kind, state = row
-    if kind not in _KINDS or state not in LIVE_CHECKOUT_STATES:
+    checkout_session_id, kind, state, offer_id = row
+    if (
+        kind not in _KINDS
+        or state not in LIVE_CHECKOUT_STATES
+        or not isinstance(offer_id, str)
+        or not offer_id
+    ):
         raise BillingReadUnavailable()
     if not isinstance(checkout_session_id, UUID):
         checkout_session_id = UUID(str(checkout_session_id))
@@ -244,6 +439,7 @@ async def read_live_checkout(
         checkout_session_id=checkout_session_id,
         kind=cast(CheckoutKind, kind),
         state=cast(LiveCheckoutState, state),
+        offer_id=offer_id,
     )
 
 
