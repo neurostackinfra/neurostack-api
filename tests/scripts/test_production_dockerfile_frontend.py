@@ -1,5 +1,6 @@
 """Static contract for the production Dockerfile: the frontend-build stage, the
-digest-pinned base images, the Poetry install and the revision label.
+digest-pinned base images, the Poetry install, the compiler-free runtime stage
+and the revision label.
 
 Everything here is static analysis of ``Dockerfile``, ``.dockerignore``,
 ``frontend/package.json``, ``poetry.lock`` and ``git ls-files``: no Docker
@@ -22,6 +23,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+from scripts.production_image_smoke import is_build_package
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCKERFILE = ROOT / "Dockerfile"
@@ -158,12 +161,12 @@ FRONTEND_BUILD_SEQUENCE = [
 # build context). Anything else (e.g. `COPY . .`) fails the contract.
 PRODUCTION_COPY_SOURCES = {
     None: [
+        "scripts/requirements-production-base.txt",
         "src",
         "config",
         "alembic.ini",
         "alembic",
         "scripts/bootstrap_admin.py",
-        "scripts/requirements-production-base.txt",
     ],
     "deps": [
         "/usr/local/lib/python3.11/site-packages",
@@ -171,6 +174,36 @@ PRODUCTION_COPY_SOURCES = {
         "/app/packages/neurostack-core",
     ],
     "frontend-build": [SPA_SOURCE],
+}
+# The production stage starts afresh from the base pin (never from a stage)
+# and runs exactly these RUNs, in order: the runtime system packages, the
+# base tooling at the lock versions (before the deps site-packages are copied
+# over it) and the non-root user, both identical to base's.
+RUNTIME_PACKAGES = ["curl"]
+APT_OPTIONS = ["-y", "--no-install-recommends"]
+APT_RUN_STEPS = [
+    "apt-get update",
+    f"apt-get install {' '.join(APT_OPTIONS)} {' '.join(RUNTIME_PACKAGES)}",
+    "rm -rf /var/lib/apt/lists/*",
+]
+BASE_TOOLING_RUN = f"pip {HASHED_INSTALL} {BASE_REQUIREMENTS_PATH}"
+USER_RUN = (
+    "groupadd --gid 1000 neurostack"
+    " && useradd --uid 1000 --gid 1000 --shell /bin/bash --create-home neurostack"
+)
+PRODUCTION_RUNS = [" && ".join(APT_RUN_STEPS), BASE_TOOLING_RUN, USER_RUN]
+PRODUCTION_SETTINGS = {
+    "USER": ["neurostack"],
+    "WORKDIR": ["/app"],
+    "EXPOSE": ["8000"],
+    "HEALTHCHECK": [
+        "--interval=30s --timeout=10s --start-period=5s --retries=3"
+        " CMD curl -f http://localhost:8000/health || exit 1"
+    ],
+    "CMD": [
+        '["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000",'
+        ' "--workers", "4", "--no-access-log"]'
+    ],
 }
 
 
@@ -375,7 +408,8 @@ def docker_ignores(path: str) -> bool:
 def test_stage_order_keeps_production_last_and_verbatim() -> None:
     assert [stage.alias for stage in _stages()] == EXPECTED_STAGES
     text = DOCKERFILE.read_text(encoding="utf-8")
-    assert re.search(r"^FROM base AS production$", text, re.MULTILINE)
+    base = _stage("base").parent
+    assert re.search(rf"^FROM {re.escape(base)} AS production$", text, re.MULTILINE)
     assert re.search(r"^FROM base AS deps$", text, re.MULTILINE)
     production_cmds = [
         instruction
@@ -405,13 +439,15 @@ def test_python_image_is_pinned_by_tag_and_digest() -> None:
     base = _stage("base")
     assert PYTHON_IMAGE.match(base.parent), base.parent
     python_stages = [s for s in _stages() if s.parent.startswith("python")]
-    assert python_stages == [base]
+    assert python_stages == [base, _stage("production")]
+    assert {stage.parent for stage in python_stages} == {base.parent}
 
 
 def test_every_external_base_image_is_pinned_by_digest() -> None:
     aliases = {stage.alias for stage in _stages()}
     external = [stage.parent for stage in _stages() if stage.parent not in aliases]
-    assert len(external) == 2, external  # python (base) and node (frontend-build)
+    # python (base and production, one pin) and node (frontend-build)
+    assert len(external) == 3 and len(set(external)) == 2, external
     for parent in external:
         assert DIGEST_PINNED.match(parent), f"base image not pinned by digest: {parent}"
 
@@ -677,7 +713,7 @@ def _assert_every_pip_install_is_hash_checked(stages: tuple[Stage, ...]) -> None
         for run in _runs(stage.alias, stages)
         for pip, options, requirements in _pip_installs(run)
     ]
-    assert len(installs) == 3, f"pip installs: {installs}"
+    assert len(installs) == 4, f"pip installs: {installs}"
     for alias, pip, options, requirements in installs:
         assert "--require-hashes" in options, f"pip without --require-hashes: {pip}"
         assert options == [*HASHED_OPTIONS, "-r"], f"pip options in {alias}: {options}"
@@ -687,7 +723,20 @@ def _assert_every_pip_install_is_hash_checked(stages: tuple[Stage, ...]) -> None
     assert [(c.sources, c.destination) for c in base] == [
         (["scripts/requirements-production-base.txt"], BASE_REQUIREMENTS_PATH)
     ], "base requirements COPY"
-    assert _runs("base", stages)[1] == f"pip {HASHED_INSTALL} {BASE_REQUIREMENTS_PATH}"
+    assert _runs("base", stages)[1] == BASE_TOOLING_RUN, "base tooling RUN"
+    # The runtime stage repeats exactly that install (see _assert_runtime_stage
+    # for where it must sit).
+    base_file = "scripts/requirements-production-base.txt"
+    runtime = [
+        (c.flags, c.sources, c.destination)
+        for c in _copies(_stage("production", stages))
+        if base_file in c.sources
+    ]
+    assert runtime == [
+        ({}, [base_file], BASE_REQUIREMENTS_PATH)
+    ], "production base requirements COPY"
+    runs = _runs("production", stages)
+    assert runs.count(BASE_TOOLING_RUN) == 1, "production tooling RUN"
 
 
 def test_every_pip_install_is_hash_checked() -> None:
@@ -766,10 +815,13 @@ _VENV_PIP = (
     "/opt/poetry/bin/pip install --require-hashes --only-binary :all: "
     "-r /opt/requirements/production-base.txt"
 )
-_BASE_PIP = (
+_PIP = (
     "RUN pip install --require-hashes --only-binary :all: "
     "-r /opt/requirements/production-base.txt\n"
 )
+# The same RUN opens base's and production's tooling: anchored by what follows.
+_BASE_PIP = _PIP + "\n# Create non-root user for security\n"
+_RUNTIME_PIP = _PIP + "\n# Non-root user, same ids as base.\n"
 _MAIN_INSTALL = (
     "RUN /opt/poetry/bin/poetry install --no-interaction --no-ansi --only main "
     "--no-root\n"
@@ -830,6 +882,30 @@ _POETRY_COPY = "COPY scripts/requirements-poetry.txt /opt/requirements/poetry.tx
             "pip options in base",
         ),
         (
+            _RUNTIME_PIP,
+            _RUNTIME_PIP.replace("--require-hashes ", ""),
+            _assert_every_pip_install_is_hash_checked,
+            "pip without --require-hashes",
+        ),
+        (
+            _RUNTIME_PIP,
+            _RUNTIME_PIP.replace("--only-binary :all: ", ""),
+            _assert_every_pip_install_is_hash_checked,
+            "pip options in production",
+        ),
+        (
+            _RUNTIME_PIP,
+            _RUNTIME_PIP.replace("production-base.txt", "poetry.txt"),
+            _assert_poetry_stays_out_of_production,
+            "Poetry: ",
+        ),
+        (
+            _RUNTIME_PIP,
+            _RUNTIME_PIP.replace(":all: ", ":all: urllib3==2.8.0 "),
+            _assert_every_pip_install_is_hash_checked,
+            "pip requirements in production",
+        ),
+        (
             _SPA_ENV,
             _SPA_ENV + "COPY --from=deps /opt/poetry /opt/poetry\n",
             _assert_poetry_stays_out_of_production,
@@ -864,6 +940,10 @@ _POETRY_COPY = "COPY scripts/requirements-poetry.txt /opt/requirements/poetry.tx
         "base-require-hashes-dropped",
         "unhashed-inline-requirement",
         "base-only-binary-dropped",
+        "runtime-require-hashes-dropped",
+        "runtime-only-binary-dropped",
+        "runtime-system-pip-installs-poetry-file",
+        "runtime-unhashed-inline-requirement",
         "poetry-venv-in-final-stage",
         "poetry-site-packages-in-final-stage",
         "system-pip-installs-poetry-file",
@@ -1294,7 +1374,7 @@ def test_exactly_one_copy_from_frontend_build_lands_in_final_stage() -> None:
 
 def test_production_lineage_has_no_node_runtime_or_modules() -> None:
     lineage = _lineage("production")
-    assert [stage.alias for stage in lineage] == ["production", "base"]
+    assert [stage.alias for stage in lineage] == ["production"]
     assert lineage[-1].parent.startswith("python:")
     for stage in lineage:
         assert not stage.parent.startswith("node")
@@ -1308,10 +1388,36 @@ def test_production_lineage_has_no_node_runtime_or_modules() -> None:
     assert copied == PRODUCTION_COPY_SOURCES
 
 
+def _supply_stages(stages: tuple[Stage, ...]) -> list[Stage]:
+    """The production lineage and, transitively, every stage it copies from
+    (deps and its base, frontend-build): whatever runs there reaches the image
+    through a COPY."""
+
+    aliases = {stage.alias for stage in stages}
+    found: dict[str, Stage] = {}
+    pending = ["production"]
+    while pending:
+        for stage in _lineage(pending.pop(), stages):
+            if stage.alias in found:
+                continue
+            found[stage.alias] = stage
+            pending += [
+                copy.flags["from"]
+                for copy in _copies(stage)
+                if copy.flags.get("from") in aliases
+            ]
+    return list(found.values())
+
+
+def test_supply_stages_are_the_production_closure() -> None:
+    aliases = [stage.alias for stage in _supply_stages(_stages())]
+    assert sorted(aliases) == ["base", "deps", "frontend-build", "production"]
+
+
 def _assert_production_lineage_imports_only_through_copies(
     stages: tuple[Stage, ...],
 ) -> None:
-    for stage in _lineage("production", stages):
+    for stage in _supply_stages(stages):
         for instruction in stage.instructions:
             allowed = instruction.keyword in PRODUCTION_KEYWORDS
             assert allowed, f"instruction not allowed in {stage.alias}: {instruction}"
@@ -1329,6 +1435,8 @@ def test_production_lineage_imports_files_only_through_the_copy_allowlist() -> N
     ("anchor", "stage"),
     [
         ("# Create non-root user for security\n", "base"),
+        ("# Configure Poetry to not create virtual environment\n", "deps"),
+        ("# Non-root user, same ids as base.\n", "production"),
         ("ENV SPA_DIST_DIR=/app/spa\n", "production"),
     ],
 )
@@ -1341,6 +1449,331 @@ def test_production_lineage_rejects_shell_that_masks_exit_statuses(
     stages = _parse_stages(text.replace(anchor, shell + anchor))
     with pytest.raises(AssertionError, match=f"not allowed in {stage}"):
         _assert_production_lineage_imports_only_through_copies(stages)
+
+
+# --- Runtime stage (no compilers) ------------------------------------------
+
+
+def _assert_runtime_stage_is_fresh(stages: tuple[Stage, ...]) -> None:
+    aliases = {stage.alias for stage in stages}
+    parent = _stage("production", stages).parent
+    assert parent not in aliases, f"production builds on stage {parent}"
+    base = _stage("base", stages).parent
+    assert parent == base, f"production FROM {parent} is not the base pin {base}"
+    assert PYTHON_IMAGE.match(parent), parent
+
+
+def test_production_starts_afresh_from_the_base_pin() -> None:
+    # Built on base (or deps), the image would carry build-essential and
+    # libpq-dev: gcc, g++, make, binutils, cpp, pg_config and the C headers.
+    _assert_runtime_stage_is_fresh(_stages())
+
+
+_PROD_FROM = f"FROM python:3.11.17-slim-trixie@sha256:{_INDEX} AS production\n"
+
+
+@pytest.mark.parametrize(
+    ("new", "message"),
+    [
+        ("FROM base AS production\n", "production builds on stage base"),
+        ("FROM deps AS production\n", "production builds on stage deps"),
+        (_PROD_FROM.replace(_INDEX, _AMD64), "is not the base pin"),
+        (_PROD_FROM.replace("3.11.17", "3.11.18"), "is not the base pin"),
+        ("FROM python:3.11-slim AS production\n", "is not the base pin"),
+    ],
+    ids=["from-base", "from-deps", "manifest-digest", "other-tag", "unpinned"],
+)
+def test_runtime_stage_origin_rejects_mutations(new: str, message: str) -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert text.count(_PROD_FROM) == 1, _PROD_FROM
+    with pytest.raises(AssertionError, match=re.escape(message)):
+        _assert_runtime_stage_is_fresh(_parse_stages(text.replace(_PROD_FROM, new)))
+
+
+def _package_run(stages: tuple[Stage, ...]) -> list[str]:
+    """The &&-steps of production's one RUN that touches the package manager."""
+
+    runs = [
+        run
+        for run in _runs("production", stages)
+        if re.search(r"\b(?:apt|apt-get|aptitude|dpkg)\b", run)
+    ]
+    assert len(runs) == 1, f"production package RUNs: {runs}"
+    return _build_steps(runs[0])
+
+
+def _runtime_packages(stages: tuple[Stage, ...]) -> list[str]:
+    installs = [
+        shlex.split(step)[2:]
+        for step in _package_run(stages)
+        if shlex.split(step)[:2] == ["apt-get", "install"]
+    ]
+    assert len(installs) == 1, f"production apt-get install steps: {installs}"
+    return [token for token in installs[0] if not token.startswith("-")]
+
+
+def _assert_runtime_packages(stages: tuple[Stage, ...]) -> None:
+    packages = _runtime_packages(stages)
+    build = [package for package in packages if is_build_package(package)]
+    assert not build, f"build package in production: {build}"
+    steps = _package_run(stages)
+    install = next(step for step in steps if step.startswith("apt-get install"))
+    options = [token for token in shlex.split(install) if token.startswith("-")]
+    assert options == APT_OPTIONS, f"apt-get install options: {options}"
+    assert packages == RUNTIME_PACKAGES, f"runtime packages: {packages}"
+    assert steps == APT_RUN_STEPS, f"production apt RUN: {steps}"
+
+
+def test_runtime_stage_installs_only_the_runtime_packages() -> None:
+    _assert_runtime_packages(_stages())
+
+
+def _assert_healthcheck_tool_is_installed(stages: tuple[Stage, ...]) -> None:
+    production = _stage("production", stages)
+    checks = [
+        " ".join(i.args.split())
+        for i in production.instructions
+        if i.keyword == "HEALTHCHECK"
+    ]
+    assert len(checks) == 1, f"production HEALTHCHECK: {checks}"
+    _, cmd, command = checks[0].partition(" CMD ")
+    assert cmd, f"HEALTHCHECK without CMD: {checks[0]}"
+    argv = json.loads(command) if command.startswith("[") else shlex.split(command)
+    tool = argv[0]
+    assert tool in _runtime_packages(
+        stages
+    ), f"HEALTHCHECK runs {tool}, which no runtime package installs"
+
+
+def test_healthcheck_tool_is_a_runtime_package() -> None:
+    _assert_healthcheck_tool_is_installed(_stages())
+
+
+def _settings(stage: Stage, keyword: str) -> list[str]:
+    return [
+        " ".join(i.args.split()) for i in stage.instructions if i.keyword == keyword
+    ]
+
+
+def _assert_runtime_matches_base(stages: tuple[Stage, ...]) -> None:
+    base, production = _stage("base", stages), _stage("production", stages)
+    expected_env = [*_settings(base, "ENV"), "SPA_DIST_DIR=/app/spa"]
+    assert _settings(production, "ENV") == expected_env, "production ENV"
+    assert USER_RUN in _runs("base", stages), "base user RUN"
+    assert _runs("production", stages) == PRODUCTION_RUNS, "production RUNs"
+    for keyword, expected in PRODUCTION_SETTINGS.items():
+        found = _settings(production, keyword)
+        assert found == expected, f"production {keyword}: {found}"
+    keywords = [instruction.keyword for instruction in production.instructions]
+    last_run = max(index for index, word in enumerate(keywords) if word == "RUN")
+    assert last_run < keywords.index("USER"), "USER must follow every RUN"
+
+
+def test_runtime_stage_runs_like_the_base_stage() -> None:
+    # Same interpreter settings, user, workdir, port, health check and command
+    # as the image built on base had.
+    _assert_runtime_matches_base(_stages())
+
+
+def _assert_tooling_precedes_the_deps_copy(stages: tuple[Stage, ...]) -> None:
+    production = _stage("production", stages).instructions
+    tooling = [
+        index
+        for index, i in enumerate(production)
+        if i.keyword == "RUN" and " ".join(i.args.split()) == BASE_TOOLING_RUN
+    ]
+    deps = [
+        index
+        for index, i in enumerate(production)
+        if i.keyword == "COPY" and _copy(i).flags.get("from") == "deps"
+    ]
+    assert len(tooling) == 1 and deps, f"tooling RUNs {tooling}, deps COPYs {deps}"
+    # The fresh image ships packaging 26.3: copied over it, deps' 26.2 would
+    # sit next to it as a second dist-info.
+    assert tooling[0] < min(deps), "base tooling must be installed before deps COPY"
+
+
+def test_runtime_tooling_is_installed_before_the_deps_site_packages() -> None:
+    _assert_tooling_precedes_the_deps_copy(_stages())
+
+
+_APT_RUN = (
+    "RUN apt-get update && apt-get install -y --no-install-recommends \\\n"
+    "    curl \\\n"
+    "    && rm -rf /var/lib/apt/lists/*\n"
+)
+_DEPS_BIN = "COPY --from=deps /usr/local/bin /usr/local/bin\n"
+# Production's USER (development has one too: anchored by what follows).
+_USER = "USER neurostack\n\n# Expose port\nEXPOSE 8000\n\n# Health check"
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "check", "message"),
+    [
+        (
+            _APT_RUN,
+            _APT_RUN.replace("curl \\", "curl build-essential \\"),
+            _assert_runtime_packages,
+            "build package in production: ['build-essential']",
+        ),
+        (
+            _APT_RUN,
+            _APT_RUN.replace("curl \\", "curl libpq-dev \\"),
+            _assert_runtime_packages,
+            "build package in production: ['libpq-dev']",
+        ),
+        (
+            _APT_RUN,
+            _APT_RUN.replace("curl \\", "curl libssl-dev \\"),
+            _assert_runtime_packages,
+            "build package in production: ['libssl-dev']",
+        ),
+        (
+            _APT_RUN,
+            _APT_RUN.replace("curl \\", "curl gcc-14 \\"),
+            _assert_runtime_packages,
+            "build package in production: ['gcc-14']",
+        ),
+        (
+            _APT_RUN,
+            _APT_RUN.replace("curl \\", "curl libpq5 \\"),
+            _assert_runtime_packages,
+            "runtime packages: ['curl', 'libpq5']",
+        ),
+        (
+            _APT_RUN,
+            _APT_RUN.replace("--no-install-recommends ", ""),
+            _assert_runtime_packages,
+            "apt-get install options: ['-y']",
+        ),
+        (
+            _APT_RUN,
+            _APT_RUN.replace(" \\\n    && rm -rf /var/lib/apt/lists/*\n", "\n"),
+            _assert_runtime_packages,
+            "production apt RUN",
+        ),
+        (
+            _APT_RUN,
+            _APT_RUN + "RUN apt-get update && apt-get install -y make\n",
+            _assert_runtime_packages,
+            "production package RUNs",
+        ),
+        (
+            _APT_RUN,
+            _APT_RUN.replace("    curl \\\n", ""),
+            _assert_healthcheck_tool_is_installed,
+            "HEALTHCHECK runs curl, which no runtime package installs",
+        ),
+        (
+            "CMD curl -f http://localhost:8000/health",
+            "CMD wget -q -O- http://localhost:8000/health",
+            _assert_healthcheck_tool_is_installed,
+            "HEALTHCHECK runs wget, which no runtime package installs",
+        ),
+        (
+            _RUNTIME_PIP,
+            _RUNTIME_PIP.replace(_PIP, ""),
+            _assert_tooling_precedes_the_deps_copy,
+            "tooling RUNs [], deps COPYs",
+        ),
+        (
+            _RUNTIME_PIP,
+            _RUNTIME_PIP.replace(_PIP, ""),
+            _assert_runtime_matches_base,
+            "production RUNs",
+        ),
+        (
+            _USER,
+            _USER.replace("USER neurostack", "USER root"),
+            _assert_runtime_matches_base,
+            "production USER: ['root']",
+        ),
+        (
+            "# Same as base.\nENV PYTHONDONTWRITEBYTECODE=1 \\\n",
+            "# Same as base.\nENV \\\n",
+            _assert_runtime_matches_base,
+            "production ENV",
+        ),
+        (
+            "useradd --uid 1000 --gid 1000 --shell /bin/bash --create-home "
+            "neurostack\n\nWORKDIR /app\n",
+            "useradd --uid 0 --gid 1000 --shell /bin/bash --create-home "
+            "neurostack\n\nWORKDIR /app\n",
+            _assert_runtime_matches_base,
+            "production RUNs",
+        ),
+        (
+            "WORKDIR /app\n\n# The deps",
+            "WORKDIR /srv\n\n# The deps",
+            _assert_runtime_matches_base,
+            "production WORKDIR",
+        ),
+        (
+            "EXPOSE 8000\n\n# Health check",
+            "EXPOSE 8080\n\n# Health check",
+            _assert_runtime_matches_base,
+            "production EXPOSE",
+        ),
+        (
+            _USER,
+            _USER.replace("USER neurostack\n", "USER neurostack\nRUN true\n"),
+            _assert_runtime_matches_base,
+            "production RUNs",
+        ),
+    ],
+    ids=[
+        "build-essential",
+        "libpq-dev",
+        "other-dev-package",
+        "versioned-gcc",
+        "unneeded-runtime-library",
+        "recommends",
+        "apt-lists-kept",
+        "second-package-run",
+        "curl-removed",
+        "healthcheck-tool-not-installed",
+        "tooling-not-installed",
+        "tooling-run-missing",
+        "user-root",
+        "env-dropped",
+        "root-uid",
+        "workdir",
+        "expose",
+        "run-after-user",
+    ],
+)
+def test_runtime_stage_contract_rejects_mutations(
+    old: str, new: str, check: Any, message: str
+) -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert text.count(old) == 1, old
+    with pytest.raises(AssertionError, match=re.escape(message)):
+        check(_parse_stages(text.replace(old, new)))
+
+
+def test_runtime_tooling_order_rejects_a_swap() -> None:
+    # The fresh image's own packaging 26.3 dist-info would survive next to the
+    # copied 26.2 one when pip runs after the COPY.
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert text.count(_RUNTIME_PIP) == 1 and text.count(_DEPS_BIN) == 1
+    swapped = text.replace(_RUNTIME_PIP, _RUNTIME_PIP.replace(_PIP, ""))
+    swapped = swapped.replace(_DEPS_BIN, _DEPS_BIN + _PIP)
+    with pytest.raises(AssertionError, match="before deps COPY"):
+        _assert_tooling_precedes_the_deps_copy(_parse_stages(swapped))
+    with pytest.raises(AssertionError, match="production RUNs"):
+        _assert_runtime_matches_base(_parse_stages(swapped))
+
+
+def test_runtime_user_must_follow_every_run() -> None:
+    # As neurostack, apt-get and pip could not write the system paths; the
+    # image must still end up running as neurostack.
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    anchor = "# Non-root user, same ids as base.\n"
+    assert text.count(_USER) == 1 and text.count(anchor) == 1
+    early = text.replace(_USER, _USER.replace("USER neurostack\n", ""))
+    early = early.replace(anchor, "USER neurostack\n" + anchor)
+    with pytest.raises(AssertionError, match="USER must follow every RUN"):
+        _assert_runtime_matches_base(_parse_stages(early))
 
 
 # --- Build context ---------------------------------------------------------
