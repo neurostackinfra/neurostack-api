@@ -161,8 +161,8 @@ These are prerequisites to check, not steps to execute now:
    port, throwaway password, no secrets). Before the suites it turns on
    `logging_collector`, so the server-log audit in
    `tests/integration/test_asaas_subscription_triggers_postgres.py` runs
-   instead of skipping, and runs `alembic upgrade head` on a service
-   database. To add or remove a suite, edit the function; CI and this gate
+   instead of skipping, and migrates a separate service database to the
+   current Alembic head. To add or remove a suite, edit the function; CI and this gate
    follow together. A green CI job does not replace this gate. These run
    only here: the contract suites
    (`tests/contracts/test_billing_fact_producer_consumer.py`,

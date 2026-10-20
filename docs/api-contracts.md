@@ -788,14 +788,16 @@ Mantém byte a byte todos os campos legados (`plan`, `active_clinics`,
     "catalog_version_id": "payment-2026-10-03",
     "status": "active",
     "amount_cents": 265000,
-    "current_period_end": "2026-11-11"
+    "current_period_end": "2026-11-11",
+    "payment_state": "paid"
   },
   "checkout": {
     "available_offer_ids": ["package_credits_500_v1"],
     "live_session": {
       "checkout_session_id": "5b0c8f7e-0000-4000-8000-000000000000",
       "kind": "topup",
-      "state": "active"
+      "state": "active",
+      "offer_id": "package_credits_500_v1"
     },
     "available": true
   },
@@ -803,14 +805,16 @@ Mantém byte a byte todos os campos legados (`plan`, `active_clinics`,
 }
 ```
 
-- `subscription`: a assinatura ASAAS atual (não terminal) ou `null`.
+- `subscription`: a assinatura ASAAS atual (não terminal), a cancelada ainda
+  dentro do período pago (abaixo) ou `null`.
   `status` é o estado financeiro do registro de assinatura (`active_linked`
   até a primeira liquidação, `active` depois dela, `readback_required` ou
   `non_billable_pending_readback` enquanto há evidência do provedor
-  pendente), **não** o flag legado `subscription_status`. `amount_cents` é o
-  valor mensal contratado (snapshot do checkout). `status` continua `active`
-  durante uma renovação vencida e depois de um estorno: ele não é prova de
-  período pago; para isso use `current_period_end`.
+  pendente, `cancelled` só dentro do período pago), **não** o flag legado
+  `subscription_status`. `amount_cents` é o valor mensal contratado
+  (snapshot do checkout). `status` continua `active` durante uma renovação
+  vencida e depois de um estorno: ele não é prova de pagamento; para isso use
+  `payment_state` e `current_period_end`.
 - `subscription.current_period_end`: o maior `cycle_end` entre os ciclos da
   assinatura **integralmente pagos, líquidos de estornos**, isto é,
   `state IN ('settled', 'restored') AND reversed_cents = restored_cents`.
@@ -825,16 +829,133 @@ Mantém byte a byte todos os campos legados (`plan`, `active_clinics`,
   todos estão estornados, parcialmente restaurados (`reversed_cents` maior
   que `restored_cents`), `pending` ou `quarantined`. Um ciclo com estorno parcial
   **não** conta (padrão conservador; é uma decisão de política do dono do
-  produto e pode mudar). É uma **data de calendário** (`YYYY-MM-DD`, o
-  vencimento do ASAAS, sem fuso), não um instante UTC: o cliente deve exibi-la
-  como data local sem conversão. Em JavaScript, `new Date("2026-11-11")` é
-  meia-noite UTC e aparece como 10/11 em `America/Sao_Paulo`; separe
-  ano/mês/dia (ou use `new Date(2026, 10, 11)`) em vez disso.
-- Assinaturas legadas (de um provedor que não é o ASAAS) e
-  encerradas (`inactive`/`cancelled`) resultam em `subscription: null`,
-  mesmo que os campos legados (`plan`, `subscription_status`) digam `active`.
-  Ao encerrar, a data de período pago também deixa de ser informada (o objeto
-  inteiro vira `null`).
+  produto e pode mudar). É uma **data de calendário** (`YYYY-MM-DD`, sem
+  fuso), não um instante UTC: o cliente deve exibi-la como data local sem
+  conversão. Em JavaScript, `new Date("2026-11-11")` é meia-noite UTC e
+  aparece como 10/11 em `America/Sao_Paulo`; separe ano/mês/dia (ou use
+  `new Date(2026, 10, 11)`) em vez disso.
+  É o fim do período pago **calculado pelo NeuroStack**, não lido do ASAAS:
+  `cycle_end` é o vencimento (`dueDate`) do pagamento daquele ciclo mais um
+  mês, com o dia limitado ao tamanho do mês (31/10 vira 30/11; 31/01 vira
+  28/02, ou 29/02 em ano bissexto). **Ressalva:** para assinaturas com vencimento nos dias 29 a 31, o
+  ASAAS pode manter o dia original na renovação (por exemplo, vencimento
+  31/12) enquanto o período calculado aqui já foi limitado (30/11 → 30/12);
+  nesse caso `payment_state` pode mostrar `overdue` de 1 a 3 dias antes do
+  vencimento real da renovação. A verificação com uma assinatura de sandbox
+  com vencimento no dia 31 está pendente.
+- `subscription.payment_state`: estado de pagamento **derivado pelo
+  servidor**, enum fechado `paid` | `overdue` | `reversed` | `pending`; a
+  tela nunca deduz atraso a partir de datas. "Hoje" é a data de calendário em
+  `America/Sao_Paulo` no instante da leitura (23:30 de 11/11 em São Paulo
+  ainda é 11/11, embora já seja 12/11 em UTC); P é `current_period_end`; o
+  ciclo mais recente é o de maior `cycle_start` (desempate: o criado por
+  último). Regras, nesta ordem:
+  1. `readback_required` ou `non_billable_pending_readback` (evidência do
+     provedor pendente): `pending`, mesmo com um ciclo pago cobrindo hoje;
+  2. sem ciclo, ou ciclo mais recente `quarantined`: `pending`;
+  3. ciclo mais recente estornado (`reversed`, integral ou parcial) ou
+     parcialmente restaurado: `reversed`, mesmo que um ciclo anterior pago
+     ainda cubra hoje (P continua informando o fim desse ciclo anterior);
+  4. P maior ou igual a hoje: `paid` (o último dia pago ainda é pago);
+  5. P menor que hoje: `overdue` (a renovação não foi paga);
+  6. nenhum ciclo jamais integralmente pago: `pending`.
+
+  Pago significa `PAYMENT_CONFIRMED` (captura no cartão) ou
+  `PAYMENT_RECEIVED`, o que chegar primeiro: um assinante de cartão é `paid`
+  desde a captura, e a renovação capturada move P sem esperar os fundos
+  (cerca de 32 dias); o `PAYMENT_RECEIVED` posterior não muda nada.
+  `reversed` significa **estorno (refund) concluído**, integral ou parcial:
+  o dinheiro estornado vem somente da soma dos estornos `DONE` lidos do
+  ASAAS. Um estorno ainda em andamento (`PAYMENT_REFUND_IN_PROGRESS`) e
+  **qualquer etapa de chargeback** (`PAYMENT_CHARGEBACK_REQUESTED`,
+  `PAYMENT_CHARGEBACK_DISPUTE`, `PAYMENT_AWAITING_CHARGEBACK_REVERSAL` ou a
+  releitura de um pagamento em chargeback) **não** mudam o ciclo: o resumo
+  continua `paid` com o mesmo `current_period_end`. É uma lacuna conhecida,
+  ligada ao item em aberto do dono "janela de exposição a chargeback"; um
+  teste em PostgreSQL fixa esse comportamento, e quem mudar o webhook precisa
+  atualizar este texto. Um estorno parcial concluído (inclusive o lido junto
+  com a captura) de uma assinatura de **uma linha** (plano sem clínicas
+  adicionais) conta como `reversed` e o ciclo não conta como pago (decisão B,
+  conservadora). Numa assinatura com clínicas adicionais (linha do plano mais
+  linha de clínicas) o estorno parcial não pode ser repartido entre as
+  linhas: o ciclo vai para `quarantined` (revisão de operador) e o resumo lê
+  `payment_state: "pending"` com `current_period_end: null`; essa
+  classificação é uma escolha de produto em aberto.
+
+  Todas as combinações (`null` = `subscription: null`; — = combinação
+  impossível: sem ciclo não há P, e um ciclo mais recente integralmente pago
+  é ele mesmo o P). Ciclo mais recente: `none` (nenhum ciclo), `pending`,
+  `settled`, `restored_full` (`restored` com `restored_cents =
+  reversed_cents`), `restored_partial` (`restored` com `restored_cents`
+  menor), `reversed_full` (`reversed_cents = settled_cents`),
+  `reversed_partial` (estorno parcial, que não conta como pago),
+  `quarantined`.
+
+  <!-- payment-state-matrix:start -->
+
+  | `status` | ciclo mais recente | sem ciclo pago | P < hoje | P = hoje | P > hoje |
+  | --- | --- | --- | --- | --- | --- |
+  | `active`, `active_linked` | `none` | `pending` | — | — | — |
+  | `active`, `active_linked` | `pending` | `pending` | `overdue` | `paid` | `paid` |
+  | `active`, `active_linked` | `settled` | — | `overdue` | `paid` | `paid` |
+  | `active`, `active_linked` | `restored_full` | — | `overdue` | `paid` | `paid` |
+  | `active`, `active_linked` | `restored_partial` | `reversed` | `reversed` | `reversed` | `reversed` |
+  | `active`, `active_linked` | `reversed_full` | `reversed` | `reversed` | `reversed` | `reversed` |
+  | `active`, `active_linked` | `reversed_partial` | `reversed` | `reversed` | `reversed` | `reversed` |
+  | `active`, `active_linked` | `quarantined` | `pending` | `pending` | `pending` | `pending` |
+  | `readback_required`, `non_billable_pending_readback` | `none` | `pending` | — | — | — |
+  | `readback_required`, `non_billable_pending_readback` | `pending` | `pending` | `pending` | `pending` | `pending` |
+  | `readback_required`, `non_billable_pending_readback` | `settled` | — | `pending` | `pending` | `pending` |
+  | `readback_required`, `non_billable_pending_readback` | `restored_full` | — | `pending` | `pending` | `pending` |
+  | `readback_required`, `non_billable_pending_readback` | `restored_partial` | `pending` | `pending` | `pending` | `pending` |
+  | `readback_required`, `non_billable_pending_readback` | `reversed_full` | `pending` | `pending` | `pending` | `pending` |
+  | `readback_required`, `non_billable_pending_readback` | `reversed_partial` | `pending` | `pending` | `pending` | `pending` |
+  | `readback_required`, `non_billable_pending_readback` | `quarantined` | `pending` | `pending` | `pending` | `pending` |
+  | `cancelled` | `none` | `null` | — | — | — |
+  | `cancelled` | `pending` | `null` | `null` | `paid` | `paid` |
+  | `cancelled` | `settled` | — | `null` | `paid` | `paid` |
+  | `cancelled` | `restored_full` | — | `null` | `paid` | `paid` |
+  | `cancelled` | `restored_partial` | `null` | `null` | `reversed` | `reversed` |
+  | `cancelled` | `reversed_full` | `null` | `null` | `reversed` | `reversed` |
+  | `cancelled` | `reversed_partial` | `null` | `null` | `reversed` | `reversed` |
+  | `cancelled` | `quarantined` | `null` | `null` | `pending` | `pending` |
+  | `inactive` | `none` | `null` | — | — | — |
+  | `inactive` | `pending` | `null` | `null` | `null` | `null` |
+  | `inactive` | `settled` | — | `null` | `null` | `null` |
+  | `inactive` | `restored_full` | — | `null` | `null` | `null` |
+  | `inactive` | `restored_partial` | `null` | `null` | `null` | `null` |
+  | `inactive` | `reversed_full` | `null` | `null` | `null` | `null` |
+  | `inactive` | `reversed_partial` | `null` | `null` | `null` | `null` |
+  | `inactive` | `quarantined` | `null` | `null` | `null` | `null` |
+
+  <!-- payment-state-matrix:end -->
+
+  A tabela é verificada contra a matriz dos testes
+  (`tests/api/test_billing_read_contract.py`), e cada célula possível é
+  reproduzida em PostgreSQL real.
+- Assinatura cancelada pelo provedor (decisão A2): quando a releitura do
+  ASAAS confirma a remoção (`deleted: true`, `status = 'cancelled'`), a
+  assinatura continua sendo retornada, com `status: "cancelled"`,
+  `current_period_end` e `payment_state`, enquanto `current_period_end` for
+  maior ou igual a hoje (data de `America/Sao_Paulo`); a partir do dia
+  seguinte ao último dia pago, o objeto inteiro vira `null`. Uma assinatura
+  atual (não terminal) sempre tem precedência, inclusive uma nova assinatura
+  ainda não paga (`active_linked`, `pending`) feita durante o período pago da
+  cancelada; entre várias canceladas dentro do período, vale a de maior
+  período pago e, em empate, a mais nova. É **só exibição**: não muda
+  `available_offer_ids`, o bloqueio de elegibilidade de assinatura nem o
+  `POST /v1/billing/checkout` (um builder cancelado ainda no período pago
+  pode contratar de novo, exatamente como um builder sem assinatura, e os
+  dois períodos podem se sobrepor), e não aplica nenhuma restrição de
+  acesso. O registro não guarda quem pediu o cancelamento (assinante,
+  operador ou contenção). Antes de a releitura convergir, a assinatura
+  aparece como `non_billable_pending_readback` com `payment_state: "pending"`.
+- Assinaturas legadas (de um provedor que não é o ASAAS), `inactive` (o
+  provedor informou `INACTIVE` ou `EXPIRED`, sem remoção) e canceladas cujo
+  período pago já terminou resultam em `subscription: null` (decisão A5),
+  mesmo com ciclos pagos e mesmo que os campos legados (`plan`,
+  `subscription_status`) digam `active`: esses campos nunca são prova de
+  assinatura nem de pagamento.
 - `checkout.available_offer_ids`: em ordem de catálogo, as ofertas que um
   `POST /v1/billing/checkout` sem cupom aceitaria agora (rollout persistido,
   builder do canário, restrição Plus/500 créditos e sem cupom do canário,
@@ -849,7 +970,9 @@ Mantém byte a byte todos os campos legados (`plan`, `active_clinics`,
   (`creating`, `active`, `paid_pending_subscription`,
   `reconciliation_required`, `terminal_pending_readback`) ou `null`; a URL
   do provedor é obtida em `GET /v1/billing/checkout/{checkout_session_id}`.
-  Não traz `offer_id`: a oferta da tentativa é lida nesse `GET`.
+  `offer_id` é a oferta do catálogo da própria tentativa (lida da linha da
+  sessão, nunca deduzida), para a tela marcar o plano ou pacote em
+  andamento (decisão A3).
 - `checkout.available`: `true` quando a leitura consultiva funcionou (mesmo
   com rollout fechado e lista vazia: "nada à venda"). A mesma resposta
   `available: true` com lista vazia também ocorre quando a configuração
@@ -877,6 +1000,17 @@ Mantém byte a byte todos os campos legados (`plan`, `active_clinics`,
 Se o estado financeiro (assinatura ou tentativa viva) não puder ser lido sem
 adivinhar, a rota responde `503 {"detail": "billing_summary_unavailable"}` em
 vez de informar "sem assinatura".
+
+A resposta `200` traz `Cache-Control: no-store`: ela é por builder e muda com
+a data (`payment_state` e a janela da assinatura cancelada), então nenhum
+navegador nem cache compartilhado pode reutilizá-la; o cache de respostas da
+API também não a guarda.
+
+Compatibilidade: `subscription.status` ganhou o valor `cancelled` e
+`subscription.payment_state` e `checkout.live_session.offer_id` são campos
+novos. Clientes gerados com enums estritos precisam tolerar valores novos de
+enum (o contrato acrescenta valores, nunca muda o significado dos
+existentes).
 
 #### POST /v1/billing/checkout — `202`
 

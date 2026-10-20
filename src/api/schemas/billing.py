@@ -11,7 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from src.services.billing_catalog import BILLING_CATALOG
 from src.services.billing_read_contract import (
     LiveCheckoutState,
-    SubscriptionFinancialStatus,
+    PaymentState,
+    SubscriptionSummaryStatus,
 )
 
 
@@ -65,34 +66,97 @@ class BillingSubscriptionSummaryResponse(BaseModel):
     """The builder's current ASAAS subscription (Group 6b read contract).
 
     ``status`` is the confirmed financial state of the subscription record,
-    never the legacy one-way ``subscription_status`` flag.
+    never the legacy one-way ``subscription_status`` flag; ``cancelled``
+    (the provider deleted it) appears only while its paid period runs.
     ``current_period_end`` is the latest ``cycle_end`` among the cycles that
     are fully paid net of reversals (``settled``, or ``restored`` with
     ``restored_cents = reversed_cents``); reversed, partially restored,
     pending and quarantined cycles are skipped, so it falls back to the
     previous fully paid cycle and is ``null`` only if none ever was.  A
-    partially reversed cycle does not count (conservative owner-policy
-    default).  It is a calendar date (the ASAAS due date, ``YYYY-MM-DD``,
-    no time zone), not a UTC instant.
+    partially reversed cycle does not count (owner decision B).  It is a
+    calendar date (``YYYY-MM-DD``, no time zone), not a UTC instant (owner
+    decision A4), computed by NeuroStack (``cycle_end`` = the cycle's due
+    date plus one month, day clamped), not read from ASAAS.  ``payment_state`` is derived by the
+    server against the São Paulo calendar date; the client never infers it
+    from dates (owner decision A1).
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        json_schema_extra={
+            "example": {
+                "offer_id": "plan_pro_monthly_v1",
+                "catalog_version_id": "payment-2026-10-03",
+                "status": "active",
+                "amount_cents": 265000,
+                "current_period_end": "2026-11-11",
+                "payment_state": "paid",
+            }
+        },
+    )
 
     offer_id: str = Field(..., min_length=1, max_length=100)
     catalog_version_id: str = Field(..., min_length=1, max_length=80)
-    status: SubscriptionFinancialStatus
+    status: SubscriptionSummaryStatus = Field(
+        ...,
+        description=(
+            "Financial state of the ASAAS subscription record; `cancelled` only "
+            "while its paid period runs. Never the legacy `subscription_status`."
+        ),
+    )
     amount_cents: int = Field(..., ge=0)
-    current_period_end: Optional[date]
+    current_period_end: Optional[date] = Field(
+        ...,
+        description=(
+            "End of the paid period as computed by NeuroStack, not read from "
+            "ASAAS: the latest fully paid cycle's due date plus one month, day "
+            "clamped to the month length. Calendar date YYYY-MM-DD, no time "
+            "zone; still paid on that day; null when no cycle is fully paid."
+        ),
+    )
+    payment_state: PaymentState = Field(
+        ...,
+        description=(
+            "Server-derived against the America/Sao_Paulo calendar date: paid, "
+            "overdue (paid period over, renewal unpaid), reversed (newest cycle "
+            "refunded, fully or partially, with the refund completed) or "
+            "pending (nothing paid yet, provider evidence pending, or a "
+            "quarantined cycle). Chargebacks and refunds still in progress are "
+            "not reflected: the cycle stays paid."
+        ),
+    )
 
 
 class BillingLiveCheckoutResponse(BaseModel):
-    """The builder's newest live checkout attempt; no provider URL."""
+    """The builder's newest live checkout attempt; no provider URL.
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    ``offer_id`` is the attempt's own catalog offer, from its session row
+    (owner decision A3).
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        json_schema_extra={
+            "example": {
+                "checkout_session_id": "5b0c8f7e-0000-4000-8000-000000000000",
+                "kind": "topup",
+                "state": "active",
+                "offer_id": "package_credits_500_v1",
+            }
+        },
+    )
 
     checkout_session_id: str
     kind: Literal["subscription", "topup"]
     state: LiveCheckoutState
+    offer_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Catalog offer of this very attempt (its own session row).",
+    )
 
 
 class BillingCheckoutSummaryResponse(BaseModel):
