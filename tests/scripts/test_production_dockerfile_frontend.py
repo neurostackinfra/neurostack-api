@@ -1,20 +1,25 @@
-"""Static contract for the frontend-build stage of the production Dockerfile.
+"""Static contract for the production Dockerfile: the frontend-build stage, the
+digest-pinned base images, the Poetry install and the revision label.
 
 Everything here is static analysis of ``Dockerfile``, ``.dockerignore``,
-``frontend/package.json`` and ``git ls-files``: no Docker daemon is needed, so
-none of these assertions proves that an image builds or what it contains at
-runtime.
+``frontend/package.json``, ``poetry.lock`` and ``git ls-files``: no Docker
+daemon is needed, so none of these assertions proves that an image builds or
+what it contains at runtime. ``scripts/production_image_smoke.py`` (and
+``tests/scripts/test_production_image_smoke.py`` on a Docker host) does.
 """
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import shlex
 import subprocess
+import tomllib
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -26,11 +31,43 @@ NEUROSTACK = ROOT / "frontend" / "artifacts" / "neurostack"
 VITE_CONFIG = NEUROSTACK / "vite.config.ts"
 NEUROSTACK_PACKAGE = NEUROSTACK / "package.json"
 WORKFLOWS = ROOT / ".github" / "workflows"
+LOCK = ROOT / "poetry.lock"
 
 EXPECTED_STAGES = ["base", "deps", "development", "frontend-build", "production"]
 NODE_IMAGE = re.compile(
     r"^node:\d+\.\d+\.\d+-[a-z0-9.-]+@sha256:[0-9a-f]{64}$"  # tag AND digest
 )
+PYTHON_IMAGE = re.compile(
+    r"^python:3\.11\.\d+-slim-[a-z]+@sha256:[0-9a-f]{64}$"  # tag AND digest
+)
+DIGEST_PINNED = re.compile(r"^[a-z0-9._/-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$")
+# Poetry runs from its own venv, outside every path the production stage copies
+# from deps, and is the version that writes poetry.lock and that CI installs.
+POETRY_VENV = "/opt/poetry"
+POETRY = f"{POETRY_VENV}/bin/poetry"
+BASE_REQUIREMENTS = ROOT / "scripts" / "requirements-production-base.txt"
+POETRY_REQUIREMENTS = ROOT / "scripts" / "requirements-poetry.txt"
+POETRY_REQUIREMENTS_IN = ROOT / "scripts" / "requirements-poetry.in"
+BASE_REQUIREMENTS_PATH = "/opt/requirements/production-base.txt"
+POETRY_REQUIREMENTS_PATH = "/opt/requirements/poetry.txt"
+REQUIREMENT_PATHS = {BASE_REQUIREMENTS_PATH, POETRY_REQUIREMENTS_PATH}
+# Every pip install downloads only hash-checked wheels named in a file.
+HASHED_OPTIONS = ["--require-hashes", "--only-binary", ":all:"]
+HASHED_INSTALL = f"install {' '.join(HASHED_OPTIONS)} -r"
+DEPS_RUNS = [
+    f"python -m venv {POETRY_VENV}"
+    f" && {POETRY_VENV}/bin/pip {HASHED_INSTALL} {BASE_REQUIREMENTS_PATH}"
+    f" && {POETRY_VENV}/bin/pip {HASHED_INSTALL} {POETRY_REQUIREMENTS_PATH}",
+    f"{POETRY} config virtualenvs.create false",
+    f"{POETRY} install --no-interaction --no-ansi --only main --no-root",
+]
+# A few of Poetry's own dependencies: the hash-locked file is its whole closure.
+POETRY_CLOSURE = {"poetry", "poetry-core", "dulwich", "virtualenv", "keyring", "cleo"}
+DEVELOPMENT_RUNS = [f"{POETRY} install --no-interaction --no-ansi --no-root"]
+# The base interpreter's own packages, raised to their poetry.lock versions.
+BASE_TOOLING = ("pip", "setuptools", "packaging")
+REVISION_ARG = "VCS_REF=unknown"
+REVISION_LABEL = 'org.opencontainers.image.revision="${VCS_REF}"'
 PNPM_PIN = re.compile(r"^\d+\.\d+\.\d+\+sha512\.[0-9a-f]{128}$")
 SPA_SOURCE = "/frontend/artifacts/neurostack/dist/public"
 NO_SOURCEMAPS = (
@@ -72,6 +109,7 @@ PRODUCTION_KEYWORDS = {
     "USER",
     "EXPOSE",
     "HEALTHCHECK",
+    "LABEL",
     "CMD",
 }
 # Instructions the frontend-build stage may use (FROM opens the stage and is
@@ -125,6 +163,7 @@ PRODUCTION_COPY_SOURCES = {
         "alembic.ini",
         "alembic",
         "scripts/bootstrap_admin.py",
+        "scripts/requirements-production-base.txt",
     ],
     "deps": [
         "/usr/local/lib/python3.11/site-packages",
@@ -360,6 +399,570 @@ def test_node_image_is_pinned_by_tag_and_digest() -> None:
     assert NODE_IMAGE.match(frontend.parent), frontend.parent
     node_stages = [stage for stage in _stages() if stage.parent.startswith("node")]
     assert node_stages == [frontend]
+
+
+def test_python_image_is_pinned_by_tag_and_digest() -> None:
+    base = _stage("base")
+    assert PYTHON_IMAGE.match(base.parent), base.parent
+    python_stages = [s for s in _stages() if s.parent.startswith("python")]
+    assert python_stages == [base]
+
+
+def test_every_external_base_image_is_pinned_by_digest() -> None:
+    aliases = {stage.alias for stage in _stages()}
+    external = [stage.parent for stage in _stages() if stage.parent not in aliases]
+    assert len(external) == 2, external  # python (base) and node (frontend-build)
+    for parent in external:
+        assert DIGEST_PINNED.match(parent), f"base image not pinned by digest: {parent}"
+
+
+def _base_from_comment(text: str) -> tuple[str, str]:
+    """The base FROM image and the comment block directly above it."""
+
+    base = _stage("base", _parse_stages(text)).parent
+    from_line = f"FROM {base} AS base"
+    return base, text[: text.index(from_line)].rsplit("\n\n", 1)[-1]
+
+
+def _assert_python_pin_matches_its_record(text: str) -> None:
+    # The comment above the FROM records the floating tag that was resolved,
+    # the exact tag it resolved to, the multi-arch INDEX digest and the
+    # linux/amd64 manifest digest, so a reviewer can re-run the resolution.
+    base, comments = _base_from_comment(text)
+    flat = " ".join(line.lstrip("#").strip() for line in comments.splitlines())
+    record = re.search(
+        r"the floating tag (?P<floating>python:\S+) was (?P<tag>python:\S+?),"
+        r" index sha256:(?P<index>[0-9a-f]{64}),",
+        flat,
+    )
+    manifest = re.search(
+        r"linux/amd64 manifest is sha256:(?P<amd64>[0-9a-f]{64})", flat
+    )
+    assert record and manifest, f"base image record missing: {flat}"
+    tag, _, digest = base.partition("@")
+    assert record["floating"] == "python:3.11-slim", record["floating"]
+    assert tag == record["tag"], f"FROM tag {tag} differs from the record"
+    assert digest == f"sha256:{record['index']}", "FROM digest is not the index digest"
+    assert record["index"] != manifest["amd64"], "index and manifest digests coincide"
+
+
+def test_python_pin_is_the_recorded_tag_and_index_digest() -> None:
+    _assert_python_pin_matches_its_record(DOCKERFILE.read_text(encoding="utf-8"))
+
+
+_INDEX = "e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce"
+_AMD64 = "e529028263dbe6910a2d96f7d2b8f5266385e917fd45d286ef166977c094a51e"
+_PY_FROM = f"FROM python:3.11.17-slim-trixie@sha256:{_INDEX} AS base"
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        (_PY_FROM, _PY_FROM.replace(_INDEX, _AMD64), "not the index digest"),
+        (
+            _PY_FROM,
+            _PY_FROM.replace("3.11.17-slim-trixie", "3.11.18-slim-trixie"),
+            "differs from the record",
+        ),
+        (
+            f"# sha256:{_INDEX},",
+            f"# sha256:{_AMD64},",
+            "not the index digest",
+        ),
+        (f"# sha256:{_AMD64}.", f"# sha256:{_INDEX}.", "digests coincide"),
+        ("# python:3.11-slim was", "# python:3.12-slim was", "python:3.12-slim"),
+    ],
+    ids=["manifest-digest", "tag-drift", "record-drift", "same-digests", "floating"],
+)
+def test_python_pin_record_rejects_mutations(old: str, new: str, message: str) -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert text.count(old) == 1, old
+    with pytest.raises(AssertionError, match=re.escape(message)):
+        _assert_python_pin_matches_its_record(text.replace(old, new))
+
+
+def _runs(alias: str, stages: tuple[Stage, ...] | None = None) -> list[str]:
+    stage = _stage(alias, stages)
+    return [" ".join(i.args.split()) for i in stage.instructions if i.keyword == "RUN"]
+
+
+def _lock_writer() -> str:
+    text = LOCK.read_text(encoding="utf-8")
+    writer = re.match(r"# This file is automatically @generated by Poetry (\S+) ", text)
+    assert writer, text.splitlines()[0]
+    return writer.group(1)
+
+
+def _lock_files() -> dict[tuple[str, str], set[str]]:
+    lock = tomllib.loads(LOCK.read_text(encoding="utf-8"))
+    return {
+        (_normalise(package["name"]), package["version"]): {
+            entry["hash"].removeprefix("sha256:") for entry in package["files"]
+        }
+        for package in lock["package"]
+    }
+
+
+def _normalise(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def hashed_requirements(text: str) -> dict[str, tuple[str, list[str]]]:
+    """Name -> (version, sha256 list) of a hash-pinned pip requirements file."""
+
+    requirements: dict[str, tuple[str, list[str]]] = {}
+    for raw in re.sub(r"\\\n", " ", text).splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        spec, *options = line.split()
+        pinned = re.fullmatch(
+            r"([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9.+!_-]+)", spec
+        )
+        assert pinned, f"requirement not pinned exactly: {line}"
+        hashes = []
+        for option in options:
+            digest = option.removeprefix("--hash=sha256:")
+            valid = option.startswith("--hash=") and re.fullmatch(
+                r"[0-9a-f]{64}", digest
+            )
+            assert valid, f"unexpected requirement option: {option}"
+            hashes.append(digest)
+        assert hashes, f"requirement without hash: {spec}"
+        name = _normalise(pinned.group(1))
+        assert name not in requirements, f"duplicate requirement: {name}"
+        requirements[name] = (pinned.group(2), hashes)
+    return requirements
+
+
+def _assert_base_requirements_are_locked_wheels(text: str) -> None:
+    requirements = hashed_requirements(text)
+    assert sorted(requirements) == sorted(BASE_TOOLING), f"base tooling: {requirements}"
+    files = _lock_files()
+    for name, (version, hashes) in requirements.items():
+        locked = files.get((name, version))
+        assert locked is not None, f"{name}=={version} is not the locked version"
+        for digest in hashes:
+            assert (
+                digest in locked
+            ), f"{name}=={version} hash not in poetry.lock: {digest}"
+
+
+def test_base_requirements_are_the_locked_versions_and_hashes() -> None:
+    # The production stage merges deps' site-packages over base's: a base
+    # package that deps replaced would leave its old metadata in the image.
+    _assert_base_requirements_are_locked_wheels(
+        BASE_REQUIREMENTS.read_text(encoding="utf-8")
+    )
+
+
+def _assert_poetry_requirements(text: str, requirements_in: str) -> None:
+    requirements = hashed_requirements(text)
+    writer = _lock_writer()
+    assert requirements.get("poetry", ("",))[0] == writer, "Poetry pin differs"
+    pins = [
+        line.strip()
+        for line in requirements_in.splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    assert pins == [f"poetry=={writer}"], f"requirements-poetry.in: {pins}"
+    header = " ".join(
+        line
+        for line in itertools.takewhile(
+            lambda row: row.startswith("#"), text.splitlines()
+        )
+    )
+    for token in (
+        "uv pip compile scripts/requirements-poetry.in",
+        "--python-version 3.11",
+        "--python-platform x86_64-unknown-linux-gnu",
+        "--generate-hashes",
+        "--exclude-newer ",
+    ):
+        assert token in header, f"regeneration command lacks {token}"
+    assert POETRY_CLOSURE <= set(requirements), POETRY_CLOSURE - set(requirements)
+
+
+def test_poetry_requirements_are_fully_hash_pinned() -> None:
+    _assert_poetry_requirements(
+        POETRY_REQUIREMENTS.read_text(encoding="utf-8"),
+        POETRY_REQUIREMENTS_IN.read_text(encoding="utf-8"),
+    )
+
+
+_BASE_FILE = "packaging==26.2 \\\n    --hash=sha256:"
+_HASH = "5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e"
+_POETRY_PIN = "poetry==2.4.1 \\\n"
+_DULWICH = "dulwich==1.2.17 \\\n"
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        (f" \\\n    --hash=sha256:{_HASH}", "", "requirement without hash"),
+        (_HASH, _HASH[:-1] + "0", "hash not in poetry.lock"),
+        ("packaging==26.2 ", "packaging==26.3 ", "is not the locked version"),
+        ("packaging==26.2 ", "packaging>=26.2 ", "not pinned exactly"),
+        ("pip==26.2.1 ", "pip==26.2.1 --no-deps ", "unexpected requirement option"),
+        ("setuptools==84.0.0 \\", "wheel==0.46.3 \\", "base tooling"),
+    ],
+    ids=["hash-removed", "wrong-hash", "version-drift", "unpinned", "option", "swap"],
+)
+def test_base_requirements_contract_rejects_mutations(
+    old: str, new: str, message: str
+) -> None:
+    text = BASE_REQUIREMENTS.read_text(encoding="utf-8")
+    assert text.count(old) == 1, old
+    with pytest.raises(AssertionError, match=re.escape(message)):
+        _assert_base_requirements_are_locked_wheels(text.replace(old, new))
+
+
+def _strip_hashes(text: str, requirement: str) -> str:
+    start = text.index(requirement)
+    end = text.index("\n    # via", start)
+    return text[:start] + requirement.replace(" \\\n", "\n") + text[end + 1 :]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "requirements_in", "message"),
+    [
+        (lambda t: _strip_hashes(t, _DULWICH), None, "requirement without hash"),
+        (lambda t: t.replace(_POETRY_PIN, "poetry==2.4.0 \\\n"), None, "Poetry pin"),
+        (lambda t: t.replace(_DULWICH, "dulwich>=1.2 \\\n"), None, "not pinned"),
+        (lambda t: t, "poetry==2.4.0\n", "requirements-poetry.in"),
+        (lambda t: t, "poetry\n", "requirements-poetry.in"),
+        (lambda t: t.replace("--generate-hashes ", ""), None, "--generate-hashes"),
+        (lambda t: t + "requests==2.34.2\n", None, "requirement without hash"),
+    ],
+    ids=[
+        "unhashed-transitive",
+        "pin-differs",
+        "unpinned-transitive",
+        "input-differs",
+        "input-unpinned",
+        "no-hash-generation",
+        "unhashed-extra",
+    ],
+)
+def test_poetry_requirements_contract_rejects_mutations(
+    mutate: Any, requirements_in: str | None, message: str
+) -> None:
+    text = POETRY_REQUIREMENTS.read_text(encoding="utf-8")
+    source = POETRY_REQUIREMENTS_IN.read_text(encoding="utf-8")
+    with pytest.raises(AssertionError, match=re.escape(message)):
+        _assert_poetry_requirements(mutate(text), requirements_in or source)
+
+
+def _assert_poetry_install(stages: tuple[Stage, ...]) -> None:
+    assert _runs("deps", stages) == DEPS_RUNS, "deps Poetry RUNs"
+    assert _runs("development", stages) == DEVELOPMENT_RUNS, "development RUNs"
+    steps = re.split(r"\s*&&\s*", _runs("deps", stages)[0])
+    assert steps[1].endswith(BASE_REQUIREMENTS_PATH), "venv pip not upgraded first"
+    deps = _stage("deps", stages)
+    copies = [(c.sources, c.destination) for c in _copies(deps)]
+    expected = (["scripts/requirements-poetry.txt"], POETRY_REQUIREMENTS_PATH)
+    assert copies[0] == expected, f"Poetry requirements COPY: {copies[0]}"
+    keywords = [i.keyword for i in deps.instructions]
+    assert keywords.index("COPY") < keywords.index("RUN"), "requirements copied late"
+
+
+def test_poetry_is_installed_from_hashes_and_installs_only_the_main_group() -> None:
+    _assert_poetry_install(_stages())
+
+
+def _assert_every_pip_install_is_hash_checked(stages: tuple[Stage, ...]) -> None:
+    installs = [
+        (stage.alias, pip, options, requirements)
+        for stage in stages
+        for run in _runs(stage.alias, stages)
+        for pip, options, requirements in _pip_installs(run)
+    ]
+    assert len(installs) == 3, f"pip installs: {installs}"
+    for alias, pip, options, requirements in installs:
+        assert "--require-hashes" in options, f"pip without --require-hashes: {pip}"
+        assert options == [*HASHED_OPTIONS, "-r"], f"pip options in {alias}: {options}"
+        assert len(requirements) == 1, f"pip requirements in {alias}: {requirements}"
+        assert requirements[0] in REQUIREMENT_PATHS, requirements
+    base = [c for c in _copies(_stage("base", stages))]
+    assert [(c.sources, c.destination) for c in base] == [
+        (["scripts/requirements-production-base.txt"], BASE_REQUIREMENTS_PATH)
+    ], "base requirements COPY"
+    assert _runs("base", stages)[1] == f"pip {HASHED_INSTALL} {BASE_REQUIREMENTS_PATH}"
+
+
+def test_every_pip_install_is_hash_checked() -> None:
+    _assert_every_pip_install_is_hash_checked(_stages())
+
+
+def test_ci_installs_the_same_poetry_as_the_image() -> None:
+    pins = {
+        (path.name, version)
+        for path in sorted(WORKFLOWS.glob("*.y*ml"))
+        for version in re.findall(
+            r"poetry==([0-9][^\s\"']*)", path.read_text(encoding="utf-8")
+        )
+    }
+    assert pins, "no workflow installs Poetry"
+    assert {version for _, version in pins} == {_lock_writer()}, pins
+
+
+def _assert_poetry_stays_out_of_production(stages: tuple[Stage, ...]) -> None:
+    for stage in _lineage("production", stages):
+        for instruction in stage.instructions:
+            assert POETRY_VENV not in instruction.args, f"Poetry venv: {instruction}"
+            assert "poetry" not in instruction.args.lower(), f"Poetry: {instruction}"
+    for copy in _copies(_stage("production", stages)):
+        if copy.flags.get("from") == "deps":
+            for source in copy.sources:
+                assert not POETRY_VENV.startswith(source.rstrip("/") + "/"), source
+    # Only the venv's own pip may install Poetry: the system pip would put it
+    # (and its dependencies) into the site-packages the production stage copies.
+    for stage in stages:
+        for run in _runs(stage.alias, stages):
+            for pip, _, requirements in _pip_installs(run):
+                names = {re.split(r"[=<>!~\[ ]", r, 1)[0] for r in requirements}
+                if POETRY_REQUIREMENTS_PATH in requirements:
+                    names.add("poetry")
+                if "poetry" in names and pip != f"{POETRY_VENV}/bin/pip":
+                    raise AssertionError(f"system pip installs Poetry: {run}")
+
+
+def _pip_installs(run: str) -> list[tuple[str, list[str], list[str]]]:
+    """(pip, options, other arguments) of every ``pip install`` step of a RUN."""
+
+    installs: list[tuple[str, list[str], list[str]]] = []
+    for step in re.split(r"\s*&&\s*", run):
+        tokens = shlex.split(step)
+        if tokens[:3] == ["python", "-m", "pip"]:
+            pip, rest = "python -m pip", tokens[3:]
+        elif tokens and re.fullmatch(r"pip[0-9.]*", tokens[0].rsplit("/", 1)[-1]):
+            pip, rest = tokens[0], tokens[1:]
+        else:
+            continue
+        if rest[:1] != ["install"]:
+            continue
+        options: list[str] = []
+        arguments: list[str] = []
+        for token in rest[1:]:
+            if token.startswith("-"):
+                options.append(token)
+            elif options and options[-1] == "--only-binary" and token == ":all:":
+                options.append(token)
+            else:
+                arguments.append(token)
+        installs.append((pip, options, arguments))
+    return installs
+
+
+def test_poetry_never_reaches_the_production_image() -> None:
+    _assert_poetry_stays_out_of_production(_stages())
+
+
+_VENV_POETRY = (
+    "/opt/poetry/bin/pip install --require-hashes --only-binary :all: "
+    "-r /opt/requirements/poetry.txt"
+)
+_VENV_PIP = (
+    "/opt/poetry/bin/pip install --require-hashes --only-binary :all: "
+    "-r /opt/requirements/production-base.txt"
+)
+_BASE_PIP = (
+    "RUN pip install --require-hashes --only-binary :all: "
+    "-r /opt/requirements/production-base.txt\n"
+)
+_MAIN_INSTALL = (
+    "RUN /opt/poetry/bin/poetry install --no-interaction --no-ansi --only main "
+    "--no-root\n"
+)
+_SPA_ENV = "ENV SPA_DIST_DIR=/app/spa\n"
+_POETRY_COPY = "COPY scripts/requirements-poetry.txt /opt/requirements/poetry.txt\n"
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "check", "message"),
+    [
+        (
+            _MAIN_INSTALL,
+            _MAIN_INSTALL.replace(" --only main", ""),
+            _assert_poetry_install,
+            "deps Poetry RUNs",
+        ),
+        (
+            _MAIN_INSTALL,
+            _MAIN_INSTALL.replace("--only main", "--with dev"),
+            _assert_poetry_install,
+            "deps Poetry RUNs",
+        ),
+        (
+            f"    && {_VENV_PIP} \\\n",
+            "",
+            _assert_poetry_install,
+            "deps Poetry RUNs",
+        ),
+        (
+            _POETRY_COPY,
+            _POETRY_COPY.replace("/opt/requirements/poetry.txt", "/tmp/poetry.txt"),
+            _assert_poetry_install,
+            "Poetry requirements COPY",
+        ),
+        (
+            _VENV_POETRY,
+            _VENV_POETRY.replace("--require-hashes ", ""),
+            _assert_every_pip_install_is_hash_checked,
+            "pip without --require-hashes",
+        ),
+        (
+            _BASE_PIP,
+            _BASE_PIP.replace("--require-hashes ", ""),
+            _assert_every_pip_install_is_hash_checked,
+            "pip without --require-hashes",
+        ),
+        (
+            _VENV_POETRY,
+            _VENV_POETRY.replace(":all: ", ":all: poetry==2.4.1 "),
+            _assert_every_pip_install_is_hash_checked,
+            "pip requirements in deps",
+        ),
+        (
+            _BASE_PIP,
+            _BASE_PIP.replace("--only-binary :all: ", ""),
+            _assert_every_pip_install_is_hash_checked,
+            "pip options in base",
+        ),
+        (
+            _SPA_ENV,
+            _SPA_ENV + "COPY --from=deps /opt/poetry /opt/poetry\n",
+            _assert_poetry_stays_out_of_production,
+            "Poetry venv",
+        ),
+        (
+            _SPA_ENV,
+            _SPA_ENV + "COPY --from=deps /opt/poetry/lib/python3.11/site-packages "
+            "/usr/local/lib/python3.11/site-packages\n",
+            _assert_poetry_stays_out_of_production,
+            "Poetry venv",
+        ),
+        (
+            _VENV_POETRY,
+            _VENV_POETRY.replace("/opt/poetry/bin/pip", "pip"),
+            _assert_poetry_stays_out_of_production,
+            "system pip installs Poetry",
+        ),
+        (
+            _MAIN_INSTALL,
+            "RUN pip install poetry==2.4.1\n" + _MAIN_INSTALL,
+            _assert_poetry_stays_out_of_production,
+            "system pip installs Poetry",
+        ),
+    ],
+    ids=[
+        "dev-group-installed",
+        "with-dev",
+        "pip-not-upgraded-first",
+        "requirements-copied-elsewhere",
+        "poetry-require-hashes-dropped",
+        "base-require-hashes-dropped",
+        "unhashed-inline-requirement",
+        "base-only-binary-dropped",
+        "poetry-venv-in-final-stage",
+        "poetry-site-packages-in-final-stage",
+        "system-pip-installs-poetry-file",
+        "system-pip-poetry-extra-run",
+    ],
+)
+def test_poetry_contract_rejects_mutations(
+    old: str, new: str, check: Any, message: str
+) -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert text.count(old) == 1, old
+    with pytest.raises(AssertionError, match=re.escape(message)):
+        check(_parse_stages(text.replace(old, new)))
+
+
+def _production_labels(stages: tuple[Stage, ...]) -> list[str]:
+    return [
+        instruction.args
+        for stage in _lineage("production", stages)
+        for instruction in stage.instructions
+        if instruction.keyword == "LABEL"
+    ]
+
+
+def _assert_revision_label(stages: tuple[Stage, ...]) -> None:
+    production = _stage("production", stages).instructions
+    keywords = [instruction.keyword for instruction in production]
+    assert _production_labels(stages) == [REVISION_LABEL], "revision label"
+    args = [i.args for i in production if i.keyword == "ARG"]
+    assert args == [REVISION_ARG], f"revision ARG: {args}"
+    label = keywords.index("LABEL")
+    assert keywords.index("ARG") < label, "revision ARG must precede the LABEL"
+    last_copy = max(i for i, keyword in enumerate(keywords) if keyword == "COPY")
+    # A changing revision must never invalidate a cached COPY layer.
+    assert last_copy < label, "revision label must follow every COPY"
+    # VCS_REF only feeds the final label: used by any earlier instruction it
+    # would invalidate cached layers or leak into what was built.
+    users = [
+        (stage.alias, instruction.keyword)
+        for stage in stages
+        for instruction in stage.instructions
+        if REVISION_ARG.partition("=")[0] in instruction.args
+    ]
+    assert users == [
+        ("production", "ARG"),
+        ("production", "LABEL"),
+    ], f"VCS_REF used outside the final ARG and LABEL: {users}"
+
+
+def test_production_image_carries_the_revision_label() -> None:
+    _assert_revision_label(_stages())
+
+
+_LABEL = 'LABEL org.opencontainers.image.revision="${VCS_REF}"\n'
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        (_LABEL, "", "revision label"),
+        (_LABEL, _LABEL.replace("revision", "version"), "revision label"),
+        (_LABEL, _LABEL + 'LABEL extra="x"\n', "revision label"),
+        ("ARG VCS_REF=unknown\n", "ARG VCS_REF\n", "revision ARG"),
+        ("ARG VCS_REF=unknown\n", "", "revision ARG"),
+        (
+            "ENV SPA_DIST_DIR=/app/spa\n",
+            "ENV SPA_DIST_DIR=/app/spa\n" + _LABEL.replace("VCS_REF", "X"),
+            "revision label",
+        ),
+        (
+            "ARG VCS_REF=unknown\n",
+            "ARG VCS_REF=unknown\nENV REVISION=${VCS_REF}\n",
+            "VCS_REF used outside",
+        ),
+        (
+            "RUN /opt/poetry/bin/poetry config virtualenvs.create false\n",
+            "ARG VCS_REF\nRUN /opt/poetry/bin/poetry config virtualenvs.create false"
+            " && echo $VCS_REF\n",
+            "VCS_REF used outside",
+        ),
+    ],
+    ids=[
+        "missing",
+        "wrong-key",
+        "extra-label",
+        "no-default",
+        "no-arg",
+        "second-label",
+        "used-before-label",
+        "used-in-deps",
+    ],
+)
+def test_revision_label_contract_rejects_mutations(
+    old: str, new: str, message: str
+) -> None:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert text.count(old) == 1, old
+    with pytest.raises(AssertionError, match=re.escape(message)):
+        _assert_revision_label(_parse_stages(text.replace(old, new)))
 
 
 def test_pnpm_pin_is_exact_and_equals_package_manager() -> None:
