@@ -1471,6 +1471,316 @@ class TestMetaWebhookFileForwardChoice:
 
 
 # ============================================
+# POST /v1/webhook/meta — LGPD privacy notice on new sessions
+# ============================================
+
+_LGPD_TEST_LINK = "https://privacidade.example.test/clinica"
+_LGPD_EXPECTED_NOTICE = (
+    "Aviso LGPD da Clínica Teste: https://privacidade.example.test/clinica"
+)
+
+
+def _meta_lgpd_clinic_config(*, enabled: bool = True) -> dict:
+    """Clinic config with a pinned LGPD copy so the notice text is exact."""
+    return {
+        "lgpd": {
+            "lgpd_enabled": enabled,
+            "lgpd_message": "Aviso LGPD da {{clinic_name}}: {{lgpd_link}}",
+            "lgpd_custom_link": _LGPD_TEST_LINK,
+        },
+        "identity": {"clinic_name": "Clínica Teste"},
+    }
+
+
+def _meta_lgpd_service(*, enabled: bool = True, suggested: str = "") -> MagicMock:
+    service = MagicMock()
+    service._load_clinic_config = AsyncMock(
+        return_value=_meta_lgpd_clinic_config(enabled=enabled)
+    )
+    service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+    service.finish_response = AsyncMock(return_value=_fake_event_response(suggested))
+    return service
+
+
+class TestMetaWebhookPrivacyNotice:
+    """The LGPD notice is the first outbound of a new Meta session, whatever
+    the patient's first message type is, and is never re-sent afterwards."""
+
+    def test_first_message_text_sends_notice_before_reply(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """Pins the pre-existing text-path order: notice, then the AI reply."""
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+        from_phone = "5511900010001"
+        notice_id = f"wamid.notice_{uuid4().hex[:10]}"
+        reply_id = f"wamid.reply_{uuid4().hex[:10]}"
+
+        with (
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(
+                    side_effect=[
+                        _fake_meta_send_result(notice_id),
+                        _fake_meta_send_result(reply_id),
+                    ]
+                ),
+            ) as mock_send,
+            patch("src.api.routes.webhook.get_event_service") as mock_get_service,
+        ):
+            service = _meta_lgpd_service(suggested="Claro, como posso ajudar?")
+            mock_get_service.return_value = service
+
+            resp = _post_meta(
+                client,
+                _meta_text_payload(
+                    phone_number_id=phone_id,
+                    from_phone=from_phone,
+                    text_body="Oi, quero agendar",
+                    message_id=f"wamid.text_{uuid4().hex[:10]}",
+                ),
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True}
+        assert [call.args[3] for call in mock_send.await_args_list] == [
+            _LGPD_EXPECTED_NOTICE,
+            "Claro, como posso ajudar?",
+        ]
+
+    @pytest.mark.parametrize("msg_type", ["image", "document", "video", "sticker"])
+    def test_first_message_file_sends_notice_before_file_ack(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        msg_type: str,
+    ):
+        """A new patient whose first message is a file must still receive the
+        LGPD notice, ahead of the fixed file acknowledgement."""
+        from src.api.routes.webhook import _INMEM_SENT, _build_meta_file_ack_message
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+        from_phone = "5511900010002"
+        notice_id = f"wamid.notice_{uuid4().hex[:10]}"
+        ack_id = f"wamid.ack_{uuid4().hex[:10]}"
+
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(),
+            ) as mock_resolve,
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(
+                    side_effect=[
+                        _fake_meta_send_result(notice_id),
+                        _fake_meta_send_result(ack_id),
+                    ]
+                ),
+            ) as mock_send,
+            patch("src.api.routes.webhook.get_event_service") as mock_get_service,
+        ):
+            service = _meta_lgpd_service()
+            mock_get_service.return_value = service
+
+            resp = _post_meta(
+                client,
+                _meta_media_payload(
+                    phone_number_id=phone_id,
+                    from_phone=from_phone,
+                    media_id=f"media_{uuid4().hex[:12]}",
+                    message_id=f"wamid.file_{uuid4().hex[:10]}",
+                    msg_type=msg_type,
+                ),
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "file_ack"}
+
+        sends = [call.args for call in mock_send.await_args_list]
+        assert [args[3] for args in sends] == [
+            _LGPD_EXPECTED_NOTICE,
+            _build_meta_file_ack_message("", "pt-BR"),
+        ]
+        assert all(args[0] == phone_id for args in sends)
+        assert all(args[2] == from_phone for args in sends)
+
+        # Both outbound ids are registered for echo dedup.
+        assert notice_id in _INMEM_SENT
+        assert ack_id in _INMEM_SENT
+
+        # The file path is otherwise unchanged: no download, no pipeline.
+        assert mock_resolve.await_count == 0
+        assert service.run_pipeline.await_count == 0
+
+    def test_lgpd_disabled_file_first_sends_only_file_ack(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        from src.api.routes.webhook import _build_meta_file_ack_message
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+
+        with (
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ) as mock_send,
+            patch("src.api.routes.webhook.get_event_service") as mock_get_service,
+        ):
+            mock_get_service.return_value = _meta_lgpd_service(enabled=False)
+
+            resp = _post_meta(
+                client,
+                _meta_media_payload(
+                    phone_number_id=phone_id,
+                    from_phone="5511900010003",
+                    media_id=f"media_{uuid4().hex[:12]}",
+                    message_id=f"wamid.file_{uuid4().hex[:10]}",
+                ),
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "file_ack"}
+        assert [call.args[3] for call in mock_send.await_args_list] == [
+            _build_meta_file_ack_message("", "pt-BR"),
+        ]
+
+    def test_file_first_then_text_sends_notice_exactly_once(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """First turn image → notice + ack. Second turn describes the need →
+        pending review is cleared, the pipeline replies, no second notice."""
+        from src.api.routes.webhook import _build_meta_file_ack_message
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+        from_phone = "5511900010004"
+
+        with (
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(side_effect=lambda *_a, **_k: _fake_meta_send_result()),
+            ) as mock_send,
+            patch("src.api.routes.webhook.get_event_service") as mock_get_service,
+        ):
+            service = _meta_lgpd_service(suggested="A consulta custa R$ 200")
+            mock_get_service.return_value = service
+
+            first = _post_meta(
+                client,
+                _meta_media_payload(
+                    phone_number_id=phone_id,
+                    from_phone=from_phone,
+                    media_id=f"media_{uuid4().hex[:12]}",
+                    message_id=f"wamid.file_{uuid4().hex[:10]}",
+                ),
+            )
+            second = _post_meta(
+                client,
+                _meta_text_payload(
+                    phone_number_id=phone_id,
+                    from_phone=from_phone,
+                    text_body="Queria saber o valor da consulta",
+                    message_id=f"wamid.text_{uuid4().hex[:10]}",
+                ),
+            )
+
+        assert first.status_code == 200, first.text
+        assert first.json() == {"ok": True, "replied": True, "action": "file_ack"}
+        assert second.status_code == 200, second.text
+        assert second.json() == {"ok": True, "replied": True}
+
+        assert [call.args[3] for call in mock_send.await_args_list] == [
+            _LGPD_EXPECTED_NOTICE,
+            _build_meta_file_ack_message("", "pt-BR"),
+            "A consulta custa R$ 200",
+        ]
+        assert service.run_pipeline.await_count == 1
+        assert (
+            service.run_pipeline.await_args.args[0].payload.content
+            == "Queria saber o valor da consulta"
+        )
+
+    def test_file_first_then_forward_intent_hands_off_without_second_notice(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """First turn image → notice + ack. Second turn asks to forward →
+        real pending-review flag drives the file handoff, no second notice."""
+        from src.api.routes.webhook import (
+            _FILE_FORWARDED_MSG_PT,
+            _build_meta_file_ack_message,
+        )
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+        from_phone = "5511900010005"
+        handoff_mock = AsyncMock()
+
+        with (
+            patch(
+                "src.api.routes.webhook._meta_initiate_file_handoff",
+                new=handoff_mock,
+            ),
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(side_effect=lambda *_a, **_k: _fake_meta_send_result()),
+            ) as mock_send,
+            patch("src.api.routes.webhook.get_event_service") as mock_get_service,
+        ):
+            service = _meta_lgpd_service(suggested="should never fire")
+            mock_get_service.return_value = service
+
+            first = _post_meta(
+                client,
+                _meta_media_payload(
+                    phone_number_id=phone_id,
+                    from_phone=from_phone,
+                    media_id=f"media_{uuid4().hex[:12]}",
+                    message_id=f"wamid.file_{uuid4().hex[:10]}",
+                    msg_type="document",
+                    filename="laudo.pdf",
+                ),
+            )
+            second = _post_meta(
+                client,
+                _meta_text_payload(
+                    phone_number_id=phone_id,
+                    from_phone=from_phone,
+                    text_body="Pode encaminhar pra equipe",
+                    message_id=f"wamid.text_{uuid4().hex[:10]}",
+                ),
+            )
+
+        assert first.status_code == 200, first.text
+        assert first.json() == {"ok": True, "replied": True, "action": "file_ack"}
+        assert second.status_code == 200, second.text
+        assert second.json() == {
+            "ok": True,
+            "replied": True,
+            "action": "file_handoff",
+        }
+
+        assert [call.args[3] for call in mock_send.await_args_list] == [
+            _LGPD_EXPECTED_NOTICE,
+            _build_meta_file_ack_message("", "pt-BR"),
+            _FILE_FORWARDED_MSG_PT,
+        ]
+        assert handoff_mock.await_count == 1
+        assert handoff_mock.await_args.args[2:] == (from_phone, "file_pending_review")
+        assert service.run_pipeline.await_count == 0
+
+
+# ============================================
 # POST /v1/webhook/meta — HMAC authenticity (Group 5)
 # ============================================
 
