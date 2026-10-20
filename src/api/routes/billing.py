@@ -7,7 +7,14 @@ from datetime import datetime, timezone
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Request,
+    Response,
+)
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -192,10 +199,21 @@ def _calc_pricing(active_clinics: int) -> dict[str, int]:
     }
 
 
+def _no_store(response: Response) -> None:
+    """Forbid browsers and shared caches from storing the builder's summary.
+
+    It is per builder and time-dependent (``payment_state`` and the cancelled
+    paid window move with the São Paulo date), so no copy may be reused.
+    """
+
+    response.headers["Cache-Control"] = "no-store"
+
+
 @router.get(
     "/summary",
     summary="Billing Summary",
     response_model=BillingSummaryResponse,
+    dependencies=[Depends(_no_store)],
 )
 async def billing_summary(
     builder_id: UUID = Depends(require_builder),
@@ -259,6 +277,7 @@ async def _summary_read_contract(builder_id: UUID, db: AsyncSession) -> tuple[
                 status=subscription.status,
                 amount_cents=subscription.amount_cents,
                 current_period_end=subscription.current_period_end,
+                payment_state=subscription.payment_state,
             )
         ),
         BillingCheckoutSummaryResponse(
@@ -271,6 +290,7 @@ async def _summary_read_contract(builder_id: UUID, db: AsyncSession) -> tuple[
                     checkout_session_id=str(live.checkout_session_id),
                     kind=live.kind,
                     state=live.state,
+                    offer_id=live.offer_id,
                 )
             ),
             available=commercial.available,
