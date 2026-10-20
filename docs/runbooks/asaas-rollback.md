@@ -107,8 +107,17 @@ as `rollback_target`, and the manifest pins it.
   verified). ASAAS may then interrupt the webhook queue and email
   `ASAAS_WEBHOOK_NOTIFICATION_EMAIL`.
   After a later re-deploy, the readback reports `interrupted` until the
-  webhook is reconciled. Pausing or deleting the provider webhook is a manual
-  provider operation with its own approval.
+  webhook is reconciled. The automatic `reconcile` that runs after each deploy
+  (`python -m src.ops.asaas_webhook reconcile`, see the D4 section of
+  [`asaas-deployment.md`](./asaas-deployment.md)) **resumes an interrupted
+  queue by default, and ASAAS then re-sends the backlog** (result reason
+  `queue_resumed`); add `--no-resume` to keep it paused. It **never
+  re-enables a webhook that is disabled** (`enabled: false`): that stays
+  `disabled` / `webhook_disabled_by_operator` until someone runs
+  `reconcile --allow-enable` on the owner's instruction. Pausing or deleting
+  the provider webhook is a manual provider operation with its own approval;
+  to keep ASAAS from delivering during a rollback, disable the webhook in the
+  ASAAS panel (an interruption alone is undone by the next deploy).
 
 Evidence records only opaque IDs, statuses, timestamps and SHA-256 digests;
 no tokens, provider payloads, customer details or card data.
