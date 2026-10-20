@@ -901,6 +901,31 @@ _asaas_waived_path_audit() {
     return "$status"
 }
 
+# The release-candidate PostgreSQL suites: the single list run by
+# asaas_release_candidate_gate below and by the `billing-postgres` job in
+# .github/workflows/billing-postgres-integration.yml, so CI and the local gate
+# cannot drift apart. Each suite creates and migrates its own databases from
+# the `postgres` maintenance database that POSTGRES_SMOKE_DATABASE_URL names
+# (a disposable loopback cluster, superuser role). The variable is required
+# because the suites skip without it, and a skipped suite must not read as a
+# pass. Usage:
+#   POSTGRES_SMOKE_DATABASE_URL=... \
+#     bash -c 'source scripts/wish-gates.sh && asaas_release_candidate_postgres_suites'
+asaas_release_candidate_postgres_suites() (
+    set -euo pipefail
+    : "${POSTGRES_SMOKE_DATABASE_URL:?set POSTGRES_SMOKE_DATABASE_URL to a disposable loopback PostgreSQL}"
+    cd "$_WISH_GATES_ROOT" || return 1
+    poetry run pytest -p no:cacheprovider -rs \
+        tests/integration/test_asaas_billing_postgres.py \
+        tests/integration/test_asaas_checkout_service_postgres.py \
+        tests/integration/test_asaas_webhook_postgres.py \
+        tests/integration/test_asaas_subscription_triggers_postgres.py \
+        tests/integration/test_billing_producer_handoff_postgres.py -v || {
+        echo "release-candidate PostgreSQL suites failed" >&2
+        return 1
+    }
+)
+
 # ASAAS release-candidate aggregate (asaas-payment-gateway Group 6). Local
 # only: Compose is validated without starting services, and no provider call,
 # database migration, deploy, rollout transition or secret-manager operation is
@@ -962,15 +987,7 @@ asaas_release_candidate_gate() (
         echo "release-candidate contract suites failed" >&2
         return 1
     }
-    poetry run pytest -p no:cacheprovider -rs \
-        tests/integration/test_asaas_billing_postgres.py \
-        tests/integration/test_asaas_checkout_service_postgres.py \
-        tests/integration/test_asaas_webhook_postgres.py \
-        tests/integration/test_asaas_subscription_triggers_postgres.py \
-        tests/integration/test_billing_producer_handoff_postgres.py -v || {
-        echo "release-candidate PostgreSQL suites failed" >&2
-        return 1
-    }
+    asaas_release_candidate_postgres_suites || return 1
     _production_compose_render || return 1
 
     rules="$(_asaas_scan_rules)" || return 1

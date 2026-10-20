@@ -152,6 +152,26 @@ These are prerequisites to check, not steps to execute now:
    environment and any local `.env` are never read. The Docker CLI must be
    installed; without it the gate fails rather than skipping the render.
 
+   **The PostgreSQL suites also run in CI.** The gate's PostgreSQL step is
+   `asaas_release_candidate_postgres_suites` in `scripts/wish-gates.sh`, the
+   only list of release-candidate PostgreSQL suites. The `Billing PostgreSQL
+   suites` job (`.github/workflows/billing-postgres-integration.yml`) runs
+   that same function on every pull request to `main` and every push to
+   `main`, against a disposable `postgres:16` service container (loopback
+   port, throwaway password, no secrets). Before the suites it turns on
+   `logging_collector`, so the server-log audit in
+   `tests/integration/test_asaas_subscription_triggers_postgres.py` runs
+   instead of skipping, and runs `alembic upgrade head` on a service
+   database. To add or remove a suite, edit the function; CI and this gate
+   follow together. A green CI job does not replace this gate. These run
+   only here: the contract suites
+   (`tests/contracts/test_billing_fact_producer_consumer.py`,
+   `tests/scripts/test_deploy_vps_gate.py`,
+   `tests/scripts/test_production_compose.py`,
+   `tests/scripts/test_asaas_observability.py`,
+   `tests/scripts/test_validate_conventional_commits.py`), the Compose
+   render, the secret/PII scans and the commit check.
+
    **Recorded secret/PII scan exception (owner decision 2026-10-18).** The
    product owner decided to commit the sandbox card capture tool
    (`scripts/asaas_sandbox_card_capture.py`,
