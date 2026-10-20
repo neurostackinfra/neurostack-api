@@ -26,9 +26,9 @@ and every rollout transition take first, so a session→subscription handoff
 can never interleave with a checkout eligibility decision and the deliveries
 and readbacks of one environment apply one at a time), then the session,
 subscription/order and projection row locks.  No path here takes the legacy
-billing roster fence (Group 10 E4); until migration 036 (Group 10 E5) drops
-it, only the database's statement trigger on ``billing_subscriptions`` still
-takes that fence, on an UPDATE, so always after the rollout lock.  The
+billing roster fence (Group 10 E4), and since migration 036 (Group 10 E5)
+neither does the database: the roster statement trigger on
+``billing_subscriptions`` is gone.  The
 rollout lock is per environment, so one environment per database is a
 requirement: the global fence used to serialize handoffs of different
 environments too, and without it two environments sharing a database could
@@ -1007,8 +1007,7 @@ class _FinancialState:
             return existing
         plan = OFFER_PLANS.get(session.offer_id)
         if (
-            session.migration_id is not None  # legacy saga link (036 drops it)
-            or session.state not in _LIVE_CHECKOUT_STATES
+            session.state not in _LIVE_CHECKOUT_STATES
             or session.resulting_external_subscription_id
             not in (
                 None,
@@ -1065,9 +1064,6 @@ class _FinancialState:
             offer_id=session.offer_id,
             amount_cents=int(session.amount_cents),
             status=status,
-            # Legacy column, NOT NULL with CHECK (> 0) until migration 036
-            # (Group 10 E5) drops it.  Constant: write-once, never read.
-            roster_revision=1,
         )
         self._db.add(subscription)
         await self._db.flush()

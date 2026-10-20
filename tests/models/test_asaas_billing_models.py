@@ -25,6 +25,7 @@ from src.models.billing import (
     BillingPaymentEffect,
     BillingPaymentProjection,
     BillingRolloutControl,
+    BillingRolloutReadinessReceipt,
     BillingRolloutReceipt,
     BillingRosterControl,
     BillingSubscription,
@@ -101,7 +102,6 @@ def test_group_zero_legacy_binding_is_physical_and_provider_unique() -> None:
         "plan",
         "billing_cycle",
         "coupon_code",
-        "roster_revision",
     }.issubset(columns.keys())
     assert _unique_columns(
         BillingSubscription,
@@ -112,10 +112,6 @@ def test_group_zero_legacy_binding_is_physical_and_provider_unique() -> None:
         "ck_billing_subscriptions_external_id_length",
     )
     assert "A-Za-z0-9._:-" in external_check
-    assert "roster_revision > 0" in _check_sql(
-        BillingSubscription,
-        "ck_billing_subscriptions_roster_revision",
-    )
 
 
 def test_asaas_target_snapshot_stays_separate_until_roster_flip() -> None:
@@ -185,10 +181,50 @@ def test_subscription_checks_allow_sqlite_legacy_insert() -> None:
                 "plan": "start",
                 "billing_cycle": "annual",
                 "status": "active",
-                "roster_revision": 1,
             },
         )
     engine.dispose()
+
+
+def test_migration_036_removed_the_legacy_links_from_the_asaas_models() -> None:
+    """The three columns migration 036 drops, their constraints and the
+    relationships that rode on ``migration_id`` are gone from the ORM (the
+    legacy models themselves stay until 037)."""
+
+    configure_mappers()
+    for model, column, constraint in (
+        (
+            BillingSubscription,
+            "roster_revision",
+            "ck_billing_subscriptions_roster_revision",
+        ),
+        (
+            BillingRolloutReadinessReceipt,
+            "roster_revision",
+            "ck_billing_rollout_readiness_roster_revision",
+        ),
+        (
+            BillingCheckoutSession,
+            "migration_id",
+            "fk_billing_checkout_sessions_builder_migration",
+        ),
+    ):
+        table = getattr(model, "__table__")
+        assert column not in table.columns, (model.__name__, column)
+        assert constraint not in {item.name for item in table.constraints}
+    assert not hasattr(BillingCheckoutSession, "migration")
+    assert not hasattr(BillingMigration, "checkout_sessions")
+    referenced = {
+        element.column.table.name
+        for constraint in BillingCheckoutSession.__table__.constraints
+        if isinstance(constraint, ForeignKeyConstraint)
+        for element in constraint.elements
+    }
+    assert "billing_migrations" not in referenced
+    exact = _check_sql(
+        BillingCheckoutSession, "ck_billing_checkout_sessions_canary_exact"
+    )
+    assert "migration_id" not in exact
 
 
 def test_checkout_session_has_one_live_attempt_per_builder_intent() -> None:
@@ -243,12 +279,6 @@ def test_three_idempotency_namespaces_are_independent() -> None:
                 "billing_subscriptions.builder_id",
                 "billing_subscriptions.id",
             ),
-        ),
-        (
-            BillingCheckoutSession,
-            "fk_billing_checkout_sessions_builder_migration",
-            ("builder_id", "migration_id"),
-            ("billing_migrations.builder_id", "billing_migrations.id"),
         ),
         (
             BillingCheckoutSession,
@@ -403,7 +433,7 @@ def test_alias_identifiers_are_bonded_to_canonical_targets() -> None:
     checkout_target = _check_sql(
         BillingCheckoutSession, "ck_billing_checkout_sessions_intent_target"
     )
-    assert "intent_id = migration_id" in checkout_target
+    assert "migration_id" not in checkout_target
     assert "intent_id = topup_order_id" in checkout_target
     assert _unique_columns(
         BillingPaymentProjection,
@@ -450,7 +480,8 @@ def test_snapshots_are_recursively_closed_and_capability_consumption_is_unique()
 
 def test_global_roster_fence_is_database_only() -> None:
     # Group 10 E4 removed the Python mirror of the key; the database fence
-    # (removed by migration 036) still takes the key it was created with.
+    # (migration 036 dropped its billing_subscriptions trigger, 037 drops the
+    # legacy tables' ones) still takes the key it was created with.
     import src.repositories.billing as repository
 
     expected_key = 3486705124568449331

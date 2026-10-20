@@ -99,10 +99,6 @@ class BillingSubscription(Base, TimestampMixin):
             "amount_cents IS NULL OR amount_cents >= 0",
             name="ck_billing_subscriptions_amount_cents",
         ),
-        CheckConstraint(
-            "roster_revision > 0",
-            name="ck_billing_subscriptions_roster_revision",
-        ),
         UniqueConstraint(
             "provider",
             "external_subscription_id",
@@ -146,7 +142,6 @@ class BillingSubscription(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(
         String(40), nullable=False, default="active", server_default="active"
     )
-    roster_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
     builder: Mapped["Builder"] = relationship(
         "Builder", back_populates="billing_subscriptions"
@@ -276,9 +271,6 @@ class BillingMigration(Base, TimestampMixin):
     )
     subscription: Mapped["BillingSubscription"] = relationship(
         "BillingSubscription", back_populates="migrations", viewonly=True
-    )
-    checkout_sessions: Mapped[list["BillingCheckoutSession"]] = relationship(
-        "BillingCheckoutSession", back_populates="migration", viewonly=True
     )
     receipts: Mapped[list["BillingMigrationReceipt"]] = relationship(
         "BillingMigrationReceipt", back_populates="migration"
@@ -519,10 +511,9 @@ class BillingCheckoutSession(Base, TimestampMixin):
             name="ck_billing_checkout_sessions_attempt_amount",
         ),
         CheckConstraint(
-            "(intent_kind = 'subscription' AND topup_order_id IS NULL "
-            "AND (migration_id IS NULL OR intent_id = migration_id)) OR "
+            "(intent_kind = 'subscription' AND topup_order_id IS NULL) OR "
             "(intent_kind = 'topup' AND topup_order_id IS NOT NULL "
-            "AND migration_id IS NULL AND intent_id = topup_order_id)",
+            "AND intent_id = topup_order_id)",
             name="ck_billing_checkout_sessions_intent_target",
         ),
         _postgresql_check(
@@ -551,7 +542,7 @@ class BillingCheckoutSession(Base, TimestampMixin):
             "canary_slot IS NULL OR (provider = 'asaas' AND attempt_no = 1 AND "
             "catalog_version_id = 'payment-2026-10-03' AND "
             "((canary_slot = 'subscription' AND intent_kind = 'subscription' "
-            "AND migration_id IS NULL AND topup_order_id IS NULL AND "
+            "AND topup_order_id IS NULL AND "
             "next_due_date IS NOT NULL AND "
             "offer_id = 'plan_plus_monthly_v1' AND amount_cents = 99900 AND "
             "pricing_snapshot ->> 'catalog_version_id' = 'payment-2026-10-03' AND "
@@ -582,7 +573,7 @@ class BillingCheckoutSession(Base, TimestampMixin):
             "'settled_cents', 0, 'reversed_cents', 0, 'restored_cents', 0, "
             "'line_financial_state', 'pending'))))) OR "
             "(canary_slot = 'topup' AND intent_kind = 'topup' AND "
-            "migration_id IS NULL AND topup_order_id IS NOT NULL AND "
+            "topup_order_id IS NOT NULL AND "
             "intent_id = topup_order_id AND "
             "offer_id = 'package_credits_500_v1' AND amount_cents = 10000 AND "
             "pricing_snapshot ->> 'catalog_version_id' = 'payment-2026-10-03' AND "
@@ -590,12 +581,6 @@ class BillingCheckoutSession(Base, TimestampMixin):
             "pricing_snapshot ->> 'amount_cents' = '10000' AND "
             "pricing_snapshot ->> 'credit_grant_mc' = '500000')))",
             name="ck_billing_checkout_sessions_canary_exact",
-        ),
-        ForeignKeyConstraint(
-            ["builder_id", "migration_id"],
-            ["billing_migrations.builder_id", "billing_migrations.id"],
-            ondelete="RESTRICT",
-            name="fk_billing_checkout_sessions_builder_migration",
         ),
         ForeignKeyConstraint(
             ["builder_id", "topup_order_id"],
@@ -666,9 +651,6 @@ class BillingCheckoutSession(Base, TimestampMixin):
     )
     intent_kind: Mapped[str] = mapped_column(String(20), nullable=False)
     intent_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
-    migration_id: Mapped[UUID | None] = mapped_column(
-        PG_UUID(as_uuid=True), nullable=True
-    )
     topup_order_id: Mapped[UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), nullable=True
     )
@@ -696,9 +678,6 @@ class BillingCheckoutSession(Base, TimestampMixin):
 
     builder: Mapped["Builder"] = relationship(
         "Builder", back_populates="billing_checkout_sessions"
-    )
-    migration: Mapped["BillingMigration | None"] = relationship(
-        "BillingMigration", back_populates="checkout_sessions", viewonly=True
     )
     topup_order: Mapped["BillingTopupOrder | None"] = relationship(
         "BillingTopupOrder", back_populates="checkout_sessions", viewonly=True
@@ -1758,10 +1737,6 @@ class BillingRolloutReadinessReceipt(Base):
         CheckConstraint(
             "status = 'passed'", name="ck_billing_rollout_readiness_status"
         ),
-        CheckConstraint(
-            "roster_revision >= 0",
-            name="ck_billing_rollout_readiness_roster_revision",
-        ),
         _postgresql_check(
             f"content_sha256 ~ '{_SHA256_CHECK}' "
             f"AND rule_digest ~ '{_SHA256_CHECK}' "
@@ -1808,7 +1783,6 @@ class BillingRolloutReadinessReceipt(Base):
     provider_receipt_id: Mapped[UUID] = mapped_column(
         PG_UUID(as_uuid=True), nullable=False
     )
-    roster_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
     rule_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     bundle_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     app_digest: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -2078,7 +2052,11 @@ class BillingRolloutReceipt(Base):
 
 
 class BillingRosterControl(Base):
-    """Global singleton revision fence for subscription/migration bindings."""
+    """Legacy global roster revision (saga only).
+
+    Since migration 036 no ASAAS table is fenced by it any more; migration
+    037 drops it with the rest of the legacy migration subsystem.
+    """
 
     __tablename__ = "billing_roster_control"
     __table_args__ = (

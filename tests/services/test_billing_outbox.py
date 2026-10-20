@@ -166,14 +166,12 @@ async def _settled_subscription(
         offer_id="plan_plus_monthly_v1",
         amount_cents=99_900,
         status="active",
-        roster_revision=1,
     )
     checkout = BillingCheckoutSession(
         id=checkout_id,
         builder_id=builder_id,
         intent_kind="subscription",
         intent_id=subscription_id,
-        migration_id=None,
         topup_order_id=None,
         attempt_no=1,
         provider="asaas",

@@ -149,8 +149,6 @@ def _readiness_evidence_is_bound(
     bundle_digest: str,
     now: datetime,
 ) -> bool:
-    # ``row.roster_revision`` is deliberately absent: the legacy column is
-    # neither hashed nor compared (Group 10 E3), so its value is not evidence.
     deployer = evidence_by_id.get(row.operation_receipt_id)
     provider = evidence_by_id.get(row.provider_receipt_id)
     return bool(
@@ -544,9 +542,6 @@ class BillingRolloutOperationService:
             operation_id=material.operation_id,
             operation_receipt_id=operation_receipt_id,
             provider_receipt_id=provider_receipt_id,
-            # Legacy column, kept with its CHECK (>= 0) until migration 036
-            # (Group 10 E5) drops it.  Constant: not hashed, never read.
-            roster_revision=0,
             rule_digest=rule_digest,
             bundle_digest=bundle_digest,
             app_digest=app_digest,

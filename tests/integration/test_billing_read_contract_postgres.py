@@ -225,11 +225,11 @@ async def _seed_subscription(
                 text("""
                     INSERT INTO billing_subscriptions (
                         id, builder_id, provider, external_subscription_id,
-                        is_active, plan, billing_cycle, status, roster_revision,
+                        is_active, plan, billing_cycle, status,
                         catalog_version_id, offer_id, amount_cents, created_at
                     ) VALUES (
                         :id, :builder_id, :provider, :external_id, :active,
-                        'pro', 'monthly', :status, 1, :catalog, :offer_id,
+                        'pro', 'monthly', :status, :catalog, :offer_id,
                         :amount_cents, :created_at
                     )
                 """),

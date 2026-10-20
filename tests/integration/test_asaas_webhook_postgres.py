@@ -793,13 +793,13 @@ async def test_handoff_holds_the_rollout_lock_against_eligibility(
     assert blocker == "asaas_subscription"
     (row,) = await _all(
         harness,
-        "SELECT s.id = c.intent_id, s.status, s.is_active, s.roster_revision, c.state "
+        "SELECT s.id = c.intent_id, s.status, s.is_active, c.state "
         "FROM billing_subscriptions s JOIN billing_checkout_sessions c "
         "ON c.resulting_external_subscription_id = s.external_subscription_id "
         "WHERE s.builder_id = :b",
         b=builder_id,
     )
-    assert tuple(row) == (True, "active_linked", True, 1, "completed")
+    assert tuple(row) == (True, "active_linked", True, "completed")
 
 
 async def test_coupon_is_consumed_once_inside_the_settlement_transaction(
@@ -2537,9 +2537,10 @@ async def test_deleted_payment_with_refunds_settles_and_reverses_on_postgres(
 # environment.  The global fence also serialized handoffs ACROSS environments;
 # without it one environment per database is a requirement (two environments
 # sharing a database could leave a builder with two active subscriptions; see
-# the billing_webhook module docstring and the deployment runbook).  What is
-# left of the fence is the database's statement trigger on UPDATE/DELETE of
-# billing_subscriptions (migration 026), which migration 036 (E5) removes.
+# the billing_webhook module docstring and the deployment runbook).  The
+# database's statement trigger on UPDATE/DELETE of billing_subscriptions
+# (migration 026), the last part of the fence, was removed by migration 036
+# (E5): since then a held fence blocks no webhook path at all.
 # ---------------------------------------------------------------------------
 
 # Inventory for Group 10 E5/E6, same convention as the characterization
@@ -2547,18 +2548,13 @@ async def test_deleted_payment_with_refunds_settles_and_reverses_on_postgres(
 # pytest node names, checked by test_break_inventory_names_only_collected_tests
 # below.  A test may appear in both lists when it breaks for both reasons.
 #
-# 036 drops billing_subscriptions.roster_revision (these tests select it) and
-# the roster statement trigger.  From 036 on the held-fence test only runs its
-# "no trigger" branch; its trigger branch becomes unreachable.
-TESTS_THAT_BREAK_AFTER_036: tuple[str, ...] = (
-    "test_handoff_holds_the_rollout_lock_against_eligibility",
-    "test_e4_former_roster_call_sites_commit_without_the_fence",
-    "test_e4_a_held_roster_fence_blocks_only_a_subscription_update",
-    "test_e4_creation_payment_cancellation_and_transition_queue_on_rollout",
-)
+# 036 is applied (E5 moved the four tests it listed: they no longer select
+# billing_subscriptions.roster_revision, and the held-fence test lost its
+# statement-trigger branch).
+TESTS_THAT_BREAK_AFTER_036: tuple[str, ...] = ()
 # 037 drops billing_roster_control, which the held-fence test locks.
 TESTS_THAT_BREAK_AFTER_037: tuple[str, ...] = (
-    "test_e4_a_held_roster_fence_blocks_only_a_subscription_update",
+    "test_e4_a_held_roster_fence_blocks_no_webhook_path",
 )
 
 
@@ -2575,7 +2571,8 @@ async def test_break_inventory_names_only_collected_tests(
         assert sorted(set(listed) - collected) == []
 
 
-# The key the 026 triggers take; it has no Python mirror any more.
+# The key 026's lock_billing_roster_statement() takes (since 036 only the
+# legacy tables' own triggers call it); it has no Python mirror any more.
 _LEGACY_ROSTER_FENCE_KEY = 3486705124568449331
 _FENCE_TRIGGER = (
     "SELECT count(*) FROM pg_trigger "
@@ -2764,13 +2761,12 @@ async def test_e4_former_roster_call_sites_commit_without_the_fence(
 
     (row,) = await _all(
         harness,
-        "SELECT status, is_active, roster_revision, "
+        "SELECT status, is_active, "
         "(SELECT count(*) FROM billing_payment_projections WHERE builder_id = :b) "
         "FROM billing_subscriptions WHERE builder_id = :b",
         b=builder_id,
     )
-    # The legacy column holds the constant the CHECK (> 0) needs until 036.
-    assert tuple(row) == ("active_linked", True, 1, 1)
+    assert tuple(row) == ("active_linked", True, 1)
 
     # 6. The checkout readback reaches the first site (a readback handoff).
     other_builder, other_session, other_checkout, _cents = await _subscription(
@@ -2800,29 +2796,28 @@ async def test_e4_former_roster_call_sites_commit_without_the_fence(
     assert (
         await _scalar(
             harness,
-            "SELECT roster_revision FROM billing_subscriptions WHERE builder_id = :b",
+            "SELECT count(*) FROM billing_subscriptions WHERE builder_id = :b",
             b=other_builder,
         )
         == 1
     )
 
 
-async def test_e4_a_held_roster_fence_blocks_only_a_subscription_update(
+async def test_e4_a_held_roster_fence_blocks_no_webhook_path(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A transaction holding the roster fence exactly as the 026 triggers take
-    it (the global key, then the control row) no longer blocks the handoff, a
-    payment of the subscription, a redelivered event or the readback; before
-    E4 each of them waited on it.  A deletion UPDATEs billing_subscriptions,
-    so it still meets the database's statement fence until migration 036 --
-    only after its rollout lock and its subscription row lock -- and applies
-    once the holder ends."""
+    it (the global key, then the control row) blocks neither the handoff, a
+    payment of the subscription, a redelivered event, the readback nor a
+    deletion.  Before E4 each of them waited on it; until migration 036 the
+    deletion (an UPDATE of billing_subscriptions) still met the database's
+    statement fence, which 036 dropped."""
 
     builder_id, session_id, checkout_id, cents = await _subscription(
         harness, monkeypatch, "E4 fence held"
     )
     external = "sub_pg_e4_fence_held"
-    fence_trigger = int(await _scalar(harness, _FENCE_TRIGGER)) == 1
+    assert int(await _scalar(harness, _FENCE_TRIGGER)) == 0
     holder = harness.session()
     writer = harness.session()
     try:
@@ -2899,41 +2894,24 @@ async def test_e4_a_held_roster_fence_blocks_only_a_subscription_update(
 
         assert await unblocked(readback()) == "converged"
 
-        pid = await _pid(writer)
-        deletion = asyncio.create_task(
+        deleted = await unblocked(
             BillingWebhookService(writer, environment="test").receive(
                 _envelope(
                     _payload("SUBSCRIPTION_DELETED", {"id": external, "deleted": True})
                 )
             )
         )
-        if fence_trigger:
-            locks = await _waiting(harness, pid)
-            # It waits on the trigger's key alone, already holding the
-            # rollout lock and the subscription it is updating.
-            assert _awaited(locks) == [("advisory", _LEGACY_ROSTER_FENCE_KEY)]
-            assert billing_advisory_key("test") in {
-                lock.advisory for lock in locks if lock.granted
-            }
-            assert {"billing_rollout_control", "billing_subscriptions"} <= {
-                lock.relation for lock in locks if lock.granted
-            }
-            assert not deletion.done()
-        else:
-            assert (await unblocked(deletion)).outcome == "readback_required"
         await holder.rollback()
-        deleted = await asyncio.wait_for(deletion, timeout=30)
     finally:
         await holder.close()
         await writer.close()
     assert deleted.outcome == "readback_required"
     (row,) = await _all(
         harness,
-        "SELECT status, is_active, roster_revision FROM billing_subscriptions "
-        "WHERE builder_id = :b",
+        "SELECT status, is_active FROM billing_subscriptions WHERE builder_id = :b",
         b=builder_id,
     )
-    assert tuple(row) == ("non_billable_pending_readback", False, 1)
+    assert tuple(row) == ("non_billable_pending_readback", False)
 
 
 async def test_e4_creation_payment_cancellation_and_transition_queue_on_rollout(
@@ -3061,7 +3039,7 @@ async def test_e4_creation_payment_cancellation_and_transition_queue_on_rollout(
     (row,) = await _all(
         harness,
         "SELECT (SELECT count(*) FROM billing_subscriptions WHERE builder_id = :b), "
-        "s.status, s.is_active, s.roster_revision, c.state, p.status, "
+        "s.status, s.is_active, c.state, p.status, "
         "p.settled_cents, "
         "(SELECT count(*) FROM billing_payment_effects WHERE builder_id = :b), "
         "(SELECT count(*) FROM transactions WHERE builder_id = :b) "
@@ -3076,7 +3054,6 @@ async def test_e4_creation_payment_cancellation_and_transition_queue_on_rollout(
         1,
         "non_billable_pending_readback",
         False,
-        1,
         "completed",
         "settled",
         cents,

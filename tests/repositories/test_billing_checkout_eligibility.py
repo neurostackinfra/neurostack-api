@@ -67,7 +67,6 @@ async def _subscription(
         plan="plus",
         billing_cycle="monthly",
         status=status,
-        roster_revision=1,
     )
     session.add(subscription)
     await session.flush()
@@ -83,7 +82,6 @@ def _checkout(
         builder_id=builder_id,
         intent_kind=intent_kind,
         intent_id=order_id,
-        migration_id=None,
         topup_order_id=order_id if intent_kind == "topup" else None,
         attempt_no=1,
         provider="asaas",
