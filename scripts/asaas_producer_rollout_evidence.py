@@ -33,10 +33,16 @@ if str(_REPOSITORY_ROOT) not in sys.path:
 from scripts.asaas_database_secret_reference import ReferenceError  # noqa: E402
 from scripts.verify_asaas_producer_image_rollout import (  # noqa: E402
     APP_CONTAINER,
+    BASE_ENVIRONMENT_NAMES,
+    D3_ENVIRONMENT_NAMES,
+    D3_SECRET_NAMES,
+    ENVIRONMENT_NAME_SETS,
     TASK_FAMILY,
     RolloutError,
+    classify_app_image,
     compare_rollout_readbacks,
     validate_deployment_snapshot,
+    validate_target_image_repository,
 )
 
 REPOSITORY = "neurostackinfra/neurostack-api"
@@ -75,9 +81,7 @@ _TASK_DEFINITION_ARN = re.compile(
 _SECRET_ARN = re.compile(
     r"^arn:aws:secretsmanager:us-east-1:388460142431:secret:[A-Za-z0-9/_+=.@-]+$"
 )
-_BASE_ENV_NAMES = frozenset(
-    {"ENVIRONMENT", "HOST", "LLM_MODEL", "LOG_FORMAT", "PORT", "QDRANT_HOST"}
-)
+_BASE_ENV_NAMES = BASE_ENVIRONMENT_NAMES
 _EXPECTED_APP_SECRET_NAMES = frozenset(
     {
         "DATABASE_URL",
@@ -86,6 +90,12 @@ _EXPECTED_APP_SECRET_NAMES = frozenset(
         "LLM_API_KEY",
         "BILLING_OPERATION_RECEIPT_SIGNING_KEY",
     }
+)
+# The revision 8 sets, or those plus exactly the Group 9 D3 wiring (F1 path A).
+_APP_ENVIRONMENT_NAME_SETS = ENVIRONMENT_NAME_SETS
+_APP_SECRET_NAME_SETS = (
+    _EXPECTED_APP_SECRET_NAMES,
+    _EXPECTED_APP_SECRET_NAMES | D3_SECRET_NAMES,
 )
 _TRUST_KINDS = ("GRANT", "BUILD", "RECEIPT")
 _EXPECTED_DEFINITION_FIELDS = frozenset(
@@ -326,6 +336,11 @@ def _pin_env_values(environment: dict[str, str]) -> dict[str, str]:
 def validate_task_definition_template(raw: Any) -> dict[str, Any]:
     """Validate the protected template and create the exact replacement request.
 
+    The app carries the revision 8 environment and secret names, or those plus
+    exactly the Group 9 D3 names (all of them or none). ``base_environment_sha256``
+    fingerprints every one of those environment values, so the deploy path
+    rejects a serving snapshot whose base or D3 values (or shape) differ.
+
     The returned request still contains the private source environment values;
     callers must write it only to a mode-0600 runner-temporary file.
     """
@@ -369,14 +384,19 @@ def validate_task_definition_template(raw: Any) -> dict[str, Any]:
     app = containers[APP_CONTAINER]
     current_env = _env_map(app)
     _require(
-        set(current_env) == _BASE_ENV_NAMES,
+        frozenset(current_env) in _APP_ENVIRONMENT_NAME_SETS,
         "task_definition_base_environment_names_mismatch",
     )
     producer_pins = _pin_env_values(current_env)
     app_secrets = _secret_map(app)
     _require(
-        set(app_secrets) == _EXPECTED_APP_SECRET_NAMES,
+        frozenset(app_secrets) in _APP_SECRET_NAME_SETS,
         "task_definition_secret_names_mismatch",
+    )
+    _require(
+        (D3_ENVIRONMENT_NAMES <= set(current_env))
+        == (D3_SECRET_NAMES <= set(app_secrets)),
+        "task_definition_d3_wiring_partial",
     )
     _require("DATABASE_URL" not in current_env, "database_url_must_be_secret_reference")
     _require(
@@ -496,23 +516,28 @@ def build_replacement_task_definition(
     app_digest: str,
     pinned_database_value_from: str,
 ) -> dict[str, Any]:
-    """Apply only the immutable app digest, trust pins, gates, and DB version."""
+    """Apply only the immutable app digest, trust pins, gates, and DB version.
+
+    ``image_uri`` is the attested target repository. The template's own app
+    image must be in that repository, or be a digest-pinned bridge image in
+    the source repository (F1 path A); either way it is replaced by
+    ``<image_uri>@<app_digest>``.
+    """
 
     validated = validate_task_definition_template(template)
     _require(_DIGEST.fullmatch(app_digest) is not None, "app_image_digest_invalid")
-    _require(
-        re.fullmatch(
-            r"388460142431\.dkr\.ecr\.us-east-1\.amazonaws\.com/[A-Za-z0-9._/-]+",
-            image_uri,
-        )
-        is not None,
-        "app_image_uri_invalid",
-    )
+    try:
+        validate_target_image_repository(image_uri)
+    except RolloutError:
+        raise EvidenceError("app_image_uri_invalid") from None
     request = validated["request"]
     containers = _container_map(request)
     app = containers[APP_CONTAINER]
     original_image = app["image"]
-    _require(original_image.startswith(image_uri), "source_image_repository_mismatch")
+    try:
+        classify_app_image(original_image, target_repository=image_uri)
+    except RolloutError as exc:
+        raise EvidenceError(f"source_image_repository_mismatch:{exc}") from None
     app["image"] = f"{image_uri}@{app_digest}"
 
     current_environment = _env_map(app)
@@ -755,8 +780,7 @@ def _validate_database_task_ip_binding(
         "database_task_ip_binding_failed",
     )
     _require(
-        bool(snapshot_tasks)
-        and all(isinstance(task, dict) for task in snapshot_tasks),
+        bool(snapshot_tasks) and all(isinstance(task, dict) for task in snapshot_tasks),
         "operator_snapshot_tasks_invalid",
     )
     snapshot_ips = [task.get("privateIp") for task in snapshot_tasks]
@@ -769,8 +793,7 @@ def _validate_database_task_ip_binding(
         all(address.version == 4 for address in sql_addresses)
         and all(address.version == 4 for address in snapshot_addresses)
         and all(
-            str(address) == value
-            for address, value in zip(sql_addresses, sql_task_ips)
+            str(address) == value for address, value in zip(sql_addresses, sql_task_ips)
         )
         and all(
             str(address) == value
@@ -1109,9 +1132,7 @@ def validate_pre_oidc_cohort_confirmation(
         "task_count": cohort_snapshot.get("task_count"),
         "task_definition_arn": cohort_snapshot.get("task_definition_arn"),
         "app_image_digest": cohort_snapshot.get("app_image_digest"),
-        "database_secret_version_id": cohort_snapshot.get(
-            "database_secret_version_id"
-        ),
+        "database_secret_version_id": cohort_snapshot.get("database_secret_version_id"),
         "readiness": cohort.get("readiness"),
     }
 
