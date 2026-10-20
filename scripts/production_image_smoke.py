@@ -29,9 +29,11 @@ the summary reports. Push that image ID; never rebuild it for the push.
   gcc, make, binutils, any ``-dev``) in the dpkg database.
 * ``native-libraries``: ``ldd`` over every ELF file under ``/usr/local`` (the
   interpreter, libpython, lib-dynload, every site-packages extension and
-  vendored library) resolves every library, so none is missing on a code path
-  the other checks never load. The one exception is CPython's ``_tkinter``
-  (Tk and Tcl are not in python:slim, and nothing imports tkinter).
+  vendored library) resolves every library and every symbol version it needs
+  (ldd's ``version `GLIBC_2.38' not found`` lines, which exit 0, fail it too),
+  so none is missing or too old on a code path the other checks never load.
+  The one exception is CPython's ``_tkinter`` missing Tk and Tcl (they are not
+  in python:slim, and nothing imports tkinter).
 * ``no-world-writable``: no file or directory under ``/app`` or site-packages
   is writable by any user. A build context on DrvFs (the ``/mnt/c`` checkout
   in WSL) shows every file as 0777 and COPY keeps it: build from a clone on
@@ -41,7 +43,9 @@ the summary reports. Push that image ID; never rebuild it for the push.
 * ``kms-signers``: the KMS receipt and grant signer factories build their
   clients (they fail closed when the AWS SDK is missing). No KMS call is made.
 * ``alembic-heads``: ``alembic heads`` prints exactly one line, the head
-  named by ``--expected-head`` (035 while 036 and 037 are not on main).
+  named by ``--expected-head``: the head of the migrations the image contains
+  (035 on main today, 036 once PR #121 is merged), not the production window
+  below, which stays 032:035.
 * ``spa-index``: ``test -f /app/spa/index.html`` (``SPA_DIST_DIR`` of the
   Dockerfile, read by ``src/api/spa.py``).
 * ``alembic-offline-sql``: ``alembic upgrade 032:035 --sql`` emits the
@@ -231,10 +235,13 @@ INTERPRETER_HEADERS = "/usr/local/include/python3.11/"
 # ldd over every ELF file under argv[1] (the smoke passes /usr/local: the
 # interpreter, libpython, lib-dynload and every site-packages extension or
 # vendored library): which ones were scanned, which libraries do not resolve,
-# and where ldd itself failed. A static ELF is not an error.
+# which need a symbol version their library lacks (a library present but too
+# old: ldd prints "<file>: <library>: version `GLIBC_2.38' not found (required
+# by <file>)" and still exits 0), and where ldd itself failed. A static ELF is
+# not an error.
 NATIVE_LIBRARIES = """
 import json, os, re, subprocess, sys
-elf, unresolved, errors = [], {}, {}
+elf, unresolved, versions, errors = [], {}, {}, {}
 for parent, _, names in os.walk(sys.argv[1]):
     for name in names:
         path = os.path.join(parent, name)
@@ -245,12 +252,21 @@ for parent, _, names in os.walk(sys.argv[1]):
                 continue
         elf.append(path)
         run = subprocess.run(["ldd", path], capture_output=True, text=True)
+        output = run.stdout + "\\n" + run.stderr
         missing = re.findall(r"^\\s*(\\S+) => not found$", run.stdout, re.MULTILINE)
+        too_old = re.findall(r"^.*\\bversion `[^`'\\n]+' not found\\b.*$", output, re.MULTILINE)
         if missing:
             unresolved[path] = sorted(missing)
-        elif run.returncode and "not a dynamic executable" not in run.stdout + run.stderr:
+        if too_old:
+            versions[path] = sorted({line.strip() for line in too_old})
+        if run.returncode and not missing and "not a dynamic executable" not in output:
             errors[path] = (run.stderr or run.stdout).strip()[-200:]
-print(json.dumps({"elf": sorted(elf), "unresolved": unresolved, "errors": errors}))
+print(json.dumps({
+    "elf": sorted(elf),
+    "unresolved": unresolved,
+    "versions": versions,
+    "errors": errors,
+}))
 """
 NATIVE_ROOT = "/usr/local"
 INTERPRETER = "/usr/local/bin/python3.11"
@@ -538,6 +554,10 @@ def native_libraries_problem(stdout: str) -> str | None:
             str(path): [str(name) for name in names]
             for path, names in report["unresolved"].items()
         }
+        versions = {
+            str(path): [str(line) for line in lines]
+            for path, lines in report["versions"].items()
+        }
         errors = {str(path): str(error) for path, error in report["errors"].items()}
     except (ValueError, KeyError, TypeError, AttributeError) as error:
         return f"unreadable native library report: {error!r}"
@@ -556,6 +576,14 @@ def native_libraries_problem(stdout: str) -> str | None:
     if gaps:
         sample = dict(list(gaps.items())[:10])
         problems.append(f"{len(gaps)} ELF files with unresolved libraries: {sample}")
+    # No exception here, _tkinter included: a library that loads but lacks a
+    # symbol version fails at import time.
+    if versions:
+        sample = dict(list(sorted(versions.items()))[:10])
+        problems.append(
+            f"{len(versions)} ELF files need a symbol version their library"
+            f" lacks: {sample}"
+        )
     if errors:
         problems.append(
             f"ldd failed on {len(errors)} files: {dict(list(errors.items())[:5])}"
@@ -914,7 +942,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--expected-head",
         required=True,
-        help="the single Alembic head the image must carry, e.g. 035",
+        help="the single Alembic head of the migrations the image contains"
+        " (e.g. 035); the production window stays 032:035 whatever it is",
     )
     parser.add_argument("--build-log", type=Path, help="write the build output here")
     args = parser.parse_args(argv)

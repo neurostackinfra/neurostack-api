@@ -757,8 +757,11 @@ Since PRs #90 and #91, the production `Dockerfile` builds the SPA in the
 this stage included, and the offline image smoke below passed on 2026-10-19
 (not the protected workflow); the browser CSP check is still open. With the
 compiler-free production stage, a local `linux/amd64` build and the extended
-smoke (`no-build-toolchain` and `serve` included) passed on 2026-10-20, again
-not the protected workflow and not `linux/arm64`.
+smoke passed on 2026-10-20, again not the protected workflow and not
+`linux/arm64`. The smoke runs eleven checks, in this order: `imports`,
+`site-packages`, `no-build-toolchain`, `native-libraries`,
+`no-world-writable`, `src-imports`, `kms-signers`, `alembic-heads`,
+`spa-index`, `alembic-offline-sql` and `serve` (see "Image smoke" below).
 
 Network access the image build needs (from the Dockerfile; the 2026-10-19
 build succeeded with it, the exact hosts were not captured):
@@ -810,7 +813,9 @@ build succeeded with it, the exact hosts were not captured):
   added: every shared library the interpreter and the locked wheels link
   against ships with the pinned image (measured once with `ldd` and
   `dpkg -S`; the smoke's `native-libraries` check now runs `ldd` over every
-  ELF file under `/usr/local` on every build), and `asyncpg` speaks the
+  ELF file under `/usr/local` on every smoke run; the protected build
+  workflow, `.github/workflows/asaas-build-attestation.yml`, only builds and
+  pushes and never runs the smoke), and `asyncpg` speaks the
   PostgreSQL protocol itself (the lock has no psycopg). The base requirements
   are installed BEFORE the copy: the
   fresh image ships `pip` 24.0, `setuptools` 79.0.1 and `packaging` 26.3, and
@@ -867,8 +872,15 @@ RUN_DOCKER_IMAGE_SMOKE=1 poetry run pytest -p no:cacheprovider -rs \
 or, for the JSON summary on stdout:
 
 ```bash
-poetry run python scripts/production_image_smoke.py --expected-head 035 --build-log /tmp/build.log
+poetry run python scripts/production_image_smoke.py --expected-head <head of the image> --build-log /tmp/build.log
 ```
+
+`--expected-head` is the head of the migrations CONTAINED in the image, that
+is of `alembic/versions` in the checkout being built: `035` on `main` today,
+`036` once PR #121 (migration 036) is merged. It is not the production
+migration window, which stays pinned at `alembic upgrade 035` (gate 5) and is
+checked offline as `032:035` whatever the image's head is. Whichever of this
+change and PR #121 lands second only changes the number given here.
 
 It runs `docker buildx build --platform linux/amd64 --load --target production`
 on the working tree (no push, no registry login) with `VCS_REF` set to the git
@@ -885,14 +897,19 @@ directories, no `/usr/lib/gcc*` or `/usr/libexec/gcc*`, no C header outside
 have no extension), empty apt lists and no build or `-dev` package in the
 dpkg database; `ldd` resolves every library of every ELF file under
 `/usr/local` (the interpreter, libpython, lib-dynload, every site-packages
-extension and vendored library), the only exception being CPython's
-`_tkinter` (Tk and Tcl are not in python:slim and nothing imports tkinter);
-no file or directory under `/app` or site-packages is world-writable; every
-top-level import under `src/`
-resolves; both KMS
+extension and vendored library) and every symbol version it needs (a
+library that is present but too old makes ldd print ``version `GLIBC_2.38'
+not found (required by …)`` and still exit 0: that fails the check too, as
+does ldd itself failing), the only exception being CPython's `_tkinter`
+missing Tk and Tcl (they are not in python:slim and nothing imports
+tkinter); no file or directory under `/app` or site-packages is
+world-writable; every top-level import under `src/` resolves; both KMS
 signer factories build their clients (no KMS call); `alembic heads` prints
-exactly `035 (head)`; `/app/spa/index.html` exists; and `alembic upgrade
-032:035 --sql` emits the migration window as one transaction. The window
+exactly one line, `<expected head> (head)`, the head of the migrations in
+the image given with `--expected-head` (`035` on `main` today, `036` once
+PR #121 is merged); `/app/spa/index.html` exists; and `alembic upgrade
+032:035 --sql` emits the production migration window, which stays `032:035`
+whatever the image's head, as one transaction. The window
 starts at `032` because migration `017` reads rows, which offline mode cannot
 do. Last, `serve` starts the image's own CMD (as `neurostack`, still with
 `--network none`) with `ENVIRONMENT=staging`, a throwaway `SECRET_KEY`, no

@@ -160,6 +160,27 @@ def test_spa_check_targets_the_directory_the_image_serves() -> None:
     assert _checks()["spa-index"].argv[-1] == f"{smoke.SPA_DIST_DIR}/{INDEX_FILE}"
 
 
+def test_scanned_site_packages_is_where_the_dockerfile_copies_them() -> None:
+    # The deps stage's site-packages land exactly where the checks look.
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    copies = re.findall(
+        r"^COPY --from=deps (\S+site-packages) (\S+)$", text, re.MULTILINE
+    )
+    assert copies == [(smoke.SITE_PACKAGES_DIR, smoke.SITE_PACKAGES_DIR)]
+    assert smoke.SITE_PACKAGES_DIR == SITE_PACKAGES_DIR
+    assert smoke.SITE_PACKAGES_DIR.startswith(smoke.NATIVE_ROOT + "/")
+
+
+def test_runbook_lists_every_check_in_the_order_the_smoke_runs_them() -> None:
+    text = " ".join(RUNBOOK.read_text(encoding="utf-8").split())
+    listed = text.split("The smoke runs eleven checks, in this order: ", 1)[1]
+    names = re.findall(r"`([a-z-]+)`", listed.split("(see", 1)[0])
+    assert names == [*_checks(), "serve"]
+    # The image's head is a parameter, never the window's 035 written in.
+    assert "--expected-head <head of the image>" in text
+    assert "--expected-head 0" not in text
+
+
 def test_offline_window_is_the_runbook_window_of_the_tree() -> None:
     assert re.search(
         rf'^MIGRATIONS_SOURCE_REVISION = "{smoke.WINDOW_FROM}"$',
@@ -813,10 +834,19 @@ def _native(**changes: Any) -> str:
             f"{SITE_PACKAGES_DIR}/numpy.libs/libscipy_openblas64_-32a4b2a6.so",
         ],
         "unresolved": {TKINTER: ["libtcl8.6.so", "libtk8.6.so"]},
+        "versions": {},
         "errors": {},
     }
     report.update(changes)
     return json.dumps(report)
+
+
+# What ldd prints (on stdout, exit status 0) for a library that is present but
+# older than the symbol version a file needs.
+TOO_OLD = (
+    f"{EXTENSION}: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found"
+    f" (required by {EXTENSION})"
+)
 
 
 def test_native_libraries_pass_with_only_tkinter_unresolved() -> None:
@@ -852,10 +882,29 @@ def test_native_libraries_pass_with_only_tkinter_unresolved() -> None:
             "/usr/local/bin/python3.11",
         ),
         ({"errors": {EXTENSION: "ldd: exited with unknown exit code (139)"}}, "ldd"),
+        (
+            {"versions": {EXTENSION: [TOO_OLD]}},
+            f"1 ELF files need a symbol version their library lacks: "
+            f"{{'{EXTENSION}': [{TOO_OLD!r}]}}",
+        ),
+        (
+            # The _tkinter exception covers Tk and Tcl being absent, nothing else.
+            {"versions": {TKINTER: [TOO_OLD.replace(EXTENSION, TKINTER)]}},
+            "1 ELF files need a symbol version",
+        ),
+        (
+            {
+                "unresolved": {},
+                "versions": {"/usr/local/bin/python3.11": [TOO_OLD]},
+            },
+            "need a symbol version",
+        ),
         ({"elf": [EXTENSION]}, "no /usr/local/bin/python3.11"),
         ({"elf": ["/usr/local/bin/python3.11"]}, "no site-packages ELF file"),
         ({"elf": []}, "no /usr/local/bin/python3.11"),
         ({"unresolved": []}, "unreadable native library report"),
+        ({"versions": []}, "unreadable native library report"),
+        ({"versions": None}, "unreadable native library report"),
         ({"errors": None}, "unreadable native library report"),
     ],
     ids=[
@@ -864,10 +913,15 @@ def test_native_libraries_pass_with_only_tkinter_unresolved() -> None:
         "tkinter-name-elsewhere",
         "interpreter-gap",
         "ldd-failed",
+        "symbol-version-missing",
+        "tkinter-symbol-version",
+        "interpreter-symbol-version",
         "no-interpreter",
         "no-extension",
         "nothing-scanned",
         "unresolved-not-a-map",
+        "versions-not-a-map",
+        "versions-missing",
         "errors-missing",
     ],
 )
@@ -879,6 +933,11 @@ def test_native_libraries_problems(changes: dict[str, Any], problem: str) -> Non
 def test_native_libraries_reject_unreadable_output() -> None:
     assert "unreadable" in (smoke.native_libraries_problem("not json") or "")
     assert "unreadable" in (smoke.native_libraries_problem("{}") or "")
+    # A snippet that stopped reporting symbol versions fails closed.
+    without_versions = json.loads(_native())
+    del without_versions["versions"]
+    found = smoke.native_libraries_problem(json.dumps(without_versions))
+    assert "unreadable" in (found or "")
 
 
 def _imports_of(path: Path) -> set[str]:
@@ -935,7 +994,291 @@ def test_native_libraries_snippet_finds_an_unresolved_library(tmp_path: Path) ->
     # Symlinks and non-ELF files are not scanned twice or at all.
     assert report["elf"] == sorted([str(good), str(broken)])
     assert report["unresolved"] == {str(broken): ["libq.so.6"]}
-    assert report["errors"] == {}
+    assert report["versions"] == {} and report["errors"] == {}
+
+
+@pytest.mark.skipif(shutil.which("ldd") is None, reason="ldd unavailable")
+def test_native_libraries_snippet_finds_a_library_too_old_for_a_symbol(
+    tmp_path: Path,
+) -> None:
+    # The library is there (ldd resolves it and exits 0) but lacks the symbol
+    # version the file needs: the loader would refuse the file at import time.
+    root, good, broken = _elf_root(tmp_path)
+    data = good.read_bytes()
+    assert b"GLIBC_2.2.5\x00" in data, "the host's true(1) needs no GLIBC_2.2.5"
+    broken.write_bytes(data.replace(b"GLIBC_2.2.5\x00", b"GLIBC_9.2.5\x00"))
+    ldd = subprocess.run(["ldd", str(broken)], capture_output=True, text=True)
+    assert ldd.returncode == 0 and "=> not found" not in ldd.stdout, ldd
+    completed = subprocess.run(
+        [sys.executable, "-c", smoke.NATIVE_LIBRARIES, str(root)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    report = json.loads(completed.stdout)
+    assert report["elf"] == sorted([str(good), str(broken)])
+    assert report["unresolved"] == {} and report["errors"] == {}
+    assert list(report["versions"]) == [str(broken)]
+    [line] = report["versions"][str(broken)]
+    assert "version `GLIBC_9.2.5' not found" in line, line
+    assert line.startswith(f"{broken}: "), line
+    problem = smoke.native_libraries_problem(_native(versions=report["versions"]))
+    assert problem is not None and "need a symbol version" in problem, problem
+    assert "GLIBC_9.2.5" in problem
+
+
+# What a fake ldd prints for a file: (stdout, stderr, exit status).
+LddAnswer = tuple[str, str, int]
+CLEAN_LDD: LddAnswer = (
+    "\tlinux-vdso.so.1 (0x00007ffd5f5e6000)\n"
+    "\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f1c2a000000)\n"
+    "\t/lib64/ld-linux-x86-64.so.2 (0x00007f1c2a3f1000)\n",
+    "",
+    0,
+)
+
+
+def _fake_ldd(directory: Path, answers: dict[str, LddAnswer]) -> dict[str, str]:
+    """An ``ldd`` first in PATH that answers by the file's base name (unknown
+    names get CLEAN_LDD); returns the environment that puts it there."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "answers.json").write_text(json.dumps(answers), encoding="utf-8")
+    script = directory / "ldd"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "here = os.path.dirname(os.path.abspath(__file__))\n"
+        "with open(os.path.join(here, 'answers.json'), encoding='utf-8') as f:\n"
+        "    answers = json.load(f)\n"
+        f"default = {list(CLEAN_LDD)!r}\n"
+        "out, err, status = answers.get(os.path.basename(sys.argv[1]), default)\n"
+        "sys.stdout.write(out)\n"
+        "sys.stderr.write(err)\n"
+        "sys.exit(status)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return {**os.environ, "PATH": f"{directory}{os.pathsep}{os.environ['PATH']}"}
+
+
+def _usr_local(root: Path, *, interpreter: str = "bin/python3.11") -> Path:
+    """A /usr/local-shaped tree of ELF-looking files (ldd is faked): the
+    interpreter and one site-packages extension."""
+
+    for relative in (interpreter, "lib/python3.11/site-packages/pkg/ext.so"):
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        (root / relative).write_bytes(b"\x7fELF\x02\x01\x01" + b"\x00" * 57)
+    return root
+
+
+def _native_scan(root: Path, env: dict[str, str]) -> dict[str, Any]:
+    completed = subprocess.run(
+        [sys.executable, "-c", smoke.NATIVE_LIBRARIES, str(root)],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+    report: dict[str, Any] = json.loads(completed.stdout)
+    return report
+
+
+def _in_image(report: dict[str, Any], root: Path, image_root: str) -> str:
+    """The report as the image would print it: the fake root replaced by the
+    directory the check scans in the image."""
+
+    return json.dumps(report).replace(str(root), image_root)
+
+
+_EXT = "ext.so"
+_VERSION_LINE = (
+    "./ext.so: /usr/lib/x86_64-linux-gnu/libstdc++.so.6: version `GLIBCXX_3.4.32'"
+    " not found (required by ./ext.so)"
+)
+
+
+@pytest.mark.parametrize(
+    ("answer", "key", "expected", "problem"),
+    [
+        pytest.param(
+            (_VERSION_LINE + "\n" + CLEAN_LDD[0], "", 0),
+            "versions",
+            [_VERSION_LINE],
+            "need a symbol version",
+            id="glibcxx",
+        ),
+        pytest.param(
+            (
+                "\t/usr/lib/x86_64-linux-gnu/libstdc++.so.6: version `CXXABI_1.3.15'"
+                " not found (required by ./ext.so)\n" + CLEAN_LDD[0],
+                "",
+                0,
+            ),
+            "versions",
+            [
+                "/usr/lib/x86_64-linux-gnu/libstdc++.so.6: version `CXXABI_1.3.15'"
+                " not found (required by ./ext.so)"
+            ],
+            "need a symbol version",
+            id="cxxabi-indented",
+        ),
+        pytest.param(
+            (
+                CLEAN_LDD[0],
+                "./ext.so: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38'"
+                " not found (required by ./ext.so)\n",
+                0,
+            ),
+            "versions",
+            [
+                "./ext.so: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38'"
+                " not found (required by ./ext.so)"
+            ],
+            "need a symbol version",
+            id="glibc-on-stderr",
+        ),
+        pytest.param(
+            (
+                _VERSION_LINE
+                + "\n"
+                + _VERSION_LINE.replace("GLIBCXX_3.4.32", "GLIBCXX_3.4.31")
+                + "\n",
+                "",
+                0,
+            ),
+            "versions",
+            sorted(
+                [
+                    _VERSION_LINE,
+                    _VERSION_LINE.replace("GLIBCXX_3.4.32", "GLIBCXX_3.4.31"),
+                ]
+            ),
+            "need a symbol version",
+            id="two-versions",
+        ),
+        pytest.param(
+            ("", "ldd: exited with unknown exit code (139)\n", 1),
+            "errors",
+            "ldd: exited with unknown exit code (139)",
+            "ldd failed on 1 files",
+            id="ldd-fails",
+        ),
+        pytest.param(
+            ("ldd: ./ext.so: Permission denied\n", "", 1),
+            "errors",
+            "ldd: ./ext.so: Permission denied",
+            "ldd failed on 1 files",
+            id="ldd-fails-on-stdout",
+        ),
+        pytest.param(
+            ("\tlibq.so.6 => not found\n", "", 0),
+            "unresolved",
+            ["libq.so.6"],
+            "unresolved libraries",
+            id="missing-library",
+        ),
+        pytest.param(CLEAN_LDD, None, None, None, id="vdso-and-resolved"),
+        pytest.param(
+            ("\tnot a dynamic executable\n", "", 1), None, None, None, id="static"
+        ),
+        pytest.param(
+            ("\tstatically linked\n", "", 0), None, None, None, id="static-pie"
+        ),
+        pytest.param(
+            # A library whose file name merely contains the words.
+            (
+                "\tlinux-vdso.so.1 (0x00007ffd5f5e6000)\n"
+                "\tlibversion-not-found.so.1 => /usr/local/lib/"
+                "libversion-not-found.so.1 (0x00007f1c2a000000)\n",
+                "",
+                0,
+            ),
+            None,
+            None,
+            None,
+            id="words-in-a-library-name",
+        ),
+    ],
+)
+def test_native_libraries_snippet_reads_what_ldd_prints(
+    tmp_path: Path,
+    answer: LddAnswer,
+    key: str | None,
+    expected: Any,
+    problem: str | None,
+) -> None:
+    root = _usr_local(tmp_path / "local")
+    env = _fake_ldd(tmp_path / "fake-bin", {_EXT: answer})
+    report = _native_scan(root, env)
+    extension = str(root / "lib/python3.11/site-packages/pkg" / _EXT)
+    assert report["elf"] == sorted([str(root / "bin/python3.11"), extension])
+    findings = {name: report[name] for name in ("unresolved", "versions", "errors")}
+    if key is None:
+        assert findings == {"unresolved": {}, "versions": {}, "errors": {}}
+    else:
+        assert findings.pop(key) == {extension: expected}
+        assert findings == {name: {} for name in findings}
+    # Through the real check, as the image would report it.
+    validate = _checks()["native-libraries"].validate
+    found = validate(_completed(_in_image(report, root, smoke.NATIVE_ROOT)))
+    if problem is None:
+        assert found is None
+    else:
+        assert found is not None and problem in found, found
+
+
+@pytest.mark.parametrize(
+    "interpreter", ["bin/python3.11", "../bin/python3.11", "lib/python3.11/x"]
+)
+def test_native_scan_root_and_interpreter_guard_hold_together(
+    tmp_path: Path, interpreter: str
+) -> None:
+    # Independent of EXPECTED_CHECKS: the root the check passes, scanned in a
+    # fake filesystem, must find the interpreter and an extension where the
+    # image has them, and the guard must fail a scan that misses the
+    # interpreter. A changed root, a dropped guard or both fail here.
+    filesystem = tmp_path / "fs"
+    image_root = _checks()["native-libraries"].argv[-1]
+    _usr_local(filesystem / "usr/local", interpreter=interpreter)
+    scanned = filesystem / image_root.lstrip("/")
+    env = _fake_ldd(tmp_path / "fake-bin", {})
+    report = _native_scan(scanned, env)
+    stdout = json.dumps(report).replace(str(filesystem), "")
+    found = _checks()["native-libraries"].validate(_completed(stdout))
+    if interpreter == "bin/python3.11":
+        assert found is None
+    else:
+        assert found is not None and "no /usr/local/bin/python3.11" in found, found
+
+
+@pytest.mark.parametrize("python3", [True, False])
+def test_toolchain_scan_root_and_guard_hold_together(
+    tmp_path: Path, python3: bool
+) -> None:
+    # Same for no-build-toolchain: the check's root, scanned in a fake root,
+    # passes; without /usr/local/bin/python3 the guard must fail it.
+    filesystem = _fake_root(tmp_path, toolchain=False)
+    if not python3:
+        (filesystem / "usr/local/bin/python3").unlink()
+    image_root = _checks()["no-build-toolchain"].argv[-1]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            smoke.TOOLCHAIN,
+            str(filesystem / image_root.lstrip("/")),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PATH": "/usr/local/bin:/bin:/usr/bin"},
+    )
+    found = _checks()["no-build-toolchain"].validate(completed)
+    if python3:
+        assert found is None, found
+    else:
+        assert found is not None and "/usr/local/bin/python3" in found, found
 
 
 # --- World-writable paths -----------------------------------------------------
@@ -993,6 +1336,16 @@ def test_world_writable_snippet_reports_files_and_directories(tmp_path: Path) ->
     (app / "open.py").chmod(0o666)
     (app / "shared").mkdir()
     (app / "shared").chmod(0o777)
+    # Only the "other" write bit counts: group-writable passes, and other-
+    # writable without group write fails.
+    (app / "group.py").write_text("", encoding="utf-8")
+    (app / "group.py").chmod(0o664)
+    (app / "other.py").write_text("", encoding="utf-8")
+    (app / "other.py").chmod(0o646)
+    (app / "group-dir").mkdir()
+    (app / "group-dir").chmod(0o775)
+    (app / "other-dir").mkdir()
+    (app / "other-dir").chmod(0o757)
     (app / "src").chmod(0o755)
     app.chmod(0o755)
     (app / "link").symlink_to("open.py")  # a symlink's own mode is always 0777
@@ -1005,8 +1358,10 @@ def test_world_writable_snippet_reports_files_and_directories(tmp_path: Path) ->
     )
     report = json.loads(completed.stdout)
     assert report[str(app)] == {
-        "scanned": 5,
-        "writable": sorted([str(app / "open.py"), str(app / "shared")]),
+        "scanned": 9,
+        "writable": sorted(
+            str(app / name) for name in ("open.py", "shared", "other.py", "other-dir")
+        ),
     }
     assert report[str(missing)] == {"scanned": 0, "writable": []}
 
@@ -1713,9 +2068,13 @@ def test_full_smoke_fails_on_any_exit_zero_failure(
             "native-libraries",
             lambda: _native(unresolved={EXTENSION: ["libpq.so.5"]}),
         ),
+        (
+            "native-libraries",
+            lambda: _native(unresolved={}, versions={EXTENSION: [TOO_OLD]}),
+        ),
         ("no-world-writable", lambda: _modes(app=["/app/src/api/main.py"])),
     ],
-    ids=["gcc-present", "library-missing", "world-writable"],
+    ids=["gcc-present", "library-missing", "library-too-old", "world-writable"],
 )
 def test_full_smoke_fails_on_a_new_check_s_finding(
     monkeypatch: pytest.MonkeyPatch, name: str, report: Callable[[], str]
@@ -1723,7 +2082,9 @@ def test_full_smoke_fails_on_a_new_check_s_finding(
     # Each report exits 0: only the check's own validator can fail it.
     summary = _full_smoke(monkeypatch, CheckDocker({name: _completed(report())}))
     assert summary.status == "fail"
-    assert _statuses(summary)[name] == "fail"
+    statuses = _statuses(summary)
+    assert statuses.pop(name) == "fail"
+    assert set(statuses.values()) == {"pass"}
     detail = next(c["detail"] for c in summary.checks if c["name"] == name)
     assert detail
 

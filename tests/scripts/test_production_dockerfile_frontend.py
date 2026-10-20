@@ -1597,12 +1597,47 @@ def test_runtime_tooling_is_installed_before_the_deps_site_packages() -> None:
     _assert_tooling_precedes_the_deps_copy(_stages())
 
 
+# Where each deps COPY lands in the production stage, with its flags: the
+# site-packages over the fresh interpreter's own (the directory the smoke's
+# site-packages, native-libraries and no-world-writable checks read), the
+# console scripts next to python, and the editable core package where its
+# .pth file points. Anywhere else the interpreter would not see the packages
+# (or would see two copies); a --chown would hand them to the app user.
+SITE_PACKAGES = "/usr/local/lib/python3.11/site-packages"
+DEPS_COPIES = [
+    ({"from": "deps"}, [SITE_PACKAGES], SITE_PACKAGES),
+    ({"from": "deps"}, ["/usr/local/bin"], "/usr/local/bin"),
+    (
+        {"from": "deps", "chown": "neurostack:neurostack"},
+        ["/app/packages/neurostack-core"],
+        "/app/packages/neurostack-core",
+    ),
+]
+
+
+def _assert_deps_copies_land_in_place(stages: tuple[Stage, ...]) -> None:
+    found = [
+        (copy.flags, copy.sources, copy.destination)
+        for copy in _copies(_stage("production", stages))
+        if copy.flags.get("from") == "deps"
+    ]
+    assert found == DEPS_COPIES, f"production deps COPYs: {found}"
+
+
+def test_deps_copies_land_where_the_interpreter_reads_them() -> None:
+    _assert_deps_copies_land_in_place(_stages())
+
+
 _APT_RUN = (
     "RUN apt-get update && apt-get install -y --no-install-recommends \\\n"
     "    curl \\\n"
     "    && rm -rf /var/lib/apt/lists/*\n"
 )
 _DEPS_BIN = "COPY --from=deps /usr/local/bin /usr/local/bin\n"
+_DEPS_SITE = (
+    "COPY --from=deps /usr/local/lib/python3.11/site-packages"
+    " /usr/local/lib/python3.11/site-packages\n"
+)
 # Production's USER (development has one too: anchored by what follows).
 _USER = "USER neurostack\n\n# Expose port\nEXPOSE 8000\n\n# Health check"
 
@@ -1720,6 +1755,45 @@ _USER = "USER neurostack\n\n# Expose port\nEXPOSE 8000\n\n# Health check"
             _assert_runtime_matches_base,
             "production RUNs",
         ),
+        (
+            _DEPS_SITE,
+            _DEPS_SITE.replace(
+                " /usr/local/lib/python3.11/site-packages\n",
+                " /usr/lib/python3/dist-packages\n",
+            ),
+            _assert_deps_copies_land_in_place,
+            "production deps COPYs",
+        ),
+        (
+            _DEPS_SITE,
+            _DEPS_SITE.replace(
+                " /usr/local/lib/python3.11/site-packages\n",
+                " /app/site-packages\n",
+            ),
+            _assert_deps_copies_land_in_place,
+            "production deps COPYs",
+        ),
+        (
+            _DEPS_SITE,
+            _DEPS_SITE.replace(
+                "site-packages /usr/local/lib/python3.11/site-packages\n",
+                "site-packages /usr/local/lib/python3.12/site-packages\n",
+            ),
+            _assert_deps_copies_land_in_place,
+            "production deps COPYs",
+        ),
+        (
+            _DEPS_SITE,
+            _DEPS_SITE.replace("--from=deps", "--from=deps --chown=neurostack"),
+            _assert_deps_copies_land_in_place,
+            "production deps COPYs",
+        ),
+        (
+            _DEPS_BIN,
+            _DEPS_BIN.replace(" /usr/local/bin\n", " /usr/bin\n"),
+            _assert_deps_copies_land_in_place,
+            "production deps COPYs",
+        ),
     ],
     ids=[
         "build-essential",
@@ -1740,6 +1814,11 @@ _USER = "USER neurostack\n\n# Expose port\nEXPOSE 8000\n\n# Health check"
         "workdir",
         "expose",
         "run-after-user",
+        "site-packages-to-dist-packages",
+        "site-packages-to-app",
+        "site-packages-to-other-python",
+        "site-packages-chowned",
+        "console-scripts-elsewhere",
     ],
 )
 def test_runtime_stage_contract_rejects_mutations(
