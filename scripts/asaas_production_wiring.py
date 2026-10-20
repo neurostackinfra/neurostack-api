@@ -2120,11 +2120,14 @@ def _plan_protected_path_integrity(
     except evidence.EvidenceError:
         app_image = None
     # asaas_producer_rollout_evidence.build_replacement_task_definition and
-    # verify_asaas_producer_image_rollout.validate_deployment_snapshot both
-    # require the template's app image to start with the producer repository.
-    if not (
-        isinstance(app_image, str) and app_image.startswith(PRODUCER_IMAGE_REPOSITORY)
-    ):
+    # verify_asaas_producer_image_rollout.validate_deployment_snapshot accept a
+    # template/serving app image in the producer repository, or a bridge image
+    # in the source repository pinned by digest (never by tag).
+    try:
+        rollout.classify_app_image(
+            app_image, target_repository=PRODUCER_IMAGE_REPOSITORY
+        )
+    except rollout.RolloutError:
         image_gate.blocks.append("F1_protected_path_image_repository_mismatch")
     try:
         candidate_fingerprint = rollout._task_definition_runtime_fingerprint(candidate)
@@ -2150,8 +2153,8 @@ def _plan_protected_path_integrity(
     # rollback target to image + wiring (Path B) cannot pass it.
     if source_fingerprint != candidate_fingerprint:
         image_gate.blocks.append("F1_path_b_runtime_fingerprint_changes")
-    # Only the six base environment values are fingerprinted, so a changed D3
-    # value (for example ASAAS_WEBHOOK_URL) is invisible to the integrity check.
+    # True since F1 path A: the runtime fingerprint hashes the D3 environment
+    # values too, so a changed ASAAS_WEBHOOK_URL fails the integrity check.
     image_gate.info["d3_environment_values_fingerprinted"] = values_fingerprinted
 
 

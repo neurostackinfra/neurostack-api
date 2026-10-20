@@ -1,0 +1,125 @@
+name: Billing PostgreSQL integration
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  push:
+    branches:
+      - main
+
+# A PR's runs share one group, so a newer push to the PR cancels the older
+# run. Each push to main gets its own group (its commit SHA): a group holds
+# only one pending run, so a shared main group would let a newer push drop an
+# older pending one even without cancel-in-progress. PR groups are prefixed
+# `pr-`, so a PR (forks included) can never join a main push's group.
+concurrency:
+  group: billing-postgres-integration-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  billing-postgres:
+    name: Billing PostgreSQL suites
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    services:
+      # Disposable cluster for this job only. The password is a throwaway
+      # literal, not a secret: the port is published on the runner's loopback
+      # and the container is destroyed with the job.
+      postgres:
+        # postgres:16.15-alpine, the digest docker-compose.production.yml pins;
+        # a new 16.x image cannot change this required check without review.
+        image: postgres@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-disposable-password
+          POSTGRES_DB: neurostack_ci
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Check out the reviewed commit
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: "3.12"
+
+      - name: Install the locked project dependencies
+        run: |
+          python -m pip install --disable-pip-version-check "poetry==2.4.1"
+          poetry install --with dev --no-root
+
+      - name: Validate this workflow's contract
+        run: |
+          poetry run pytest -q -p no:cacheprovider \
+            tests/scripts/test_billing_postgres_integration_workflow.py
+
+      # Service containers take no server arguments, so the settings that
+      # test_server_log_contains_only_intentional_rejections needs (it skips
+      # without them) are applied with ALTER SYSTEM and a container restart.
+      # Rotation is off: the audit reads only the current log file, so a
+      # rotation at 00:00 UTC mid-module would hide its expected rejections.
+      - name: Enable the server log the trigger characterization audits
+        shell: bash
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          PGPASSWORD: ci-disposable-password
+        run: |
+          set -euo pipefail
+          # test_asaas_billing_postgres.py runs scripts/init-db.sql with this path.
+          test -x /usr/bin/psql || { echo "/usr/bin/psql is required" >&2; exit 1; }
+          docker exec "$POSTGRES_CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d postgres \
+            -c "ALTER SYSTEM SET logging_collector = on" \
+            -c "ALTER SYSTEM SET log_line_prefix = '%m [%p] %d '" \
+            -c "ALTER SYSTEM SET log_rotation_age = 0" \
+            -c "ALTER SYSTEM SET log_rotation_size = 0"
+          docker restart "$POSTGRES_CONTAINER"
+          for _ in $(seq 1 60); do
+            if pg_isready -h 127.0.0.1 -p 5432 -U postgres -d postgres; then
+              break
+            fi
+            sleep 1
+          done
+          settings="$(psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -v ON_ERROR_STOP=1 -tA \
+            -c "SELECT current_setting('logging_collector') || '|' || current_setting('log_line_prefix') || '|' || current_setting('log_rotation_age') || '|' || current_setting('log_rotation_size') || '|' || (pg_current_logfile() IS NOT NULL)")"
+          echo "server log settings: $settings"
+          test "$settings" = "on|%m [%p] %d |0|0|true"
+
+      - name: Migrate the service database to the Alembic head
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:ci-disposable-password@127.0.0.1:5432/neurostack_ci
+        run: |
+          set -euo pipefail
+          poetry run alembic upgrade head
+          current="$(poetry run alembic current 2>&1)"
+          echo "$current"
+          case "$current" in
+            *"(head)"*) ;;
+            *) echo "service database is not at the Alembic head" >&2; exit 1 ;;
+          esac
+
+      - name: Run the release-candidate PostgreSQL suites
+        shell: bash
+        env:
+          POSTGRES_SMOKE_DATABASE_URL: postgresql://postgres:ci-disposable-password@127.0.0.1:5432/postgres
+        run: |
+          set -euo pipefail
+          source scripts/wish-gates.sh
+          asaas_release_candidate_postgres_suites

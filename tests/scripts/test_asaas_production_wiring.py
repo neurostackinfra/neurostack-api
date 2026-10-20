@@ -20,6 +20,7 @@ import yaml
 
 from scripts import asaas_producer_rollout_evidence as evidence
 from scripts import asaas_production_wiring as wiring
+from scripts import verify_asaas_producer_image_rollout as rollout
 from src.config.settings import Settings
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1145,20 +1146,121 @@ def test_secrets_appear_only_as_valuefrom_references() -> None:
     assert all(set(row) == {"name", "valueFrom"} for row in app["secrets"])
 
 
-def test_structural_evidence_validators_pass_and_group5_allowlist_blocks() -> None:
+def test_structural_evidence_validators_and_group5_template_accept_the_rendering() -> (
+    None
+):
     _plan_result, rendered = _plan(FakeAws(applied=True))
     assert rendered is not None
     results = wiring.run_evidence_validators(rendered, SOURCE_ARN)
     structural = [row for row in results if row["scope"] == "structural"]
     assert structural and all(row["result"] == "pass" for row in structural)
     (deploy_path,) = [row for row in results if row["scope"] == "group5_deploy_path"]
-    # Known block F1: the protected deploy path pins revision 8's name sets.
+    # F1 path A: the protected template validator accepts exactly the D3 names.
     assert deploy_path == {
         "validator": "asaas_producer_rollout_evidence.validate_task_definition_template",
         "scope": "group5_deploy_path",
-        "result": "fail",
-        "reason": "task_definition_base_environment_names_mismatch",
+        "result": "pass",
     }
+    # It still fails closed on any name outside the reviewed sets.
+    extra = copy.deepcopy(rendered)
+    evidence._container_map(extra)["app"]["environment"].append(
+        {"name": "ASAAS_SANDBOX_API_URL", "value": "https://sandbox.example"}
+    )
+    assert wiring.group5_template_verdict(extra, SOURCE_ARN) == (
+        False,
+        "task_definition_base_environment_names_mismatch",
+    )
+
+
+def test_validator_d3_names_are_exactly_the_manifest_and_planner_names() -> None:
+    manifest = wiring.load_yaml(MANIFEST)["task_definition"]
+    assert rollout.D3_ENVIRONMENT_NAMES == set(wiring.ADDED_ENVIRONMENT)
+    assert rollout.D3_ENVIRONMENT_NAMES == set(manifest["app_environment_added"])
+    assert rollout.D3_SECRET_NAMES == set(wiring.ADDED_SECRETS)
+    assert rollout.D3_SECRET_NAMES == set(manifest["app_secrets_added"])
+    assert rollout.D3_SECRET_NAMES == {row[0] for row in wiring.SECRET_REFERENCES}
+    assert not rollout.D3_ENVIRONMENT_NAMES & rollout.D3_SECRET_NAMES
+    assert rollout.SOURCE_IMAGE_REPOSITORY == LIVE_IMAGE.split(":", 1)[0]
+
+
+def _registered_revision_9(rendered: dict[str, Any]) -> dict[str, Any]:
+    """DescribeTaskDefinition of revision 9 as registered from the rendering."""
+
+    registered = _task_definition(NEXT_ARN)
+    registered["taskDefinition"]["containerDefinitions"] = copy.deepcopy(
+        rendered["containerDefinitions"]
+    )
+    return registered
+
+
+PINNED_DATABASE_REFERENCE = (
+    SECRET_PREFIX + "database-url-fyOYuj:::12345678-1234-5678-1234-567812345678"
+)
+
+
+def _protected_template_from_revision_9(response: dict[str, Any]) -> dict[str, Any]:
+    """The documented regeneration of ASAAS_PRODUCER_TASK_DEFINITION_TEMPLATE_JSON."""
+
+    return {
+        "schema_version": evidence.TASK_DEFINITION_TEMPLATE_SCHEMA,
+        "source_task_definition_arn": response["taskDefinition"]["taskDefinitionArn"],
+        "task_definition": wiring._request_from_response(response),
+    }
+
+
+def test_template_regenerated_from_revision_9_validates_clean() -> None:
+    plan, rendered = _plan(FakeAws(applied=True), app_image_override=OVERRIDE_IMAGE)
+    assert rendered is not None
+    template = _protected_template_from_revision_9(_registered_revision_9(rendered))
+    assert template["source_task_definition_arn"] == NEXT_ARN
+    with wiring._synthetic_trust_pins():
+        validated = evidence.validate_task_definition_template(template)
+        request = evidence.build_replacement_task_definition(
+            template,
+            image_uri=wiring.PRODUCER_IMAGE_REPOSITORY,
+            app_digest="sha256:" + "a" * 64,
+            pinned_database_value_from=PINNED_DATABASE_REFERENCE,
+        )
+    assert set(validated["base_environment_sha256"]) == (
+        evidence._BASE_ENV_NAMES | set(wiring.ADDED_ENVIRONMENT)
+    )
+    assert validated["app_secret_names"] == sorted(
+        evidence._EXPECTED_APP_SECRET_NAMES | set(wiring.ADDED_SECRETS)
+    )
+    app = evidence._container_map(request)["app"]
+    assert app["image"] == f"{wiring.PRODUCER_IMAGE_REPOSITORY}@sha256:" + "a" * 64
+    assert (
+        rollout.classify_app_image(
+            OVERRIDE_IMAGE, target_repository=wiring.PRODUCER_IMAGE_REPOSITORY
+        )
+        == "source"
+    )
+    reasons = {row["reason"] for row in plan["gate_blocks"]}
+    assert not any(reason.startswith("F1_group5") for reason in reasons)
+    assert "F1_protected_path_image_repository_mismatch" not in reasons
+
+
+def test_template_regenerated_from_a_tagged_revision_9_is_refused_by_the_deploy() -> (
+    None
+):
+    """Without app_image_override revision 9 keeps revision 8's mutable tag."""
+
+    _plan_result, rendered = _plan(FakeAws(applied=True))
+    assert rendered is not None
+    template = _protected_template_from_revision_9(_registered_revision_9(rendered))
+    with wiring._synthetic_trust_pins():
+        evidence.validate_task_definition_template(template)
+        with pytest.raises(
+            evidence.EvidenceError,
+            match="^source_image_repository_mismatch:"
+            "source_image_reference_not_digest_pinned$",
+        ):
+            evidence.build_replacement_task_definition(
+                template,
+                image_uri=wiring.PRODUCER_IMAGE_REPOSITORY,
+                app_digest="sha256:" + "a" * 64,
+                pinned_database_value_from=PINNED_DATABASE_REFERENCE,
+            )
 
 
 def test_rollback_target_itself_passes_the_group5_template_validator() -> None:
@@ -1656,11 +1758,11 @@ def test_cli_plan_render_and_check_from_a_readback_file(
         rendered
     )
     code, out, err = _run(["check", *args], capsys)
-    assert code == 2
+    assert code == 0, err
     check = json.loads(out)
     assert check["structural_status"] == "pass"
-    assert check["group5_deploy_path_status"] == "blocked"
-    assert check["status"] == "blocked"
+    assert check["group5_deploy_path_status"] == "pass"
+    assert check["status"] == "pass"
 
 
 def test_render_refuses_before_the_secret_access_stack_exists(
@@ -1801,10 +1903,14 @@ def test_gates_are_never_performed_and_report_their_known_blocks() -> None:
             assert step["changes"] == []
             assert step["state"] in {"not_performed", "blocked"}
     reasons = {row["reason"] for row in plan["gate_blocks"]}
+    # F1 path A: the deploy-path template validator accepts the D3 names; the
+    # live image (a mutable tag outside the producer repository) still blocks.
+    assert not any(reason.startswith("F1_group5") for reason in reasons)
     assert (
-        "F1_group5_deploy_validator_allowlist:"
-        "task_definition_base_environment_names_mismatch" in reasons
+        "signed_image_build_and_attestation:"
+        "group5_deploy_template_validator_accepts_rendering" in plan["compliant"]
     )
+    assert "F1_protected_path_image_repository_mismatch" in reasons
     assert "F3_webhook_registration_entry_point:missing" in reasons
     assert (
         _step(plan, "signed_image_build_and_attestation")["info"][
@@ -2253,7 +2359,9 @@ def test_producer_repository_override_clears_the_repository_mismatch() -> None:
     assert "F1_protected_path_image_repository_mismatch" not in reasons
 
 
-def test_path_b_fingerprint_and_unfingerprinted_d3_values_are_reported() -> None:
+def test_path_b_fingerprint_change_is_reported_and_d3_values_are_fingerprinted() -> (
+    None
+):
     plan, rendered = _plan(FakeAws(applied=True))
     assert rendered is not None
     reasons = {row["reason"] for row in plan["gate_blocks"]}
@@ -2266,4 +2374,42 @@ def test_path_b_fingerprint_and_unfingerprinted_d3_values_are_reported() -> None
     assert info["runtime_fingerprint_candidate"] == (
         wiring.rollout._task_definition_runtime_fingerprint(rendered)
     )
+    # F1 path A: a changed D3 value now changes the runtime fingerprint.
+    assert info["d3_environment_values_fingerprinted"] is True
+
+
+def test_d3_fingerprint_probe_reports_false_when_d3_values_are_not_hashed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The planner probe changes only D3 values, so it can detect a regression."""
+
+    monkeypatch.setattr(
+        rollout, "FINGERPRINTED_ENVIRONMENT_NAMES", rollout.BASE_ENVIRONMENT_NAMES
+    )
+    plan, rendered = _plan(FakeAws(applied=True))
+    assert rendered is not None
+    info = _step(plan, "signed_image_build_and_attestation")["info"]
     assert info["d3_environment_values_fingerprinted"] is False
+
+
+def test_digest_pinned_bridge_image_clears_the_repository_mismatch() -> None:
+    plan, rendered = _plan(FakeAws(applied=True), app_image_override=OVERRIDE_IMAGE)
+    assert rendered is not None
+    reasons = {row["reason"] for row in plan["gate_blocks"]}
+    assert "F1_protected_path_image_repository_mismatch" not in reasons
+    # A digest in any other repository of the account is still a mismatch.
+    other = OVERRIDE_IMAGE.replace("/neurostack-staging@", "/neurostack-other@")
+    fake = FakeAws(applied=True)
+    fake.put(
+        "ecr",
+        "DescribeImages",
+        {
+            "repositoryName": "neurostack-other",
+            "imageIds": [{"imageDigest": "sha256:" + "2" * 64}],
+        },
+        {"imageDetails": [{"imageDigest": "sha256:" + "2" * 64}]},
+    )
+    plan, rendered = _plan(fake, app_image_override=other)
+    assert rendered is not None
+    reasons = {row["reason"] for row in plan["gate_blocks"]}
+    assert "F1_protected_path_image_repository_mismatch" in reasons

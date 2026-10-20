@@ -14,10 +14,45 @@ readonly COMPOSE_FILE="${REPO_ROOT}/docker-compose.production.yml"
 readonly DOCKERFILE="${REPO_ROOT}/Dockerfile"
 readonly ENV_FILE="${REPO_ROOT}/.env"
 
+# The one Alembic revision this deploy may migrate to. Bumping it is a
+# deliberate, owner-approved change, exactly like the production migration
+# window pin it mirrors: infra/production/asaas-production-wiring.yaml
+# (migrations_033_035), MIGRATIONS_TARGET_REVISION in
+# scripts/asaas_production_wiring.py and the migrations gate in
+# docs/runbooks/asaas-deployment.md. Revisions 036 and 037 each need their own
+# owner instruction first. tests/scripts/test_production_migration_window.py
+# fails if this pin and the window disagree. Never use the head, heads, base or
+# a relative step here: the value must be one exact revision id. Before anything
+# starts, the pulled image's Alembic head must equal this pin, so an image that
+# carries a newer migration is refused instead of running on an older schema.
+# This guard protects against an unreviewed pin or image, not against a hostile
+# caller environment (for example BASH_ENV or exported shell functions), which
+# the operator running the deploy already controls.
+readonly APPROVED_ALEMBIC_REVISION="035"
+
 fail() {
     printf 'deploy blocked: %s\n' "$1" >&2
     return 1
 }
+
+# Runs before main, so a missing or non-exact pin executes nothing: no release
+# checker, no .env read and no Docker command.
+require_exact_alembic_revision() {
+    case "${APPROVED_ALEMBIC_REVISION,,}" in
+        head|heads|base)
+            fail "APPROVED_ALEMBIC_REVISION must be one exact revision id, not a symbolic target"
+            return 1
+            ;;
+    esac
+    case "$APPROVED_ALEMBIC_REVISION" in
+        ''|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_]*)
+            fail "APPROVED_ALEMBIC_REVISION must be a plain revision id (letters, digits and underscore only)"
+            return 1
+            ;;
+    esac
+}
+
+require_exact_alembic_revision
 
 reject_weak_identifier() {
     local name="$1"
@@ -154,13 +189,26 @@ main() {
     /usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" version >/dev/null 2>&1 || fail "Docker Compose is required"
 
     /usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" pull api
+    # Fail closed before anything starts: the pulled image must carry exactly the
+    # approved revision as its single Alembic head. An image whose head is newer
+    # (036, 037, ...), several heads, an error or no output is refused, because
+    # an upgrade to the pin would be a no-op and leave newer code on an older
+    # schema.
+    local image_heads
+    image_heads="$(/usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" run --rm --no-deps -T api alembic heads)" ||
+        image_heads="unreadable (alembic heads failed)"
+    if [ "$image_heads" != "$APPROVED_ALEMBIC_REVISION (head)" ]; then
+        image_heads="${image_heads//[[:cntrl:]]/ }"
+        fail "image alembic head '${image_heads:-<none>}' is not the approved revision $APPROVED_ALEMBIC_REVISION; bump APPROVED_ALEMBIC_REVISION only with the owner-approved migration window"
+        return 1
+    fi
     /usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d
     # Guard: this migrates the VPS compose-local Postgres only, never the AWS
     # production database, whose window (033-035) is pinned to an exact revision
-    # in docs/runbooks/asaas-deployment.md. It applies every migration in the
-    # approved image, so an image carrying 036 or 037 needs the same owner
-    # instruction per migration before it is deployed here.
-    /usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" exec -T api alembic upgrade head
+    # in docs/runbooks/asaas-deployment.md. It stops at APPROVED_ALEMBIC_REVISION,
+    # which the image head check above proved is the image's only head; 036 and
+    # 037 each need their own owner instruction and a deliberate pin bump first.
+    /usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" exec -T api alembic upgrade "$APPROVED_ALEMBIC_REVISION"
     /usr/bin/docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" ps
 }
 
