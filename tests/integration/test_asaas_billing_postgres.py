@@ -35,7 +35,6 @@ from src.repositories.billing import (
     BillingRevisionConflict,
     BillingTransitionEvidence,
     BillingTransitionRejected,
-    billing_roster_advisory_key,
 )
 from src.services.billing_outbox import billing_fact_schema_digest
 
@@ -1072,7 +1071,7 @@ async def test_roster_lock_holder_and_roster_writer_serialize_in_both_orders(
     async def hold_roster_lock(session: AsyncSession) -> None:
         await session.execute(
             text("SELECT pg_advisory_xact_lock(:roster_lock_key)"),
-            {"roster_lock_key": billing_roster_advisory_key()},
+            {"roster_lock_key": _GLOBAL_ROSTER_FENCE_KEY},
         )
 
     async def is_active(session: AsyncSession, subscription_id: UUID) -> bool:

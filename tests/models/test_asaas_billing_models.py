@@ -34,11 +34,7 @@ from src.models.billing import (
 )
 from src.models.builder import Builder
 from src.models.transaction import Transaction
-from src.repositories.billing import (
-    BillingRepository,
-    billing_advisory_key,
-    billing_roster_advisory_key,
-)
+from src.repositories.billing import BillingRepository, billing_advisory_key
 from src.repositories.database import _patch_jsonb_for_sqlite
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -452,9 +448,13 @@ def test_snapshots_are_recursively_closed_and_capability_consumption_is_unique()
     assert "IS NOT NULL" in str(index.dialect_options["postgresql"]["where"])
 
 
-def test_global_roster_advisory_key_matches_database_fence() -> None:
+def test_global_roster_fence_is_database_only() -> None:
+    # Group 10 E4 removed the Python mirror of the key; the database fence
+    # (removed by migration 036) still takes the key it was created with.
+    import src.repositories.billing as repository
+
     expected_key = 3486705124568449331
-    assert billing_roster_advisory_key() == expected_key
+    assert not hasattr(repository, "billing_roster_advisory_key")
     migration = (
         _ROOT / "alembic/versions/20261011_000003_026_asaas_billing.py"
     ).read_text()

@@ -113,6 +113,13 @@ reads the column, so a stored value is not evidence. By the owner's plan,
 migration 036 will refuse to run while any unexpired readiness receipt
 exists. Readiness and every rollout transition take the per-environment
 rollout control lock first and no longer take the legacy roster fence.
+Since phase E4 the ASAAS webhook and its readbacks take that lock first as
+well and no longer take the roster fence either, so the per-environment
+rollout lock is the only lock that serializes subscription creation. One
+environment per database is therefore a requirement: two environments
+sharing a database are no longer serialized against each other, and both
+could hand off a subscription for the same builder, leaving it with two
+active subscriptions.
 
 ## Work in progress that changes these steps
 

@@ -341,8 +341,30 @@ def test_repository_and_rollout_drop_the_legacy_saga_entry_points() -> None:
     assert not hasattr(billing_rollout, "rebase_legacy_billing_migration")
     reserve = inspect.signature(BillingRepository.reserve_general_subscription_checkout)
     assert "migration_id" not in reserve.parameters
-    # The roster fence and readiness roster revision belong to phases E3/E4.
-    assert hasattr(BillingRepository, "lock_billing_roster")
+
+
+def test_application_code_no_longer_takes_the_roster_fence() -> None:
+    """Group 10 E4: the Python roster fence is gone; only the database's own
+    triggers (dropped by migration 036) still know the roster key."""
+
+    import src.repositories.billing as repository
+    from src.repositories.billing import BillingRepository
+
+    assert not hasattr(BillingRepository, "lock_billing_roster")
+    assert not hasattr(repository, "billing_roster_advisory_key")
+    assert not hasattr(repository, "BillingRosterControl")
+    for path in sorted((ROOT / "src").rglob("*.py")):
+        if path.is_relative_to(ROOT / "src/models"):
+            continue  # the ORM mirror of the tables goes with 036/037
+        source = path.read_text(encoding="utf-8")
+        for needle in (
+            "lock_billing_roster",
+            "billing_roster_advisory_key",
+            "BillingRosterControl",
+            "billing-roster-control",
+            "3486705124568449331",
+        ):
+            assert needle not in source, (path.relative_to(ROOT), needle)
 
 
 def test_operation_scope_migration_is_retired_in_code() -> None:

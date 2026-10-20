@@ -572,8 +572,8 @@ class BillingRolloutOperationService:
         Lock order: :meth:`BillingRepository.lock_rollout_control` first,
         then (``general``) the readiness rows, then the quorum receipts in
         ``consume_quorum``.  The legacy roster fence is not taken (Group 10
-        E3), so this path and the webhook (rollout, then roster fence) can no
-        longer wait on each other in opposite orders.
+        E3), and the webhook takes the rollout lock first too and no roster
+        fence of its own (E4), so the two never wait in opposite orders.
         """
 
         if material.scope != "rollout" or material.to_state not in {
