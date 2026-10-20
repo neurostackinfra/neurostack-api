@@ -161,8 +161,8 @@ These are prerequisites to check, not steps to execute now:
    port, throwaway password, no secrets). Before the suites it turns on
    `logging_collector`, so the server-log audit in
    `tests/integration/test_asaas_subscription_triggers_postgres.py` runs
-   instead of skipping, and runs `alembic upgrade head` on a service
-   database. To add or remove a suite, edit the function; CI and this gate
+   instead of skipping, and migrates a separate service database to the
+   current Alembic head. To add or remove a suite, edit the function; CI and this gate
    follow together. A green CI job does not replace this gate. These run
    only here: the contract suites
    (`tests/contracts/test_billing_fact_producer_consumer.py`,
@@ -423,8 +423,8 @@ own explicit owner approval and is never performed from the manifest.
    digest**, and always deploys the attested producer-repository digest (F1
    path A, below). Revision 8, and a D3 revision rendered without
    `app_image_override`, run a mutable tag and are still rejected
-   (`F1_protected_path_image_repository_mismatch`). Before the first
-   protected deploy, also resolve F1 residual 5 below. It also needs the build
+   (`F1_protected_path_image_repository_mismatch`). F1 residual 5 (the
+   `DATABASE_URL` fingerprint) is fixed (F1 item 5 below). It also needs the build
    network access listed under
    [Frontend build and deployment](#frontend-build-and-deployment).
 5. **Gate: migrations 033-035 (separate approval).** In an expand-only
@@ -779,8 +779,8 @@ and a new binary to the image supply chain.
      revision except `DATABASE_URL`: the serving revision has the plain ARN,
      and `build_replacement_task_definition` pins it to
      `<ARN>:<json key>::<VersionId>` (an empty JSON key for a plain ARN).
-     With today's normalization that difference alone changes the
-     fingerprint (item 5). `plan` still prints
+     The fingerprint binds only the `DATABASE_URL` ARN and JSON key, so that
+     difference does not change it (item 5). `plan` still prints
      `F1_path_b_runtime_fingerprint_changes` for the revision 8 to D3
      transition; under Path A it is informational.
   4. **D3 values: fingerprinted.** The four D3 environment values join the six
@@ -792,18 +792,12 @@ and a new binary to the image supply chain.
      the before and after readbacks fails the comparison
      (`readback_runtime_fingerprint_sha256_changed`). `plan` reports
      `d3_environment_values_fingerprinted: true`.
-  5. **Residual, not fixed (found 2026-10-19): `DATABASE_URL` normalization.**
-     The template must carry the plain `DATABASE_URL` secret ARN
-     (`database_url_source_selector_must_be_default`), and
-     `build_replacement_task_definition` pins it to `<ARN>:::<VersionId>`.
-     `_task_definition_runtime_fingerprint` normalizes a plain ARN to `<ARN>`
-     but a pinned reference to `<ARN>:<json key>` (here `<ARN>:`). A serving
-     revision with a plain ARN (revision 8 and the D3 revision) and its
-     replacement therefore never have equal fingerprints. The first protected
-     deploy would update the service, fail `compare_rollout_readbacks` with
-     `readback_runtime_fingerprint_sha256_changed`, and roll back. In
-     bootstrap mode that consumes the one-time slot. **Do not start a
-     protected deploy until this is decided and fixed** with its own review.
+  5. **`DATABASE_URL` normalization: fixed (found and fixed 2026-10-19).**
+     A plain secret ARN now fingerprints as `<ARN>:` (empty JSON key), like
+     its pinned replacement `<ARN>:::<VersionId>`, so a plain-ARN serving
+     revision (8 or D3) round-trips; pinned by
+     `test_protected_deploy_round_trips_a_plain_database_url_serving_revision`
+     in `tests/scripts/test_verify_asaas_producer_image_rollout.py`.
 
   **Regenerating the protected template from the deployed D3 revision.** This
   is an owner step on the GitHub side; no agent sets these secrets. Do it after
