@@ -404,13 +404,22 @@ def _mark_stt_fallback_notice_sent(tenant_id: UUID, phone: str) -> None:
 
 
 class ReplayStoreUnavailable(RuntimeError):
-    """Raised when the replay store cannot be consulted in production.
+    """Raised when the replay store cannot be consulted outside development/test.
 
-    Production requires the Redis-backed 31-day dedup window because we
-    run multiple Uvicorn workers; when Redis is unavailable the webhook
-    must fail closed with HTTP 503, never quietly fall back to the
+    Deployed environments require the Redis-backed 31-day dedup window
+    because we run multiple Uvicorn workers; when Redis is unavailable the
+    webhook must fail closed with HTTP 503, never quietly fall back to the
     per-process in-memory store (which would only cover one worker).
     """
+
+
+def _replay_memory_fallback_allowed() -> bool:
+    """The in-memory replay store never stands in for Redis in staging or production.
+
+    Allowlist, not ``is_production``: the production service runs with
+    ``ENVIRONMENT=staging``.
+    """
+    return settings.environment in ("development", "test")
 
 
 def _claim_incoming_message(
@@ -421,13 +430,14 @@ def _claim_incoming_message(
     """Return True only for the first delivery of an inbound provider message.
 
     Uses Redis ``SET NX EX 2678400`` (31 days) as the authoritative claim
-    store shared across workers. When Redis is unavailable in production
-    the caller must translate the raised :class:`ReplayStoreUnavailable`
-    into an HTTP 503 fail-closed response.
+    store shared across workers. When Redis is unavailable in any
+    environment other than development/test (staging and production both
+    serve multi-worker traffic) this raises :class:`ReplayStoreUnavailable`,
+    which the caller must translate into an HTTP 503 fail-closed response.
 
-    In test / development environments with a single worker, an in-memory
-    fallback is permitted so tests keep running without a live Redis; it
-    is explicitly not durable and not distributed.
+    Only in development / test environments with a single worker is an
+    in-memory fallback permitted so tests keep running without a live
+    Redis; it is explicitly not durable and not distributed.
     """
     if not message_id:
         return True
@@ -444,11 +454,11 @@ def _claim_incoming_message(
             )
             return bool(claimed)
         except Exception as exc:
-            if settings.is_production:
+            if not _replay_memory_fallback_allowed():
                 raise ReplayStoreUnavailable(str(exc)) from exc
-            # non-production single-worker fallback: fall through to memory
+            # development/test single-worker fallback: fall through to memory
     else:
-        if settings.is_production:
+        if not _replay_memory_fallback_allowed():
             raise ReplayStoreUnavailable("redis_unavailable")
 
     now = _time.monotonic()
@@ -2743,17 +2753,21 @@ async def uazapi_webhook(
     # on match, so without this ordering the second delivery would slip
     # past them and pause the session. The claim is ``SET NX EX`` with a
     # 31-day retention: claim-and-hold, not consume.
-    if (
-        msg_id
-        and not audio_is_transcribable
-        and not _claim_incoming_message("uazapi", tenant_id, msg_id)
-    ):
-        logger.info(
-            "Uazapi webhook: duplicate msg %s from %s skipped",
-            msg_id,
-            from_phone,
-        )
-        return {"ok": True, "skipped": "duplicate_message"}
+    if msg_id and not audio_is_transcribable:
+        try:
+            first_delivery = _claim_incoming_message("uazapi", tenant_id, msg_id)
+        except ReplayStoreUnavailable:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "replay_store_unavailable"},
+            )
+        if not first_delivery:
+            logger.info(
+                "Uazapi webhook: duplicate msg %s from %s skipped",
+                msg_id,
+                from_phone,
+            )
+            return {"ok": True, "skipped": "duplicate_message"}
 
     # ── fromMe=true: AI-sent echo or real clinic message ──
     # Routing lives between the claim (lower bound) and _check_pause_state
@@ -2795,10 +2809,23 @@ async def uazapi_webhook(
             _raw_creds_memo = await _load_tenant_credentials(tenant_id, db)
         return _raw_creds_memo
 
-    def _claim_audio_message() -> dict[str, Any] | None:
-        """Claim audio only after any required provider download succeeds."""
+    def _claim_audio_message() -> Response | dict[str, Any] | None:
+        """Claim audio only after any required provider download succeeds.
 
-        if msg_id and not _claim_incoming_message("uazapi", tenant_id, msg_id):
+        Returns the response to send when processing must stop (duplicate,
+        or replay store unavailable → 503), else None.
+        """
+
+        if not msg_id:
+            return None
+        try:
+            first_delivery = _claim_incoming_message("uazapi", tenant_id, msg_id)
+        except ReplayStoreUnavailable:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "replay_store_unavailable"},
+            )
+        if not first_delivery:
             return {"ok": True, "skipped": "duplicate_message"}
         return None
 
