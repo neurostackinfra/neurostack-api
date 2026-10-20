@@ -31,7 +31,7 @@ from src.models.session import Session
 from src.models.tenant import Tenant, TenantConfig
 from src.models.user import User, UserRole
 
-# Same hashing context as auth middleware
+# Same bcrypt context as the password login (src/api/routes/auth.py)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # ---------------------------------------------------------------------------

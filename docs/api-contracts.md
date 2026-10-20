@@ -54,6 +54,12 @@ A API usa autenticação via API Key. Inclua sua chave no header `X-API-Key`:
 curl -H "X-API-Key: your-api-key" https://api.neurostack.ai/v1/health
 ```
 
+> **Estado atual:** ainda não há emissão de API key por tenant. Em staging e
+> produção todo `X-API-Key` é recusado com `401` `Invalid API key`, sem consulta
+> ao banco; só as chaves de desenvolvimento (`ns_dev_*`, `test-api-key*`)
+> autenticam, e apenas com `ENVIRONMENT` `development` ou `test`. Em ambientes
+> implantados, autentique com `Authorization: Bearer <JWT>`.
+
 ### Obtendo uma API Key
 
 1. Entre em contato com a equipe NeuroStack
@@ -1213,7 +1219,9 @@ Você pode enviar seu próprio Request ID no header `X-Request-ID` e ele será p
 
 ### Authentication Middleware
 
-Todas as requisições (exceto endpoints de health) requerem autenticação via `X-API-Key`.
+Todas as requisições (exceto endpoints de health) requerem autenticação via
+`Authorization: Bearer <JWT>` ou `X-API-Key`. `X-API-Key` só autentica
+chaves de desenvolvimento em `development`/`test` (ver [Autenticação](#autenticação)).
 
 **Endpoints Públicos (sem autenticação):**
 - `GET /health`
