@@ -152,6 +152,26 @@ These are prerequisites to check, not steps to execute now:
    environment and any local `.env` are never read. The Docker CLI must be
    installed; without it the gate fails rather than skipping the render.
 
+   **The PostgreSQL suites also run in CI.** The gate's PostgreSQL step is
+   `asaas_release_candidate_postgres_suites` in `scripts/wish-gates.sh`, the
+   only list of release-candidate PostgreSQL suites. The `Billing PostgreSQL
+   suites` job (`.github/workflows/billing-postgres-integration.yml`) runs
+   that same function on every pull request to `main` and every push to
+   `main`, against a disposable `postgres:16` service container (loopback
+   port, throwaway password, no secrets). Before the suites it turns on
+   `logging_collector`, so the server-log audit in
+   `tests/integration/test_asaas_subscription_triggers_postgres.py` runs
+   instead of skipping, and runs `alembic upgrade head` on a service
+   database. To add or remove a suite, edit the function; CI and this gate
+   follow together. A green CI job does not replace this gate. These run
+   only here: the contract suites
+   (`tests/contracts/test_billing_fact_producer_consumer.py`,
+   `tests/scripts/test_deploy_vps_gate.py`,
+   `tests/scripts/test_production_compose.py`,
+   `tests/scripts/test_asaas_observability.py`,
+   `tests/scripts/test_validate_conventional_commits.py`), the Compose
+   render, the secret/PII scans and the commit check.
+
    **Recorded secret/PII scan exception (owner decision 2026-10-18).** The
    product owner decided to commit the sandbox card capture tool
    (`scripts/asaas_sandbox_card_capture.py`,
@@ -264,8 +284,10 @@ python scripts/asaas_production_wiring.py check          --params "$params"
   created from must equal the reviewed template. The manifest's `applied`
   record (stack, change set, smoke token ARN) must match live state.
 - `check` runs the existing evidence validators against the rendered request.
-  It exits 2 today: every structural validator passes, but the Group 5 deploy
-  template validator rejects the request (known block F1 below).
+  Since the F1 path A change it exits 0: every structural validator and the
+  Group 5 deploy template validator accept exactly the D3 names. What the
+  protected deploy path still rejects is reported under `gate_blocks` by `plan`
+  (known block F1 below).
 
 ### What D3 changes, and why
 
@@ -395,11 +417,15 @@ own explicit owner approval and is never performed from the manifest.
 4. **Gate: signed image build and attestation (separate approval).** The
    running image (`neurostack-staging:asaas-gateway-staging-20261014-cfcb7f0b`,
    pushed 2026-10-14) predates the SPA and the latest billing code. Production
-   images are built, signed and attested only by the protected workflows. This
-   gate is **blocked by F1** today, even without D3: the protected deploy path
-   requires the serving revision's image to come from the producer
-   repository, and revision 8 runs a `neurostack-staging` image. It also needs
-   the build network access listed under
+   images are built, signed and attested only by the protected workflows. The
+   protected deploy path now accepts a serving revision (and the template
+   captured from it) whose app image is in `neurostack-staging` **pinned by
+   digest**, and always deploys the attested producer-repository digest (F1
+   path A, below). Revision 8, and a D3 revision rendered without
+   `app_image_override`, run a mutable tag and are still rejected
+   (`F1_protected_path_image_repository_mismatch`). Before the first
+   protected deploy, also resolve F1 residual 5 below. It also needs the build
+   network access listed under
    [Frontend build and deployment](#frontend-build-and-deployment).
 5. **Gate: migrations 033-035 (separate approval).** In an expand-only
    window, read back the exact `alembic_version` first (it was `032` on
@@ -418,8 +444,9 @@ own explicit owner approval and is never performed from the manifest.
      revision on the current image with the current tooling, outside the
      protected path:
      `aws ecs update-service --cluster neurostack-staging --service neurostack-staging-app --task-definition <new ARN>`.
-     Then land the minimal reviewed F1 change before the first signed-image
-     deploy.
+     The minimal F1 change is implemented (F1 below). Before the first
+     signed-image deploy, regenerate the protected template from the deployed
+     D3 revision (F1, "Regenerating the protected template").
    - **Path B.** One protected deployment that carries the signed image and
      the wiring together. It needs everything Path A's F1 change needs, plus
      a reviewed exception to the runtime fingerprint equality check.
@@ -686,49 +713,150 @@ and a new binary to the image supply chain.
 
 ### Known blocks and follow-ups
 
-- **F1, the protected deploy path (blocks gate 4).** This change leaves the
-  deploy-path code untouched; the planner only evaluates its rules and reports
-  them in `gate_blocks`. Four independent problems:
-  1. **Name sets.** `validate_task_definition_template`
-     (`scripts/asaas_producer_rollout_evidence.py`) and
-     `validate_deployment_snapshot`
-     (`scripts/verify_asaas_producer_image_rollout.py`) pin the `app`
-     environment and secret names to the revision 8 sets. Any revision with
-     the D3 names fails (verified against the live revision:
-     `task_definition_base_environment_names_mismatch`; plan reason
-     `F1_group5_deploy_validator_allowlist`).
-  2. **Image repository, even without D3.** The protected path expects images
-     from
-     `388460142431.dkr.ecr.us-east-1.amazonaws.com/neurostack-asaas-producer-release-producerimagerepository-jqtdjqst9o1j`
-     (`BOOTSTRAP_ECR_URI` in `scripts/asaas_build_release_preflight.py`).
-     `build_replacement_task_definition` (`source_image_repository_mismatch`)
-     and `validate_deployment_snapshot` (`task_definition_image_mismatch`)
-     reject the `neurostack-staging` image that revision 8 runs. The protected
-     path therefore cannot deploy against the live service today (plan reason
-     `F1_protected_path_image_repository_mismatch`).
-  3. **Runtime fingerprint equality.** `compare_rollout_readbacks` requires the
-     before and after `runtime_fingerprint_sha256` to be equal, and
-     `_task_definition_runtime_fingerprint` hashes every secret reference. One
-     protected deploy from revision 8 to image plus wiring therefore fails
-     with `readback_runtime_fingerprint_sha256_changed` (plan reason
-     `F1_path_b_runtime_fingerprint_changes`; both fingerprints are printed).
-  4. **Unfingerprinted D3 values.** The fingerprint hashes only the six base
-     environment values, so a changed `ASAAS_WEBHOOK_URL` or
-     `BILLING_FACT_WORKER_ENABLED` is invisible to the integrity check (plan
-     info `d3_environment_values_fingerprinted: false`).
+- **F1, the protected deploy path (gate 4): Path A implemented.** Owner
+  approval A1 (2026-10-19) chose Path A: register the D3 revision and deploy
+  it with the current tooling, outside the protected path, then make one
+  minimal reviewed change to the deploy-path validators. That change is in
+  `scripts/verify_asaas_producer_image_rollout.py` and
+  `scripts/asaas_producer_rollout_evidence.py` (the planner now evaluates the
+  same image rule). State of the four problems, plus one found since:
+  1. **Name sets: extended.** `validate_task_definition_template` accepts the
+     revision 8 `app` names, or those plus exactly the D3 names, all or none.
+     Environment: the six base names `ENVIRONMENT`, `HOST`, `LLM_MODEL`,
+     `LOG_FORMAT`, `PORT`, `QDRANT_HOST`, plus `ASAAS_WEBHOOK_URL`,
+     `ASAAS_CHECKOUT_RETURN_URL`, `ASAAS_WEBHOOK_NOTIFICATION_EMAIL` and
+     `BILLING_FACT_WORKER_ENABLED`. Secrets: `DATABASE_URL`, `REDIS_URL`,
+     `SECRET_KEY`, `LLM_API_KEY`, `BILLING_OPERATION_RECEIPT_SIGNING_KEY`,
+     plus `ASAAS_API_KEY`, `ASAAS_WEBHOOK_TOKEN` and
+     `BILLING_OBSERVABILITY_SMOKE_TOKEN`. The D3 environment names and the D3
+     secrets must be present together (`task_definition_d3_wiring_partial`).
+     Any other name, a missing name, or a secret given as plain environment
+     fails (`task_definition_base_environment_names_mismatch`,
+     `task_definition_secret_names_mismatch`). `validate_deployment_snapshot`
+     accepts the same environment sets before deployment, and the same set
+     plus the trust pins and commercial gates after it
+     (`task_environment_name_set_mismatch`). It has no secret-name set: the
+     sanitized snapshot keeps only `DATABASE_URL`, and the other secret
+     references are covered only by the runtime fingerprint. That check runs
+     in `compare_rollout_readbacks`, **after** the service update, and a
+     mismatch is followed by a rollback: a template that points a D3 secret
+     at a different secret passes every pre-deployment check and is rejected
+     only then (`readback_runtime_fingerprint_sha256_changed`). A test pins the D3
+     names to the manifest and to the planner. Revision 8's names still
+     validate on purpose: the planner requires its rollback target to pass
+     this validator. A revision 8 template still cannot drop the wiring of a
+     serving D3 revision, because the template's environment fingerprints must
+     equal the serving snapshot's (`base_task_environment_changed`).
+  2. **Image repositories: separated.** The *source* repository is
+     `388460142431.dkr.ecr.us-east-1.amazonaws.com/neurostack-staging` (the
+     hand-built bridge image). The *target* is the attested producer
+     repository (`BILLING_PRODUCER_ECR_REPOSITORY_URI`,
+     `neurostack-asaas-producer-release-producerimagerepository-jqtdjqst9o1j`,
+     equal to `BOOTSTRAP_ECR_URI` in `scripts/asaas_build_release_preflight.py`).
+     The template's app image, and the serving (before and cohort) snapshot's
+     app image, must be either in the target repository
+     (`<target>[:<tag>][@sha256:<digest>]`, exact repository, no prefix match)
+     or exactly `neurostack-staging@sha256:<64 hex>` in this account and
+     region, with no tag. A serving digest must equal the running tasks'
+     digest. The deployed (after) snapshot must run exactly
+     `<target>@<attested digest>`, and `build_replacement_task_definition`
+     always writes that reference. The target must be an ECR repository URI
+     in this account and region whose name follows the ECR grammar (lowercase
+     alphanumeric components joined by a single `.`, `_`, `-` or `/`; no
+     leading, trailing or doubled separator), and is never the source
+     repository. A tag is at most 128 characters (the Docker limit) and a
+     digest is lowercase hex. Anything
+     else fails closed: `source_image_reference_not_digest_pinned`,
+     `app_image_repository_not_allowed`, `app_image_reference_invalid` or
+     `target_image_repository_invalid`, prefixed by
+     `source_image_repository_mismatch:` (replacement) or
+     `task_definition_image_mismatch:` (snapshot). `plan` still reports
+     `F1_protected_path_image_repository_mismatch` while the rendering runs a
+     tag: render the D3 revision with `app_image_override` set to the bridge
+     image digest.
+  3. **Runtime fingerprint equality: unchanged.** Path B was not chosen. Under
+     Path A the replacement keeps every secret reference of the serving D3
+     revision except `DATABASE_URL`: the serving revision has the plain ARN,
+     and `build_replacement_task_definition` pins it to
+     `<ARN>:<json key>::<VersionId>` (an empty JSON key for a plain ARN).
+     With today's normalization that difference alone changes the
+     fingerprint (item 5). `plan` still prints
+     `F1_path_b_runtime_fingerprint_changes` for the revision 8 to D3
+     transition; under Path A it is informational.
+  4. **D3 values: fingerprinted.** The four D3 environment values join the six
+     base values in the template's and the snapshot's
+     `base_environment_sha256`, in the sanitizer's `value_sha256` (the value
+     itself stays `<redacted>`) and in the runtime fingerprint. A D3 value
+     that differs between the template and the serving revision fails before
+     deployment (`base_task_environment_changed`). One that differs between
+     the before and after readbacks fails the comparison
+     (`readback_runtime_fingerprint_sha256_changed`). `plan` reports
+     `d3_environment_values_fingerprinted: true`.
+  5. **Residual, not fixed (found 2026-10-19): `DATABASE_URL` normalization.**
+     The template must carry the plain `DATABASE_URL` secret ARN
+     (`database_url_source_selector_must_be_default`), and
+     `build_replacement_task_definition` pins it to `<ARN>:::<VersionId>`.
+     `_task_definition_runtime_fingerprint` normalizes a plain ARN to `<ARN>`
+     but a pinned reference to `<ARN>:<json key>` (here `<ARN>:`). A serving
+     revision with a plain ARN (revision 8 and the D3 revision) and its
+     replacement therefore never have equal fingerprints. The first protected
+     deploy would update the service, fail `compare_rollout_readbacks` with
+     `readback_runtime_fingerprint_sha256_changed`, and roll back. In
+     bootstrap mode that consumes the one-time slot. **Do not start a
+     protected deploy until this is decided and fixed** with its own review.
 
-  **Cheapest path, Path A.** With owner approval, register the D3 revision
-  and deploy it with the current tooling, outside the protected path. Then
-  make one minimal reviewed F1 change: extend the environment and secret name
-  sets in `validate_task_definition_template` and `validate_deployment_snapshot`
-  with exactly the D3 names; separate the source and target image
-  repositories; fingerprint the D3 environment values; and regenerate the
-  protected template secret (`ASAAS_PRODUCER_TASK_DEFINITION_TEMPLATE_JSON`)
-  from the D3 revision. Until then, a signed-image deploy from a revision 8
-  template would silently drop the D3 wiring.
-  **Path B** (one deployment carrying image and wiring) needs all of that plus
-  a reviewed exception to the fingerprint equality check for this one
-  transition.
+  **Regenerating the protected template from the deployed D3 revision.** This
+  is an owner step on the GitHub side; no agent sets these secrets. Do it after
+  Path A has deployed the D3 revision and before the first protected deploy:
+  1. Run `plan` and continue only if it shows
+     `registered_and_deployed:<ARN>` for the D3 revision, and that revision's
+     app image is `neurostack-staging@sha256:<digest>`. A tag is refused by
+     the deploy path (item 2).
+  2. Read back that exact revision and build the template in a private
+     directory, from the repository root. Only the canonical SHA-256 is
+     printed:
+
+     ```bash
+     workdir="$(mktemp -d)" && chmod 700 "$workdir"
+     umask 077
+     aws ecs describe-task-definition --region us-east-1 \
+       --task-definition neurostack-staging-app:<D3 revision> --include TAGS \
+       > "$workdir/taskdef.json"
+     python3 - "$workdir/taskdef.json" "$workdir/template.json" <<'PY'
+     import json, sys
+     from pathlib import Path
+     from scripts import asaas_producer_rollout_evidence as evidence
+     from scripts import asaas_production_wiring as wiring
+     response = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+     template = {
+         "schema_version": evidence.TASK_DEFINITION_TEMPLATE_SCHEMA,
+         "source_task_definition_arn": response["taskDefinition"]["taskDefinitionArn"],
+         "task_definition": wiring._request_from_response(response),
+     }
+     Path(sys.argv[2]).write_text(
+         json.dumps(template, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+         encoding="utf-8",
+     )
+     print(evidence.canonical_sha256(template))
+     PY
+     ```
+
+     `_request_from_response` drops the response-only fields and keeps the
+     tags, exactly as the planner rendered the revision. The test
+     `test_template_regenerated_from_revision_9_validates_clean` builds the
+     template the same way.
+  3. Validate it offline with `validate-template` and the Group 2 variables,
+     as in
+     [`asaas-producer-image-rollout-group5.md`](./asaas-producer-image-rollout-group5.md#prepare-the-protected-task-definition-template).
+     Expect `task_definition_template: ready`.
+  4. Store `ASAAS_PRODUCER_TASK_DEFINITION_TEMPLATE_JSON` (the file) and
+     `ASAAS_PRODUCER_TASK_DEFINITION_TEMPLATE_SHA256` (the printed hash) as
+     environment secrets on `asaas-production-deployment`, as that runbook
+     describes, then `rm -rf -- "$workdir"`.
+
+  **Path B** (one deployment carrying image and wiring) would still need a
+  reviewed exception to the fingerprint equality check for that one
+  transition. It was not chosen.
 - **F2, AppConfig reader (needed only to open financial egress).** See above.
 - **F3, webhook registration entry point.** Resolved by
   `python -m src.ops.asaas_webhook` (see D4 above). The deploy hook that

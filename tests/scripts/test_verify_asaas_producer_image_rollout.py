@@ -3,26 +3,30 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 
+import scripts.asaas_producer_rollout_evidence as rollout_evidence
+import scripts.verify_asaas_producer_image_rollout as rollout
 from scripts.asaas_producer_rollout_evidence import (
     ENCRYPTED_READBACK_MARKER,
     EvidenceError,
-    _validate_database_task_ip_binding,
     _task_readiness_check,
+    _validate_database_task_ip_binding,
     build_replacement_task_definition,
     decrypt_operator_snapshot,
     encrypt_operator_snapshot,
     generate_post_readback_key,
     parse_post_readback_comment,
-    validate_operator_readback,
     validate_before_after,
+    validate_operator_readback,
     validate_pre_oidc_cohort_confirmation,
     validate_registered_task_definition,
     validate_task_definition_template,
@@ -551,9 +555,12 @@ def test_readiness_cli_output_can_be_embedded_unchanged_in_readback_gate(
     output_path = tmp_path / "readiness-validated.json"
     input_path.write_text(json.dumps(sql_row), encoding="utf-8")
 
-    assert validate_database_readiness_cli(
-        ["--input", str(input_path), "--output", str(output_path)]
-    ) == 0
+    assert (
+        validate_database_readiness_cli(
+            ["--input", str(input_path), "--output", str(output_path)]
+        )
+        == 0
+    )
     validated_readiness = json.loads(output_path.read_text(encoding="utf-8"))
     assert validated_readiness["task_ips"] == ["10.0.1.7"]
     assert validated_readiness["readiness_ok"] is True
@@ -763,8 +770,16 @@ def _cohort_summary(
         "task_arns": [f"task-{task_suffix}-1", f"task-{task_suffix}-2"],
         "task_private_ips": ["10.0.1.7", "10.0.1.8"],
         "task_timestamps": [
-            {"task_arn": f"task-{task_suffix}-1", "created_at": "2026-10-16T10:00:00Z", "started_at": "2026-10-16T10:00:05Z"},
-            {"task_arn": f"task-{task_suffix}-2", "created_at": "2026-10-16T10:00:01Z", "started_at": "2026-10-16T10:00:06Z"},
+            {
+                "task_arn": f"task-{task_suffix}-1",
+                "created_at": "2026-10-16T10:00:00Z",
+                "started_at": "2026-10-16T10:00:05Z",
+            },
+            {
+                "task_arn": f"task-{task_suffix}-2",
+                "created_at": "2026-10-16T10:00:01Z",
+                "started_at": "2026-10-16T10:00:06Z",
+            },
         ],
         "runtime_fingerprint_sha256": "b" * 64,
         "base_environment_sha256": {"HOST": "c" * 64},
@@ -792,7 +807,9 @@ def _cohort_summary(
     }
 
 
-def test_pre_oidc_cohort_allows_changed_tasks_only_with_fresh_readiness_contract() -> None:
+def test_pre_oidc_cohort_allows_changed_tasks_only_with_fresh_readiness_contract() -> (
+    None
+):
     before = _cohort_summary(
         phase="before", task_suffix="old", primary_deployment_id="deploy-old"
     )
@@ -1209,3 +1226,878 @@ def test_encrypted_readback_comment_binds_full_context_and_admin_identity(
     tampered["ciphertext_b64"] = tampered["ciphertext_b64"][:-2] + "AA"
     with pytest.raises(EvidenceError, match="post_snapshot_decryption_failed"):
         decrypt_operator_snapshot(tampered, private_pem, expected_context=context)
+
+
+# ---------------------------------------------------------------------------
+# F1 path A: the D3 name sets, the source/target image repositories and the
+# D3 environment value fingerprints (docs/runbooks/asaas-deployment.md, F1).
+# ---------------------------------------------------------------------------
+
+BASE_ENV_VALUES = {
+    "ENVIRONMENT": "staging",
+    "HOST": "0.0.0.0",
+    "LLM_MODEL": "model-1",
+    "LOG_FORMAT": "json",
+    "PORT": "8000",
+    "QDRANT_HOST": "qdrant.private",
+}
+BASE_SECRET_NAMES = {
+    "DATABASE_URL",
+    "REDIS_URL",
+    "SECRET_KEY",
+    "LLM_API_KEY",
+    "BILLING_OPERATION_RECEIPT_SIGNING_KEY",
+}
+# Exactly the Group 9 D3 wiring names (infra/production/asaas-production-wiring.yaml);
+# the values are illustrative and non-secret.
+D3_ENV = {
+    "ASAAS_WEBHOOK_URL": "https://staging.example.test/v1/billing/webhook/asaas",
+    "ASAAS_CHECKOUT_RETURN_URL": "https://payments.staging.example.test/billing",
+    "ASAAS_WEBHOOK_NOTIFICATION_EMAIL": "operator@example.test",
+    "BILLING_FACT_WORKER_ENABLED": "false",
+}
+_D3_SECRET_PREFIX = "arn:aws:secretsmanager:us-east-1:388460142431:secret:neurostack/"
+D3_SECRETS = {
+    "ASAAS_API_KEY": _D3_SECRET_PREFIX + "staging/asaas-api-key-AbC123",
+    "ASAAS_WEBHOOK_TOKEN": _D3_SECRET_PREFIX + "staging/asaas-webhook-token-DeF456",
+    "BILLING_OBSERVABILITY_SMOKE_TOKEN": _D3_SECRET_PREFIX
+    + "staging/billing-observability-smoke-token-mSR8Ux",
+}
+REGISTRY = "388460142431.dkr.ecr.us-east-1.amazonaws.com"
+SOURCE_REPOSITORY = f"{REGISTRY}/neurostack-staging"
+SOURCE_DIGEST = "sha256:" + "5" * 64
+SOURCE_IMAGE = f"{SOURCE_REPOSITORY}@{SOURCE_DIGEST}"
+REV8_TAGGED_IMAGE = f"{SOURCE_REPOSITORY}:asaas-gateway-staging-20261014-cfcb7f0b"
+REV9_ARN = "arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:9"
+REV10_ARN = REV9_ARN.replace(":9", ":10")
+PINNED_DATABASE_REFERENCE = f"{SECRET_ARN}:::{VERSION_ID}"
+
+
+def _sha(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _app_container(definition: dict[str, Any]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = definition["containerDefinitions"]
+    return next(row for row in rows if row["name"] == "app")
+
+
+def _d3_template(signer: P256Signer, *, image: str = SOURCE_IMAGE) -> dict[str, Any]:
+    """The protected template regenerated from a D3 revision 9 readback."""
+
+    template = cast(dict[str, Any], _task_definition_template(signer))
+    template["source_task_definition_arn"] = REV9_ARN
+    app = _app_container(template["task_definition"])
+    app["image"] = image
+    app["environment"] += [{"name": n, "value": v} for n, v in D3_ENV.items()]
+    app["secrets"] += [{"name": n, "valueFrom": v} for n, v in D3_SECRETS.items()]
+    return template
+
+
+def _rev8_template(signer: P256Signer) -> dict[str, Any]:
+    template = cast(dict[str, Any], _task_definition_template(signer))
+    _app_container(template["task_definition"])["image"] = REV8_TAGGED_IMAGE
+    return template
+
+
+def _drop_name(template: dict[str, Any], field: str, name: str) -> dict[str, Any]:
+    app = _app_container(template["task_definition"])
+    app[field] = [row for row in app[field] if row["name"] != name]
+    return template
+
+
+def _d3_snapshot(*, phase: str = "before", image: str | None = None) -> dict[str, Any]:
+    """Serving D3 snapshot (before) or the attested replacement (after)."""
+
+    raw = cast(dict[str, Any], _snapshot())
+    app = _app_container(raw["task_definition"])
+    app["environment"] += [{"name": n, "value": v} for n, v in D3_ENV.items()]
+    app["secrets"] += [{"name": n, "valueFrom": v} for n, v in D3_SECRETS.items()]
+    if phase == "before":
+        app["environment"] = [
+            row
+            for row in app["environment"]
+            if row["name"] in set(BASE_ENV_VALUES) | set(D3_ENV)
+        ]
+        app["image"] = SOURCE_IMAGE
+        raw["tasks"][0]["containers"][0]["imageDigest"] = SOURCE_DIGEST
+        raw["ecr"]["imageDetails"] = [{"imageDigest": SOURCE_DIGEST}]
+    if image is not None:
+        app["image"] = image
+    return raw
+
+
+def _drop_d3_environment(raw: dict[str, Any]) -> dict[str, Any]:
+    """Turn a serving D3 snapshot into the revision 8 environment shape."""
+
+    app = _app_container(raw["task_definition"])
+    app["environment"] = [
+        row for row in app["environment"] if row["name"] not in D3_ENV
+    ]
+    return raw
+
+
+def _set_env(raw: dict[str, Any], name: str, value: str) -> dict[str, Any]:
+    for row in _app_container(raw["task_definition"])["environment"]:
+        if row["name"] == name:
+            row["value"] = value
+    return raw
+
+
+def _validate_d3_snapshot(
+    raw: dict[str, Any],
+    *,
+    phase: str = "before",
+    expected_image_uri: str = IMAGE_URI,
+    expected_base: dict[str, str] | None = None,
+    expected_environment: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    return validate_deployment_snapshot(
+        raw,
+        expected_digest="current" if phase == "before" else DIGEST,
+        expected_image_uri=expected_image_uri,
+        expected_task_role_arn=TASK_ROLE,
+        expected_execution_role_arn=EXECUTION_ROLE,
+        expected_secret_arn=SECRET_ARN,
+        expected_secret_json_key="database_url",
+        expected_secret_version_id=VERSION_ID,
+        expected_task_environment=(
+            _expected_environment()
+            if expected_environment is None
+            else expected_environment
+        ),
+        expected_base_environment_sha256=expected_base,
+        phase=phase,
+    )
+
+
+def _snapshot_of(
+    definition: dict[str, Any], *, arn: str, running_digest: str
+) -> dict[str, Any]:
+    """A raw snapshot whose task definition is ``definition`` registered as ``arn``."""
+
+    raw = cast(dict[str, Any], _snapshot())
+    raw["service"]["taskDefinition"] = arn
+    raw["service"]["deployments"][0]["taskDefinition"] = arn
+    raw["tasks"][0]["taskDefinitionArn"] = arn
+    raw["tasks"][0]["containers"][0]["imageDigest"] = running_digest
+    raw["tasks"][0]["containers"][0]["healthStatus"] = "UNKNOWN"
+    raw["ecr"]["imageDetails"] = [{"imageDigest": running_digest}]
+    raw["task_definition"] = {
+        **copy.deepcopy(definition),
+        "taskDefinitionArn": arn,
+        "status": "ACTIVE",
+    }
+    return raw
+
+
+def _pinned_task_environment() -> dict[str, str]:
+    expected = {
+        "BILLING_ROLLOUT_STATE": "disabled",
+        "BILLING_TOPUP_COMMERCIAL_ENABLED": "false",
+    }
+    for kind in ("GRANT", "BUILD", "RECEIPT"):
+        expected[f"BILLING_PRODUCER_{kind}_KID"] = os.environ[
+            f"BILLING_PRODUCER_{kind}_KMS_KEY_ARN"
+        ]
+        expected[f"BILLING_PRODUCER_{kind}_PUBLIC_KEY"] = os.environ[
+            f"BILLING_PRODUCER_{kind}_PUBLIC_KEY_PEM"
+        ]
+    return expected
+
+
+def test_validator_name_sets_are_the_revision_8_sets_plus_exactly_the_d3_names() -> (
+    None
+):
+    assert rollout.BASE_ENVIRONMENT_NAMES == set(BASE_ENV_VALUES)
+    assert rollout.D3_ENVIRONMENT_NAMES == set(D3_ENV)
+    assert rollout.D3_SECRET_NAMES == set(D3_SECRETS)
+    assert rollout.FINGERPRINTED_ENVIRONMENT_NAMES == set(BASE_ENV_VALUES) | set(D3_ENV)
+    assert rollout_evidence._BASE_ENV_NAMES == set(BASE_ENV_VALUES)
+    assert rollout_evidence._EXPECTED_APP_SECRET_NAMES == BASE_SECRET_NAMES
+    assert rollout.SOURCE_IMAGE_REPOSITORY == SOURCE_REPOSITORY
+
+
+def test_template_accepts_exactly_the_d3_names_and_fingerprints_their_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signer = P256Signer()
+    _set_group2_key_pins(monkeypatch, signer)
+    validated = validate_task_definition_template(_d3_template(signer))
+    assert validated["source_task_definition_arn"] == REV9_ARN
+    assert validated["app_environment_names"] == sorted(
+        set(BASE_ENV_VALUES) | set(D3_ENV)
+    )
+    assert validated["app_secret_names"] == sorted(BASE_SECRET_NAMES | set(D3_SECRETS))
+    assert validated["base_environment_sha256"] == {
+        name: _sha(value) for name, value in {**BASE_ENV_VALUES, **D3_ENV}.items()
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "row", "reason"),
+    [
+        (
+            "environment",
+            {"name": "ASAAS_SANDBOX_API_URL", "value": "https://sandbox.example"},
+            "task_definition_base_environment_names_mismatch",
+        ),
+        (
+            "environment",
+            {"name": "APPCONFIG_ENABLED", "value": "true"},
+            "task_definition_base_environment_names_mismatch",
+        ),
+        (
+            "environment",
+            {"name": "ASAAS_API_KEY", "value": "inline-secret-never-allowed"},
+            "task_definition_base_environment_names_mismatch",
+        ),
+        (
+            "secrets",
+            {"name": "ASAAS_SANDBOX_API_KEY", "valueFrom": SECRET_ARN},
+            "task_definition_secret_names_mismatch",
+        ),
+        (
+            "secrets",
+            {"name": "ASAAS_WEBHOOK_URL", "valueFrom": SECRET_ARN},
+            "task_definition_secret_names_mismatch",
+        ),
+    ],
+)
+def test_template_rejects_an_extra_unknown_name(
+    monkeypatch: pytest.MonkeyPatch, field: str, row: dict[str, str], reason: str
+) -> None:
+    signer = P256Signer()
+    _set_group2_key_pins(monkeypatch, signer)
+    template = _d3_template(signer)
+    _app_container(template["task_definition"])[field].append(row)
+    with pytest.raises(EvidenceError, match=reason) as error:
+        validate_task_definition_template(template)
+    assert "inline-secret-never-allowed" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "name", "reason"),
+    [
+        *(
+            ("environment", name, "task_definition_base_environment_names_mismatch")
+            for name in sorted(D3_ENV)
+        ),
+        (
+            "environment",
+            "QDRANT_HOST",
+            "task_definition_base_environment_names_mismatch",
+        ),
+        *(
+            ("secrets", name, "task_definition_secret_names_mismatch")
+            for name in sorted(D3_SECRETS)
+        ),
+        ("secrets", "REDIS_URL", "task_definition_secret_names_mismatch"),
+    ],
+)
+def test_template_rejects_a_missing_name(
+    monkeypatch: pytest.MonkeyPatch, field: str, name: str, reason: str
+) -> None:
+    signer = P256Signer()
+    _set_group2_key_pins(monkeypatch, signer)
+    template = _drop_name(_d3_template(signer), field, name)
+    with pytest.raises(EvidenceError, match=reason):
+        validate_task_definition_template(template)
+
+
+@pytest.mark.parametrize("missing", ["environment", "secrets"])
+def test_template_rejects_half_of_the_d3_wiring(
+    monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    signer = P256Signer()
+    _set_group2_key_pins(monkeypatch, signer)
+    template = _d3_template(signer)
+    for name in D3_ENV if missing == "environment" else D3_SECRETS:
+        _drop_name(template, missing, name)
+    with pytest.raises(EvidenceError, match="task_definition_d3_wiring_partial"):
+        validate_task_definition_template(template)
+
+
+def test_revision_8_shape_keeps_its_names_but_its_tagged_image_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decision: the revision 8 name sets still validate (D3 is all or nothing).
+
+    The read-only D3 planner requires its rollback target (revision 8) to pass
+    this validator, and a template can never drop the D3 wiring of a serving
+    D3 revision because its environment fingerprints must equal the serving
+    snapshot's. The real revision 8 still cannot use the protected path: its
+    app image is a mutable tag in the source repository.
+    """
+
+    signer = P256Signer()
+    _set_group2_key_pins(monkeypatch, signer)
+    template = _rev8_template(signer)
+    validated = validate_task_definition_template(template)
+    assert set(validated["base_environment_sha256"]) == set(BASE_ENV_VALUES)
+    with pytest.raises(
+        EvidenceError,
+        match="^source_image_repository_mismatch:source_image_reference_not_digest_pinned$",
+    ):
+        build_replacement_task_definition(
+            template,
+            image_uri=IMAGE_URI,
+            app_digest=DIGEST,
+            pinned_database_value_from=PINNED_DATABASE_REFERENCE,
+        )
+    serving_rev8 = _d3_snapshot(image=REV8_TAGGED_IMAGE)
+    _drop_d3_environment(serving_rev8)
+    with pytest.raises(
+        RolloutError,
+        match="^task_definition_image_mismatch:source_image_reference_not_digest_pinned$",
+    ):
+        _validate_d3_snapshot(serving_rev8)
+
+
+def test_a_revision_8_template_cannot_drop_the_wiring_of_a_serving_d3_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signer = P256Signer()
+    _set_group2_key_pins(monkeypatch, signer)
+    rev8 = validate_task_definition_template(
+        cast(dict[str, Any], _task_definition_template(signer))
+    )
+    with pytest.raises(RolloutError, match="^base_task_environment_changed$"):
+        _validate_d3_snapshot(
+            _d3_snapshot(), expected_base=rev8["base_environment_sha256"]
+        )
+    d3 = validate_task_definition_template(_d3_template(signer))
+    serving_rev8 = _d3_snapshot()
+    _drop_d3_environment(serving_rev8)
+    with pytest.raises(RolloutError, match="^base_task_environment_changed$"):
+        _validate_d3_snapshot(serving_rev8, expected_base=d3["base_environment_sha256"])
+
+
+@pytest.mark.parametrize(
+    ("reference", "origin"),
+    [
+        (SOURCE_IMAGE, "source"),
+        (f"{IMAGE_URI}@{DIGEST}", "target"),
+        (f"{IMAGE_URI}:active", "target"),
+        (f"{IMAGE_URI}:active@{DIGEST}", "target"),
+        # The Docker tag limit: one leading word character plus 127 more.
+        (f"{IMAGE_URI}:" + "t" * 128, "target"),
+    ],
+)
+def test_image_rule_accepts_the_target_or_a_digest_pinned_source(
+    reference: str, origin: str
+) -> None:
+    assert rollout.classify_app_image(reference, target_repository=IMAGE_URI) == origin
+
+
+@pytest.mark.parametrize(
+    ("reference", "reason"),
+    [
+        (REV8_TAGGED_IMAGE, "source_image_reference_not_digest_pinned"),
+        (
+            f"{SOURCE_REPOSITORY}:bridge@{SOURCE_DIGEST}",
+            "source_image_reference_not_digest_pinned",
+        ),
+        (SOURCE_REPOSITORY, "source_image_reference_not_digest_pinned"),
+        (
+            f"{SOURCE_REPOSITORY}@sha256:" + "A" * 64,
+            "source_image_reference_not_digest_pinned",
+        ),
+        (
+            f"{SOURCE_REPOSITORY}@sha256:" + "5" * 63,
+            "source_image_reference_not_digest_pinned",
+        ),
+        (
+            f"{SOURCE_REPOSITORY}@{SOURCE_DIGEST}\n",
+            "source_image_reference_not_digest_pinned",
+        ),
+        (
+            SOURCE_IMAGE.replace("388460142431", "111111111111"),
+            "app_image_repository_not_allowed",
+        ),
+        (
+            SOURCE_IMAGE.replace("us-east-1", "us-east-2"),
+            "app_image_repository_not_allowed",
+        ),
+        (
+            f"docker.io/library/neurostack-staging@{SOURCE_DIGEST}",
+            "app_image_repository_not_allowed",
+        ),
+        (
+            f"{SOURCE_REPOSITORY}-evil@{SOURCE_DIGEST}",
+            "app_image_repository_not_allowed",
+        ),
+        (
+            f"{SOURCE_REPOSITORY}/nested@{SOURCE_DIGEST}",
+            "app_image_repository_not_allowed",
+        ),
+        (f"{IMAGE_URI}-evil@{DIGEST}", "app_image_repository_not_allowed"),
+        (f"{IMAGE_URI}/nested@{DIGEST}", "app_image_repository_not_allowed"),
+        (f"{REGISTRY}/neurostack-other@{DIGEST}", "app_image_repository_not_allowed"),
+        (f"{IMAGE_URI}:", "app_image_reference_invalid"),
+        (f"{IMAGE_URI}@sha256:abc", "app_image_reference_invalid"),
+        (f"{IMAGE_URI}@{DIGEST}:active", "app_image_reference_invalid"),
+        (f"{IMAGE_URI}@sha256:" + "A" * 64, "app_image_reference_invalid"),
+        (f"{IMAGE_URI}:active@sha256:" + "A" * 64, "app_image_reference_invalid"),
+        (f"{IMAGE_URI}:" + "t" * 129, "app_image_reference_invalid"),
+        (None, "app_image_reference_invalid"),
+        ("", "app_image_repository_not_allowed"),
+    ],
+)
+def test_image_rule_fails_closed_on_anything_else(
+    reference: object, reason: str
+) -> None:
+    with pytest.raises(RolloutError, match=f"^{reason}$"):
+        rollout.classify_app_image(reference, target_repository=IMAGE_URI)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        SOURCE_REPOSITORY,
+        "",
+        None,
+        IMAGE_URI.replace("388460142431", "111111111111"),
+        IMAGE_URI.replace("us-east-1", "us-west-2"),
+        IMAGE_URI.replace("us-east-1", "us-east-2"),
+        f"{IMAGE_URI}@{DIGEST}",
+        f"{IMAGE_URI}:active",
+        # The ECR repository-name grammar (lowercase, single separators).
+        f"{REGISTRY}/Neurostack/asaas-producer",
+        f"{REGISTRY}/NEUROSTACK-PRODUCER",
+        f"{SOURCE_REPOSITORY}/",
+        f"{IMAGE_URI}/",
+        f"{IMAGE_URI}.",
+        f"{IMAGE_URI}-",
+        f"{REGISTRY}/neurostack//asaas-producer",
+        f"{REGISTRY}/a..b",
+        f"{REGISTRY}/a.-b",
+        f"{REGISTRY}/-neurostack",
+        f"{REGISTRY}/.neurostack",
+        f"{REGISTRY}/neurostack/_producer",
+        f"{REGISTRY}/",
+        f"{REGISTRY}//neurostack",
+        f"{REGISTRY}/neurostack producer",
+    ],
+)
+def test_image_rule_rejects_a_target_that_is_not_an_attestable_repository(
+    target: object,
+) -> None:
+    with pytest.raises(RolloutError, match="^target_image_repository_invalid$"):
+        rollout.classify_app_image(SOURCE_IMAGE, target_repository=target)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        IMAGE_URI,
+        f"{REGISTRY}/neurostack-asaas-producer-release-"
+        "producerimagerepository-jqtdjqst9o1j",
+        f"{REGISTRY}/a.b_c-d/e",
+        f"{REGISTRY}/a/b/c",
+        f"{REGISTRY}/n7",
+    ],
+)
+def test_image_rule_accepts_a_well_formed_target_repository(target: str) -> None:
+    assert rollout.validate_target_image_repository(target) == target
+    assert (
+        rollout.classify_app_image(f"{target}@{DIGEST}", target_repository=target)
+        == "target"
+    )
+
+
+def test_replacement_from_a_digest_pinned_source_image_attests_the_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signer = P256Signer()
+    _set_group2_key_pins(monkeypatch, signer)
+    request = build_replacement_task_definition(
+        _d3_template(signer),
+        image_uri=IMAGE_URI,
+        app_digest=DIGEST,
+        pinned_database_value_from=PINNED_DATABASE_REFERENCE,
+    )
+    app = _app_container(request)
+    assert app["image"] == f"{IMAGE_URI}@{DIGEST}"
+    environment = {row["name"]: row["value"] for row in app["environment"]}
+    assert set(environment) == set(BASE_ENV_VALUES) | set(D3_ENV) | set(
+        _pinned_task_environment()
+    )
+    assert {name: environment[name] for name in D3_ENV} == D3_ENV
+    secrets = {row["name"]: row["valueFrom"] for row in app["secrets"]}
+    assert set(secrets) == BASE_SECRET_NAMES | set(D3_SECRETS)
+    assert {name: secrets[name] for name in D3_SECRETS} == D3_SECRETS
+    assert secrets["DATABASE_URL"] == PINNED_DATABASE_REFERENCE
+
+
+@pytest.mark.parametrize(
+    ("image", "image_uri", "reason"),
+    [
+        # Image from an unknown repository in the right account and region.
+        (
+            f"{REGISTRY}/neurostack-other@{SOURCE_DIGEST}",
+            IMAGE_URI,
+            "^source_image_repository_mismatch:app_image_repository_not_allowed$",
+        ),
+        # A mutable tag in the source repository.
+        (
+            f"{SOURCE_REPOSITORY}:bridge",
+            IMAGE_URI,
+            "^source_image_repository_mismatch:source_image_reference_not_digest_pinned$",
+        ),
+        # The source repository can never be the attested target.
+        (SOURCE_IMAGE, SOURCE_REPOSITORY, "^app_image_uri_invalid$"),
+        # A template captured from one target cannot be replaced into another.
+        (
+            f"{IMAGE_URI}@{DIGEST}",
+            f"{IMAGE_URI}-other",
+            "^source_image_repository_mismatch:app_image_repository_not_allowed$",
+        ),
+        # Prefix confusion: the old startswith() accepted this repository.
+        (
+            f"{IMAGE_URI}-evil@{DIGEST}",
+            IMAGE_URI,
+            "^source_image_repository_mismatch:app_image_repository_not_allowed$",
+        ),
+    ],
+)
+def test_replacement_rejects_unknown_repository_tag_and_target_mismatch(
+    monkeypatch: pytest.MonkeyPatch, image: str, image_uri: str, reason: str
+) -> None:
+    signer = P256Signer()
+    _set_group2_key_pins(monkeypatch, signer)
+    template = _d3_template(signer, image=image)
+    with pytest.raises(EvidenceError, match=reason):
+        build_replacement_task_definition(
+            template,
+            image_uri=image_uri,
+            app_digest=DIGEST,
+            pinned_database_value_from=PINNED_DATABASE_REFERENCE,
+        )
+
+
+def test_serving_snapshot_may_run_the_digest_pinned_source_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signer = P256Signer()
+    _set_group2_key_pins(monkeypatch, signer)
+    template = validate_task_definition_template(_d3_template(signer))
+    checked = _validate_d3_snapshot(
+        _d3_snapshot(), expected_base=template["base_environment_sha256"]
+    )
+    assert checked["app_image_digest"] == SOURCE_DIGEST
+    assert checked["base_environment_sha256"] == template["base_environment_sha256"]
+    assert set(checked["base_environment_sha256"]) == set(BASE_ENV_VALUES) | set(D3_ENV)
+
+
+@pytest.mark.parametrize(
+    ("phase", "image", "target", "reason"),
+    [
+        (
+            "before",
+            f"{SOURCE_REPOSITORY}@sha256:" + "6" * 64,
+            IMAGE_URI,
+            "^task_definition_image_mismatch$",
+        ),
+        (
+            "before",
+            f"{SOURCE_REPOSITORY}:asaas-gateway",
+            IMAGE_URI,
+            "^task_definition_image_mismatch:source_image_reference_not_digest_pinned$",
+        ),
+        (
+            "before",
+            f"{REGISTRY}/neurostack-other@{SOURCE_DIGEST}",
+            IMAGE_URI,
+            "^task_definition_image_mismatch:app_image_repository_not_allowed$",
+        ),
+        (
+            "before",
+            f"{SOURCE_REPOSITORY}-evil@{SOURCE_DIGEST}",
+            IMAGE_URI,
+            "^task_definition_image_mismatch:app_image_repository_not_allowed$",
+        ),
+        ("before", None, SOURCE_REPOSITORY, "^target_image_repository_invalid$"),
+        ("before", None, "", "^target_image_repository_invalid$"),
+        (
+            "after",
+            f"{SOURCE_REPOSITORY}@{DIGEST}",
+            IMAGE_URI,
+            "^task_definition_image_mismatch$",
+        ),
+        ("after", f"{IMAGE_URI}:active", IMAGE_URI, "^task_definition_image_mismatch$"),
+        ("after", None, SOURCE_REPOSITORY, "^target_image_repository_invalid$"),
+    ],
+)
+def test_snapshot_image_rule_fails_closed(
+    phase: str, image: str | None, target: str, reason: str
+) -> None:
+    raw = _d3_snapshot(phase=phase, image=image)
+    with pytest.raises(RolloutError, match=reason):
+        _validate_d3_snapshot(raw, phase=phase, expected_image_uri=target)
+
+
+def test_attested_snapshot_accepts_exactly_the_d3_names() -> None:
+    checked = _validate_d3_snapshot(_d3_snapshot(phase="after"), phase="after")
+    assert checked["app_image_digest"] == DIGEST
+    assert checked["base_environment_sha256"] == {
+        name: _sha(value) for name, value in {**BASE_ENV_VALUES, **D3_ENV}.items()
+    }
+
+
+@pytest.mark.parametrize("phase", ["before", "after"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        *(("drop", name) for name in sorted(D3_ENV)),
+        ("drop", "HOST"),
+        ("add", "ASAAS_SANDBOX_API_URL"),
+        ("add", "APPCONFIG_ENABLED"),
+        ("add", "ASAAS_API_KEY"),
+    ],
+)
+def test_snapshot_rejects_a_missing_or_extra_environment_name(
+    phase: str, change: tuple[str, str]
+) -> None:
+    raw = _d3_snapshot(phase=phase)
+    app = _app_container(raw["task_definition"])
+    action, name = change
+    if action == "drop":
+        app["environment"] = [row for row in app["environment"] if row["name"] != name]
+    else:
+        app["environment"].append({"name": name, "value": "x"})
+    with pytest.raises(RolloutError, match="^task_environment_name_set_mismatch$"):
+        _validate_d3_snapshot(raw, phase=phase)
+
+
+@pytest.mark.parametrize("name", sorted(D3_ENV))
+def test_d3_value_drift_from_the_template_is_detected_before_deployment(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    signer = P256Signer()
+    _set_group2_key_pins(monkeypatch, signer)
+    template = validate_task_definition_template(_d3_template(signer))
+    drifted = _set_env(_d3_snapshot(), name, D3_ENV[name] + "-drifted")
+    with pytest.raises(RolloutError, match="^base_task_environment_changed$"):
+        _validate_d3_snapshot(
+            drifted, expected_base=template["base_environment_sha256"]
+        )
+
+
+@pytest.mark.parametrize("name", sorted(D3_ENV))
+def test_d3_values_are_part_of_the_runtime_fingerprint(name: str) -> None:
+    definition = _d3_snapshot()["task_definition"]
+    drifted = copy.deepcopy(definition)
+    _set_env({"task_definition": drifted}, name, D3_ENV[name] + "-drifted")
+    assert rollout._task_definition_runtime_fingerprint(
+        definition
+    ) != rollout._task_definition_runtime_fingerprint(drifted)
+    # The trust pins and commercial gates the rollout adds stay outside it.
+    with_pins = copy.deepcopy(definition)
+    _app_container(with_pins)["environment"].append(
+        {"name": "BILLING_ROLLOUT_STATE", "value": "disabled"}
+    )
+    assert rollout._task_definition_runtime_fingerprint(
+        definition
+    ) == rollout._task_definition_runtime_fingerprint(with_pins)
+
+
+@pytest.mark.parametrize("name", sorted(D3_ENV))
+def test_d3_value_drift_between_before_and_after_is_detected(name: str) -> None:
+    before = _validate_d3_snapshot(_d3_snapshot())
+    after = _validate_d3_snapshot(
+        _set_env(_d3_snapshot(phase="after"), name, D3_ENV[name] + "-drifted"),
+        phase="after",
+    )
+    with pytest.raises(
+        RolloutError, match="readback_runtime_fingerprint_sha256_changed"
+    ):
+        compare_rollout_readbacks(before, after, expected_digest=DIGEST)
+    # With equal runtime fingerprints the environment map still catches it.
+    after["runtime_fingerprint_sha256"] = before["runtime_fingerprint_sha256"]
+    with pytest.raises(RolloutError, match="readback_base_environment_sha256_changed"):
+        compare_rollout_readbacks(before, after, expected_digest=DIGEST)
+
+
+@pytest.mark.parametrize("name", sorted(D3_SECRETS))
+def test_d3_secret_reference_swap_between_before_and_after_is_detected(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """The snapshot has no secret-name set: the runtime fingerprint is the guard.
+
+    A template that points one D3 secret at a different secret passes every
+    pre-deployment check; the before/after comparison after the service update
+    is what rejects it (and the executor then rolls back).
+    """
+
+    signer = P256Signer()
+    _set_group2_key_pins(monkeypatch, signer)
+    honest = _d3_template(signer)
+    serving = copy.deepcopy(honest["task_definition"])
+    for row in _app_container(serving)["secrets"]:
+        if row["name"] == "DATABASE_URL":
+            row["valueFrom"] = PINNED_DATABASE_REFERENCE
+    forged = copy.deepcopy(honest)
+    for row in _app_container(forged["task_definition"])["secrets"]:
+        if row["name"] == name:
+            row["valueFrom"] = _D3_SECRET_PREFIX + "staging/other-secret-ZzZ999"
+    validated = validate_task_definition_template(forged)
+    common: dict[str, Any] = {
+        "expected_image_uri": IMAGE_URI,
+        "expected_task_role_arn": TASK_ROLE,
+        "expected_execution_role_arn": EXECUTION_ROLE,
+        "expected_secret_arn": SECRET_ARN,
+        "expected_secret_json_key": "",
+        "expected_secret_version_id": VERSION_ID,
+        "expected_task_environment": _pinned_task_environment(),
+        "external_readiness_verified": True,
+    }
+    before = validate_deployment_snapshot(
+        _snapshot_of(serving, arn=REV9_ARN, running_digest=SOURCE_DIGEST),
+        expected_digest="current",
+        expected_base_environment_sha256=validated["base_environment_sha256"],
+        phase="before",
+        **common,
+    )
+    request = build_replacement_task_definition(
+        forged,
+        image_uri=IMAGE_URI,
+        app_digest=DIGEST,
+        pinned_database_value_from=PINNED_DATABASE_REFERENCE,
+    )
+    after = validate_deployment_snapshot(
+        _snapshot_of(request, arn=REV10_ARN, running_digest=DIGEST),
+        expected_digest=DIGEST,
+        expected_base_environment_sha256=before["base_environment_sha256"],
+        phase="after",
+        **common,
+    )
+    assert before["base_environment_sha256"] == after["base_environment_sha256"]
+    with pytest.raises(
+        RolloutError, match="^readback_runtime_fingerprint_sha256_changed$"
+    ):
+        compare_rollout_readbacks(before, after, expected_digest=DIGEST)
+
+
+@pytest.mark.parametrize("name", sorted(D3_SECRETS))
+def test_d3_secret_references_are_part_of_the_runtime_fingerprint(name: str) -> None:
+    definition = _d3_snapshot()["task_definition"]
+    swapped = copy.deepcopy(definition)
+    for row in _app_container(swapped)["secrets"]:
+        if row["name"] == name:
+            row["valueFrom"] = _D3_SECRET_PREFIX + "staging/other-secret-ZzZ999"
+    assert rollout._task_definition_runtime_fingerprint(
+        definition
+    ) != rollout._task_definition_runtime_fingerprint(swapped)
+
+
+def test_sanitized_readback_carries_d3_value_fingerprints_without_values() -> None:
+    normalized = _d3_snapshot()
+    raw = {
+        "service_response": {"services": [normalized["service"]], "failures": []},
+        "tasks_response": {
+            "tasks": [
+                {
+                    **normalized["tasks"][0],
+                    "attachments": [
+                        {
+                            "details": [
+                                {"name": "privateIPv4Address", "value": "10.0.1.7"}
+                            ]
+                        }
+                    ],
+                },
+            ],
+            "failures": [],
+        },
+        "task_definition_response": {"taskDefinition": normalized["task_definition"]},
+        "ecr_response": normalized["ecr"],
+        "secret_description": normalized["secret_description"],
+        "secret_versions": normalized["secret_versions"],
+    }
+    projected = sanitize_aws_readbacks(raw)
+    encoded = json.dumps(projected, sort_keys=True)
+    for value in D3_ENV.values():
+        if value != "false":
+            assert value not in encoded
+    rows = {
+        row["name"]: row
+        for row in _app_container(projected["task_definition"])["environment"]
+    }
+    for name, value in D3_ENV.items():
+        assert rows[name] == {
+            "name": name,
+            "value": "<redacted>",
+            "value_sha256": _sha(value),
+        }
+    assert projected["task_definition"][
+        "runtime_fingerprint_sha256"
+    ] == rollout._task_definition_runtime_fingerprint(normalized["task_definition"])
+    checked = _validate_d3_snapshot(
+        projected,
+        expected_base={
+            name: _sha(value) for name, value in {**BASE_ENV_VALUES, **D3_ENV}.items()
+        },
+    )
+    assert checked["runtime_fingerprint_sha256"] == (
+        projected["task_definition"]["runtime_fingerprint_sha256"]
+    )
+
+
+def test_path_a_round_trip_from_a_serving_d3_revision_to_the_attested_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Template from revision 9 -> before -> replacement -> after -> compare.
+
+    The serving revision is modelled with an already version-pinned
+    DATABASE_URL so this test isolates the D3 rules from the separate
+    plain-ARN normalization question of the runtime fingerprint.
+    """
+
+    signer = P256Signer()
+    _set_group2_key_pins(monkeypatch, signer)
+    template = _d3_template(signer)
+    validated = validate_task_definition_template(template)
+    serving = copy.deepcopy(template["task_definition"])
+    for row in _app_container(serving)["secrets"]:
+        if row["name"] == "DATABASE_URL":
+            row["valueFrom"] = PINNED_DATABASE_REFERENCE
+    before = validate_deployment_snapshot(
+        _snapshot_of(serving, arn=REV9_ARN, running_digest=SOURCE_DIGEST),
+        expected_digest="current",
+        expected_image_uri=IMAGE_URI,
+        expected_task_role_arn=TASK_ROLE,
+        expected_execution_role_arn=EXECUTION_ROLE,
+        expected_secret_arn=SECRET_ARN,
+        expected_secret_json_key="",
+        expected_secret_version_id=VERSION_ID,
+        expected_task_environment=_pinned_task_environment(),
+        expected_base_environment_sha256=validated["base_environment_sha256"],
+        phase="before",
+        external_readiness_verified=True,
+    )
+    request = build_replacement_task_definition(
+        template,
+        image_uri=IMAGE_URI,
+        app_digest=DIGEST,
+        pinned_database_value_from=PINNED_DATABASE_REFERENCE,
+    )
+    after = validate_deployment_snapshot(
+        _snapshot_of(request, arn=REV10_ARN, running_digest=DIGEST),
+        expected_digest=DIGEST,
+        expected_image_uri=IMAGE_URI,
+        expected_task_role_arn=TASK_ROLE,
+        expected_execution_role_arn=EXECUTION_ROLE,
+        expected_secret_arn=SECRET_ARN,
+        expected_secret_json_key="",
+        expected_secret_version_id=VERSION_ID,
+        expected_task_environment=_pinned_task_environment(),
+        expected_base_environment_sha256=before["base_environment_sha256"],
+        phase="after",
+        external_readiness_verified=True,
+    )
+    result = compare_rollout_readbacks(before, after, expected_digest=DIGEST)
+    assert result["previous_image_digest"] == SOURCE_DIGEST
+    assert result["active_image_digest"] == DIGEST
+    assert result["base_environment_sha256"] == validated["base_environment_sha256"]
+    assert set(result["base_environment_sha256"]) == set(BASE_ENV_VALUES) | set(D3_ENV)
