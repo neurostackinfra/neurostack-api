@@ -493,28 +493,154 @@ Exposure, read back 2026-10-18 and checked by `plan`:
   `waf_rule_may_block_receiver`, and ASAAS deliveries must be re-checked
   (large bodies and provider IP reputation).
 
-Registration:
+Registration (owner decision A2, 2026-10-19: automatic at deploy):
 
-- `AsaasWebhookProvisioner.reconcile()` creates or converges the one webhook
-  this environment owns: name `neurostack-billing-staging`, the configured
-  URL, the closed event set, `SEQUENTIALLY`, API version 3, and the token from
-  the secret. `readback()` is its dry run: it reads `GET /v3/webhooks` and
-  `GET /v3/webhooks/{id}` and returns `ready` or closed-vocabulary reasons
-  (`absent`, `ambiguous`, `url`, `events`, `disabled`, `interrupted`,
-  `token_absent`, `token_unconfigured` and so on).
-- **Known block F3:** neither method has an operator entry point today. Only
-  the in-process readiness refresher calls `readback()`. Follow-up F3 is a
-  small operator command, run as a one-off ECS task from the deployed
-  revision so that the secrets never reach the operator. Its `--dry-run`
-  default prints only the readback verdict. Its `--apply` mode calls
-  `reconcile()` once and prints the verdict and a SHA-256 of the webhook ID.
-  It needs code review and separate approval for the provider write.
-- After the dry run reports `absent` and the owner approves, run `--apply`
-  once, then the dry run again.
+- The command is `python -m src.ops.asaas_webhook <subcommand>`
+  (`src/ops/asaas_webhook.py`, shipped in the image with `src/`). The deploy
+  hook runs it as a one-off ECS task on the service's own task definition, so
+  the API key and the webhook token never leave the task. It reads only the
+  process environment, never a `.env` file: `ENVIRONMENT` (`staging` or
+  `production`; the owned name is `neurostack-billing-<ENVIRONMENT>`, so
+  `neurostack-billing-staging` here), `ASAAS_API_KEY` (production namespace),
+  `ASAAS_WEBHOOK_TOKEN` (32 to 255 printable ASCII characters),
+  `ASAAS_WEBHOOK_URL`, `ASAAS_WEBHOOK_NOTIFICATION_EMAIL` and
+  `ASAAS_USER_AGENT`. Any invalid value fails closed before any network call.
+- **URL pin (deliberate safety net).** `ASAAS_WEBHOOK_URL` must be exactly
+  `https://staging.api.neurostack.global/v1/billing/webhook/asaas`
+  (`ALLOWED_WEBHOOK_URLS` in the module, the D3 parameter in
+  `infra/production/asaas-production-wiring.params.yaml`; the host set
+  `ALLOWED_WEBHOOK_HOSTS` is derived from it). Another host (including a port
+  or different case) is `unconfigured` / `webhook_host_not_allowed`; the
+  decided host with any other path is `unconfigured` /
+  `webhook_url_not_allowed`; neither makes a network call. If the D3
+  parameter ever changes, change both constants in the same reviewed change
+  as the D3 parameters.
+- Subcommands: `check-config` (configuration only, no network), `readback`
+  (the default; read-only), `reconcile` (at most one write, then the smoke
+  checks) and `smoke` (`readback` plus a second listing proving the webhook is
+  still the only one). Flags, all for `reconcile` only and off by default:
+  `--force-rewrite-token`, `--allow-enable` and `--no-resume`; plus
+  `--deadline-seconds N` (10 to 600, default 120, the hard limit for the whole
+  run). There is no `--help`: the only exit 0 is a `ready` verdict.
+- `reconcile`: list every page of `GET /v3/webhooks`. A webhook is a
+  candidate when its name is the owned name or its URL is `ASAAS_WEBHOOK_URL`.
+  No candidate: `POST` once. One candidate with the owned name: read it by
+  exact ID; when it drifted, `PUT` it; when it is exact, write nothing. Two or
+  more candidates, or one that matches by URL only with another name:
+  `ambiguous`, nothing written. Then re-read by ID and list again. Nothing
+  ever deletes a webhook: the command's transport refuses every request other
+  than `GET /v3/webhooks`, `GET /v3/webhooks/{id}`, `POST /v3/webhooks` and
+  `PUT /v3/webhooks/{id}` (writes without a query string), and refuses the
+  two writes outside `reconcile`.
+- **Listing completeness.** A listing is used only when its pages are
+  complete and contiguous (every page but the last is full and says
+  `hasMore`, the last does not, each page starts where the items read so far
+  end, a reported `totalCount` equals what was read), no webhook ID appears
+  twice, and no page exceeds the client's 64 KiB response cap. Otherwise the
+  verdict is `error` / `listing_inconsistent` before any decision or write.
+  This catches short pages, pages that overlap (an ignored `offset`, an
+  unstable sort) and totals that disagree. It cannot catch a provider that
+  leaves a webhook out of every page and reports a total that matches what it
+  served; no client can.
+- **Operator pause and ASAAS queue interruption.** Every `PUT` sends
+  `enabled: true` and `interrupted: false`.
+  - A webhook **disabled** in ASAAS (`enabled: false`, an operator pause) is
+    report-only: verdict `disabled` (exit 13), reason
+    `webhook_disabled_by_operator`, and nothing is written, not even other
+    drift. The pause outranks `requires_recreate`: a disabled webhook with
+    `apiVersion` drift still reports `disabled` (both reasons are listed).
+    `reconcile --allow-enable` re-enables it (reason `webhook_reenabled`).
+    Reconcile never re-enables a disabled webhook on its own.
+  - A queue ASAAS **interrupted** by itself after failed deliveries (for
+    example while the service was rolled back and answered 503) is resumed by
+    default, which makes ASAAS re-send the backlog; the result shows
+    `queue_resumed`. `reconcile --no-resume` makes it report-only (verdict
+    `interrupted`, exit 12, reason `queue_not_resumed`). When a webhook is
+    both disabled and interrupted, a `PUT` needs both permissions.
+- Drift in `apiVersion`, which ASAAS accepts only at creation, is never
+  written: the verdict is `drift` with `requires_recreate` (procedure below).
+  A read whose body omits `apiVersion` or sends `null` is not compared on it
+  (reason `api_version_unreported`; the verdict can still be `ready`). Any
+  other value that is not the integer 3 (for example `"3"`, `3.0`, `true`) is
+  drift and is never `ready`. The in-process
+  readiness refresher does not skip it yet, so in that case hosted checkout
+  stays closed until `compare_webhook` gets the same rule. The notification
+  e-mail is also creation-only and is not read back, so a change of
+  `ASAAS_WEBHOOK_NOTIFICATION_EMAIL` does not reach an existing webhook.
+- **Token rotation.** ASAAS exposes only `hasAuthToken`, never the token, so
+  an exact webhook is never rewritten by default. After changing
+  `ASAAS_WEBHOOK_TOKEN`, deploy the revision with the new token (the receiver
+  then accepts only the new token) and run
+  `reconcile --force-rewrite-token` once; it sends one `PUT` with the new
+  token. Every successful `PUT` carries the current token and reports
+  `token_rewritten`. ASAAS deliveries fail with 401 between the deploy and
+  that run.
+- **Failures.** 429, 408, 5xx, timeouts and connection errors are retried 3
+  times per call (exponential backoff with jitter, capped at 8 s) inside the
+  deadline, then the verdict is `error` with `transient`. 401 or 403 is `error`
+  with `auth` at once. A `POST` is re-sent only when it provably never
+  reached ASAAS (connection not made, or 429). When its outcome is unknown or
+  it is rejected, the command lists again and adopts what it finds
+  (`create_unconfirmed` or `create_rejected`), never posting twice. A result
+  with `"writes": 1` and the reasons `transient` and `deadline_exceeded`
+  means the deadline fired while a write was in flight: the write may have
+  been applied, and the next run adopts what ASAAS holds.
+- **Concurrency.** The command takes no lock: run one task at a time. If two
+  runs overlap and both read an empty listing, both can create a webhook.
+  Either ASAAS rejects the second creation and that run adopts the first
+  run's webhook, or both runs exit 20 (`ambiguous`, `duplicate_detected`)
+  when their final listing shows the duplicate; a run whose final listing
+  came before the other's creation can still report `ready`, and every later
+  run then reports `ambiguous`. Nothing is deleted: see the procedure below.
+- **Output.** Exactly one JSON line on stdout and one JSON log line on
+  stderr (`"event": "asaas_webhook_registration"`). Fields: `schema`
+  (`neurostack.asaas_webhook_registration.v1`), `command`, `verdict`,
+  `action` (`none`, `created` or `updated`), `reasons`, `webhook_id_sha256`,
+  `counts`, `checks` (booleans), `force_rewrite_token`, `allow_enable`,
+  `no_resume` and `exit_code`. They never contain the key, the token, the
+  URL, the e-mail or the webhook ID.
+- **Exit codes:** 0 `ready`, 10 `absent`, 11 `drift`, 12 `interrupted`, 13
+  `disabled`, 20 `ambiguous`, 30 `unconfigured` (including a bad command line
+  or settings that cannot load), 40 `error`. Any other code (for example 1)
+  means the process crashed.
+- The in-process refresher keeps calling `AsaasWebhookProvisioner.readback()`.
+  Apart from the unreported `apiVersion` case above, a `ready` from this
+  command is the same readiness predicate, so the gauge below follows within
+  one refresher period.
+
+Operator procedures (each is a manual provider operation in the ASAAS panel
+with its own approval; the command itself never deletes or renames):
+
+- **`requires_recreate`** (`apiVersion` drift, which a `PUT` cannot change):
+  run `readback` and record `webhook_id_sha256`. With approval, in the ASAAS
+  panel, delete the webhook named `neurostack-billing-staging` whose ID
+  hashes to that value. Then run `reconcile` at once: it finds no candidate,
+  creates the webhook once (`action: created`) and ends `ready`. Whether ASAAS
+  delivers events that happen while no webhook exists is not verified, so
+  keep that window short and check the affected payments by readback
+  afterwards. **The new webhook is created ENABLED.** If the webhook is also
+  disabled (the result lists `webhook_disabled_by_operator`), deleting and
+  recreating it would undo that pause: never use this procedure to get
+  around a pause; the person who paused it, or the owner, must decide
+  explicitly first.
+- **`foreign_name_on_url`** (a webhook with another name already points at
+  `ASAAS_WEBHOOK_URL`): it is not ours by name, so the command refuses it.
+  Identify it in the ASAAS panel and decide with the owner: if it belongs to
+  another integration, move that integration to another URL; if it is an old
+  NeuroStack webhook, delete it (approval) or rename it to the owned name
+  (approval; the next `reconcile` then converges it). Run `readback` until it
+  reports `absent` or `ready`, then `reconcile`.
+- **`multiple_owned` / `duplicate_detected`**: delete all but one of the
+  candidates in the ASAAS panel (approval), then run `reconcile`.
+- **`webhook_disabled_by_operator`**: someone paused the webhook on purpose.
+  Re-enable only on that person's or the owner's instruction, with
+  `reconcile --allow-enable`.
 
 Read-only verification after registration:
 
-1. The dry run reports `ready` with no reasons.
+1. `smoke` (or `readback`) reports `ready`. Its reasons are empty, or only
+   `api_version_unreported` (see the `apiVersion` note above; in that case
+   step 2 does not turn green until `compare_webhook` gets the same rule).
 2. The gauge `neurostack_billing_webhook_config_ready` reads 1 on every worker
    within one refresher period (300 s).
 3. `GET /v1/billing/summary` without a JWT still returns 401, so the receiver
@@ -604,7 +730,9 @@ and a new binary to the image supply chain.
   a reviewed exception to the fingerprint equality check for this one
   transition.
 - **F2, AppConfig reader (needed only to open financial egress).** See above.
-- **F3, webhook registration entry point (blocks gate 8).** See D4 above.
+- **F3, webhook registration entry point.** Resolved by
+  `python -m src.ops.asaas_webhook` (see D4 above). The deploy hook that
+  launches it after each deployment is separate work.
 - **Re-pinning after later deployments.** The manifest and the planner pin
   revision 8 as the source and rollback target. Once a later revision serves
   (for example after the signed-image gate), `plan` reports
