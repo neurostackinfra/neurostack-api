@@ -59,10 +59,17 @@ after.
 
 ## Rolling back the Group 9 D3 wiring
 
-The rollback target is `neurostack-staging-app:8`
+The rollback target is the manifest field `rollback_target`
+(`infra/production/asaas-production-wiring.yaml`), which `plan` reports as
+`rollback_target`. Today it is `neurostack-staging-app:8`
 (`arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:8`),
-the revision the service ran when the wiring was prepared. `plan` reports it
-as `rollback_target`, and the manifest pins it.
+the revision the service ran when the wiring was prepared. It is re-pinned to
+revision 9 (the D3 revision on the bridge image) once revision 9 has served
+and its observation period closed, and before migration 036: revision 8 reads
+columns 036 drops, so after 036 roll back to revision 9, never to 8. Read the
+revision below as the field's current value. A failed post-deploy webhook
+registration (`DEPLOYED_WEBHOOK_PENDING`) is an alert, never a reason to roll
+back.
 
 - **Before the service deployment gate**, nothing needs rolling back. The
   stack and the extra task definition revision are inert while the service

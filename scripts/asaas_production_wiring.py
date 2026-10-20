@@ -6,8 +6,12 @@ and the CloudFormation template without AWS access. ``plan`` reads AWS state
 (live, or a recorded readback file), compares it with the manifest and prints a
 JSON diff: what would change, what is already compliant and what blocks.
 ``render-taskdef`` prints the proposed task definition request, derived from the
-live rollback-target revision, with secrets as ARN references only. ``check``
-runs the existing rollout evidence validators against that request.
+live D3 source revision, with secrets as ARN references only, the otel image
+pinned by digest and ``ManagedBy=manual``. ``check`` runs the existing rollout
+evidence validators against that request. ``render-migrations-taskdef`` prints
+a new ``neurostack-staging-migrations`` revision that bakes exactly
+``MIGRATIONS_COMMAND`` on the reviewed bridge image; revision 3 is only read.
+The service rollback target is the manifest field ``rollback_target``.
 
 Every AWS request passes through :class:`ReadOnlyAws`, which allows only an
 exact list of Describe/Get/List operations and never ``GetSecretValue``;
@@ -26,7 +30,8 @@ import json
 import os
 import re
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -57,10 +62,45 @@ CLUSTER = "neurostack-staging"
 SERVICE = rollout.SERVICE_NAME
 TASK_FAMILY = rollout.TASK_FAMILY
 APP_CONTAINER = rollout.APP_CONTAINER
-ROLLBACK_REVISION = 8
-ROLLBACK_TASK_DEFINITION_ARN = (
-    f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task-definition/"
-    f"{TASK_FAMILY}:{ROLLBACK_REVISION}"
+
+
+def task_definition_arn(family: str, revision: int) -> str:
+    return f"arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task-definition/{family}:{revision}"
+
+
+# The revision the D3 wiring is derived from (task_definition.source_revision).
+# It is history, not the rollback target: revision 9 stays derived from it after
+# the rollback target moves.
+D3_SOURCE_REVISION = 8
+D3_SOURCE_TASK_DEFINITION_ARN = task_definition_arn(TASK_FAMILY, D3_SOURCE_REVISION)
+# The bridge-image D3 revision the rollback target is re-pinned to.
+BRIDGE_REVISION = 9
+# The service rollback target lives in the manifest (rollback_target); these
+# are the only pins it may hold and the documented step at which each one takes
+# effect. Revision 8 runs code that reads columns migration 036 drops, so the
+# re-pin to 9 must happen before 036, and only once revision 9 has served and
+# its observation period closed (until then 8 is the safe way back).
+ROLLBACK_EFFECTIVE_INITIAL = "initial_d3_planning_2026_10_18"
+ROLLBACK_EFFECTIVE_BRIDGE = "bridge_revision_9_serving_verified_and_observation_closed"
+ROLLBACK_REPIN_BEFORE = "migration_036"
+# revision -> (effective_after, (next revision, its effective_after, before) | None)
+ROLLBACK_TARGET_PINS: dict[int, tuple[str, tuple[int, str, str] | None]] = {
+    D3_SOURCE_REVISION: (
+        ROLLBACK_EFFECTIVE_INITIAL,
+        (BRIDGE_REVISION, ROLLBACK_EFFECTIVE_BRIDGE, ROLLBACK_REPIN_BEFORE),
+    ),
+    BRIDGE_REVISION: (ROLLBACK_EFFECTIVE_BRIDGE, None),
+}
+# New revisions (app and migrations) carry ManagedBy=manual: owner approval A4
+# (2026-10-19) moved the two ECS roles to manual management; no code manages the
+# task definitions or the service.
+TAG_OVERRIDES: Mapping[str, str] = {"ManagedBy": "manual"}
+# The otel collector runs by digest, never by tag. The digest itself is the
+# manifest field task_definition.otel_image (the deliberate pin of the current
+# :latest resolution); only its repository and form are pinned here.
+OTEL_CONTAINER = "otel"
+_OTEL_IMAGE = re.compile(
+    r"^public\.ecr\.aws/aws-observability/aws-otel-collector@sha256:[0-9a-f]{64}$"
 )
 EXECUTION_ROLE_NAME = "neurostack-staging-ecs-execution"
 TASK_ROLE_NAME = "neurostack-staging-ecs-task"
@@ -166,10 +206,34 @@ MIGRATIONS_EXCLUDED = (
 _UNPINNED_UPGRADE = re.compile(r"upgrade\s+(?:heads?\b|[+-])", re.IGNORECASE)
 _ALEMBIC_UPGRADE = re.compile(r"alembic\s+upgrade\s+([^\s`'\"),.;]+)", re.IGNORECASE)
 _ALEMBIC_VERSION = re.compile(r"alembic_version\s*==\s*(\w+)")
+_PINNED_ALEMBIC_REVISION = re.compile(r"^[0-9]{3}$")
+# The one-off migrations family. Revision 3 bakes the unpinned upgrade, so it
+# is only read (roles, the database-url-migrations secret, sizing, logs) and
+# never run: render-migrations-taskdef registers a new revision whose command
+# is exactly MIGRATIONS_COMMAND, on the reviewed bridge image.
+MIGRATIONS_FAMILY = "neurostack-staging-migrations"
+MIGRATIONS_TASK_SOURCE_REVISION = 3
+MIGRATIONS_TASK_SOURCE_ARN = task_definition_arn(
+    MIGRATIONS_FAMILY, MIGRATIONS_TASK_SOURCE_REVISION
+)
+MIGRATIONS_DATABASE_SECRET_NAME = "neurostack/staging/database-url-migrations"
+_MIGRATIONS_DATABASE_SECRET_ARN = re.compile(
+    rf"^arn:aws:secretsmanager:{REGION}:{ACCOUNT_ID}:secret:"
+    rf"{re.escape(MIGRATIONS_DATABASE_SECRET_NAME)}-[A-Za-z0-9]{{6}}$"
+)
+# The operator entry point of the webhook registration (T1, PR #120). The F3
+# block is a fact checked at plan time: reported only while it is absent.
+WEBHOOK_REGISTRATION_ENTRY_POINT = "src/ops/asaas_webhook.py"
 KNOWN_BLOCKS = {
-    "F1_group5_deploy_validator_allowlist": "signed_image_build_and_attestation",
+    "F1_residual_5_database_url_fingerprint": "signed_image_build_and_attestation",
     "F3_webhook_registration_entry_point": "webhook_exposure_and_registration",
 }
+# Synthetic inputs for the residual 5 probe (never printed): the image is
+# normalized out of the runtime fingerprint, the version ID only shapes the
+# pinned DATABASE_URL reference the protected deploy writes.
+_PROBE_BRIDGE_IMAGE = f"{rollout.SOURCE_IMAGE_REPOSITORY}@sha256:{'0' * 64}"
+_PROBE_DIGEST = "sha256:" + "0" * 64
+_PROBE_SECRET_VERSION = "00000000-0000-4000-8000-000000000000"
 
 READ_ONLY_OPERATION_PREFIXES = ("Describe", "Get", "List")
 FORBIDDEN_OPERATIONS = frozenset(
@@ -493,7 +557,6 @@ def _expected_target() -> dict[str, Any]:
         "cluster": CLUSTER,
         "service": SERVICE,
         "task_family": TASK_FAMILY,
-        "rollback_task_definition_revision": ROLLBACK_REVISION,
         "execution_role_name": EXECUTION_ROLE_NAME,
         "task_role_name": TASK_ROLE_NAME,
         "application_environment": "staging",
@@ -544,8 +607,10 @@ def _expected_parameters_section() -> dict[str, Any]:
 
 
 def _expected_task_definition_section() -> dict[str, Any]:
+    """Every pinned key; ``otel_image`` is validated by form (its value is data)."""
+
     return {
-        "source_revision": ROLLBACK_REVISION,
+        "source_revision": D3_SOURCE_REVISION,
         "app_secrets_added": list(ADDED_SECRETS),
         "app_environment_added": {
             name: {kind: reference}
@@ -554,7 +619,79 @@ def _expected_task_definition_section() -> dict[str, Any]:
         "forbidden_name_prefixes": list(FORBIDDEN_NAME_PREFIXES),
         "forbidden_names": sorted(FORBIDDEN_NAMES),
         "image": "preserve_live_unless_override",
+        "tag_overrides": dict(TAG_OVERRIDES),
     }
+
+
+def _expected_migrations_section() -> dict[str, Any]:
+    return {
+        "family": MIGRATIONS_FAMILY,
+        "source_revision": MIGRATIONS_TASK_SOURCE_REVISION,
+        "database_secret_name": MIGRATIONS_DATABASE_SECRET_NAME,
+        "image": IMAGE_PARAMETER,
+        "command": "MIGRATIONS_COMMAND",
+        "tag_overrides": dict(TAG_OVERRIDES),
+    }
+
+
+def _validate_rollback_target(section: Any) -> None:
+    """Only the pinned revisions, each with its documented effective step."""
+
+    revision = section.get("revision") if isinstance(section, dict) else None
+    pin = (
+        ROLLBACK_TARGET_PINS.get(revision)
+        if type(revision) is int and not isinstance(revision, bool)
+        else None
+    )
+    _require(pin is not None, "manifest_rollback_target_invalid")
+    assert isinstance(section, dict) and pin is not None
+    effective_after, repin = pin
+    expected_keys = {"revision", "effective_after"} | ({"repin"} if repin else set())
+    _require(
+        set(section) == expected_keys and section["effective_after"] == effective_after,
+        "manifest_rollback_target_invalid",
+    )
+    if repin is not None:
+        note = section["repin"]
+        _require(
+            isinstance(note, dict)
+            and set(note) == {"revision", "effective_after", "before", "why"}
+            and (note["revision"], note["effective_after"], note["before"]) == repin
+            and isinstance(note["why"], str)
+            and "036" in note["why"],
+            "manifest_rollback_target_invalid",
+        )
+
+
+@dataclass(frozen=True)
+class ManifestPins:
+    """The reviewed manifest values the planner's code paths read."""
+
+    rollback_revision: int
+    rollback_effective_after: str
+    rollback_repin_before: str | None
+    otel_image: str
+    tag_overrides: tuple[tuple[str, str], ...]
+
+    @property
+    def rollback_task_definition_arn(self) -> str:
+        return task_definition_arn(TASK_FAMILY, self.rollback_revision)
+
+
+def manifest_pins(manifest: dict[str, Any]) -> ManifestPins:
+    """Pins of a manifest that ``validate_manifest`` already accepted."""
+
+    target = manifest["rollback_target"]
+    repin = target.get("repin")
+    return ManifestPins(
+        rollback_revision=int(target["revision"]),
+        rollback_effective_after=str(target["effective_after"]),
+        rollback_repin_before=str(repin["before"]) if isinstance(repin, dict) else None,
+        otel_image=str(manifest["task_definition"]["otel_image"]),
+        tag_overrides=tuple(
+            sorted(manifest["task_definition"]["tag_overrides"].items())
+        ),
+    )
 
 
 def _validate_applied_record(record: Any) -> None:
@@ -604,9 +741,11 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
             "schema_version",
             "context",
             "target",
+            "rollback_target",
             "secrets",
             "parameters",
             "task_definition",
+            "migrations_task_definition",
             "financial_egress",
             "steps",
             "known_blocks",
@@ -614,6 +753,7 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
         "manifest",
     )
     _require(document["schema_version"] == MANIFEST_SCHEMA, "manifest_schema_invalid")
+    _validate_rollback_target(document["rollback_target"])
     context = _exact_keys(document["context"], {"arch", "must", "ref"}, "context")
     _require(
         isinstance(context["arch"], str)
@@ -628,9 +768,21 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
         document["parameters"] == _expected_parameters_section(),
         "manifest_parameters_mismatch",
     )
+    task_definition = document["task_definition"]
     _require(
-        document["task_definition"] == _expected_task_definition_section(),
+        isinstance(task_definition, dict)
+        and {k: v for k, v in task_definition.items() if k != "otel_image"}
+        == _expected_task_definition_section(),
         "manifest_task_definition_mismatch",
+    )
+    otel_image = task_definition.get("otel_image")
+    _require(
+        isinstance(otel_image, str) and _OTEL_IMAGE.fullmatch(otel_image) is not None,
+        "manifest_otel_image_not_digest",
+    )
+    _require(
+        document["migrations_task_definition"] == _expected_migrations_section(),
+        "manifest_migrations_task_definition_mismatch",
     )
     egress = _exact_keys(
         document["financial_egress"],
@@ -1032,7 +1184,7 @@ def _image_lookup_params(image: str) -> dict[str, Any] | None:
 
 
 def collect_readback(
-    aws: ReadOnlyAws, parameters: dict[str, Any] | None
+    aws: ReadOnlyAws, parameters: dict[str, Any] | None, *, pins: ManifestPins
 ) -> dict[str, Any]:
     """Issue the fixed set of read-only requests the plan needs."""
 
@@ -1045,9 +1197,21 @@ def collect_readback(
             "ecs",
             "DescribeTaskDefinition",
             {
-                "taskDefinition": f"{TASK_FAMILY}:{ROLLBACK_REVISION}",
+                "taskDefinition": f"{TASK_FAMILY}:{D3_SOURCE_REVISION}",
                 "include": ["TAGS"],
             },
+        ),
+        "rollback_task_definition": (
+            aws.call(
+                "ecs",
+                "DescribeTaskDefinition",
+                {
+                    "taskDefinition": f"{TASK_FAMILY}:{pins.rollback_revision}",
+                    "include": ["TAGS"],
+                },
+            )
+            if pins.rollback_revision != D3_SOURCE_REVISION
+            else None
         ),
         "latest_task_definition": aws.call(
             "ecs",
@@ -1261,14 +1425,52 @@ def forbidden_names_in(request: dict[str, Any]) -> list[str]:
     return sorted(found)
 
 
+def apply_tag_overrides(
+    request: dict[str, Any], overrides: tuple[tuple[str, str], ...]
+) -> None:
+    """Set each override tag in place (or append it); keep every other tag."""
+
+    tags = request.get("tags", [])
+    _require(
+        isinstance(tags, list)
+        and all(
+            isinstance(tag, dict)
+            and set(tag) == {"key", "value"}
+            and all(isinstance(item, str) for item in tag.values())
+            for tag in tags
+        )
+        and len({tag["key"] for tag in tags}) == len(tags),
+        "task_definition_tags_invalid",
+    )
+    wanted = dict(overrides)
+    output = [
+        {"key": tag["key"], "value": wanted.get(tag["key"], tag["value"])}
+        for tag in tags
+    ]
+    present = {tag["key"] for tag in tags}
+    output.extend(
+        {"key": key, "value": value} for key, value in overrides if key not in present
+    )
+    request["tags"] = output
+
+
 def render_task_definition(
     source_response: Any,
     *,
     secret_arns: dict[str, str],
     parameters: dict[str, Any],
+    pins: ManifestPins,
 ) -> dict[str, Any]:
-    """Derive the new revision request: live source plus exactly the D3 names."""
+    """Derive the new revision request: live source plus exactly the D3 names.
 
+    Besides the D3 names only two things change: the otel image becomes the
+    manifest's digest pin and the tags carry ``ManagedBy=manual``.
+    """
+
+    _require(
+        _OTEL_IMAGE.fullmatch(pins.otel_image) is not None,
+        "manifest_otel_image_not_digest",
+    )
     request = _request_from_response(source_response)
     try:
         containers = evidence._container_map(request)
@@ -1304,9 +1506,223 @@ def render_task_definition(
     override = parameters.get(IMAGE_PARAMETER)
     if override is not None:
         app["image"] = override
+    containers[OTEL_CONTAINER]["image"] = pins.otel_image
+    apply_tag_overrides(request, pins.tag_overrides)
     forbidden = forbidden_names_in(request)
     _require(not forbidden, "forbidden_name_in_rendering:" + ",".join(forbidden))
     return request
+
+
+def _migrations_command_pinned(command: tuple[str, ...]) -> bool:
+    return (
+        _PINNED_ALEMBIC_REVISION.fullmatch(MIGRATIONS_TARGET_REVISION) is not None
+        and tuple(MIGRATIONS_COMMAND)
+        == ("alembic", "upgrade", MIGRATIONS_TARGET_REVISION)
+        and tuple(command) == tuple(MIGRATIONS_COMMAND)
+    )
+
+
+def _without_fault_injection(response: Any) -> Any:
+    """Drop ``enableFaultInjection`` when false; refuse it when true.
+
+    Newer DescribeTaskDefinition responses carry the key. Only ``false`` (the
+    default) is reproduced by omitting it from a registration request.
+    """
+
+    definition = response.get("taskDefinition") if isinstance(response, dict) else None
+    if not isinstance(definition, dict) or "enableFaultInjection" not in definition:
+        return response
+    _require(
+        definition["enableFaultInjection"] is False,
+        "migrations_source_fault_injection_not_false",
+    )
+    cleaned = copy.deepcopy(response)
+    cleaned["taskDefinition"].pop("enableFaultInjection")
+    return cleaned
+
+
+def render_migrations_task_definition(
+    source_response: Any,
+    *,
+    image: str,
+    pins: ManifestPins,
+    command: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """A new migrations revision: revision 3 with the image and command replaced.
+
+    The command is baked into the revision (no override at run time) and must be
+    exactly ``MIGRATIONS_COMMAND``; anything else is refused. Roles, the
+    ``database-url-migrations`` secret, sizing and logs come from revision 3,
+    which is only read and never run.
+    """
+
+    _require(
+        _migrations_command_pinned(MIGRATIONS_COMMAND if command is None else command),
+        "migrations_command_not_pinned",
+    )
+    definition = (
+        source_response.get("taskDefinition")
+        if isinstance(source_response, dict)
+        else None
+    )
+    _require(
+        isinstance(definition, dict)
+        and definition.get("taskDefinitionArn") == MIGRATIONS_TASK_SOURCE_ARN
+        and definition.get("family") == MIGRATIONS_FAMILY
+        and definition.get("revision") == MIGRATIONS_TASK_SOURCE_REVISION,
+        "migrations_source_revision_mismatch",
+    )
+    assert isinstance(definition, dict)
+    _require(definition.get("status") == "ACTIVE", "migrations_source_not_active")
+    _require(
+        definition.get("executionRoleArn") == evidence.EXECUTION_ROLE_ARN
+        and definition.get("taskRoleArn", evidence.TASK_ROLE_ARN)
+        == evidence.TASK_ROLE_ARN,
+        "migrations_source_roles_mismatch",
+    )
+    _require(
+        isinstance(image, str) and _ECR_DIGEST_REFERENCE.fullmatch(image) is not None,
+        "migrations_image_not_digest_pinned",
+    )
+    request = _request_from_response(_without_fault_injection(source_response))
+    containers = request.get("containerDefinitions")
+    _require(
+        isinstance(containers, list)
+        and len(containers) == 1
+        and isinstance(containers[0], dict),
+        "migrations_source_container_count_invalid",
+    )
+    assert isinstance(containers, list)
+    container = containers[0]
+    _require(
+        not container.get("entryPoint"), "migrations_source_entry_point_unexpected"
+    )
+    try:
+        environment = evidence._env_map(container)
+        secrets = evidence._secret_map(container)
+    except evidence.EvidenceError as exc:
+        raise WiringError(f"migrations_source_{exc}") from None
+    _require(
+        "DATABASE_URL" not in environment
+        and _MIGRATIONS_DATABASE_SECRET_ARN.fullmatch(secrets.get("DATABASE_URL", ""))
+        is not None,
+        "migrations_database_secret_mismatch",
+    )
+    container["image"] = image
+    container["command"] = list(MIGRATIONS_COMMAND)
+    apply_tag_overrides(request, pins.tag_overrides)
+    forbidden = forbidden_names_in(request)
+    _require(not forbidden, "forbidden_name_in_rendering:" + ",".join(forbidden))
+    return request
+
+
+def collect_migrations_readback(
+    aws: ReadOnlyAws, parameters: dict[str, Any]
+) -> dict[str, Any]:
+    """The three reads the migrations revision needs (all read-only)."""
+
+    image = parameters.get(IMAGE_PARAMETER)
+    _require(isinstance(image, str), "migrations_image_requires_app_image_override")
+    assert isinstance(image, str)
+    lookup = _image_lookup_params(image)
+    _require(lookup is not None, "migrations_image_not_digest_pinned")
+    assert lookup is not None
+    return {
+        "source": aws.call(
+            "ecs",
+            "DescribeTaskDefinition",
+            {
+                "taskDefinition": f"{MIGRATIONS_FAMILY}:{MIGRATIONS_TASK_SOURCE_REVISION}",
+                "include": ["TAGS"],
+            },
+        ),
+        "latest": aws.call(
+            "ecs",
+            "DescribeTaskDefinition",
+            {"taskDefinition": MIGRATIONS_FAMILY, "include": ["TAGS"]},
+        ),
+        "image": aws.call("ecr", "DescribeImages", lookup),
+    }
+
+
+def plan_migrations(
+    readback: dict[str, Any], parameters: dict[str, Any], *, pins: ManifestPins
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Status of the migrations revision plus the request, None when blocked."""
+
+    image = parameters[IMAGE_PARAMETER]
+    status: dict[str, Any] = {
+        "family": MIGRATIONS_FAMILY,
+        "read_only_source": MIGRATIONS_TASK_SOURCE_ARN,
+        "command": " ".join(MIGRATIONS_COMMAND),
+        "blocks": [],
+        "state": None,
+        "run_task_definition": None,
+    }
+    rows = (readback.get("image") or {}).get("imageDetails")
+    match = _ECR_IMAGE.fullmatch(image) if isinstance(image, str) else None
+    if not (
+        isinstance(rows, list)
+        and len(rows) == 1
+        and isinstance(rows[0], dict)
+        and match is not None
+        and rows[0].get("imageDigest") == match.group("digest")
+    ):
+        status["blocks"].append("migrations_image_not_found_in_ecr")
+    try:
+        rendered = render_migrations_task_definition(
+            readback.get("source"), image=image, pins=pins
+        )
+    except WiringError as exc:
+        status["blocks"].append(str(exc))
+        return status, None
+    latest_response = readback.get("latest")
+    latest = (
+        latest_response.get("taskDefinition")
+        if isinstance(latest_response, dict)
+        else None
+    )
+    latest_arn = latest.get("taskDefinitionArn") if isinstance(latest, dict) else None
+    if not _is_migrations_revision(latest, latest_arn):
+        # Never tell the operator to run a revision of another account,
+        # region or family, or one that is not at least revision 3.
+        status["blocks"].append("migrations_newest_revision_invalid")
+    elif latest_arn == MIGRATIONS_TASK_SOURCE_ARN:
+        status["state"] = "would_register"
+    else:
+        try:
+            same = _comparable(
+                _request_from_response(_without_fault_injection(latest_response))
+            ) == _comparable(rendered)
+        except WiringError:
+            same = False
+        if same and isinstance(latest_arn, str):
+            status["state"] = f"registered:{latest_arn}"
+            status["run_task_definition"] = latest_arn
+        else:
+            status["blocks"].append(f"migrations_newer_revision_differs:{latest_arn}")
+    if status["blocks"]:
+        return status, None
+    return status, rendered
+
+
+_MIGRATIONS_REVISION_ARN = re.compile(
+    rf"^arn:aws:ecs:{re.escape(REGION)}:{ACCOUNT_ID}:task-definition/"
+    rf"{re.escape(MIGRATIONS_FAMILY)}:(?P<revision>[1-9][0-9]*)$"
+)
+
+
+def _is_migrations_revision(definition: Any, arn: Any) -> bool:
+    """An ARN of this family in this account and region, revision >= 3."""
+
+    match = _MIGRATIONS_REVISION_ARN.fullmatch(arn) if isinstance(arn, str) else None
+    return (
+        match is not None
+        and isinstance(definition, dict)
+        and definition.get("family") == MIGRATIONS_FAMILY
+        and int(match.group("revision")) >= MIGRATIONS_TASK_SOURCE_REVISION
+        and definition.get("revision") == int(match.group("revision"))
+    )
 
 
 def _comparable(request: dict[str, Any]) -> str:
@@ -1952,8 +2368,13 @@ def _plan_task_definition(
     arns: dict[str, str | None],
     service: dict[str, Any] | None,
     service_problems: list[str],
+    pins: ManifestPins,
 ) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, Any] | None]:
-    """Return (renderable request or None, diff, request to evaluate gates on)."""
+    """Return (renderable request or None, diff, request to evaluate gates on).
+
+    The ``rollback_target_*`` reasons below name the D3 source revision, which
+    was the rollback target when they were introduced (their IDs are kept).
+    """
 
     diff: dict[str, Any] = {}
     step.blocks.extend(service_problems)
@@ -1964,7 +2385,7 @@ def _plan_task_definition(
         else None
     )
     if not isinstance(source, dict) or source.get("taskDefinitionArn") != (
-        ROLLBACK_TASK_DEFINITION_ARN
+        D3_SOURCE_TASK_DEFINITION_ARN
     ):
         step.blocks.append("rollback_target_unreadable")
         return None, diff, None
@@ -1981,7 +2402,7 @@ def _plan_task_definition(
         step.blocks.append(str(exc))
         return None, diff, None
     passed, reason = group5_template_verdict(
-        source_request, ROLLBACK_TASK_DEFINITION_ARN
+        source_request, D3_SOURCE_TASK_DEFINITION_ARN
     )
     if passed:
         step.compliant.append("rollback_target_passes_group5_template_validator")
@@ -1995,7 +2416,7 @@ def _plan_task_definition(
 
     app = _source_app_container(source_response) or {}
     live_image = app.get("image")
-    diff["source_task_definition_arn"] = ROLLBACK_TASK_DEFINITION_ARN
+    diff["source_task_definition_arn"] = D3_SOURCE_TASK_DEFINITION_ARN
     diff["live_app_image"] = live_image
     live_images = (readback.get("live_image") or {}).get("imageDetails")
     if isinstance(live_images, list) and len(live_images) == 1:
@@ -2050,6 +2471,7 @@ def _plan_task_definition(
                     for env, name, _source, _parameter in SECRET_REFERENCES
                 },
                 parameters=parameters,
+                pins=pins,
             )
         except WiringError as exc:
             step.blocks.append(str(exc))
@@ -2060,6 +2482,7 @@ def _plan_task_definition(
             source_response,
             secret_arns={env: str(arns[env]) for env in ADDED_SECRETS},
             parameters=parameters,
+            pins=pins,
         )
     except WiringError as exc:
         step.blocks.append(str(exc))
@@ -2075,20 +2498,20 @@ def _plan_task_definition(
     latest_arn = latest.get("taskDefinitionArn") if isinstance(latest, dict) else None
     current = service.get("taskDefinition") if isinstance(service, dict) else None
     latest_matches = False
-    if isinstance(latest_arn, str) and latest_arn != ROLLBACK_TASK_DEFINITION_ARN:
+    if isinstance(latest_arn, str) and latest_arn != D3_SOURCE_TASK_DEFINITION_ARN:
         try:
             latest_matches = _comparable(_request_from_response(latest_response)) == (
                 _comparable(rendered)
             )
         except WiringError:
             latest_matches = False
-    if current == ROLLBACK_TASK_DEFINITION_ARN:
-        if latest_arn == ROLLBACK_TASK_DEFINITION_ARN:
+    if current == D3_SOURCE_TASK_DEFINITION_ARN:
+        if latest_arn == D3_SOURCE_TASK_DEFINITION_ARN:
             step.changes.append(
                 {
                     "action": "register_task_definition",
                     "family": TASK_FAMILY,
-                    "derived_from": ROLLBACK_TASK_DEFINITION_ARN,
+                    "derived_from": D3_SOURCE_TASK_DEFINITION_ARN,
                     "request_sha256": diff["rendered_request_sha256"],
                     "service_changes": "none (service_deployment is a separate gate)",
                 }
@@ -2156,10 +2579,99 @@ def _plan_protected_path_integrity(
     # True since F1 path A: the runtime fingerprint hashes the D3 environment
     # values too, so a changed ASAAS_WEBHOOK_URL fails the integrity check.
     image_gate.info["d3_environment_values_fingerprinted"] = values_fingerprinted
+    residual = residual_5_fingerprint_kept(candidate)
+    image_gate.info["protected_replacement_keeps_runtime_fingerprint"] = residual
+    if residual is None:
+        image_gate.blocks.append("F1_residual_5_database_url_fingerprint:not_evaluated")
+    elif not residual:
+        image_gate.blocks.append("F1_residual_5_database_url_fingerprint")
+
+
+def residual_5_fingerprint_kept(candidate: dict[str, Any]) -> bool | None:
+    """Whether the protected deploy's replacement keeps the runtime fingerprint.
+
+    F1 residual 5: the template carries the plain ``DATABASE_URL`` ARN and the
+    replacement pins it to ``<ARN>:::<VersionId>``, which the fingerprint
+    normalizes differently, so ``compare_rollout_readbacks`` fails after the
+    service update. Evaluated with the real ``build_replacement_task_definition``
+    and fingerprint on a copy of the candidate (synthetic digest and version;
+    the app image is normalized out of the fingerprint). None when the
+    replacement cannot be built from the candidate at all.
+    """
+
+    probe = copy.deepcopy(candidate)
+    try:
+        app = evidence._container_map(probe)[APP_CONTAINER]
+        app["image"] = _PROBE_BRIDGE_IMAGE
+        database = evidence._secret_map(app)["DATABASE_URL"]
+        template = {
+            "schema_version": evidence.TASK_DEFINITION_TEMPLATE_SCHEMA,
+            "source_task_definition_arn": D3_SOURCE_TASK_DEFINITION_ARN,
+            "task_definition": probe,
+        }
+        with _synthetic_trust_pins():
+            replacement = evidence.build_replacement_task_definition(
+                template,
+                image_uri=PRODUCER_IMAGE_REPOSITORY,
+                app_digest=_PROBE_DIGEST,
+                pinned_database_value_from=f"{database}:::{_PROBE_SECRET_VERSION}",
+            )
+        return bool(
+            rollout._task_definition_runtime_fingerprint(replacement)
+            == rollout._task_definition_runtime_fingerprint(candidate)
+        )
+    except (evidence.EvidenceError, rollout.RolloutError, KeyError):
+        return None
+
+
+def webhook_registration_entry_point_present() -> bool:
+    """Whether this tree ships ``python -m src.ops.asaas_webhook`` (fact, not pin)."""
+
+    return (_REPOSITORY_ROOT / WEBHOOK_REGISTRATION_ENTRY_POINT).is_file()
 
 
 def _preview_secret_arn(name: str) -> str:
     return f"arn:aws:secretsmanager:{REGION}:{ACCOUNT_ID}:secret:{name}-PREVEW"
+
+
+def _plan_rollback_target(
+    deployment: _Step, readback: dict[str, Any], pins: ManifestPins
+) -> None:
+    """The manifest's rollback target: where a failed deployment goes back to."""
+
+    deployment.info["rollback_target"] = pins.rollback_task_definition_arn
+    deployment.info["rollback_target_effective_after"] = pins.rollback_effective_after
+    deployment.info["rollback_target_must_repin_before"] = pins.rollback_repin_before
+    response = (
+        readback.get("source_task_definition")
+        if pins.rollback_revision == D3_SOURCE_REVISION
+        else readback.get("rollback_task_definition")
+    )
+    definition = response.get("taskDefinition") if isinstance(response, dict) else None
+    app = _source_app_container(response) or {}
+    image = app.get("image")
+    pinned_by_digest = pins.rollback_revision == D3_SOURCE_REVISION or (
+        isinstance(image, str) and _ECR_DIGEST_REFERENCE.fullmatch(image) is not None
+    )
+    digest = (
+        isinstance(image, str) and _ECR_DIGEST_REFERENCE.fullmatch(image) is not None
+    )
+    deployment.info["rollback_target_image_pinned_by_digest"] = digest
+    if (
+        isinstance(definition, dict)
+        and definition.get("taskDefinitionArn") == pins.rollback_task_definition_arn
+        and definition.get("status") == "ACTIVE"
+        and pinned_by_digest
+    ):
+        # Revision 8 runs an immutable-repository tag; only a digest is
+        # reported as digest pinned.
+        deployment.compliant.append(
+            "rollback_target_active_and_digest_pinned"
+            if digest
+            else "rollback_target_active_on_initial_tagged_revision"
+        )
+    else:
+        deployment.blocks.append("rollback_target_revision_unusable")
 
 
 def _plan_gates(
@@ -2169,22 +2681,29 @@ def _plan_gates(
     candidate: dict[str, Any] | None,
     evaluated_on: str,
     source_request: dict[str, Any] | None,
+    pins: ManifestPins,
 ) -> None:
     image_gate = steps["signed_image_build_and_attestation"]
     image_gate.info["deploy_path_verdict_evaluated_on"] = evaluated_on
+    # Since F1 path A the Group 5 template validator accepts the D3 rendering;
+    # a rejection now is a regression and is reported under its own name.
     if candidate is not None:
         passed, reason = group5_template_verdict(
-            candidate, ROLLBACK_TASK_DEFINITION_ARN
+            candidate, D3_SOURCE_TASK_DEFINITION_ARN
         )
         if passed:
             image_gate.compliant.append(
                 "group5_deploy_template_validator_accepts_rendering"
             )
         else:
-            image_gate.blocks.append(f"F1_group5_deploy_validator_allowlist:{reason}")
+            image_gate.blocks.append(
+                f"F1_group5_template_validator_regression:{reason}"
+            )
         _plan_protected_path_integrity(image_gate, candidate, source_request)
     else:
-        image_gate.blocks.append("F1_group5_deploy_validator_allowlist:not_evaluated")
+        image_gate.blocks.append(
+            "F1_group5_template_validator_regression:not_evaluated"
+        )
 
     steps[MIGRATIONS_STEP].info.update(
         {
@@ -2201,7 +2720,7 @@ def _plan_gates(
     )
 
     deployment = steps["service_deployment"]
-    deployment.info["rollback_target"] = ROLLBACK_TASK_DEFINITION_ARN
+    _plan_rollback_target(deployment, readback, pins)
     config = (service or {}).get("deploymentConfiguration") or {}
     breaker = config.get("deploymentCircuitBreaker") or {}
     if (
@@ -2256,7 +2775,10 @@ def _plan_gates(
             webhook.compliant.append("waf_count_only_blocks_nothing")
         else:
             webhook.blocks.append("waf_rule_may_block_receiver:" + ",".join(enforcing))
-    webhook.blocks.append("F3_webhook_registration_entry_point:missing")
+    if webhook_registration_entry_point_present():
+        webhook.compliant.append("webhook_registration_entry_point_present")
+    else:
+        webhook.blocks.append("F3_webhook_registration_entry_point:missing")
     steps["rollout_transitions"].info["state"] = "not planned until credits exist"
 
 
@@ -2266,11 +2788,14 @@ def build_plan(
     digests: dict[str, str],
     *,
     applied: dict[str, Any] | None,
+    pins: ManifestPins,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Pure comparison of a readback with the manifest; no AWS access.
 
     ``applied`` is the manifest's record of an already applied
     secret_access_stack (``applied_record``), checked against the live stack.
+    ``pins`` carries the manifest values code paths read (``manifest_pins``):
+    the rollback target, the otel digest and the tag overrides.
     """
 
     steps = {step_id: _Step(step_id, scope) for step_id, scope in STEPS}
@@ -2289,6 +2814,7 @@ def build_plan(
         arns,
         service,
         service_problems,
+        pins,
     )
     evaluated_on = (
         "rendering"
@@ -2345,7 +2871,7 @@ def build_plan(
             else "unreadable"
         ),
     }
-    _plan_gates(steps, readback, service, candidate, evaluated_on, source_request)
+    _plan_gates(steps, readback, service, candidate, evaluated_on, source_request, pins)
 
     ordered = [steps[step_id].as_dict() for step_id, _scope in STEPS]
     blocks = [{"step": "preflight", "reason": reason} for reason in preflight] + [
@@ -2376,7 +2902,7 @@ def build_plan(
             "region": REGION,
             "cluster": CLUSTER,
             "service": SERVICE,
-            "rollback_target": ROLLBACK_TASK_DEFINITION_ARN,
+            "rollback_target": pins.rollback_task_definition_arn,
             "current_task_definition": (service or {}).get("taskDefinition"),
         },
         "parameters": {
@@ -2432,11 +2958,11 @@ def renderable(plan: dict[str, Any], rendered: dict[str, Any] | None) -> dict[st
     return rendered
 
 
-def _plan_from_args(
-    args: argparse.Namespace, transport_factory: Callable[[], Transport] | None
-) -> tuple[dict[str, Any], dict[str, Any] | None, list[tuple[str, str]]]:
-    manifest, parameters, digests = load_inputs(args.manifest, args.params)
-    assert parameters is not None
+def _aws_from_args(
+    args: argparse.Namespace,
+    transport_factory: Callable[[], Transport] | None,
+    digests: dict[str, str],
+) -> ReadOnlyAws:
     if args.readback_file is not None:
         transport = snapshot_transport(args.readback_file)
         digests["readback_file_sha256"] = _file_sha256(args.readback_file)
@@ -2444,13 +2970,46 @@ def _plan_from_args(
     else:
         transport = (transport_factory or boto3_transport)()
         digests["readback_source"] = "live"
-    aws = ReadOnlyAws(transport)
-    readback = collect_readback(aws, parameters)
+    return ReadOnlyAws(transport)
+
+
+def _plan_from_args(
+    args: argparse.Namespace, transport_factory: Callable[[], Transport] | None
+) -> tuple[dict[str, Any], dict[str, Any] | None, list[tuple[str, str]]]:
+    manifest, parameters, digests = load_inputs(args.manifest, args.params)
+    assert parameters is not None
+    pins = manifest_pins(manifest)
+    aws = _aws_from_args(args, transport_factory, digests)
+    readback = collect_readback(aws, parameters, pins=pins)
     plan, rendered = build_plan(
-        parameters, readback, digests, applied=applied_record(manifest)
+        parameters, readback, digests, applied=applied_record(manifest), pins=pins
     )
     plan["aws_operations"] = sorted({f"{s}.{o}" for s, o in aws.calls})
     return plan, rendered, aws.calls
+
+
+MIGRATIONS_ALREADY_REGISTERED_EXIT = 3
+
+
+def _render_migrations_from_args(
+    args: argparse.Namespace, transport_factory: Callable[[], Transport] | None
+) -> tuple[dict[str, Any] | None, str | None]:
+    """(request to register, or None; the equal revision already registered)."""
+
+    manifest, parameters, digests = load_inputs(args.manifest, args.params)
+    assert parameters is not None
+    aws = _aws_from_args(args, transport_factory, digests)
+    readback = collect_migrations_readback(aws, parameters)
+    status, rendered = plan_migrations(
+        readback, parameters, pins=manifest_pins(manifest)
+    )
+    _require(rendered is not None, "migrations_blocked:" + ",".join(status["blocks"]))
+    assert rendered is not None
+    registered = status["run_task_definition"]
+    if registered is not None and not args.force_new_revision:
+        # Run that revision; registering an identical one again is refused.
+        return None, str(registered)
+    return rendered, registered
 
 
 def main(
@@ -2460,7 +3019,13 @@ def main(
 ) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("check-manifest", "plan", "render-taskdef", "check"):
+    for name in (
+        "check-manifest",
+        "plan",
+        "render-taskdef",
+        "check",
+        "render-migrations-taskdef",
+    ):
         sub = subparsers.add_parser(name)
         sub.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
         sub.add_argument(
@@ -2468,6 +3033,8 @@ def main(
         )
         if name != "check-manifest":
             sub.add_argument("--readback-file", type=Path, default=None)
+        if name == "render-migrations-taskdef":
+            sub.add_argument("--force-new-revision", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "check-manifest":
@@ -2480,6 +3047,13 @@ def main(
                 }
             )
             return 0
+        if args.command == "render-migrations-taskdef":
+            request, registered = _render_migrations_from_args(args, transport_factory)
+            if request is None:
+                print(f"already registered: {registered}", file=sys.stderr)
+                return MIGRATIONS_ALREADY_REGISTERED_EXIT
+            _emit(request)
+            return 0
         plan, rendered, _calls = _plan_from_args(args, transport_factory)
         if args.command == "plan":
             _emit(plan)
@@ -2488,7 +3062,7 @@ def main(
         if args.command == "render-taskdef":
             _emit(rendered)
             return 0
-        results = run_evidence_validators(rendered, ROLLBACK_TASK_DEFINITION_ARN)
+        results = run_evidence_validators(rendered, D3_SOURCE_TASK_DEFINITION_ARN)
         structural = all(
             row["result"] == "pass" for row in results if row["scope"] == "structural"
         )
