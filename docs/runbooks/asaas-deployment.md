@@ -1134,8 +1134,8 @@ keeps them true reads AppConfig from inside the `app` container:
   last success is older than a hard bound (for example 3 poll intervals). An
   empty `Configuration` means unchanged. Parsing reuses the current
   duplicate-rejecting flag parser. A setting selects the source (`agent` or
-  `sdk`), and the lifespan starts and stops the refresher. `boto3` must become
-  a locked main dependency: it is not in `poetry.lock` today.
+  `sdk`), and the lifespan starts and stops the refresher. `boto3` and
+  `botocore` are locked main dependencies (added for the KMS signers).
 - **IAM:** a separately named task-role policy that allows
   `appconfig:StartConfigurationSession` and
   `appconfig:GetLatestConfiguration` on the exact
@@ -1324,32 +1324,98 @@ Since PRs #90 and #91, the production `Dockerfile` builds the SPA in the
 `dist/public` is copied to `/app/spa`, and the image sets
 `SPA_DIST_DIR=/app/spa`. The API serves the SPA at exact routes
 (`src/api/spa.py`); `/billing` is the hosted-checkout return page named by
-`ASAAS_CHECKOUT_RETURN_URL`. No `docker build` of this stage has been run on a
-Docker host yet, and the browser CSP check is still open.
+`ASAAS_CHECKOUT_RETURN_URL`. A local `linux/amd64` build of the whole image,
+this stage included, and the offline image smoke below passed on 2026-10-19
+(not the protected workflow); the browser CSP check is still open.
 
-Network access the image build needs (from the Dockerfile; no build was run
-here):
+Network access the image build needs (from the Dockerfile; the 2026-10-19
+build succeeded with it, the exact hosts were not captured):
 
 - **Docker Hub** (`registry-1.docker.io`, `auth.docker.io` and its blob CDN):
-  `python:3.11-slim`, which is pinned by tag only, and
-  `node:22.22.3-bookworm-slim@sha256:e21fc383…`.
+  `python:3.11.17-slim-trixie@sha256:e88e9763…` (what `python:3.11-slim`
+  resolved to on 2026-10-19; tag and digests are recorded in the Dockerfile)
+  and `node:22.22.3-bookworm-slim@sha256:e21fc383…`.
 - **Debian package mirrors** (`deb.debian.org`): `build-essential`, `curl`,
   `libpq-dev`.
-- **PyPI** (`pypi.org`, `files.pythonhosted.org`): `poetry==1.8.2` and the
-  locked main dependencies.
+- **PyPI** (`pypi.org`, `files.pythonhosted.org`), every download checked
+  against a recorded sha256:
+  - `pip==26.2.1`, `setuptools==84.0.0` and `packaging==26.2`, the base
+    interpreter's own packages at their `poetry.lock` versions, from
+    `scripts/requirements-production-base.txt` (the lock's wheel hashes,
+    `pip install --require-hashes --only-binary :all:`).
+  - `poetry==2.4.1` and its 48 dependencies, from
+    `scripts/requirements-poetry.txt`, after the venv's bundled pip is
+    replaced from the base file. Poetry 2.4.1 wrote `poetry.lock` and is the CI
+    version. The file is regenerated from `scripts/requirements-poetry.in`
+    with uv 0.11.6, outside the build:
+    `uv pip compile scripts/requirements-poetry.in --python-version 3.11 --python-platform x86_64-unknown-linux-gnu --generate-hashes --exclude-newer 2026-10-19T00:00:00Z --output-file scripts/requirements-poetry.txt`
+    (move `--exclude-newer` forward on purpose when Poetry is upgraded).
+  - The locked main dependencies, `boto3` and `botocore` included (the KMS
+    receipt and grant signers fail closed without them), installed by Poetry
+    from `poetry.lock`.
+
+  Poetry runs from its own venv (`/opt/poetry`) in the `deps` stage and
+  installs into the system interpreter, so neither Poetry nor its
+  dependencies reach the production image, whose `site-packages` holds
+  exactly the locked main group plus the base image's `pip`, `setuptools` and
+  `wheel`. The production stage still builds on `base`, so the system
+  compilers and headers of `build-essential` and `libpq-dev` (gcc, g++,
+  make, ld, as, cpp, `pg_config`; about 353 MB uncompressed) are in the
+  image. A compiler-free runtime stage is a separate owner decision.
 - **npm registry** (`registry.npmjs.org`):
   - The pnpm tarball, fetched by `corepack prepare` and checked against the
     sha512 in `PNPM_PIN`. The host is corepack's documented default registry
     (overridable with `COREPACK_NPM_REGISTRY`), which would make the URL
-    `https://registry.npmjs.org/pnpm/-/pnpm-11.1.2.tgz`. **Unverified:** no
-    build was observed.
+    `https://registry.npmjs.org/pnpm/-/pnpm-11.1.2.tgz`. The download
+    succeeded in the 2026-10-19 build; its URL was not captured.
   - The frontend packages: `frontend/.npmrc` sets no registry and the lockfile
     has no off-registry tarballs. The lockfile closure of
     `@workspace/neurostack...` is 476 package versions, including
     platform-specific optional binaries that pnpm skips on linux/amd64. The
     earlier measurement of about 412 downloads was not repeated here.
-- At task start, not at build time, Fargate also pulls the `otel` image from
-  `public.ecr.aws`. Revision 8 names the mutable tag `:latest`; revision 9
-  and every revision rendered by the planner run the digest in the manifest
-  field `task_definition.otel_image` (what `:latest` resolved to on
-  2026-10-19), never a tag.
+- At task start, not at build time, Fargate also pulls
+  `public.ecr.aws/aws-observability/aws-otel-collector:latest` for `otel`.
+  That is a mutable tag, and it predates this work.
+
+### Image smoke (local, before the signed build)
+
+The live chain's S5 dry run runs the smoke explicitly, from the reviewed
+checkout, on a host with Docker and the build network:
+
+```bash
+RUN_DOCKER_IMAGE_SMOKE=1 poetry run pytest -p no:cacheprovider -rs \
+  tests/scripts/test_production_image_smoke.py::test_production_image_builds_and_passes_the_smoke
+```
+
+or, for the JSON summary on stdout:
+
+```bash
+poetry run python scripts/production_image_smoke.py --expected-head 035 --build-log /tmp/build.log
+```
+
+It runs `docker buildx build --platform linux/amd64 --load --target production`
+on the working tree (no push, no registry login) with `VCS_REF` set to the git
+revision (`-dirty` when the tree is modified), then runs each check in the
+image, addressed by its image ID with `--pull never` and `--network none`:
+`import src.api.main, boto3, botocore`; the interpreter's Python
+distributions are exactly the locked main group at the locked versions plus
+`pip`, `setuptools` and `wheel` (no Poetry, no Python build backend other
+than setuptools and wheel, no duplicate metadata; the system compilers are
+not checked and are still present); every top-level import under `src/`
+resolves; both KMS
+signer factories build their clients (no KMS call); `alembic heads` prints
+exactly `035 (head)`; `/app/spa/index.html` exists; and `alembic upgrade
+032:035 --sql` emits the migration window as one transaction. The window
+starts at `032` because migration `017` reads rows, which offline mode cannot
+do. It prints a JSON summary (image ID, build time, image size, warnings,
+checks) and exits 0 only when everything passes. Push the image by that image
+ID (tag the ID, then push); never rebuild it for the push, or the pushed image
+is not the one that was checked. The pytest end-to-end test is opt-in: without
+`RUN_DOCKER_IMAGE_SMOKE=1` it is skipped with that reason, so the normal
+`tests/scripts` run needs neither Docker nor the network; with it, an unusable
+Docker fails the test instead of skipping it. The static Dockerfile and smoke
+contract tests always run.
+
+The image carries `org.opencontainers.image.revision` from the `VCS_REF` build
+argument (default `unknown`). The protected build workflow passes no build
+argument, so its images read `unknown` until that workflow changes.

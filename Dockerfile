@@ -6,7 +6,14 @@
 # ============================================
 # Stage 1: Base image with Python
 # ============================================
-FROM python:3.11-slim AS base
+# Pinned by tag AND by the multi-arch index digest. Resolved on 2026-10-19 with
+# `docker buildx imagetools inspect python:3.11-slim`: the floating tag
+# python:3.11-slim was python:3.11.17-slim-trixie, index
+# sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce,
+# whose linux/amd64 manifest is
+# sha256:e529028263dbe6910a2d96f7d2b8f5266385e917fd45d286ef166977c094a51e.
+# Every Python stage derives from this one FROM.
+FROM python:3.11.17-slim-trixie@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce AS base
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -22,6 +29,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# The interpreter's own packages, at the poetry.lock versions and wheel hashes.
+# The production stage merges the deps stage's site-packages over this stage's,
+# so a package the deps install had to replace would leave its old metadata
+# behind (the image ships packaging 26.3, the lock pins 26.2); pip and
+# setuptools move past the base image's known advisories.
+COPY scripts/requirements-production-base.txt /opt/requirements/production-base.txt
+RUN pip install --require-hashes --only-binary :all: -r /opt/requirements/production-base.txt
+
 # Create non-root user for security
 RUN groupadd --gid 1000 neurostack \
     && useradd --uid 1000 --gid 1000 --shell /bin/bash --create-home neurostack
@@ -33,18 +48,28 @@ FROM base AS deps
 
 WORKDIR /app
 
-# Install Poetry
-RUN pip install poetry==1.8.2
+# Poetry (the version that writes poetry.lock and that CI runs) lives in its own
+# virtual environment. With virtualenvs.create false, a Poetry inside a venv
+# installs into the base interpreter (/usr/local), and the production stage
+# copies only that interpreter's site-packages: neither Poetry nor its
+# dependencies reach the production image. The venv first replaces its bundled
+# pip with the hashed one, then installs Poetry and every dependency from
+# scripts/requirements-poetry.txt (hash-locked, regenerated with the uv command
+# in its header).
+COPY scripts/requirements-poetry.txt /opt/requirements/poetry.txt
+RUN python -m venv /opt/poetry \
+    && /opt/poetry/bin/pip install --require-hashes --only-binary :all: -r /opt/requirements/production-base.txt \
+    && /opt/poetry/bin/pip install --require-hashes --only-binary :all: -r /opt/requirements/poetry.txt
 
 # Copy dependency files and the editable path dependency before installation.
 COPY pyproject.toml poetry.lock* ./
 COPY packages/neurostack-core ./packages/neurostack-core
 
 # Configure Poetry to not create virtual environment
-RUN poetry config virtualenvs.create false
+RUN /opt/poetry/bin/poetry config virtualenvs.create false
 
 # Install dependencies (production only)
-RUN poetry install --no-interaction --no-ansi --only main --no-root
+RUN /opt/poetry/bin/poetry install --no-interaction --no-ansi --only main --no-root
 
 # ============================================
 # Stage 3: Development image
@@ -52,7 +77,7 @@ RUN poetry install --no-interaction --no-ansi --only main --no-root
 FROM deps AS development
 
 # Install dev dependencies
-RUN poetry install --no-interaction --no-ansi --no-root
+RUN /opt/poetry/bin/poetry install --no-interaction --no-ansi --no-root
 
 # Copy application code
 COPY --chown=neurostack:neurostack . .
@@ -143,6 +168,11 @@ EXPOSE 8000
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
+
+# Source revision of the build (OCI annotation key). Declared after every COPY
+# so a new value never invalidates a cached layer.
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.revision="${VCS_REF}"
 
 # Production command with workers.
 # ``--no-access-log`` is defence-in-depth: :mod:`src.config.logging` also
