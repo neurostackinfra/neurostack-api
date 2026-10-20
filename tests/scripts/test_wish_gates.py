@@ -239,6 +239,7 @@ def _candidate_repo(tmp_path: Path) -> tuple[Path, Path]:
     (bin_dir / "poetry").write_text(
         "#!/usr/bin/env bash\n"
         'echo "poetry $*" >>"$CALL_LOG"\n'
+        '[ -z "${CWD_LOG:-}" ] || echo "$PWD" >>"$CWD_LOG"\n'
         'if [ "$1 $2" = "run pytest" ]; then\n'
         '  case "$*" in *"${FAIL_PYTEST_ON:-@none@}"*) exit 1 ;; esac\n'
         "  exit 0\n"
@@ -342,15 +343,95 @@ def test_release_gate_passes_clean_conventional_candidate(tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stdout + result.stderr
     calls = log.read_text()
-    assert "tests/integration/test_asaas_billing_postgres.py" in calls
+    assert _POSTGRES_SUITES_CALL in calls.splitlines()
     assert "docker compose" in calls
     assert "added-line secret/PII scan: no findings" in result.stdout
     # The pre-existing fixture hit is shown for review but does not fail.
     assert "baseline secret/PII findings (review required)" in result.stdout
     assert "tests/legacy_fixture.py" in result.stdout
-    assert "tests/integration/test_billing_producer_handoff_postgres.py" in calls
-    assert "tests/integration/test_asaas_subscription_triggers_postgres.py" in calls
     assert "conventional commits: 1 checked" in result.stdout
+
+
+_SUITES_AND = "source scripts/wish-gates.sh && asaas_release_candidate_postgres_suites"
+# The release-candidate PostgreSQL suites, pinned: dropping or adding one is a
+# deliberate change to this test, not a silent shrink of the gate and CI job.
+_RELEASE_CANDIDATE_POSTGRES_SUITES = (
+    "tests/integration/test_asaas_billing_postgres.py",
+    "tests/integration/test_asaas_checkout_service_postgres.py",
+    "tests/integration/test_asaas_webhook_postgres.py",
+    "tests/integration/test_asaas_subscription_triggers_postgres.py",
+    "tests/integration/test_billing_producer_handoff_postgres.py",
+)
+_POSTGRES_SUITES_CALL = (
+    "poetry run pytest -p no:cacheprovider -rs "
+    + " ".join(_RELEASE_CANDIDATE_POSTGRES_SUITES)
+    + " -v"
+)
+
+
+def test_postgres_suites_require_the_smoke_url(tmp_path: Path) -> None:
+    repo, log = _candidate_repo(tmp_path)
+
+    result = _run_release_gate(repo, log, command=_SUITES_AND)
+
+    assert result.returncode != 0
+    assert "set POSTGRES_SMOKE_DATABASE_URL" in result.stderr
+    assert not log.exists()
+
+
+def test_postgres_suites_run_the_release_candidate_list_from_the_root(
+    tmp_path: Path,
+) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    (repo / "elsewhere").mkdir()
+    cwd_log = tmp_path / "cwd.log"
+
+    result = _run_release_gate(
+        repo,
+        log,
+        command=(
+            "cd elsewhere && source ../scripts/wish-gates.sh && "
+            "asaas_release_candidate_postgres_suites && pwd"
+        ),
+        POSTGRES_SMOKE_DATABASE_URL="postgresql://x",
+        CWD_LOG=str(cwd_log),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    # The function runs in a subshell: the caller's directory is unchanged.
+    assert result.stdout.strip().endswith("/elsewhere")
+    assert log.read_text().splitlines() == [_POSTGRES_SUITES_CALL]
+    # ...but pytest itself runs from the repository root.
+    assert [os.path.realpath(line) for line in cwd_log.read_text().splitlines()] == [
+        os.path.realpath(repo)
+    ]
+
+
+@pytest.mark.parametrize("form", ["and", "or"])
+def test_postgres_suites_fail_in_every_calling_context(
+    tmp_path: Path, form: str
+) -> None:
+    repo, log = _candidate_repo(tmp_path)
+    command = {
+        "and": _SUITES_AND,
+        "or": (
+            "source scripts/wish-gates.sh\n"
+            "asaas_release_candidate_postgres_suites || { echo FAILED; exit 1; }\n"
+            "echo PASSED\n"
+        ),
+    }[form]
+
+    result = _run_release_gate(
+        repo,
+        log,
+        command=command,
+        POSTGRES_SMOKE_DATABASE_URL="postgresql://x",
+        FAIL_PYTEST_ON="test_billing_producer_handoff_postgres.py",
+    )
+
+    assert result.returncode != 0
+    assert "release-candidate PostgreSQL suites failed" in result.stderr
+    assert "PASSED" not in result.stdout
 
 
 @pytest.mark.parametrize(

@@ -459,8 +459,14 @@ recusados sem imprimir o conteúdo. O arquivo continua sendo passado ao Compose
 por `--env-file`, mas nunca é executado pelo Bash.
 
 O VPS requer Python 3.11+, Git, trust GPG/SSH, Docker e Docker Compose. A única
-entrada é `scripts/deploy-vps.sh`; sua primeira operação chama diretamente o
-checker stdlib. O gate de orçamento também usa apenas a stdlib e o comando
+entrada é `scripts/deploy-vps.sh`; sua primeira operação valida, sem I/O, a
+revisão Alembic fixada em `APPROVED_ALEMBIC_REVISION` (hoje `035`, a mesma da
+janela de migrations de produção) e a seguinte chama diretamente o checker
+stdlib. Depois do `pull` e antes do `up -d`, o deploy exige que o único head
+Alembic da imagem aprovada seja exatamente essa revisão; um head mais novo,
+vários heads, erro ou saída vazia bloqueiam o deploy sem iniciar nada. A
+migration aplica apenas essa revisão exata, e subir o pin exige a mesma
+aprovação do owner que a janela de produção. O gate de orçamento também usa apenas a stdlib e o comando
 `docker compose config --format json`, já exigido pelo deploy, para resolver a
 estrutura efetiva. Não instale PyYAML ou qualquer outra dependência Python para
 o gate.
