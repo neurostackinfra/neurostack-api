@@ -59,10 +59,17 @@ after.
 
 ## Rolling back the Group 9 D3 wiring
 
-The rollback target is `neurostack-staging-app:8`
+The rollback target is the manifest field `rollback_target`
+(`infra/production/asaas-production-wiring.yaml`), which `plan` reports as
+`rollback_target`. Today it is `neurostack-staging-app:8`
 (`arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:8`),
-the revision the service ran when the wiring was prepared. `plan` reports it
-as `rollback_target`, and the manifest pins it.
+the revision the service ran when the wiring was prepared. It is re-pinned to
+revision 9 (the D3 revision on the bridge image) once revision 9 has served
+and its observation period closed, and before migration 036: revision 8 reads
+columns 036 drops, so after 036 roll back to revision 9, never to 8. Read the
+revision below as the field's current value. A failed post-deploy webhook
+registration (`DEPLOYED_WEBHOOK_PENDING`) is an alert, never a reason to roll
+back.
 
 - **Before the service deployment gate**, nothing needs rolling back. The
   stack and the extra task definition revision are inert while the service
@@ -107,8 +114,17 @@ as `rollback_target`, and the manifest pins it.
   verified). ASAAS may then interrupt the webhook queue and email
   `ASAAS_WEBHOOK_NOTIFICATION_EMAIL`.
   After a later re-deploy, the readback reports `interrupted` until the
-  webhook is reconciled. Pausing or deleting the provider webhook is a manual
-  provider operation with its own approval.
+  webhook is reconciled. The automatic `reconcile` that runs after each deploy
+  (`python -m src.ops.asaas_webhook reconcile`, see the D4 section of
+  [`asaas-deployment.md`](./asaas-deployment.md)) **resumes an interrupted
+  queue by default, and ASAAS then re-sends the backlog** (result reason
+  `queue_resumed`); add `--no-resume` to keep it paused. It **never
+  re-enables a webhook that is disabled** (`enabled: false`): that stays
+  `disabled` / `webhook_disabled_by_operator` until someone runs
+  `reconcile --allow-enable` on the owner's instruction. Pausing or deleting
+  the provider webhook is a manual provider operation with its own approval;
+  to keep ASAAS from delivering during a rollback, disable the webhook in the
+  ASAAS panel (an interruption alone is undone by the next deploy).
 
 Evidence records only opaque IDs, statuses, timestamps and SHA-256 digests;
 no tokens, provider payloads, customer details or card data.

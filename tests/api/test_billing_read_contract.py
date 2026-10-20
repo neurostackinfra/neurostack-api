@@ -8,10 +8,14 @@ top-up truth table) live in
 
 from __future__ import annotations
 
+import asyncio
+import collections
 import functools
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, get_args
+from pathlib import Path
+from typing import Any, Final, get_args
 from uuid import UUID, uuid4
 
 import jwt
@@ -51,12 +55,104 @@ from src.services.billing_read_contract import (
     CommercialReadback,
     LiveCheckoutReadback,
     LiveCheckoutState,
+    PaymentState,
     SubscriptionFinancialStatus,
     SubscriptionReadback,
+    SubscriptionSummaryStatus,
+    billing_today,
+    derive_payment_state,
+    latest_cycle_kind,
+    read_current_subscription,
+    read_live_checkout,
 )
 from src.services.billing_rollout import BillingCheckoutUnavailable
 
 _FROZEN_NOW = datetime(2026, 10, 18, 12, 0, 0, tzinfo=timezone.utc)
+_ROOT = Path(__file__).resolve().parents[2]
+
+# -- payment_state (owner A1) and the cancelled paid window (owner A2) ---------
+#
+# The literal oracle shared with the PostgreSQL matrix and with the table in
+# docs/api-contracts.md (``test_docs_table_is_the_payment_state_matrix``).
+# Columns: the paid-through date P (``current_period_end``, the latest
+# ``cycle_end`` among fully-paid-net-of-reversals cycles) against the São Paulo
+# calendar date ``today``: no such cycle, P < today, P = today, P > today.
+DATE_RELATIONS: Final = ("none", "before", "today", "after")
+# The newest cycle (by ``cycle_start``) as ``(state, settled, reversed,
+# restored)`` cents, exactly what ``_line_state`` writes for those totals.
+_AMOUNT: Final = 265_000
+LATEST_CYCLES: Final[dict[str, tuple[str, int, int, int] | None]] = {
+    "none": None,
+    "pending": ("pending", 0, 0, 0),
+    "settled": ("settled", _AMOUNT, 0, 0),
+    "restored_full": ("restored", _AMOUNT, _AMOUNT, _AMOUNT),
+    "restored_partial": ("restored", _AMOUNT, _AMOUNT, 1),
+    "reversed_full": ("reversed", _AMOUNT, _AMOUNT, 0),
+    "reversed_partial": ("reversed", _AMOUNT, 1, 0),
+    "quarantined": ("quarantined", 0, 0, 0),
+}
+UNREACHABLE: Final = "—"
+# ``null`` = the summary answers ``subscription: null``.
+_LIVE_ROWS: Final = {
+    "none": ("pending", UNREACHABLE, UNREACHABLE, UNREACHABLE),
+    "pending": ("pending", "overdue", "paid", "paid"),
+    "settled": (UNREACHABLE, "overdue", "paid", "paid"),
+    "restored_full": (UNREACHABLE, "overdue", "paid", "paid"),
+    "restored_partial": ("reversed", "reversed", "reversed", "reversed"),
+    "reversed_full": ("reversed", "reversed", "reversed", "reversed"),
+    "reversed_partial": ("reversed", "reversed", "reversed", "reversed"),
+    "quarantined": ("pending", "pending", "pending", "pending"),
+}
+_EVIDENCE_PENDING_ROWS: Final = {
+    "none": ("pending", UNREACHABLE, UNREACHABLE, UNREACHABLE),
+    "pending": ("pending", "pending", "pending", "pending"),
+    "settled": (UNREACHABLE, "pending", "pending", "pending"),
+    "restored_full": (UNREACHABLE, "pending", "pending", "pending"),
+    "restored_partial": ("pending", "pending", "pending", "pending"),
+    "reversed_full": ("pending", "pending", "pending", "pending"),
+    "reversed_partial": ("pending", "pending", "pending", "pending"),
+    "quarantined": ("pending", "pending", "pending", "pending"),
+}
+_CANCELLED_ROWS: Final = {
+    "none": ("null", UNREACHABLE, UNREACHABLE, UNREACHABLE),
+    "pending": ("null", "null", "paid", "paid"),
+    "settled": (UNREACHABLE, "null", "paid", "paid"),
+    "restored_full": (UNREACHABLE, "null", "paid", "paid"),
+    "restored_partial": ("null", "null", "reversed", "reversed"),
+    "reversed_full": ("null", "null", "reversed", "reversed"),
+    "reversed_partial": ("null", "null", "reversed", "reversed"),
+    "quarantined": ("null", "null", "pending", "pending"),
+}
+_INACTIVE_ROWS: Final = {
+    "none": ("null", UNREACHABLE, UNREACHABLE, UNREACHABLE),
+    "pending": ("null", "null", "null", "null"),
+    "settled": (UNREACHABLE, "null", "null", "null"),
+    "restored_full": (UNREACHABLE, "null", "null", "null"),
+    "restored_partial": ("null", "null", "null", "null"),
+    "reversed_full": ("null", "null", "null", "null"),
+    "reversed_partial": ("null", "null", "null", "null"),
+    "quarantined": ("null", "null", "null", "null"),
+}
+PAYMENT_STATE_MATRIX: Final[dict[tuple[str, str], tuple[str, ...]]] = {
+    (status, latest): row
+    for status, rows in (
+        ("active", _LIVE_ROWS),
+        ("active_linked", _LIVE_ROWS),
+        ("readback_required", _EVIDENCE_PENDING_ROWS),
+        ("non_billable_pending_readback", _EVIDENCE_PENDING_ROWS),
+        ("cancelled", _CANCELLED_ROWS),
+        ("inactive", _INACTIVE_ROWS),
+    )
+    for latest, row in rows.items()
+}
+MATRIX_STATUSES: Final = (
+    "active",
+    "active_linked",
+    "readback_required",
+    "non_billable_pending_readback",
+    "cancelled",
+    "inactive",
+)
 
 # The exact bytes the pre-Group-6b route produced for the golden fixture
 # (captured from origin/main 975bc394 before the route was changed).
@@ -240,6 +336,30 @@ def test_summary_keeps_every_legacy_byte_and_only_appends_new_fields(
     }
 
 
+def test_summary_is_never_stored_by_any_cache(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Per builder and time-dependent (payment_state, the cancelled window):
+    # browsers and shared caches must not keep it, and the API response cache
+    # (which skips paths without a TTL) never answers it.
+    builder_id = uuid4()
+    client._submit(_seed_golden_builder(builder_id))
+    _freeze_usage(monkeypatch)
+
+    first = client.get("/v1/billing/summary", headers=_headers(builder_id))
+    second = client.get("/v1/billing/summary", headers=_headers(builder_id))
+
+    assert first.status_code == second.status_code == 200
+    assert first.headers.get("cache-control") == "no-store"
+    assert second.headers.get("cache-control") == "no-store"
+    assert second.headers.get("x-cache") != "HIT"
+    # Only a header was added: the body keeps the legacy bytes.
+    assert first.content.startswith(_LEGACY_GOLDEN[:-1] + b',"subscription":')
+    # The catalog is identical for every builder and is left as it was.
+    catalog = client.get("/v1/billing/catalog", headers=_headers(builder_id))
+    assert catalog.headers.get("cache-control") != "no-store"
+
+
 def test_summary_and_catalog_require_builder_login(client) -> None:
     for path in ("/v1/billing/summary", "/v1/billing/catalog"):
         assert client.get(path).status_code == 401
@@ -328,6 +448,28 @@ def test_subscription_status_literal_is_the_non_terminal_asaas_status_set() -> N
     assert set(get_args(LiveCheckoutState)) == set(LIVE_CHECKOUT_STATES)
 
 
+def test_summary_status_adds_only_cancelled_and_payment_state_is_closed() -> None:
+    # Owner A2: only a subscription cancelled at the provider is returned past
+    # its end, and only while its paid period runs; ``inactive`` never is.
+    assert get_args(SubscriptionSummaryStatus) == (
+        *get_args(SubscriptionFinancialStatus),
+        "cancelled",
+    )
+    assert "inactive" not in get_args(SubscriptionSummaryStatus)
+    # Owner A1: a closed, server-derived enum.
+    assert get_args(PaymentState) == ("paid", "overdue", "reversed", "pending")
+
+
+_SUBSCRIPTION_SUMMARY: Final[dict[str, object]] = {
+    "offer_id": "plan_plus_monthly_v1",
+    "catalog_version_id": "payment-2026-10-03",
+    "status": "active",
+    "amount_cents": 99_900,
+    "current_period_end": "2026-11-11",
+    "payment_state": "paid",
+}
+
+
 @pytest.mark.parametrize(
     ("override", "match"),
     [
@@ -337,21 +479,46 @@ def test_subscription_status_literal_is_the_non_terminal_asaas_status_set() -> N
         ({"offer_id": ""}, "String should have at least 1 character"),
         ({"builder_id": str(uuid4())}, "Extra inputs are not permitted"),
         ({"external_subscription_id": "sub_1"}, "Extra inputs are not permitted"),
+        (
+            {"payment_state": "late"},
+            "Input should be 'paid', 'overdue', 'reversed' or 'pending'",
+        ),
+        ({"payment_state": None}, "Input should be 'paid', 'overdue'"),
+        (
+            {"current_period_end": "2026-11-11T03:00:00-03:00"},
+            "Datetimes provided to dates should have zero time",
+        ),
     ],
 )
 def test_subscription_summary_model_is_closed(
     override: dict[str, object], match: str
 ) -> None:
-    payload: dict[str, object] = {
-        "offer_id": "plan_plus_monthly_v1",
-        "catalog_version_id": "payment-2026-10-03",
-        "status": "active",
-        "amount_cents": 99_900,
-        "current_period_end": "2026-11-11",
-    }
+    payload = dict(_SUBSCRIPTION_SUMMARY)
     payload.update(override)
     with pytest.raises(ValidationError, match=match):
         BillingSubscriptionSummaryResponse.model_validate(payload)
+
+
+def test_subscription_summary_model_requires_the_payment_state() -> None:
+    payload = dict(_SUBSCRIPTION_SUMMARY)
+    del payload["payment_state"]
+    with pytest.raises(ValidationError, match="payment_state\n  Field required"):
+        BillingSubscriptionSummaryResponse.model_validate(payload)
+    for status in ("active", "cancelled"):
+        assert (
+            BillingSubscriptionSummaryResponse.model_validate(
+                {**_SUBSCRIPTION_SUMMARY, "status": status}
+            ).status
+            == status
+        )
+
+
+_LIVE_SESSION: Final[dict[str, object]] = {
+    "checkout_session_id": "5b0c8f7e-0000-4000-8000-000000000000",
+    "kind": "subscription",
+    "state": "active",
+    "offer_id": "plan_plus_monthly_v1",
+}
 
 
 @pytest.mark.parametrize(
@@ -360,16 +527,22 @@ def test_subscription_summary_model_is_closed(
         ({"state": "completed"}, "Input should be 'creating', 'active'"),
         ({"kind": "annual"}, "Input should be 'subscription' or 'topup'"),
         ({"checkout_url": "https://x"}, "Extra inputs are not permitted"),
+        ({"offer_id": ""}, "String should have at least 1 character"),
+        ({"offer_id": "x" * 101}, "String should have at most 100 characters"),
+        ({"offer_id": None}, "Input should be a valid string"),
     ],
 )
 def test_live_session_model_is_closed(override: dict[str, object], match: str) -> None:
-    payload: dict[str, object] = {
-        "checkout_session_id": str(uuid4()),
-        "kind": "subscription",
-        "state": "active",
-    }
+    payload = dict(_LIVE_SESSION)
     payload.update(override)
     with pytest.raises(ValidationError, match=match):
+        BillingLiveCheckoutResponse.model_validate(payload)
+
+
+def test_live_session_model_requires_the_offer_id() -> None:
+    payload = dict(_LIVE_SESSION)
+    del payload["offer_id"]
+    with pytest.raises(ValidationError, match="offer_id\n  Field required"):
         BillingLiveCheckoutResponse.model_validate(payload)
 
 
@@ -426,9 +599,13 @@ def test_summary_serializes_the_read_contract_from_the_jwt_builder_only(
             status="active",
             amount_cents=265_000,
             current_period_end=date(2026, 11, 11),
+            payment_state="overdue",
         ),
         live=LiveCheckoutReadback(
-            checkout_session_id=session_id, kind="topup", state="active"
+            checkout_session_id=session_id,
+            kind="topup",
+            state="active",
+            offer_id="package_credits_1000_v1",
         ),
         commercial=CommercialReadback(
             available_offer_ids=("package_credits_500_v1", "package_credits_1000_v1"),
@@ -452,6 +629,7 @@ def test_summary_serializes_the_read_contract_from_the_jwt_builder_only(
         "status": "active",
         "amount_cents": 265_000,
         "current_period_end": "2026-11-11",
+        "payment_state": "overdue",
     }
     assert body["checkout"] == {
         "available_offer_ids": ["package_credits_500_v1", "package_credits_1000_v1"],
@@ -459,13 +637,70 @@ def test_summary_serializes_the_read_contract_from_the_jwt_builder_only(
             "checkout_session_id": str(session_id),
             "kind": "topup",
             "state": "active",
+            "offer_id": "package_credits_1000_v1",
         },
         "available": True,
     }
     assert body["topup_commercial_enabled"] is True
+    # Owner A4, byte for byte: a timezone-free calendar date, the new fields
+    # appended after the existing ones, nothing else.
+    assert (
+        b'"subscription":{"offer_id":"plan_pro_monthly_v1",'
+        b'"catalog_version_id":"payment-2026-10-03","status":"active",'
+        b'"amount_cents":265000,"current_period_end":"2026-11-11",'
+        b'"payment_state":"overdue"},'
+        b'"checkout":{"available_offer_ids":["package_credits_500_v1",'
+        b'"package_credits_1000_v1"],"live_session":{"checkout_session_id":"'
+        + str(session_id).encode()
+        + b'","kind":"topup","state":"active",'
+        b'"offer_id":"package_credits_1000_v1"},"available":true},'
+        b'"topup_commercial_enabled":true}'
+    ) in response.content
     # The legacy fields stay the builder's own, untouched by the new reads.
     legacy = json.loads(_LEGACY_GOLDEN)
     assert {key: body[key] for key in legacy} == legacy
+    assert response.content.startswith(_LEGACY_GOLDEN[:-1] + b',"subscription":')
+
+
+def test_summary_serializes_a_cancelled_subscription_inside_its_paid_period(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder_id = uuid4()
+    client._submit(_seed_golden_builder(builder_id))
+    _freeze_usage(monkeypatch)
+    _stub_reads(
+        monkeypatch,
+        subscription=SubscriptionReadback(
+            offer_id="plan_plus_monthly_v1",
+            catalog_version_id="payment-2026-10-03",
+            status="cancelled",
+            amount_cents=99_900,
+            current_period_end=date(2026, 11, 11),
+            payment_state="paid",
+        ),
+        live=None,
+        commercial=CommercialReadback(
+            available_offer_ids=("plan_plus_monthly_v1",),
+            topup_commercial_enabled=False,
+            available=True,
+        ),
+        seen=[],
+    )
+
+    response = client.get("/v1/billing/summary", headers=_headers(builder_id))
+
+    assert response.status_code == 200
+    assert (
+        b',"subscription":{"offer_id":"plan_plus_monthly_v1",'
+        b'"catalog_version_id":"payment-2026-10-03","status":"cancelled",'
+        b'"amount_cents":99900,"current_period_end":"2026-11-11",'
+        b'"payment_state":"paid"},"checkout":{"available_offer_ids":'
+        b'["plan_plus_monthly_v1"],"live_session":null,"available":true},'
+        b'"topup_commercial_enabled":false}'
+    ) in response.content
+    # The legacy fields are the builder's own and never derived from it.
+    legacy = json.loads(_LEGACY_GOLDEN)
+    assert {key: response.json()[key] for key in legacy} == legacy
 
 
 @pytest.mark.parametrize("failure", ["subscription", "live"])
@@ -547,7 +782,10 @@ def _unavailable_count() -> float:
 def _live_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     async def live_read(db: object, *, builder_id: UUID) -> object:
         return LiveCheckoutReadback(
-            checkout_session_id=uuid4(), kind="subscription", state="active"
+            checkout_session_id=uuid4(),
+            kind="subscription",
+            state="active",
+            offer_id="plan_plus_monthly_v1",
         )
 
     monkeypatch.setattr(billing, "read_live_checkout", live_read)
@@ -663,7 +901,10 @@ def test_summary_closed_rollout_is_available_and_empty_not_a_failure(
 
     async def live_read(db: object, *, builder_id: UUID) -> object:
         return LiveCheckoutReadback(
-            checkout_session_id=session_id, kind="topup", state="active"
+            checkout_session_id=session_id,
+            kind="topup",
+            state="active",
+            offer_id="package_credits_500_v1",
         )
 
     async def closed(db: object, builder_id: UUID) -> None:
@@ -682,6 +923,7 @@ def test_summary_closed_rollout_is_available_and_empty_not_a_failure(
             "checkout_session_id": str(session_id),
             "kind": "topup",
             "state": "active",
+            "offer_id": "package_credits_500_v1",
         },
         "available": True,
     }
@@ -816,13 +1058,59 @@ def test_openapi_documents_the_read_contract(client) -> None:
         "checkout",
         "topup_commercial_enabled",
     ]
-    assert set(components["BillingSubscriptionSummaryResponse"]["properties"]) == {
+    subscription = components["BillingSubscriptionSummaryResponse"]
+    assert list(subscription["properties"]) == [
         "offer_id",
         "catalog_version_id",
         "status",
         "amount_cents",
         "current_period_end",
-    }
+        "payment_state",
+    ]
+    assert subscription["additionalProperties"] is False
+    assert "payment_state" in subscription["required"]
+    assert subscription["properties"]["payment_state"]["enum"] == [
+        "paid",
+        "overdue",
+        "reversed",
+        "pending",
+    ]
+    assert subscription["properties"]["status"]["enum"] == [
+        "active",
+        "active_linked",
+        "readback_required",
+        "non_billable_pending_readback",
+        "cancelled",
+    ]
+    # Owner A4: a calendar date in the schema, never a date-time.
+    assert {"type": "string", "format": "date"} in subscription["properties"][
+        "current_period_end"
+    ]["anyOf"]
+    live = components["BillingLiveCheckoutResponse"]
+    assert list(live["properties"]) == [
+        "checkout_session_id",
+        "kind",
+        "state",
+        "offer_id",
+    ]
+    assert live["additionalProperties"] is False
+    assert "offer_id" in live["required"]
+    # The published examples are valid contract payloads.
+    example = subscription["example"]
+    assert (
+        BillingSubscriptionSummaryResponse.model_validate(example).model_dump(
+            mode="json"
+        )
+        == example
+    )
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", example["current_period_end"])
+    assert example["payment_state"] in get_args(PaymentState)
+    live_example = live["example"]
+    assert (
+        BillingLiveCheckoutResponse.model_validate(live_example).model_dump(mode="json")
+        == live_example
+    )
+    assert live_example["offer_id"] in BILLING_CATALOG
     assert set(components["BillingCheckoutSummaryResponse"]["properties"]) == {
         "available_offer_ids",
         "live_session",
@@ -892,3 +1180,334 @@ def test_canary_predicate_admits_only_the_canary_builder_offers_and_free_slots()
             )
             for offer_id in BILLING_CATALOG
         )
+
+
+# -- payment_state: São Paulo calendar, cycle classification, full matrix --------
+
+_TODAY: Final = date(2026, 11, 11)
+_RELATION_DATES: Final[dict[str, date | None]] = {
+    "none": None,
+    "before": date(2026, 11, 10),
+    "today": _TODAY,
+    "after": date(2026, 11, 12),
+}
+
+
+@pytest.mark.parametrize(
+    ("instant", "expected"),
+    [
+        # 23:30 in São Paulo is already the next day in UTC: São Paulo wins.
+        (datetime(2026, 11, 12, 2, 30, tzinfo=timezone.utc), date(2026, 11, 11)),
+        (datetime(2026, 11, 12, 2, 59, 59, tzinfo=timezone.utc), date(2026, 11, 11)),
+        (datetime(2026, 11, 12, 3, 0, tzinfo=timezone.utc), date(2026, 11, 12)),
+        (datetime(2026, 11, 11, 3, 0, tzinfo=timezone.utc), date(2026, 11, 11)),
+        (datetime(2026, 11, 11, 2, 59, 59, tzinfo=timezone.utc), date(2026, 11, 10)),
+        # Any aware instant is placed on the São Paulo calendar.
+        (
+            datetime(2026, 11, 12, 11, 0, tzinfo=timezone(timedelta(hours=9))),
+            date(2026, 11, 11),
+        ),
+        (
+            datetime(2026, 11, 11, 23, 59, tzinfo=timezone(timedelta(hours=-3))),
+            date(2026, 11, 11),
+        ),
+    ],
+)
+def test_billing_today_is_the_sao_paulo_calendar_date(
+    instant: datetime, expected: date
+) -> None:
+    assert billing_today(instant) == expected
+
+
+def test_billing_today_refuses_a_naive_instant() -> None:
+    # A naive instant has no place on the commercial calendar: fail closed
+    # (the summary answers 503) instead of reading it in the host zone.
+    with pytest.raises(BillingReadUnavailable):
+        billing_today(datetime(2026, 11, 12, 2, 30))
+
+
+@pytest.mark.parametrize(
+    ("state", "reversed_cents", "restored_cents", "expected"),
+    [
+        ("pending", 0, 0, "pending"),
+        ("settled", 0, 0, "paid"),
+        ("restored", _AMOUNT, _AMOUNT, "paid"),
+        ("restored", _AMOUNT, 1, "reversed"),
+        ("reversed", _AMOUNT, 0, "reversed"),
+        ("reversed", 1, 0, "reversed"),
+        ("quarantined", 0, 0, "quarantined"),
+        ("quarantined", _AMOUNT, 0, "quarantined"),
+        # Shapes production never writes still classify conservatively.
+        ("settled", 1, 0, "reversed"),
+        ("reversed", 0, 0, "reversed"),
+        ("pending", 1, 0, "pending"),
+    ],
+)
+def test_latest_cycle_kind_classifies_every_check_admitted_state(
+    state: str, reversed_cents: int, restored_cents: int, expected: str
+) -> None:
+    assert latest_cycle_kind(state, reversed_cents, restored_cents) == expected
+
+
+@pytest.mark.parametrize(
+    ("state", "reversed_cents", "restored_cents"),
+    [
+        ("refunded", 0, 0),
+        ("partially_reversed", 1, 0),
+        (None, 0, 0),
+        ("settled", None, 0),
+        ("settled", 0, "0"),
+        ("settled", True, True),
+        ("settled", 0.0, 0),
+    ],
+)
+def test_latest_cycle_kind_fails_closed_on_an_unknown_shape(
+    state: object, reversed_cents: object, restored_cents: object
+) -> None:
+    with pytest.raises(BillingReadUnavailable):
+        latest_cycle_kind(state, reversed_cents, restored_cents)
+
+
+def _unreachable(latest: str, relation: str) -> bool:
+    """No cycle has no paid-through date; a fully-paid newest cycle always has
+    one (its own ``cycle_end``)."""
+
+    cycle = LATEST_CYCLES[latest]
+    if cycle is None:
+        return relation != "none"
+    state, _settled, reversed_cents, restored_cents = cycle
+    return (
+        latest_cycle_kind(state, reversed_cents, restored_cents) == "paid"
+        and relation == "none"
+    )
+
+
+@pytest.mark.parametrize("relation", DATE_RELATIONS)
+@pytest.mark.parametrize("latest", list(LATEST_CYCLES))
+@pytest.mark.parametrize("status", MATRIX_STATUSES)
+def test_payment_state_matrix_cell(status: str, latest: str, relation: str) -> None:
+    """Every (status x newest cycle x paid-through relation) combination.
+
+    The visibility cells (``null``) are decided in SQL and proven against the
+    same matrix on PostgreSQL
+    (``test_payment_state_matrix_on_postgres``); here they are pinned to the
+    shape of owner rule A2.
+    """
+
+    expected = PAYMENT_STATE_MATRIX[(status, latest)][DATE_RELATIONS.index(relation)]
+    assert (expected == UNREACHABLE) is _unreachable(latest, relation)
+    if expected == UNREACHABLE:
+        return
+    if expected == "null":
+        assert status == "inactive" or (
+            status == "cancelled" and relation in ("none", "before")
+        )
+        return
+    cycle = LATEST_CYCLES[latest]
+    kind = None if cycle is None else latest_cycle_kind(cycle[0], cycle[2], cycle[3])
+    assert (
+        derive_payment_state(
+            status=status,  # type: ignore[arg-type]
+            latest=kind,
+            paid_through=_RELATION_DATES[relation],
+            today=_TODAY,
+        )
+        == expected
+    )
+
+
+def test_payment_state_matrix_is_complete() -> None:
+    assert set(PAYMENT_STATE_MATRIX) == {
+        (status, latest) for status in MATRIX_STATUSES for latest in LATEST_CYCLES
+    }
+    assert all(len(row) == len(DATE_RELATIONS) for row in PAYMENT_STATE_MATRIX.values())
+    assert {cell for row in PAYMENT_STATE_MATRIX.values() for cell in row} == {
+        *get_args(PaymentState),
+        "null",
+        UNREACHABLE,
+    }
+
+
+def _docs_matrix() -> dict[tuple[str, str], tuple[str, ...]]:
+    text = (_ROOT / "docs/api-contracts.md").read_text(encoding="utf-8")
+    start = text.index("<!-- payment-state-matrix:start -->")
+    end = text.index("<!-- payment-state-matrix:end -->")
+    rows = [
+        line.strip()
+        for line in text[start:end].splitlines()
+        if line.strip().startswith("|") and not set(line.strip()) <= set("|-: ")
+    ]
+    header, *data = rows
+    assert [cell.strip() for cell in header.strip("|").split("|")] == [
+        "`status`",
+        "ciclo mais recente",
+        "sem ciclo pago",
+        "P < hoje",
+        "P = hoje",
+        "P > hoje",
+    ]
+    matrix: dict[tuple[str, str], tuple[str, ...]] = {}
+    for line in data:
+        status_cell, latest_cell, *cells = (
+            cell.strip() for cell in line.strip().strip("|").split("|")
+        )
+        latest = re.findall(r"`([a-z_]+)`", latest_cell)[0]
+        values = tuple(cell.strip("`") for cell in cells)
+        for status in re.findall(r"`([a-z_]+)`", status_cell):
+            assert (status, latest) not in matrix
+            matrix[(status, latest)] = values
+    return matrix
+
+
+def test_docs_table_is_the_payment_state_matrix() -> None:
+    assert _docs_matrix() == PAYMENT_STATE_MATRIX
+
+
+def test_docs_summary_example_is_a_valid_contract_payload() -> None:
+    text = (_ROOT / "docs/api-contracts.md").read_text(encoding="utf-8")
+    section = text[text.index("#### GET /v1/billing/summary") :]
+    block = section[section.index("```json") + len("```json") :]
+    example = json.loads(block[: block.index("```")])
+    assert list(example) == ["subscription", "checkout", "topup_commercial_enabled"]
+    for model, key in (
+        (BillingSubscriptionSummaryResponse, "subscription"),
+        (BillingCheckoutSummaryResponse, "checkout"),
+    ):
+        assert model.model_validate(example[key]).model_dump(mode="json") == (
+            example[key]
+        )
+
+
+# -- read functions over a stub session: fail-closed shapes ------------------------
+
+_SubscriptionRow = collections.namedtuple(
+    "_SubscriptionRow",
+    [
+        "offer_id",
+        "catalog_version_id",
+        "status",
+        "amount_cents",
+        "paid_through",
+        "newest_state",
+        "newest_reversed_cents",
+        "newest_restored_cents",
+    ],
+)
+
+
+class _StubResult:
+    def __init__(self, rows: list[Any]) -> None:
+        self._rows = rows
+
+    def all(self) -> list[Any]:
+        return list(self._rows)
+
+    def first(self) -> Any:
+        return self._rows[0] if self._rows else None
+
+
+class _StubSession:
+    def __init__(self, rows: list[Any]) -> None:
+        self._rows = rows
+        self.statements = 0
+
+    async def execute(self, statement: object) -> _StubResult:
+        self.statements += 1
+        return _StubResult(self._rows)
+
+
+def _row(**overrides: object) -> _SubscriptionRow:
+    values: dict[str, object] = {
+        "offer_id": "plan_plus_monthly_v1",
+        "catalog_version_id": "payment-2026-10-03",
+        "status": "cancelled",
+        "amount_cents": 99_900,
+        "paid_through": date(2026, 11, 11),
+        "newest_state": "settled",
+        "newest_reversed_cents": 0,
+        "newest_restored_cents": 0,
+    }
+    values.update(overrides)
+    return _SubscriptionRow(**values)
+
+
+def _read(rows: list[Any], instant: datetime = _FROZEN_NOW) -> Any:
+    session = _StubSession(rows)
+    result = asyncio.run(
+        read_current_subscription(
+            session, builder_id=uuid4(), clock=lambda: instant  # type: ignore[arg-type]
+        )
+    )
+    assert session.statements == 1  # one statement, one snapshot
+    return result
+
+
+def test_subscription_read_returns_a_cancelled_row_and_its_payment_state() -> None:
+    readback = _read([_row(), _row(offer_id="plan_pro_monthly_v1")])
+    assert readback == SubscriptionReadback(
+        offer_id="plan_plus_monthly_v1",
+        catalog_version_id="payment-2026-10-03",
+        status="cancelled",
+        amount_cents=99_900,
+        current_period_end=date(2026, 11, 11),
+        payment_state="paid",
+    )
+    # A current row sorts first and wins over a cancelled one.
+    current = _read(
+        [_row(status="active", paid_through=None, newest_state=None), _row()]
+    )
+    assert (current.status, current.payment_state) == ("active", "pending")
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [_row(status="active"), _row(status="active_linked")],
+        [_row(status="readback_required"), _row(status="active")],
+        [_row(status="inactive")],
+        [_row(status="trial")],
+        [_row(offer_id="")],
+        [_row(offer_id=None)],
+        [_row(catalog_version_id="")],
+        [_row(amount_cents=-1)],
+        [_row(amount_cents=True)],
+        [_row(paid_through="2026-11-11")],
+        # Owner A4: a calendar date only.  ``datetime`` is a ``date``
+        # subclass, so an instant (aware or naive) must not slip through.
+        [_row(paid_through=datetime(2026, 11, 11, tzinfo=timezone.utc))],
+        [_row(paid_through=datetime(2026, 11, 11))],
+        [_row(newest_state="refunded")],
+        [_row(newest_reversed_cents=None)],
+    ],
+)
+def test_subscription_read_fails_closed_on_an_unexpected_shape(rows: list[Any]) -> None:
+    with pytest.raises(BillingReadUnavailable):
+        _read(rows)
+
+
+def test_subscription_read_refuses_a_naive_clock() -> None:
+    with pytest.raises(BillingReadUnavailable):
+        _read([_row()], datetime(2026, 11, 1, 12, 0))
+
+
+@pytest.mark.parametrize("offer_id", ["", None, 7])
+def test_live_read_fails_closed_without_a_session_offer(offer_id: object) -> None:
+    session = _StubSession([(uuid4(), "subscription", "active", offer_id)])
+    with pytest.raises(BillingReadUnavailable):
+        asyncio.run(
+            read_live_checkout(session, builder_id=uuid4())  # type: ignore[arg-type]
+        )
+
+
+def test_live_read_returns_the_session_offer() -> None:
+    session_id = uuid4()
+    session = _StubSession([(session_id, "topup", "active", "package_credits_2000_v1")])
+    readback = asyncio.run(
+        read_live_checkout(session, builder_id=uuid4())  # type: ignore[arg-type]
+    )
+    assert readback == LiveCheckoutReadback(
+        checkout_session_id=session_id,
+        kind="topup",
+        state="active",
+        offer_id="package_credits_2000_v1",
+    )

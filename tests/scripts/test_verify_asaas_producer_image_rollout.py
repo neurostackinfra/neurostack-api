@@ -1919,9 +1919,12 @@ def test_d3_value_drift_between_before_and_after_is_detected(name: str) -> None:
         compare_rollout_readbacks(before, after, expected_digest=DIGEST)
 
 
+@pytest.mark.parametrize(
+    "serving_database_reference", [SECRET_ARN, PINNED_DATABASE_REFERENCE]
+)
 @pytest.mark.parametrize("name", sorted(D3_SECRETS))
 def test_d3_secret_reference_swap_between_before_and_after_is_detected(
-    monkeypatch: pytest.MonkeyPatch, name: str
+    monkeypatch: pytest.MonkeyPatch, name: str, serving_database_reference: str
 ) -> None:
     """The snapshot has no secret-name set: the runtime fingerprint is the guard.
 
@@ -1936,7 +1939,7 @@ def test_d3_secret_reference_swap_between_before_and_after_is_detected(
     serving = copy.deepcopy(honest["task_definition"])
     for row in _app_container(serving)["secrets"]:
         if row["name"] == "DATABASE_URL":
-            row["valueFrom"] = PINNED_DATABASE_REFERENCE
+            row["valueFrom"] = serving_database_reference
     forged = copy.deepcopy(honest)
     for row in _app_container(forged["task_definition"])["secrets"]:
         if row["name"] == name:
@@ -2044,15 +2047,16 @@ def test_sanitized_readback_carries_d3_value_fingerprints_without_values() -> No
     )
 
 
+@pytest.mark.parametrize(
+    "serving_database_reference",
+    # The plain ARN is what revision 9 serves and what the template must carry;
+    # the pinned form is a serving revision a previous protected deploy wrote.
+    [SECRET_ARN, PINNED_DATABASE_REFERENCE],
+)
 def test_path_a_round_trip_from_a_serving_d3_revision_to_the_attested_image(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, serving_database_reference: str
 ) -> None:
-    """Template from revision 9 -> before -> replacement -> after -> compare.
-
-    The serving revision is modelled with an already version-pinned
-    DATABASE_URL so this test isolates the D3 rules from the separate
-    plain-ARN normalization question of the runtime fingerprint.
-    """
+    """Template from revision 9 -> before -> replacement -> after -> compare."""
 
     signer = P256Signer()
     _set_group2_key_pins(monkeypatch, signer)
@@ -2061,7 +2065,7 @@ def test_path_a_round_trip_from_a_serving_d3_revision_to_the_attested_image(
     serving = copy.deepcopy(template["task_definition"])
     for row in _app_container(serving)["secrets"]:
         if row["name"] == "DATABASE_URL":
-            row["valueFrom"] = PINNED_DATABASE_REFERENCE
+            row["valueFrom"] = serving_database_reference
     before = validate_deployment_snapshot(
         _snapshot_of(serving, arn=REV9_ARN, running_digest=SOURCE_DIGEST),
         expected_digest="current",
@@ -2101,3 +2105,222 @@ def test_path_a_round_trip_from_a_serving_d3_revision_to_the_attested_image(
     assert result["active_image_digest"] == DIGEST
     assert result["base_environment_sha256"] == validated["base_environment_sha256"]
     assert set(result["base_environment_sha256"]) == set(BASE_ENV_VALUES) | set(D3_ENV)
+
+
+@pytest.mark.parametrize("shape", ["revision_8", "revision_9"])
+def test_protected_deploy_round_trips_a_plain_database_url_serving_revision(
+    monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """F1 residual 5: the template and the serving revision carry the plain ARN.
+
+    The replacement pins DATABASE_URL to ``<ARN>:::<VersionId>``. Both forms
+    must normalize to the same ARN and JSON key, or the first protected
+    deploy fails ``readback_runtime_fingerprint_sha256_changed`` after
+    ``update-service`` and rolls back.
+    """
+
+    signer = P256Signer()
+    _set_group2_key_pins(monkeypatch, signer)
+    if shape == "revision_8":
+        template = cast(dict[str, Any], _task_definition_template(signer))
+        _app_container(template["task_definition"])["image"] = SOURCE_IMAGE
+    else:
+        template = _d3_template(signer)
+    validated = validate_task_definition_template(template)
+    serving = copy.deepcopy(template["task_definition"])
+    assert {
+        row["name"]: row["valueFrom"] for row in _app_container(serving)["secrets"]
+    }["DATABASE_URL"] == SECRET_ARN
+    serving_arn = template["source_task_definition_arn"]
+    kwargs: dict[str, Any] = {
+        "expected_image_uri": IMAGE_URI,
+        "expected_task_role_arn": TASK_ROLE,
+        "expected_execution_role_arn": EXECUTION_ROLE,
+        "expected_secret_arn": SECRET_ARN,
+        "expected_secret_json_key": "",
+        "expected_secret_version_id": VERSION_ID,
+        "expected_task_environment": _pinned_task_environment(),
+        "external_readiness_verified": True,
+    }
+    before = validate_deployment_snapshot(
+        _snapshot_of(serving, arn=serving_arn, running_digest=SOURCE_DIGEST),
+        expected_digest="current",
+        expected_base_environment_sha256=validated["base_environment_sha256"],
+        phase="before",
+        **kwargs,
+    )
+    request = build_replacement_task_definition(
+        template,
+        image_uri=IMAGE_URI,
+        app_digest=DIGEST,
+        pinned_database_value_from=PINNED_DATABASE_REFERENCE,
+    )
+    assert {
+        row["name"]: row["valueFrom"] for row in _app_container(request)["secrets"]
+    }["DATABASE_URL"] == PINNED_DATABASE_REFERENCE
+    after = validate_deployment_snapshot(
+        _snapshot_of(
+            request, arn=serving_arn.rsplit(":", 1)[0] + ":99", running_digest=DIGEST
+        ),
+        expected_digest=DIGEST,
+        expected_base_environment_sha256=before["base_environment_sha256"],
+        phase="after",
+        **kwargs,
+    )
+    result = compare_rollout_readbacks(before, after, expected_digest=DIGEST)
+    assert result["active_image_digest"] == DIGEST
+
+
+_OTHER_SECRET_ARN = "arn:aws:secretsmanager:us-east-1:388460142431:secret:redis-123456"
+_OTHER_DB_ARN = SECRET_ARN.replace("neurostack-db", "neurostack-other")
+
+
+def _database_url_definition(
+    reference: str | None, *, other_secrets: list[dict[str, str]] | None = None
+) -> dict[str, Any]:
+    """A minimal definition whose fingerprint pins the secret normalization."""
+
+    secrets = (
+        [
+            {"name": "REDIS_URL", "valueFrom": _OTHER_SECRET_ARN},
+            {"name": "LLM_API_KEY", "valueFrom": f"{_OTHER_SECRET_ARN}:api_key::"},
+            {
+                "name": "SECRET_KEY",
+                "valueFrom": f"{_OTHER_SECRET_ARN}:key::{VERSION_ID}",
+            },
+        ]
+        if other_secrets is None
+        else other_secrets
+    )
+    if reference is not None:
+        secrets = [{"name": "DATABASE_URL", "valueFrom": reference}, *secrets]
+    return {
+        "family": "neurostack-staging-app",
+        "cpu": "1024",
+        "containerDefinitions": [
+            {
+                "name": "app",
+                "image": "ignored",
+                "environment": [{"name": "ENVIRONMENT", "value": "staging"}],
+                "secrets": secrets,
+            },
+            {"name": "otel", "image": "public.ecr.aws/otel/collector:1", "secrets": []},
+        ],
+    }
+
+
+def _fingerprint(reference: str | None, **kwargs: Any) -> str:
+    return rollout._task_definition_runtime_fingerprint(
+        _database_url_definition(reference, **kwargs)
+    )
+
+
+# Computed on origin/main 1fff19e7, before the plain-ARN fix: the fix must not
+# move any 10-part reference or any other secret.
+_GOLDEN_EMPTY_KEY = "1e7bbc3f7548e0fa3c958d76e4ad1db29817602619f073b9d05c8bacf5e1753a"
+_GOLDEN_JSON_KEY = "6b4945c2faa05dd3da635c4477185688688c5eeb896e3929de8c3b81cacdef6e"
+_GOLDEN_OTHER_ARN = "71313d12f3cc0c89a7cfdfd791bfc77ba7afaf8a4438e9c027885c45898b5d8a"
+_GOLDEN_NO_DATABASE_URL = (
+    "c1d3652580361faadbfc8da7042b99a284c5aef9bad5282f2ab8f941cf237cd3"
+)
+
+
+@pytest.mark.parametrize(
+    ("reference", "golden"),
+    [
+        (f"{SECRET_ARN}:::{VERSION_ID}", _GOLDEN_EMPTY_KEY),
+        (f"{SECRET_ARN}:::", _GOLDEN_EMPTY_KEY),
+        (f"{SECRET_ARN}:database_url::{VERSION_ID}", _GOLDEN_JSON_KEY),
+        (f"{SECRET_ARN}:database_url:AWSCURRENT:", _GOLDEN_JSON_KEY),
+        (f"{_OTHER_DB_ARN}:::{VERSION_ID}", _GOLDEN_OTHER_ARN),
+        (None, _GOLDEN_NO_DATABASE_URL),
+    ],
+)
+def test_ten_part_database_url_and_other_secret_fingerprints_are_unchanged(
+    reference: str | None, golden: str
+) -> None:
+    assert _fingerprint(reference) == golden
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        SECRET_ARN,
+        f"{SECRET_ARN}:::",
+        f"{SECRET_ARN}:::{VERSION_ID}",
+        f"{SECRET_ARN}:::87654321-4321-8765-4321-876543218765",
+        f"{SECRET_ARN}::AWSCURRENT:",
+        f"{SECRET_ARN}::AWSPREVIOUS:",
+    ],
+)
+def test_database_url_fingerprint_binds_the_arn_and_json_key_not_the_version(
+    reference: str,
+) -> None:
+    """A plain ARN is ``<ARN>`` with an empty JSON key and the default version.
+
+    The version is the one change the protected deploy makes on purpose
+    (``build_replacement_task_definition`` pins it); the snapshot validator
+    checks it separately against ``expected_secret_version_id``.
+    """
+
+    assert _fingerprint(reference) == _GOLDEN_EMPTY_KEY
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        f"{_OTHER_DB_ARN}:::{VERSION_ID}",
+        _OTHER_DB_ARN,
+        f"{SECRET_ARN}:database_url::{VERSION_ID}",
+        f"{SECRET_ARN}:password::{VERSION_ID}",
+        SECRET_ARN.replace("us-east-1", "us-east-2"),
+        SECRET_ARN.replace("388460142431", "111111111111") + f":::{VERSION_ID}",
+        SECRET_ARN.replace("neurostack-db-a1b2c3", "neurostack-db-zzzzzz"),
+    ],
+)
+def test_database_url_fingerprint_still_changes_with_the_secret_or_json_key(
+    reference: str,
+) -> None:
+    assert _fingerprint(reference) != _fingerprint(SECRET_ARN)
+    assert _fingerprint(reference) != _GOLDEN_EMPTY_KEY
+
+
+def test_database_url_json_keys_stay_distinct_from_each_other() -> None:
+    assert _fingerprint(f"{SECRET_ARN}:database_url::{VERSION_ID}") != _fingerprint(
+        f"{SECRET_ARN}:password::{VERSION_ID}"
+    )
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        f"{SECRET_ARN}:database_url",
+        f"{SECRET_ARN}:database_url:",
+        f"{SECRET_ARN}:database_url::{VERSION_ID}:extra",
+        "postgresql://user:password@db.example/private",
+    ],
+)
+def test_database_url_fingerprint_rejects_other_reference_shapes(
+    reference: str,
+) -> None:
+    with pytest.raises(RolloutError, match="^database_url_reference_invalid$"):
+        _fingerprint(reference)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        f"{_OTHER_SECRET_ARN}:::{VERSION_ID}",
+        f"{_OTHER_SECRET_ARN}:",
+        f"{_OTHER_SECRET_ARN}::AWSCURRENT:",
+    ],
+)
+def test_other_secrets_still_hash_the_whole_reference(variant: str) -> None:
+    """Only DATABASE_URL is normalized; any other secret's form is bound as is."""
+
+    changed = [
+        {"name": "REDIS_URL", "valueFrom": variant},
+        {"name": "LLM_API_KEY", "valueFrom": f"{_OTHER_SECRET_ARN}:api_key::"},
+        {"name": "SECRET_KEY", "valueFrom": f"{_OTHER_SECRET_ARN}:key::{VERSION_ID}"},
+    ]
+    assert _fingerprint(None, other_secrets=changed) != _GOLDEN_NO_DATABASE_URL

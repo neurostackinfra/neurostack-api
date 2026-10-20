@@ -161,8 +161,8 @@ These are prerequisites to check, not steps to execute now:
    port, throwaway password, no secrets). Before the suites it turns on
    `logging_collector`, so the server-log audit in
    `tests/integration/test_asaas_subscription_triggers_postgres.py` runs
-   instead of skipping, and runs `alembic upgrade head` on a service
-   database. To add or remove a suite, edit the function; CI and this gate
+   instead of skipping, and migrates a separate service database to the
+   current Alembic head. To add or remove a suite, edit the function; CI and this gate
    follow together. A green CI job does not replace this gate. These run
    only here: the contract suites
    (`tests/contracts/test_billing_fact_producer_consumer.py`,
@@ -254,7 +254,23 @@ python scripts/asaas_production_wiring.py check-manifest --params "$params"
 python scripts/asaas_production_wiring.py plan           --params "$params"
 python scripts/asaas_production_wiring.py render-taskdef --params "$params"
 python scripts/asaas_production_wiring.py check          --params "$params"
+python scripts/asaas_production_wiring.py render-migrations-taskdef --params "$params"
 ```
+
+- The service rollback target is the manifest field `rollback_target`
+  (revision 8 today). Every code path reads it from there; it moves to
+  revision 9 only through its documented re-pin (gate 6). The D3 source
+  revision (`task_definition.source_revision`, 8) is a separate, fixed value:
+  revision 9 stays derived from it.
+- Two gate blocks are facts computed at plan time, not pinned states.
+  `F1_residual_5_database_url_fingerprint` (F1 residual 5; it replaced the
+  id `F1_group5_deploy_validator_allowlist`, whose check passes since F1
+  path A) is reported by the planner while the real runtime fingerprint of
+  the rendering differs from that of its protected replacement; PR #118
+  fixes it. `F3_webhook_registration_entry_point:missing` is reported only
+  while `src/ops/asaas_webhook.py` (PR #120) is absent from the tree the
+  planner runs from. A Group 5 template validator rejection of the rendering
+  is reported as `F1_group5_template_validator_regression:<reason>`.
 
 - Every AWS request goes through one allow-list of 20 `Describe*`, `Get*` and
   `List*` operations (the list is printed as `aws_operations` in the plan).
@@ -311,10 +327,18 @@ python scripts/asaas_production_wiring.py check          --params "$params"
    `DeletionPolicy: Retain`. The value never appears in the repository, a
    parameter, an output or a shell.
 4. **Task definition.** One new revision of `neurostack-staging-app`, derived
-   from the live rollback target `neurostack-staging-app:8` at plan time. It
-   keeps everything else byte for byte, including the image reference (unless
+   from the live D3 source revision `neurostack-staging-app:8` at plan time
+   (it was also the rollback target when the wiring was planned). It keeps
+   everything else byte for byte, including the image reference (unless
    `app_image_override` names an existing ECR digest), the containers `app`
-   and `otel` (`otel` keeps an empty environment and no secrets) and the tags.
+   and `otel` (`otel` keeps an empty environment and no secrets) and the
+   other tags. Two non-D3 changes, both reviewed manifest fields: the `otel`
+   image becomes `task_definition.otel_image`, the digest the mutable
+   `:latest` tag resolved to on 2026-10-19 (no behaviour change, never a tag
+   again), and the tags carry `ManagedBy=manual` (`task_definition.tag_overrides`,
+   **pending owner confirmation**: owner approval A4 covered the two ECS
+   roles; tagging the new revisions the same way is an inference, truthful
+   and reversible, to confirm before registering).
    It adds the following to `app` only:
    - secrets, as `valueFrom` ARN references: `ASAAS_API_KEY`,
      `ASAAS_WEBHOOK_TOKEN`, `BILLING_OBSERVABILITY_SMOKE_TOKEN`;
@@ -423,33 +447,82 @@ own explicit owner approval and is never performed from the manifest.
    digest**, and always deploys the attested producer-repository digest (F1
    path A, below). Revision 8, and a D3 revision rendered without
    `app_image_override`, run a mutable tag and are still rejected
-   (`F1_protected_path_image_repository_mismatch`). Before the first
-   protected deploy, also resolve F1 residual 5 below. It also needs the build
+   (`F1_protected_path_image_repository_mismatch`). F1 residual 5 (the
+   `DATABASE_URL` fingerprint) is fixed (F1 item 5 below). It also needs the build
    network access listed under
    [Frontend build and deployment](#frontend-build-and-deployment).
 5. **Gate: migrations 033-035 (separate approval).** In an expand-only
    window, read back the exact `alembic_version` first (it was `032` on
-   2026-10-17), continue only if it is still `032`, then run the
-   `neurostack-staging-migrations` one-off task on the same image as the
-   deployment with the container command overridden to the exact revision
-   `alembic upgrade 035`. Never upgrade to the head: once migrations `036`
-   and `037` (decouple and drop the legacy objects) are on main, the image
-   carries them and the head would apply them in the same run. Each of them
-   needs its own explicit owner instruction, 036 before 037, after a fresh
-   SELECT showing zero legacy rows. **Verify:** read back `alembic_version`
-   == `035`. Never downgrade.
+   2026-10-17), continue only if it is still `032`. Revision 3 of the
+   one-off family `neurostack-staging-migrations` bakes an unpinned upgrade,
+   so it is **never run**. Register a new revision instead, on the same
+   bridge image as the deployment (`app_image_override` in the parameters
+   file), with the command baked to exactly `alembic upgrade 035` (the planner
+   constant `MIGRATIONS_COMMAND`); the roles, the `database-url-migrations`
+   secret, sizing and logs are read from revision 3, and the tags carry
+   `ManagedBy=manual` (pending owner confirmation, as for the app revision).
+   The readback file holds three reads:
+   `ecs:DescribeTaskDefinition` of `neurostack-staging-migrations:3` and of
+   `neurostack-staging-migrations` (latest), both with `"include": ["TAGS"]`,
+   and `ecr:DescribeImages` of the bridge digest.
+
+   ```bash
+   params=infra/production/asaas-production-wiring.params.yaml
+   workdir="$(mktemp -d)" && chmod 700 "$workdir"
+   umask 077
+   python scripts/asaas_production_wiring.py render-migrations-taskdef \
+     --params "$params" --readback-file "$workdir/migrations-readback.json" \
+     > "$workdir/migrations-taskdef.json" || exit 1
+   ```
+
+   It prints nothing and exits 2 for any command other than the pin, a
+   revision 3 other than the reviewed shape (roles, the
+   `database-url-migrations` secret as a plain ARN, one container, no entry
+   point), an image missing from ECR, or a newer migrations revision that
+   differs from the rendering, or a newest revision whose ARN is not
+   `arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-migrations:<n>`
+   with `n` at least 3 (`migrations_newest_revision_invalid`). If the newest
+   revision already equals the rendering it prints nothing on stdout, `already registered: <ARN>` on
+   stderr, and exits 3: run that revision instead of registering again
+   (`--force-new-revision` prints the request anyway). Otherwise register
+   `migrations-taskdef.json` (`ecs:RegisterTaskDefinition`), take a manual
+   RDS snapshot (`pre-033-035-<date>`, status `available`), then run the new
+   revision once as a one-off Fargate task in the service's private subnets
+   with **no** command override. Never upgrade to the head: once migrations
+   `036` and `037` (decouple and drop the legacy objects) are on main, the
+   image carries them and the head would apply them in the same run. Each of
+   them needs its own explicit owner instruction, 036 before 037, after a
+   fresh SELECT showing zero legacy rows. **Verify:** read back
+   `alembic_version` == `035`. Never downgrade.
 6. **Gate: service deployment (separate approval).** Two paths (see F1
    below):
-   - **Path A (cheapest).** If the owner approves, deploy the registered D3
-     revision on the current image with the current tooling, outside the
-     protected path:
-     `aws ecs update-service --cluster neurostack-staging --service neurostack-staging-app --task-definition <new ARN>`.
+   - **Path A (owner approval A1, 2026-10-19).** Deploy the registered D3
+     revision 9 (bridge image pinned by digest) with the current tooling,
+     outside the protected path:
+     `aws ecs update-service --cluster neurostack-staging --service neurostack-staging-app --task-definition <revision 9 ARN>`.
      The minimal F1 change is implemented (F1 below). Before the first
      signed-image deploy, regenerate the protected template from the deployed
      D3 revision (F1, "Regenerating the protected template").
    - **Path B.** One protected deployment that carries the signed image and
      the wiring together. It needs everything Path A's F1 change needs, plus
-     a reviewed exception to the runtime fingerprint equality check.
+     a reviewed exception to the runtime fingerprint equality check. Not
+     chosen.
+
+   After the deployment is `COMPLETED`, run the
+   [post-deploy webhook registration hook](#post-deploy-webhook-registration-hook).
+   Its failure is the alert `DEPLOYED_WEBHOOK_PENDING`: the deployment stays.
+
+   **Re-pinning the rollback target (8 to 9).** While revision 9 is under
+   observation, `rollback_target` stays 8: rolling back to 8 is safe until
+   migration 036 runs. Once revision 9 has served, been verified and its
+   observation period (24 h) has closed, and **before** migration 036, edit
+   the manifest field to `revision: 9`,
+   `effective_after: bridge_revision_9_serving_verified_and_observation_closed`
+   and remove its `repin` block (a reviewed change; the planner refuses any
+   other value). Revision 8 is not safe after 036: it reads columns 036
+   drops. `plan` then reports `rollback_target` = revision 9 and checks that
+   it is `ACTIVE` and runs an image pinned by digest
+   (`rollback_target_revision_unusable` otherwise).
 
    What the current image does with the D3 names (not verified for the image
    itself): it was pushed on 2026-10-14, and commit `55651b58` on
@@ -520,28 +593,154 @@ Exposure, read back 2026-10-18 and checked by `plan`:
   `waf_rule_may_block_receiver`, and ASAAS deliveries must be re-checked
   (large bodies and provider IP reputation).
 
-Registration:
+Registration (owner decision A2, 2026-10-19: automatic at deploy):
 
-- `AsaasWebhookProvisioner.reconcile()` creates or converges the one webhook
-  this environment owns: name `neurostack-billing-staging`, the configured
-  URL, the closed event set, `SEQUENTIALLY`, API version 3, and the token from
-  the secret. `readback()` is its dry run: it reads `GET /v3/webhooks` and
-  `GET /v3/webhooks/{id}` and returns `ready` or closed-vocabulary reasons
-  (`absent`, `ambiguous`, `url`, `events`, `disabled`, `interrupted`,
-  `token_absent`, `token_unconfigured` and so on).
-- **Known block F3:** neither method has an operator entry point today. Only
-  the in-process readiness refresher calls `readback()`. Follow-up F3 is a
-  small operator command, run as a one-off ECS task from the deployed
-  revision so that the secrets never reach the operator. Its `--dry-run`
-  default prints only the readback verdict. Its `--apply` mode calls
-  `reconcile()` once and prints the verdict and a SHA-256 of the webhook ID.
-  It needs code review and separate approval for the provider write.
-- After the dry run reports `absent` and the owner approves, run `--apply`
-  once, then the dry run again.
+- The command is `python -m src.ops.asaas_webhook <subcommand>`
+  (`src/ops/asaas_webhook.py`, shipped in the image with `src/`). The deploy
+  hook runs it as a one-off ECS task on the service's own task definition, so
+  the API key and the webhook token never leave the task. It reads only the
+  process environment, never a `.env` file: `ENVIRONMENT` (`staging` or
+  `production`; the owned name is `neurostack-billing-<ENVIRONMENT>`, so
+  `neurostack-billing-staging` here), `ASAAS_API_KEY` (production namespace),
+  `ASAAS_WEBHOOK_TOKEN` (32 to 255 printable ASCII characters),
+  `ASAAS_WEBHOOK_URL`, `ASAAS_WEBHOOK_NOTIFICATION_EMAIL` and
+  `ASAAS_USER_AGENT`. Any invalid value fails closed before any network call.
+- **URL pin (deliberate safety net).** `ASAAS_WEBHOOK_URL` must be exactly
+  `https://staging.api.neurostack.global/v1/billing/webhook/asaas`
+  (`ALLOWED_WEBHOOK_URLS` in the module, the D3 parameter in
+  `infra/production/asaas-production-wiring.params.yaml`; the host set
+  `ALLOWED_WEBHOOK_HOSTS` is derived from it). Another host (including a port
+  or different case) is `unconfigured` / `webhook_host_not_allowed`; the
+  decided host with any other path is `unconfigured` /
+  `webhook_url_not_allowed`; neither makes a network call. If the D3
+  parameter ever changes, change both constants in the same reviewed change
+  as the D3 parameters.
+- Subcommands: `check-config` (configuration only, no network), `readback`
+  (the default; read-only), `reconcile` (at most one write, then the smoke
+  checks) and `smoke` (`readback` plus a second listing proving the webhook is
+  still the only one). Flags, all for `reconcile` only and off by default:
+  `--force-rewrite-token`, `--allow-enable` and `--no-resume`; plus
+  `--deadline-seconds N` (10 to 600, default 120, the hard limit for the whole
+  run). There is no `--help`: the only exit 0 is a `ready` verdict.
+- `reconcile`: list every page of `GET /v3/webhooks`. A webhook is a
+  candidate when its name is the owned name or its URL is `ASAAS_WEBHOOK_URL`.
+  No candidate: `POST` once. One candidate with the owned name: read it by
+  exact ID; when it drifted, `PUT` it; when it is exact, write nothing. Two or
+  more candidates, or one that matches by URL only with another name:
+  `ambiguous`, nothing written. Then re-read by ID and list again. Nothing
+  ever deletes a webhook: the command's transport refuses every request other
+  than `GET /v3/webhooks`, `GET /v3/webhooks/{id}`, `POST /v3/webhooks` and
+  `PUT /v3/webhooks/{id}` (writes without a query string), and refuses the
+  two writes outside `reconcile`.
+- **Listing completeness.** A listing is used only when its pages are
+  complete and contiguous (every page but the last is full and says
+  `hasMore`, the last does not, each page starts where the items read so far
+  end, a reported `totalCount` equals what was read), no webhook ID appears
+  twice, and no page exceeds the client's 64 KiB response cap. Otherwise the
+  verdict is `error` / `listing_inconsistent` before any decision or write.
+  This catches short pages, pages that overlap (an ignored `offset`, an
+  unstable sort) and totals that disagree. It cannot catch a provider that
+  leaves a webhook out of every page and reports a total that matches what it
+  served; no client can.
+- **Operator pause and ASAAS queue interruption.** Every `PUT` sends
+  `enabled: true` and `interrupted: false`.
+  - A webhook **disabled** in ASAAS (`enabled: false`, an operator pause) is
+    report-only: verdict `disabled` (exit 13), reason
+    `webhook_disabled_by_operator`, and nothing is written, not even other
+    drift. The pause outranks `requires_recreate`: a disabled webhook with
+    `apiVersion` drift still reports `disabled` (both reasons are listed).
+    `reconcile --allow-enable` re-enables it (reason `webhook_reenabled`).
+    Reconcile never re-enables a disabled webhook on its own.
+  - A queue ASAAS **interrupted** by itself after failed deliveries (for
+    example while the service was rolled back and answered 503) is resumed by
+    default, which makes ASAAS re-send the backlog; the result shows
+    `queue_resumed`. `reconcile --no-resume` makes it report-only (verdict
+    `interrupted`, exit 12, reason `queue_not_resumed`). When a webhook is
+    both disabled and interrupted, a `PUT` needs both permissions.
+- Drift in `apiVersion`, which ASAAS accepts only at creation, is never
+  written: the verdict is `drift` with `requires_recreate` (procedure below).
+  A read whose body omits `apiVersion` or sends `null` is not compared on it
+  (reason `api_version_unreported`; the verdict can still be `ready`). Any
+  other value that is not the integer 3 (for example `"3"`, `3.0`, `true`) is
+  drift and is never `ready`. The in-process
+  readiness refresher does not skip it yet, so in that case hosted checkout
+  stays closed until `compare_webhook` gets the same rule. The notification
+  e-mail is also creation-only and is not read back, so a change of
+  `ASAAS_WEBHOOK_NOTIFICATION_EMAIL` does not reach an existing webhook.
+- **Token rotation.** ASAAS exposes only `hasAuthToken`, never the token, so
+  an exact webhook is never rewritten by default. After changing
+  `ASAAS_WEBHOOK_TOKEN`, deploy the revision with the new token (the receiver
+  then accepts only the new token) and run
+  `reconcile --force-rewrite-token` once; it sends one `PUT` with the new
+  token. Every successful `PUT` carries the current token and reports
+  `token_rewritten`. ASAAS deliveries fail with 401 between the deploy and
+  that run.
+- **Failures.** 429, 408, 5xx, timeouts and connection errors are retried 3
+  times per call (exponential backoff with jitter, capped at 8 s) inside the
+  deadline, then the verdict is `error` with `transient`. 401 or 403 is `error`
+  with `auth` at once. A `POST` is re-sent only when it provably never
+  reached ASAAS (connection not made, or 429). When its outcome is unknown or
+  it is rejected, the command lists again and adopts what it finds
+  (`create_unconfirmed` or `create_rejected`), never posting twice. A result
+  with `"writes": 1` and the reasons `transient` and `deadline_exceeded`
+  means the deadline fired while a write was in flight: the write may have
+  been applied, and the next run adopts what ASAAS holds.
+- **Concurrency.** The command takes no lock: run one task at a time. If two
+  runs overlap and both read an empty listing, both can create a webhook.
+  Either ASAAS rejects the second creation and that run adopts the first
+  run's webhook, or both runs exit 20 (`ambiguous`, `duplicate_detected`)
+  when their final listing shows the duplicate; a run whose final listing
+  came before the other's creation can still report `ready`, and every later
+  run then reports `ambiguous`. Nothing is deleted: see the procedure below.
+- **Output.** Exactly one JSON line on stdout and one JSON log line on
+  stderr (`"event": "asaas_webhook_registration"`). Fields: `schema`
+  (`neurostack.asaas_webhook_registration.v1`), `command`, `verdict`,
+  `action` (`none`, `created` or `updated`), `reasons`, `webhook_id_sha256`,
+  `counts`, `checks` (booleans), `force_rewrite_token`, `allow_enable`,
+  `no_resume` and `exit_code`. They never contain the key, the token, the
+  URL, the e-mail or the webhook ID.
+- **Exit codes:** 0 `ready`, 10 `absent`, 11 `drift`, 12 `interrupted`, 13
+  `disabled`, 20 `ambiguous`, 30 `unconfigured` (including a bad command line
+  or settings that cannot load), 40 `error`. Any other code (for example 1)
+  means the process crashed.
+- The in-process refresher keeps calling `AsaasWebhookProvisioner.readback()`.
+  Apart from the unreported `apiVersion` case above, a `ready` from this
+  command is the same readiness predicate, so the gauge below follows within
+  one refresher period.
+
+Operator procedures (each is a manual provider operation in the ASAAS panel
+with its own approval; the command itself never deletes or renames):
+
+- **`requires_recreate`** (`apiVersion` drift, which a `PUT` cannot change):
+  run `readback` and record `webhook_id_sha256`. With approval, in the ASAAS
+  panel, delete the webhook named `neurostack-billing-staging` whose ID
+  hashes to that value. Then run `reconcile` at once: it finds no candidate,
+  creates the webhook once (`action: created`) and ends `ready`. Whether ASAAS
+  delivers events that happen while no webhook exists is not verified, so
+  keep that window short and check the affected payments by readback
+  afterwards. **The new webhook is created ENABLED.** If the webhook is also
+  disabled (the result lists `webhook_disabled_by_operator`), deleting and
+  recreating it would undo that pause: never use this procedure to get
+  around a pause; the person who paused it, or the owner, must decide
+  explicitly first.
+- **`foreign_name_on_url`** (a webhook with another name already points at
+  `ASAAS_WEBHOOK_URL`): it is not ours by name, so the command refuses it.
+  Identify it in the ASAAS panel and decide with the owner: if it belongs to
+  another integration, move that integration to another URL; if it is an old
+  NeuroStack webhook, delete it (approval) or rename it to the owned name
+  (approval; the next `reconcile` then converges it). Run `readback` until it
+  reports `absent` or `ready`, then `reconcile`.
+- **`multiple_owned` / `duplicate_detected`**: delete all but one of the
+  candidates in the ASAAS panel (approval), then run `reconcile`.
+- **`webhook_disabled_by_operator`**: someone paused the webhook on purpose.
+  Re-enable only on that person's or the owner's instruction, with
+  `reconcile --allow-enable`.
 
 Read-only verification after registration:
 
-1. The dry run reports `ready` with no reasons.
+1. `smoke` (or `readback`) reports `ready`. Its reasons are empty, or only
+   `api_version_unreported` (see the `apiVersion` note above; in that case
+   step 2 does not turn green until `compare_webhook` gets the same rule).
 2. The gauge `neurostack_billing_webhook_config_ready` reads 1 on every worker
    within one refresher period (300 s).
 3. `GET /v1/billing/summary` without a JWT still returns 401, so the receiver
@@ -550,6 +749,197 @@ Read-only verification after registration:
    `POST /v1/billing/webhook/asaas` with body `{}` returns 401 and persists
    nothing. This is the token smoke that `AsaasWebhookProvisioner.smoke()`
    automates.
+
+### Post-deploy webhook registration hook
+
+Owner decision A2 (2026-10-19) made the ASAAS webhook registration
+automatic at deploy. After every approved service deployment reaches
+`COMPLETED`, one one-off ECS task on the deployed revision runs
+`python -m src.ops.asaas_webhook reconcile`, so the ASAAS key and token never
+leave the task. `scripts/asaas_deploy_hook.py` is pure, like the planner: it
+reads a recorded readback file, renders the requests and verifies the result.
+It never calls AWS; the orchestrator sends the requests with its own tools and
+writes the responses back. The only requests it ever renders are
+`ecs:RunTask`, `ecs:DescribeTasks`, `ecs:ListTasks` and `logs:GetLogEvents`.
+It never renders or recommends `UpdateService`, `RegisterTaskDefinition`,
+`StopTask` or a rollback; its output guard refuses to print one.
+
+Files, in a private directory (`workdir="$(mktemp -d)" && chmod 700 "$workdir"; umask 077`):
+
+| File | Content |
+|------|---------|
+| `hook-readback.json` | schema `asaas_deploy_hook_readback.v1`: `schema_version`, `account_id` `388460142431`, `region` `us-east-1`, `captured_at_utc` (aware ISO 8601, updated on every poll), `reads` (`service`, `operation`, `params`, `response`, one per exact request) and, after the run, `run_task` (`params`, `response`). An AWS error response is recorded as `{"__error_code__": "<Code>"}`. |
+| `hook-plan.json` | output of `plan` |
+| `hook-run-task.json` | output of `render-run-task`: the exact `ecs:RunTask` parameters |
+| `hook-verify-reads.json` | output of `render-verify-reads` |
+| `hook-result.json` | output of `verify-result` |
+
+Sequence (`ARN` is the revision the deployment completed on):
+
+1. **Immediately before RunTask**, read into `hook-readback.json` (and set
+   `captured_at_utc` to the time of the reads):
+   `ecs:DescribeServices` `{"cluster": "neurostack-staging", "services": ["neurostack-staging-app"]}`;
+   `ecs:ListTasks` `{"cluster": "neurostack-staging", "startedBy": "neurostack-asaas-webhook-reconcile"}`
+   (`startedBy` must be the only filter; the default desired status `RUNNING`
+   covers provisioning, pending and running tasks);
+   `ecs:DescribeTaskDefinition` `{"taskDefinition": "<ARN>"}`; and
+   `ecr:DescribeImages` `{"repositoryName": "<repository>", "imageIds": [{"imageDigest": "<digest>"}]}`
+   for that revision's `app` image.
+2. `python scripts/asaas_deploy_hook.py plan --expected-task-definition "$ARN" --readback-file "$workdir/hook-readback.json" > "$workdir/hook-plan.json"`.
+   Live runs omit `--now`: the system clock judges freshness, so time spent
+   between `plan` and `render-run-task` counts. `--now <aware ISO 8601>` is
+   only for replays and tests. A readback older than 10 minutes
+   (`readback_stale`) or dated more than 60 s in the future
+   (`readback_captured_in_future`) is blocked: read again.
+   Exit 0 is `status: ready`. Exit 2 is `blocked` (the reasons are in
+   `blocks`, or on stderr as `blocked: <reason>` for a missing read or an
+   invalid file): send no RunTask, raise `DEPLOYED_WEBHOOK_PENDING` with the
+   reasons, and leave the deployment alone. Preconditions: exactly one
+   deployment, `PRIMARY` and `COMPLETED`, on `ARN`, the service on `ARN`,
+   `runningCount == desiredCount > 0` and nothing pending; no task with the
+   hook's `startedBy` (single flight); Fargate; awsvpc with subnets, security
+   groups and `assignPublicIp: DISABLED` on the service; the revision
+   `ACTIVE` on awsvpc and Fargate, with exactly the containers `app` and
+   `otel`, an essential `app` container, no entry point, the D3
+   webhook wiring, an `awslogs` log configuration in `us-east-1` with a
+   stream prefix, and an image pinned by digest that still exists in ECR; no
+   RunTask already recorded in the file.
+3. `python scripts/asaas_deploy_hook.py render-run-task --expected-task-definition "$ARN" --readback-file "$workdir/hook-readback.json" > "$workdir/hook-run-task.json"`
+   (no `--now` in a live run: it re-checks freshness against the system
+   clock; add `--force-rewrite-token` only for a token rotation, below;
+   `--attempt N`, 1 to 20, only for a deliberate re-run of the same
+   deployment). It refuses (exit 2, nothing printed) unless `plan` is ready.
+   Keep `hook-run-task.json`: it is what crash recovery re-sends. Send
+   `ecs:RunTask` with exactly that object as parameters, then record
+   `"run_task": {"params": <hook-run-task.json>, "response": <RunTask response>}`.
+4. `python scripts/asaas_deploy_hook.py render-verify-reads ... > "$workdir/hook-verify-reads.json"`
+   prints the `ecs:DescribeTasks` request for the started task and the first
+   `logs:GetLogEvents` page of its `app` stream
+   (`<awslogs-stream-prefix>/app/<task id>`, `startFromHead: true`,
+   `limit: 500`). Read the stream page by page: send the same request with
+   `nextToken` set to the previous response's `nextForwardToken` until a
+   response returns the token that was sent (the end of the stream; a page
+   without `nextForwardToken` is not an end and is reported as
+   `log_pages_incomplete`). Record every page; each page is its own entry (the `nextToken` makes the requests
+   differ). Every 15 s, re-send `DescribeTasks` and the pages, replace their
+   entries and update `captured_at_utc`.
+5. `python scripts/asaas_deploy_hook.py verify-result ... > "$workdir/hook-result.json"`.
+   Exit 0 `registered`; exit 3 `in_progress` (poll again: `next_requests`
+   names the reads still needed, for example the next log page,
+   `log_events_incomplete`); exit 4 `DEPLOYED_WEBHOOK_PENDING`; exit 2 the
+   input is incomplete or invalid (fix the file; if it cannot be fixed, treat
+   it as `DEPLOYED_WEBHOOK_PENDING`). The one-result-line check and the
+   exposure scan run over every recorded page.
+
+Crash recovery. If the orchestrator stops after sending RunTask but before
+recording it:
+
+- Re-send the saved `hook-run-task.json` unchanged. The same `clientToken`
+  makes ECS return the task it already started instead of starting another
+  (as long as ECS still honours the token); record that response and
+  continue at step 4.
+- If that cannot be done and the task is still running, `plan` is blocked
+  (`registration_task_running`, with the task in
+  `running_registration_tasks`) and `render-run-task` refuses: wait for that
+  task to stop, then run `render-verify-reads --task-arn <task ARN>` and
+  `verify-result --task-arn <task ARN>` against a readback file without a
+  `run_task` record. The task is accepted only if its `startedBy`, task
+  definition and command override are the hook's and it was created at or
+  after the current PRIMARY deployment's `createdAt` on the expected revision
+  (`recovered_task_predates_deployment` or
+  `recovered_task_not_tied_to_deployment` otherwise); the result says
+  `recovered_without_run_record: true`. Never start a second run while the
+  first one may still be running.
+
+The RunTask request: `cluster` `neurostack-staging`, `taskDefinition` the
+service's current revision, `count` 1, `launchType` `FARGATE`, the service's
+`platformVersion`, the service's subnets and security groups with
+`assignPublicIp` `DISABLED`, `overrides.containerOverrides` exactly
+`[{"name": "app", "command": ["python", "-m", "src.ops.asaas_webhook", "reconcile"]}]`,
+`startedBy` `neurostack-asaas-webhook-reconcile`, `propagateTags` `NONE`,
+`enableECSManagedTags` and `enableExecuteCommand` false, and a `clientToken`
+derived from the deployment ID, the request and the attempt: a retried call
+cannot start a second task. Single flight is the `ListTasks` precondition plus
+that token; two operators planning at the same instant can still both start
+a task (the window between the listing and the RunTask), in which case the
+command itself reports `ambiguous` and deletes nothing.
+
+Time bounds. ECS has no maximum runtime for a RunTask task, the container
+`stopTimeout` cannot be overridden in RunTask (and is at most 120 s on
+Fargate), and `StopTask` is outside what the hook may render. The run is
+bounded by the command's own deadline: 120 s for all ASAAS I/O
+(`--deadline-seconds` default, enforced in-process). The watch only decides
+when to stop waiting: 600 s from the task's `createdAt`, which covers the
+deadline plus a 180 s start budget (ENI, image pull, imports) and a 60 s stop
+budget (exit, `otel` SIGTERM and its 30 s stop timeout), 360 s, with margin.
+After that `verify-result` reports `task_watch_deadline_exceeded`. A stream
+still empty within 120 s of `stoppedAt` is `in_progress`
+(`log_events_not_delivered`); later it is a missing result line.
+
+`verify-result` reads the `app` exit code and the stream's one result line
+(the command's stdout document; its stderr twin, `"event":
+"asaas_webhook_registration"`, is optional and must agree). The document is
+checked against the closed schema `neurostack.asaas_webhook_registration.v1`
+(`schema`, `command`, `verdict`, `action`, `reasons`, `webhook_id_sha256`,
+`counts`, `checks`, `force_rewrite_token`, `allow_enable`, `no_resume`,
+`exit_code`). The hook never passes `--allow-enable` (re-enabling a webhook an
+operator paused is an owner decision) or `--no-resume` (an interrupted queue is
+resumed by default), so both must read `false` (`result_options_mismatch`
+otherwise). Any line in the
+stream that carries a URL, a host of ours or of ASAAS, an e-mail address, an
+ASAAS key, a PEM block, an AWS key, `authToken`, a bearer token or a webhook
+path fails the verification (`log_forbidden_material`, alert kind
+`secret_exposure_suspected`) and is never printed. The hook's own output
+carries only ARNs, digests, counts and closed vocabularies; the webhook ID
+appears only as the SHA-256 the command prints.
+
+Failure semantics. Every outcome other than `registered` is the alert
+`DEPLOYED_WEBHOOK_PENDING`: it is **never** a rollback and **never** a service
+update. The deployed revision keeps serving; checkout stays closed because
+webhook readiness is not ready (the gauge
+`neurostack_billing_webhook_config_ready` stays 0).
+
+| `app` exit | Command verdict | Hook outcome | Owner action |
+|-----------|-----------------|--------------|--------------|
+| 0 | `ready` | `registered` | none; the gauge usually reads 1 within 300 s (caveat below) |
+| 10 | `absent` | `DEPLOYED_WEBHOOK_PENDING` | the webhook was not found after the run; check the ASAAS panel, then re-run |
+| 11 | `drift` | `DEPLOYED_WEBHOOK_PENDING` | `requires_recreate` (apiVersion) needs a provider-side decision; otherwise the update did not converge: check the panel, then re-run |
+| 12 | `interrupted` | `DEPLOYED_WEBHOOK_PENDING` | the queue was not resumed (`queue_not_resumed`) or did not converge; check the queue in the ASAAS panel, then re-run |
+| 13 | `disabled` | `DEPLOYED_WEBHOOK_PENDING` | an operator paused the webhook (`webhook_disabled_by_operator`); the hook never re-enables it: the owner decides (enable it in the panel, then re-run) |
+| 20 | `ambiguous` | `DEPLOYED_WEBHOOK_PENDING` | remove the duplicate in the ASAAS panel (nothing is deleted automatically), then re-run |
+| 30 | `unconfigured` | `DEPLOYED_WEBHOOK_PENDING` | fix the configuration (`checks`, `settings_invalid:<field>`) in a new reviewed revision |
+| 40 | `error` | `DEPLOYED_WEBHOOK_PENDING` | `auth`: check the key; `transient`: re-run later |
+| any other, or none | crash, OOM, failed start | `DEPLOYED_WEBHOOK_PENDING` | `cli_exit_code_unknown` or `task_stopped_without_app_exit_code` with `stop_code` |
+| 0 with another verdict, or a mismatch | contract violation | `DEPLOYED_WEBHOOK_PENDING` | `exit_code_verdict_mismatch`, `result_line_*`, `result_ready_inconsistent` |
+
+Readiness-gauge caveat: after a `ready` that carries `api_version_unreported`
+(ASAAS omitted `apiVersion`, so the command did not compare it), the gauge
+`neurostack_billing_webhook_config_ready` can stay 0 until `compare_webhook`
+in the readiness refresher gets the same rule. The registration is still
+correct; record it with the alert text and do not re-run.
+
+A re-run is a new owner-approved run of the same sequence: start again at
+step 1 with a fresh `hook-readback.json` (a file that already records a
+RunTask is refused with `run_task_already_recorded`) and pass `--attempt` one
+higher than the previous run for the same deployment, so its `clientToken`
+differs.
+
+Hook-level reasons that are also `DEPLOYED_WEBHOOK_PENDING`: `run_task_failed`
+(RunTask started nothing), `run_task_request_not_rendered_by_hook`,
+`task_identity_mismatch` and `task_command_override_mismatch` (alert kind
+`evidence_mismatch`), `task_watch_deadline_exceeded`, `log_events_truncated`
+and `log_forbidden_material` (rotate per
+[`asaas-secret-rotation.md`](./asaas-secret-rotation.md) if the line could
+have carried a secret).
+
+Token rotation. ASAAS never returns the token, so an exact webhook is never
+rewritten by default. After `ASAAS_WEBHOOK_TOKEN` changes, deploy a revision
+that reads the new value (new tasks read the secret at start) and wait for
+`COMPLETED`; then run this hook once with
+`render-run-task --force-rewrite-token`. Expect `registered` with `action`
+`updated` (or `created`) and `token_rewritten` in the command's reasons; a
+`ready` with `action: none` under the flag is `force_rewrite_not_applied`.
+ASAAS deliveries fail with 401 between that deploy and the run.
 
 ### AppConfig and opening financial egress (follow-up F2, not written)
 
@@ -653,8 +1043,8 @@ and a new binary to the image supply chain.
      revision except `DATABASE_URL`: the serving revision has the plain ARN,
      and `build_replacement_task_definition` pins it to
      `<ARN>:<json key>::<VersionId>` (an empty JSON key for a plain ARN).
-     With today's normalization that difference alone changes the
-     fingerprint (item 5). `plan` still prints
+     The fingerprint binds only the `DATABASE_URL` ARN and JSON key, so that
+     difference does not change it (item 5). `plan` still prints
      `F1_path_b_runtime_fingerprint_changes` for the revision 8 to D3
      transition; under Path A it is informational.
   4. **D3 values: fingerprinted.** The four D3 environment values join the six
@@ -666,18 +1056,12 @@ and a new binary to the image supply chain.
      the before and after readbacks fails the comparison
      (`readback_runtime_fingerprint_sha256_changed`). `plan` reports
      `d3_environment_values_fingerprinted: true`.
-  5. **Residual, not fixed (found 2026-10-19): `DATABASE_URL` normalization.**
-     The template must carry the plain `DATABASE_URL` secret ARN
-     (`database_url_source_selector_must_be_default`), and
-     `build_replacement_task_definition` pins it to `<ARN>:::<VersionId>`.
-     `_task_definition_runtime_fingerprint` normalizes a plain ARN to `<ARN>`
-     but a pinned reference to `<ARN>:<json key>` (here `<ARN>:`). A serving
-     revision with a plain ARN (revision 8 and the D3 revision) and its
-     replacement therefore never have equal fingerprints. The first protected
-     deploy would update the service, fail `compare_rollout_readbacks` with
-     `readback_runtime_fingerprint_sha256_changed`, and roll back. In
-     bootstrap mode that consumes the one-time slot. **Do not start a
-     protected deploy until this is decided and fixed** with its own review.
+  5. **`DATABASE_URL` normalization: fixed (found and fixed 2026-10-19).**
+     A plain secret ARN now fingerprints as `<ARN>:` (empty JSON key), like
+     its pinned replacement `<ARN>:::<VersionId>`, so a plain-ARN serving
+     revision (8 or D3) round-trips; pinned by
+     `test_protected_deploy_round_trips_a_plain_database_url_serving_revision`
+     in `tests/scripts/test_verify_asaas_producer_image_rollout.py`.
 
   **Regenerating the protected template from the deployed D3 revision.** This
   is an owner step on the GitHub side; no agent sets these secrets. Do it after
@@ -732,17 +1116,26 @@ and a new binary to the image supply chain.
   reviewed exception to the fingerprint equality check for that one
   transition. It was not chosen.
 - **F2, AppConfig reader (needed only to open financial egress).** See above.
-- **F3, webhook registration entry point (blocks gate 8).** See D4 above.
+- **F3, webhook registration entry point.** Resolved by
+  `python -m src.ops.asaas_webhook` (see D4 above). The deploy hook that
+  launches it after each deployment is separate work.
 - **Re-pinning after later deployments.** The manifest and the planner pin
-  revision 8 as the source and rollback target. Once a later revision serves
-  (for example after the signed-image gate), `plan` reports
-  `service_not_on_rollback_target:<ARN>`. Moving the pin is a reviewed change
-  to the manifest and to `ROLLBACK_REVISION` in the planner.
+  revision 8 as the D3 source (`task_definition.source_revision`, fixed). The
+  rollback target is the separate manifest field `rollback_target`, which the
+  planner reads; its only allowed move is 8 to 9 (gate 6). Once a revision
+  other than 8 or the D3 rendering serves (for example after the
+  signed-image gate), `plan` reports `service_not_on_rollback_target:<ARN>`
+  for the D3 step (the reason ID is historical: it names the D3 source). A
+  later re-pin is a reviewed change to `ROLLBACK_TARGET_PINS` in the planner
+  and to the manifest field.
 - **Terraform drift (owner or infra question).** The execution role and the
-  task definition family are tagged `ManagedBy=terraform`. Whether that
-  Terraform manages inline policies exclusively, or the service's task
-  definition, was not verified. Mirror the D3 grant and revision in Terraform,
-  or confirm that a later apply leaves them alone.
+  task definition family were tagged `ManagedBy=terraform`. Owner approval A4
+  (2026-10-19) moves the two ECS roles to `ManagedBy=manual`. Every new
+  revision rendered here (app and migrations) carries `ManagedBy=manual`;
+  that part is pending owner confirmation (A4 named only the roles).
+  Whether a Terraform state still manages inline policies exclusively, or
+  the service's task definition, was not verified. Confirm that a later apply
+  leaves them alone.
 
 ## Frontend build and deployment
 

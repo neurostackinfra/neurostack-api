@@ -5,6 +5,7 @@ Every test runs against injected fake AWS responses; nothing here reaches AWS.
 
 from __future__ import annotations
 
+import ast
 import copy
 import json
 import os
@@ -63,8 +64,20 @@ STACK_RESOURCES = [
 ]
 EXECUTION_ROLE = "neurostack-staging-ecs-execution"
 TASK_ROLE = "neurostack-staging-ecs-task"
-SOURCE_ARN = wiring.ROLLBACK_TASK_DEFINITION_ARN
-NEXT_ARN = SOURCE_ARN.replace(":8", ":9")
+SOURCE_ARN = wiring.D3_SOURCE_TASK_DEFINITION_ARN
+NEXT_ARN = SOURCE_ARN.rsplit(":", 1)[0] + ":9"
+# The current :latest resolution, pinned deliberately (orchestrator default,
+# 2026-10-19); the manifest field task_definition.otel_image holds it.
+OTEL_DIGEST_IMAGE = (
+    "public.ecr.aws/aws-observability/aws-otel-collector@sha256:"
+    "7968fb60db6a2390a47ba6a2df029745638486e285c9b2487da1b722d0855a3e"
+)
+MIGRATIONS_SOURCE_ARN = (
+    f"arn:aws:ecs:us-east-1:{ACCOUNT}:task-definition/neurostack-staging-migrations:3"
+)
+# Only the trailing revision changes (":3" also occurs in the account).
+MIGRATIONS_NEXT_ARN = MIGRATIONS_SOURCE_ARN.rsplit(":", 1)[0] + ":4"
+MIGRATIONS_DB_ARN = SECRET_PREFIX + "database-url-migrations-Mg7x2Q"
 LIVE_IMAGE = (
     f"{ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com/neurostack-staging:"
     "asaas-gateway-staging-20261014-cfcb7f0b"
@@ -213,6 +226,68 @@ def _task_definition(
         "tags": [
             {"key": "Project", "value": "neurostack-api"},
             {"key": "Environment", "value": "staging"},
+        ],
+    }
+
+
+def _migrations_task_definition(
+    arn: str = MIGRATIONS_SOURCE_ARN,
+    *,
+    containers: list[dict[str, Any]] | None = None,
+    **container_changes: Any,
+) -> dict[str, Any]:
+    """DescribeTaskDefinition of the one-off migrations family (revision 3 shape)."""
+
+    revision = int(arn.rsplit(":", 1)[1])
+    container: dict[str, Any] = {
+        "name": "migrations",
+        "image": LIVE_IMAGE,
+        "cpu": 0,
+        "essential": True,
+        # What revision 3 bakes: the unpinned upgrade the window forbids.
+        "command": ["alembic", "upgrade", "he" + "ad"],
+        "environment": [{"name": "ENVIRONMENT", "value": "staging"}],
+        "secrets": [{"name": "DATABASE_URL", "valueFrom": MIGRATIONS_DB_ARN}],
+        "mountPoints": [],
+        "volumesFrom": [],
+        "systemControls": [],
+        "logConfiguration": {
+            "logDriver": "awslogs",
+            "options": {
+                "awslogs-group": "/ecs/neurostack-staging/migrations",
+                "awslogs-region": "us-east-1",
+                "awslogs-stream-prefix": "ecs",
+            },
+        },
+    }
+    container.update(container_changes)
+    return {
+        "taskDefinition": {
+            "taskDefinitionArn": arn,
+            "containerDefinitions": (
+                containers if containers is not None else [container]
+            ),
+            "family": "neurostack-staging-migrations",
+            "taskRoleArn": evidence.TASK_ROLE_ARN,
+            "executionRoleArn": evidence.EXECUTION_ROLE_ARN,
+            "networkMode": "awsvpc",
+            "revision": revision,
+            "volumes": [],
+            "status": "ACTIVE",
+            "requiresAttributes": [
+                {"name": "ecs.capability.secrets.asm.environment-variables"}
+            ],
+            "placementConstraints": [],
+            "compatibilities": ["EC2", "FARGATE"],
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "512",
+            "memory": "1024",
+            "registeredAt": "2026-10-10T20:00:00.000000+00:00",
+            "registeredBy": f"arn:aws:iam::{ACCOUNT}:user/operator",
+        },
+        "tags": [
+            {"key": "ManagedBy", "value": "terraform"},
+            {"key": "Project", "value": "neurostack-api"},
         ],
     }
 
@@ -369,6 +444,18 @@ class FakeAws:
             {"__error_code__": "ValidationError"},
         )
         self.put("appconfig", "ListApplications", {}, {"Items": []})
+        self.put(
+            "ecs",
+            "DescribeTaskDefinition",
+            {"taskDefinition": "neurostack-staging-migrations:3", "include": ["TAGS"]},
+            _migrations_task_definition(),
+        )
+        self.put(
+            "ecs",
+            "DescribeTaskDefinition",
+            {"taskDefinition": "neurostack-staging-migrations", "include": ["TAGS"]},
+            _migrations_task_definition(),
+        )
         self.put(
             "ecr",
             "DescribeImages",
@@ -624,12 +711,23 @@ def _validated(**changes: Any) -> dict[str, Any]:
     return wiring.validate_parameters(_parameters(**changes))
 
 
+def _pins(manifest: dict[str, Any] | None = None) -> Any:
+    return wiring.manifest_pins(
+        wiring.validate_manifest(manifest or wiring.load_yaml(MANIFEST))
+    )
+
+
 def _plan(
-    fake: FakeAws, *, applied: dict[str, Any] | None = None, **changes: Any
+    fake: FakeAws,
+    *,
+    applied: dict[str, Any] | None = None,
+    pins: Any = None,
+    **changes: Any,
 ) -> tuple[dict[str, Any], Any]:
     parameters = _validated(**changes)
+    pins = pins if pins is not None else _pins()
     aws = wiring.ReadOnlyAws(fake.transport)
-    readback = wiring.collect_readback(aws, parameters)
+    readback = wiring.collect_readback(aws, parameters, pins=pins)
     return wiring.build_plan(
         parameters,
         readback,
@@ -639,6 +737,7 @@ def _plan(
         applied=(
             (APPLIED if fake.stack_applied else None) if applied is None else applied
         ),
+        pins=pins,
     )
 
 
@@ -1107,7 +1206,8 @@ def test_rendering_keeps_app_and_otel_and_adds_exactly_the_d3_names() -> None:
     assert evidence._env_map(containers["otel"]) == {}
     assert evidence._secret_map(containers["otel"]) == {}
     source = _task_definition()["taskDefinition"]["containerDefinitions"]
-    assert containers["otel"] == source[1]
+    # otel changes only its image: the manifest's digest pin of the live tag.
+    assert containers["otel"] == {**source[1], "image": OTEL_DIGEST_IMAGE}
     app_env = evidence._env_map(containers["app"])
     app_secrets = evidence._secret_map(containers["app"])
     assert set(app_env) == evidence._BASE_ENV_NAMES | set(wiring.ADDED_ENVIRONMENT)
@@ -1123,12 +1223,20 @@ def test_rendering_keeps_app_and_otel_and_adds_exactly_the_d3_names() -> None:
     )
     assert app_env["ASAAS_WEBHOOK_NOTIFICATION_EMAIL"] == "neurostack.infra@gmail.com"
     assert {
-        key: value for key, value in rendered.items() if key != "containerDefinitions"
+        key: value
+        for key, value in rendered.items()
+        if key not in {"containerDefinitions", "tags"}
     } == {
         key: value
         for key, value in wiring._request_from_response(_task_definition()).items()
-        if key != "containerDefinitions"
+        if key not in {"containerDefinitions", "tags"}
     }
+    # Tags: the source tags plus ManagedBy=manual (owner approval A4).
+    assert rendered["tags"] == [
+        {"key": "Project", "value": "neurostack-api"},
+        {"key": "Environment", "value": "staging"},
+        {"key": "ManagedBy", "value": "manual"},
+    ]
     assert not set(rendered) & evidence._RESPONSE_ONLY_FIELDS
 
 
@@ -1190,6 +1298,7 @@ def _registered_revision_9(rendered: dict[str, Any]) -> dict[str, Any]:
     registered["taskDefinition"]["containerDefinitions"] = copy.deepcopy(
         rendered["containerDefinitions"]
     )
+    registered["tags"] = copy.deepcopy(rendered["tags"])
     return registered
 
 
@@ -1318,6 +1427,8 @@ def test_image_override_must_be_a_digest_that_exists_in_ecr() -> None:
 
 
 def test_rollback_target_is_revision_8() -> None:
+    """The manifest field reads 8 until its documented re-pin to 9."""
+
     plan, _rendered = _plan(FakeAws(applied=True))
     assert plan["target"]["rollback_target"] == SOURCE_ARN
     assert SOURCE_ARN.endswith(":task-definition/neurostack-staging-app:8")
@@ -1329,10 +1440,7 @@ def test_registered_revision_matching_the_rendering_is_compliant() -> None:
     fake = FakeAws(applied=True)
     _plan_result, rendered = _plan(fake)
     assert rendered is not None
-    registered = _task_definition(NEXT_ARN)
-    registered["taskDefinition"]["containerDefinitions"] = copy.deepcopy(
-        rendered["containerDefinitions"]
-    )
+    registered = _registered_revision_9(rendered)
     fake.put(
         "ecs",
         "DescribeTaskDefinition",
@@ -1680,7 +1788,8 @@ def test_unknown_parameter_is_rejected() -> None:
 
 def test_manifest_and_template_validate() -> None:
     manifest, parameters, digests = wiring.load_inputs(MANIFEST, PARAMS)
-    assert manifest["target"]["rollback_task_definition_revision"] == 8
+    assert manifest["rollback_target"]["revision"] == 8
+    assert "rollback_task_definition_revision" not in manifest["target"]
     assert parameters is not None
     assert set(digests) == {"manifest_sha256", "template_sha256", "parameters_sha256"}
 
@@ -1709,7 +1818,8 @@ def test_manifest_and_template_validate() -> None:
         lambda m: m["steps"][5].__setitem__("scope", "d3_apply"),
         lambda m: m["steps"].reverse(),
         lambda m: m["steps"][3].__setitem__("approval", "approved"),
-        lambda m: m["target"].__setitem__("rollback_task_definition_revision", 7),
+        lambda m: m["rollback_target"].__setitem__("revision", 7),
+        lambda m: m["target"].__setitem__("rollback_task_definition_revision", 8),
         lambda m: m["target"]["served_hosts"].append("evil.example"),
         lambda m: m["parameters"]["required"].pop("ASAAS_WEBHOOK_NOTIFICATION_EMAIL"),
         lambda m: m["known_blocks"].pop(),
@@ -1779,10 +1889,14 @@ def test_render_refuses_before_the_secret_access_stack_exists(
     assert "blocked: plan_blocked:applied_record_but_stack_absent" in err
     parameters = _validated()
     readback = wiring.collect_readback(
-        wiring.ReadOnlyAws(FakeAws().transport), parameters
+        wiring.ReadOnlyAws(FakeAws().transport), parameters, pins=_pins()
     )
     plan, rendered = wiring.build_plan(
-        parameters, readback, {"template_sha256": "t" * 64}, applied=None
+        parameters,
+        readback,
+        {"template_sha256": "t" * 64},
+        applied=None,
+        pins=_pins(),
     )
     assert plan["status"] == "ready"
     with pytest.raises(wiring.WiringError, match="secret_access_stack_not_compliant"):
@@ -1885,7 +1999,9 @@ def test_readback_file_missing_a_read_fails_closed(tmp_path: Path) -> None:
     ]
     transport = wiring.snapshot_transport(fake.snapshot(tmp_path / "readback.json"))
     with pytest.raises(wiring.WiringError, match="readback_missing:iam.GetRolePolicy"):
-        wiring.collect_readback(wiring.ReadOnlyAws(transport), _validated())
+        wiring.collect_readback(
+            wiring.ReadOnlyAws(transport), _validated(), pins=_pins()
+        )
 
 
 def test_wrong_account_blocks_everything() -> None:
@@ -1911,7 +2027,10 @@ def test_gates_are_never_performed_and_report_their_known_blocks() -> None:
         "group5_deploy_template_validator_accepts_rendering" in plan["compliant"]
     )
     assert "F1_protected_path_image_repository_mismatch" in reasons
-    assert "F3_webhook_registration_entry_point:missing" in reasons
+    # F3 is a fact checked at plan time: reported only without the CLI file.
+    assert ("F3_webhook_registration_entry_point:missing" in reasons) is (
+        not (ROOT / "src/ops/asaas_webhook.py").is_file()
+    )
     assert (
         _step(plan, "signed_image_build_and_attestation")["info"][
             "deploy_path_verdict_evaluated_on"
@@ -2413,3 +2532,875 @@ def test_digest_pinned_bridge_image_clears_the_repository_mismatch() -> None:
     assert rendered is not None
     reasons = {row["reason"] for row in plan["gate_blocks"]}
     assert "F1_protected_path_image_repository_mismatch" in reasons
+
+
+# ---------------------------------------------------------------------------
+# T2 (live chain): otel digest pin and ManagedBy=manual on new revisions
+# ---------------------------------------------------------------------------
+
+OTEL_DIGEST_PATTERN = re.compile(
+    r"^public\.ecr\.aws/aws-observability/aws-otel-collector@sha256:[0-9a-f]{64}$"
+)
+
+
+def test_otel_image_is_a_manifest_digest_pin_of_the_live_resolution() -> None:
+    manifest = wiring.validate_manifest(wiring.load_yaml(MANIFEST))
+    assert manifest["task_definition"]["otel_image"] == OTEL_DIGEST_IMAGE
+    assert OTEL_DIGEST_PATTERN.fullmatch(_pins().otel_image)
+    # The planner holds the repository and the digest form, never the value.
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "7968fb60db6a2390a47ba6a2df029745638486e285c9b2487da1b722d0855a3e" not in (
+        source
+    )
+
+
+def test_rendered_revision_9_runs_otel_by_digest_never_a_tag() -> None:
+    _plan_result, rendered = _plan(
+        FakeAws(applied=True), app_image_override=OVERRIDE_IMAGE
+    )
+    assert rendered is not None
+    otel = evidence._container_map(rendered)["otel"]["image"]
+    assert otel == OTEL_DIGEST_IMAGE
+    assert OTEL_DIGEST_PATTERN.fullmatch(otel)
+    assert ":latest" not in json.dumps(rendered)
+    registered = _registered_revision_9(rendered)
+    assert (
+        evidence._container_map(registered["taskDefinition"])["otel"]["image"]
+        == OTEL_DIGEST_IMAGE
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "public.ecr.aws/aws-observability/aws-otel-collector:latest",
+        "public.ecr.aws/aws-observability/aws-otel-collector:v0.40.0@sha256:"
+        + "7" * 64,
+        "public.ecr.aws/other/aws-otel-collector@sha256:" + "7" * 64,
+        "public.ecr.aws/aws-observability/aws-otel-collector@sha256:" + "A" * 64,
+        "public.ecr.aws/aws-observability/aws-otel-collector@sha256:" + "7" * 63,
+        None,
+        7,
+    ],
+)
+def test_manifest_validator_rejects_an_otel_tag_or_other_image(value: Any) -> None:
+    manifest = wiring.load_yaml(MANIFEST)
+    manifest["task_definition"]["otel_image"] = value
+    with pytest.raises(wiring.WiringError, match="manifest_otel_image_not_digest"):
+        wiring.validate_manifest(manifest)
+
+
+def test_rendered_revision_replaces_a_terraform_managed_by_tag() -> None:
+    fake = FakeAws(applied=True)
+    source = _task_definition()
+    source["tags"] = [
+        {"key": "ManagedBy", "value": "terraform"},
+        {"key": "Project", "value": "neurostack-api"},
+    ]
+    for request in (
+        {"taskDefinition": "neurostack-staging-app:8", "include": ["TAGS"]},
+        {"taskDefinition": "neurostack-staging-app", "include": ["TAGS"]},
+    ):
+        fake.put("ecs", "DescribeTaskDefinition", request, source)
+    _plan_result, rendered = _plan(fake)
+    assert rendered is not None
+    assert rendered["tags"] == [
+        {"key": "ManagedBy", "value": "manual"},
+        {"key": "Project", "value": "neurostack-api"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [{"ManagedBy": "terraform"}, {}, {"ManagedBy": "manual", "Owner": "x"}, None],
+)
+def test_manifest_validator_pins_the_managed_by_override(value: Any) -> None:
+    for section in ("task_definition", "migrations_task_definition"):
+        manifest = wiring.load_yaml(MANIFEST)
+        manifest[section]["tag_overrides"] = value
+        with pytest.raises(wiring.WiringError):
+            wiring.validate_manifest(manifest)
+
+
+# ---------------------------------------------------------------------------
+# T2: the rollback target is a manifest field, re-pinned 8 -> 9 before 036
+# ---------------------------------------------------------------------------
+
+
+def _repinned_manifest() -> dict[str, Any]:
+    """The manifest as it reads after the documented re-pin step."""
+
+    manifest: dict[str, Any] = wiring.load_yaml(MANIFEST)
+    repin = manifest["rollback_target"].pop("repin")
+    manifest["rollback_target"] = {
+        "revision": repin["revision"],
+        "effective_after": repin["effective_after"],
+    }
+    return manifest
+
+
+def test_rollback_target_field_carries_the_repin_note() -> None:
+    manifest = wiring.validate_manifest(wiring.load_yaml(MANIFEST))
+    target = manifest["rollback_target"]
+    assert target["revision"] == 8
+    assert target["effective_after"] == wiring.ROLLBACK_EFFECTIVE_INITIAL
+    assert target["repin"]["revision"] == 9
+    assert target["repin"]["effective_after"] == wiring.ROLLBACK_EFFECTIVE_BRIDGE
+    assert target["repin"]["before"] == "migration_036"
+    assert "036" in target["repin"]["why"]
+    pins = _pins()
+    assert pins.rollback_revision == 8
+    assert pins.rollback_task_definition_arn == SOURCE_ARN
+    assert pins.rollback_repin_before == "migration_036"
+
+
+def test_repinned_rollback_target_9_flows_through_the_plan() -> None:
+    pins = _pins(_repinned_manifest())
+    assert pins.rollback_revision == 9
+    assert pins.rollback_repin_before is None
+    fake = FakeAws(applied=True)
+    _plan_result, rendered = _plan(fake, app_image_override=OVERRIDE_IMAGE)
+    assert rendered is not None
+    registered = _registered_revision_9(rendered)
+    fake.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        {"taskDefinition": "neurostack-staging-app:9", "include": ["TAGS"]},
+        registered,
+    )
+    fake.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        {"taskDefinition": "neurostack-staging-app", "include": ["TAGS"]},
+        registered,
+    )
+    fake.put(
+        "ecs",
+        "DescribeServices",
+        {"cluster": "neurostack-staging", "services": ["neurostack-staging-app"]},
+        _service(NEXT_ARN),
+    )
+    fake.calls.clear()
+    plan, _rendered = _plan(fake, pins=pins, app_image_override=OVERRIDE_IMAGE)
+    assert plan["target"]["rollback_target"] == NEXT_ARN
+    deployment = _step(plan, "service_deployment")
+    assert deployment["info"]["rollback_target"] == NEXT_ARN
+    assert "rollback_target_active_and_digest_pinned" in deployment["compliant"]
+    # The D3 source stays revision 8: revision 9 is still derived from it.
+    assert plan["task_definition_diff"]["source_task_definition_arn"] == SOURCE_ARN
+    assert (
+        f"registered_and_deployed:{NEXT_ARN}"
+        in _step(plan, "task_definition_revision")["compliant"]
+    )
+    reads = [p for _s, o, p in fake.calls if o == "DescribeTaskDefinition"]
+    assert {"taskDefinition": "neurostack-staging-app:9", "include": ["TAGS"]} in reads
+
+
+@pytest.mark.parametrize(
+    "changes,reason",
+    [
+        ({"status": "INACTIVE"}, "rollback_target_revision_unusable"),
+        ({"image": LIVE_IMAGE}, "rollback_target_revision_unusable"),
+    ],
+)
+def test_repinned_rollback_target_must_be_active_and_digest_pinned(
+    changes: dict[str, Any], reason: str
+) -> None:
+    pins = _pins(_repinned_manifest())
+    fake = FakeAws(applied=True)
+    target = _task_definition(NEXT_ARN, image=OVERRIDE_IMAGE)
+    if "status" in changes:
+        target["taskDefinition"]["status"] = changes["status"]
+    if "image" in changes:
+        target = _task_definition(NEXT_ARN, image=changes["image"])
+    fake.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        {"taskDefinition": "neurostack-staging-app:9", "include": ["TAGS"]},
+        target,
+    )
+    plan, _rendered = _plan(fake, pins=pins)
+    assert reason in _step(plan, "service_deployment")["blocks"]
+
+
+def _set_rollback(**values: Any) -> Callable[[dict[str, Any]], None]:
+    return lambda m: m["rollback_target"].update(values)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _set_rollback(revision=7),
+        _set_rollback(revision=10),
+        _set_rollback(revision=True),
+        _set_rollback(revision="8"),
+        _set_rollback(effective_after="whenever"),
+        lambda m: m["rollback_target"].pop("repin"),
+        lambda m: m["rollback_target"]["repin"].__setitem__("before", "migration_037"),
+        lambda m: m["rollback_target"]["repin"].__setitem__("revision", 10),
+        lambda m: m["rollback_target"]["repin"].__setitem__("why", ""),
+        lambda m: m["rollback_target"]["repin"].__setitem__(
+            "effective_after", wiring.ROLLBACK_EFFECTIVE_INITIAL
+        ),
+        lambda m: m["rollback_target"].__setitem__("note", "x"),
+        lambda m: m.pop("rollback_target"),
+    ],
+)
+def test_manifest_validator_rejects_an_invalid_rollback_target(
+    mutate: Callable[[dict[str, Any]], None],
+) -> None:
+    manifest = wiring.load_yaml(MANIFEST)
+    mutate(manifest)
+    with pytest.raises(wiring.WiringError):
+        wiring.validate_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda m: m["rollback_target"].__setitem__(
+            "repin", {"revision": 10, "effective_after": "x", "before": "y", "why": "z"}
+        ),
+        lambda m: m["rollback_target"].__setitem__(
+            "effective_after", wiring.ROLLBACK_EFFECTIVE_INITIAL
+        ),
+    ],
+)
+def test_a_repinned_rollback_target_cannot_be_repinned_again(
+    mutate: Callable[[dict[str, Any]], None],
+) -> None:
+    manifest = _repinned_manifest()
+    wiring.validate_manifest(copy.deepcopy(manifest))
+    mutate(manifest)
+    with pytest.raises(wiring.WiringError, match="manifest_rollback_target_invalid"):
+        wiring.validate_manifest(manifest)
+
+
+def test_planner_code_never_hardcodes_the_rollback_revision() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "ROLLBACK_REVISION" not in source
+    assert "ROLLBACK_TASK_DEFINITION_ARN" not in source
+    # Every use of the rollback target goes through the manifest pins.
+    tree = ast.parse(source)
+    reads = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr.startswith("rollback_")
+    }
+    assert "rollback_task_definition_arn" in reads
+
+
+# ---------------------------------------------------------------------------
+# T2: the migrations revision bakes exactly the pinned upgrade
+# ---------------------------------------------------------------------------
+
+
+def _migrations(
+    fake: FakeAws | None = None, **changes: Any
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    parameters = _validated(**({"app_image_override": OVERRIDE_IMAGE} | changes))
+    aws = wiring.ReadOnlyAws((fake or FakeAws(applied=True)).transport)
+    readback = wiring.collect_migrations_readback(aws, parameters)
+    return wiring.plan_migrations(readback, parameters, pins=_pins())
+
+
+def _put_migrations(
+    fake: FakeAws, response: dict[str, Any], *, latest: bool = False
+) -> None:
+    fake.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        {
+            "taskDefinition": "neurostack-staging-migrations"
+            + ("" if latest else ":3"),
+            "include": ["TAGS"],
+        },
+        response,
+    )
+
+
+def test_migrations_revision_bakes_the_pinned_upgrade_on_the_bridge_image() -> None:
+    status, rendered = _migrations()
+    assert status["blocks"] == [], status
+    assert status["state"] == "would_register"
+    assert rendered is not None
+    (container,) = rendered["containerDefinitions"]
+    assert container["command"] == [
+        "alembic",
+        "upgrade",
+        wiring.MIGRATIONS_TARGET_REVISION,
+    ]
+    assert container["command"] == list(wiring.MIGRATIONS_COMMAND)
+    assert container["image"] == OVERRIDE_IMAGE
+    assert container["secrets"] == [
+        {"name": "DATABASE_URL", "valueFrom": MIGRATIONS_DB_ARN}
+    ]
+    source = wiring._request_from_response(_migrations_task_definition())
+    assert rendered["family"] == "neurostack-staging-migrations"
+    assert rendered["executionRoleArn"] == source["executionRoleArn"]
+    assert rendered["taskRoleArn"] == source["taskRoleArn"]
+    assert {
+        k: v for k, v in rendered.items() if k not in {"containerDefinitions", "tags"}
+    } == {k: v for k, v in source.items() if k not in {"containerDefinitions", "tags"}}
+    assert {k: v for k, v in container.items() if k not in {"image", "command"}} == {
+        k: v
+        for k, v in source["containerDefinitions"][0].items()
+        if k not in {"image", "command"}
+    }
+    assert rendered["tags"] == [
+        {"key": "ManagedBy", "value": "manual"},
+        {"key": "Project", "value": "neurostack-api"},
+    ]
+    # A RegisterTaskDefinition request: never revision 3 (it bakes the head).
+    text = json.dumps(rendered)
+    assert "neurostack-staging-migrations:3" not in text
+    assert not set(rendered) & evidence._RESPONSE_ONLY_FIELDS
+    assert UPGRADE_HEAD.search(text) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("alembic", "upgrade", "head"),
+        ("alembic", "upgrade", "heads"),
+        ("alembic", "upgrade", "+1"),
+        ("alembic", "upgrade", "036"),
+        ("alembic", "upgrade", "037"),
+        ("alembic", "upgrade", "0350"),
+        ("alembic", "upgrade", "035", "--sql"),
+        ("sh", "-c", "alembic upgrade 035"),
+        ("alembic", "downgrade", "035"),
+        (),
+    ],
+)
+def test_migrations_render_refuses_any_command_but_the_pinned_upgrade(
+    command: tuple[str, ...],
+) -> None:
+    with pytest.raises(wiring.WiringError, match="migrations_command_not_pinned"):
+        wiring.render_migrations_task_definition(
+            _migrations_task_definition(),
+            image=OVERRIDE_IMAGE,
+            pins=_pins(),
+            command=command,
+        )
+
+
+@pytest.mark.parametrize(
+    "pinned", [("alembic", "upgrade", "heads"), ("alembic", "upgrade", "35")]
+)
+def test_migrations_render_refuses_a_widened_pin_constant(
+    pinned: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pins = _pins()
+    monkeypatch.setattr(wiring, "MIGRATIONS_COMMAND", pinned)
+    monkeypatch.setattr(wiring, "MIGRATIONS_TARGET_REVISION", pinned[2])
+    with pytest.raises(wiring.WiringError, match="migrations_command_not_pinned"):
+        wiring.render_migrations_task_definition(
+            _migrations_task_definition(), image=OVERRIDE_IMAGE, pins=pins
+        )
+    # The manifest validator refuses the widened window on its own as well.
+    with pytest.raises(wiring.WiringError, match="manifest_migrations_window"):
+        _pins()
+
+
+def _migrations_with(**changes: Any) -> dict[str, Any]:
+    return _migrations_task_definition(**changes)
+
+
+MIGRATIONS_SOURCE_PROBLEMS: dict[str, tuple[Callable[[], dict[str, Any]], str]] = {
+    "revision_4_answered": (
+        lambda: _migrations_task_definition(MIGRATIONS_NEXT_ARN),
+        "migrations_source_revision_mismatch",
+    ),
+    "inactive": (
+        lambda: {
+            **_migrations_task_definition(),
+            "taskDefinition": {
+                **_migrations_task_definition()["taskDefinition"],
+                "status": "INACTIVE",
+            },
+        },
+        "migrations_source_not_active",
+    ),
+    "entry_point": (
+        lambda: _migrations_with(entryPoint=["sh", "-c"]),
+        "migrations_source_entry_point_unexpected",
+    ),
+    "two_containers": (
+        lambda: _migrations_task_definition(
+            containers=[
+                _migrations_task_definition()["taskDefinition"]["containerDefinitions"][
+                    0
+                ],
+                {"name": "sidecar", "image": LIVE_IMAGE},
+            ]
+        ),
+        "migrations_source_container_count_invalid",
+    ),
+    "app_database_secret": (
+        lambda: _migrations_with(
+            secrets=[
+                {
+                    "name": "DATABASE_URL",
+                    "valueFrom": SECRET_PREFIX + "database-url-fyOYuj",
+                }
+            ]
+        ),
+        "migrations_database_secret_mismatch",
+    ),
+    "pinned_database_reference": (
+        lambda: _migrations_with(
+            secrets=[
+                {
+                    "name": "DATABASE_URL",
+                    "valueFrom": MIGRATIONS_DB_ARN
+                    + ":::12345678-1234-5678-1234-567812345678",
+                }
+            ]
+        ),
+        "migrations_database_secret_mismatch",
+    ),
+    "no_database_secret": (
+        lambda: _migrations_with(secrets=[]),
+        "migrations_database_secret_mismatch",
+    ),
+    "database_url_in_environment": (
+        lambda: _migrations_with(
+            environment=[{"name": "DATABASE_URL", "value": "postgresql://x"}]
+        ),
+        "migrations_database_secret_mismatch",
+    ),
+    "forbidden_name": (
+        lambda: _migrations_with(
+            environment=[{"name": "APPCONFIG_ENABLED", "value": "true"}]
+        ),
+        "forbidden_name_in_rendering",
+    ),
+    "execution_role": (
+        lambda: {
+            **_migrations_task_definition(),
+            "taskDefinition": {
+                **_migrations_task_definition()["taskDefinition"],
+                "executionRoleArn": f"arn:aws:iam::{ACCOUNT}:role/other",
+            },
+        },
+        "migrations_source_roles_mismatch",
+    ),
+    "task_role": (
+        lambda: {
+            **_migrations_task_definition(),
+            "taskDefinition": {
+                **_migrations_task_definition()["taskDefinition"],
+                "taskRoleArn": f"arn:aws:iam::{ACCOUNT}:role/admin",
+            },
+        },
+        "migrations_source_roles_mismatch",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(MIGRATIONS_SOURCE_PROBLEMS))
+def test_migrations_render_refuses_an_unexpected_revision_3(case: str) -> None:
+    make, reason = MIGRATIONS_SOURCE_PROBLEMS[case]
+    fake = FakeAws(applied=True)
+    _put_migrations(fake, make())
+    status, rendered = _migrations(fake)
+    assert rendered is None
+    assert any(block.startswith(reason) for block in status["blocks"]), status
+
+
+def test_migrations_render_requires_the_reviewed_bridge_image() -> None:
+    with pytest.raises(
+        wiring.WiringError, match="migrations_image_requires_app_image_override"
+    ):
+        _migrations(app_image_override=None)
+    fake = FakeAws(applied=True)
+    fake.put(
+        "ecr",
+        "DescribeImages",
+        {
+            "repositoryName": "neurostack-staging",
+            "imageIds": [{"imageDigest": "sha256:" + "2" * 64}],
+        },
+        {"__error_code__": "ImageNotFoundException"},
+    )
+    status, rendered = _migrations(fake)
+    assert rendered is None
+    assert "migrations_image_not_found_in_ecr" in status["blocks"]
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        LIVE_IMAGE,
+        "docker.io/library/python@sha256:" + "2" * 64,
+        OVERRIDE_IMAGE.replace("sha256:", "sha256:A"),
+        OVERRIDE_IMAGE.replace("@sha256:", ":tag@sha256:"),
+        "",
+    ],
+)
+def test_migrations_render_refuses_an_image_not_pinned_by_digest(image: str) -> None:
+    with pytest.raises(wiring.WiringError, match="migrations_image_not_digest_pinned"):
+        wiring.render_migrations_task_definition(
+            _migrations_task_definition(), image=image, pins=_pins()
+        )
+
+
+def test_migrations_registered_revision_is_reported_and_a_differing_one_blocks() -> (
+    None
+):
+    fake = FakeAws(applied=True)
+    _status, rendered = _migrations(fake)
+    assert rendered is not None
+    registered = copy.deepcopy(_migrations_task_definition(MIGRATIONS_NEXT_ARN))
+    registered["taskDefinition"]["containerDefinitions"] = copy.deepcopy(
+        rendered["containerDefinitions"]
+    )
+    registered["tags"] = copy.deepcopy(rendered["tags"])
+    _put_migrations(fake, registered, latest=True)
+    status, again = _migrations(fake)
+    assert again == rendered
+    assert status["state"] == f"registered:{MIGRATIONS_NEXT_ARN}"
+    assert status["run_task_definition"] == MIGRATIONS_NEXT_ARN
+    _put_migrations(fake, _migrations_task_definition(MIGRATIONS_NEXT_ARN), latest=True)
+    status, again = _migrations(fake)
+    assert again is None
+    assert (
+        f"migrations_newer_revision_differs:{MIGRATIONS_NEXT_ARN}" in status["blocks"]
+    )
+
+
+def test_cli_render_migrations_taskdef_from_a_readback_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    snapshot = FakeAws(applied=True).snapshot(tmp_path / "readback.json")
+    params = _write_params(tmp_path, app_image_override=OVERRIDE_IMAGE)
+    code, out, err = _run(
+        [
+            "render-migrations-taskdef",
+            "--params",
+            str(params),
+            "--readback-file",
+            str(snapshot),
+        ],
+        capsys,
+    )
+    assert code == 0, err
+    rendered = json.loads(out)
+    assert rendered["containerDefinitions"][0]["command"] == [
+        "alembic",
+        "upgrade",
+        "035",
+    ]
+    assert UPGRADE_HEAD.search(out + err) is None
+    assert "neurostack-staging-migrations:3" not in out
+    params = _write_params(tmp_path)
+    code, out, err = _run(
+        [
+            "render-migrations-taskdef",
+            "--params",
+            str(params),
+            "--readback-file",
+            str(snapshot),
+        ],
+        capsys,
+    )
+    assert code == 2
+    assert out == ""
+    assert "blocked: migrations_image_requires_app_image_override" in err
+
+
+# ---------------------------------------------------------------------------
+# T2: F1 known block names the open residual, and its text is current
+# ---------------------------------------------------------------------------
+
+
+def test_known_block_ids_name_open_blocks_only() -> None:
+    assert wiring.KNOWN_BLOCKS == {
+        "F1_residual_5_database_url_fingerprint": "signed_image_build_and_attestation",
+        "F3_webhook_registration_entry_point": "webhook_exposure_and_registration",
+    }
+    manifest = wiring.validate_manifest(wiring.load_yaml(MANIFEST))
+    assert {row["id"] for row in manifest["known_blocks"]} == set(wiring.KNOWN_BLOCKS)
+    for text in (
+        MANIFEST.read_text(encoding="utf-8"),
+        SCRIPT.read_text(encoding="utf-8"),
+    ):
+        assert "F1_group5_deploy_validator_allowlist" not in text
+
+
+def _plain_and_pinned_fingerprints_differ(request: dict[str, Any]) -> bool:
+    """What the protected deploy compares: plain ARN serving vs pinned replacement."""
+
+    pinned = copy.deepcopy(request)
+    for row in evidence._container_map(pinned)["app"]["secrets"]:
+        if row["name"] == "DATABASE_URL":
+            row["valueFrom"] += ":::12345678-1234-5678-1234-567812345678"
+    return bool(
+        rollout._task_definition_runtime_fingerprint(request)
+        != rollout._task_definition_runtime_fingerprint(pinned)
+    )
+
+
+def test_residual_5_is_reported_from_the_real_fingerprint() -> None:
+    """Present iff the real fingerprint differs (true until PR #118 merges)."""
+
+    plan, rendered = _plan(FakeAws(applied=True), app_image_override=OVERRIDE_IMAGE)
+    assert rendered is not None
+    reasons = {row["reason"] for row in plan["gate_blocks"]}
+    assert ("F1_residual_5_database_url_fingerprint" in reasons) is (
+        _plain_and_pinned_fingerprints_differ(rendered)
+    )
+    assert not any(reason.startswith("F1_group5") for reason in reasons)
+    info = _step(plan, "signed_image_build_and_attestation")["info"]
+    assert info["protected_replacement_keeps_runtime_fingerprint"] is (
+        not _plain_and_pinned_fingerprints_differ(rendered)
+    )
+
+
+def test_residual_5_probe_reports_a_difference_when_the_fingerprint_differs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forced difference: the probe must report it whatever main ships."""
+
+    original = rollout._task_definition_runtime_fingerprint
+
+    def strict(definition: dict[str, Any]) -> str:
+        app = evidence._container_map(definition)["app"]
+        database = [r for r in app["secrets"] if r["name"] == "DATABASE_URL"]
+        return str(original(definition)) + str(database[0]["valueFrom"])
+
+    monkeypatch.setattr(rollout, "_task_definition_runtime_fingerprint", strict)
+    plan, rendered = _plan(FakeAws(applied=True), app_image_override=OVERRIDE_IMAGE)
+    reasons = {row["reason"] for row in plan["gate_blocks"]}
+    assert "F1_residual_5_database_url_fingerprint" in reasons
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_f3_block_follows_the_entry_point_file(
+    present: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        wiring,
+        "WEBHOOK_REGISTRATION_ENTRY_POINT",
+        "scripts/asaas_production_wiring.py" if present else "src/ops/absent.py",
+    )
+    plan, _rendered = _plan(FakeAws(applied=True))
+    webhook = _step(plan, "webhook_exposure_and_registration")
+    assert ("F3_webhook_registration_entry_point:missing" in webhook["blocks"]) is (
+        not present
+    )
+    assert ("webhook_registration_entry_point_present" in webhook["compliant"]) is (
+        present
+    )
+
+
+def test_rollback_target_8_is_never_reported_as_digest_pinned() -> None:
+    plan, _rendered = _plan(FakeAws(applied=True))
+    deployment = _step(plan, "service_deployment")
+    assert "rollback_target_active_and_digest_pinned" not in deployment["compliant"]
+    assert (
+        "rollback_target_active_on_initial_tagged_revision" in deployment["compliant"]
+    )
+    assert deployment["info"]["rollback_target_image_pinned_by_digest"] is False
+
+
+def test_migrations_fault_injection_false_is_dropped_and_true_refused() -> None:
+    fake = FakeAws(applied=True)
+    off = _migrations_task_definition()
+    off["taskDefinition"]["enableFaultInjection"] = False
+    _put_migrations(fake, off)
+    status, rendered = _migrations(fake)
+    assert rendered is not None and status["blocks"] == []
+    assert "enableFaultInjection" not in rendered
+    on = _migrations_task_definition()
+    on["taskDefinition"]["enableFaultInjection"] = True
+    _put_migrations(fake, on)
+    status, rendered = _migrations(fake)
+    assert rendered is None
+    assert "migrations_source_fault_injection_not_false" in status["blocks"]
+
+
+def test_migrations_registered_with_fault_injection_false_still_matches() -> None:
+    fake = FakeAws(applied=True)
+    _status, rendered = _migrations(fake)
+    assert rendered is not None
+    registered = copy.deepcopy(_migrations_task_definition(MIGRATIONS_NEXT_ARN))
+    registered["taskDefinition"]["containerDefinitions"] = copy.deepcopy(
+        rendered["containerDefinitions"]
+    )
+    registered["tags"] = copy.deepcopy(rendered["tags"])
+    registered["taskDefinition"]["enableFaultInjection"] = False
+    _put_migrations(fake, registered, latest=True)
+    status, _again = _migrations(fake)
+    assert status["state"] == f"registered:{MIGRATIONS_NEXT_ARN}"
+
+
+def test_cli_render_migrations_refuses_to_register_an_identical_revision_again(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = FakeAws(applied=True)
+    _status, rendered = _migrations(fake)
+    assert rendered is not None
+    registered = copy.deepcopy(_migrations_task_definition(MIGRATIONS_NEXT_ARN))
+    registered["taskDefinition"]["containerDefinitions"] = copy.deepcopy(
+        rendered["containerDefinitions"]
+    )
+    registered["tags"] = copy.deepcopy(rendered["tags"])
+    _put_migrations(fake, registered, latest=True)
+    snapshot = fake.snapshot(tmp_path / "readback.json")
+    params = _write_params(tmp_path, app_image_override=OVERRIDE_IMAGE)
+    args = [
+        "render-migrations-taskdef",
+        "--params",
+        str(params),
+        "--readback-file",
+        str(snapshot),
+    ]
+    code, out, err = _run(args, capsys)
+    assert code == 3
+    assert out == ""
+    assert f"already registered: {MIGRATIONS_NEXT_ARN}" in err
+    code, out, err = _run([*args, "--force-new-revision"], capsys)
+    assert code == 0, err
+    assert json.loads(out) == rendered
+
+
+def test_residual_5_block_clears_once_the_fingerprint_normalizes_the_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = rollout._task_definition_runtime_fingerprint
+
+    def fixed(definition: dict[str, Any]) -> str:
+        probe = copy.deepcopy(definition)
+        for container in probe.get("containerDefinitions") or []:
+            for secret in container.get("secrets") or []:
+                if secret.get("name") == "DATABASE_URL":
+                    secret["valueFrom"] = ":".join(secret["valueFrom"].split(":")[:7])
+        return str(original(probe))
+
+    monkeypatch.setattr(rollout, "_task_definition_runtime_fingerprint", fixed)
+    plan, rendered = _plan(FakeAws(applied=True), app_image_override=OVERRIDE_IMAGE)
+    assert rendered is not None
+    reasons = {row["reason"] for row in plan["gate_blocks"]}
+    assert not any(reason.startswith("F1_residual_5") for reason in reasons)
+
+
+def test_group5_template_regression_is_still_reported_under_its_own_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        wiring, "group5_template_verdict", lambda *_a: (False, "names_mismatch")
+    )
+    plan, _rendered = _plan(FakeAws(applied=True))
+    reasons = {row["reason"] for row in plan["gate_blocks"]}
+    assert "F1_group5_template_validator_regression:names_mismatch" in reasons
+
+
+def test_manifest_f1_and_deployment_text_is_current() -> None:
+    text = " ".join(MANIFEST.read_text(encoding="utf-8").split())
+    for stale in (
+        "rejects it even without D3",
+        "if the owner approves",
+        "The deploy-path code is not changed here",
+        "pin the app environment and secret names to the revision 8 sets",
+        "only the six base environment values",
+        "it does not exist today",
+        "derived from the live rollback target",
+    ):
+        assert stale not in text, stale
+    raw = MANIFEST.read_text(encoding="utf-8")
+    assert raw.count("PENDING OWNER CONFIRMATION") == 2
+    assert "PR #118" in text and "PR #120" in text
+    for current in (
+        "residual 5",
+        "mutable tag",
+        "A1",
+        "readback_runtime_fingerprint_sha256_changed",
+        "scripts/asaas_deploy_hook.py",
+        "DEPLOYED_WEBHOOK_PENDING",
+    ):
+        assert current in text, current
+
+
+# ---------------------------------------------------------------------------
+# Final loop: the newest migrations revision must be ours before reuse
+# ---------------------------------------------------------------------------
+
+
+def test_migrations_fixture_arns_keep_the_account() -> None:
+    for arn in (MIGRATIONS_SOURCE_ARN, MIGRATIONS_NEXT_ARN, NEXT_ARN, SOURCE_ARN):
+        assert arn.startswith(f"arn:aws:ecs:us-east-1:{ACCOUNT}:task-definition/")
+    assert MIGRATIONS_NEXT_ARN.endswith("/neurostack-staging-migrations:4")
+
+
+def _registered_migrations(arn: str, rendered: dict[str, Any], **changes: Any) -> Any:
+    registered = copy.deepcopy(_migrations_task_definition(MIGRATIONS_NEXT_ARN))
+    registered["taskDefinition"]["containerDefinitions"] = copy.deepcopy(
+        rendered["containerDefinitions"]
+    )
+    registered["taskDefinition"]["taskDefinitionArn"] = arn
+    registered["taskDefinition"].update(changes)
+    registered["tags"] = copy.deepcopy(rendered["tags"])
+    return registered
+
+
+@pytest.mark.parametrize(
+    "arn,changes",
+    [
+        (MIGRATIONS_NEXT_ARN.replace(f":{ACCOUNT}:", ":488460142431:"), {}),
+        (MIGRATIONS_NEXT_ARN.replace(":us-east-1:", ":us-east-2:"), {}),
+        (
+            MIGRATIONS_NEXT_ARN.replace(
+                "neurostack-staging-migrations", "other-family"
+            ),
+            {},
+        ),
+        (MIGRATIONS_NEXT_ARN.rsplit(":", 1)[0] + ":2", {"revision": 2}),
+        (MIGRATIONS_NEXT_ARN, {"revision": 5}),
+        (MIGRATIONS_NEXT_ARN, {"family": "other-family"}),
+        (MIGRATIONS_NEXT_ARN + "x", {}),
+    ],
+)
+def test_an_equal_newest_revision_outside_this_family_is_never_reused(
+    arn: str,
+    changes: dict[str, Any],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake = FakeAws(applied=True)
+    _status, rendered = _migrations(fake)
+    assert rendered is not None
+    _put_migrations(fake, _registered_migrations(arn, rendered, **changes), latest=True)
+    status, again = _migrations(fake)
+    assert again is None
+    assert status["run_task_definition"] is None
+    assert "migrations_newest_revision_invalid" in status["blocks"]
+    snapshot = fake.snapshot(tmp_path / "readback.json")
+    params = _write_params(tmp_path, app_image_override=OVERRIDE_IMAGE)
+    code, out, err = _run(
+        [
+            "render-migrations-taskdef",
+            "--params",
+            str(params),
+            "--readback-file",
+            str(snapshot),
+        ],
+        capsys,
+    )
+    assert code == 2 and out == ""
+    assert "already registered" not in err
+    assert "migrations_newest_revision_invalid" in err
+
+
+def test_an_equal_newest_revision_of_this_family_is_reported(
+    tmp_path: Path,
+) -> None:
+    fake = FakeAws(applied=True)
+    _status, rendered = _migrations(fake)
+    assert rendered is not None
+    _put_migrations(
+        fake, _registered_migrations(MIGRATIONS_NEXT_ARN, rendered), latest=True
+    )
+    status, _again = _migrations(fake)
+    assert status["run_task_definition"] == MIGRATIONS_NEXT_ARN
