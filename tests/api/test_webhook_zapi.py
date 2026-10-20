@@ -576,7 +576,7 @@ class TestZapiReplay:
             patch(
                 "src.api.routes.webhook.settings",
                 SimpleNamespace(
-                    is_production=True,
+                    environment="production",
                     rate_limit_enabled=True,
                     rate_limit_requests_per_minute=60,
                     rate_limit_burst=10,
@@ -599,6 +599,128 @@ class TestZapiReplay:
 
         assert resp.status_code == 503
         assert resp.json() == {"error": "replay_store_unavailable"}
+
+
+def _unavailable_redis(mode: str) -> MagicMock | None:
+    """Simulate a Redis outage: no client at all, or a client whose SET fails."""
+
+    if mode == "no_client":
+        return None
+    redis_client = MagicMock()
+    redis_client.set.side_effect = ConnectionError("redis down")
+    return redis_client
+
+
+class TestZapiReplayStoreEnvironmentGate:
+    """Only development/test may fall back to the per-process replay store.
+
+    Production traffic is served with ``ENVIRONMENT=staging``
+    (``infra/production/asaas-production-wiring.yaml``), so a fail-closed
+    branch gated on ``is_production`` would let each worker accept the same
+    provider retry during a Redis outage.
+    """
+
+    @pytest.mark.parametrize("environment", ["staging", "production"])
+    def test_claim_fails_closed_without_redis_client(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        environment: str,
+    ):
+        from src.api.routes import webhook as webhook_module
+
+        monkeypatch.setattr(settings, "environment", environment)
+        monkeypatch.setattr(webhook_module, "_get_redis", lambda: None)
+        tenant = uuid4()
+
+        with pytest.raises(
+            webhook_module.ReplayStoreUnavailable, match="^redis_unavailable$"
+        ):
+            webhook_module._claim_incoming_message("zapi", tenant, "mid_no_client")
+
+        assert f"zapi:{tenant}:mid_no_client" not in webhook_module._INMEM_INCOMING
+
+    @pytest.mark.parametrize("environment", ["staging", "production"])
+    def test_claim_fails_closed_when_redis_set_raises(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        environment: str,
+    ):
+        from src.api.routes import webhook as webhook_module
+
+        redis_client = _unavailable_redis("set_raises")
+        monkeypatch.setattr(settings, "environment", environment)
+        monkeypatch.setattr(webhook_module, "_get_redis", lambda: redis_client)
+        tenant = uuid4()
+
+        with pytest.raises(
+            webhook_module.ReplayStoreUnavailable, match="^redis down$"
+        ) as excinfo:
+            webhook_module._claim_incoming_message("zapi", tenant, "mid_set_raises")
+
+        assert isinstance(excinfo.value.__cause__, ConnectionError)
+        assert redis_client is not None
+        redis_client.set.assert_called_once_with(
+            f"incoming_msg:zapi:{tenant}:mid_set_raises",
+            "1",
+            nx=True,
+            ex=2678400,
+        )
+        assert f"zapi:{tenant}:mid_set_raises" not in webhook_module._INMEM_INCOMING
+
+    @pytest.mark.parametrize("redis_mode", ["no_client", "set_raises"])
+    @pytest.mark.parametrize("environment", ["development", "test"])
+    def test_development_and_test_keep_single_worker_memory_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        environment: str,
+        redis_mode: str,
+    ):
+        from src.api.routes import webhook as webhook_module
+
+        redis_client = _unavailable_redis(redis_mode)
+        monkeypatch.setattr(settings, "environment", environment)
+        monkeypatch.setattr(webhook_module, "_get_redis", lambda: redis_client)
+        tenant = uuid4()
+
+        assert webhook_module._claim_incoming_message("zapi", tenant, "mid_dev") is True
+        assert (
+            webhook_module._claim_incoming_message("zapi", tenant, "mid_dev") is False
+        )
+
+    @pytest.mark.parametrize("redis_mode", ["no_client", "set_raises"])
+    def test_staging_route_returns_exact_503_and_runs_no_effects(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        redis_mode: str,
+    ):
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_tenant(client, tenant_id, instance_id, raw_token)
+
+        body = _zapi_body(instance_id=instance_id, message_id=f"mid_{uuid4().hex[:8]}")
+
+        with (
+            patch.object(settings, "environment", "staging"),
+            patch(
+                "src.api.routes.webhook._get_redis",
+                return_value=_unavailable_redis(redis_mode),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+                side_effect=AssertionError("must not run pipeline"),
+            ) as get_service,
+            patch(
+                "src.api.routes.webhook.send_text_message",
+                new=AsyncMock(side_effect=AssertionError("must not send")),
+            ) as send,
+        ):
+            resp = client.post(f"/v1/webhook/zapi/{raw_token}", json=body)
+
+        assert resp.status_code == 503
+        assert resp.json() == {"error": "replay_store_unavailable"}
+        get_service.assert_not_called()
+        send.assert_not_awaited()
 
 
 # ============================================

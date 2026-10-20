@@ -1830,7 +1830,7 @@ class TestMetaWebhookReplay:
             patch(
                 "src.api.routes.webhook.settings",
                 SimpleNamespace(
-                    is_production=True,
+                    environment="production",
                     rate_limit_enabled=True,
                     rate_limit_requests_per_minute=60,
                     rate_limit_burst=10,

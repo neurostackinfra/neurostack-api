@@ -661,6 +661,118 @@ class TestUazapiWebhookDuplicateMessage:
         webhook_module._INMEM_INCOMING.clear()
 
 
+def _unavailable_redis(mode: str) -> MagicMock | None:
+    """Simulate a Redis outage: no client at all, or a client whose SET fails."""
+
+    if mode == "no_client":
+        return None
+    redis_client = MagicMock()
+    redis_client.set.side_effect = ConnectionError("redis down")
+    return redis_client
+
+
+class TestUazapiReplayStoreUnavailable:
+    """Uazapi translates a replay-store outage into the shared 503 contract.
+
+    Production traffic is served with ``ENVIRONMENT=staging``, where the
+    claim fails closed instead of using the per-process memory store; both
+    Uazapi claim sites (text and post-download audio) must answer 503
+    ``replay_store_unavailable`` rather than leak an unhandled 500.
+    """
+
+    @pytest.mark.parametrize("redis_mode", ["no_client", "set_raises"])
+    def test_text_claim_returns_exact_503_and_runs_no_effects(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        redis_mode: str,
+    ):
+        webhook_module._INMEM_INCOMING.clear()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511988887777",
+            body="Olá",
+            message_id=f"3EB0_replay_down_{uuid4().hex[:8]}",
+        )
+
+        with (
+            patch.object(settings, "environment", "staging"),
+            patch(
+                "src.api.routes.webhook._get_redis",
+                return_value=_unavailable_redis(redis_mode),
+            ),
+            patch(
+                "src.api.routes.webhook.get_event_service",
+                side_effect=AssertionError("must not run pipeline"),
+            ) as get_service,
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(side_effect=AssertionError("must not send")),
+            ) as send,
+        ):
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 503, response.text
+        assert response.json() == {"error": "replay_store_unavailable"}
+        get_service.assert_not_called()
+        send.assert_not_awaited()
+        assert not webhook_module._INMEM_INCOMING
+
+    @pytest.mark.parametrize("redis_mode", ["no_client", "set_raises"])
+    def test_audio_claim_after_download_returns_exact_503_and_runs_no_effects(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        redis_mode: str,
+    ):
+        webhook_module._INMEM_INCOMING.clear()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(client, tenant_id, instance, stt=True)
+        payload = _build_uazapi_media_body(
+            "audio",
+            instance=instance,
+            message_id=f"3EB0_replay_down_audio_{uuid4().hex[:8]}",
+        )
+        service = MagicMock()
+        service._load_clinic_config = AsyncMock(return_value={})
+        service.run_pipeline = AsyncMock()
+        service.finish_response = AsyncMock()
+        download = AsyncMock(return_value=(b"OggS_replay_down", "audio/ogg"))
+        chain = AsyncMock()
+        send = AsyncMock()
+        reply = AsyncMock()
+        fallback = AsyncMock()
+
+        with (
+            patch.object(settings, "environment", "staging"),
+            patch(
+                "src.api.routes.webhook._get_redis",
+                return_value=_unavailable_redis(redis_mode),
+            ),
+            patch("src.api.routes.webhook.get_event_service", return_value=service),
+            patch("src.api.routes.webhook.download_uazapi_media", download),
+            patch("src.api.routes.webhook._transcribe_audio_chain", chain),
+            patch("src.api.routes.webhook.send_uazapi_text", send),
+            patch("src.api.routes.webhook._send_reply_with_optional_tts", reply),
+            patch("src.api.routes.webhook._send_uazapi_stt_fallback", fallback),
+        ):
+            response = client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 503, response.text
+        assert response.json() == {"error": "replay_store_unavailable"}
+        # The claim is reached (download succeeded first), then fails closed.
+        download.assert_awaited_once()
+        chain.assert_not_awaited()
+        service.run_pipeline.assert_not_awaited()
+        service.finish_response.assert_not_awaited()
+        send.assert_not_awaited()
+        reply.assert_not_awaited()
+        fallback.assert_not_awaited()
+        assert not webhook_module._INMEM_INCOMING
+
+
 class TestUazapiInboundWhenEgressClosed:
     @pytest.mark.parametrize("flag_failure", ["false", "error"])
     def test_new_session_privacy_and_reply_are_suppressed_after_processing(
