@@ -15,7 +15,6 @@ import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 from httpx import AsyncClient
-from sqlalchemy.exc import SQLAlchemyError
 from starlette.responses import RedirectResponse
 
 from src.api.middleware.auth import (
@@ -71,55 +70,52 @@ async def _auth_session() -> AsyncIterator[AsyncMock]:
     yield AsyncMock()
 
 
-def test_invalid_hash_does_not_block_following_valid_tenant(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+_INVALID_API_KEY_BODY = {
+    "error": "unauthorized",
+    "message": "Invalid API key",
+    "documentation_url": "https://docs.neurostack.ai/auth",
+}
+
+
+def _guard_tenant_scan(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, MagicMock]:
+    """Record any tenant lookup or bcrypt verify an API key would trigger.
+
+    ``verify`` is patched on ``CryptContext`` itself so the guard catches a
+    hash check through any context instance, not only a module-level one.
+    A working session is provided so a scan, if one existed, would reach
+    ``find_active`` instead of failing early on an uninitialised database.
+    """
+    from passlib.context import CryptContext
+
     from src.api.middleware import auth
+    from src.repositories.tenant import TenantRepository
 
-    invalid_tenant = MagicMock(id=uuid4(), api_key_hash="not-a-hash")
-    valid_tenant = MagicMock(
-        id=uuid4(),
-        api_key_hash="$2b$12$valid",
-        is_active=True,
-    )
-    valid_tenant.get_config.return_value.rate_limit = 42
-    repository = MagicMock()
-    repository.find_active = AsyncMock(return_value=[invalid_tenant, valid_tenant])
-    verify = MagicMock(side_effect=[ValueError("invalid hash"), True])
-    fallback = MagicMock(return_value=None)
-
-    monkeypatch.setattr(auth, "get_db_session", _auth_session)
-    monkeypatch.setattr(auth, "TenantRepository", MagicMock(return_value=repository))
-    monkeypatch.setattr(auth.pwd_context, "verify", verify)
-    monkeypatch.setattr(APIKeyStore, "_fallback_to_dev_keys", fallback)
-
-    result = asyncio.run(APIKeyStore.validate_api_key("real-key"))
-
-    assert result is not None
-    assert result.tenant_id == valid_tenant.id
-    assert result.rate_limit == 42
-    assert verify.call_count == 2
-    fallback.assert_not_called()
+    tenants = [MagicMock(id=uuid4(), api_key_hash="$2b$12$x") for _ in range(3)]
+    find_active = AsyncMock(return_value=tenants)
+    verify = MagicMock(return_value=False)
+    monkeypatch.setattr(auth, "get_db_session", _auth_session, raising=False)
+    monkeypatch.setattr(TenantRepository, "find_active", find_active)
+    monkeypatch.setattr(CryptContext, "verify", verify)
+    return find_active, verify
 
 
 @pytest.mark.parametrize("environment", ["staging", "production"])
-@pytest.mark.parametrize("database_fails", [False, True])
-def test_dev_keys_rejected_outside_development_and_test(
-    monkeypatch: pytest.MonkeyPatch, environment: str, database_fails: bool
+@pytest.mark.parametrize(
+    "api_key",
+    ["bogus-key", "ns_dev_anything", "ns_dev_test_key_12345", "test-api-key-12345"],
+)
+def test_api_key_rejected_without_tenant_scan_outside_development_and_test(
+    monkeypatch: pytest.MonkeyPatch, environment: str, api_key: str
 ) -> None:
+    """Deployed environments reject API keys before any DB read or bcrypt."""
     from src.api.middleware import auth
 
-    repository = MagicMock()
-    repository.find_active = AsyncMock(
-        side_effect=SQLAlchemyError("down") if database_fails else None,
-        return_value=[],
-    )
-    monkeypatch.setattr(auth, "get_db_session", _auth_session)
-    monkeypatch.setattr(auth, "TenantRepository", MagicMock(return_value=repository))
+    find_active, verify = _guard_tenant_scan(monkeypatch)
     monkeypatch.setattr(auth.settings, "environment", environment)
 
-    for key in ("ns_dev_anything", "ns_dev_test_key_12345", "test-api-key-12345"):
-        assert asyncio.run(APIKeyStore.validate_api_key(key)) is None, key
+    assert asyncio.run(APIKeyStore.validate_api_key(api_key)) is None
+    assert find_active.await_count == 0
+    assert verify.call_count == 0
 
 
 @pytest.mark.parametrize("environment", ["development", "test"])
@@ -128,37 +124,55 @@ def test_dev_keys_accepted_in_development_and_test(
 ) -> None:
     from src.api.middleware import auth
 
-    repository = MagicMock()
-    repository.find_active = AsyncMock(return_value=[])
-    monkeypatch.setattr(auth, "get_db_session", _auth_session)
-    monkeypatch.setattr(auth, "TenantRepository", MagicMock(return_value=repository))
+    find_active, verify = _guard_tenant_scan(monkeypatch)
     monkeypatch.setattr(auth.settings, "environment", environment)
 
     result = asyncio.run(APIKeyStore.validate_api_key("ns_dev_anything"))
 
     assert result is not None
     assert result.tenant_id == UUID("a0000000-0000-0000-0000-000000000001")
+    assert result.api_key == "ns_dev_anything"
+    assert find_active.await_count == 0
+    assert verify.call_count == 0
 
 
-def test_invalid_hash_only_returns_none_through_normal_contract(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("environment", ["development", "test"])
+def test_unknown_api_key_rejected_without_tenant_scan_in_development_and_test(
+    monkeypatch: pytest.MonkeyPatch, environment: str
 ) -> None:
     from src.api.middleware import auth
 
-    tenants = [
-        MagicMock(id=uuid4(), api_key_hash="not-a-hash"),
-        MagicMock(id=uuid4(), api_key_hash="still-not-a-hash"),
-    ]
-    repository = MagicMock()
-    repository.find_active = AsyncMock(return_value=tenants)
-    verify = MagicMock(side_effect=ValueError("invalid hash"))
+    find_active, verify = _guard_tenant_scan(monkeypatch)
+    monkeypatch.setattr(auth.settings, "environment", environment)
 
-    monkeypatch.setattr(auth, "get_db_session", _auth_session)
-    monkeypatch.setattr(auth, "TenantRepository", MagicMock(return_value=repository))
-    monkeypatch.setattr(auth.pwd_context, "verify", verify)
+    assert asyncio.run(APIKeyStore.validate_api_key("bogus-key")) is None
+    assert find_active.await_count == 0
+    assert verify.call_count == 0
 
-    assert asyncio.run(APIKeyStore.validate_api_key("unknown-key")) is None
-    assert verify.call_count == 2
+
+@pytest.mark.parametrize("environment", ["staging", "production"])
+def test_bogus_api_key_request_is_401_without_tenant_scan(
+    client: TestClient,
+    sample_event_payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    environment: str,
+) -> None:
+    """An unauthenticated X-API-Key request costs no DB read and no bcrypt."""
+    from src.api.middleware import auth
+
+    find_active, verify = _guard_tenant_scan(monkeypatch)
+    monkeypatch.setattr(auth.settings, "environment", environment)
+
+    response = client.post(
+        "/v1/events",
+        json=sample_event_payload,
+        headers={"Content-Type": "application/json", "X-API-Key": "bogus-key"},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == _INVALID_API_KEY_BODY
+    assert find_active.await_count == 0
+    assert verify.call_count == 0
 
 
 @pytest.mark.parametrize("role", ["clinic_admin", "builder", "super_admin"])
@@ -310,35 +324,6 @@ def test_tenant_resolver_denies_builder_without_builder_claim_before_db() -> Non
     assert error.value.status_code == 403
     assert cast(Any, error.value.detail) == {"code": "tenant_override_forbidden"}
     db.execute.assert_not_awaited()
-
-
-def test_api_key_store_skips_malformed_database_hash_locally() -> None:
-    """Malformed tenant hashes are a per-row miss, not an auth-wide failure."""
-    tenant = MagicMock(
-        id=uuid4(),
-        api_key_hash="not-a-passlib-hash",
-        is_active=True,
-    )
-    repository = MagicMock()
-    repository.find_active = AsyncMock(return_value=[tenant])
-
-    @asynccontextmanager
-    async def session_scope() -> AsyncIterator[AsyncMock]:
-        yield AsyncMock()
-
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr("src.api.middleware.auth.get_db_session", session_scope)
-        monkeypatch.setattr(
-            "src.api.middleware.auth.TenantRepository",
-            lambda _session: repository,
-        )
-        logger = MagicMock()
-        monkeypatch.setattr("src.api.middleware.auth.logger", logger)
-
-        assert asyncio.run(APIKeyStore.validate_api_key("unknown-api-key")) is None
-
-    logger.debug.assert_called_once()
-    logger.error.assert_not_called()
 
 
 def test_sync_client_runs_application_lifespan(client: Any) -> None:
@@ -544,9 +529,7 @@ class TestAuthMiddleware:
         )
 
         assert response.status_code == 401
-        data = response.json()
-        assert data["error"] == "unauthorized"
-        assert "Invalid API key" in data["message"]
+        assert response.json() == _INVALID_API_KEY_BODY
 
     def test_request_with_valid_api_key_returns_200(
         self,
