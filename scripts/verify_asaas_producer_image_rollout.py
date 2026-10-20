@@ -458,7 +458,8 @@ def _task_definition_runtime_fingerprint(definition: dict[str, Any]) -> str:
     """Hash runtime settings while normalizing only approved image/env/DB changes.
 
     Environment values are hashed for the base and D3 names; the trust pins
-    and commercial gates the rollout itself adds are left out.
+    and commercial gates the rollout itself adds are left out. DATABASE_URL
+    binds its secret ARN and JSON key only (a plain ARN has an empty key).
     """
     normalized = {
         key: value
@@ -527,7 +528,12 @@ def _task_definition_runtime_fingerprint(definition: dict[str, Any]) -> str:
             if secret["name"] == "DATABASE_URL":
                 parts = secret["valueFrom"].split(":")
                 _require(len(parts) in {7, 10}, "database_url_reference_invalid")
-                arn_and_key = ":".join(parts[:8] if len(parts) == 10 else parts[:7])
+                # A plain ARN (7 parts) is the empty JSON key at the default
+                # version, so it must hash like ``<ARN>:::<VersionId>`` (the
+                # pin build_replacement_task_definition applies): bind the ARN
+                # and the JSON key, never the version stage or id.
+                json_key = parts[7] if len(parts) == 10 else ""
+                arn_and_key = ":".join([*parts[:7], json_key])
                 normalized_secrets.append(
                     {
                         "name": secret["name"],

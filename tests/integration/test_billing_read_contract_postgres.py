@@ -41,9 +41,20 @@ from src.api.schemas.billing import (
 from src.config.settings import settings
 from src.repositories import billing as billing_repository_module
 from src.repositories.billing import BillingRepository
+from src.services import billing_read_contract as read_contract_module
 from src.services.asaas import AsaasClient
 from src.services.billing_catalog import BILLING_CATALOG
-from src.services.billing_read_contract import read_commercial_availability
+from src.services.billing_read_contract import (
+    read_commercial_availability,
+    read_current_subscription,
+)
+from tests.api.test_billing_read_contract import (
+    DATE_RELATIONS,
+    LATEST_CYCLES,
+    MATRIX_STATUSES,
+    PAYMENT_STATE_MATRIX,
+    UNREACHABLE,
+)
 from tests.integration.test_asaas_billing_postgres import (
     _create_child,
     _drop_child,
@@ -68,6 +79,18 @@ _ALL_OFFERS = list(BILLING_CATALOG)
 _SUBSCRIPTIONS = [o for o, offer in BILLING_CATALOG.items() if offer.cycle == "MONTHLY"]
 _TOPUPS = [o for o, offer in BILLING_CATALOG.items() if offer.cycle == "DETACHED"]
 _OUTCOME_ACCEPTED = (200, 202)
+
+# Injected instants (never the host clock).  São Paulo is UTC-3.
+_T = date(2026, 11, 11)
+_MID_CYCLE = datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc)  # 10-20 12:00
+_T_LATE = datetime(2026, 11, 12, 2, 30, tzinfo=timezone.utc)  # 11-11 23:30
+_T_NEXT_DAY = datetime(2026, 11, 12, 3, 0, tzinfo=timezone.utc)  # 11-12 00:00
+
+
+def _at(monkeypatch: pytest.MonkeyPatch, instant: datetime) -> None:
+    """The route's ``today``: the summary reads ``_utc_now`` at call time."""
+
+    monkeypatch.setattr(read_contract_module, "_utc_now", lambda: instant)
 
 
 @dataclass(frozen=True)
@@ -259,6 +282,7 @@ async def _seed_cycle(
     state: str,
     reversed_cents: int = 0,
     restored_cents: int = 0,
+    created_at: datetime | None = None,
 ) -> None:
     async with harness.session() as session:
         async with session.begin():
@@ -269,12 +293,14 @@ async def _seed_cycle(
                         catalog_version_id, offer_id, cycle_start, cycle_end,
                         amount_cents, credit_grant_mc, pricing_snapshot,
                         financial_snapshot, state, financial_revision,
-                        settled_cents, reversed_cents, restored_cents
+                        settled_cents, reversed_cents, restored_cents,
+                        created_at
                     ) VALUES (
                         :id, :builder_id, :subscription_id, 'asaas', :payment_id,
                         'payment-2026-10-03', 'plan_pro_monthly_v1', :start,
                         :end, 265000, 15000000, '{}'::jsonb, '{}'::jsonb,
-                        :state, 0, :settled, :reversed, :restored
+                        :state, 0, :settled, :reversed, :restored,
+                        COALESCE(CAST(:created_at AS timestamptz), now())
                     )
                 """),
                 {
@@ -288,6 +314,7 @@ async def _seed_cycle(
                     "settled": 0 if state in ("pending", "quarantined") else 265_000,
                     "reversed": reversed_cents,
                     "restored": restored_cents,
+                    "created_at": created_at,
                 },
             )
 
@@ -720,6 +747,8 @@ async def test_subscription_status_comes_from_the_financial_record(
         "status": "active_linked",
         "amount_cents": 265_000,
         "current_period_end": None,
+        # Never paid: pending whatever the day.
+        "payment_state": "pending",
     }
 
     # Legacy flag still trial; settled cycles define the period end.
@@ -751,6 +780,9 @@ async def test_subscription_status_comes_from_the_financial_record(
     assert summary.subscription is not None
     assert summary.subscription.status == "active"
     assert summary.subscription.current_period_end == date(2026, 11, 11)
+    # The newest cycle (2026-12-11) is reversed: reversed whatever the day,
+    # and the cancelled row's later paid cycle never leaks into the current one.
+    assert summary.subscription.payment_state == "reversed"
 
     # Only terminal or legacy-provider rows: no current ASAAS subscription.
     ended = await _builder(harness, "G6b ended")
@@ -869,6 +901,9 @@ async def test_live_session_is_the_newest_live_attempt_only(
     live = (await _summary(harness, builder_id)).checkout.live_session
     assert live is not None
     assert (live.checkout_session_id, live.kind) == (topup_id, "topup")
+    # Owner A3: the offer of that very attempt, from its own session row.
+    assert live.offer_id == await _session_offer(harness, topup_id)
+    assert live.offer_id == "package_credits_500_v1"
 
     # The newest attempt ends: it is no longer a live session, the older live
     # one is returned instead.
@@ -883,11 +918,23 @@ async def test_live_session_is_the_newest_live_attempt_only(
             )
     live = (await _summary(harness, builder_id)).checkout.live_session
     assert live is not None
-    assert (live.checkout_session_id, live.kind, live.state) == (
+    assert (live.checkout_session_id, live.kind, live.state, live.offer_id) == (
         subscription_id,
         "subscription",
         "active",
+        "plan_plus_monthly_v1",
     )
+    assert live.offer_id == await _session_offer(harness, subscription_id)
+
+
+async def _session_offer(harness: _Harness, session_id: str) -> str:
+    async with harness.session() as session:
+        value = await session.scalar(
+            text("SELECT offer_id FROM billing_checkout_sessions WHERE id = :id"),
+            {"id": UUID(session_id)},
+        )
+    assert isinstance(value, str)
+    return value
 
 
 async def _consume_bound_receipt(harness: _Harness, environment: str) -> None:
@@ -1051,6 +1098,7 @@ async def test_post_202_carries_the_stored_reservation_id(
         "checkout_session_id": body["checkout_session_id"],
         "kind": "subscription",
         "state": "reconciliation_required",
+        "offer_id": "plan_plus_monthly_v1",
     }
 
 
@@ -1208,3 +1256,429 @@ async def test_legacy_summary_fields_are_unchanged_on_postgres(
         "checkout",
         "topup_commercial_enabled",
     ]
+
+
+# -- owner A1/A2/A4/A5: payment_state and the cancelled paid window ----------------
+
+_RELATION_END: dict[str, date] = {
+    "before": date(2026, 11, 10),
+    "today": _T,
+    "after": date(2026, 11, 12),
+}
+
+
+async def _seed_matrix_cell(
+    harness: _Harness, status: str, latest: str, relation: str
+) -> tuple[UUID, date | None]:
+    """One fresh builder: the newest cycle ``latest`` and, unless that cycle is
+    itself fully paid, an older settled cycle ending on the ``relation`` day."""
+
+    builder_id = await _builder(harness, f"G6b-2 matrix {status} {latest}")
+    subscription_id = await _seed_subscription(harness, builder_id, status=status)
+    cycle = LATEST_CYCLES[latest]
+    if cycle is None:
+        return builder_id, None
+    state, _settled, reversed_cents, restored_cents = cycle
+    fully_paid = state in ("settled", "restored") and reversed_cents == restored_cents
+    paid_through = None if relation == "none" else _RELATION_END[relation]
+    if fully_paid:
+        assert paid_through is not None
+        start, end = paid_through - timedelta(days=31), paid_through
+    else:
+        if paid_through is None:
+            start = date(2026, 10, 11)
+        else:
+            await _seed_paid_cycles(harness, builder_id, subscription_id, paid_through)
+            start = paid_through  # the newest cycle starts where that one ends
+        end = start + timedelta(days=30)
+    await _seed_cycle(
+        harness,
+        builder_id,
+        subscription_id,
+        start=start,
+        end=end,
+        state=state,
+        reversed_cents=reversed_cents,
+        restored_cents=restored_cents,
+    )
+    return builder_id, paid_through
+
+
+# Every possible cell (the impossible ones are pinned by the unit matrix).
+_POSSIBLE_CELLS = [
+    (status, latest, relation, expected)
+    for status in MATRIX_STATUSES
+    for latest in LATEST_CYCLES
+    for relation, expected in zip(
+        DATE_RELATIONS, PAYMENT_STATE_MATRIX[(status, latest)], strict=True
+    )
+    if expected != UNREACHABLE
+]
+
+
+@pytest.mark.parametrize(("status", "latest", "relation", "expected"), _POSSIBLE_CELLS)
+async def test_payment_state_matrix_on_postgres(
+    harness: _Harness, status: str, latest: str, relation: str, expected: str
+) -> None:
+    """The literal matrix through the real SQL, at 23:30 in São Paulo on the
+    boundary day (already the next day in UTC)."""
+
+    builder_id, paid_through = await _seed_matrix_cell(
+        harness, status, latest, relation
+    )
+    async with harness.session() as session:
+        await session.execute(text("SET TRANSACTION READ ONLY"))
+        readback = await read_current_subscription(
+            session, builder_id=builder_id, clock=lambda: _T_LATE
+        )
+        await session.rollback()
+    if expected == "null":
+        assert readback is None
+        return
+    assert readback is not None
+    assert (
+        readback.status,
+        readback.payment_state,
+        readback.current_period_end,
+        readback.offer_id,
+        readback.amount_cents,
+    ) == (status, expected, paid_through, "plan_pro_monthly_v1", 265_000)
+
+
+async def _seed_paid_cycles(
+    harness: _Harness, builder_id: UUID, subscription_id: UUID, *ends: date
+) -> None:
+    for end in ends:
+        await _seed_cycle(
+            harness,
+            builder_id,
+            subscription_id,
+            start=end - timedelta(days=31),
+            end=end,
+            state="settled",
+        )
+
+
+async def test_cancelled_subscription_keeps_its_paid_period_then_turns_null(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner A2: cancelled mid-cycle keeps the paid period through its last
+    calendar day in São Paulo, then the whole object is ``null``."""
+
+    _wire(monkeypatch, harness, "development")
+    builder_id = await _builder(harness, "G6b-2 cancelled mid-cycle")
+    await _seed_legacy_builder_flag(harness, builder_id, "active")
+    subscription_id = await _seed_subscription(
+        harness,
+        builder_id,
+        status="cancelled",
+        offer_id="plan_plus_monthly_v1",
+        amount_cents=99_900,
+    )
+    await _seed_paid_cycles(
+        harness, builder_id, subscription_id, date(2026, 10, 11), date(2026, 11, 11)
+    )
+    expected = {
+        "offer_id": "plan_plus_monthly_v1",
+        "catalog_version_id": "payment-2026-10-03",
+        "status": "cancelled",
+        "amount_cents": 99_900,
+        "current_period_end": "2026-11-11",
+        "payment_state": "paid",
+    }
+    for instant in (_MID_CYCLE, _T_LATE):
+        _at(monkeypatch, instant)
+        summary = await _summary(harness, builder_id)
+        assert summary.subscription is not None
+        assert summary.subscription.model_dump(mode="json") == expected
+        # Owner A4: the exact JSON string, a date without a time zone.
+        assert '"current_period_end":"2026-11-11"' in summary.model_dump_json()
+
+    # 00:00 on the next São Paulo day: the paid period is over.
+    _at(monkeypatch, _T_NEXT_DAY)
+    summary = await _summary(harness, builder_id)
+    assert summary.subscription is None
+    # Owner A5: the legacy fields still say active; they are never the proof.
+    assert (summary.plan, summary.subscription_status) == ("plus", "active")
+
+
+async def test_ended_legacy_and_inactive_subscriptions_are_null_with_legacy_active(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner A5 and the A2 mapping: only a provider-deleted (``cancelled``)
+    ASAAS subscription inside its paid period is shown."""
+
+    _wire(monkeypatch, harness, "development")
+    _at(monkeypatch, _T_LATE)
+
+    async def flagged(label: str) -> UUID:
+        builder_id = await _builder(harness, label)
+        await _seed_legacy_builder_flag(harness, builder_id, "active")
+        return builder_id
+
+    # Cancelled after its paid period ended (yesterday in São Paulo).
+    expired = await flagged("G6b-2 cancelled and expired")
+    expired_sub = await _seed_subscription(harness, expired, status="cancelled")
+    await _seed_paid_cycles(harness, expired, expired_sub, date(2026, 11, 10))
+    # Ended as INACTIVE/EXPIRED at the provider, even if paid through tomorrow.
+    inactive = await flagged("G6b-2 inactive but paid")
+    inactive_sub = await _seed_subscription(harness, inactive, status="inactive")
+    await _seed_paid_cycles(harness, inactive, inactive_sub, date(2026, 11, 12))
+    # Legacy (non-ASAAS) rows, live or cancelled, even with paid cycles.
+    legacy_live = await flagged("G6b-2 legacy live")
+    live_sub = await _seed_subscription(
+        harness,
+        legacy_live,
+        status="active",
+        provider="abacatepay",
+        offer_id=None,
+        amount_cents=None,
+    )
+    await _seed_paid_cycles(harness, legacy_live, live_sub, date(2026, 11, 12))
+    legacy_cancelled = await flagged("G6b-2 legacy cancelled")
+    cancelled_sub = await _seed_subscription(
+        harness, legacy_cancelled, status="cancelled", provider="abacatepay"
+    )
+    await _seed_paid_cycles(
+        harness, legacy_cancelled, cancelled_sub, date(2026, 11, 12)
+    )
+
+    for builder_id in (expired, inactive, legacy_live, legacy_cancelled):
+        summary = await _summary(harness, builder_id)
+        assert summary.subscription is None, builder_id
+        assert (summary.plan, summary.subscription_status) == ("plus", "active")
+
+
+async def test_route_payment_states_for_reversal_restoration_and_pending_evidence(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _wire(monkeypatch, harness, "development")
+    _at(monkeypatch, _T_LATE)
+    october = (date(2026, 10, 11), date(2026, 11, 11))
+    november = (date(2026, 11, 11), date(2026, 12, 11))
+    full = 265_000
+
+    async def state_of(
+        status: str, cycles: list[tuple[date, date, str, int, int]]
+    ) -> tuple[str, date | None]:
+        builder_id = await _builder(harness, f"G6b-2 route {status}")
+        subscription_id = await _seed_subscription(harness, builder_id, status=status)
+        for start, end, state, reversed_cents, restored_cents in cycles:
+            await _seed_cycle(
+                harness,
+                builder_id,
+                subscription_id,
+                start=start,
+                end=end,
+                state=state,
+                reversed_cents=reversed_cents,
+                restored_cents=restored_cents,
+            )
+        summary = await _summary(harness, builder_id)
+        assert summary.subscription is not None
+        return summary.subscription.payment_state, (
+            summary.subscription.current_period_end
+        )
+
+    paid = (*october, "settled", 0, 0)
+    # Paid through today: paid; the renewal then reversed or partially
+    # restored: reversed, with the previous paid end still reported.
+    assert await state_of("active", [paid]) == ("paid", date(2026, 11, 11))
+    assert await state_of("active", [paid, (*november, "reversed", full, 0)]) == (
+        "reversed",
+        date(2026, 11, 11),
+    )
+    assert await state_of("active", [paid, (*november, "restored", full, 1)]) == (
+        "reversed",
+        date(2026, 11, 11),
+    )
+    assert await state_of("active", [paid, (*november, "restored", full, full)]) == (
+        "paid",
+        date(2026, 12, 11),
+    )
+    # Only a partially restored cycle, never fully paid: reversed, no end.
+    assert await state_of("active", [(*october, "restored", full, 1)]) == (
+        "reversed",
+        None,
+    )
+    # Pending provider evidence and quarantine never claim paid.
+    assert await state_of("readback_required", [paid]) == (
+        "pending",
+        date(2026, 11, 11),
+    )
+    assert await state_of("non_billable_pending_readback", [paid]) == (
+        "pending",
+        date(2026, 11, 11),
+    )
+    assert await state_of("active", [paid, (*november, "quarantined", 0, 0)]) == (
+        "pending",
+        date(2026, 11, 11),
+    )
+    assert await state_of("active_linked", []) == ("pending", None)
+    # The renewal never came: overdue from the next São Paulo day on.
+    _at(monkeypatch, _T_NEXT_DAY)
+    assert await state_of("active", [paid]) == ("overdue", date(2026, 11, 11))
+
+
+async def test_cancelled_selection_prefers_the_longest_paid_period_and_live_rows(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _wire(monkeypatch, harness, "development")
+    _at(monkeypatch, _T_LATE)
+    now = datetime.now(timezone.utc)
+    builder_id = await _builder(harness, "G6b-2 two cancelled")
+    # Older cancelled Plus paid through 11-20; newer cancelled Pro through
+    # 11-15; the newest cancelled Max never paid.
+    plus = await _seed_subscription(
+        harness,
+        builder_id,
+        status="cancelled",
+        offer_id="plan_plus_monthly_v1",
+        created_at=now - timedelta(days=60),
+    )
+    await _seed_paid_cycles(harness, builder_id, plus, date(2026, 11, 20))
+    pro = await _seed_subscription(
+        harness,
+        builder_id,
+        status="cancelled",
+        offer_id="plan_pro_monthly_v1",
+        created_at=now - timedelta(days=30),
+    )
+    await _seed_paid_cycles(harness, builder_id, pro, date(2026, 11, 15))
+    await _seed_subscription(
+        harness,
+        builder_id,
+        status="cancelled",
+        offer_id="plan_max_monthly_v1",
+        created_at=now - timedelta(days=1),
+    )
+    summary = await _summary(harness, builder_id)
+    assert summary.subscription is not None
+    assert (
+        summary.subscription.offer_id,
+        summary.subscription.current_period_end,
+    ) == ("plan_plus_monthly_v1", date(2026, 11, 20))
+
+    # Same paid-through day: the newer subscription.
+    await _seed_paid_cycles(harness, builder_id, pro, date(2026, 11, 20))
+    summary = await _summary(harness, builder_id)
+    assert summary.subscription is not None
+    assert summary.subscription.offer_id == "plan_pro_monthly_v1"
+
+    # A current (non-terminal) subscription is always the one returned.
+    await _seed_subscription(
+        harness, builder_id, status="active_linked", offer_id="plan_max_monthly_v1"
+    )
+    summary = await _summary(harness, builder_id)
+    assert summary.subscription is not None
+    assert summary.subscription.model_dump(mode="json") == {
+        "offer_id": "plan_max_monthly_v1",
+        "catalog_version_id": "payment-2026-10-03",
+        "status": "active_linked",
+        "amount_cents": 265_000,
+        "current_period_end": None,
+        "payment_state": "pending",
+    }
+    # ...and a second current one still fails closed, cancelled rows or not.
+    await _seed_subscription(harness, builder_id, status="active")
+    with pytest.raises(HTTPException) as raised:
+        await _summary(harness, builder_id)
+    assert (raised.value.status_code, raised.value.detail) == (
+        503,
+        "billing_summary_unavailable",
+    )
+
+
+async def test_cancelled_but_paid_builder_keeps_checkout_eligibility_unchanged(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The A2 window is display only: ``available_offer_ids``, the blocker and
+    ``POST /checkout`` behave exactly as for a builder with no subscription,
+    and the summary agrees with the POST."""
+
+    environment = "development"
+    provider = _wire(monkeypatch, harness, environment)
+    await _ensure_general(harness, environment, topup=True)
+    _at(monkeypatch, _MID_CYCLE)
+    cancelled = await _builder(harness, "G6b-2 cancelled still paid")
+    fresh = await _builder(harness, "G6b-2 never subscribed")
+    subscription_id = await _seed_subscription(
+        harness, cancelled, status="cancelled", offer_id="plan_plus_monthly_v1"
+    )
+    await _seed_paid_cycles(harness, cancelled, subscription_id, date(2026, 11, 11))
+
+    async def blocker(builder_id: UUID) -> str | None:
+        async with harness.session() as session:
+            return await BillingRepository(session).subscription_checkout_blocker(
+                builder_id=builder_id
+            )
+
+    mine = await _summary(harness, cancelled)
+    theirs = await _summary(harness, fresh)
+    assert mine.subscription is not None
+    assert (mine.subscription.status, mine.subscription.payment_state) == (
+        "cancelled",
+        "paid",
+    )
+    assert theirs.subscription is None
+    assert mine.checkout == theirs.checkout
+    assert mine.checkout.available_offer_ids == _ALL_OFFERS
+    assert mine.topup_commercial_enabled is theirs.topup_commercial_enabled is True
+    assert await blocker(cancelled) is None and await blocker(fresh) is None
+
+    posts = len(provider.posts)
+    assert await _agrees(harness, cancelled, "plan_pro_monthly_v1") == 200
+    assert len(provider.posts) == posts + 1
+    after = await _summary(harness, cancelled)
+    # Still the cancelled record inside its period; the new attempt is the
+    # live session, with its own offer.
+    assert after.subscription is not None
+    assert after.subscription.status == "cancelled"
+    assert after.checkout.live_session is not None
+    assert (after.checkout.live_session.kind, after.checkout.live_session.offer_id) == (
+        "subscription",
+        "plan_pro_monthly_v1",
+    )
+    assert after.checkout.available_offer_ids == ["plan_pro_monthly_v1", *_TOPUPS]
+    assert await _agrees(harness, cancelled, "plan_plus_monthly_v1") == 409
+
+
+async def test_newest_cycle_tie_on_cycle_start_is_the_last_created(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two cycles with the same ``cycle_start`` (same due date): the newest is
+    the one created last, in both orders (explicit timestamps, never the
+    host clock)."""
+
+    _wire(monkeypatch, harness, "development")
+    _at(monkeypatch, _MID_CYCLE)
+    first = datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc)
+    later = first + timedelta(hours=1)
+
+    async def payment_state(order: tuple[str, str]) -> tuple[str, date | None]:
+        builder_id = await _builder(harness, f"G6b-2 tie {order}")
+        subscription_id = await _seed_subscription(harness, builder_id, status="active")
+        for state, created_at in zip(order, (first, later), strict=True):
+            await _seed_cycle(
+                harness,
+                builder_id,
+                subscription_id,
+                start=date(2026, 10, 11),
+                end=date(2026, 11, 11),
+                state=state,
+                reversed_cents=265_000 if state == "reversed" else 0,
+                created_at=created_at,
+            )
+        summary = await _summary(harness, builder_id)
+        assert summary.subscription is not None
+        return (
+            summary.subscription.payment_state,
+            summary.subscription.current_period_end,
+        )
+
+    # The settled one still bounds the paid period either way.
+    assert await payment_state(("settled", "reversed")) == (
+        "reversed",
+        date(2026, 11, 11),
+    )
+    assert await payment_state(("reversed", "settled")) == ("paid", date(2026, 11, 11))
