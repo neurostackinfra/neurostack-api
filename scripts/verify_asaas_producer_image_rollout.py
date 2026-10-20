@@ -74,6 +74,49 @@ _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ARN = re.compile(
     r"^arn:aws:secretsmanager:us-east-1:388460142431:secret:[A-Za-z0-9/_+=.@-]+$"
 )
+ECR_REGISTRY = "388460142431.dkr.ecr.us-east-1.amazonaws.com"
+# Path A (docs/runbooks/asaas-deployment.md, F1): the serving revision, and the
+# protected template captured from it, may run a hand-built bridge image from
+# this repository, pinned by digest. It is only ever a deployment source; the
+# attested target is always another repository (the producer repository).
+SOURCE_IMAGE_REPOSITORY = f"{ECR_REGISTRY}/neurostack-staging"
+# The ECR repository-name grammar: lowercase alphanumeric components joined by
+# a single ".", "_" or "-", and path segments joined by a single "/"; no
+# leading, trailing or doubled separator.
+_ECR_REPOSITORY_NAME = r"(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*"
+_ECR_REPOSITORY_URI = re.compile(
+    r"388460142431\.dkr\.ecr\.us-east-1\.amazonaws\.com/" + _ECR_REPOSITORY_NAME
+)
+_SOURCE_IMAGE_REFERENCE = re.compile(
+    r"388460142431\.dkr\.ecr\.us-east-1\.amazonaws\.com/neurostack-staging"
+    r"@sha256:[0-9a-f]{64}"
+)
+_TARGET_IMAGE_SUFFIX = re.compile(
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(?:@sha256:[0-9a-f]{64})?"
+)
+# The six revision 8 app environment names whose values are fingerprinted.
+BASE_ENVIRONMENT_NAMES = frozenset(
+    {"ENVIRONMENT", "HOST", "LLM_MODEL", "LOG_FORMAT", "PORT", "QDRANT_HOST"}
+)
+# Exactly the Group 9 D3 wiring: infra/production/asaas-production-wiring.yaml
+# task_definition.app_environment_added and app_secrets_added (the same names as
+# ADDED_ENVIRONMENT and ADDED_SECRETS in scripts/asaas_production_wiring.py; a
+# test pins all three). The D3 environment values are not secret and are
+# fingerprinted like the base values; the secrets are ARN references only.
+D3_ENVIRONMENT_NAMES = frozenset(
+    {
+        "ASAAS_CHECKOUT_RETURN_URL",
+        "ASAAS_WEBHOOK_NOTIFICATION_EMAIL",
+        "ASAAS_WEBHOOK_URL",
+        "BILLING_FACT_WORKER_ENABLED",
+    }
+)
+D3_SECRET_NAMES = frozenset(
+    {"ASAAS_API_KEY", "ASAAS_WEBHOOK_TOKEN", "BILLING_OBSERVABILITY_SMOKE_TOKEN"}
+)
+FINGERPRINTED_ENVIRONMENT_NAMES = BASE_ENVIRONMENT_NAMES | D3_ENVIRONMENT_NAMES
+# A template or serving revision carries the D3 wiring completely or not at all.
+ENVIRONMENT_NAME_SETS = (BASE_ENVIRONMENT_NAMES, FINGERPRINTED_ENVIRONMENT_NAMES)
 
 
 class RolloutError(ValueError):
@@ -83,6 +126,46 @@ class RolloutError(ValueError):
 def _require(condition: bool, reason: str) -> None:
     if not condition:
         raise RolloutError(reason)
+
+
+def validate_target_image_repository(target_repository: Any) -> str:
+    """The attested target: an exact ECR repository URI, never the source."""
+
+    _require(
+        isinstance(target_repository, str)
+        and _ECR_REPOSITORY_URI.fullmatch(target_repository) is not None
+        and target_repository != SOURCE_IMAGE_REPOSITORY,
+        "target_image_repository_invalid",
+    )
+    return str(target_repository)
+
+
+def classify_app_image(reference: Any, *, target_repository: Any) -> str:
+    """Classify a pre-deployment app image reference; anything else raises.
+
+    ``"target"``: ``<target repository>[:<tag>][@sha256:<digest>]`` (the rule
+    the protected path always had, now with an exact repository match).
+    ``"source"``: exactly ``SOURCE_IMAGE_REPOSITORY@sha256:<64 hex>``, in this
+    account and region, with no tag. Used for the protected template's image
+    and the serving (before/cohort) snapshot only; the after snapshot must run
+    exactly ``<target>@<attested digest>``.
+    """
+
+    target = validate_target_image_repository(target_repository)
+    _require(isinstance(reference, str), "app_image_reference_invalid")
+    repository = re.split(r"[:@]", reference, maxsplit=1)[0]
+    if repository == SOURCE_IMAGE_REPOSITORY:
+        _require(
+            _SOURCE_IMAGE_REFERENCE.fullmatch(reference) is not None,
+            "source_image_reference_not_digest_pinned",
+        )
+        return "source"
+    _require(repository == target, "app_image_repository_not_allowed")
+    _require(
+        _TARGET_IMAGE_SUFFIX.fullmatch(reference[len(target) :]) is not None,
+        "app_image_reference_invalid",
+    )
+    return "target"
 
 
 def _strict_json(path: Path, *, max_bytes: int = 4_000_000) -> Any:
@@ -372,7 +455,11 @@ def _environment_hash_map(definition: dict[str, Any]) -> dict[str, str]:
 
 
 def _task_definition_runtime_fingerprint(definition: dict[str, Any]) -> str:
-    """Hash runtime settings while normalizing only approved image/env/DB changes."""
+    """Hash runtime settings while normalizing only approved image/env/DB changes.
+
+    Environment values are hashed for the base and D3 names; the trust pins
+    and commercial gates the rollout itself adds are left out.
+    """
     normalized = {
         key: value
         for key, value in definition.items()
@@ -417,14 +504,7 @@ def _task_definition_runtime_fingerprint(definition: dict[str, Any]) -> str:
                 and isinstance(item.get("value"), str),
                 "task_definition_environment_invalid",
             )
-            if item["name"] in {
-                "ENVIRONMENT",
-                "HOST",
-                "LLM_MODEL",
-                "LOG_FORMAT",
-                "PORT",
-                "QDRANT_HOST",
-            }:
+            if item["name"] in FINGERPRINTED_ENVIRONMENT_NAMES:
                 env_rows.append(
                     {
                         "name": item["name"],
@@ -674,14 +754,7 @@ def sanitize_aws_readbacks(raw: Any) -> dict[str, Any]:
             else:
                 value = "<redacted>"
             safe_row = {"name": name, "value": value}
-            if name in {
-                "ENVIRONMENT",
-                "HOST",
-                "LLM_MODEL",
-                "LOG_FORMAT",
-                "PORT",
-                "QDRANT_HOST",
-            }:
+            if name in FINGERPRINTED_ENVIRONMENT_NAMES:
                 safe_row["value_sha256"] = hashlib.sha256(
                     row["value"].encode("utf-8")
                 ).hexdigest()
@@ -970,30 +1043,30 @@ def validate_deployment_snapshot(
     )
     app = _app_container(definition)
     image_reference = app.get("image")
-    _require(
-        isinstance(image_reference, str)
-        and image_reference.startswith(expected_image_uri),
-        "task_definition_image_mismatch",
-    )
+    validate_target_image_repository(expected_image_uri)
+    _require(isinstance(image_reference, str), "task_definition_image_mismatch")
     if phase == "after":
+        # The deployed revision runs exactly the attested target digest.
         _require(
             image_reference == f"{expected_image_uri}@{expected_digest}",
             "task_definition_image_mismatch",
         )
-    elif "@" in image_reference:
-        _require(
-            image_reference.endswith(f"@{expected_digest}"),
-            "task_definition_image_mismatch",
-        )
+    else:
+        # The serving revision runs the target or a digest-pinned source image.
+        try:
+            classify_app_image(image_reference, target_repository=expected_image_uri)
+        except RolloutError as exc:
+            raise RolloutError(f"task_definition_image_mismatch:{exc}") from None
+        if "@" in image_reference:
+            _require(
+                image_reference.endswith(f"@{expected_digest}"),
+                "task_definition_image_mismatch",
+            )
     env = _environment_map(definition)
-    base_names = {
-        "ENVIRONMENT",
-        "HOST",
-        "LLM_MODEL",
-        "LOG_FORMAT",
-        "PORT",
-        "QDRANT_HOST",
-    }
+    # The base names, plus the D3 names all or none; their values are
+    # fingerprinted together as the "base environment" of the template.
+    base_names = frozenset(env) & FINGERPRINTED_ENVIRONMENT_NAMES
+    _require(base_names in ENVIRONMENT_NAME_SETS, "task_environment_name_set_mismatch")
     expected_env_names = (
         base_names if phase == "before" else base_names | set(expected_task_environment)
     )
