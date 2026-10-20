@@ -107,11 +107,13 @@ with a new revision, each step its own approved operation:
 
 The table column
 `billing_rollout_readiness_receipts.roster_revision` and its
-`CHECK (roster_revision >= 0)` stay until migration 036 (phase E5, not yet
-written) drops them. Until then the backend writes the constant `0` and never
-reads the column, so a stored value is not evidence. By the owner's plan,
-migration 036 will refuse to run while any unexpired readiness receipt
-exists. Readiness and every rollout transition take the per-environment
+`CHECK (roster_revision >= 0)` stay until migration 036 (phase E5, written,
+not applied in production; see
+[Migration 036](#migration-036-decouple-from-the-legacy-roster-group-10-e5))
+drops them. Images built from E3 up to E4 write the constant `0` and never
+read the column, so a stored value is not evidence; images from E5 on no
+longer map it. Migration 036 refuses to run while any unexpired readiness
+receipt exists. Readiness and every rollout transition take the per-environment
 rollout control lock first and no longer take the legacy roster fence.
 Since phase E4 the ASAAS webhook and its readbacks take that lock first as
 well and no longer take the roster fence either, so the per-environment
@@ -228,6 +230,182 @@ These are prerequisites to check, not steps to execute now:
 4. Evidence records only opaque IDs, statuses, timestamps and SHA-256
    digests. Never record tokens, provider payloads, customer details or card
    data.
+
+## Migration 036: decouple from the legacy roster (Group 10 E5)
+
+Written and tested on disposable PostgreSQL 16 only; **not applied in
+production**. Running it needs its own explicit owner instruction, after
+033-035 are applied and verified, and the production window stays pinned to
+`alembic upgrade 035` until that instruction (see "How the pin moves" below).
+
+### What 036 changes
+
+- Drops the statement trigger `trg_billing_subscriptions_roster_fence` (the
+  last database part of the legacy roster fence). The function
+  `lock_billing_roster_statement()` stays for the legacy tables' own
+  triggers until 037.
+- Rewrites the four canary trigger functions
+  (`protect_billing_canary_subscription`, `validate_billing_canary_checkout`,
+  `validate_billing_canary_projection`, `validate_billing_canary_effect`) so
+  that none reads `billing_migrations`, the roster or the dropped columns. A
+  non-ASAAS subscription row (provider `abacatepay` or NULL) stays
+  representable. Its snapshot, provider included, can no longer change
+  (`legacy subscription snapshot is immutable`), and a self-asserted move to
+  `legacy_cancelled` is still refused
+  (`legacy cancellation cannot be self-asserted`).
+- Drops `billing_subscriptions.roster_revision`,
+  `billing_rollout_readiness_receipts.roster_revision` and
+  `billing_checkout_sessions.migration_id` with their constraints
+  (`ck_billing_subscriptions_roster_revision`,
+  `ck_billing_rollout_readiness_roster_revision`,
+  `fk_billing_checkout_sessions_builder_migration`). It re-adds
+  `ck_billing_checkout_sessions_intent_target` and
+  `ck_billing_checkout_sessions_canary_exact` without `migration_id`.
+- Leaves out the optional hardening (owner decision 2026-10-17): no provider
+  NOT NULL, no tighter status/cycle/provider CHECKs (`transactions`
+  included), no unique open subscription per builder. The legacy tables
+  (`billing_migrations*`, `billing_roster_control`) stay until 037, and two
+  of their validators read what 036 drops, so from 036 on they fail closed
+  (those tables must stay empty anyway):
+  - `validate_billing_migration_receipt` reads
+    `billing_subscriptions.roster_revision`: any new
+    `billing_migration_receipts` row fails with
+    `record "subscription" has no field "roster_revision"` (observed on
+    PostgreSQL 16).
+  - `validate_billing_migration_absence_read` reads
+    `billing_checkout_sessions.migration_id`: any new
+    `billing_migration_absence_reads` row fails on the missing column.
+  - `billing_migrations` itself has no INSERT trigger and still accepts a
+    raw-SQL row until 037.
+
+  **Notes for 037 (E6):** its preflight must count `billing_migrations`,
+  `billing_migration_receipts`, `billing_migration_absence_reads` and the
+  roster control again, because 036's guarantees only hold at the moment
+  it ran: `billing_migrations` stays writable by raw SQL, and the two
+  validators above fail rather than guard.
+
+### Preflight (SELECT only, immediately before the run)
+
+Read back `alembic_version` (must be `035`), then run these on the target
+database. Every count must be `0`:
+
+```sql
+SELECT 'billing_migrations' AS check, count(*) FROM billing_migrations
+UNION ALL SELECT 'billing_migration_receipts', count(*) FROM billing_migration_receipts
+UNION ALL SELECT 'billing_migration_absence_reads', count(*) FROM billing_migration_absence_reads
+UNION ALL SELECT 'roster revision not 0', count(*) FROM billing_roster_control WHERE billing_roster_revision <> 0
+UNION ALL SELECT 'subscriptions not asaas', count(*) FROM billing_subscriptions WHERE provider IS DISTINCT FROM 'asaas'
+UNION ALL SELECT 'subscriptions roster_revision not 1', count(*) FROM billing_subscriptions WHERE roster_revision <> 1
+UNION ALL SELECT 'checkouts with migration_id', count(*) FROM billing_checkout_sessions WHERE migration_id IS NOT NULL
+UNION ALL SELECT 'readiness roster_revision not 0', count(*) FROM billing_rollout_readiness_receipts WHERE roster_revision <> 0
+UNION ALL SELECT 'unexpired readiness', count(*) FROM billing_rollout_readiness_receipts WHERE expires_at > now();
+```
+
+These are the same checks the migration runs itself, under `ACCESS
+EXCLUSIVE` locks on the seven tables. The migration also refuses when any
+catalog object other than the five constraints listed above depends on a
+dropped column (for example a hand-made index), because `DROP COLUMN` would
+drop it silently and the downgrade could not restore it.
+`transactions` and `billing_webhook_deliveries` are not read: 036 does not
+touch them. If anything is non-zero, stop and return to the owner. When a
+check fails the migration raises SQLSTATE `55000` with one message listing
+every failing check, for example
+`migration 036 refused (nothing was changed): billing_migrations has 1 row(s); billing_rollout_readiness_receipts has 1 unexpired row(s)`,
+and changes nothing. Alembic runs every revision of one invocation in a
+single transaction, so a refused 036 inside a multi-revision run also rolls
+back the earlier revisions of that run. Run `alembic upgrade 036` on its own,
+after 035 is verified.
+
+**Expected output of the run:** one line
+`Running upgrade 035 -> 036, decouple ASAAS billing from the legacy roster and migration saga`;
+then `alembic_version` reads `036`.
+
+**Lock wait.** Both directions start with `SET LOCAL lock_timeout = '5s'`
+(as migrations 024 and 025 do). The preflight then takes `ACCESS EXCLUSIVE`
+on the seven tables (three in the downgrade). An open transaction that
+touched one of them, even a plain `SELECT` left idle in a transaction, blocks
+that lock. While the migration waits, every new read of that table queues
+behind it, which is why the wait is bounded. A timeout raises SQLSTATE
+`55P03` (`canceling statement due to lock timeout`). **55P03 means nothing
+changed**: the whole migration transaction rolled back and `alembic_version`
+is unchanged. Wait for the blocking transaction to end (see
+`pg_stat_activity` and `pg_locks` for the holder; never kill it without the
+owner) and rerun the same one-off task.
+
+### What the application needs
+
+The image must contain this release (the E5 code), which no longer maps the
+three columns. Verified on PostgreSQL 16 on 2026-10-19:
+
+- Every earlier image fails on 036 at its first read of
+  `billing_subscriptions`, `billing_checkout_sessions` or
+  `billing_rollout_readiness_receipts` (`column ... does not exist`).
+- The E5 image works on 035 for every read and for checkout writes. It cannot
+  insert a subscription or a readiness row there (`roster_revision` is NOT
+  NULL without default). That happens only through a handoff or a readiness
+  record, which cannot happen while the rollout is `disabled` everywhere.
+
+Order (each step stops on any divergence and returns to the owner):
+
+1. **Deploy the E5 image** while every environment sharing the database is
+   `disabled`. **Verify:** the ECS deployment is `COMPLETED` and every RUNNING
+   task runs the new task definition revision: no task of an earlier image is
+   left, because an earlier image cannot read the 036 schema. A `/ready` 200
+   alone proves nothing here: under `ENVIRONMENT=staging` it does not probe
+   the database.
+2. **RDS snapshot** (owner decision 2026-10-19 b): take a manual snapshot
+   named `pre-036-<date>` of the production database and wait until its
+   status is `available` before going on.
+3. **Preflight readback** (the SELECT above) right before the run; every
+   count `0`, `alembic_version` == `035`.
+4. **Run 036** as a one-off `neurostack-staging-migrations` task on the same
+   E5 image, with the command fixed to the exact revision
+   (`alembic upgrade 036`). The service itself never migrates. On `55P03`
+   see "Lock wait" above.
+5. **Verify** `alembic_version` == `036`.
+
+Never run 036 under an earlier image.
+
+### Rollback (downgrade 036 -> 035)
+
+The downgrade is real and restores the 035 columns, constraints, functions
+and trigger from `alembic/frozen/036_downgrade_restores_035.json`. That DDL
+was extracted from a fresh 035 database by `scripts/alembic_frozen_ddl.py`,
+its SHA-256 is pinned in the migration, and the fidelity test proves the
+result equal to a brand-new 035 catalog. One difference remains: the
+restored columns are appended, so their physical position differs.
+
+- It refuses (SQLSTATE `55000`, nothing changed) while any
+  `billing_subscriptions` or `billing_rollout_readiness_receipts` row exists.
+  Restoring their NOT NULL `roster_revision` would mean inventing roster
+  evidence. In that state an application rollback can only go back to an
+  image that contains E5.
+- **Once any such row exists there is no supported way back to 035.** No
+  cleanup is supported: readiness rows are append-only, and a DELETE of a
+  subscription is silently skipped by its trigger. The independent review
+  could remove them only as a superuser with
+  `session_replication_role = replica`, deleting across outbox, facts,
+  transactions, effects, projections, cycles and checkouts, which is not an
+  operation this runbook allows. The downgrade is usable today only because
+  production held zero such rows (read-only count, 2026-10-17); re-read them
+  before relying on it.
+- It takes the same 5-second lock timeout as the upgrade: `55P03` means
+  nothing changed (see "Lock wait").
+- Checkout rows need no invented value: they come back with
+  `migration_id = NULL`.
+- An earlier image runs again only after the downgrade succeeded.
+
+### How the pin moves (separate, deliberate step)
+
+The production window stays `alembic upgrade 035`: the manifest
+`infra/production/asaas-production-wiring.yaml`, the planner constants in
+`scripts/asaas_production_wiring.py`, gate 5 above,
+`docs/configuration.md` and their tests (`tests/scripts/test_production_migration_window.py`,
+`tests/scripts/test_asaas_production_wiring.py`). Only after the owner's
+explicit instruction to run 036, one reviewed change moves the pin to the
+exact revision `036` in all of them together, with this section's preflight
+as the readback before the run. 037 gets its own instruction and its own
+change. The command always names the exact revision, never the head.
 
 ## Production wiring (Group 9 D3/D4)
 

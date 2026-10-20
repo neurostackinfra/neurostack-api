@@ -442,7 +442,6 @@ def _readiness_fixture(
     now: datetime,
     operation_expires_at: datetime,
     app_digest: str = "d" * 64,
-    stored_roster_revision: int = 0,
 ) -> tuple[BillingRolloutReadinessReceipt, dict[UUID, BillingOperationReceipt]]:
     operation_id = uuid4()
     deployer_id = uuid4()
@@ -483,8 +482,6 @@ def _readiness_fixture(
         environment="test",
         receipt_kind="readiness",
         rollout_revision=0,
-        # Legacy column (dropped by migration 036): stored, never evidence.
-        roster_revision=stored_roster_revision,
         status="passed",
         operation_id=operation_id,
         operation_receipt_id=deployer_id,
@@ -773,9 +770,7 @@ def test_readiness_digest_computed_with_roster_revision_never_verifies(
 
     now = datetime.now(timezone.utc)
     row, evidence = _readiness_fixture(
-        now=now,
-        operation_expires_at=now + timedelta(minutes=10),
-        stored_roster_revision=roster_revision,
+        now=now, operation_expires_at=now + timedelta(minutes=10)
     )
     legacy = {**_row_values(row), "roster_revision": roster_revision}
     row.content_sha256 = _hand_digest(legacy)
@@ -784,18 +779,17 @@ def test_readiness_digest_computed_with_roster_revision_never_verifies(
     assert _is_bound(row, evidence, now=now) is False
 
 
-@pytest.mark.parametrize("stored_roster_revision", [0, 1, 7, 2**62])
-def test_readiness_stored_roster_revision_is_not_evidence(
-    stored_roster_revision: int,
-) -> None:
-    """The column stays until migration 036; its value is neither hashed nor
-    compared, so any value the CHECK allows (``>= 0``) binds alike."""
+def test_readiness_row_has_no_roster_revision_since_migration_036() -> None:
+    """E3 kept the column (constant 0, never hashed nor compared) until
+    migration 036 dropped it: the model refuses the field and a row binds on
+    the documented fields alone."""
 
+    assert "roster_revision" not in BillingRolloutReadinessReceipt.__table__.columns
+    with pytest.raises(TypeError, match="roster_revision"):
+        BillingRolloutReadinessReceipt(roster_revision=0)
     now = datetime.now(timezone.utc)
     row, evidence = _readiness_fixture(
-        now=now,
-        operation_expires_at=now + timedelta(minutes=10),
-        stored_roster_revision=stored_roster_revision,
+        now=now, operation_expires_at=now + timedelta(minutes=10)
     )
 
     assert _is_bound(row, evidence, now=now) is True

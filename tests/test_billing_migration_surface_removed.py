@@ -3,8 +3,9 @@
 The AbacatePay -> ASAAS migration saga (service, export, operator client,
 admin routes, provider-evidence configuration) was removed without a schema
 change: production holds no legacy rows, and the database objects it used
-(``billing_migrations*``, the roster fence, ``migration_id`` and
-``roster_revision``) are dropped by later phases with their own migrations.
+are dropped by later phases with their own migrations (036 dropped the roster
+fence on ``billing_subscriptions``, ``migration_id`` and ``roster_revision``;
+037 drops ``billing_migrations*`` and ``billing_roster_control``).
 These checks fail if any removed entry point comes back, while pinning what
 must NOT move in this phase (the alert rules and their digest).
 """
@@ -344,8 +345,9 @@ def test_repository_and_rollout_drop_the_legacy_saga_entry_points() -> None:
 
 
 def test_application_code_no_longer_takes_the_roster_fence() -> None:
-    """Group 10 E4: the Python roster fence is gone; only the database's own
-    triggers (dropped by migration 036) still know the roster key."""
+    """Group 10 E4: the Python roster fence is gone; only the legacy tables'
+    own triggers (dropped by migration 037; 036 dropped the one on
+    billing_subscriptions) still know the roster key."""
 
     import src.repositories.billing as repository
     from src.repositories.billing import BillingRepository
@@ -355,7 +357,7 @@ def test_application_code_no_longer_takes_the_roster_fence() -> None:
     assert not hasattr(repository, "BillingRosterControl")
     for path in sorted((ROOT / "src").rglob("*.py")):
         if path.is_relative_to(ROOT / "src/models"):
-            continue  # the ORM mirror of the tables goes with 036/037
+            continue  # the ORM mirror of the legacy tables goes with 037
         source = path.read_text(encoding="utf-8")
         for needle in (
             "lock_billing_roster",

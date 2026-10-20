@@ -5,7 +5,7 @@ from __future__ import annotations
 from tests.alembic_graph import heads, migration_revisions
 
 
-def test_asaas_producer_migrations_extend_026_through_035_linearly() -> None:
+def test_asaas_producer_migrations_extend_026_through_036_linearly() -> None:
     revisions = migration_revisions()
     expected = {
         "026": "025",
@@ -18,6 +18,8 @@ def test_asaas_producer_migrations_extend_026_through_035_linearly() -> None:
         "033": "032",
         "034": "033",
         "035": "034",
+        # Group 10 E5 (decouple from the legacy roster); 037 is reserved for E6.
+        "036": "035",
     }
     by_revision: dict[str, list[tuple[str, str | None]]] = {}
     for filename, (revision, down_revision) in revisions.items():
@@ -33,4 +35,4 @@ def test_asaas_producer_migrations_extend_026_through_035_linearly() -> None:
         )
         assert filename.split("_", 3)[2] == revision
 
-    assert heads(revisions) == ["035"]
+    assert heads(revisions) == ["036"]

@@ -1,0 +1,483 @@
+{
+  "protect_billing_canary_subscription": [
+    {
+      "add": [],
+      "remove": [
+        "DECLARE",
+        "approved_migration_id UUID;",
+        "saga_migration_id UUID;",
+        "current_roster_revision BIGINT;",
+        "resulting_roster_revision BIGINT;",
+        "cancellation_observed_at TIMESTAMPTZ;"
+      ]
+    },
+    {
+      "add": [
+        "OLD.catalog_version_id, OLD.offer_id, OLD.amount_cents"
+      ],
+      "remove": [
+        "OLD.catalog_version_id, OLD.offer_id,",
+        "OLD.amount_cents, OLD.roster_revision"
+      ]
+    },
+    {
+      "add": [
+        "NEW.catalog_version_id, NEW.offer_id, NEW.amount_cents"
+      ],
+      "remove": [
+        "NEW.catalog_version_id, NEW.offer_id,",
+        "NEW.amount_cents, NEW.roster_revision"
+      ]
+    },
+    {
+      "add": [
+        "-- Non-ASAAS rows (abacatepay or NULL provider) stay representable, but",
+        "-- the legacy saga that could cancel, rebase or flip them is gone (036):",
+        "-- a self-asserted legacy cancellation is still refused and their",
+        "-- snapshot, provider included, can no longer change."
+      ],
+      "remove": []
+    },
+    {
+      "add": [],
+      "remove": [
+        "AND OLD.provider IS NULL",
+        "AND NEW.provider IS NULL",
+        "AND OLD.status IS DISTINCT FROM NEW.status",
+        "AND NEW.status = 'legacy_cancelled'",
+        "THEN",
+        "IF OLD.status <> 'legacy_cancel_pending'",
+        "OR OLD.is_active OR NEW.is_active",
+        "OR ROW(OLD.external_subscription_id, OLD.plan,",
+        "OLD.billing_cycle, OLD.coupon_code,",
+        "OLD.catalog_version_id, OLD.offer_id,",
+        "OLD.amount_cents, OLD.roster_revision)",
+        "IS DISTINCT FROM",
+        "ROW(NEW.external_subscription_id, NEW.plan,",
+        "NEW.billing_cycle, NEW.coupon_code,",
+        "NEW.catalog_version_id, NEW.offer_id,",
+        "NEW.amount_cents, NEW.roster_revision)",
+        "THEN",
+        "RAISE EXCEPTION 'legacy cancellation cannot be self-asserted';",
+        "END IF;",
+        "PERFORM pg_advisory_xact_lock(3486705124568449331);",
+        "SELECT billing_roster_revision INTO current_roster_revision",
+        "FROM billing_roster_control WHERE singleton = true FOR UPDATE;",
+        "IF OLD.roster_revision <> current_roster_revision THEN",
+        "RAISE EXCEPTION 'legacy cancellation source is stale';",
+        "END IF;",
+        "SELECT migration.id, receipt.observed_at",
+        "INTO saga_migration_id, cancellation_observed_at",
+        "FROM billing_migrations migration",
+        "JOIN billing_migration_receipts receipt",
+        "ON receipt.migration_id = migration.id",
+        "AND receipt.builder_id = migration.builder_id",
+        "AND receipt.operation_id = migration.operation_id",
+        "AND receipt.receipt_kind = 'cancel_observation'",
+        "AND receipt.provider = 'abacatepay'",
+        "AND receipt.status = 'cancelled'",
+        "AND receipt.external_reference =",
+        "OLD.external_subscription_id",
+        "WHERE migration.builder_id = OLD.builder_id",
+        "AND migration.subscription_id = OLD.id",
+        "AND migration.state = 'legacy_cancel_pending'",
+        "AND migration.source_roster_revision =",
+        "current_roster_revision",
+        "FOR UPDATE OF migration;",
+        "IF saga_migration_id IS NULL THEN",
+        "RAISE EXCEPTION 'exact cancellation observation required';",
+        "END IF;",
+        "UPDATE billing_migrations",
+        "SET state = 'legacy_cancelled',",
+        "legacy_cancelled_at = cancellation_observed_at,",
+        "updated_at = now()",
+        "WHERE id = saga_migration_id",
+        "AND state = 'legacy_cancel_pending';",
+        "ELSIF TG_OP = 'UPDATE'"
+      ]
+    },
+    {
+      "add": [],
+      "remove": [
+        "AND OLD.provider IS NULL AND NEW.provider IS NULL",
+        "AND OLD.status = 'legacy_cancelled'",
+        "AND NEW.status = 'legacy_cancelled'",
+        "AND OLD.roster_revision IS DISTINCT FROM NEW.roster_revision",
+        "AND ROW(OLD.external_subscription_id, OLD.plan,",
+        "OLD.billing_cycle, OLD.coupon_code,",
+        "OLD.catalog_version_id, OLD.offer_id, OLD.amount_cents)",
+        "IS NOT DISTINCT FROM",
+        "ROW(NEW.external_subscription_id, NEW.plan,",
+        "NEW.billing_cycle, NEW.coupon_code,",
+        "NEW.catalog_version_id, NEW.offer_id, NEW.amount_cents)",
+        "THEN",
+        "PERFORM pg_advisory_xact_lock(3486705124568449331);",
+        "SELECT billing_roster_revision INTO current_roster_revision",
+        "FROM billing_roster_control WHERE singleton = true FOR UPDATE;",
+        "IF NEW.roster_revision <> current_roster_revision THEN",
+        "RAISE EXCEPTION 'legacy migration rebase is stale';",
+        "END IF;",
+        "UPDATE billing_migrations",
+        "SET source_roster_revision = current_roster_revision,",
+        "updated_at = now()",
+        "WHERE builder_id = OLD.builder_id",
+        "AND subscription_id = OLD.id",
+        "AND state = 'legacy_cancelled'",
+        "AND source_roster_revision = OLD.roster_revision",
+        "AND NOT EXISTS (",
+        "SELECT 1 FROM billing_migration_receipts receipt",
+        "WHERE receipt.migration_id = billing_migrations.id",
+        "AND receipt.receipt_kind = 'provider_flip')",
+        "AND EXISTS (",
+        "SELECT 1 FROM billing_migration_receipts receipt",
+        "WHERE receipt.migration_id = billing_migrations.id",
+        "AND receipt.builder_id = billing_migrations.builder_id",
+        "AND receipt.operation_id = billing_migrations.operation_id",
+        "AND receipt.receipt_kind = 'cancel_observation'",
+        "AND receipt.provider = 'abacatepay'",
+        "AND receipt.status = 'cancelled'",
+        "AND receipt.external_reference =",
+        "OLD.external_subscription_id",
+        "AND receipt.observed_at = legacy_cancelled_at",
+        "AND receipt.content_sha256 = encode(",
+        "sha256(convert_to(jsonb_build_object(",
+        "'migration_id', billing_migrations.id,",
+        "'builder_id', billing_migrations.builder_id,",
+        "'subscription_id',",
+        "billing_migrations.subscription_id,",
+        "'operation_id', billing_migrations.operation_id,",
+        "'legacy_external_subscription_id',",
+        "OLD.external_subscription_id,",
+        "'provider', 'abacatepay',",
+        "'status', 'cancelled',",
+        "'observed_at', receipt.observed_at",
+        ")::text, 'UTF8')), 'hex'));",
+        "IF NOT FOUND THEN RAISE EXCEPTION 'legacy rebase denied'; END IF;",
+        "RETURN NEW;",
+        "END IF;",
+        "IF TG_OP = 'UPDATE'",
+        "AND OLD.provider IN ('abacatepay')",
+        "AND NEW.provider IS NULL",
+        "AND ROW(",
+        "OLD.external_subscription_id, OLD.plan,",
+        "OLD.billing_cycle, OLD.coupon_code,",
+        "OLD.catalog_version_id, OLD.offer_id,",
+        "OLD.amount_cents",
+        ") IS NOT DISTINCT FROM ROW(",
+        "NEW.external_subscription_id, NEW.plan,",
+        "NEW.billing_cycle, NEW.coupon_code,",
+        "NEW.catalog_version_id, NEW.offer_id,",
+        "NEW.amount_cents",
+        ")",
+        "AND NEW.is_active = false",
+        "AND NEW.status = 'legacy_cancel_pending'",
+        "THEN",
+        "PERFORM pg_advisory_xact_lock(3486705124568449331);",
+        "SELECT billing_roster_revision INTO current_roster_revision",
+        "FROM billing_roster_control WHERE singleton = true FOR UPDATE;",
+        "IF OLD.roster_revision <> current_roster_revision",
+        "OR NEW.roster_revision <> current_roster_revision + 1 THEN",
+        "RAISE EXCEPTION 'legacy cancellation roster revision is stale';",
+        "END IF;",
+        "UPDATE billing_migrations",
+        "SET state = 'legacy_cancel_pending',",
+        "source_roster_revision = NEW.roster_revision,",
+        "updated_at = now()",
+        "WHERE builder_id = OLD.builder_id",
+        "AND subscription_id = OLD.id",
+        "AND state IN ('in_progress', 'legacy_cancel_pending')",
+        "AND source_roster_revision = OLD.roster_revision",
+        "RETURNING id INTO saga_migration_id;",
+        "IF saga_migration_id IS NULL THEN",
+        "RAISE EXCEPTION 'legacy cancellation migration required';",
+        "END IF;",
+        "UPDATE billing_roster_control",
+        "SET billing_roster_revision = billing_roster_revision + 1,",
+        "updated_at = now()",
+        "WHERE singleton = true",
+        "AND billing_roster_revision = current_roster_revision;",
+        "ELSIF TG_OP = 'UPDATE'"
+      ]
+    },
+    {
+      "add": [
+        "OLD.catalog_version_id, OLD.offer_id, OLD.amount_cents"
+      ],
+      "remove": [
+        "OLD.catalog_version_id, OLD.offer_id,",
+        "OLD.amount_cents, OLD.roster_revision"
+      ]
+    },
+    {
+      "add": [
+        "NEW.catalog_version_id, NEW.offer_id, NEW.amount_cents",
+        ") THEN",
+        "RAISE EXCEPTION 'legacy subscription snapshot is immutable'"
+      ],
+      "remove": [
+        "NEW.catalog_version_id, NEW.offer_id,",
+        "NEW.amount_cents, NEW.roster_revision",
+        ")",
+        "THEN",
+        "IF OLD.provider IS NOT NULL",
+        "OR OLD.status <> 'legacy_cancelled'",
+        "OR OLD.is_active",
+        "OR NEW.provider <> 'asaas'",
+        "THEN",
+        "RAISE EXCEPTION 'subscription snapshot mutation requires legacy flip'"
+      ]
+    },
+    {
+      "add": [],
+      "remove": [
+        "END IF;",
+        "PERFORM pg_advisory_xact_lock(3486705124568449331);",
+        "SELECT billing_roster_revision",
+        "INTO current_roster_revision",
+        "FROM billing_roster_control",
+        "WHERE singleton = true",
+        "FOR UPDATE;",
+        "IF NOT FOUND THEN",
+        "RAISE EXCEPTION 'global billing roster control is unavailable'",
+        "USING ERRCODE = 'integrity_constraint_violation';",
+        "END IF;",
+        "IF NEW.roster_revision <> current_roster_revision + 1 THEN",
+        "RAISE EXCEPTION 'provider flip roster revision is stale'",
+        "USING ERRCODE = 'integrity_constraint_violation';",
+        "END IF;",
+        "IF OLD.roster_revision <> current_roster_revision THEN",
+        "RAISE EXCEPTION 'provider flip source revision is stale'",
+        "USING ERRCODE = 'integrity_constraint_violation';",
+        "END IF;",
+        "SELECT migration.id",
+        "INTO approved_migration_id",
+        "FROM billing_migrations AS migration",
+        "JOIN billing_migration_receipts AS receipt",
+        "ON receipt.builder_id = migration.builder_id",
+        "AND receipt.migration_id = migration.id",
+        "AND receipt.operation_id = migration.operation_id",
+        "AND receipt.receipt_kind = 'provider_flip'",
+        "AND receipt.provider = 'asaas'",
+        "AND receipt.external_reference =",
+        "migration.target_external_subscription_id",
+        "AND receipt.status = 'verified'",
+        "AND receipt.content_sha256 = encode(",
+        "sha256(convert_to(jsonb_build_object(",
+        "'migration_id', migration.id,",
+        "'builder_id', migration.builder_id,",
+        "'subscription_id', migration.subscription_id,",
+        "'operation_id', migration.operation_id,",
+        "'source_roster_revision',",
+        "migration.source_roster_revision,",
+        "'target_provider', migration.target_provider,",
+        "'target_external_subscription_id',",
+        "migration.target_external_subscription_id,",
+        "'target_catalog_version_id',",
+        "migration.target_catalog_version_id,",
+        "'target_offer_id', migration.target_offer_id,",
+        "'target_plan', migration.target_plan,",
+        "'target_billing_cycle',",
+        "migration.target_billing_cycle,",
+        "'target_coupon_code',",
+        "migration.target_coupon_code,",
+        "'target_amount_cents',",
+        "migration.target_amount_cents,",
+        "'target_snapshot', migration.target_snapshot",
+        ")::text, 'UTF8')),",
+        "'hex'",
+        ")",
+        "WHERE migration.builder_id = OLD.builder_id",
+        "AND migration.subscription_id = OLD.id",
+        "AND migration.state = 'legacy_cancelled'",
+        "AND migration.operation_id IS NOT NULL",
+        "AND migration.source_roster_revision = OLD.roster_revision",
+        "AND migration.source_roster_revision =",
+        "current_roster_revision",
+        "AND migration.target_provider = NEW.provider",
+        "AND migration.target_external_subscription_id =",
+        "NEW.external_subscription_id",
+        "AND migration.target_catalog_version_id =",
+        "NEW.catalog_version_id",
+        "AND migration.target_offer_id = NEW.offer_id",
+        "AND migration.target_plan = NEW.plan",
+        "AND migration.target_billing_cycle = NEW.billing_cycle",
+        "AND migration.target_coupon_code IS NOT DISTINCT FROM",
+        "NEW.coupon_code",
+        "AND migration.target_amount_cents = NEW.amount_cents",
+        "AND EXISTS (",
+        "SELECT 1 FROM billing_migration_receipts cancellation",
+        "WHERE cancellation.migration_id = migration.id",
+        "AND cancellation.builder_id = migration.builder_id",
+        "AND cancellation.operation_id = migration.operation_id",
+        "AND cancellation.receipt_kind = 'cancel_observation'",
+        "AND cancellation.provider = 'abacatepay'",
+        "AND cancellation.status = 'cancelled'",
+        "AND cancellation.external_reference =",
+        "OLD.external_subscription_id",
+        "AND cancellation.observed_at =",
+        "migration.legacy_cancelled_at",
+        "AND cancellation.content_sha256 = encode(",
+        "sha256(convert_to(jsonb_build_object(",
+        "'migration_id', migration.id,",
+        "'builder_id', migration.builder_id,",
+        "'subscription_id', migration.subscription_id,",
+        "'operation_id', migration.operation_id,",
+        "'legacy_external_subscription_id',",
+        "OLD.external_subscription_id,",
+        "'provider', 'abacatepay',",
+        "'status', 'cancelled',",
+        "'observed_at', cancellation.observed_at",
+        ")::text, 'UTF8')), 'hex')",
+        ")",
+        "FOR UPDATE OF migration;",
+        "IF approved_migration_id IS NULL THEN",
+        "RAISE EXCEPTION 'ASAAS provider flip requires exact bound target'",
+        "USING ERRCODE = 'integrity_constraint_violation';",
+        "END IF;",
+        "UPDATE billing_roster_control",
+        "SET billing_roster_revision = billing_roster_revision + 1,",
+        "updated_at = now()",
+        "WHERE singleton = true",
+        "AND billing_roster_revision = current_roster_revision",
+        "RETURNING billing_roster_revision",
+        "INTO resulting_roster_revision;",
+        "IF resulting_roster_revision IS DISTINCT FROM",
+        "NEW.roster_revision",
+        "THEN",
+        "RAISE EXCEPTION 'global billing roster advance failed'",
+        "USING ERRCODE = 'integrity_constraint_violation';",
+        "END IF;",
+        "UPDATE billing_migrations",
+        "SET state = 'migrated', updated_at = now()",
+        "WHERE id = approved_migration_id",
+        "AND state = 'legacy_cancelled'",
+        "AND source_roster_revision = current_roster_revision",
+        "AND target_provider = NEW.provider",
+        "AND target_external_subscription_id =",
+        "NEW.external_subscription_id",
+        "AND target_catalog_version_id = NEW.catalog_version_id",
+        "AND target_offer_id = NEW.offer_id",
+        "AND target_plan = NEW.plan",
+        "AND target_billing_cycle = NEW.billing_cycle",
+        "AND target_coupon_code IS NOT DISTINCT FROM NEW.coupon_code",
+        "AND target_amount_cents = NEW.amount_cents;",
+        "IF NOT FOUND THEN",
+        "RAISE EXCEPTION 'provider flip migration was already consumed'",
+        "USING ERRCODE = 'integrity_constraint_violation';",
+        "END IF;"
+      ]
+    },
+    {
+      "add": [
+        "OLD.catalog_version_id, OLD.offer_id, OLD.amount_cents"
+      ],
+      "remove": [
+        "OLD.catalog_version_id, OLD.offer_id,",
+        "OLD.amount_cents, OLD.roster_revision"
+      ]
+    },
+    {
+      "add": [
+        "NEW.catalog_version_id, NEW.offer_id, NEW.amount_cents"
+      ],
+      "remove": [
+        "NEW.catalog_version_id, NEW.offer_id,",
+        "NEW.amount_cents, NEW.roster_revision"
+      ]
+    }
+  ],
+  "validate_billing_canary_checkout": [
+    {
+      "add": [
+        "OLD.topup_order_id, OLD.attempt_no,"
+      ],
+      "remove": [
+        "OLD.migration_id, OLD.topup_order_id, OLD.attempt_no,"
+      ]
+    },
+    {
+      "add": [
+        "NEW.topup_order_id, NEW.attempt_no,"
+      ],
+      "remove": [
+        "NEW.migration_id, NEW.topup_order_id, NEW.attempt_no,"
+      ]
+    }
+  ],
+  "validate_billing_canary_effect": [
+    {
+      "add": [],
+      "remove": [
+        "LEFT JOIN billing_migrations AS migration",
+        "ON migration.builder_id = checkout.builder_id",
+        "AND migration.id = checkout.migration_id"
+      ]
+    },
+    {
+      "add": [
+        "AND checkout.intent_id = projection_subscription_id)"
+      ],
+      "remove": [
+        "AND (checkout.intent_id =",
+        "projection_subscription_id",
+        "OR migration.subscription_id =",
+        "projection_subscription_id))"
+      ]
+    }
+  ],
+  "validate_billing_canary_projection": [
+    {
+      "add": [],
+      "remove": [
+        "checkout_migration_id UUID;"
+      ]
+    },
+    {
+      "add": [
+        "intent_id, external_checkout_id,"
+      ],
+      "remove": [
+        "intent_id, migration_id, external_checkout_id,"
+      ]
+    },
+    {
+      "add": [
+        "checkout_external_checkout_id,"
+      ],
+      "remove": [
+        "checkout_migration_id, checkout_external_checkout_id,"
+      ]
+    },
+    {
+      "add": [],
+      "remove": [
+        "LEFT JOIN billing_migrations AS migration",
+        "ON migration.builder_id = checkout.builder_id",
+        "AND migration.id = checkout.migration_id"
+      ]
+    },
+    {
+      "add": [
+        "AND checkout.intent_id = NEW.subscription_id"
+      ],
+      "remove": [
+        "AND (checkout.intent_id = NEW.subscription_id",
+        "OR migration.subscription_id = NEW.subscription_id)"
+      ]
+    },
+    {
+      "add": [
+        "AND NEW.subscription_id IS DISTINCT FROM checkout_intent_id THEN"
+      ],
+      "remove": [
+        "AND NEW.subscription_id IS DISTINCT FROM checkout_intent_id",
+        "AND NOT EXISTS (",
+        "SELECT 1 FROM billing_migrations",
+        "WHERE id = checkout_migration_id",
+        "AND builder_id = NEW.builder_id",
+        "AND subscription_id = NEW.subscription_id",
+        ") THEN"
+      ]
+    }
+  ]
+}

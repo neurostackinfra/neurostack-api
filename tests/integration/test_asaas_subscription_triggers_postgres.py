@@ -1,13 +1,19 @@
-"""Characterization of the ASAAS side of the migration-026 canary triggers.
+"""Characterization of the canary triggers as migration 036 left them.
 
-Migration 036 rewrites the four functions that reference the legacy schema
-(``billing_migrations`` / the roster): ``protect_billing_canary_subscription``,
+Migration 036 (Group 10 E5) rewrote the four functions that referenced the
+legacy schema (``billing_migrations`` / the roster):
+``protect_billing_canary_subscription``,
 ``validate_billing_canary_projection``, ``validate_billing_canary_checkout``
 and ``validate_billing_canary_effect`` -- plus the two checkout CHECKs
 ``ck_billing_checkout_sessions_canary_exact`` and
-``ck_billing_checkout_sessions_intent_target`` -- and 037 drops the legacy
-roster objects.  These tests pin what those objects do *today* for ASAAS
-rows, on real PostgreSQL, so the rewrite is a visible, deliberate change:
+``ck_billing_checkout_sessions_intent_target`` -- dropped the roster
+statement trigger and the ``roster_revision``/``migration_id`` columns; 037
+drops the legacy roster objects.  E1 wrote this module against 035 so the
+rewrite would be a visible, deliberate change; E5 moved the probes that named
+the removed objects to the 036 behaviour (section (e)).  The 035 definitions
+themselves are frozen in ``alembic/frozen/036_downgrade_restores_035.json``
+and proven by ``test_migration_036_postgres.py``.  These tests pin, on real
+PostgreSQL at the head revision:
 
 * every intentional trigger rejection pins the exact message, SQLSTATE
   ``23000`` and the PL/pgSQL function that raised it (never a bare
@@ -31,9 +37,10 @@ those 32 tests FAIL -- deliberately, not skip -- with one explicit message
 naming the role (``_require_superuser``), like the sibling suites' CREATEDB
 requirement, so the release gate cannot go green by skipping them.
 
-The legacy (``abacatepay`` / NULL provider) branches of
-``protect_billing_canary_subscription`` are deliberately not pinned; see the
-inventory comment in section (e).
+What the rewritten ``protect_billing_canary_subscription`` does with a
+non-ASAAS (``abacatepay`` or NULL provider) row is pinned in section (e2):
+the row stays representable, its snapshot is immutable and a self-asserted
+legacy cancellation is refused.
 
 The canary chain is produced by the production services (checkout service,
 webhook handoff, payment settlement), exactly like
@@ -57,12 +64,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from src.repositories.billing import BillingRepository
@@ -493,7 +495,7 @@ async def test_service_chains_produce_the_rows_the_triggers_guard(
         harness,
         "SELECT provider, external_subscription_id, plan, billing_cycle, "
         "coupon_code, catalog_version_id, offer_id, amount_cents, status, "
-        "is_active, roster_revision FROM billing_subscriptions WHERE id = :id",
+        "is_active FROM billing_subscriptions WHERE id = :id",
         id=canary.subscription_id,
     )
     assert tuple(canary_row) == (
@@ -507,23 +509,16 @@ async def test_service_chains_produce_the_rows_the_triggers_guard(
         99_900,
         "active",
         True,
-        max(canary.roster_revision_before, 1),
     )
     general_row = await _row(
         harness,
-        "SELECT provider, status, is_active, roster_revision, "
+        "SELECT provider, status, is_active, "
         "(SELECT count(*) FROM billing_payment_projections p "
         " WHERE p.subscription_id = s.id) FROM billing_subscriptions s "
         "WHERE id = :id",
         id=general.subscription_id,
     )
-    assert tuple(general_row) == (
-        "asaas",
-        "active_linked",
-        True,
-        max(general.roster_revision_before, 1),
-        0,
-    )
+    assert tuple(general_row) == ("asaas", "active_linked", True, 0)
     projection = await _row(
         harness,
         "SELECT builder_id, provider, aggregate_kind, subscription_id, "
@@ -608,7 +603,6 @@ _SNAPSHOT_MUTATIONS = {
     "catalog_version_id": "catalog_version_id = 'catalog-v2'",
     "offer_id": "offer_id = 'plan_pro_monthly_v1'",
     "amount_cents": "amount_cents = amount_cents + 1",
-    "roster_revision": "roster_revision = roster_revision + 1",
 }
 
 
@@ -1405,8 +1399,8 @@ async def test_general_projection_rejections(
 
 
 # ---------------------------------------------------------------------------
-# (c2) validate_billing_canary_effect (026 L2218; LEFT JOINs billing_migrations
-# on checkout.migration_id for the historical settlement lineage).
+# (c2) validate_billing_canary_effect (026 L2218; since 036 the historical
+# settlement lineage is the canary checkout's intent alone, no billing_migrations).
 # ---------------------------------------------------------------------------
 
 _EFFECT = "validate_billing_canary_effect"
@@ -1599,7 +1593,6 @@ _CHECKOUT_TUPLE = {
     "builder_id": "builder_id = :other_builder",
     "intent_kind": "intent_kind = 'topup'",
     "intent_id": "intent_id = gen_random_uuid()",
-    "migration_id": "migration_id = gen_random_uuid()",
     "topup_order_id": "topup_order_id = gen_random_uuid()",
     "attempt_no": "attempt_no = attempt_no + 1",
     "provider": "provider = 'g10_unknown'",
@@ -1976,11 +1969,6 @@ _CANARY_EXACT_CASES: dict[str, tuple[dict[str, str], dict[str, Any], str | None]
         _plus_snapshot(credit_grant_mc=5_000, line_credit_grant_mc=5_000_000),
         _CANARY_EXACT,
     ),
-    "subscription_migration_id_set": (
-        {"migration_id": ":intent"},
-        _plus_snapshot(),
-        _CANARY_EXACT,
-    ),
     "subscription_next_due_null": (
         {"next_due_date": "NULL"},
         _plus_snapshot(),
@@ -2006,25 +1994,12 @@ _CANARY_EXACT_CASES: dict[str, tuple[dict[str, str], dict[str, Any], str | None]
 # name -> (column overrides, refusing constraint or None); non-canary rows.
 _INTENT_TARGET_CASES: dict[str, tuple[dict[str, str], str | None]] = {
     "subscription_plain": ({}, None),
-    "subscription_with_matching_migration": ({"migration_id": ":intent"}, None),
     "topup_plain": ({"intent_kind": "'topup'", "topup_order_id": ":intent"}, None),
     "subscription_with_topup_order": (
         {"topup_order_id": "gen_random_uuid()"},
         _INTENT_TARGET,
     ),
-    "subscription_with_other_migration": (
-        {"migration_id": "gen_random_uuid()"},
-        _INTENT_TARGET,
-    ),
     "topup_without_order": ({"intent_kind": "'topup'"}, _INTENT_TARGET),
-    "topup_with_migration": (
-        {
-            "intent_kind": "'topup'",
-            "topup_order_id": ":intent",
-            "migration_id": ":intent",
-        },
-        _INTENT_TARGET,
-    ),
     "topup_order_is_not_intent": (
         {"intent_kind": "'topup'", "topup_order_id": "gen_random_uuid()"},
         _INTENT_TARGET,
@@ -2170,71 +2145,42 @@ async def test_canary_financial_history_is_not_deletable(
 
 
 # ---------------------------------------------------------------------------
-# (e) Legacy roster fence as it applies to ASAAS rows today.
+# (e) The legacy roster after migration 036.
 #
-# EXPECTED TO BE REPLACED when the roster is removed: these tests pin the
-# current coupling (every billing_subscriptions UPDATE/DELETE statement takes
-# the global roster fence; ASAAS rows freeze roster_revision) so that removing
-# it is a conscious, visible change.
+# E1 pinned the 035 coupling here: every billing_subscriptions UPDATE/DELETE
+# statement took the global roster fence and ASAAS rows froze
+# roster_revision.  Migration 036 removed both, so these tests now prove the
+# absence: holding the global advisory key or the billing_roster_control row
+# no longer delays any billing_subscriptions statement, the ASAAS paths never
+# touch the global revision, and the catalog keeps no roster or migration
+# link on the ASAAS tables.  billing_roster_control itself (and its history
+# trigger) lives on, inert, until 037.
 #
-# Inventory for E5/E6 -- the machine-checkable list is the two module
-# constants TESTS_THAT_BREAK_AFTER_036 / TESTS_THAT_BREAK_AFTER_037 right
-# below this comment (pytest node-id suffixes, parameters included);
+# Inventory for E6 -- the machine-checkable list is the two module constants
+# right below this comment (pytest node-id suffixes, parameters included);
 # test_break_inventory_names_only_collected_tests proves every entry exists.
-# Every test NOT listed is expected to pass unchanged after 036, and E5 can
-# prove it mechanically by deselecting exactly the 036 list.
-#
-# 036 (decouple) removes the roster fence trigger, the roster_revision and
-# migration_id columns and rewrites the four functions and two CHECKs; 037
-# drops the legacy tables (billing_migrations*, billing_roster_control, ...).
+# TESTS_THAT_BREAK_AFTER_036 is empty: E5 moved every test it listed to the
+# 036 behaviour (or removed the parametrizations that named a dropped column).
 #
 # AFTER 037 THE WHOLE MODULE ERRORS, not only the listed tests: the three
 # chain fixtures ``canary``, ``general`` and ``general_paid`` call
 # _roster_revision(), which reads billing_roster_control.  E6 must first edit
 # those fixtures (drop roster_revision_before/after from _Chain and the
-# _roster_revision() calls), then remove _roster_revision(), the local
-# _GLOBAL_ROSTER_FENCE_KEY / _wait_for_global_fence_waiters copies and the
-# tests listed in TESTS_THAT_BREAK_AFTER_037.
-#
-# NOT pinned on purpose: the legacy branches of
-# protect_billing_canary_subscription that only fire for OLD.provider
-# 'abacatepay' or NULL (legacy cancellation, legacy rebase, provider flip and
-# 'subscription snapshot mutation requires legacy flip').  They depend on
-# billing_migrations / billing_migration_receipts / billing_roster_control,
-# which 037 drops.  E5 must state explicitly what the rewritten function does
-# with a non-ASAAS (abacatepay or NULL provider) row -- refuse, ignore, or
-# make it unrepresentable through the provider CHECK -- since no test here
-# constrains that choice.
+# _roster_revision() calls), then remove _roster_revision() and the tests
+# listed in TESTS_THAT_BREAK_AFTER_037.
 # ---------------------------------------------------------------------------
 
-TESTS_THAT_BREAK_AFTER_036: tuple[str, ...] = (
-    # The statement fence trigger is removed.
-    "test_legacy_roster_subscription_statements_wait_on_global_fence"
-    "[asaas_row_update]",
-    "test_legacy_roster_subscription_statements_wait_on_global_fence"
-    "[zero_row_update]",
-    "test_legacy_roster_subscription_statements_wait_on_global_fence"
-    "[zero_row_delete]",
-    "test_legacy_roster_subscription_update_waits_on_roster_row_lock",
-    # billing_subscriptions.roster_revision is dropped.
-    "test_legacy_roster_asaas_paths_record_but_never_advance_the_revision",
-    "test_asaas_subscription_snapshot_field_is_write_once[roster_revision-canary]",
-    "test_asaas_subscription_snapshot_field_is_write_once[roster_revision-general]",
-    "test_service_chains_produce_the_rows_the_triggers_guard",
-    "test_concurrent_handoff_payment_effect_and_readback_converge",
-    # billing_checkout_sessions.migration_id is dropped (tuple and CHECKs).
-    "test_canary_checkout_identity_tuple_is_guarded[migration_id]",
-    "test_canary_checkout_check_constraints[subscription_migration_id_set]",
-    "test_checkout_intent_target_check[subscription_with_matching_migration]",
-    "test_checkout_intent_target_check[subscription_with_other_migration]",
-    "test_checkout_intent_target_check[topup_with_migration]",
-)
+TESTS_THAT_BREAK_AFTER_036: tuple[str, ...] = ()
 
 # Only the tests that newly break with 037; on top of these, every test of
 # the module errors through the chain fixtures until E6 edits them (above).
 TESTS_THAT_BREAK_AFTER_037: tuple[str, ...] = (
     # billing_roster_control and its history trigger are dropped.
     "test_legacy_roster_revision_is_saga_owned",
+    "test_subscription_update_does_not_wait_on_the_roster_row_lock",
+    "test_asaas_paths_never_touch_the_global_roster_revision",
+    # Reads the global revision through _roster_revision().
+    "test_concurrent_handoff_payment_effect_and_readback_converge",
 )
 
 
@@ -2255,68 +2201,43 @@ async def _pid(session: AsyncSession) -> int:
     return int((await session.execute(text("SELECT pg_backend_pid()"))).scalar_one())
 
 
-# Local copies (not imports) of the roster-fence helpers of
-# test_asaas_billing_postgres.py, so this module stays self-contained when
-# that suite drops its legacy cases.  Migration 036 removes the roster fence
-# trigger (P2 is only the application-code removal); these two definitions and
-# their only users (the test_legacy_roster_* fence tests) go with it.
+# The global key 026's lock_billing_roster_statement() takes; until 036 the
+# billing_subscriptions statement trigger called it (the legacy tables' own
+# triggers still do, until 037 drops them).
 _GLOBAL_ROSTER_FENCE_KEY = 3486705124568449331
+# Long enough for a lock-free statement on a slow runner.  The 035 trigger
+# waited for as long as the key was held, so a regression fails here: the
+# holder is released after this window and the write is reported as blocked.
+_FENCE_FREE_SECONDS = 15.0
 
 
-async def _wait_for_global_fence_waiters(
-    engine: AsyncEngine,
-    holder_pid: int,
-    waiter_pids: set[int],
-    *,
-    timeout: float,
-) -> None:
-    """Return once every waiter is observably queued on the global roster fence."""
+async def _completes_while_held(
+    harness: _Harness, hold: Statement, statement: Statement
+) -> tuple[bool, int]:
+    """Run *statement* while another session holds *hold*; never hangs.
 
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    fence = {
-        "high": _GLOBAL_ROSTER_FENCE_KEY >> 32,
-        "low": _GLOBAL_ROSTER_FENCE_KEY & 0xFFFFFFFF,
-        "holder": holder_pid,
-        "waiters": sorted(waiter_pids),
-    }
-    async with engine.connect() as monitor:
-        while True:
-            rows = (
-                await monitor.execute(
-                    text("""
-                        SELECT lock.pid, lock.granted
-                        FROM pg_locks AS lock
-                        LEFT JOIN pg_stat_activity AS activity
-                          ON activity.pid = lock.pid
-                        WHERE lock.locktype = 'advisory'
-                          AND lock.classid::bigint = :high
-                          AND lock.objid::bigint = :low
-                          AND lock.objsubid = 1
-                          AND (
-                            (lock.pid = :holder AND lock.granted)
-                            OR (
-                              lock.pid = ANY(:waiters)
-                              AND NOT lock.granted
-                              AND activity.wait_event_type = 'Lock'
-                              AND activity.wait_event = 'advisory'
-                            )
-                          )
-                    """),
-                    fence,
-                )
-            ).all()
-            await monitor.rollback()
-            holder_granted = any(pid == holder_pid for pid, _ in rows)
-            blocked = {pid for pid, granted in rows if not granted}
-            if holder_granted and blocked == waiter_pids:
-                return
-            assert loop.time() < deadline, (
-                "global roster fence waiters were not observed within "
-                f"{timeout}s: holder_granted={holder_granted}, "
-                f"blocked={sorted(blocked)}, expected={sorted(waiter_pids)}"
-            )
-            await asyncio.sleep(0.02)
+    Returns ``(completed_while_held, rowcount)``; the writer is rolled back.
+    """
+
+    holder = harness.session()
+    writer = harness.session()
+    try:
+        await holder.execute(text(hold[0]), hold[1])
+
+        async def write() -> int:
+            result = await writer.execute(text(statement[0]), statement[1])
+            count = int(result.rowcount)  # type: ignore[attr-defined]
+            await writer.rollback()
+            return count
+
+        task = asyncio.create_task(write())
+        done, _ = await asyncio.wait({task}, timeout=_FENCE_FREE_SECONDS)
+        # Released only now: a writer that waited on *hold* finishes after it.
+        await holder.rollback()
+        return bool(done), await asyncio.wait_for(task, timeout=_WAIT_SECONDS)
+    finally:
+        await holder.close()
+        await writer.close()
 
 
 @pytest.mark.parametrize(
@@ -2332,99 +2253,116 @@ async def _wait_for_global_fence_waiters(
     ],
     ids=["asaas_row_update", "zero_row_update", "zero_row_delete"],
 )
-async def test_legacy_roster_subscription_statements_wait_on_global_fence(
+async def test_subscription_statements_do_not_wait_on_the_global_roster_fence(
     trigger_harness: _TriggerHarness, canary: _Chain, statement: str, rows: int
 ) -> None:
-    # EXPECTED TO BE REPLACED when the roster is removed.
-    harness = trigger_harness
-    holder = harness.session()
-    writer = harness.session()
-    try:
-        holder_pid = await _pid(holder)
-        await holder.execute(
-            text("SELECT pg_advisory_xact_lock(:key)"),
+    """035: each of these statements queued behind a held global roster key
+    (the statement trigger ``trg_billing_subscriptions_roster_fence``).  036
+    dropped that trigger: they complete while the key is held."""
+
+    completed, count = await _completes_while_held(
+        trigger_harness,
+        (
+            "SELECT pg_advisory_xact_lock(:key)",
             {"key": _GLOBAL_ROSTER_FENCE_KEY},
-        )
-        writer_pid = await _pid(writer)
-
-        async def write() -> int:
-            result = await writer.execute(
-                text(statement), {"id": canary.subscription_id}
-            )
-            count = int(result.rowcount)  # type: ignore[attr-defined]
-            await writer.rollback()
-            return count
-
-        task = asyncio.create_task(write())
-        await _wait_for_global_fence_waiters(
-            harness.engine, holder_pid, {writer_pid}, timeout=_WAIT_SECONDS
-        )
-        assert not task.done()
-        await holder.rollback()
-        assert await asyncio.wait_for(task, timeout=_WAIT_SECONDS) == rows
-    finally:
-        await holder.close()
-        await writer.close()
+        ),
+        (statement, {"id": canary.subscription_id}),
+    )
+    assert completed, "the statement waited on the global roster key"
+    assert count == rows
 
 
-async def test_legacy_roster_subscription_update_waits_on_roster_row_lock(
+async def test_subscription_update_does_not_wait_on_the_roster_row_lock(
     trigger_harness: _TriggerHarness, canary: _Chain
 ) -> None:
-    # EXPECTED TO BE REPLACED when the roster is removed.
-    harness = trigger_harness
-    holder = harness.session()
-    writer = harness.session()
-    try:
-        await holder.execute(
-            text(
-                "SELECT 1 FROM billing_roster_control WHERE singleton = true "
-                "FOR UPDATE"
-            )
-        )
-        writer_pid = await _pid(writer)
+    """035: an update queued behind a ``billing_roster_control`` row lock."""
 
-        async def write() -> int:
-            result = await writer.execute(
-                text(
-                    "UPDATE billing_subscriptions SET updated_at = updated_at "
-                    "WHERE id = :id"
-                ),
-                {"id": canary.subscription_id},
-            )
-            count = int(result.rowcount)  # type: ignore[attr-defined]
-            await writer.rollback()
-            return count
-
-        task = asyncio.create_task(write())
-        assert await _wait_until_blocked(harness, writer_pid, timeout=_WAIT_SECONDS)
-        assert not task.done()
-        await holder.rollback()
-        assert await asyncio.wait_for(task, timeout=_WAIT_SECONDS) == 1
-    finally:
-        await holder.close()
-        await writer.close()
+    completed, count = await _completes_while_held(
+        trigger_harness,
+        (
+            "SELECT 1 FROM billing_roster_control WHERE singleton = true " "FOR UPDATE",
+            {},
+        ),
+        (
+            "UPDATE billing_subscriptions SET updated_at = updated_at "
+            "WHERE id = :id",
+            {"id": canary.subscription_id},
+        ),
+    )
+    assert completed, "the update waited on the billing_roster_control row"
+    assert count == 1
 
 
-async def test_legacy_roster_asaas_paths_record_but_never_advance_the_revision(
-    trigger_harness: _TriggerHarness, canary: _Chain, general: _Chain
+async def test_asaas_paths_never_touch_the_global_roster_revision(
+    trigger_harness: _TriggerHarness,
+    canary: _Chain,
+    general: _Chain,
+    general_paid: _Chain,
 ) -> None:
-    # EXPECTED TO BE REPLACED when the roster is removed.
-    for chain in (canary, general):
-        # Handoff, settlement and the webhook paths leave the global revision
-        # untouched and stamp max(revision, 1) on the new ASAAS row.
+    """Handoff, settlement and the webhook paths leave the inert global
+    revision untouched (035: they also stamped ``max(revision, 1)`` on the
+    row, a column 036 dropped)."""
+
+    for chain in (canary, general, general_paid):
         assert chain.roster_revision_after == chain.roster_revision_before
-        assert await _scalar(
-            trigger_harness,
-            "SELECT roster_revision FROM billing_subscriptions WHERE id = :id",
-            id=chain.subscription_id,
-        ) == max(chain.roster_revision_before, 1)
     assert await _roster_revision(trigger_harness) == canary.roster_revision_before
+
+
+async def test_036_left_no_roster_or_migration_link_on_the_asaas_tables(
+    trigger_harness: _TriggerHarness,
+) -> None:
+    harness = trigger_harness
+    assert (
+        await _scalar(
+            harness,
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND (table_name, column_name) IN ("
+            "('billing_subscriptions', 'roster_revision'), "
+            "('billing_rollout_readiness_receipts', 'roster_revision'), "
+            "('billing_checkout_sessions', 'migration_id'))",
+        )
+        == 0
+    )
+    assert (
+        await _scalar(
+            harness,
+            "SELECT count(*) FROM pg_trigger "
+            "WHERE tgname = 'trg_billing_subscriptions_roster_fence'",
+        )
+        == 0
+    )
+    async with harness.session() as session:
+        coupled = (
+            await session.execute(
+                text(
+                    "SELECT proname FROM pg_proc WHERE proname = ANY(:names) "
+                    "AND prosrc ~ '(billing_migration|roster|migration_id)' "
+                    "ORDER BY proname"
+                ),
+                {"names": [_PROTECT, _PROJECTION, _CHECKOUT, _EFFECT]},
+            )
+        ).all()
+        checks = (
+            await session.execute(
+                text(
+                    "SELECT conname FROM pg_constraint "
+                    "WHERE conrelid = ANY(ARRAY["
+                    "'billing_subscriptions'::regclass, "
+                    "'billing_checkout_sessions'::regclass, "
+                    "'billing_rollout_readiness_receipts'::regclass]) "
+                    "AND (pg_get_constraintdef(oid) ~ '(roster|migration)' "
+                    "     OR conname ~ '(roster|migration)') "
+                    "ORDER BY conname"
+                )
+            )
+        ).all()
+    assert coupled == [] and checks == []
 
 
 async def test_legacy_roster_revision_is_saga_owned(
     trigger_harness: _TriggerHarness, canary: _Chain
 ) -> None:
-    # EXPECTED TO BE REPLACED when the roster is removed.
+    # The legacy table keeps its 026 history trigger until 037 drops both.
     current = await _roster_revision(trigger_harness)
     await _rejected(
         trigger_harness,
@@ -2434,6 +2372,180 @@ async def test_legacy_roster_revision_is_saga_owned(
         message="billing roster revision is saga-owned",
         function=_ROSTER_HISTORY,
     )
+
+
+# ---------------------------------------------------------------------------
+# (e2) Non-ASAAS rows (abacatepay or NULL provider) under the rewritten guard.
+#
+# Owner decision (Group 10 plan answers, 2026-10-18): such rows stay
+# representable (no provider hardening); the rewritten
+# protect_billing_canary_subscription keeps their snapshot immutable --
+# provider included -- and still refuses a self-asserted legacy cancellation.
+# The saga that could cancel, rebase or flip them is gone, so each of those
+# paths is refused now.  No production path writes such a row any more; each
+# probe plants one inside its rolled-back transaction (billing_subscriptions
+# has no INSERT trigger).
+# ---------------------------------------------------------------------------
+
+_LEGACY_ROWS: dict[str, tuple[str, str, str]] = {
+    # provider, status, is_active -- each satisfying every CHECK.
+    "abacatepay": ("'abacatepay'", "'active'", "true"),
+    "null_provider": ("NULL", "'legacy_cancel_pending'", "false"),
+}
+_LEGACY_SNAPSHOT_IMMUTABLE = "legacy subscription snapshot is immutable"
+_SELF_ASSERTED_CANCELLATION = "legacy cancellation cannot be self-asserted"
+
+
+def _planted_legacy_row(kind: str, builder_id: UUID, row_id: UUID) -> Statement:
+    provider, status, is_active = _LEGACY_ROWS[kind]
+    return (
+        "INSERT INTO billing_subscriptions (id, builder_id, provider, "
+        "external_subscription_id, is_active, plan, billing_cycle, status) "
+        f"VALUES (:legacy, :builder, {provider}, :external, {is_active}, "
+        f"'start', 'annual', {status})",
+        {
+            "legacy": row_id,
+            "builder": builder_id,
+            "external": f"legacy-g10-{row_id.hex[:12]}",
+        },
+    )
+
+
+_LEGACY_SNAPSHOT_MUTATIONS = {
+    "provider_to_asaas": "provider = 'asaas'",
+    "provider_to_other_legacy": (
+        "provider = CASE WHEN provider IS NULL THEN 'abacatepay' END"
+    ),
+    "external_subscription_id": "external_subscription_id = 'legacy-g10-rewritten'",
+    "plan": "plan = 'pro'",
+    "billing_cycle": "billing_cycle = 'monthly'",
+    "coupon_code": "coupon_code = 'G10COUPON'",
+    "catalog_version_id": "catalog_version_id = 'payment-2026-10-03'",
+    "offer_id": "offer_id = 'plan_plus_monthly_v1'",
+    "amount_cents": "amount_cents = 99900",
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_LEGACY_ROWS))
+@pytest.mark.parametrize("field", sorted(_LEGACY_SNAPSHOT_MUTATIONS))
+async def test_non_asaas_subscription_snapshot_is_immutable(
+    trigger_harness: _TriggerHarness, general: _Chain, kind: str, field: str
+) -> None:
+    row_id = uuid4()
+    await _rejected(
+        trigger_harness,
+        f"UPDATE billing_subscriptions SET {_LEGACY_SNAPSHOT_MUTATIONS[field]} "
+        "WHERE id = :id",
+        {"id": row_id},
+        setup=[_planted_legacy_row(kind, general.builder_id, row_id)],
+        message=_LEGACY_SNAPSHOT_IMMUTABLE,
+        function=_PROTECT,
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "assignment"),
+    [
+        # The retired saga's entry point: AbacatePay row -> pending cancellation.
+        (
+            "abacatepay",
+            "provider = NULL, status = 'legacy_cancel_pending', is_active = false",
+        ),
+        # The retired provider flip: legacy row -> its ASAAS successor.
+        (
+            "null_provider",
+            "provider = 'asaas', status = 'active', is_active = true, "
+            "billing_cycle = 'monthly', plan = 'plus', "
+            "catalog_version_id = 'payment-2026-10-03', "
+            "offer_id = 'plan_plus_monthly_v1', amount_cents = 99900",
+        ),
+    ],
+    ids=["abacatepay_to_pending_cancellation", "legacy_provider_flip_to_asaas"],
+)
+async def test_retired_saga_transitions_are_refused(
+    trigger_harness: _TriggerHarness, general: _Chain, kind: str, assignment: str
+) -> None:
+    row_id = uuid4()
+    await _rejected(
+        trigger_harness,
+        f"UPDATE billing_subscriptions SET {assignment} WHERE id = :id",
+        {"id": row_id},
+        setup=[_planted_legacy_row(kind, general.builder_id, row_id)],
+        message=_LEGACY_SNAPSHOT_IMMUTABLE,
+        function=_PROTECT,
+    )
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "status = 'legacy_cancelled'",
+        # Checked before the snapshot: same refusal with a snapshot change.
+        "status = 'legacy_cancelled', external_subscription_id = 'legacy-g10-x'",
+        # ... and while leaving the NULL provider (035's second branch).
+        "status = 'legacy_cancelled', provider = 'asaas'",
+    ],
+    ids=["status_only", "with_snapshot_change", "with_provider_change"],
+)
+async def test_legacy_cancellation_cannot_be_self_asserted(
+    trigger_harness: _TriggerHarness, general: _Chain, assignment: str
+) -> None:
+    """035 refused this unless the saga held an exact cancellation receipt;
+    036 has no saga, so it is always refused (same message, SQLSTATE P0001
+    as in 035: that RAISE never named an error code)."""
+
+    row_id = uuid4()
+    await _rejected(
+        trigger_harness,
+        f"UPDATE billing_subscriptions SET {assignment} WHERE id = :id",
+        {"id": row_id},
+        setup=[_planted_legacy_row("null_provider", general.builder_id, row_id)],
+        message=_SELF_ASSERTED_CANCELLATION,
+        function=_PROTECT,
+        sqlstate="P0001",
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "status_moves"),
+    [
+        ("abacatepay", ["status = 'cancelled', is_active = false"]),
+        (
+            "null_provider",
+            ["status = 'manual_intervention'", "status = 'provider_unknown'"],
+        ),
+    ],
+    ids=["abacatepay", "null_provider"],
+)
+async def test_non_asaas_subscription_status_and_timestamps_stay_mutable(
+    trigger_harness: _TriggerHarness,
+    general: _Chain,
+    kind: str,
+    status_moves: list[str],
+) -> None:
+    """Only the snapshot is frozen: other status moves and timestamps pass,
+    and a DELETE is silently skipped like any non-canary row's (the BEFORE
+    DELETE trigger returns ``NEW``, NULL on DELETE)."""
+
+    row_id = uuid4()
+    by_id = {"id": row_id}
+    update = "UPDATE billing_subscriptions SET {} WHERE id = :id"
+    counts, observed = await _accepted(
+        trigger_harness,
+        [
+            _planted_legacy_row(kind, general.builder_id, row_id),
+            *[(update.format(move), by_id) for move in status_moves],
+            (update.format("updated_at = updated_at + interval '1 day'"), by_id),
+            ("DELETE FROM billing_subscriptions WHERE id = :id", by_id),
+        ],
+        probe=(
+            "SELECT count(*), max(status) FROM billing_subscriptions " "WHERE id = :id",
+            by_id,
+        ),
+    )
+    assert counts == [1, *[1] * len(status_moves), 1, 0]
+    final_status = status_moves[-1].split("'")[1]
+    assert tuple(observed) == (1, final_status)
 
 
 # ---------------------------------------------------------------------------
@@ -2625,7 +2737,7 @@ async def test_concurrent_handoff_payment_effect_and_readback_converge(
         harness,
         "SELECT (SELECT count(*) FROM billing_subscriptions WHERE builder_id = :b), "
         "s.id, s.external_subscription_id, s.status, s.is_active, "
-        "s.roster_revision, c.state, c.resulting_external_subscription_id, "
+        "c.state, c.resulting_external_subscription_id, "
         "(SELECT count(*) FROM billing_payment_projections WHERE builder_id = :b), "
         "p.status, p.settled_cents, p.canary_environment, p.canary_slot, "
         "p.checkout_session_id, "
@@ -2646,7 +2758,6 @@ async def test_concurrent_handoff_payment_effect_and_readback_converge(
         external_subscription_id,
         "active",
         True,
-        max(roster_before, 1),
         "completed",
         external_subscription_id,
         1,

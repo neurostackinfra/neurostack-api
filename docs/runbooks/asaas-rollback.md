@@ -10,6 +10,12 @@ Rollback is application-only. Never downgrade the schema as part of a
 rollback, and never infer a financial outcome from a browser return, a
 redirect or a UI state.
 
+Once migration 036 is applied, no image built before Group 10 E5 can run
+(its ORM reads the dropped `roster_revision`/`migration_id` columns), so roll
+back only to an image that contains E5. Downgrading 036 is a separate owner
+decision, refused while any subscription or readiness row exists; see
+"Migration 036" in [`asaas-deployment.md`](./asaas-deployment.md).
+
 ## Current state (2026-10-17)
 
 Billing rollout is `disabled` and `topup_commercial_enabled=false`. While it

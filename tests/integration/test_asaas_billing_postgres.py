@@ -696,230 +696,6 @@ async def _concurrent_unique(
         await session_two.close()
 
 
-async def _insert_provider_flip_receipt(
-    session: AsyncSession,
-    migration_id: UUID,
-    *,
-    valid_digest: bool = True,
-) -> None:
-    digest_sql = (
-        "encode(sha256(convert_to(jsonb_build_object("
-        "'migration_id', migration.id, 'builder_id', migration.builder_id, "
-        "'subscription_id', migration.subscription_id, "
-        "'operation_id', migration.operation_id, "
-        "'source_roster_revision', migration.source_roster_revision, "
-        "'target_provider', migration.target_provider, "
-        "'target_external_subscription_id', migration.target_external_subscription_id, "
-        "'target_catalog_version_id', migration.target_catalog_version_id, "
-        "'target_offer_id', migration.target_offer_id, "
-        "'target_plan', migration.target_plan, "
-        "'target_billing_cycle', migration.target_billing_cycle, "
-        "'target_coupon_code', migration.target_coupon_code, "
-        "'target_amount_cents', migration.target_amount_cents, "
-        "'target_snapshot', migration.target_snapshot"
-        ")::text, 'UTF8')), 'hex')"
-        if valid_digest
-        else "repeat('a', 64)"
-    )
-    event_id = f"evt-provider-{uuid4()}"
-    # Migration 032's canonical evidence digest (shared with Python's
-    # ``provider_evidence_digest``); argument order follows its signature.
-    evidence_digest_sql = f"""
-        billing_provider_evidence_digest(
-            'asaas.api.v3', CAST(:provider_event_id AS TEXT),
-            now() + interval '15 minutes',
-            migration.target_external_subscription_id, migration.id, now(),
-            'subscription.migration.provider_flip', migration.operation_id,
-            'asaas', {digest_sql})
-    """
-    await session.execute(
-        text(f"""
-            INSERT INTO billing_migration_receipts (
-                id, builder_id, migration_id, operation_id, receipt_kind,
-                provider, external_reference, provider_event_id,
-                provider_authority, provider_key_id, provider_operation,
-                provider_signature, provider_observed_at,
-                provider_expires_at, provider_snapshot_digest,
-                provider_evidence_digest, status, content_sha256,
-                actor_user_id, observed_at
-            ) SELECT :id, migration.builder_id, migration.id,
-                migration.operation_id, 'provider_flip', 'asaas',
-                migration.target_external_subscription_id,
-                CAST(:provider_event_id AS TEXT),
-                'asaas.api.v3', 'fixture-v1',
-                'subscription.migration.provider_flip', :provider_signature,
-                now(), now() + interval '15 minutes',
-                {digest_sql}, {evidence_digest_sql}, 'verified',
-                {digest_sql}, :actor, now()
-            FROM billing_migrations AS migration
-            WHERE migration.id = :migration_id
-        """),
-        {
-            "id": uuid4(),
-            "migration_id": migration_id,
-            "actor": uuid4(),
-            "provider_event_id": event_id,
-            "provider_signature": "a" * 128,
-        },
-    )
-
-
-async def _seed_bound_legacy_flip(
-    session: AsyncSession,
-    *,
-    builder_id: UUID,
-    source_revision: int,
-    valid_digest: bool = True,
-    include_provider_receipt: bool = True,
-) -> tuple[UUID, UUID, str]:
-    subscription_id = uuid4()
-    migration_id = uuid4()
-    operation_id = uuid4()
-    target_external_id = f"asaas-{subscription_id}"
-    await session.execute(
-        text("""
-            INSERT INTO billing_subscriptions (
-                id, builder_id, provider, external_subscription_id,
-                is_active, plan, billing_cycle, status, roster_revision
-            ) VALUES (
-                :id, :builder_id, NULL, :legacy_external_id,
-                false, 'start', 'monthly', 'legacy_cancel_pending', :revision
-            )
-        """),
-        {
-            "id": subscription_id,
-            "builder_id": builder_id,
-            "legacy_external_id": f"legacy-{subscription_id}",
-            "revision": source_revision,
-        },
-    )
-    await session.execute(
-        text("""
-            INSERT INTO billing_migrations (
-                id, builder_id, subscription_id, state, renewal_date,
-                open_by_date, cutover_by_date, target_external_subscription_id,
-                target_catalog_version_id, target_offer_id, target_plan,
-                target_billing_cycle, target_amount_cents, target_snapshot,
-                operation_id, source_roster_revision, legacy_cancelled_at
-            ) VALUES (
-                :id, :builder_id, :subscription_id, 'legacy_cancel_pending',
-                DATE '2026-12-10', DATE '2026-12-03', DATE '2026-12-08',
-                :target_external_id, 'payment-2026-10-03',
-                'plan_plus_monthly_v1', 'plus', 'monthly', 99900,
-                jsonb_build_object(
-                  'catalog_version_id','payment-2026-10-03',
-                  'offer_id','plan_plus_monthly_v1','plan','plus',
-                  'billing_cycle','monthly','coupon_code',NULL,
-                  'amount_cents',99900,'credit_grant_mc',5000,
-                  'included_clinics',1,'additional_clinics',0,
-                  'lines',jsonb_build_array(jsonb_build_object(
-                    'line_id','plan','offer_id','plan_plus_monthly_v1',
-                    'kind','plan','quantity',1,'unit_amount_cents',99900,
-                    'line_amount_cents',99900,'credit_grant_mc',5000,
-                    'settled_cents',0,'reversed_cents',0,'restored_cents',0,
-                    'line_financial_state','pending'))),
-                :operation_id, :revision, NULL
-            )
-        """),
-        {
-            "id": migration_id,
-            "builder_id": builder_id,
-            "subscription_id": subscription_id,
-            "target_external_id": target_external_id,
-            "operation_id": operation_id,
-            "revision": source_revision,
-        },
-    )
-    await session.execute(
-        text("""
-            INSERT INTO billing_migration_receipts (
-                id, builder_id, migration_id, operation_id, receipt_kind,
-                provider, external_reference, status, content_sha256,
-                actor_user_id, observed_at
-            ) SELECT :id, migration.builder_id, migration.id,
-                migration.operation_id, 'cancel_observation', 'abacatepay',
-                subscription.external_subscription_id, 'cancelled',
-                encode(sha256(convert_to(jsonb_build_object(
-                  'migration_id',migration.id,'builder_id',migration.builder_id,
-                  'subscription_id',migration.subscription_id,
-                  'operation_id',migration.operation_id,
-                  'legacy_external_subscription_id',
-                    subscription.external_subscription_id,
-                  'provider','abacatepay','status','cancelled',
-                  'observed_at',CAST(:observed_at AS TIMESTAMPTZ)
-                )::text,'UTF8')),'hex'), :actor,
-                CAST(:observed_at AS TIMESTAMPTZ)
-            FROM billing_migrations migration
-            JOIN billing_subscriptions subscription
-              ON subscription.id = migration.subscription_id
-             AND subscription.builder_id = migration.builder_id
-            WHERE migration.id = :migration_id
-        """),
-        {
-            "id": uuid4(),
-            "migration_id": migration_id,
-            "actor": uuid4(),
-            "observed_at": datetime.now(timezone.utc),
-        },
-    )
-    await session.execute(
-        text("""
-            UPDATE billing_subscriptions SET status = 'legacy_cancelled'
-            WHERE id = :subscription_id
-        """),
-        {"subscription_id": subscription_id},
-    )
-    if include_provider_receipt:
-        await _insert_provider_flip_receipt(
-            session,
-            migration_id,
-            valid_digest=valid_digest,
-        )
-    return subscription_id, migration_id, target_external_id
-
-
-async def _raw_legacy_rebase(
-    session: AsyncSession,
-    *,
-    subscription_id: UUID,
-    expected_source_revision: int,
-) -> int | None:
-    """Raw-SQL twin of the removed ``BillingRepository.rebase_legacy_migration``.
-
-    The saga service went away in Group 10 phase E2, but the legacy-rebase
-    branch of ``protect_billing_canary_subscription`` (migration 026) stays
-    live until migrations 036/037.  This issues the same statements the
-    service did: the global roster fence, the roster row lock and a guarded
-    ``roster_revision`` UPDATE of the cancelled legacy row; the trigger then
-    rebases the saga row itself.  Returns the new revision, or ``None`` when
-    the guarded UPDATE matched nothing (a stale writer).
-    """
-
-    await session.execute(
-        text("SELECT pg_advisory_xact_lock(:key)"), {"key": _GLOBAL_ROSTER_FENCE_KEY}
-    )
-    current = await session.scalar(text("""
-            SELECT billing_roster_revision FROM billing_roster_control
-            WHERE singleton = true FOR UPDATE
-        """))
-    assert current is not None
-    result = await session.execute(
-        text("""
-            UPDATE billing_subscriptions SET roster_revision = :current
-            WHERE id = :id AND provider IS NULL AND status = 'legacy_cancelled'
-              AND roster_revision = :expected
-            RETURNING roster_revision
-        """),
-        {
-            "current": current,
-            "id": subscription_id,
-            "expected": expected_source_revision,
-        },
-    )
-    revision = result.scalar_one_or_none()
-    return None if revision is None else int(revision)
-
-
 async def test_upgrade_downgrade_and_fresh_schema_are_equivalent(
     postgres_harness: _Harness,
 ) -> None:
@@ -928,7 +704,7 @@ async def test_upgrade_downgrade_and_fresh_schema_are_equivalent(
     async with postgres_harness.engine.connect() as connection:
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "035"
+            == "036"
         )
         legacy = (
             await connection.execute(
@@ -1012,1009 +788,150 @@ async def test_bootstrap_is_fail_closed_for_every_environment(
     ]
 
 
-async def test_group_zero_roster_keeps_annual_and_fences_unapproved_legacy_flip(
+# Group 10 E5 (migration 036): the legacy saga cannot run any more.  The
+# saga-mechanics tests that used to follow (roster lock holder/writer order,
+# exact approved provider flip, concurrent flips on the global roster, stale
+# provider-flip receipts and legacy rebase, malformed receipts, receipt vs
+# target serialization, the three-transaction flip order) drove the 035
+# legacy branches of protect_billing_canary_subscription and the migration
+# receipt validators through roster_revision, which 036 dropped; they were
+# removed with it.  What 036 does instead is pinned here and in section
+# (e2) of test_asaas_subscription_triggers_postgres.py; the 035 definitions
+# are frozen in alembic/frozen/036_downgrade_restores_035.json and proven by
+# test_migration_036_postgres.py.
+#
+# Inventory for Group 10 E6, same convention as the characterization module:
+# the tests of this module that still touch a legacy table 037 drops.
+TESTS_THAT_BREAK_AFTER_037: tuple[str, ...] = (
+    # Pins the head revision ("036").
+    "test_upgrade_downgrade_and_fresh_schema_are_equivalent",
+    # Requires trg_billing_migration_receipts_immutable; the ORM still maps
+    # the legacy tables until E6 removes their models.
+    "test_live_schema_matches_orm_metadata_and_required_triggers",
+    # Reads billing_roster_control.
+    "test_bootstrap_is_fail_closed_for_every_environment",
+    # Insert into billing_migrations.
+    "test_cross_builder_correlations_and_snapshot_pii_are_rejected",
+    "test_migration_snapshot_requires_exact_coherent_shape",
+)
+
+
+async def test_break_inventory_names_only_collected_tests(
+    request: pytest.FixtureRequest,
+) -> None:
+    """Every inventory entry is a real node name of this module (not stale)."""
+
+    module = request.node.parent
+    assert isinstance(module, pytest.Module)
+    collected = {item.name for item in module.collect()}
+    assert len(set(TESTS_THAT_BREAK_AFTER_037)) == len(TESTS_THAT_BREAK_AFTER_037)
+    assert sorted(set(TESTS_THAT_BREAK_AFTER_037) - collected) == []
+
+
+async def test_group_zero_roster_keeps_annual_and_refuses_the_retired_saga(
     postgres_harness: _Harness,
 ) -> None:
-    async with postgres_harness.session() as session:
-        async with session.begin():
-            await session.execute(text("""
-                    UPDATE billing_roster_control
-                    SET billing_roster_revision = 1, updated_at = now()
-                    WHERE singleton = true
-                """))
+    """A Group 0 legacy binding (annual AbacatePay row with its coupon) stays
+    representable; since migration 036 none of the retired saga steps can
+    move it or a NULL-provider legacy row: the pending cancellation, the
+    self-asserted cancellation and the provider flip are refused."""
 
-    subscription_id = uuid4()
+    annual_id, legacy_id = uuid4(), uuid4()
     async with postgres_harness.session() as session:
         async with session.begin():
             await session.execute(
                 text("""
                     INSERT INTO billing_subscriptions (
                         id, builder_id, provider, external_subscription_id,
-                        is_active, plan, billing_cycle, coupon_code, status,
-                        roster_revision
+                        is_active, plan, billing_cycle, coupon_code, status
                     ) VALUES (
-                        :id, :builder_id, 'abacatepay', 'sub-annual', true,
-                        'start', 'annual', 'LEGACY10', 'active', 1
+                        :annual, :builder_id, 'abacatepay', 'sub-annual', true,
+                        'start', 'annual', 'LEGACY10', 'active'
+                    ), (
+                        :legacy, :builder_id, NULL, :legacy_external, false,
+                        'start', 'monthly', NULL, 'legacy_cancel_pending'
                     )
                 """),
-                {"id": subscription_id, "builder_id": postgres_harness.builder_id},
+                {
+                    "annual": annual_id,
+                    "legacy": legacy_id,
+                    "builder_id": postgres_harness.builder_id,
+                    "legacy_external": f"legacy-{legacy_id}",
+                },
             )
         stored = (
             await session.execute(
                 text("""
-                    SELECT plan, billing_cycle, coupon_code, roster_revision
+                    SELECT plan, billing_cycle, coupon_code
                     FROM billing_subscriptions WHERE id = :id
                 """),
-                {"id": subscription_id},
+                {"id": annual_id},
             )
         ).one()
-        assert tuple(stored) == ("start", "annual", "LEGACY10", 1)
+        assert tuple(stored) == ("start", "annual", "LEGACY10")
         await session.commit()
-        with pytest.raises(DBAPIError, match="legacy cancellation migration required"):
-            async with session.begin_nested():
-                await session.execute(
-                    text("""
-                        UPDATE billing_subscriptions
-                        SET provider = NULL, is_active = false,
-                            status = 'legacy_cancel_pending', roster_revision = 2
-                        WHERE id = :id
-                    """),
-                    {"id": subscription_id},
-                )
 
-
-async def test_roster_lock_holder_and_roster_writer_serialize_in_both_orders(
-    postgres_harness: _Harness,
-) -> None:
-    # The retired legacy receiver used to be the lock holder here; the roster
-    # writer's own serialization on the roster advisory lock is still owed.
-    async def hold_roster_lock(session: AsyncSession) -> None:
-        await session.execute(
-            text("SELECT pg_advisory_xact_lock(:roster_lock_key)"),
-            {"roster_lock_key": _GLOBAL_ROSTER_FENCE_KEY},
-        )
-
-    async def is_active(session: AsyncSession, subscription_id: UUID) -> bool:
-        return bool(
-            await session.scalar(
-                text("SELECT is_active FROM billing_subscriptions WHERE id = :id"),
-                {"id": subscription_id},
-            )
-        )
-
-    async def seed_legacy(session: AsyncSession, revision: int) -> tuple[UUID, str]:
-        subscription_id = uuid4()
-        external_id = f"legacy-race-{subscription_id}"
-        await session.execute(
-            text("""
-                INSERT INTO billing_subscriptions (
-                    id, builder_id, provider, external_subscription_id,
-                    is_active, plan, billing_cycle, status, roster_revision
-                ) VALUES (
-                    :id, :builder_id, 'abacatepay', :external_id,
-                    true, 'start', 'monthly', 'active', :revision
-                )
-            """),
-            {
-                "id": subscription_id,
-                "builder_id": postgres_harness.builder_id,
-                "external_id": external_id,
-                "revision": revision,
-            },
-        )
-        await session.execute(
-            text("""
-                INSERT INTO billing_migrations (
-                    id, builder_id, subscription_id, state, renewal_date,
-                    open_by_date, cutover_by_date,
-                    target_external_subscription_id,
-                    target_catalog_version_id, target_offer_id, target_plan,
-                    target_billing_cycle, target_amount_cents, target_snapshot,
-                    operation_id, source_roster_revision
-                ) VALUES (
-                    :id, :builder_id, :subscription_id, 'in_progress',
-                    DATE '2026-12-10', DATE '2026-12-03', DATE '2026-12-08',
-                    :target, 'payment-2026-10-03',
-                    'plan_plus_monthly_v1', 'plus', 'monthly', 99900,
-                    jsonb_build_object(
-                      'catalog_version_id','payment-2026-10-03',
-                      'offer_id','plan_plus_monthly_v1','plan','plus',
-                      'billing_cycle','monthly','coupon_code',NULL,
-                      'amount_cents',99900,'credit_grant_mc',5000,
-                      'included_clinics',1,'additional_clinics',0,
-                      'lines',jsonb_build_array(jsonb_build_object(
-                        'line_id','plan','offer_id','plan_plus_monthly_v1',
-                        'kind','plan','quantity',1,'unit_amount_cents',99900,
-                        'line_amount_cents',99900,'credit_grant_mc',5000,
-                        'settled_cents',0,'reversed_cents',0,'restored_cents',0,
-                        'line_financial_state','pending'))),
-                    :operation_id, :revision
-                )
-            """),
-            {
-                "id": uuid4(),
-                "builder_id": postgres_harness.builder_id,
-                "subscription_id": subscription_id,
-                "target": f"asaas-{subscription_id}",
-                "operation_id": uuid4(),
-                "revision": revision,
-            },
-        )
-        return subscription_id, external_id
-
-    async with postgres_harness.session() as setup:
-        async with setup.begin():
-            await setup.execute(text("""
-                UPDATE billing_roster_control SET billing_roster_revision = 1
-                WHERE singleton = true AND billing_roster_revision = 0
-            """))
-            revision = await setup.scalar(
-                text("SELECT billing_roster_revision FROM billing_roster_control")
-            )
-            assert revision is not None
-            first_id, _first_external = await seed_legacy(setup, revision)
-
-    receiver = postgres_harness.session()
-    writer = postgres_harness.session()
-    await receiver.begin()
-    await writer.begin()
-    try:
-        await hold_roster_lock(receiver)
-        assert await is_active(receiver, first_id)
-
-        async def cancel_first() -> None:
-            await writer.execute(
-                text("""
-                    UPDATE billing_subscriptions
-                    SET provider = NULL, is_active = false,
-                        status = 'legacy_cancel_pending',
-                        roster_revision = :revision
-                    WHERE id = :id
-                """),
-                {"id": first_id, "revision": revision + 1},
-            )
-
-        contender = asyncio.create_task(cancel_first())
-        done, _ = await asyncio.wait({contender}, timeout=0.15)
-        assert not done
-        await receiver.commit()
-        await contender
-        await writer.commit()
-    finally:
-        if receiver.in_transaction():
-            await receiver.rollback()
-        if writer.in_transaction():
-            await writer.rollback()
-        await receiver.close()
-        await writer.close()
-
-    async with postgres_harness.session() as setup:
-        async with setup.begin():
-            second_id, _second_external = await seed_legacy(setup, revision + 1)
-
-    writer = postgres_harness.session()
-    receiver = postgres_harness.session()
-    await writer.begin()
-    await receiver.begin()
-    try:
-        await writer.execute(
-            text("""
-                UPDATE billing_subscriptions
-                SET provider = NULL, is_active = false,
-                    status = 'legacy_cancel_pending', roster_revision = :revision
-                WHERE id = :id
-            """),
-            {"id": second_id, "revision": revision + 2},
-        )
-
-        async def receive_after_writer() -> bool:
-            await hold_roster_lock(receiver)
-            return await is_active(receiver, second_id)
-
-        contender = asyncio.create_task(receive_after_writer())
-        done, _ = await asyncio.wait({contender}, timeout=0.15)
-        assert not done
-        await writer.commit()
-        assert await contender is False
-        await receiver.commit()
-    finally:
-        if writer.in_transaction():
-            await writer.rollback()
-        if receiver.in_transaction():
-            await receiver.rollback()
-        await writer.close()
-        await receiver.close()
-
-
-async def test_legacy_provider_flip_requires_exact_approved_roster_target(
-    postgres_harness: _Harness,
-) -> None:
-    subscription_id = uuid4()
-    migration_id = uuid4()
-    operation_id = uuid4()
-    target_external_id = f"asaas-{subscription_id}"
-    async with postgres_harness.session() as session:
-        async with session.begin():
-            await session.execute(text("""
-                UPDATE billing_roster_control
-                SET billing_roster_revision = 1, updated_at = now()
-                WHERE singleton = true AND billing_roster_revision = 0
-            """))
-            current_revision = (await session.execute(text("""
-                        SELECT billing_roster_revision
-                        FROM billing_roster_control
-                        WHERE singleton = true
-                        FOR UPDATE
-                    """))).scalar_one()
-            with pytest.raises(DBAPIError, match="roster revision is saga-owned"):
-                async with session.begin_nested():
-                    await session.execute(text("""
-                        UPDATE billing_roster_control
-                        SET billing_roster_revision = billing_roster_revision + 1
-                        WHERE singleton = true
-                    """))
-            for provider, status, is_active in (
-                ("abacatepay", "active", True),
-                (None, "provider_unknown", False),
-            ):
-                guarded_id = uuid4()
-                await session.execute(
-                    text("""
-                        INSERT INTO billing_subscriptions (
-                            id, builder_id, provider, external_subscription_id,
-                            is_active, plan, billing_cycle, status, roster_revision
-                        ) VALUES (
-                            :id, :builder_id, :provider, :external_id,
-                            :is_active, 'start', 'monthly', :status, :revision
-                        )
-                    """),
-                    {
-                        "id": guarded_id,
-                        "builder_id": postgres_harness.builder_id,
-                        "provider": provider,
-                        "external_id": f"guarded-{guarded_id}",
-                        "is_active": is_active,
-                        "status": status,
-                        "revision": current_revision,
-                    },
-                )
-                with pytest.raises(DBAPIError):
-                    async with session.begin_nested():
-                        await session.execute(
-                            text("""
-                                UPDATE billing_subscriptions
-                                SET provider = CASE
-                                        WHEN provider IS NULL THEN 'asaas'
-                                        ELSE provider
-                                    END,
-                                    plan = 'forbidden-mutation'
-                                WHERE id = :id
-                            """),
-                            {"id": guarded_id},
-                        )
-                if provider is None:
-                    with pytest.raises(DBAPIError):
-                        async with session.begin_nested():
-                            await session.execute(
-                                text("""UPDATE billing_subscriptions
-                                         SET status = 'legacy_cancelled'
-                                         WHERE id = :id"""),
-                                {"id": guarded_id},
-                            )
-            await session.execute(
-                text("""
-                    INSERT INTO billing_subscriptions (
-                        id, builder_id, provider, external_subscription_id,
-                        is_active, plan, billing_cycle, status, roster_revision
-                    ) VALUES (
-                        :id, :builder_id, NULL, :external_id,
-                        false, 'start', 'monthly', 'legacy_cancel_pending', :revision
-                    )
-                """),
-                {
-                    "id": subscription_id,
-                    "builder_id": postgres_harness.builder_id,
-                    "external_id": f"legacy-{subscription_id}",
-                    "revision": current_revision,
-                },
-            )
-            await session.execute(
-                text("""
-                    INSERT INTO billing_migrations (
-                        id, builder_id, subscription_id, state, renewal_date,
-                        open_by_date, cutover_by_date, target_external_subscription_id,
-                        target_catalog_version_id, target_offer_id, target_plan,
-                        target_billing_cycle, target_amount_cents, target_snapshot,
-                        operation_id, source_roster_revision,
-                        legacy_cancelled_at
-                    ) VALUES (
-                        :id, :builder_id, :subscription_id, 'legacy_cancel_pending',
-                        DATE '2026-12-10', DATE '2026-12-03', DATE '2026-12-08',
-                        :target_external_id, 'payment-2026-10-03',
-                        'plan_plus_monthly_v1', 'plus', 'monthly', 99900,
-                        jsonb_build_object(
-                          'catalog_version_id','payment-2026-10-03',
-                          'offer_id','plan_plus_monthly_v1','plan','plus',
-                          'billing_cycle','monthly','coupon_code',NULL,
-                          'amount_cents',99900,'credit_grant_mc',5000,
-                          'included_clinics',1,'additional_clinics',0,
-                          'lines',jsonb_build_array(jsonb_build_object(
-                            'line_id','plan','offer_id','plan_plus_monthly_v1',
-                            'kind','plan','quantity',1,
-                            'unit_amount_cents',99900,
-                            'line_amount_cents',99900,'credit_grant_mc',5000,
-                            'settled_cents',0,'reversed_cents',0,
-                            'restored_cents',0,
-                            'line_financial_state','pending'))),
-                        :operation_id, :revision, NULL
-                    )
-                """),
-                {
-                    "id": migration_id,
-                    "builder_id": postgres_harness.builder_id,
-                    "subscription_id": subscription_id,
-                    "target_external_id": target_external_id,
-                    "operation_id": operation_id,
-                    "revision": current_revision,
-                },
-            )
-            with pytest.raises(DBAPIError):
-                async with session.begin_nested():
-                    await session.execute(
-                        text("""UPDATE billing_migrations
-                                 SET state = 'legacy_cancelled'
-                                 WHERE id = :id"""),
-                        {"id": migration_id},
-                    )
-            observed_at = datetime.now(timezone.utc)
-            await session.execute(
-                text("""
-                    INSERT INTO billing_migration_receipts (
-                        id, builder_id, migration_id, operation_id, receipt_kind,
-                        provider, external_reference, status, content_sha256,
-                        actor_user_id, observed_at
-                    ) SELECT :id, migration.builder_id, migration.id,
-                        migration.operation_id, 'cancel_observation',
-                        'abacatepay', subscription.external_subscription_id,
-                        'cancelled', encode(sha256(convert_to(jsonb_build_object(
-                          'migration_id',migration.id,
-                          'builder_id',migration.builder_id,
-                          'subscription_id',migration.subscription_id,
-                          'operation_id',migration.operation_id,
-                          'legacy_external_subscription_id',
-                            subscription.external_subscription_id,
-                          'provider','abacatepay','status','cancelled',
-                          'observed_at',CAST(:observed_at AS TIMESTAMPTZ)
-                        )::text,'UTF8')),'hex'), :actor,
-                        CAST(:observed_at AS TIMESTAMPTZ)
-                    FROM billing_migrations migration
-                    JOIN billing_subscriptions subscription
-                      ON subscription.id = migration.subscription_id
-                    WHERE migration.id = :migration_id
-                """),
-                {
-                    "id": uuid4(),
-                    "migration_id": migration_id,
-                    "actor": uuid4(),
-                    "observed_at": observed_at,
-                },
-            )
-            await session.execute(
-                text("""UPDATE billing_subscriptions
-                         SET status = 'legacy_cancelled' WHERE id = :id"""),
-                {"id": subscription_id},
-            )
-            await _insert_provider_flip_receipt(session, migration_id)
-            with pytest.raises(DBAPIError):
-                async with session.begin_nested():
-                    await session.execute(
-                        text("""
-                            UPDATE billing_migrations
-                            SET target_plan = 'mutable-after-receipt'
-                            WHERE id = :migration_id
-                        """),
-                        {"migration_id": migration_id},
-                    )
-            with pytest.raises(DBAPIError):
-                async with session.begin_nested():
-                    await session.execute(
-                        text("""
-                            UPDATE billing_subscriptions
-                            SET plan = 'mutable-while-null'
-                            WHERE id = :subscription_id
-                        """),
-                        {"subscription_id": subscription_id},
-                    )
-            with pytest.raises(DBAPIError):
-                async with session.begin_nested():
-                    await _seed_bound_legacy_flip(
-                        session,
-                        builder_id=postgres_harness.builder_id,
-                        source_revision=current_revision,
-                        valid_digest=False,
-                    )
-            with pytest.raises(DBAPIError):
-                async with session.begin_nested():
-                    await session.execute(
-                        text("""
-                            UPDATE billing_subscriptions
-                            SET provider = 'asaas',
-                                external_subscription_id = :target_external_id,
-                                plan = 'plus', billing_cycle = 'monthly',
-                                coupon_code = NULL,
-                                catalog_version_id = 'payment-2026-10-03',
-                                offer_id = 'plan_plus_monthly_v1',
-                                amount_cents = 99900, status = 'inactive',
-                                roster_revision = :stale_revision
-                            WHERE id = :subscription_id
-                        """),
-                        {
-                            "subscription_id": subscription_id,
-                            "target_external_id": target_external_id,
-                            "stale_revision": current_revision,
-                        },
-                    )
-            await session.execute(
-                text("""
-                    UPDATE billing_subscriptions
-                    SET provider = 'asaas',
-                        external_subscription_id = :target_external_id,
-                        plan = 'plus', billing_cycle = 'monthly', coupon_code = NULL,
-                        catalog_version_id = 'payment-2026-10-03',
-                        offer_id = 'plan_plus_monthly_v1', amount_cents = 99900,
-                        status = 'inactive', roster_revision = :revision
-                    WHERE id = :subscription_id
-                """),
-                {
-                    "subscription_id": subscription_id,
-                    "target_external_id": target_external_id,
-                    "revision": current_revision + 1,
-                },
-            )
-            state = (
-                await session.execute(
-                    text("SELECT state FROM billing_migrations WHERE id = :id"),
-                    {"id": migration_id},
-                )
-            ).scalar_one()
-            assert state == "migrated"
-            revision = (
-                await session.execute(
-                    text("SELECT billing_roster_revision FROM billing_roster_control")
-                )
-            ).scalar_one()
-            assert revision == current_revision + 1
-            with pytest.raises(DBAPIError):
-                async with session.begin_nested():
-                    await session.execute(
-                        text("""
-                            UPDATE billing_subscriptions SET plan = 'post-flip-mutation'
-                            WHERE id = :subscription_id
-                        """),
-                        {"subscription_id": subscription_id},
-                    )
-
-
-async def test_concurrent_provider_flips_serialize_on_global_roster(
-    postgres_harness: _Harness,
-) -> None:
-    async with postgres_harness.session() as setup:
-        async with setup.begin():
-            await setup.execute(text("""
-                UPDATE billing_roster_control
-                SET billing_roster_revision = 1, updated_at = now()
-                WHERE singleton = true AND billing_roster_revision = 0
-            """))
-            current_revision = (
-                await setup.execute(
-                    text("SELECT billing_roster_revision FROM billing_roster_control")
-                )
-            ).scalar_one()
-            first_id, first_migration_id, first_target = await _seed_bound_legacy_flip(
-                setup,
-                builder_id=postgres_harness.builder_id,
-                source_revision=current_revision,
-                include_provider_receipt=False,
-            )
-
-    statement = text("""
-        UPDATE billing_subscriptions
-        SET provider = 'asaas', external_subscription_id = :target_external_id,
-            plan = 'plus', billing_cycle = 'monthly', coupon_code = NULL,
-            catalog_version_id = 'payment-2026-10-03',
-            offer_id = 'plan_plus_monthly_v1', amount_cents = 99900,
-            status = 'inactive', roster_revision = :revision
-        WHERE id = :subscription_id
-    """)
-    first = postgres_harness.session()
-    second = postgres_harness.session()
-    await first.begin()
-    await second.begin()
-    try:
-        await _insert_provider_flip_receipt(first, first_migration_id)
-        await first.execute(
-            statement,
-            {
-                "subscription_id": first_id,
-                "target_external_id": first_target,
-                "revision": current_revision + 1,
-            },
-        )
-
-        async def flip_second() -> None:
-            second_id, _, second_target = await _seed_bound_legacy_flip(
-                second,
-                builder_id=postgres_harness.builder_id,
-                source_revision=current_revision + 1,
-            )
-            await second.execute(
-                statement,
-                {
-                    "subscription_id": second_id,
-                    "target_external_id": second_target,
-                    "revision": current_revision + 2,
-                },
-            )
-            await second.commit()
-
-        contender = asyncio.create_task(flip_second())
-        done, _ = await asyncio.wait({contender}, timeout=0.15)
-        assert not done
-        await first.commit()
-        await contender
-        async with postgres_harness.session() as verify:
-            revision = await verify.scalar(
-                text("SELECT billing_roster_revision FROM billing_roster_control")
-            )
-            assert revision == current_revision + 2
-    finally:
-        if first.in_transaction():
-            await first.rollback()
-        if second.in_transaction():
-            await second.rollback()
-        await first.close()
-        await second.close()
-
-
-async def test_provider_flip_rejects_receipt_bound_to_stale_source(
-    postgres_harness: _Harness,
-) -> None:
-    async with postgres_harness.session() as setup:
-        async with setup.begin():
-            await setup.execute(text("""
-                UPDATE billing_roster_control SET billing_roster_revision = 1
-                WHERE singleton = true AND billing_roster_revision = 0
-            """))
-            source_revision = await setup.scalar(
-                text("SELECT billing_roster_revision FROM billing_roster_control")
-            )
-            assert source_revision is not None
-            first_id, first_migration_id, first_target = await _seed_bound_legacy_flip(
-                setup,
-                builder_id=postgres_harness.builder_id,
-                source_revision=source_revision,
-                include_provider_receipt=False,
-            )
-            stale_subscription_id, stale_migration_id, stale_target = (
-                await _seed_bound_legacy_flip(
-                    setup,
-                    builder_id=postgres_harness.builder_id,
-                    source_revision=source_revision,
-                    include_provider_receipt=False,
-                )
-            )
-            await setup.execute(
-                text("""
-                    UPDATE billing_subscriptions
-                    SET status = 'legacy_cancelled'
-                    WHERE id = :subscription_id
-                """),
-                {"subscription_id": stale_subscription_id},
-            )
-
-    async with postgres_harness.session() as session:
-        async with session.begin():
-            await _insert_provider_flip_receipt(session, first_migration_id)
-            await session.execute(
-                text("""
-                    UPDATE billing_subscriptions
-                    SET provider='asaas', external_subscription_id=:target,
-                        plan='plus', billing_cycle='monthly',
-                        catalog_version_id='payment-2026-10-03',
-                        offer_id='plan_plus_monthly_v1', amount_cents=99900,
-                        status='inactive', roster_revision=:revision
-                    WHERE id=:id
-                """),
-                {
-                    "id": first_id,
-                    "target": first_target,
-                    "revision": source_revision + 1,
-                },
-            )
-
-    async with postgres_harness.session() as session:
-        with pytest.raises(DBAPIError, match="source revision is stale"):
-            async with session.begin():
-                await _insert_provider_flip_receipt(session, stale_migration_id)
-
-    # A rebase onto anything but the current roster revision is refused by
-    # the legacy-rebase branch of protect_billing_canary_subscription.
-    async with postgres_harness.session() as session:
-        with pytest.raises(DBAPIError, match="legacy migration rebase is stale"):
-            async with session.begin():
-                await session.execute(
-                    text("""
-                        UPDATE billing_subscriptions
-                        SET roster_revision = :revision WHERE id = :id
-                    """),
-                    {"id": stale_subscription_id, "revision": source_revision + 7},
-                )
-
-    # Rebased onto the current revision, the stale saga flips again.
-    async with postgres_harness.session() as session:
-        async with session.begin():
-            rebased = await _raw_legacy_rebase(
-                session,
-                subscription_id=stale_subscription_id,
-                expected_source_revision=source_revision,
-            )
-            assert rebased == source_revision + 1
-            # The trigger moved the saga row with its subscription.
-            assert (
-                await session.scalar(
-                    text(
-                        "SELECT source_roster_revision FROM billing_migrations "
-                        "WHERE id = :id"
-                    ),
-                    {"id": stale_migration_id},
-                )
-                == source_revision + 1
-            )
-            await _insert_provider_flip_receipt(session, stale_migration_id)
-            await session.execute(
-                text("""
-                    UPDATE billing_subscriptions
-                    SET provider='asaas', external_subscription_id=:target,
-                        plan='plus', billing_cycle='monthly',
-                        catalog_version_id='payment-2026-10-03',
-                        offer_id='plan_plus_monthly_v1', amount_cents=99900,
-                        status='inactive', roster_revision=:revision
-                    WHERE id=:id
-                """),
-                {
-                    "id": stale_subscription_id,
-                    "target": stale_target,
-                    "revision": source_revision + 2,
-                },
-            )
-
-
-async def test_malformed_receipts_do_not_poison_slot_and_standalone_commit_fails(
-    postgres_harness: _Harness,
-) -> None:
-    async with postgres_harness.session() as setup:
-        async with setup.begin():
-            await setup.execute(text("""
-                UPDATE billing_roster_control SET billing_roster_revision = 1
-                WHERE singleton = true AND billing_roster_revision = 0
-            """))
-            revision = await setup.scalar(
-                text("SELECT billing_roster_revision FROM billing_roster_control")
-            )
-            assert revision is not None
-            subscription_id, migration_id, target = await _seed_bound_legacy_flip(
-                setup,
-                builder_id=postgres_harness.builder_id,
-                source_revision=revision,
-                include_provider_receipt=False,
-            )
-
-    malformed_insert = text("""
-        INSERT INTO billing_migration_receipts (
-            id, builder_id, migration_id, operation_id, receipt_kind,
-            provider, external_reference, status, content_sha256,
-            actor_user_id, observed_at
-        ) SELECT :id, builder_id, id,
-            CASE WHEN :wrong_operation THEN gen_random_uuid() ELSE operation_id END,
-            'provider_flip', :provider,
-            CASE WHEN :use_target THEN target_external_subscription_id
-                 ELSE :external_reference END,
-            :status,
-            CASE WHEN :valid_digest THEN encode(sha256(convert_to(jsonb_build_object(
-              'migration_id', id, 'builder_id', builder_id,
-              'subscription_id', subscription_id, 'operation_id', operation_id,
-              'source_roster_revision', source_roster_revision,
-              'target_provider', target_provider,
-              'target_external_subscription_id', target_external_subscription_id,
-              'target_catalog_version_id', target_catalog_version_id,
-              'target_offer_id', target_offer_id, 'target_plan', target_plan,
-              'target_billing_cycle', target_billing_cycle,
-              'target_coupon_code', target_coupon_code,
-              'target_amount_cents', target_amount_cents,
-              'target_snapshot', target_snapshot)::text,'UTF8')),'hex')
-            ELSE repeat('f', 64) END,
-            :actor, now()
-        FROM billing_migrations WHERE id = :migration_id
-    """)
-    malformed = (
-        {
-            "provider": None,
-            "use_target": True,
-            "external_reference": None,
-            "status": "verified",
-            "wrong_operation": False,
-            "valid_digest": True,
-        },
-        {
-            "provider": "abacatepay",
-            "use_target": True,
-            "external_reference": None,
-            "status": "verified",
-            "wrong_operation": False,
-            "valid_digest": True,
-        },
-        {
-            "provider": "asaas",
-            "use_target": False,
-            "external_reference": "wrong",
-            "status": "verified",
-            "wrong_operation": False,
-            "valid_digest": True,
-        },
-        {
-            "provider": "asaas",
-            "use_target": True,
-            "external_reference": None,
-            "status": "failed",
-            "wrong_operation": False,
-            "valid_digest": True,
-        },
-        {
-            "provider": "asaas",
-            "use_target": True,
-            "external_reference": None,
-            "status": "verified",
-            "wrong_operation": True,
-            "valid_digest": True,
-        },
-        {
-            "provider": "asaas",
-            "use_target": True,
-            "external_reference": None,
-            "status": "verified",
-            "wrong_operation": False,
-            "valid_digest": False,
-        },
+    refusals = (
+        # The retired saga's entry point: AbacatePay -> pending cancellation.
+        (
+            annual_id,
+            "SET provider = NULL, is_active = false, "
+            "status = 'legacy_cancel_pending'",
+            "legacy subscription snapshot is immutable",
+            "23000",
+        ),
+        (
+            annual_id,
+            "SET plan = 'forbidden-mutation'",
+            "legacy subscription snapshot is immutable",
+            "23000",
+        ),
+        # Cancellation the saga used to confirm from a receipt (035: P0001).
+        (
+            legacy_id,
+            "SET status = 'legacy_cancelled'",
+            "legacy cancellation cannot be self-asserted",
+            "P0001",
+        ),
+        # The provider flip onto the exact ASAAS target the saga approved.
+        (
+            legacy_id,
+            "SET provider = 'asaas', external_subscription_id = 'asaas-target', "
+            "plan = 'plus', billing_cycle = 'monthly', "
+            "catalog_version_id = 'payment-2026-10-03', "
+            "offer_id = 'plan_plus_monthly_v1', amount_cents = 99900, "
+            "status = 'inactive'",
+            "legacy subscription snapshot is immutable",
+            "23000",
+        ),
     )
+    for row_id, assignment, message, sqlstate in refusals:
+        async with postgres_harness.session() as session:
+            with pytest.raises(DBAPIError, match=re.escape(message)) as info:
+                async with session.begin():
+                    await session.execute(
+                        text(
+                            f"UPDATE billing_subscriptions {assignment} WHERE id = :id"
+                        ),
+                        {"id": row_id},
+                    )
+        assert _sqlstate(info.value) == sqlstate, assignment
     async with postgres_harness.session() as session:
-        async with session.begin():
-            for values in malformed:
-                with pytest.raises(DBAPIError):
-                    async with session.begin_nested():
-                        await session.execute(
-                            malformed_insert,
-                            {
-                                "id": uuid4(),
-                                "migration_id": migration_id,
-                                "actor": uuid4(),
-                                **values,
-                            },
-                        )
-            count = await session.scalar(
-                text("""
-                    SELECT count(*) FROM billing_migration_receipts
-                    WHERE migration_id = :migration_id
-                      AND receipt_kind = 'provider_flip'
-                """),
-                {"migration_id": migration_id},
-            )
-            assert count == 0
-
-    async with postgres_harness.session() as session:
-        with pytest.raises(
-            DBAPIError, match="provider flip receipt requires migrated saga at commit"
-        ):
-            async with session.begin():
-                await _insert_provider_flip_receipt(session, migration_id)
-
-    async with postgres_harness.session() as session:
-        async with session.begin():
-            await _insert_provider_flip_receipt(session, migration_id)
+        rows = (
             await session.execute(
                 text("""
-                    UPDATE billing_subscriptions
-                    SET provider='asaas', external_subscription_id=:target,
-                        plan='plus', billing_cycle='monthly',
-                        catalog_version_id='payment-2026-10-03',
-                        offer_id='plan_plus_monthly_v1', amount_cents=99900,
-                        status='inactive', roster_revision=:revision
-                    WHERE id=:id
+                    SELECT id, provider, status, plan FROM billing_subscriptions
+                    WHERE id IN (:annual, :legacy)
                 """),
-                {"id": subscription_id, "target": target, "revision": revision + 1},
+                {"annual": annual_id, "legacy": legacy_id},
             )
-
-
-async def test_provider_receipt_and_target_updates_are_serialized(
-    postgres_harness: _Harness,
-) -> None:
-    digest_query = text("""
-        SELECT encode(sha256(convert_to(jsonb_build_object(
-          'migration_id', id, 'builder_id', builder_id,
-          'subscription_id', subscription_id, 'operation_id', operation_id,
-          'source_roster_revision', source_roster_revision,
-          'target_provider', target_provider,
-          'target_external_subscription_id', target_external_subscription_id,
-          'target_catalog_version_id', target_catalog_version_id,
-          'target_offer_id', target_offer_id, 'target_plan', target_plan,
-          'target_billing_cycle', target_billing_cycle,
-          'target_coupon_code', target_coupon_code,
-          'target_amount_cents', target_amount_cents,
-          'target_snapshot', target_snapshot)::text,'UTF8')),'hex')
-        FROM billing_migrations WHERE id = :migration_id
-    """)
-    insert_receipt = text("""
-        INSERT INTO billing_migration_receipts (
-            id, builder_id, migration_id, operation_id, receipt_kind,
-            provider, external_reference, provider_event_id,
-            provider_authority, provider_key_id, provider_operation,
-            provider_signature, provider_observed_at,
-            provider_expires_at, provider_snapshot_digest,
-            provider_evidence_digest, status, content_sha256,
-            actor_user_id, observed_at
-        ) SELECT :id, builder_id, id, operation_id, 'provider_flip',
-            'asaas', target_external_subscription_id, CAST(:event_id AS TEXT),
-            'asaas.api.v3', 'fixture-v1', 'subscription.migration.provider_flip',
-            repeat('a', 128),
-            now(), now() + interval '15 minutes', CAST(:digest AS TEXT),
-            billing_provider_evidence_digest(
-                'asaas.api.v3', CAST(:event_id AS TEXT),
-                now() + interval '15 minutes', target_external_subscription_id,
-                id, now(), 'subscription.migration.provider_flip', operation_id,
-                'asaas', CAST(:digest AS TEXT)), 'verified', CAST(:digest AS TEXT),
-            :actor, now()
-        FROM billing_migrations WHERE id = :migration_id
-    """)
-
-    async with postgres_harness.session() as setup:
-        async with setup.begin():
-            await setup.execute(text("""
-                UPDATE billing_roster_control SET billing_roster_revision = 1
-                WHERE singleton = true AND billing_roster_revision = 0
-            """))
-            revision = await setup.scalar(
-                text("SELECT billing_roster_revision FROM billing_roster_control")
-            )
-            assert revision is not None
-            _, stale_migration_id, _ = await _seed_bound_legacy_flip(
-                setup,
-                builder_id=postgres_harness.builder_id,
-                source_revision=revision,
-                include_provider_receipt=False,
-            )
-            stale_digest = await setup.scalar(
-                digest_query, {"migration_id": stale_migration_id}
-            )
-
-    updater = postgres_harness.session()
-    receiver = postgres_harness.session()
-    await updater.begin()
-    await receiver.begin()
-    try:
-        await updater.execute(
-            text("""
-                UPDATE billing_migrations
-                SET target_plan = 'premium',
-                    target_snapshot = jsonb_set(
-                        target_snapshot, '{plan}', '"premium"'::jsonb)
-                WHERE id = :migration_id
-            """),
-            {"migration_id": stale_migration_id},
-        )
-
-        async def insert_stale_receipt() -> None:
-            await receiver.execute(
-                insert_receipt,
-                {
-                    "id": uuid4(),
-                    "migration_id": stale_migration_id,
-                    "digest": stale_digest,
-                    "event_id": f"evt-stale-{uuid4()}",
-                    "actor": uuid4(),
-                },
-            )
-
-        contender = asyncio.create_task(insert_stale_receipt())
-        done, _ = await asyncio.wait({contender}, timeout=0.15)
-        assert not done
-        await updater.commit()
-        with pytest.raises(DBAPIError):
-            await contender
-        await receiver.rollback()
-    finally:
-        if updater.in_transaction():
-            await updater.rollback()
-        if receiver.in_transaction():
-            await receiver.rollback()
-        await updater.close()
-        await receiver.close()
-
-    async with postgres_harness.session() as setup:
-        async with setup.begin():
-            bound_subscription_id, bound_migration_id, bound_target = (
-                await _seed_bound_legacy_flip(
-                    setup,
-                    builder_id=postgres_harness.builder_id,
-                    source_revision=revision,
-                    include_provider_receipt=False,
-                )
-            )
-            bound_digest = await setup.scalar(
-                digest_query, {"migration_id": bound_migration_id}
-            )
-
-    receipt_owner = postgres_harness.session()
-    target_writer = postgres_harness.session()
-    await receipt_owner.begin()
-    await target_writer.begin()
-    try:
-        await receipt_owner.execute(
-            insert_receipt,
-            {
-                "id": uuid4(),
-                "migration_id": bound_migration_id,
-                "digest": bound_digest,
-                "event_id": f"evt-bound-{uuid4()}",
-                "actor": uuid4(),
-            },
-        )
-        await receipt_owner.execute(
-            text("""
-                UPDATE billing_subscriptions
-                SET provider = 'asaas', external_subscription_id = :target,
-                    plan = 'plus', billing_cycle = 'monthly', coupon_code = NULL,
-                    catalog_version_id = 'payment-2026-10-03',
-                    offer_id = 'plan_plus_monthly_v1', amount_cents = 99900,
-                    status = 'inactive', roster_revision = :revision
-                WHERE id = :subscription_id
-            """),
-            {
-                "subscription_id": bound_subscription_id,
-                "target": bound_target,
-                "revision": revision + 1,
-            },
-        )
-
-        async def mutate_bound_target() -> None:
-            await target_writer.execute(
-                text("""
-                    UPDATE billing_migrations
-                    SET target_plan = 'premium',
-                        target_snapshot = jsonb_set(
-                            target_snapshot, '{plan}', '"premium"'::jsonb)
-                    WHERE id = :migration_id
-                """),
-                {"migration_id": bound_migration_id},
-            )
-
-        contender = asyncio.create_task(mutate_bound_target())
-        done, _ = await asyncio.wait({contender}, timeout=0.15)
-        assert not done
-        await receipt_owner.commit()
-        with pytest.raises(
-            DBAPIError, match="receipt-bound migration target is immutable"
-        ):
-            await contender
-    finally:
-        if receipt_owner.in_transaction():
-            await receipt_owner.rollback()
-        if target_writer.in_transaction():
-            await target_writer.rollback()
-        await receipt_owner.close()
-        await target_writer.close()
-
-
-_GLOBAL_ROSTER_FENCE_KEY = 3486705124568449331
-_DEADLOCK_DETECTED_SQLSTATE = "40P01"
+        ).all()
+    assert sorted(tuple(row) for row in rows) == sorted(
+        [
+            (annual_id, "abacatepay", "active", "start"),
+            (legacy_id, None, "legacy_cancel_pending", "start"),
+        ]
+    )
 
 
 def _sqlstate(error: DBAPIError) -> str | None:
@@ -2027,342 +944,15 @@ def _sqlstate(error: DBAPIError) -> str | None:
     return None
 
 
-async def _wait_for_global_fence_waiters(
-    engine: AsyncEngine,
-    holder_pid: int,
-    waiter_pids: set[int],
-    *,
-    timeout: float = 15.0,
-) -> None:
-    """Return once every waiter is observably queued on the global roster fence."""
-
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    fence = {
-        "high": _GLOBAL_ROSTER_FENCE_KEY >> 32,
-        "low": _GLOBAL_ROSTER_FENCE_KEY & 0xFFFFFFFF,
-        "holder": holder_pid,
-        "waiters": sorted(waiter_pids),
-    }
-    blocked: set[int] = set()
-    holder_granted = False
-    async with engine.connect() as monitor:
-        while True:
-            rows = (
-                await monitor.execute(
-                    text("""
-                        SELECT lock.pid, lock.granted
-                        FROM pg_locks AS lock
-                        LEFT JOIN pg_stat_activity AS activity
-                          ON activity.pid = lock.pid
-                        WHERE lock.locktype = 'advisory'
-                          AND lock.classid::bigint = :high
-                          AND lock.objid::bigint = :low
-                          AND lock.objsubid = 1
-                          AND (
-                            (lock.pid = :holder AND lock.granted)
-                            OR (
-                              lock.pid = ANY(:waiters)
-                              AND NOT lock.granted
-                              AND activity.wait_event_type = 'Lock'
-                              AND activity.wait_event = 'advisory'
-                            )
-                          )
-                    """),
-                    fence,
-                )
-            ).all()
-            await monitor.rollback()
-            holder_granted = any(pid == holder_pid for pid, _ in rows)
-            blocked = {pid for pid, granted in rows if not granted}
-            if holder_granted and blocked == waiter_pids:
-                return
-            if loop.time() >= deadline:
-                observed = (
-                    await monitor.execute(
-                        text("""
-                            SELECT activity.pid, activity.state,
-                                   activity.wait_event_type, activity.wait_event,
-                                   lock.locktype, lock.classid, lock.objid,
-                                   lock.granted
-                            FROM pg_stat_activity AS activity
-                            LEFT JOIN pg_locks AS lock
-                              ON lock.pid = activity.pid
-                             AND lock.locktype = 'advisory'
-                            WHERE activity.pid = ANY(:pids)
-                        """),
-                        {"pids": [holder_pid, *sorted(waiter_pids)]},
-                    )
-                ).all()
-                raise AssertionError(
-                    "global roster fence waiters were not observed within "
-                    f"{timeout}s: holder_granted={holder_granted}, "
-                    f"blocked={sorted(blocked)}, expected={sorted(waiter_pids)}, "
-                    f"observed={[tuple(row) for row in observed]}"
-                )
-            await asyncio.sleep(0.02)
-
-
-async def test_three_transaction_target_receipt_flip_order_has_no_deadlock(
-    postgres_harness: _Harness,
-) -> None:
-    async with postgres_harness.session() as setup:
-        async with setup.begin():
-            await setup.execute(text("""
-                UPDATE billing_roster_control SET billing_roster_revision = 1
-                WHERE singleton = true AND billing_roster_revision = 0
-            """))
-            revision = await setup.scalar(
-                text("SELECT billing_roster_revision FROM billing_roster_control")
-            )
-            assert revision is not None
-            flip_first_subscription_id, flip_first_migration_id, flip_first_target = (
-                await _seed_bound_legacy_flip(
-                    setup,
-                    builder_id=postgres_harness.builder_id,
-                    source_revision=revision,
-                    include_provider_receipt=False,
-                )
-            )
-            subscription_id, migration_id, target = await _seed_bound_legacy_flip(
-                setup,
-                builder_id=postgres_harness.builder_id,
-                source_revision=revision,
-                include_provider_receipt=False,
-            )
-
-    update_target = text("""
-        UPDATE billing_migrations
-        SET target_plan = 'premium',
-            target_snapshot = jsonb_set(
-                target_snapshot, '{plan}', '"premium"'::jsonb)
-        WHERE id = :migration_id
-    """)
-    flip = text("""
-        UPDATE billing_subscriptions
-        SET provider='asaas', external_subscription_id=:target,
-            plan='premium', billing_cycle='monthly',
-            catalog_version_id='payment-2026-10-03',
-            offer_id='plan_plus_monthly_v1', amount_cents=99900,
-            status='inactive', roster_revision=:revision
-        WHERE id=:id
-    """)
-    expected_failures = {
-        "receipt": "provider evidence envelope is invalid",
-        "flip": "ASAAS provider flip requires exact bound target",
-    }
-
-    def assert_fail_closed(name: str, task: asyncio.Task[Any]) -> None:
-        assert not task.cancelled(), f"{name} waiter was cancelled"
-        error = task.exception()
-        assert error is not None, f"{name} waiter must fail closed but succeeded"
-        assert isinstance(error, DBAPIError), f"{name} waiter raised {error!r}"
-        sqlstate = _sqlstate(error)
-        assert sqlstate is not None, f"{name} waiter error has no SQLSTATE"
-        assert (
-            sqlstate != _DEADLOCK_DETECTED_SQLSTATE
-        ), f"{name} waiter hit deadlock_detected: {error}"
-        assert expected_failures[name] in str(error), f"{name} waiter: {error}"
-
-    async def race(
-        first: str,
-        *,
-        race_subscription_id: UUID,
-        race_migration_id: UUID,
-        race_target: str,
-    ) -> None:
-        """Queue both sibling waiters behind the target writer in a fixed order.
-
-        PostgreSQL grants the exclusive advisory fence to queued waiters in
-        arrival order, so ``first`` selects which waiter resumes first after
-        the target writer commits. The assertions do not depend on that
-        order: whichever waiter finishes first, both must fail closed with
-        their own integrity error and neither may report deadlock_detected.
-        """
-
-        target_writer = postgres_harness.session()
-        receipt_writer = postgres_harness.session()
-        flip_writer = postgres_harness.session()
-        sessions = {"receipt": receipt_writer, "flip": flip_writer}
-        tasks: dict[str, asyncio.Task[Any]] = {}
-        await target_writer.begin()
-        await receipt_writer.begin()
-        await flip_writer.begin()
-        try:
-            pid_query = text("SELECT pg_backend_pid()")
-            target_pid = await target_writer.scalar(pid_query)
-            pids = {
-                "receipt": await receipt_writer.scalar(pid_query),
-                "flip": await flip_writer.scalar(pid_query),
-            }
-            starters = {
-                "receipt": lambda: _insert_provider_flip_receipt(
-                    receipt_writer, race_migration_id
-                ),
-                "flip": lambda: flip_writer.execute(
-                    flip,
-                    {
-                        "id": race_subscription_id,
-                        "target": race_target,
-                        "revision": revision + 1,
-                    },
-                ),
-            }
-            await target_writer.execute(
-                update_target, {"migration_id": race_migration_id}
-            )
-            queue_order = (first, *(name for name in starters if name != first))
-            for name in queue_order:
-                tasks[name] = asyncio.create_task(starters[name]())
-                # Start the next waiter only once this one is observably
-                # queued on the global fence held by the target writer.
-                await _wait_for_global_fence_waiters(
-                    postgres_harness.engine,
-                    target_pid,
-                    {pids[started] for started in tasks},
-                )
-            assert not any(task.done() for task in tasks.values())
-
-            await target_writer.commit()
-            done, _ = await asyncio.wait(
-                tasks.values(), timeout=15, return_when=asyncio.FIRST_COMPLETED
-            )
-            assert done, "no sibling waiter resumed after the target writer commit"
-            # PostgreSQL releases an aborted transaction's locks at the error,
-            # so the second waiter may already have finished too. Either
-            # completion order is valid; every finished waiter must fail closed.
-            for name in queue_order:
-                if tasks[name] in done:
-                    assert_fail_closed(name, tasks[name])
-                    await sessions[name].rollback()
-            for name in queue_order:
-                if tasks[name] not in done:
-                    finished, _ = await asyncio.wait({tasks[name]}, timeout=15)
-                    assert finished, f"{name} waiter never resumed"
-                    assert_fail_closed(name, tasks[name])
-                    await sessions[name].rollback()
-        finally:
-            for task in tasks.values():
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks.values(), return_exceptions=True)
-            for session in (target_writer, receipt_writer, flip_writer):
-                if session.in_transaction():
-                    await session.rollback()
-                await session.close()
-
-        async with postgres_harness.session() as verify_race:
-            leftover = (
-                await verify_race.execute(
-                    text("""
-                        SELECT subscription.provider, migration.state,
-                               (SELECT count(*) FROM billing_migration_receipts r
-                                WHERE r.migration_id = migration.id
-                                  AND r.receipt_kind = 'provider_flip')
-                        FROM billing_migrations migration
-                        JOIN billing_subscriptions subscription
-                          ON subscription.id = migration.subscription_id
-                        WHERE migration.id = :migration_id
-                    """),
-                    {"migration_id": race_migration_id},
-                )
-            ).one()
-            assert tuple(leftover) == (None, "legacy_cancelled", 0)
-
-    # Flip waiter queued first, then receipt waiter queued first.
-    await race(
-        "flip",
-        race_subscription_id=flip_first_subscription_id,
-        race_migration_id=flip_first_migration_id,
-        race_target=flip_first_target,
-    )
-    await race(
-        "receipt",
-        race_subscription_id=subscription_id,
-        race_migration_id=migration_id,
-        race_target=target,
-    )
-
-    async with postgres_harness.session() as recovery:
-        async with recovery.begin():
-            await _insert_provider_flip_receipt(recovery, migration_id)
-            await recovery.execute(
-                flip,
-                {"id": subscription_id, "target": target, "revision": revision + 1},
-            )
-    async with postgres_harness.session() as verify:
-        row = (
-            await verify.execute(
-                text("""
-                    SELECT migration.state, subscription.provider,
-                           subscription.plan, subscription.roster_revision,
-                           roster.billing_roster_revision
-                    FROM billing_migrations migration
-                    JOIN billing_subscriptions subscription
-                      ON subscription.id = migration.subscription_id
-                    CROSS JOIN billing_roster_control roster
-                    WHERE migration.id = :migration_id
-                """),
-                {"migration_id": migration_id},
-            )
-        ).one()
-        assert tuple(row) == (
-            "migrated",
-            "asaas",
-            "premium",
-            revision + 1,
-            revision + 1,
-        )
-
-
 async def test_concurrent_uniques_cover_intent_delivery_projection_effect_receipt_outbox(
     postgres_harness: _Harness,
 ) -> None:
     builder_id = postgres_harness.builder_id
-    subscription_id = uuid4()
-    migration_id = uuid4()
     topup_order_id = uuid4()
     projection_id = uuid4()
     projection_payment_id = f"pay-{projection_id}"
     delivery_id = uuid4()
     async with postgres_harness.engine.begin() as connection:
-        await connection.execute(
-            text("""
-                INSERT INTO billing_subscriptions (
-                    id, builder_id, provider, external_subscription_id,
-                    is_active, plan, billing_cycle, status, roster_revision
-                ) VALUES (
-                    :id, :builder_id, 'abacatepay', :external_id,
-                    true, 'start', 'monthly', 'active', 1
-                )
-            """),
-            {
-                "id": subscription_id,
-                "builder_id": builder_id,
-                "external_id": f"sub-{subscription_id}",
-            },
-        )
-        await connection.execute(
-            text("""
-                INSERT INTO billing_migrations (
-                    id, builder_id, subscription_id, renewal_date,
-                    open_by_date, cutover_by_date, target_catalog_version_id,
-                    target_offer_id, target_plan, target_amount_cents,
-                    target_snapshot, source_roster_revision
-                ) VALUES (
-                    :id, :builder_id, :subscription_id, DATE '2026-12-10',
-                    DATE '2026-12-03', DATE '2026-12-08', 'catalog-v1',
-                    'plan_plus_monthly_v1', 'plus', 99900,
-                    CAST(:target_snapshot AS JSONB), 1
-                )
-            """),
-            {
-                "id": migration_id,
-                "builder_id": builder_id,
-                "subscription_id": subscription_id,
-                "target_snapshot": _MIGRATION_SNAPSHOT_JSON,
-            },
-        )
         await connection.execute(
             text("""
                 INSERT INTO billing_topup_orders (
@@ -2414,13 +1004,13 @@ async def test_concurrent_uniques_cover_intent_delivery_projection_effect_receip
             },
         )
 
-    intent_id = migration_id
+    intent_id = uuid4()
     session_statement = """
         INSERT INTO billing_checkout_sessions (
-            id, builder_id, intent_kind, intent_id, migration_id, attempt_no,
+            id, builder_id, intent_kind, intent_id, attempt_no,
             catalog_version_id, offer_id, amount_cents, pricing_snapshot
         ) VALUES (
-            :id, :builder_id, 'subscription', :intent_id, :migration_id,
+            :id, :builder_id, 'subscription', :intent_id,
             :attempt_no, 'catalog-v1', 'plan_plus_monthly_v1', 99900,
             '{"catalog_version_id":"catalog-v1"}'::jsonb
         )
@@ -2432,14 +1022,12 @@ async def test_concurrent_uniques_cover_intent_delivery_projection_effect_receip
             "id": uuid4(),
             "builder_id": builder_id,
             "intent_id": intent_id,
-            "migration_id": migration_id,
             "attempt_no": 1,
         },
         {
             "id": uuid4(),
             "builder_id": builder_id,
             "intent_id": intent_id,
-            "migration_id": migration_id,
             "attempt_no": 2,
         },
     )
@@ -2505,28 +1093,6 @@ async def test_concurrent_uniques_cover_intent_delivery_projection_effect_receip
         ),
         (
             """
-            INSERT INTO billing_migration_receipts (
-                id, builder_id, migration_id, operation_id, receipt_kind,
-                provider, external_reference, status, content_sha256,
-                actor_user_id, observed_at
-            ) VALUES (
-                :id, :builder_id, :migration_id, :natural_id,
-                'roster_import', 'abacatepay', 'opaque-ref', 'observed',
-                :sha, :actor, now()
-            )
-            """,
-            {
-                "id": uuid4(),
-                "builder_id": builder_id,
-                "migration_id": migration_id,
-                "natural_id": uuid4(),
-                "sha": "c" * 64,
-                "actor": uuid4(),
-            },
-            {},
-        ),
-        (
-            """
             INSERT INTO billing_outbox (
                 id, builder_id, schema_version, event_type, aggregate_kind,
                 aggregate_id, topup_order_id, financial_revision,
@@ -2558,7 +1124,7 @@ async def test_concurrent_uniques_cover_intent_delivery_projection_effect_receip
         )
 
 
-async def test_rollout_and_roster_locks_serialize_stale_writers(
+async def test_rollout_locks_serialize_stale_writers(
     postgres_harness: _Harness,
 ) -> None:
     async with postgres_harness.session() as session:
@@ -2713,100 +1279,6 @@ async def test_rollout_and_roster_locks_serialize_stale_writers(
                     WHERE environment = 'development'
                 """))).one()
         assert tuple(row) == ("general", 2, False, 0)
-
-    async with postgres_harness.session() as setup:
-        async with setup.begin():
-            await setup.execute(text("""
-                UPDATE billing_roster_control SET billing_roster_revision = 1
-                WHERE singleton = true AND billing_roster_revision = 0
-            """))
-            current_roster_revision = await setup.scalar(
-                text("SELECT billing_roster_revision FROM billing_roster_control")
-            )
-            assert current_roster_revision is not None
-            rebase_id, migration_id, _ = await _seed_bound_legacy_flip(
-                setup,
-                builder_id=postgres_harness.builder_id,
-                source_revision=current_roster_revision,
-                include_provider_receipt=False,
-            )
-            advance_id, advance_migration_id, advance_target = (
-                await _seed_bound_legacy_flip(
-                    setup,
-                    builder_id=postgres_harness.builder_id,
-                    source_revision=current_roster_revision,
-                    include_provider_receipt=False,
-                )
-            )
-            await _insert_provider_flip_receipt(setup, advance_migration_id)
-            await setup.execute(
-                text("""
-                    UPDATE billing_subscriptions
-                    SET provider='asaas', external_subscription_id=:target,
-                        plan='plus', billing_cycle='monthly',
-                        catalog_version_id='payment-2026-10-03',
-                        offer_id='plan_plus_monthly_v1', amount_cents=99900,
-                        status='inactive', roster_revision=:revision
-                    WHERE id=:id
-                """),
-                {
-                    "id": advance_id,
-                    "target": advance_target,
-                    "revision": current_roster_revision + 1,
-                },
-            )
-
-    # Two legacy rebases of the same saga serialize on the global roster
-    # fence; the late one finds its expected source revision gone.
-    roster_one = postgres_harness.session()
-    roster_two = postgres_harness.session()
-    await roster_one.begin()
-    await roster_two.begin()
-    try:
-        revision = await _raw_legacy_rebase(
-            roster_one,
-            subscription_id=rebase_id,
-            expected_source_revision=current_roster_revision,
-        )
-        assert revision == current_roster_revision + 1
-        contender = asyncio.create_task(
-            _raw_legacy_rebase(
-                roster_two,
-                subscription_id=rebase_id,
-                expected_source_revision=current_roster_revision,
-            )
-        )
-        done, _ = await asyncio.wait({contender}, timeout=0.15)
-        assert not done
-        await roster_one.commit()
-        assert await contender is None
-        await roster_two.rollback()
-    finally:
-        if roster_one.in_transaction():
-            await roster_one.rollback()
-        if roster_two.in_transaction():
-            await roster_two.rollback()
-        await roster_one.close()
-        await roster_two.close()
-    async with postgres_harness.session() as session:
-        assert (
-            tuple(
-                (
-                    await session.execute(
-                        text("""
-                        SELECT subscription.roster_revision,
-                               migration.source_roster_revision
-                        FROM billing_migrations migration
-                        JOIN billing_subscriptions subscription
-                          ON subscription.id = migration.subscription_id
-                        WHERE migration.id = :id
-                    """),
-                        {"id": migration_id},
-                    )
-                ).one()
-            )
-            == (current_roster_revision + 1, current_roster_revision + 1)
-        )
 
 
 async def test_topup_gate_requires_valid_capability_and_general_preserves_it(
@@ -3052,11 +1524,11 @@ async def test_topup_authorization_reserves_budget_atomically_and_disable_wins(
                     INSERT INTO billing_subscriptions (
                         id, builder_id, provider, external_subscription_id,
                         is_active, plan, billing_cycle, catalog_version_id,
-                        offer_id, amount_cents, status, roster_revision
+                        offer_id, amount_cents, status
                     ) VALUES (
                         :id, :builder_id, 'asaas', :external_id, true, 'plus',
                         'monthly', 'payment-2026-10-03',
-                        'plan_plus_monthly_v1', 99900, 'active', 1
+                        'plan_plus_monthly_v1', 99900, 'active'
                     )
                 """),
                 {
@@ -3070,11 +1542,11 @@ async def test_topup_authorization_reserves_budget_atomically_and_disable_wins(
                     INSERT INTO billing_subscriptions (
                         id, builder_id, provider, external_subscription_id,
                         is_active, plan, billing_cycle, catalog_version_id,
-                        offer_id, amount_cents, status, roster_revision
+                        offer_id, amount_cents, status
                     ) VALUES (
                         :id, :builder_id, 'asaas', :external_id, true, 'plus',
                         'monthly', 'payment-2026-10-03',
-                        'plan_plus_monthly_v1', 99900, 'active', 1
+                        'plan_plus_monthly_v1', 99900, 'active'
                     )
                 """),
                 {
@@ -4019,10 +2491,10 @@ async def test_cross_builder_correlations_and_snapshot_pii_are_rejected(
             text("""
                 INSERT INTO billing_subscriptions (
                     id, builder_id, provider, external_subscription_id,
-                    is_active, plan, billing_cycle, status, roster_revision
+                    is_active, plan, billing_cycle, status
                 ) VALUES (
                     :id, :builder_id, 'abacatepay', :external_id,
-                    true, 'start', 'monthly', 'active', 1
+                    true, 'start', 'monthly', 'active'
                 )
             """),
             {
@@ -4035,10 +2507,10 @@ async def test_cross_builder_correlations_and_snapshot_pii_are_rejected(
             text("""
                 INSERT INTO billing_subscriptions (
                     id, builder_id, provider, external_subscription_id,
-                    is_active, plan, billing_cycle, status, roster_revision
+                    is_active, plan, billing_cycle, status
                 ) VALUES (
                     :id, :builder_id, 'asaas', :external_id,
-                    true, 'plus', 'monthly', 'active', 1
+                    true, 'plus', 'monthly', 'active'
                 )
             """),
             {
@@ -4190,24 +2662,20 @@ async def test_migration_snapshot_requires_exact_coherent_shape(
     subscription_id = uuid4()
     async with postgres_harness.session() as session:
         async with session.begin():
-            revision = await session.scalar(
-                text("SELECT billing_roster_revision FROM billing_roster_control")
-            )
             await session.execute(
                 text("""
                     INSERT INTO billing_subscriptions (
                         id, builder_id, provider, external_subscription_id,
-                        is_active, plan, billing_cycle, status, roster_revision
+                        is_active, plan, billing_cycle, status
                     ) VALUES (
                         :id, :builder_id, NULL, :external_id,
-                        false, 'start', 'monthly', 'provider_unknown', :revision
+                        false, 'start', 'monthly', 'provider_unknown'
                     )
                 """),
                 {
                     "id": subscription_id,
                     "builder_id": postgres_harness.builder_id,
                     "external_id": f"snapshot-{subscription_id}",
-                    "revision": revision,
                 },
             )
 
@@ -4229,11 +2697,15 @@ async def test_migration_snapshot_requires_exact_coherent_shape(
                     :id, :builder_id, :subscription_id, DATE '2026-12-10',
                     DATE '2026-12-03', DATE '2026-12-08', 'catalog-v1',
                     'plan_plus_monthly_v1', 'plus', 'monthly', 99900,
-                    CAST(:snapshot AS jsonb), :revision
+                    CAST(:snapshot AS jsonb), 1
                 )
             """)
             for snapshot in invalid_snapshots:
-                with pytest.raises(DBAPIError):
+                # Pinned: a literal source revision (CHECK > 0), so only the
+                # snapshot allowlist can refuse these rows.
+                with pytest.raises(
+                    DBAPIError, match="ck_billing_migrations_snapshot_allowlist"
+                ):
                     async with session.begin_nested():
                         await session.execute(
                             statement,
@@ -4242,7 +2714,6 @@ async def test_migration_snapshot_requires_exact_coherent_shape(
                                 "builder_id": postgres_harness.builder_id,
                                 "subscription_id": subscription_id,
                                 "snapshot": json.dumps(snapshot),
-                                "revision": revision,
                             },
                         )
 
@@ -4250,65 +2721,26 @@ async def test_migration_snapshot_requires_exact_coherent_shape(
 async def test_receipts_and_outbox_reject_update_and_delete(
     postgres_harness: _Harness,
 ) -> None:
+    # The billing_migration_receipts case left with migration 036: its
+    # validator reads billing_subscriptions.roster_revision, so the legacy
+    # table (empty by 036's preflight, dropped by 037) accepts no row.
     subscription_id = uuid4()
-    migration_id = uuid4()
-    receipt_id = uuid4()
     outbox_id = uuid4()
     async with postgres_harness.engine.begin() as connection:
         await connection.execute(
             text("""
                 INSERT INTO billing_subscriptions (
                     id, builder_id, provider, external_subscription_id,
-                    is_active, plan, billing_cycle, status, roster_revision
+                    is_active, plan, billing_cycle, status
                 ) VALUES (
                     :id, :builder_id, 'abacatepay', :external_id,
-                    true, 'start', 'monthly', 'active', 1
+                    true, 'start', 'monthly', 'active'
                 )
             """),
             {
                 "id": subscription_id,
                 "builder_id": postgres_harness.builder_id,
                 "external_id": f"immutable-{subscription_id}",
-            },
-        )
-        await connection.execute(
-            text("""
-                INSERT INTO billing_migrations (
-                    id, builder_id, subscription_id, renewal_date,
-                    open_by_date, cutover_by_date, target_catalog_version_id,
-                    target_offer_id, target_plan, target_amount_cents,
-                    target_snapshot, source_roster_revision
-                ) VALUES (
-                    :id, :builder_id, :subscription_id, DATE '2026-12-10',
-                    DATE '2026-12-03', DATE '2026-12-08', 'catalog-v1',
-                    'plan_plus_monthly_v1', 'plus', 99900,
-                    CAST(:target_snapshot AS JSONB), 1
-                )
-            """),
-            {
-                "id": migration_id,
-                "builder_id": postgres_harness.builder_id,
-                "subscription_id": subscription_id,
-                "target_snapshot": _MIGRATION_SNAPSHOT_JSON,
-            },
-        )
-        await connection.execute(
-            text("""
-                INSERT INTO billing_migration_receipts (
-                    id, builder_id, migration_id, operation_id, receipt_kind,
-                    status, content_sha256, actor_user_id, observed_at
-                ) VALUES (
-                    :id, :builder_id, :migration_id, :operation_id,
-                    'provider_delete', 'inconclusive', :sha, :actor, now()
-                )
-            """),
-            {
-                "id": receipt_id,
-                "builder_id": postgres_harness.builder_id,
-                "migration_id": migration_id,
-                "operation_id": uuid4(),
-                "sha": "f" * 64,
-                "actor": uuid4(),
             },
         )
         await connection.execute(
@@ -4332,11 +2764,6 @@ async def test_receipts_and_outbox_reject_update_and_delete(
         )
 
     for statement, row_id in (
-        (
-            "UPDATE billing_migration_receipts SET status = 'failed' WHERE id = :id",
-            receipt_id,
-        ),
-        ("DELETE FROM billing_migration_receipts WHERE id = :id", receipt_id),
         (
             "UPDATE billing_outbox SET payload_sha256 = :sha WHERE id = :id",
             outbox_id,
@@ -4700,11 +3127,11 @@ async def _seed_settled_coupon_checkout(
                     INSERT INTO billing_subscriptions (
                         id, builder_id, provider, external_subscription_id,
                         is_active, plan, billing_cycle, catalog_version_id,
-                        offer_id, amount_cents, status, roster_revision
+                        offer_id, amount_cents, status
                     ) VALUES (
                         :id, :builder_id, 'asaas', :external_id, true, 'plus',
                         'monthly', 'payment-2026-10-03',
-                        'plan_plus_monthly_v1', :amount, 'active', 1
+                        'plan_plus_monthly_v1', :amount, 'active'
                     )
                 """),
                 {

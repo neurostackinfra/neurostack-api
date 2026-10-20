@@ -9,9 +9,22 @@ alembic/
 ├── env.py              # Configuração do ambiente Alembic
 ├── script.py.mako      # Template para novas migrations
 ├── README.md           # Este arquivo
+├── frozen/             # DDL congelada que um downgrade restaura (dados, não migrations)
+│   └── 036_downgrade_restores_035.json
 └── versions/           # Arquivos de migration
     └── *.py
 ```
+
+`frozen/` guarda a DDL extraída do catálogo de um banco recém-criado na
+revisão anterior (`pg_get_functiondef`, `pg_get_triggerdef`,
+`pg_get_constraintdef` e as colunas), para que um downgrade restaure
+exatamente o que a migration removeu, sem DDL digitada à mão. O Alembic não
+lê esse diretório; cada migration lê o seu arquivo e confere o SHA-256 fixado
+nela antes de executar. Para regenerar (somente a partir de um banco novo na
+revisão de origem): `python -m scripts.alembic_frozen_ddl --database-url ...`,
+e atualizar o SHA-256 da migration; o teste de fidelidade
+(`tests/integration/test_migration_036_postgres.py`) compara o arquivo com o
+catálogo de um banco novo byte a byte.
 
 ## Comandos Principais
 
