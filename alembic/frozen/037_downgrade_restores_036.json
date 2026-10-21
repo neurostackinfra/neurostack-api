@@ -1,0 +1,491 @@
+{
+  "comment": "Frozen by scripts/alembic_frozen_ddl.py from a database at revision 036 (pg_get_functiondef, pg_get_constraintdef, pg_get_indexdef, pg_get_triggerdef, the column catalog and the seed row). Migration 037's downgrade executes these statements verbatim, in the order tables, functions, constraints, indexes, rows, triggers; its upgrade derives the allowlist of the objects it may drop from this file. Never edit by hand: regenerate from a fresh 036 database and update the SHA-256 pinned in the migration.",
+  "constraints": [
+    {
+      "name": "billing_roster_control_pkey",
+      "owns_index": true,
+      "statement": "ALTER TABLE public.billing_roster_control ADD CONSTRAINT billing_roster_control_pkey PRIMARY KEY (singleton)",
+      "table": "billing_roster_control"
+    },
+    {
+      "name": "ck_billing_roster_control_revision",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_roster_control ADD CONSTRAINT ck_billing_roster_control_revision CHECK ((billing_roster_revision >= 0))",
+      "table": "billing_roster_control"
+    },
+    {
+      "name": "ck_billing_roster_control_singleton",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_roster_control ADD CONSTRAINT ck_billing_roster_control_singleton CHECK ((singleton = true))",
+      "table": "billing_roster_control"
+    },
+    {
+      "name": "billing_migrations_pkey",
+      "owns_index": true,
+      "statement": "ALTER TABLE public.billing_migrations ADD CONSTRAINT billing_migrations_pkey PRIMARY KEY (id)",
+      "table": "billing_migrations"
+    },
+    {
+      "name": "ck_billing_migrations_attempt_count",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migrations ADD CONSTRAINT ck_billing_migrations_attempt_count CHECK ((attempt_count >= 0))",
+      "table": "billing_migrations"
+    },
+    {
+      "name": "ck_billing_migrations_cutoffs",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migrations ADD CONSTRAINT ck_billing_migrations_cutoffs CHECK (((open_by_date <= cutover_by_date) AND (cutover_by_date <= renewal_date)))",
+      "table": "billing_migrations"
+    },
+    {
+      "name": "ck_billing_migrations_roster_revision",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migrations ADD CONSTRAINT ck_billing_migrations_roster_revision CHECK ((source_roster_revision > 0))",
+      "table": "billing_migrations"
+    },
+    {
+      "name": "ck_billing_migrations_snapshot_allowlist",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migrations ADD CONSTRAINT ck_billing_migrations_snapshot_allowlist CHECK (billing_migration_snapshot_is_valid(target_snapshot, (target_catalog_version_id)::text, (target_offer_id)::text, (target_plan)::text, (target_billing_cycle)::text, (target_coupon_code)::text, target_amount_cents))",
+      "table": "billing_migrations"
+    },
+    {
+      "name": "ck_billing_migrations_state",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migrations ADD CONSTRAINT ck_billing_migrations_state CHECK (((state)::text = ANY ((ARRAY['pending'::character varying, 'in_progress'::character varying, 'legacy_cancel_pending'::character varying, 'legacy_cancelled'::character varying, 'recreate_pending'::character varying, 'migrated'::character varying, 'manual_intervention'::character varying]::character varying[])::text[])))",
+      "table": "billing_migrations"
+    },
+    {
+      "name": "ck_billing_migrations_target_amount",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migrations ADD CONSTRAINT ck_billing_migrations_target_amount CHECK ((target_amount_cents >= 0))",
+      "table": "billing_migrations"
+    },
+    {
+      "name": "ck_billing_migrations_target_cycle",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migrations ADD CONSTRAINT ck_billing_migrations_target_cycle CHECK (((target_billing_cycle)::text = 'monthly'::text))",
+      "table": "billing_migrations"
+    },
+    {
+      "name": "ck_billing_migrations_target_provider",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migrations ADD CONSTRAINT ck_billing_migrations_target_provider CHECK (((target_provider)::text = 'asaas'::text))",
+      "table": "billing_migrations"
+    },
+    {
+      "name": "uq_billing_migrations_builder_id_id",
+      "owns_index": true,
+      "statement": "ALTER TABLE public.billing_migrations ADD CONSTRAINT uq_billing_migrations_builder_id_id UNIQUE (builder_id, id)",
+      "table": "billing_migrations"
+    },
+    {
+      "name": "uq_billing_migrations_builder_subscription",
+      "owns_index": true,
+      "statement": "ALTER TABLE public.billing_migrations ADD CONSTRAINT uq_billing_migrations_builder_subscription UNIQUE (builder_id, subscription_id)",
+      "table": "billing_migrations"
+    },
+    {
+      "name": "uq_billing_migrations_target_external",
+      "owns_index": true,
+      "statement": "ALTER TABLE public.billing_migrations ADD CONSTRAINT uq_billing_migrations_target_external UNIQUE (target_provider, target_external_subscription_id)",
+      "table": "billing_migrations"
+    },
+    {
+      "name": "billing_migration_receipts_pkey",
+      "owns_index": true,
+      "statement": "ALTER TABLE public.billing_migration_receipts ADD CONSTRAINT billing_migration_receipts_pkey PRIMARY KEY (id)",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "name": "ck_billing_migration_receipts_external_reference",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migration_receipts ADD CONSTRAINT ck_billing_migration_receipts_external_reference CHECK (((external_reference IS NULL) OR ((external_reference)::text ~ '^[A-Za-z0-9._:-]+$'::text)))",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "name": "ck_billing_migration_receipts_kind",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migration_receipts ADD CONSTRAINT ck_billing_migration_receipts_kind CHECK (((receipt_kind)::text = ANY ((ARRAY['roster_import'::character varying, 'cancel_observation'::character varying, 'provider_delete'::character varying, 'recreate_authorized'::character varying, 'provider_flip'::character varying, 'roster_cutover'::character varying, 'roster_disposal'::character varying]::character varying[])::text[])))",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "name": "ck_billing_migration_receipts_provider",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migration_receipts ADD CONSTRAINT ck_billing_migration_receipts_provider CHECK (((provider IS NULL) OR ((provider)::text = ANY ((ARRAY['abacatepay'::character varying, 'asaas'::character varying]::character varying[])::text[]))))",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "name": "ck_billing_migration_receipts_provider_evidence",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migration_receipts ADD CONSTRAINT ck_billing_migration_receipts_provider_evidence CHECK (((provider_event_id IS NULL) OR (((provider_event_id)::text ~ '^[A-Za-z0-9._:-]{1,160}$'::text) AND ((provider_key_id)::text ~ '^[A-Za-z0-9._:-]{1,80}$'::text) AND ((provider_operation)::text = ANY ((ARRAY['subscription.migration.provider_flip'::character varying, 'subscription.migration.absence'::character varying]::character varying[])::text[])) AND ((provider_authority)::text = 'asaas.api.v3'::text) AND ((provider_signature)::text ~ '^[0-9a-f]{128}$'::text) AND ((provider_snapshot_digest)::text ~ '^[0-9a-f]{64}$'::text) AND ((provider_evidence_digest)::text ~ '^[0-9a-f]{64}$'::text))))",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "name": "ck_billing_migration_receipts_provider_expiry",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migration_receipts ADD CONSTRAINT ck_billing_migration_receipts_provider_expiry CHECK (((provider_expires_at IS NULL) OR (provider_observed_at IS NULL) OR (provider_expires_at > provider_observed_at)))",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "name": "ck_billing_migration_receipts_saga_shape",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migration_receipts ADD CONSTRAINT ck_billing_migration_receipts_saga_shape CHECK ((((receipt_kind)::text <> ALL ((ARRAY['cancel_observation'::character varying, 'provider_flip'::character varying, 'recreate_authorized'::character varying]::character varying[])::text[])) OR (((receipt_kind)::text = 'cancel_observation'::text) AND ((provider)::text = 'abacatepay'::text) AND (external_reference IS NOT NULL) AND ((status)::text = 'cancelled'::text)) OR (((receipt_kind)::text = ANY ((ARRAY['provider_flip'::character varying, 'recreate_authorized'::character varying]::character varying[])::text[])) AND ((provider)::text = 'asaas'::text) AND (external_reference IS NOT NULL) AND ((((receipt_kind)::text = 'provider_flip'::text) AND ((status)::text = 'verified'::text)) OR (((receipt_kind)::text = 'recreate_authorized'::text) AND ((status)::text = 'absent'::text))) AND (provider_event_id IS NOT NULL) AND (provider_key_id IS NOT NULL) AND (provider_operation IS NOT NULL) AND ((provider_authority)::text = 'asaas.api.v3'::text) AND (provider_signature IS NOT NULL) AND (provider_observed_at IS NOT NULL) AND (provider_expires_at IS NOT NULL) AND (provider_snapshot_digest IS NOT NULL) AND (provider_evidence_digest IS NOT NULL))))",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "name": "ck_billing_migration_receipts_sha256",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migration_receipts ADD CONSTRAINT ck_billing_migration_receipts_sha256 CHECK (((content_sha256)::text ~ '^[0-9a-f]{64}$'::text))",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "name": "ck_billing_migration_receipts_status",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migration_receipts ADD CONSTRAINT ck_billing_migration_receipts_status CHECK (((status)::text = ANY ((ARRAY['observed'::character varying, 'active'::character varying, 'cancelled'::character varying, 'absent'::character varying, 'verified'::character varying, 'failed'::character varying, 'inconclusive'::character varying, 'consumed'::character varying]::character varying[])::text[])))",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "name": "uq_billing_migration_receipts_operation_kind",
+      "owns_index": true,
+      "statement": "ALTER TABLE public.billing_migration_receipts ADD CONSTRAINT uq_billing_migration_receipts_operation_kind UNIQUE (migration_id, operation_id, receipt_kind)",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "name": "uq_billing_migration_receipts_provider_event",
+      "owns_index": true,
+      "statement": "ALTER TABLE public.billing_migration_receipts ADD CONSTRAINT uq_billing_migration_receipts_provider_event UNIQUE (provider, provider_event_id)",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "name": "billing_migration_absence_reads_pkey",
+      "owns_index": true,
+      "statement": "ALTER TABLE public.billing_migration_absence_reads ADD CONSTRAINT billing_migration_absence_reads_pkey PRIMARY KEY (id)",
+      "table": "billing_migration_absence_reads"
+    },
+    {
+      "name": "ck_billing_migration_absence_reads_evidence",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migration_absence_reads ADD CONSTRAINT ck_billing_migration_absence_reads_evidence CHECK ((((provider_event_id)::text ~ '^[A-Za-z0-9._:-]{1,160}$'::text) AND ((external_reference)::text ~ '^[A-Za-z0-9._:-]{1,160}$'::text) AND ((provider_key_id)::text ~ '^[A-Za-z0-9._:-]{1,80}$'::text) AND ((provider_signature)::text ~ '^[0-9a-f]{128}$'::text) AND ((provider_snapshot_digest)::text ~ '^[0-9a-f]{64}$'::text) AND ((provider_evidence_digest)::text ~ '^[0-9a-f]{64}$'::text)))",
+      "table": "billing_migration_absence_reads"
+    },
+    {
+      "name": "ck_billing_migration_absence_reads_read_no",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migration_absence_reads ADD CONSTRAINT ck_billing_migration_absence_reads_read_no CHECK ((read_no = ANY (ARRAY[1, 2])))",
+      "table": "billing_migration_absence_reads"
+    },
+    {
+      "name": "ck_billing_migration_absence_reads_shape",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migration_absence_reads ADD CONSTRAINT ck_billing_migration_absence_reads_shape CHECK ((((provider)::text = 'asaas'::text) AND ((status)::text = 'absent'::text) AND ((provider_authority)::text = 'asaas.api.v3'::text) AND ((provider_operation)::text = 'subscription.migration.absence'::text)))",
+      "table": "billing_migration_absence_reads"
+    },
+    {
+      "name": "ck_billing_migration_absence_reads_times",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migration_absence_reads ADD CONSTRAINT ck_billing_migration_absence_reads_times CHECK (((provider_expires_at > provider_observed_at) AND (provider_observed_at > convergence_limit_at) AND (provider_observed_at <= observed_at)))",
+      "table": "billing_migration_absence_reads"
+    },
+    {
+      "name": "uq_billing_migration_absence_reads_event",
+      "owns_index": true,
+      "statement": "ALTER TABLE public.billing_migration_absence_reads ADD CONSTRAINT uq_billing_migration_absence_reads_event UNIQUE (provider, provider_event_id)",
+      "table": "billing_migration_absence_reads"
+    },
+    {
+      "name": "uq_billing_migration_absence_reads_slot",
+      "owns_index": true,
+      "statement": "ALTER TABLE public.billing_migration_absence_reads ADD CONSTRAINT uq_billing_migration_absence_reads_slot UNIQUE (migration_id, operation_id, read_no)",
+      "table": "billing_migration_absence_reads"
+    },
+    {
+      "name": "billing_migrations_builder_id_fkey",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migrations ADD CONSTRAINT billing_migrations_builder_id_fkey FOREIGN KEY (builder_id) REFERENCES builders(id) ON DELETE RESTRICT",
+      "table": "billing_migrations"
+    },
+    {
+      "name": "fk_billing_migrations_builder_subscription",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migrations ADD CONSTRAINT fk_billing_migrations_builder_subscription FOREIGN KEY (builder_id, subscription_id) REFERENCES billing_subscriptions(builder_id, id) ON DELETE RESTRICT",
+      "table": "billing_migrations"
+    },
+    {
+      "name": "fk_billing_migration_receipts_builder_migration",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migration_receipts ADD CONSTRAINT fk_billing_migration_receipts_builder_migration FOREIGN KEY (builder_id, migration_id) REFERENCES billing_migrations(builder_id, id) ON DELETE RESTRICT",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "name": "fk_billing_migration_absence_reads_checkout",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migration_absence_reads ADD CONSTRAINT fk_billing_migration_absence_reads_checkout FOREIGN KEY (builder_id, prior_checkout_session_id) REFERENCES billing_checkout_sessions(builder_id, id) ON DELETE RESTRICT",
+      "table": "billing_migration_absence_reads"
+    },
+    {
+      "name": "fk_billing_migration_absence_reads_migration",
+      "owns_index": false,
+      "statement": "ALTER TABLE public.billing_migration_absence_reads ADD CONSTRAINT fk_billing_migration_absence_reads_migration FOREIGN KEY (builder_id, migration_id) REFERENCES billing_migrations(builder_id, id) ON DELETE RESTRICT",
+      "table": "billing_migration_absence_reads"
+    }
+  ],
+  "functions": [
+    {
+      "name": "billing_migration_snapshot_is_valid",
+      "signature": "billing_migration_snapshot_is_valid(jsonb,text,text,text,text,text,bigint)",
+      "statement": "CREATE OR REPLACE FUNCTION public.billing_migration_snapshot_is_valid(value jsonb, catalog_id text, offer_id text, plan_name text, cycle_name text, coupon text, amount bigint)\n RETURNS boolean\n LANGUAGE sql\n IMMUTABLE\nAS $function$\n                SELECT jsonb_typeof(value) = 'object'\n                  AND value ?& ARRAY['catalog_version_id','offer_id','plan',\n                    'billing_cycle','coupon_code','amount_cents','credit_grant_mc',\n                    'included_clinics','additional_clinics','lines']\n                  AND value - ARRAY['catalog_version_id','offer_id','plan',\n                    'billing_cycle','coupon_code','amount_cents','credit_grant_mc',\n                    'included_clinics','additional_clinics','lines'] = '{}'::jsonb\n                  AND billing_snapshot_has_no_pii(value)\n                  AND value ->> 'catalog_version_id' = catalog_id\n                  AND value ->> 'offer_id' = offer_id\n                  AND value ->> 'plan' = plan_name\n                  AND value ->> 'billing_cycle' = cycle_name\n                  AND value ->> 'coupon_code' IS NOT DISTINCT FROM coupon\n                  AND jsonb_typeof(value -> 'coupon_code') IN ('string','null')\n                  AND (value ->> 'amount_cents')::bigint = amount\n                  AND (value ->> 'credit_grant_mc')::bigint >= 0\n                  AND (value ->> 'included_clinics')::bigint >= 0\n                  AND (value ->> 'additional_clinics')::bigint >= 0\n                  AND jsonb_typeof(value -> 'lines') = 'array'\n                  AND jsonb_array_length(value -> 'lines') > 0\n                  AND NOT EXISTS (\n                    SELECT 1 FROM jsonb_array_elements(value -> 'lines') e(line)\n                    WHERE jsonb_typeof(line) <> 'object'\n                       OR NOT line ?& ARRAY['line_id','offer_id','kind','quantity',\n                         'unit_amount_cents','line_amount_cents','credit_grant_mc',\n                         'settled_cents','reversed_cents','restored_cents',\n                         'line_financial_state']\n                       OR line - ARRAY['line_id','offer_id','kind','quantity',\n                         'unit_amount_cents','line_amount_cents','credit_grant_mc',\n                         'settled_cents','reversed_cents','restored_cents',\n                         'line_financial_state'] <> '{}'::jsonb\n                  )\n                  AND (SELECT sum((line ->> 'line_amount_cents')::bigint)\n                       FROM jsonb_array_elements(value -> 'lines') e(line)) = amount\n                  AND (SELECT sum((line ->> 'credit_grant_mc')::bigint)\n                       FROM jsonb_array_elements(value -> 'lines') e(line)) =\n                      (value ->> 'credit_grant_mc')::bigint\n            $function$\n"
+    },
+    {
+      "name": "lock_billing_roster_statement",
+      "signature": "lock_billing_roster_statement()",
+      "statement": "CREATE OR REPLACE FUNCTION public.lock_billing_roster_statement()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n            BEGIN\n                PERFORM pg_advisory_xact_lock(3486705124568449331);\n                PERFORM 1 FROM billing_roster_control\n                WHERE singleton = true FOR UPDATE;\n                IF NOT FOUND THEN\n                    RAISE EXCEPTION 'global billing roster control is unavailable'\n                        USING ERRCODE = 'integrity_constraint_violation';\n                END IF;\n                RETURN NULL;\n            END;\n            $function$\n"
+    },
+    {
+      "name": "validate_billing_migration_receipt",
+      "signature": "validate_billing_migration_receipt()",
+      "statement": "CREATE OR REPLACE FUNCTION public.validate_billing_migration_receipt()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n            DECLARE migration billing_migrations%ROWTYPE;\n                    subscription billing_subscriptions%ROWTYPE;\n                    current_revision BIGINT;\n                    expected_digest TEXT;\n            BEGIN\n                PERFORM pg_advisory_xact_lock(3486705124568449331);\n                SELECT billing_roster_revision INTO current_revision\n                FROM billing_roster_control WHERE singleton = true FOR UPDATE;\n                SELECT * INTO migration FROM billing_migrations\n                WHERE id = NEW.migration_id AND builder_id = NEW.builder_id FOR UPDATE;\n                IF NOT FOUND THEN RAISE EXCEPTION 'migration receipt target missing'; END IF;\n                SELECT * INTO subscription FROM billing_subscriptions\n                WHERE id = migration.subscription_id\n                  AND builder_id = migration.builder_id FOR UPDATE;\n                IF NEW.receipt_kind IN ('provider_flip', 'recreate_authorized')\n                   AND migration.operation_id IS DISTINCT FROM NEW.operation_id THEN\n                    RAISE EXCEPTION 'migration receipt operation mismatch';\n                END IF;\n                IF NEW.receipt_kind = 'cancel_observation' THEN\n                    expected_digest := encode(sha256(convert_to(jsonb_build_object(\n                      'migration_id', migration.id, 'builder_id', migration.builder_id,\n                      'subscription_id', migration.subscription_id,\n                      'operation_id', migration.operation_id,\n                      'legacy_external_subscription_id', subscription.external_subscription_id,\n                      'provider', 'abacatepay', 'status', 'cancelled',\n                      'observed_at', NEW.observed_at)::text,'UTF8')),'hex');\n                    IF migration.state IS DISTINCT FROM 'legacy_cancel_pending'\n                       OR subscription.provider IS NOT NULL\n                       OR subscription.status IS DISTINCT FROM 'legacy_cancel_pending'\n                       OR NEW.provider IS DISTINCT FROM 'abacatepay'\n                       OR NEW.status IS DISTINCT FROM 'cancelled'\n                       OR NEW.external_reference IS DISTINCT FROM subscription.external_subscription_id\n                       OR NEW.observed_at < migration.created_at\n                       OR NEW.observed_at > clock_timestamp()\n                       OR NEW.content_sha256 IS DISTINCT FROM expected_digest THEN\n                        RAISE EXCEPTION 'invalid cancellation observation';\n                    END IF;\n                END IF;\n                IF NEW.receipt_kind IN ('provider_flip', 'recreate_authorized')\n                   AND (\n                       migration.source_roster_revision <> subscription.roster_revision\n                       OR migration.source_roster_revision <> current_revision\n                   )\n                   AND NEW.receipt_kind = 'provider_flip' THEN\n                    RAISE EXCEPTION 'migration receipt source revision is stale';\n                END IF;\n                RETURN NEW;\n            END;\n            $function$\n"
+    },
+    {
+      "name": "validate_billing_migration_receipt_commit",
+      "signature": "validate_billing_migration_receipt_commit()",
+      "statement": "CREATE OR REPLACE FUNCTION public.validate_billing_migration_receipt_commit()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n            DECLARE migration billing_migrations%ROWTYPE;\n                    subscription billing_subscriptions%ROWTYPE;\n                    current_revision BIGINT;\n            BEGIN\n                IF NEW.receipt_kind NOT IN ('cancel_observation', 'provider_flip') THEN\n                    RETURN NULL;\n                END IF;\n                SELECT * INTO migration FROM billing_migrations\n                WHERE id = NEW.migration_id AND builder_id = NEW.builder_id;\n                SELECT * INTO subscription FROM billing_subscriptions\n                WHERE id = migration.subscription_id\n                  AND builder_id = migration.builder_id;\n                SELECT billing_roster_revision INTO current_revision\n                FROM billing_roster_control WHERE singleton = true;\n                IF NEW.receipt_kind = 'cancel_observation' AND (\n                    migration.state NOT IN ('legacy_cancelled', 'migrated')\n                    OR migration.legacy_cancelled_at IS DISTINCT FROM NEW.observed_at\n                    OR (migration.state = 'legacy_cancelled' AND (\n                        subscription.provider IS NOT NULL\n                        OR subscription.status IS DISTINCT FROM 'legacy_cancelled'\n                        OR subscription.roster_revision IS DISTINCT FROM\n                           migration.source_roster_revision\n                    ))\n                    OR (migration.state = 'migrated' AND (\n                        subscription.provider IS DISTINCT FROM 'asaas'\n                        OR subscription.roster_revision IS DISTINCT FROM\n                           migration.source_roster_revision + 1\n                    ))\n                ) THEN\n                    RAISE EXCEPTION 'cancellation receipt requires converged saga at commit'\n                        USING ERRCODE = 'integrity_constraint_violation';\n                ELSIF NEW.receipt_kind = 'provider_flip' AND (\n                    migration.state IS DISTINCT FROM 'migrated'\n                    OR subscription.provider IS DISTINCT FROM 'asaas'\n                    OR subscription.external_subscription_id IS DISTINCT FROM\n                       migration.target_external_subscription_id\n                    OR subscription.catalog_version_id IS DISTINCT FROM\n                       migration.target_catalog_version_id\n                    OR subscription.offer_id IS DISTINCT FROM migration.target_offer_id\n                    OR subscription.plan IS DISTINCT FROM migration.target_plan\n                    OR subscription.billing_cycle IS DISTINCT FROM\n                       migration.target_billing_cycle\n                    OR subscription.coupon_code IS DISTINCT FROM\n                       migration.target_coupon_code\n                    OR subscription.amount_cents IS DISTINCT FROM\n                       migration.target_amount_cents\n                    OR subscription.roster_revision IS DISTINCT FROM\n                       migration.source_roster_revision + 1\n                    OR current_revision IS DISTINCT FROM subscription.roster_revision\n                ) THEN\n                    RAISE EXCEPTION 'provider flip receipt requires migrated saga at commit'\n                        USING ERRCODE = 'integrity_constraint_violation';\n                END IF;\n                RETURN NULL;\n            END;\n            $function$\n"
+    },
+    {
+      "name": "protect_bound_billing_migration_target",
+      "signature": "protect_bound_billing_migration_target()",
+      "statement": "CREATE OR REPLACE FUNCTION public.protect_bound_billing_migration_target()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n            BEGIN\n                IF OLD.state IS DISTINCT FROM NEW.state\n                   AND NEW.state IN (\n                       'legacy_cancel_pending', 'legacy_cancelled', 'migrated'\n                   )\n                   AND pg_trigger_depth() = 1\n                   AND NOT (\n                       OLD.state = 'recreate_pending'\n                       AND NEW.state = 'legacy_cancelled'\n                       AND EXISTS (\n                           SELECT 1\n                           FROM billing_migration_receipts receipt\n                           JOIN billing_migration_absence_reads second_read\n                             ON second_read.migration_id = receipt.migration_id\n                            AND second_read.builder_id = receipt.builder_id\n                            AND second_read.operation_id = receipt.operation_id\n                            AND second_read.read_no = 2\n                            AND second_read.provider_event_id\n                                = receipt.provider_event_id\n                            AND second_read.provider_evidence_digest\n                                = receipt.provider_evidence_digest\n                           JOIN billing_migration_absence_reads first_read\n                             ON first_read.migration_id = receipt.migration_id\n                            AND first_read.builder_id = receipt.builder_id\n                            AND first_read.operation_id = receipt.operation_id\n                            AND first_read.read_no = 1\n                            AND first_read.provider_event_id\n                                <> second_read.provider_event_id\n                            AND first_read.provider_observed_at\n                                < second_read.provider_observed_at\n                           WHERE receipt.migration_id = OLD.id\n                             AND receipt.builder_id = OLD.builder_id\n                             AND receipt.operation_id = OLD.operation_id\n                             AND receipt.receipt_kind = 'recreate_authorized'\n                             AND receipt.status = 'absent'\n                       )\n                   )\n                THEN\n                    RAISE EXCEPTION 'migration saga state is subscription-owned';\n                END IF;\n                IF EXISTS (\n                    SELECT 1\n                    FROM billing_migration_receipts\n                    WHERE migration_id = OLD.id\n                      AND builder_id = OLD.builder_id\n                      AND receipt_kind = 'provider_flip'\n                ) AND ROW(\n                    OLD.id, OLD.builder_id, OLD.subscription_id,\n                    OLD.operation_id, OLD.source_roster_revision,\n                    OLD.target_provider, OLD.target_external_subscription_id,\n                    OLD.target_catalog_version_id, OLD.target_offer_id,\n                    OLD.target_plan, OLD.target_billing_cycle,\n                    OLD.target_coupon_code, OLD.target_amount_cents,\n                    OLD.target_snapshot\n                ) IS DISTINCT FROM ROW(\n                    NEW.id, NEW.builder_id, NEW.subscription_id,\n                    NEW.operation_id, NEW.source_roster_revision,\n                    NEW.target_provider, NEW.target_external_subscription_id,\n                    NEW.target_catalog_version_id, NEW.target_offer_id,\n                    NEW.target_plan, NEW.target_billing_cycle,\n                    NEW.target_coupon_code, NEW.target_amount_cents,\n                    NEW.target_snapshot\n                ) THEN\n                    RAISE EXCEPTION 'receipt-bound migration target is immutable'\n                        USING ERRCODE = 'integrity_constraint_violation';\n                END IF;\n                RETURN NEW;\n            END;\n            $function$\n"
+    },
+    {
+      "name": "protect_billing_roster_control",
+      "signature": "protect_billing_roster_control()",
+      "statement": "CREATE OR REPLACE FUNCTION public.protect_billing_roster_control()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n            BEGIN\n                IF TG_OP = 'DELETE' THEN\n                    RAISE EXCEPTION 'billing financial history is not deletable'\n                        USING ERRCODE = 'integrity_constraint_violation';\n                END IF;\n                IF NEW.billing_roster_revision < OLD.billing_roster_revision THEN\n                    RAISE EXCEPTION 'billing roster revision cannot reset'\n                        USING ERRCODE = 'integrity_constraint_violation';\n                END IF;\n                IF NEW.billing_roster_revision IS DISTINCT FROM\n                       OLD.billing_roster_revision\n                   AND pg_trigger_depth() = 1\n                   AND NOT (\n                       OLD.billing_roster_revision = 0\n                       AND NEW.billing_roster_revision = 1\n                   ) THEN\n                    RAISE EXCEPTION 'billing roster revision is saga-owned'\n                        USING ERRCODE = 'integrity_constraint_violation';\n                END IF;\n                RETURN NEW;\n            END;\n            $function$\n"
+    },
+    {
+      "name": "validate_billing_provider_evidence",
+      "signature": "validate_billing_provider_evidence()",
+      "statement": "CREATE OR REPLACE FUNCTION public.validate_billing_provider_evidence()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n            DECLARE migration billing_migrations%ROWTYPE;\n                    expected_snapshot_digest TEXT;\n                    expected_evidence_digest TEXT;\n            BEGIN\n                IF NEW.receipt_kind NOT IN ('provider_flip', 'recreate_authorized') THEN\n                    RETURN NEW;\n                END IF;\n                SELECT * INTO migration FROM billing_migrations\n                WHERE id = NEW.migration_id AND builder_id = NEW.builder_id FOR UPDATE;\n                IF NOT FOUND THEN\n                    RAISE EXCEPTION 'provider evidence migration target missing';\n                END IF;\n                expected_snapshot_digest := \n    encode(sha256(convert_to(jsonb_build_object(\n        'migration_id', migration.id,\n        'builder_id', migration.builder_id,\n        'subscription_id', migration.subscription_id,\n        'operation_id', migration.operation_id,\n        'source_roster_revision', migration.source_roster_revision,\n        'target_provider', migration.target_provider,\n        'target_external_subscription_id',\n            migration.target_external_subscription_id,\n        'target_catalog_version_id', migration.target_catalog_version_id,\n        'target_offer_id', migration.target_offer_id,\n        'target_plan', migration.target_plan,\n        'target_billing_cycle', migration.target_billing_cycle,\n        'target_coupon_code', migration.target_coupon_code,\n        'target_amount_cents', migration.target_amount_cents,\n        'target_snapshot', migration.target_snapshot\n    )::text, 'UTF8')), 'hex')\n;\n                expected_evidence_digest := billing_provider_evidence_digest(\n                    NEW.provider_authority, NEW.provider_event_id,\n                    NEW.provider_expires_at, NEW.external_reference,\n                    NEW.migration_id, NEW.provider_observed_at,\n                    NEW.provider_operation, NEW.operation_id,\n                    NEW.provider, NEW.provider_snapshot_digest);\n                IF migration.operation_id IS DISTINCT FROM NEW.operation_id\n                   OR migration.target_provider IS DISTINCT FROM NEW.provider\n                   OR NEW.external_reference IS DISTINCT FROM\n                       COALESCE(migration.target_external_subscription_id,\n                                'migration:' || migration.id::text)\n                   OR NEW.provider_authority IS DISTINCT FROM 'asaas.api.v3'\n                   OR NEW.provider_key_id IS NULL\n                   OR NEW.provider_event_id IS NULL\n                   OR NEW.provider_observed_at IS NULL\n                   OR NEW.provider_expires_at IS NULL\n                   OR NEW.provider_observed_at < migration.created_at\n                   OR NEW.provider_observed_at > NEW.observed_at\n                   OR NEW.provider_expires_at <= NEW.provider_observed_at\n                   OR NEW.provider_expires_at <= clock_timestamp()\n                   OR NEW.provider_snapshot_digest IS DISTINCT FROM expected_snapshot_digest\n                   OR NEW.provider_evidence_digest IS DISTINCT FROM expected_evidence_digest\n                   OR (NEW.receipt_kind = 'provider_flip' AND (\n                       migration.state IS DISTINCT FROM 'legacy_cancelled'\n                       OR NEW.provider_operation IS DISTINCT FROM\n                          'subscription.migration.provider_flip'\n                       OR EXISTS (\n                           SELECT 1 FROM billing_migration_absence_reads absence\n                           WHERE absence.provider = NEW.provider\n                             AND absence.provider_event_id = NEW.provider_event_id\n                       )))\n                   OR (NEW.receipt_kind = 'recreate_authorized' AND (\n                       migration.state NOT IN ('recreate_pending', 'legacy_cancelled')\n                       OR NEW.provider_operation IS DISTINCT FROM\n                          'subscription.migration.absence'\n                       OR NOT EXISTS (\n                           SELECT 1\n                           FROM billing_migration_absence_reads second_read\n                           JOIN billing_migration_absence_reads first_read\n                             ON first_read.migration_id = second_read.migration_id\n                            AND first_read.builder_id = second_read.builder_id\n                            AND first_read.operation_id = second_read.operation_id\n                            AND first_read.read_no = 1\n                            AND first_read.provider_event_id\n                                <> second_read.provider_event_id\n                            AND first_read.provider_observed_at\n                                < second_read.provider_observed_at\n                           WHERE second_read.migration_id = NEW.migration_id\n                             AND second_read.builder_id = NEW.builder_id\n                             AND second_read.operation_id = NEW.operation_id\n                             AND second_read.read_no = 2\n                             AND second_read.provider_event_id = NEW.provider_event_id\n                             AND second_read.provider_evidence_digest\n                                 = NEW.provider_evidence_digest\n                             AND second_read.provider_observed_at\n                                 = NEW.provider_observed_at\n                             AND second_read.provider_expires_at\n                                 = NEW.provider_expires_at\n                       )))\n                THEN\n                    RAISE EXCEPTION 'provider evidence envelope is invalid'\n                        USING ERRCODE = 'integrity_constraint_violation';\n                END IF;\n                RETURN NEW;\n            END;\n            $function$\n"
+    },
+    {
+      "name": "billing_evidence_timestamp",
+      "signature": "billing_evidence_timestamp(timestamp with time zone)",
+      "statement": "CREATE OR REPLACE FUNCTION public.billing_evidence_timestamp(value timestamp with time zone)\n RETURNS text\n LANGUAGE sql\n STABLE STRICT\nAS $function$\n                SELECT to_char(value AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS')\n                    || CASE\n                           WHEN to_char(value AT TIME ZONE 'UTC', 'US') = '000000'\n                           THEN ''\n                           ELSE '.' || to_char(value AT TIME ZONE 'UTC', 'US')\n                       END\n                    || '+00:00'\n            $function$\n"
+    },
+    {
+      "name": "billing_provider_evidence_digest",
+      "signature": "billing_provider_evidence_digest(text,text,timestamp with time zone,text,uuid,timestamp with time zone,text,uuid,text,text)",
+      "statement": "CREATE OR REPLACE FUNCTION public.billing_provider_evidence_digest(authority text, event_id text, expires_at timestamp with time zone, external_reference text, migration_id uuid, observed_at timestamp with time zone, operation text, operation_id uuid, provider text, snapshot_digest text)\n RETURNS text\n LANGUAGE sql\n STABLE STRICT\nAS $function$\n                SELECT CASE\n                    WHEN authority !~ '^[A-Za-z0-9._:-]+$'\n                      OR event_id !~ '^[A-Za-z0-9._:-]+$'\n                      OR external_reference !~ '^[A-Za-z0-9._:-]+$'\n                      OR operation !~ '^[A-Za-z0-9._:-]+$'\n                      OR provider !~ '^[A-Za-z0-9._:-]+$'\n                      OR snapshot_digest !~ '^[0-9a-f]{64}$'\n                    THEN NULL\n                    ELSE encode(sha256(convert_to(\n                        '{\"authority\":\"' || authority\n                        || '\",\"event_id\":\"' || event_id\n                        || '\",\"expires_at\":\"' || billing_evidence_timestamp(expires_at)\n                        || '\",\"external_reference\":\"' || external_reference\n                        || '\",\"migration_id\":\"' || migration_id::text\n                        || '\",\"observed_at\":\"' || billing_evidence_timestamp(observed_at)\n                        || '\",\"operation\":\"' || operation\n                        || '\",\"operation_id\":\"' || operation_id::text\n                        || '\",\"provider\":\"' || provider\n                        || '\",\"snapshot_digest\":\"' || snapshot_digest\n                        || '\"}', 'UTF8')), 'hex')\n                END\n            $function$\n"
+    },
+    {
+      "name": "validate_billing_migration_absence_read",
+      "signature": "validate_billing_migration_absence_read()",
+      "statement": "CREATE OR REPLACE FUNCTION public.validate_billing_migration_absence_read()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\n            DECLARE migration billing_migrations%ROWTYPE;\n                    subscription billing_subscriptions%ROWTYPE;\n                    latest_attempt billing_checkout_sessions%ROWTYPE;\n                    first_read billing_migration_absence_reads%ROWTYPE;\n                    convergence_base TIMESTAMPTZ;\n            BEGIN\n                SELECT * INTO migration FROM billing_migrations\n                WHERE id = NEW.migration_id AND builder_id = NEW.builder_id\n                FOR UPDATE;\n                IF NOT FOUND THEN\n                    RAISE EXCEPTION 'absence read migration target missing'\n                        USING ERRCODE = 'integrity_constraint_violation';\n                END IF;\n                SELECT * INTO subscription FROM billing_subscriptions\n                WHERE id = migration.subscription_id\n                  AND builder_id = migration.builder_id\n                FOR UPDATE;\n                SELECT * INTO latest_attempt FROM billing_checkout_sessions\n                WHERE migration_id = migration.id\n                  AND builder_id = migration.builder_id\n                ORDER BY attempt_no DESC\n                LIMIT 1;\n                convergence_base := GREATEST(\n                    migration.legacy_cancelled_at,\n                    COALESCE(latest_attempt.created_at, migration.legacy_cancelled_at)\n                );\n                -- 90 minutes mirrors CHECKOUT_CONVERGENCE_LIMIT\n                -- (ASAAS Checkout expiry 60 min + 30 min); the backend derives\n                -- the exact limit, the database refuses anything earlier.\n                IF migration.state NOT IN ('legacy_cancelled', 'recreate_pending')\n                   OR migration.operation_id IS DISTINCT FROM NEW.operation_id\n                   OR migration.legacy_cancelled_at IS NULL\n                   OR subscription.id IS NULL\n                   OR subscription.provider IS NOT NULL\n                   OR subscription.is_active IS NOT FALSE\n                   OR subscription.status IS DISTINCT FROM 'legacy_cancelled'\n                   OR NEW.external_reference IS DISTINCT FROM\n                       COALESCE(migration.target_external_subscription_id,\n                                'migration:' || migration.id::text)\n                   OR NEW.provider_snapshot_digest IS DISTINCT FROM\n                       \n    encode(sha256(convert_to(jsonb_build_object(\n        'migration_id', migration.id,\n        'builder_id', migration.builder_id,\n        'subscription_id', migration.subscription_id,\n        'operation_id', migration.operation_id,\n        'source_roster_revision', migration.source_roster_revision,\n        'target_provider', migration.target_provider,\n        'target_external_subscription_id',\n            migration.target_external_subscription_id,\n        'target_catalog_version_id', migration.target_catalog_version_id,\n        'target_offer_id', migration.target_offer_id,\n        'target_plan', migration.target_plan,\n        'target_billing_cycle', migration.target_billing_cycle,\n        'target_coupon_code', migration.target_coupon_code,\n        'target_amount_cents', migration.target_amount_cents,\n        'target_snapshot', migration.target_snapshot\n    )::text, 'UTF8')), 'hex')\n\n                   OR NEW.provider_evidence_digest IS DISTINCT FROM\n                       billing_provider_evidence_digest(\n                           NEW.provider_authority, NEW.provider_event_id,\n                           NEW.provider_expires_at, NEW.external_reference,\n                           NEW.migration_id, NEW.provider_observed_at,\n                           NEW.provider_operation, NEW.operation_id,\n                           NEW.provider, NEW.provider_snapshot_digest)\n                   OR NEW.provider_observed_at < migration.created_at\n                   OR NEW.provider_expires_at <= clock_timestamp()\n                   OR NEW.observed_at > clock_timestamp()\n                   OR NEW.prior_checkout_session_id IS DISTINCT FROM latest_attempt.id\n                   OR NEW.convergence_limit_at <\n                       convergence_base + interval '90 minutes'\n                   OR EXISTS (\n                       SELECT 1 FROM billing_checkout_sessions live\n                       WHERE live.migration_id = migration.id\n                         AND live.builder_id = migration.builder_id\n                         AND live.state IN (\n                             'creating', 'active', 'paid_pending_subscription',\n                             'reconciliation_required', 'terminal_pending_readback')\n                   )\n                   OR EXISTS (\n                       SELECT 1 FROM billing_migration_receipts receipt\n                       WHERE receipt.provider = NEW.provider\n                         AND receipt.provider_event_id = NEW.provider_event_id\n                   )\n                THEN\n                    RAISE EXCEPTION 'absence read evidence is invalid'\n                        USING ERRCODE = 'integrity_constraint_violation';\n                END IF;\n                IF NEW.read_no = 2 THEN\n                    SELECT * INTO first_read FROM billing_migration_absence_reads\n                    WHERE migration_id = NEW.migration_id\n                      AND builder_id = NEW.builder_id\n                      AND operation_id = NEW.operation_id\n                      AND read_no = 1;\n                    -- 5 minutes mirrors CONVERGENCE_READ_SPACING.\n                    IF NOT FOUND\n                       OR first_read.provider_event_id = NEW.provider_event_id\n                       OR NEW.provider_observed_at <\n                           first_read.provider_observed_at + interval '5 minutes'\n                       OR first_read.prior_checkout_session_id IS DISTINCT FROM\n                           NEW.prior_checkout_session_id\n                       OR first_read.convergence_limit_at IS DISTINCT FROM\n                           NEW.convergence_limit_at\n                    THEN\n                        RAISE EXCEPTION 'second absence read must follow a distinct first read'\n                            USING ERRCODE = 'integrity_constraint_violation';\n                    END IF;\n                END IF;\n                RETURN NEW;\n            END;\n            $function$\n"
+    }
+  ],
+  "indexes": [
+    {
+      "name": "ix_billing_migrations_builder_id",
+      "statement": "CREATE INDEX ix_billing_migrations_builder_id ON public.billing_migrations USING btree (builder_id)",
+      "table": "billing_migrations"
+    },
+    {
+      "name": "ix_billing_migration_receipts_builder_id",
+      "statement": "CREATE INDEX ix_billing_migration_receipts_builder_id ON public.billing_migration_receipts USING btree (builder_id)",
+      "table": "billing_migration_receipts"
+    }
+  ],
+  "revision": "036",
+  "rows": [
+    {
+      "statement": "INSERT INTO public.billing_roster_control (singleton, billing_roster_revision) VALUES ('true', '0')",
+      "table": "billing_roster_control"
+    }
+  ],
+  "tables": [
+    {
+      "columns": [
+        "singleton",
+        "billing_roster_revision",
+        "updated_at"
+      ],
+      "defaults": [
+        "singleton",
+        "billing_roster_revision",
+        "updated_at"
+      ],
+      "statement": "CREATE TABLE public.billing_roster_control (\n    singleton boolean DEFAULT true NOT NULL,\n    billing_roster_revision bigint DEFAULT 0 NOT NULL,\n    updated_at timestamp with time zone DEFAULT now() NOT NULL\n)",
+      "table": "billing_roster_control"
+    },
+    {
+      "columns": [
+        "id",
+        "builder_id",
+        "subscription_id",
+        "state",
+        "renewal_date",
+        "open_by_date",
+        "cutover_by_date",
+        "target_provider",
+        "target_external_subscription_id",
+        "target_catalog_version_id",
+        "target_offer_id",
+        "target_plan",
+        "target_billing_cycle",
+        "target_coupon_code",
+        "target_amount_cents",
+        "target_snapshot",
+        "operation_id",
+        "attempt_count",
+        "source_roster_revision",
+        "legacy_cancelled_at",
+        "created_at",
+        "updated_at"
+      ],
+      "defaults": [
+        "state",
+        "target_provider",
+        "target_billing_cycle",
+        "attempt_count",
+        "created_at",
+        "updated_at"
+      ],
+      "statement": "CREATE TABLE public.billing_migrations (\n    id uuid NOT NULL,\n    builder_id uuid NOT NULL,\n    subscription_id uuid NOT NULL,\n    state character varying(40) DEFAULT 'pending'::character varying NOT NULL,\n    renewal_date date NOT NULL,\n    open_by_date date NOT NULL,\n    cutover_by_date date NOT NULL,\n    target_provider character varying(20) DEFAULT 'asaas'::character varying NOT NULL,\n    target_external_subscription_id character varying(160),\n    target_catalog_version_id character varying(80) NOT NULL,\n    target_offer_id character varying(100) NOT NULL,\n    target_plan character varying(100) NOT NULL,\n    target_billing_cycle character varying(20) DEFAULT 'monthly'::character varying NOT NULL,\n    target_coupon_code character varying(50),\n    target_amount_cents bigint NOT NULL,\n    target_snapshot jsonb NOT NULL,\n    operation_id uuid,\n    attempt_count integer DEFAULT 0 NOT NULL,\n    source_roster_revision bigint NOT NULL,\n    legacy_cancelled_at timestamp with time zone,\n    created_at timestamp with time zone DEFAULT now() NOT NULL,\n    updated_at timestamp with time zone DEFAULT now() NOT NULL\n)",
+      "table": "billing_migrations"
+    },
+    {
+      "columns": [
+        "id",
+        "builder_id",
+        "migration_id",
+        "operation_id",
+        "receipt_kind",
+        "provider",
+        "external_reference",
+        "status",
+        "content_sha256",
+        "actor_user_id",
+        "observed_at",
+        "created_at",
+        "provider_event_id",
+        "provider_authority",
+        "provider_key_id",
+        "provider_operation",
+        "provider_signature",
+        "provider_observed_at",
+        "provider_expires_at",
+        "provider_snapshot_digest",
+        "provider_evidence_digest"
+      ],
+      "defaults": [
+        "created_at"
+      ],
+      "statement": "CREATE TABLE public.billing_migration_receipts (\n    id uuid NOT NULL,\n    builder_id uuid NOT NULL,\n    migration_id uuid NOT NULL,\n    operation_id uuid NOT NULL,\n    receipt_kind character varying(40) NOT NULL,\n    provider character varying(20),\n    external_reference character varying(160),\n    status character varying(30) NOT NULL,\n    content_sha256 character varying(64) NOT NULL,\n    actor_user_id uuid NOT NULL,\n    observed_at timestamp with time zone NOT NULL,\n    created_at timestamp with time zone DEFAULT now() NOT NULL,\n    provider_event_id character varying(160),\n    provider_authority character varying(80),\n    provider_key_id character varying(80),\n    provider_operation character varying(80),\n    provider_signature character varying(128),\n    provider_observed_at timestamp with time zone,\n    provider_expires_at timestamp with time zone,\n    provider_snapshot_digest character varying(64),\n    provider_evidence_digest character varying(64)\n)",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "columns": [
+        "id",
+        "builder_id",
+        "migration_id",
+        "operation_id",
+        "read_no",
+        "prior_checkout_session_id",
+        "convergence_limit_at",
+        "provider",
+        "external_reference",
+        "provider_event_id",
+        "provider_authority",
+        "provider_key_id",
+        "provider_operation",
+        "provider_signature",
+        "provider_observed_at",
+        "provider_expires_at",
+        "provider_snapshot_digest",
+        "provider_evidence_digest",
+        "status",
+        "actor_user_id",
+        "observed_at",
+        "created_at"
+      ],
+      "defaults": [
+        "created_at"
+      ],
+      "statement": "CREATE TABLE public.billing_migration_absence_reads (\n    id uuid NOT NULL,\n    builder_id uuid NOT NULL,\n    migration_id uuid NOT NULL,\n    operation_id uuid NOT NULL,\n    read_no integer NOT NULL,\n    prior_checkout_session_id uuid,\n    convergence_limit_at timestamp with time zone NOT NULL,\n    provider character varying(20) NOT NULL,\n    external_reference character varying(160) NOT NULL,\n    provider_event_id character varying(160) NOT NULL,\n    provider_authority character varying(80) NOT NULL,\n    provider_key_id character varying(80) NOT NULL,\n    provider_operation character varying(80) NOT NULL,\n    provider_signature character varying(128) NOT NULL,\n    provider_observed_at timestamp with time zone NOT NULL,\n    provider_expires_at timestamp with time zone NOT NULL,\n    provider_snapshot_digest character varying(64) NOT NULL,\n    provider_evidence_digest character varying(64) NOT NULL,\n    status character varying(20) NOT NULL,\n    actor_user_id uuid NOT NULL,\n    observed_at timestamp with time zone NOT NULL,\n    created_at timestamp with time zone DEFAULT now() NOT NULL\n)",
+      "table": "billing_migration_absence_reads"
+    }
+  ],
+  "triggers": [
+    {
+      "constraint": false,
+      "name": "trg_billing_roster_control_fence",
+      "statement": "CREATE TRIGGER trg_billing_roster_control_fence BEFORE DELETE OR UPDATE ON public.billing_roster_control FOR EACH STATEMENT EXECUTE FUNCTION lock_billing_roster_statement()",
+      "table": "billing_roster_control"
+    },
+    {
+      "constraint": false,
+      "name": "trg_billing_roster_control_history",
+      "statement": "CREATE TRIGGER trg_billing_roster_control_history BEFORE DELETE OR UPDATE ON public.billing_roster_control FOR EACH ROW EXECUTE FUNCTION protect_billing_roster_control()",
+      "table": "billing_roster_control"
+    },
+    {
+      "constraint": false,
+      "name": "trg_billing_migration_target_immutable",
+      "statement": "CREATE TRIGGER trg_billing_migration_target_immutable BEFORE UPDATE ON public.billing_migrations FOR EACH ROW EXECUTE FUNCTION protect_bound_billing_migration_target()",
+      "table": "billing_migrations"
+    },
+    {
+      "constraint": false,
+      "name": "trg_billing_migrations_roster_fence",
+      "statement": "CREATE TRIGGER trg_billing_migrations_roster_fence BEFORE DELETE OR UPDATE ON public.billing_migrations FOR EACH STATEMENT EXECUTE FUNCTION lock_billing_roster_statement()",
+      "table": "billing_migrations"
+    },
+    {
+      "constraint": true,
+      "name": "trg_billing_migration_receipt_commit",
+      "statement": "CREATE CONSTRAINT TRIGGER trg_billing_migration_receipt_commit AFTER INSERT ON public.billing_migration_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION validate_billing_migration_receipt_commit()",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "constraint": false,
+      "name": "trg_billing_migration_receipt_validate",
+      "statement": "CREATE TRIGGER trg_billing_migration_receipt_validate BEFORE INSERT ON public.billing_migration_receipts FOR EACH ROW EXECUTE FUNCTION validate_billing_migration_receipt()",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "constraint": false,
+      "name": "trg_billing_migration_receipts_immutable",
+      "statement": "CREATE TRIGGER trg_billing_migration_receipts_immutable BEFORE DELETE OR UPDATE ON public.billing_migration_receipts FOR EACH ROW EXECUTE FUNCTION reject_immutable_billing_row()",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "constraint": false,
+      "name": "trg_billing_migration_receipts_roster_fence",
+      "statement": "CREATE TRIGGER trg_billing_migration_receipts_roster_fence BEFORE INSERT OR DELETE OR UPDATE ON public.billing_migration_receipts FOR EACH STATEMENT EXECUTE FUNCTION lock_billing_roster_statement()",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "constraint": false,
+      "name": "trg_billing_provider_evidence_validate",
+      "statement": "CREATE TRIGGER trg_billing_provider_evidence_validate BEFORE INSERT ON public.billing_migration_receipts FOR EACH ROW EXECUTE FUNCTION validate_billing_provider_evidence()",
+      "table": "billing_migration_receipts"
+    },
+    {
+      "constraint": false,
+      "name": "trg_billing_migration_absence_read_validate",
+      "statement": "CREATE TRIGGER trg_billing_migration_absence_read_validate BEFORE INSERT ON public.billing_migration_absence_reads FOR EACH ROW EXECUTE FUNCTION validate_billing_migration_absence_read()",
+      "table": "billing_migration_absence_reads"
+    },
+    {
+      "constraint": false,
+      "name": "trg_billing_migration_absence_reads_immutable",
+      "statement": "CREATE TRIGGER trg_billing_migration_absence_reads_immutable BEFORE DELETE OR UPDATE ON public.billing_migration_absence_reads FOR EACH ROW EXECUTE FUNCTION reject_immutable_billing_row()",
+      "table": "billing_migration_absence_reads"
+    },
+    {
+      "constraint": false,
+      "name": "trg_billing_migration_absence_reads_roster_fence",
+      "statement": "CREATE TRIGGER trg_billing_migration_absence_reads_roster_fence BEFORE INSERT OR DELETE OR UPDATE ON public.billing_migration_absence_reads FOR EACH STATEMENT EXECUTE FUNCTION lock_billing_roster_statement()",
+      "table": "billing_migration_absence_reads"
+    }
+  ]
+}

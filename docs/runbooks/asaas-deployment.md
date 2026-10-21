@@ -282,7 +282,8 @@ production**. Running it needs its own explicit owner instruction, after
   `billing_migration_receipts`, `billing_migration_absence_reads` and the
   roster control again, because 036's guarantees only hold at the moment
   it ran: `billing_migrations` stays writable by raw SQL, and the two
-  validators above fail rather than guard.
+  validators above fail rather than guard. 037 does (see
+  [Migration 037](#migration-037-drop-the-legacy-saga-and-roster-objects-group-10-e6)).
 
 ### Preflight (SELECT only, immediately before the run)
 
@@ -406,6 +407,292 @@ explicit instruction to run 036, one reviewed change moves the pin to the
 exact revision `036` in all of them together, with this section's preflight
 as the readback before the run. 037 gets its own instruction and its own
 change. The command always names the exact revision, never the head.
+
+## Migration 037: drop the legacy saga and roster objects (Group 10 E6)
+
+Written and tested on disposable PostgreSQL 16 only; **not applied in
+production**. Running it needs its own explicit owner instruction, after 036
+is applied and verified (036 before 037, owner condition of 2026-10-17). The
+production window stays pinned to `alembic upgrade 035`; moving the pin to
+`036` and later to `037` is a separate reviewed change each (see "How the pin
+moves" above).
+
+### What 037 changes
+
+Everything 036 left of the AbacatePay migration saga is dropped, whole:
+
+- The tables `billing_migrations`, `billing_migration_receipts`,
+  `billing_migration_absence_reads` and `billing_roster_control`, with
+  their 38 constraints (among them the CHECK listing the legacy receipt kinds
+  `roster_import`, `roster_cutover` and `roster_disposal`), two plain
+  indexes, twelve triggers, the roster's seed row and the columns that held
+  the saga's roster revisions (`source_roster_revision`,
+  `billing_roster_revision`). Their foreign keys to `builders`,
+  `billing_subscriptions` and `billing_checkout_sessions` go with them, and
+  so do the RI triggers those keys kept on the three live tables. No live
+  table references a legacy table (036 dropped the last link,
+  `billing_checkout_sessions.migration_id`); `transactions` and
+  `billing_webhook_deliveries` have no key to them.
+- The ten functions only those tables use, each with its only caller:
+  `lock_billing_roster_statement` (the legacy tables' statement fences),
+  `protect_billing_roster_control` (roster history trigger),
+  `protect_bound_billing_migration_target` (trigger on `billing_migrations`),
+  `validate_billing_migration_receipt` and
+  `validate_billing_migration_receipt_commit` (receipt triggers; the first
+  reads `billing_subscriptions.roster_revision`, gone since 036),
+  `validate_billing_provider_evidence` (receipt trigger),
+  `validate_billing_migration_absence_read` (absence-read trigger; reads
+  `billing_checkout_sessions.migration_id`, gone since 036),
+  `billing_migration_snapshot_is_valid` (the `billing_migrations` snapshot
+  CHECK), `billing_provider_evidence_digest` (called only by the two evidence
+  validators) and `billing_evidence_timestamp` (called only by the digest).
+  No application code calls any of them.
+- Nothing else changes: no live table, column, constraint, index, function
+  or user-defined trigger (only the internal RI triggers above leave the
+  three live tables). `billing_snapshot_has_no_pii` and
+  `reject_immutable_billing_row` stay (live CHECKs and triggers use them).
+  The values `abacatepay`, NULL provider and the legacy subscription
+  statuses stay in the live CHECKs, and so does the operation scope
+  `migration` (owner decision: no optional hardening).
+- The same release removes the ORM models `BillingMigration`,
+  `BillingMigrationReceipt`, `BillingMigrationAbsenceRead` and
+  `BillingRosterControl` and the relationships `Builder.billing_migrations`
+  and `BillingSubscription.migrations`.
+
+### Preflight readback (read only, immediately before the run)
+
+The readback is `scripts/migration_037_readback.sql`. It is generated from the
+migration (`python -m scripts.migration_037_readback --output <file>`; a test
+fails while the committed file differs), so it runs the migration's own
+checks: same predicates, same allowlists (the 64 dependents and 68 columns of
+the frozen file), same refusal lines. Run it **connected as the role that
+will run the migration**: the role of the migrations database URL (the
+`neurostack/staging/database-url-migrations` secret of the
+`neurostack-staging-migrations` task family), not the DML application role.
+It is not catalog-only: it reads `alembic_version` and counts the rows of the
+four legacy tables. As the application role its privilege row is red (the
+owner is another role: conservative, but not the migration's answer), and a
+role without `SELECT` on those tables stops with `permission denied`. Run it
+only in this exact form, and never leave the transaction open:
+
+```sql
+BEGIN READ ONLY;
+\i scripts/migration_037_readback.sql
+ROLLBACK;
+```
+
+While its transaction is open it holds ordinary read locks (`ACCESS SHARE`)
+on `alembic_version` and the four tables; an open readback transaction would
+make the migration's `ACCESS EXCLUSIVE` lock wait and give up with `55P03`.
+
+It returns one row per check (`check_no`, `check_name`, `verdict`). Every
+`verdict` `ok` means the migration's preflight passes on this state of the
+database; any other `verdict` is the exact line the migration's refusal would
+carry. Stop and return to the owner on anything but eleven `ok`. Outputs
+that are expected elsewhere, so no surprise: at revision `035` three rows are
+red -- `revision` (`alembic_version is 035, not 036`), `catalog dependents`
+(036's foreign key `fk_billing_checkout_sessions_builder_migration` and
+trigger `trg_billing_subscriptions_roster_fence` still exist) and `function
+sources` (the three 035 canary functions still name the legacy objects) --;
+at `037` the query stops with `relation "billing_migrations" does not
+exist` (the tables are gone).
+
+What the readback covers, and what is migration-only:
+
+| Check (`check_name`) | Readback | Migration |
+|---|---|---|
+| `revision`: `alembic_version` is exactly `036` | same | same |
+| rows in the three saga tables; `roster revision` not `0` | same | same |
+| `functions to drop exist`: the ten signatures | same | same |
+| `catalog dependents`: nothing but the 64 frozen objects depends on a dropped table, row type (array type included) or function | same | same |
+| `function sources`: no function outside the drop set, in any non-system schema, names a dropped object (case-insensitive word match) | same | same |
+| `columns`: no column the frozen file does not restore | same | same |
+| `owners and privileges` | computed from the role's default privileges in `pg_default_acl` | read from a probe table and function the role creates and drops inside the preflight |
+| `comments` on the tables, columns, row types, constraints, indexes, triggers and the ten functions | same | same |
+| `ACCESS EXCLUSIVE` locks on the seven tables before the checks | **no**: only the read locks of its row counts while its transaction is open (a snapshot: the state can change before the run; the run checks again under its locks) | yes |
+
+**The privilege rule, exactly.** Each of the four tables and ten functions
+must be owned by the migration role, carry no column privileges, and its
+access list must grant exactly (as a set of grantor, grantee, privilege and
+grant option; order does not matter) what a table, or a function, created
+now in `public` by that role gets. PostgreSQL computes that from
+`pg_default_acl`: the role's global entry for the object type (`r` for
+tables, `f` for functions) or, when it has none, the built-in default
+(`acldefault`), merged with the role's entry for schema `public`
+(privileges and grant options OR-ed); an empty merged list (a global entry
+`{}` and no schema entry) is stored as NULL, which means the built-in default
+again. The readback computes the same; the migration observes it on its
+probe. They
+agree in every setup the tests build (superuser and non-superuser owners;
+grants by `GRANT ... ON ALL TABLES` with and without default privileges;
+schema and global default privileges set before or after the migrations;
+`EXECUTE` revoked from `PUBLIC` by default privileges; empty global entries
+for tables and functions, alone and with a schema entry; the same privilege
+with different grant options in the global and the schema entries; a
+migration run by a role other than the owner). A typical red case: the application role was
+granted with `GRANT ... ON ALL TABLES` but the migration role has no default
+privileges, so a downgrade would recreate the tables without those grants;
+the remedy (an owner decision) is to set the matching default privileges
+or to revoke the extra grants on the legacy objects. To see the role's
+default privileges:
+
+```sql
+SELECT defaclobjtype, coalesce(defaclnamespace::regnamespace::text, '(global)') AS schema,
+       defaclacl
+FROM pg_default_acl
+WHERE defaclrole = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+  AND defaclobjtype IN ('r', 'f')
+ORDER BY 1, 2;
+```
+
+Run as another role, the readback answers for that role (owner check
+included), so it must be the migration role.
+
+The migration runs these checks itself, inside one `DO` block, after taking
+`ACCESS EXCLUSIVE` locks on the four tables and on `builders`,
+`billing_subscriptions` and `billing_checkout_sessions` (dropping the legacy
+foreign keys removes RI triggers from those three, which takes that lock
+anyway; a test proves no other live table is touched). It refuses with
+SQLSTATE `55000` and one message listing every failing line, in the
+readback's order, and changes nothing. For example
+`migration 037 refused (nothing was changed): billing_migrations has 1 row(s); unexpected objects depend on the dropped objects: index public.g10_e6_index`.
+Run `alembic upgrade 037` on its own: Alembic runs every revision of one
+invocation in a single transaction.
+
+**What neither compares** (each object is restored as the frozen 036
+definition; harmless for a database built only from migrations 026-036, but
+not detected): SECURITY DEFINER, a `SET` option or any other change to a
+dropped function's definition, a disabled trigger, a changed column type or
+default, storage options such as fillfactor, row-level security flags, and a
+constraint, index, trigger or function redefined under its own name. A
+dropped object named inside dynamic SQL built by concatenation (for example
+`EXECUTE 'SELECT 1 FROM billing_' || 'migrations'`) cannot be found by any
+text scan. A legacy function that belongs to an extension is not detected
+either: the migration would fail at `DROP FUNCTION` and roll back, nothing
+changed (unrealistic on RDS: the functions were created by migrations, not by
+an extension).
+
+**"036 first" is procedural.** Neither check knows whether 036 was verified
+in production: the production window is pinned to an exact revision (see
+"How the pin moves"), and 037 gets its own owner instruction after 036 is
+verified. A mechanical guard would break the run of the whole chain on a
+fresh database in development and CI, which applies 036 and 037 together.
+
+No readiness-receipt check, unlike 036: 037 changes no live column, so no
+receipt content digest changes meaning, and an unexpired readiness receipt
+is unaffected (tested). The rollout state does not matter either: no live
+code path reads the dropped objects.
+
+**Expected output of the run:** one line
+`Running upgrade 036 -> 037, drop the legacy AbacatePay migration saga and roster objects`;
+then `alembic_version` reads `037` and `SELECT to_regclass('billing_migrations')`
+is NULL.
+
+**Lock wait.** Both directions start with `SET LOCAL lock_timeout = '5s'`.
+The upgrade's preflight then takes `ACCESS EXCLUSIVE` on seven tables,
+`builders` among them; the downgrade's on `builders`,
+`billing_subscriptions` and `billing_checkout_sessions`. An open transaction
+that touched one of them, even a plain `SELECT` left idle in a transaction,
+blocks that lock, and while the migration waits every new read of that
+table queues behind it, which is why the wait is bounded. A timeout raises
+SQLSTATE `55P03` (`canceling statement due to lock timeout`). If another
+session holds one of these tables and waits for one the migration already
+holds, PostgreSQL breaks the cycle and may cancel the migration with SQLSTATE
+`40P01` (`deadlock detected`). **55P03 and 40P01 both mean nothing changed**:
+the whole migration transaction rolled back and `alembic_version` is
+unchanged. Wait for the blocking transaction to end (see `pg_stat_activity`
+and `pg_locks` for the holder; never kill it without the owner) and rerun the
+same one-off task. Once the locks are granted the run takes milliseconds.
+
+### What the application needs (deploy order)
+
+Verified on PostgreSQL 16 on 2026-10-20 by running each code tree's ORM
+against each schema (every mapped table read with all its columns, and the
+ORM deletion of a builder that `DELETE /v1/admin/builders/{id}` performs):
+
+- **The image of this release on a 036 database works**: every mapped table
+  reads, and a builder deletes (the ORM no longer maps the legacy tables, and
+  their foreign keys to `builders` are satisfied while they are empty).
+- **The previous image (the E5 release) on a 037 database** reads every live
+  table, but the ORM deletion of a builder loads `Builder.billing_migrations`
+  and fails with `relation "billing_migrations" does not exist`: the
+  super_admin route `DELETE /v1/admin/builders/{id}` answers 500 and the
+  transaction rolls back (nothing deleted). No other code path of that image
+  touches the dropped tables.
+
+Order (each step stops on any divergence and returns to the owner):
+
+1. **Deploy this release's image** (the one that contains 037). **Verify:**
+   the ECS deployment is `COMPLETED` and every RUNNING task runs the new task
+   definition revision. A `/ready` 200 alone proves nothing here: under
+   `ENVIRONMENT=staging` it does not probe the database.
+2. **RDS snapshot** (owner decision 2026-10-19 b): take a manual snapshot
+   named `pre-037-<date>` and wait until its status is `available`.
+3. **Preflight readback** (`scripts/migration_037_readback.sql`, above) right
+   before the run, connected with the migrations database URL (the role that
+   runs step 4, never the application role), as `BEGIN READ ONLY; ...;
+   ROLLBACK;` with nothing left open: eleven `ok`.
+4. **Run 037** as a one-off `neurostack-staging-migrations` task on the same
+   image, with the command fixed to the exact revision
+   (`alembic upgrade 037`). The service itself never migrates. On `55P03` or
+   `40P01` see "Lock wait" above.
+5. **Verify** `alembic_version` == `037` and the four tables are gone.
+
+### Rollback (downgrade 037 -> 036)
+
+The downgrade is real. It restores the 036 objects from
+`alembic/frozen/037_downgrade_restores_036.json`: the four tables (empty)
+with their columns in the original order, the ten functions, the
+constraints, the two indexes, the twelve triggers and the roster's seed row
+at revision `0` (the value 037's preflight required when it dropped it).
+That DDL was extracted from a fresh 036 database by
+`scripts/alembic_frozen_ddl.py --migration 037`; every CHECK in it is
+proven, at extraction, to read back exactly as it was. Its SHA-256 is pinned
+in the migration, which refuses a changed byte before any SQL (the upgrade
+reads the same file to know what it may drop). The fidelity test proves the
+result equal to a brand-new 036 catalog, column order included, and that the
+restored guards refuse what they refused.
+
+- It needs no data: the restored tables were empty by construction and no
+  live row refers to them. It refuses (SQLSTATE `55000`, nothing changed)
+  only when the revision is not exactly `037` or when a relation, type or
+  function whose name the restore needs already exists.
+- The restored objects belong to the role that runs the downgrade and get
+  its default privileges. Run it with the same migration role as the
+  upgrade: the upgrade refused unless that is what the dropped objects had.
+- It takes the same 5-second lock timeout: `55P03` (or `40P01`) means
+  nothing changed.
+- **Rollback target.** After 037 the previous release image cannot use the
+  removed objects: only its builder deletion is affected (above), but roll
+  back the application only to an image of this release; running the E5
+  image again needs the downgrade to 036 first, which is a separate owner
+  decision.
+
+### Open follow-ups recorded by E6
+
+- **E7 (alerts and digest):** remove the dead alert
+  `BillingMigrationManualIntervention`, rename `BillingMigrationReadbackBacklog`
+  (it reads a live metric), and retire the metrics
+  `neurostack_billing_migration_operations`/`_backlog` with their label
+  dimensions in `src/observability/metric_dimensions.py`
+  (`_BILLING_MIGRATION_OPERATION`, which still lists `roster_import`, and
+  `_BILLING_MIGRATION_STATE`), plus the names in
+  `scripts/verify-asaas-observability.py`, in the same coordinated digest
+  rotation. E6 left them: the metric is still registered and the rules
+  digest must not move here.
+- **E8 / A8 (CI):** `tests/integration/test_migration_036_postgres.py` and
+  `tests/integration/test_migration_037_postgres.py` are not in
+  `asaas_release_candidate_postgres_suites`; add them there (the CI job runs
+  that function) when the PostgreSQL 16 job lands. The characterization
+  module's server-log audit needs `logging_collector` on, as the job sets.
+- **T8 (planner pins and zero-read SQL):** reuse
+  `scripts/migration_037_readback.sql` verbatim, run as the migration role in
+  a read-only transaction; eleven `ok` is the green readback. It shares the
+  migration's checks except two things that are migration-only: the
+  `ACCESS EXCLUSIVE` locks (the readback is a snapshot) and the probe table
+  and function behind the privilege check (the readback computes the same
+  expectation from `pg_default_acl`; see the table in "Preflight readback").
+  Running it as any other role makes the privilege row answer for that role.
 
 ## Production wiring (Group 9 D3/D4)
 

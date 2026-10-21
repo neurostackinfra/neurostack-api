@@ -2552,10 +2552,11 @@ async def test_deleted_payment_with_refunds_settles_and_reverses_on_postgres(
 # billing_subscriptions.roster_revision, and the held-fence test lost its
 # statement-trigger branch).
 TESTS_THAT_BREAK_AFTER_036: tuple[str, ...] = ()
-# 037 drops billing_roster_control, which the held-fence test locks.
-TESTS_THAT_BREAK_AFTER_037: tuple[str, ...] = (
-    "test_e4_a_held_roster_fence_blocks_no_webhook_path",
-)
+# 037 is applied: it dropped billing_roster_control, whose row the held-fence
+# test also locked.  E6 rewrote that test as
+# test_e4_a_held_roster_key_blocks_no_webhook_path: it holds the global key
+# alone and pins that the table is gone.
+TESTS_THAT_BREAK_AFTER_037: tuple[str, ...] = ()
 
 
 async def test_break_inventory_names_only_collected_tests(
@@ -2571,8 +2572,9 @@ async def test_break_inventory_names_only_collected_tests(
         assert sorted(set(listed) - collected) == []
 
 
-# The key 026's lock_billing_roster_statement() takes (since 036 only the
-# legacy tables' own triggers call it); it has no Python mirror any more.
+# The key 026's lock_billing_roster_statement() took (036 dropped the trigger
+# on billing_subscriptions, 037 the function and the legacy tables whose
+# triggers still called it); it has no Python mirror any more.
 _LEGACY_ROSTER_FENCE_KEY = 3486705124568449331
 _FENCE_TRIGGER = (
     "SELECT count(*) FROM pg_trigger "
@@ -2803,33 +2805,30 @@ async def test_e4_former_roster_call_sites_commit_without_the_fence(
     )
 
 
-async def test_e4_a_held_roster_fence_blocks_no_webhook_path(
+async def test_e4_a_held_roster_key_blocks_no_webhook_path(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A transaction holding the roster fence exactly as the 026 triggers take
-    it (the global key, then the control row) blocks neither the handoff, a
-    payment of the subscription, a redelivered event, the readback nor a
-    deletion.  Before E4 each of them waited on it; until migration 036 the
-    deletion (an UPDATE of billing_subscriptions) still met the database's
-    statement fence, which 036 dropped."""
+    """A transaction holding the global roster key the 026 triggers took
+    blocks neither the handoff, a payment of the subscription, a redelivered
+    event, the readback nor a deletion.  Before E4 each of them waited on it
+    (and on the control row); until migration 036 the deletion (an UPDATE of
+    billing_subscriptions) still met the database's statement fence, which
+    036 dropped; since 037 the control row it also locked does not exist."""
 
     builder_id, session_id, checkout_id, cents = await _subscription(
         harness, monkeypatch, "E4 fence held"
     )
     external = "sub_pg_e4_fence_held"
     assert int(await _scalar(harness, _FENCE_TRIGGER)) == 0
+    assert (
+        await _scalar(harness, "SELECT to_regclass('billing_roster_control')") is None
+    )
     holder = harness.session()
     writer = harness.session()
     try:
         await holder.execute(
             text("SELECT pg_advisory_xact_lock(:key)"),
             {"key": _LEGACY_ROSTER_FENCE_KEY},
-        )
-        await holder.execute(
-            text(
-                "SELECT 1 FROM billing_roster_control WHERE singleton = true "
-                "FOR UPDATE"
-            )
         )
 
         async def unblocked(call: Awaitable[Any]) -> Any:

@@ -8,6 +8,7 @@ repository SQL runs on SQLite so every blocker condition and the
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import date
 from pathlib import Path
@@ -21,7 +22,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from src.models.base import Base
 from src.models.billing import (
     BillingCheckoutSession,
-    BillingMigration,
     BillingRolloutControl,
     BillingSubscription,
 )
@@ -114,31 +114,33 @@ async def test_a_builder_without_billing_rows_is_eligible(
     assert await _blocker(sessions, uuid4()) is None
 
 
+SUBSCRIPTION_CASES: list[tuple[str | None, str, bool, str | None]] = [
+    ("abacatepay", "active", True, "abacatepay_subscription"),
+    ("abacatepay", "inactive", False, None),
+    ("abacatepay", "cancelled", False, None),
+    # Non-terminal legacy rows fail closed even when not billable.
+    (
+        "abacatepay",
+        "non_billable_pending_readback",
+        False,
+        "abacatepay_subscription",
+    ),
+    ("abacatepay", "readback_required", True, "abacatepay_subscription"),
+    ("asaas", "active", True, "asaas_subscription"),
+    ("asaas", "active_linked", True, "asaas_subscription"),
+    ("asaas", "readback_required", True, "asaas_subscription"),
+    ("asaas", "non_billable_pending_readback", False, "asaas_subscription"),
+    ("asaas", "inactive", False, None),
+    ("asaas", "cancelled", False, None),
+    (None, "legacy_cancel_pending", False, "unresolved_subscription"),
+    (None, "legacy_cancelled", False, "unresolved_subscription"),
+    (None, "provider_unknown", False, "unresolved_subscription"),
+    (None, "manual_intervention", False, "unresolved_subscription"),
+]
+
+
 @pytest.mark.parametrize(
-    ("provider", "status", "is_active", "expected"),
-    [
-        ("abacatepay", "active", True, "abacatepay_subscription"),
-        ("abacatepay", "inactive", False, None),
-        ("abacatepay", "cancelled", False, None),
-        # Non-terminal legacy rows fail closed even when not billable.
-        (
-            "abacatepay",
-            "non_billable_pending_readback",
-            False,
-            "abacatepay_subscription",
-        ),
-        ("abacatepay", "readback_required", True, "abacatepay_subscription"),
-        ("asaas", "active", True, "asaas_subscription"),
-        ("asaas", "active_linked", True, "asaas_subscription"),
-        ("asaas", "readback_required", True, "asaas_subscription"),
-        ("asaas", "non_billable_pending_readback", False, "asaas_subscription"),
-        ("asaas", "inactive", False, None),
-        ("asaas", "cancelled", False, None),
-        (None, "legacy_cancel_pending", False, "unresolved_subscription"),
-        (None, "legacy_cancelled", False, "unresolved_subscription"),
-        (None, "provider_unknown", False, "unresolved_subscription"),
-        (None, "manual_intervention", False, "unresolved_subscription"),
-    ],
+    ("provider", "status", "is_active", "expected"), SUBSCRIPTION_CASES
 )
 async def test_subscription_rows_block_until_terminal(
     sessions: async_sessionmaker[AsyncSession],
@@ -189,10 +191,16 @@ async def test_legacy_row_flipped_to_asaas_blocks_while_asaas_is_billable(
     assert await _blocker(sessions, builder_id) is None
 
 
-# The migration saga was removed (Group 10 phase E2) and production holds no
-# billing_migrations rows; the table goes in a later phase.  Every saga state
-# (migration 026) is paired with the subscription row that state leaves
-# behind: each of those still fails closed, now through the subscription rule.
+# The migration saga was removed (Group 10 phase E2) and migration 037 (E6)
+# dropped billing_migrations: no saga row can exist any more, so eligibility
+# reads subscription rows only.  Each saga state (migration 026) is paired
+# with the subscription row that state left behind; every such shape is a
+# case of test_subscription_rows_block_until_terminal above, and the shapes
+# that still block are exactly the non-terminal ones.  E6 deleted the two
+# tests that inserted a BillingMigration row next to each shape (the ORM no
+# longer maps the table): the "saga row + live subscription" half is the
+# subscription case alone, and the "leftover saga row + ended subscription"
+# shape (owner-acknowledged E2 behaviour change) cannot be built at 037.
 SAGA_LIVE_SUBSCRIPTION: dict[str, tuple[str | None, str, bool, str]] = {
     "pending": ("abacatepay", "active", True, "abacatepay_subscription"),
     "in_progress": (None, "legacy_cancel_pending", False, "unresolved_subscription"),
@@ -213,88 +221,32 @@ SAGA_LIVE_SUBSCRIPTION: dict[str, tuple[str | None, str, bool, str]] = {
     ),
 }
 ENDED_SUBSCRIPTIONS = (("abacatepay", "inactive"), ("asaas", "cancelled"))
+_FROZEN_036 = (
+    Path(__file__).resolve().parents[2]
+    / "alembic"
+    / "frozen"
+    / "037_downgrade_restores_036.json"
+)
 
 
-async def _saga_builder(
-    sessions: async_sessionmaker[AsyncSession],
-    *,
-    state: str,
-    provider: str | None,
-    status: str,
-    is_active: bool,
-) -> UUID:
-    builder_id = uuid4()
-    async with sessions() as session:
-        subscription_id = await _subscription(
-            session,
-            builder_id,
-            provider=provider,
-            status=status,
-            is_active=is_active,
-        )
-        session.add(
-            BillingMigration(
-                id=uuid4(),
-                builder_id=builder_id,
-                subscription_id=subscription_id,
-                state=state,
-                renewal_date=date(2026, 11, 10),
-                open_by_date=date(2026, 11, 3),
-                cutover_by_date=date(2026, 11, 8),
-                target_provider="asaas",
-                target_catalog_version_id="payment-2026-10-03",
-                target_offer_id="plan_plus_monthly_v1",
-                target_plan="plus",
-                target_billing_cycle="monthly",
-                target_amount_cents=99_900,
-                target_snapshot={},
-                attempt_count=0,
-                source_roster_revision=1,
-            )
-        )
-        await session.commit()
-    return builder_id
-
-
-def test_the_saga_matrix_covers_every_persisted_saga_state() -> None:
-    from sqlalchemy import CheckConstraint
+def test_every_shape_the_retired_saga_left_behind_is_a_blocking_case() -> None:
+    """The saga states come from the 036 CHECK that 037's downgrade restores
+    (the only place they still exist); each state's subscription shape is a
+    case above that blocks, and both ended shapes are cases that do not."""
 
     (check,) = [
-        str(constraint.sqltext)
-        for constraint in BillingMigration.__table__.constraints
-        if isinstance(constraint, CheckConstraint)
-        and constraint.name == "ck_billing_migrations_state"
+        entry["statement"]
+        for entry in json.loads(_FROZEN_036.read_text(encoding="ascii"))["constraints"]
+        if entry["name"] == "ck_billing_migrations_state"
     ]
-    persisted = set(re.findall(r"'([a-z_]+)'", check))
+    persisted = set(re.findall(r"'([a-z_]+)'::character varying", check))
 
     assert persisted == set(SAGA_LIVE_SUBSCRIPTION)
-
-
-@pytest.mark.parametrize("state", sorted(SAGA_LIVE_SUBSCRIPTION))
-async def test_every_live_saga_state_still_blocks_through_its_subscription(
-    sessions: async_sessionmaker[AsyncSession], state: str
-) -> None:
-    provider, status, is_active, expected = SAGA_LIVE_SUBSCRIPTION[state]
-    builder_id = await _saga_builder(
-        sessions, state=state, provider=provider, status=status, is_active=is_active
-    )
-
-    assert await _blocker(sessions, builder_id) == expected
-
-
-@pytest.mark.parametrize(("provider", "status"), ENDED_SUBSCRIPTIONS)
-@pytest.mark.parametrize("state", sorted(SAGA_LIVE_SUBSCRIPTION))
-async def test_a_leftover_saga_row_with_an_ended_subscription_does_not_block(
-    sessions: async_sessionmaker[AsyncSession],
-    state: str,
-    provider: str,
-    status: str,
-) -> None:
-    builder_id = await _saga_builder(
-        sessions, state=state, provider=provider, status=status, is_active=False
-    )
-
-    assert await _blocker(sessions, builder_id) is None
+    for shape in SAGA_LIVE_SUBSCRIPTION.values():
+        assert shape in SUBSCRIPTION_CASES, shape
+        assert shape[3] is not None
+    for provider, status in ENDED_SUBSCRIPTIONS:
+        assert (provider, status, False, None) in SUBSCRIPTION_CASES
 
 
 @pytest.mark.parametrize(

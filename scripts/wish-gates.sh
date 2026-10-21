@@ -946,12 +946,11 @@ asaas_release_candidate_postgres_suites() (
 #   BASE_REF=origin/main POSTGRES_SMOKE_DATABASE_URL=... \
 #     bash -c 'source scripts/wish-gates.sh && asaas_release_candidate_gate'
 #
-# Known legacy references, removed by later phases of asaas-payment-gateway
-# Group 10 and not by this gate: tests/integration/test_asaas_billing_postgres.py
-# and tests/integration/test_asaas_subscription_triggers_postgres.py still
-# exercise the legacy migration tables and roster triggers with raw SQL until
-# those database objects are dropped. The migration saga service, its admin
-# routes and operator client were removed in Group 10 phase E2;
+# Legacy references removed by asaas-payment-gateway Group 10: the migration
+# saga service, its admin routes and operator client (phase E2); the legacy
+# migration tables, the roster and their triggers (migration 037, phase E6),
+# whose absence tests/integration/test_asaas_billing_postgres.py and
+# tests/integration/test_asaas_subscription_triggers_postgres.py now pin;
 # docker-compose.production.yml no longer requires ABACATEPAY_WEBHOOK_SECRET
 # (phase 1) nor ASAAS_PROVIDER_EVIDENCE_* (phase E2).
 #

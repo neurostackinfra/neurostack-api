@@ -2497,19 +2497,14 @@ async def test_l5_readiness_conflicts_do_not_cross_environments(
 # _insert_readiness_past_the_service, and moved the "stored value is inert"
 # test to "the column is gone".
 TESTS_THAT_BREAK_AFTER_036: tuple[str, ...] = ()
-# 037 drops billing_roster_control: _advance_roster_revision updates it and
-# _assert_roster_fence_free locks it.
-TESTS_THAT_BREAK_AFTER_037: tuple[str, ...] = (
-    "test_e3_readiness_ignores_the_roster_and_promotes",
-    "test_e3_readiness_locks_rollout_first_and_never_the_roster_fence"
-    "[SUBSCRIPTION_CREATED]",
-    "test_e3_readiness_locks_rollout_first_and_never_the_roster_fence"
-    "[SUBSCRIPTION_DELETED]",
-    "test_e3_general_locks_rollout_first_and_never_the_roster_fence"
-    "[SUBSCRIPTION_CREATED]",
-    "test_e3_general_locks_rollout_first_and_never_the_roster_fence"
-    "[SUBSCRIPTION_DELETED]",
-)
+# 037 is applied: it dropped billing_roster_control.  E6 removed
+# _advance_roster_revision (it moved the global revision 0 -> 1) and turned
+# test_e3_readiness_ignores_the_roster_and_promotes into
+# test_e3_readiness_promotes_without_any_roster (no table to move);
+# _assert_roster_fence_free became _assert_roster_key_free (the advisory key
+# is still never taken; the row it also locked no longer exists), so the two
+# lock-order tests keep their parametrizations.
+TESTS_THAT_BREAK_AFTER_037: tuple[str, ...] = ()
 
 
 async def test_break_inventory_names_only_collected_tests(
@@ -2525,9 +2520,10 @@ async def test_break_inventory_names_only_collected_tests(
         assert sorted(set(listed) - collected) == []
 
 
-# The global roster key the migration 026 triggers take (the Python mirror
+# The global roster key the migration 026 triggers took (the Python mirror
 # was removed in Group 10 E4; migration 036 removed the trigger on
-# billing_subscriptions, the legacy tables keep theirs until 037).
+# billing_subscriptions, 037 the legacy tables, their triggers and
+# lock_billing_roster_statement()).
 _ROSTER_KEY = 3486705124568449331
 _HELD_ADVISORY = (
     "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted "
@@ -2535,24 +2531,6 @@ _HELD_ADVISORY = (
     "AND classid::bigint = ((CAST(:key AS bigint) >> 32) & 4294967295) "
     "AND objid::bigint = (CAST(:key AS bigint) & 4294967295)"
 )
-
-
-async def _advance_roster_revision(plane: _ControlPlane) -> int:
-    """Move the global roster revision 0 -> 1 (the one step the database
-    allows outside the saga), so readiness bound to the roster would differ."""
-
-    async with plane.sessions() as session:
-        async with session.begin():
-            result = await session.execute(
-                text(
-                    "UPDATE billing_roster_control SET billing_roster_revision = 1 "
-                    "WHERE singleton = true AND billing_roster_revision = 0"
-                )
-            )
-            assert result.rowcount == 1
-    return int(
-        await plane.scalar("SELECT billing_roster_revision FROM billing_roster_control")
-    )
 
 
 async def _held_advisory(session: AsyncSession, key: int) -> int:
@@ -2618,8 +2596,9 @@ async def _assert_lockable(
         await probe.rollback()
 
 
-async def _assert_roster_fence_free(plane: _ControlPlane) -> None:
-    """Neither the roster advisory key nor the roster row is held."""
+async def _assert_roster_key_free(plane: _ControlPlane) -> None:
+    """Nobody holds the global roster advisory key (since migration 037 the
+    roster row it used to guard does not exist)."""
 
     async with plane.sessions() as probe:
         assert (
@@ -2628,12 +2607,10 @@ async def _assert_roster_fence_free(plane: _ControlPlane) -> None:
             )
             is True
         )
-        rows = (
-            await probe.execute(
-                text("SELECT singleton FROM billing_roster_control FOR UPDATE NOWAIT")
-            )
-        ).all()
-        assert len(rows) == 1
+        assert (
+            await probe.scalar(text("SELECT to_regclass('billing_roster_control')"))
+            is None
+        )
         await probe.rollback()
 
 
@@ -2837,14 +2814,15 @@ async def test_e3_readiness_request_with_roster_revision_is_422_before_anything(
     assert await plane.readiness_rows(revision) == 1
 
 
-async def test_e3_readiness_ignores_the_roster_and_promotes(
+async def test_e3_readiness_promotes_without_any_roster(
     plane: _ControlPlane,
 ) -> None:
-    """The global roster revision moved (1): readiness neither checks nor
-    copies it (since migration 036 the row has no roster column at all) and
-    the stored digest is the documented one, re-derived from the field list."""
+    """Readiness never checked nor copied the global roster revision (E3),
+    since migration 036 its row has no roster column and since 037 there is
+    no roster at all: the receipts are recorded with the documented digest,
+    re-derived from the field list, and ``general`` is reached."""
 
-    assert await _advance_roster_revision(plane) == 1
+    assert await plane.scalar("SELECT to_regclass('billing_roster_control')") is None
     revision = await _open_canary(plane)
     material = _material(from_state="canary_allowlist", to_state="general")
     quorum = await plane.quorum(material)
@@ -2893,10 +2871,6 @@ async def test_e3_readiness_ignores_the_roster_and_promotes(
     assert response.status_code == 200, response.text
     assert response.json()["state"] == "general"
     assert await plane.applied(material) == 3
-    assert (
-        await plane.scalar("SELECT billing_roster_revision FROM billing_roster_control")
-        == 1
-    )
 
 
 async def test_e3_a_digest_that_hashes_roster_revision_never_verifies(
@@ -3083,7 +3057,7 @@ async def test_e3_readiness_locks_rollout_first_and_never_the_roster_fence(
                 3,
                 op=material["operation_id"],
             )
-            await _assert_roster_fence_free(plane)
+            await _assert_roster_key_free(plane)
             await _finish_webhook(plane, webhook, event)
         finally:
             webhook.resume.set()
@@ -3095,7 +3069,7 @@ async def test_e3_readiness_locks_rollout_first_and_never_the_roster_fence(
         assert outcome.receipt_kind == "smoke"
         assert await _held_advisory(worker, billing_advisory_key(_ENVIRONMENT)) == 1
         assert await _held_advisory(worker, _ROSTER_KEY) == 0
-        await _assert_roster_fence_free(plane)
+        await _assert_roster_key_free(plane)
         await worker.commit()
 
     assert await plane.readiness_rows(revision) == 4
@@ -3153,7 +3127,7 @@ async def test_e3_general_locks_rollout_first_and_never_the_roster_fence(
                 3,
                 op=material["operation_id"],
             )
-            await _assert_roster_fence_free(plane)
+            await _assert_roster_key_free(plane)
             await _finish_webhook(plane, webhook, event)
         finally:
             webhook.resume.set()
@@ -3165,7 +3139,7 @@ async def test_e3_general_locks_rollout_first_and_never_the_roster_fence(
         assert outcome.state == "general"
         assert await _held_advisory(worker, billing_advisory_key(_ENVIRONMENT)) == 1
         assert await _held_advisory(worker, _ROSTER_KEY) == 0
-        await _assert_roster_fence_free(plane)
+        await _assert_roster_key_free(plane)
         await worker.commit()
 
     assert (await plane.readback())["state"] == "general"
