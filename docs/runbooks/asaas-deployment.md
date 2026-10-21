@@ -1034,10 +1034,21 @@ service's current revision, `count` 1, `launchType` `FARGATE`, the service's
 `platformVersion`, the service's subnets and security groups with
 `assignPublicIp` `DISABLED`, `overrides.containerOverrides` exactly
 `[{"name": "app", "command": ["python", "-m", "src.ops.asaas_webhook", "reconcile"]}]`,
-`startedBy` `neurostack-asaas-webhook-reconcile`, `propagateTags` `NONE`,
-`enableECSManagedTags` and `enableExecuteCommand` false, and a `clientToken`
-derived from the deployment ID, the request and the attempt: a retried call
-cannot start a second task. Single flight is the `ListTasks` precondition plus
+`startedBy` `neurostack-asaas-webhook-reconcile`, `enableECSManagedTags` and
+`enableExecuteCommand` false, and a `clientToken` derived from the deployment
+ID, the request and the attempt: a retried call cannot start a second task.
+`propagateTags` is omitted on purpose: the live RunTask API rejects `NONE`
+(`InvalidParameterException: Invalid value for propagateTags`) even though the
+SDK model lists it, and omission means no propagation. The hook refuses to
+render a request that carries the key, and a recorded RunTask that carries it
+is `run_task_request_propagate_tags_present`. The top-level key set is pinned
+by the hook and its tests. A request with only `cluster`, `taskDefinition`,
+`launchType`, `count`, `startedBy`, `enableExecuteCommand`,
+`networkConfiguration` and `overrides` was accepted live; `clientToken`,
+`platformVersion` and `enableECSManagedTags` are documented RunTask parameters
+not yet verified live in this request. The first real registration run is that
+check: on any `InvalidParameterException` from RunTask, stop (do not edit the
+request, do not retry) and report the exact error message. Single flight is the `ListTasks` precondition plus
 that token; two operators planning at the same instant can still both start
 a task (the window between the listing and the RunTask), in which case the
 command itself reports `ambiguous` and deletes nothing.
@@ -1104,6 +1115,7 @@ differs.
 
 Hook-level reasons that are also `DEPLOYED_WEBHOOK_PENDING`: `run_task_failed`
 (RunTask started nothing), `run_task_request_not_rendered_by_hook`,
+`run_task_request_propagate_tags_present`,
 `task_identity_mismatch` and `task_command_override_mismatch` (alert kind
 `evidence_mismatch`), `task_watch_deadline_exceeded`, `log_events_truncated`
 and `log_forbidden_material` (rotate per
