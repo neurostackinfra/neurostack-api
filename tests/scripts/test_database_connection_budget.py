@@ -291,20 +291,53 @@ def test_worker_parser_accepts_both_literal_forms(
     assert budget.parse_worker_count(command, "test command") == expected
 
 
+# The production stage's own CMD (the development CMD carries --reload).
+_PRODUCTION_CMD = (
+    'CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", '
+    '"--workers"'
+)
+
+
 def test_docker_effective_entrypoint_and_cmd_reject_mixed_worker_options(
     tmp_path: Path,
 ) -> None:
     _compose, dockerfile, _env_file = _vps_files(tmp_path)
+    text = dockerfile.read_text(encoding="utf-8")
+    assert text.count(_PRODUCTION_CMD) == 1
     dockerfile.write_text(
-        dockerfile.read_text(encoding="utf-8").replace(
-            "FROM base AS deps",
-            'ENTRYPOINT ["uvicorn", "--workers=99"]\n\nFROM base AS deps',
+        text.replace(
+            _PRODUCTION_CMD,
+            'ENTRYPOINT ["uvicorn", "--workers=99"]\n' + _PRODUCTION_CMD,
             1,
         ),
         encoding="utf-8",
     )
     with pytest.raises(budget.BudgetError, match="unambiguous"):
         budget._production_workers(dockerfile)
+
+
+def test_build_stage_entrypoint_does_not_reach_the_runtime_stage(
+    tmp_path: Path,
+) -> None:
+    # production starts afresh from the pinned python image, not from base:
+    # nothing declared in the build stages is inherited by it.
+    _compose, dockerfile, _env_file = _vps_files(tmp_path)
+    text = dockerfile.read_text(encoding="utf-8")
+    # A renamed anchor would leave the Dockerfile untouched and the test vacuous.
+    assert text.count("FROM base AS deps") == 1
+    dockerfile.write_text(
+        text.replace(
+            "FROM base AS deps",
+            'ENTRYPOINT ["uvicorn", "--workers=99"]\n\nFROM base AS deps',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    assert budget._production_workers(dockerfile) == 4
+    # The ENTRYPOINT did land in the build stages.
+    assert 'ENTRYPOINT ["uvicorn", "--workers=99"]' in dockerfile.read_text(
+        encoding="utf-8"
+    )
 
 
 @requires_docker_compose
