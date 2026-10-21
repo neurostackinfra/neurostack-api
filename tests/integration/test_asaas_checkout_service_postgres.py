@@ -715,33 +715,19 @@ async def test_ineligible_builder_gets_stable_rejection_without_rows_or_post(
 
 # ---------------------------------------------------------------------------
 # Group 10 phase E2: the migration saga is removed and a billing_migrations row
-# no longer blocks by itself.  Every live saga state still fails closed through
-# the subscription row it leaves behind; a row left over after its
-# subscription ended does not.  The advisory read contract (6b) and the POST
-# must agree in both directions.
+# no longer blocked by itself; migration 037 (E6) dropped the table, so no
+# saga row can exist any more.  Every live saga state still fails closed
+# through the subscription row it left behind; an ended subscription does
+# not.  The advisory read contract (6b) and the POST must agree in both
+# directions.  (Until E6 each case also seeded a billing_migrations row next
+# to the subscription; only the subscription ever decided, since E2.)
 # ---------------------------------------------------------------------------
 
-_SAGA_SNAPSHOT = """
-    jsonb_build_object(
-      'catalog_version_id','payment-2026-10-03',
-      'offer_id','plan_plus_monthly_v1','plan','plus',
-      'billing_cycle','monthly','coupon_code',NULL,
-      'amount_cents',99900,'credit_grant_mc',5000,
-      'included_clinics',1,'additional_clinics',0,
-      'lines',jsonb_build_array(jsonb_build_object(
-        'line_id','plan','offer_id','plan_plus_monthly_v1',
-        'kind','plan','quantity',1,'unit_amount_cents',99900,
-        'line_amount_cents',99900,'credit_grant_mc',5000,
-        'settled_cents',0,'reversed_cents',0,'restored_cents',0,
-        'line_financial_state','pending')))
-"""
 
-
-async def _seed_saga(
+async def _seed_left_behind_subscription(
     harness: _Harness,
     builder_id: UUID,
     *,
-    state: str,
     provider: str | None,
     status: str,
     is_active: bool,
@@ -768,30 +754,6 @@ async def _seed_saga(
                     "status": status,
                 },
             )
-            await session.execute(
-                text(f"""
-                    INSERT INTO billing_migrations (
-                        id, builder_id, subscription_id, state,
-                        renewal_date, open_by_date, cutover_by_date,
-                        target_catalog_version_id, target_offer_id,
-                        target_plan, target_billing_cycle,
-                        target_amount_cents, target_snapshot,
-                        source_roster_revision
-                    ) VALUES (
-                        :id, :builder_id, :subscription_id, :state,
-                        DATE '2026-12-10', DATE '2026-12-03',
-                        DATE '2026-12-08', 'payment-2026-10-03',
-                        'plan_plus_monthly_v1', 'plus', 'monthly', 99900,
-                        {_SAGA_SNAPSHOT}, 1
-                    )
-                """),
-                {
-                    "id": uuid4(),
-                    "builder_id": builder_id,
-                    "subscription_id": subscription_id,
-                    "state": state,
-                },
-            )
 
 
 async def _listed_offers(harness: _Harness, builder_id: UUID) -> tuple[str, ...]:
@@ -815,7 +777,7 @@ async def _listed_offers(harness: _Harness, builder_id: UUID) -> tuple[str, ...]
         ("manual_intervention", None, "manual_intervention", False),
     ],
 )
-async def test_live_saga_pairings_still_reject_without_rows_or_post(
+async def test_what_a_live_saga_left_behind_still_rejects_without_rows_or_post(
     harness: _Harness,
     monkeypatch: pytest.MonkeyPatch,
     state: str,
@@ -827,13 +789,8 @@ async def test_live_saga_pairings_still_reject_without_rows_or_post(
     builder_id = await _builder(harness, f"E2 live saga {state}")
     _configure(monkeypatch, "development", _Flag())
     fake = _Provider(harness)
-    await _seed_saga(
-        harness,
-        builder_id,
-        state=state,
-        provider=provider,
-        status=status,
-        is_active=is_active,
+    await _seed_left_behind_subscription(
+        harness, builder_id, provider=provider, status=status, is_active=is_active
     )
     before = await _rows(harness, builder_id)
 
@@ -862,7 +819,7 @@ async def test_live_saga_pairings_still_reject_without_rows_or_post(
         ("manual_intervention", "abacatepay", "cancelled"),
     ],
 )
-async def test_leftover_saga_row_with_an_ended_subscription_checks_out(
+async def test_an_ended_subscription_a_saga_left_behind_checks_out(
     harness: _Harness,
     monkeypatch: pytest.MonkeyPatch,
     state: str,
@@ -873,13 +830,8 @@ async def test_leftover_saga_row_with_an_ended_subscription_checks_out(
     builder_id = await _builder(harness, f"E2 leftover saga {state}")
     _configure(monkeypatch, "development", _Flag())
     fake = _Provider(harness)
-    await _seed_saga(
-        harness,
-        builder_id,
-        state=state,
-        provider=provider,
-        status=status,
-        is_active=False,
+    await _seed_left_behind_subscription(
+        harness, builder_id, provider=provider, status=status, is_active=False
     )
 
     # Read contract and POST agree: listed, then exactly one provider POST.

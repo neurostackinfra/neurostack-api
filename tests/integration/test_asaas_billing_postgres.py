@@ -42,35 +42,6 @@ pytestmark = pytest.mark.integration
 
 _ROOT = Path(__file__).resolve().parents[2]
 _CHILD_PATTERN = re.compile(r"^neurostack_asaas_smoke_[0-9a-f]{12}$")
-_MIGRATION_SNAPSHOT_JSON = json.dumps(
-    {
-        "catalog_version_id": "catalog-v1",
-        "offer_id": "plan_plus_monthly_v1",
-        "plan": "plus",
-        "billing_cycle": "monthly",
-        "coupon_code": None,
-        "amount_cents": 99900,
-        "credit_grant_mc": 5000,
-        "included_clinics": 1,
-        "additional_clinics": 0,
-        "lines": [
-            {
-                "line_id": "plan",
-                "offer_id": "plan_plus_monthly_v1",
-                "kind": "plan",
-                "quantity": 1,
-                "unit_amount_cents": 99900,
-                "line_amount_cents": 99900,
-                "credit_grant_mc": 5000,
-                "settled_cents": 0,
-                "reversed_cents": 0,
-                "restored_cents": 0,
-                "line_financial_state": "pending",
-            }
-        ],
-    },
-    separators=(",", ":"),
-)
 
 
 @dataclass(frozen=True)
@@ -704,7 +675,7 @@ async def test_upgrade_downgrade_and_fresh_schema_are_equivalent(
     async with postgres_harness.engine.connect() as connection:
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "036"
+            == "037"
         )
         legacy = (
             await connection.execute(
@@ -751,7 +722,6 @@ async def test_live_schema_matches_orm_metadata_and_required_triggers(
         ),
         ("billing_payment_effects", "trg_billing_canary_effect_validate"),
         ("billing_rollout_receipts", "trg_billing_rollout_receipts_immutable"),
-        ("billing_migration_receipts", "trg_billing_migration_receipts_immutable"),
         ("billing_outbox", "trg_billing_outbox_immutable"),
         ("billing_fact_handoffs", "trg_billing_fact_handoffs_immutable"),
         ("billing_fact_acks", "trg_billing_fact_acks_immutable"),
@@ -765,6 +735,13 @@ async def test_live_schema_matches_orm_metadata_and_required_triggers(
             "trg_billing_subscription_cycle_fact_atomic",
         ),
     }.issubset(triggers)
+    # Migration 037 dropped the legacy saga tables with their triggers (the
+    # ORM, compared above, no longer maps them either).
+    assert {
+        (table, name)
+        for table, name in triggers
+        if table.startswith(("billing_migration", "billing_roster"))
+    } == set()
 
 
 async def test_bootstrap_is_fail_closed_for_every_environment(
@@ -774,18 +751,22 @@ async def test_bootstrap_is_fail_closed_for_every_environment(
         rows = (await connection.execute(text("""
                     SELECT rollout.environment, rollout.state,
                            rollout.topup_commercial_enabled,
-                           rollout.rollout_revision, rollout.topup_revision,
-                           roster.billing_roster_revision
+                           rollout.rollout_revision, rollout.topup_revision
                     FROM billing_rollout_control AS rollout
-                    CROSS JOIN billing_roster_control AS roster
                     ORDER BY rollout.environment
                 """))).all()
+        # The legacy roster revision that used to sit beside it: dropped by
+        # migration 037 (its singleton seed row with it).
+        roster = await connection.scalar(
+            text("SELECT to_regclass('billing_roster_control')")
+        )
     assert rows == [
-        ("development", "disabled", False, 0, 0, 0),
-        ("production", "disabled", False, 0, 0, 0),
-        ("staging", "disabled", False, 0, 0, 0),
-        ("test", "disabled", False, 0, 0, 0),
+        ("development", "disabled", False, 0, 0),
+        ("production", "disabled", False, 0, 0),
+        ("staging", "disabled", False, 0, 0),
+        ("test", "disabled", False, 0, 0),
     ]
+    assert roster is None
 
 
 # Group 10 E5 (migration 036): the legacy saga cannot run any more.  The
@@ -801,19 +782,19 @@ async def test_bootstrap_is_fail_closed_for_every_environment(
 # test_migration_036_postgres.py.
 #
 # Inventory for Group 10 E6, same convention as the characterization module:
-# the tests of this module that still touch a legacy table 037 drops.
-TESTS_THAT_BREAK_AFTER_037: tuple[str, ...] = (
-    # Pins the head revision ("036").
-    "test_upgrade_downgrade_and_fresh_schema_are_equivalent",
-    # Requires trg_billing_migration_receipts_immutable; the ORM still maps
-    # the legacy tables until E6 removes their models.
-    "test_live_schema_matches_orm_metadata_and_required_triggers",
-    # Reads billing_roster_control.
-    "test_bootstrap_is_fail_closed_for_every_environment",
-    # Insert into billing_migrations.
-    "test_cross_builder_correlations_and_snapshot_pii_are_rejected",
-    "test_migration_snapshot_requires_exact_coherent_shape",
-)
+# the tests of this module that still touched a legacy table 037 drops.  It
+# is empty: 037 is applied.  E6 moved the head pin to "037", dropped the
+# legacy trigger from the required set (and pins its absence), read the
+# bootstrap without billing_roster_control (and pins that the table is gone),
+# removed the billing_migrations cross-builder probe from
+# test_cross_builder_correlations_and_snapshot_pii_are_rejected (the table and
+# its foreign key are gone; the checkout and top-up probes stay), and deleted
+# test_migration_snapshot_requires_exact_coherent_shape: it probed
+# ck_billing_migrations_snapshot_allowlist on billing_migrations, which no
+# longer exists; test_migration_037_postgres.py proves that 037's downgrade
+# restores that CHECK and billing_migration_snapshot_is_valid() byte for byte
+# and that the restored CHECK refuses the same invalid snapshots.
+TESTS_THAT_BREAK_AFTER_037: tuple[str, ...] = ()
 
 
 async def test_break_inventory_names_only_collected_tests(
@@ -2544,32 +2525,6 @@ async def test_cross_builder_correlations_and_snapshot_pii_are_rejected(
                     },
                 )
 
-    async with postgres_harness.session() as session:
-        with pytest.raises(IntegrityError):
-            async with session.begin():
-                await session.execute(
-                    text("""
-                        INSERT INTO billing_migrations (
-                            id, builder_id, subscription_id, renewal_date,
-                            open_by_date, cutover_by_date,
-                            target_catalog_version_id, target_offer_id,
-                            target_plan, target_amount_cents, target_snapshot,
-                            source_roster_revision
-                        ) VALUES (
-                            :id, :foreign_builder, :subscription_id,
-                            DATE '2026-12-10', DATE '2026-12-03',
-                            DATE '2026-12-08', 'catalog-v1',
-                            'plan_plus_monthly_v1', 'plus', 99900,
-                            '{"catalog_version_id":"catalog-v1"}'::jsonb, 1
-                        )
-                    """),
-                    {
-                        "id": uuid4(),
-                        "foreign_builder": postgres_harness.foreign_builder_id,
-                        "subscription_id": subscription_id,
-                    },
-                )
-
     insert_topup = text("""
         INSERT INTO billing_topup_orders (
             id, builder_id, payment_method, catalog_version_id,
@@ -2656,74 +2611,12 @@ async def test_cross_builder_correlations_and_snapshot_pii_are_rejected(
             )
 
 
-async def test_migration_snapshot_requires_exact_coherent_shape(
-    postgres_harness: _Harness,
-) -> None:
-    subscription_id = uuid4()
-    async with postgres_harness.session() as session:
-        async with session.begin():
-            await session.execute(
-                text("""
-                    INSERT INTO billing_subscriptions (
-                        id, builder_id, provider, external_subscription_id,
-                        is_active, plan, billing_cycle, status
-                    ) VALUES (
-                        :id, :builder_id, NULL, :external_id,
-                        false, 'start', 'monthly', 'provider_unknown'
-                    )
-                """),
-                {
-                    "id": subscription_id,
-                    "builder_id": postgres_harness.builder_id,
-                    "external_id": f"snapshot-{subscription_id}",
-                },
-            )
-
-            canonical = json.loads(_MIGRATION_SNAPSHOT_JSON)
-            invalid_snapshots = [
-                {},
-                {"catalog_version_id": "catalog-v1"},
-                {**canonical, "unexpected": True},
-                {**canonical, "amount_cents": 99899},
-                {**canonical, "lines": [{**canonical["lines"][0], "extra": 1}]},
-            ]
-            statement = text("""
-                INSERT INTO billing_migrations (
-                    id, builder_id, subscription_id, renewal_date,
-                    open_by_date, cutover_by_date, target_catalog_version_id,
-                    target_offer_id, target_plan, target_billing_cycle,
-                    target_amount_cents, target_snapshot, source_roster_revision
-                ) VALUES (
-                    :id, :builder_id, :subscription_id, DATE '2026-12-10',
-                    DATE '2026-12-03', DATE '2026-12-08', 'catalog-v1',
-                    'plan_plus_monthly_v1', 'plus', 'monthly', 99900,
-                    CAST(:snapshot AS jsonb), 1
-                )
-            """)
-            for snapshot in invalid_snapshots:
-                # Pinned: a literal source revision (CHECK > 0), so only the
-                # snapshot allowlist can refuse these rows.
-                with pytest.raises(
-                    DBAPIError, match="ck_billing_migrations_snapshot_allowlist"
-                ):
-                    async with session.begin_nested():
-                        await session.execute(
-                            statement,
-                            {
-                                "id": uuid4(),
-                                "builder_id": postgres_harness.builder_id,
-                                "subscription_id": subscription_id,
-                                "snapshot": json.dumps(snapshot),
-                            },
-                        )
-
-
 async def test_receipts_and_outbox_reject_update_and_delete(
     postgres_harness: _Harness,
 ) -> None:
-    # The billing_migration_receipts case left with migration 036: its
-    # validator reads billing_subscriptions.roster_revision, so the legacy
-    # table (empty by 036's preflight, dropped by 037) accepts no row.
+    # The billing_migration_receipts case left with migration 036 (its
+    # validator read billing_subscriptions.roster_revision, so the legacy
+    # table accepted no row); migration 037 dropped the table.
     subscription_id = uuid4()
     outbox_id = uuid4()
     async with postgres_harness.engine.begin() as connection:

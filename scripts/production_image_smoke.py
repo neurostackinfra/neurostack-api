@@ -25,7 +25,7 @@ the summary reports. Push that image ID; never rebuild it for the push.
 * ``kms-signers``: the KMS receipt and grant signer factories build their
   clients (they fail closed when the AWS SDK is missing). No KMS call is made.
 * ``alembic-heads``: ``alembic heads`` prints exactly one line, the head
-  named by ``--expected-head`` (035 while 036 and 037 are not on main).
+  named by ``--expected-head`` (the tree's head, 037 since Group 10 E6).
 * ``spa-index``: ``test -f /app/spa/index.html`` (``SPA_DIST_DIR`` of the
   Dockerfile, read by ``src/api/spa.py``).
 * ``alembic-offline-sql``: ``alembic upgrade 032:035 --sql`` emits the

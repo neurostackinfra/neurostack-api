@@ -16,6 +16,14 @@ back only to an image that contains E5. Downgrading 036 is a separate owner
 decision, refused while any subscription or readiness row exists; see
 "Migration 036" in [`asaas-deployment.md`](./asaas-deployment.md).
 
+Once migration 037 is applied, roll back only to an image that contains
+Group 10 E6. The E5 image still maps the dropped legacy tables: its ORM
+deletion of a builder (`DELETE /v1/admin/builders/{id}`) fails with
+`relation "billing_migrations" does not exist` and rolls back; its other
+paths do not touch them. Running the E5 image again needs the 037 downgrade
+first, a separate owner decision; see "Migration 037" in
+[`asaas-deployment.md`](./asaas-deployment.md).
+
 ## Current state (2026-10-17)
 
 Billing rollout is `disabled` and `topup_commercial_enabled=false`. While it

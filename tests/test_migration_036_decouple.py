@@ -78,10 +78,13 @@ def migration() -> ModuleType:
     return _load()
 
 
-def test_036_revises_035_and_is_the_single_head(migration: ModuleType) -> None:
+def test_036_revises_035_and_037_follows_it(migration: ModuleType) -> None:
     assert (migration.revision, migration.down_revision) == ("036", "035")
-    assert current_head() == "036"
-    assert migration_revisions()[_MIGRATION.name] == ("036", "035")
+    revisions = migration_revisions()
+    assert revisions[_MIGRATION.name] == ("036", "035")
+    # Group 10 E6: 037 (drop the legacy objects) is the only child of 036.
+    assert [rev for rev, parent in revisions.values() if parent == "036"] == ["037"]
+    assert current_head() == "037"
 
 
 def test_frozen_file_is_pinned_rendered_and_outside_versions(

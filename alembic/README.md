@@ -10,21 +10,31 @@ alembic/
 ├── script.py.mako      # Template para novas migrations
 ├── README.md           # Este arquivo
 ├── frozen/             # DDL congelada que um downgrade restaura (dados, não migrations)
-│   └── 036_downgrade_restores_035.json
+│   ├── 036_downgrade_restores_035.json
+│   └── 037_downgrade_restores_036.json
 └── versions/           # Arquivos de migration
     └── *.py
 ```
 
 `frozen/` guarda a DDL extraída do catálogo de um banco recém-criado na
 revisão anterior (`pg_get_functiondef`, `pg_get_triggerdef`,
-`pg_get_constraintdef` e as colunas), para que um downgrade restaure
+`pg_get_constraintdef`, `pg_get_indexdef`, as colunas e, na 037, a linha
+semente de `billing_roster_control`), para que um downgrade restaure
 exatamente o que a migration removeu, sem DDL digitada à mão. O Alembic não
 lê esse diretório; cada migration lê o seu arquivo e confere o SHA-256 fixado
-nela antes de executar. Para regenerar (somente a partir de um banco novo na
-revisão de origem): `python -m scripts.alembic_frozen_ddl --database-url ...`,
-e atualizar o SHA-256 da migration; o teste de fidelidade
-(`tests/integration/test_migration_036_postgres.py`) compara o arquivo com o
-catálogo de um banco novo byte a byte.
+nela antes de executar qualquer SQL (a 037 lê o arquivo também no upgrade:
+dele vem a lista exata do que ela pode remover). Para regenerar (somente a
+partir de um banco novo na revisão de origem, 035 para a 036 e 036 para a
+037): `python -m scripts.alembic_frozen_ddl --migration 036|037
+--database-url ...`, e atualizar o SHA-256 da migration; os testes de
+fidelidade (`tests/integration/test_migration_036_postgres.py` e
+`tests/integration/test_migration_037_postgres.py`) comparam o arquivo com o
+catálogo de um banco novo byte a byte. A imagem de produção copia `alembic/`
+inteiro (`COPY alembic`), então os arquivos congelados estão nela. A 037
+também gera, a partir das próprias verificações, a releitura somente leitura
+que o operador roda antes da janela (`scripts/migration_037_readback.sql`,
+`python -m scripts.migration_037_readback --output ...`); um teste falha
+enquanto o arquivo diferir do que a migration gera.
 
 ## Comandos Principais
 

@@ -15,7 +15,6 @@ from src.models.base import Base, TimestampMixin
 if TYPE_CHECKING:
     from src.models.billing import (
         BillingCheckoutSession,
-        BillingMigration,
         BillingSubscription,
         BillingTopupOrder,
     )
@@ -78,10 +77,6 @@ class Builder(Base, TimestampMixin):
     )
     billing_subscriptions: Mapped[list["BillingSubscription"]] = relationship(
         "BillingSubscription",
-        back_populates="builder",
-    )
-    billing_migrations: Mapped[list["BillingMigration"]] = relationship(
-        "BillingMigration",
         back_populates="builder",
     )
     billing_checkout_sessions: Mapped[list["BillingCheckoutSession"]] = relationship(

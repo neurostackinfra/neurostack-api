@@ -19,15 +19,12 @@ import src.models as model_exports
 from src.models.base import Base
 from src.models.billing import (
     BillingCheckoutSession,
-    BillingMigration,
-    BillingMigrationReceipt,
     BillingOutboxEvent,
     BillingPaymentEffect,
     BillingPaymentProjection,
     BillingRolloutControl,
     BillingRolloutReadinessReceipt,
     BillingRolloutReceipt,
-    BillingRosterControl,
     BillingSubscription,
     BillingTopupCapabilityReceipt,
     BillingTopupOrder,
@@ -42,15 +39,12 @@ _ROOT = Path(__file__).resolve().parents[2]
 
 _BILLING_MODELS = (
     BillingSubscription,
-    BillingMigration,
     BillingCheckoutSession,
-    BillingMigrationReceipt,
     BillingWebhookDelivery,
     BillingPaymentProjection,
     BillingPaymentEffect,
     BillingRolloutControl,
     BillingRolloutReceipt,
-    BillingRosterControl,
     BillingTopupCapabilityReceipt,
     BillingTopupOrder,
     BillingOutboxEvent,
@@ -114,24 +108,42 @@ def test_group_zero_legacy_binding_is_physical_and_provider_unique() -> None:
     assert "A-Za-z0-9._:-" in external_check
 
 
-def test_asaas_target_snapshot_stays_separate_until_roster_flip() -> None:
-    migration_columns = BillingMigration.__table__.columns
-    assert {
-        "target_provider",
-        "target_external_subscription_id",
-        "target_plan",
-        "target_billing_cycle",
-        "target_coupon_code",
-        "target_snapshot",
-        "source_roster_revision",
-    }.issubset(migration_columns.keys())
-    allowlist = _check_sql(
-        BillingMigration,
-        "ck_billing_migrations_snapshot_allowlist",
-    )
-    assert "billing_migration_snapshot_is_valid" in allowlist
-    assert "customer" not in allowlist
-    assert "email" not in allowlist
+# Migration 037 (Group 10 E6) dropped billing_migrations,
+# billing_migration_receipts, billing_migration_absence_reads and
+# billing_roster_control, and the ORM no longer maps them.  E6 deleted
+# test_asaas_target_snapshot_stays_separate_until_roster_flip (it read the
+# BillingMigration target columns and snapshot CHECK); what replaces it is the
+# absence below and in tests/test_migration_037_drop_legacy.py, and the 036
+# definitions of those tables are frozen in
+# alembic/frozen/037_downgrade_restores_036.json.
+_DROPPED_BY_037 = (
+    "billing_migrations",
+    "billing_migration_receipts",
+    "billing_migration_absence_reads",
+    "billing_roster_control",
+)
+
+
+def test_the_legacy_saga_tables_are_not_mapped_since_037() -> None:
+    configure_mappers()
+    assert not set(_DROPPED_BY_037) & set(Base.metadata.tables)
+    for name in (
+        "BillingMigration",
+        "BillingMigrationReceipt",
+        "BillingMigrationAbsenceRead",
+        "BillingRosterControl",
+    ):
+        assert not hasattr(model_exports, name), name
+    referenced = {
+        element.column.table.name
+        for table in Base.metadata.tables.values()
+        for constraint in table.constraints
+        if isinstance(constraint, ForeignKeyConstraint)
+        for element in constraint.elements
+    }
+    assert not set(_DROPPED_BY_037) & referenced
+    assert "billing_migrations" not in Builder.__mapper__.relationships
+    assert "migrations" not in BillingSubscription.__mapper__.relationships
 
 
 def test_legacy_cycle_and_unknown_provider_saga_are_representable() -> None:
@@ -189,7 +201,7 @@ def test_subscription_checks_allow_sqlite_legacy_insert() -> None:
 def test_migration_036_removed_the_legacy_links_from_the_asaas_models() -> None:
     """The three columns migration 036 drops, their constraints and the
     relationships that rode on ``migration_id`` are gone from the ORM (the
-    legacy models themselves stay until 037)."""
+    legacy models themselves went with 037)."""
 
     configure_mappers()
     for model, column, constraint in (
@@ -213,7 +225,6 @@ def test_migration_036_removed_the_legacy_links_from_the_asaas_models() -> None:
         assert column not in table.columns, (model.__name__, column)
         assert constraint not in {item.name for item in table.constraints}
     assert not hasattr(BillingCheckoutSession, "migration")
-    assert not hasattr(BillingMigration, "checkout_sessions")
     referenced = {
         element.column.table.name
         for constraint in BillingCheckoutSession.__table__.constraints
@@ -271,15 +282,6 @@ def test_three_idempotency_namespaces_are_independent() -> None:
 @pytest.mark.parametrize(
     ("model", "constraint_name", "local", "remote"),
     [
-        (
-            BillingMigration,
-            "fk_billing_migrations_builder_subscription",
-            ("builder_id", "subscription_id"),
-            (
-                "billing_subscriptions.builder_id",
-                "billing_subscriptions.id",
-            ),
-        ),
         (
             BillingCheckoutSession,
             "fk_billing_checkout_sessions_result_subscription",
@@ -384,7 +386,7 @@ def test_transaction_keeps_legacy_external_id_semantics() -> None:
     assert "billing_payment_effect_id IS NOT NULL" in identity
 
 
-def test_rollout_and_roster_have_independent_revision_fences() -> None:
+def test_rollout_control_keeps_its_own_revision_fences() -> None:
     rollout_columns = BillingRolloutControl.__table__.columns
     assert "rollout_revision" in rollout_columns
     assert "topup_revision" in rollout_columns
@@ -400,10 +402,8 @@ def test_rollout_and_roster_have_independent_revision_fences() -> None:
         "canary_subscription_effect_id",
         "canary_topup_effect_id",
     }.issubset(rollout_columns.keys())
-    roster_columns = BillingRosterControl.__table__.columns
-    assert "billing_roster_revision" in roster_columns
-    assert "singleton" in roster_columns
-    assert "environment" not in roster_columns
+    # The legacy global roster revision it used to sit beside went with 037.
+    assert "billing_roster_control" not in Base.metadata.tables
 
 
 def test_sqlite_create_all_skips_postgresql_canary_aggregate_check() -> None:
@@ -456,13 +456,6 @@ def test_snapshots_are_recursively_closed_and_capability_consumption_is_unique()
         (BillingCheckoutSession, "ck_billing_checkout_sessions_snapshot_allowlist"),
     ):
         assert "billing_snapshot_has_no_pii" in _check_sql(model, name)
-    migration_snapshot = _check_sql(
-        BillingMigration, "ck_billing_migrations_snapshot_allowlist"
-    )
-    assert "billing_migration_snapshot_is_valid" in migration_snapshot
-    assert "target_plan" in migration_snapshot
-    assert "target_billing_cycle" in migration_snapshot
-    assert "target_coupon_code" in migration_snapshot
     migration = (
         _ROOT / "alembic/versions/20261011_000003_026_asaas_billing.py"
     ).read_text()
@@ -478,10 +471,11 @@ def test_snapshots_are_recursively_closed_and_capability_consumption_is_unique()
     assert "IS NOT NULL" in str(index.dialect_options["postgresql"]["where"])
 
 
-def test_global_roster_fence_is_database_only() -> None:
-    # Group 10 E4 removed the Python mirror of the key; the database fence
-    # (migration 036 dropped its billing_subscriptions trigger, 037 drops the
-    # legacy tables' ones) still takes the key it was created with.
+def test_global_roster_fence_is_gone_from_code_and_schema() -> None:
+    # Group 10 E4 removed the Python mirror of the key; migration 036 dropped
+    # the billing_subscriptions trigger and 037 the legacy tables, their
+    # triggers and lock_billing_roster_statement().  Migration 026 (never
+    # edited) still creates them all with the same key.
     import src.repositories.billing as repository
 
     expected_key = 3486705124568449331
@@ -497,11 +491,12 @@ def test_global_roster_fence_is_database_only() -> None:
         "trg_billing_roster_control_fence",
     ):
         assert trigger in migration
-    receipt_shape = _check_sql(
-        BillingMigrationReceipt, "ck_billing_migration_receipts_saga_shape"
-    )
-    assert "provider = 'abacatepay'" in receipt_shape
-    assert "provider = 'asaas'" in receipt_shape
+    drop = (
+        _ROOT
+        / "alembic/versions/20261020_000001_037_drop_legacy_billing_migration_objects.py"
+    ).read_text(encoding="utf-8")
+    assert '"lock_billing_roster_statement()",' in drop
+    assert "billing_roster_control" not in Base.metadata.tables
 
 
 def test_canary_plus_snapshot_and_transitive_provenance_are_closed() -> None:
@@ -541,10 +536,8 @@ def test_migration_035_preserves_legacy_canary_rows_and_guards_downgrade() -> No
 
 def test_postgresql_model_constraints_match_migration_names() -> None:
     expected = {
-        "ck_billing_migrations_snapshot_allowlist",
         "ck_billing_topup_orders_snapshot_allowlist",
         "ck_billing_checkout_sessions_snapshot_allowlist",
-        "ck_billing_migration_receipts_external_reference",
         "ck_billing_webhook_deliveries_event_fields",
         "ck_billing_webhook_deliveries_resource_id",
         "ck_billing_payment_projections_payment_id",
@@ -555,6 +548,14 @@ def test_postgresql_model_constraints_match_migration_names() -> None:
         for constraint in model.__table__.constraints
     }
     assert expected.issubset(metadata_names)
+    # The legacy tables' PostgreSQL-only CHECKs left the ORM with 037.
+    assert (
+        not {
+            "ck_billing_migrations_snapshot_allowlist",
+            "ck_billing_migration_receipts_external_reference",
+        }
+        & metadata_names
+    )
     migration = (
         _ROOT / "alembic/versions/20261011_000003_026_asaas_billing.py"
     ).read_text(encoding="utf-8")

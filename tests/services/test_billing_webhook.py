@@ -33,7 +33,6 @@ from src.models.billing import (
     BillingPaymentEffect,
     BillingPaymentProjection,
     BillingRolloutControl,
-    BillingRosterControl,
     BillingSubscription,
     BillingTopupOrder,
     BillingWebhookDelivery,
@@ -414,11 +413,11 @@ async def world(
     sessions = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     builder_id = uuid4()
     async with sessions() as session:
-        # No billing_roster_control row (Group 10 E4): the application code
-        # no longer reads it, and every test here proves that.  Since
-        # migration 036 the database does not need it either: the 026
-        # statement trigger that took it on every UPDATE of
-        # billing_subscriptions is gone.
+        # No billing_roster_control (Group 10 E4: the application code no
+        # longer reads it; migration 036 dropped the 026 statement trigger
+        # that took it on every UPDATE of billing_subscriptions; migration
+        # 037 dropped the table, which the ORM no longer maps, so this
+        # schema has none).
         session.add_all(
             [
                 Builder(id=builder_id, name="Fixture Builder"),
@@ -952,11 +951,10 @@ async def test_provider_amount_drift_blocks_settlement(world: _World) -> None:
 # BillingCheckoutSession.migration_id from the model and from the three tests
 # (and the two _World helpers) that set or read them.
 TESTS_THAT_BREAK_AFTER_036: tuple[str, ...] = ()
-# 037 drops BillingRosterControl: this test writes it, and the module-level
-# import of the model must go too (or the whole module fails to import).
-TESTS_THAT_BREAK_AFTER_037: tuple[str, ...] = (
-    "test_handoff_ignores_the_legacy_roster_row",
-)
+# 037 is applied: E6 removed BillingRosterControl (model and import) and
+# rewrote test_handoff_ignores_the_legacy_roster_row as
+# test_handoff_needs_no_legacy_roster_table (a schema without the table).
+TESTS_THAT_BREAK_AFTER_037: tuple[str, ...] = ()
 
 
 def test_break_inventory_names_only_collected_tests(
@@ -972,12 +970,13 @@ def test_break_inventory_names_only_collected_tests(
         assert sorted(set(listed) - collected) == []
 
 
-async def test_handoff_ignores_the_legacy_roster_row(world: _World) -> None:
-    """Group 10 E4: a stray roster row at revision 7 is neither read nor
-    locked.  Since migration 036 the new row carries no roster revision at
-    all (E4 wrote the constant 1 the dropped CHECK needed)."""
+async def test_handoff_needs_no_legacy_roster_table(world: _World) -> None:
+    """Group 10 E4 stopped reading the legacy roster, 036 stopped the
+    database from taking it and 037 dropped billing_roster_control: the
+    world's schema (the ORM metadata) has no such table, and the handoff is
+    processed and links the subscription without any roster column."""
 
-    await world.add(BillingRosterControl(singleton=True, billing_roster_revision=7))
+    assert "billing_roster_control" not in Base.metadata.tables
     checkout = await world.subscription_session()
     created = await world.receive(
         _event(
@@ -991,8 +990,6 @@ async def test_handoff_ignores_the_legacy_roster_row(world: _World) -> None:
     (row,) = await world.rows(BillingSubscription)
     assert (row.id, row.status) == (checkout.intent_id, "active_linked")
     assert "roster_revision" not in BillingSubscription.__table__.columns
-    (control,) = await world.rows(BillingRosterControl)
-    assert control.billing_roster_revision == 7
 
 
 async def test_subscription_created_hands_off_and_settlement_activates_once(
