@@ -1,16 +1,40 @@
+# DEVELOPMENT stack only. Compose interpolates the whole file when it loads it,
+# so every command that reads this file (up, down -v, run, exec, logs, config,
+# ...) aborts here unless NEUROSTACK_DEV_STACK is set: a production checkout
+# shares this file's Compose project name, postgres_data volume and .env, and
+# scripts/deploy-vps.sh refuses the key in the production .env. Set
+# NEUROSTACK_DEV_STACK=1 in your local dev .env (see .env.example). ANY
+# non-empty value enables this file (NEUROSTACK_DEV_STACK=0 does too); never set
+# it on a production host.
+x-neurostack-dev-stack: "${NEUROSTACK_DEV_STACK:?this is the DEVELOPMENT compose file (docker-compose.yml) and must never run on the production checkout; set NEUROSTACK_DEV_STACK=1 in your local dev .env (any non-empty value enables it, even 0; never set it on a production host)}"
+
 services:
+  # Development only. Every command of this service passes through
+  # scripts/guard_alembic_upgrade_head.py first, which refuses unless the target
+  # is a development database: on a production checkout (the VPS shares this
+  # Compose project name, the postgres_data volume and the .env) the production
+  # POSTGRES_* identifiers and ENVIRONMENT make it refuse before Alembic runs.
+  # The guard's override is deliberately not forwarded into this container.
   migrate:
     build:
       context: .
       dockerfile: Dockerfile
+    entrypoint:
+      - sh
+      - -c
+      - 'python scripts/guard_alembic_upgrade_head.py && exec "$$@"'
+      - guard_alembic_upgrade_head
     command: ["alembic", "upgrade", "head"]
     environment:
       - ENVIRONMENT=development
+      - NEUROSTACK_CHECKOUT_ENVIRONMENT=${ENVIRONMENT:-}
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
     volumes:
       - ./src:/app/src
       - ./alembic:/app/alembic
       - ./alembic.ini:/app/alembic.ini
+      # The image (production stage) ships only scripts/bootstrap_admin.py.
+      - ./scripts/guard_alembic_upgrade_head.py:/app/scripts/guard_alembic_upgrade_head.py:ro
     depends_on:
       postgres:
         condition: service_healthy

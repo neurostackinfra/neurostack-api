@@ -34,15 +34,16 @@ help:
 	@echo "  make typecheck   - Run type checking"
 	@echo "  make quality     - Run all quality checks"
 	@echo ""
-	@echo "Docker:"
+	@echo "Docker (development stack; needs NEUROSTACK_DEV_STACK=1 in your local .env):"
 	@echo "  make docker-up   - Start all services"
 	@echo "  make docker-down - Stop all services"
 	@echo "  make docker-logs - View logs"
 	@echo "  make docker-build- Build Docker image"
 	@echo ""
 	@echo "Database:"
-	@echo "  make db-migrate  - Run database migrations"
-	@echo "  make db-reset    - Reset database"
+	@echo "  make db-migrate  - Migrate the local dev database to head (guarded)"
+	@echo "  make db-rollback - Roll back one revision on the local dev database (guarded)"
+	@echo "  make db-reset    - Reset the local dev database (guarded)"
 	@echo ""
 	@echo "Cleanup:"
 	@echo "  make clean       - Clean build artifacts"
@@ -175,15 +176,28 @@ docker-infra:
 # Database
 # ============================================
 
+# db-migrate, db-rollback and db-reset are for a local development database
+# only. Each recipe is ONE shell line chained with `&&`, so the guard's refusal
+# stops it even under `make -i`/`-k`. The guard refuses unless DATABASE_URL
+# (process environment, then ./.env) is loopback or the dev Compose `postgres`
+# service with development identifiers, ENVIRONMENT is unset, development or
+# test, and this checkout's POSTGRES_USER/POSTGRES_DB are development
+# identifiers (so the DROP never reaches a production volume). Every other
+# environment migrates to the revision approved for it
+# (`alembic upgrade <revision>`); see scripts/guard_alembic_upgrade_head.py and
+# docs/runbooks/asaas-deployment.md.
 db-migrate:
-	poetry run alembic upgrade head
+	poetry run python scripts/guard_alembic_upgrade_head.py --operation upgrade-head && \
+		poetry run alembic upgrade head
 
 db-rollback:
-	poetry run alembic downgrade -1
+	poetry run python scripts/guard_alembic_upgrade_head.py --operation downgrade && \
+		poetry run alembic downgrade -1
 
 db-reset:
-	docker compose exec postgres psql -U neurostack -d neurostack -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
-	poetry run alembic upgrade head
+	poetry run python scripts/guard_alembic_upgrade_head.py --operation reset && \
+		docker compose exec postgres psql -U neurostack -d neurostack -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" && \
+		poetry run alembic upgrade head
 
 # ============================================
 # Cleanup

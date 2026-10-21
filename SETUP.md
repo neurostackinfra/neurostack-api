@@ -36,7 +36,12 @@ cd neurostack/back-end/neurostack-api
 
 ## 2. Subir a infraestrutura (PostgreSQL, Redis, Qdrant)
 
-O `docker-compose.yml` ja tem tudo configurado:
+O `docker-compose.yml` ja tem tudo configurado. Ele e so de desenvolvimento:
+todo comando `docker compose` sobre ele aborta sem `NEUROSTACK_DEV_STACK=1` no
+`.env` local (qualquer valor nao vazio habilita o arquivo, ate `0`; por isso
+nunca defina essa variavel num host de producao). Crie o `.env`
+antes (`cp .env.example .env`, ver secao 3), que ja traz essa linha e os
+defaults do Postgres:
 
 ```bash
 docker compose up -d postgres redis qdrant
@@ -107,9 +112,17 @@ local deve permanecer no checkout; nao copie apenas `src/` para outro diretorio.
 
 ## 5. Rodar migrations do banco
 
+No banco local de desenvolvimento:
+
 ```bash
-alembic upgrade head
+make db-migrate
+# sem Poetry: python scripts/guard_alembic_upgrade_head.py && alembic upgrade head
 ```
+
+`make db-migrate` roda `scripts/guard_alembic_upgrade_head.py` antes do Alembic, e o
+guard recusa qualquer banco que não seja de desenvolvimento local. Qualquer outro
+ambiente é migrado para a revisão aprovada para o ambiente (`alembic upgrade <revisão>`;
+`head` só num banco local de desenvolvimento, via `make db-migrate`).
 
 Isso cria todas as tabelas: `tenants`, `events`, `sessions`, `clinic_configs`, `users`, etc.
 

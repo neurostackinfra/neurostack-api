@@ -50,11 +50,15 @@ alembic revision -m "Descrição da mudança"
 
 ### Executar migrations
 
-```bash
-# Upgrade para a última versão
-alembic upgrade head
+Migre cada ambiente para a revisão aprovada para o ambiente (`alembic upgrade <revision>`;
+`head` só num banco local de desenvolvimento, via `make db-migrate`, que roda
+`scripts/guard_alembic_upgrade_head.py` antes e recusa qualquer outro banco).
 
-# Upgrade para uma versão específica
+```bash
+# Banco local de desenvolvimento: upgrade para a última versão (com o guard)
+make db-migrate
+
+# Upgrade para uma versão específica (a aprovada para o ambiente)
 alembic upgrade <revision_id>
 
 # Upgrade um passo
@@ -95,9 +99,9 @@ alembic upgrade head --sql > migration.sql
    alembic revision --autogenerate -m "Add new feature"
    ```
 3. **Revisar o arquivo gerado** em `versions/`
-4. **Testar localmente**:
+4. **Testar localmente** (banco local de desenvolvimento):
    ```bash
-   alembic upgrade head
+   make db-migrate
    ```
 5. **Commit** a migration junto com as mudanças do modelo
 

@@ -117,7 +117,7 @@ exit 0
     executable(
         directory / "docker",
         """#!/usr/bin/env bash
-echo "docker $*" >> "$COMMAND_LOG"
+echo "docker $* [NEUROSTACK_DEV_STACK=${NEUROSTACK_DEV_STACK-unset}]" >> "$COMMAND_LOG"
 if [ "${FAIL_MATCH:-}" = compose-api ] && [ "$1" = compose ]; then
   for arg in "$@"; do [ "$arg" = run ] && exit 1; done
 fi
@@ -138,7 +138,7 @@ def run_gate(
     command_shims(tmp_path)
     command_log = tmp_path / "commands.log"
     env = {
-        **os.environ,
+        **{k: v for k, v in os.environ.items() if k != "NEUROSTACK_DEV_STACK"},
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
         "COMMAND_LOG": str(command_log),
         "FAKE_PYTHON": str(tmp_path / "fake-python"),
@@ -177,6 +177,17 @@ def test_install_gate_executes_real_commands_for_all_six_rows(tmp_path: Path) ->
     assert "docker compose" in joined and " run --build --rm --no-deps " in joined
     assert "docker build --target production" in joined
     assert "docker run --rm -i" in joined
+    # docker-compose.yml aborts without the dev-stack flag; the gate sets it
+    # for its own disposable-project compose commands only.
+    compose_calls = [line for line in commands if line.startswith("docker compose")]
+    assert compose_calls
+    assert all("[NEUROSTACK_DEV_STACK=1]" in line for line in compose_calls)
+    other_docker = [
+        line
+        for line in commands
+        if line.startswith("docker ") and not line.startswith("docker compose")
+    ]
+    assert all("[NEUROSTACK_DEV_STACK=unset]" in line for line in other_docker)
     oracle_calls = [
         line for line in commands if "assert-neurostack-core-origin.py" in line
     ]

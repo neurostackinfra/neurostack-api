@@ -16,7 +16,9 @@ maintained. Unexpected states (another super_admin, another role, inactive
 account, only case variants of the email, an account outside the platform
 tenant, an existing platform tenant) are refused without writing anything.
 
-Run once per environment, after ``alembic upgrade head``:
+Run once per environment, after migrating it to the revision approved for the
+environment (``alembic upgrade <revision>``; ``head`` only on a local
+development database through ``make db-migrate``):
     python -m scripts.bootstrap_admin
 """
 
